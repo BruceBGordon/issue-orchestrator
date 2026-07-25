@@ -375,6 +375,73 @@ class TestCreateIssueDedup:
         assert len(creates) == 2
         assert all(PROPOSED_TECH_LEAD_LABEL not in c.labels for c in creates)
 
+    def test_cited_sibling_is_gated_not_a_second_ungated_create(self) -> None:
+        # #6883 review case 1: a CommentExisting proposal must still register as a
+        # sibling. A1 cites #1234 (routed onto it as a comment); A2 is identical
+        # but uncited, and #1234's stored text is lexically distant so A2 does NOT
+        # trip the corpus backstop -> it would classify FileNew. Without covering
+        # CommentExisting in the batch ledger, A2 files an UNGATED create. It must
+        # instead be gated as an intra-decision duplicate of A1.
+        distant = self._ready(OpenIssueRef(1234, "Migrate billing webhooks", "v2"))
+        planned = _plan(
+            _decision(self._issue(id="A1", duplicate_of=1234), self._issue(id="A2")),
+            dedup_corpus=distant,
+            dedup_grant=self._GRANT,
+        )
+        comments = [a for a in planned if isinstance(a, AddCommentAction)]
+        assert len(comments) == 1 and comments[0].number == 1234  # only A1 routes
+        creates = [x for x in planned if isinstance(x, CreateTechLeadIssueAction)]
+        assert [PROPOSED_TECH_LEAD_LABEL in c.labels for c in creates] == [True]
+        assert not any(  # the invariant the reviewer proved was broken
+            PROPOSED_TECH_LEAD_LABEL not in c.labels for c in creates
+        )
+        assert "intra-decision duplicate" in creates[0].body
+        assert "A1" in creates[0].body
+
+    def test_two_identical_citations_emit_one_comment_not_two(self) -> None:
+        # #6883 review case 2: two identical proposals both citing #1234 must not
+        # emit two AddCommentActions to the same issue. A1 comments; A2 is gated,
+        # and its gate note COMPOSES the sibling reason with the cited candidate so
+        # #1234 is not lost.
+        planned = _plan(
+            _decision(
+                self._issue(id="A1", duplicate_of=1234),
+                self._issue(id="A2", duplicate_of=1234),
+            ),
+            dedup_corpus=self._ready(),
+            dedup_grant=self._GRANT,
+        )
+        comments = [a for a in planned if isinstance(a, AddCommentAction)]
+        assert len(comments) == 1 and comments[0].number == 1234  # never two
+        [gated] = [x for x in planned if isinstance(x, CreateTechLeadIssueAction)]
+        assert PROPOSED_TECH_LEAD_LABEL in gated.labels
+        assert "intra-decision duplicate" in gated.body and "A1" in gated.body
+        assert "#1234" in gated.body  # composed: the cited candidate survives
+
+    def test_sibling_that_is_also_a_corpus_match_keeps_its_candidate_and_score(
+        self,
+    ) -> None:
+        # #6883 review finding 2: batch gating must COMPOSE with, not REPLACE, the
+        # typed gate's evidence. Two identical uncited proposals both lexically
+        # match #1234 -> GateSuspectedDuplicate with a score. The first gated body
+        # carries #1234 + score; the sibling must retain BOTH plus the batch note.
+        planned = _plan(
+            _decision(self._issue(id="A1"), self._issue(id="A2")),
+            dedup_corpus=self._ready(),  # _MATCH #1234 is lexically similar
+            dedup_grant=DuplicateTargetGrant.none(),
+        )
+        creates = [x for x in planned if isinstance(x, CreateTechLeadIssueAction)]
+        assert len(creates) == 2 and all(
+            PROPOSED_TECH_LEAD_LABEL in c.labels for c in creates
+        )
+        [sibling] = [c for c in creates if "intra-decision duplicate" in c.body]
+        [first] = [c for c in creates if "intra-decision duplicate" not in c.body]
+        # The sibling loses NOTHING the standalone gate captured...
+        assert "#1234" in sibling.body and "score" in sibling.body.lower()
+        assert "A1" in sibling.body  # ...and still names the sibling it duplicates
+        # ...while the first still carries the standalone candidate + score.
+        assert "#1234" in first.body and "score" in first.body.lower()
+
 
 class TestDecisionIssuePolicy:
     """Decision-created issues route through the tech_lead: config owner (F4)."""
