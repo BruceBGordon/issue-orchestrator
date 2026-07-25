@@ -153,6 +153,18 @@ tech_lead:
   # stays a gated proposal (execute is still a startup error until fully wired).
   authority:
     reset_retry: propose
+    # Auto-file create_issue follow-ups directly (the default), made explicit now
+    # that it is safe: duplicate proposals are deduped against the full open
+    # backlog (#6880 gate + #6882 trusted SQL corpus), so the tech lead cannot
+    # spam duplicates. The agent's duplicate_of is verified; a verified in-scope
+    # duplicate is commented onto the existing issue, otherwise the proposal is
+    # gated for human reconciliation rather than filed twice.
+    create_issue: execute
+  # Full-backlog create_issue dedup (#6878). Enabled by default; explicit here as
+  # the safety mechanism that lets create_issue: execute run unattended.
+  dedup:
+    enabled: true
+    similarity_threshold: 0.72
   # Periodic "walk the board" health review — uses the single session slot when
   # due (deduped, skips at capacity).
   health_review:
@@ -161,9 +173,12 @@ tech_lead:
   # open issues stuck in a terminal blocking state the normal loop cannot
   # re-discover and re-injects each into reactive tech_lead. Bounded per issue: after
   # max_recovery_attempts it stops re-injecting and flags the issue as exhausted.
+  # Its scan is a BROAD exhaustive open-issue read, so it runs on a slow
+  # reconcile-backstop cadence (4h) — stranded issues are quiescent, so a few
+  # hours of recovery latency is fine and keeps the broad scan off the hot path.
   stuck_sweep:
     enabled: true
-    interval_minutes: 15
+    interval_minutes: 240
     max_recovery_attempts: 3
 
 goal_pilot:

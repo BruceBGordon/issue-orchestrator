@@ -421,11 +421,15 @@ class StuckSweepConfig:
     reactive-tech-lead pipeline. ``interval_minutes`` is the cadence;
     ``max_recovery_attempts`` bounds re-injection per issue before the sweep
     surfaces it as exhausted (needs human attention) instead of looping.
-    ``enabled`` is False (off) by default.
+    ``enabled`` is False (off) by default. The default cadence is 4h: the sweep
+    is a reconcile-for-strays BACKSTOP, not a hot path, and its scan is a broad
+    exhaustive open-issue read — a slow interval keeps that off the frequent
+    paths (stranded issues are quiescent, so a few hours of recovery latency is
+    fine; lower it when faster reclamation is worth the extra scans).
     """
 
     enabled: bool = False
-    interval_minutes: int = 15
+    interval_minutes: int = 240
     max_recovery_attempts: int = 3
 
     @classmethod
@@ -433,7 +437,7 @@ class StuckSweepConfig:
         """Parse the ``tech_lead.stuck_sweep`` YAML sub-dict."""
         return cls(
             enabled=bool(data.get("enabled", False)),
-            interval_minutes=int(data.get("interval_minutes", 15)),
+            interval_minutes=int(data.get("interval_minutes", 240)),
             max_recovery_attempts=int(data.get("max_recovery_attempts", 3)),
         )
 

@@ -1312,16 +1312,19 @@ class ReviewSettings(BaseModel):
         },
     )
     tech_lead_stuck_sweep_interval_minutes: int = Field(
-        15,
+        240,
         title="Stuck Sweep Interval (minutes)",
         description="Scan for stuck issues every N minutes (>= 1; disable via 'enabled')",
         ge=1,
         json_schema_extra={
-            "doc_examples": ["15", "30", "60"],
+            "doc_examples": ["240", "60", "480"],
             "doc_notes": (
                 "How often the tech-lead sweep scans open issues for terminal "
-                "stuck state. Only runs when the sweep is enabled; each scan is "
-                "a single bounded query."
+                "stuck state. Only runs when the sweep is enabled. The scan is a "
+                "broad exhaustive open-issue read, so this is a reconcile-for-"
+                "strays BACKSTOP cadence, not a hot path — the 4h default keeps "
+                "that read off the frequent paths; lower it only when faster "
+                "recovery of stranded issues is worth the extra scans."
             ),
             "section": _TECH_LEAD_SECTION,
             "config_attr": "tech_lead.stuck_sweep.interval_minutes",

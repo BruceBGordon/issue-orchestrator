@@ -572,7 +572,9 @@ def test_disabled_sweep_injects_nothing_via_fact_gatherer():
 def test_stuck_sweep_config_defaults():
     tech_lead = parse_tech_lead_config({})
     assert tech_lead.stuck_sweep.enabled is False
-    assert tech_lead.stuck_sweep.interval_minutes == 15
+    # 4h backstop cadence by default (a broad exhaustive scan for a rare-miss
+    # reconcile, not a hot path).
+    assert tech_lead.stuck_sweep.interval_minutes == 240
     assert tech_lead.stuck_sweep.max_recovery_attempts == 3
 
 

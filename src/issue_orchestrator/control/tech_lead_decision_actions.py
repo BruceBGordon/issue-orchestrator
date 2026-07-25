@@ -81,17 +81,19 @@ from .actions import (
     SurfaceTechLeadProposalAction,
 )
 from .label_manager import LabelManager
+from .proposal_dedup import similarity
 from .proposal_dedup_gate import (
     CommentExisting,
     DedupAuthority,
     DuplicateTargetGrant,
-    GateDedupUnavailable,
-    GateSuspectedDuplicate,
-    GateUnverifiedDuplicate,
     OpenIssueCorpus,
     ProposalIntent,
-    RejectCandidate,
     classify_proposal,
+)
+from .tech_lead_gate_notes import (
+    batch_duplicate_note,
+    compose_gate_note,
+    outcome_gate_note,
 )
 from .tech_lead_case_files import (
     build_case_file_evidence_comment,
@@ -116,53 +118,8 @@ if TYPE_CHECKING:
 # Cap applied to SurfaceTechLeadProposalAction.body_preview at construction.
 _BODY_PREVIEW_CHARS = 500
 
-# Operator-facing gate reasons rendered into the gated issue body and its action
-# reason. The PRESENCE of a reason is what gates the create (never a bare
-# boolean), so every gated issue explains itself.
-_PROPOSE_AUTHORITY_NOTE = (
-    "Gated with the proposed-tech-lead label under `propose` authority (#6778):"
-    " remove the label to approve."
-)
-
-
-def _suspected_note(outcome: GateSuspectedDuplicate) -> str:
-    # A lexical match names its score (once); an agent-confirmed-but-uncommentable
-    # duplicate has no score and its reason names the blocking mode(s).
-    if outcome.score is not None:
-        headline = (
-            f"SUSPECTED DUPLICATE of #{outcome.issue_number}"
-            f" (lexical score {outcome.score:.2f})"
-        )
-    else:
-        headline = f"DUPLICATE of #{outcome.issue_number}"
-    return (
-        f"Gated as a {headline}: {outcome.reason}. Confirm and dedup onto that"
-        " issue, or remove the proposed-tech-lead label to file this as a new"
-        " issue."
-    )
-
-
-def _unavailable_note(outcome: GateDedupUnavailable) -> str:
-    return (
-        f"Gated for review: {outcome.reason}. Filed nothing automatically —"
-        " remove the proposed-tech-lead label once checked, or dedup by hand."
-    )
-
-
-def _unverified_note(outcome: GateUnverifiedDuplicate) -> str:
-    return (
-        f"Gated as a possible DUPLICATE of #{outcome.issue_number}:"
-        f" {outcome.reason}. Verify against #{outcome.issue_number}, then dedup"
-        " onto it, or remove the proposed-tech-lead label to file this as new."
-    )
-
-
-def _rejected_note(outcome: RejectCandidate) -> str:
-    return (
-        f"Gated for review: the agent cited #{outcome.issue_number} as a duplicate"
-        f" but {outcome.reason}. Filed as a new issue pending confirmation; remove"
-        " the proposed-tech-lead label to approve."
-    )
+# Operator-facing gate-note rendering (outcome → prose, batch note, composition)
+# lives in tech_lead_gate_notes so the planner stays focused on action mapping.
 
 
 def _provenance_footer(action: ProposedTechLeadAction) -> str:
@@ -383,6 +340,13 @@ class _DecisionActionPlanner:
     shadow: list[SurfaceTechLeadProposalAction] = field(default_factory=list)
     _planned_ops: set[tuple[str, int]] = field(default_factory=set)
     _planned_patterns: dict[str, int] = field(default_factory=dict)
+    # (action_id, title, body) of EVERY create_issue intent this decision has
+    # processed — whether it filed a new issue or routed onto an existing one.
+    # The persisted-corpus gate cannot see them (they have no issue number yet),
+    # so identical sibling proposals in one decision would each take an
+    # independent primary action (two files, or two comments on the same issue)
+    # under execute — intra-decision dedup closes that for every create intent.
+    _seen_create_intents: list[tuple[str, str, str]] = field(default_factory=list)
 
     @property
     def _anchor_number(self) -> int:
@@ -615,36 +579,59 @@ class _DecisionActionPlanner:
             self._dedup_authority(),
             threshold=self.config.tech_lead.dedup.similarity_threshold,
         )
+        # Intra-decision dedup owns the batch boundary. The persisted corpus
+        # cannot see sibling create_issue proposals this decision has already
+        # processed (they have no issue number yet), so EVERY create_issue
+        # intent — file-new AND comment-onto-existing — is checked and recorded
+        # here. A repeated proposal never takes a second primary action
+        # (duplicate file OR duplicate comment); it is gated, and its gate note
+        # COMPOSES the sibling reason with whatever candidate/score/reason its
+        # own typed outcome carried, so no gate evidence is lost (#6883 review).
+        sibling = self._batch_duplicate_of(proposed)  # earlier siblings only
+        self._seen_create_intents.append(
+            (proposed.id, proposed.title or "", proposed.body or "")
+        )
+        if sibling is not None:
+            self.actions.extend(
+                self._concrete_decision(
+                    proposed,
+                    gate_reason=compose_gate_note(
+                        batch_duplicate_note(sibling),
+                        outcome_gate_note(outcome, execute=execute),
+                    ),
+                )
+            )
+            return
         if isinstance(outcome, CommentExisting):
+            # First occurrence of this content: route the observation onto the
+            # verified, granted existing issue.
             self.actions.append(
                 self._dedup_comment_action(proposed, outcome.issue_number)
             )
-        elif isinstance(outcome, GateSuspectedDuplicate):
-            self.actions.extend(
-                self._concrete_decision(proposed, gate_reason=_suspected_note(outcome))
+            return
+        self.actions.extend(
+            self._concrete_decision(
+                proposed, gate_reason=outcome_gate_note(outcome, execute=execute)
             )
-        elif isinstance(outcome, GateDedupUnavailable):
-            # Fail closed: facts were expected but missing -> gate, never file.
-            self.actions.extend(
-                self._concrete_decision(proposed, gate_reason=_unavailable_note(outcome))
-            )
-        elif isinstance(outcome, GateUnverifiedDuplicate):
-            # Agent cited a duplicate we cannot yet verify -> gate with the
-            # candidate, never discard the evidence and never auto-comment.
-            self.actions.extend(
-                self._concrete_decision(proposed, gate_reason=_unverified_note(outcome))
-            )
-        elif isinstance(outcome, RejectCandidate):
-            # A provably-bad citation is filed gated for review — never commented.
-            self.actions.extend(
-                self._concrete_decision(proposed, gate_reason=_rejected_note(outcome))
-            )
-        else:  # FileNew — gated only when create_issue authority is propose.
-            self.actions.extend(
-                self._concrete_decision(
-                    proposed, gate_reason=None if execute else _PROPOSE_AUTHORITY_NOTE
-                )
-            )
+        )
+
+    def _batch_duplicate_of(self, proposed: ProposedTechLeadAction) -> str | None:
+        """Action id of an earlier create_issue intent this decision already
+        processed whose content matches ``proposed`` (else None) — regardless of
+        whether that earlier sibling filed a new issue or routed onto an existing
+        one. Uses the same lexical threshold as the corpus backstop and the same
+        ``dedup.enabled`` toggle, so intra-decision dedup and against-the-backlog
+        dedup agree and turn off together."""
+        dedup = self.config.tech_lead.dedup
+        if not dedup.enabled:
+            return None
+        for action_id, title, body in self._seen_create_intents:
+            if (
+                similarity(proposed.title or "", proposed.body or "", title, body)
+                >= dedup.similarity_threshold
+            ):
+                return action_id
+        return None
 
     def _plan_decision_tier(self, proposed: ProposedTechLeadAction) -> None:
         # Execute authority -> the concrete action(s). Propose-authority
