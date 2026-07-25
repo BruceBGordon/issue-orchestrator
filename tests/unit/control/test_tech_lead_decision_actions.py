@@ -442,6 +442,16 @@ class TestCreateIssueDedup:
         # ...while the first still carries the standalone candidate + score.
         assert "#1234" in first.body and "score" in first.body.lower()
 
+    def test_outcome_gate_note_fails_fast_never_falls_open(self) -> None:
+        # #6883 review: the outcome→note mapper must not silently degrade to the
+        # ungated path (return None under execute) for anything but FileNew. A
+        # value outside DedupOutcome — a bad caller, or a future variant added
+        # without extending the mapper — must FAIL FAST, never fail open.
+        from issue_orchestrator.control.tech_lead_gate_notes import outcome_gate_note
+
+        with pytest.raises(AssertionError):
+            outcome_gate_note(object(), execute=True)  # type: ignore[arg-type]
+
 
 class TestDecisionIssuePolicy:
     """Decision-created issues route through the tech_lead: config owner (F4)."""

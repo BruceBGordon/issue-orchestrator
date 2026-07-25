@@ -12,8 +12,12 @@ ever lost (#6883 review).
 
 from __future__ import annotations
 
+from typing import assert_never
+
 from .proposal_dedup_gate import (
     CommentExisting,
+    DedupOutcome,
+    FileNew,
     GateDedupUnavailable,
     GateSuspectedDuplicate,
     GateUnverifiedDuplicate,
@@ -87,7 +91,7 @@ def batch_duplicate_note(sibling_action_id: str) -> str:
     )
 
 
-def outcome_gate_note(outcome: object, *, execute: bool) -> str | None:
+def outcome_gate_note(outcome: DedupOutcome, *, execute: bool) -> str | None:
     """Single owner of the create_issue outcome → gate-note mapping.
 
     Returns the note a proposal's OWN typed outcome carries, independent of
@@ -95,19 +99,31 @@ def outcome_gate_note(outcome: object, *, execute: bool) -> str | None:
     execute authority). Every duplicate-flavored outcome names its
     candidate/score/reason so a composed batch note never loses that evidence
     (#6883 review — composition, not replacement).
+
+    Typed to the ``DedupOutcome`` union and matched exhaustively: ``FileNew`` is
+    the ONLY value that may reach the ungated ``None`` path, and it is handled
+    explicitly. Any other value — a bad caller or a future ``DedupOutcome``
+    variant added without extending this mapper — hits ``assert_never`` and
+    fails fast (a static exhaustiveness error at type-check time, an
+    ``AssertionError`` at runtime) rather than silently degrading to an ungated
+    create (#6883 review — fail-fast, never fail-open).
     """
-    if isinstance(outcome, CommentExisting):
-        return _comment_existing_note(outcome)
-    if isinstance(outcome, GateSuspectedDuplicate):
-        return _suspected_note(outcome)
-    if isinstance(outcome, GateDedupUnavailable):
-        return _unavailable_note(outcome)  # fail closed
-    if isinstance(outcome, GateUnverifiedDuplicate):
-        return _unverified_note(outcome)
-    if isinstance(outcome, RejectCandidate):
-        return _rejected_note(outcome)
-    # FileNew — gated only when create_issue authority is propose (#6778).
-    return None if execute else _PROPOSE_AUTHORITY_NOTE
+    match outcome:
+        case FileNew():
+            # Novel — gated only when create_issue authority is propose (#6778).
+            return None if execute else _PROPOSE_AUTHORITY_NOTE
+        case CommentExisting():
+            return _comment_existing_note(outcome)
+        case GateSuspectedDuplicate():
+            return _suspected_note(outcome)
+        case GateDedupUnavailable():
+            return _unavailable_note(outcome)  # fail closed
+        case GateUnverifiedDuplicate():
+            return _unverified_note(outcome)
+        case RejectCandidate():
+            return _rejected_note(outcome)
+        case _:
+            assert_never(outcome)
 
 
 def compose_gate_note(batch_note: str, typed_note: str | None) -> str:
