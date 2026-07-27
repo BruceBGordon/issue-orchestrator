@@ -4551,7 +4551,7 @@ class TestTechLeadProducerToLaunchBoundary:
         assert state.pending_tech_lead_reviews == []
         assert state.active_sessions == [session]
         decision = TechLeadWorkflow(config, NullEventSink()).should_launch_tech_lead(
-            state.pending_tech_lead_reviews, len(state.active_sessions), paused=False
+            state.pending_tech_lead_reviews, paused=False, available_slots=0
         )
         assert decision.should_launch is False
         assert decision.tech_lead_to_launch == ()

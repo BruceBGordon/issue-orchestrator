@@ -326,7 +326,7 @@ def plan_health_review_issue_creation(
     config: "Config",
     *,
     workflow: "TechLeadWorkflow",
-    active_session_count: int,
+    available_slots: int,
     paused: bool,
     storm_problems: Sequence["DiscoveredFailure"] = (),
 ) -> Optional[CreateTechLeadIssueAction]:
@@ -377,7 +377,7 @@ def plan_health_review_issue_creation(
         logger.debug("Planner: health review already pending launch")
         return None
     if not workflow.should_create_health_review(
-        active_session_count=active_session_count, paused=paused
+        paused=paused, available_slots=available_slots
     ):
         logger.debug("Planner: health review due but gated (paused/at capacity)")
         return None

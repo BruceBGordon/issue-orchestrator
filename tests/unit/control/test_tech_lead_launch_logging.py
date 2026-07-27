@@ -16,6 +16,7 @@ import pytest
 from issue_orchestrator.control.actions import (
     AddLabelAction,
     LaunchSessionAction,
+    LaunchValidationRetryAction,
     SessionType,
 )
 from issue_orchestrator.control.planner import Planner
@@ -23,7 +24,12 @@ from issue_orchestrator.control.planner_types import OrchestratorSnapshot
 from issue_orchestrator.control.scheduler import Scheduler
 from issue_orchestrator.control.workflows import TechLeadWorkflow
 from issue_orchestrator.domain.issue_key import FakeIssueKey
-from issue_orchestrator.domain.models import PendingReview, PendingTechLeadReview
+from issue_orchestrator.domain.models import (
+    PendingReview,
+    PendingTechLeadReview,
+    PendingValidationRetry,
+)
+from issue_orchestrator.domain.session_key import TaskKind
 from issue_orchestrator.domain.tech_lead_session import TechLeadSessionFlavor
 from issue_orchestrator.infra.config import Config
 from issue_orchestrator.ports.event_sink import InMemoryEventSink
@@ -44,9 +50,9 @@ def _planner() -> Planner:
     )
 
 
-def _health_review() -> PendingTechLeadReview:
+def _health_review(number: int = ANCHOR) -> PendingTechLeadReview:
     return PendingTechLeadReview(
-        issue_number=ANCHOR,
+        issue_number=number,
         title="Health Review — walk the floor",
         flavor=TechLeadSessionFlavor.HEALTH_REVIEW,
     )
@@ -213,3 +219,83 @@ def test_provider_skipped_review_does_not_steal_the_tech_lead_slot(caplog) -> No
     ]
     assert [a.number for a in tl] == [ANCHOR]
     assert "higher_priority_launched_this_tick" not in caplog.text
+
+
+def _validation_retry(issue_number: int = 1) -> PendingValidationRetry:
+    return PendingValidationRetry(
+        issue_number=issue_number,
+        issue_title="Retry me",
+        agent_label="agent:developer",
+        worktree_path=f"/tmp/repo-{issue_number}",
+        branch_name=f"{issue_number}-retry",
+        original_prompt="original task",
+        validation_error="dirty worktree",
+        validation_error_file=None,
+        retry_count=1,
+        source_task=TaskKind.CODE,
+        validation_cmd="make test",
+    )
+
+
+def test_validation_retry_consumes_a_slot_and_does_not_oversubscribe_tech_lead(
+    caplog,
+) -> None:
+    # #6892 review F1: LaunchValidationRetryAction is a capacity-consuming launch
+    # too. With one shared slot, a pending validation retry AND a pending
+    # tech-lead item must NOT both launch; the retry takes the slot, the tech
+    # lead is deferred (no oversubscription of max_concurrent_sessions=1).
+    config = Config(repo="test/repo", max_concurrent_sessions=1)
+    config.tech_lead_review_agent = "agent:tech-lead"  # shared budget
+    planner = Planner(
+        config=config,
+        scheduler=Scheduler(config),
+        tech_lead_workflow=TechLeadWorkflow(config, InMemoryEventSink()),
+    )
+    snapshot = make_snapshot(
+        pending_validation_retries=[_validation_retry()],
+        pending_tech_lead=[_health_review()],
+    )
+    with caplog.at_level(logging.INFO, logger=PLANNER_LOGGER):
+        plan = planner.plan(snapshot)
+    consuming = [
+        a
+        for a in plan.actions
+        if isinstance(a, (LaunchSessionAction, LaunchValidationRetryAction))
+    ]
+    assert len(consuming) == 1  # only the retry — the single slot is not oversubscribed
+    assert any(isinstance(a, LaunchValidationRetryAction) for a in plan.actions)
+    assert not any(
+        isinstance(a, LaunchSessionAction) and a.session_type is SessionType.TECH_LEAD
+        for a in plan.actions
+    )
+    assert f"issue={ANCHOR}" in caplog.text
+    assert "higher_priority_launched_this_tick" in caplog.text
+
+
+def test_launching_event_count_matches_planned_launches_under_e2e() -> None:
+    # #6892 review F2/A2 (event contract): max=2, E2E holds one worker slot, two
+    # pending tech leads. Availability is 1, so the TECH_LEAD_LAUNCHING event must
+    # report count=1/capacity=1 (matching the single planned launch), not the
+    # pre-owner false count=2.
+    config = Config(repo="test/repo", max_concurrent_sessions=2)
+    config.tech_lead_review_agent = "agent:tech-lead"  # shared budget
+    events = InMemoryEventSink()
+    planner = Planner(
+        config=config,
+        scheduler=Scheduler(config),
+        tech_lead_workflow=TechLeadWorkflow(config, events),
+    )
+    snapshot = make_snapshot(
+        pending_tech_lead=[_health_review(6887), _health_review(6888)],
+        e2e_occupies_slot=True,
+    )
+    plan = planner.plan(snapshot)
+    tl_launches = [
+        a
+        for a in plan.actions
+        if isinstance(a, LaunchSessionAction) and a.session_type is SessionType.TECH_LEAD
+    ]
+    launching = [e for e in events.events if e.name == "tech_lead.launching"]
+    assert len(tl_launches) == 1
+    assert launching and launching[-1].data["count"] == len(tl_launches)
+    assert launching[-1].data["capacity"] == 1

@@ -55,6 +55,7 @@ from .workflows import (
 )
 from .actions import (
     Action,
+    ActionType,
     AddCommentAction,
     AddLabelAction,
     RemoveLabelAction,
@@ -98,6 +99,14 @@ from .tech_lead_issue_policy import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Launch action kinds that occupy a worker slot when planned — the single source
+# of truth the capacity counter uses so a new launch kind can't silently escape
+# the worker budget (#6892 review F1/F2). A provider-skip label action is
+# deliberately absent (it launches nothing).
+_CAPACITY_CONSUMING_LAUNCH_TYPES: frozenset[ActionType] = frozenset(
+    {ActionType.LAUNCH_SESSION, ActionType.LAUNCH_VALIDATION_RETRY}
+)
 
 
 class Planner:
@@ -363,10 +372,14 @@ class Planner:
 
     @staticmethod
     def _launch_count(actions: list[Action]) -> int:
-        """Count only capacity-consuming launches — a provider-skip
-        ``AddLabelAction`` is not a launch and must not consume a slot or be
-        reported as a higher-priority launch (#6892 review F2)."""
-        return sum(1 for a in actions if isinstance(a, LaunchSessionAction))
+        """Count capacity-consuming launches only — a provider-skip label action
+        is not a launch. Every launch KIND is registered in
+        ``_CAPACITY_CONSUMING_LAUNCH_TYPES`` (not a per-call concrete-class
+        check), so a new launch kind can't silently escape the budget the way
+        validation retries did (#6892 review F1/F2)."""
+        return sum(
+            1 for a in actions if a.action_type in _CAPACITY_CONSUMING_LAUNCH_TYPES
+        )
 
     def _defer_pending_tech_lead(
         self, snapshot: OrchestratorSnapshot, slot: TechLeadSlotAvailability
@@ -1683,9 +1696,8 @@ Flip labels from `{facts.watch_label}` to `{self.config.tech_lead_reviewed_label
                 pending_tech_lead.append(item)
         decision: TechLeadDecision = self.tech_lead_workflow.should_launch_tech_lead(
             pending_tech_lead=pending_tech_lead,
-            active_session_count=snapshot.active_count,
             paused=snapshot.paused,
-            reserved_capacity=capacity if reserved else None,
+            available_slots=capacity,  # owner-computed availability (worker_budget)
         )
 
         if decision.skip_reason:
