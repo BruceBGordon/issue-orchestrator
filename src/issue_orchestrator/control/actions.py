@@ -22,7 +22,7 @@ Usage:
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Optional
 
 from ..domain.models import (
     AwaitingMergeReconciliationSource,
@@ -39,7 +39,9 @@ from ..domain.tech_lead_session import TechLeadSessionFlavor
 # `action_results.py` (an ActionResult is about *what happened*, not about the
 # action vocabulary) and are re-exported here so existing importers are
 # unaffected.
-from .action_results import ActionResult, ActionResultType
+# Redundant aliases mark these as intentional re-exports (PEP 484).
+from .action_results import ActionResult as ActionResult
+from .action_results import ActionResultType as ActionResultType
 from .session_manager import SessionType
 
 if TYPE_CHECKING:
