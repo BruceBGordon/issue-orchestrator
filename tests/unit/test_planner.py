@@ -51,6 +51,7 @@ from issue_orchestrator.domain.models import (
 from issue_orchestrator.domain.issue_key import FakeIssueKey
 from issue_orchestrator.domain.session_key import SessionKey, TaskKind
 from issue_orchestrator.domain.tech_lead_session import TechLeadSessionFlavor
+from issue_orchestrator.control.provider_impact import ProviderImpactTransition
 from issue_orchestrator.control.provider_resilience import ProviderResilienceManager
 from issue_orchestrator.control.workflows import (
     RetrospectiveReviewWorkflow,
@@ -229,9 +230,27 @@ class TestProviderResilienceLabels:
 
         plan = planner.plan(snapshot)
 
-        removed = [a for a in plan.actions if getattr(a, "action_type", None) == ActionType.REMOVE_LABEL]
-        removed_numbers = {a.issue_number for a in removed}
-        assert removed_numbers == {1, 2, 3}
+        # The planner delegates to the provider-availability owner, which emits
+        # the typed provider-impact command (label transition + durable
+        # issue-scoped record) rather than a bare RemoveLabelAction (#5980 F1).
+        cleared = [
+            a for a in plan.actions
+            if getattr(a, "action_type", None) == ActionType.APPLY_PROVIDER_IMPACT
+            and a.transition is ProviderImpactTransition.CLEARED
+        ]
+        assert {a.issue_number for a in cleared} == {1, 2, 3}
+        # Each command still carries the blocked label it is shedding, and the
+        # provider(s) that recovered.
+        assert all(a.label == config.get_label_provider_unavailable() for a in cleared)
+        assert {p for a in cleared for p in a.providers} == {
+            "review-provider", "rework-provider", "tech-lead-provider",
+        }
+        # No raw label mutation bypasses the owner command.
+        assert not [
+            a for a in plan.actions
+            if getattr(a, "action_type", None) == ActionType.REMOVE_LABEL
+            and getattr(a, "label", "") == config.get_label_provider_unavailable()
+        ]
 
     def test_empty_plan_when_at_capacity(self):
         """Planner returns empty plan when at max capacity."""

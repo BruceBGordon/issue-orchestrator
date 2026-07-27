@@ -13,13 +13,17 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import pytest
+
 from issue_orchestrator.contracts.public import DashboardDataContract
 from issue_orchestrator.control.provider_resilience import ProviderResilienceManager
 from issue_orchestrator.domain.models import OrchestratorState
 from issue_orchestrator.infra.config import Config, ProviderResilienceConfig
 from issue_orchestrator.ports.provider_resilience import (
+    NO_PROVIDER_CIRCUIT_STATUS,
     InMemoryProviderCircuitStore,
     ProviderCircuitState,
+    StaticProviderCircuitStatusReader,
 )
 from issue_orchestrator.view_models.dashboard import build_dashboard_view_model
 from issue_orchestrator.view_models.provider_circuit import (
@@ -184,34 +188,27 @@ def _config() -> Config:
     return config
 
 
-class _FixedSnapshotManager:
-    """Behavior-level test double that keeps dashboard reads deterministic."""
-
-    def __init__(self, manager: ProviderResilienceManager) -> None:
-        self._manager = manager
-
-    def snapshot(self):
-        return self._manager.snapshot(NOW)
-
-
-def _orchestrator_with_manager(manager: object | None):
+def _orchestrator_stub():
     class _Stub:
         def __init__(self) -> None:
             self.state = OrchestratorState(startup_status="complete")
             self.config = _config()
             self.shutdown_requested = False
-            if manager is not None:
-                self.deps = type("_Deps", (), {"provider_resilience": manager})()
 
     return _Stub()
 
 
-def test_dashboard_data_surfaces_open_circuit():
-    manager = _manager(_open("anthropic", 300, error="overloaded"))
-    orchestrator = _orchestrator_with_manager(_FixedSnapshotManager(manager))
+def _fixed_reader(*states: ProviderCircuitState) -> StaticProviderCircuitStatusReader:
+    """An explicit reader over an interpreted snapshot (deterministic clock)."""
+    return StaticProviderCircuitStatusReader(
+        statuses=tuple(_manager(*states).snapshot(NOW))
+    )
 
+
+def test_dashboard_data_surfaces_open_circuit():
     view_model = build_dashboard_view_model(
-        orchestrator,
+        _orchestrator_stub(),
+        provider_circuit=_fixed_reader(_open("anthropic", 300, error="overloaded")),
         e2e_status_provider=lambda _: {"enabled": False, "running": False},
     )
 
@@ -222,14 +219,28 @@ def test_dashboard_data_surfaces_open_circuit():
     DashboardDataContract.model_validate(view_model.dashboard_data())
 
 
-def test_dashboard_data_circuit_empty_without_deps():
-    # A pre-bootstrap orchestrator (no deps/manager) must not crash and must
-    # still emit a well-formed, hidden circuit payload — and it is the genuine
-    # healthy-empty case, NOT the read-failure warning.
-    orchestrator = _orchestrator_with_manager(None)
+def test_dashboard_builder_requires_an_explicit_circuit_reader():
+    """Missing provider-circuit wiring must be impossible, not "healthy".
 
+    Regression for issue #5980 F2/A1: the projection used to reach through
+    ``orchestrator.deps.provider_resilience`` and treat a missing orchestrator,
+    missing ``deps``, or missing manager as an empty (healthy) fleet — masking a
+    composition error as "no outage". The reader is now a required
+    behaviour-level port, so omitting it fails loudly at the call boundary.
+    """
+    with pytest.raises(TypeError):
+        build_dashboard_view_model(  # type: ignore[call-arg]
+            _orchestrator_stub(),
+            e2e_status_provider=lambda _: {"enabled": False, "running": False},
+        )
+
+
+def test_dashboard_data_circuit_hidden_for_an_explicitly_empty_reader():
+    # The genuine healthy-empty case (nothing tracked): a well-formed, hidden
+    # payload — and explicitly NOT the read-failure warning.
     view_model = build_dashboard_view_model(
-        orchestrator,
+        _orchestrator_stub(),
+        provider_circuit=NO_PROVIDER_CIRCUIT_STATUS,
         e2e_status_provider=lambda _: {"enabled": False, "running": False},
     )
 
@@ -238,6 +249,26 @@ def test_dashboard_data_circuit_empty_without_deps():
     assert circuit["entries"] == []
     assert circuit["status_unavailable"] is False
     DashboardDataContract.model_validate(view_model.dashboard_data())
+
+
+def test_orchestrator_exposes_its_resilience_owner_as_the_circuit_reader():
+    """The composition root wires the reader; the dashboard reads the facade.
+
+    Proves the required facade property exists and returns the resilience owner,
+    so the projection never has to know ``deps`` layout (issue #5980 F2/A1).
+    """
+    from unittest.mock import MagicMock, patch
+
+    from issue_orchestrator.entrypoints.bootstrap import build_orchestrator_for_testing
+
+    github = MagicMock()
+    github.get_issue_labels.return_value = []
+    with patch("issue_orchestrator.entrypoints.bootstrap.install_gh_guard"):
+        orchestrator = build_orchestrator_for_testing(config=_config(), github=github)
+
+    assert orchestrator.provider_circuit is orchestrator.deps.provider_resilience
+    # And it satisfies the narrow read port the projection depends on.
+    assert isinstance(orchestrator.provider_circuit.snapshot(NOW), list)
 
 
 class _BrokenStore:
@@ -266,13 +297,13 @@ def test_dashboard_data_circuit_read_failure_surfaces_as_unavailable_not_healthy
     an explicit ``status_unavailable`` warning the banner renders instead of
     hiding — the operator sees the status is unknown, not that all is well.
     """
-    manager = ProviderResilienceManager(
+    broken = ProviderResilienceManager(
         config=ProviderResilienceConfig(), store=_BrokenStore(), events=_NullEvents()
     )
-    orchestrator = _orchestrator_with_manager(manager)
 
     view_model = build_dashboard_view_model(
-        orchestrator,
+        _orchestrator_stub(),
+        provider_circuit=broken,
         e2e_status_provider=lambda _: {"enabled": False, "running": False},
     )
 

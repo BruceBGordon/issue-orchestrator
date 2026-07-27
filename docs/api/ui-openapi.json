@@ -523,7 +523,14 @@
               {"$ref": "#/components/schemas/StackChipViewPayload"},
               {"type": "null"}
             ]
-          }
+          },
+          "provider_badge": {
+            "oneOf": [
+              {"$ref": "#/components/schemas/ProviderBadgeViewPayload"},
+              {"type": "null"}
+            ]
+          },
+          "provider_signal": {"type": ["string", "null"]}
         }
       },
       "StackChipViewPayload": {
@@ -534,6 +541,16 @@
           "tone": {"type": "string"},
           "mode_label": {"type": "string"},
           "status_text": {"type": "string"},
+          "title": {"type": "string"}
+        }
+      },
+      "ProviderBadgeViewPayload": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["tone", "label_text", "title"],
+        "properties": {
+          "tone": {"type": "string"},
+          "label_text": {"type": "string"},
           "title": {"type": "string"}
         }
       },

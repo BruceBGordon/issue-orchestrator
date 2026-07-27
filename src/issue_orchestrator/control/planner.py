@@ -702,24 +702,22 @@ class Planner:
         skipped: list[SkippedItem],
         plan_context: PlanContext,
     ) -> None:
-        skipped.append(SkippedItem(
-            item_type=item_type,
-            number=item_number,
-            reason=f"provider unavailable: {provider}",
-        ))
-        logger.info(issue_log(issue_number, "Skipped: reason=provider_unavailable provider=%s"), provider)
         if not self.provider_policy:
-            return
-        issue_labels = plan_context.issue_labels(issue_number)
-        planned_labels = plan_context.planned_adds(issue_number)
-        if self.provider_policy.should_add_blocked_label(issue_labels, planned_labels):
-            actions.append(AddLabelAction(
-                issue_number=issue_number,
-                label=self.provider_policy.blocked_label(),
+            skipped.append(SkippedItem(
+                item_type=item_type,
+                number=item_number,
                 reason=f"provider unavailable: {provider}",
-                expected=build_expected_for_mutation(),
             ))
-            plan_context.record_add(issue_number, self.provider_policy.blocked_label())
+            return
+        self.provider_policy.record_provider_skip(
+            issue_number=issue_number,
+            item_type=item_type,
+            item_number=item_number,
+            provider=provider,
+            actions=actions,
+            skipped=skipped,
+            plan_context=plan_context,
+        )
 
     def _plan_provider_resilience_labels(
         self,
@@ -728,39 +726,7 @@ class Planner:
     ) -> list[Action]:
         if not self.provider_policy:
             return []
-        actions: list[Action] = []
-        label = self.provider_policy.blocked_label()
-        providers_by_issue = self.provider_policy.providers_for_snapshot(snapshot)
-        for issue in snapshot.issues:
-            providers = providers_by_issue.get(issue.number, set())
-            if not providers:
-                continue
-            any_open = self.provider_policy.any_open(providers)
-            issue_labels = plan_context.issue_labels(issue.number)
-            planned_labels = plan_context.planned_adds(issue.number)
-            if any_open and self.provider_policy.should_add_blocked_label(issue_labels, planned_labels):
-                actions.append(AddLabelAction(
-                    issue_number=issue.number,
-                    label=label,
-                    reason=f"provider unavailable: {', '.join(sorted(providers))}",
-                    expected=build_expected_for_mutation(),
-                    issue_key=issue.key.stable_id(),
-                ))
-                plan_context.record_add(issue.number, label)
-            if (
-                not any_open
-                and self.provider_policy.should_remove_blocked_label(issue_labels, planned_labels)
-                and plan_context.should_remove_label(issue.number, label)
-            ):
-                actions.append(RemoveLabelAction(
-                    issue_number=issue.number,
-                    label=label,
-                    reason=f"provider available: {', '.join(sorted(providers))}",
-                    expected=build_expected_for_mutation(),
-                    issue_key=issue.key.stable_id(),
-                ))
-                plan_context.record_remove(issue.number, label)
-        return actions
+        return self.provider_policy.plan_provider_impact(snapshot, plan_context)
 
     def _plan_tech_lead_issue_creation(self, snapshot: OrchestratorSnapshot) -> Optional[CreateTechLeadIssueAction]:
         """Plan tech_lead issue creation if threshold is met."""

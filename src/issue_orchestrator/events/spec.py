@@ -112,6 +112,10 @@ EVENT_SPEC: dict[PublicEventName, EventSpec] = {
     PublicEventName.ISSUE_UNBLOCKED: EventSpec(phase='in_progress', step='unblocked', status='completed', level='phase'),
     PublicEventName.ISSUE_PR_CREATED: EventSpec(phase='orchestrator', step='pr_created', status='completed', level='phase'),
 
+    # ----- Provider outage impact on this issue (issue #5980) -----
+    PublicEventName.PROVIDER_ISSUE_BLOCKED: EventSpec(phase='blocked', step='provider_blocked', status='failed', level='phase'),
+    PublicEventName.PROVIDER_ISSUE_UNBLOCKED: EventSpec(phase='in_progress', step='provider_unblocked', status='completed', level='phase'),
+
     # ----- Publish failure -----
     PublicEventName.PUBLISH_FAILED: EventSpec(phase='orchestrator', step='publish.failed', status='failed', level='detail'),
 }

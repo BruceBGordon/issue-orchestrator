@@ -2,6 +2,7 @@
 
 # ruff: noqa: F403,F405,SLF001
 
+from issue_orchestrator.ports.provider_resilience import NO_PROVIDER_CIRCUIT_STATUS
 from tests.unit import test_web as _support
 from tests.unit.route_helpers import iter_route_paths
 from tests.unit.test_web import *  # noqa: F403
@@ -393,6 +394,10 @@ class TestIssueRowsEndpoint:
                 self.config.repo = "test/repo"
                 self.config.repo_root = Path("/tmp/repo")
                 self.shutdown_requested = False
+                # The dashboard route resolves its circuit reader from this
+                # required facade property (issue #5980 F2/A1); a stub must
+                # supply one explicitly rather than default to "healthy".
+                self.provider_circuit = NO_PROVIDER_CIRCUIT_STATUS
 
         original = get_orchestrator()
         set_orchestrator(OrchestratorStub())
@@ -423,6 +428,10 @@ class TestIssueRowsEndpoint:
                 self.config.repo = "test/repo"
                 self.config.repo_root = Path("/tmp/repo")
                 self.shutdown_requested = False
+                # The dashboard route resolves its circuit reader from this
+                # required facade property (issue #5980 F2/A1); a stub must
+                # supply one explicitly rather than default to "healthy".
+                self.provider_circuit = NO_PROVIDER_CIRCUIT_STATUS
 
         original = get_orchestrator()
         set_orchestrator(OrchestratorStub())

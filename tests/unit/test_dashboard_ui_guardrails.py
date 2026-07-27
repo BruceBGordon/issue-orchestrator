@@ -608,10 +608,7 @@ def test_refresh_view_model_coalesces_concurrent_calls() -> None:
 
 def test_expanded_cards_render_label_badges() -> None:
     js = _read(DASHBOARD_JS)
-    marker = "async function loadExpandedColumn"
-    start = js.find(marker)
-    assert start != -1
-    snippet = js[start : start + 6000]
+    snippet = _function_body(js, "renderExpandedCardHtml")
     assert "orchestrator_labels" in snippet
     assert "badge-orch" in snippet
     assert "card-badges" in snippet
@@ -624,10 +621,7 @@ def test_expanded_cards_render_label_badges() -> None:
 
 def test_pr_closed_block_cards_offer_only_retry_and_close() -> None:
     js = _read(DASHBOARD_JS)
-    marker = "async function loadExpandedColumn"
-    start = js.find(marker)
-    assert start != -1
-    snippet = js[start : start + 6000]
+    snippet = _function_body(js, "renderExpandedCardHtml")
     assert "columnId === 'blocked' && isPrClosedBlock" in snippet
     assert "Close Issue" in snippet
     assert "columnId === 'blocked' && !isPrClosedBlock" in snippet
@@ -3702,3 +3696,45 @@ def test_provider_circuit_summary_toggle_has_visible_focus_style() -> None:
         css, ".pcircuit-details > summary.pcircuit-summary-toggle:focus-visible"
     )
     assert "outline" in focus_body
+
+
+def test_provider_badge_renders_in_both_row_forms() -> None:
+    # Issue #5980 item 2: the provider-outage badge is rendered by BOTH the
+    # compact kanban card and the expanded list row, from the same shared
+    # helper — so the two paths cannot drift. Behavior is covered by
+    # tests/js/provider_badge_row.test.js; this is the structural rail.
+    js = _read(DASHBOARD_JS)
+    assert "function renderProviderBadgeHtml(" in js
+    assert "renderProviderBadgeHtml(card)" in _function_body(js, "renderCompactCardHtml")
+    assert "renderProviderBadgeHtml(item)" in _function_body(js, "renderExpandedCardHtml")
+
+
+def test_provider_badge_status_is_text_not_colour_only() -> None:
+    # The visible badge text is the accessible name; the icon is decorative.
+    body = _function_body(_read(DASHBOARD_JS), "renderProviderBadgeHtml")
+    assert "badge.label_text" in body
+    assert 'class="provider-badge-icon" aria-hidden="true"' in body
+
+
+def test_provider_badge_uses_theme_variables_for_contrast() -> None:
+    # Both light and dark themes take their contrast from shared variables.
+    css = _read_dashboard_css_bundle()
+    badge_body = _last_css_rule_body(css, ".provider-badge")
+    assert "var(--border)" in badge_body
+    assert "var(--bg-panel)" in badge_body
+    tone_body = _last_css_rule_body(css, ".provider-badge--blocked .provider-badge-text")
+    assert "var(--danger)" in tone_body
+
+
+def test_provider_badge_text_wraps_to_avoid_clipping() -> None:
+    css = _read_dashboard_css_bundle()
+    text_body = _last_css_rule_body(css, ".provider-badge-text")
+    assert "overflow-wrap: anywhere" in text_body
+
+
+def test_provider_impact_events_trigger_live_row_refresh() -> None:
+    # Issue #5980: when an issue gains or loses the provider-blocked state its
+    # row badge must appear/clear without a manual reload.
+    source = _read(DASHBOARD_JS_DIR / "issue_metadata.js")
+    assert "'provider.issue_blocked'" in source
+    assert "'provider.issue_unblocked'" in source

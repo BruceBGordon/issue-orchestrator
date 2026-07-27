@@ -10,11 +10,14 @@ remains" are decided by the manager; this module only formats them.
 from __future__ import annotations
 
 import logging
-from typing import Any, Sequence
+from typing import Sequence
 
 from pydantic import BaseModel, ConfigDict
 
-from ..ports.provider_resilience import ProviderCircuitStatus
+from ..ports.provider_resilience import (
+    ProviderCircuitStatus,
+    ProviderCircuitStatusReader,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -184,24 +187,24 @@ def build_provider_circuit_status(
     )
 
 
-def read_provider_circuit_status(orchestrator: Any) -> ProviderCircuitStatusView:
-    """Read the circuit owner and project its snapshot for the dashboard.
+def read_provider_circuit_status(
+    reader: ProviderCircuitStatusReader,
+) -> ProviderCircuitStatusView:
+    """Project a circuit reader's snapshot into the dashboard payload.
 
-    Missing pre-bootstrap dependencies are the one healthy-empty case. Once a
-    provider-resilience manager exists, a read or projection failure becomes an
-    explicit unavailable payload so a broken store cannot masquerade as a
-    healthy provider fleet.
+    ``reader`` is required: the dashboard depends on the behaviour-level
+    :class:`ProviderCircuitStatusReader` port, never on the orchestrator's
+    dependency-container layout, and there is no "missing wiring" branch that
+    could report an unwired fleet as healthy — a composition error surfaces as
+    a hard failure instead (#5980 F2/A1).
+
+    A *runtime* read or projection failure (corrupt store, broken owner) is
+    different: it becomes an explicit unavailable payload so a broken read
+    cannot masquerade as a healthy provider fleet, and the dashboard stays
+    available.
     """
-    if orchestrator is None:
-        return ProviderCircuitStatusView.empty()
-    deps = getattr(orchestrator, "deps", None)
-    if deps is None:
-        return ProviderCircuitStatusView.empty()
-    manager = getattr(deps, "provider_resilience", None)
-    if manager is None:
-        return ProviderCircuitStatusView.empty()
     try:
-        return build_provider_circuit_status(manager.snapshot())
+        return build_provider_circuit_status(reader.snapshot())
     except Exception as exc:  # noqa: BLE001 - failure is rendered as an explicit warning
         logger.exception("provider circuit status read/projection failed")
         return ProviderCircuitStatusView.unavailable(str(exc))

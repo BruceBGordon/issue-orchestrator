@@ -544,6 +544,8 @@ export interface IssueItemPayload {
   issue_number?: number | string | null;
   issue_url?: string | null;
   open_run_command?: OpenE2ERunCommandPayload | null;
+  provider_badge?: ProviderBadgeViewPayload | null;
+  provider_signal?: string | null;
   runtime_label?: string | null;
   show_stale_badge: boolean;
   stack_chip?: StackChipViewPayload | null;
@@ -742,6 +744,12 @@ export interface PhaseDialogPayload {
   phase: Record<string, any> | null;
   phases: Record<string, any>[];
   title: string;
+}
+
+export interface ProviderBadgeViewPayload {
+  label_text: string;
+  title: string;
+  tone: string;
 }
 
 export interface ProviderCircuitEntryPayload {

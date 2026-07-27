@@ -2246,14 +2246,12 @@ class SessionLauncher:
             return None
         if not self._provider_policy.is_open(provider):
             return None
-        blocked_label = self._provider_policy.blocked_label()
-        self._apply_actions([
-            AddLabelAction(
-                issue_number=issue_number,
-                label=blocked_label,
-                reason=f"provider unavailable: {provider}",
-            ),
-        ], context="provider_unavailable")
+        # The provider-impact command owns both the blocked label and the
+        # durable issue-scoped record of the outage (#5980).
+        self._apply_actions(
+            [self._provider_policy.blocked_transition(issue_number, (provider,))],
+            context="provider_unavailable",
+        )
         return LaunchResult(None, False, f"Provider unavailable: {provider}")
 
     def _trigger_issue_session_state_transitions(

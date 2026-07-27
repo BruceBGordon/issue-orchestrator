@@ -288,6 +288,9 @@
                                 <div class="card-line card-muted">{{ card.summary }}</div>
                                 {% endif %}
                                 {% endif %}
+                                {% if card.provider_badge %}
+                                <div class="card-line card-provider"><span class="provider-badge provider-badge--{{ card.provider_badge.tone }}" title="{{ card.provider_badge.title | e }}"><span class="provider-badge-icon" aria-hidden="true">&#x26A1;</span><span class="provider-badge-text">{{ card.provider_badge.label_text }}</span></span></div>
+                                {% endif %}
                                 {% if card.stack_chip %}
                                 <div class="card-line card-stack"><span class="stack-chip stack-chip--{{ card.stack_chip.tone }}" title="{{ card.stack_chip.title | e }}"><span class="stack-chip-icon" aria-hidden="true">&#x26D3;</span><span class="stack-chip-mode">{{ card.stack_chip.mode_label }}</span><span class="stack-chip-status">{{ card.stack_chip.status_text }}</span></span></div>
                                 {% endif %}

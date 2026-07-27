@@ -50,25 +50,42 @@ class ProviderResilienceManager:
         circuit has no row).
         """
         now = now or _now()
-        statuses: list[ProviderCircuitStatus] = []
-        for state in self.store.list_all():
-            open_until = state.open_until
-            is_open = open_until is not None and open_until > now
-            if is_open and open_until is not None:
-                cooldown_remaining = max(0, int((open_until - now).total_seconds()))
-            else:
-                cooldown_remaining = 0
-            statuses.append(ProviderCircuitStatus(
-                provider=state.provider,
-                is_open=is_open,
-                open_until=open_until if is_open else None,
-                cooldown_remaining_seconds=cooldown_remaining,
-                consecutive_outages=state.consecutive_outages,
-                last_error_summary=state.last_error_summary,
-                updated_at=state.updated_at,
-            ))
+        statuses = [self._interpret(state, now) for state in self.store.list_all()]
         statuses.sort(key=lambda s: s.provider)
         return statuses
+
+    def status(self, provider: str, now: datetime | None = None) -> ProviderCircuitStatus | None:
+        """Interpreted status of one provider's circuit, or ``None`` if untracked.
+
+        Same policy as :meth:`snapshot`, addressed by provider — used by the
+        provider-availability owner to stamp "when does this provider retry
+        next" onto the issue-scoped provider-impact record.
+        """
+        if not provider:
+            return None
+        state = self.store.get(provider)
+        if state is None:
+            return None
+        return self._interpret(state, now or _now())
+
+    @staticmethod
+    def _interpret(state: ProviderCircuitState, now: datetime) -> ProviderCircuitStatus:
+        open_until = state.open_until
+        is_open = open_until is not None and open_until > now
+        cooldown_remaining = (
+            max(0, int((open_until - now).total_seconds()))
+            if is_open and open_until is not None
+            else 0
+        )
+        return ProviderCircuitStatus(
+            provider=state.provider,
+            is_open=is_open,
+            open_until=open_until if is_open else None,
+            cooldown_remaining_seconds=cooldown_remaining,
+            consecutive_outages=state.consecutive_outages,
+            last_error_summary=state.last_error_summary,
+            updated_at=state.updated_at,
+        )
 
     def record_transient_failure(
         self,

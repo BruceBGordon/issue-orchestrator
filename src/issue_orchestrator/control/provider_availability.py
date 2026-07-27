@@ -1,7 +1,17 @@
-"""Provider availability policy helpers (shared between planner and launcher)."""
+"""Provider availability policy (shared owner for planner and launcher).
+
+Owns every "is this issue affected by a provider outage, and what should the
+orchestrator do about it" decision: which providers an issue depends on,
+whether their circuits are open, and the typed provider-impact transition that
+carries the blocked-label mutation *and* its durable issue-scoped record.
+
+Call sites ask this owner for actions; they never assemble the label mutation
+themselves, so the label and the history record cannot drift apart (#5980 F1).
+"""
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Iterable
 
@@ -9,11 +19,16 @@ from typing import TYPE_CHECKING
 
 from ..ports.issue import Issue
 from ..infra.config import Config
+from .actions import Action
+from .provider_impact import ApplyProviderImpactAction, ProviderImpactTransition
 from .provider_resilience import ProviderResilienceManager
+from .reconciliation import build_expected_for_mutation
 
 if TYPE_CHECKING:
     from .label_manager import LabelManager
-    from .planner_types import OrchestratorSnapshot
+    from .planner_types import OrchestratorSnapshot, PlanContext, SkippedItem
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -84,3 +99,138 @@ class ProviderAvailabilityPolicy:
     def should_remove_blocked_label(self, issue_labels: Iterable[str], planned_labels: set[str]) -> bool:
         label = self.blocked_label()
         return label in issue_labels and label not in planned_labels
+
+    # ------------------------------------------------------------------
+    # Provider-impact transitions (#5980)
+    #
+    # The only supported way to move an issue's provider-blocked label. The
+    # returned command carries the durable issue-scoped record with it, so a
+    # caller cannot apply the label and forget the history.
+    # ------------------------------------------------------------------
+
+    def blocked_transition(
+        self,
+        issue_number: int,
+        providers: Iterable[str],
+        *,
+        issue_key: str = "",
+    ) -> ApplyProviderImpactAction:
+        ordered = tuple(sorted(providers))
+        next_retry_at, cooldown = self._soonest_retry(ordered)
+        return ApplyProviderImpactAction(
+            issue_number=issue_number,
+            transition=ProviderImpactTransition.BLOCKED,
+            label=self.blocked_label(),
+            providers=ordered,
+            next_retry_at=next_retry_at,
+            cooldown_remaining_seconds=cooldown,
+            issue_key=issue_key,
+            reason=f"provider unavailable: {', '.join(ordered)}",
+            expected=build_expected_for_mutation(),
+        )
+
+    def cleared_transition(
+        self,
+        issue_number: int,
+        providers: Iterable[str],
+        *,
+        issue_key: str = "",
+    ) -> ApplyProviderImpactAction:
+        ordered = tuple(sorted(providers))
+        return ApplyProviderImpactAction(
+            issue_number=issue_number,
+            transition=ProviderImpactTransition.CLEARED,
+            label=self.blocked_label(),
+            providers=ordered,
+            issue_key=issue_key,
+            reason=f"provider available: {', '.join(ordered)}",
+            expected=build_expected_for_mutation(),
+        )
+
+    def _soonest_retry(self, providers: Iterable[str]) -> tuple[str | None, int | None]:
+        """When the soonest still-open circuit next allows a retry.
+
+        ``(None, None)`` when every named circuit is merely recovering (cooldown
+        elapsed, no successful call yet) — there is no retry window to advertise.
+        """
+        statuses = [
+            status
+            for status in (self.provider_resilience.status(p) for p in providers)
+            if status is not None and status.is_open
+        ]
+        if not statuses:
+            return None, None
+        soonest = min(statuses, key=lambda s: s.cooldown_remaining_seconds)
+        open_until = soonest.open_until
+        return (
+            open_until.isoformat() if open_until is not None else None,
+            soonest.cooldown_remaining_seconds,
+        )
+
+    # ------------------------------------------------------------------
+    # Planning (moved out of Planner: provider policy has one owner)
+    # ------------------------------------------------------------------
+
+    def record_provider_skip(
+        self,
+        *,
+        issue_number: int,
+        item_type: str,
+        item_number: int,
+        provider: str,
+        actions: list[Action],
+        skipped: "list[SkippedItem]",
+        plan_context: "PlanContext",
+    ) -> None:
+        """Record a launch skipped because ``provider``'s circuit is open."""
+        from .planner_types import SkippedItem
+
+        skipped.append(SkippedItem(
+            item_type=item_type,
+            number=item_number,
+            reason=f"provider unavailable: {provider}",
+        ))
+        logger.info(
+            "[issue #%s] Skipped: reason=provider_unavailable provider=%s",
+            issue_number,
+            provider,
+        )
+        issue_labels = plan_context.issue_labels(issue_number)
+        planned_labels = plan_context.planned_adds(issue_number)
+        if not self.should_add_blocked_label(issue_labels, planned_labels):
+            return
+        actions.append(self.blocked_transition(issue_number, (provider,)))
+        plan_context.record_add(issue_number, self.blocked_label())
+
+    def plan_provider_impact(
+        self,
+        snapshot: "OrchestratorSnapshot",
+        plan_context: "PlanContext",
+    ) -> list[Action]:
+        """Plan provider-impact transitions for every in-scope issue."""
+        actions: list[Action] = []
+        label = self.blocked_label()
+        providers_by_issue = self.providers_for_snapshot(snapshot)
+        for issue in snapshot.issues:
+            providers = providers_by_issue.get(issue.number, set())
+            if not providers:
+                continue
+            any_open = self.any_open(providers)
+            issue_labels = plan_context.issue_labels(issue.number)
+            planned_labels = plan_context.planned_adds(issue.number)
+            issue_key = issue.key.stable_id()
+            if any_open and self.should_add_blocked_label(issue_labels, planned_labels):
+                actions.append(
+                    self.blocked_transition(issue.number, providers, issue_key=issue_key)
+                )
+                plan_context.record_add(issue.number, label)
+            if (
+                not any_open
+                and self.should_remove_blocked_label(issue_labels, planned_labels)
+                and plan_context.should_remove_label(issue.number, label)
+            ):
+                actions.append(
+                    self.cleared_transition(issue.number, providers, issue_key=issue_key)
+                )
+                plan_context.record_remove(issue.number, label)
+        return actions

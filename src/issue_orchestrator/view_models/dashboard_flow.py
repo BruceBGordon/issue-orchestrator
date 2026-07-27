@@ -51,6 +51,11 @@ def compute_compact_card_fingerprint(card: dict[str, Any]) -> str:
         _s(card.get("github_aria_label")),
         labels_str,
         _s(card.get("stack_signal")),
+        # `provider_signal` encodes the precomputed provider-outage badge. It
+        # deliberately excludes the cooldown/ETA so a counting-down outage does
+        # not re-fingerprint (and re-flash) every affected card each refresh;
+        # gaining or losing the badge does re-fingerprint.
+        _s(card.get("provider_signal")),
         # `run_dir` binds the reused card node to a specific run. A card whose
         # other fields are unchanged but whose run directory advanced (e.g. a
         # `rework-<issue>` slot replaced by a new run) must re-fingerprint so
@@ -125,6 +130,10 @@ def compact_card(item: dict[str, Any], state_label: str | None = None) -> dict[s
         # Precomputed chip display; carried so the server-rendered first paint and
         # the client rebuild render the identical chip.
         "stack_chip": item.get("stack_chip"),
+        # Precomputed provider-outage badge + its fingerprint signal (#5980),
+        # carried for the same reason as the stack chip above.
+        "provider_badge": item.get("provider_badge"),
+        "provider_signal": item.get("provider_signal") or "",
     }
     card["fingerprint"] = compute_compact_card_fingerprint(card)
     return card

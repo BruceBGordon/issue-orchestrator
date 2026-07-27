@@ -554,6 +554,8 @@ class IssueItemPayload(BaseModel):
     issue_number: int | str | None = None
     issue_url: str | None = None
     open_run_command: OpenE2ERunCommandPayload | None = None
+    provider_badge: ProviderBadgeViewPayload | None = None
+    provider_signal: str | None = None
     runtime_label: str | None = None
     show_stale_badge: bool
     stack_chip: StackChipViewPayload | None = None
@@ -751,6 +753,12 @@ class PhaseDialogPayload(BaseModel):
     phase: dict[str, Any] | None
     phases: list[dict[str, Any]]
     title: str
+
+class ProviderBadgeViewPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    label_text: str
+    title: str
+    tone: str
 
 class ProviderCircuitEntryPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")

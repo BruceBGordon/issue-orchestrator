@@ -479,3 +479,39 @@ body.column-focus-mode .column-expanded {
 .stack-chip--ok .stack-chip-status {
     color: var(--ok);
 }
+
+/* Provider-outage badge (issue #5980). Present on both the compact card and
+   the expanded list row. The provider name and cooldown live in the global
+   banner / health panel; this badge only answers "is this issue stalled by a
+   provider outage", so its text is stable and it never re-flashes on the
+   cooldown tick. Status is text ("Provider unavailable"), not colour alone —
+   the icon is decorative and the tone colour only reinforces the label. Both
+   palettes take their contrast from the shared theme variables, and the text
+   wraps rather than clipping on narrow columns. */
+.card-provider {
+    margin-top: 4px;
+}
+.provider-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    max-width: 100%;
+    flex-wrap: wrap;
+    font-size: 10px;
+    line-height: 1.4;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 2px 8px;
+    color: var(--text-muted);
+    background: color-mix(in srgb, var(--bg-panel) 78%, var(--bg) 22%);
+}
+.provider-badge-text {
+    font-weight: 600;
+    overflow-wrap: anywhere;
+}
+.provider-badge--blocked {
+    border-color: color-mix(in srgb, var(--danger) 55%, var(--border));
+}
+.provider-badge--blocked .provider-badge-text {
+    color: var(--danger);
+}

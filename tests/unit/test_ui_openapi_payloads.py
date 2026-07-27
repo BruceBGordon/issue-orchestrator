@@ -44,6 +44,7 @@ from issue_orchestrator.domain.dependency_gates import (
     build_gate_report,
 )
 from issue_orchestrator.infra.config import Config
+from issue_orchestrator.ports.provider_resilience import NO_PROVIDER_CIRCUIT_STATUS
 from issue_orchestrator.view_models.dashboard import build_dashboard_view_model
 from tests.unit.session_run_helpers import make_session_run_assets
 from issue_orchestrator.view_models.dialogs import (
@@ -224,6 +225,7 @@ def test_dashboard_view_model_matches_ui_openapi() -> None:
 
     view_model = build_dashboard_view_model(
         orchestrator,
+        provider_circuit=NO_PROVIDER_CIRCUIT_STATUS,
         queue_page=1,
         active_tab="active",
         e2e_page=1,
@@ -259,6 +261,7 @@ def test_dashboard_view_model_history_and_e2e_items_match_ui_openapi() -> None:
 
     view_model = build_dashboard_view_model(
         orchestrator,
+        provider_circuit=NO_PROVIDER_CIRCUIT_STATUS,
         queue_page=1,
         active_tab="e2e",
         e2e_page=1,
@@ -403,6 +406,7 @@ def test_view_model_snapshot_payload_matches_ui_openapi() -> None:
 
     view_model = build_dashboard_view_model(
         orchestrator,
+        provider_circuit=NO_PROVIDER_CIRCUIT_STATUS,
         queue_page=1,
         active_tab="flow",
         e2e_page=1,
@@ -1659,6 +1663,7 @@ def _stacked_view_model_dict() -> dict:
     )
     view_model = build_dashboard_view_model(
         _OrchestratorStub(state=state, config=config),
+        provider_circuit=NO_PROVIDER_CIRCUIT_STATUS,
         queue_page=1,
         active_tab="flow",
         e2e_page=1,
