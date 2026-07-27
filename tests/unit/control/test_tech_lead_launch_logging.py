@@ -9,6 +9,7 @@ logs once, not every tick.
 """
 
 import logging
+from unittest.mock import Mock
 
 import pytest
 
@@ -17,7 +18,8 @@ from issue_orchestrator.control.planner import Planner
 from issue_orchestrator.control.planner_types import OrchestratorSnapshot
 from issue_orchestrator.control.scheduler import Scheduler
 from issue_orchestrator.control.workflows import TechLeadWorkflow
-from issue_orchestrator.domain.models import PendingTechLeadReview
+from issue_orchestrator.domain.issue_key import FakeIssueKey
+from issue_orchestrator.domain.models import PendingReview, PendingTechLeadReview
 from issue_orchestrator.domain.tech_lead_session import TechLeadSessionFlavor
 from issue_orchestrator.infra.config import Config
 from issue_orchestrator.ports.event_sink import InMemoryEventSink
@@ -88,3 +90,47 @@ def test_steady_state_logs_once_not_every_tick(caplog) -> None:
         and "orchestrator_paused" in r.getMessage()
     ]
     assert len(defer_lines) == 1  # on-change: the repeat is suppressed
+
+
+def test_review_taking_last_shared_slot_reports_true_reason_not_false_saturation(
+    caplog,
+) -> None:
+    # #6892 review F1: shared budget (no tech_lead.max_concurrent), 1 slot. A
+    # higher-priority review launches and consumes the slot IN this tick, while
+    # snapshot.active_count is still 0. The tech-lead deferral must name the real
+    # cause (higher-priority in-tick launch), not a false "no_worker_capacity:
+    # active=0".
+    config = Config(repo="test/repo", max_concurrent_sessions=1)
+    config.tech_lead_review_agent = "agent:tech-lead"
+    # shared budget: leave config.tech_lead.max_concurrent = None
+    review = PendingReview(
+        issue_key=FakeIssueKey(name="1"),
+        pr_number=100,
+        pr_url="url",
+        branch_name="branch",
+        _issue_number=1,
+    )
+    review_wf = Mock()
+    review_wf.is_configured.return_value = True
+    decision = Mock(should_launch=True, skip_reason=None, reviews_to_launch=[review])
+    review_wf.should_launch_reviews.return_value = decision
+    planner = Planner(
+        config=config,
+        scheduler=Scheduler(config),
+        review_workflow=review_wf,
+        tech_lead_workflow=TechLeadWorkflow(config, InMemoryEventSink()),
+    )
+    snapshot = make_snapshot(
+        pending_reviews=[review], pending_tech_lead=[_health_review()]
+    )
+    with caplog.at_level(logging.INFO, logger=PLANNER_LOGGER):
+        plan = planner.plan(snapshot)
+    # the review consumed the single shared slot this tick...
+    assert any(
+        isinstance(a, LaunchSessionAction) and a.session_type is SessionType.REVIEW
+        for a in plan.actions
+    )
+    # ...and the tech-lead deferral names the TRUE cause, not false saturation.
+    assert f"issue={ANCHOR}" in caplog.text
+    assert "higher_priority_launched_this_tick" in caplog.text
+    assert "no_worker_capacity:active=0" not in caplog.text

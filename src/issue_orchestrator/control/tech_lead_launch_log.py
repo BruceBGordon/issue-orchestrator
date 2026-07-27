@@ -25,6 +25,42 @@ _MESSAGE = (
 )
 
 
+def no_slot_reason(
+    *,
+    workflow_configured: bool,
+    reserved_capacity: int | None,
+    worker_active_count: int,
+    launched_this_tick: int,
+    e2e_occupies_slot: bool,
+    max_sessions: int,
+    tech_lead_max_concurrent: int | None,
+    active_tech_lead: int,
+) -> str:
+    """The TRUE reason a queued tech_lead session got no slot this tick, from
+    facts the planner (the budget/priority owner) supplies — so the deferral is
+    trustworthy, never a blanket or false "no capacity" (#6892 review F1).
+    ``worker_active_count`` is the PRE-tick worker count, so ``launched_this_tick``
+    distinguishes a higher-priority launch consuming the last shared slot (where
+    active is still 0) from pre-existing saturation."""
+    if not workflow_configured:
+        return "tech_lead_workflow_unavailable"
+    if reserved_capacity is not None:
+        return (
+            f"reserved_slot_occupied:max_concurrent={tech_lead_max_concurrent},"
+            f"active_tech_lead={active_tech_lead}"
+        )
+    if worker_active_count >= max_sessions:
+        return f"worker_slot_occupied:active={worker_active_count},max={max_sessions}"
+    if e2e_occupies_slot:
+        return f"e2e_occupies_worker_slot:max={max_sessions}"
+    if launched_this_tick > 0:
+        return (
+            f"higher_priority_launched_this_tick:launched={launched_this_tick},"
+            f"max={max_sessions}"
+        )
+    return f"no_worker_capacity:active={worker_active_count},max={max_sessions}"
+
+
 class TechLeadLaunchLog:
     """On-change log of per-issue tech_lead launch decisions (INFO)."""
 
@@ -84,34 +120,20 @@ class TechLeadLaunchLog:
         self, pending: Sequence[PendingTechLeadReview], reason: str
     ) -> None:
         """Every queued item is deferred this tick for one shared ``reason``
-        (used by the pre-launch exits — paused, or no capacity)."""
+        (used by the pre-launch exits — paused, or no slot). The caller (the
+        budget/priority owner) supplies the true reason so it is never a blanket
+        or false 'no capacity'."""
         for item in pending:
             self._note(item, "defer", reason, len(pending))
 
-    def capacity_deferral(
-        self,
-        pending: Sequence[PendingTechLeadReview],
-        reserved_capacity: int | None,
-        *,
-        active_count: int,
-        max_concurrent_sessions: int,
-        tech_lead_max_concurrent: int | None,
-        active_tech_lead: int,
+    def note_suppressed(
+        self, item: PendingTechLeadReview, pending: int
     ) -> None:
-        """Queued tech_lead work got no slot before ``_plan_tech_lead`` ran: the
-        shared worker budget is full (no reserved slot), or the reserved slot is
-        occupied. The numbers name exactly which budget blocked it."""
-        if reserved_capacity is None:
-            reason = (
-                f"no_worker_capacity:active={active_count},"
-                f"max={max_concurrent_sessions}"
-            )
-        else:
-            reason = (
-                f"no_reserved_capacity:max_concurrent={tech_lead_max_concurrent},"
-                f"active_tech_lead={active_tech_lead}"
-            )
-        self.defer_all(pending, reason)
+        """A failure-investigation dropped by the storm-cohort suppression
+        filter — its cohort was escalated this tick (the health-review anchor
+        covers it, #6780), so it will not launch. Logged so it is not silently
+        removed from the launch decision."""
+        self._note(item, "defer", "suppressed_cohort_escalated", pending)
 
     def retain(self, pending: Sequence[PendingTechLeadReview]) -> None:
         """Forget decisions for issues no longer queued, so a re-queue logs fresh."""

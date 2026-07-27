@@ -79,7 +79,7 @@ from .awaiting_merge_post_publish_policy import (
 )
 from .queue_decision_log import QueueDecisionLog
 from .reactive_tech_lead_planning import plan_reactive_tech_lead
-from .tech_lead_launch_log import TechLeadLaunchLog
+from .tech_lead_launch_log import TechLeadLaunchLog, no_slot_reason
 from .tech_lead_proposals import plan_approved_tech_lead_op_executions
 from .tech_lead_reaction import TechLeadReactionPolicy
 from .worker_budget import (
@@ -405,8 +405,10 @@ class Planner:
                 self.config.max_concurrent_sessions,
             )
             # Even with no slot for anyone, a queued tech_lead session must not
-            # go silent: log why it is deferred this tick (on-change).
-            self._defer_tech_lead_capacity(snapshot, reserved_tech_lead_capacity)
+            # go silent: log the true reason (nothing has launched yet this tick).
+            self._defer_tech_lead_no_slot(
+                snapshot, reserved_tech_lead_capacity, worker_active_count, 0
+            )
             self._tech_lead_launch_log.retain(snapshot.pending_tech_lead)
             return actions, skipped
 
@@ -490,10 +492,20 @@ class Planner:
                 capacity -= len(tech_lead_actions)
             tech_lead_launch_count = len(tech_lead_actions)
         else:
-            # Worker/other launches consumed the slot(s) but tech_lead has no
-            # capacity this tick: a queued tech_lead session is deferred without
-            # ever reaching _plan_tech_lead, so log the reason here (on-change).
-            self._defer_tech_lead_capacity(snapshot, reserved_tech_lead_capacity)
+            # No slot opened for tech_lead this tick — log the TRUE reason, not a
+            # false "no capacity": active_count can still be 0 when a higher-
+            # priority launch consumed the last shared slot this tick (#6892 F1).
+            self._defer_tech_lead_no_slot(
+                snapshot,
+                reserved_tech_lead_capacity,
+                worker_active_count,
+                launched_this_tick=(
+                    review_launch_count
+                    + retrospective_review_launch_count
+                    + rework_launch_count
+                    + validation_retry_launch_count
+                ),
+            )
         self._tech_lead_launch_log.retain(snapshot.pending_tech_lead)
 
         # 5b. Reserve one worker slot for a due first-class E2E run — after all
@@ -1649,14 +1661,20 @@ Flip labels from `{facts.watch_label}` to `{self.config.tech_lead_reviewed_label
         if not self.tech_lead_workflow or not self.tech_lead_workflow.is_configured():
             return actions, skipped
 
-        pending_tech_lead = [
-            item
-            for item in snapshot.pending_tech_lead
-            if not (
+        # A failure-investigation whose storm cohort was escalated this tick is
+        # dropped from the launch set (#6780). Log the drop instead of removing
+        # it silently, so a suppressed item explains WHY in its per-issue trace.
+        pending_tech_lead = []
+        for item in snapshot.pending_tech_lead:
+            if (
                 item.flavor is TechLeadSessionFlavor.FAILURE_INVESTIGATION
                 and item.issue_number in suppressed_issue_numbers
-            )
-        ]
+            ):
+                self._tech_lead_launch_log.note_suppressed(
+                    item, len(snapshot.pending_tech_lead)
+                )
+            else:
+                pending_tech_lead.append(item)
         decision: TechLeadDecision = self.tech_lead_workflow.should_launch_tech_lead(
             pending_tech_lead=pending_tech_lead,
             active_session_count=snapshot.active_count,
@@ -1713,20 +1731,30 @@ Flip labels from `{facts.watch_label}` to `{self.config.tech_lead_reviewed_label
 
         return actions, skipped
 
-    def _defer_tech_lead_capacity(
+    def _defer_tech_lead_no_slot(
         self,
         snapshot: OrchestratorSnapshot,
         reserved_tech_lead_capacity: Optional[int],
+        worker_active_count: int,
+        launched_this_tick: int,
     ) -> None:
-        """Delegate the pre-launch capacity-deferral log to the launch-log owner,
-        supplying this tick's budget numbers (why no slot opened for tech_lead)."""
-        self._tech_lead_launch_log.capacity_deferral(
+        """Log (on-change) the TRUE reason a queued tech_lead session got no slot
+        this tick. The planner (budget/priority owner) supplies the facts;
+        ``no_slot_reason`` classifies them (#6892 review F1)."""
+        self._tech_lead_launch_log.defer_all(
             snapshot.pending_tech_lead,
-            reserved_tech_lead_capacity,
-            active_count=snapshot.active_count,
-            max_concurrent_sessions=self.config.max_concurrent_sessions,
-            tech_lead_max_concurrent=self.config.tech_lead.max_concurrent,
-            active_tech_lead=self._active_tech_lead_count(snapshot),
+            no_slot_reason(
+                workflow_configured=bool(
+                    self.tech_lead_workflow and self.tech_lead_workflow.is_configured()
+                ),
+                reserved_capacity=reserved_tech_lead_capacity,
+                worker_active_count=worker_active_count,
+                launched_this_tick=launched_this_tick,
+                e2e_occupies_slot=snapshot.e2e_occupies_slot,
+                max_sessions=self.config.max_concurrent_sessions,
+                tech_lead_max_concurrent=self.config.tech_lead.max_concurrent,
+                active_tech_lead=self._active_tech_lead_count(snapshot),
+            ),
         )
 
     def _get_priority_reason(self, issue: Issue) -> str:
