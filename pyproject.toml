@@ -23,10 +23,10 @@ dependencies = [
     "pyyaml>=6.0",
     "rich>=13.0",      # Nice terminal UI
     "textual>=0.40",   # TUI framework with keyboard input
-    "fastapi>=0.104",  # Web dashboard
+    "fastapi>=0.140.1",  # Web dashboard
     "uvicorn>=0.24",   # ASGI server
     "jinja2>=3.1",     # HTML templates
-    "sse-starlette>=1.6",  # Server-Sent Events for real-time updates
+    "sse-starlette>=3.4.6",  # Server-Sent Events for real-time updates
     "pluggy>=1.3",     # Plugin architecture (same as pytest uses)
     "transitions>=0.9",  # Lightweight state machine library
     "httpx>=0.27",     # GitHub HTTP client
@@ -50,13 +50,13 @@ dev = [
     "pytest-timeout>=2.0",  # For e2e test timeouts
     "pytest-xdist>=3.5",  # Parallel test execution
     "pyright>=1.1.408",
-    "ruff>=0.9",  # Fast Python linter
+    "ruff>=0.16.0",  # Fast Python linter
     "import-linter>=2.0",  # Architecture boundary enforcement
     "beautifulsoup4>=4.12",  # HTML parsing for template tests
     "lxml>=6.1.0",  # Fast HTML parser for BeautifulSoup
-    "playwright==1.57.0",  # Pinned to avoid 250MB browser re-downloads on version bumps
+    "playwright==1.61.0",  # Pinned to avoid 250MB browser re-downloads on version bumps
     "pytest-playwright>=0.7",  # Playwright pytest integration
-    "hypothesis>=6.0",  # Property-based testing
+    "hypothesis>=6.161.6",  # Property-based testing
 ]
 
 [project.scripts]
