@@ -1689,11 +1689,34 @@ Flip labels from `{facts.watch_label}` to `{self.config.tech_lead_reviewed_label
                 item.flavor is TechLeadSessionFlavor.FAILURE_INVESTIGATION
                 and item.issue_number in suppressed_issue_numbers
             ):
-                self._tech_lead_launch_log.note_suppressed(
-                    item, len(snapshot.pending_tech_lead)
-                )
+                self._tech_lead_launch_log.note_suppressed(item, len(snapshot.pending_tech_lead))
             else:
                 pending_tech_lead.append(item)
+        # Provider eligibility precedes the workflow decision so the launching
+        # event can never claim a launch the provider gate then suppresses
+        # (#6892). One shared agent/provider => one gate for the whole queue.
+        provider = self.provider_policy.provider_for_agent_label(self.config.tech_lead_review_agent) if self.provider_policy else None
+        if provider and self.provider_policy and self.provider_policy.is_open(provider):
+            for tech_lead in pending_tech_lead:
+                self._record_provider_skip(
+                    issue_number=tech_lead.issue_number,
+                    item_type="tech_lead",
+                    item_number=tech_lead.issue_number,
+                    provider=provider,
+                    actions=actions,
+                    skipped=skipped,
+                    plan_context=plan_context,
+                )
+            # Nothing is asked of the workflow => no launching event; log all as provider-skipped.
+            self._tech_lead_launch_log.launch_outcomes(
+                pending_tech_lead,
+                [],
+                list(pending_tech_lead),
+                reserved=reserved,
+                provider=provider,
+            )
+            return actions, skipped
+
         decision: TechLeadDecision = self.tech_lead_workflow.should_launch_tech_lead(
             pending_tech_lead=pending_tech_lead,
             paused=snapshot.paused,
@@ -1711,23 +1734,9 @@ Flip labels from `{facts.watch_label}` to `{self.config.tech_lead_reviewed_label
             return actions, skipped
 
         launched: list[PendingTechLeadReview] = []
-        provider_skipped: list[PendingTechLeadReview] = []
-        provider = None
         if decision.should_launch:
-            provider = self.provider_policy.provider_for_agent_label(self.config.tech_lead_review_agent) if self.provider_policy else None
+            # Provider cleared above => every asked item launches; TECH_LEAD_LAUNCHING count == these actions.
             for tech_lead in decision.tech_lead_to_launch[:capacity]:
-                if provider and self.provider_policy and self.provider_policy.is_open(provider):
-                    self._record_provider_skip(
-                        issue_number=tech_lead.issue_number,
-                        item_type="tech_lead",
-                        item_number=tech_lead.issue_number,
-                        provider=provider,
-                        actions=actions,
-                        skipped=skipped,
-                        plan_context=plan_context,
-                    )
-                    provider_skipped.append(tech_lead)
-                    continue
                 actions.append(LaunchSessionAction(
                     session_type=SessionType.TECH_LEAD,
                     number=tech_lead.issue_number,
@@ -1737,12 +1746,11 @@ Flip labels from `{facts.watch_label}` to `{self.config.tech_lead_reviewed_label
                     reason=f"tech_lead review for #{tech_lead.issue_number}",
                 ))
                 launched.append(tech_lead)
-            # Log the per-item outcome (launch / provider-skip / deferred-by-
-            # capacity) on-change so a queued session is never silent.
+            # Per-item outcome (launch / capacity-deferred), on-change so a queued session is never silent.
             self._tech_lead_launch_log.launch_outcomes(
                 pending_tech_lead,
                 launched,
-                provider_skipped,
+                [],
                 reserved=reserved,
                 provider=provider,
             )

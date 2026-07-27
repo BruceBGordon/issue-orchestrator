@@ -299,3 +299,31 @@ def test_launching_event_count_matches_planned_launches_under_e2e() -> None:
     assert len(tl_launches) == 1
     assert launching and launching[-1].data["count"] == len(tl_launches)
     assert launching[-1].data["capacity"] == 1
+
+
+def test_provider_open_tech_lead_no_launch_and_no_launching_event() -> None:
+    # #6892 review: the TECH_LEAD_LAUNCHING event must not claim a launch the
+    # provider gate then suppresses. With the tech-lead provider circuit OPEN, the
+    # plan carries only the provider-skip label — no LaunchSessionAction — and NO
+    # TECH_LEAD_LAUNCHING event fires (provider eligibility is applied before the
+    # workflow decides/publishes).
+    config = Config(repo="test/repo", max_concurrent_sessions=1)
+    config.tech_lead_review_agent = "agent:tech-lead"
+    events = InMemoryEventSink()
+    planner = Planner(
+        config=config,
+        scheduler=Scheduler(config),
+        tech_lead_workflow=TechLeadWorkflow(config, events),
+    )
+    policy = Mock()
+    policy.provider_for_agent_label = lambda label: "prov-tl"
+    policy.is_open = lambda prov: True  # tech-lead provider circuit OPEN
+    policy.should_add_blocked_label = lambda *a, **k: True
+    planner.provider_policy = policy
+    plan = planner.plan(make_snapshot(pending_tech_lead=[_health_review()]))
+    assert not any(
+        isinstance(a, LaunchSessionAction) and a.session_type is SessionType.TECH_LEAD
+        for a in plan.actions
+    )
+    assert any(isinstance(a, AddLabelAction) for a in plan.actions)  # provider-skip label
+    assert [e for e in events.events if e.name == "tech_lead.launching"] == []
