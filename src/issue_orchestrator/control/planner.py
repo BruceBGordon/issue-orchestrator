@@ -29,6 +29,7 @@ from ..infra.config import Config
 from ..infra.logging_config import issue_log
 from ..ports.issue import Issue
 from ..domain.models import (
+    PendingTechLeadReview,
     TechLeadFacts,
     active_retrospective_review_issue_numbers,
 )
@@ -76,7 +77,9 @@ from .awaiting_merge_post_publish_policy import (
     build_post_publish_validation_comment,
     POST_PUBLISH_VALIDATION_SOURCE,
 )
+from .queue_decision_log import QueueDecisionLog
 from .reactive_tech_lead_planning import plan_reactive_tech_lead
+from .tech_lead_launch_log import TechLeadLaunchLog
 from .tech_lead_proposals import plan_approved_tech_lead_op_executions
 from .tech_lead_reaction import TechLeadReactionPolicy
 from .worker_budget import (
@@ -154,9 +157,13 @@ class Planner:
             dependency_evaluator=self.dependency_evaluator,
             clock=clock,
         )
-        self._last_queue_decisions: dict[int, str] = {}
-        self._last_queue_summary_logged_at: float = 0.0
-        self._queue_summary_interval_seconds = 60.0
+        # On-change human logs for the two coarse control decisions the planner
+        # makes each tick — the per-issue queue decision, and the tech_lead
+        # launch decision. Both write INFO lines keyed ``issue=<n>`` so a
+        # deferred issue/session explains WHY in its per-issue trace instead of
+        # going silent, and log only on change to avoid per-tick spam.
+        self._queue_decision_log = QueueDecisionLog(logger)
+        self._tech_lead_launch_log = TechLeadLaunchLog(logger)
 
     def _align_dependency_evaluator(
         self,
@@ -205,6 +212,13 @@ class Planner:
             # cannot act on are instead RETAINED by clear_discovered_facts, so
             # a storm cohort survives the pause (#6780). The health-review
             # gate already ran above for its TECH_LEAD_SKIPPED emission (#6763).
+            # A queued tech_lead session (e.g. a health review) is deferred by the
+            # pause and never reaches the launch path, so log WHY here on-change —
+            # else it sits queued with no explanation in its per-issue trace.
+            self._tech_lead_launch_log.defer_all(
+                snapshot.pending_tech_lead, "orchestrator_paused"
+            )
+            self._tech_lead_launch_log.retain(snapshot.pending_tech_lead)
             return Plan.empty()
 
         plan_context = PlanContext(issue_labels_by_number={
@@ -390,6 +404,10 @@ class Planner:
                 snapshot.active_count,
                 self.config.max_concurrent_sessions,
             )
+            # Even with no slot for anyone, a queued tech_lead session must not
+            # go silent: log why it is deferred this tick (on-change).
+            self._defer_tech_lead_capacity(snapshot, reserved_tech_lead_capacity)
+            self._tech_lead_launch_log.retain(snapshot.pending_tech_lead)
             return actions, skipped
 
         # PRIORITY ORDER: Reviews > Retrospective Reviews > Reworks >
@@ -471,6 +489,12 @@ class Planner:
             if reserved_tech_lead_capacity is None:
                 capacity -= len(tech_lead_actions)
             tech_lead_launch_count = len(tech_lead_actions)
+        else:
+            # Worker/other launches consumed the slot(s) but tech_lead has no
+            # capacity this tick: a queued tech_lead session is deferred without
+            # ever reaching _plan_tech_lead, so log the reason here (on-change).
+            self._defer_tech_lead_capacity(snapshot, reserved_tech_lead_capacity)
+        self._tech_lead_launch_log.retain(snapshot.pending_tech_lead)
 
         # 5b. Reserve one worker slot for a due first-class E2E run — after all
         # completion work above, before new issues below (see method docstring).
@@ -1323,92 +1347,9 @@ Flip labels from `{facts.watch_label}` to `{self.config.tech_lead_reviewed_label
                 continue
             scheduler_reason = decision_reason_by_issue.get(issue.number, "unknown")
             decision_by_issue[issue.number] = f"skip:{scheduler_reason}"
-        self._log_queue_decision_changes(decision_by_issue, detail_by_issue)
+        self._queue_decision_log.record(decision_by_issue, detail_by_issue)
 
         return actions, skipped, len(actions)
-
-    def _log_queue_decision_changes(
-        self,
-        decision_by_issue: dict[int, str],
-        detail_by_issue: dict[int, str],
-    ) -> None:
-        """Emit queue decision traces only when they change, plus periodic summary."""
-        for issue_number, decision in decision_by_issue.items():
-            self._log_queue_decision_if_changed(
-                issue_number,
-                decision,
-                detail_by_issue.get(issue_number),
-            )
-
-        # Prune stale issues no longer in this snapshot.
-        current_numbers = set(decision_by_issue.keys())
-        for issue_number in list(self._last_queue_decisions.keys()):
-            if issue_number not in current_numbers:
-                del self._last_queue_decisions[issue_number]
-
-        now = time.monotonic()
-        if (now - self._last_queue_summary_logged_at) < self._queue_summary_interval_seconds:
-            return
-        self._last_queue_summary_logged_at = now
-
-        launch_count = 0
-        reason_counts: dict[str, int] = {}
-        for decision in decision_by_issue.values():
-            kind, reason = decision.split(":", 1)
-            if kind == "launch":
-                launch_count += 1
-                continue
-            reason_counts[reason] = reason_counts.get(reason, 0) + 1
-        reason_summary = ", ".join(f"{reason}:{count}" for reason, count in sorted(reason_counts.items()))
-        logger.info(
-            "trace-queue-summary total=%d launch=%d skip=%d reasons=%s",
-            len(decision_by_issue),
-            launch_count,
-            len(decision_by_issue) - launch_count,
-            reason_summary or "none",
-        )
-
-    def _log_queue_decision_if_changed(
-        self,
-        issue_number: int,
-        decision: str,
-        detail: str | None,
-    ) -> None:
-        fingerprint = f"{decision}|{detail}" if detail else decision
-        previous = self._last_queue_decisions.get(issue_number)
-        if previous == fingerprint:
-            return
-        self._last_queue_decisions[issue_number] = fingerprint
-        if decision.startswith("launch:"):
-            reason = decision.split(":", 1)[1]
-            logger.info(
-                "trace-queue-decision issue=%d decision=launch reason=%s",
-                issue_number,
-                reason,
-            )
-            return
-
-        reason = decision.split(":", 1)[1]
-        if reason == "dependency_blocked":
-            logger.info(
-                "trace-queue-decision issue=%d decision=skip reason=dependency_blocked detail=%s",
-                issue_number,
-                detail or "dependency blocked",
-            )
-            return
-        if detail:
-            logger.info(
-                "trace-queue-decision issue=%d decision=skip reason=%s detail=%s",
-                issue_number,
-                reason,
-                detail,
-            )
-            return
-        logger.info(
-            "trace-queue-decision issue=%d decision=skip reason=%s",
-            issue_number,
-            reason,
-        )
 
     def _plan_reviews(
         self,
@@ -1730,8 +1671,12 @@ Flip labels from `{facts.watch_label}` to `{self.config.tech_lead_reviewed_label
                     number=tech_lead.issue_number,
                     reason=decision.skip_reason,
                 ))
+            self._tech_lead_launch_log.gate_skip(pending_tech_lead, decision.skip_reason)
             return actions, skipped
 
+        launched: list[PendingTechLeadReview] = []
+        provider_skipped: list[PendingTechLeadReview] = []
+        provider = None
         if decision.should_launch:
             provider = self.provider_policy.provider_for_agent_label(self.config.tech_lead_review_agent) if self.provider_policy else None
             for tech_lead in decision.tech_lead_to_launch[:capacity]:
@@ -1745,6 +1690,7 @@ Flip labels from `{facts.watch_label}` to `{self.config.tech_lead_reviewed_label
                         skipped=skipped,
                         plan_context=plan_context,
                     )
+                    provider_skipped.append(tech_lead)
                     continue
                 actions.append(LaunchSessionAction(
                     session_type=SessionType.TECH_LEAD,
@@ -1754,8 +1700,34 @@ Flip labels from `{facts.watch_label}` to `{self.config.tech_lead_reviewed_label
                     title=tech_lead.title,
                     reason=f"tech_lead review for #{tech_lead.issue_number}",
                 ))
+                launched.append(tech_lead)
+            # Log the per-item outcome (launch / provider-skip / deferred-by-
+            # capacity) on-change so a queued session is never silent.
+            self._tech_lead_launch_log.launch_outcomes(
+                pending_tech_lead,
+                launched,
+                provider_skipped,
+                reserved=reserved,
+                provider=provider,
+            )
 
         return actions, skipped
+
+    def _defer_tech_lead_capacity(
+        self,
+        snapshot: OrchestratorSnapshot,
+        reserved_tech_lead_capacity: Optional[int],
+    ) -> None:
+        """Delegate the pre-launch capacity-deferral log to the launch-log owner,
+        supplying this tick's budget numbers (why no slot opened for tech_lead)."""
+        self._tech_lead_launch_log.capacity_deferral(
+            snapshot.pending_tech_lead,
+            reserved_tech_lead_capacity,
+            active_count=snapshot.active_count,
+            max_concurrent_sessions=self.config.max_concurrent_sessions,
+            tech_lead_max_concurrent=self.config.tech_lead.max_concurrent,
+            active_tech_lead=self._active_tech_lead_count(snapshot),
+        )
 
     def _get_priority_reason(self, issue: Issue) -> str:
         """Get a human-readable priority explanation for an issue."""
