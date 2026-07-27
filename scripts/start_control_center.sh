@@ -275,6 +275,14 @@ sync_deps() {
   if [[ "${mode}" == "uv-frozen-extra-dev" ]]; then
     echo "Syncing Python dependencies from ${ROOT_DIR} with uv..."
     (cd "${ROOT_DIR}" && "${uv_bin}" sync --frozen --extra dev)
+    # `uv sync --frozen` keys on the installed package VERSION, not the editable
+    # SOURCE PATH, so it will not repoint an already-version-satisfied editable
+    # install that points at a stale location (e.g. a transient issue worktree
+    # this same venv was last `uv sync`/`pip install -e`'d from). Without this,
+    # ``ensure_deps`` detects the stale pointer but its remedy is a no-op and the
+    # CLI keeps importing another worktree's (possibly half-written) ``src``.
+    # Force the project's own editable install back to ROOT_DIR.
+    (cd "${ROOT_DIR}" && "${uv_bin}" pip install --python "${VENV_PATH}/bin/python" -e . --no-deps)
   else
     echo "Syncing Python dependencies from ${ROOT_DIR} with pip..."
     ensure_pip

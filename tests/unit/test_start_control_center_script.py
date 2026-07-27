@@ -252,7 +252,15 @@ def test_ensure_deps_resyncs_when_install_points_to_another_repo(
     )
 
     _assert_ok(result)
-    assert "uv sync --frozen --extra dev" in install_log.read_text(encoding="utf-8")
+    log = install_log.read_text(encoding="utf-8")
+    assert "uv sync --frozen --extra dev" in log
+    # `uv sync --frozen` alone won't repoint an already-version-satisfied editable
+    # install, so detecting the stale pointer must be followed by an explicit
+    # editable reinstall that binds the project's src back to ROOT_DIR. Without
+    # this the CLI keeps importing the other worktree's src.
+    assert (
+        f"uv pip install --python {venv_path}/bin/python -e . --no-deps" in log
+    ), log
 
 
 def test_ensure_deps_uses_pip_for_custom_venv_path(tmp_path: Path) -> None:
