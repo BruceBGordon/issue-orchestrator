@@ -13,7 +13,11 @@ from unittest.mock import Mock
 
 import pytest
 
-from issue_orchestrator.control.actions import LaunchSessionAction, SessionType
+from issue_orchestrator.control.actions import (
+    AddLabelAction,
+    LaunchSessionAction,
+    SessionType,
+)
 from issue_orchestrator.control.planner import Planner
 from issue_orchestrator.control.planner_types import OrchestratorSnapshot
 from issue_orchestrator.control.scheduler import Scheduler
@@ -134,3 +138,78 @@ def test_review_taking_last_shared_slot_reports_true_reason_not_false_saturation
     assert f"issue={ANCHOR}" in caplog.text
     assert "higher_priority_launched_this_tick" in caplog.text
     assert "no_worker_capacity:active=0" not in caplog.text
+
+
+def test_e2e_occupancy_is_not_misclassified_as_worker_saturation(caplog) -> None:
+    # #6892 review F1: shared budget, no active sessions, but a first-class E2E
+    # run holds the single worker slot. The tech-lead deferral must name E2E, not
+    # a false "worker_slot_occupied:active=1".
+    config = Config(repo="test/repo", max_concurrent_sessions=1)
+    config.tech_lead_review_agent = "agent:tech-lead"  # shared budget (no max_concurrent)
+    planner = Planner(
+        config=config,
+        scheduler=Scheduler(config),
+        tech_lead_workflow=TechLeadWorkflow(config, InMemoryEventSink()),
+    )
+    snapshot = make_snapshot(
+        pending_tech_lead=[_health_review()], e2e_occupies_slot=True
+    )
+    with caplog.at_level(logging.INFO, logger=PLANNER_LOGGER):
+        planner.plan(snapshot)
+    assert f"issue={ANCHOR}" in caplog.text
+    assert "e2e_occupies_worker_slot" in caplog.text
+    assert "worker_slot_occupied:active=1" not in caplog.text
+
+
+def test_provider_skipped_review_does_not_steal_the_tech_lead_slot(caplog) -> None:
+    # #6892 review F2: a review whose provider circuit is open produces an
+    # AddLabelAction, NOT a session launch. It must not consume worker capacity
+    # nor be counted as a higher-priority launch — the tech lead (on an available
+    # provider) still gets the shared slot.
+    config = Config(repo="test/repo", max_concurrent_sessions=1)
+    config.tech_lead_review_agent = "agent:tech-lead"  # shared budget
+    review = PendingReview(
+        issue_key=FakeIssueKey(name="10"),
+        pr_number=100,
+        pr_url="url",
+        branch_name="branch",
+        _issue_number=10,
+    )
+    review_wf = Mock()
+    review_wf.is_configured.return_value = True
+    review_wf.should_launch_reviews.return_value = Mock(
+        should_launch=True, skip_reason=None, reviews_to_launch=[review]
+    )
+    planner = Planner(
+        config=config,
+        scheduler=Scheduler(config),
+        review_workflow=review_wf,
+        tech_lead_workflow=TechLeadWorkflow(config, InMemoryEventSink()),
+    )
+    # review provider open, tech-lead provider available.
+    policy = Mock()
+    policy.provider_for_agent_label = (
+        lambda label: "prov-tl" if label == "agent:tech-lead" else "prov-review"
+    )
+    policy.is_open = lambda prov: prov == "prov-review"
+    policy.should_add_blocked_label = lambda *a, **k: True
+    planner.provider_policy = policy
+    snapshot = make_snapshot(
+        pending_reviews=[review], pending_tech_lead=[_health_review()]
+    )  # review issue 10 absent from snapshot.issues
+    with caplog.at_level(logging.INFO, logger=PLANNER_LOGGER):
+        plan = planner.plan(snapshot)
+    # the review was provider-skipped (label, not launch)...
+    assert any(isinstance(a, AddLabelAction) and a.issue_number == 10 for a in plan.actions)
+    assert not any(
+        isinstance(a, LaunchSessionAction) and a.session_type is SessionType.REVIEW
+        for a in plan.actions
+    )
+    # ...and the tech lead STILL got the shared slot (not stolen by the skip).
+    tl = [
+        a
+        for a in plan.actions
+        if isinstance(a, LaunchSessionAction) and a.session_type is SessionType.TECH_LEAD
+    ]
+    assert [a.number for a in tl] == [ANCHOR]
+    assert "higher_priority_launched_this_tick" not in caplog.text

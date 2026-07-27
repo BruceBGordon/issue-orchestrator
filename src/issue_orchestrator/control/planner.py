@@ -79,12 +79,14 @@ from .awaiting_merge_post_publish_policy import (
 )
 from .queue_decision_log import QueueDecisionLog
 from .reactive_tech_lead_planning import plan_reactive_tech_lead
-from .tech_lead_launch_log import TechLeadLaunchLog, no_slot_reason
+from .tech_lead_launch_log import TechLeadLaunchLog
 from .tech_lead_proposals import plan_approved_tech_lead_op_executions
 from .tech_lead_reaction import TechLeadReactionPolicy
 from .worker_budget import (
+    TechLeadSlotAvailability,
     active_tech_lead_session_count,
     active_worker_session_count,
+    tech_lead_slot_availability,
 )
 from .reconciliation import build_expected_for_mutation
 from .stuck_sweep import build_stuck_sweep_escalation_actions
@@ -345,36 +347,36 @@ class Planner:
         """
         return active_tech_lead_session_count(self.config, snapshot.active_sessions)
 
-    def _launch_budgets(
-        self, snapshot: OrchestratorSnapshot
-    ) -> tuple[int, Optional[int]]:
-        """Compute ``(worker_capacity, reserved_tech_lead_capacity)`` for this tick.
-
-        ``reserved_tech_lead_capacity`` is ``None`` when ``tech_lead.max_concurrent``
-        is unset: tech_lead then SHARES the worker budget and worker capacity
-        counts every active session, exactly as before (byte-for-byte). When
-        set, active tech_lead sessions are ADDITIVE — they neither consume worker
-        capacity nor count against ``max_concurrent_sessions`` — and tech_lead
-        draws from its own ``max_concurrent - active_tech_lead`` budget so the
-        tech lead can launch even at worker saturation.
-
-        A running first-class E2E workload (``snapshot.e2e_occupies_slot``, only
-        ever set when ``e2e.occupies_session_slot`` is on) occupies one WORKER
-        slot for as long as it runs, so worker capacity drops by 1 — one fewer
-        agent launches. It is charged to the worker budget ONLY: the reserved
-        tech_lead capacity is untouched, so the tech lead still runs in its own
-        slot while E2E holds a worker slot.
-        """
-        reserved = self.config.tech_lead.max_concurrent
-        worker_capacity = self.config.max_concurrent_sessions - (
-            active_worker_session_count(self.config, snapshot.active_sessions)
+    def _worker_capacity(self, snapshot: OrchestratorSnapshot) -> int:
+        """Remaining worker-budget capacity this tick — charged for reviews,
+        reworks, validation retries and new issues (and for tech_lead only in
+        the shared-budget default). A running first-class E2E workload
+        (``snapshot.e2e_occupies_slot``) occupies one worker slot. Tech-lead
+        reserved-slot accounting lives in ``tech_lead_slot_availability``
+        (worker_budget), the single slot-accounting owner (#6892 review A2)."""
+        worker_capacity = self.config.max_concurrent_sessions - active_worker_session_count(
+            self.config, snapshot.active_sessions
         )
         if snapshot.e2e_occupies_slot:
             worker_capacity -= 1
-        if reserved is None:
-            return worker_capacity, None
-        active_tech_lead = self._active_tech_lead_count(snapshot)
-        return worker_capacity, reserved - active_tech_lead
+        return worker_capacity
+
+    @staticmethod
+    def _launch_count(actions: list[Action]) -> int:
+        """Count only capacity-consuming launches — a provider-skip
+        ``AddLabelAction`` is not a launch and must not consume a slot or be
+        reported as a higher-priority launch (#6892 review F2)."""
+        return sum(1 for a in actions if isinstance(a, LaunchSessionAction))
+
+    def _defer_pending_tech_lead(
+        self, snapshot: OrchestratorSnapshot, slot: TechLeadSlotAvailability
+    ) -> None:
+        """Log (on-change) the owner-computed reason every queued tech_lead
+        session was deferred this tick. ``slot.reason`` is set because the owner
+        returns it iff ``available == 0``. Pruning departed items is the
+        caller's job (``retain``)."""
+        assert slot.reason is not None  # invariant of TechLeadSlotAvailability
+        self._tech_lead_launch_log.defer_all(snapshot.pending_tech_lead, slot.reason)
 
     def _plan_session_launches(
         self,
@@ -386,29 +388,34 @@ class Planner:
         """Plan capacity-consuming session launches in priority order."""
         actions: list[Action] = []
         skipped: list[SkippedItem] = []
-        capacity, reserved_tech_lead_capacity = self._launch_budgets(snapshot)
-        # Worker-only active count for the issue scheduler's own slot gate.
-        # Derived from the (pre-decrement) worker capacity so it excludes active
-        # tech_lead sessions exactly when they are additive; in the shared-budget
-        # default this equals snapshot.active_count (unchanged behavior).
+        capacity = self._worker_capacity(snapshot)
+        # Worker-only active count for the review/rework worker gate (includes the
+        # E2E charge, exactly as before). Tech-lead slot accounting does NOT reuse
+        # this — its owner derives active-worker independently so E2E is never
+        # misattributed as worker saturation (#6892 review F1/A2).
         worker_active_count = self.config.max_concurrent_sessions - capacity
-        # Short-circuit only when NEITHER budget can launch anything. When
-        # tech_lead shares the worker budget (reserved_tech_lead_capacity is None)
-        # this reduces to exactly the original ``capacity <= 0`` guard; a
-        # reserved tech_lead budget lets the tech lead run past worker saturation.
-        if capacity <= 0 and (
-            reserved_tech_lead_capacity is None or reserved_tech_lead_capacity <= 0
-        ):
+        workflow_configured = bool(
+            self.tech_lead_workflow and self.tech_lead_workflow.is_configured()
+        )
+        # The tech-lead slot budget + (when 0) its true reason, from the single
+        # slot-accounting owner. Recomputed after higher-priority launches below.
+        tech_lead_slot = tech_lead_slot_availability(
+            self.config,
+            snapshot.active_sessions,
+            e2e_occupies_slot=snapshot.e2e_occupies_slot,
+            launched_this_tick=0,
+            workflow_configured=workflow_configured,
+        )
+        # Short-circuit only when NEITHER budget can launch anything.
+        if capacity <= 0 and tech_lead_slot.available <= 0:
             logger.debug(
                 "Planner: no capacity available (active=%d, max=%d)",
                 snapshot.active_count,
                 self.config.max_concurrent_sessions,
             )
-            # Even with no slot for anyone, a queued tech_lead session must not
-            # go silent: log the true reason (nothing has launched yet this tick).
-            self._defer_tech_lead_no_slot(
-                snapshot, reserved_tech_lead_capacity, worker_active_count, 0
-            )
+            # A queued tech_lead session must not go silent: log the owner's
+            # reason (nothing has launched yet this tick).
+            self._defer_pending_tech_lead(snapshot, tech_lead_slot)
             self._tech_lead_launch_log.retain(snapshot.pending_tech_lead)
             return actions, skipped
 
@@ -424,15 +431,16 @@ class Planner:
         # 2. Plan review launches (highest priority). The worker workflows gate
         # on the WORKER-only count (``worker_active_count``, owner: worker_budget),
         # NOT raw ``snapshot.active_count`` — else a reserved-tech-lead session steals
-        # worker review/rework capacity (#6824 F5).
+        # worker review/rework capacity (#6824 F5). Only actual launches consume
+        # capacity — a provider-skip label action does not (#6892 review F2).
         if capacity > 0 and self.review_workflow:
             review_actions, review_skipped = self._plan_reviews(
                 snapshot, capacity, worker_active_count, plan_context
             )
             actions.extend(review_actions)
             skipped.extend(review_skipped)
-            capacity -= len(review_actions)
-            review_launch_count = len(review_actions)
+            review_launch_count = self._launch_count(review_actions)
+            capacity -= review_launch_count
 
         # 2b. Plan retrospective review launches
         if capacity > 0 and self.retrospective_review_workflow:
@@ -444,8 +452,8 @@ class Planner:
             )
             actions.extend(retrospective_actions)
             skipped.extend(retrospective_skipped)
-            capacity -= len(retrospective_actions)
-            retrospective_review_launch_count = len(retrospective_actions)
+            retrospective_review_launch_count = self._launch_count(retrospective_actions)
+            capacity -= retrospective_review_launch_count
 
         # 3. Plan rework launches
         if capacity > 0 and self.rework_workflow:
@@ -454,8 +462,8 @@ class Planner:
             )
             actions.extend(rework_actions)
             skipped.extend(rework_skipped)
-            capacity -= len(rework_actions)
-            rework_launch_count = len(rework_actions)
+            rework_launch_count = self._launch_count(rework_actions)
+            capacity -= rework_launch_count
 
         # 4. Plan validation retry launches. These are continuations of
         # existing coding work and are not subject to max_issues_to_start.
@@ -467,45 +475,43 @@ class Planner:
             )
             actions.extend(validation_retry_actions)
             skipped.extend(validation_retry_skipped)
-            capacity -= len(validation_retry_actions)
-            validation_retry_launch_count = len(validation_retry_actions)
+            validation_retry_launch_count = self._launch_count(validation_retry_actions)
+            capacity -= validation_retry_launch_count
 
-        # 5. Plan tech_lead launches. By default tech_lead draws from the shared
-        # worker ``capacity`` (decremented above). When tech_lead.max_concurrent
-        # is set, it draws from its own reserved additive budget instead, so
-        # the tech lead runs even when the worker budget is exhausted, and its
-        # launches do NOT decrement the shared worker capacity.
-        tech_lead_capacity = (
-            capacity if reserved_tech_lead_capacity is None else reserved_tech_lead_capacity
+        # 5. Plan tech_lead launches. Recompute the slot now that higher-priority
+        # launches this tick are known — the owner returns available>0 to launch,
+        # or available==0 with the true deferral reason. By default tech_lead
+        # draws from the shared worker budget; with tech_lead.max_concurrent set
+        # it uses its own reserved additive slot and does NOT decrement worker
+        # capacity.
+        launched_this_tick = (
+            review_launch_count
+            + retrospective_review_launch_count
+            + rework_launch_count
+            + validation_retry_launch_count
         )
-        if tech_lead_capacity > 0 and self.tech_lead_workflow:
+        tech_lead_slot = tech_lead_slot_availability(
+            self.config,
+            snapshot.active_sessions,
+            e2e_occupies_slot=snapshot.e2e_occupies_slot,
+            launched_this_tick=launched_this_tick,
+            workflow_configured=workflow_configured,
+        )
+        if tech_lead_slot.available > 0:
             tech_lead_actions, tech_lead_skipped = self._plan_tech_lead(
                 snapshot,
-                tech_lead_capacity,
+                tech_lead_slot.available,
                 plan_context,
-                reserved=reserved_tech_lead_capacity is not None,
+                reserved=self.config.tech_lead.max_concurrent is not None,
                 suppressed_issue_numbers=suppressed_tech_lead_issue_numbers,
             )
             actions.extend(tech_lead_actions)
             skipped.extend(tech_lead_skipped)
-            if reserved_tech_lead_capacity is None:
-                capacity -= len(tech_lead_actions)
-            tech_lead_launch_count = len(tech_lead_actions)
+            tech_lead_launch_count = self._launch_count(tech_lead_actions)
+            if self.config.tech_lead.max_concurrent is None:
+                capacity -= tech_lead_launch_count
         else:
-            # No slot opened for tech_lead this tick — log the TRUE reason, not a
-            # false "no capacity": active_count can still be 0 when a higher-
-            # priority launch consumed the last shared slot this tick (#6892 F1).
-            self._defer_tech_lead_no_slot(
-                snapshot,
-                reserved_tech_lead_capacity,
-                worker_active_count,
-                launched_this_tick=(
-                    review_launch_count
-                    + retrospective_review_launch_count
-                    + rework_launch_count
-                    + validation_retry_launch_count
-                ),
-            )
+            self._defer_pending_tech_lead(snapshot, tech_lead_slot)
         self._tech_lead_launch_log.retain(snapshot.pending_tech_lead)
 
         # 5b. Reserve one worker slot for a due first-class E2E run — after all
@@ -1730,32 +1736,6 @@ Flip labels from `{facts.watch_label}` to `{self.config.tech_lead_reviewed_label
             )
 
         return actions, skipped
-
-    def _defer_tech_lead_no_slot(
-        self,
-        snapshot: OrchestratorSnapshot,
-        reserved_tech_lead_capacity: Optional[int],
-        worker_active_count: int,
-        launched_this_tick: int,
-    ) -> None:
-        """Log (on-change) the TRUE reason a queued tech_lead session got no slot
-        this tick. The planner (budget/priority owner) supplies the facts;
-        ``no_slot_reason`` classifies them (#6892 review F1)."""
-        self._tech_lead_launch_log.defer_all(
-            snapshot.pending_tech_lead,
-            no_slot_reason(
-                workflow_configured=bool(
-                    self.tech_lead_workflow and self.tech_lead_workflow.is_configured()
-                ),
-                reserved_capacity=reserved_tech_lead_capacity,
-                worker_active_count=worker_active_count,
-                launched_this_tick=launched_this_tick,
-                e2e_occupies_slot=snapshot.e2e_occupies_slot,
-                max_sessions=self.config.max_concurrent_sessions,
-                tech_lead_max_concurrent=self.config.tech_lead.max_concurrent,
-                active_tech_lead=self._active_tech_lead_count(snapshot),
-            ),
-        )
 
     def _get_priority_reason(self, issue: Issue) -> str:
         """Get a human-readable priority explanation for an issue."""

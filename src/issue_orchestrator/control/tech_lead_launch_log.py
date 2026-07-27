@@ -25,42 +25,6 @@ _MESSAGE = (
 )
 
 
-def no_slot_reason(
-    *,
-    workflow_configured: bool,
-    reserved_capacity: int | None,
-    worker_active_count: int,
-    launched_this_tick: int,
-    e2e_occupies_slot: bool,
-    max_sessions: int,
-    tech_lead_max_concurrent: int | None,
-    active_tech_lead: int,
-) -> str:
-    """The TRUE reason a queued tech_lead session got no slot this tick, from
-    facts the planner (the budget/priority owner) supplies — so the deferral is
-    trustworthy, never a blanket or false "no capacity" (#6892 review F1).
-    ``worker_active_count`` is the PRE-tick worker count, so ``launched_this_tick``
-    distinguishes a higher-priority launch consuming the last shared slot (where
-    active is still 0) from pre-existing saturation."""
-    if not workflow_configured:
-        return "tech_lead_workflow_unavailable"
-    if reserved_capacity is not None:
-        return (
-            f"reserved_slot_occupied:max_concurrent={tech_lead_max_concurrent},"
-            f"active_tech_lead={active_tech_lead}"
-        )
-    if worker_active_count >= max_sessions:
-        return f"worker_slot_occupied:active={worker_active_count},max={max_sessions}"
-    if e2e_occupies_slot:
-        return f"e2e_occupies_worker_slot:max={max_sessions}"
-    if launched_this_tick > 0:
-        return (
-            f"higher_priority_launched_this_tick:launched={launched_this_tick},"
-            f"max={max_sessions}"
-        )
-    return f"no_worker_capacity:active={worker_active_count},max={max_sessions}"
-
-
 class TechLeadLaunchLog:
     """On-change log of per-issue tech_lead launch decisions (INFO)."""
 

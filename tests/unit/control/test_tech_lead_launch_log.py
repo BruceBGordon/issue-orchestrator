@@ -2,46 +2,9 @@
 
 import logging
 
-from issue_orchestrator.control.tech_lead_launch_log import (
-    TechLeadLaunchLog,
-    no_slot_reason,
-)
+from issue_orchestrator.control.tech_lead_launch_log import TechLeadLaunchLog
 from issue_orchestrator.domain.models import PendingTechLeadReview
 from issue_orchestrator.domain.tech_lead_session import TechLeadSessionFlavor
-
-
-def _reason(**overrides):
-    facts = dict(
-        workflow_configured=True,
-        reserved_capacity=None,
-        worker_active_count=0,
-        launched_this_tick=0,
-        e2e_occupies_slot=False,
-        max_sessions=1,
-        tech_lead_max_concurrent=None,
-        active_tech_lead=0,
-    )
-    facts.update(overrides)
-    return no_slot_reason(**facts)
-
-
-def test_no_slot_reason_distinguishes_every_cause() -> None:
-    # unavailable workflow wins over everything
-    assert _reason(workflow_configured=False) == "tech_lead_workflow_unavailable"
-    # reserved additive slot occupied
-    assert _reason(reserved_capacity=0, tech_lead_max_concurrent=1, active_tech_lead=1) == (
-        "reserved_slot_occupied:max_concurrent=1,active_tech_lead=1"
-    )
-    # pre-existing worker saturation
-    assert _reason(worker_active_count=1) == "worker_slot_occupied:active=1,max=1"
-    # E2E holding the worker slot
-    assert _reason(e2e_occupies_slot=True) == "e2e_occupies_worker_slot:max=1"
-    # the F1 case: higher-priority launch consumed the last slot THIS tick
-    assert _reason(launched_this_tick=1) == (
-        "higher_priority_launched_this_tick:launched=1,max=1"
-    )
-    # fallback: genuinely no capacity, active still 0
-    assert _reason() == "no_worker_capacity:active=0,max=1"
 
 LOGGER = "test.tech_lead_launch_log"
 
