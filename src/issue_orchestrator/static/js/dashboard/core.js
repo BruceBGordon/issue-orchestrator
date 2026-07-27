@@ -544,6 +544,7 @@ async function _refreshViewModelImpl({ reloadOnListChange = true } = {}) {
         setDashboardInitializing(viewModel.startup_status && viewModel.startup_status !== 'complete');
         applyNetworkSyncScheduler();
         renderGitHubUsage();
+        renderProviderCircuitFromDashboardData();
 
         // Post status to parent CC when embedded
         if (isEmbedded && viewModel) {
@@ -637,6 +638,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         initFlowLazyVisibleRefresh();
         applyGitHubUsagePrefs();
         renderGitHubUsage();
+        renderProviderCircuitFromDashboardData();
         applyNetworkSyncScheduler();
         // Await the first refresh so `data-booting` (which suppresses CSS
         // transitions) stays set through the initial DOM mutations. Without

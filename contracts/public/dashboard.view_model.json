@@ -53,6 +53,9 @@
           "title": "Paused",
           "type": "boolean"
         },
+        "providerCircuit": {
+          "$ref": "#/$defs/ProviderCircuitStatusContract"
+        },
         "queueRefreshSeconds": {
           "title": "Queuerefreshseconds",
           "type": "integer"
@@ -98,9 +101,132 @@
         "githubOwner",
         "githubRepo",
         "agents",
-        "validationConfigured"
+        "validationConfigured",
+        "providerCircuit"
       ],
       "title": "DashboardDataContract",
+      "type": "object"
+    },
+    "ProviderCircuitEntryContract": {
+      "additionalProperties": true,
+      "description": "One provider's circuit row in the health panel (issue #5980).",
+      "properties": {
+        "consecutive_outages": {
+          "title": "Consecutive Outages",
+          "type": "integer"
+        },
+        "cooldown_remaining_label": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Cooldown Remaining Label"
+        },
+        "is_open": {
+          "title": "Is Open",
+          "type": "boolean"
+        },
+        "last_error_summary": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Last Error Summary"
+        },
+        "next_retry_at": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Next Retry At"
+        },
+        "provider": {
+          "title": "Provider",
+          "type": "string"
+        },
+        "status_label": {
+          "title": "Status Label",
+          "type": "string"
+        }
+      },
+      "required": [
+        "provider",
+        "is_open",
+        "status_label",
+        "consecutive_outages"
+      ],
+      "title": "ProviderCircuitEntryContract",
+      "type": "object"
+    },
+    "ProviderCircuitStatusContract": {
+      "additionalProperties": true,
+      "description": "Provider circuit-breaker status powering the outage banner + panel.\n\n``any_open`` is the single flag the banner gates on. ``summary_text`` is a\ncolour-independent one-liner (provider names + next retry) so the outage is\nlegible without relying on the banner's colour alone.",
+      "properties": {
+        "any_open": {
+          "title": "Any Open",
+          "type": "boolean"
+        },
+        "entries": {
+          "items": {
+            "$ref": "#/$defs/ProviderCircuitEntryContract"
+          },
+          "title": "Entries",
+          "type": "array"
+        },
+        "next_retry_at": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Next Retry At"
+        },
+        "open_count": {
+          "title": "Open Count",
+          "type": "integer"
+        },
+        "open_providers": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Open Providers",
+          "type": "array"
+        },
+        "status_unavailable": {
+          "default": false,
+          "title": "Status Unavailable",
+          "type": "boolean"
+        },
+        "summary_text": {
+          "title": "Summary Text",
+          "type": "string"
+        }
+      },
+      "required": [
+        "any_open",
+        "open_count",
+        "summary_text"
+      ],
+      "title": "ProviderCircuitStatusContract",
       "type": "object"
     }
   },

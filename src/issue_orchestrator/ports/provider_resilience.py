@@ -24,6 +24,26 @@ class ProviderCircuitState:
     updated_at: datetime
 
 
+@dataclass(frozen=True)
+class ProviderCircuitStatus:
+    """Derived, point-in-time read model of a provider's circuit.
+
+    Unlike the persisted :class:`ProviderCircuitState`, this carries the
+    *interpreted* status the circuit owner computes against a clock:
+    whether the circuit is open right now and how much cooldown remains.
+    UI/observation layers consume this instead of re-deriving "is open"
+    from ``open_until`` (that policy lives once, on the manager).
+    """
+
+    provider: str
+    is_open: bool
+    open_until: datetime | None
+    cooldown_remaining_seconds: int
+    consecutive_outages: int
+    last_error_summary: str | None
+    updated_at: datetime
+
+
 class ProviderCircuitStore(Protocol):
     """Persistence for provider circuit breaker state."""
 

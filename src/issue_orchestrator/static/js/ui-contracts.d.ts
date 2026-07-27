@@ -101,6 +101,7 @@ export interface DashboardDataPayload {
   githubOwner: string;
   githubRepo: string;
   paused: boolean;
+  providerCircuit: ProviderCircuitStatusPayload;
   queueRefreshSeconds: number;
   repo: string;
   repoRoot: string;
@@ -741,6 +742,26 @@ export interface PhaseDialogPayload {
   phase: Record<string, any> | null;
   phases: Record<string, any>[];
   title: string;
+}
+
+export interface ProviderCircuitEntryPayload {
+  consecutive_outages: number;
+  cooldown_remaining_label: string | null;
+  is_open: boolean;
+  last_error_summary: string | null;
+  next_retry_at: string | null;
+  provider: string;
+  status_label: string;
+}
+
+export interface ProviderCircuitStatusPayload {
+  any_open: boolean;
+  entries: ProviderCircuitEntryPayload[];
+  next_retry_at: string | null;
+  open_count: number;
+  open_providers: string[];
+  status_unavailable: boolean;
+  summary_text: string;
 }
 
 export interface PublishFailedCodingAttemptPayload {

@@ -7,7 +7,11 @@ from datetime import datetime, timedelta, timezone
 
 from ..events import EventName
 from ..ports import EventSink,  make_trace_event
-from ..ports.provider_resilience import ProviderCircuitState, ProviderCircuitStore
+from ..ports.provider_resilience import (
+    ProviderCircuitState,
+    ProviderCircuitStatus,
+    ProviderCircuitStore,
+)
 from ..infra.config import ProviderResilienceConfig
 
 
@@ -34,6 +38,37 @@ class ProviderResilienceManager:
             return False
         now = now or _now()
         return state.open_until > now
+
+    def snapshot(self, now: datetime | None = None) -> list[ProviderCircuitStatus]:
+        """Return the interpreted status of every tracked provider circuit.
+
+        This is the single read surface for UI/observation layers: the "is
+        the circuit open right now" and "how much cooldown remains" policy
+        lives here (next to :meth:`is_open`), so callers never re-derive it
+        from ``open_until``. Results are sorted by provider for stable
+        rendering. Providers with no recorded outage are absent (a healthy
+        circuit has no row).
+        """
+        now = now or _now()
+        statuses: list[ProviderCircuitStatus] = []
+        for state in self.store.list_all():
+            open_until = state.open_until
+            is_open = open_until is not None and open_until > now
+            if is_open and open_until is not None:
+                cooldown_remaining = max(0, int((open_until - now).total_seconds()))
+            else:
+                cooldown_remaining = 0
+            statuses.append(ProviderCircuitStatus(
+                provider=state.provider,
+                is_open=is_open,
+                open_until=open_until if is_open else None,
+                cooldown_remaining_seconds=cooldown_remaining,
+                consecutive_outages=state.consecutive_outages,
+                last_error_summary=state.last_error_summary,
+                updated_at=state.updated_at,
+            ))
+        statuses.sort(key=lambda s: s.provider)
+        return statuses
 
     def record_transient_failure(
         self,

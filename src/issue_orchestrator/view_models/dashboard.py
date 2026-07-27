@@ -22,10 +22,11 @@ from .dependency_gate import (
     stack_dependency_view,
     stack_signal,
 )
+from .provider_circuit import ProviderCircuitStatusView, read_provider_circuit_status
 from .dashboard_e2e import E2E_PAGE_SIZE
 from .dashboard_e2e import build_e2e_items
 from .dashboard_e2e import build_e2e_view_model
-from .dashboard_e2e import build_recent_e2e_runs
+from .dashboard_e2e import build_recent_e2e_runs_payload
 from .dashboard_e2e import get_e2e_status
 from .lifecycle_semantics import RecentE2ERunsPayload
 from .dashboard_assets import DASHBOARD_CSS_CHUNKS
@@ -95,6 +96,8 @@ class DashboardViewModel:
     agents: dict[str, Any]
     agent_names: list[str]
 
+    provider_circuit: ProviderCircuitStatusView
+
     def template_context(self) -> dict[str, Any]:
         return {
             "issues": self.issues,
@@ -159,6 +162,7 @@ class DashboardViewModel:
             "scope": self.scope_summary,
             "refresh": self.scope_summary.get("refresh", {}),
             "githubUsage": github_usage,
+            "providerCircuit": self.provider_circuit.model_dump(mode="json"),
             "fetchLayerVisibilityAwareEnabled": self.scope_summary.get("refresh", {}).get("visibilityAwareEnabled", False),
             "fetchLayerSelectiveSyncPlannerEnabled": self.scope_summary.get("refresh", {}).get("selectiveSyncPlannerEnabled", False),
         }
@@ -1414,7 +1418,7 @@ def build_dashboard_view_model(
             "refresh": refresh_status,
         }
 
-    recent_e2e_runs = _build_recent_e2e_runs_payload(config)
+    recent_e2e_runs = build_recent_e2e_runs_payload(config)
 
     return DashboardViewModel(
         issues=issues,
@@ -1456,27 +1460,5 @@ def build_dashboard_view_model(
         recent_e2e_runs=recent_e2e_runs,
         agents=agents,
         agent_names=list(agents.keys()) if agents else [],
+        provider_circuit=read_provider_circuit_status(orchestrator),
     )
-
-
-def _build_recent_e2e_runs_payload(config: Any) -> RecentE2ERunsPayload:
-    """Build the typed runs-as-rows payload for the inline panel (issue #6334).
-
-    Tolerates a missing e2e DB (fresh repo / E2E disabled) by returning
-    an empty payload — the JS chunk renders the empty state and the
-    rest of the dashboard is unaffected.
-    """
-    if config is None or not getattr(config, "e2e", None) or not config.e2e.enabled:
-        return RecentE2ERunsPayload(runs=())
-    db_path = config.repo_root / ".issue-orchestrator" / "e2e.db" if config.repo_root else None
-    if db_path is None or not db_path.exists():
-        return RecentE2ERunsPayload(runs=())
-    try:
-        from ..infra.e2e_db import E2EDB
-
-        db = E2EDB(db_path)
-        return build_recent_e2e_runs(db, config, limit=100)
-    except Exception:
-        # Same defensive shape as ``_build_e2e_db_items`` — a broken
-        # e2e.db should not take the dashboard down with it.
-        return RecentE2ERunsPayload(runs=())

@@ -281,6 +281,21 @@ def test_dashboard_view_model_history_and_e2e_items_match_ui_openapi() -> None:
     _validator("DashboardViewModelPayload").validate(view_model.to_dict())
 
 
+def _provider_circuit_payload(**overrides: object) -> dict[str, object]:
+    """A minimal complete ``ProviderCircuitStatusPayload`` (hidden/healthy)."""
+    payload: dict[str, object] = {
+        "any_open": False,
+        "open_count": 0,
+        "open_providers": [],
+        "summary_text": "",
+        "next_retry_at": None,
+        "entries": [],
+        "status_unavailable": False,
+    }
+    payload.update(overrides)
+    return payload
+
+
 def _dashboard_data_payload(**overrides: object) -> dict[str, object]:
     """A minimal complete ``DashboardDataPayload`` for contract validation."""
     payload: dict[str, object] = {
@@ -294,6 +309,7 @@ def _dashboard_data_payload(**overrides: object) -> dict[str, object]:
         "githubRepo": "repo",
         "agents": ["agent:web"],
         "validationConfigured": False,
+        "providerCircuit": _provider_circuit_payload(),
     }
     payload.update(overrides)
     return payload
@@ -329,6 +345,55 @@ def test_dashboard_data_payload_requires_validation_configured() -> None:
         DashboardDataPayload.model_validate(
             _dashboard_data_payload(validationConfigured=None)
         )
+
+
+def test_dashboard_data_payload_requires_provider_circuit() -> None:
+    """Issue #5980: ``providerCircuit`` is a *required*, typed field on both
+    contract layers. The UI reads ``window.dashboardData.providerCircuit`` to
+    render the outage banner — a dropped or malformed payload must fail the UI
+    OpenAPI validation loudly, not slip through as an untyped extra and silently
+    hide a provider outage.
+    """
+    from issue_orchestrator.contracts.ui_openapi_models import DashboardDataPayload
+    from pydantic import ValidationError
+
+    data_validator = _validator("DashboardDataPayload")
+    circuit_validator = _validator("ProviderCircuitStatusPayload")
+
+    valid = _dashboard_data_payload()
+    data_validator.validate(valid)  # must not raise
+    DashboardDataPayload.model_validate(valid)
+
+    # Missing entirely → rejected on both layers.
+    incomplete = _dashboard_data_payload()
+    del incomplete["providerCircuit"]
+    with pytest.raises(JsonSchemaValidationError):
+        data_validator.validate(incomplete)
+    with pytest.raises(ValidationError):
+        DashboardDataPayload.model_validate(incomplete)
+
+    # Malformed circuit (missing required ``status_unavailable``) → rejected
+    # because the typed ``ProviderCircuitStatusPayload`` forbids partial shapes.
+    malformed_circuit = _provider_circuit_payload()
+    del malformed_circuit["status_unavailable"]
+    with pytest.raises(JsonSchemaValidationError):
+        data_validator.validate(_dashboard_data_payload(providerCircuit=malformed_circuit))
+    with pytest.raises(JsonSchemaValidationError):
+        circuit_validator.validate(malformed_circuit)
+    with pytest.raises(ValidationError):
+        DashboardDataPayload.model_validate(
+            _dashboard_data_payload(providerCircuit=malformed_circuit)
+        )
+
+    # Wrong type for a circuit field (``any_open`` must be boolean) → rejected.
+    bad_type = _provider_circuit_payload(any_open="yes")
+    with pytest.raises(JsonSchemaValidationError):
+        data_validator.validate(_dashboard_data_payload(providerCircuit=bad_type))
+
+    # Unknown extra key inside the strict circuit payload → rejected.
+    extra_key = _provider_circuit_payload(unexpected_field=True)
+    with pytest.raises(JsonSchemaValidationError):
+        circuit_validator.validate(extra_key)
 
 
 def test_view_model_snapshot_payload_matches_ui_openapi() -> None:

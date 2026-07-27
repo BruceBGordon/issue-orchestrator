@@ -113,6 +113,7 @@ class DashboardDataPayload(BaseModel):
     githubOwner: str
     githubRepo: str
     paused: bool
+    providerCircuit: ProviderCircuitStatusPayload
     queueRefreshSeconds: int
     repo: str
     repoRoot: str
@@ -750,6 +751,26 @@ class PhaseDialogPayload(BaseModel):
     phase: dict[str, Any] | None
     phases: list[dict[str, Any]]
     title: str
+
+class ProviderCircuitEntryPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    consecutive_outages: int
+    cooldown_remaining_label: str | None
+    is_open: bool
+    last_error_summary: str | None
+    next_retry_at: str | None
+    provider: str
+    status_label: str
+
+class ProviderCircuitStatusPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    any_open: bool
+    entries: list[ProviderCircuitEntryPayload]
+    next_retry_at: str | None
+    open_count: int
+    open_providers: list[str]
+    status_unavailable: bool
+    summary_text: str
 
 class PublishFailedCodingAttemptPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")

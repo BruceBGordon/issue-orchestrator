@@ -1208,6 +1208,14 @@
       "rule_id": "control_policy_branch_sites",
       "value": 3
     },
+    "control_policy_branch_sites:src/issue_orchestrator/static/js/dashboard/provider_circuit.js": {
+      "detail": "4 branch site(s) mention lifecycle/control terms",
+      "kind": "control_policy_branch_sites",
+      "metric_id": "src/issue_orchestrator/static/js/dashboard/provider_circuit.js",
+      "path": "src/issue_orchestrator/static/js/dashboard/provider_circuit.js",
+      "rule_id": "control_policy_branch_sites",
+      "value": 4
+    },
     "control_policy_branch_sites:src/issue_orchestrator/static/js/dashboard/session_dialogs.js": {
       "detail": "7 branch site(s) mention lifecycle/control terms",
       "kind": "control_policy_branch_sites",
@@ -1301,6 +1309,14 @@
       "kind": "control_policy_branch_sites",
       "metric_id": "src/issue_orchestrator/view_models/lifecycle_semantics.py",
       "path": "src/issue_orchestrator/view_models/lifecycle_semantics.py",
+      "rule_id": "control_policy_branch_sites",
+      "value": 5
+    },
+    "control_policy_branch_sites:src/issue_orchestrator/view_models/provider_circuit.py": {
+      "detail": "5 branch site(s) mention lifecycle/control terms",
+      "kind": "control_policy_branch_sites",
+      "metric_id": "src/issue_orchestrator/view_models/provider_circuit.py",
+      "path": "src/issue_orchestrator/view_models/provider_circuit.py",
       "rule_id": "control_policy_branch_sites",
       "value": 5
     },
@@ -1577,12 +1593,12 @@
       "value": 984
     },
     "oversized_control_hotspots:src/issue_orchestrator/view_models/dashboard.py": {
-      "detail": "1482 lines exceeds budget 800",
+      "detail": "1464 lines exceeds budget 800",
       "kind": "file_line_budget",
       "metric_id": "src/issue_orchestrator/view_models/dashboard.py",
       "path": "src/issue_orchestrator/view_models/dashboard.py",
       "rule_id": "oversized_control_hotspots",
-      "value": 1482
+      "value": 1464
     },
     "oversized_control_hotspots:src/issue_orchestrator/view_models/issue_detail.py": {
       "detail": "1099 lines exceeds budget 800",
@@ -2557,6 +2573,14 @@
       "kind": "ruff_noqa_suppression",
       "metric_id": "src/issue_orchestrator/view_models/journey_projection.py:b01adb1c5d5d",
       "path": "src/issue_orchestrator/view_models/journey_projection.py",
+      "rule_id": "ruff_noqa_suppressions",
+      "value": 1
+    },
+    "ruff_noqa_suppressions:src/issue_orchestrator/view_models/provider_circuit.py:4492131310dc": {
+      "detail": "line 205: # noqa: BLE001 - failure is rendered as an explicit warning",
+      "kind": "ruff_noqa_suppression",
+      "metric_id": "src/issue_orchestrator/view_models/provider_circuit.py:4492131310dc",
+      "path": "src/issue_orchestrator/view_models/provider_circuit.py",
       "rule_id": "ruff_noqa_suppressions",
       "value": 1
     },

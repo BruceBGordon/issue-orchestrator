@@ -550,6 +550,50 @@
           "session_scoped": {"type": "boolean"}
         }
       },
+      "ProviderCircuitEntryPayload": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "provider",
+          "is_open",
+          "status_label",
+          "cooldown_remaining_label",
+          "next_retry_at",
+          "consecutive_outages",
+          "last_error_summary"
+        ],
+        "properties": {
+          "provider": {"type": "string"},
+          "is_open": {"type": "boolean"},
+          "status_label": {"type": "string"},
+          "cooldown_remaining_label": {"type": ["string", "null"]},
+          "next_retry_at": {"type": ["string", "null"]},
+          "consecutive_outages": {"type": "integer"},
+          "last_error_summary": {"type": ["string", "null"]}
+        }
+      },
+      "ProviderCircuitStatusPayload": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "any_open",
+          "open_count",
+          "open_providers",
+          "summary_text",
+          "next_retry_at",
+          "entries",
+          "status_unavailable"
+        ],
+        "properties": {
+          "any_open": {"type": "boolean"},
+          "open_count": {"type": "integer"},
+          "open_providers": {"type": "array", "items": {"type": "string"}},
+          "summary_text": {"type": "string"},
+          "next_retry_at": {"type": ["string", "null"]},
+          "entries": {"type": "array", "items": {"$ref": "#/components/schemas/ProviderCircuitEntryPayload"}},
+          "status_unavailable": {"type": "boolean"}
+        }
+      },
       "DashboardDataPayload": {
         "type": "object",
         "additionalProperties": true,
@@ -563,7 +607,8 @@
           "githubOwner",
           "githubRepo",
           "agents",
-          "validationConfigured"
+          "validationConfigured",
+          "providerCircuit"
         ],
         "properties": {
           "startupComplete": {"type": "boolean"},
@@ -576,7 +621,8 @@
           "githubRepo": {"type": "string"},
           "e2eLastRun": {"type": ["object", "null"], "additionalProperties": true},
           "agents": {"type": "array", "items": {"type": "string"}},
-          "validationConfigured": {"type": "boolean"}
+          "validationConfigured": {"type": "boolean"},
+          "providerCircuit": {"$ref": "#/components/schemas/ProviderCircuitStatusPayload"}
         }
       },
       "DashboardViewModelPayload": {
