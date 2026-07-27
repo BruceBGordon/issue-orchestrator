@@ -1839,8 +1839,8 @@ class TestPlanHealthReviewIssueCreation:
         skipped = self._tech_lead_skipped(events)
         assert len(skipped) == 1
         assert skipped[0].data["reason"] == "no_capacity"
-        assert skipped[0].data["active"] == 2
-        assert skipped[0].data["max"] == 2
+        # Owner-computed availability (worker budget 2 - 2 active = 0) (#6892 A2).
+        assert skipped[0].data["available"] == 0
 
     def test_open_gate_still_creates_and_emits_no_skip(self):
         """Belt and braces: with the gate open the anchor is filed and NO

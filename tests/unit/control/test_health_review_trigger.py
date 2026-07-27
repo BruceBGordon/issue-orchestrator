@@ -597,7 +597,7 @@ class TestPlannerCarriesTheDecidedFingerprint:
     decided on onto the action, or the stamp has nothing truthful to record."""
 
     class _OpenGate:
-        def should_create_health_review(self, active_session_count, paused) -> bool:
+        def should_create_health_review(self, paused, *, available_slots) -> bool:
             return True
 
     def _plan(self, config, facts, storm_problems=()):
@@ -606,7 +606,7 @@ class TestPlannerCarriesTheDecidedFingerprint:
             (),
             config,
             workflow=self._OpenGate(),
-            active_session_count=0,
+            available_slots=1,
             paused=False,
             storm_problems=storm_problems,
         )

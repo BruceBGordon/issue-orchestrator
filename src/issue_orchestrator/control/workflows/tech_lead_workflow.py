@@ -9,7 +9,7 @@ lives in the fact-gathering/planning path:
 
 Usage:
     workflow = TechLeadWorkflow(config=config, events=event_sink)
-    decision = workflow.should_launch_tech_lead(pending_tech_lead, active_sessions, paused)
+    decision = workflow.should_launch_tech_lead(pending_tech_lead, paused, available_slots=n)
     if decision.should_launch:
         for tech_lead in decision.tech_lead_to_launch:
             # Launch the tech_lead session
@@ -61,93 +61,69 @@ class TechLeadWorkflow:
     def should_launch_tech_lead(
         self,
         pending_tech_lead: Sequence[PendingTechLeadReview],
-        active_session_count: int,
         paused: bool,
         *,
-        reserved_capacity: int | None = None,
+        available_slots: int,
     ) -> TechLeadDecision:
         """Determine if and which tech_lead reviews should be launched.
 
-        Args:
-            pending_tech_lead: Queue of pending tech_lead reviews
-            active_session_count: Number of active sessions
-            paused: Whether the orchestrator is paused
-            reserved_capacity: When None (default), tech_lead shares the worker
-                budget and the gate/available slots derive from
-                ``max_concurrent_sessions - active_session_count``, exactly as
-                before. When set, tech_lead has its own reserved additive budget
-                (``tech_lead.max_concurrent - active_tech_lead``): the gate and the
-                slot count use it directly, so tech_lead may launch even when the
-                worker budget is saturated.
-
-        Returns:
-            TechLeadDecision describing what should happen
+        ``available_slots`` is the tech-lead slot budget for this tick, computed
+        by the single slot-accounting owner (``worker_budget.tech_lead_slot_
+        availability``). The workflow does NOT recompute a second capacity policy
+        (#6892 review A2): it slices the queue by ``available_slots`` and reports
+        that same number in the ``TECH_LEAD_LAUNCHING`` event, so the machine
+        event can never disagree with the actual planned launches.
         """
-        # Check if configured
         if not self.is_configured():
             return TechLeadDecision.skip("No tech_lead_review_agent configured")
 
-        # Check if queue is empty
         if not pending_tech_lead:
             return TechLeadDecision.skip("No pending tech_lead reviews")
 
-        gate_skip = self._gate_skip_reason(
-            active_session_count, paused, reserved_capacity=reserved_capacity
-        )
+        gate_skip = self._gate_skip_reason(paused, available_slots)
         if gate_skip:
             return TechLeadDecision.skip(gate_skip)
 
-        # Determine which tech_lead reviews to launch
-        available = (
-            reserved_capacity
-            if reserved_capacity is not None
-            else self.config.max_concurrent_sessions - active_session_count
-        )
-        tech_lead_to_launch = list(pending_tech_lead)[:available]
+        tech_lead_to_launch = list(pending_tech_lead)[:available_slots]
 
         self.events.publish(
             make_trace_event(
                 EventName.TECH_LEAD_LAUNCHING,
                 {
                     "count": len(tech_lead_to_launch),
-                    "capacity": available,
+                    "capacity": available_slots,
                     "pending": len(pending_tech_lead),
                 },
             )
         )
 
-        return TechLeadDecision.launch(tech_lead_to_launch, available)
+        return TechLeadDecision.launch(tech_lead_to_launch, available_slots)
 
     def should_create_health_review(
         self,
-        active_session_count: int,
         paused: bool,
+        *,
+        available_slots: int,
     ) -> bool:
         """Gate the periodic health-review anchor creation (ADR-0031 §4).
 
-        Same owned paused/capacity gate as launch decisions: when the
-        orchestrator is paused or at capacity the anchor is NOT created —
+        Same owned paused/capacity gate as launch decisions, over the same
+        owner-computed ``available_slots`` (#6892 review A2): when the
+        orchestrator is paused or has no slot, the anchor is NOT created —
         due-ness persists, so creation retries once the gate opens — and
         TECH_LEAD_SKIPPED is emitted with the proper reason (#6763).
         """
         if not self.is_configured():
             return False
-        return self._gate_skip_reason(active_session_count, paused) is None
+        return self._gate_skip_reason(paused, available_slots) is None
 
-    def _gate_skip_reason(
-        self,
-        active_session_count: int,
-        paused: bool,
-        *,
-        reserved_capacity: int | None = None,
-    ) -> str | None:
+    def _gate_skip_reason(self, paused: bool, available_slots: int) -> str | None:
         """Owned paused/capacity gate shared by launch and creation decisions.
 
         Emits TECH_LEAD_SKIPPED with the rejection reason; returns None when
-        tech_lead work may proceed. When ``reserved_capacity`` is set the gate
-        checks the reserved additive tech_lead budget instead of the shared
-        worker budget, so a saturated worker budget no longer blocks the tech
-        lead; when None (default) the shared-budget behavior is unchanged.
+        tech_lead work may proceed. Capacity is NOT derived here — the caller
+        passes the owner-computed ``available_slots`` (#6892 review A2), so the
+        workflow never holds a second capacity policy.
         """
         if paused:
             self.events.publish(
@@ -158,34 +134,12 @@ class TechLeadWorkflow:
             )
             return "Orchestrator paused"
 
-        if reserved_capacity is not None:
-            if reserved_capacity <= 0:
-                self.events.publish(
-                    make_trace_event(
-                        EventName.TECH_LEAD_SKIPPED,
-                        {
-                            "reason": "no_reserved_capacity",
-                            "reserved_remaining": reserved_capacity,
-                        },
-                    )
-                )
-                return (
-                    "No reserved tech_lead capacity "
-                    f"(remaining={reserved_capacity})"
-                )
-            return None
-
-        max_sessions = self.config.max_concurrent_sessions
-        if max_sessions - active_session_count <= 0:
+        if available_slots <= 0:
             self.events.publish(
                 make_trace_event(
                     EventName.TECH_LEAD_SKIPPED,
-                    {
-                        "reason": "no_capacity",
-                        "active": active_session_count,
-                        "max": max_sessions,
-                    },
+                    {"reason": "no_capacity", "available": available_slots},
                 )
             )
-            return f"No capacity (active={active_session_count}, max={max_sessions})"
+            return f"No tech_lead capacity (available={available_slots})"
         return None
