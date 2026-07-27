@@ -13,17 +13,26 @@ started / stopped affecting this issue". It owns *both* halves of the
 transition — the blocked-label mutation and the durable issue-scoped record —
 so no call site can move the label without leaving history behind, and the
 record is only written once the label mutation actually applied.
+
+Everything the command says about providers comes from a single
+:class:`ProviderImpactAssessment`: one bounded, point-in-time read of every
+provider the issue depends on, taken at one instant. The label decision, the
+retry metadata, and the user-facing history text are all derived from that same
+assessment, so they cannot drift apart or describe different moments (#5980
+F4/A2).
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime
 from enum import Enum
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 from ..events import EventName
 from ..ports import make_trace_event
 from ..ports.event_sink import TraceEvent
+from ..ports.provider_resilience import ProviderCircuitStatus
 from .actions import (
     Action,
     ActionResult,
@@ -31,6 +40,36 @@ from .actions import (
     AddLabelAction,
     RemoveLabelAction,
 )
+
+
+class ProviderAvailability(Enum):
+    """How one provider's circuit reads at a single instant.
+
+    Mirrors the three states the circuit owner can be in, and the same three
+    the health panel renders:
+
+    ``OPEN``        the circuit is open right now — calls are blocked.
+    ``RECOVERING``  tracked, but the cooldown has elapsed; a retry is allowed
+                    and no call has succeeded yet, so recovery is unconfirmed.
+    ``HEALTHY``     untracked — either it never failed, or ``record_success``
+                    confirmed recovery and deleted the row.
+    """
+
+    OPEN = "open"
+    RECOVERING = "recovering"
+    HEALTHY = "healthy"
+
+
+class ProviderReleaseKind(Enum):
+    """Why an issue was released from the provider-blocked state.
+
+    ``COOLDOWN_ELAPSED`` is deliberately distinct from ``AVAILABLE``: a circuit
+    that ``close_expired()`` moved out of the open state has *not* been proven
+    healthy, so the history must not claim the provider recovered (#5980 F4).
+    """
+
+    COOLDOWN_ELAPSED = "cooldown_elapsed"
+    AVAILABLE = "available"
 
 
 class ProviderImpactTransition(Enum):
@@ -61,25 +100,168 @@ def format_cooldown(seconds: int) -> str:
 
 
 @dataclass(frozen=True)
+class ProviderImpactAssessment:
+    """One point-in-time read of every provider an issue depends on.
+
+    Built by :class:`ProviderAvailabilityPolicy` from a single ``assessed_at``
+    instant, so "is this issue blocked", "which providers are actually to
+    blame", and "when is the next retry" are all answered from the same moment.
+    Providers are partitioned — a provider appears in exactly one bucket.
+    """
+
+    assessed_at: datetime
+    open_providers: tuple[str, ...] = ()
+    recovering_providers: tuple[str, ...] = ()
+    healthy_providers: tuple[str, ...] = ()
+    # Soonest instant an *open* circuit next allows a retry, and how far away
+    # that is. Both ``None`` when nothing is open (nothing to wait for).
+    next_retry_at: str | None = None
+    cooldown_remaining_seconds: int | None = None
+
+    @classmethod
+    def from_statuses(
+        cls,
+        assessed_at: datetime,
+        statuses: Iterable[tuple[str, ProviderCircuitStatus | None]],
+    ) -> "ProviderImpactAssessment":
+        """Partition ``(provider, status)`` reads taken at ``assessed_at``.
+
+        ``status is None`` means the circuit owner is not tracking the provider
+        at all: it never failed, or a successful call deleted the row.
+        """
+        open_providers: list[str] = []
+        recovering: list[str] = []
+        healthy: list[str] = []
+        open_statuses: list[ProviderCircuitStatus] = []
+        for provider, status in statuses:
+            if status is None:
+                healthy.append(provider)
+            elif status.is_open:
+                open_providers.append(provider)
+                open_statuses.append(status)
+            else:
+                recovering.append(provider)
+        next_retry_at: str | None = None
+        cooldown: int | None = None
+        if open_statuses:
+            soonest = min(open_statuses, key=lambda s: s.cooldown_remaining_seconds)
+            next_retry_at = (
+                soonest.open_until.isoformat() if soonest.open_until is not None else None
+            )
+            cooldown = soonest.cooldown_remaining_seconds
+        return cls(
+            assessed_at=assessed_at,
+            open_providers=tuple(sorted(open_providers)),
+            recovering_providers=tuple(sorted(recovering)),
+            healthy_providers=tuple(sorted(healthy)),
+            next_retry_at=next_retry_at,
+            cooldown_remaining_seconds=cooldown,
+        )
+
+    @property
+    def blocked(self) -> bool:
+        """Whether any circuit is open right now — the label decision."""
+        return bool(self.open_providers)
+
+    @property
+    def release_kind(self) -> ProviderReleaseKind:
+        """Why a non-blocked issue is being released.
+
+        A still-tracked ``RECOVERING`` provider means the cooldown merely
+        elapsed; nothing has proven the provider healthy yet.
+        """
+        if self.recovering_providers:
+            return ProviderReleaseKind.COOLDOWN_ELAPSED
+        return ProviderReleaseKind.AVAILABLE
+
+    def availability(self, provider: str) -> ProviderAvailability:
+        if provider in self.open_providers:
+            return ProviderAvailability.OPEN
+        if provider in self.recovering_providers:
+            return ProviderAvailability.RECOVERING
+        return ProviderAvailability.HEALTHY
+
+    @property
+    def assessed_providers(self) -> tuple[str, ...]:
+        return tuple(
+            sorted(
+                (*self.open_providers, *self.recovering_providers, *self.healthy_providers)
+            )
+        )
+
+    def as_payload(self) -> dict[str, Any]:
+        """Machine-readable partition for the issue-scoped event."""
+        return {
+            "assessed_at": self.assessed_at.isoformat(),
+            "open_providers": list(self.open_providers),
+            "recovering_providers": list(self.recovering_providers),
+            "healthy_providers": list(self.healthy_providers),
+        }
+
+
+# Placeholder for the dataclass-inheritance default every Action subclass needs.
+# Never a usable value: `ApplyProviderImpactAction.__post_init__` rejects any
+# action whose assessment does not support its transition, so an action built
+# without a real assessment fails loudly instead of recording an empty story.
+_UNASSESSED = ProviderImpactAssessment(assessed_at=datetime.min)
+
+
+@dataclass(frozen=True)
 class ApplyProviderImpactAction(Action):
     """Move an issue across the provider-availability boundary, and record it.
 
-    ``providers`` are the provider(s) whose circuit caused the transition;
-    ``next_retry_at`` / ``cooldown_remaining_seconds`` describe when the
-    soonest circuit will next allow a retry (blocked transitions only, and
-    absent when the circuit is recovering rather than open).
+    Everything the record says is derived from ``assessment`` — a single
+    point-in-time read — so the label decision, the retry window, and the
+    history text describe the same moment and the same providers.
     """
 
     issue_number: int = 0
     transition: ProviderImpactTransition = ProviderImpactTransition.BLOCKED
     label: str = ""
-    providers: tuple[str, ...] = ()
-    next_retry_at: str | None = None
-    cooldown_remaining_seconds: int | None = None
+    assessment: ProviderImpactAssessment = _UNASSESSED
     issue_key: str = ""
     action_type: ActionType = field(
         default=ActionType.APPLY_PROVIDER_IMPACT, init=False
     )
+
+    def __post_init__(self) -> None:
+        """Fail fast when the assessment cannot support the transition."""
+        if self.transition is ProviderImpactTransition.BLOCKED:
+            if not self.assessment.open_providers:
+                raise ValueError(
+                    "provider-impact BLOCKED requires at least one open circuit; "
+                    f"assessment has none (issue #{self.issue_number})"
+                )
+            return
+        if self.assessment.open_providers:
+            raise ValueError(
+                "provider-impact CLEARED requires no open circuit; assessment has "
+                f"{list(self.assessment.open_providers)} (issue #{self.issue_number})"
+            )
+
+    @property
+    def providers(self) -> tuple[str, ...]:
+        """The providers this transition is *about*.
+
+        Blocking names only the circuits that are actually open — never the
+        issue's other, healthy providers (#5980 F4). Clearing names the
+        still-tracked recovering circuits when there are any, because those are
+        the ones whose state the operator was waiting on; otherwise it names
+        every provider the issue depends on, all of which read healthy.
+        """
+        if self.transition is ProviderImpactTransition.BLOCKED:
+            return self.assessment.open_providers
+        if self.assessment.recovering_providers:
+            return self.assessment.recovering_providers
+        return self.assessment.assessed_providers
+
+    @property
+    def next_retry_at(self) -> str | None:
+        return self.assessment.next_retry_at
+
+    @property
+    def cooldown_remaining_seconds(self) -> int | None:
+        return self.assessment.cooldown_remaining_seconds
 
     @property
     def provider_list(self) -> str:
@@ -110,21 +292,27 @@ class ApplyProviderImpactAction(Action):
     def summary(self) -> str:
         """User-facing one-liner for the issue timeline.
 
-        Blocked entries fold the retry window in ("enter" + "retry" text);
-        cleared entries say the issue was released.
+        Blocked entries fold the retry window in ("enter" + "retry" text).
+        Cleared entries distinguish "the cooldown elapsed, retry allowed but
+        recovery unconfirmed" from "every provider reads healthy" — claiming
+        recovery for a merely-recovering circuit would make the audit trail
+        wrong (#5980 F4).
         """
         providers = self.provider_list or "provider"
-        if self.transition is ProviderImpactTransition.CLEARED:
+        if self.transition is ProviderImpactTransition.BLOCKED:
+            if self.cooldown_remaining_seconds is not None:
+                window = format_cooldown(self.cooldown_remaining_seconds)
+                return (
+                    f"Blocked by provider outage: {providers} unavailable — "
+                    f"next retry in {window}"
+                )
+            return f"Blocked by provider outage: {providers} unavailable"
+        if self.assessment.release_kind is ProviderReleaseKind.COOLDOWN_ELAPSED:
             return (
-                f"Provider available again: {providers} — issue released for retry"
+                f"Provider cooldown elapsed: {providers} — issue released to retry "
+                "(recovery not confirmed yet)"
             )
-        if self.cooldown_remaining_seconds is not None:
-            window = format_cooldown(self.cooldown_remaining_seconds)
-            return (
-                f"Blocked by provider outage: {providers} unavailable — "
-                f"next retry in {window}"
-            )
-        return f"Blocked by provider outage: {providers} unavailable"
+        return f"Providers available: {providers} — issue released for retry"
 
     def event_payload(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -136,7 +324,12 @@ class ApplyProviderImpactAction(Action):
             # `summary` is what the timeline projection surfaces as the event
             # summary line (see `timeline._summary_from_data`).
             "summary": self.summary(),
+            **self.assessment.as_payload(),
         }
+        if self.transition is ProviderImpactTransition.CLEARED:
+            # Typed counterpart to the summary wording, so consumers can tell a
+            # cooldown expiry from a healthy fleet without parsing prose.
+            payload["release_kind"] = self.assessment.release_kind.value
         if self.next_retry_at is not None:
             payload["next_retry_at"] = self.next_retry_at
         if self.cooldown_remaining_seconds is not None:
@@ -180,7 +373,10 @@ def apply_provider_impact(
 
 __all__ = [
     "ApplyProviderImpactAction",
+    "ProviderAvailability",
+    "ProviderImpactAssessment",
     "ProviderImpactTransition",
+    "ProviderReleaseKind",
     "apply_provider_impact",
     "format_cooldown",
 ]

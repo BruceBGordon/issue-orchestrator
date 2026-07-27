@@ -2244,12 +2244,14 @@ class SessionLauncher:
     def _check_provider_circuit(self, provider: str | None, issue_number: int) -> Optional["LaunchResult"]:
         if not provider or not self._provider_policy:
             return None
-        if not self._provider_policy.is_open(provider):
+        # One point-in-time assessment drives both the launch gate and the
+        # provider-impact command (blocked label + durable record), so the two
+        # can never describe different instants (#5980 F4/A2).
+        assessment = self._provider_policy.assess((provider,))
+        if not assessment.blocked:
             return None
-        # The provider-impact command owns both the blocked label and the
-        # durable issue-scoped record of the outage (#5980).
         self._apply_actions(
-            [self._provider_policy.blocked_transition(issue_number, (provider,))],
+            [self._provider_policy.blocked_transition(issue_number, assessment)],
             context="provider_unavailable",
         )
         return LaunchResult(None, False, f"Provider unavailable: {provider}")

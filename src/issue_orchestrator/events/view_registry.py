@@ -183,8 +183,13 @@ VIEW_REGISTRY: dict[str, list[ViewEvent]] = {
     "provider.issue_blocked": [
         _user("provider.issue_blocked", "Blocked by provider outage", "orchestrator"),
     ],
+    # Neutral on purpose: a release can mean "the cooldown elapsed, retry
+    # allowed, recovery unconfirmed" OR "every circuit reads healthy". The
+    # static narrative must not claim recovery the circuit owner never observed
+    # (#5980 F4) — the event's `summary` and typed `release_kind` carry the
+    # distinction.
     "provider.issue_unblocked": [
-        _user("provider.issue_unblocked", "Provider recovered", "orchestrator"),
+        _user("provider.issue_unblocked", "Provider block cleared", "orchestrator"),
     ],
 
     # -- Tech Lead --

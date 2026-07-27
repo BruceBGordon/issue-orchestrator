@@ -217,12 +217,12 @@
       "value": 1
     },
     "control_policy_branch_sites:src/issue_orchestrator/control/provider_impact.py": {
-      "detail": "3 branch site(s) mention lifecycle/control terms",
+      "detail": "6 branch site(s) mention lifecycle/control terms",
       "kind": "control_policy_branch_sites",
       "metric_id": "src/issue_orchestrator/control/provider_impact.py",
       "path": "src/issue_orchestrator/control/provider_impact.py",
       "rule_id": "control_policy_branch_sites",
-      "value": 3
+      "value": 6
     },
     "control_policy_branch_sites:src/issue_orchestrator/control/publish_recovery.py": {
       "detail": "13 branch site(s) mention lifecycle/control terms",
