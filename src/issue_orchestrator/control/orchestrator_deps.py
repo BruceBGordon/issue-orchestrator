@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from ..events import EventHub
+    from ..ports.agent_callback_endpoint import AgentCallbackEndpoint
     from ..ports.label_store import LabelStore
     from ..ports.queue_cache_store import QueueCacheStore
     from ..ports import (
@@ -104,6 +105,11 @@ class OrchestratorDeps:
     # Board-snapshot fact assembly (ADR-0031 §3); the orchestrator binds it to
     # live state when wiring the session launcher's snapshot provider.
     board_snapshot_builder: "BoardSnapshotBuilder"
+    # Where spawned agents can reach this orchestrator. Runtime state
+    # with a lifecycle (the port is only known after the server binds),
+    # so it is a port injected here rather than read from Config —
+    # ``control_api_port: 0`` is a request, not an address (#6924).
+    agent_callback_endpoint: "AgentCallbackEndpoint"
 
     # IO adapters
     worktree_manager: "WorktreeManager"

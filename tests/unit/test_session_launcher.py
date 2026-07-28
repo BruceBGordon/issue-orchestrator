@@ -33,6 +33,9 @@ from issue_orchestrator.control.session_decision import (
     SessionDecision,
 )
 from issue_orchestrator.control.session_launch_types import LaunchResult
+from issue_orchestrator.infra.agent_callback_endpoint import (
+    RuntimeAgentCallbackEndpoint,
+)
 from issue_orchestrator.control.session_launcher import (
     SessionLauncher,
     detect_existing_work,
@@ -586,6 +589,7 @@ def _build_launcher_bundle(
         get_review_machine=get_review_machine,
         remove_session_machine=remove_session_machine,
         board_snapshot_provider=board_snapshot_provider,
+        agent_callback_endpoint=RuntimeAgentCallbackEndpoint(),
     )
 
     bundle = LauncherTestBundle(
@@ -1189,6 +1193,7 @@ class TestLaunchIssueSession:
             refresh_issue_fn=refresh_issue,
             dependency_evaluator=_Evaluator(),
             board_snapshot_provider=NullBoardSnapshotProvider(),
+            agent_callback_endpoint=RuntimeAgentCallbackEndpoint(),
         )
 
         result = launcher.launch_issue_session(sample_issue, active_sessions=[])
@@ -6797,6 +6802,7 @@ class TestStackRelaunchGate:
             refresh_issue_fn=refresh_issue,
             dependency_evaluator=self._CannedWorkEvaluator(report_fn),
             board_snapshot_provider=NullBoardSnapshotProvider(),
+            agent_callback_endpoint=RuntimeAgentCallbackEndpoint(),
         )
 
     @pytest.fixture

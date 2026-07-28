@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Optional, Callable, Mapping, Sequence
 
 if TYPE_CHECKING:
+    from ..ports.agent_callback_endpoint import AgentCallbackEndpoint
     from ..ports.board_snapshot_provider import BoardSnapshotProvider
     from ..domain.state_machines.issue_machine import IssueStateMachine
     from ..domain.state_machines.session_machine import SessionStateMachine
@@ -207,6 +208,7 @@ class SessionLauncher:
         # authoritative required input, so the launcher must always be able to
         # produce one. Tests inject a null-object/fake provider, never None.
         board_snapshot_provider: "BoardSnapshotProvider",
+        agent_callback_endpoint: "AgentCallbackEndpoint",
     ):
         self.config = config
         self.events = events
@@ -220,6 +222,7 @@ class SessionLauncher:
         self._manifest_downloader = manifest_downloader
         self._tech_lead_authority = tech_lead_authority
         self._board_snapshot_provider = board_snapshot_provider
+        self._agent_callback_endpoint = agent_callback_endpoint
         self._session_exists = session_exists_fn
         self._create_session = create_session_fn
         self._get_issue_machine = get_issue_machine
@@ -435,6 +438,7 @@ class SessionLauncher:
             issue_number=issue_number,
             run_dir=run_assets.run_dir,
             worktree_path=worktree_path,
+            callback_endpoint=self._agent_callback_endpoint,
         )
 
     # ─────────────────────────────────────────────────────────────────────────

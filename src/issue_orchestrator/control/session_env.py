@@ -15,11 +15,13 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
-from ..infra.agent_callback_endpoint import resolve_agent_callback_port
 from ..infra.env import ENV_PREFIX
 from .isolation import build_agent_tool_env_assignments
+
+if TYPE_CHECKING:
+    from ..ports.agent_callback_endpoint import AgentCallbackEndpoint
 
 
 class SessionEnvConfig(Protocol):
@@ -29,20 +31,22 @@ class SessionEnvConfig(Protocol):
     config_path: Path | None
 
 
-def api_port_export(control_api_port: int) -> str:
+def api_port_export(
+    control_api_port: int, callback_endpoint: "AgentCallbackEndpoint"
+) -> str:
     """Render the Control API port export agents call back on.
 
-    Resolved through the bound-endpoint owner, so agents get the port
-    that is actually listening. ``control_api_port: 0`` means "bind any
-    free port" and the supervised engine never writes the real port back
-    into ``Config`` — exporting the configured value handed agents an
+    Resolved through the injected endpoint, so agents get the port that
+    is actually listening. ``control_api_port: 0`` means "bind any free
+    port" and the supervised engine never writes the real port back into
+    ``Config`` — exporting the configured value handed agents an
     unreachable ``localhost:0`` and made every callback fail (#6924).
 
     When nothing is bound and nothing is configured there is genuinely
     no endpoint, so the variable is omitted rather than set to a
     sentinel that merely looks configured.
     """
-    port = resolve_agent_callback_port(control_api_port)
+    port = callback_endpoint.resolve_port(control_api_port)
     if port is None:
         return ""
     return f" {ENV_PREFIX}API_PORT='{port}'"
@@ -72,6 +76,7 @@ def build_session_env_exports(
     issue_number: int,
     run_dir: Path,
     worktree_path: Path,
+    callback_endpoint: "AgentCallbackEndpoint",
 ) -> str:
     """Build the common env-export string for all session types.
 
@@ -94,7 +99,7 @@ def build_session_env_exports(
         f" {ENV_PREFIX}AGENT_LABEL='{agent_label}'"
         f" {ENV_PREFIX}ISSUE_NUMBER='{issue_number}'"
         f"{config_exports(config.config_path)}"
-        f"{api_port_export(config.control_api_port)}"
+        f"{api_port_export(config.control_api_port, callback_endpoint)}"
         f" {ENV_PREFIX}VALIDATION_OUTPUT_DIR='{run_dir}'"
         f" {ENV_PREFIX}RUN_DIR='{run_dir}'"
         f" {ENV_PREFIX}WORKTREE='{worktree_path}'"

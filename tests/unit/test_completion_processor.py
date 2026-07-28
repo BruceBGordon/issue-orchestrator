@@ -32,6 +32,9 @@ from issue_orchestrator.domain.review_exchange_run import (
 )
 from issue_orchestrator.domain.review_exchange_summary import ReviewExchangeSummaryV1
 from issue_orchestrator.domain.runtime_config import RuntimeConfigReference
+from issue_orchestrator.infra.agent_callback_endpoint import (
+    RuntimeAgentCallbackEndpoint,
+)
 from issue_orchestrator.control.completion_processor import (
     CompletionProcessor,
     ProcessingResult,
@@ -2201,6 +2204,9 @@ class TestReviewExchangeExecution:
             event_bus=EventBus(),
             label_config={},
             config=config,
+            # This test drives a real exchange, so it reaches the
+            # callback endpoint and must inject one.
+            agent_callback_endpoint=RuntimeAgentCallbackEndpoint(),
         )
 
         exchange_run = ReviewExchangeRun(

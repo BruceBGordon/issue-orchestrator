@@ -22,6 +22,7 @@ import time
 from typing import TYPE_CHECKING
 from uuid import uuid4
 
+from ..infra.agent_callback_endpoint import RuntimeAgentCallbackEndpoint
 from ..infra.config import Config
 from ..infra.env import ENV_PREFIX
 from ..adapters.github.repo import get_repo_from_git, GitRepoError
@@ -445,6 +446,7 @@ def _create_completion_components(
     attempt_store: "AttemptStore | None" = None,
     turn_mailbox: "TurnMailbox | None" = None,
     tech_lead_authority: "TechLeadAuthorityStore | None" = None,
+    agent_callback_endpoint: "AgentCallbackEndpoint | None" = None,
 ) -> tuple["CompletionProcessor | None", "SessionController | None"]:
     """Create completion processor and session controller."""
     from ..control.completion_processor import CompletionProcessor
@@ -495,6 +497,7 @@ def _create_completion_components(
         pre_publish_gate=PrePublishGate(command_runner) if config.enforce_hooks else None,
         config=config,
         background_job_supervisor=background_job_supervisor,
+        agent_callback_endpoint=agent_callback_endpoint,
         review_exchange_canceller=_cancel_review_exchange,
         review_artifact_reader=ManifestReviewArtifactReader(),
         runtime_identity=runtime_identity.resolve_runtime_identity(),
@@ -842,11 +845,19 @@ def build_orchestrator(
     from ..execution.review_exchange_turn_mailbox import InMemoryTurnMailbox
     turn_mailbox = InMemoryTurnMailbox()
 
+    # One instance per orchestrator, shared by everything that needs to
+    # know where agents can call back: the review exchange, the session
+    # launcher, and the server-started hook that publishes the bound
+    # port into it (#6924).
+    agent_callback_endpoint = RuntimeAgentCallbackEndpoint()
+
+
     # Create completion components
     completion_processor, session_controller_instance = _create_completion_components(
         config, github, events, working_copy, session_output, command_runner, provider_resilience,
         label_manager=label_manager,
         background_job_supervisor=background_job_supervisor,
+        agent_callback_endpoint=agent_callback_endpoint,
         pair_registry=pair_registry,
         attempt_store=attempt_store,
         turn_mailbox=turn_mailbox,
@@ -959,6 +970,7 @@ def build_orchestrator(
         # on a dedicated runner so a slow publish never blocks the heartbeat.
         completion_dispatcher=BackgroundCompletionDispatcher(ThreadBackgroundJobRunner()),
         health_gate=health_gate,
+        agent_callback_endpoint=agent_callback_endpoint,
         board_snapshot_builder=create_board_snapshot_builder(
             config, timeline_store, tech_lead_board_publisher, working_copy
         ),
@@ -1159,6 +1171,13 @@ def build_orchestrator_for_testing(
     pair_registry_for_testing = _build_pair_registry_with_worktree_hook()
     from ..execution.review_exchange_turn_mailbox import InMemoryTurnMailbox
     turn_mailbox = InMemoryTurnMailbox()
+
+    # One instance per orchestrator, shared by everything that needs to
+    # know where agents can call back: the review exchange, the session
+    # launcher, and the server-started hook that publishes the bound
+    # port into it (#6924).
+    agent_callback_endpoint = RuntimeAgentCallbackEndpoint()
+
     if action_applier is not None:
         action_applier.pair_registry = pair_registry_for_testing
         action_applier.background_job_supervisor = background_job_supervisor
@@ -1188,6 +1207,7 @@ def build_orchestrator_for_testing(
         pre_publish_gate=PrePublishGate(command_runner) if config.enforce_hooks else None,
         config=config,
         background_job_supervisor=background_job_supervisor,
+        agent_callback_endpoint=agent_callback_endpoint,
         review_exchange_canceller=_cancel_review_exchange_for_testing,
         review_artifact_reader=ManifestReviewArtifactReader(),
         runtime_identity=runtime_identity.resolve_runtime_identity(),
@@ -1302,6 +1322,7 @@ def build_orchestrator_for_testing(
         # Tests default to synchronous; async dispatch is exercised explicitly.
         completion_dispatcher=SynchronousCompletionDispatcher(),
         health_gate=health_gate,
+        agent_callback_endpoint=agent_callback_endpoint,
         board_snapshot_builder=create_board_snapshot_builder(
             config, timeline_store, tech_lead_board_publisher_for_testing, working_copy
         ),

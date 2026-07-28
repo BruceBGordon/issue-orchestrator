@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import re
 import threading
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -32,20 +33,28 @@ from issue_orchestrator.entrypoints.control_api import (
     get_configured_agent_callback_token,
     get_configured_api_token,
 )
-from issue_orchestrator.entrypoints.run_orchestrator import _configure_dashboard_auth
+from issue_orchestrator.entrypoints.engine_startup import EngineStartup
 from issue_orchestrator.entrypoints.web import (
     app,
     configure_dashboard_admin_token,
     get_configured_dashboard_admin_token,
 )
 from issue_orchestrator.infra.agent_callback_endpoint import (
-    record_bound_callback_port,
-    reset_bound_callback_port,
+    RuntimeAgentCallbackEndpoint,
 )
 from issue_orchestrator.infra.api_token import AGENT_CALLBACK_TOKEN_ENV_VAR
 from issue_orchestrator.infra.config import Config
 
 _PORT_EXPORT = re.compile(r"ISSUE_ORCHESTRATOR_API_PORT='(\d+)'")
+
+
+@dataclass
+class _Cfg:
+    """The config surface engine startup reads."""
+
+    browser_session_ttl_seconds: int = 900
+    sse_token_ttl_seconds: int = 10
+    browser_session_max: int = 7
 
 # Routes an agent must be able to reach with its scoped token. Each is
 # POSTed with an empty body: we assert on the auth verdict only, so any
@@ -120,7 +129,6 @@ def clean_auth_state(monkeypatch: pytest.MonkeyPatch):
     prev_dashboard = get_configured_dashboard_admin_token()
     prev_admin = get_configured_api_token()
     prev_agent = get_configured_agent_callback_token()
-    reset_bound_callback_port()
     # Absent, not pre-seeded — pre-seeding is what let the earlier test
     # pass while the engine published nothing (#6924 F2).
     monkeypatch.delenv(AGENT_CALLBACK_TOKEN_ENV_VAR, raising=False)
@@ -132,7 +140,6 @@ def clean_auth_state(monkeypatch: pytest.MonkeyPatch):
     finally:
         configure_dashboard_admin_token(prev_dashboard)
         configure_api_token(prev_admin, agent_callback=prev_agent)
-        reset_bound_callback_port()
 
 
 def _post(url: str, token: str) -> int:
@@ -155,13 +162,10 @@ def test_agent_callback_is_deliverable_from_the_generated_environment(
     clean_auth_state: None,
     tmp_path: Path,
 ) -> None:
-    # 1. Engine startup: resolves and publishes the callback token.
-    class _Cfg:
-        browser_session_ttl_seconds = 900
-        sse_token_ttl_seconds = 10
-        browser_session_max = 7
-
-    _configure_dashboard_auth(dev_no_auth=False, config=_Cfg())
+    # 1. Engine startup — the same object run_orchestrator drives.
+    endpoint = RuntimeAgentCallbackEndpoint()
+    startup = EngineStartup(callback_endpoint=endpoint)
+    startup.configure_auth(dev_no_auth=False, config=_Cfg())
 
     import os
 
@@ -171,9 +175,12 @@ def test_agent_callback_is_deliverable_from_the_generated_environment(
         "environment agents inherit"
     )
 
-    # 2. The server binds an auto-assigned port and records it.
+    # 2. The server binds an auto-assigned port; startup's own hook
+    #    publishes it, exactly as uvicorn's on_server_started does.
     bound_port = live_server.start()
-    record_bound_callback_port(bound_port)
+    startup.server_started_hook(
+        repo_root=tmp_path, requested_port=0, instance_id=None
+    )(bound_port)
 
     # 3. Session launch builds the agent environment — config still 0.
     exports = build_session_env_exports(
@@ -184,6 +191,7 @@ def test_agent_callback_is_deliverable_from_the_generated_environment(
         issue_number=6410,
         run_dir=tmp_path / "run",
         worktree_path=tmp_path,
+        callback_endpoint=endpoint,
     )
     match = _PORT_EXPORT.search(exports)
     assert match, f"no callback port in the agent environment: {exports}"
@@ -208,12 +216,8 @@ def test_agent_token_still_cannot_reach_admin_routes(
 ) -> None:
     """The fix must not turn the scoped token into an admin credential."""
 
-    class _Cfg:
-        browser_session_ttl_seconds = 900
-        sse_token_ttl_seconds = 10
-        browser_session_max = 7
-
-    _configure_dashboard_auth(dev_no_auth=False, config=_Cfg())
+    startup = EngineStartup(callback_endpoint=RuntimeAgentCallbackEndpoint())
+    startup.configure_auth(dev_no_auth=False, config=_Cfg())
 
     import os
 

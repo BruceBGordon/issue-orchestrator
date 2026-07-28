@@ -1,21 +1,12 @@
-"""Where agents can actually reach this orchestrator process.
+"""Runtime implementation of the agent-callback endpoint port.
 
-One runtime owner for the *bound* Control API port, because the
-configured port is not a usable answer. ``control_api_port: 0`` means
-"bind any free port", and the supervised engine never writes the real
-port back into ``Config`` — so every consumer that read
-``config.control_api_port`` handed agents a ``0`` they could not dial
-(#6913, #6924).
+Instance state, not module state: each orchestrator instance owns its
+own endpoint, so two instances in one process (tests, multi-instance
+deployments) cannot leak a port into each other, and no test needs a
+production reset API to undo a global.
 
-The bound port is only knowable after uvicorn binds, so the server
-records it here via ``on_server_started`` and consumers resolve through
-:func:`resolve_agent_callback_port`. Both agent-environment builders —
-normal session launch and the review-exchange pair — must go through
-this owner, or they drift apart again.
-
-Process-global by nature: there is exactly one server per process, and
-the CLI tools that consume the resulting environment are separate
-processes. :func:`reset_bound_callback_port` exists for tests.
+See ``ports.agent_callback_endpoint`` for why this is runtime state at
+all.
 """
 
 from __future__ import annotations
@@ -28,52 +19,71 @@ logger = logging.getLogger(__name__)
 # ``0`` is the auto-assign request in configuration, never a destination.
 AUTO_ASSIGN_PORT = 0
 
-_lock = threading.Lock()
-_bound_port: int | None = None
 
+class NullAgentCallbackEndpoint:
+    """Test-only default that refuses to answer.
 
-def record_bound_callback_port(port: int) -> None:
-    """Publish the port uvicorn actually bound.
+    Production always injects a real endpoint via the composition root.
+    This exists so the twelve-odd test fixtures that never spawn an
+    agent do not have to wire one — but it *raises* rather than
+    returning ``None``, so a test that genuinely reaches the callback
+    path fails immediately instead of silently reproducing the original
+    bug (an agent told to dial nowhere).
 
-    Called from the server-started hook, including — especially — when
-    the configured port was the ``0`` auto-assign sentinel, which is the
-    case this owner exists for.
+    Mirrors ``NullReviewExchangeRunner``, which guards the same seam for
+    the same reason.
     """
-    if port <= AUTO_ASSIGN_PORT:
-        raise ValueError(
-            f"bound callback port must be a real port, got {port!r}"
+
+    def publish_bound_port(self, port: int) -> None:
+        raise NotImplementedError(
+            "No agent callback endpoint was injected. Production wires one "
+            "in bootstrap; a test reaching this must inject "
+            "RuntimeAgentCallbackEndpoint."
         )
-    global _bound_port
-    with _lock:
-        _bound_port = port
-    logger.info("Agent callback endpoint bound on port %d", port)
+
+    def resolve_port(self, configured_port: int) -> int | None:
+        raise NotImplementedError(
+            "No agent callback endpoint was injected, so there is no port to "
+            "hand an agent. Production wires one in bootstrap; a test "
+            "reaching this must inject RuntimeAgentCallbackEndpoint."
+        )
 
 
-def bound_callback_port() -> int | None:
-    """The bound port, or ``None`` before the server has started."""
-    with _lock:
-        return _bound_port
+class RuntimeAgentCallbackEndpoint:
+    """Holds the bound Control API port for the process serving it."""
 
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._bound_port: int | None = None
 
-def reset_bound_callback_port() -> None:
-    """Clear the recorded port. Tests only."""
-    global _bound_port
-    with _lock:
-        _bound_port = None
+    def publish_bound_port(self, port: int) -> None:
+        """Publish the port uvicorn actually bound.
 
+        Called from the server-started hook, including — especially —
+        when the configured port was the auto-assign sentinel, which is
+        the case this owner exists for.
+        """
+        if port <= AUTO_ASSIGN_PORT:
+            raise ValueError(
+                f"bound callback port must be a real port, got {port!r}"
+            )
+        with self._lock:
+            self._bound_port = port
+        logger.info("Agent callback endpoint bound on port %d", port)
 
-def resolve_agent_callback_port(configured_port: int) -> int | None:
-    """The port to hand agents, or ``None`` when there is nothing to say.
+    def bound_port(self) -> int | None:
+        """The bound port, or ``None`` before the server has started."""
+        with self._lock:
+            return self._bound_port
 
-    The bound port wins: it is what is actually listening. A non-zero
-    configured port is the fallback for callers that run before the
-    server binds. A configured ``0`` with nothing bound yields ``None``
-    rather than a sentinel, so downstream fails honestly instead of
-    dialling ``localhost:0``.
-    """
-    bound = bound_callback_port()
-    if bound is not None:
-        return bound
-    if configured_port != AUTO_ASSIGN_PORT:
-        return configured_port
-    return None
+    def resolve_port(self, configured_port: int) -> int | None:
+        """The port to hand agents, or ``None`` when there is none.
+
+        See the port docstring for the precedence rule.
+        """
+        bound = self.bound_port()
+        if bound is not None:
+            return bound
+        if configured_port != AUTO_ASSIGN_PORT:
+            return configured_port
+        return None

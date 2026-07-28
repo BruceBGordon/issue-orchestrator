@@ -9,6 +9,9 @@ import pytest
 from issue_orchestrator.domain.claim import ClaimResult, ClaimState
 from issue_orchestrator.domain.lease_config import LeaseConfig
 from issue_orchestrator.domain.models import Session, SessionStatus
+from issue_orchestrator.infra.agent_callback_endpoint import (
+    RuntimeAgentCallbackEndpoint,
+)
 from issue_orchestrator.ports import NullBoardSnapshotProvider
 from tests.unit.session_run_helpers import make_session_run_assets
 
@@ -116,6 +119,7 @@ class TestSessionLauncherClaimAcquisition:
             get_review_machine=lambda *args: MagicMock(),
             claim_manager=mock_claim_manager,
             board_snapshot_provider=NullBoardSnapshotProvider(),
+            agent_callback_endpoint=RuntimeAgentCallbackEndpoint(),
         )
 
         claim = launcher._acquire_issue_claim(MockIssue())  # noqa: SLF001
@@ -224,6 +228,7 @@ class TestSessionLauncherClaimAcquisition:
                     get_review_machine=lambda *args: MagicMock(),
                     claim_manager=mock_claim_manager,
                     board_snapshot_provider=NullBoardSnapshotProvider(),
+                    agent_callback_endpoint=RuntimeAgentCallbackEndpoint(),
                 )
 
                 issue = MockIssue()
@@ -278,6 +283,7 @@ class TestSessionLauncherClaimAcquisition:
             get_review_machine=lambda *args: MagicMock(),
             claim_manager=mock_claim_manager,
             board_snapshot_provider=NullBoardSnapshotProvider(),
+            agent_callback_endpoint=RuntimeAgentCallbackEndpoint(),
         )
 
         issue = MockIssue()
@@ -325,6 +331,7 @@ class TestSessionLauncherClaimAcquisition:
             get_review_machine=lambda *args: MagicMock(),
             claim_manager=mock_claim_manager,
             board_snapshot_provider=NullBoardSnapshotProvider(),
+            agent_callback_endpoint=RuntimeAgentCallbackEndpoint(),
         )
 
         issue = MockIssue()

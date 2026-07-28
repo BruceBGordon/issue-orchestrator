@@ -20,12 +20,9 @@ import atexit
 import logging
 import os
 import sys
-from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from ..infra.agent_callback_endpoint import record_bound_callback_port
-from ..infra.repo_lock import set_lock_http_port
 
 logger = logging.getLogger(__name__)
 _EXPECTED_IDENTITY_ENV = "ISSUE_ORCHESTRATOR_EXPECTED_IDENTITY"
@@ -155,113 +152,6 @@ def _load_config_for_instance(repo_root: Path, config_path: Path | None, instanc
     return config
 
 
-def _configure_dashboard_auth(dev_no_auth: bool, config: Any) -> None:
-    """Activate (or explicitly disable) dashboard auth before binding.
-
-    Security #5987 F3 — PR 8. The same admin token is shared with the
-    Control API so a single login covers both surfaces. ``config`` is
-    the loaded ``Config`` instance; its ``browser_session_ttl_seconds``
-    / ``sse_token_ttl_seconds`` / ``browser_session_max`` settings are
-    threaded into ``browser_session.initialize`` so operator hardening
-    under ``ui.browser_session.*`` applies to the dashboard too (#6041
-    re-review P2). Without this, the dashboard silently fell back to
-    the built-in defaults while the Control API honored the config —
-    the same rule enforced differently by path.
-    """
-    from ..entrypoints.control_api import configure_api_token
-    from ..entrypoints.web import configure_dashboard_admin_token
-    from ..infra import browser_session
-    from ..infra.api_token import (
-        AGENT_CALLBACK_TOKEN_ENV_VAR,
-        resolve_agent_callback_token,
-        resolve_api_token,
-    )
-
-    session_ttl = getattr(config, "browser_session_ttl_seconds", None)
-    sse_ttl = getattr(config, "sse_token_ttl_seconds", None)
-    max_sessions = getattr(config, "browser_session_max", None)
-
-    if dev_no_auth:
-        logger.error(
-            "⚠  Web Dashboard running with --dev-no-auth: authentication "
-            "is DISABLED. Any local process can mutate state. DO NOT use "
-            "on a shared host or in production."
-        )
-        print(
-            "\n\033[1;31m"
-            "⚠  AUTH DISABLED (--dev-no-auth). Any local process can "
-            "mutate dashboard state. Dev only."
-            "\033[0m\n",
-            flush=True,
-        )
-        configure_dashboard_admin_token(None)
-        configure_api_token(None, agent_callback=None)
-        os.environ.pop("ISSUE_ORCHESTRATOR_API_TOKEN", None)
-        # Clear the callback token too: agents must not carry a secret
-        # the (now open) API no longer enforces.
-        os.environ.pop(AGENT_CALLBACK_TOKEN_ENV_VAR, None)
-        browser_session.initialize(
-            session_ttl_seconds=session_ttl,
-            sse_token_ttl_seconds=sse_ttl,
-            max_sessions=max_sessions,
-        )
-        return
-    admin_token = resolve_api_token()
-    configure_dashboard_admin_token(admin_token)
-    # This process serves ``control_app`` mounted under the dashboard
-    # app, so it must configure the Control API tokens too. Without
-    # this the engine held no agent-callback token at all and every
-    # agent callback — ``exchange-respond``, ``preflight-push`` — was
-    # rejected on the only surface that served it (#6913).
-    #
-    # Resolve ONCE and publish the same value to the process
-    # environment, which ``agent_runner_env`` passes through to agent
-    # subprocesses. Configuring the server without exporting would make
-    # the API demand a secret its agents never receive (#6924 F2).
-    agent_callback_token = resolve_agent_callback_token()
-    configure_api_token(admin_token, agent_callback=agent_callback_token)
-    os.environ[AGENT_CALLBACK_TOKEN_ENV_VAR] = agent_callback_token
-    # Derive the HMAC secret from the admin token so a session cookie
-    # minted by the Control Center on port 19080 validates here too —
-    # one login covers both processes.
-    browser_session.initialize(
-        admin_token=admin_token,
-        session_ttl_seconds=session_ttl,
-        sse_token_ttl_seconds=sse_ttl,
-        max_sessions=max_sessions,
-    )
-    os.environ.setdefault("ISSUE_ORCHESTRATOR_API_TOKEN", admin_token)
-
-
-def build_bound_port_recorder(
-    *,
-    repo_root: Path,
-    requested_port: int,
-    instance_id: str | None,
-) -> Callable[[int], None]:
-    """Build the ``on_server_started`` hook for a bound HTTP port.
-
-    Two consumers learn the real port here, and only here — the repo
-    lock (so operators and sibling processes can find the dashboard) and
-    the agent-callback owner (so spawned agents can call back).
-
-    The lock write is skipped when the server bound exactly what was
-    requested, because the lock already says so. The callback publish
-    must NOT inherit that condition: with ``port: 0`` every bind is a
-    "change", but with an explicit port the agent still needs an
-    endpoint. Publishing unconditionally is what makes the two cases
-    behave the same (#6924).
-    """
-
-    def _record_bound_port(actual_port: int) -> None:
-        record_bound_callback_port(actual_port)
-        if actual_port != requested_port:
-            set_lock_http_port(repo_root, actual_port, instance_id=instance_id)
-            logger.info("Updated lock with actual bound port %d", actual_port)
-
-    return _record_bound_port
-
-
 def _install_shutdown_signal_handlers(
     orchestrator: Any,
     trigger_server_shutdown: Any,
@@ -314,6 +204,7 @@ async def run(
     from ..entrypoints.bootstrap import build_orchestrator
     from ..entrypoints.web import run_with_web_dashboard
     from ..infra.repo_lock import acquire_lock, release_lock, touch_lock
+    from .engine_startup import EngineStartup
 
     _assert_expected_identity(repo_root)
 
@@ -335,22 +226,25 @@ async def run(
             touch_lock(repo_root, instance_id=instance_id)
             await asyncio.sleep(5.0)
 
-    _record_bound_port = build_bound_port_recorder(
-        repo_root=repo_root, requested_port=port, instance_id=instance_id
-    )
-
     config = _load_config_for_instance(repo_root, config_path, instance_id)
 
-    # Configure dashboard auth AFTER config is loaded so operator-set
-    # ``ui.browser_session.*`` values take effect on this surface
-    # (#6041 re-review P2). Run before uvicorn binds so the first
-    # request already sees the gate.
-    _configure_dashboard_auth(dev_no_auth, config)
-    install_access_log_redaction()
-
-    # Build orchestrator
+    # Build the orchestrator before startup publishes anything, so auth
+    # and the bound port land on the same agent-callback endpoint the
+    # sessions it launches will read (#6924).
     logger.info("Building orchestrator...")
     orchestrator = build_orchestrator(config)
+    engine_startup = EngineStartup(
+        callback_endpoint=orchestrator.deps.agent_callback_endpoint
+    )
+    # Auth is configured AFTER config is loaded so operator-set
+    # ``ui.browser_session.*`` values take effect (#6041 re-review P2),
+    # and BEFORE uvicorn binds so the first request already sees the
+    # gate.
+    engine_startup.configure_auth(dev_no_auth=dev_no_auth, config=config)
+    install_access_log_redaction()
+    _record_bound_port = engine_startup.server_started_hook(
+        repo_root=repo_root, requested_port=port, instance_id=instance_id
+    )
     if start_paused:
         orchestrator.set_start_paused()
         logger.info("Initial paused state applied before run loop")
