@@ -114,4 +114,3 @@ def test_deliver_reports_malformed_success_body(monkeypatch: pytest.MonkeyPatch)
 
     assert accepted is False
     assert "malformed response JSON" in message
-

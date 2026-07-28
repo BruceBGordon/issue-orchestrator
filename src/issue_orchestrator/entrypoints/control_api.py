@@ -163,14 +163,17 @@ if STATIC_DIR.exists():
 #   the operator CLI, the Control Center, and MCP clients driven by the
 #   operator.
 # - ``_agent_callback_token`` authorizes an allowlist of routes only
-#   (``_AGENT_CALLBACK_ROUTES``). Issued to agent subprocesses so they
-#   can call preflight-push / issue-resume without holding the admin
-#   credential (#6017 P2 review).
+#   (see ``_auth_middleware.is_agent_callback_route``). Issued to agent
+#   subprocesses so they can call preflight-push / exchange-respond /
+#   issue-resume without holding the admin credential (#6017 P2 review).
 #
 # Both are ``None`` by default so unit tests using ``TestClient`` keep
-# working. Production startup in ``ControlAPIServer.start`` and
-# ``control_center.main`` calls ``configure_api_token`` to turn
-# enforcement on.
+# working. Every production entrypoint that serves these routes must
+# call ``configure_api_token`` to turn enforcement on:
+# ``ControlAPIServer.start``, ``control_center.main``, and
+# ``run_orchestrator._configure_dashboard_auth`` — the last of these
+# serves ``control_app`` mounted under the dashboard app, and omitting
+# it left the engine with no callback token at all (#6924).
 _admin_token: str | None = None
 _agent_callback_token: str | None = None
 

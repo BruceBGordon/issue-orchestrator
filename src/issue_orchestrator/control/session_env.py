@@ -70,7 +70,7 @@ def build_session_env_exports(
     session_id: str,
     agent_label: str,
     issue_number: int,
-    run_dir: Path | str,
+    run_dir: Path,
     worktree_path: Path,
 ) -> str:
     """Build the common env-export string for all session types.

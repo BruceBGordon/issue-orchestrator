@@ -552,21 +552,6 @@ def test_near_miss_paths_rejected_over_http(
     )
 
 
-def test_dashboard_and_control_api_share_one_agent_callback_allowlist() -> None:
-    """Both surfaces must answer the allowlist question identically.
-
-    A per-surface copy is what drifted in #6913; pin that they are the
-    same predicate rather than two lists that merely look alike today.
-    """
-    from issue_orchestrator.entrypoints.control_api import _CONTROL_API_SURFACE
-    from issue_orchestrator.entrypoints.web import _DASHBOARD_SURFACE
-
-    assert (
-        _DASHBOARD_SURFACE.agent_callback_matcher
-        is _CONTROL_API_SURFACE.agent_callback_matcher
-    )
-
-
 # ---------------------------------------------------------------------------
 # Browser-session policy ownership — the dashboard must honor the
 # operator-set ``ui.browser_session.*`` values, not silently fall

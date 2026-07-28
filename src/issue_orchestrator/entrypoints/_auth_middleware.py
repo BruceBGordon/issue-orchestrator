@@ -142,9 +142,12 @@ class AuthSurfaceConfig:
     ``public_paths`` — exact paths that bypass auth (login form, etc.).
     ``public_prefixes`` — path prefixes that bypass auth (static assets).
     ``agent_callback_matcher`` — returns True for paths that the agent-
-      callback scoped token is allowed to reach. Control API has a real
-      allowlist; the dashboard passes a no-op that always returns False
-      because agent tokens never need to hit the dashboard.
+      callback scoped token is allowed to reach. Both real surfaces pass
+      :func:`is_agent_callback_route`: the dashboard mounts
+      ``control_app`` at ``""``, so it serves those routes and its gate
+      runs first. The always-False default is for surfaces that serve no
+      agent-callback route at all; relying on it for the dashboard is
+      what made every agent callback 401 (#6913, #6924).
     """
 
     sse_path: str
