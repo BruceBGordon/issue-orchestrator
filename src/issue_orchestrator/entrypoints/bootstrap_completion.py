@@ -107,6 +107,9 @@ def create_completion_components(
         cancel_issue_review_exchange,
     )
 
+    if github is None:
+        # No repository host: there is no completion pipeline to build.
+        return None, None
     if label_manager is None:
         label_manager = _LM(config)
     if pair_registry is None:
@@ -144,7 +147,7 @@ def create_completion_components(
         review_artifact_reader=ManifestReviewArtifactReader(),
         runtime_identity=runtime_identity.resolve_runtime_identity(),
         tech_lead_authority=tech_lead_authority,
-    ) if github else None
+    )
 
     session_controller_instance = SessionController(
         completion_processor=completion_processor,
@@ -161,7 +164,7 @@ def create_completion_components(
         max_validation_retries=config.retry.max_validation_retries,
         provider_blocked_label=label_manager.provider_unavailable,
         review_exchange_canceller=_cancel_review_exchange,
-    ) if completion_processor else None
+    )
 
     return completion_processor, session_controller_instance
 

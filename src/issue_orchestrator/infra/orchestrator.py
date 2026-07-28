@@ -42,7 +42,8 @@ from ..control.session_completion import (
     handle_session_completion as _handle_session_completion,
     process_active_sessions as _process_active_sessions,
 )
-from ..control.session_launcher import SessionLauncher, create_session_launcher
+from ..control.session_launcher import SessionLauncher
+from ..control.session_launcher_factory import create_session_launcher
 from ..control.board_snapshot_builder import StateBoardSnapshotProvider
 from ..control.health_review_trigger import (
     ensure_on_demand_health_review_anchor as _ensure_on_demand_health_review_anchor,
