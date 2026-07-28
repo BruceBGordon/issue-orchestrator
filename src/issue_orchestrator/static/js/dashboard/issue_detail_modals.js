@@ -108,37 +108,13 @@ function closePhaseModal(e) {
     }
 }
 
-const timelineModal = document.getElementById('timelineModal');
+// The legacy ``#timelineModal`` teleport was retired with the uncontracted
+// ``GET /api/timeline/{issue_number}`` route (#6421).  The issue-detail drawer
+// is the single issue-timeline surface; it renders the same events/phase_toc/
+// cycles from the contracted ``/api/issue-detail/{issue_number}`` payload.
 const issueDetailDrawer = document.getElementById('issueDetailDrawer');
 let issueDetailData = null;
 let lastIssueDetailTrigger = null;
 let journeyFilter = 'latest-run'; // 'latest-run' or 'all'
 let timelineView = 'user'; // 'user', 'ops', or 'debug'
-
-async function openTimelineModal(issueNumber) {
-    if (!timelineModal) return;
-    timelineModal.classList.add('visible');
-    document.getElementById('timelineModalTitle').textContent = `Timeline #${issueNumber}`;
-    const content = document.getElementById('timelineModalContent');
-    content.innerHTML = '<div class="timeline-loading">Loading timeline...</div>';
-
-    try {
-        const res = await fetch(`/api/timeline/${issueNumber}`);
-        if (!res.ok) {
-            content.innerHTML = '<div class="timeline-empty">No timeline data found.</div>';
-            return;
-        }
-        const data = await res.json();
-        renderTimeline(content, data.events || [], data.phase_toc || [], data.cycles || []);
-    } catch (err) {
-        console.error('Failed to load timeline:', err);
-        content.innerHTML = '<div class="timeline-empty">Failed to load timeline.</div>';
-    }
-}
-
-function closeTimelineModal(e) {
-    if (!e || e.target === timelineModal) {
-        timelineModal.classList.remove('visible');
-    }
-}
 

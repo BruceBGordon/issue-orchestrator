@@ -435,7 +435,12 @@ function openDiagnoseFromCycle(issueNumber, runDir = null) {
         openSessionManifest(issueNumber, runDir);
         return;
     }
-    openTimelineModal(issueNumber);
+    // No run directory to diagnose against: fall back to the issue-scoped
+    // timeline.  This is the same target the typed ``open_issue_timeline``
+    // Command dispatches to, so both paths land on the contracted
+    // ``/api/issue-detail/{issue_number}`` payload instead of the retired
+    // ``/api/timeline/{issue_number}`` modal (#6421).
+    openIssueTimeline(issueNumber);
 }
 
 function setJourneyFilter(filter) {

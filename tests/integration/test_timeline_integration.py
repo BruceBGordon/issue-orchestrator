@@ -173,8 +173,13 @@ def _write_terminal_recording(path: Path, text: str) -> None:
     )
 
 
-def test_timeline_and_issue_detail_read_from_sqlite_store(sample_config, mock_repository_host):
-    """`/api/timeline` and `/api/issue-detail` should project DB timeline data."""
+def test_issue_detail_reads_from_sqlite_store(sample_config, mock_repository_host):
+    """`/api/issue-detail` should project DB timeline data.
+
+    The legacy `/api/timeline/{issue_number}` route was retired in #6421;
+    `/api/issue-detail/{issue_number}` is the single contracted surface and
+    carries the same projected `events` (visible in the `debug` view).
+    """
     orch, timeline_writer = _build_orchestrator_with_sqlite_timeline(sample_config, mock_repository_host)
     issue_number = 4057
     timeline_db = sample_config.repo_root / ".issue-orchestrator" / "state" / "timeline.sqlite"
@@ -233,7 +238,7 @@ def test_timeline_and_issue_detail_read_from_sqlite_store(sample_config, mock_re
     web.set_orchestrator(orch)
     try:
         client = TestClient(web.app)
-        timeline_response = client.get(f"/api/timeline/{issue_number}")
+        timeline_response = client.get(f"/api/issue-detail/{issue_number}?view=debug")
         assert timeline_response.status_code == 200
         timeline_payload = timeline_response.json()
         assert len(timeline_payload["events"]) == 4
@@ -512,7 +517,7 @@ def test_timeline_store_does_not_migrate_legacy_jsonl_via_api(sample_config, moc
     web.set_orchestrator(orch)
     try:
         client = TestClient(web.app)
-        response = client.get(f"/api/timeline/{issue_number}")
+        response = client.get(f"/api/issue-detail/{issue_number}?view=debug")
         assert response.status_code == 200
         payload = response.json()
         assert payload["events"] == []

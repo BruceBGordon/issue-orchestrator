@@ -2634,6 +2634,58 @@ def test_dashboard_templates_expose_direct_timeline_affordances() -> None:
     assert "openTimelineModal({{ issue.issue_number }})" not in issue_row
 
 
+def test_issue_timeline_surface_uses_contracted_issue_detail_route_only() -> None:
+    """The retired ``/api/timeline/{issue_number}`` route has no UI consumer left.
+
+    Issue #6421 deleted that uncontracted route.  Its replacement is the
+    contracted ``/api/issue-detail/{issue_number}`` payload rendered by the
+    issue-detail drawer, so no dashboard chunk may fetch the old path and the
+    legacy ``#timelineModal`` teleport must be gone from the template.
+    """
+    js = _read(DASHBOARD_JS)
+    dashboard = _read(DASHBOARD_TEMPLATE)
+
+    # No chunk may call the retired route. Comment lines are excluded so the
+    # code that documents the retirement doesn't trip its own guardrail.
+    code_lines = [
+        line for line in js.splitlines() if not line.lstrip().startswith("//")
+    ]
+    offenders = [line.strip() for line in code_lines if "/api/timeline/" in line]
+    assert not offenders, (
+        "Dashboard JS must not fetch the retired /api/timeline/{issue_number} "
+        f"route; use /api/issue-detail/{{issue_number}} instead (#6421). "
+        f"Offending lines: {offenders}"
+    )
+    # The modal it fed is gone, markup and handlers alike.
+    for removed in (
+        "openTimelineModal",
+        "closeTimelineModal",
+        "timelineModalContent",
+        "timelineModalTitle",
+    ):
+        assert removed not in js, f"{removed} should have been retired with #6421"
+    for removed_markup in ('id="timelineModal"', 'id="timelineModalContent"'):
+        assert removed_markup not in dashboard, (
+            f"{removed_markup} should have been retired with #6421"
+        )
+
+    # The one caller that used to teleport into the modal now routes to the
+    # same target the typed ``open_issue_timeline`` Command dispatches to.
+    diagnose_body = _function_body(js, "openDiagnoseFromCycle")
+    assert "openIssueTimeline(issueNumber)" in diagnose_body
+    assert "openTimelineModal" not in diagnose_body
+
+    # ``openIssueTimeline`` remains the drawer entrypoint, and the drawer is
+    # fed by the contracted issue-detail route.  (These are checked against the
+    # bundle rather than via ``_function_body`` because both functions declare
+    # an ``opts = {}`` default, which that helper's brace scan can't span.)
+    assert (
+        "function openIssueTimeline(issueNumber, triggerEl = null, opts = {}) {" in js
+    )
+    assert "return openIssueDetail(issueNumber, triggerEl, {...opts, focus: 'timeline'});" in js
+    assert "`/api/issue-detail/${issueNumber}?view=${timelineView}`" in js
+
+
 def test_e2e_latest_results_affordance_uses_formatted_run_modal() -> None:
     """Latest/passed E2E runs should open the formatted run view via the typed Command.
 

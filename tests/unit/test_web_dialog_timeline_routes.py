@@ -219,10 +219,16 @@ class TestRefreshEndpoint:
 
 
 class TestApiTimelineEndpoint:
-    """Test the GET /api/timeline/{issue_number} endpoint."""
+    """Test the GET /api/issue-detail/{issue_number} endpoint.
 
-    def test_timeline_returns_events(self, tmp_path: Path):
-        """Timeline endpoint returns stream events with artifacts."""
+    Issue #6421 retired the uncontracted ``GET /api/timeline/{issue_number}``
+    route; ``/api/issue-detail/{issue_number}`` is the single contracted
+    issue-timeline surface and runs the identical projection pipeline, so the
+    timeline-projection coverage below now exercises it directly.
+    """
+
+    def test_issue_detail_returns_decorated_timeline_events(self, tmp_path: Path):
+        """Issue-detail endpoint returns stream events with artifacts."""
         from issue_orchestrator.entrypoints import web
         from issue_orchestrator.execution.session_output_adapter import (
             FileSystemSessionOutput,
@@ -303,7 +309,7 @@ class TestApiTimelineEndpoint:
         set_orchestrator(mock_orch)
         try:
             client = TestClient(app)
-            response = client.get("/api/timeline/123")
+            response = client.get("/api/issue-detail/123?view=debug")
             assert response.status_code == 200
             payload = response.json()
             assert payload["issue_number"] == 123
@@ -344,7 +350,7 @@ class TestApiTimelineEndpoint:
         finally:
             set_orchestrator(None)
 
-    def test_timeline_surfaces_review_report_primary_and_decision_menu(
+    def test_issue_detail_surfaces_review_report_primary_and_decision_menu(
         self, tmp_path: Path
     ):
         """Review artifact pair should be independently actionable from timelines."""
@@ -392,7 +398,7 @@ class TestApiTimelineEndpoint:
         set_orchestrator(mock_orch)
         try:
             client = TestClient(app)
-            response = client.get("/api/timeline/123")
+            response = client.get("/api/issue-detail/123?view=debug")
             assert response.status_code == 200
             actions = response.json()["events"][0]["actions"]
             report_action = next(
@@ -503,7 +509,7 @@ class TestApiTimelineEndpoint:
         finally:
             set_orchestrator(None)
 
-    def test_timeline_cycles_include_orchestrator_phase_events_within_active_cycle(
+    def test_issue_detail_cycles_include_orchestrator_phase_events_within_active_cycle(
         self,
     ):
         """Validation/queue orchestration events should remain in the same active cycle."""
@@ -546,7 +552,7 @@ class TestApiTimelineEndpoint:
         set_orchestrator(mock_orch)
         try:
             client = TestClient(app)
-            response = client.get("/api/timeline/123")
+            response = client.get("/api/issue-detail/123?view=debug")
             assert response.status_code == 200
             payload = response.json()
             assert len(payload["cycles"]) == 1
@@ -1167,6 +1173,40 @@ class TestApiTimelineEndpoint:
         assert payload["route"] == "issue_detail"
         assert "broken lifecycle" in payload["detail"]
 
+    def test_legacy_issue_timeline_route_is_retired(self):
+        """``GET /api/timeline/{issue_number}`` is gone; issue-detail replaces it.
+
+        Issue #6421 retired the uncontracted route rather than adding it to
+        ``docs/api/ui-openapi.json``. Assert both halves: the old path no
+        longer resolves, and the contracted replacement serves the same
+        projected timeline events for the same issue.
+        """
+        assert "/api/timeline/{issue_number}" not in {
+            getattr(route, "path", None) for route in app.routes
+        }
+
+        mock_orch = create_mock_orchestrator()
+        mock_orch.deps.timeline_reader.read.return_value = TimelineStream(
+            issue_number=123,
+            events=[build_timeline_event("session.started", issue_number=123)],
+        )
+        set_orchestrator(mock_orch)
+        try:
+            client = TestClient(app)
+            assert client.get("/api/timeline/123").status_code == 404
+
+            replacement = client.get("/api/issue-detail/123?view=debug")
+            assert replacement.status_code == 200
+            payload = replacement.json()
+            assert [event["event"] for event in payload["events"]] == [
+                "session.started"
+            ]
+            # The fields the retired route uniquely served are all present.
+            assert "phase_toc" in payload
+            assert "cycles" in payload
+        finally:
+            set_orchestrator(None)
+
     def test_timeline_projection_boundary_is_not_global(self):
         """Non-projection routes must keep their own exception contracts."""
         from pydantic import ValidationError
@@ -1729,8 +1769,13 @@ class TestApiTimelineEndpoint:
         finally:
             set_orchestrator(None)
 
-    def test_timeline_reports_expected_history_missing_when_empty(self):
-        """Timeline endpoint should include diagnostics for missing expected history."""
+    def test_issue_detail_reports_expected_history_missing_for_pending_review(self):
+        """A pending review with no timeline events is an expected-history gap.
+
+        Complements ``test_issue_detail_reports_expected_history_missing_when_empty``
+        which covers the ``session_history_present`` signal; this one covers
+        ``pending_review_present``.
+        """
         mock_orch = create_mock_orchestrator()
         mock_orch.state.pending_reviews = [
             PendingReview(
@@ -1748,10 +1793,10 @@ class TestApiTimelineEndpoint:
         set_orchestrator(mock_orch)
         try:
             client = TestClient(app)
-            response = client.get("/api/timeline/123")
+            response = client.get("/api/issue-detail/123")
             assert response.status_code == 200
             payload = response.json()
-            diagnostic = payload.get("diagnostic")
+            diagnostic = payload["summary"].get("timeline_diagnostic")
             assert diagnostic is not None
             assert diagnostic["state"] == "expected_history_missing"
             assert "pending_review_present" in diagnostic["signals"]
@@ -1882,8 +1927,8 @@ class TestApiTimelineEndpoint:
             "20260216-074751Z",
         ]
 
-    def test_timeline_filters_label_churn_events(self, tmp_path: Path):
-        """Timeline endpoint omits low-signal issue.labels_changed churn events."""
+    def test_issue_detail_filters_label_churn_events(self, tmp_path: Path):
+        """Issue-detail endpoint omits low-signal issue.labels_changed churn events."""
         from issue_orchestrator.execution.session_output_adapter import (
             FileSystemSessionOutput,
         )
@@ -1942,7 +1987,7 @@ class TestApiTimelineEndpoint:
         set_orchestrator(mock_orch)
         try:
             client = TestClient(app)
-            response = client.get("/api/timeline/123")
+            response = client.get("/api/issue-detail/123?view=debug")
             assert response.status_code == 200
             payload = response.json()
             assert len(payload["events"]) == 1
@@ -1954,8 +1999,8 @@ class TestApiTimelineEndpoint:
         finally:
             set_orchestrator(None)
 
-    def test_timeline_keeps_pr_pending_removal_label_event(self, tmp_path: Path):
-        """Timeline should retain pr-pending removal because it changes run boundaries."""
+    def test_issue_detail_keeps_pr_pending_removal_label_event(self, tmp_path: Path):
+        """Issue detail retains pr-pending removal because it changes run boundaries."""
         from issue_orchestrator.execution.session_output_adapter import (
             FileSystemSessionOutput,
         )
@@ -2020,7 +2065,7 @@ class TestApiTimelineEndpoint:
         set_orchestrator(mock_orch)
         try:
             client = TestClient(app)
-            response = client.get("/api/timeline/123")
+            response = client.get("/api/issue-detail/123?view=debug")
             assert response.status_code == 200
             payload = response.json()
             assert [event["event"] for event in payload["events"]] == [
