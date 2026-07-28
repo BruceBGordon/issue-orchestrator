@@ -19,6 +19,12 @@ ROOT = Path(__file__).resolve().parents[2]
 CONTROL_CENTER_JS = (
     ROOT / "src" / "issue_orchestrator" / "static" / "js" / "control_center.js"
 )
+CONTROL_CENTER_SETUP_JS = (
+    ROOT / "src" / "issue_orchestrator" / "static" / "js" / "control_center_setup.js"
+)
+CONTROL_CENTER_TEMPLATE = (
+    ROOT / "src" / "issue_orchestrator" / "templates" / "control_center.html"
+)
 CONTROLS_REFRESH_JS = (
     ROOT
     / "src"
@@ -32,6 +38,30 @@ CONTROLS_REFRESH_JS = (
 
 def _read(path: Path) -> str:
     return path.read_text(encoding="utf-8")
+
+
+def test_repository_setup_uses_command_controller_and_accessible_modal() -> None:
+    """Setup actions must dispatch through the tested controller contract."""
+    script = _read(CONTROL_CENTER_JS)
+    setup_script = _read(CONTROL_CENTER_SETUP_JS)
+    template = _read(CONTROL_CENTER_TEMPLATE)
+
+    assert "let setupWizardController = null;" in script
+    assert "await openRepositorySetup(path, e.currentTarget);" in script
+    assert "function openSetupWizard(" not in script
+    assert "let setupWizardState" not in script
+    assert "setupCommands.buildSetupPreviewRequest(" in setup_script
+    assert 'id="setupWizardModal"' in template
+    assert 'aria-hidden="true"' in template
+    assert 'id="setupContent" aria-live="polite"' in template
+    assert '<ol id="setupSteps" aria-label="Setup progress"' in template
+    assert 'aria-current="step"' in template
+
+    browser_auth = template.index("/static/js/browser_auth.js")
+    commands = template.index("/static/js/control_center_setup_commands.js")
+    controller = template.index("/static/js/control_center_setup.js")
+    main = template.index("/static/js/control_center.js")
+    assert browser_auth < commands < controller < main
 
 
 _SHUTDOWN_REASON_ROUTES = (

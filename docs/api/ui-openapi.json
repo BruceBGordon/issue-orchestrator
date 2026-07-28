@@ -451,6 +451,52 @@
         }
       }
     },
+    "/control/setup/preview": {
+      "post": {
+        "summary": "Preview a repository setup command",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {"$ref": "#/components/schemas/RepositorySetupCommandPayload"}
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Repository setup preview",
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "#/components/schemas/RepositorySetupPreviewPayload"}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/control/setup/save": {
+      "post": {
+        "summary": "Execute a repository setup command",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {"$ref": "#/components/schemas/RepositorySetupCommandPayload"}
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Repository setup result",
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "#/components/schemas/RepositorySetupResultPayload"}
+              }
+            }
+          }
+        }
+      }
+    },
     "/control/e2e/run/{run_id}/timeline": {
       "get": {
         "summary": "Get E2E run timeline payload",
@@ -2296,6 +2342,70 @@
         "required": ["issues"],
         "properties": {
           "issues": {"type": "array", "items": {"type": "integer", "minimum": 1}}
+        }
+      },
+      "RepositorySetupCommandPayload": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "repo_root",
+          "repo_name",
+          "worker_agent_label",
+          "model",
+          "configure_tech_lead"
+        ],
+        "properties": {
+          "repo_root": {"type": "string", "minLength": 1},
+          "repo_name": {"type": "string", "minLength": 1},
+          "worker_agent_label": {
+            "type": "string",
+            "pattern": "^agent:(?!tech-lead$).+"
+          },
+          "model": {"type": "string", "enum": ["haiku", "sonnet", "opus"]},
+          "configure_tech_lead": {"type": "boolean", "default": true},
+          "config_name": {"type": "string", "default": "default.yaml"},
+          "create_prompts": {"type": "boolean", "default": true},
+          "create_labels": {"type": "boolean", "default": true}
+        }
+      },
+      "RepositorySetupFilePayload": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "action"],
+        "properties": {
+          "path": {"type": "string"},
+          "action": {"type": "string", "enum": ["create", "overwrite"]},
+          "type": {"type": "string", "enum": ["prompt"]},
+          "agent": {"type": "string"},
+          "size": {"type": "integer", "minimum": 0}
+        }
+      },
+      "RepositorySetupPreviewPayload": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["yaml", "files"],
+        "properties": {
+          "yaml": {"type": "string"},
+          "files": {
+            "type": "array",
+            "items": {"$ref": "#/components/schemas/RepositorySetupFilePayload"}
+          }
+        }
+      },
+      "RepositorySetupResultPayload": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "status",
+          "config_path",
+          "created_files",
+          "created_labels"
+        ],
+        "properties": {
+          "status": {"const": "saved"},
+          "config_path": {"type": "string"},
+          "created_files": {"type": "array", "items": {"type": "string"}},
+          "created_labels": {"type": "array", "items": {"type": "string"}}
         }
       },
       "RetrospectiveReviewDecisionPayload": {

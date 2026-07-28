@@ -23,6 +23,9 @@ from issue_orchestrator.contracts.ui_openapi_models import (
     E2ERunTimelinePayload,
     IssueDetailActionPayload,
     IssueDetailPayload,
+    RepositorySetupCommandPayload,
+    RepositorySetupPreviewPayload,
+    RepositorySetupResultPayload,
     ViewModelSnapshotPayload,
 )
 from issue_orchestrator.domain.issue_key import FakeIssueKey
@@ -196,6 +199,55 @@ def _e2e_timeline_cycle(*events: dict[str, object]) -> dict[str, object]:
         "events": list(events),
         "summary": "E2E execution",
     }
+
+
+def test_repository_setup_command_and_results_match_ui_openapi() -> None:
+    command = {
+        "repo_root": "/repos/porchpin",
+        "repo_name": "owner/porchpin",
+        "worker_agent_label": "agent:dev",
+        "model": "sonnet",
+        "configure_tech_lead": True,
+        "config_name": "default.yaml",
+        "create_prompts": True,
+        "create_labels": True,
+    }
+    preview = {
+        "yaml": "repo:\n  name: owner/porchpin\n",
+        "files": [
+            {
+                "path": "/repos/porchpin/.issue-orchestrator/config/default.yaml",
+                "action": "create",
+                "size": 33,
+            },
+            {
+                "path": "/repos/porchpin/.io/tech-lead.md",
+                "action": "create",
+                "type": "prompt",
+                "agent": "agent:tech-lead",
+            },
+        ],
+    }
+    result = {
+        "status": "saved",
+        "config_path": "/repos/porchpin/.issue-orchestrator/config/default.yaml",
+        "created_files": ["/repos/porchpin/.io/tech-lead.md"],
+        "created_labels": ["agent:tech-lead", "needs-tech-lead-review"],
+    }
+
+    for schema_name, model, payload in (
+        ("RepositorySetupCommandPayload", RepositorySetupCommandPayload, command),
+        ("RepositorySetupPreviewPayload", RepositorySetupPreviewPayload, preview),
+        ("RepositorySetupResultPayload", RepositorySetupResultPayload, result),
+    ):
+        _validator(schema_name).validate(payload)
+        model.model_validate(payload)
+
+    malformed = {**command, "config": {"agents": {}}}
+    with pytest.raises(JsonSchemaValidationError):
+        _validator("RepositorySetupCommandPayload").validate(malformed)
+    with pytest.raises(ValueError):
+        RepositorySetupCommandPayload.model_validate(malformed)
 
 
 def test_dashboard_view_model_matches_ui_openapi() -> None:

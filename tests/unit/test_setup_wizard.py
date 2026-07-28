@@ -636,6 +636,7 @@ class TestSetupWizardSharedHelpers:
         assert "needs-code-review" in label_names
         assert "code-reviewed" in label_names
         assert "tech-lead-reviewed" in label_names
+        assert "tech-lead-failed" in label_names
         # R3: a tech-lead-enabled config provisions the act-level proposal gate
         # (raw, never prefixed), health-review marker, and the static blocking
         # observation marker. Dynamic area:* labels are provisioned at apply.
@@ -665,12 +666,17 @@ class TestSetupWizardSharedHelpers:
         config = Config()
         config.agents = {"agent:backend": Mock()}
         config.tech_lead_review_agent = "agent:tech-lead"
+        config.tech_lead_review_label = "needs-tech-lead-review"
         config.tech_lead_reviewed_label = "tech-lead-reviewed"
+        config.tech_lead_failed_label = "tech-lead-failed"
 
         labels = required_repo_labels(config)
 
         assert "proposed-tech-lead" in labels
         assert "agent:tech-lead" in labels
+        assert "needs-tech-lead-review" in labels
+        assert "tech-lead-reviewed" in labels
+        assert "tech-lead-failed" in labels
         assert "tech_lead:health-review" in labels
         assert "tech-lead-observation" in labels
         assert "agent:backend" in labels

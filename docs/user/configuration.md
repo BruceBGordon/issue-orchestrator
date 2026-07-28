@@ -32,6 +32,15 @@ Use `validation.quick` for fast coding/review feedback and
 `validation.publish` for the authoritative pre-push/pre-publish gate. The
 publish dirty-tree policy lives at `validation.publish.dirty_check`.
 
+### Control Center Repository Setup
+
+For a discovered repository that needs configuration, select **Setup** in the
+Control Center. The wizard previews the generated YAML and files before saving
+them. Its **Configure tech lead** question is enabled by default; when selected,
+setup creates the tech-lead agent and prompt, follow-up routing to the worker
+agent, and the labels required for tech-lead review, failure, and proposal
+flows. Clear the checkbox to create a worker-only configuration.
+
 ### Use Claude Opus With XHigh Effort
 
 Set this on `default_agent` to apply it to every agent that does not override

@@ -339,18 +339,18 @@ class TestSetupWizardEndpoints:
         assert "repo_root" in data
         assert "existing_config" in data
 
-    def test_preview_endpoint_exists(self) -> None:
-        """POST /control/setup/preview endpoint exists."""
+    def test_preview_endpoint_executes_setup_command(self, tmp_path: Path) -> None:
+        """POST /control/setup/preview executes the typed setup command."""
         client = TestClient(control_app)
 
         response = client.post(
             "/control/setup/preview",
             json={
-                "repo_root": "/tmp/test",
-                "config": {
-                    "repo": {"name": "test/repo"},
-                    "agents": {"agent:dev": {"prompt": "dev.md", "model": "sonnet"}},
-                },
+                "repo_root": str(tmp_path),
+                "repo_name": "test/repo",
+                "worker_agent_label": "agent:dev",
+                "model": "sonnet",
+                "configure_tech_lead": True,
             },
         )
 
@@ -368,10 +368,10 @@ class TestSetupWizardEndpoints:
             "/control/setup/save",
             json={
                 "repo_root": str(tmp_path),
-                "config": {
-                    "repo": {"name": "test/repo"},
-                    "agents": {"agent:dev": {"prompt": ".io/dev.md", "model": "sonnet"}},
-                },
+                "repo_name": "test/repo",
+                "worker_agent_label": "agent:dev",
+                "model": "sonnet",
+                "configure_tech_lead": True,
                 "create_prompts": True,
                 "create_labels": False,  # Skip GitHub API calls
             },
@@ -430,10 +430,10 @@ agents:
             "/control/setup/save",
             json={
                 "repo_root": str(tmp_path),
-                "config": {
-                    "repo": {"name": "new/repo"},
-                    "agents": {"agent:new": {"prompt": "new.md", "model": "sonnet"}},
-                },
+                "repo_name": "new/repo",
+                "worker_agent_label": "agent:new",
+                "model": "sonnet",
+                "configure_tech_lead": False,
                 "create_prompts": False,
                 "create_labels": False,
             },

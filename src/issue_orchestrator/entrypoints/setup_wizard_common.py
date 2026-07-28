@@ -6,7 +6,7 @@ import io
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Iterable, Mapping
+from typing import TYPE_CHECKING, Any, Iterable, Literal, Mapping
 from urllib.parse import urlparse
 
 import yaml
@@ -32,7 +32,7 @@ class PlannedWrite:
 
     path: Path
     content: str
-    action: str
+    action: Literal["create", "overwrite"]
     kind: str | None = None
     agent: str | None = None
 
@@ -55,7 +55,7 @@ class FileCollector:
         self,
         path: Path,
         content: str,
-        action: str = "create",
+        action: Literal["create", "overwrite"] = "create",
         *,
         kind: str | None = None,
         agent: str | None = None,
@@ -497,13 +497,27 @@ def _plan_setup_labels(
         observation_color, observation_description = tech_lead_issue_label_metadata(
             TECH_LEAD_OBSERVATION_LABEL
         )
+        tech_lead_watch_label = resolve_tech_lead_watch_label(
+            review_config.get("tech_lead_review_label"),
+            review_config.get("code_reviewed_label"),
+        )
 
         all_labels.extend(
             [
                 (
+                    tech_lead_watch_label,
+                    "7057FF",
+                    "PR needs tech-lead review",
+                ),
+                (
                     review_config.get("tech_lead_reviewed_label", "tech-lead-reviewed"),
                     "1D76DB",
                     "PR has been tech_lead reviewed",
+                ),
+                (
+                    review_config.get("tech_lead_failed_label", "tech-lead-failed"),
+                    "B60205",
+                    "Tech-lead review failed",
                 ),
                 # Gate label for act-level tech_lead proposals (#6779 R3): a fresh
                 # install must provision it, else a proposal issue is created
@@ -567,7 +581,9 @@ def required_repo_labels(config: "Config") -> list[str]:
             label
             for label in (
                 config.tech_lead_review_agent,
+                config.tech_lead_watch_label,
                 config.tech_lead_reviewed_label,
+                config.tech_lead_failed_label,
                 PROPOSED_TECH_LEAD_LABEL,
                 HEALTH_REVIEW_MARKER_LABEL,
                 TECH_LEAD_OBSERVATION_LABEL,

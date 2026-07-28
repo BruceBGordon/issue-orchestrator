@@ -905,7 +905,7 @@
     </div>
 
     <!-- Setup Wizard Modal -->
-    <div class="modal-backdrop" id="setupWizardModal" role="dialog" aria-labelledby="setupWizardModalTitle" aria-modal="true">
+    <div class="modal-backdrop" id="setupWizardModal" role="dialog" aria-labelledby="setupWizardModalTitle" aria-modal="true" aria-hidden="true">
         <div class="modal" style="max-width: 600px;">
             <div class="modal-header">
                 <h2 class="modal-title" id="setupWizardModalTitle">Setup Repository</h2>
@@ -917,12 +917,12 @@
             </div>
             <div class="modal-body" style="max-height: 500px; overflow-y: auto;">
                 <!-- Step indicator -->
-                <div id="setupSteps" style="display: flex; gap: 8px; margin-bottom: 20px; padding-bottom: 16px; border-bottom: 1px solid var(--border-subtle);">
-                    <div class="setup-step active" data-step="1">1. Prerequisites</div>
-                    <div class="setup-step" data-step="2">2. Configure</div>
-                    <div class="setup-step" data-step="3">3. Preview</div>
-                </div>
-                <div id="setupContent">Loading...</div>
+                <ol id="setupSteps" aria-label="Setup progress" style="display: flex; gap: 8px; margin: 0 0 20px; padding: 0 0 16px; border-bottom: 1px solid var(--border-subtle); list-style: none;">
+                    <li class="setup-step active" data-step="1" aria-current="step">1. Prerequisites</li>
+                    <li class="setup-step" data-step="2">2. Configure</li>
+                    <li class="setup-step" data-step="3">3. Preview</li>
+                </ol>
+                <div id="setupContent" aria-live="polite">Loading...</div>
             </div>
             <div class="modal-footer">
                 <button class="btn" id="setupWizardBack" style="display: none;">Back</button>
@@ -933,6 +933,8 @@
     </div>
 
     <script src="/static/js/browser_auth.js?v={{ static_version }}"></script>
+    <script src="/static/js/control_center_setup_commands.js?v={{ static_version }}"></script>
+    <script src="/static/js/control_center_setup.js?v={{ static_version }}"></script>
     <script src="/static/js/control_center.js?v={{ static_version }}"></script>
 </body>
 </html>

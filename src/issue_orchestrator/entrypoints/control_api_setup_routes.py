@@ -2,14 +2,20 @@
 
 from __future__ import annotations
 
-import json
 import logging
 from pathlib import Path
 from typing import Any, Mapping
 
-from fastapi import APIRouter, Query, Request
+from fastapi import APIRouter, Query
 from fastapi.responses import JSONResponse
 
+from ..contracts.ui_openapi_models import (
+    RepositorySetupCommandPayload,
+    RepositorySetupFilePayload,
+    RepositorySetupPreviewPayload,
+    RepositorySetupResultPayload,
+)
+from ..control.repository_setup import RepositorySetupCommand
 from .control_api_setup_support import ControlApiSetupDependency
 from .setup_wizard_common import (
     FileCollector,
@@ -33,26 +39,38 @@ logger = logging.getLogger(__name__)
 control_setup_router = APIRouter()
 
 
+def _repository_setup_command(
+    payload: RepositorySetupCommandPayload,
+) -> RepositorySetupCommand:
+    """Translate the HTTP command contract into setup-owner policy."""
+    return RepositorySetupCommand(
+        repo_name=payload.repo_name,
+        worker_agent_label=payload.worker_agent_label,
+        model=payload.model,
+        configure_tech_lead=payload.configure_tech_lead,
+    )
+
+
 def _preview_prompt_files(
     config: Mapping[str, Any],
     repo_root: str | None,
-) -> list[dict[str, Any]]:
+) -> list[RepositorySetupFilePayload]:
     """Build prompt-file preview rows without mutating the filesystem."""
     if repo_root:
         collector = FileCollector()
         write_missing_setup_prompts(config, Path(repo_root), file_collector=collector)
-        prompt_rows: list[dict[str, Any]] = []
+        prompt_rows: list[RepositorySetupFilePayload] = []
         for write in collector.writes:
             if write.kind != "prompt":
                 continue
-            row: dict[str, Any] = {
-                "path": str(write.path),
-                "action": write.action,
-                "type": "prompt",
-            }
-            if write.agent:
-                row["agent"] = write.agent
-            prompt_rows.append(row)
+            prompt_rows.append(
+                RepositorySetupFilePayload(
+                    path=str(write.path),
+                    action=write.action,
+                    type="prompt",
+                    agent=write.agent,
+                )
+            )
         return prompt_rows
 
     prompt_rows = []
@@ -62,12 +80,14 @@ def _preview_prompt_files(
         prompt_path = agent_config.get("prompt", "")
         if not isinstance(prompt_path, str) or not prompt_path:
             continue
-        prompt_rows.append({
-            "path": prompt_path,
-            "action": "create",
-            "type": "prompt",
-            "agent": agent_name,
-        })
+        prompt_rows.append(
+            RepositorySetupFilePayload(
+                path=prompt_path,
+                action="create",
+                type="prompt",
+                agent=agent_name,
+            )
+        )
     return prompt_rows
 
 
@@ -217,68 +237,74 @@ async def setup_detect(
     return JSONResponse(result)
 
 
-@control_setup_router.post("/control/setup/preview")
-async def setup_preview(request: Request) -> JSONResponse:
+@control_setup_router.post(
+    "/control/setup/preview",
+    response_model=RepositorySetupPreviewPayload,
+)
+async def setup_preview(
+    payload: RepositorySetupCommandPayload,
+    deps: ControlApiSetupDependency,
+) -> RepositorySetupPreviewPayload | JSONResponse:
     """Generate a setup-wizard config preview without saving."""
     try:
-        body = await request.json()
-    except json.JSONDecodeError:
-        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+        config = _repository_setup_command(payload).build_config()
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
 
-    config = body.get("config")
-    if not config:
-        return JSONResponse({"error": "Missing config"}, status_code=400)
+    repo_root = deps.validate_repo_root(payload.repo_root)
+    if repo_root is None:
+        return JSONResponse(
+            {"error": "Invalid or missing repo_root"},
+            status_code=400,
+        )
+    from ..infra.config import get_config_path
 
-    from ..infra.config import CONFIG_DIR, DEFAULT_CONFIG_NAME
-
-    repo_root = body.get("repo_root")
-    config_path = (
-        str(Path(repo_root) / CONFIG_DIR / DEFAULT_CONFIG_NAME)
-        if repo_root
-        else str(Path(CONFIG_DIR) / DEFAULT_CONFIG_NAME)
+    config_path = str(
+        get_config_path(repo_root, _normalize_config_name(payload.config_name))
     )
 
     yaml_content = render_config_yaml(config, include_header=False)
-    files_to_create: list[dict[str, Any]] = [{
-        "path": config_path,
-        "action": "create",
-        "size": len(yaml_content),
-    }]
-    files_to_create.extend(_preview_prompt_files(config, repo_root))
+    files_to_create = [
+        RepositorySetupFilePayload(
+            path=config_path,
+            action="overwrite" if Path(config_path).exists() else "create",
+            size=len(yaml_content),
+        )
+    ]
+    files_to_create.extend(_preview_prompt_files(config, str(repo_root)))
 
-    return JSONResponse({
-        "yaml": yaml_content,
-        "files": files_to_create,
-    })
+    return RepositorySetupPreviewPayload(
+        yaml=yaml_content,
+        files=files_to_create,
+    )
 
 
-@control_setup_router.post("/control/setup/save")
+@control_setup_router.post(
+    "/control/setup/save",
+    response_model=RepositorySetupResultPayload,
+)
 async def setup_save(
-    request: Request,
+    payload: RepositorySetupCommandPayload,
     deps: ControlApiSetupDependency,
-) -> JSONResponse:
+) -> RepositorySetupResultPayload | JSONResponse:
     """Save a setup-wizard config and create requested setup artifacts."""
     try:
-        body = await request.json()
-    except json.JSONDecodeError:
-        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+        config = _repository_setup_command(payload).build_config()
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
 
-    repo_root = deps.validate_repo_root(body.get("repo_root"))
+    repo_root = deps.validate_repo_root(payload.repo_root)
     if repo_root is None:
         return JSONResponse(
             {"error": "Invalid or missing repo_root"},
             status_code=400,
         )
 
-    config = body.get("config")
-    if not config:
-        return JSONResponse({"error": "Missing config"}, status_code=400)
-
-    create_prompts = body.get("create_prompts", True)
-    create_labels = body.get("create_labels", True)
+    create_prompts = payload.create_prompts is not False
+    create_labels = payload.create_labels is not False
     created_files: list[str] = []
     created_labels: list[str] = []
-    config_name = _normalize_config_name(body.get("config_name"))
+    config_name = _normalize_config_name(payload.config_name)
 
     try:
         config_path = _persist_setup_config(repo_root, config, config_name)
@@ -297,9 +323,9 @@ async def setup_save(
     if create_labels and repo_name:
         created_labels.extend(_create_setup_labels(repo_name, config))
 
-    return JSONResponse({
-        "status": "saved",
-        "config_path": str(config_path),
-        "created_files": created_files,
-        "created_labels": created_labels,
-    })
+    return RepositorySetupResultPayload(
+        status="saved",
+        config_path=str(config_path),
+        created_files=created_files,
+        created_labels=created_labels,
+    )

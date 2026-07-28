@@ -786,6 +786,37 @@ class RecentE2ERunsPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
     runs: list[RecentE2ERunSummaryPayload]
 
+class RepositorySetupCommandPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    config_name: str | None = None
+    configure_tech_lead: bool
+    create_labels: bool | None = None
+    create_prompts: bool | None = None
+    model: Literal['haiku', 'sonnet', 'opus']
+    repo_name: str = Field(..., min_length=1)
+    repo_root: str = Field(..., min_length=1)
+    worker_agent_label: str
+
+class RepositorySetupFilePayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    action: Literal['create', 'overwrite']
+    agent: str | None = None
+    path: str
+    size: int | None = Field(default=None, ge=0, strict=True)
+    type: Literal['prompt'] | None = None
+
+class RepositorySetupPreviewPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    files: list[RepositorySetupFilePayload]
+    yaml: str
+
+class RepositorySetupResultPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    config_path: str
+    created_files: list[str]
+    created_labels: list[str]
+    status: Literal['saved']
+
 class RetrospectiveReviewDecisionPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
     action: str

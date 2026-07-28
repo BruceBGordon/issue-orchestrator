@@ -10,10 +10,16 @@
 .setup-step.active {
     background: var(--primary-color);
     color: white;
+    font-weight: 600;
+    box-shadow: inset 0 0 0 2px currentColor;
 }
 .setup-step.done {
     background: var(--success-color);
     color: white;
+}
+.setup-step.done::after {
+    content: " ✓";
+    font-weight: 700;
 }
 .prereq-item {
     display: flex;

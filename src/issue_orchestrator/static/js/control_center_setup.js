@@ -1,0 +1,309 @@
+(function (root, factory) {
+    if (typeof module === 'object' && module.exports) {
+        module.exports = factory;
+    }
+    if (root) {
+        root.createControlCenterSetupWizard = factory;
+    }
+})(typeof globalThis !== 'undefined' ? globalThis : this, function createControlCenterSetupWizard(deps) {
+    const {
+        document,
+        fetch,
+        escapeHtml,
+        loadRepos,
+        setupCommands,
+    } = deps;
+
+    let state = {
+        step: 1,
+        repoPath: null,
+        options: null,
+    };
+    let returnFocusElement = null;
+    let bound = false;
+
+    function element(id) {
+        const found = document.getElementById(id);
+        if (!found) throw new Error(`Setup wizard element is missing: ${id}`);
+        return found;
+    }
+
+    async function responseJson(response, fallbackMessage) {
+        const data = await response.json();
+        if (!response.ok || data.error) {
+            throw new Error(data.error || fallbackMessage);
+        }
+        return data;
+    }
+
+    function updateSteps() {
+        document.querySelectorAll('.setup-step').forEach((stepElement) => {
+            const step = parseInt(stepElement.dataset.step, 10);
+            stepElement.classList.remove('active', 'done');
+            stepElement.removeAttribute('aria-current');
+            if (step < state.step) {
+                stepElement.classList.add('done');
+                stepElement.setAttribute('aria-label', `${stepElement.textContent}, complete`);
+            } else if (step === state.step) {
+                stepElement.classList.add('active');
+                stepElement.setAttribute('aria-current', 'step');
+                stepElement.setAttribute('aria-label', `${stepElement.textContent}, current`);
+            } else {
+                stepElement.setAttribute('aria-label', `${stepElement.textContent}, not started`);
+            }
+        });
+        element('setupWizardBack').style.display = state.step > 1 ? 'inline-flex' : 'none';
+        element('setupWizardNext').textContent =
+            state.step === 3 ? 'Save Configuration' : 'Next';
+    }
+
+    function close() {
+        const modal = element('setupWizardModal');
+        modal.classList.remove('active');
+        modal.setAttribute('aria-hidden', 'true');
+        if (returnFocusElement && typeof returnFocusElement.focus === 'function') {
+            returnFocusElement.focus();
+        }
+        returnFocusElement = null;
+    }
+
+    async function open(repoPath, triggerElement = null) {
+        state = { step: 1, repoPath, options: null };
+        returnFocusElement = triggerElement;
+        const modal = element('setupWizardModal');
+        modal.classList.add('active');
+        modal.setAttribute('aria-hidden', 'false');
+        updateSteps();
+        element('closeSetupWizardModal').focus();
+        await loadStep1();
+    }
+
+    async function loadStep1() {
+        element('setupContent').innerHTML =
+            '<div class="loading-spinner"></div> Checking prerequisites...';
+        try {
+            const response = await fetch(
+                `/control/setup/prereqs?repo_root=${encodeURIComponent(state.repoPath)}`,
+            );
+            const data = await responseJson(response, 'Failed to check prerequisites');
+
+            let html = '<h3 style="margin-top: 0;">Prerequisites</h3>';
+            for (const [name, check] of Object.entries(data.checks || {})) {
+                const isOk = check.ok;
+                html += `<div class="prereq-item ${isOk ? 'ok' : 'fail'}">
+                    <span class="prereq-icon" aria-hidden="true">${isOk ? '✓' : '✗'}</span>
+                    <div>
+                        <div class="prereq-name">${escapeHtml(name)}</div>
+                        <div class="prereq-detail">${escapeHtml(check.detail || (isOk ? 'Found' : 'Not found'))}</div>
+                    </div>
+                </div>`;
+            }
+
+            if (!data.all_ok) {
+                html += '<p style="color: var(--warning-color); margin-top: 16px;">Some prerequisites are missing. You can still continue, but the repository engine may not work correctly.</p>';
+            }
+            element('setupContent').innerHTML = html;
+        } catch (error) {
+            element('setupContent').innerHTML =
+                `<div class="error-message">Failed to check prerequisites: ${escapeHtml(error.message)}</div>`;
+        }
+    }
+
+    async function loadStep2() {
+        element('setupContent').innerHTML =
+            '<div class="loading-spinner"></div> Detecting repository...';
+        try {
+            const response = await fetch(
+                `/control/setup/detect?repo_root=${encodeURIComponent(state.repoPath)}`,
+            );
+            const data = await responseJson(response, 'Failed to detect repository');
+            const existingConfig = data.existing_config || {};
+            const existingAgents = existingConfig.agents || {};
+            const workerEntry = Object.entries(existingAgents).find(
+                ([label]) => label !== 'agent:tech-lead',
+            );
+            const detectedRepoName = typeof data.repo === 'string' ? data.repo : data.repo?.name;
+            const repoName = existingConfig.repo?.name
+                || detectedRepoName
+                || data.repo_root?.split('/').pop()
+                || 'unknown/repo';
+            const workerAgentLabel = workerEntry?.[0] || 'agent:dev';
+            const model = workerEntry?.[1]?.model || 'sonnet';
+            const configureTechLead = data.existing_config
+                ? Boolean(existingConfig.review?.tech_lead_review_agent)
+                : true;
+
+            let html = '<h3 style="margin-top: 0;">Configuration</h3>';
+            html += data.existing_config
+                ? '<p>Existing configuration found. Review the setup choices below.</p>'
+                : '<p>No configuration found. Create a new repository setup.</p>';
+            html += `
+                <div class="form-group" style="margin-top: 16px;">
+                    <label class="form-label" for="setupRepoName">Repository Name</label>
+                    <input type="text" id="setupRepoName" class="form-input" value="${escapeHtml(repoName)}" style="width: 100%;">
+                </div>
+                <div class="form-group" style="margin-top: 12px;">
+                    <label class="form-label" for="setupAgentLabel">Worker Agent Label</label>
+                    <input type="text" id="setupAgentLabel" class="form-input" value="${escapeHtml(workerAgentLabel)}" style="width: 100%;">
+                    <div style="font-size: 12px; color: var(--text-muted); margin-top: 4px;">The GitHub label that routes implementation work to this agent.</div>
+                </div>
+                <div class="form-group" style="margin-top: 12px;">
+                    <label class="form-label" for="setupModel">Model</label>
+                    <select id="setupModel" class="form-input" style="width: 100%;">
+                        <option value="sonnet" ${model === 'sonnet' ? 'selected' : ''}>Sonnet (recommended)</option>
+                        <option value="opus" ${model === 'opus' ? 'selected' : ''}>Opus</option>
+                        <option value="haiku" ${model === 'haiku' ? 'selected' : ''}>Haiku</option>
+                    </select>
+                </div>
+                <div class="form-group" style="margin-top: 16px;">
+                    <label style="display: flex; align-items: flex-start; gap: 8px; cursor: pointer;">
+                        <input type="checkbox" id="setupConfigureTechLead" ${configureTechLead ? 'checked' : ''}>
+                        <span>
+                            <strong>Configure a tech-lead agent?</strong>
+                            <span style="display: block; font-size: 12px; color: var(--text-muted); margin-top: 3px;">Creates the tech-lead agent, prompt, review labels, and follow-up routing. Enabled by default.</span>
+                        </span>
+                    </label>
+                </div>
+            `;
+            element('setupContent').innerHTML = html;
+        } catch (error) {
+            element('setupContent').innerHTML =
+                `<div class="error-message">Failed to detect repository: ${escapeHtml(error.message)}</div>`;
+        }
+    }
+
+    function collectOptions() {
+        return {
+            repoName: element('setupRepoName').value,
+            workerAgentLabel: element('setupAgentLabel').value,
+            model: element('setupModel').value,
+            configureTechLead: element('setupConfigureTechLead').checked,
+        };
+    }
+
+    async function loadStep3() {
+        state.options = collectOptions();
+        element('setupContent').innerHTML =
+            '<div class="loading-spinner"></div> Generating preview...';
+        try {
+            const command = setupCommands.buildSetupPreviewRequest(
+                state.repoPath,
+                state.options,
+            );
+            const response = await fetch(command.endpoint, {
+                method: command.method,
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(command.body),
+            });
+            const data = await responseJson(response, 'Failed to generate preview');
+
+            let html = '<h3 style="margin-top: 0;">Preview Configuration</h3>';
+            html += '<p>The following configuration will be saved:</p>';
+            html += `<pre style="background: var(--bg-tertiary); padding: 12px; border-radius: 8px; font-size: 12px; overflow-x: auto;">${escapeHtml(data.yaml || '')}</pre>`;
+
+            if (data.files && data.files.length > 0) {
+                html += '<p style="margin-top: 16px;"><strong>Files to create:</strong></p>';
+                html += '<ul style="margin: 8px 0; padding-left: 20px;">';
+                data.files.forEach((file) => {
+                    html += `<li><code>${escapeHtml(file.path)}</code></li>`;
+                });
+                html += '</ul>';
+            }
+
+            html += `
+                <div class="form-group" style="margin-top: 16px;">
+                    <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
+                        <input type="checkbox" id="setupCreateLabels" checked>
+                        Create GitHub labels for configured agents and workflows
+                    </label>
+                </div>
+            `;
+            element('setupContent').innerHTML = html;
+        } catch (error) {
+            element('setupContent').innerHTML =
+                `<div class="error-message">Failed to generate preview: ${escapeHtml(error.message)}</div>`;
+        }
+    }
+
+    async function save() {
+        const nextButton = element('setupWizardNext');
+        element('setupContent').innerHTML =
+            '<div class="loading-spinner"></div> Saving configuration...';
+        nextButton.disabled = true;
+
+        try {
+            const command = setupCommands.buildSetupSaveRequest(
+                state.repoPath,
+                state.options,
+                {
+                    createPrompts: true,
+                    createLabels: element('setupCreateLabels').checked,
+                },
+            );
+            const response = await fetch(command.endpoint, {
+                method: command.method,
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(command.body),
+            });
+            const data = await responseJson(response, 'Failed to save configuration');
+
+            let html = '<h3 style="margin-top: 0; color: var(--success-color);">Setup Complete!</h3>';
+            html += '<p>Configuration has been saved successfully.</p>';
+            if (data.created_files && data.created_files.length > 0) {
+                html += '<p><strong>Created files:</strong></p>';
+                html += '<ul style="margin: 8px 0; padding-left: 20px;">';
+                data.created_files.forEach((file) => {
+                    html += `<li><code>${escapeHtml(file)}</code></li>`;
+                });
+                html += '</ul>';
+            }
+            html += '<p style="margin-top: 16px;">You can now start the repository engine for this repository.</p>';
+
+            element('setupContent').innerHTML = html;
+            nextButton.textContent = 'Done';
+            nextButton.disabled = false;
+            element('setupWizardBack').style.display = 'none';
+            state.step = 4;
+            await loadRepos();
+        } catch (error) {
+            element('setupContent').innerHTML =
+                `<div class="error-message">Failed to save configuration: ${escapeHtml(error.message)}</div>`;
+            nextButton.disabled = false;
+        }
+    }
+
+    function bind() {
+        if (bound) return;
+        bound = true;
+        element('closeSetupWizardModal').addEventListener('click', close);
+        element('setupWizardCancel').addEventListener('click', close);
+        element('setupWizardBack').addEventListener('click', async () => {
+            if (state.step <= 1) return;
+            state.step -= 1;
+            updateSteps();
+            if (state.step === 1) await loadStep1();
+            else if (state.step === 2) await loadStep2();
+        });
+        element('setupWizardNext').addEventListener('click', async () => {
+            if (state.step === 4) {
+                close();
+                return;
+            }
+            if (state.step === 3) {
+                await save();
+                return;
+            }
+            state.step += 1;
+            updateSteps();
+            if (state.step === 2) await loadStep2();
+            else if (state.step === 3) await loadStep3();
+        });
+        document.addEventListener('keydown', (event) => {
+            if (event.key === 'Escape' && element('setupWizardModal').classList.contains('active')) {
+                close();
+            }
+        });
+    }
+
+    return { bind, open, close };
+});
