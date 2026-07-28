@@ -274,27 +274,41 @@ sync_deps() {
 
   if [[ "${mode}" == "uv-frozen-extra-dev" ]]; then
     echo "Syncing Python dependencies from ${ROOT_DIR} with uv..."
-    (cd "${ROOT_DIR}" && "${uv_bin}" sync --frozen --extra dev)
-    # `uv sync --frozen` keys on the installed package VERSION, not the editable
-    # SOURCE PATH, so it will not repoint an already-version-satisfied editable
-    # install that points at a stale location (e.g. a transient issue worktree
-    # this same venv was last `uv sync`/`pip install -e`'d from). Without this,
-    # ``ensure_deps`` detects the stale pointer but its remedy is a no-op and the
-    # CLI keeps importing another worktree's (possibly half-written) ``src``.
-    # Force the project's own editable install back to ROOT_DIR.
-    (cd "${ROOT_DIR}" && "${uv_bin}" pip install --python "${VENV_PATH}/bin/python" -e . --no-deps)
+    # An inherited UV_PROJECT_ENVIRONMENT redirects `uv sync` away from
+    # VENV_PATH. That leaves the stale environment detected by ensure_deps
+    # untouched while uv successfully updates a different environment.
+    (
+      cd "${ROOT_DIR}"
+      UV_PROJECT_ENVIRONMENT="${VENV_PATH}" "${uv_bin}" sync --frozen --extra dev
+    )
   else
     echo "Syncing Python dependencies from ${ROOT_DIR} with pip..."
     ensure_pip
     (cd "${ROOT_DIR}" && "${VENV_PATH}/bin/python" -m pip install -e ".[dev]")
   fi
+  verify_project_install
   record_deps_synced
+}
+
+installed_project_path() {
+  "${VENV_PATH}/bin/python" \
+    -c "import issue_orchestrator; print(issue_orchestrator.__file__)" \
+    2>/dev/null || true
+}
+
+verify_project_install() {
+  local installed_path
+  installed_path="$(installed_project_path)"
+  if [[ -z "${installed_path}" || "${installed_path}" != "${ROOT_DIR}"/* ]]; then
+    echo "ERROR: Dependency sync did not install issue_orchestrator from ${ROOT_DIR}: ${installed_path:-not importable}" >&2
+    return 1
+  fi
 }
 
 ensure_deps() {
   # Check if installed AND pointing to this repo (not a stale worktree)
   local installed_path
-  installed_path=$("${VENV_PATH}/bin/python" -c "import issue_orchestrator; print(issue_orchestrator.__file__)" 2>/dev/null || echo "")
+  installed_path="$(installed_project_path)"
 
   if [[ -z "${installed_path}" ]]; then
     echo "Package not installed."
