@@ -34,7 +34,6 @@ if TYPE_CHECKING:
     from .label_manager import LabelManager
 
 from ..infra.config import Config
-from ..infra.env import ENV_PREFIX
 from ..infra.logging_config import issue_log, log_context
 from ..events import EventName
 from ..domain.models import (
@@ -95,7 +94,8 @@ from .session_worktree_diagnostics import (
     write_worktree_diagnostic,
 )
 from .transition_log import log_transition
-from .isolation import build_agent_tool_env_assignments, build_runtime_tool_env
+from .isolation import build_runtime_tool_env
+from .session_env import build_session_env_exports
 from .provider_command_wrapper import ProviderCommandWrapper
 
 logger = logging.getLogger(__name__)
@@ -425,49 +425,17 @@ class SessionLauncher:
     ) -> str:
         """Build the common env-export string for all session types.
 
-        Includes the orchestrator venv on PATH so ``coding-done``/``reviewer-done``
-        is always reachable — even when the target repo is a foreign
-        (non-orchestrator) repository with no ``.venv``.
-
-        Also exports orchestrator ``src`` on ``PYTHONPATH`` so subprocess
-        commands launched from arbitrary worktree directories can import
-        ``issue_orchestrator`` without depending on editable installs.
-
-        NOTE: The selected orchestrator config name is exported so ``coding-done``/``reviewer-done``
-        resolves validation from the same config file used by the launcher.
+        Delegates to :mod:`.session_env`, which owns the agent session
+        environment contract for every launch path.
         """
-        orch_bin = Path(sys.executable).parent
-        orch_src = Path(__file__).resolve().parents[2]
-        runtime_tool_assignments = " ".join(build_agent_tool_env_assignments(worktree_path))
-        # ``control_api_port: 0`` means "bind any free port", so it is a
-        # request, not a destination. Exporting the literal 0 handed
-        # agents an unreachable port that *looked* configured and
-        # shadowed the live port injected per-exchange (#6913); omit it
-        # instead so consumers see "unset" and fail honestly.
-        port_export = ""
-        if self.config.control_api_port != 0:
-            port_export = f" {ENV_PREFIX}API_PORT='{self.config.control_api_port}'"
-        config_exports = ""
-        if self.config.config_path is not None:
-            config_name = self.config.config_path.name
-            config_path = str(self.config.config_path.resolve())
-            config_exports = (
-                f" {ENV_PREFIX}CONFIG_NAME='{config_name}'"
-                f" {ENV_PREFIX}CONFIG_PATH='{config_path}'"
-            )
-        return (
-            f"export {ENV_PREFIX}COMPLETION_PATH='{completion_path}'"
-            f" {ENV_PREFIX}SESSION_ID='{session_id}'"
-            f" {ENV_PREFIX}AGENT_LABEL='{agent_label}'"
-            f" {ENV_PREFIX}ISSUE_NUMBER='{issue_number}'"
-            f"{config_exports}"
-            f"{port_export}"
-            f" {ENV_PREFIX}VALIDATION_OUTPUT_DIR='{run_assets.run_dir}'"
-            f" {ENV_PREFIX}RUN_DIR='{run_assets.run_dir}'"
-            f" {ENV_PREFIX}WORKTREE='{worktree_path}'"
-            f" {runtime_tool_assignments}"
-            f' PYTHONPATH="{orch_src}:${{PYTHONPATH:-}}"'
-            f' PATH="{orch_bin}:$PATH"'
+        return build_session_env_exports(
+            config=self.config,
+            completion_path=completion_path,
+            session_id=session_id,
+            agent_label=agent_label,
+            issue_number=issue_number,
+            run_dir=run_assets.run_dir,
+            worktree_path=worktree_path,
         )
 
     # ─────────────────────────────────────────────────────────────────────────
