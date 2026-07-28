@@ -58,6 +58,7 @@ from ...execution.run_evidence import RunEvidenceRecorder
 from ...execution.session_output_adapter import FileSystemSessionOutput
 from .orchestrator_resume import (
     api_request_headers as _api_request_headers,
+    resolve_control_api_port as _resolve_control_api_port,
 )
 
 
@@ -643,22 +644,9 @@ def run_preflight_push_check(worktree: Path, verbose: bool = False) -> tuple[boo
     import urllib.request
     import urllib.error
 
-    # Get orchestrator port from environment
-    # Support prefixed orchestrator env var first, with legacy fallback.
-    # ``"0"`` is the auto-assign sentinel, not a reachable port — treat
-    # it as unset so this skips honestly instead of dialling
-    # ``localhost:0`` and reporting a connection failure (#6913).
-    port = next(
-        (
-            candidate.strip()
-            for candidate in (
-                get_env("API_PORT"),
-                os.environ.get("ORCHESTRATOR_API_PORT"),
-            )
-            if candidate and candidate.strip() and candidate.strip() != "0"
-        ),
-        None,
-    )
+    # Resolved by the shared agent-callback owner, which treats the
+    # ``0`` auto-assign sentinel as unset (#6913).
+    port = _resolve_control_api_port()
     if not port:
         # No port configured - skip preflight check
         # This happens when running coding-done/reviewer-done outside orchestrator context

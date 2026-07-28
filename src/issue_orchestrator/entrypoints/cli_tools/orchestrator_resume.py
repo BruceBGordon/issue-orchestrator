@@ -46,6 +46,31 @@ def api_request_headers() -> ApiRequestHeaders:
     return ApiRequestHeaders.from_agent_environment()
 
 
+def resolve_control_api_port() -> str | None:
+    """Resolve the port serving the Control API, or ``None`` if unset.
+
+    Single owner for the rule every agent callback needs, so the three
+    callback paths (``exchange-respond``, preflight-push, resume) cannot
+    answer it differently.
+
+    ``control_api_port: 0`` means "bind any free port", so a literal
+    ``"0"`` is a request, never a reachable destination. It is also a
+    *truthy* string, so a naive ``a or b`` chain returns it and shadows
+    the live port the review exchange injects as
+    ``ORCHESTRATOR_API_PORT`` — which is how every verdict became
+    undeliverable (#6913). Treat it as unset so callers fail honestly
+    instead of dialling ``localhost:0``.
+    """
+    for name in ("ISSUE_ORCHESTRATOR_API_PORT", "ORCHESTRATOR_API_PORT"):
+        raw = os.environ.get(name)
+        if raw is None:
+            continue
+        port = raw.strip()
+        if port and port != "0":
+            return port
+    return None
+
+
 @dataclass(frozen=True, slots=True)
 class ResumeTarget:
     """Typed Control API endpoint identity for an agent resume callback."""
@@ -55,11 +80,10 @@ class ResumeTarget:
 
     @classmethod
     def from_agent_environment(cls) -> "ResumeTarget":
-        raw_port = get_env("API_PORT") or os.environ.get("ORCHESTRATOR_API_PORT")
         raw_issue_number = get_env("ISSUE_NUMBER") or os.environ.get(
             "ORCHESTRATOR_ISSUE_NUMBER"
         )
-        port = raw_port.strip() if raw_port else ""
+        port = resolve_control_api_port() or ""
         issue_number = raw_issue_number.strip() if raw_issue_number else ""
         missing: list[str] = []
         if port == "":

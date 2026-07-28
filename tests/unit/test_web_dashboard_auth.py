@@ -473,16 +473,36 @@ def test_agent_callback_token_reaches_allowlisted_route_on_dashboard(
     )
 
 
+@pytest.mark.parametrize("path", ["/api/shutdown", "/api/resume", "/api/kill"])
 def test_agent_callback_token_still_rejected_off_allowlist(
     authed_client: TestClient,
     agent_callback_tokens: None,
+    path: str,
 ) -> None:
-    """Honouring the token must not widen it into an admin credential."""
+    """Honouring the token must not widen it into an admin credential.
+
+    ``/api/resume`` is the dashboard's own pause/resume action and is a
+    deliberate near-miss: the allowlist matches
+    ``/api/issues/{n}/resume`` by prefix+suffix, and a looser
+    ``endswith("/resume")`` would hand agents this route too.
+    """
     resp = authed_client.post(
-        "/api/shutdown",
+        path,
         headers={"Authorization": "Bearer test-agent-token"},
     )
     assert resp.status_code in (401, 403), resp.text
+
+
+def test_dashboard_own_resume_route_is_not_an_agent_callback_route() -> None:
+    """Pin the near-miss at the predicate, not just over HTTP."""
+    from issue_orchestrator.entrypoints._auth_middleware import (
+        is_agent_callback_route,
+    )
+
+    assert is_agent_callback_route("/api/issues/6410/resume") is True
+    assert is_agent_callback_route("/api/resume") is False
+    assert is_agent_callback_route("/resume") is False
+    assert is_agent_callback_route("/api/issues/6410/kill") is False
 
 
 def test_dashboard_and_control_api_share_one_agent_callback_allowlist() -> None:
