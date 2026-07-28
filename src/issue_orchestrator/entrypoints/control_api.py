@@ -1245,7 +1245,23 @@ class ControlAPIServer:
         for _ in range(50):
             if self._server.started:
                 break
+            if self._task.done():
+                break
             await asyncio.sleep(0.1)
+
+        # Never publish an endpoint the server is not actually serving.
+        # Publishing unconditionally reported ready with a fixed port
+        # that nothing was listening on, so orchestration launched agents
+        # against a dead address (#6924 F9). Surface the serve() failure
+        # if there was one; otherwise report the timeout.
+        if not self._server.started:
+            if self._task.done() and self._task.exception() is not None:
+                raise RuntimeError(
+                    "Control API server failed to start"
+                ) from self._task.exception()
+            raise RuntimeError(
+                f"Control API server did not start within 5s on port {self.port}"
+            )
 
         # Read back the actual bound port (important when port=0)
         if self.port == 0 and self._server.started:

@@ -139,3 +139,44 @@ class TestReadinessLifecycle:
         endpoint.publish_bound_port(59957)
         assert endpoint.resolve_port(0) == 59957
         assert endpoint.is_ready() is True
+
+
+class TestUnavailableWins:
+    """"Unavailable" must beat both the fallback and stale bound state (F10).
+
+    A run mode that says it serves no Control API was still handing
+    agents a port: ``resolve_port`` consulted the bound port and the
+    configured fallback but never the unavailable flag, so an agent
+    dialled a dead address and the failure looked like an unresponsive
+    orchestrator rather than a missing endpoint.
+    """
+
+    def test_declared_unavailable_beats_the_configured_fallback(
+        self, endpoint: RuntimeAgentCallbackEndpoint
+    ) -> None:
+        endpoint.declare_unavailable()
+        assert endpoint.resolve_port(19080) is None
+
+    def test_declared_unavailable_clears_a_stale_bound_port(
+        self, endpoint: RuntimeAgentCallbackEndpoint
+    ) -> None:
+        endpoint.publish_bound_port(59957)
+        endpoint.declare_unavailable()
+        assert endpoint.resolve_port(0) is None
+        assert endpoint.bound_port() is None
+
+    def test_declared_unavailable_beats_stale_port_and_fallback_together(
+        self, endpoint: RuntimeAgentCallbackEndpoint
+    ) -> None:
+        endpoint.publish_bound_port(59957)
+        endpoint.declare_unavailable()
+        assert endpoint.resolve_port(19080) is None
+
+    def test_a_later_bind_recovers(
+        self, endpoint: RuntimeAgentCallbackEndpoint
+    ) -> None:
+        """The transition must work in both directions."""
+        endpoint.declare_unavailable()
+        endpoint.publish_bound_port(1234)
+        assert endpoint.resolve_port(0) == 1234
+        assert endpoint.is_ready() is True

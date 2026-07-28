@@ -33,7 +33,10 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from tests.callback_endpoint_helpers import ready_callback_endpoint
+from tests.callback_endpoint_helpers import (
+    published_callback_endpoint,
+    ready_callback_endpoint,
+)
 from issue_orchestrator.control.completion_review_exchange import (
     CompletionReviewExchange,
 )
@@ -898,7 +901,7 @@ def test_real_interactive_codex_reviewer_round_trips_through_exchange(
     ):
         config.control_api_port = port
         cre = CompletionReviewExchange(
-            agent_callback_endpoint=ready_callback_endpoint(),
+            agent_callback_endpoint=published_callback_endpoint(port),
             config=config,
             session_output=session_output,
             emit_review_started=lambda **_: None,
@@ -1735,7 +1738,7 @@ def test_persistent_review_exchange_end_to_end_through_mailbox(
             turn_mailbox=mailbox,
         )
         cre = CompletionReviewExchange(
-            agent_callback_endpoint=ready_callback_endpoint(),
+            agent_callback_endpoint=published_callback_endpoint(port),
             config=config,
             session_output=session_output,
             emit_review_started=lambda **_: None,

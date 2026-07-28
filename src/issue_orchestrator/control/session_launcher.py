@@ -447,6 +447,24 @@ class SessionLauncher:
     # the launch process. See .claude/skills/refactoring/SKILL.md
     # ─────────────────────────────────────────────────────────────────────────
 
+    def _callback_endpoint_not_ready(self) -> LaunchResult | None:
+        """Shared launch boundary: defer while the endpoint is unresolved.
+
+        Every flavor spawns an agent with the same callback-dependent
+        completion environment, so every flavor must observe this rule —
+        it previously lived only in ``_check_launch_preconditions``,
+        which review and rework launches never reach (#6924 F7-R3).
+
+        Retryable: the next tick launches once the server has published
+        or a run mode has declared that it serves no Control API.
+        """
+        if self._agent_callback_endpoint.is_ready():
+            return None
+        return LaunchResult(
+            None, False,
+            "Agent callback endpoint not published yet; deferring launch",
+        )
+
     def _check_launch_preconditions(
         self,
         issue: "IssueProtocol",
@@ -457,17 +475,8 @@ class SessionLauncher:
 
         Returns LaunchResult on failure, None if preconditions pass.
         """
-        # An agent spawned before the callback endpoint is known gets an
-        # environment with no way to reach us, and every callback it makes
-        # fails — the exact failure this whole change exists to remove.
-        # Every start mode either binds a Control API or declares that it
-        # serves none, so this is a regression guard, not a normal path
-        # (#6924 F7). Retryable: the next tick launches once ready.
-        if not self._agent_callback_endpoint.is_ready():
-            return LaunchResult(
-                None, False,
-                "Agent callback endpoint not published yet; deferring launch",
-            )
+        if result := self._callback_endpoint_not_ready():
+            return result
 
         if issue.agent_type is None:
             return LaunchResult(None, False, f"Issue #{issue.number} has no agent type label")
@@ -1565,6 +1574,8 @@ class SessionLauncher:
         active_sessions: list[Session],
     ) -> LaunchResult:
         """Launch a code review session for a PR."""
+        if result := self._callback_endpoint_not_ready():
+            return result
         # Get the reviewer for this agent (per-agent override or default)
         agent_label = self.config.get_reviewer_for_agent(review.agent_label) if review.agent_label else self.config.code_review_agent
         if not agent_label:
@@ -1848,12 +1859,42 @@ class SessionLauncher:
 
         return LaunchResult(session, True)
 
+    def _retrospective_session_conflict(
+        self,
+        session_name: str,
+        issue_number: int,
+        active_sessions: list[Session],
+    ) -> LaunchResult | None:
+        """Whether a retrospective review for this issue is already live.
+
+        Two distinct conflicts with different queue semantics: an
+        in-flight session drops the request, while a lingering terminal
+        keeps it queued for a later tick.
+        """
+        if any(s.terminal_id == session_name for s in active_sessions):
+            log_transition(
+                "retrospective-review", issue_number, "QUEUED", "SKIP",
+                "already in active_sessions",
+            )
+            return LaunchResult(None, False, "Already in active sessions")
+        if self._session_exists(session_name):
+            log_transition(
+                "retrospective-review", issue_number, "QUEUED", "SKIP",
+                "terminal session already running",
+            )
+            return LaunchResult(
+                None, False, "Terminal session already running", keep_queued=True
+            )
+        return None
+
     def launch_retrospective_review_session(
         self,
         review: PendingRetrospectiveReview,
         active_sessions: list[Session],
     ) -> LaunchResult:
         """Launch a reviewer session to audit an existing implementation."""
+        if result := self._callback_endpoint_not_ready():
+            return result
         agent_label = (
             self.config.get_reviewer_for_agent(review.agent_label)
             if review.agent_label
@@ -1870,25 +1911,10 @@ class SessionLauncher:
             return result
 
         session_name = SessionRef.for_retrospective_review(review.issue_number).name
-        if any(s.terminal_id == session_name for s in active_sessions):
-            log_transition(
-                "retrospective-review",
-                review.issue_number,
-                "QUEUED",
-                "SKIP",
-                "already in active_sessions",
-            )
-            return LaunchResult(None, False, "Already in active sessions")
-
-        if self._session_exists(session_name):
-            log_transition(
-                "retrospective-review",
-                review.issue_number,
-                "QUEUED",
-                "SKIP",
-                "terminal session already running",
-            )
-            return LaunchResult(None, False, "Terminal session already running", keep_queued=True)
+        if result := self._retrospective_session_conflict(
+            session_name, review.issue_number, active_sessions
+        ):
+            return result
 
         if not self.config.repo:
             return LaunchResult(None, False, "No repo configured")
@@ -2121,6 +2147,8 @@ class SessionLauncher:
         active_sessions: list[Session],
     ) -> LaunchResult:
         """Launch a rework session to fix issues found in review."""
+        if result := self._callback_endpoint_not_ready():
+            return result
         deps = ReworkLaunchDependencies(
             config=self.config,
             events=self.events,
