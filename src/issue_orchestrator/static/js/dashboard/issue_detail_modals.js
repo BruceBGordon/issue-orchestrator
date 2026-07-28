@@ -142,3 +142,38 @@ function applyTimelineView(view) {
     return timelineView;
 }
 
+function isIssueDetailDrawerOpen() {
+    return Boolean(issueDetailDrawer) && issueDetailDrawer.classList.contains('visible');
+}
+
+// Single owner of the drawer's focus-return target.
+//
+// ``openIssueDetail`` is re-entrant: retiring the ``#timelineModal`` teleport
+// (#6421) means the Diagnose affordance now reloads the *already-visible*
+// drawer under the debug lens instead of opening a separate modal.  Capturing
+// ``document.activeElement`` on every entry would therefore overwrite the real
+// opener with whatever happened to be focused mid-session — for Diagnose the
+// popover link is already detached by ``closeArtifactPopover`` when the handler
+// runs, and for a plain reload it is the drawer's own close button.  Closing
+// would then strand focus on a removed node or inside the hidden drawer
+// instead of returning it to the card/timeline control the user came from.
+//
+// Rule: an explicit trigger always wins; the implicit ``document.activeElement``
+// capture happens only on the closed -> open transition.  Call this BEFORE the
+// drawer is marked visible.
+function captureIssueDetailReturnFocus(triggerEl) {
+    if (triggerEl) {
+        lastIssueDetailTrigger = triggerEl;
+    } else if (!isIssueDetailDrawerOpen()) {
+        lastIssueDetailTrigger = document.activeElement;
+    }
+    return lastIssueDetailTrigger;
+}
+
+function restoreIssueDetailReturnFocus() {
+    if (lastIssueDetailTrigger && typeof lastIssueDetailTrigger.focus === 'function') {
+        lastIssueDetailTrigger.focus();
+    }
+    return lastIssueDetailTrigger;
+}
+

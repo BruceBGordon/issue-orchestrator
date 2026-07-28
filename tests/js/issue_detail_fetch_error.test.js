@@ -47,6 +47,12 @@ function loadDrawer(fetchImpl) {
     const fetchCalls = [];
     const context = {
         console,
+        // Owned by issue_detail_modals.js, which this harness deliberately
+        // does not load. Focus-return behavior is covered by
+        // tests/js/issue_detail_focus_return.test.js.
+        captureIssueDetailReturnFocus() {},
+        restoreIssueDetailReturnFocus() {},
+        isIssueDetailDrawerOpen() { return false; },
         currentIssueDetailFocus: null,
         document: {
             activeElement: _element(),

@@ -2732,6 +2732,46 @@ def test_timeline_view_state_has_a_single_writer() -> None:
     assert "?view=${resolvedView}`" in toggle_body
 
 
+def test_issue_detail_focus_return_target_has_a_single_writer() -> None:
+    """``lastIssueDetailTrigger`` is only ever written by its owner.
+
+    Retiring the ``#timelineModal`` teleport (#6421) made the diagnostic
+    entrypoint reload the *already-visible* drawer, so ``openIssueDetail`` is
+    re-entrant while open.  Capturing ``document.activeElement`` on every entry
+    loses the opener — the Diagnose link is detached by
+    ``closeArtifactPopover`` before its handler runs — and closing then strands
+    keyboard focus.  The owner keys the implicit capture off the closed -> open
+    transition; a second writer would reintroduce the regression.
+
+    Behaviour is covered by ``tests/js/issue_detail_focus_return.test.js``;
+    this is the structural backstop.
+    """
+    js = _read(DASHBOARD_JS)
+
+    owner_body = _function_body(js, "captureIssueDetailReturnFocus")
+    assert "lastIssueDetailTrigger = triggerEl;" in owner_body
+    assert "lastIssueDetailTrigger = document.activeElement;" in owner_body
+    assert "} else if (!isIssueDetailDrawerOpen()) {" in owner_body, (
+        "the implicit capture must be gated on the drawer being closed"
+    )
+
+    writers = [
+        line.strip()
+        for line in js.splitlines()
+        if re.match(r"^\s*lastIssueDetailTrigger\s*=[^=]", line)
+    ]
+    assert writers == [
+        "lastIssueDetailTrigger = triggerEl;",
+        "lastIssueDetailTrigger = document.activeElement;",
+    ], (
+        "lastIssueDetailTrigger must be written only by "
+        f"captureIssueDetailReturnFocus; found writers: {writers}"
+    )
+
+    # Close restores through the same owner rather than reading the state.
+    assert "restoreIssueDetailReturnFocus();" in _function_body(js, "closeIssueDetail")
+
+
 def test_dashboard_timeline_views_match_generated_wire_enum() -> None:
     """The dashboard's accepted view set must not drift from the wire enum.
 

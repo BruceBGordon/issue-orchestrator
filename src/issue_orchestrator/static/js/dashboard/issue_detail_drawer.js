@@ -58,7 +58,9 @@ async function readIssueDetailFailureMessage(res) {
 
 async function openIssueDetail(issueNumber, triggerEl = null, opts = {}) {
     if (!issueDetailDrawer) return;
-    lastIssueDetailTrigger = triggerEl || document.activeElement;
+    // Must run before the drawer is marked visible below: the owner keys the
+    // implicit capture off the closed -> open transition.
+    captureIssueDetailReturnFocus(triggerEl);
     currentIssueDetailFocus = opts && opts.focus === 'timeline' ? 'timeline' : null;
     // ``opts.view`` lets an entrypoint open the drawer under an explicit
     // timeline lens (see ``DIAGNOSTIC_TIMELINE_VIEW``).  It is applied through
@@ -125,9 +127,7 @@ function closeIssueDetail() {
     currentIssueDetailFocus = null;
     issueDetailDrawer.classList.remove('visible');
     issueDetailDrawer.setAttribute('aria-hidden', 'true');
-    if (lastIssueDetailTrigger && typeof lastIssueDetailTrigger.focus === 'function') {
-        lastIssueDetailTrigger.focus();
-    }
+    restoreIssueDetailReturnFocus();
 }
 
 async function unblockFromDrawer() {
@@ -914,7 +914,7 @@ function applyIssueDetailInitialFocus() {
 }
 
 document.addEventListener('keydown', (event) => {
-    if (!issueDetailDrawer || !issueDetailDrawer.classList.contains('visible')) return;
+    if (!isIssueDetailDrawerOpen()) return;
     if (event.key === 'Escape') {
         event.preventDefault();
         closeIssueDetail();
