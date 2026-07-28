@@ -14,7 +14,6 @@ the orchestrator focused on coordination and main loop logic.
 """
 
 import logging
-import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
