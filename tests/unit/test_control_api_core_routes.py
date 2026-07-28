@@ -983,7 +983,7 @@ class TestControlAPIServer:
 
     def test_init_sets_attributes(self, mock_orchestrator):
         """Server initialization stores orchestrator and port."""
-        from issue_orchestrator.entrypoints.control_api import ControlAPIServer
+        from issue_orchestrator.entrypoints.control_api_server import ControlAPIServer
 
         server = ControlAPIServer(mock_orchestrator, port=8888)
 
@@ -992,7 +992,7 @@ class TestControlAPIServer:
 
     def test_init_uses_default_port(self, mock_orchestrator):
         """Server uses default port 19080 when not specified."""
-        from issue_orchestrator.entrypoints.control_api import ControlAPIServer
+        from issue_orchestrator.entrypoints.control_api_server import ControlAPIServer
 
         server = ControlAPIServer(mock_orchestrator)
 
@@ -1001,7 +1001,7 @@ class TestControlAPIServer:
     @pytest.mark.asyncio
     async def test_start_sets_global_orchestrator(self, mock_orchestrator):
         """Starting the server sets the global orchestrator reference."""
-        from issue_orchestrator.entrypoints.control_api import ControlAPIServer
+        from issue_orchestrator.entrypoints.control_api_server import ControlAPIServer
         import uvicorn
 
         server = ControlAPIServer(mock_orchestrator, port=19999)
@@ -1024,7 +1024,7 @@ class TestControlAPIServer:
     @pytest.mark.asyncio
     async def test_start_with_port_zero_reads_back_bound_port(self, mock_orchestrator):
         """When port=0, start() reads back the OS-assigned port."""
-        from issue_orchestrator.entrypoints.control_api import ControlAPIServer
+        from issue_orchestrator.entrypoints.control_api_server import ControlAPIServer
         import uvicorn
 
         api_server = ControlAPIServer(mock_orchestrator, port=0)
@@ -1050,7 +1050,7 @@ class TestControlAPIServer:
     @pytest.mark.asyncio
     async def test_stop_signals_server_exit(self, mock_orchestrator):
         """Stopping sets should_exit on the uvicorn server."""
-        from issue_orchestrator.entrypoints.control_api import ControlAPIServer
+        from issue_orchestrator.entrypoints.control_api_server import ControlAPIServer
         import asyncio
 
         server = ControlAPIServer(mock_orchestrator, port=19999)
@@ -1066,7 +1066,7 @@ class TestControlAPIServer:
     @pytest.mark.asyncio
     async def test_stop_handles_missing_server(self, mock_orchestrator):
         """Stopping when server is None does not raise."""
-        from issue_orchestrator.entrypoints.control_api import ControlAPIServer
+        from issue_orchestrator.entrypoints.control_api_server import ControlAPIServer
 
         server = ControlAPIServer(mock_orchestrator)
         # Set up internal state for testing stop() handles missing server (noqa: SLF001)

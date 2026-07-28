@@ -26,10 +26,10 @@ from typing import Any
 
 import uvicorn
 
+from ._auth_middleware import install_access_log_redaction
 from .control_api import (
     configure_api_token,
     control_app,
-    install_access_log_redaction,
 )
 from ..execution.process_control import ManagedProcess, list_processes_matching, spawn_tray_helper
 from ..infra import browser_session

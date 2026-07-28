@@ -15,10 +15,10 @@ from unittest.mock import MagicMock
 import pytest
 
 from issue_orchestrator.entrypoints.control_api import (
-    ControlAPIServer,
     get_orchestrator,
     set_orchestrator,
 )
+from issue_orchestrator.entrypoints.control_api_server import ControlAPIServer
 from issue_orchestrator.infra.agent_callback_endpoint import (
     RuntimeAgentCallbackEndpoint,
 )

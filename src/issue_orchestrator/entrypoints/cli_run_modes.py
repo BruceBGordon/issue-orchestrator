@@ -36,7 +36,7 @@ def declare_no_control_api(orchestrator, api_port: int | None) -> None:
 
 async def run_no_dashboard(orchestrator, api_port: int | None) -> None:
     """Run orchestrator without dashboard UI."""
-    from .control_api import ControlAPIServer
+    from .control_api_server import ControlAPIServer
 
     declare_no_control_api(orchestrator, api_port)
 
@@ -63,7 +63,7 @@ async def run_web_dashboard_mode(
     """Run orchestrator with web dashboard."""
     import signal
     from .web import run_with_web_dashboard, trigger_server_shutdown
-    from .control_api import ControlAPIServer
+    from .control_api_server import ControlAPIServer
 
     def handle_signal():
         if orchestrator.shutdown_requested:
@@ -106,7 +106,7 @@ async def run_tui_dashboard(
     orchestrator, config: "Config", api_port: int | None
 ) -> bool:
     """Run orchestrator with TUI dashboard."""
-    from .control_api import ControlAPIServer
+    from .control_api_server import ControlAPIServer
     from .dashboard import run_with_dashboard
 
     declare_no_control_api(orchestrator, api_port)
