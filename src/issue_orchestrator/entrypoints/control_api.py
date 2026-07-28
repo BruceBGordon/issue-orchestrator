@@ -68,6 +68,7 @@ from ._auth_middleware import (
     evaluate_request,
     handle_login_post,
     install_access_log_redaction,
+    is_agent_callback_route,
     issue_sse_token_response,
     resolve_browser_page_auth,
 )
@@ -188,38 +189,15 @@ _UNAUTHENTICATED_PATHS: frozenset[str] = frozenset({
 })
 _UNAUTHENTICATED_PREFIXES: tuple[str, ...] = ("/static/",)
 
-# Routes the agent-callback token is allowed to reach. Anything NOT in
-# this set requires the admin token.
-#
-# Honest scope: this allowlist limits what the agent-callback token
-# can do IF an agent holds only that token. It does NOT stop an
-# agent that reads ``~/.issue-orchestrator/api-token`` off the same
-# filesystem (agents run with the real HOME under the same user;
-# see issue #6024) from mutating any route. The callback token is
-# defense in depth — it narrows the default blast radius and is
-# the right shape for a future isolated-agent model — not a
-# privilege boundary against same-user agents today.
-_AGENT_CALLBACK_ROUTES: frozenset[str] = frozenset(
-    {"/api/preflight-push", "/api/review-exchange/respond"}
-)
-
-
-def _is_agent_callback_route(path: str) -> bool:
-    if path in _AGENT_CALLBACK_ROUTES:
-        return True
-    # ``/api/issues/{issue_number}/resume`` has a variable path segment;
-    # match by prefix + suffix rather than hardcoding every number.
-    if path.startswith("/api/issues/") and path.endswith("/resume"):
-        return True
-    return False
-
-
+# The agent-callback route allowlist lives in ``_auth_middleware`` so
+# every surface serving these routes answers identically — see that
+# module's docstring for why a per-surface copy was a defect (#6913).
 _CONTROL_API_SURFACE = AuthSurfaceConfig(
     sse_path="/api/events",
     public_paths=_UNAUTHENTICATED_PATHS,
     name="control_api",
     public_prefixes=_UNAUTHENTICATED_PREFIXES,
-    agent_callback_matcher=_is_agent_callback_route,
+    agent_callback_matcher=is_agent_callback_route,
 )
 
 

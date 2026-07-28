@@ -420,6 +420,87 @@ def test_mounted_control_route_accepts_dashboard_bearer(
 
 
 # ---------------------------------------------------------------------------
+# Agent-callback token on the dashboard surface (#6913).
+#
+# ``control_app`` is mounted at ``""``, so the agent-callback routes are
+# served on the dashboard port and the dashboard gate runs first. It
+# used to pass ``agent=None`` with no route matcher, so a *valid* agent
+# token was rejected on the only surface that served the route. The
+# round runner then read the undelivered verdict as an unresponsive
+# agent, SIGKILLed a healthy coder, and stranded validated work.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def agent_callback_tokens():
+    """Configure both surfaces with a real agent-callback token."""
+    from issue_orchestrator.entrypoints.control_api import (
+        configure_api_token,
+        get_configured_agent_callback_token,
+        get_configured_api_token,
+    )
+
+    prev_admin = get_configured_api_token()
+    prev_agent = get_configured_agent_callback_token()
+    configure_api_token("test-admin-token", agent_callback="test-agent-token")
+    try:
+        yield
+    finally:
+        configure_api_token(prev_admin, agent_callback=prev_agent)
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["/api/review-exchange/respond", "/api/preflight-push", "/api/issues/6410/resume"],
+)
+def test_agent_callback_token_reaches_allowlisted_route_on_dashboard(
+    authed_client: TestClient,
+    agent_callback_tokens: None,
+    path: str,
+) -> None:
+    """The scoped agent token must pass the dashboard gate on the
+    allowlisted routes. Any 401/403 here is the #6913 regression: the
+    agent holds a valid credential and still cannot deliver.
+    """
+    resp = authed_client.post(
+        path,
+        headers={"Authorization": "Bearer test-agent-token"},
+        json={},
+    )
+    assert resp.status_code not in (401, 403), (
+        f"agent-callback token rejected on {path}: "
+        f"{resp.status_code} {resp.text}"
+    )
+
+
+def test_agent_callback_token_still_rejected_off_allowlist(
+    authed_client: TestClient,
+    agent_callback_tokens: None,
+) -> None:
+    """Honouring the token must not widen it into an admin credential."""
+    resp = authed_client.post(
+        "/api/shutdown",
+        headers={"Authorization": "Bearer test-agent-token"},
+    )
+    assert resp.status_code in (401, 403), resp.text
+
+
+def test_dashboard_and_control_api_share_one_agent_callback_allowlist() -> None:
+    """Both surfaces must answer the allowlist question identically.
+
+    A per-surface copy is what drifted in #6913; pin that they are the
+    same predicate rather than two lists that merely look alike today.
+    """
+    from issue_orchestrator.entrypoints.control_api import _CONTROL_API_SURFACE
+    from issue_orchestrator.entrypoints.web import _DASHBOARD_SURFACE
+
+    assert (
+        _DASHBOARD_SURFACE.agent_callback_matcher
+        is _CONTROL_API_SURFACE.agent_callback_matcher
+    )
+
+
+# ---------------------------------------------------------------------------
 # Browser-session policy ownership — the dashboard must honor the
 # operator-set ``ui.browser_session.*`` values, not silently fall
 # back to the module defaults (#6041 re-review P2).
@@ -473,6 +554,64 @@ def test_dashboard_startup_honors_browser_session_config(
             sse_token_ttl_seconds=previous_sse,
             max_sessions=previous_max,
         )
+
+
+def test_engine_startup_configures_control_api_agent_callback_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``run_orchestrator`` serves ``control_app`` mounted under the
+    dashboard app, so it must configure the Control API tokens too.
+
+    It previously configured only the dashboard admin token, leaving
+    ``_agent_callback_token = None`` in the engine process — so even a
+    request that got past the outer gate had nothing to match against.
+    Agents could never deliver a verdict to the running engine (#6913).
+    """
+    from dataclasses import dataclass
+
+    from issue_orchestrator.entrypoints.control_api import (
+        configure_api_token,
+        get_configured_agent_callback_token,
+        get_configured_api_token,
+    )
+    from issue_orchestrator.entrypoints.run_orchestrator import (
+        _configure_dashboard_auth,
+    )
+    from issue_orchestrator.entrypoints.web import (
+        configure_dashboard_admin_token,
+        get_configured_dashboard_admin_token,
+    )
+
+    @dataclass
+    class _FakeConfig:
+        browser_session_ttl_seconds: int = 900
+        sse_token_ttl_seconds: int = 10
+        browser_session_max: int = 7
+
+    monkeypatch.setenv(
+        "ISSUE_ORCHESTRATOR_API_TOKEN",
+        "bootstrap-admin-token-that-is-long-enough",
+    )
+    monkeypatch.setenv(
+        "ISSUE_ORCHESTRATOR_AGENT_CALLBACK_TOKEN",
+        "bootstrap-agent-token-that-is-long-enough",
+    )
+
+    prev_dashboard = get_configured_dashboard_admin_token()
+    prev_admin = get_configured_api_token()
+    prev_agent = get_configured_agent_callback_token()
+    try:
+        _configure_dashboard_auth(dev_no_auth=False, config=_FakeConfig())
+        assert (
+            get_configured_agent_callback_token()
+            == "bootstrap-agent-token-that-is-long-enough"
+        )
+        assert get_configured_api_token() == (
+            "bootstrap-admin-token-that-is-long-enough"
+        )
+    finally:
+        configure_dashboard_admin_token(prev_dashboard)
+        configure_api_token(prev_admin, agent_callback=prev_agent)
 
 
 def test_cookie_minted_via_cc_login_works_on_dashboard() -> None:

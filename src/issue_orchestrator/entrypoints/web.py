@@ -25,6 +25,7 @@ from ._auth_middleware import (
     AuthSurfaceConfig,
     evaluate_request,
     handle_login_post,
+    is_agent_callback_route,
     issue_sse_token_response,
 )
 from .brand_assets import read_logo_svg
@@ -110,11 +111,16 @@ _DASHBOARD_UNAUTHENTICATED_PATHS: frozenset[str] = frozenset({
 })
 _DASHBOARD_UNAUTHENTICATED_PREFIXES: tuple[str, ...] = ("/static/",)
 
+# This app mounts ``control_app`` at ``""`` (see the bottom of this
+# module), so the agent-callback routes are served on the dashboard
+# port and *this* gate is the first one they hit. It must therefore
+# honour the same allowlist the Control API does — see #6913.
 _DASHBOARD_SURFACE = AuthSurfaceConfig(
     sse_path="/api/events",
     public_paths=_DASHBOARD_UNAUTHENTICATED_PATHS,
     name="web_dashboard",
     public_prefixes=_DASHBOARD_UNAUTHENTICATED_PREFIXES,
+    agent_callback_matcher=is_agent_callback_route,
 )
 
 
@@ -140,12 +146,21 @@ async def _dashboard_auth_middleware(  # pyright: ignore[reportUnusedFunction]
 ) -> Response:
     """Enforce dashboard auth via the shared three-path gate.
 
-    The mounted ``control_app`` has its own middleware — requests to
-    ``/control/*`` flow through both gates, which is intentional
-    defense in depth.
+    ``control_app`` is mounted at ``""`` (bottom of this module), so its
+    routes are served here and flow through both gates — intentional
+    defense in depth. That also means agent-callback requests reach
+    *this* gate first, so it must know the agent-callback token; passing
+    ``None`` here rejected every valid agent callback before the inner
+    gate ever ran (#6913). The token is read from the Control API rather
+    than mirrored, so the two surfaces cannot drift apart.
     """
+    from .control_api import get_configured_agent_callback_token
+
     gate_response = evaluate_request(
-        request, _dashboard_admin_token, None, _DASHBOARD_SURFACE
+        request,
+        _dashboard_admin_token,
+        get_configured_agent_callback_token(),
+        _DASHBOARD_SURFACE,
     )
     if gate_response is not None:
         return gate_response

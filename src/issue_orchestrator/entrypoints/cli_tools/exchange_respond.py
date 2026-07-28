@@ -47,10 +47,22 @@ def _routing_key() -> str | None:
 
 
 def _api_port() -> str | None:
-    port = os.environ.get("ISSUE_ORCHESTRATOR_API_PORT") or os.environ.get(
-        "ORCHESTRATOR_API_PORT"
-    )
-    return port.strip() if port else None
+    """Resolve the port serving the Control API, ignoring the 0 sentinel.
+
+    ``control_api_port: 0`` means "bind any free port", so a literal
+    ``"0"`` in the environment is a request, never a reachable
+    destination. Treating it as a port made this fall through to
+    ``http://localhost:0`` and shadowed the live port the review
+    exchange injects as ``ORCHESTRATOR_API_PORT`` (#6913).
+    """
+    for name in ("ISSUE_ORCHESTRATOR_API_PORT", "ORCHESTRATOR_API_PORT"):
+        raw = os.environ.get(name)
+        if raw is None:
+            continue
+        port = raw.strip()
+        if port and port != "0":
+            return port
+    return None
 
 
 def build_parser() -> argparse.ArgumentParser:

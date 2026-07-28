@@ -645,7 +645,20 @@ def run_preflight_push_check(worktree: Path, verbose: bool = False) -> tuple[boo
 
     # Get orchestrator port from environment
     # Support prefixed orchestrator env var first, with legacy fallback.
-    port = get_env("API_PORT") or os.environ.get("ORCHESTRATOR_API_PORT")
+    # ``"0"`` is the auto-assign sentinel, not a reachable port — treat
+    # it as unset so this skips honestly instead of dialling
+    # ``localhost:0`` and reporting a connection failure (#6913).
+    port = next(
+        (
+            candidate.strip()
+            for candidate in (
+                get_env("API_PORT"),
+                os.environ.get("ORCHESTRATOR_API_PORT"),
+            )
+            if candidate and candidate.strip() and candidate.strip() != "0"
+        ),
+        None,
+    )
     if not port:
         # No port configured - skip preflight check
         # This happens when running coding-done/reviewer-done outside orchestrator context

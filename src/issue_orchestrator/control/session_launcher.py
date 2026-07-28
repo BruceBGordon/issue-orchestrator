@@ -439,6 +439,14 @@ class SessionLauncher:
         orch_bin = Path(sys.executable).parent
         orch_src = Path(__file__).resolve().parents[2]
         runtime_tool_assignments = " ".join(build_agent_tool_env_assignments(worktree_path))
+        # ``control_api_port: 0`` means "bind any free port", so it is a
+        # request, not a destination. Exporting the literal 0 handed
+        # agents an unreachable port that *looked* configured and
+        # shadowed the live port injected per-exchange (#6913); omit it
+        # instead so consumers see "unset" and fail honestly.
+        port_export = ""
+        if self.config.control_api_port != 0:
+            port_export = f" {ENV_PREFIX}API_PORT='{self.config.control_api_port}'"
         config_exports = ""
         if self.config.config_path is not None:
             config_name = self.config.config_path.name
@@ -453,7 +461,7 @@ class SessionLauncher:
             f" {ENV_PREFIX}AGENT_LABEL='{agent_label}'"
             f" {ENV_PREFIX}ISSUE_NUMBER='{issue_number}'"
             f"{config_exports}"
-            f" {ENV_PREFIX}API_PORT='{self.config.control_api_port}'"
+            f"{port_export}"
             f" {ENV_PREFIX}VALIDATION_OUTPUT_DIR='{run_assets.run_dir}'"
             f" {ENV_PREFIX}RUN_DIR='{run_assets.run_dir}'"
             f" {ENV_PREFIX}WORKTREE='{worktree_path}'"

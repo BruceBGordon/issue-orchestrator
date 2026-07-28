@@ -164,9 +164,10 @@ def _configure_dashboard_auth(dev_no_auth: bool, config: Any) -> None:
     the built-in defaults while the Control API honored the config —
     the same rule enforced differently by path.
     """
+    from ..entrypoints.control_api import configure_api_token
     from ..entrypoints.web import configure_dashboard_admin_token
     from ..infra import browser_session
-    from ..infra.api_token import resolve_api_token
+    from ..infra.api_token import resolve_agent_callback_token, resolve_api_token
 
     session_ttl = getattr(config, "browser_session_ttl_seconds", None)
     sse_ttl = getattr(config, "sse_token_ttl_seconds", None)
@@ -186,6 +187,7 @@ def _configure_dashboard_auth(dev_no_auth: bool, config: Any) -> None:
             flush=True,
         )
         configure_dashboard_admin_token(None)
+        configure_api_token(None, agent_callback=None)
         os.environ.pop("ISSUE_ORCHESTRATOR_API_TOKEN", None)
         browser_session.initialize(
             session_ttl_seconds=session_ttl,
@@ -195,6 +197,12 @@ def _configure_dashboard_auth(dev_no_auth: bool, config: Any) -> None:
         return
     admin_token = resolve_api_token()
     configure_dashboard_admin_token(admin_token)
+    # This process serves ``control_app`` mounted under the dashboard
+    # app, so it must configure the Control API tokens too. Without
+    # this the engine held no agent-callback token at all and every
+    # agent callback — ``exchange-respond``, ``preflight-push`` — was
+    # rejected on the only surface that served it (#6913).
+    configure_api_token(admin_token, agent_callback=resolve_agent_callback_token())
     # Derive the HMAC secret from the admin token so a session cookie
     # minted by the Control Center on port 19080 validates here too —
     # one login covers both processes.

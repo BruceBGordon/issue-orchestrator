@@ -20,6 +20,16 @@ This module owns:
 - ``render_login_page`` — the minimal self-contained login form that
   both ``/`` handlers fall back to when the visitor has no session.
 
+It also owns ``is_agent_callback_route`` — the single allowlist of
+routes the scoped agent-callback token may reach. Both surfaces must
+answer that question identically: the Web Dashboard mounts
+``control_app`` at ``""``, so the agent-callback routes are served on
+the dashboard port and the dashboard's gate runs *first*. When the two
+surfaces disagreed, a valid agent token was rejected on the only port
+that actually served the route (#6913) — a delivery failure the round
+runner then misread as an unresponsive agent, destroying validated
+work. One owner, one answer.
+
 It does NOT own the admin / agent-callback token state. Each app
 configures its own tokens via ``configure_api_token`` (Control API)
 or ``configure_dashboard_admin_token`` (Web Dashboard); they typically
@@ -41,6 +51,37 @@ from ..infra import browser_session
 from ..infra.api_token import verify_token
 
 logger = logging.getLogger(__name__)
+
+# Routes the agent-callback token is allowed to reach. Anything NOT in
+# this set requires the admin token.
+#
+# Honest scope: this allowlist limits what the agent-callback token
+# can do IF an agent holds only that token. It does NOT stop an
+# agent that reads ``~/.issue-orchestrator/api-token`` off the same
+# filesystem (agents run with the real HOME under the same user;
+# see issue #6024) from mutating any route. The callback token is
+# defense in depth — it narrows the default blast radius and is
+# the right shape for a future isolated-agent model — not a
+# privilege boundary against same-user agents today.
+_AGENT_CALLBACK_ROUTES: frozenset[str] = frozenset(
+    {"/api/preflight-push", "/api/review-exchange/respond"}
+)
+
+
+def is_agent_callback_route(path: str) -> bool:
+    """Whether ``path`` is reachable with the scoped agent-callback token.
+
+    Shared by every surface that serves these routes. The Web Dashboard
+    mounts ``control_app`` at ``""``, so it serves them too and must
+    apply the same answer — see the module docstring.
+    """
+    if path in _AGENT_CALLBACK_ROUTES:
+        return True
+    # ``/api/issues/{issue_number}/resume`` has a variable path segment;
+    # match by prefix + suffix rather than hardcoding every number.
+    if path.startswith("/api/issues/") and path.endswith("/resume"):
+        return True
+    return False
 
 
 BROWSER_SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})

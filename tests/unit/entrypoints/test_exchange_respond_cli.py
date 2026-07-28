@@ -10,6 +10,7 @@ from __future__ import annotations
 import pytest
 
 from issue_orchestrator.entrypoints.cli_tools.exchange_respond import (
+    _api_port,
     _deliver,
     build_parser,
     build_verdict,
@@ -114,3 +115,43 @@ def test_deliver_reports_malformed_success_body(monkeypatch: pytest.MonkeyPatch)
 
     assert accepted is False
     assert "malformed response JSON" in message
+
+
+class TestApiPortResolution:
+    """``control_api_port: 0`` means "bind any free port".
+
+    A literal ``"0"`` in the environment is therefore a request, never a
+    reachable destination. Because ``"0"`` is a truthy string, the old
+    ``or`` chain returned it and the CLI dialled ``http://localhost:0``,
+    shadowing the live port the review exchange injects as
+    ``ORCHESTRATOR_API_PORT``. That made every verdict undeliverable
+    (#6913).
+    """
+
+    def test_sentinel_zero_falls_through_to_live_port(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("ISSUE_ORCHESTRATOR_API_PORT", "0")
+        monkeypatch.setenv("ORCHESTRATOR_API_PORT", "59957")
+        assert _api_port() == "59957"
+
+    def test_sentinel_zero_alone_is_unset(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("ISSUE_ORCHESTRATOR_API_PORT", "0")
+        monkeypatch.delenv("ORCHESTRATOR_API_PORT", raising=False)
+        assert _api_port() is None
+
+    def test_real_prefixed_port_still_wins(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("ISSUE_ORCHESTRATOR_API_PORT", "8080")
+        monkeypatch.setenv("ORCHESTRATOR_API_PORT", "59957")
+        assert _api_port() == "8080"
+
+    def test_unset_everywhere_is_none(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("ISSUE_ORCHESTRATOR_API_PORT", raising=False)
+        monkeypatch.delenv("ORCHESTRATOR_API_PORT", raising=False)
+        assert _api_port() is None
