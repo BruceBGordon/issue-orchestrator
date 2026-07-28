@@ -33,6 +33,9 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from issue_orchestrator.infra.agent_callback_endpoint import (
+    RuntimeAgentCallbackEndpoint,
+)
 from issue_orchestrator.control.completion_review_exchange import (
     CompletionReviewExchange,
 )
@@ -399,6 +402,7 @@ def test_persistent_review_exchange_end_to_end_through_completion_owner(
 
     pair_registry = InMemoryPersistentExchangePairRegistry()
     cre = CompletionReviewExchange(
+        agent_callback_endpoint=RuntimeAgentCallbackEndpoint(),
         config=config,
         session_output=session_output,
         emit_review_started=_emit_started,
@@ -540,6 +544,7 @@ def test_persistent_review_exchange_multi_round_changes_then_ok(
 
     _session_output_for_test = FileSystemSessionOutput()
     cre = CompletionReviewExchange(
+        agent_callback_endpoint=RuntimeAgentCallbackEndpoint(),
         config=config,
         session_output=_session_output_for_test,
         emit_review_started=lambda **_: None,
@@ -629,6 +634,7 @@ def test_codex_shaped_interactive_agent_receives_argv_bootstrap_then_pty_rounds(
 
     session_output = FileSystemSessionOutput()
     cre = CompletionReviewExchange(
+        agent_callback_endpoint=RuntimeAgentCallbackEndpoint(),
         config=config,
         session_output=session_output,
         emit_review_started=lambda **_: None,
@@ -776,6 +782,7 @@ def test_synthetic_raw_tui_review_exchange_suppresses_bootstrap_response(
 
     session_output = FileSystemSessionOutput()
     cre = CompletionReviewExchange(
+        agent_callback_endpoint=RuntimeAgentCallbackEndpoint(),
         config=config,
         session_output=session_output,
         emit_review_started=lambda **_: None,
@@ -893,6 +900,7 @@ def test_real_interactive_codex_reviewer_round_trips_through_exchange(
     ):
         config.control_api_port = port
         cre = CompletionReviewExchange(
+            agent_callback_endpoint=RuntimeAgentCallbackEndpoint(),
             config=config,
             session_output=session_output,
             emit_review_started=lambda **_: None,
@@ -991,6 +999,7 @@ def test_one_shot_reviewer_respawns_after_addressable_nits(
     pair_registry = pair_registry_with_cleanup
     session_output = FileSystemSessionOutput()
     cre = CompletionReviewExchange(
+        agent_callback_endpoint=RuntimeAgentCallbackEndpoint(),
         config=config,
         session_output=session_output,
         emit_review_started=lambda **_: None,
@@ -1093,6 +1102,7 @@ def test_one_shot_coder_respawns_for_later_rework_turn(
     pair_registry = pair_registry_with_cleanup
     session_output = FileSystemSessionOutput()
     cre = CompletionReviewExchange(
+        agent_callback_endpoint=RuntimeAgentCallbackEndpoint(),
         config=config,
         session_output=session_output,
         emit_review_started=lambda **_: None,
@@ -1170,6 +1180,7 @@ def test_persistent_review_exchange_max_rounds_exhausted(
 
     _session_output_for_test = FileSystemSessionOutput()
     cre = CompletionReviewExchange(
+        agent_callback_endpoint=RuntimeAgentCallbackEndpoint(),
         config=config,
         session_output=_session_output_for_test,
         emit_review_started=lambda **_: None,
@@ -1270,6 +1281,7 @@ def test_two_rework_rounds_render_distinguishably_in_projected_timeline(
 
     _session_output_for_test = FileSystemSessionOutput()
     cre = CompletionReviewExchange(
+        agent_callback_endpoint=RuntimeAgentCallbackEndpoint(),
         config=config,
         session_output=_session_output_for_test,
         emit_review_started=lambda **_: None,
@@ -1376,6 +1388,7 @@ def test_persistent_pair_respawns_for_second_exchange_run(
     pair_registry = pair_registry_with_cleanup
     session_output = FileSystemSessionOutput()
     cre = CompletionReviewExchange(
+        agent_callback_endpoint=RuntimeAgentCallbackEndpoint(),
         config=config,
         session_output=session_output,
         emit_review_started=lambda **_: None,
@@ -1544,6 +1557,7 @@ def test_persistent_pair_response_and_completion_paths_stable_across_exchanges(
     pair_registry = pair_registry_with_cleanup
     session_output = FileSystemSessionOutput()
     cre = CompletionReviewExchange(
+        agent_callback_endpoint=RuntimeAgentCallbackEndpoint(),
         config=config,
         session_output=session_output,
         emit_review_started=lambda **_: None,
@@ -1723,6 +1737,7 @@ def test_persistent_review_exchange_end_to_end_through_mailbox(
             turn_mailbox=mailbox,
         )
         cre = CompletionReviewExchange(
+            agent_callback_endpoint=RuntimeAgentCallbackEndpoint(),
             config=config,
             session_output=session_output,
             emit_review_started=lambda **_: None,
