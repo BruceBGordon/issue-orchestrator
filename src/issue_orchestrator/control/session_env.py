@@ -17,6 +17,7 @@ import sys
 from pathlib import Path
 from typing import Protocol
 
+from ..infra.agent_callback_endpoint import resolve_agent_callback_port
 from ..infra.env import ENV_PREFIX
 from .isolation import build_agent_tool_env_assignments
 
@@ -29,20 +30,22 @@ class SessionEnvConfig(Protocol):
 
 
 def api_port_export(control_api_port: int) -> str:
-    """Render the Control API port export, omitting the 0 sentinel.
+    """Render the Control API port export agents call back on.
 
-    ``control_api_port: 0`` means "bind any free port" — a request, not
-    a destination. Exporting the literal 0 handed agents an unreachable
-    ``ISSUE_ORCHESTRATOR_API_PORT=0`` that *looked* configured and, being
-    a truthy string, shadowed the live port the review exchange injects
-    as ``ORCHESTRATOR_API_PORT``. Agent callbacks then dialled
-    ``localhost:0`` and every verdict was undeliverable (#6913).
+    Resolved through the bound-endpoint owner, so agents get the port
+    that is actually listening. ``control_api_port: 0`` means "bind any
+    free port" and the supervised engine never writes the real port back
+    into ``Config`` — exporting the configured value handed agents an
+    unreachable ``localhost:0`` and made every callback fail (#6924).
 
-    Omitting it lets consumers see "unset" and fail honestly.
+    When nothing is bound and nothing is configured there is genuinely
+    no endpoint, so the variable is omitted rather than set to a
+    sentinel that merely looks configured.
     """
-    if control_api_port == 0:
+    port = resolve_agent_callback_port(control_api_port)
+    if port is None:
         return ""
-    return f" {ENV_PREFIX}API_PORT='{control_api_port}'"
+    return f" {ENV_PREFIX}API_PORT='{port}'"
 
 
 def config_exports(config_path: Path | None) -> str:

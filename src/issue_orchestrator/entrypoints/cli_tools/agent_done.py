@@ -56,7 +56,7 @@ from ...domain.artifact_contracts import ValidationFailed, ValidationPassed
 from ...domain.session_run import ValidationArtifactPaths
 from ...execution.run_evidence import RunEvidenceRecorder
 from ...execution.session_output_adapter import FileSystemSessionOutput
-from .orchestrator_resume import (
+from .agent_callback import (
     api_request_headers as _api_request_headers,
     resolve_control_api_port as _resolve_control_api_port,
 )

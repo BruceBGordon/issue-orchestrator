@@ -13,6 +13,8 @@ reachable with no credentials.
 
 from __future__ import annotations
 
+import os
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -493,16 +495,61 @@ def test_agent_callback_token_still_rejected_off_allowlist(
     assert resp.status_code in (401, 403), resp.text
 
 
-def test_dashboard_own_resume_route_is_not_an_agent_callback_route() -> None:
-    """Pin the near-miss at the predicate, not just over HTTP."""
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/api/resume",
+        "/resume",
+        "/api/issues/6410/kill",
+        # Non-numeric and extra-segment near misses. These 404 today, but
+        # a prefix+suffix match authorized them at the *auth* layer, so a
+        # future admin route of this shape would silently inherit
+        # agent-token access (#6924 F3).
+        "/api/issues/not-an-int/resume",
+        "/api/issues/6410/extra/resume",
+        "/api/issues//resume",
+        "/api/issues/6410/resume/extra",
+    ],
+)
+def test_near_miss_paths_are_not_agent_callback_routes(path: str) -> None:
+    """Pin the allowlist to the declared route template exactly."""
+    from issue_orchestrator.entrypoints._auth_middleware import (
+        is_agent_callback_route,
+    )
+
+    assert is_agent_callback_route(path) is False, f"{path} must require admin"
+
+
+def test_declared_resume_template_is_an_agent_callback_route() -> None:
     from issue_orchestrator.entrypoints._auth_middleware import (
         is_agent_callback_route,
     )
 
     assert is_agent_callback_route("/api/issues/6410/resume") is True
-    assert is_agent_callback_route("/api/resume") is False
-    assert is_agent_callback_route("/resume") is False
-    assert is_agent_callback_route("/api/issues/6410/kill") is False
+    assert is_agent_callback_route("/api/issues/1/resume") is True
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/api/issues/not-an-int/resume",
+        "/api/issues/6410/extra/resume",
+        "/api/issues/6410/resume/extra",
+    ],
+)
+def test_near_miss_paths_rejected_over_http(
+    authed_client: TestClient,
+    agent_callback_tokens: None,
+    path: str,
+) -> None:
+    """The same near misses, asserted through the real auth middleware."""
+    resp = authed_client.post(
+        path,
+        headers={"Authorization": "Bearer test-agent-token"},
+    )
+    assert resp.status_code in (401, 403), (
+        f"{path} passed auth with an agent-callback token: {resp.status_code}"
+    )
 
 
 def test_dashboard_and_control_api_share_one_agent_callback_allowlist() -> None:
@@ -612,23 +659,65 @@ def test_engine_startup_configures_control_api_agent_callback_token(
         "ISSUE_ORCHESTRATOR_API_TOKEN",
         "bootstrap-admin-token-that-is-long-enough",
     )
-    monkeypatch.setenv(
-        "ISSUE_ORCHESTRATOR_AGENT_CALLBACK_TOKEN",
-        "bootstrap-agent-token-that-is-long-enough",
-    )
+    # Deliberately ABSENT. Pre-seeding this made the earlier version of
+    # this test vacuous: it could not tell "the engine published the
+    # token" from "the token happened to be inherited" (#6924 F2).
+    monkeypatch.delenv("ISSUE_ORCHESTRATOR_AGENT_CALLBACK_TOKEN", raising=False)
 
     prev_dashboard = get_configured_dashboard_admin_token()
     prev_admin = get_configured_api_token()
     prev_agent = get_configured_agent_callback_token()
     try:
         _configure_dashboard_auth(dev_no_auth=False, config=_FakeConfig())
-        assert (
-            get_configured_agent_callback_token()
-            == "bootstrap-agent-token-that-is-long-enough"
-        )
+        configured = get_configured_agent_callback_token()
+        assert configured, "engine must configure an agent-callback token"
         assert get_configured_api_token() == (
             "bootstrap-admin-token-that-is-long-enough"
         )
+        # The same value must reach agent subprocesses, which inherit it
+        # from the process environment via ``agent_runner_env``.
+        assert os.environ.get("ISSUE_ORCHESTRATOR_AGENT_CALLBACK_TOKEN") == configured, (
+            "the API demands a secret its agents never receive"
+        )
+    finally:
+        configure_dashboard_admin_token(prev_dashboard)
+        configure_api_token(prev_admin, agent_callback=prev_agent)
+
+
+def test_dev_no_auth_clears_the_agent_callback_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Agents must not carry a secret the now-open API does not enforce."""
+    from dataclasses import dataclass
+
+    from issue_orchestrator.entrypoints.control_api import (
+        configure_api_token,
+        get_configured_agent_callback_token,
+        get_configured_api_token,
+    )
+    from issue_orchestrator.entrypoints.run_orchestrator import (
+        _configure_dashboard_auth,
+    )
+    from issue_orchestrator.entrypoints.web import (
+        configure_dashboard_admin_token,
+        get_configured_dashboard_admin_token,
+    )
+
+    @dataclass
+    class _FakeConfig:
+        browser_session_ttl_seconds: int = 900
+        sse_token_ttl_seconds: int = 10
+        browser_session_max: int = 7
+
+    monkeypatch.setenv("ISSUE_ORCHESTRATOR_AGENT_CALLBACK_TOKEN", "stale-agent-token")
+
+    prev_dashboard = get_configured_dashboard_admin_token()
+    prev_admin = get_configured_api_token()
+    prev_agent = get_configured_agent_callback_token()
+    try:
+        _configure_dashboard_auth(dev_no_auth=True, config=_FakeConfig())
+        assert get_configured_agent_callback_token() is None
+        assert "ISSUE_ORCHESTRATOR_AGENT_CALLBACK_TOKEN" not in os.environ
     finally:
         configure_dashboard_admin_token(prev_dashboard)
         configure_api_token(prev_admin, agent_callback=prev_agent)

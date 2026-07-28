@@ -1,4 +1,9 @@
-"""Control API resume helper for agent completion commands."""
+"""Control API resume helper for agent completion commands.
+
+Generic callback plumbing (endpoint resolution, auth headers) lives in
+:mod:`.agent_callback`; this module owns only the resume command. The
+names are re-exported for existing importers.
+"""
 
 from __future__ import annotations
 
@@ -12,63 +17,12 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ...infra.env import ENV_PREFIX, get_env
-
-
-@dataclass(frozen=True, slots=True)
-class ApiHeader:
-    """One HTTP header for an agent-scoped Control API callback."""
-
-    name: str
-    value: str
-
-
-@dataclass(frozen=True, slots=True)
-class ApiRequestHeaders:
-    """Typed HTTP headers for an agent-scoped Control API callback."""
-
-    headers: tuple[ApiHeader, ...]
-
-    @classmethod
-    def from_agent_environment(cls) -> "ApiRequestHeaders":
-        values = [ApiHeader("Content-Type", "application/json")]
-        token = os.environ.get("ISSUE_ORCHESTRATOR_AGENT_CALLBACK_TOKEN")
-        if token:
-            values.append(ApiHeader("Authorization", f"Bearer {token}"))
-        return cls(headers=tuple(values))
-
-    def to_mutable_mapping(self) -> MutableMapping[str, str]:
-        """Project to the mutable mapping required by ``urllib``."""
-        return {header.name: header.value for header in self.headers}
-
-
-def api_request_headers() -> ApiRequestHeaders:
-    """Build Control API request headers for agent-scoped callbacks."""
-    return ApiRequestHeaders.from_agent_environment()
-
-
-def resolve_control_api_port() -> str | None:
-    """Resolve the port serving the Control API, or ``None`` if unset.
-
-    Single owner for the rule every agent callback needs, so the three
-    callback paths (``exchange-respond``, preflight-push, resume) cannot
-    answer it differently.
-
-    ``control_api_port: 0`` means "bind any free port", so a literal
-    ``"0"`` is a request, never a reachable destination. It is also a
-    *truthy* string, so a naive ``a or b`` chain returns it and shadows
-    the live port the review exchange injects as
-    ``ORCHESTRATOR_API_PORT`` — which is how every verdict became
-    undeliverable (#6913). Treat it as unset so callers fail honestly
-    instead of dialling ``localhost:0``.
-    """
-    for name in ("ISSUE_ORCHESTRATOR_API_PORT", "ORCHESTRATOR_API_PORT"):
-        raw = os.environ.get(name)
-        if raw is None:
-            continue
-        port = raw.strip()
-        if port and port != "0":
-            return port
-    return None
+from .agent_callback import (
+    ApiHeader,
+    ApiRequestHeaders,
+    api_request_headers,
+    resolve_control_api_port,
+)
 
 
 @dataclass(frozen=True, slots=True)

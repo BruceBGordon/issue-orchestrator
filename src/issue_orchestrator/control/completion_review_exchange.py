@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
 from ..domain.models import CompletionRecord, RequestedAction
+from ..infra.agent_callback_endpoint import resolve_agent_callback_port
 from ..domain.completion_finalization import ReviewExchangeRunningQuery
 from ..domain.review_exchange_run import ReviewExchangeRun, ReviewExchangeRunAssets
 from ..domain.review_exchange_resume import ResumeDecision
@@ -1307,7 +1308,11 @@ class CompletionReviewExchange:
             require_validation=self._config.review_exchange_require_validation,
             nit_policy=nit_policy,
             initial_validation_record_path=initial_validation_record_path,
-            web_port=self._config.control_api_port,
+            # Through the bound-endpoint owner, not the configured
+            # value: the engine binds an auto-assigned port and never
+            # writes it back into Config, so the raw value is 0 and the
+            # exchange exported an undialable port (#6924).
+            web_port=resolve_agent_callback_port(self._config.control_api_port),
             events=events,
             event_context=event_context,
         )

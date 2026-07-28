@@ -67,6 +67,15 @@ _AGENT_CALLBACK_ROUTES: frozenset[str] = frozenset(
     {"/api/preflight-push", "/api/review-exchange/respond"}
 )
 
+# ``/api/issues/{issue_number}/resume`` has a variable segment, so it is
+# matched against the declared route template exactly. A prefix+suffix
+# test also authorized shapes like ``/api/issues/x/extra/resume``; those
+# 404 today, but a future admin route of that shape would silently
+# inherit agent-token access (#6924 F3).
+_AGENT_CALLBACK_ROUTE_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"^/api/issues/\d+/resume$"),
+)
+
 
 def is_agent_callback_route(path: str) -> bool:
     """Whether ``path`` is reachable with the scoped agent-callback token.
@@ -77,11 +86,10 @@ def is_agent_callback_route(path: str) -> bool:
     """
     if path in _AGENT_CALLBACK_ROUTES:
         return True
-    # ``/api/issues/{issue_number}/resume`` has a variable path segment;
-    # match by prefix + suffix rather than hardcoding every number.
-    if path.startswith("/api/issues/") and path.endswith("/resume"):
-        return True
-    return False
+    return any(
+        pattern.match(path) is not None
+        for pattern in _AGENT_CALLBACK_ROUTE_PATTERNS
+    )
 
 
 BROWSER_SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})

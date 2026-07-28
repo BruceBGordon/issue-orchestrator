@@ -30,7 +30,7 @@ import urllib.error
 import urllib.request
 
 from ...domain.review_exchange_verdict import ExchangeVerdict
-from .orchestrator_resume import api_request_headers, resolve_control_api_port
+from .agent_callback import api_request_headers, resolve_control_api_port
 
 _VALID_RESPONSE_TYPES = ("ok", "changes_requested", "disagree")
 
