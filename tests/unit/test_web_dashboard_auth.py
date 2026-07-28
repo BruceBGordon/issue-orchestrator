@@ -610,4 +610,3 @@ def test_cookie_minted_via_cc_login_works_on_dashboard() -> None:
         bs_module.shutdown()
         configure_api_token(prev_admin, agent_callback=prev_agent)
         configure_dashboard_admin_token(prev_dashboard)
-

@@ -24,6 +24,7 @@ from uuid import uuid4
 
 from ..control.background_job_supervisor import BackgroundJobSupervisor
 from ..infra.agent_callback_endpoint import RuntimeAgentCallbackEndpoint
+from .bootstrap_session_launcher import build_session_launcher_factory
 from .bootstrap_completion import (
     _validation_attempt_key_factory,
     create_completion_components,
@@ -821,6 +822,26 @@ def build_orchestrator(
     )
 
     # Bundle all dependencies into OrchestratorDeps (no nulls, no optionals)
+    # Assembly of the session launcher lives here, at the composition
+    # root, rather than in the facade or the control layer (#6924 A3-R2).
+    session_launcher_factory = build_session_launcher_factory(
+        config=config,
+        events=events,
+        repository_host=github,
+        action_applier=action_applier,
+        session_manager=session_manager,
+        worktree_manager=worktree_manager,
+        working_copy=working_copy,
+        command_runner=command_runner,
+        session_output=session_output,
+        manifest_downloader=manifest_downloader,
+        tech_lead_authority=tech_lead_authority,
+        claim_manager=claim_manager,
+        provider_resilience=provider_resilience,
+        state_machine_manager=state_machine_manager,
+        label_manager=label_manager,
+        agent_callback_endpoint=agent_callback_endpoint,
+    )
     deps = OrchestratorDeps(
         events=events,
         runner=runner,
@@ -848,6 +869,7 @@ def build_orchestrator(
         completion_dispatcher=BackgroundCompletionDispatcher(ThreadBackgroundJobRunner()),
         health_gate=health_gate,
         agent_callback_endpoint=agent_callback_endpoint,
+        session_launcher_factory=session_launcher_factory,
         board_snapshot_builder=create_board_snapshot_builder(
             config, timeline_store, tech_lead_board_publisher, working_copy
         ),
@@ -1178,6 +1200,26 @@ def build_orchestrator_for_testing(
     )
 
     # Bundle all dependencies into OrchestratorDeps (no nulls, no optionals)
+    # Assembly of the session launcher lives here, at the composition
+    # root, rather than in the facade or the control layer (#6924 A3-R2).
+    session_launcher_factory = build_session_launcher_factory(
+        config=config,
+        events=events,
+        repository_host=github,
+        action_applier=action_applier,
+        session_manager=session_manager,
+        worktree_manager=worktree_manager,
+        working_copy=working_copy,
+        command_runner=command_runner,
+        session_output=session_output,
+        manifest_downloader=manifest_downloader,
+        tech_lead_authority=tech_lead_authority_for_testing,
+        claim_manager=claim_manager,
+        provider_resilience=provider_resilience,
+        state_machine_manager=state_machine_manager,
+        label_manager=label_manager,
+        agent_callback_endpoint=agent_callback_endpoint,
+    )
     deps = OrchestratorDeps(
         events=events,
         runner=runner,
@@ -1204,6 +1246,7 @@ def build_orchestrator_for_testing(
         completion_dispatcher=SynchronousCompletionDispatcher(),
         health_gate=health_gate,
         agent_callback_endpoint=agent_callback_endpoint,
+        session_launcher_factory=session_launcher_factory,
         board_snapshot_builder=create_board_snapshot_builder(
             config, timeline_store, tech_lead_board_publisher_for_testing, working_copy
         ),

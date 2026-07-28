@@ -11,6 +11,10 @@ from issue_orchestrator.control.scheduler import (
 from issue_orchestrator.domain.models import Issue, AgentConfig
 from issue_orchestrator.infra.config import Config
 from issue_orchestrator.ports.repository_host import DependencyIssueSnapshot
+from issue_orchestrator.entrypoints.bootstrap_session_launcher import (
+    build_session_launcher_factory,
+)
+from tests.callback_endpoint_helpers import ready_callback_endpoint
 
 
 def create_mock_issue(number, priority=None, milestone=None, state="open", milestone_number=None, milestone_due_on=None, title=None):
@@ -1431,6 +1435,28 @@ class TestLaunchSessionDependencyCAS:
             orch.deps.working_copy = MagicMock()
             orch.deps.command_runner = MagicMock()
             orch.deps.session_restorer.restore_known_terminal.return_value = []
+            # Build a REAL launcher from these mocks. Assembly moved to the
+            # composition root, so a MagicMock factory would return a mock
+            # launcher and the dependency CAS check under test would never
+            # run (#6924 A3-R2).
+            orch.deps.session_launcher_factory = build_session_launcher_factory(
+                config=config,
+                events=events,
+                repository_host=mock_repository_host,
+                action_applier=orch.deps.action_applier,
+                session_manager=orch.deps.session_manager,
+                worktree_manager=orch.deps.worktree_manager,
+                working_copy=orch.deps.working_copy,
+                command_runner=orch.deps.command_runner,
+                session_output=orch.deps.session_output,
+                manifest_downloader=orch.deps.manifest_downloader,
+                tech_lead_authority=orch.deps.tech_lead_authority,
+                claim_manager=orch.deps.claim_manager,
+                provider_resilience=orch.deps.provider_resilience,
+                state_machine_manager=orch.deps.state_machine_manager,
+                label_manager=orch.deps.label_manager,
+                agent_callback_endpoint=ready_callback_endpoint(),
+            )
 
         # Original issue had no dependencies
         issue = Issue(
@@ -1500,6 +1526,28 @@ class TestLaunchSessionDependencyCAS:
             orch.deps.working_copy = MagicMock()
             orch.deps.command_runner = MagicMock()
             orch.deps.session_restorer.restore_known_terminal.return_value = []
+            # Build a REAL launcher from these mocks. Assembly moved to the
+            # composition root, so a MagicMock factory would return a mock
+            # launcher and the dependency CAS check under test would never
+            # run (#6924 A3-R2).
+            orch.deps.session_launcher_factory = build_session_launcher_factory(
+                config=config,
+                events=events,
+                repository_host=mock_repository_host,
+                action_applier=orch.deps.action_applier,
+                session_manager=orch.deps.session_manager,
+                worktree_manager=orch.deps.worktree_manager,
+                working_copy=orch.deps.working_copy,
+                command_runner=orch.deps.command_runner,
+                session_output=orch.deps.session_output,
+                manifest_downloader=orch.deps.manifest_downloader,
+                tech_lead_authority=orch.deps.tech_lead_authority,
+                claim_manager=orch.deps.claim_manager,
+                provider_resilience=orch.deps.provider_resilience,
+                state_machine_manager=orch.deps.state_machine_manager,
+                label_manager=orch.deps.label_manager,
+                agent_callback_endpoint=ready_callback_endpoint(),
+            )
 
         issue = Issue(
             number=1,

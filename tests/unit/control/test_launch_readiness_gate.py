@@ -20,6 +20,12 @@ from unittest.mock import MagicMock
 import pytest
 
 from issue_orchestrator.control.session_launcher import SessionLauncher
+from issue_orchestrator.domain.issue_key import FakeIssueKey
+from issue_orchestrator.domain.models import (
+    PendingRetrospectiveReview,
+    PendingReview,
+    PendingRework,
+)
 from issue_orchestrator.infra.agent_callback_endpoint import (
     RuntimeAgentCallbackEndpoint,
 )
@@ -58,6 +64,37 @@ def unresolved_endpoint() -> RuntimeAgentCallbackEndpoint:
     return RuntimeAgentCallbackEndpoint()
 
 
+def _pending(flavor: str):
+    """Concrete domain values, not mocks.
+
+    Mock-shaped input lets a launcher fail for unrelated reasons and
+    still satisfy an assertion about which error string is absent, which
+    is what made the earlier version of the "proceeds" test hollow (N5).
+    """
+    if flavor == "review":
+        return PendingReview(
+            issue_key=FakeIssueKey(name="4058"),
+            pr_number=99,
+            pr_url="https://github.com/owner/repo/pull/99",
+            branch_name="4058-fix",
+            _issue_number=4058,
+        )
+    if flavor == "retrospective_review":
+        return PendingRetrospectiveReview(
+            issue_key=FakeIssueKey(name="4058"),
+            issue_number=4058,
+            issue_title="Already finished",
+            agent_label="agent:backend",
+            trigger_label="lack-of-review-redo",
+        )
+    return PendingRework(
+        issue_key=FakeIssueKey(name="4058"),
+        agent_type="agent:backend",
+        issue_number=4058,
+        pr_number=99,
+    )
+
+
 @pytest.mark.parametrize(
     "flavor",
     ["review", "retrospective_review", "rework"],
@@ -73,7 +110,7 @@ def test_flavor_defers_while_endpoint_unresolved(
         "rework": launcher.launch_rework_session,
     }[flavor]
 
-    result = call(MagicMock(), [])
+    result = call(_pending(flavor), [])
 
     assert result.session is None, f"{flavor} launched with no callback endpoint"
     assert result.success is False
@@ -89,10 +126,11 @@ def test_flavor_proceeds_past_the_gate_once_resolved(
 ) -> None:
     """The gate must not be a permanent block.
 
-    Once a run mode declares it serves no Control API, launches proceed
-    — they simply fail later for their own reasons (no configured
-    reviewer here), which is exactly what proves the gate is no longer
-    what stopped them.
+    Asserting only that one error string is absent would pass even if
+    the launcher blew up on mock-shaped data, so this pins the *next*
+    boundary each flavor reaches: with no reviewer configured, review
+    and retrospective-review must refuse for that reason, and rework
+    must get past the gate to its own agent-config check.
     """
     unresolved_endpoint.declare_unavailable()
     launcher = _launcher(unresolved_endpoint)
@@ -102,8 +140,17 @@ def test_flavor_proceeds_past_the_gate_once_resolved(
         "rework": launcher.launch_rework_session,
     }[flavor]
 
-    result = call(MagicMock(), [])
+    result = call(_pending(flavor), [])
 
     assert DEFER_REASON not in (result.reason or ""), (
         f"{flavor} still blocked on readiness after the endpoint resolved"
+    )
+    assert result.success is False
+    expected = {
+        "review": "No code review agent configured",
+        "retrospective_review": "No code review agent configured",
+        "rework": "No agent config",
+    }[flavor]
+    assert expected in (result.reason or ""), (
+        f"{flavor} did not reach its next boundary; got {result.reason!r}"
     )
