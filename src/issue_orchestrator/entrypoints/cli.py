@@ -17,6 +17,11 @@ from .cli_dry_run import run_dry_run as _run_dry_run
 from .cli_hook_commands import cmd_setup_guardrails, cmd_setup_hooks, cmd_verify
 from .cli_parser import CLICommandHandlers, build_parser
 from .cli_queue_commands import cmd_audit
+from .cli_run_modes import (
+    run_no_dashboard,
+    run_tui_dashboard,
+    run_web_dashboard_mode,
+)
 from .cli_support import (
     client_dashboard_link as _client_dashboard_link,
     get_repository_host as _get_repository_host,
@@ -28,12 +33,6 @@ from .cli_tech_lead import cmd_health_review, cmd_tech_lead
 from .cli_utility_commands import cmd_demo, cmd_doctor, cmd_trace
 
 console = Console()
-
-from .cli_run_modes import (  # noqa: E402 - after console for import-cycle safety
-    run_no_dashboard,
-    run_tui_dashboard,
-    run_web_dashboard_mode,
-)
 logger = logging.getLogger(__name__)
 
 
