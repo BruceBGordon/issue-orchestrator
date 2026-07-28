@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 VENV_PATH="${CC_VENV_PATH:-${ROOT_DIR}/.venv}"
 PYTHON_BIN="${PYTHON:-python3}"
 PORT="${CC_PORT:-19080}"
@@ -274,24 +274,62 @@ sync_deps() {
 
   if [[ "${mode}" == "uv-frozen-extra-dev" ]]; then
     echo "Syncing Python dependencies from ${ROOT_DIR} with uv..."
-    (cd "${ROOT_DIR}" && "${uv_bin}" sync --frozen --extra dev)
+    # An inherited UV_PROJECT_ENVIRONMENT redirects `uv sync` away from
+    # VENV_PATH. That leaves the stale environment detected by ensure_deps
+    # untouched while uv successfully updates a different environment.
+    (
+      cd "${ROOT_DIR}"
+      UV_PROJECT_ENVIRONMENT="${VENV_PATH}" "${uv_bin}" sync --frozen --extra dev
+    )
   else
     echo "Syncing Python dependencies from ${ROOT_DIR} with pip..."
     ensure_pip
     (cd "${ROOT_DIR}" && "${VENV_PATH}/bin/python" -m pip install -e ".[dev]")
   fi
+  verify_project_install
   record_deps_synced
+}
+
+installed_project_path() {
+  # Isolated mode ignores PYTHONPATH (including inherited CC snapshots) and the
+  # current directory while retaining this venv's site-packages. The probe must
+  # inspect the installed editable, not an import-path override.
+  "${VENV_PATH}/bin/python" \
+    -I \
+    -c "from pathlib import Path; import issue_orchestrator; print(Path(issue_orchestrator.__file__).resolve())" \
+    2>/dev/null || true
+}
+
+project_root_path() {
+  (cd "${ROOT_DIR}" && pwd -P)
+}
+
+project_install_is_current() {
+  local installed_path="$1"
+  local root_path
+  [[ -n "${installed_path}" ]] || return 1
+  root_path="$(project_root_path)"
+  [[ "${installed_path}" == "${root_path}"/* ]]
+}
+
+verify_project_install() {
+  local installed_path
+  installed_path="$(installed_project_path)"
+  if ! project_install_is_current "${installed_path}"; then
+    echo "ERROR: Dependency sync did not install issue_orchestrator from ${ROOT_DIR}: ${installed_path:-not importable}" >&2
+    return 1
+  fi
 }
 
 ensure_deps() {
   # Check if installed AND pointing to this repo (not a stale worktree)
   local installed_path
-  installed_path=$("${VENV_PATH}/bin/python" -c "import issue_orchestrator; print(issue_orchestrator.__file__)" 2>/dev/null || echo "")
+  installed_path="$(installed_project_path)"
 
   if [[ -z "${installed_path}" ]]; then
     echo "Package not installed."
     sync_deps
-  elif [[ "${installed_path}" != "${ROOT_DIR}"/* ]]; then
+  elif ! project_install_is_current "${installed_path}"; then
     echo "Stale install detected: ${installed_path}"
     sync_deps
   elif deps_fingerprint_changed; then
