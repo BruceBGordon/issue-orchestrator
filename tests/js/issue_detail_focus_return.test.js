@@ -84,13 +84,19 @@ function loadDrawer() {
 
 const settle = () => new Promise((resolve) => setImmediate(resolve));
 
+// Drawer visibility is asserted through the observable DOM state, not through
+// the implementation's own ``isIssueDetailDrawerOpen`` predicate: a renamed or
+// missing helper would otherwise throw and preempt the focus assertions these
+// tests exist to make, turning a behavioural regression into a TypeError.
+const drawerIsOpen = (elements) => elements.issueDetailDrawer.classList.contains('visible');
+
 test('in-drawer Diagnose keeps the original opener as the focus-return target', async () => {
     const {context, doc, elements, detached} = loadDrawer();
     const sentinel = detached('kanban-card-timeline-btn');
     sentinel.focus();
 
     await context.openIssueTimeline(123, sentinel);
-    assert.equal(context.isIssueDetailDrawerOpen(), true);
+    assert.equal(drawerIsOpen(elements), true);
     // The drawer moved focus to its own close button on open.
     assert.equal(doc.activeElement, elements.issueDetailCloseBtn);
 
@@ -102,7 +108,7 @@ test('in-drawer Diagnose keeps the original opener as the focus-return target', 
 
     context.openDiagnoseFromCycle(123);
     await settle();
-    assert.equal(context.isIssueDetailDrawerOpen(), true);
+    assert.equal(drawerIsOpen(elements), true);
 
     context.closeIssueDetail();
 
@@ -136,12 +142,12 @@ test('an explicit trigger re-targets focus return even while the drawer is open'
 });
 
 test('a reopen after close captures the new opener, not the stale one', async () => {
-    const {context, doc, detached} = loadDrawer();
+    const {context, doc, elements, detached} = loadDrawer();
     const firstOpener = detached('issue-row-timeline-btn');
 
     await context.openIssueTimeline(123, firstOpener);
     context.closeIssueDetail();
-    assert.equal(context.isIssueDetailDrawerOpen(), false);
+    assert.equal(drawerIsOpen(elements), false);
 
     const laterOpener = detached('kanban-card-timeline-btn');
     laterOpener.focus();
