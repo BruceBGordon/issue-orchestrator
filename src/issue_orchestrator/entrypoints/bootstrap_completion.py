@@ -8,18 +8,18 @@ collaborators they share.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 from ..execution.git_working_copy import GitWorkingCopy
 from ..execution.command_runner import LocalCommandRunner
 from ..execution.review_artifact_reader import ManifestReviewArtifactReader
 from ..execution.session_output_adapter import FileSystemSessionOutput
 from ..infra import runtime_identity
+from ..control.completion_ports import LabelAdapter, PRAdapter
 from ..infra.config import Config
 from ..ports import EventSink
 
 if TYPE_CHECKING:
-    from ..adapters.github.github_adapter import GitHubAdapter
     from ..domain.attempt import AttemptKey
     from ..domain.issue_key import IssueKey
     from ..ports.validation_attempt_key_factory import ValidationAttemptKeyFactory
@@ -35,6 +35,16 @@ if TYPE_CHECKING:
         InMemoryPersistentExchangePairRegistry,
     )
     from ..ports.tech_lead_authority import TechLeadAuthorityStore
+
+
+class CompletionRepositoryPorts(LabelAdapter, PRAdapter, Protocol):
+    """What the completion pipeline needs from the repository host.
+
+    The composition root passes a ``GitHubAdapter``, but this module
+    only ever uses it as these two ports — so it depends on them rather
+    than the concrete adapter, and the entrypoints-use-protocols
+    guardrail holds without an exemption.
+    """
 
 
 def _validation_junit_xml_paths(config: Config) -> tuple[str, ...]:
@@ -66,7 +76,7 @@ def _validation_attempt_key_factory(
 
 def create_completion_components(
     config: Config,
-    github: GitHubAdapter | None,
+    github: "CompletionRepositoryPorts | None",
     events: EventSink,
     working_copy: GitWorkingCopy,
     session_output: FileSystemSessionOutput,
