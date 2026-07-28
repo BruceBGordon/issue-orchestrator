@@ -1053,6 +1053,11 @@ def build_orchestrator_for_testing(
     # launcher, and the server-started hook that publishes the bound
     # port into it (#6924).
     agent_callback_endpoint = RuntimeAgentCallbackEndpoint()
+    # This composition never binds a Control API, so it answers the
+    # endpoint question here. Production answers it from the CLI run
+    # mode (declare) or the server-started hook (publish); without an
+    # answer the launcher correctly refuses to start sessions (#6924 F7).
+    agent_callback_endpoint.declare_unavailable()
 
     if action_applier is not None:
         action_applier.pair_registry = pair_registry_for_testing
