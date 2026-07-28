@@ -19,6 +19,7 @@ import subprocess
 import sys
 import tomllib
 import tokenize
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
@@ -128,8 +129,19 @@ class RouteOperation:
     @property
     def metric_id(self) -> str:
         if self.url_path is None:
-            return f"{self.method.upper()} {self.file_path}:{self.line}"
+            raise ValueError("dynamic route path has no literal metric id; use dynamic_identity")
         return _route_metric_id(self.method, self.url_path)
+
+    @property
+    def dynamic_identity(self) -> str:
+        """Line-independent identity of a route whose path is not a string literal.
+
+        Keys on method, file, and path expression so an accepted baseline entry
+        survives unrelated line shifts above the decorator.
+        """
+        if self.url_path is not None:
+            raise ValueError("literal route paths are identified by method and URL path")
+        return f"{self.method.upper()} {self.file_path}:{self.path_expression}"
 
 
 def _load_yaml(path: Path) -> dict[str, Any]:
@@ -1042,25 +1054,13 @@ def _collect_ui_openapi_routes(root: Path, rule: Mapping[str, Any]) -> list[Metr
             )
         )
 
+    dynamic_routes: list[RouteOperation] = []
+
     for route in sorted(routes, key=lambda item: (item.file_path, item.line, item.method, item.url_path or "")):
         if not _is_browser_route(route, rule):
             continue
         if route.url_path is None:
-            metrics.append(
-                Metric(
-                    rule_id=rule_id,
-                    kind="ui_openapi_dynamic_route_path",
-                    metric_id=f"dynamic-path:{route.metric_id}",
-                    value=1,
-                    path=route.file_path,
-                    detail=(
-                        f"{route.method.upper()} route at line {route.line} uses dynamic path "
-                        f"{route.path_expression!r}; browser-facing routes must use string literals "
-                        "so the UI OpenAPI guardrail can compare them"
-                    ),
-                    new_metric_min_value=new_metric_min_value,
-                )
-            )
+            dynamic_routes.append(route)
             continue
         if route.key in schema_operations:
             continue
@@ -1079,6 +1079,53 @@ def _collect_ui_openapi_routes(root: Path, rule: Mapping[str, Any]) -> list[Metr
             )
         )
 
+    metrics.extend(
+        _dynamic_route_metrics(
+            dynamic_routes,
+            rule_id=rule_id,
+            new_metric_min_value=new_metric_min_value,
+        )
+    )
+
+    return metrics
+
+
+def _dynamic_route_metrics(
+    routes: Sequence[RouteOperation],
+    *,
+    rule_id: str,
+    new_metric_min_value: int,
+) -> list[Metric]:
+    """Metrics for browser-facing routes whose path is not a string literal.
+
+    Owns dynamic-route metric identity: ids key on method, file, and path
+    expression rather than the source line, so an intentionally accepted baseline
+    entry is not invalidated by unrelated edits above the decorator. Repeated
+    identical decorators in one file are disambiguated by occurrence order (the
+    source line stays in the human-readable detail).
+    """
+    occurrences: Counter[str] = Counter()
+    metrics: list[Metric] = []
+    for route in routes:
+        identity = route.dynamic_identity
+        occurrences[identity] += 1
+        ordinal = occurrences[identity]
+        metric_id = identity if ordinal == 1 else f"{identity}#{ordinal}"
+        metrics.append(
+            Metric(
+                rule_id=rule_id,
+                kind="ui_openapi_dynamic_route_path",
+                metric_id=f"dynamic-path:{metric_id}",
+                value=1,
+                path=route.file_path,
+                detail=(
+                    f"{route.method.upper()} route at line {route.line} uses dynamic path "
+                    f"{route.path_expression!r}; browser-facing routes must use string literals "
+                    "so the UI OpenAPI guardrail can compare them"
+                ),
+                new_metric_min_value=new_metric_min_value,
+            )
+        )
     return metrics
 
 
