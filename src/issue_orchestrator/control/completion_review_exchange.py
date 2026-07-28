@@ -12,7 +12,6 @@ from ..domain.review_exchange_run import ReviewExchangeRun, ReviewExchangeRunAss
 from ..domain.review_exchange_resume import ResumeDecision
 from ..domain.review_artifacts import review_artifacts_from_exchange_result
 from ..domain.runtime_config import RuntimeConfigReference
-from ..infra.agent_callback_endpoint import NullAgentCallbackEndpoint
 from ..ports.background_job import NullBackgroundJobRunner
 from ..ports.review_exchange_runner import ReviewExchangeRunner
 from ..ports.session_output import SessionOutput
@@ -201,7 +200,7 @@ class CompletionReviewExchange:
         review_exchange_runner: ReviewExchangeRunner,
         job_supervisor: BackgroundJobSupervisor | None = None,
         review_exchange_canceller: ReviewExchangeCanceller | None = None,
-        agent_callback_endpoint: "AgentCallbackEndpoint | None" = None,
+        agent_callback_endpoint: "AgentCallbackEndpoint",
     ) -> None:
         self._config = config
         self._session_output = session_output
@@ -209,9 +208,7 @@ class CompletionReviewExchange:
         self._emit_review_started = emit_review_started
         self._emit_review_outcome = emit_review_outcome
         self._review_exchange_canceller = review_exchange_canceller
-        self._agent_callback_endpoint = (
-            agent_callback_endpoint or NullAgentCallbackEndpoint()
-        )
+        self._agent_callback_endpoint = agent_callback_endpoint
         # Supervisor injection is REQUIRED for the async failure path to work:
         # ``take_failure`` only returns values that ``tick()`` has populated,
         # and ``tick()`` must be called from the orchestrator's main loop.

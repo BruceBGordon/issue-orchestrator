@@ -26,7 +26,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
-from ..infra.agent_callback_endpoint import NullAgentCallbackEndpoint
 from ..domain.artifact_contracts import ValidationFailed
 from ..domain.completion_finalization import (
     CompletionFinalizationCommand,
@@ -188,9 +187,10 @@ class CompletionProcessor:
         config: "Config | None" = None,
         background_job_supervisor: "BackgroundJobSupervisor | None" = None,
         review_exchange_canceller: ReviewExchangeCanceller | None = None,
-        # Production injects the shared endpoint via bootstrap; the null
-        # default raises if a test actually reaches the callback path.
-        agent_callback_endpoint: "AgentCallbackEndpoint | None" = None,
+        *,
+        # Required: an agent with no callback endpoint cannot report
+        # anything back, so there is no sensible default to fall back to.
+        agent_callback_endpoint: "AgentCallbackEndpoint",
         review_artifact_reader: ReviewArtifactReader | None = None,
         runtime_identity: RuntimeIdentity | None = None,
         tech_lead_authority: "TechLeadAuthorityStore | None" = None,
@@ -255,7 +255,7 @@ class CompletionProcessor:
             review_exchange_runner=review_exchange_runner or NullReviewExchangeRunner(),
             job_supervisor=background_job_supervisor,
             review_exchange_canceller=review_exchange_canceller,
-            agent_callback_endpoint=agent_callback_endpoint or NullAgentCallbackEndpoint(),
+            agent_callback_endpoint=agent_callback_endpoint,
         )
         # Per-(session, head_sha) consecutive validation-failed reroute count.
         # The reroute path can re-enter every tick when downstream rework

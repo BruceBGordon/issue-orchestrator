@@ -48,6 +48,7 @@ from issue_orchestrator.resources import get_coding_done_instructions, get_revie
 from tests.unit.session_run_helpers import make_session_run_assets
 
 from .conftest import xdist_timeout
+from tests.callback_endpoint_helpers import ready_callback_endpoint
 
 @pytest.fixture(scope="module")
 def lm() -> LabelManager:
@@ -383,6 +384,7 @@ def test_completion_record_drives_expected_review_actions(
     label_adapter = _RecordingLabelAdapter()
     pr_adapter = _RecordingPRAdapter()
     processor = CompletionProcessor(
+        agent_callback_endpoint=ready_callback_endpoint(),
         label_adapter=label_adapter,
         pr_adapter=pr_adapter,
         git_adapter=_NoopGitAdapter(),

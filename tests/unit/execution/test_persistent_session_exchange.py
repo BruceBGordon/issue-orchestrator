@@ -35,6 +35,7 @@ from issue_orchestrator.execution.persistent_role_prompt_policy import (
 )
 from issue_orchestrator.execution.session_output_adapter import FileSystemSessionOutput
 from issue_orchestrator.ports import TraceEvent
+from tests.callback_endpoint_helpers import ready_callback_endpoint
 
 
 # ---------------------------------------------------------------------------
@@ -6758,6 +6759,7 @@ class TestProductionLayoutCacheResolution:
             ),
         }
         return CompletionReviewExchange(
+            agent_callback_endpoint=ready_callback_endpoint(),
             config=cfg,
             session_output=session_output,
             emit_review_started=lambda **_: None,

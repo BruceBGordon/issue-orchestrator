@@ -15,7 +15,6 @@ from __future__ import annotations
 import pytest
 
 from issue_orchestrator.infra.agent_callback_endpoint import (
-    NullAgentCallbackEndpoint,
     RuntimeAgentCallbackEndpoint,
 )
 from issue_orchestrator.ports.agent_callback_endpoint import AgentCallbackEndpoint
@@ -97,21 +96,6 @@ class TestInstanceIsolation:
         assert second.resolve_port(0) is None
 
 
-class TestNullEndpoint:
-    """The test-only default must fail loudly, never answer plausibly."""
-
-    def test_resolving_raises(self) -> None:
-        with pytest.raises(NotImplementedError, match="no port to hand an agent"):
-            NullAgentCallbackEndpoint().resolve_port(0)
-
-    def test_publishing_raises(self) -> None:
-        with pytest.raises(NotImplementedError, match="No agent callback endpoint"):
-            NullAgentCallbackEndpoint().publish_bound_port(59957)
-
-    def test_satisfies_the_port(self) -> None:
-        assert isinstance(NullAgentCallbackEndpoint(), AgentCallbackEndpoint)
-
-
 class TestReadinessLifecycle:
     """Readiness is what gates agent launch (#6924 F7).
 
@@ -155,7 +139,3 @@ class TestReadinessLifecycle:
         endpoint.publish_bound_port(59957)
         assert endpoint.resolve_port(0) == 59957
         assert endpoint.is_ready() is True
-
-    def test_null_endpoint_refuses_to_answer_readiness(self) -> None:
-        with pytest.raises(NotImplementedError, match="readiness"):
-            NullAgentCallbackEndpoint().is_ready()

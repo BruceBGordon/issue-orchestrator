@@ -20,47 +20,6 @@ logger = logging.getLogger(__name__)
 AUTO_ASSIGN_PORT = 0
 
 
-class NullAgentCallbackEndpoint:
-    """Test-only default that refuses to answer.
-
-    Production always injects a real endpoint via the composition root.
-    This exists so the twelve-odd test fixtures that never spawn an
-    agent do not have to wire one — but it *raises* rather than
-    returning ``None``, so a test that genuinely reaches the callback
-    path fails immediately instead of silently reproducing the original
-    bug (an agent told to dial nowhere).
-
-    Mirrors ``NullReviewExchangeRunner``, which guards the same seam for
-    the same reason.
-    """
-
-    def publish_bound_port(self, port: int) -> None:
-        raise NotImplementedError(
-            "No agent callback endpoint was injected. Production wires one "
-            "in bootstrap; a test reaching this must inject "
-            "RuntimeAgentCallbackEndpoint."
-        )
-
-    def declare_unavailable(self) -> None:
-        raise NotImplementedError(
-            "No agent callback endpoint was injected. Production wires one "
-            "in bootstrap."
-        )
-
-    def is_ready(self) -> bool:
-        raise NotImplementedError(
-            "No agent callback endpoint was injected, so readiness is "
-            "unknowable. Production wires one in bootstrap."
-        )
-
-    def resolve_port(self, configured_port: int) -> int | None:
-        raise NotImplementedError(
-            "No agent callback endpoint was injected, so there is no port to "
-            "hand an agent. Production wires one in bootstrap; a test "
-            "reaching this must inject RuntimeAgentCallbackEndpoint."
-        )
-
-
 class RuntimeAgentCallbackEndpoint:
     """Holds the bound Control API port for the process serving it."""
 

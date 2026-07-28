@@ -88,7 +88,9 @@ def create_completion_components(
     attempt_store: "AttemptStore | None" = None,
     turn_mailbox: "TurnMailbox | None" = None,
     tech_lead_authority: "TechLeadAuthorityStore | None" = None,
-    agent_callback_endpoint: "AgentCallbackEndpoint | None" = None,
+    *,
+    # Required: the composition root owns the single shared endpoint.
+    agent_callback_endpoint: "AgentCallbackEndpoint",
 ) -> tuple["CompletionProcessor | None", "SessionController | None"]:
     """Create completion processor and session controller."""
     from ..control.completion_processor import CompletionProcessor
@@ -167,5 +169,3 @@ def create_completion_components(
     )
 
     return completion_processor, session_controller_instance
-
-

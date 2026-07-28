@@ -19,6 +19,7 @@ from issue_orchestrator.observation.observer import SessionObserver
 from issue_orchestrator.ports import TraceEvent
 from issue_orchestrator.execution.session_output_adapter import FileSystemSessionOutput
 from tests.unit.session_run_helpers import make_session_run_assets
+from tests.callback_endpoint_helpers import ready_callback_endpoint
 
 
 class StubSessionRunner:
@@ -144,6 +145,7 @@ def test_timeout_observation_and_decision(tmp_path):
     assert observation.session_exists is True
 
     completion_processor = CompletionProcessor(
+        agent_callback_endpoint=ready_callback_endpoint(),
         label_adapter=StubLabelAdapter(),
         pr_adapter=StubPrAdapter(),
         git_adapter=StubGitAdapter(),
