@@ -43,6 +43,8 @@ JavaScript branch-site scanning uses a lightweight lexical pass rather than a fu
 
 UI OpenAPI route scanning reads `docs/api/ui-openapi.json` and FastAPI route decorators under `src/issue_orchestrator/entrypoints/`. If a schema path is removed from the server or stops naming the generated `response_model`, the check fails as new drift. Existing dashboard `/api/*` routes not yet represented in OpenAPI are tracked as baseline debt; adding another uncontracted browser JSON route fails until the endpoint is added to the schema or the ratchet is explicitly accepted. Browser-facing route decorators must use string-literal paths so the checker can compare them to the OpenAPI path keys; dynamic path expressions are tracked as explicit guardrail findings rather than being skipped.
 
+Route metadata a decorator does not carry is named in prose rather than with a placeholder sentinel: a route with no `response_model` keyword reports `found (no response_model)`, and a decorator with neither a positional path nor a `path=` keyword reports `uses dynamic path (unknown route path expression)`. Concrete dynamic paths still render as quoted source (`uses dynamic path 'API_DYNAMIC'`). Metric IDs are unaffected — a pathless decorator is still keyed by `dynamic-path:<METHOD> <file>:<line>` — so the wording can be improved without invalidating baseline entries.
+
 ## Ratchet Model
 
 Existing violations are stored in the baseline. A PR fails when it:
