@@ -2287,13 +2287,13 @@ def create_session_launcher(
     config: Config,
     deps: "OrchestratorDeps",
     board_snapshot_provider: "BoardSnapshotProvider",
-    session_exists_fn,
-    create_session_fn,
-    get_issue_machine,
-    get_session_machine,
-    get_review_machine,
-    refresh_issue_fn,
-    dependency_evaluator,
+    session_exists_fn: Callable[[str], bool],
+    create_session_fn: Callable[[str, str, Path, str | None], bool],
+    get_issue_machine: Callable[["IssueProtocol"], Optional["IssueStateMachine"]],
+    get_session_machine: Callable[[str, int, int], Optional["SessionStateMachine"]],
+    get_review_machine: Callable[[int, int], Optional["ReviewStateMachine"]],
+    refresh_issue_fn: Optional[Callable[[int], Optional["IssueProtocol"]]],
+    dependency_evaluator: Optional["DependencyEvaluator"],
 ) -> SessionLauncher:
     """Build a launcher from the orchestrator's dependency bundle.
 
