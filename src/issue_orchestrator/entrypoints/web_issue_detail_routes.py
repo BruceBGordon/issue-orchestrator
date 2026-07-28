@@ -484,55 +484,15 @@ def _finalize_issue_detail_payload(
             )
     return payload
 
-@web_issue_detail_router.get("/api/timeline/{issue_number}")
-async def get_issue_timeline(
-    issue_number: int,
-    orchestrator: WebOrchestratorDependency,
-) -> JSONResponse:
-    """Get timeline events for an issue."""
-    if not orchestrator:
-        return JSONResponse({"error": "Orchestrator not running"}, status_code=503)
-
-    reader = orchestrator.deps.timeline_reader
-    try:
-        stream = reader.read(issue_number, limit=2000)
-    except RuntimeError as exc:
-        logger.error("Timeline read failed for issue %d: %s", issue_number, exc)
-        return JSONResponse(
-            status_code=503,
-            content={"error": "timeline_unavailable", "detail": str(exc)},
-        )
-    payload = stream.to_dict()
-    raw_events = payload.get("events", [])
-    filtered_events = _filter_timeline_events(raw_events)
-    events, dropped_missing_semantics = _retain_semantic_timeline_events(
-        filtered_events
-    )
-    events = _decorate_timeline_events(events, issue_number)
-    payload["events"] = events
-    payload["phase_toc"] = _build_phase_toc(events)
-    payload["cycles"] = _build_timeline_cycles(events)
-    if is_timeline_trace_enabled():
-        logger.info(
-            "[TIMELINE] api.timeline issue=%s raw=%s filtered=%s semantic=%s "
-            "dropped_missing_semantics=%s cycles=%s",
-            issue_number,
-            len(raw_events),
-            len(filtered_events),
-            len(events),
-            dropped_missing_semantics,
-            len(payload["cycles"]) if isinstance(payload.get("cycles"), list) else 0,
-        )
-    diagnostic = _timeline_missing_diagnostic(
-        orchestrator,
-        issue_number,
-        events,
-        dropped_missing_semantics=dropped_missing_semantics,
-    )
-    if diagnostic:
-        payload["diagnostic"] = diagnostic
-    return JSONResponse(payload)
-
+# NOTE (#6421): the legacy ``GET /api/timeline/{issue_number}`` route was
+# retired here.  It read the same ``timeline_reader`` stream and ran the same
+# filter/retain/decorate/phase-toc/cycles projection as
+# ``/api/issue-detail/{issue_number}``, but returned an untyped ``JSONResponse``
+# outside the ``timeline_projection_endpoint`` boundary and was therefore
+# absent from ``docs/api/ui-openapi.json``.  Its only browser consumer read
+# ``events``/``phase_toc``/``cycles`` — all of which the contracted
+# issue-detail payload already carries — so the route was deleted rather than
+# contracted.  ``/api/issue-detail/{issue_number}`` is the replacement.
 @web_issue_detail_router.get(
     "/api/issue-detail/{issue_number}", response_model=IssueDetailPayload
 )

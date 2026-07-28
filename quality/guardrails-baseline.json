@@ -6008,14 +6008,6 @@
       "rule_id": "ui_openapi_routes",
       "value": 1
     },
-    "ui_openapi_routes:uncontracted:GET /api/timeline/{issue_number}": {
-      "detail": "GET /api/timeline/{issue_number} is a browser-facing JSON route absent from docs/api/ui-openapi.json; add it to the UI OpenAPI contract or explicitly accept the ratchet",
-      "kind": "ui_openapi_uncontracted_route",
-      "metric_id": "uncontracted:GET /api/timeline/{issue_number}",
-      "path": "src/issue_orchestrator/entrypoints/web_issue_detail_routes.py",
-      "rule_id": "ui_openapi_routes",
-      "value": 1
-    },
     "ui_openapi_routes:uncontracted:POST /api/bulk-cancel-queued": {
       "detail": "POST /api/bulk-cancel-queued is a browser-facing JSON route absent from docs/api/ui-openapi.json; add it to the UI OpenAPI contract or explicitly accept the ratchet",
       "kind": "ui_openapi_uncontracted_route",

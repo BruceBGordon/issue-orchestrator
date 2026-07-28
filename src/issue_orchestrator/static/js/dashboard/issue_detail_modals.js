@@ -108,37 +108,72 @@ function closePhaseModal(e) {
     }
 }
 
-const timelineModal = document.getElementById('timelineModal');
+// The legacy ``#timelineModal`` teleport was retired with the uncontracted
+// ``GET /api/timeline/{issue_number}`` route (#6421).  The issue-detail drawer
+// is the single issue-timeline surface; it renders the same events/phase_toc/
+// cycles from the contracted ``/api/issue-detail/{issue_number}`` payload.
 const issueDetailDrawer = document.getElementById('issueDetailDrawer');
 let issueDetailData = null;
 let lastIssueDetailTrigger = null;
 let journeyFilter = 'latest-run'; // 'latest-run' or 'all'
-let timelineView = 'user'; // 'user', 'ops', or 'debug'
+let timelineView = 'user'; // one of TIMELINE_VIEWS
 
-async function openTimelineModal(issueNumber) {
-    if (!timelineModal) return;
-    timelineModal.classList.add('visible');
-    document.getElementById('timelineModalTitle').textContent = `Timeline #${issueNumber}`;
-    const content = document.getElementById('timelineModalContent');
-    content.innerHTML = '<div class="timeline-loading">Loading timeline...</div>';
+// Mirrors the generated ``TimelineView`` wire enum (ui-contracts.d.ts), whose
+// runtime owner on the server side is ``view_models/timeline_view.py``.
+const TIMELINE_VIEWS = ['user', 'ops', 'debug', 'raw'];
 
-    try {
-        const res = await fetch(`/api/timeline/${issueNumber}`);
-        if (!res.ok) {
-            content.innerHTML = '<div class="timeline-empty">No timeline data found.</div>';
-            return;
-        }
-        const data = await res.json();
-        renderTimeline(content, data.events || [], data.phase_toc || [], data.cycles || []);
-    } catch (err) {
-        console.error('Failed to load timeline:', err);
-        content.innerHTML = '<div class="timeline-empty">Failed to load timeline.</div>';
+// The broad semantic lens: every semantically retained event, including the
+// Ops-only ones (``validation.completed``) and Debug-only ones
+// (``issue.labels_changed``) that the default Story view hides.  Diagnostic
+// entrypoints open the drawer with this lens so they keep showing what the
+// retired ``GET /api/timeline/{issue_number}`` route — which applied no view
+// filter at all — used to show (#6421).
+const DIAGNOSTIC_TIMELINE_VIEW = 'debug';
+
+// Single owner of the shared ``timelineView`` state.  Every writer (the view
+// toggle and any view-scoped drawer open) goes through here, so the lens the
+// drawer requests from the server and the lens its toggle reports as active
+// cannot drift.  Unrecognised values are ignored, matching the server-side
+// ``normalize_timeline_view`` coercion.
+function applyTimelineView(view) {
+    if (TIMELINE_VIEWS.includes(view)) {
+        timelineView = view;
     }
+    return timelineView;
 }
 
-function closeTimelineModal(e) {
-    if (!e || e.target === timelineModal) {
-        timelineModal.classList.remove('visible');
+function isIssueDetailDrawerOpen() {
+    return Boolean(issueDetailDrawer) && issueDetailDrawer.classList.contains('visible');
+}
+
+// Single owner of the drawer's focus-return target.
+//
+// ``openIssueDetail`` is re-entrant: retiring the ``#timelineModal`` teleport
+// (#6421) means the Diagnose affordance now reloads the *already-visible*
+// drawer under the debug lens instead of opening a separate modal.  Capturing
+// ``document.activeElement`` on every entry would therefore overwrite the real
+// opener with whatever happened to be focused mid-session — for Diagnose the
+// popover link is already detached by ``closeArtifactPopover`` when the handler
+// runs, and for a plain reload it is the drawer's own close button.  Closing
+// would then strand focus on a removed node or inside the hidden drawer
+// instead of returning it to the card/timeline control the user came from.
+//
+// Rule: an explicit trigger always wins; the implicit ``document.activeElement``
+// capture happens only on the closed -> open transition.  Call this BEFORE the
+// drawer is marked visible.
+function captureIssueDetailReturnFocus(triggerEl) {
+    if (triggerEl) {
+        lastIssueDetailTrigger = triggerEl;
+    } else if (!isIssueDetailDrawerOpen()) {
+        lastIssueDetailTrigger = document.activeElement;
     }
+    return lastIssueDetailTrigger;
+}
+
+function restoreIssueDetailReturnFocus() {
+    if (lastIssueDetailTrigger && typeof lastIssueDetailTrigger.focus === 'function') {
+        lastIssueDetailTrigger.focus();
+    }
+    return lastIssueDetailTrigger;
 }
 

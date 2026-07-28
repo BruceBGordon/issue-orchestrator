@@ -21,10 +21,14 @@
 
 /*
  * When the issue-detail drawer is open, any modal dialog opened FROM
- * within it (session-replay via #modalOverlay, timeline focus via
- * #timelineModal, validation-failure, review-transcript, etc.) must
- * render above the drawer so it is reachable. Default-elevate every
- * .modal-overlay above the drawer.
+ * within it (session-replay via #modalOverlay, validation-failure,
+ * review-transcript, etc.) must render above the drawer so it is
+ * reachable. Default-elevate every .modal-overlay above the drawer.
+ *
+ * Issue #6421 dropped the ``#timelineModal`` exception: issue-scoped
+ * timeline focus is no longer a modal teleport — it scrolls the drawer
+ * to its own timeline section, fed by the contracted
+ * ``/api/issue-detail/{issue_number}`` payload.
  *
  * Issue #6334 dropped the ``#e2eDiagnosisModal`` exception: the E2E
  * run view is no longer a modal — it mounts inline in the runs list
