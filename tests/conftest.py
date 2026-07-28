@@ -859,7 +859,10 @@ def build_test_orchestrator_deps(
     from issue_orchestrator.execution.persistent_review_exchange_runner import (
         PersistentReviewExchangeRunner,
     )
+    agent_callback_endpoint = RuntimeAgentCallbackEndpoint()
+
     completion_processor = CompletionProcessor(
+        agent_callback_endpoint=agent_callback_endpoint,
         label_adapter=repo_host,
         pr_adapter=repo_host,
         git_adapter=working_copy,
@@ -1034,10 +1037,10 @@ def build_test_orchestrator_deps(
     return OrchestratorDeps(
         events=events,
         runner=runner,
-        # A real endpoint, not the null one: these fixtures build agent
-        # session environments, and nothing has bound a port, so it
-        # honestly resolves to "no endpoint yet".
-        agent_callback_endpoint=RuntimeAgentCallbackEndpoint(),
+        # The same endpoint the completion processor got, mirroring how
+        # bootstrap shares one instance. Nothing binds a port in tests, so
+        # it honestly resolves to "no endpoint yet".
+        agent_callback_endpoint=agent_callback_endpoint,
         repository_host=repo_host,
         e2e_issue_tracker=e2e_issue_tracker,
         fresh_issue_reader=fresh_reader,
