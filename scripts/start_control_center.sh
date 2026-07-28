@@ -291,7 +291,11 @@ sync_deps() {
 }
 
 installed_project_path() {
+  # Isolated mode ignores PYTHONPATH (including inherited CC snapshots) and the
+  # current directory while retaining this venv's site-packages. The probe must
+  # inspect the installed editable, not an import-path override.
   "${VENV_PATH}/bin/python" \
+    -I \
     -c "from pathlib import Path; import issue_orchestrator; print(Path(issue_orchestrator.__file__).resolve())" \
     2>/dev/null || true
 }

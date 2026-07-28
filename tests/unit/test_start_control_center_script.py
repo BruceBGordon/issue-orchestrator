@@ -19,6 +19,10 @@ def _write_fake_python(venv_path: Path) -> Path:
         """#!/usr/bin/env bash
 set -euo pipefail
 
+if [[ "${1:-}" == "-I" && "${2:-}" == "-c" ]]; then
+  shift
+fi
+
 if [[ "${1:-}" == "-c" ]]; then
   if [[ ! -f "${FAKE_INSTALLED_PATH_FILE}" ]]; then
     exit 1
@@ -217,7 +221,14 @@ def _site_packages(venv_path: Path) -> Path:
     return Path(result.stdout.strip())
 
 
-def _imported_package_path(venv_path: Path) -> Path:
+def _imported_package_path(
+    venv_path: Path,
+    *,
+    env_overrides: dict[str, str] | None = None,
+) -> Path:
+    env = os.environ.copy()
+    if env_overrides:
+        env.update(env_overrides)
     result = subprocess.run(
         [
             str(venv_path / "bin" / "python"),
@@ -226,6 +237,7 @@ def _imported_package_path(venv_path: Path) -> Path:
         ],
         check=True,
         capture_output=True,
+        env=env,
         text=True,
     )
     return Path(result.stdout.strip()).resolve()
@@ -435,6 +447,45 @@ def test_ensure_deps_accepts_repaired_install_from_symlinked_checkout(
     )
 
     _assert_ok(result)
+    assert _imported_package_path(venv_path).is_relative_to(repo.resolve())
+
+
+def test_ensure_deps_ignores_foreign_pythonpath_when_probing_install(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    foreign_repo = tmp_path / "foreign"
+    _write_importable_package(repo)
+    _write_importable_package(foreign_repo)
+
+    venv_path = repo / ".venv"
+    venv.EnvBuilder(with_pip=False).create(venv_path)
+    editable_pth = _site_packages(venv_path) / "issue_orchestrator_editable.pth"
+    editable_pth.write_text(f"{repo / 'src'}\n", encoding="utf-8")
+    foreign_pythonpath = str(foreign_repo / "src")
+    assert _imported_package_path(
+        venv_path,
+        env_overrides={"PYTHONPATH": foreign_pythonpath},
+    ).is_relative_to(foreign_repo.resolve())
+
+    install_log = tmp_path / "install.log"
+    tools_path = tmp_path / "tools"
+    home_path = tmp_path / "home"
+    home_path.mkdir()
+    _write_environment_targeting_fake_uv(tools_path)
+
+    result = _run_ensure_deps(
+        repo,
+        venv_path,
+        install_log,
+        tools_path,
+        home_path,
+        env_overrides={"PYTHONPATH": foreign_pythonpath},
+    )
+
+    _assert_ok(result)
+    assert "Stale install detected" not in result.stdout
+    assert "sync --frozen --extra dev" in install_log.read_text(encoding="utf-8")
     assert _imported_package_path(venv_path).is_relative_to(repo.resolve())
 
 
