@@ -1,8 +1,7 @@
 """Control API resume helper for agent completion commands.
 
 Generic callback plumbing (endpoint resolution, auth headers) lives in
-:mod:`.agent_callback`; this module owns only the resume command. The
-names are re-exported for existing importers.
+:mod:`.agent_callback`; this module owns only the resume command.
 """
 
 from __future__ import annotations
@@ -12,17 +11,11 @@ import os
 import urllib.error
 import urllib.request
 
-from collections.abc import MutableMapping
 from dataclasses import dataclass
 from pathlib import Path
 
 from ...infra.env import ENV_PREFIX, get_env
-from .agent_callback import (
-    ApiHeader,
-    ApiRequestHeaders,
-    api_request_headers,
-    resolve_control_api_port,
-)
+from .agent_callback import api_request_headers, resolve_control_api_port
 
 
 @dataclass(frozen=True, slots=True)
