@@ -68,7 +68,7 @@ def _write_fake_uv(tools_path: Path) -> Path:
 set -euo pipefail
 printf 'uv %s\\n' "$*" >> "${INSTALL_LOG}"
 if [[ "${1:-}" == "sync" ]]; then
-  printf '%s\\n' "${PWD}/src/issue_orchestrator/__init__.py" > "${FAKE_INSTALLED_PATH_FILE}"
+  printf '%s\\n' "$(pwd -P)/src/issue_orchestrator/__init__.py" > "${FAKE_INSTALLED_PATH_FILE}"
 fi
 """,
         encoding="utf-8",
@@ -89,7 +89,7 @@ site_packages=$(
   "${target_environment}/bin/python" \
     -c 'import site; print(site.getsitepackages()[0])'
 )
-printf '%s\\n' "${PWD}/src" > "${site_packages}/issue_orchestrator_editable.pth"
+printf '%s\\n' "$(pwd -P)/src" > "${site_packages}/issue_orchestrator_editable.pth"
 """,
         encoding="utf-8",
     )
@@ -120,6 +120,9 @@ def _make_fake_repo(
     repo.mkdir()
     (repo / "pyproject.toml").write_text("[project]\nname='fake'\n", encoding="utf-8")
     (repo / "uv.lock").write_text("# lock\n", encoding="utf-8")
+    package_path = repo / "src" / "issue_orchestrator"
+    package_path.mkdir(parents=True)
+    package_path.joinpath("__init__.py").write_text("", encoding="utf-8")
     venv_path = repo / ("custom-venv" if custom_venv else ".venv")
     _write_fake_python(venv_path)
     install_log = repo / "install.log"
@@ -399,6 +402,40 @@ def test_ensure_deps_rejects_sync_that_leaves_stale_install(tmp_path: Path) -> N
     assert "Dependency sync did not install issue_orchestrator" in result.stderr
     assert not (venv_path / ".deps-fingerprint").exists()
     assert not (venv_path / ".deps-synced").exists()
+
+
+def test_ensure_deps_accepts_repaired_install_from_symlinked_checkout(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    sibling_repo = tmp_path / "sibling"
+    linked_repo = tmp_path / "linked-repo"
+    _write_importable_package(repo)
+    _write_importable_package(sibling_repo)
+    linked_repo.symlink_to(repo, target_is_directory=True)
+
+    venv_path = repo / ".venv"
+    venv.EnvBuilder(with_pip=False).create(venv_path)
+    stale_pth = _site_packages(venv_path) / "issue_orchestrator_editable.pth"
+    stale_pth.write_text(f"{sibling_repo / 'src'}\n", encoding="utf-8")
+    assert _imported_package_path(venv_path).is_relative_to(sibling_repo.resolve())
+
+    install_log = tmp_path / "install.log"
+    tools_path = tmp_path / "tools"
+    home_path = tmp_path / "home"
+    home_path.mkdir()
+    _write_environment_targeting_fake_uv(tools_path)
+
+    result = _run_ensure_deps(
+        linked_repo,
+        linked_repo / ".venv",
+        install_log,
+        tools_path,
+        home_path,
+    )
+
+    _assert_ok(result)
+    assert _imported_package_path(venv_path).is_relative_to(repo.resolve())
 
 
 def test_ensure_deps_uses_pip_for_custom_venv_path(tmp_path: Path) -> None:
