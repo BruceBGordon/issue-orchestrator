@@ -42,7 +42,7 @@ from ..control.session_completion import (
     handle_session_completion as _handle_session_completion,
     process_active_sessions as _process_active_sessions,
 )
-from ..control.session_launcher import SessionLauncher
+from ..control.session_launcher import SessionLauncher, create_session_launcher
 from ..control.board_snapshot_builder import StateBoardSnapshotProvider
 from ..control.health_review_trigger import (
     ensure_on_demand_health_review_anchor as _ensure_on_demand_health_review_anchor,
@@ -302,20 +302,13 @@ class Orchestrator:
 
     @cached_property
     def _session_launcher(self) -> SessionLauncher:
-        return SessionLauncher(
-            self.config, self.deps.events, self.deps.repository_host, self.deps.action_applier, self.deps.session_manager,
-            self.deps.worktree_manager, self.deps.working_copy, self.deps.command_runner, self.deps.session_output,
-            self.deps.manifest_downloader, self.deps.tech_lead_authority,
-            lambda name: _session_exists(name, self.deps.session_manager, self.deps.events),
-            self._create_session, self._get_issue_machine, self._get_session_machine,
-            self._get_review_machine, self._refresh_issue, self.scheduler.dependency_evaluator,
-            claim_manager=self.deps.claim_manager,
-            provider_resilience=self.deps.provider_resilience,
-            remove_session_machine=self.deps.state_machine_manager.remove_session_machine,
-            label_manager=self.deps.label_manager,
-            send_to_session_fn=lambda name, text: self.deps.session_manager.runner.send_to_session_by_name(name, text),
+        return create_session_launcher(
+            config=self.config, deps=self.deps,
             board_snapshot_provider=StateBoardSnapshotProvider(self.deps.board_snapshot_builder, lambda: self.state),
-            agent_callback_endpoint=self.deps.agent_callback_endpoint,
+            session_exists_fn=lambda name: _session_exists(name, self.deps.session_manager, self.deps.events),
+            create_session_fn=self._create_session, get_issue_machine=self._get_issue_machine,
+            get_session_machine=self._get_session_machine, get_review_machine=self._get_review_machine,
+            refresh_issue_fn=self._refresh_issue, dependency_evaluator=self.scheduler.dependency_evaluator,
         )
 
     @cached_property

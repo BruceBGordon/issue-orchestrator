@@ -22,7 +22,12 @@ import time
 from typing import TYPE_CHECKING
 from uuid import uuid4
 
+from ..control.background_job_supervisor import BackgroundJobSupervisor
 from ..infra.agent_callback_endpoint import RuntimeAgentCallbackEndpoint
+from .bootstrap_completion import (
+    _validation_attempt_key_factory,
+    create_completion_components,
+)
 from ..infra.config import Config
 from ..infra.env import ENV_PREFIX
 from ..adapters.github.repo import get_repo_from_git, GitRepoError
@@ -105,17 +110,9 @@ if TYPE_CHECKING:
     from ..control.session_controller import SessionController
     from ..adapters.github.fresh_issue_reader import GitHubFreshIssueReader
     from ..ports.fresh_issue_reader import FreshIssueReader
-    from ..domain.attempt import AttemptKey
-    from ..domain.issue_key import IssueKey
     from ..ports.e2e_issue_tracker import E2EIssueTracker
     from ..ports.attempt_store import AttemptStore
-    from ..ports.validation_attempt_key_factory import ValidationAttemptKeyFactory
-    from ..execution.persistent_exchange_pair_registry_inmemory import (
-        InMemoryPersistentExchangePairRegistry,
-    )
-    from ..ports.turn_mailbox import TurnMailbox
     from ..ports.tech_lead_authority import TechLeadAuthorityStore
-    from ..control.background_job_supervisor import BackgroundJobSupervisor
 
 logger = logging.getLogger(__name__)
 
@@ -403,125 +400,6 @@ def create_attempt_store(config: Config) -> "AttemptStore":
     from ..adapters.sidecar_attempt_store import SidecarAttemptStore
 
     return SidecarAttemptStore(config.repo_root)
-
-
-def _validation_junit_xml_paths(config: Config) -> tuple[str, ...]:
-    from ..infra.validation_junit_paths import configured_validation_junit_xml_paths
-
-    return configured_validation_junit_xml_paths(config)
-
-
-class _IssueKeyValidationAttemptKeyFactory:
-    """Derives validation attempt identity from a stable issue key."""
-
-    def for_validation_attempt(
-        self,
-        *,
-        issue_key: "IssueKey",
-        head_sha: str,
-    ) -> "AttemptKey":
-        from ..domain.attempt import AttemptKey
-
-        return AttemptKey(issue_key, head_sha)
-
-
-def _validation_attempt_key_factory(
-    config: Config,
-) -> "ValidationAttemptKeyFactory":
-    _ = config
-    return _IssueKeyValidationAttemptKeyFactory()
-
-
-def _create_completion_components(
-    config: Config,
-    github: GitHubAdapter | None,
-    events: EventSink,
-    working_copy: GitWorkingCopy,
-    session_output: FileSystemSessionOutput,
-    command_runner: LocalCommandRunner,
-    provider_resilience: ProviderResilienceManager | None = None,
-    label_manager: "LabelManager | None" = None,
-    background_job_supervisor: "BackgroundJobSupervisor | None" = None,
-    pair_registry: "InMemoryPersistentExchangePairRegistry | None" = None,
-    attempt_store: "AttemptStore | None" = None,
-    turn_mailbox: "TurnMailbox | None" = None,
-    tech_lead_authority: "TechLeadAuthorityStore | None" = None,
-    agent_callback_endpoint: "AgentCallbackEndpoint | None" = None,
-) -> tuple["CompletionProcessor | None", "SessionController | None"]:
-    """Create completion processor and session controller."""
-    from ..control.completion_processor import CompletionProcessor
-    from ..control.pre_publish_gate import PrePublishGate
-    from ..control.session_controller import SessionController
-    from ..control.label_manager import LabelManager as _LM
-    from ..execution.run_evidence import RunEvidenceRecorder
-    from ..execution.persistent_exchange_pair_registry_inmemory import (
-        InMemoryPersistentExchangePairRegistry,
-    )
-    from ..execution.persistent_review_exchange_runner import (
-        PersistentReviewExchangeRunner,
-    )
-    from ..control.review_exchange_lifecycle import (
-        ReviewExchangeCancellation,
-        cancel_issue_review_exchange,
-    )
-
-    if label_manager is None:
-        label_manager = _LM(config)
-    if pair_registry is None:
-        pair_registry = InMemoryPersistentExchangePairRegistry()
-
-    def _cancel_review_exchange(
-        issue_number: int,
-        reason: str,
-    ) -> ReviewExchangeCancellation:
-        return cancel_issue_review_exchange(
-            issue_number=issue_number,
-            reason=reason,
-            pair_registry=pair_registry,
-            job_supervisor=background_job_supervisor,
-        )
-
-    completion_processor = CompletionProcessor(
-        label_adapter=github,
-        pr_adapter=github,
-        git_adapter=working_copy,
-        session_output=session_output,
-        # The review exchange delivers verdicts through the orchestrator-owned
-        # mailbox: agents run `exchange-respond`, the Control API delivers into
-        # the open turn slot, and send_round polls the mailbox (#6549).
-        review_exchange_runner=PersistentReviewExchangeRunner(
-            session_output, pair_registry, turn_mailbox=turn_mailbox,
-        ),
-        event_bus=None,
-        label_config=label_manager.to_label_config_dict(),
-        pre_publish_gate=PrePublishGate(command_runner) if config.enforce_hooks else None,
-        config=config,
-        background_job_supervisor=background_job_supervisor,
-        agent_callback_endpoint=agent_callback_endpoint,
-        review_exchange_canceller=_cancel_review_exchange,
-        review_artifact_reader=ManifestReviewArtifactReader(),
-        runtime_identity=runtime_identity.resolve_runtime_identity(),
-        tech_lead_authority=tech_lead_authority,
-    ) if github else None
-
-    session_controller_instance = SessionController(
-        completion_processor=completion_processor,
-        events=events,
-        session_output=session_output,
-        working_copy=working_copy,
-        command_runner=command_runner if config.validation.quick.cmd else None,
-        validation_cmd=config.validation.quick.cmd,
-        validation_timeout_seconds=config.validation.quick.timeout_seconds,
-        validation_junit_xml_paths=_validation_junit_xml_paths(config),
-        validation_evidence_recorder=RunEvidenceRecorder(session_output),
-        attempt_store=attempt_store,
-        validation_attempt_key_factory=_validation_attempt_key_factory(config),
-        max_validation_retries=config.retry.max_validation_retries,
-        provider_blocked_label=label_manager.provider_unavailable,
-        review_exchange_canceller=_cancel_review_exchange,
-    ) if completion_processor else None
-
-    return completion_processor, session_controller_instance
 
 
 def _wire_stack_publish_gate(
@@ -828,7 +706,6 @@ def build_orchestrator(
     # N concurrent subprocesses. Add a bounded executor if this becomes a real
     # load issue.
     background_job_runner = ThreadBackgroundJobRunner()
-    from ..control.background_job_supervisor import BackgroundJobSupervisor
     background_job_supervisor = BackgroundJobSupervisor(background_job_runner)
 
     # The persistent exchange pair registry is process-scoped: one
@@ -853,7 +730,7 @@ def build_orchestrator(
 
 
     # Create completion components
-    completion_processor, session_controller_instance = _create_completion_components(
+    completion_processor, session_controller_instance = create_completion_components(
         config, github, events, working_copy, session_output, command_runner, provider_resilience,
         label_manager=label_manager,
         background_job_supervisor=background_job_supervisor,
@@ -1044,7 +921,6 @@ def build_orchestrator_for_testing(
         Orchestrator configured with test dependencies
     """
     from ..infra.orchestrator import Orchestrator
-    from ..control.background_job_supervisor import BackgroundJobSupervisor
     from ..ports.background_job import NullBackgroundJobRunner
 
     install_gh_guard()
