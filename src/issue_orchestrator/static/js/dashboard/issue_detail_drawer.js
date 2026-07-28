@@ -60,6 +60,12 @@ async function openIssueDetail(issueNumber, triggerEl = null, opts = {}) {
     if (!issueDetailDrawer) return;
     lastIssueDetailTrigger = triggerEl || document.activeElement;
     currentIssueDetailFocus = opts && opts.focus === 'timeline' ? 'timeline' : null;
+    // ``opts.view`` lets an entrypoint open the drawer under an explicit
+    // timeline lens (see ``DIAGNOSTIC_TIMELINE_VIEW``).  It is applied through
+    // the shared view-state owner, not written here, so the requested lens and
+    // the rendered view toggle stay in step.  Omitting it keeps whatever view
+    // the user last selected.
+    if (opts && opts.view) applyTimelineView(opts.view);
     issueDetailDrawer.classList.add('visible');
     issueDetailDrawer.setAttribute('aria-hidden', 'false');
     document.getElementById('issueDetailTitle').textContent = `Issue #${issueNumber}`;
@@ -440,7 +446,12 @@ function openDiagnoseFromCycle(issueNumber, runDir = null) {
     // Command dispatches to, so both paths land on the contracted
     // ``/api/issue-detail/{issue_number}`` payload instead of the retired
     // ``/api/timeline/{issue_number}`` modal (#6421).
-    openIssueTimeline(issueNumber);
+    //
+    // Diagnose asks for the broad lens explicitly: the retired route applied
+    // no view filter, so opening under the default Story view would hide the
+    // Ops/Debug-only evidence (validation, label churn) this affordance exists
+    // to show.
+    openIssueTimeline(issueNumber, null, {view: DIAGNOSTIC_TIMELINE_VIEW});
 }
 
 function setJourneyFilter(filter) {
@@ -452,13 +463,13 @@ function setJourneyFilter(filter) {
 }
 
 async function setTimelineView(view) {
-    timelineView = view;
+    const resolvedView = applyTimelineView(view);
     if (issueDetailData) {
         const issueNumber = issueDetailData.issue_number;
         const e2eRunId = currentIssueDetailE2ERunId || issueDetailData.e2e_run_id || null;
         const url = e2eRunId
-            ? `/api/e2e-run/${e2eRunId}/issue-detail/${issueNumber}?view=${view}`
-            : `/api/issue-detail/${issueNumber}?view=${view}`;
+            ? `/api/e2e-run/${e2eRunId}/issue-detail/${issueNumber}?view=${resolvedView}`
+            : `/api/issue-detail/${issueNumber}?view=${resolvedView}`;
         try {
             const res = await fetch(url);
             if (res.ok) {

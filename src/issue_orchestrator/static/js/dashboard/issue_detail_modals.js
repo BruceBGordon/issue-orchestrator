@@ -116,5 +116,29 @@ const issueDetailDrawer = document.getElementById('issueDetailDrawer');
 let issueDetailData = null;
 let lastIssueDetailTrigger = null;
 let journeyFilter = 'latest-run'; // 'latest-run' or 'all'
-let timelineView = 'user'; // 'user', 'ops', or 'debug'
+let timelineView = 'user'; // one of TIMELINE_VIEWS
+
+// Mirrors the generated ``TimelineView`` wire enum (ui-contracts.d.ts), whose
+// runtime owner on the server side is ``view_models/timeline_view.py``.
+const TIMELINE_VIEWS = ['user', 'ops', 'debug', 'raw'];
+
+// The broad semantic lens: every semantically retained event, including the
+// Ops-only ones (``validation.completed``) and Debug-only ones
+// (``issue.labels_changed``) that the default Story view hides.  Diagnostic
+// entrypoints open the drawer with this lens so they keep showing what the
+// retired ``GET /api/timeline/{issue_number}`` route — which applied no view
+// filter at all — used to show (#6421).
+const DIAGNOSTIC_TIMELINE_VIEW = 'debug';
+
+// Single owner of the shared ``timelineView`` state.  Every writer (the view
+// toggle and any view-scoped drawer open) goes through here, so the lens the
+// drawer requests from the server and the lens its toggle reports as active
+// cannot drift.  Unrecognised values are ignored, matching the server-side
+// ``normalize_timeline_view`` coercion.
+function applyTimelineView(view) {
+    if (TIMELINE_VIEWS.includes(view)) {
+        timelineView = view;
+    }
+    return timelineView;
+}
 

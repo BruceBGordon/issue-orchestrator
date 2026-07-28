@@ -255,8 +255,15 @@ def build_timeline_event(
     logical_cycle: int | None = None,
     logical_phase: str | None = None,
     timeline_schema_version: int = TIMELINE_SCHEMA_VERSION,
+    views: list[str] | None = None,
 ) -> TimelineEvent:
-    """Build a TimelineEvent with sensible defaults for intent-focused tests."""
+    """Build a TimelineEvent with sensible defaults for intent-focused tests.
+
+    ``views`` mirrors the tags the TimelineWriter copies from
+    ``events/view_registry.py``.  Leaving it ``None`` reproduces pre-registry
+    data, which every timeline view includes; pass it explicitly (e.g.
+    ``["ops", "debug"]``) to exercise view filtering.
+    """
     from issue_orchestrator.entrypoints.web import _timeline_event_requires_run_dir
 
     inferred_intent = infer_event_intent(event_name=event_name, task=task)
@@ -300,6 +307,7 @@ def build_timeline_event(
         logical_run=logical_run,
         logical_cycle=logical_cycle,
         logical_phase=inferred_phase,
+        views=views,
     )
 
 

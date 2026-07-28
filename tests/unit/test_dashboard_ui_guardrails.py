@@ -2104,8 +2104,13 @@ def test_issue_detail_timeline_view_preserves_e2e_run_route() -> None:
     js = _read(DASHBOARD_JS)
     body = _function_body(js, "setTimelineView")
     assert "currentIssueDetailE2ERunId" in body
-    assert "/api/e2e-run/${e2eRunId}/issue-detail/${issueNumber}?view=${view}" in body
-    assert "/api/issue-detail/${issueNumber}?view=${view}" in body
+    # ``resolvedView`` is what ``applyTimelineView`` accepted, so the request
+    # and the active-toggle state cannot disagree (#6421).
+    assert (
+        "/api/e2e-run/${e2eRunId}/issue-detail/${issueNumber}?view=${resolvedView}"
+        in body
+    )
+    assert "/api/issue-detail/${issueNumber}?view=${resolvedView}" in body
     assert "setTimelineView('raw')" in js
 
 
@@ -2670,9 +2675,13 @@ def test_issue_timeline_surface_uses_contracted_issue_detail_route_only() -> Non
         )
 
     # The one caller that used to teleport into the modal now routes to the
-    # same target the typed ``open_issue_timeline`` Command dispatches to.
+    # same target the typed ``open_issue_timeline`` Command dispatches to,
+    # carrying the broad lens the retired (unfiltered) route was equivalent to.
     diagnose_body = _function_body(js, "openDiagnoseFromCycle")
-    assert "openIssueTimeline(issueNumber)" in diagnose_body
+    assert (
+        "openIssueTimeline(issueNumber, null, {view: DIAGNOSTIC_TIMELINE_VIEW})"
+        in diagnose_body
+    )
     assert "openTimelineModal" not in diagnose_body
 
     # ``openIssueTimeline`` remains the drawer entrypoint, and the drawer is
@@ -2684,6 +2693,66 @@ def test_issue_timeline_surface_uses_contracted_issue_detail_route_only() -> Non
     )
     assert "return openIssueDetail(issueNumber, triggerEl, {...opts, focus: 'timeline'});" in js
     assert "`/api/issue-detail/${issueNumber}?view=${timelineView}`" in js
+
+
+def test_timeline_view_state_has_a_single_writer() -> None:
+    """``timelineView`` is only ever written through ``applyTimelineView``.
+
+    The drawer sends the shared ``timelineView`` to the server *and* renders
+    the view toggle from it, so a second writer lets the requested lens and the
+    lens shown as active drift.  Issue #6421 made the diagnostic entrypoint
+    view-scoped (``DIAGNOSTIC_TIMELINE_VIEW``); this keeps that opt-in flowing
+    through the one owner instead of ad hoc global mutation at the call sites.
+
+    Behaviour is covered by ``tests/js/issue_timeline_diagnostic_view.test.js``;
+    this is the structural backstop.
+    """
+    js = _read(DASHBOARD_JS)
+
+    owner_body = _function_body(js, "applyTimelineView")
+    assert "timelineView = view;" in owner_body
+
+    writers = [
+        line.strip()
+        for line in js.splitlines()
+        if re.match(r"^\s*timelineView\s*=[^=]", line)
+    ]
+    assert writers == ["timelineView = view;"], (
+        "timelineView must be written only by applyTimelineView; "
+        f"found writers: {writers}"
+    )
+
+    # The broad lens is a named constant, not a literal sprinkled at call sites.
+    assert "const DIAGNOSTIC_TIMELINE_VIEW = 'debug';" in js
+    # The drawer applies an explicit ``opts.view`` through that owner.
+    assert "if (opts && opts.view) applyTimelineView(opts.view);" in js
+    # The view toggle routes through it too, and requests what it resolved to.
+    toggle_body = _function_body(js, "setTimelineView")
+    assert "const resolvedView = applyTimelineView(view);" in toggle_body
+    assert "?view=${resolvedView}`" in toggle_body
+
+
+def test_dashboard_timeline_views_match_generated_wire_enum() -> None:
+    """The dashboard's accepted view set must not drift from the wire enum.
+
+    ``applyTimelineView`` rejects anything outside ``TIMELINE_VIEWS``, so a
+    view added to the generated ``TimelineView`` schema (and honoured by the
+    server's ``normalize_timeline_view``) would be silently unreachable from
+    the UI if that list were not kept in step.
+    """
+    from typing import get_args
+
+    from issue_orchestrator.contracts.ui_openapi_models import TimelineView
+
+    js = _read(DASHBOARD_JS)
+    match = re.search(r"const TIMELINE_VIEWS = \[([^\]]*)\];", js)
+    assert match, "TIMELINE_VIEWS declaration not found in the dashboard bundle"
+    declared = {value.strip().strip("'\"") for value in match.group(1).split(",")}
+
+    assert declared == set(get_args(TimelineView)), (
+        "static/js TIMELINE_VIEWS has drifted from the generated TimelineView "
+        "enum; update it (and any view-specific UI affordance) to match."
+    )
 
 
 def test_e2e_latest_results_affordance_uses_formatted_run_modal() -> None:

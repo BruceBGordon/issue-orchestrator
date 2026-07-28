@@ -1207,6 +1207,64 @@ class TestApiTimelineEndpoint:
         finally:
             set_orchestrator(None)
 
+    def test_replacement_broad_lens_retains_ops_and_debug_only_events(self):
+        """The lens Diagnose requests must keep the evidence the old route showed.
+
+        The retired ``/api/timeline/{issue_number}`` applied no view filter, so
+        it returned every semantically retained event.  Its replacement filters
+        by ``view``, and the default ``user`` lens hides Ops-only events (e.g.
+        ``validation.completed``) and Debug-only ones (e.g. ``claim.acquired``)
+        — exactly the operational evidence Diagnose exists to show.  The
+        no-``run_dir`` Diagnose dispatch therefore requests ``view=debug``
+        (``tests/js/issue_timeline_diagnostic_view.test.js`` pins the request
+        side); this pins the response side (#6421).
+        """
+        mock_orch = create_mock_orchestrator()
+        mock_orch.deps.timeline_reader.read.return_value = TimelineStream(
+            issue_number=123,
+            events=[
+                build_timeline_event(
+                    "session.started",
+                    issue_number=123,
+                    event_id="e1",
+                    views=["user", "ops", "debug"],
+                ),
+                build_timeline_event(
+                    "validation.completed",
+                    issue_number=123,
+                    event_id="e2",
+                    status="completed",
+                    views=["ops", "debug"],
+                ),
+                build_timeline_event(
+                    "claim.acquired",
+                    issue_number=123,
+                    event_id="e3",
+                    views=["debug"],
+                ),
+            ],
+        )
+        set_orchestrator(mock_orch)
+        try:
+            client = TestClient(app)
+
+            broad = client.get("/api/issue-detail/123?view=debug")
+            assert broad.status_code == 200
+            assert [event["event"] for event in broad.json()["events"]] == [
+                "session.started",
+                "validation.completed",
+                "claim.acquired",
+            ]
+
+            # The default lens is not a substitute: it drops both.
+            story = client.get("/api/issue-detail/123")
+            assert story.status_code == 200
+            assert [event["event"] for event in story.json()["events"]] == [
+                "session.started"
+            ]
+        finally:
+            set_orchestrator(None)
+
     def test_timeline_projection_boundary_is_not_global(self):
         """Non-projection routes must keep their own exception contracts."""
         from pydantic import ValidationError
