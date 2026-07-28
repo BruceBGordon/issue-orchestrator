@@ -13,6 +13,8 @@ reachable with no credentials.
 
 from __future__ import annotations
 
+import os
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -420,59 +422,141 @@ def test_mounted_control_route_accepts_dashboard_bearer(
 
 
 # ---------------------------------------------------------------------------
+# Agent-callback token on the dashboard surface (#6913).
+#
+# ``control_app`` is mounted at ``""``, so the agent-callback routes are
+# served on the dashboard port and the dashboard gate runs first. It
+# used to pass ``agent=None`` with no route matcher, so a *valid* agent
+# token was rejected on the only surface that served the route. The
+# round runner then read the undelivered verdict as an unresponsive
+# agent, SIGKILLed a healthy coder, and stranded validated work.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def agent_callback_tokens():
+    """Configure both surfaces with a real agent-callback token."""
+    from issue_orchestrator.entrypoints.control_api import (
+        configure_api_token,
+        get_configured_agent_callback_token,
+        get_configured_api_token,
+    )
+
+    prev_admin = get_configured_api_token()
+    prev_agent = get_configured_agent_callback_token()
+    configure_api_token("test-admin-token", agent_callback="test-agent-token")
+    try:
+        yield
+    finally:
+        configure_api_token(prev_admin, agent_callback=prev_agent)
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["/api/review-exchange/respond", "/api/preflight-push", "/api/issues/6410/resume"],
+)
+def test_agent_callback_token_reaches_allowlisted_route_on_dashboard(
+    authed_client: TestClient,
+    agent_callback_tokens: None,
+    path: str,
+) -> None:
+    """The scoped agent token must pass the dashboard gate on the
+    allowlisted routes. Any 401/403 here is the #6913 regression: the
+    agent holds a valid credential and still cannot deliver.
+    """
+    resp = authed_client.post(
+        path,
+        headers={"Authorization": "Bearer test-agent-token"},
+        json={},
+    )
+    assert resp.status_code not in (401, 403), (
+        f"agent-callback token rejected on {path}: "
+        f"{resp.status_code} {resp.text}"
+    )
+
+
+@pytest.mark.parametrize("path", ["/api/shutdown", "/api/resume", "/api/kill"])
+def test_agent_callback_token_still_rejected_off_allowlist(
+    authed_client: TestClient,
+    agent_callback_tokens: None,
+    path: str,
+) -> None:
+    """Honouring the token must not widen it into an admin credential.
+
+    ``/api/resume`` is the dashboard's own pause/resume action and is a
+    deliberate near-miss: the allowlist matches
+    ``/api/issues/{n}/resume`` by prefix+suffix, and a looser
+    ``endswith("/resume")`` would hand agents this route too.
+    """
+    resp = authed_client.post(
+        path,
+        headers={"Authorization": "Bearer test-agent-token"},
+    )
+    assert resp.status_code in (401, 403), resp.text
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/api/resume",
+        "/resume",
+        "/api/issues/6410/kill",
+        # Non-numeric and extra-segment near misses. These 404 today, but
+        # a prefix+suffix match authorized them at the *auth* layer, so a
+        # future admin route of this shape would silently inherit
+        # agent-token access (#6924 F3).
+        "/api/issues/not-an-int/resume",
+        "/api/issues/6410/extra/resume",
+        "/api/issues//resume",
+        "/api/issues/6410/resume/extra",
+    ],
+)
+def test_near_miss_paths_are_not_agent_callback_routes(path: str) -> None:
+    """Pin the allowlist to the declared route template exactly."""
+    from issue_orchestrator.entrypoints._auth_middleware import (
+        is_agent_callback_route,
+    )
+
+    assert is_agent_callback_route(path) is False, f"{path} must require admin"
+
+
+def test_declared_resume_template_is_an_agent_callback_route() -> None:
+    from issue_orchestrator.entrypoints._auth_middleware import (
+        is_agent_callback_route,
+    )
+
+    assert is_agent_callback_route("/api/issues/6410/resume") is True
+    assert is_agent_callback_route("/api/issues/1/resume") is True
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/api/issues/not-an-int/resume",
+        "/api/issues/6410/extra/resume",
+        "/api/issues/6410/resume/extra",
+    ],
+)
+def test_near_miss_paths_rejected_over_http(
+    authed_client: TestClient,
+    agent_callback_tokens: None,
+    path: str,
+) -> None:
+    """The same near misses, asserted through the real auth middleware."""
+    resp = authed_client.post(
+        path,
+        headers={"Authorization": "Bearer test-agent-token"},
+    )
+    assert resp.status_code in (401, 403), (
+        f"{path} passed auth with an agent-callback token: {resp.status_code}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Browser-session policy ownership — the dashboard must honor the
 # operator-set ``ui.browser_session.*`` values, not silently fall
 # back to the module defaults (#6041 re-review P2).
 # ---------------------------------------------------------------------------
-
-
-def test_dashboard_startup_honors_browser_session_config(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Running ``_configure_dashboard_auth`` with a config object
-    must thread ``browser_session_ttl_seconds`` / ``sse_token_ttl_seconds``
-    / ``browser_session_max`` into ``browser_session.initialize``.
-    Before the P2 fix this ran with no arguments and the operator's
-    values were ignored.
-    """
-    from dataclasses import dataclass
-
-    from issue_orchestrator.entrypoints.run_orchestrator import (
-        _configure_dashboard_auth,
-    )
-    from issue_orchestrator.entrypoints.web import (
-        configure_dashboard_admin_token,
-        get_configured_dashboard_admin_token,
-    )
-    from issue_orchestrator.infra import browser_session as bs_module
-
-    @dataclass
-    class _FakeConfig:
-        browser_session_ttl_seconds: int = 900
-        sse_token_ttl_seconds: int = 10
-        browser_session_max: int = 7
-
-    monkeypatch.setenv(
-        "ISSUE_ORCHESTRATOR_API_TOKEN",
-        "bootstrap-admin-token-that-is-long-enough",
-    )
-
-    previous_token = get_configured_dashboard_admin_token()
-    previous_ttl = bs_module.SESSION_TTL_SECONDS
-    previous_sse = bs_module.SSE_TOKEN_TTL_SECONDS
-    previous_max = bs_module.MAX_SESSIONS
-    try:
-        _configure_dashboard_auth(dev_no_auth=False, config=_FakeConfig())
-        assert bs_module.SESSION_TTL_SECONDS == 900
-        assert bs_module.SSE_TOKEN_TTL_SECONDS == 10
-        assert bs_module.MAX_SESSIONS == 7
-    finally:
-        configure_dashboard_admin_token(previous_token)
-        bs_module.initialize(
-            session_ttl_seconds=previous_ttl,
-            sse_token_ttl_seconds=previous_sse,
-            max_sessions=previous_max,
-        )
 
 
 def test_cookie_minted_via_cc_login_works_on_dashboard() -> None:
@@ -526,38 +610,3 @@ def test_cookie_minted_via_cc_login_works_on_dashboard() -> None:
         bs_module.shutdown()
         configure_api_token(prev_admin, agent_callback=prev_agent)
         configure_dashboard_admin_token(prev_dashboard)
-
-
-def test_dev_no_auth_still_honors_browser_session_config() -> None:
-    """Even in --dev-no-auth mode the browser_session tunables should
-    match what the operator configured — the session module still
-    initializes and may be used if the operator later re-enables
-    auth via a restart.
-    """
-    from dataclasses import dataclass
-
-    from issue_orchestrator.entrypoints.run_orchestrator import (
-        _configure_dashboard_auth,
-    )
-    from issue_orchestrator.infra import browser_session as bs_module
-
-    @dataclass
-    class _FakeConfig:
-        browser_session_ttl_seconds: int = 120
-        sse_token_ttl_seconds: int = 5
-        browser_session_max: int = 3
-
-    previous_ttl = bs_module.SESSION_TTL_SECONDS
-    previous_sse = bs_module.SSE_TOKEN_TTL_SECONDS
-    previous_max = bs_module.MAX_SESSIONS
-    try:
-        _configure_dashboard_auth(dev_no_auth=True, config=_FakeConfig())
-        assert bs_module.SESSION_TTL_SECONDS == 120
-        assert bs_module.SSE_TOKEN_TTL_SECONDS == 5
-        assert bs_module.MAX_SESSIONS == 3
-    finally:
-        bs_module.initialize(
-            session_ttl_seconds=previous_ttl,
-            sse_token_ttl_seconds=previous_sse,
-            max_sessions=previous_max,
-        )

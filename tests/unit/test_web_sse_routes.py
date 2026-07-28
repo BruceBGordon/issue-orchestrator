@@ -259,7 +259,14 @@ class TestSSEFunctionality:
             port: int,
             open_browser: bool = True,
             on_server_started=None,
+            server_published=None,
         ) -> None:
+            # The real implementation sets this once the server has
+            # published its bound port; orchestration waits on it before
+            # launching anything (#6924 F7). A stub that never sets it
+            # would stall startup for the full publish timeout.
+            if server_published is not None:
+                server_published.set()
             await startup_event.wait()
 
         async def fast_sleep(_seconds: float) -> None:

@@ -114,6 +114,7 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from ..infra.config import Config
+    from ..ports.agent_callback_endpoint import AgentCallbackEndpoint
     from ..ports.tech_lead_authority import TechLeadAuthorityStore
     from .stack_base import StackBaseDecision
     from .stack_publish_gate import StackBaseGate
@@ -186,6 +187,10 @@ class CompletionProcessor:
         config: "Config | None" = None,
         background_job_supervisor: "BackgroundJobSupervisor | None" = None,
         review_exchange_canceller: ReviewExchangeCanceller | None = None,
+        *,
+        # Required: an agent with no callback endpoint cannot report
+        # anything back, so there is no sensible default to fall back to.
+        agent_callback_endpoint: "AgentCallbackEndpoint",
         review_artifact_reader: ReviewArtifactReader | None = None,
         runtime_identity: RuntimeIdentity | None = None,
         tech_lead_authority: "TechLeadAuthorityStore | None" = None,
@@ -250,6 +255,7 @@ class CompletionProcessor:
             review_exchange_runner=review_exchange_runner or NullReviewExchangeRunner(),
             job_supervisor=background_job_supervisor,
             review_exchange_canceller=review_exchange_canceller,
+            agent_callback_endpoint=agent_callback_endpoint,
         )
         # Per-(session, head_sha) consecutive validation-failed reroute count.
         # The reroute path can re-enter every tick when downstream rework

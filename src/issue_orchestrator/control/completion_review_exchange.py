@@ -33,6 +33,7 @@ from .review_publish_pipeline import resolve_review_publish_pipeline
 if TYPE_CHECKING:
     from ..infra.config import Config
     from ..domain.review_exchange import ReviewExchangeOutcome
+    from ..ports.agent_callback_endpoint import AgentCallbackEndpoint
 
 logger = logging.getLogger(__name__)
 
@@ -199,6 +200,7 @@ class CompletionReviewExchange:
         review_exchange_runner: ReviewExchangeRunner,
         job_supervisor: BackgroundJobSupervisor | None = None,
         review_exchange_canceller: ReviewExchangeCanceller | None = None,
+        agent_callback_endpoint: "AgentCallbackEndpoint",
     ) -> None:
         self._config = config
         self._session_output = session_output
@@ -206,6 +208,7 @@ class CompletionReviewExchange:
         self._emit_review_started = emit_review_started
         self._emit_review_outcome = emit_review_outcome
         self._review_exchange_canceller = review_exchange_canceller
+        self._agent_callback_endpoint = agent_callback_endpoint
         # Supervisor injection is REQUIRED for the async failure path to work:
         # ``take_failure`` only returns values that ``tick()`` has populated,
         # and ``tick()`` must be called from the orchestrator's main loop.
@@ -1307,7 +1310,13 @@ class CompletionReviewExchange:
             require_validation=self._config.review_exchange_require_validation,
             nit_policy=nit_policy,
             initial_validation_record_path=initial_validation_record_path,
-            web_port=self._config.control_api_port,
+            # Through the bound-endpoint owner, not the configured
+            # value: the engine binds an auto-assigned port and never
+            # writes it back into Config, so the raw value is 0 and the
+            # exchange exported an undialable port (#6924).
+            web_port=self._agent_callback_endpoint.resolve_port(
+                self._config.control_api_port
+            ),
             events=events,
             event_context=event_context,
         )

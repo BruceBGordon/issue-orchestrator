@@ -832,6 +832,10 @@ def build_test_orchestrator_deps(
     from issue_orchestrator.control.label_sync import LabelSync
     from issue_orchestrator.control.board_snapshot_builder import BoardSnapshotBuilder
     from issue_orchestrator.control.orchestrator_deps import OrchestratorDeps
+    from issue_orchestrator.entrypoints.bootstrap_session_launcher import (
+        build_session_launcher_factory,
+    )
+    from tests.callback_endpoint_helpers import ready_callback_endpoint
     from issue_orchestrator.events import EventHub
     from issue_orchestrator.execution.git_working_copy import GitWorkingCopy
     from issue_orchestrator.execution.command_runner import LocalCommandRunner
@@ -856,7 +860,10 @@ def build_test_orchestrator_deps(
     from issue_orchestrator.execution.persistent_review_exchange_runner import (
         PersistentReviewExchangeRunner,
     )
+    agent_callback_endpoint = ready_callback_endpoint()
+
     completion_processor = CompletionProcessor(
+        agent_callback_endpoint=agent_callback_endpoint,
         label_adapter=repo_host,
         pr_adapter=repo_host,
         git_adapter=working_copy,
@@ -1031,6 +1038,30 @@ def build_test_orchestrator_deps(
     return OrchestratorDeps(
         events=events,
         runner=runner,
+        # The same endpoint the completion processor got, mirroring how
+        # bootstrap shares one instance. Nothing binds a port in tests, so
+        # it honestly resolves to "no endpoint yet".
+        agent_callback_endpoint=agent_callback_endpoint,
+        # Same shape as bootstrap: assembly at the composition boundary,
+        # closing over these collaborators (#6924 A3-R2).
+        session_launcher_factory=build_session_launcher_factory(
+            config=config,
+            events=events,
+            repository_host=repo_host,
+            action_applier=_action_applier,
+            session_manager=_session_manager,
+            worktree_manager=worktree_manager,
+            working_copy=working_copy,
+            command_runner=command_runner,
+            session_output=session_output,
+            manifest_downloader=manifest_downloader,
+            tech_lead_authority=tech_lead_authority,
+            claim_manager=claim_manager,
+            provider_resilience=provider_resilience,
+            state_machine_manager=state_machine_manager,
+            label_manager=label_manager,
+            agent_callback_endpoint=agent_callback_endpoint,
+        ),
         repository_host=repo_host,
         e2e_issue_tracker=e2e_issue_tracker,
         fresh_issue_reader=fresh_reader,

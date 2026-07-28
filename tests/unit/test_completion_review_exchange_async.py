@@ -38,6 +38,7 @@ from issue_orchestrator.infra.config import Config
 from issue_orchestrator.domain.models import AgentConfig
 from issue_orchestrator.ports.background_job import CompletedJob
 from issue_orchestrator.ports.session_output import ReviewExchangeSummary, SessionOutput
+from tests.callback_endpoint_helpers import ready_callback_endpoint
 
 
 class _FakeReviewExchangeRunner:
@@ -350,6 +351,7 @@ def _build(
     # these tests because the fake runner doesn't raise; when failure paths
     # need testing, tests call `supervisor.tick()` themselves.
     review = CompletionReviewExchange(
+        agent_callback_endpoint=ready_callback_endpoint(),
         config=_make_config(tmp_path, require_validation=require_validation),
         session_output=cast(SessionOutput, session_output),
         emit_review_started=_record_review_started,
@@ -417,6 +419,7 @@ def test_background_deadline_is_derived_from_runner_port(tmp_path: Path) -> None
     supervisor = _CapturingSupervisor()
     cfg = _make_config(tmp_path)
     review = CompletionReviewExchange(
+        agent_callback_endpoint=ready_callback_endpoint(),
         config=cfg,
         session_output=cast(SessionOutput, _FakeSessionOutput(tmp_path)),
         emit_review_started=lambda **_: None,
@@ -515,6 +518,7 @@ def test_running_background_job_without_deadline_halts(tmp_path: Path) -> None:
 
     errors: list[str] = []
     review = CompletionReviewExchange(
+        agent_callback_endpoint=ready_callback_endpoint(),
         config=_make_config(tmp_path),
         session_output=cast(SessionOutput, _FakeSessionOutput(tmp_path)),
         emit_review_started=lambda **_: None,
@@ -602,6 +606,7 @@ def test_within_deadline_for_completion_returns_false_for_unbounded_job(
     job_runner = _FakeJobRunner()
     supervisor = BackgroundJobSupervisor(job_runner)
     review = CompletionReviewExchange(
+        agent_callback_endpoint=ready_callback_endpoint(),
         config=_make_config(tmp_path),
         session_output=cast(SessionOutput, _FakeSessionOutput(tmp_path)),
         emit_review_started=lambda **_: None,
@@ -660,6 +665,7 @@ def test_within_deadline_for_completion_returns_true_for_bounded_running_job(
     # The default _FakeReviewExchangeRunner reports a 60s deadline, so
     # the BG job is bounded and still inside it.
     review = CompletionReviewExchange(
+        agent_callback_endpoint=ready_callback_endpoint(),
         config=_make_config(tmp_path),
         session_output=cast(SessionOutput, _FakeSessionOutput(tmp_path)),
         emit_review_started=lambda **_: None,
@@ -725,6 +731,7 @@ def test_background_deadline_failure_cancels_runtime(tmp_path: Path) -> None:
 
     errors: list[str] = []
     review = CompletionReviewExchange(
+        agent_callback_endpoint=ready_callback_endpoint(),
         config=_make_config(tmp_path),
         session_output=cast(SessionOutput, _FakeSessionOutput(tmp_path)),
         emit_review_started=lambda **_: None,
@@ -1411,6 +1418,7 @@ def test_no_job_runner_falls_back_to_inline_execution(
     )
 
     review = CompletionReviewExchange(
+        agent_callback_endpoint=ready_callback_endpoint(),
         config=_make_config(tmp_path),
         session_output=cast(SessionOutput, session_output),
         emit_review_started=lambda **kw: started.append(kw),
@@ -1477,6 +1485,7 @@ def test_inline_review_exchange_halt_is_logged(
     )
 
     review = CompletionReviewExchange(
+        agent_callback_endpoint=ready_callback_endpoint(),
         config=_make_config(tmp_path),
         session_output=cast(SessionOutput, session_output),
         emit_review_started=lambda **kw: started.append(kw),
@@ -1575,6 +1584,7 @@ def test_retry_does_not_reconsume_prior_run_timeout_cancellation(
         return _Cancellation(cancelled_job_ids=cancelled)
 
     review = CompletionReviewExchange(
+        agent_callback_endpoint=ready_callback_endpoint(),
         config=_make_config(tmp_path),
         session_output=cast(SessionOutput, _FakeSessionOutput(tmp_path)),
         emit_review_started=lambda **_: None,

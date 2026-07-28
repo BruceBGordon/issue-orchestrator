@@ -30,7 +30,7 @@ import urllib.error
 import urllib.request
 
 from ...domain.review_exchange_verdict import ExchangeVerdict
-from .orchestrator_resume import api_request_headers
+from .agent_callback import api_request_headers, resolve_control_api_port
 
 _VALID_RESPONSE_TYPES = ("ok", "changes_requested", "disagree")
 
@@ -47,10 +47,8 @@ def _routing_key() -> str | None:
 
 
 def _api_port() -> str | None:
-    port = os.environ.get("ISSUE_ORCHESTRATOR_API_PORT") or os.environ.get(
-        "ORCHESTRATOR_API_PORT"
-    )
-    return port.strip() if port else None
+    """Resolve the Control API port via the shared agent-callback owner."""
+    return resolve_control_api_port()
 
 
 def build_parser() -> argparse.ArgumentParser:

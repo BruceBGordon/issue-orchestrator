@@ -14,7 +14,6 @@ the orchestrator focused on coordination and main loop logic.
 """
 
 import logging
-import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -22,6 +21,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Optional, Callable, Mapping, Sequence
 
 if TYPE_CHECKING:
+    from ..ports.agent_callback_endpoint import AgentCallbackEndpoint
     from ..ports.board_snapshot_provider import BoardSnapshotProvider
     from ..domain.state_machines.issue_machine import IssueStateMachine
     from ..domain.state_machines.session_machine import SessionStateMachine
@@ -34,7 +34,6 @@ if TYPE_CHECKING:
     from .label_manager import LabelManager
 
 from ..infra.config import Config
-from ..infra.env import ENV_PREFIX
 from ..infra.logging_config import issue_log, log_context
 from ..events import EventName
 from ..domain.models import (
@@ -95,7 +94,12 @@ from .session_worktree_diagnostics import (
     write_worktree_diagnostic,
 )
 from .transition_log import log_transition
-from .isolation import build_agent_tool_env_assignments, build_runtime_tool_env
+from .isolation import build_runtime_tool_env
+from .launch_guards import (
+    callback_endpoint_not_ready,
+    retrospective_session_conflict,
+)
+from .session_env import build_session_env_exports
 from .provider_command_wrapper import ProviderCommandWrapper
 
 logger = logging.getLogger(__name__)
@@ -208,6 +212,7 @@ class SessionLauncher:
         # authoritative required input, so the launcher must always be able to
         # produce one. Tests inject a null-object/fake provider, never None.
         board_snapshot_provider: "BoardSnapshotProvider",
+        agent_callback_endpoint: "AgentCallbackEndpoint",
     ):
         self.config = config
         self.events = events
@@ -221,6 +226,7 @@ class SessionLauncher:
         self._manifest_downloader = manifest_downloader
         self._tech_lead_authority = tech_lead_authority
         self._board_snapshot_provider = board_snapshot_provider
+        self._agent_callback_endpoint = agent_callback_endpoint
         self._session_exists = session_exists_fn
         self._create_session = create_session_fn
         self._get_issue_machine = get_issue_machine
@@ -425,41 +431,18 @@ class SessionLauncher:
     ) -> str:
         """Build the common env-export string for all session types.
 
-        Includes the orchestrator venv on PATH so ``coding-done``/``reviewer-done``
-        is always reachable — even when the target repo is a foreign
-        (non-orchestrator) repository with no ``.venv``.
-
-        Also exports orchestrator ``src`` on ``PYTHONPATH`` so subprocess
-        commands launched from arbitrary worktree directories can import
-        ``issue_orchestrator`` without depending on editable installs.
-
-        NOTE: The selected orchestrator config name is exported so ``coding-done``/``reviewer-done``
-        resolves validation from the same config file used by the launcher.
+        Delegates to :mod:`.session_env`, which owns the agent session
+        environment contract for every launch path.
         """
-        orch_bin = Path(sys.executable).parent
-        orch_src = Path(__file__).resolve().parents[2]
-        runtime_tool_assignments = " ".join(build_agent_tool_env_assignments(worktree_path))
-        config_exports = ""
-        if self.config.config_path is not None:
-            config_name = self.config.config_path.name
-            config_path = str(self.config.config_path.resolve())
-            config_exports = (
-                f" {ENV_PREFIX}CONFIG_NAME='{config_name}'"
-                f" {ENV_PREFIX}CONFIG_PATH='{config_path}'"
-            )
-        return (
-            f"export {ENV_PREFIX}COMPLETION_PATH='{completion_path}'"
-            f" {ENV_PREFIX}SESSION_ID='{session_id}'"
-            f" {ENV_PREFIX}AGENT_LABEL='{agent_label}'"
-            f" {ENV_PREFIX}ISSUE_NUMBER='{issue_number}'"
-            f"{config_exports}"
-            f" {ENV_PREFIX}API_PORT='{self.config.control_api_port}'"
-            f" {ENV_PREFIX}VALIDATION_OUTPUT_DIR='{run_assets.run_dir}'"
-            f" {ENV_PREFIX}RUN_DIR='{run_assets.run_dir}'"
-            f" {ENV_PREFIX}WORKTREE='{worktree_path}'"
-            f" {runtime_tool_assignments}"
-            f' PYTHONPATH="{orch_src}:${{PYTHONPATH:-}}"'
-            f' PATH="{orch_bin}:$PATH"'
+        return build_session_env_exports(
+            config=self.config,
+            completion_path=completion_path,
+            session_id=session_id,
+            agent_label=agent_label,
+            issue_number=issue_number,
+            run_dir=run_assets.run_dir,
+            worktree_path=worktree_path,
+            callback_endpoint=self._agent_callback_endpoint,
         )
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -478,6 +461,9 @@ class SessionLauncher:
 
         Returns LaunchResult on failure, None if preconditions pass.
         """
+        if result := callback_endpoint_not_ready(self._agent_callback_endpoint):
+            return result
+
         if issue.agent_type is None:
             return LaunchResult(None, False, f"Issue #{issue.number} has no agent type label")
 
@@ -1574,6 +1560,8 @@ class SessionLauncher:
         active_sessions: list[Session],
     ) -> LaunchResult:
         """Launch a code review session for a PR."""
+        if result := callback_endpoint_not_ready(self._agent_callback_endpoint):
+            return result
         # Get the reviewer for this agent (per-agent override or default)
         agent_label = self.config.get_reviewer_for_agent(review.agent_label) if review.agent_label else self.config.code_review_agent
         if not agent_label:
@@ -1863,6 +1851,8 @@ class SessionLauncher:
         active_sessions: list[Session],
     ) -> LaunchResult:
         """Launch a reviewer session to audit an existing implementation."""
+        if result := callback_endpoint_not_ready(self._agent_callback_endpoint):
+            return result
         agent_label = (
             self.config.get_reviewer_for_agent(review.agent_label)
             if review.agent_label
@@ -1879,25 +1869,11 @@ class SessionLauncher:
             return result
 
         session_name = SessionRef.for_retrospective_review(review.issue_number).name
-        if any(s.terminal_id == session_name for s in active_sessions):
-            log_transition(
-                "retrospective-review",
-                review.issue_number,
-                "QUEUED",
-                "SKIP",
-                "already in active_sessions",
-            )
-            return LaunchResult(None, False, "Already in active sessions")
-
-        if self._session_exists(session_name):
-            log_transition(
-                "retrospective-review",
-                review.issue_number,
-                "QUEUED",
-                "SKIP",
-                "terminal session already running",
-            )
-            return LaunchResult(None, False, "Terminal session already running", keep_queued=True)
+        if result := retrospective_session_conflict(
+            session_name, review.issue_number, active_sessions,
+            session_exists=self._session_exists,
+        ):
+            return result
 
         if not self.config.repo:
             return LaunchResult(None, False, "No repo configured")
@@ -2130,6 +2106,8 @@ class SessionLauncher:
         active_sessions: list[Session],
     ) -> LaunchResult:
         """Launch a rework session to fix issues found in review."""
+        if result := callback_endpoint_not_ready(self._agent_callback_endpoint):
+            return result
         deps = ReworkLaunchDependencies(
             config=self.config,
             events=self.events,
