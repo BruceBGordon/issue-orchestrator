@@ -457,6 +457,18 @@ class SessionLauncher:
 
         Returns LaunchResult on failure, None if preconditions pass.
         """
+        # An agent spawned before the callback endpoint is known gets an
+        # environment with no way to reach us, and every callback it makes
+        # fails — the exact failure this whole change exists to remove.
+        # Every start mode either binds a Control API or declares that it
+        # serves none, so this is a regression guard, not a normal path
+        # (#6924 F7). Retryable: the next tick launches once ready.
+        if not self._agent_callback_endpoint.is_ready():
+            return LaunchResult(
+                None, False,
+                "Agent callback endpoint not published yet; deferring launch",
+            )
+
         if issue.agent_type is None:
             return LaunchResult(None, False, f"Issue #{issue.number} has no agent type label")
 

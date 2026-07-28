@@ -171,9 +171,9 @@ if STATIC_DIR.exists():
 # working. Every production entrypoint that serves these routes must
 # call ``configure_api_token`` to turn enforcement on:
 # ``ControlAPIServer.start``, ``control_center.main``, and
-# ``run_orchestrator._configure_dashboard_auth`` — the last of these
-# serves ``control_app`` mounted under the dashboard app, and omitting
-# it left the engine with no callback token at all (#6924).
+# ``EngineStartup.configure_auth`` — the last of these serves
+# ``control_app`` mounted under the dashboard app, and omitting it
+# left the engine with no callback token at all (#6924).
 _admin_token: str | None = None
 _agent_callback_token: str | None = None
 
@@ -1256,6 +1256,13 @@ class ControlAPIServer:
                         self.port = addr[1]
                         break
 
+        # Publish where agents can reach us. All three CLI start modes
+        # bind through this class, so routing publication here covers
+        # every supported server lifecycle rather than just the
+        # supervised web entrypoint (#6924 F7).
+        self.orchestrator.deps.agent_callback_endpoint.publish_bound_port(
+            self.port
+        )
         logger.info(f"Control API started on http://127.0.0.1:{self.port}")
 
     async def stop(self) -> None:

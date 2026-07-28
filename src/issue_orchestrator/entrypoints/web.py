@@ -57,6 +57,10 @@ if TYPE_CHECKING:
     from ..infra.orchestrator import Orchestrator
 
 logger = logging.getLogger(__name__)
+
+# How long orchestration waits for the server to publish its bound port
+# before starting anyway (and reporting the problem).
+_SERVER_PUBLISH_TIMEOUT_SECONDS = 30.0
 _COMPAT_EXPORTS = (
     _decorate_timeline_events,
     _is_agent_scoped_event,
@@ -551,6 +555,7 @@ async def run_web_dashboard(
     port: int = 8080,
     open_browser: bool = True,
     on_server_started: Callable[[int], Awaitable[None] | None] | None = None,
+    server_published: asyncio.Event | None = None,
 ) -> None:
     """Run the web dashboard server.
 
@@ -590,6 +595,10 @@ async def run_web_dashboard(
             result = on_server_started(actual_port)
             if asyncio.iscoroutine(result):
                 await result
+        # Set only after the hook has run, so anything awaiting this
+        # sees a published callback endpoint, not merely a bound socket.
+        if server_published is not None:
+            server_published.set()
         if open_browser:
             url = f"http://127.0.0.1:{actual_port}"
             logger.info("[web] Starting uvicorn server on %s", url)
@@ -637,12 +646,33 @@ async def run_with_web_dashboard(
         """
         asyncio.run(orchestrator.startup())
 
+    server_published = asyncio.Event()
+
     async def run_startup_and_loop():
         """Run startup then the orchestrator loop."""
         global _main_loop
 
-        # Wait for server to start and serve initial request before running startup
-        await asyncio.sleep(0.5)
+        # Wait for the server to publish its bound port before starting
+        # orchestration. A fixed sleep raced session launch against
+        # endpoint publication, so an agent could be spawned before it
+        # could be told where to call back (#6924 F7).
+        #
+        # Bounded: if the server never comes up, the loop must still
+        # start so the dashboard reports the problem instead of hanging
+        # silently. Agent launch stays blocked by the readiness gate in
+        # SessionLauncher, so proceeding here cannot spawn an agent that
+        # has nowhere to call back.
+        try:
+            await asyncio.wait_for(
+                server_published.wait(), timeout=_SERVER_PUBLISH_TIMEOUT_SECONDS
+            )
+        except asyncio.TimeoutError:
+            logger.error(
+                "[web] Server did not publish a bound port within %.0fs; "
+                "starting orchestration anyway. Agent sessions stay "
+                "blocked until the callback endpoint is available.",
+                _SERVER_PUBLISH_TIMEOUT_SECONDS,
+            )
         try:
             # Run startup in a thread pool to avoid blocking the event loop
             # startup() makes synchronous GitHub API calls that would block serving requests
@@ -685,6 +715,7 @@ async def run_with_web_dashboard(
             port,
             open_browser=open_browser,
             on_server_started=on_server_started,
+            server_published=server_published,
         )
     finally:
         # When web server stops, stop orchestrator

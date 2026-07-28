@@ -832,9 +832,7 @@ def build_test_orchestrator_deps(
     from issue_orchestrator.control.label_sync import LabelSync
     from issue_orchestrator.control.board_snapshot_builder import BoardSnapshotBuilder
     from issue_orchestrator.control.orchestrator_deps import OrchestratorDeps
-    from issue_orchestrator.infra.agent_callback_endpoint import (
-        RuntimeAgentCallbackEndpoint,
-    )
+    from tests.callback_endpoint_helpers import ready_callback_endpoint
     from issue_orchestrator.events import EventHub
     from issue_orchestrator.execution.git_working_copy import GitWorkingCopy
     from issue_orchestrator.execution.command_runner import LocalCommandRunner
@@ -859,7 +857,7 @@ def build_test_orchestrator_deps(
     from issue_orchestrator.execution.persistent_review_exchange_runner import (
         PersistentReviewExchangeRunner,
     )
-    agent_callback_endpoint = RuntimeAgentCallbackEndpoint()
+    agent_callback_endpoint = ready_callback_endpoint()
 
     completion_processor = CompletionProcessor(
         agent_callback_endpoint=agent_callback_endpoint,

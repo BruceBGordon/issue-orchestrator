@@ -121,6 +121,12 @@ async def _run_no_dashboard(orchestrator, api_port: int | None) -> None:
     """Run orchestrator without dashboard UI."""
     from .control_api import ControlAPIServer
 
+    if api_port is None:
+        # No Control API in this mode: answer the endpoint question
+        # explicitly so readiness resolves and agent launch is not
+        # gated on a publication that will never come (#6924 F7).
+        orchestrator.deps.agent_callback_endpoint.declare_unavailable()
+
     control_api = None
     if api_port is not None:
         control_api = ControlAPIServer(orchestrator, port=api_port)
@@ -158,6 +164,12 @@ async def _run_web_dashboard(
     loop.add_signal_handler(signal.SIGINT, handle_signal)
     loop.add_signal_handler(signal.SIGTERM, handle_signal)
 
+    if api_port is None:
+        # No Control API in this mode: answer the endpoint question
+        # explicitly so readiness resolves and agent launch is not
+        # gated on a publication that will never come (#6924 F7).
+        orchestrator.deps.agent_callback_endpoint.declare_unavailable()
+
     control_api = None
     if api_port is not None:
         if api_port != 0:
@@ -187,6 +199,12 @@ async def _run_tui_dashboard(
     """Run orchestrator with TUI dashboard."""
     from .control_api import ControlAPIServer
     from .dashboard import run_with_dashboard
+
+    if api_port is None:
+        # No Control API in this mode: answer the endpoint question
+        # explicitly so readiness resolves and agent launch is not
+        # gated on a publication that will never come (#6924 F7).
+        orchestrator.deps.agent_callback_endpoint.declare_unavailable()
 
     control_api = None
     if api_port is not None:

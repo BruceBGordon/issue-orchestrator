@@ -122,3 +122,34 @@ def test_session_env_still_carries_the_other_launch_contract(
         "PATH=",
     ):
         assert expected in exports, f"missing {expected}"
+
+
+class TestLaunchGateOnEndpointReadiness:
+    """The launcher must not spawn an agent before the endpoint is known.
+
+    Reproduces the production gap F7 found: the CLI start modes bound a
+    Control API but never published it, so an agent could be launched
+    into an environment with no callback. The gate makes publication a
+    precondition rather than a hope.
+    """
+
+    def test_endpoint_starts_unready(
+        self, endpoint: RuntimeAgentCallbackEndpoint
+    ) -> None:
+        assert endpoint.is_ready() is False
+
+    def test_unready_endpoint_exports_no_port(
+        self, tmp_path: Path, endpoint: RuntimeAgentCallbackEndpoint
+    ) -> None:
+        """The state the gate exists to prevent an agent from ever seeing."""
+        exports = _exports(Config(control_api_port=0), tmp_path, endpoint)
+        assert "ISSUE_ORCHESTRATOR_API_PORT" not in exports
+
+    def test_declaring_unavailable_is_ready_with_no_port(
+        self, tmp_path: Path, endpoint: RuntimeAgentCallbackEndpoint
+    ) -> None:
+        """A no-Control-API deployment must launch, just without a port."""
+        endpoint.declare_unavailable()
+        assert endpoint.is_ready() is True
+        exports = _exports(Config(control_api_port=0), tmp_path, endpoint)
+        assert "ISSUE_ORCHESTRATOR_API_PORT" not in exports

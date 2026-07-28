@@ -41,6 +41,18 @@ class NullAgentCallbackEndpoint:
             "RuntimeAgentCallbackEndpoint."
         )
 
+    def declare_unavailable(self) -> None:
+        raise NotImplementedError(
+            "No agent callback endpoint was injected. Production wires one "
+            "in bootstrap."
+        )
+
+    def is_ready(self) -> bool:
+        raise NotImplementedError(
+            "No agent callback endpoint was injected, so readiness is "
+            "unknowable. Production wires one in bootstrap."
+        )
+
     def resolve_port(self, configured_port: int) -> int | None:
         raise NotImplementedError(
             "No agent callback endpoint was injected, so there is no port to "
@@ -55,6 +67,9 @@ class RuntimeAgentCallbackEndpoint:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._bound_port: int | None = None
+        # Distinct from "no port": tells us the question has been
+        # answered, so readiness is not just "port is None".
+        self._unavailable = False
 
     def publish_bound_port(self, port: int) -> None:
         """Publish the port uvicorn actually bound.
@@ -69,7 +84,22 @@ class RuntimeAgentCallbackEndpoint:
             )
         with self._lock:
             self._bound_port = port
+            self._unavailable = False
         logger.info("Agent callback endpoint bound on port %d", port)
+
+    def declare_unavailable(self) -> None:
+        """Record that this deployment serves no Control API."""
+        with self._lock:
+            self._unavailable = True
+        logger.info(
+            "No Control API in this deployment; agents will have no callback "
+            "endpoint"
+        )
+
+    def is_ready(self) -> bool:
+        """True once the endpoint is bound or explicitly unavailable."""
+        with self._lock:
+            return self._bound_port is not None or self._unavailable
 
     def bound_port(self) -> int | None:
         """The bound port, or ``None`` before the server has started."""

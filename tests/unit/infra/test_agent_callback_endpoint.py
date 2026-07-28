@@ -110,3 +110,52 @@ class TestNullEndpoint:
 
     def test_satisfies_the_port(self) -> None:
         assert isinstance(NullAgentCallbackEndpoint(), AgentCallbackEndpoint)
+
+
+class TestReadinessLifecycle:
+    """Readiness is what gates agent launch (#6924 F7).
+
+    An agent spawned before the endpoint question is answered gets an
+    environment with no way to call back. But "no Control API in this
+    deployment" is a legitimate answer — ``issue-orchestrator start``
+    without ``--api-port`` binds no server — so readiness must
+    distinguish "answered: none" from "not answered yet". Conflating
+    them would either deadlock those deployments or reopen the race.
+    """
+
+    def test_not_ready_before_anything_is_declared(
+        self, endpoint: RuntimeAgentCallbackEndpoint
+    ) -> None:
+        assert endpoint.is_ready() is False
+
+    def test_ready_after_binding(
+        self, endpoint: RuntimeAgentCallbackEndpoint
+    ) -> None:
+        endpoint.publish_bound_port(59957)
+        assert endpoint.is_ready() is True
+
+    def test_ready_after_declaring_unavailable(
+        self, endpoint: RuntimeAgentCallbackEndpoint
+    ) -> None:
+        endpoint.declare_unavailable()
+        assert endpoint.is_ready() is True
+
+    def test_unavailable_still_resolves_to_no_port(
+        self, endpoint: RuntimeAgentCallbackEndpoint
+    ) -> None:
+        """Ready, but with nothing to hand the agent — and that is correct."""
+        endpoint.declare_unavailable()
+        assert endpoint.resolve_port(0) is None
+
+    def test_binding_after_unavailable_wins(
+        self, endpoint: RuntimeAgentCallbackEndpoint
+    ) -> None:
+        """A late-binding server must override an earlier declaration."""
+        endpoint.declare_unavailable()
+        endpoint.publish_bound_port(59957)
+        assert endpoint.resolve_port(0) == 59957
+        assert endpoint.is_ready() is True
+
+    def test_null_endpoint_refuses_to_answer_readiness(self) -> None:
+        with pytest.raises(NotImplementedError, match="readiness"):
+            NullAgentCallbackEndpoint().is_ready()

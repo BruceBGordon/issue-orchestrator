@@ -39,6 +39,28 @@ class AgentCallbackEndpoint(Protocol):
         """
         ...
 
+    def declare_unavailable(self) -> None:
+        """Record that this deployment serves no Control API at all.
+
+        ``issue-orchestrator start`` without ``--api-port`` is a valid
+        configuration: no server binds, so agents genuinely have no
+        callback. Saying so explicitly is what lets :meth:`is_ready`
+        distinguish "no endpoint exists" from "the server has not
+        published yet" — the second is a race that must not launch
+        agents, the first is normal.
+        """
+        ...
+
+    def is_ready(self) -> bool:
+        """Whether the endpoint question has been answered either way.
+
+        False only in the window between process start and the server
+        publishing (or declaring unavailable). Launching an agent in
+        that window hands it an environment that is missing a callback
+        it should have had (#6924 F7).
+        """
+        ...
+
     def resolve_port(self, configured_port: int) -> int | None:
         """The port to hand an agent, or ``None`` if there is none yet.
 
