@@ -7,6 +7,8 @@ import sys
 import venv
 from pathlib import Path
 
+import pytest
+
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = REPO_ROOT / "scripts" / "start_control_center.sh"
@@ -227,6 +229,11 @@ def _imported_package_path(
     env_overrides: dict[str, str] | None = None,
 ) -> Path:
     env = os.environ.copy()
+    # This probe asks which install the venv itself resolves to, so an ambient
+    # PYTHONPATH would silently answer for a different checkout — and agent
+    # sessions always export one pointing at the Control Center snapshot. Drop
+    # it; tests that need a foreign PYTHONPATH pass it via env_overrides.
+    env.pop("PYTHONPATH", None)
     if env_overrides:
         env.update(env_overrides)
     result = subprocess.run(
@@ -452,6 +459,7 @@ def test_ensure_deps_accepts_repaired_install_from_symlinked_checkout(
 
 def test_ensure_deps_ignores_foreign_pythonpath_when_probing_install(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     repo = tmp_path / "repo"
     foreign_repo = tmp_path / "foreign"
@@ -463,6 +471,10 @@ def test_ensure_deps_ignores_foreign_pythonpath_when_probing_install(
     editable_pth = _site_packages(venv_path) / "issue_orchestrator_editable.pth"
     editable_pth.write_text(f"{repo / 'src'}\n", encoding="utf-8")
     foreign_pythonpath = str(foreign_repo / "src")
+    # Poison the ambient environment the way an agent session does, so this
+    # stays a real assertion wherever it runs rather than depending on the
+    # caller's shell happening to have PYTHONPATH unset.
+    monkeypatch.setenv("PYTHONPATH", foreign_pythonpath)
     assert _imported_package_path(
         venv_path,
         env_overrides={"PYTHONPATH": foreign_pythonpath},

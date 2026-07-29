@@ -43,6 +43,15 @@ _SEMGREP_PIN = re.compile(r"^semgrep==(?P<version>\d+\.\d+\.\d+)$")
 _SEMGREP_PROJECT = Path("tools/semgrep/pyproject.toml")
 _HTTP_ROUTE_METHODS = {"delete", "get", "patch", "post", "put"}
 _UI_OPENAPI_COMPONENT_PREFIX = "#/components/schemas/"
+# Diagnostic wording for route metadata a decorator simply does not carry. These
+# are prose for humans reading a guardrail failure, never metric identifiers.
+_NO_RESPONSE_MODEL_DETAIL = "(no response_model)"
+_UNKNOWN_ROUTE_PATH_DETAIL = "(unknown route path expression)"
+# Machine-readable stand-in used only inside a dynamic-route metric id when the
+# decorator carries no path argument to key on. Deliberately distinct from the
+# prose above: metric ids are baseline keys, so rewording a diagnostic must never
+# invalidate an accepted entry.
+_ABSENT_ROUTE_PATH_IDENTITY = "<no-path-argument>"
 
 
 @dataclass(frozen=True)
@@ -118,7 +127,7 @@ class RouteOperation:
     file_path: str
     line: int
     response_model: str | None
-    path_expression: str
+    path_expression: str | None
 
     @property
     def key(self) -> tuple[str, str]:
@@ -137,11 +146,34 @@ class RouteOperation:
         """Line-independent identity of a route whose path is not a string literal.
 
         Keys on method, file, and path expression so an accepted baseline entry
-        survives unrelated line shifts above the decorator.
+        survives unrelated line shifts above the decorator. A decorator carrying
+        no path argument has no expression to key on, so it keys on an explicit
+        token instead — never on the diagnostic prose, which is free to change.
         """
         if self.url_path is not None:
             raise ValueError("literal route paths are identified by method and URL path")
-        return f"{self.method.upper()} {self.file_path}:{self.path_expression}"
+        expression = (
+            _ABSENT_ROUTE_PATH_IDENTITY if self.path_expression is None else self.path_expression
+        )
+        return f"{self.method.upper()} {self.file_path}:{expression}"
+
+    @property
+    def response_model_detail(self) -> str:
+        """Render this route's response model for a guardrail failure message."""
+        if self.response_model is None:
+            return _NO_RESPONSE_MODEL_DETAIL
+        return self.response_model
+
+    @property
+    def path_expression_detail(self) -> str:
+        """Render this route's path expression for a guardrail failure message.
+
+        Concrete expressions are quoted so they read as source; a decorator that
+        carries no path argument at all renders as explicit prose instead.
+        """
+        if self.path_expression is None:
+            return _UNKNOWN_ROUTE_PATH_DETAIL
+        return repr(self.path_expression)
 
 
 def _load_yaml(path: Path) -> dict[str, Any]:
@@ -861,13 +893,14 @@ def _route_literal_path(call: ast.Call) -> str | None:
     return None
 
 
-def _route_path_expression(call: ast.Call) -> str:
+def _route_path_expression(call: ast.Call) -> str | None:
+    """Return the route's path source expression, or None when it has no path argument."""
     if call.args:
         return ast.unparse(call.args[0])
     for keyword in call.keywords:
         if keyword.arg == "path":
             return ast.unparse(keyword.value)
-    return "<missing>"
+    return None
 
 
 def _expr_model_name(expr: ast.AST) -> str:
@@ -1036,7 +1069,7 @@ def _collect_ui_openapi_routes(root: Path, rule: Mapping[str, Any]) -> list[Metr
         if any(route.response_model == expected_model for route in matching_routes):
             continue
         actual_models = ", ".join(
-            sorted({route.response_model or "<missing>" for route in matching_routes})
+            sorted({route.response_model_detail for route in matching_routes})
         )
         primary_route = matching_routes[0]
         metrics.append(
@@ -1120,8 +1153,8 @@ def _dynamic_route_metrics(
                 path=route.file_path,
                 detail=(
                     f"{route.method.upper()} route at line {route.line} uses dynamic path "
-                    f"{route.path_expression!r}; browser-facing routes must use string literals "
-                    "so the UI OpenAPI guardrail can compare them"
+                    f"{route.path_expression_detail}; browser-facing routes must use string "
+                    "literals so the UI OpenAPI guardrail can compare them"
                 ),
                 new_metric_min_value=new_metric_min_value,
             )
