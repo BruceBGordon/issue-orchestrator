@@ -19,6 +19,7 @@ from ..control.repository_setup import (
     RepositorySetupCommand,
     RepositorySetupConflictError,
     RepositorySetupExecutionError,
+    RepositorySetupRequest,
 )
 from ..domain.repository_config_name import RepositoryConfigName
 from ..ports.repository_setup import RepositorySetupPlannedFile
@@ -38,10 +39,10 @@ from .setup_wizard_common import (
 control_setup_router = APIRouter()
 
 
-def _repository_setup_command(
+def repository_setup_request_from_payload(
     payload: RepositorySetupCommandPayload,
     deps: ControlApiSetupDependency,
-) -> RepositorySetupCommand:
+) -> RepositorySetupRequest:
     """Translate the HTTP command contract into setup-owner policy."""
     repo_root = deps.validate_repo_root(payload.repo_root)
     if repo_root is None:
@@ -59,7 +60,7 @@ def _repository_setup_command(
         create_prompts=payload.create_prompts is not False,
         create_labels=payload.create_labels is not False,
         replace_existing=payload.replace_existing is True,
-    )
+    ).to_request()
 
 
 def _setup_file_payload(
@@ -169,7 +170,9 @@ async def setup_preview(
 ) -> RepositorySetupPreviewPayload | JSONResponse:
     """Generate a setup-wizard config preview without saving."""
     try:
-        preview = deps.setup_owner.preview(_repository_setup_command(payload, deps))
+        preview = deps.setup_owner.preview(
+            repository_setup_request_from_payload(payload, deps)
+        )
     except ValueError as exc:
         return JSONResponse({"error": str(exc)}, status_code=400)
     except Exception as exc:
@@ -194,7 +197,9 @@ async def setup_save(
 ) -> RepositorySetupResultPayload | JSONResponse:
     """Save a setup-wizard config and create requested setup artifacts."""
     try:
-        result = deps.setup_owner.execute(_repository_setup_command(payload, deps))
+        result = deps.setup_owner.execute(
+            repository_setup_request_from_payload(payload, deps)
+        )
     except ValueError as exc:
         return JSONResponse({"error": str(exc)}, status_code=400)
     except RepositorySetupConflictError as exc:

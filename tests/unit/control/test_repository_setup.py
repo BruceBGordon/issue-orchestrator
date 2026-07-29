@@ -12,11 +12,14 @@ from issue_orchestrator.control.repository_setup import (
     RepositorySetupConflictError,
     RepositorySetupExecutionError,
     RepositorySetupOwner,
+    RepositorySetupRequest,
 )
 from issue_orchestrator.domain.repository_config_name import RepositoryConfigName
 from issue_orchestrator.ports.repository_setup import (
     RepositorySetupArtifactPlan,
+    RepositorySetupConfigTarget,
     RepositorySetupFileSystemError,
+    RepositorySetupNamedConfig,
     RepositorySetupPlannedFile,
 )
 
@@ -51,6 +54,21 @@ def test_setup_command_can_explicitly_disable_tech_lead(tmp_path: Path) -> None:
 
     assert set(config["agents"]) == {"agent:dev"}
     assert "review" not in config
+
+
+def test_setup_request_detaches_nested_config_from_surface_mutation(
+    tmp_path: Path,
+) -> None:
+    config = {"repo": {"name": "owner/repo"}, "agents": {"agent:dev": {}}}
+    request = RepositorySetupRequest(
+        repo_root=tmp_path,
+        repo_name="owner/repo",
+        config=config,
+    )
+
+    config["agents"]["agent:dev"]["model"] = "changed"
+
+    assert request.config["agents"]["agent:dev"] == {}
 
 
 @pytest.mark.parametrize(
@@ -102,15 +120,15 @@ class _FakeSetupFileSystem:
         self.plan_result = plan
         self.apply_error = apply_error
         self.apply_calls = 0
-        self.planned_config_names: list[RepositoryConfigName] = []
+        self.planned_config_targets: list[RepositorySetupConfigTarget] = []
 
     def plan(
         self,
         *,
-        config_name: RepositoryConfigName,
+        config_target: RepositorySetupConfigTarget,
         **_kwargs,
     ) -> RepositorySetupArtifactPlan:
-        self.planned_config_names.append(config_name)
+        self.planned_config_targets.append(config_target)
         return self.plan_result
 
     def apply(self, plan: RepositorySetupArtifactPlan) -> tuple[Path, ...]:
@@ -157,7 +175,7 @@ def _owner(
     )
 
 
-def _command(tmp_path: Path, **overrides) -> RepositorySetupCommand:
+def _request(tmp_path: Path, **overrides) -> RepositorySetupRequest:
     values = {
         "repo_root": tmp_path,
         "repo_name": "owner/repo",
@@ -166,19 +184,21 @@ def _command(tmp_path: Path, **overrides) -> RepositorySetupCommand:
         "config_name": RepositoryConfigName.default(),
     }
     values.update(overrides)
-    return RepositorySetupCommand(**values)
+    return RepositorySetupCommand(**values).to_request()
 
 
 def test_setup_owner_preview_is_non_mutating(tmp_path: Path) -> None:
     file_system = _FakeSetupFileSystem(_artifact_plan(tmp_path))
     host = MagicMock()
 
-    preview = _owner(file_system, host).preview(_command(tmp_path))
+    preview = _owner(file_system, host).preview(_request(tmp_path))
 
     assert preview.yaml == "repo:\n  name: owner/repo\n"
     assert [file.kind for file in preview.files] == ["config", "prompt"]
     assert file_system.apply_calls == 0
-    assert file_system.planned_config_names == [RepositoryConfigName.default()]
+    assert file_system.planned_config_targets == [
+        RepositorySetupNamedConfig(RepositoryConfigName.default())
+    ]
     host.assert_not_called()
 
 
@@ -191,7 +211,7 @@ def test_setup_owner_requires_explicit_existing_config_replacement(
     host = MagicMock()
 
     with pytest.raises(RepositorySetupConflictError):
-        _owner(file_system, host).execute(_command(tmp_path))
+        _owner(file_system, host).execute(_request(tmp_path))
 
     assert file_system.apply_calls == 0
     host.assert_not_called()
@@ -210,7 +230,7 @@ def test_setup_owner_reports_partial_prompt_failure(tmp_path: Path) -> None:
     )
 
     with pytest.raises(RepositorySetupExecutionError) as error:
-        _owner(file_system, MagicMock()).execute(_command(tmp_path))
+        _owner(file_system, MagicMock()).execute(_request(tmp_path))
 
     assert error.value.stage == "files"
     assert error.value.applied_files == (config_path,)
@@ -228,7 +248,7 @@ def test_setup_owner_reports_partial_label_failure(tmp_path: Path) -> None:
     ]
 
     with pytest.raises(RepositorySetupExecutionError) as error:
-        _owner(_FakeSetupFileSystem(plan), host, labels).execute(_command(tmp_path))
+        _owner(_FakeSetupFileSystem(plan), host, labels).execute(_request(tmp_path))
 
     assert error.value.stage == "labels"
     assert error.value.applied_files == tuple(file.path for file in plan.files)
@@ -246,7 +266,7 @@ def test_setup_owner_never_mutates_duplicate_label_twice(tmp_path: Path) -> None
         [duplicate, duplicate],
     )
 
-    result = owner.execute(_command(tmp_path))
+    result = owner.execute(_request(tmp_path))
 
     assert result.created_labels == ("code-reviewed",)
     host.create_label.assert_called_once()

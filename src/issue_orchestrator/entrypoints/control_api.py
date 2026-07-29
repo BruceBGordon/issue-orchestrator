@@ -59,9 +59,7 @@ from ..infra import gh_audit
 from ..infra.supervisor import DefaultSupervisorOps, SupervisorOps
 from ..ports import RepositoryHost
 from ..control.goal_pilot import GoalPilot
-from ..control.repository_setup import RepositorySetupOwner
 from ..execution.control_center_actions import ControlCenterActions
-from ..execution.repository_setup_files import RepositorySetupFileSystemAdapter
 from ._auth_middleware import (
     AuthSurfaceConfig,
     evaluate_request,
@@ -71,6 +69,7 @@ from ._auth_middleware import (
     resolve_browser_page_auth,
 )
 from .brand_assets import read_logo_svg
+from .bootstrap_repository_setup import build_repository_setup_owner
 from .control_api_goal_pilot_routes import control_goal_pilot_router
 from .control_api_goal_pilot_support import (
     ControlApiGoalPilotDependencies,
@@ -102,7 +101,6 @@ from .control_api_setup_support import (
     ControlApiSetupDependencies,
     install_control_api_setup_dependencies,
 )
-from .setup_wizard_common import plan_setup_labels
 from .control_api_shutdown_routes import control_shutdown_router
 from .control_api_shutdown_state import (
     begin_engine_shutdown_operation,
@@ -152,17 +150,6 @@ def _create_repository_setup_host(repo_name: str) -> RepositoryHost:
     from ..execution.providers import create_repository_host
 
     return create_repository_host(repo=repo_name)
-
-
-def _plan_control_api_setup_labels(
-    config: Mapping[str, Any],
-) -> list[tuple[str, str, str]]:
-    """Apply the Control Center label surface to the shared setup label owner."""
-    return plan_setup_labels(
-        config,
-        include_priority_labels=False,
-        include_review_labels_without_default=True,
-    )
 
 
 # Create minimal control API app
@@ -1085,11 +1072,7 @@ install_control_api_setup_dependencies(
     control_app,
     ControlApiSetupDependencies(
         validate_repo_root=_validate_repo_root,
-        setup_owner=RepositorySetupOwner(
-            file_system=RepositorySetupFileSystemAdapter(),
-            repository_host_factory=_create_repository_setup_host,
-            label_planner=_plan_control_api_setup_labels,
-        ),
+        setup_owner=build_repository_setup_owner(_create_repository_setup_host),
     ),
 )
 control_app.include_router(control_orchestrator_router)

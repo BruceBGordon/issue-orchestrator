@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 import re
@@ -10,9 +11,11 @@ from typing import Any, Callable, Literal, Mapping, Sequence
 from ..domain.repository_config_name import RepositoryConfigName
 from ..ports.repository_setup import (
     RepositorySetupArtifactPlan,
+    RepositorySetupConfigTarget,
     RepositorySetupFileSystem,
     RepositorySetupFileSystemError,
     RepositorySetupHostFactory,
+    RepositorySetupNamedConfig,
     RepositorySetupPlannedFile,
 )
 
@@ -93,6 +96,40 @@ class RepositorySetupCommand:
 
         return config
 
+    def to_request(self) -> RepositorySetupRequest:
+        """Translate simplified setup choices into the shared owner request."""
+        return RepositorySetupRequest(
+            repo_root=self.repo_root,
+            repo_name=self.repo_name,
+            config=self.build_config(),
+            config_target=RepositorySetupNamedConfig(self.config_name),
+            create_prompts=self.create_prompts,
+            create_labels=self.create_labels,
+            replace_existing=self.replace_existing,
+        )
+
+
+@dataclass(frozen=True)
+class RepositorySetupRequest:
+    """A complete config plus the mutation choices owned by repository setup."""
+
+    repo_root: Path
+    repo_name: str
+    config: Mapping[str, Any]
+    config_target: RepositorySetupConfigTarget = RepositorySetupNamedConfig(
+        RepositoryConfigName.default()
+    )
+    create_prompts: bool = True
+    create_labels: bool = True
+    replace_existing: bool = False
+
+    def __post_init__(self) -> None:
+        if not self.repo_root.is_absolute():
+            raise ValueError("repo_root must be absolute")
+        if not self.repo_name.strip():
+            raise ValueError("repo_name is required")
+        object.__setattr__(self, "config", deepcopy(dict(self.config)))
+
 
 @dataclass(frozen=True, slots=True)
 class RepositorySetupPreview:
@@ -100,6 +137,7 @@ class RepositorySetupPreview:
 
     yaml: str
     files: tuple[RepositorySetupPlannedFile, ...]
+    labels: tuple[RepositorySetupLabel, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -154,20 +192,24 @@ class RepositorySetupOwner:
         self._repository_host_factory = repository_host_factory
         self._label_planner = label_planner
 
-    def preview(self, command: RepositorySetupCommand) -> RepositorySetupPreview:
+    def preview(self, request: RepositorySetupRequest) -> RepositorySetupPreview:
         """Build the exact filesystem plan without applying it."""
-        plan = self._plan(command)
-        return RepositorySetupPreview(yaml=plan.config_yaml, files=plan.files)
+        plan = self._plan(request)
+        return RepositorySetupPreview(
+            yaml=plan.config_yaml,
+            files=plan.files,
+            labels=tuple(self._label_planner(request.config)),
+        )
 
-    def execute(self, command: RepositorySetupCommand) -> RepositorySetupResult:
+    def execute(self, request: RepositorySetupRequest) -> RepositorySetupResult:
         """Apply one setup command or fail with a typed partial outcome."""
-        config = command.build_config()
+        config = request.config
         try:
             plan = self._file_system.plan(
-                repo_root=command.repo_root,
-                config_name=command.config_name,
+                repo_root=request.repo_root,
+                config_target=request.config_target,
                 config=config,
-                include_prompts=command.create_prompts,
+                include_prompts=request.create_prompts,
             )
         except Exception as exc:
             raise RepositorySetupExecutionError(
@@ -177,7 +219,7 @@ class RepositorySetupOwner:
 
         config_path = self._config_path(plan)
         config_file = next(file for file in plan.files if file.kind == "config")
-        if config_file.action == "overwrite" and not command.replace_existing:
+        if config_file.action == "overwrite" and not request.replace_existing:
             raise RepositorySetupConflictError(config_path)
 
         try:
@@ -195,9 +237,9 @@ class RepositorySetupOwner:
             ) from exc
 
         created_labels: list[str] = []
-        if command.create_labels:
+        if request.create_labels:
             try:
-                created_labels.extend(self._create_labels(command.repo_name, config))
+                created_labels.extend(self._create_labels(request.repo_name, config))
             except _RepositorySetupLabelError as exc:
                 raise RepositorySetupExecutionError(
                     stage="labels",
@@ -219,12 +261,12 @@ class RepositorySetupOwner:
             created_labels=tuple(created_labels),
         )
 
-    def _plan(self, command: RepositorySetupCommand) -> RepositorySetupArtifactPlan:
+    def _plan(self, request: RepositorySetupRequest) -> RepositorySetupArtifactPlan:
         return self._file_system.plan(
-            repo_root=command.repo_root,
-            config_name=command.config_name,
-            config=command.build_config(),
-            include_prompts=command.create_prompts,
+            repo_root=request.repo_root,
+            config_target=request.config_target,
+            config=request.config,
+            include_prompts=request.create_prompts,
         )
 
     @staticmethod
@@ -274,6 +316,7 @@ __all__ = [
     "RepositorySetupExecutionError",
     "RepositorySetupOwner",
     "RepositorySetupPreview",
+    "RepositorySetupRequest",
     "RepositorySetupResult",
     "RepositorySetupStage",
     "TECH_LEAD_AGENT_LABEL",

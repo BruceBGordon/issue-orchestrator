@@ -80,11 +80,11 @@ class FileCollector:
         self.labels.append((name, color, description))
 
 
-def get_repository_host(repo: str):
+def get_repository_host(repo_name: str):
     """Get a RepositoryHost for the given repo."""
     from ..execution.providers import create_repository_host
 
-    return create_repository_host(repo=repo)
+    return create_repository_host(repo=repo_name)
 
 
 def run_git(

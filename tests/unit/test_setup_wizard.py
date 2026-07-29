@@ -1625,8 +1625,10 @@ class TestRunWizard:
             False,                  # Set up AI provider API keys now?
         ])
 
+        host = Mock()
+        host.list_labels.return_value = []
         with patch("issue_orchestrator.entrypoints.cli_tools.setup_wizard.detect_repo", return_value="owner/repo"):
-            with patch("issue_orchestrator.entrypoints.cli_tools.setup_wizard._get_repository_host", return_value=Mock()):
+            with patch("issue_orchestrator.entrypoints.cli_tools.setup_wizard._get_repository_host", return_value=host):
                 with patch("issue_orchestrator.entrypoints.cli_tools.setup_wizard.offer_readiness_assessment"):
                     run_wizard(target_path=target, prompter=prompter)
 

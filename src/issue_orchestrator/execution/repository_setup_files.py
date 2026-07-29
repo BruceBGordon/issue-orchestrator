@@ -10,7 +10,10 @@ from ..infra.atomic_io import atomic_write_bytes
 from ..infra.config import get_config_path
 from ..ports.repository_setup import (
     RepositorySetupArtifactPlan,
+    RepositorySetupConfigTarget,
+    RepositorySetupExplicitConfig,
     RepositorySetupFileSystemError,
+    RepositorySetupNamedConfig,
     RepositorySetupPlannedFile,
 )
 from .repository_setup_artifacts import (
@@ -26,13 +29,12 @@ class RepositorySetupFileSystemAdapter:
         self,
         *,
         repo_root: Path,
-        config_name: RepositoryConfigName,
+        config_target: RepositorySetupConfigTarget,
         config: Mapping[str, Any],
         include_prompts: bool,
     ) -> RepositorySetupArtifactPlan:
-        validated_name = RepositoryConfigName(config_name.value)
-        config_path = get_config_path(repo_root, validated_name.value)
-        config_yaml = render_setup_config_yaml(config, include_header=False)
+        config_path = self._config_path(repo_root, config_target)
+        config_yaml = render_setup_config_yaml(config)
         files = [
             RepositorySetupPlannedFile(
                 path=config_path,
@@ -58,6 +60,18 @@ class RepositorySetupFileSystemAdapter:
             config_yaml=config_yaml,
             files=tuple(files),
         )
+
+    @staticmethod
+    def _config_path(
+        repo_root: Path,
+        config_target: RepositorySetupConfigTarget,
+    ) -> Path:
+        if isinstance(config_target, RepositorySetupNamedConfig):
+            validated_name = RepositoryConfigName(config_target.name.value)
+            return get_config_path(repo_root, validated_name.value)
+        if isinstance(config_target, RepositorySetupExplicitConfig):
+            return RepositorySetupExplicitConfig(config_target.path).path
+        raise TypeError(f"Unsupported repository setup config target: {config_target!r}")
 
     def apply(self, plan: RepositorySetupArtifactPlan) -> tuple[Path, ...]:
         applied_paths: list[Path] = []

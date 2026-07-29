@@ -43,6 +43,14 @@ _EXPORTS = {
         ".repository_setup",
         "RepositorySetupArtifactPlan",
     ),
+    "RepositorySetupConfigTarget": (
+        ".repository_setup",
+        "RepositorySetupConfigTarget",
+    ),
+    "RepositorySetupExplicitConfig": (
+        ".repository_setup",
+        "RepositorySetupExplicitConfig",
+    ),
     "RepositorySetupFileSystem": (
         ".repository_setup",
         "RepositorySetupFileSystem",
@@ -54,6 +62,10 @@ _EXPORTS = {
     "RepositorySetupHostFactory": (
         ".repository_setup",
         "RepositorySetupHostFactory",
+    ),
+    "RepositorySetupNamedConfig": (
+        ".repository_setup",
+        "RepositorySetupNamedConfig",
     ),
     "RepositorySetupPlannedFile": (
         ".repository_setup",
@@ -153,9 +165,12 @@ __all__ = (
     "RepositoryHost",
     "RepositoryHostError",
     "RepositorySetupArtifactPlan",
+    "RepositorySetupConfigTarget",
+    "RepositorySetupExplicitConfig",
     "RepositorySetupFileSystem",
     "RepositorySetupFileSystemError",
     "RepositorySetupHostFactory",
+    "RepositorySetupNamedConfig",
     "RepositorySetupPlannedFile",
     "IssueResolver",
     "StackPredecessorFactsProvider",

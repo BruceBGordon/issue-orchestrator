@@ -11,23 +11,22 @@ import yaml
 from issue_orchestrator.agent_runner import list_providers, get_provider
 
 from ..setup_wizard_common import (
-    FileCollector,
+    FileCollector as FileCollector,
     PlannedWrite as _PlannedWrite,
-    create_code_review_prompt,
-    create_starter_prompt,
-    create_tech_lead_review_prompt,
+    create_code_review_prompt as create_code_review_prompt,
+    create_starter_prompt as create_starter_prompt,
+    create_tech_lead_review_prompt as create_tech_lead_review_prompt,
     find_existing_config,
     find_prompt_candidates,
     get_repository_host as _get_repository_host,
-    plan_setup_labels,
+    plan_setup_labels as plan_setup_labels,
     run_git,
-    write_config,
+    write_config as write_config,
 )
 from .setup_wizard_support import (
     ConsolePrompter,
     DetectedState,
     Prompter,
-    apply_changes as _apply_changes_impl,
     check_prerequisites as _check_prerequisites,
     detect_repo as _detect_repo,
     fetch_github_labels as _fetch_github_labels,
@@ -36,7 +35,14 @@ from .setup_wizard_support import (
     scan_existing_repo as _scan_existing_repo,
     setup_ai_providers,
 )
+from .setup_wizard_repository_setup import (
+    apply_cli_repository_setup,
+    authorize_repository_setup,
+    build_cli_repository_setup_request,
+    setup_preview_collector,
+)
 from .readiness_launch import offer_readiness_assessment
+from ..bootstrap_repository_setup import build_repository_setup_owner
 
 # Schema metadata for defaults/labels/hints
 from ...infra.settings_schema import get_setup_fields
@@ -1156,13 +1162,6 @@ def wizard_existing_project(  # noqa: C901, PLR0912 - interactive wizard with br
     return config, updating_existing_path
 
 
-def _apply_changes(
-    collector: FileCollector, repo: str | None, prompter: Prompter
-) -> None:
-    """Apply all collected changes."""
-    _apply_changes_impl(collector, repo, prompter, _get_repository_host)
-
-
 def run_wizard(  # noqa: C901, PLR0912 - main wizard entry point with prerequisite checks, mode selection, and confirmation flow
     target_path: Path | None = None,
     prompter: Prompter | None = None,
@@ -1177,9 +1176,6 @@ def run_wizard(  # noqa: C901, PLR0912 - main wizard entry point with prerequisi
     """
     if prompter is None:
         prompter = ConsolePrompter()
-
-    # Always create file collector to track changes before applying
-    file_collector = FileCollector()
 
     prompter.print("\n" + "=" * 50)
     if dry_run:
@@ -1343,67 +1339,20 @@ def run_wizard(  # noqa: C901, PLR0912 - main wizard entry point with prerequisi
             target_path / user_path if not user_path.is_absolute() else user_path
         )
 
-    write_config(config, output_path, file_collector)
-
-    # Collect prompt file writes (removed intermediate confirmations)
-
-    # Get review config
-    review_config = config.get("review", {})
-    code_review_agent = review_config.get("default")
-    code_review_label = review_config.get("code_review_label", "needs-code-review")
-    code_reviewed_label = review_config.get("code_reviewed_label", "code-reviewed")
-    tech_lead_review_agent = review_config.get("tech_lead_review_agent")
-    tech_lead_reviewed_label = review_config.get(
-        "tech_lead_reviewed_label", "tech-lead-reviewed"
+    setup_owner = build_repository_setup_owner(_get_repository_host)
+    setup_request = build_cli_repository_setup_request(
+        config=config,
+        repo_root=target_path,
+        config_path=output_path,
     )
+    setup_preview = setup_owner.preview(setup_request)
+    file_collector = setup_preview_collector(setup_preview)
+    all_prompt_paths = [
+        Path(agent_config["prompt"])
+        for agent_config in config.get("agents", {}).values()
+        if isinstance(agent_config, dict) and agent_config.get("prompt")
+    ]
 
-    # Track all prompt files for the next steps summary
-    all_prompt_paths: list[Path] = []
-
-    for agent_name, agent_config in config.get("agents", {}).items():
-        prompt_rel_path = Path(agent_config["prompt"])
-        # Use absolute path for file operations
-        prompt_path = (
-            target_path / prompt_rel_path
-            if not prompt_rel_path.is_absolute()
-            else prompt_rel_path
-        )
-        all_prompt_paths.append(prompt_rel_path)  # Keep relative for display
-
-        # Collect prompt file writes for missing files
-        if not prompt_path.exists():
-            is_code_review_agent = (
-                code_review_agent and agent_name == code_review_agent
-            ) or (agent_name.lower() == "agent:reviewer")
-
-            is_tech_lead_review_agent = (
-                tech_lead_review_agent and agent_name == tech_lead_review_agent
-            ) or "tech_lead" in agent_name.lower()
-
-            if is_code_review_agent and code_review_agent:
-                create_code_review_prompt(
-                    prompt_path, code_review_label, code_reviewed_label, file_collector
-                )
-            elif is_tech_lead_review_agent and tech_lead_review_agent:
-                create_tech_lead_review_prompt(
-                    prompt_path,
-                    code_reviewed_label,
-                    tech_lead_reviewed_label,
-                    file_collector,
-                )
-            else:
-                create_starter_prompt(agent_name, prompt_path, file_collector)
-
-    # Collect all labels to create on GitHub
-    repo_config = config.get("repo") or {}
-    repo_name = (
-        repo_config.get("name") if isinstance(repo_config, dict) else repo_config
-    )
-    if repo_name:
-        existing_labels = set(fetch_github_labels(repo_name))
-        for name, color, description in plan_setup_labels(config):
-            if name not in existing_labels:
-                file_collector.add_label(name, color, description)
     # Show summary and ask for confirmation
     _print_changes_summary(file_collector, prompter, dry_run)
 
@@ -1417,7 +1366,11 @@ def run_wizard(  # noqa: C901, PLR0912 - main wizard entry point with prerequisi
 
     # Apply all changes
     prompter.print("\nApplying changes...")
-    _apply_changes(file_collector, repo_name, prompter)
+    apply_cli_repository_setup(
+        owner=setup_owner,
+        request=authorize_repository_setup(setup_request, setup_preview),
+        prompter=prompter,
+    )
 
     install_hooks_now = False
     setup_repo_guardrails_now = False
@@ -1549,6 +1502,9 @@ def run_wizard(  # noqa: C901, PLR0912 - main wizard entry point with prerequisi
     step_number += 1
 
     # List agent labels to add to issues
+    review_config = config.get("review", {}) or {}
+    code_review_agent = review_config.get("default")
+    tech_lead_review_agent = review_config.get("tech_lead_review_agent")
     agent_labels = list(config.get("agents", {}).keys())
     # Exclude review agents from the list (they work on PRs, not issues)
     work_agent_labels = [

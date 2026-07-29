@@ -177,6 +177,8 @@ def test_local_onboarding_smoke_journey(tmp_path: Path, monkeypatch: pytest.Monk
         "provider:claude-code": True,
         "any_ai_provider": True,
     }
+    host = Mock()
+    host.list_labels.return_value = []
 
     with patch(
         "issue_orchestrator.entrypoints.cli_tools.setup_wizard.check_prerequisites",
@@ -186,7 +188,7 @@ def test_local_onboarding_smoke_journey(tmp_path: Path, monkeypatch: pytest.Monk
         return_value=[],
     ), patch(
         "issue_orchestrator.entrypoints.cli_tools.setup_wizard._get_repository_host",
-        return_value=Mock(),
+        return_value=host,
     ), patch(
         # Readiness is an interactive, CLI-dependent step with its own tests;
         # this journey verifies the config/guardrail flow, so skip the offer.

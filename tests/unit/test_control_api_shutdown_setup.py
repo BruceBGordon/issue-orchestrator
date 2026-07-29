@@ -295,8 +295,8 @@ class TestControlCenterSetupRoutes:
 
         assert response.status_code == 200
         data = response.json()
-        assert "Issue Orchestrator Configuration" not in data["yaml"]
-        assert data["yaml"].startswith("repo:\n  name: owner/repo\n")
+        assert "Issue Orchestrator Configuration" in data["yaml"]
+        assert "repo:\n  name: owner/repo\n" in data["yaml"]
         assert "agent:tech-lead" in data["yaml"]
         assert "tech_lead_follow_up_agent: agent:dev" in data["yaml"]
         assert data["files"][0]["size"] == len(data["yaml"])
@@ -443,7 +443,7 @@ class TestControlCenterSetupRoutes:
 
         assert response.status_code == 200
         data = response.json()
-        assert "priority:high" not in data["created_labels"]
+        assert "priority:high" in data["created_labels"]
         assert "agent:backend" in data["created_labels"]
         assert "agent:tech-lead" in data["created_labels"]
         assert "needs-tech-lead-review" in data["created_labels"]
@@ -451,8 +451,8 @@ class TestControlCenterSetupRoutes:
 
         config_path = repo_root / ".issue-orchestrator" / "config" / "default.yaml"
         config_text = config_path.read_text()
-        assert "Issue Orchestrator Configuration" not in config_text
-        assert config_text.startswith("repo:\n  name: owner/repo\n")
+        assert "Issue Orchestrator Configuration" in config_text
+        assert "repo:\n  name: owner/repo\n" in config_text
         assert (repo_root / ".io" / "dev.md").is_file()
         assert (repo_root / ".io" / "tech-lead.md").is_file()
         assert Config.load(config_path).validate() == []

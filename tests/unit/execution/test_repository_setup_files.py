@@ -14,6 +14,7 @@ from issue_orchestrator.execution.repository_setup_files import (
 )
 from issue_orchestrator.infra.config import Config, get_config_dir
 from issue_orchestrator.ports.repository_setup import RepositorySetupFileSystemError
+from issue_orchestrator.ports.repository_setup import RepositorySetupNamedConfig
 
 
 def _command(repo_root: Path) -> RepositorySetupCommand:
@@ -33,7 +34,7 @@ def test_setup_file_adapter_plans_and_writes_runnable_contained_artifacts(
 
     plan = adapter.plan(
         repo_root=tmp_path,
-        config_name=command.config_name,
+        config_target=RepositorySetupNamedConfig(command.config_name),
         config=command.build_config(),
         include_prompts=True,
     )
@@ -62,7 +63,7 @@ def test_setup_file_adapter_revalidates_forged_config_name(
     with pytest.raises(ValueError, match="Invalid config_name"):
         RepositorySetupFileSystemAdapter().plan(
             repo_root=tmp_path,
-            config_name=forged,
+            config_target=RepositorySetupNamedConfig(forged),
             config=command.build_config(),
             include_prompts=False,
         )
@@ -76,7 +77,7 @@ def test_setup_file_adapter_refuses_create_when_target_appears_after_plan(
     adapter = RepositorySetupFileSystemAdapter()
     plan = adapter.plan(
         repo_root=tmp_path,
-        config_name=RepositoryConfigName("default"),
+        config_target=RepositorySetupNamedConfig(RepositoryConfigName("default")),
         config=_command(tmp_path).build_config(),
         include_prompts=False,
     )
@@ -102,7 +103,7 @@ def test_setup_file_adapter_preserves_existing_file_when_atomic_replace_fails(
     config_path.write_text("sentinel", encoding="utf-8")
     plan = adapter.plan(
         repo_root=tmp_path,
-        config_name=RepositoryConfigName("default"),
+        config_target=RepositorySetupNamedConfig(RepositoryConfigName("default")),
         config=_command(tmp_path).build_config(),
         include_prompts=False,
     )
@@ -133,7 +134,7 @@ def test_setup_file_adapter_plans_shared_prompt_target_once(
 
     plan = adapter.plan(
         repo_root=tmp_path,
-        config_name=RepositoryConfigName("default"),
+        config_target=RepositorySetupNamedConfig(RepositoryConfigName("default")),
         config=config,
         include_prompts=True,
     )

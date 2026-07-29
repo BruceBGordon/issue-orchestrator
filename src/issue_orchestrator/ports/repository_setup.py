@@ -14,6 +14,29 @@ RepositorySetupFileKind = Literal["config", "prompt"]
 
 
 @dataclass(frozen=True, slots=True)
+class RepositorySetupNamedConfig:
+    """A config stored in the repository's managed config directory."""
+
+    name: RepositoryConfigName
+
+
+@dataclass(frozen=True, slots=True)
+class RepositorySetupExplicitConfig:
+    """An explicit config path selected by an interactive CLI user."""
+
+    path: Path
+
+    def __post_init__(self) -> None:
+        if not self.path.is_absolute() or not self.path.name:
+            raise ValueError("Repository setup config path must be an absolute file path")
+
+
+RepositorySetupConfigTarget = (
+    RepositorySetupNamedConfig | RepositorySetupExplicitConfig
+)
+
+
+@dataclass(frozen=True, slots=True)
 class RepositorySetupPlannedFile:
     """One exact filesystem mutation in a repository setup plan."""
 
@@ -51,7 +74,7 @@ class RepositorySetupFileSystem(Protocol):
         self,
         *,
         repo_root: Path,
-        config_name: RepositoryConfigName,
+        config_target: RepositorySetupConfigTarget,
         config: Mapping[str, Any],
         include_prompts: bool,
     ) -> RepositorySetupArtifactPlan: ...
@@ -67,10 +90,13 @@ class RepositorySetupHostFactory(Protocol):
 
 __all__ = [
     "RepositorySetupArtifactPlan",
+    "RepositorySetupConfigTarget",
+    "RepositorySetupExplicitConfig",
     "RepositorySetupFileAction",
     "RepositorySetupFileKind",
     "RepositorySetupFileSystem",
     "RepositorySetupFileSystemError",
     "RepositorySetupHostFactory",
+    "RepositorySetupNamedConfig",
     "RepositorySetupPlannedFile",
 ]
