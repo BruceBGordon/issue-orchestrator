@@ -24,6 +24,7 @@
     let returnFocusElement = null;
     let inertSiblings = [];
     let bound = false;
+    let operationGeneration = 0;
 
     function element(id) {
         const found = document.getElementById(id);
@@ -71,6 +72,26 @@
         return html;
     }
 
+    function beginOperation(expectedStep) {
+        operationGeneration += 1;
+        return {
+            generation: operationGeneration,
+            repoPath: state.repoPath,
+            step: expectedStep,
+        };
+    }
+
+    function invalidateOperations() {
+        operationGeneration += 1;
+    }
+
+    function isCurrentOperation(operation) {
+        return operation.generation === operationGeneration
+            && operation.repoPath === state.repoPath
+            && operation.step === state.step
+            && element('setupWizardModal').classList.contains('active');
+    }
+
     function updateSteps() {
         document.querySelectorAll('.setup-step').forEach((stepElement) => {
             const step = parseInt(stepElement.dataset.step, 10);
@@ -93,6 +114,7 @@
     }
 
     function close() {
+        invalidateOperations();
         const modal = element('setupWizardModal');
         modal.classList.remove('active');
         modal.setAttribute('aria-hidden', 'true');
@@ -107,6 +129,7 @@
     }
 
     async function open(repoPath, triggerElement = null) {
+        invalidateOperations();
         state = {
             step: 1,
             repoPath,
@@ -131,6 +154,7 @@
     }
 
     async function loadStep1() {
+        const operation = beginOperation(1);
         element('setupContent').innerHTML =
             '<div class="loading-spinner"></div> Checking prerequisites...';
         try {
@@ -138,6 +162,7 @@
                 `/control/setup/prereqs?repo_root=${encodeURIComponent(state.repoPath)}`,
             );
             const data = await responseJson(response, 'Failed to check prerequisites');
+            if (!isCurrentOperation(operation)) return;
 
             let html = '<h3 style="margin-top: 0;">Prerequisites</h3>';
             for (const [name, check] of Object.entries(data.checks || {})) {
@@ -156,12 +181,14 @@
             }
             element('setupContent').innerHTML = html;
         } catch (error) {
+            if (!isCurrentOperation(operation)) return;
             element('setupContent').innerHTML =
                 `<div class="error-message">Failed to check prerequisites: ${escapeHtml(error.message)}</div>`;
         }
     }
 
     async function loadStep2() {
+        const operation = beginOperation(2);
         const nextButton = element('setupWizardNext');
         nextButton.disabled = true;
         element('setupContent').innerHTML =
@@ -171,6 +198,7 @@
                 `/control/setup/detect?repo_root=${encodeURIComponent(state.repoPath)}`,
             );
             const data = await responseJson(response, 'Failed to detect repository');
+            if (!isCurrentOperation(operation)) return;
             const existingConfig = data.existing_config || {};
             const existingAgents = existingConfig.agents || {};
             const reviewAgents = new Set([
@@ -226,6 +254,7 @@
             element('setupContent').innerHTML = html;
             nextButton.disabled = false;
         } catch (error) {
+            if (!isCurrentOperation(operation)) return;
             element('setupContent').innerHTML =
                 `<div class="error-message" role="alert">
                     Failed to detect repository: ${escapeHtml(error.message)}
@@ -244,6 +273,7 @@
     }
 
     async function loadStep3() {
+        const operation = beginOperation(3);
         state.previewReady = false;
         const nextButton = element('setupWizardNext');
         nextButton.disabled = true;
@@ -261,6 +291,7 @@
                 body: JSON.stringify(command.body),
             });
             const data = await responseJson(response, 'Failed to generate preview');
+            if (!isCurrentOperation(operation)) return;
 
             let html = '<h3 style="margin-top: 0;">Preview Configuration</h3>';
             html += '<p>The following configuration will be saved:</p>';
@@ -306,9 +337,11 @@
             nextButton.disabled = Boolean(replaceConfirmation);
             state.previewReady = true;
             replaceConfirmation?.addEventListener('change', () => {
+                if (!isCurrentOperation(operation)) return;
                 nextButton.disabled = !replaceConfirmation.checked;
             });
         } catch (error) {
+            if (!isCurrentOperation(operation)) return;
             element('setupContent').innerHTML =
                 `<div class="error-message" role="alert">
                     Failed to generate preview: ${escapeHtml(error.message)}
@@ -319,6 +352,7 @@
 
     async function save() {
         if (!state.previewReady) return;
+        const operation = beginOperation(3);
         const nextButton = element('setupWizardNext');
         const createLabels = element('setupCreateLabels').checked;
         const replaceExisting = state.requiresReplacementConfirmation
@@ -349,6 +383,7 @@
                 body: JSON.stringify(command.body),
             });
             const data = await responseJson(response, 'Failed to save configuration');
+            if (!isCurrentOperation(operation)) return;
 
             let html = '<h3 style="margin-top: 0; color: var(--success-color);">Setup Complete!</h3>';
             html += '<p>Configuration has been saved successfully.</p>';
@@ -369,6 +404,7 @@
             state.step = 4;
             await loadRepos();
         } catch (error) {
+            if (!isCurrentOperation(operation)) return;
             element('setupContent').innerHTML = renderSaveFailure(error);
             nextButton.disabled = true;
             element('setupWizardBack').style.display = 'inline-flex';
@@ -382,6 +418,7 @@
         element('setupWizardCancel').addEventListener('click', close);
         element('setupWizardBack').addEventListener('click', async () => {
             if (state.step <= 1) return;
+            invalidateOperations();
             state.step -= 1;
             state.previewReady = false;
             element('setupWizardNext').disabled = false;

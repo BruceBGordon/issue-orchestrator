@@ -72,3 +72,40 @@ def atomic_write_bytes(path: Path, payload: bytes) -> None:
         except FileNotFoundError:
             pass
         raise
+
+
+def atomic_create_bytes(path: Path, payload: bytes) -> None:
+    """Publish a complete file atomically without replacing an existing target.
+
+    The payload is written, flushed, and closed in a sibling temporary file
+    before an exclusive hard-link publishes it at ``path``. ``os.link`` fails
+    with ``FileExistsError`` when another writer wins the create race, while a
+    write or close failure leaves the final path absent.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path_str = tempfile.mkstemp(
+        prefix=f"{ATOMIC_WRITE_TMP_PREFIX}{path.name}.",
+        suffix=ATOMIC_WRITE_TMP_SUFFIX,
+        dir=str(path.parent),
+    )
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(payload)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.link(tmp_path_str, path)
+    except Exception:
+        try:
+            os.unlink(tmp_path_str)
+        except OSError:
+            # Preserve the publication error. Startup cleanup owns any
+            # otherwise-unremovable sibling temporary file.
+            pass
+        raise
+    else:
+        try:
+            os.unlink(tmp_path_str)
+        except OSError:
+            # The final path is already complete and published. Do not turn
+            # best-effort temporary-file cleanup into a false write failure.
+            pass

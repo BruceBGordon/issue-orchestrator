@@ -126,6 +126,16 @@ function jsonResponse(data, ok = true) {
     };
 }
 
+function deferred() {
+    let resolve;
+    let reject;
+    const promise = new Promise((resolvePromise, rejectPromise) => {
+        resolve = resolvePromise;
+        reject = rejectPromise;
+    });
+    return { promise, resolve, reject };
+}
+
 test('setup action command dispatches to the repository setup controller', async () => {
     const calls = [];
     const controller = {
@@ -468,6 +478,194 @@ test('preview failure disables save click and keyboard activation', async () => 
     await next.emit('click', { detail: 1 });
     await next.emit('click', { detail: 0 });
     assert.equal(fetchCalls.length, 3);
+});
+
+test('pending detect cannot overwrite prerequisites after Back', async () => {
+    const document = fakeDocument();
+    const pendingDetect = deferred();
+    let prereqCall = 0;
+    const wizard = createSetupWizard({
+        document,
+        fetch: async (url) => {
+            if (url.startsWith('/control/setup/prereqs')) {
+                prereqCall += 1;
+                return jsonResponse({
+                    all_ok: true,
+                    checks: {
+                        git: {
+                            ok: true,
+                            detail: prereqCall === 1 ? 'first check' : 'back check',
+                        },
+                    },
+                });
+            }
+            if (url.startsWith('/control/setup/detect')) {
+                return pendingDetect.promise;
+            }
+            throw new Error(`Unexpected request: ${url}`);
+        },
+        escapeHtml: (value) => String(value),
+        loadRepos: async () => {},
+        setupCommands,
+    });
+    wizard.bind();
+    await wizard.open('/repos/porchpin');
+
+    const next = document.elements.get('setupWizardNext');
+    const detectClick = next.emit('click');
+    await document.elements.get('setupWizardBack').emit('click');
+
+    pendingDetect.resolve(jsonResponse({
+        repo_root: '/repos/porchpin',
+        repo: 'owner/porchpin',
+        existing_config: null,
+    }));
+    await detectClick;
+
+    const content = document.elements.get('setupContent').innerHTML;
+    assert.match(content, /Prerequisites/);
+    assert.match(content, /back check/);
+    assert.doesNotMatch(content, /Configuration/);
+    assert.equal(document.elements.get('setupWizardBack').style.display, 'none');
+    assert.equal(next.textContent, 'Next');
+});
+
+test('pending preview cannot render after close and reopen for another repository', async () => {
+    const document = fakeDocument();
+    const pendingPreview = deferred();
+    const wizard = createSetupWizard({
+        document,
+        fetch: async (url) => {
+            if (url.startsWith('/control/setup/prereqs')) {
+                const repo = new URL(`http://test${url}`).searchParams.get('repo_root');
+                return jsonResponse({
+                    all_ok: true,
+                    checks: { git: { ok: true, detail: `prerequisites for ${repo}` } },
+                });
+            }
+            if (url.startsWith('/control/setup/detect')) {
+                return jsonResponse({
+                    repo_root: '/repos/porchpin',
+                    repo: 'owner/porchpin',
+                    existing_config: null,
+                });
+            }
+            if (url === '/control/setup/preview') {
+                return pendingPreview.promise;
+            }
+            throw new Error(`Unexpected request: ${url}`);
+        },
+        escapeHtml: (value) => String(value),
+        loadRepos: async () => {},
+        setupCommands,
+    });
+    wizard.bind();
+    await wizard.open('/repos/porchpin');
+
+    const next = document.elements.get('setupWizardNext');
+    await next.emit('click');
+    document.elements.set(
+        'setupRepoName',
+        document.makeElement({ value: 'owner/porchpin' }),
+    );
+    document.elements.set(
+        'setupAgentLabel',
+        document.makeElement({ value: 'agent:dev' }),
+    );
+    document.elements.set('setupModel', document.makeElement({ value: 'sonnet' }));
+    document.elements.set(
+        'setupConfigureTechLead',
+        document.makeElement({ checked: true }),
+    );
+    const previewClick = next.emit('click');
+
+    wizard.close();
+    await wizard.open('/repos/other');
+    pendingPreview.resolve(jsonResponse({
+        yaml: 'repo:\n  name: owner/porchpin\n',
+        files: [],
+    }));
+    await previewClick;
+
+    const content = document.elements.get('setupContent').innerHTML;
+    assert.match(content, /Prerequisites/);
+    assert.match(content, /prerequisites for \/repos\/other/);
+    assert.doesNotMatch(content, /Preview Configuration/);
+    assert.equal(document.elements.get('setupWizardBack').style.display, 'none');
+});
+
+test('pending save cannot complete after close and reopen for another repository', async () => {
+    const document = fakeDocument();
+    const pendingSave = deferred();
+    let loadReposCalls = 0;
+    const wizard = createSetupWizard({
+        document,
+        fetch: async (url) => {
+            if (url.startsWith('/control/setup/prereqs')) {
+                const repo = new URL(`http://test${url}`).searchParams.get('repo_root');
+                return jsonResponse({
+                    all_ok: true,
+                    checks: { git: { ok: true, detail: `prerequisites for ${repo}` } },
+                });
+            }
+            if (url.startsWith('/control/setup/detect')) {
+                return jsonResponse({
+                    repo_root: '/repos/porchpin',
+                    repo: 'owner/porchpin',
+                    existing_config: null,
+                });
+            }
+            if (url === '/control/setup/preview') {
+                return jsonResponse({
+                    yaml: 'repo:\n  name: owner/porchpin\n',
+                    files: [],
+                });
+            }
+            if (url === '/control/setup/save') {
+                return pendingSave.promise;
+            }
+            throw new Error(`Unexpected request: ${url}`);
+        },
+        escapeHtml: (value) => String(value),
+        loadRepos: async () => { loadReposCalls += 1; },
+        setupCommands,
+    });
+    wizard.bind();
+    await wizard.open('/repos/porchpin');
+
+    const next = document.elements.get('setupWizardNext');
+    await next.emit('click');
+    document.elements.set(
+        'setupRepoName',
+        document.makeElement({ value: 'owner/porchpin' }),
+    );
+    document.elements.set(
+        'setupAgentLabel',
+        document.makeElement({ value: 'agent:dev' }),
+    );
+    document.elements.set('setupModel', document.makeElement({ value: 'sonnet' }));
+    document.elements.set(
+        'setupConfigureTechLead',
+        document.makeElement({ checked: true }),
+    );
+    await next.emit('click');
+    const saveClick = next.emit('click');
+
+    wizard.close();
+    await wizard.open('/repos/other');
+    pendingSave.resolve(jsonResponse({
+        status: 'saved',
+        created_files: ['/repos/porchpin/.issue-orchestrator/config/default.yaml'],
+        created_labels: [],
+    }));
+    await saveClick;
+
+    const content = document.elements.get('setupContent').innerHTML;
+    assert.match(content, /Prerequisites/);
+    assert.match(content, /prerequisites for \/repos\/other/);
+    assert.doesNotMatch(content, /Setup Complete!/);
+    assert.equal(document.elements.get('setupWizardBack').style.display, 'none');
+    assert.equal(loadReposCalls, 0);
 });
 
 test('existing config preview requires explicit replacement confirmation before save', async () => {

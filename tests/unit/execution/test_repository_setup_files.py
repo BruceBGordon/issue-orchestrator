@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from unittest.mock import patch
 
@@ -92,6 +93,61 @@ def test_setup_file_adapter_refuses_create_when_target_appears_after_plan(
     assert isinstance(exc_info.value.cause, FileExistsError)
     assert exc_info.value.applied_paths == ()
     assert config_file.path.read_text(encoding="utf-8") == "sentinel"
+
+
+@pytest.mark.parametrize("failure_stage", ["write", "close"])
+def test_setup_file_adapter_does_not_publish_incomplete_create(
+    tmp_path: Path,
+    failure_stage: str,
+) -> None:
+    adapter = RepositorySetupFileSystemAdapter()
+    plan = adapter.plan(
+        repo_root=tmp_path,
+        config_target=RepositorySetupNamedConfig(RepositoryConfigName("default")),
+        config=_command(tmp_path).build_config(),
+        include_prompts=False,
+    )
+    config_file = plan.files[0]
+    real_fdopen = os.fdopen
+
+    class FailingFile:
+        def __init__(self, fd: int, mode: str) -> None:
+            self._file = real_fdopen(fd, mode)
+
+        def __enter__(self) -> FailingFile:
+            self._file.__enter__()
+            return self
+
+        def write(self, payload: bytes) -> int:
+            if failure_stage == "write":
+                self._file.write(payload[:5])
+                raise OSError("injected mid-write failure")
+            return self._file.write(payload)
+
+        def flush(self) -> None:
+            self._file.flush()
+
+        def fileno(self) -> int:
+            return self._file.fileno()
+
+        def __exit__(self, *args: object) -> bool:
+            result = self._file.__exit__(*args)
+            if failure_stage == "close" and args[0] is None:
+                raise OSError("injected close failure")
+            return bool(result)
+
+    with (
+        patch(
+            "issue_orchestrator.infra.atomic_io.os.fdopen",
+            side_effect=FailingFile,
+        ),
+        pytest.raises(RepositorySetupFileSystemError) as exc_info,
+    ):
+        adapter.apply(plan)
+
+    assert exc_info.value.applied_paths == ()
+    assert not config_file.path.exists()
+    assert list(config_file.path.parent.glob(f".{config_file.path.name}.*.tmp")) == []
 
 
 def test_setup_file_adapter_preserves_existing_file_when_atomic_replace_fails(
