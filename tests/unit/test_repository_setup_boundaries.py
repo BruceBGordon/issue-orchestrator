@@ -13,6 +13,9 @@ from issue_orchestrator.contracts.ui_openapi_models import (
 from issue_orchestrator.control.repository_setup import (
     RepositorySetupExecutionError,
 )
+from issue_orchestrator.domain.repository_setup_auth import (
+    RepositorySetupGitHubAuthorization,
+)
 from issue_orchestrator.entrypoints.bootstrap_repository_setup import (
     build_repository_setup_owner,
 )
@@ -29,6 +32,7 @@ from issue_orchestrator.entrypoints.control_api_setup_support import (
 from issue_orchestrator.infra.config import get_config_path
 from issue_orchestrator.ports.repository_setup import (
     RepositorySetupExplicitConfig,
+    RepositorySetupGitHubVerification,
 )
 
 
@@ -60,21 +64,50 @@ def test_cli_and_http_produce_equivalent_owner_request_and_preview(
     host = MagicMock()
     host.list_labels.return_value = []
 
-    def repository_host_factory(repo_name: str) -> MagicMock:
+    def repository_host_factory(
+        repo_name: str,
+        _authorization: RepositorySetupGitHubAuthorization,
+    ) -> MagicMock:
         assert repo_name == "owner/repo"
         return host
 
-    owner = build_repository_setup_owner(repository_host_factory)
+    verification = RepositorySetupGitHubVerification(
+        identity="setup-user",
+        repository="owner/repo",
+        auth_kind="personal",
+        source="Environment variable ISSUE_ORCH_GITHUB_TOKEN",
+        normalized_authorization=RepositorySetupGitHubAuthorization(kind="detected"),
+    )
+    owner = build_repository_setup_owner(
+        repository_host_factory,
+        lambda _repo_name, _authorization: verification,
+    )
     dependencies = ControlApiSetupDependencies(
         validate_repo_root=lambda raw: Path(raw).resolve() if raw else None,
         setup_owner=owner,
+        github_token_store=lambda _token, *, repo: RepositorySetupGitHubAuthorization(
+            kind="personal",
+            keyring_service="issue-orchestrator",
+            keyring_username=f"github-token:{repo}",
+        ),
     )
     payload = RepositorySetupCommandPayload(
         repo_root=str(tmp_path),
         repo_name="owner/repo",
         worker_agent_label="agent:dev",
         model="sonnet",
+        effort="high",
+        configure_reviewer=True,
+        reviewer_model="opus",
+        reviewer_effort="max",
+        validation_quick_command="make test-quick",
+        validation_publish_command="make validate",
+        worktree_base="../worktrees/repo",
+        github_authorization={"kind": "detected"},
         configure_tech_lead=True,
+        tech_lead_model="sonnet",
+        tech_lead_effort="high",
+        tech_lead_review_threshold=1,
         config_name="default",
         create_prompts=True,
         create_labels=True,
@@ -104,9 +137,7 @@ def test_cli_request_preserves_explicit_legacy_config_path(tmp_path: Path) -> No
         config_path=config_path,
     )
 
-    assert request.config_target == RepositorySetupExplicitConfig(
-        config_path.resolve()
-    )
+    assert request.config_target == RepositorySetupExplicitConfig(config_path.resolve())
 
 
 def test_cli_surfaces_owner_partial_outcome() -> None:

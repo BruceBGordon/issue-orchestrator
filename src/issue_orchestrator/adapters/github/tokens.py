@@ -10,7 +10,7 @@ import sys
 from base64 import b64decode
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Literal, Protocol
 from urllib.parse import urlparse
 
 import yaml
@@ -51,6 +51,25 @@ class StaticGitHubTokenProvider:
 
     def get_token(self) -> str:
         return self.token
+
+
+@dataclass(frozen=True, slots=True)
+class GitHubAuthSource:
+    """Non-secret identity of the credential source selected by resolution."""
+
+    kind: Literal["configured", "environment", "github_cli", "keyring", "github_app"]
+    description: str
+    environment_variable: str | None = None
+    keyring_service: str | None = None
+    keyring_username: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class GitHubTokenResolution:
+    """Resolved personal token plus its separately safe source metadata."""
+
+    token: str
+    source: GitHubAuthSource
 
 
 @dataclass(frozen=True)
@@ -137,7 +156,9 @@ class GitHubAppAuthConfig:
             ) from exc
 
     def describe_source(self) -> str:
-        issuer = f"client_id {self.client_id}" if self.client_id else f"app_id {self.app_id}"
+        issuer = (
+            f"client_id {self.client_id}" if self.client_id else f"app_id {self.app_id}"
+        )
         key_source = (
             f"env:{self.private_key_env}"
             if self.private_key_env
@@ -208,39 +229,166 @@ def resolve_github_token(
     silently falling back to a different token that may not have access to the
     configured repository.
     """
-    if has_github_app_auth_config(
+    return resolve_github_token_with_source(
+        configured_token=configured_token,
+        configured_env=configured_env,
+        configured_keyring_service=configured_keyring_service,
+        configured_keyring_username=configured_keyring_username,
+        configured_app_client_id=configured_app_client_id,
+        configured_app_id=configured_app_id,
+        configured_app_installation_id=configured_app_installation_id,
+        configured_app_private_key_path=configured_app_private_key_path,
+        configured_app_private_key_env=configured_app_private_key_env,
+        api_url=api_url,
+    ).token
+
+
+def resolve_github_token_with_source(
+    *,
+    configured_token: str | None = None,
+    configured_env: str | None = None,
+    configured_keyring_service: str | None = None,
+    configured_keyring_username: str | None = None,
+    configured_app_client_id: str | None = None,
+    configured_app_id: str | None = None,
+    configured_app_installation_id: str | None = None,
+    configured_app_private_key_path: str | None = None,
+    configured_app_private_key_env: str | None = None,
+    api_url: str = "https://api.github.com",
+) -> GitHubTokenResolution:
+    """Resolve a personal token and identify the exact non-secret source used."""
+    _reject_github_app_token_resolution(
+        configured_app_client_id=configured_app_client_id,
+        configured_app_id=configured_app_id,
+        configured_app_installation_id=configured_app_installation_id,
+        configured_app_private_key_path=configured_app_private_key_path,
+        configured_app_private_key_env=configured_app_private_key_env,
+    )
+
+    if configured_token:
+        return GitHubTokenResolution(
+            token=configured_token,
+            source=GitHubAuthSource(
+                kind="configured",
+                description="Inline token from repo.github.token",
+            ),
+        )
+
+    configured_resolution = _resolve_configured_personal_source(
+        configured_env=configured_env,
+        configured_keyring_service=configured_keyring_service,
+        configured_keyring_username=configured_keyring_username,
+    )
+    if configured_resolution is not None:
+        return configured_resolution
+
+    return _resolve_default_personal_source(api_url=api_url)
+
+
+def _reject_github_app_token_resolution(
+    *,
+    configured_app_client_id: str | None,
+    configured_app_id: str | None,
+    configured_app_installation_id: str | None,
+    configured_app_private_key_path: str | None,
+    configured_app_private_key_env: str | None,
+) -> None:
+    if not has_github_app_auth_config(
         configured_app_client_id=configured_app_client_id,
         configured_app_id=configured_app_id,
         configured_app_installation_id=configured_app_installation_id,
         configured_app_private_key_path=configured_app_private_key_path,
         configured_app_private_key_env=configured_app_private_key_env,
     ):
-        raise GitHubAuthError(
-            "GitHub App auth is configured; use the GitHub HTTP token provider "
-            "to mint an installation token."
+        return
+    raise GitHubAuthError(
+        "GitHub App auth is configured; use the GitHub HTTP token provider "
+        "to mint an installation token."
+    )
+
+
+def _resolve_configured_personal_source(
+    *,
+    configured_env: str | None,
+    configured_keyring_service: str | None,
+    configured_keyring_username: str | None,
+) -> GitHubTokenResolution | None:
+    if not any(
+        (configured_env, configured_keyring_service, configured_keyring_username)
+    ):
+        return None
+
+    if configured_env and (token := os.environ.get(configured_env)):
+        return GitHubTokenResolution(
+            token=token,
+            source=GitHubAuthSource(
+                kind="environment",
+                description=f"Environment variable {configured_env}",
+                environment_variable=configured_env,
+            ),
         )
 
-    if configured_token:
-        return configured_token
-
-    if any((configured_env, configured_keyring_service, configured_keyring_username)):
-        return _resolve_repo_scoped_github_token(
-            configured_env=configured_env,
-            configured_keyring_service=configured_keyring_service,
-            configured_keyring_username=configured_keyring_username,
+    service = configured_keyring_service or KEYRING_SERVICE
+    username = configured_keyring_username or KEYRING_USERNAME
+    if (configured_keyring_service or configured_keyring_username) and (
+        token := _read_keyring_token(service=service, username=username)
+    ):
+        return GitHubTokenResolution(
+            token=token,
+            source=GitHubAuthSource(
+                kind="keyring",
+                description=f"Keyring ({service}/{username})",
+                keyring_service=service,
+                keyring_username=username,
+            ),
         )
-    # Primary env var per ADR-0014
+
+    expected_sources = []
+    if configured_env:
+        expected_sources.append(f"env:{configured_env}")
+    if configured_keyring_service or configured_keyring_username:
+        expected_sources.append(f"keyring:{service}/{username}")
+    raise GitHubAuthError(
+        "GitHub token not configured for repo-specific auth. "
+        f"Checked {', '.join(expected_sources)}."
+    )
+
+
+def _resolve_default_personal_source(*, api_url: str) -> GitHubTokenResolution:
+    """Resolve the configured global source chain from ADR-0014."""
     for env_name in ("ISSUE_ORCH_GITHUB_TOKEN", "GITHUB_TOKEN", "GH_TOKEN"):
         token = os.environ.get(env_name)
         if token:
-            return token
-    token = _read_gh_cli_token(host=_github_host_for_api_url(api_url))
+            return GitHubTokenResolution(
+                token=token,
+                source=GitHubAuthSource(
+                    kind="environment",
+                    description=f"Environment variable {env_name}",
+                    environment_variable=env_name,
+                ),
+            )
+    host = _github_host_for_api_url(api_url)
+    token = _read_gh_cli_token(host=host)
     if token:
-        return token
+        return GitHubTokenResolution(
+            token=token,
+            source=GitHubAuthSource(
+                kind="github_cli",
+                description=f"GitHub CLI auth ({host})",
+            ),
+        )
     # Optional keychain via keyring library
     token = _read_keyring_token(service=KEYRING_SERVICE, username=KEYRING_USERNAME)
     if token:
-        return token
+        return GitHubTokenResolution(
+            token=token,
+            source=GitHubAuthSource(
+                kind="keyring",
+                description=f"Keyring ({KEYRING_SERVICE}/{KEYRING_USERNAME})",
+                keyring_service=KEYRING_SERVICE,
+                keyring_username=KEYRING_USERNAME,
+            ),
+        )
     raise GitHubAuthError(
         "GitHub token not configured. Set ISSUE_ORCH_GITHUB_TOKEN or run: "
         "issue-orchestrator auth store"
@@ -420,7 +568,9 @@ def _read_gh_hosts_record(*, host: str) -> dict[str, object] | None:
                 continue
             raw_text = hosts_path.read_text(encoding="utf-8")
         except OSError as exc:
-            logger.debug("Could not read GitHub CLI hosts.yml at %s: %s", hosts_path, exc)
+            logger.debug(
+                "Could not read GitHub CLI hosts.yml at %s: %s", hosts_path, exc
+            )
             continue
         try:
             payload = yaml.safe_load(raw_text)
@@ -474,27 +624,11 @@ def _resolve_repo_scoped_github_token(
     configured_keyring_username: str | None,
 ) -> str:
     """Resolve a token from repo-configured auth sources only."""
-    if configured_env:
-        token = os.environ.get(configured_env)
-        if token:
-            return token
-    if configured_keyring_service or configured_keyring_username:
-        keyring_service = configured_keyring_service or KEYRING_SERVICE
-        keyring_username = configured_keyring_username or KEYRING_USERNAME
-        token = _read_keyring_token(service=keyring_service, username=keyring_username)
-        if token:
-            return token
-    expected_sources: list[str] = []
-    if configured_env:
-        expected_sources.append(f"env:{configured_env}")
-    if configured_keyring_service or configured_keyring_username:
-        keyring_service = configured_keyring_service or KEYRING_SERVICE
-        keyring_username = configured_keyring_username or KEYRING_USERNAME
-        expected_sources.append(f"keyring:{keyring_service}/{keyring_username}")
-    raise GitHubAuthError(
-        "GitHub token not configured for repo-specific auth. "
-        f"Checked {', '.join(expected_sources)}."
-    )
+    return resolve_github_token_with_source(
+        configured_env=configured_env,
+        configured_keyring_service=configured_keyring_service,
+        configured_keyring_username=configured_keyring_username,
+    ).token
 
 
 def _read_keyring_token(
@@ -621,6 +755,22 @@ def store_keyring_token(token: str) -> None:
     keyring.set_password(KEYRING_SERVICE, KEYRING_USERNAME, token)
 
 
+def store_keyring_token_for(
+    token: str,
+    *,
+    service: str,
+    username: str,
+) -> None:
+    """Store a token at one explicit repo-scoped keychain reference."""
+    if not token.strip():
+        raise ValueError("GitHub token is required")
+    if not service.strip() or not username.strip():
+        raise ValueError("GitHub keyring service and username are required")
+    import keyring
+
+    keyring.set_password(service, username, token)
+
+
 def clear_keyring_token() -> bool:
     """Remove GitHub token from OS keychain.
 
@@ -644,6 +794,8 @@ __all__ = [
     "KEYRING_SERVICE",
     "KEYRING_USERNAME",
     "GitHubAppAuthConfig",
+    "GitHubAuthSource",
+    "GitHubTokenResolution",
     "GitHubTokenProvider",
     "StaticGitHubTokenProvider",
     "TokenValidationResult",
@@ -661,5 +813,7 @@ __all__ = [
     "describe_github_token_sources",
     "has_github_app_auth_config",
     "resolve_github_token",
+    "resolve_github_token_with_source",
     "store_keyring_token",
+    "store_keyring_token_for",
 ]

@@ -126,7 +126,8 @@ agents:
     ai_system: "claude-code"
 
 worktrees:
-  base: "../"                     # Where to create worktrees (relative to repo)
+  # Dedicated sibling collection; replace my-repo with this repository's directory name.
+  base: "../worktrees/my-repo"    # Worktrees become ../worktrees/my-repo/my-repo-123
   # base_branch_override: "main"         # Optional: override base branch (must exist on origin)
   # seed_ref: "HEAD"                     # Optional: local ref to seed fresh issue worktrees during local iteration
   # setup:                               # Commands to run after worktree creation.
@@ -174,7 +175,7 @@ review:
   tech_lead_review_label: "needs-tech-lead-review"
   tech_lead_reviewed_label: "tech-lead-reviewed"
   tech_lead_failed_label: "tech-lead-failed"
-  tech_lead_review_threshold: 0
+  tech_lead_review_threshold: 1        # Review every approved PR; 0 = manual/failure only
   tech_lead_review_on_failure: true
   max_rework_cycles: 5
   reviewer_feedback_cache_minutes: 5

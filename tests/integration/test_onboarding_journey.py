@@ -17,6 +17,9 @@ from issue_orchestrator.infra.doctor.checks import guardrails as guardrail_check
 from issue_orchestrator.infra.doctor.checks import hooks as hook_checks
 from issue_orchestrator.infra.doctor.checks import schema as schema_checks
 from issue_orchestrator.infra.doctor.checks import workspace as workspace_checks
+from issue_orchestrator.ports.repository_setup import (
+    RepositorySetupGitHubVerification,
+)
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _GIT_ENV_STRIP = (
@@ -161,6 +164,17 @@ def _local_onboarding_prompter() -> _QueuePrompter:
     )
 
 
+def _verify_setup_authorization(repo_name, authorization):
+    """Keep the local journey behind the GitHub verification port."""
+    return RepositorySetupGitHubVerification(
+        identity="onboarding-test-user",
+        repository=repo_name,
+        auth_kind="personal",
+        source="integration test credential",
+        normalized_authorization=authorization,
+    )
+
+
 @pytest.mark.integration
 @pytest.mark.heavy_e2e
 def test_local_onboarding_smoke_journey(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -189,6 +203,10 @@ def test_local_onboarding_smoke_journey(tmp_path: Path, monkeypatch: pytest.Monk
     ), patch(
         "issue_orchestrator.entrypoints.cli_tools.setup_wizard._get_repository_host",
         return_value=host,
+    ), patch(
+        "issue_orchestrator.entrypoints.cli_tools.setup_wizard."
+        "verify_repository_setup_github_authorization",
+        side_effect=_verify_setup_authorization,
     ), patch(
         # Readiness is an interactive, CLI-dependent step with its own tests;
         # this journey verifies the config/guardrail flow, so skip the offer.

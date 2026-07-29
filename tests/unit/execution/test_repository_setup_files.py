@@ -45,6 +45,7 @@ def test_setup_file_adapter_plans_and_writes_runnable_contained_artifacts(
     assert config_file.path.name == "default.yaml"
     assert {file.agent for file in plan.files if file.kind == "prompt"} == {
         "agent:dev",
+        "agent:reviewer",
         "agent:tech-lead",
     }
 

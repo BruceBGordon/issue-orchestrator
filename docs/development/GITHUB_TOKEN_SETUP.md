@@ -160,6 +160,11 @@ Notes:
 - `keyring_service` and `keyring_username` let a repo demand a specific keyring entry.
 - You can declare one or both. Resolution order within repo-scoped mode is:
   `repo.github.token` > `repo.github.token_env` > `repo.github.keyring_service` / `keyring_username`
+- Guided Control Center Setup stores a submitted PAT under service
+  `issue-orchestrator` and account `github-token:<owner>/<repo>`, then writes
+  only those two locators to repository YAML.
+- A credential detected from GitHub CLI remains `detected`; it is re-resolved
+  at runtime rather than copied into YAML or Keychain.
 
 On macOS you can create a matching generic password entry like this:
 

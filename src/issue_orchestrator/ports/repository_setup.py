@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, Mapping, Protocol
 
+from ..domain.repository_setup_auth import RepositorySetupGitHubAuthorization
 from ..domain.repository_config_name import RepositoryConfigName
 from .repository_host import RepositoryHost
 
@@ -28,12 +29,12 @@ class RepositorySetupExplicitConfig:
 
     def __post_init__(self) -> None:
         if not self.path.is_absolute() or not self.path.name:
-            raise ValueError("Repository setup config path must be an absolute file path")
+            raise ValueError(
+                "Repository setup config path must be an absolute file path"
+            )
 
 
-RepositorySetupConfigTarget = (
-    RepositorySetupNamedConfig | RepositorySetupExplicitConfig
-)
+RepositorySetupConfigTarget = RepositorySetupNamedConfig | RepositorySetupExplicitConfig
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,7 +86,43 @@ class RepositorySetupFileSystem(Protocol):
 class RepositorySetupHostFactory(Protocol):
     """Resolve the repository host used for setup label mutations."""
 
-    def __call__(self, repo_name: str) -> RepositoryHost: ...
+    def __call__(
+        self,
+        repo_name: str,
+        authorization: RepositorySetupGitHubAuthorization,
+    ) -> RepositoryHost: ...
+
+
+@dataclass(frozen=True, slots=True)
+class RepositorySetupGitHubVerification:
+    """Verified, non-secret GitHub identity and source shown during setup."""
+
+    identity: str
+    repository: str
+    auth_kind: Literal["personal", "github_app"]
+    source: str
+    normalized_authorization: RepositorySetupGitHubAuthorization
+
+
+class RepositorySetupGitHubVerifier(Protocol):
+    """Verify a setup authorization without mutating GitHub or repository files."""
+
+    def __call__(
+        self,
+        repo_name: str,
+        authorization: RepositorySetupGitHubAuthorization,
+    ) -> RepositorySetupGitHubVerification: ...
+
+
+class RepositorySetupGitHubTokenStore(Protocol):
+    """Persist a verified personal token at a repo-scoped secret reference."""
+
+    def __call__(
+        self,
+        token: str,
+        *,
+        repo: str,
+    ) -> RepositorySetupGitHubAuthorization: ...
 
 
 __all__ = [
@@ -96,6 +133,9 @@ __all__ = [
     "RepositorySetupFileKind",
     "RepositorySetupFileSystem",
     "RepositorySetupFileSystemError",
+    "RepositorySetupGitHubVerification",
+    "RepositorySetupGitHubTokenStore",
+    "RepositorySetupGitHubVerifier",
     "RepositorySetupHostFactory",
     "RepositorySetupNamedConfig",
     "RepositorySetupPlannedFile",

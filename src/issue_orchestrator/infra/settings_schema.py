@@ -63,6 +63,7 @@ if TYPE_CHECKING:
 # Sub-models for each settings tab
 # ---------------------------------------------------------------------------
 
+
 class ConcurrencySettings(BaseModel):
     """Settings for the Concurrency tab."""
 
@@ -351,7 +352,10 @@ class E2ESettings(BaseModel):
         title="Command",
         description="Space-separated command used when Runner Kind is command",
         json_schema_extra={
-            "doc_examples": ["./scripts/run-e2e-suite.sh", "npm run test:e2e -- --reporter=junit"],
+            "doc_examples": [
+                "./scripts/run-e2e-suite.sh",
+                "npm run test:e2e -- --reporter=junit",
+            ],
             "doc_notes": "Used when runner_kind=command. The command runs inside the E2E worktree.",
             "config_attr": "e2e.command",
             "yaml_path": "e2e.command",
@@ -423,7 +427,10 @@ class E2ESettings(BaseModel):
         title="Quarantine File",
         description="Path to quarantine file for skipping known-flaky tests",
         json_schema_extra={
-            "doc_examples": ["tests/e2e/quarantine.txt", "tests/e2e/quarantine-local.txt"],
+            "doc_examples": [
+                "tests/e2e/quarantine.txt",
+                "tests/e2e/quarantine-local.txt",
+            ],
             "doc_notes": "Doctor verifies the file exists when E2E is enabled.",
             "config_attr": "e2e.quarantine_file",
             "yaml_path": "e2e.quarantine_file",
@@ -518,7 +525,10 @@ class ValidationSettings(BaseModel):
         title="Publish Validation Command",
         description="Authoritative command run before push/publish",
         json_schema_extra={
-            "doc_examples": ["./scripts/validate-pr.sh", "./scripts/validate-pr-suite.sh"],
+            "doc_examples": [
+                "./scripts/validate-pr.sh",
+                "./scripts/validate-pr-suite.sh",
+            ],
             "doc_notes": "This should match the repo's authoritative local PR/pre-push gate. If make validate-pr wraps the cache-aware verify hook, configure a private non-recursive suite command instead.",
             "section": "Publish Gate",
             "config_attr": "validation.publish.cmd",
@@ -585,7 +595,7 @@ class FilteringSettings(BaseModel):
         title="Milestones",
         description="Milestones to process (comma-separated string or YAML list)",
         json_schema_extra={
-            "doc_examples": ["M1, M2", "[\"M1\", \"M2\"]", ""],
+            "doc_examples": ["M1, M2", '["M1", "M2"]', ""],
             "doc_notes": "Accepts a comma-separated string or a YAML list. Leave empty to allow all milestones.",
             "config_attr": "filtering.milestones",
             "config_read_method": "filtering.get_milestones",
@@ -598,7 +608,7 @@ class FilteringSettings(BaseModel):
         title="Exclude Labels",
         description="Labels to exclude (comma-separated string or YAML list)",
         json_schema_extra={
-            "doc_examples": ["test-data, skip", "[\"test-data\", \"skip\"]", ""],
+            "doc_examples": ["test-data, skip", '["test-data", "skip"]', ""],
             "doc_notes": "Accepts a comma-separated string or a YAML list.",
             "config_attr": "filtering.exclude_labels",
             "yaml_path": "filtering.exclude_labels",
@@ -610,7 +620,7 @@ class FilteringSettings(BaseModel):
         title="Exclude Label Prefixes",
         description="Label prefixes to exclude (comma-separated string or YAML list)",
         json_schema_extra={
-            "doc_examples": ["io:e2e:", "[\"io:e2e:\", \"tmp:\"]", ""],
+            "doc_examples": ["io:e2e:", '["io:e2e:", "tmp:"]', ""],
             "doc_notes": "Exclude issues that have any label starting with one of these prefixes.",
             "config_attr": "filtering.exclude_label_prefixes",
             "yaml_path": "filtering.exclude_label_prefixes",
@@ -1429,7 +1439,10 @@ class ReviewSettings(BaseModel):
         # disabled at runtime. Reject the pair so the misconfiguration is
         # loud instead of degrading (0 disables; a positive interval needs
         # an agent to walk the board).
-        if self.tech_lead_health_review_interval_minutes > 0 and not self.tech_lead_agent:
+        if (
+            self.tech_lead_health_review_interval_minutes > 0
+            and not self.tech_lead_agent
+        ):
             raise ValueError(
                 "tech_lead.health_review.interval_minutes is "
                 f"{self.tech_lead_health_review_interval_minutes} but no tech lead "
@@ -1998,13 +2011,20 @@ class AdvancedSettings(BaseModel):
         },
     )
     worktree_base: str = Field(
-        "../",
+        "../worktrees",
         title="Worktree Base Directory",
-        description="Directory where git worktrees are created",
+        description="Outside-repository directory where git worktrees are created",
         min_length=1,
         json_schema_extra={
-            "doc_examples": ["../", "../worktrees", "/tmp/worktrees"],
-            "doc_notes": "Relative paths are resolved from the repo root.",
+            "doc_examples": [
+                "../worktrees/my-repo",
+                "../worktrees",
+                "/tmp/worktrees/my-repo",
+            ],
+            "doc_notes": (
+                "Relative paths are resolved from the repo root. New repository "
+                "Setup defaults to ../worktrees/<repository-directory>."
+            ),
             "section": "Worktrees",
             "restart_required": True,
             "config_value_type": CONFIG_VALUE_TYPE_PATH,
@@ -2014,6 +2034,7 @@ class AdvancedSettings(BaseModel):
                 "enabled": True,
                 "section": "worktrees",
                 "order": 10,
+                "prompt": "Worktree Base Directory",
             },
         },
     )
@@ -2145,6 +2166,7 @@ TAB_DEFINITIONS: list[dict[str, Any]] = [
 # Config <-> Schema bridge
 # ---------------------------------------------------------------------------
 
+
 def from_config(config: Config) -> dict[str, BaseModel]:
     """Build all tab models from a Config object.
 
@@ -2195,6 +2217,7 @@ def get_restart_fields() -> set[str]:
 # JSON Schema generation (cached for template rendering)
 # ---------------------------------------------------------------------------
 
+
 @functools.lru_cache(maxsize=1)
 def get_settings_json_schema() -> dict[str, Any]:
     """Generate per-tab JSON schemas for template rendering.
@@ -2209,6 +2232,7 @@ def get_settings_json_schema() -> dict[str, Any]:
 # Metadata accessor for wizard / docs
 # ---------------------------------------------------------------------------
 
+
 def get_field_meta(tab_key: str, field_name: str) -> dict[str, Any]:
     """Get schema metadata for a specific field.
 
@@ -2220,6 +2244,7 @@ def get_field_meta(tab_key: str, field_name: str) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # Setup wizard field extraction (data-driven)
 # ---------------------------------------------------------------------------
+
 
 def get_setup_fields(section: str) -> list[dict[str, Any]]:
     """Get schema fields for a wizard section, sorted by order.
@@ -2233,6 +2258,7 @@ def get_setup_fields(section: str) -> list[dict[str, Any]]:
 # ---------------------------------------------------------------------------
 # Doctor check field extraction (data-driven)
 # ---------------------------------------------------------------------------
+
 
 def get_doctor_check_fields() -> list[dict[str, Any]]:
     """Get all schema fields that have doctor_check annotations.
@@ -2255,6 +2281,7 @@ def get_summary_fields(section: str) -> list[dict[str, Any]]:
 # ---------------------------------------------------------------------------
 # Documentation generation
 # ---------------------------------------------------------------------------
+
 
 def generate_config_reference() -> str:
     """Generate markdown configuration reference from schema.

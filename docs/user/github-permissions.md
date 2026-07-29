@@ -11,18 +11,51 @@ identity. It is the right first setup for trials, personal repos without strict
 approval rules, and teams where someone other than the token owner reviews the
 PR.
 
+## Guided Control Center Setup
+
+For a repository discovered by the Control Center, select **Setup**. The GitHub
+stage is deliberately resumable:
+
+1. Choose **Use my GitHub identity** or **Use a GitHub App**.
+2. Follow the GitHub-side instructions. Setup waits while you create a
+   fine-grained token or App, install the App, and save its private key.
+3. Return to Setup and select **Verify**.
+4. Review the detected identity, repository, credential source, authorship
+   tradeoff, and required permissions.
+5. Continue to Preview. Setup verifies the same authorization again immediately
+   before it writes YAML, prompts, or labels.
+
+Verification is read-only: it proves the selected identity can authenticate and
+access the target repository without changing GitHub. It cannot safely prove
+every write permission without performing a write, so confirm the listed write
+permissions in GitHub. Runtime operations fail clearly if GitHub later denies a
+specific operation.
+
+Setup never sends an existing inline YAML token to the browser. A new personal
+token is accepted only when you explicitly select **Verify and store token**;
+after verification it is stored in a repository-scoped OS keychain entry and
+YAML receives only the keychain locator. GitHub App YAML stores a private-key
+path or environment-variable name, never the private key. Agents receive
+neither form of GitHub credential.
+
 ## Authentication Modes
 
 ### Simple Mode: Personal Token
 
 Use a fine-grained PAT, GitHub CLI auth, or the OS keychain when you are
-comfortable with orchestrator-created branches and PRs being attributed to the
-token owner.
+comfortable with GitHub API operations and PR creation being attributed to the
+token owner. In personal mode, branch pushes continue to use the repository's
+configured git transport rather than forcing the PAT into git.
 
 This mode is supported today. It has one important branch-protection limit:
 GitHub will not let a PR author approve their own PR. If your repo requires all
 PRs to be approved and the orchestrator opens PRs as you, you will need another
 eligible reviewer or an admin bypass.
+
+When Setup verifies a credential detected from GitHub CLI, it leaves the YAML
+authorization as detected so runtime re-resolves that credential. To pin a
+durable, repository-scoped source, use a named environment variable or let
+guided Setup store a fine-grained PAT in the OS keychain.
 
 ### Protected-Branch Mode: GitHub App
 

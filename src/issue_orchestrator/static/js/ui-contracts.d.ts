@@ -780,14 +780,25 @@ export interface RecentE2ERunsPayload {
 
 export interface RepositorySetupCommandPayload {
   config_name?: string;
+  configure_reviewer: boolean;
   configure_tech_lead: boolean;
   create_labels?: boolean;
   create_prompts?: boolean;
+  effort: "low" | "medium" | "high" | "xhigh" | "max";
+  github_authorization: RepositorySetupGitHubAuthorizationPayload;
   model: "haiku" | "sonnet" | "opus";
   replace_existing?: boolean;
   repo_name: string;
   repo_root: string;
+  reviewer_effort: "low" | "medium" | "high" | "xhigh" | "max";
+  reviewer_model: "haiku" | "sonnet" | "opus";
+  tech_lead_effort: "low" | "medium" | "high" | "xhigh" | "max";
+  tech_lead_model: "haiku" | "sonnet" | "opus";
+  tech_lead_review_threshold: number;
+  validation_publish_command: string;
+  validation_quick_command: string;
   worker_agent_label: string;
+  worktree_base?: string;
 }
 
 export interface RepositorySetupConflictPayload {
@@ -801,7 +812,7 @@ export interface RepositorySetupFailurePayload {
   created_labels: string[];
   detail: string;
   error: "repository_setup_failed";
-  stage: "planning" | "files" | "labels";
+  stage: "authorization" | "planning" | "files" | "labels";
 }
 
 export interface RepositorySetupFilePayload {
@@ -812,8 +823,47 @@ export interface RepositorySetupFilePayload {
   type?: "prompt";
 }
 
+export interface RepositorySetupGitHubAuthorizationPayload {
+  api_url?: string;
+  app_client_id?: string;
+  app_id?: string;
+  app_installation_id?: string;
+  app_private_key_env?: string;
+  app_private_key_path?: string;
+  keyring_service?: string;
+  keyring_username?: string;
+  kind: "detected" | "personal" | "github_app";
+  token_env?: string;
+}
+
+export interface RepositorySetupGitHubTokenPayload {
+  repo_name: string;
+  repo_root: string;
+  token: string;
+}
+
+export interface RepositorySetupGitHubVerificationPayload {
+  auth_kind: "personal" | "github_app";
+  authorization: RepositorySetupGitHubAuthorizationPayload;
+  authorship_notice: string;
+  identity: string;
+  repository: string;
+  required_permissions: string[];
+  source: string;
+  verification_note: string;
+  verified: true;
+}
+
+export interface RepositorySetupGitHubVerifyRequestPayload {
+  authorization: RepositorySetupGitHubAuthorizationPayload;
+  repo_name: string;
+  repo_root: string;
+}
+
 export interface RepositorySetupPreviewPayload {
   files: RepositorySetupFilePayload[];
+  github_authorization: RepositorySetupGitHubVerificationPayload;
+  worktree_base: string;
   yaml: string;
 }
 

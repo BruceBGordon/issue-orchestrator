@@ -80,8 +80,32 @@ function fakeDocument() {
     const dynamicIds = [
         'setupRepoName',
         'setupAgentLabel',
-        'setupModel',
+        'setupWorkerModel',
+        'setupWorkerEffort',
+        'setupConfigureReviewer',
+        'setupReviewerModel',
+        'setupReviewerEffort',
+        'setupValidationQuickCommand',
+        'setupValidationPublishCommand',
+        'setupWorktreeBase',
         'setupConfigureTechLead',
+        'setupTechLeadModel',
+        'setupTechLeadEffort',
+        'setupTechLeadReviewThreshold',
+        'setupGithubPersonal',
+        'setupGithubApp',
+        'setupGithubPersonalPanel',
+        'setupGithubAppPanel',
+        'setupVerifyDetectedGithub',
+        'setupGithubToken',
+        'setupStoreGithubToken',
+        'setupGithubAppClientId',
+        'setupGithubAppId',
+        'setupGithubAppInstallationId',
+        'setupGithubAppKeyPath',
+        'setupGithubAppKeyEnv',
+        'setupVerifyGithubApp',
+        'setupGithubStatus',
         'setupCreateLabels',
         'setupConfirmReplace',
     ];
@@ -97,9 +121,30 @@ function fakeDocument() {
             if (html.includes('id="setupConfirmReplace"')) {
                 elements.set('setupConfirmReplace', makeElement({ checked: false }));
             }
+            if (html.includes('id="setupWorktreeBase"')) {
+                const value = html.match(/id="setupWorktreeBase"[\s\S]*?value="([^"]*)"/)?.[1]
+                    || '../worktrees/repository';
+                elements.set('setupWorktreeBase', makeElement({ value }));
+            }
+            dynamicIds.forEach((id) => {
+                if (elements.has(id) || !html.includes(`id="${id}"`)) return;
+                const tag = html.match(new RegExp(`<[^>]+id="${id}"[^>]*>`))?.[0] || '';
+                const select = html.match(
+                    new RegExp(`<select[^>]+id="${id}"[^>]*>[\\s\\S]*?<\\/select>`),
+                )?.[0] || '';
+                const value = tag.match(/value="([^"]*)"/)?.[1]
+                    || select.match(/<option value="([^"]*)"[^>]*selected/)?.[1]
+                    || '';
+                const node = makeElement({
+                    value,
+                    checked: /\schecked(?:\s|>)/.test(tag),
+                });
+                node.hidden = /\shidden(?:\s|>)/.test(tag);
+                elements.set(id, node);
+            });
         },
     });
-    const steps = [1, 2, 3].map((step) => makeElement({
+    const steps = [1, 2, 3, 4].map((step) => makeElement({
         dataset: { step: String(step) },
     }));
     const modal = elements.get('setupWizardModal');
@@ -123,6 +168,37 @@ function jsonResponse(data, ok = true) {
     return {
         ok,
         json: async () => data,
+    };
+}
+
+function githubVerificationResponse() {
+    return jsonResponse({
+        verified: true,
+        identity: 'setup-user',
+        repository: 'owner/porchpin',
+        auth_kind: 'personal',
+        source: 'Environment variable ISSUE_ORCH_GITHUB_TOKEN',
+        authorship_notice: 'Branches and pull requests will be authored as setup-user.',
+        verification_note: (
+            'Setup verified identity and repository access without making writes.'
+        ),
+        required_permissions: [
+            'Contents: read and write',
+            'Issues: read and write',
+            'Pull requests: read and write',
+            'Metadata: read',
+        ],
+        authorization: {
+            kind: 'personal',
+            token_env: 'ISSUE_ORCH_GITHUB_TOKEN',
+        },
+    });
+}
+
+function githubPreviewSummary() {
+    return {
+        identity: 'setup-user',
+        source: 'Environment variable ISSUE_ORCH_GITHUB_TOKEN',
     };
 }
 
@@ -152,41 +228,87 @@ test('setup action command dispatches to the repository setup controller', async
     assert.deepEqual(calls, [['/repos/porchpin', trigger]]);
 });
 
-test('setup request contract defaults tech lead on and supports explicit opt-out', () => {
+test('setup request contract defaults the complete review pipeline on', () => {
     const enabled = setupCommands.buildSetupPreviewRequest('/repos/porchpin', {
         repoName: 'owner/porchpin',
         workerAgentLabel: 'agent:dev',
         model: 'sonnet',
+        worktreeBase: '../worktrees/porchpin',
     });
     const disabled = setupCommands.buildSetupSaveRequest('/repos/porchpin', {
         repoName: 'owner/porchpin',
         workerAgentLabel: 'agent:dev',
         model: 'sonnet',
+        worktreeBase: '../worktrees/porchpin',
+        configureReviewer: false,
         configureTechLead: false,
     }, {
         createLabels: false,
     });
 
     assert.equal(enabled.endpoint, '/control/setup/preview');
+    assert.equal(enabled.body.effort, 'high');
+    assert.equal(enabled.body.configure_reviewer, true);
+    assert.equal(enabled.body.reviewer_model, 'sonnet');
+    assert.equal(enabled.body.reviewer_effort, 'high');
+    assert.equal(enabled.body.validation_quick_command, 'git diff --check');
+    assert.equal(enabled.body.validation_publish_command, 'git diff --check');
     assert.equal(enabled.body.configure_tech_lead, true);
+    assert.equal(enabled.body.tech_lead_model, 'sonnet');
+    assert.equal(enabled.body.tech_lead_effort, 'high');
+    assert.equal(enabled.body.tech_lead_review_threshold, 1);
+    assert.equal(enabled.body.worktree_base, '../worktrees/porchpin');
     assert.equal(disabled.endpoint, '/control/setup/save');
+    assert.equal(disabled.body.configure_reviewer, false);
     assert.equal(disabled.body.configure_tech_lead, false);
     assert.equal(disabled.body.create_prompts, true);
     assert.equal(disabled.body.create_labels, false);
     assert.equal(disabled.body.replace_existing, false);
 });
 
-test('setup request contract rejects empty and tech-lead worker labels', () => {
-    for (const workerAgentLabel of ['agent:', 'agent:tech-lead']) {
+test('setup request contract rejects empty and reserved worker labels', () => {
+    for (const workerAgentLabel of ['agent:', 'agent:reviewer', 'agent:tech-lead']) {
         assert.throws(
             () => setupCommands.buildSetupPreviewRequest('/repos/porchpin', {
                 repoName: 'owner/porchpin',
                 workerAgentLabel,
                 model: 'sonnet',
+                worktreeBase: '../worktrees/porchpin',
             }),
             /workerAgentLabel must match/,
         );
     }
+});
+
+test('setup request contract rejects invalid role and validation choices', () => {
+    const valid = {
+        repoName: 'owner/porchpin',
+        workerAgentLabel: 'agent:dev',
+        model: 'sonnet',
+        worktreeBase: '../worktrees/porchpin',
+    };
+
+    assert.throws(
+        () => setupCommands.buildSetupPreviewRequest('/repos/porchpin', {
+            ...valid,
+            reviewerEffort: 'unbounded',
+        }),
+        /Unsupported reviewer effort/,
+    );
+    assert.throws(
+        () => setupCommands.buildSetupPreviewRequest('/repos/porchpin', {
+            ...valid,
+            techLeadReviewThreshold: 51,
+        }),
+        /techLeadReviewThreshold must be an integer/,
+    );
+    assert.throws(
+        () => setupCommands.buildSetupPreviewRequest('/repos/porchpin', {
+            ...valid,
+            validationQuickCommand: '   ',
+        }),
+        /validationQuickCommand is required/,
+    );
 });
 
 test('setup modal completes the default-on preview and save round trip', async () => {
@@ -203,10 +325,14 @@ test('setup modal completes the default-on preview and save round trip', async (
             repo: 'owner/porchpin',
             existing_config: null,
         }),
+        githubVerificationResponse(),
         jsonResponse({
             yaml: 'repo:\n  name: owner/porchpin\n',
+            worktree_base: '/repos/worktrees/porchpin',
+            github_authorization: githubPreviewSummary(),
             files: [
                 { path: '/repos/porchpin/.issue-orchestrator/config/default.yaml', action: 'create' },
+                { path: '/repos/porchpin/.io/reviewer.md', action: 'create', type: 'prompt' },
                 { path: '/repos/porchpin/.io/tech-lead.md', action: 'create', type: 'prompt' },
             ],
         }),
@@ -215,9 +341,10 @@ test('setup modal completes the default-on preview and save round trip', async (
             config_path: '/repos/porchpin/.issue-orchestrator/config/default.yaml',
             created_files: [
                 '/repos/porchpin/.issue-orchestrator/config/default.yaml',
+                '/repos/porchpin/.io/reviewer.md',
                 '/repos/porchpin/.io/tech-lead.md',
             ],
-            created_labels: ['agent:dev', 'agent:tech-lead'],
+            created_labels: ['agent:dev', 'agent:reviewer', 'agent:tech-lead'],
         }),
     ];
     const fetch = async (...args) => {
@@ -250,9 +377,23 @@ test('setup modal completes the default-on preview and save round trip', async (
     const next = document.elements.get('setupWizardNext');
     await next.emit('click');
     const configureHtml = document.elements.get('setupContent').innerHTML;
+    assert.match(configureHtml, /<fieldset class="setup-role-card">/);
+    assert.match(configureHtml, /<legend>Worker<\/legend>/);
+    assert.match(configureHtml, /<legend>Code reviewer<\/legend>/);
+    assert.match(configureHtml, /id="setupConfigureReviewer" checked/);
     assert.match(configureHtml, /id="setupConfigureTechLead" checked/);
-    assert.match(configureHtml, /Configure a tech-lead agent\?/);
-    assert.match(configureHtml, /Enabled by default/);
+    assert.match(configureHtml, /id="setupWorkerEffort"/);
+    assert.match(configureHtml, /id="setupReviewerEffort"/);
+    assert.match(configureHtml, /id="setupTechLeadEffort"/);
+    assert.match(configureHtml, /id="setupTechLeadReviewThreshold"/);
+    assert.match(configureHtml, /<legend>Validation gates<\/legend>/);
+    assert.match(configureHtml, /id="setupValidationQuickCommand"/);
+    assert.match(configureHtml, /id="setupValidationPublishCommand"/);
+    assert.match(configureHtml, /Authoritative gate before push and PR publication/);
+    assert.match(configureHtml, /1 reviews every approved PR/);
+    assert.match(configureHtml, /id="setupWorktreeBase"/);
+    assert.match(configureHtml, /value="\.\.\/worktrees\/porchpin"/);
+    assert.match(configureHtml, /aria-describedby="setupWorktreeBaseHelp"/);
 
     document.elements.set(
         'setupRepoName',
@@ -262,18 +403,71 @@ test('setup modal completes the default-on preview and save round trip', async (
         'setupAgentLabel',
         document.makeElement({ value: 'agent:dev' }),
     );
-    document.elements.set('setupModel', document.makeElement({ value: 'sonnet' }));
+    document.elements.set('setupWorkerModel', document.makeElement({ value: 'sonnet' }));
     document.elements.set(
         'setupConfigureTechLead',
         document.makeElement({ checked: true }),
     );
     await next.emit('click');
 
-    const previewRequest = fetchCalls[2];
+    const authorizationHtml = document.elements.get('setupContent').innerHTML;
+    assert.match(authorizationHtml, /Use my GitHub identity/);
+    assert.match(authorizationHtml, /Use a GitHub App/);
+    assert.match(authorizationHtml, /GitHub API identity/);
+    assert.match(authorizationHtml, /personal mode keeps the repository’s configured git transport/);
+    assert.match(authorizationHtml, /Setup waits here until repository access is verified/);
+    assert.match(authorizationHtml, /Contents: read and write/);
+    assert.match(authorizationHtml, /<fieldset/);
+    assert.match(authorizationHtml, /<legend class="form-label">Authorization mode/);
+    assert.match(authorizationHtml, /<details/);
+    assert.match(authorizationHtml, /type="password" id="setupGithubToken"/);
+    assert.match(authorizationHtml, /rel="noopener noreferrer"/);
+    assert.equal(next.disabled, true);
+
+    await document.elements.get('setupVerifyDetectedGithub').emit('click');
+    const verificationRequest = fetchCalls[2];
+    assert.equal(verificationRequest[0], '/control/setup/github-auth/verify');
+    assert.deepEqual(JSON.parse(verificationRequest[1].body).authorization, {
+        kind: 'detected',
+    });
+    assert.equal(next.disabled, false);
+    assert.match(document.elements.get('setupGithubStatus').innerHTML, /Verified as setup-user/);
+    assert.match(
+        document.elements.get('setupGithubStatus').innerHTML,
+        /Agents never receive this credential/,
+    );
+
+    await next.emit('click');
+    const previewRequest = fetchCalls[3];
     assert.equal(previewRequest[0], '/control/setup/preview');
+    assert.equal(JSON.parse(previewRequest[1].body).configure_reviewer, true);
     assert.equal(JSON.parse(previewRequest[1].body).configure_tech_lead, true);
+    assert.equal(JSON.parse(previewRequest[1].body).effort, 'high');
+    assert.equal(JSON.parse(previewRequest[1].body).reviewer_effort, 'high');
+    assert.equal(JSON.parse(previewRequest[1].body).tech_lead_effort, 'high');
+    assert.equal(JSON.parse(previewRequest[1].body).tech_lead_review_threshold, 1);
+    assert.equal(
+        JSON.parse(previewRequest[1].body).validation_quick_command,
+        'git diff --check',
+    );
+    assert.equal(
+        JSON.parse(previewRequest[1].body).validation_publish_command,
+        'git diff --check',
+    );
+    assert.deepEqual(
+        JSON.parse(previewRequest[1].body).github_authorization,
+        { kind: 'personal', token_env: 'ISSUE_ORCH_GITHUB_TOKEN' },
+    );
+    assert.equal(
+        JSON.parse(previewRequest[1].body).worktree_base,
+        '../worktrees/porchpin',
+    );
     const previewHtml = document.elements.get('setupContent').innerHTML;
+    assert.match(previewHtml, /\/repos\/porchpin\/\.io\/reviewer\.md/);
     assert.match(previewHtml, /\/repos\/porchpin\/\.io\/tech-lead\.md/);
+    assert.match(previewHtml, /Resolved worktree location:/);
+    assert.match(previewHtml, /\/repos\/worktrees\/porchpin/);
+    assert.match(previewHtml, /Verified GitHub identity:<\/strong> setup-user/);
     assert.doesNotMatch(previewHtml, /\[object Object\]/);
 
     let prevented = 0;
@@ -294,11 +488,28 @@ test('setup modal completes the default-on preview and save round trip', async (
     assert.equal(prevented, 2);
 
     await next.emit('click');
-    const saveRequest = fetchCalls[3];
+    const saveRequest = fetchCalls[4];
     assert.equal(saveRequest[0], '/control/setup/save');
     assert.equal(JSON.parse(saveRequest[1].body).create_labels, true);
     assert.equal(JSON.parse(saveRequest[1].body).replace_existing, false);
     assert.match(document.elements.get('setupContent').innerHTML, /Setup Complete!/);
+    assert.match(
+        document.elements.get('setupContent').innerHTML,
+        /Configured pipeline:<\/strong> worker → reviewer\/rework → tech lead/,
+    );
+    assert.match(
+        document.elements.get('setupContent').innerHTML,
+        /Optional capabilities to consider later/,
+    );
+    assert.match(document.elements.get('setupContent').innerHTML, /Specialized routing/);
+    assert.match(document.elements.get('setupContent').innerHTML, /Other AI providers/);
+    assert.match(document.elements.get('setupContent').innerHTML, /E2E runner/);
+    assert.match(document.elements.get('setupContent').innerHTML, /Merge queue/);
+    assert.match(document.elements.get('setupContent').innerHTML, /Goal pilot/);
+    assert.match(
+        document.elements.get('setupContent').innerHTML,
+        /Tech-lead health automation/,
+    );
     assert.equal(loadReposCalls, 1);
 
     wizard.close();
@@ -321,8 +532,11 @@ test('partial save failure renders applied mutations and requires a new preview'
             checks: { git: { ok: true, detail: 'git version 2' } },
         }),
         jsonResponse(detectedRepo),
+        githubVerificationResponse(),
         jsonResponse({
             yaml: 'repo:\n  name: owner/porchpin\n',
+            worktree_base: '/repos/worktrees/porchpin',
+            github_authorization: githubPreviewSummary(),
             files: [{
                 path: '/repos/porchpin/.issue-orchestrator/config/default.yaml',
                 action: 'create',
@@ -363,11 +577,13 @@ test('partial save failure renders applied mutations and requires a new preview'
         'setupAgentLabel',
         document.makeElement({ value: 'agent:dev' }),
     );
-    document.elements.set('setupModel', document.makeElement({ value: 'sonnet' }));
+    document.elements.set('setupWorkerModel', document.makeElement({ value: 'sonnet' }));
     document.elements.set(
         'setupConfigureTechLead',
         document.makeElement({ checked: true }),
     );
+    await next.emit('click');
+    await document.elements.get('setupVerifyDetectedGithub').emit('click');
     await next.emit('click');
     await next.emit('click');
 
@@ -383,12 +599,12 @@ test('partial save failure renders applied mutations and requires a new preview'
     assert.equal(next.disabled, true);
 
     await next.emit('click');
-    assert.equal(fetchCalls.length, 4);
+    assert.equal(fetchCalls.length, 5);
 
     await document.elements.get('setupWizardBack').emit('click');
     assert.equal(fetchCalls.length, 5);
-    assert.match(document.elements.get('setupContent').innerHTML, /Configuration/);
-    assert.equal(next.disabled, false);
+    assert.match(document.elements.get('setupContent').innerHTML, /GitHub Authorization/);
+    assert.equal(next.disabled, true);
 });
 
 test('detect failure disables forward click and keyboard activation', async () => {
@@ -439,6 +655,7 @@ test('preview failure disables save click and keyboard activation', async () => 
             repo: 'owner/porchpin',
             existing_config: null,
         }),
+        githubVerificationResponse(),
         jsonResponse({ detail: 'preview unavailable' }, false),
     ];
     const wizard = createSetupWizard({
@@ -464,11 +681,13 @@ test('preview failure disables save click and keyboard activation', async () => 
         'setupAgentLabel',
         document.makeElement({ value: 'agent:dev' }),
     );
-    document.elements.set('setupModel', document.makeElement({ value: 'sonnet' }));
+    document.elements.set('setupWorkerModel', document.makeElement({ value: 'sonnet' }));
     document.elements.set(
         'setupConfigureTechLead',
         document.makeElement({ checked: true }),
     );
+    await next.emit('click');
+    await document.elements.get('setupVerifyDetectedGithub').emit('click');
     await next.emit('click');
 
     assert.equal(next.disabled, true);
@@ -477,7 +696,7 @@ test('preview failure disables save click and keyboard activation', async () => 
 
     await next.emit('click', { detail: 1 });
     await next.emit('click', { detail: 0 });
-    assert.equal(fetchCalls.length, 3);
+    assert.equal(fetchCalls.length, 4);
 });
 
 test('pending detect cannot overwrite prerequisites after Back', async () => {
@@ -550,6 +769,9 @@ test('pending preview cannot render after close and reopen for another repositor
                     existing_config: null,
                 });
             }
+            if (url === '/control/setup/github-auth/verify') {
+                return githubVerificationResponse();
+            }
             if (url === '/control/setup/preview') {
                 return pendingPreview.promise;
             }
@@ -572,17 +794,21 @@ test('pending preview cannot render after close and reopen for another repositor
         'setupAgentLabel',
         document.makeElement({ value: 'agent:dev' }),
     );
-    document.elements.set('setupModel', document.makeElement({ value: 'sonnet' }));
+    document.elements.set('setupWorkerModel', document.makeElement({ value: 'sonnet' }));
     document.elements.set(
         'setupConfigureTechLead',
         document.makeElement({ checked: true }),
     );
+    await next.emit('click');
+    await document.elements.get('setupVerifyDetectedGithub').emit('click');
     const previewClick = next.emit('click');
 
     wizard.close();
     await wizard.open('/repos/other');
     pendingPreview.resolve(jsonResponse({
         yaml: 'repo:\n  name: owner/porchpin\n',
+        worktree_base: '/repos/worktrees/porchpin',
+        github_authorization: githubPreviewSummary(),
         files: [],
     }));
     await previewClick;
@@ -615,9 +841,14 @@ test('pending save cannot complete after close and reopen for another repository
                     existing_config: null,
                 });
             }
+            if (url === '/control/setup/github-auth/verify') {
+                return githubVerificationResponse();
+            }
             if (url === '/control/setup/preview') {
                 return jsonResponse({
                     yaml: 'repo:\n  name: owner/porchpin\n',
+                    worktree_base: '/repos/worktrees/porchpin',
+                    github_authorization: githubPreviewSummary(),
                     files: [],
                 });
             }
@@ -643,11 +874,13 @@ test('pending save cannot complete after close and reopen for another repository
         'setupAgentLabel',
         document.makeElement({ value: 'agent:dev' }),
     );
-    document.elements.set('setupModel', document.makeElement({ value: 'sonnet' }));
+    document.elements.set('setupWorkerModel', document.makeElement({ value: 'sonnet' }));
     document.elements.set(
         'setupConfigureTechLead',
         document.makeElement({ checked: true }),
     );
+    await next.emit('click');
+    await document.elements.get('setupVerifyDetectedGithub').emit('click');
     await next.emit('click');
     const saveClick = next.emit('click');
 
@@ -692,8 +925,11 @@ test('existing config preview requires explicit replacement confirmation before 
                 },
             },
         }),
+        githubVerificationResponse(),
         jsonResponse({
             yaml: 'repo:\n  name: owner/porchpin\n',
+            worktree_base: '/repos/worktrees/porchpin',
+            github_authorization: githubPreviewSummary(),
             files: [{
                 path: '/repos/porchpin/.issue-orchestrator/config/default.yaml',
                 action: 'overwrite',
@@ -736,11 +972,13 @@ test('existing config preview requires explicit replacement confirmation before 
         'setupAgentLabel',
         document.makeElement({ value: 'agent:backend' }),
     );
-    document.elements.set('setupModel', document.makeElement({ value: 'opus' }));
+    document.elements.set('setupWorkerModel', document.makeElement({ value: 'opus' }));
     document.elements.set(
         'setupConfigureTechLead',
         document.makeElement({ checked: true }),
     );
+    await next.emit('click');
+    await document.elements.get('setupVerifyDetectedGithub').emit('click');
     await next.emit('click');
 
     const previewHtml = document.elements.get('setupContent').innerHTML;
@@ -755,7 +993,7 @@ test('existing config preview requires explicit replacement confirmation before 
     assert.equal(next.disabled, false);
 
     await next.emit('click');
-    const saveBody = JSON.parse(fetchCalls[3][1].body);
+    const saveBody = JSON.parse(fetchCalls[4][1].body);
     assert.equal(saveBody.replace_existing, true);
     assert.equal(saveBody.worker_agent_label, 'agent:backend');
 });

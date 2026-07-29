@@ -43,13 +43,25 @@ from .setup_wizard_repository_setup import (
 )
 from .readiness_launch import offer_readiness_assessment
 from ..bootstrap_repository_setup import build_repository_setup_owner
+from ...execution.providers import (
+    create_repository_setup_host,
+    verify_repository_setup_github_authorization,
+)
 
 # Schema metadata for defaults/labels/hints
+from ...domain.worktree_paths import default_worktree_base_config
 from ...infra.settings_schema import get_setup_fields
 from ...ports.session_log import detect_ai_system_from_command
 
 # Compatibility re-export for existing tests and external imports.
 PlannedWrite = _PlannedWrite
+
+
+def _create_cli_repository_setup_host(repo_name, authorization):
+    """Use the legacy detected-auth seam or an exact explicit setup choice."""
+    if authorization.kind == "detected":
+        return _get_repository_host(repo_name)
+    return create_repository_setup_host(repo_name, authorization)
 
 
 # Default prompter for backwards compatibility
@@ -195,12 +207,8 @@ def _prompt_agent_runtime_details(
 
 def _prompt_custom_agent_details(prompter: Prompter) -> tuple[str, str | None]:
     """Collect custom command details and infer the ai_system when possible."""
-    prompter.print(
-        "\n  Enter your custom command template. Available variables:"
-    )
-    prompter.print(
-        "    {issue_number}, {issue_title}, {prompt}, {worktree}, {model}"
-    )
+    prompter.print("\n  Enter your custom command template. Available variables:")
+    prompter.print("    {issue_number}, {issue_title}, {prompt}, {worktree}, {model}")
     custom_command = prompter.input("Custom command")
     ai_system = detect_ai_system_from_command(custom_command)
     if ai_system:
@@ -233,13 +241,9 @@ def _prompt_claude_runtime_details(prompter: Prompter) -> tuple[str, str]:
     """Collect Claude model and permission preferences."""
     model = prompter.choice("Model", ["sonnet", "opus", "haiku"])
 
-    prompter.print(
-        "\n  Permission mode controls how Claude handles tool permissions:"
-    )
+    prompter.print("\n  Permission mode controls how Claude handles tool permissions:")
     prompter.print("    default          - Prompt for each action (safest)")
-    prompter.print(
-        "    acceptEdits      - Auto-accept file edits, prompt for others"
-    )
+    prompter.print("    acceptEdits      - Auto-accept file edits, prompt for others")
     prompter.print(
         "    bypassPermissions - Skip all prompts (use for trusted automation)"
     )
@@ -257,16 +261,10 @@ def _confirm_claude_permission_mode(
     if permission_mode != "bypassPermissions":
         return permission_mode
 
-    prompter.print(
-        "\n  ⚠️  WARNING: bypassPermissions allows the agent to:"
-    )
-    prompter.print(
-        "     - Execute any shell commands without confirmation"
-    )
+    prompter.print("\n  ⚠️  WARNING: bypassPermissions allows the agent to:")
+    prompter.print("     - Execute any shell commands without confirmation")
     prompter.print("     - Read/write any files without confirmation")
-    prompter.print(
-        "     - Access network resources without confirmation"
-    )
+    prompter.print("     - Access network resources without confirmation")
     if prompter.yes_no(
         "Are you sure you want to bypass all permission prompts?",
         default=False,
@@ -357,9 +355,7 @@ def _prompt_manual_existing_agent(
             prompter.print("You need at least one agent!")
             continue
         if not agent_name.startswith("agent:"):
-            if prompter.yes_no(
-                f"Add 'agent:' prefix to make it 'agent:{agent_name}'?"
-            ):
+            if prompter.yes_no(f"Add 'agent:' prefix to make it 'agent:{agent_name}'?"):
                 agent_name = f"agent:{agent_name}"
 
         agent_short = agent_name.split(":")[-1]
@@ -450,9 +446,7 @@ def _claude_session_interactions_enabled(config: dict[str, Any]) -> bool:
 
 def _print_claude_code_worktree_note(prompter: Prompter) -> None:
     """Explain Claude Code's per-worktree trust prompt behavior."""
-    prompter.print(
-        "  Claude Code note: trust is stored per worktree path."
-    )
+    prompter.print("  Claude Code note: trust is stored per worktree path.")
     prompter.print(
         "  Issue Orchestrator can auto-accept Claude's initial trust prompt "
         "when trusted session interactions are enabled."
@@ -478,16 +472,12 @@ def _prompt_claude_session_interactions(
         return
 
     prompter.print("\n--- Claude Startup Prompts ---")
-    prompter.print(
-        "Claude Code may pause on its first worktree trust screen."
-    )
+    prompter.print("Claude Code may pause on its first worktree trust screen.")
     prompter.print(
         "Issue Orchestrator can auto-accept this trusted startup prompt in "
         "orchestrator-created worktrees."
     )
-    prompter.print(
-        "Recommended for hands-free Claude onboarding."
-    )
+    prompter.print("Recommended for hands-free Claude onboarding.")
     if prompter.yes_no(
         "Enable trusted session interactions for Claude startup prompts?",
         default=True,
@@ -502,9 +492,7 @@ def _print_claude_code_next_steps(
     """Call out how Claude trust prompts will behave after onboarding."""
     prompter.print("\n  Claude Code note:")
     if _claude_session_interactions_enabled(config):
-        prompter.print(
-            "     Trusted session interactions are enabled."
-        )
+        prompter.print("     Trusted session interactions are enabled.")
         prompter.print(
             "     Issue Orchestrator will auto-accept Claude's initial trust "
             "prompt in orchestrator-created worktrees."
@@ -526,7 +514,10 @@ def _print_claude_code_next_steps(
 
 
 def _collect_stage2_tech_lead(
-    prompter: Prompter, review: dict, code_reviewed_label: str, agent_labels: Iterable[str]
+    prompter: Prompter,
+    review: dict,
+    code_reviewed_label: str,
+    agent_labels: Iterable[str],
 ) -> None:
     """Prompt for the optional Stage 2 tech_lead batch review and write it into the
     review block (shared by both wizard flows).
@@ -540,9 +531,13 @@ def _collect_stage2_tech_lead(
         return
     prompter.print("\n  --- Stage 2: Tech Lead Batch Review ---")
     review_agent = prompter.input("  tech_lead review agent label", "agent:tech-lead")
-    reviewed_label = prompter.input("  Label after tech_lead review", "tech-lead-reviewed")
+    reviewed_label = prompter.input(
+        "  Label after tech_lead review", "tech-lead-reviewed"
+    )
     threshold_raw = prompter.input("  Trigger after N code-reviewed PRs", "5")
-    follow_up_default = next((a for a in agent_labels if a != review_agent), review_agent)
+    follow_up_default = next(
+        (a for a in agent_labels if a != review_agent), review_agent
+    )
     review["tech_lead_review_agent"] = review_agent
     review["tech_lead_follow_up_agent"] = prompter.input(
         "  Worker agent for tech-lead-created follow-up issues", follow_up_default
@@ -645,13 +640,17 @@ def wizard_new_project(prompter: Prompter) -> dict[str, Any]:  # noqa: C901, PLR
         prompter.print("  4. Sequence      - The number after Px: [P1-001] < [P1-002]")
         prompter.print("  5. Issue number  - Tie-breaker (lower first)\n")
         prompter.print("Milestone sort strategies:")
-        prompter.print("  milestone_number - Extract number from name (M1 < M2 < M10) [default]")
+        prompter.print(
+            "  milestone_number - Extract number from name (M1 < M2 < M10) [default]"
+        )
         prompter.print("  due_date         - By milestone due date (earliest first)")
         prompter.print("  pattern          - Custom regex to extract number")
         prompter.print("  name             - Alphabetically by milestone name\n")
         valid_strategies = ("due_date", "milestone_number", "pattern", "name")
         while True:
-            milestone_sort = prompter.input("Milestone sort strategy", "milestone_number")
+            milestone_sort = prompter.input(
+                "Milestone sort strategy", "milestone_number"
+            )
             if milestone_sort in valid_strategies:
                 break
             prompter.print(
@@ -695,19 +694,19 @@ def wizard_new_project(prompter: Prompter) -> dict[str, Any]:  # noqa: C901, PLR
     prompter.print("\n--- Worktree Location ---")
     prompter.print("Each issue gets its own git worktree for isolated work.")
     prompter.print("Examples:")
-    prompter.print("  '../'           → sibling dirs (~/dev/myrepo-123)")
     prompter.print(
-        "  './worktrees'   → subdirectory (~/dev/myrepo/worktrees/myrepo-123)"
+        "  '../worktrees/myrepo' → dedicated sibling collection "
+        "(~/dev/worktrees/myrepo/myrepo-123)"
     )
+    prompter.print("  '../'                  → direct sibling dirs (~/dev/myrepo-123)")
     if _config_uses_claude_code(config):
         _print_claude_code_worktree_note(prompter)
     _wt_fields = get_setup_fields("worktrees")
-    _wt_field = (
-        _wt_fields[0]
-        if _wt_fields
-        else {"prompt": "Worktree Base Directory", "default": "../"}
+    _wt_field = _wt_fields[0] if _wt_fields else {"prompt": "Worktree Base Directory"}
+    worktree_base = prompter.input(
+        _wt_field["prompt"],
+        default_worktree_base_config(Path.cwd().resolve()),
     )
-    worktree_base = prompter.input(_wt_field["prompt"], str(_wt_field["default"]))
 
     # Set at top-level (not per-agent)
     worktrees_config: dict[str, Any] = {"base": worktree_base}
@@ -935,9 +934,7 @@ def wizard_existing_project(  # noqa: C901, PLR0912 - interactive wizard with br
             min_value=1,
         )
         config.setdefault("execution", {})
-        config["execution"]["concurrency"] = {
-            "max_concurrent_sessions": max_sessions
-        }
+        config["execution"]["concurrency"] = {"max_concurrent_sessions": max_sessions}
 
     # Milestone sorting - only ask if not already configured
     if "milestones" not in config or "sort" not in config.get("milestones", {}):
@@ -953,13 +950,17 @@ def wizard_existing_project(  # noqa: C901, PLR0912 - interactive wizard with br
         prompter.print("  4. Sequence      - The number after Px: [P1-001] < [P1-002]")
         prompter.print("  5. Issue number  - Tie-breaker (lower first)\n")
         prompter.print("Milestone sort strategies:")
-        prompter.print("  milestone_number - Extract number from name (M1 < M2 < M10) [default]")
+        prompter.print(
+            "  milestone_number - Extract number from name (M1 < M2 < M10) [default]"
+        )
         prompter.print("  due_date         - By milestone due date (earliest first)")
         prompter.print("  pattern          - Custom regex to extract number")
         prompter.print("  name             - Alphabetically by milestone name\n")
         valid_strategies = ("due_date", "milestone_number", "pattern", "name")
         while True:
-            milestone_sort = prompter.input("Milestone sort strategy", "milestone_number")
+            milestone_sort = prompter.input(
+                "Milestone sort strategy", "milestone_number"
+            )
             if milestone_sort in valid_strategies:
                 break
             prompter.print(
@@ -1007,19 +1008,23 @@ def wizard_existing_project(  # noqa: C901, PLR0912 - interactive wizard with br
         prompter.print("\n--- Worktree Location ---")
         prompter.print("Each issue gets its own git worktree for isolated work.")
         prompter.print("Examples:")
-        prompter.print("  '../'           → sibling dirs (~/dev/myrepo-123)")
         prompter.print(
-            "  './worktrees'   → subdirectory (~/dev/myrepo/worktrees/myrepo-123)"
+            "  '../worktrees/myrepo' → dedicated sibling collection "
+            "(~/dev/worktrees/myrepo/myrepo-123)"
+        )
+        prompter.print(
+            "  '../'                  → direct sibling dirs (~/dev/myrepo-123)"
         )
         if _config_uses_claude_code(config):
             _print_claude_code_worktree_note(prompter)
         _wt_fields = get_setup_fields("worktrees")
         _wt_field = (
-            _wt_fields[0]
-            if _wt_fields
-            else {"prompt": "Worktree Base Directory", "default": "../"}
+            _wt_fields[0] if _wt_fields else {"prompt": "Worktree Base Directory"}
         )
-        worktree_base = prompter.input(_wt_field["prompt"], str(_wt_field["default"]))
+        worktree_base = prompter.input(
+            _wt_field["prompt"],
+            default_worktree_base_config(Path.cwd().resolve()),
+        )
         worktrees_config = cast(dict[str, Any], config.setdefault("worktrees", {}))
         worktrees_config["base"] = worktree_base
 
@@ -1339,7 +1344,10 @@ def run_wizard(  # noqa: C901, PLR0912 - main wizard entry point with prerequisi
             target_path / user_path if not user_path.is_absolute() else user_path
         )
 
-    setup_owner = build_repository_setup_owner(_get_repository_host)
+    setup_owner = build_repository_setup_owner(
+        _create_cli_repository_setup_host,
+        verify_repository_setup_github_authorization,
+    )
     setup_request = build_cli_repository_setup_request(
         config=config,
         repo_root=target_path,
@@ -1376,9 +1384,7 @@ def run_wizard(  # noqa: C901, PLR0912 - main wizard entry point with prerequisi
     setup_repo_guardrails_now = False
 
     validation_config = config.get("validation") or {}
-    publish_validation_cmd = bool(
-        (validation_config.get("publish") or {}).get("cmd")
-    )
+    publish_validation_cmd = bool((validation_config.get("publish") or {}).get("cmd"))
 
     if publish_validation_cmd:
         setup_repo_guardrails_now = prompter.yes_no(

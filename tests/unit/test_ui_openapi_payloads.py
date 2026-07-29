@@ -92,7 +92,6 @@ class _OrchestratorStub:
     shutdown_requested: bool = False
 
 
-
 # OutcomeBadge constructor shim for tests (PR #6333): the
 # projection layer owns tone classification, but tests construct
 # IssueCycle/JourneyRun directly with bare label strings.  This
@@ -103,6 +102,7 @@ def _ob(label: str, tone: str = "neutral") -> OutcomeBadge:
     Tone defaults to neutral; tests that care about tone pass it
     explicitly."""
     return OutcomeBadge(label=label, tone=tone)  # type: ignore[arg-type]
+
 
 def _make_config() -> Config:
     config = Config()
@@ -126,7 +126,9 @@ def _validator(component: str) -> Draft202012Validator:
     schema = Path("docs/api/ui-openapi.json").read_text()
     data = __import__("json").loads(schema)
     resolver = RefResolver.from_schema(data)
-    return Draft202012Validator(data["components"]["schemas"][component], resolver=resolver)
+    return Draft202012Validator(
+        data["components"]["schemas"][component], resolver=resolver
+    )
 
 
 def _assert_response_view_is_timeline_view_constrained(
@@ -209,7 +211,18 @@ def test_repository_setup_command_and_results_match_ui_openapi() -> None:
         "repo_name": "owner/porchpin",
         "worker_agent_label": "agent:dev",
         "model": "sonnet",
+        "effort": "xhigh",
+        "configure_reviewer": True,
+        "reviewer_model": "opus",
+        "reviewer_effort": "max",
+        "validation_quick_command": "make validate-quick",
+        "validation_publish_command": "make validate-pr-raw",
+        "worktree_base": "../worktrees/porchpin",
+        "github_authorization": {"kind": "detected"},
         "configure_tech_lead": True,
+        "tech_lead_model": "sonnet",
+        "tech_lead_effort": "high",
+        "tech_lead_review_threshold": 1,
         "config_name": "default.yaml",
         "create_prompts": True,
         "create_labels": True,
@@ -217,11 +230,38 @@ def test_repository_setup_command_and_results_match_ui_openapi() -> None:
     }
     preview = {
         "yaml": "repo:\n  name: owner/porchpin\n",
+        "worktree_base": "/repos/worktrees/porchpin",
+        "github_authorization": {
+            "verified": True,
+            "identity": "setup-user",
+            "repository": "owner/porchpin",
+            "auth_kind": "personal",
+            "source": "Environment variable ISSUE_ORCH_GITHUB_TOKEN",
+            "authorship_notice": "Pull requests are authored as setup-user.",
+            "verification_note": (
+                "Setup verified identity and repository access without "
+                "making GitHub writes."
+            ),
+            "required_permissions": [
+                "Contents: read and write",
+                "Issues: read and write",
+            ],
+            "authorization": {
+                "kind": "personal",
+                "token_env": "ISSUE_ORCH_GITHUB_TOKEN",
+            },
+        },
         "files": [
             {
                 "path": "/repos/porchpin/.issue-orchestrator/config/default.yaml",
                 "action": "create",
                 "size": 33,
+            },
+            {
+                "path": "/repos/porchpin/.io/reviewer.md",
+                "action": "create",
+                "type": "prompt",
+                "agent": "agent:reviewer",
             },
             {
                 "path": "/repos/porchpin/.io/tech-lead.md",
@@ -234,8 +274,15 @@ def test_repository_setup_command_and_results_match_ui_openapi() -> None:
     result = {
         "status": "saved",
         "config_path": "/repos/porchpin/.issue-orchestrator/config/default.yaml",
-        "created_files": ["/repos/porchpin/.io/tech-lead.md"],
-        "created_labels": ["agent:tech-lead", "needs-tech-lead-review"],
+        "created_files": [
+            "/repos/porchpin/.io/reviewer.md",
+            "/repos/porchpin/.io/tech-lead.md",
+        ],
+        "created_labels": [
+            "agent:reviewer",
+            "agent:tech-lead",
+            "needs-tech-lead-review",
+        ],
     }
     conflict = {
         "error": "replace_confirmation_required",
@@ -268,7 +315,7 @@ def test_repository_setup_command_and_results_match_ui_openapi() -> None:
     with pytest.raises(ValueError):
         RepositorySetupCommandPayload.model_validate(malformed)
 
-    for invalid_label in ("agent:", "agent:tech-lead"):
+    for invalid_label in ("agent:", "agent:reviewer", "agent:tech-lead"):
         malformed_label = {**command, "worker_agent_label": invalid_label}
         with pytest.raises(JsonSchemaValidationError):
             _validator("RepositorySetupCommandPayload").validate(malformed_label)
@@ -347,7 +394,10 @@ def test_dashboard_view_model_history_and_e2e_items_match_ui_openapi() -> None:
             "untriaged_count": 1,
             "last_run": {"id": 88, "relative_time": "1m ago"},
             "failed_tests": [
-                {"nodeid": "tests/e2e/test_example.py::test_fails", "duration_seconds": 0.4},
+                {
+                    "nodeid": "tests/e2e/test_example.py::test_fails",
+                    "duration_seconds": 0.4,
+                },
             ],
         },
     )
@@ -569,44 +619,50 @@ def test_issue_item_open_run_command_pydantic_rejects_non_positive_run_id() -> N
     from pydantic import ValidationError
 
     # Valid → succeeds.
-    valid = IssueItemPayload.model_validate({
-        "issue_number": "E2E-88",
-        "show_stale_badge": False,
-        "open_run_command": {
-            "kind": "open_e2e_run",
-            "label": "Open E2E Run",
-            "run_id": 88,
-            "expand_run_details": False,
-        },
-    })
+    valid = IssueItemPayload.model_validate(
+        {
+            "issue_number": "E2E-88",
+            "show_stale_badge": False,
+            "open_run_command": {
+                "kind": "open_e2e_run",
+                "label": "Open E2E Run",
+                "run_id": 88,
+                "expand_run_details": False,
+            },
+        }
+    )
     assert valid.open_run_command is not None
     assert valid.open_run_command.run_id == 88
 
     # run_id=0 → rejected by the generated Pydantic model.
     with pytest.raises(ValidationError, match="greater than or equal to 1"):
-        IssueItemPayload.model_validate({
-            "issue_number": "E2E-88",
-            "show_stale_badge": False,
-            "open_run_command": {
-                "kind": "open_e2e_run",
-                "label": "Open E2E Run",
-                "run_id": 0,
-                "expand_run_details": False,
-            },
-        })
+        IssueItemPayload.model_validate(
+            {
+                "issue_number": "E2E-88",
+                "show_stale_badge": False,
+                "open_run_command": {
+                    "kind": "open_e2e_run",
+                    "label": "Open E2E Run",
+                    "run_id": 0,
+                    "expand_run_details": False,
+                },
+            }
+        )
 
     # Negative run_id → also rejected.
     with pytest.raises(ValidationError, match="greater than or equal to 1"):
-        IssueItemPayload.model_validate({
-            "issue_number": "E2E-88",
-            "show_stale_badge": False,
-            "open_run_command": {
-                "kind": "open_e2e_run",
-                "label": "Open E2E Run",
-                "run_id": -1,
-                "expand_run_details": False,
-            },
-        })
+        IssueItemPayload.model_validate(
+            {
+                "issue_number": "E2E-88",
+                "show_stale_badge": False,
+                "open_run_command": {
+                    "kind": "open_e2e_run",
+                    "label": "Open E2E Run",
+                    "run_id": -1,
+                    "expand_run_details": False,
+                },
+            }
+        )
 
 
 def test_issue_item_open_run_command_strict_int_rejects_string_and_boolean() -> None:
@@ -627,42 +683,48 @@ def test_issue_item_open_run_command_strict_int_rejects_string_and_boolean() -> 
 
     # String ``run_id`` → rejected.
     with pytest.raises(ValidationError):
-        IssueItemPayload.model_validate({
-            "issue_number": "E2E-88",
-            "show_stale_badge": False,
-            "open_run_command": {
-                "kind": "open_e2e_run",
-                "label": "Open E2E Run",
-                "run_id": "88",  # string — should not coerce
-                "expand_run_details": False,
-            },
-        })
+        IssueItemPayload.model_validate(
+            {
+                "issue_number": "E2E-88",
+                "show_stale_badge": False,
+                "open_run_command": {
+                    "kind": "open_e2e_run",
+                    "label": "Open E2E Run",
+                    "run_id": "88",  # string — should not coerce
+                    "expand_run_details": False,
+                },
+            }
+        )
 
     # Boolean True ``run_id`` → rejected.
     with pytest.raises(ValidationError):
-        IssueItemPayload.model_validate({
-            "issue_number": "E2E-88",
-            "show_stale_badge": False,
-            "open_run_command": {
-                "kind": "open_e2e_run",
-                "label": "Open E2E Run",
-                "run_id": True,  # bool — should not coerce to 1
-                "expand_run_details": False,
-            },
-        })
+        IssueItemPayload.model_validate(
+            {
+                "issue_number": "E2E-88",
+                "show_stale_badge": False,
+                "open_run_command": {
+                    "kind": "open_e2e_run",
+                    "label": "Open E2E Run",
+                    "run_id": True,  # bool — should not coerce to 1
+                    "expand_run_details": False,
+                },
+            }
+        )
 
     # Boolean False ``run_id`` → rejected.
     with pytest.raises(ValidationError):
-        IssueItemPayload.model_validate({
-            "issue_number": "E2E-88",
-            "show_stale_badge": False,
-            "open_run_command": {
-                "kind": "open_e2e_run",
-                "label": "Open E2E Run",
-                "run_id": False,
-                "expand_run_details": False,
-            },
-        })
+        IssueItemPayload.model_validate(
+            {
+                "issue_number": "E2E-88",
+                "show_stale_badge": False,
+                "open_run_command": {
+                    "kind": "open_e2e_run",
+                    "label": "Open E2E Run",
+                    "run_id": False,
+                    "expand_run_details": False,
+                },
+            }
+        )
 
 
 def test_expand_e2e_run_command_payload_matches_openapi() -> None:
@@ -784,9 +846,9 @@ def test_timeline_view_enum_is_reused_across_the_ui_openapi_contract() -> None:
         assert "enum" not in view_param["schema"], f"{path} kept an inline enum"
 
     # The typed command payload references it too.
-    view_field = data["components"]["schemas"][
-        "SwitchE2ETimelineViewCommandPayload"
-    ]["properties"]["view"]
+    view_field = data["components"]["schemas"]["SwitchE2ETimelineViewCommandPayload"][
+        "properties"
+    ]["view"]
     assert view_field == {"$ref": ref}
 
     # The response payloads that echo the rendered lens back to the client
@@ -910,8 +972,12 @@ def test_recent_e2e_runs_payload_matches_openapi() -> None:
         "runner_kind": "pytest",
         "command_summary": "pytest tests/e2e",
         "results": {
-            "passed": 36, "failed": 1, "errored": 0,
-            "skipped": 2, "quarantined": 0, "total": 39,
+            "passed": 36,
+            "failed": 1,
+            "errored": 0,
+            "skipped": 2,
+            "quarantined": 0,
+            "total": 39,
         },
         "note": None,
         "expand_command": {
@@ -954,7 +1020,9 @@ def test_recent_e2e_runs_payload_matches_openapi() -> None:
     )
 
     # expand_command.run_id mismatch → reject.
-    counts = E2ERunResultCounts(passed=0, failed=0, errored=0, skipped=0, quarantined=0, total=0)
+    counts = E2ERunResultCounts(
+        passed=0, failed=0, errored=0, skipped=0, quarantined=0, total=0
+    )
     badge = OutcomeBadge(label="Passed", tone="passed")
     with pytest.raises(ValidationError):
         RecentE2ERunSummary(
@@ -969,13 +1037,21 @@ def test_recent_e2e_runs_payload_matches_openapi() -> None:
 
     # Duplicate run_ids in payload → reject.
     s1 = RecentE2ERunSummary(
-        run_id=1, outcome=badge, started_at="2026-05-12T10:00:00Z",
-        runner_kind="pytest", command_summary="pytest", results=counts,
+        run_id=1,
+        outcome=badge,
+        started_at="2026-05-12T10:00:00Z",
+        runner_kind="pytest",
+        command_summary="pytest",
+        results=counts,
         expand_command=ExpandE2ERunCommand(run_id=1),
     )
     s2 = RecentE2ERunSummary(
-        run_id=1, outcome=badge, started_at="2026-05-12T10:00:00Z",
-        runner_kind="pytest", command_summary="pytest", results=counts,
+        run_id=1,
+        outcome=badge,
+        started_at="2026-05-12T10:00:00Z",
+        runner_kind="pytest",
+        command_summary="pytest",
+        results=counts,
         expand_command=ExpandE2ERunCommand(run_id=1),
     )
     with pytest.raises(ValidationError):
@@ -1016,73 +1092,97 @@ def test_open_inline_agent_attempts_command_payload_matches_openapi() -> None:
     with pytest.raises(JsonSchemaValidationError):
         validator.validate({**valid, "issue_number": 0})
     with pytest.raises(ValidationError):
-        OpenInlineAgentAttemptsCommandPayload.model_validate({**valid, "issue_number": 0})
+        OpenInlineAgentAttemptsCommandPayload.model_validate(
+            {**valid, "issue_number": 0}
+        )
     with pytest.raises(ValidationError):
-        OpenInlineAgentAttemptsCommandPayload.model_validate({**valid, "issue_number": -1})
+        OpenInlineAgentAttemptsCommandPayload.model_validate(
+            {**valid, "issue_number": -1}
+        )
 
     # Strict-int: reject string and boolean coercion at the Python layer.
     with pytest.raises(ValidationError):
-        OpenInlineAgentAttemptsCommandPayload.model_validate({**valid, "issue_number": "4503"})
+        OpenInlineAgentAttemptsCommandPayload.model_validate(
+            {**valid, "issue_number": "4503"}
+        )
     with pytest.raises(ValidationError):
-        OpenInlineAgentAttemptsCommandPayload.model_validate({**valid, "issue_number": True})
+        OpenInlineAgentAttemptsCommandPayload.model_validate(
+            {**valid, "issue_number": True}
+        )
 
 
 def test_dialog_payloads_match_ui_openapi() -> None:
-    info = build_info_dialog({
-        "version": "1.0",
-        "repo": "test/repo",
-        "ui_mode": "web",
-        "terminal_backend": "subprocess",
-        "commit_short": "abc123",
-        "max_sessions": 2,
-        "active_sessions": 1,
-        "completed_today": 0,
-    })
+    info = build_info_dialog(
+        {
+            "version": "1.0",
+            "repo": "test/repo",
+            "ui_mode": "web",
+            "terminal_backend": "subprocess",
+            "commit_short": "abc123",
+            "max_sessions": 2,
+            "active_sessions": 1,
+            "completed_today": 0,
+        }
+    )
     _validator("InfoDialogPayload").validate(info)
 
     config_dialog = build_config_dialog("config: value")
     _validator("ConfigDialogPayload").validate(config_dialog)
 
-    debug_dialog = build_debug_dialog({
-        "startup_options": {"ui_mode": "web", "web_port": 8080, "test_mode": False, "filtering": {}},
-        "paused": False,
-        "priority_queue": [],
-        "config_path": "/tmp/config.yaml",
-        "repo_root": "/tmp/repo",
-    })
+    debug_dialog = build_debug_dialog(
+        {
+            "startup_options": {
+                "ui_mode": "web",
+                "web_port": 8080,
+                "test_mode": False,
+                "filtering": {},
+            },
+            "paused": False,
+            "priority_queue": [],
+            "config_path": "/tmp/config.yaml",
+            "repo_root": "/tmp/repo",
+        }
+    )
     _validator("DebugDialogPayload").validate(debug_dialog)
 
-    doctor_dialog = build_doctor_dialog({
-        "overall": "ok",
-        "checks": [{"name": "health", "status": "ok", "detail": "ok"}],
-    })
+    doctor_dialog = build_doctor_dialog(
+        {
+            "overall": "ok",
+            "checks": [{"name": "health", "status": "ok", "detail": "ok"}],
+        }
+    )
     _validator("DoctorDialogPayload").validate(doctor_dialog)
 
-    session_diag = build_session_diagnostics_dialog(42, {
-        "manifest": {
-            "session_name": "session-42",
-            "started_at": "2024-01-01T00:00:00Z",
-            "run_id": "run-1",
-            "backend": "subprocess",
-            "agent_label": "agent:web",
-            "claude_session_id": "abc",
-            "worktree": "/tmp/worktree",
-            "follow_up_issues": [
-                {
-                    "title": "Create flaky test follow-up",
-                    "reason": "A flaky test was discovered while validating the assigned issue.",
-                    "blocking": False,
-                }
-            ],
+    session_diag = build_session_diagnostics_dialog(
+        42,
+        {
+            "manifest": {
+                "session_name": "session-42",
+                "started_at": "2024-01-01T00:00:00Z",
+                "run_id": "run-1",
+                "backend": "subprocess",
+                "agent_label": "agent:web",
+                "claude_session_id": "abc",
+                "worktree": "/tmp/worktree",
+                "follow_up_issues": [
+                    {
+                        "title": "Create flaky test follow-up",
+                        "reason": "A flaky test was discovered while validating the assigned issue.",
+                        "blocking": False,
+                    }
+                ],
+            },
+            "run_dir": "/tmp/run",
         },
-        "run_dir": "/tmp/run",
-    })
+    )
     _validator("SessionDiagnosticsDialogPayload").validate(session_diag)
 
     blocked_dialog = build_blocked_issues_dialog({"blocked_issues": [{"issue": 1}]})
     _validator("BlockedIssuesDialogPayload").validate(blocked_dialog)
 
-    phase_dialog = build_phase_dialog({"phases": [{"name": "review-1", "display_name": "Review"}]}, 12, None)
+    phase_dialog = build_phase_dialog(
+        {"phases": [{"name": "review-1", "display_name": "Review"}]}, 12, None
+    )
     _validator("PhaseDialogPayload").validate(phase_dialog)
 
     validation_dialog = build_validation_failure_dialog(
@@ -1363,7 +1463,8 @@ def test_e2e_run_timeline_payload_rejects_untyped_aggregate_fields() -> None:
     errors = list(_validator("E2ERunTimelinePayload").iter_errors(payload))
 
     assert any(
-        "unexpected_event_field" in error.message and "Additional properties" in error.message
+        "unexpected_event_field" in error.message
+        and "Additional properties" in error.message
         for error in errors
     )
 
@@ -1463,10 +1564,18 @@ def test_e2e_run_detail_payload_matches_ui_openapi() -> None:
     }
     payload["artifacts"] = [
         {"kind": "raw_log", "label": "Raw Output", "path": "/tmp/run.log"},
-        {"kind": "junit_xml", "label": "JUnit XML", "path": "/tmp/e2e-artifacts/run-88/junit.xml"},
+        {
+            "kind": "junit_xml",
+            "label": "JUnit XML",
+            "path": "/tmp/e2e-artifacts/run-88/junit.xml",
+        },
     ]
     payload["reports"] = [
-        {"kind": "junit_xml", "label": "JUnit XML", "path": "/tmp/e2e-artifacts/run-88/junit.xml"},
+        {
+            "kind": "junit_xml",
+            "label": "JUnit XML",
+            "path": "/tmp/e2e-artifacts/run-88/junit.xml",
+        },
     ]
     payload["artifact_diagnostic"] = {
         "state": "collected",
@@ -1642,7 +1751,9 @@ def _issue_lifecycle(issue_number: int) -> IssueLifecycle:
                         reason="fixture has no recording",
                     ),
                     commands=(
-                        ShowEventDetailsCommand(event_ref=f"event:issue:{issue_number}"),
+                        ShowEventDetailsCommand(
+                            event_ref=f"event:issue:{issue_number}"
+                        ),
                         OpenCompletionRecordCommand(
                             path=f"/runs/issue-{issue_number}/completion-record.json",
                         ),
@@ -1659,10 +1770,15 @@ def _stacked_view_model_dict() -> dict:
     """A real dashboard payload whose queued flow card is a stacked successor."""
     config = _make_config()
     config.agents = {"agent:web": _make_agent_config()}
-    issue = Issue(number=201, title="Stacked successor", labels=["agent:web"],
-                  body="Stack-after: #5")
-    dep = Dependency(issue_number=5, mode=DependencyMode.STACK,
-                     state=DependencyState.UNSATISFIED)
+    issue = Issue(
+        number=201,
+        title="Stacked successor",
+        labels=["agent:web"],
+        body="Stack-after: #5",
+    )
+    dep = Dependency(
+        issue_number=5, mode=DependencyMode.STACK, state=DependencyState.UNSATISFIED
+    )
     state = OrchestratorState(
         startup_status="complete",
         cached_queue_issues=[issue],

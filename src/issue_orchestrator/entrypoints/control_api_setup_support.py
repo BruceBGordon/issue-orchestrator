@@ -9,6 +9,7 @@ from typing import Annotated, Callable
 from fastapi import Depends, FastAPI, Request
 
 from ..control.repository_setup import RepositorySetupOwner
+from ..ports.repository_setup import RepositorySetupGitHubTokenStore
 
 _SETUP_DEPENDENCIES_STATE_KEY = "control_api_setup_dependencies"
 
@@ -19,6 +20,7 @@ class ControlApiSetupDependencies:
 
     validate_repo_root: Callable[[str | None], Path | None]
     setup_owner: RepositorySetupOwner
+    github_token_store: RepositorySetupGitHubTokenStore
 
 
 def install_control_api_setup_dependencies(
