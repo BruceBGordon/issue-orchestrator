@@ -51,6 +51,9 @@ def test_repository_setup_uses_command_controller_and_accessible_modal() -> None
     assert "function openSetupWizard(" not in script
     assert "let setupWizardState" not in script
     assert "setupCommands.buildSetupPreviewRequest(" in setup_script
+    assert "sibling.inert = true;" in setup_script
+    assert "if (event.key !== 'Tab') return;" in setup_script
+    assert "!modal.contains(activeElement)" in setup_script
     assert 'id="setupWizardModal"' in template
     assert 'aria-hidden="true"' in template
     assert 'id="setupContent" aria-live="polite"' in template

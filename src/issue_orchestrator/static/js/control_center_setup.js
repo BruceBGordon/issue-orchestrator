@@ -18,8 +18,10 @@
         step: 1,
         repoPath: null,
         options: null,
+        requiresReplacementConfirmation: false,
     };
     let returnFocusElement = null;
+    let inertSiblings = [];
     let bound = false;
 
     function element(id) {
@@ -61,6 +63,10 @@
         const modal = element('setupWizardModal');
         modal.classList.remove('active');
         modal.setAttribute('aria-hidden', 'true');
+        inertSiblings.forEach(({ sibling, wasInert }) => {
+            sibling.inert = wasInert;
+        });
+        inertSiblings = [];
         if (returnFocusElement && typeof returnFocusElement.focus === 'function') {
             returnFocusElement.focus();
         }
@@ -68,11 +74,23 @@
     }
 
     async function open(repoPath, triggerElement = null) {
-        state = { step: 1, repoPath, options: null };
+        state = {
+            step: 1,
+            repoPath,
+            options: null,
+            requiresReplacementConfirmation: false,
+        };
         returnFocusElement = triggerElement;
         const modal = element('setupWizardModal');
         modal.classList.add('active');
         modal.setAttribute('aria-hidden', 'false');
+        inertSiblings = Array.from(document.body?.children || [])
+            .filter((sibling) => sibling !== modal)
+            .map((sibling) => {
+                const wasInert = Boolean(sibling.inert);
+                sibling.inert = true;
+                return { sibling, wasInert };
+            });
         updateSteps();
         element('closeSetupWizardModal').focus();
         await loadStep1();
@@ -119,8 +137,12 @@
             const data = await responseJson(response, 'Failed to detect repository');
             const existingConfig = data.existing_config || {};
             const existingAgents = existingConfig.agents || {};
+            const reviewAgents = new Set([
+                existingConfig.review?.default,
+                existingConfig.review?.tech_lead_review_agent,
+            ].filter(Boolean));
             const workerEntry = Object.entries(existingAgents).find(
-                ([label]) => label !== 'agent:tech-lead',
+                ([label]) => label !== 'agent:tech-lead' && !reviewAgents.has(label),
             );
             const detectedRepoName = typeof data.repo === 'string' ? data.repo : data.repo?.name;
             const repoName = existingConfig.repo?.name
@@ -183,6 +205,8 @@
 
     async function loadStep3() {
         state.options = collectOptions();
+        const nextButton = element('setupWizardNext');
+        nextButton.disabled = true;
         element('setupContent').innerHTML =
             '<div class="loading-spinner"></div> Generating preview...';
         try {
@@ -202,14 +226,32 @@
             html += `<pre style="background: var(--bg-tertiary); padding: 12px; border-radius: 8px; font-size: 12px; overflow-x: auto;">${escapeHtml(data.yaml || '')}</pre>`;
 
             if (data.files && data.files.length > 0) {
-                html += '<p style="margin-top: 16px;"><strong>Files to create:</strong></p>';
+                html += '<p style="margin-top: 16px;"><strong>Planned file changes:</strong></p>';
                 html += '<ul style="margin: 8px 0; padding-left: 20px;">';
                 data.files.forEach((file) => {
-                    html += `<li><code>${escapeHtml(file.path)}</code></li>`;
+                    const action = file.action === 'overwrite' ? 'Replace' : 'Create';
+                    html += `<li><strong>${action}:</strong> <code>${escapeHtml(file.path)}</code></li>`;
                 });
                 html += '</ul>';
             }
 
+            state.requiresReplacementConfirmation = Boolean(
+                data.files?.some((file) => file.action === 'overwrite'),
+            );
+            if (state.requiresReplacementConfirmation) {
+                html += `
+                    <div class="setup-replacement-warning" role="alert">
+                        This setup will replace an existing configuration. Settings and agents
+                        not shown in the preview will be discarded.
+                    </div>
+                    <div class="form-group" style="margin-top: 16px;">
+                        <label style="display: flex; align-items: flex-start; gap: 8px; cursor: pointer;">
+                            <input type="checkbox" id="setupConfirmReplace">
+                            <span>I understand that saving will replace the existing configuration.</span>
+                        </label>
+                    </div>
+                `;
+            }
             html += `
                 <div class="form-group" style="margin-top: 16px;">
                     <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
@@ -219,14 +261,28 @@
                 </div>
             `;
             element('setupContent').innerHTML = html;
+            const replaceConfirmation = document.getElementById('setupConfirmReplace');
+            nextButton.disabled = Boolean(replaceConfirmation);
+            replaceConfirmation?.addEventListener('change', () => {
+                nextButton.disabled = !replaceConfirmation.checked;
+            });
         } catch (error) {
             element('setupContent').innerHTML =
                 `<div class="error-message">Failed to generate preview: ${escapeHtml(error.message)}</div>`;
+            nextButton.disabled = false;
         }
     }
 
     async function save() {
         const nextButton = element('setupWizardNext');
+        const createLabels = element('setupCreateLabels').checked;
+        const replaceExisting = state.requiresReplacementConfirmation
+            ? element('setupConfirmReplace').checked
+            : false;
+        if (state.requiresReplacementConfirmation && !replaceExisting) {
+            element('setupConfirmReplace').focus();
+            return;
+        }
         element('setupContent').innerHTML =
             '<div class="loading-spinner"></div> Saving configuration...';
         nextButton.disabled = true;
@@ -237,7 +293,8 @@
                 state.options,
                 {
                     createPrompts: true,
-                    createLabels: element('setupCreateLabels').checked,
+                    createLabels,
+                    replaceExisting,
                 },
             );
             const response = await fetch(command.endpoint, {
@@ -250,7 +307,7 @@
             let html = '<h3 style="margin-top: 0; color: var(--success-color);">Setup Complete!</h3>';
             html += '<p>Configuration has been saved successfully.</p>';
             if (data.created_files && data.created_files.length > 0) {
-                html += '<p><strong>Created files:</strong></p>';
+                html += '<p><strong>Written files:</strong></p>';
                 html += '<ul style="margin: 8px 0; padding-left: 20px;">';
                 data.created_files.forEach((file) => {
                     html += `<li><code>${escapeHtml(file)}</code></li>`;
@@ -299,8 +356,40 @@
             else if (state.step === 3) await loadStep3();
         });
         document.addEventListener('keydown', (event) => {
-            if (event.key === 'Escape' && element('setupWizardModal').classList.contains('active')) {
+            const modal = element('setupWizardModal');
+            if (!modal.classList.contains('active')) return;
+            if (event.key === 'Escape') {
                 close();
+                return;
+            }
+            if (event.key !== 'Tab') return;
+
+            const focusable = Array.from(modal.querySelectorAll(
+                'button, [href], input, select, textarea, [tabindex]',
+            )).filter((candidate) => (
+                !candidate.disabled
+                && !candidate.hidden
+                && candidate.style?.display !== 'none'
+                && candidate.getAttribute?.('tabindex') !== '-1'
+            ));
+            if (focusable.length === 0) {
+                event.preventDefault();
+                modal.focus();
+                return;
+            }
+
+            const first = focusable[0];
+            const last = focusable[focusable.length - 1];
+            const activeElement = document.activeElement;
+            if (event.shiftKey && (activeElement === first || !modal.contains(activeElement))) {
+                event.preventDefault();
+                last.focus();
+            } else if (
+                !event.shiftKey
+                && (activeElement === last || !modal.contains(activeElement))
+            ) {
+                event.preventDefault();
+                first.focus();
             }
         });
     }

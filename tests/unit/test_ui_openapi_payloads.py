@@ -211,6 +211,7 @@ def test_repository_setup_command_and_results_match_ui_openapi() -> None:
         "config_name": "default.yaml",
         "create_prompts": True,
         "create_labels": True,
+        "replace_existing": False,
     }
     preview = {
         "yaml": "repo:\n  name: owner/porchpin\n",

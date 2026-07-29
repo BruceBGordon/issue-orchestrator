@@ -248,6 +248,14 @@
       "rule_id": "control_policy_branch_sites",
       "value": 1
     },
+    "control_policy_branch_sites:src/issue_orchestrator/control/repository_setup.py": {
+      "detail": "3 branch site(s) mention lifecycle/control terms",
+      "kind": "control_policy_branch_sites",
+      "metric_id": "src/issue_orchestrator/control/repository_setup.py",
+      "path": "src/issue_orchestrator/control/repository_setup.py",
+      "rule_id": "control_policy_branch_sites",
+      "value": 3
+    },
     "control_policy_branch_sites:src/issue_orchestrator/control/retrospective_review.py": {
       "detail": "4 branch site(s) mention lifecycle/control terms",
       "kind": "control_policy_branch_sites",

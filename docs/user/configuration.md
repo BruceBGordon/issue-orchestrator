@@ -39,7 +39,10 @@ Control Center. The wizard previews the generated YAML and files before saving
 them. Its **Configure tech lead** question is enabled by default; when selected,
 setup creates the tech-lead agent and prompt, follow-up routing to the worker
 agent, and the labels required for tech-lead review, failure, and proposal
-flows. Clear the checkbox to create a worker-only configuration.
+flows. Clear the checkbox to create a worker-only configuration. If the selected
+config already exists, the preview labels it as **Replace** and requires an
+explicit acknowledgement before saving; settings not shown in the generated
+preview are not preserved.
 
 ### Use Claude Opus With XHigh Effort
 

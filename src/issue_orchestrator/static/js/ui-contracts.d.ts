@@ -784,6 +784,7 @@ export interface RepositorySetupCommandPayload {
   create_labels?: boolean;
   create_prompts?: boolean;
   model: "haiku" | "sonnet" | "opus";
+  replace_existing?: boolean;
   repo_name: string;
   repo_root: string;
   worker_agent_label: string;

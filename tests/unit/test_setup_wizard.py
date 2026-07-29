@@ -627,7 +627,9 @@ class TestSetupWizardSharedHelpers:
             },
         })
 
-        label_names = {name for name, _, _ in labels}
+        ordered_label_names = [name for name, _, _ in labels]
+        label_names = set(ordered_label_names)
+        assert len(ordered_label_names) == len(label_names)
         assert "agent:backend" in label_names
         assert "agent:reviewer" in label_names
         assert "priority:high" in label_names
@@ -643,6 +645,11 @@ class TestSetupWizardSharedHelpers:
         assert "proposed-tech-lead" in label_names
         assert "tech_lead:health-review" in label_names
         assert "tech-lead-observation" in label_names
+        assert next(label for label in labels if label[0] == "code-reviewed") == (
+            "code-reviewed",
+            "0E8A16",
+            "PR has been code reviewed",
+        )
 
     def test_plan_setup_labels_omits_gate_without_tech_lead(self):
         """No tech lead agent -> no gate label to provision."""

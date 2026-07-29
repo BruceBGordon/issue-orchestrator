@@ -76,6 +76,7 @@
                 config_name: saveOptions.configName || 'default.yaml',
                 create_prompts: saveOptions.createPrompts !== false,
                 create_labels: saveOptions.createLabels !== false,
+                replace_existing: saveOptions.replaceExisting === true,
             },
         };
     }

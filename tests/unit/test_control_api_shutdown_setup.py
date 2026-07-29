@@ -329,6 +329,41 @@ class TestControlCenterSetupRoutes:
         assert response.status_code == 200
         assert response.json()["files"][0]["action"] == "overwrite"
 
+    @pytest.mark.parametrize(
+        "config_name",
+        ["", "../escaped", "nested/default", "/tmp/escaped.yaml"],
+    )
+    @pytest.mark.parametrize(
+        "endpoint",
+        ["/control/setup/preview", "/control/setup/save"],
+    )
+    def test_setup_routes_reject_unsafe_config_names(
+        self,
+        tmp_path,
+        endpoint,
+        config_name,
+    ):
+        """Preview and save share one traversal-safe config-name contract."""
+        repo_root = tmp_path / "repo"
+        repo_root.mkdir()
+        client = TestClient(control_app)
+
+        response = client.post(
+            endpoint,
+            json={
+                "repo_root": str(repo_root),
+                "repo_name": "owner/repo",
+                "worker_agent_label": "agent:dev",
+                "model": "sonnet",
+                "configure_tech_lead": True,
+                "config_name": config_name,
+                "create_labels": False,
+            },
+        )
+
+        assert response.status_code in {400, 422}
+        assert not (tmp_path / "escaped.yaml").exists()
+
     def test_setup_detect_ignores_non_default_config_files(self, tmp_path):
         """Detect should only surface the legacy default config file."""
         repo_root = tmp_path / "repo"
@@ -391,3 +426,49 @@ class TestControlCenterSetupRoutes:
         assert (repo_root / ".io" / "dev.md").is_file()
         assert (repo_root / ".io" / "tech-lead.md").is_file()
         assert Config.load(config_path).validate() == []
+
+    @pytest.mark.parametrize("stage", ["files", "labels"])
+    def test_setup_save_surfaces_required_artifact_failures(
+        self,
+        tmp_path,
+        stage,
+    ):
+        """The HTTP adapter must not convert owner failures into saved results."""
+        from issue_orchestrator.control.repository_setup import (
+            RepositorySetupExecutionError,
+        )
+
+        repo_root = tmp_path / "repo"
+        repo_root.mkdir()
+        dependencies = control_app.state.control_api_setup_dependencies
+        failure = RepositorySetupExecutionError(
+            stage=stage,
+            detail=f"{stage} failed",
+            applied_files=(repo_root / "partial",),
+            created_labels=("agent:dev",) if stage == "labels" else (),
+        )
+
+        with patch.object(
+            dependencies.setup_owner,
+            "execute",
+            side_effect=failure,
+        ):
+            response = TestClient(control_app).post(
+                "/control/setup/save",
+                json={
+                    "repo_root": str(repo_root),
+                    "repo_name": "owner/repo",
+                    "worker_agent_label": "agent:dev",
+                    "model": "sonnet",
+                    "configure_tech_lead": True,
+                },
+            )
+
+        assert response.status_code == 500
+        assert response.json() == {
+            "error": "repository_setup_failed",
+            "stage": stage,
+            "detail": f"{stage} failed",
+            "applied_files": [str(repo_root / "partial")],
+            "created_labels": ["agent:dev"] if stage == "labels" else [],
+        }

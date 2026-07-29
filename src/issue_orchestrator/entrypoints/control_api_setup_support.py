@@ -8,6 +8,8 @@ from typing import Annotated, Callable
 
 from fastapi import Depends, FastAPI, Request
 
+from ..control.repository_setup import RepositorySetupOwner
+
 _SETUP_DEPENDENCIES_STATE_KEY = "control_api_setup_dependencies"
 
 
@@ -16,6 +18,7 @@ class ControlApiSetupDependencies:
     """Dependency hooks needed by Control Center setup-wizard routes."""
 
     validate_repo_root: Callable[[str | None], Path | None]
+    setup_owner: RepositorySetupOwner
 
 
 def install_control_api_setup_dependencies(

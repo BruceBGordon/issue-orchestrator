@@ -35,3 +35,12 @@
 .prereq-icon { font-size: 18px; }
 .prereq-name { font-weight: 500; }
 .prereq-detail { font-size: 12px; color: var(--text-muted); }
+
+.setup-replacement-warning {
+    margin-top: 16px;
+    padding: 12px;
+    border: 1px solid var(--accent-yellow);
+    border-radius: 8px;
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
+}

@@ -544,7 +544,10 @@ def _plan_setup_labels(
             ]
         )
 
-    return all_labels
+    unique_labels: dict[str, tuple[str, str, str]] = {}
+    for label in all_labels:
+        unique_labels.setdefault(label[0], label)
+    return list(unique_labels.values())
 
 
 def required_repo_labels(config: "Config") -> list[str]:

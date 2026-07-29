@@ -788,11 +788,12 @@ class RecentE2ERunsPayload(BaseModel):
 
 class RepositorySetupCommandPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    config_name: str | None = None
+    config_name: str | None = Field(default=None, min_length=1)
     configure_tech_lead: bool
     create_labels: bool | None = None
     create_prompts: bool | None = None
     model: Literal['haiku', 'sonnet', 'opus']
+    replace_existing: bool | None = None
     repo_name: str = Field(..., min_length=1)
     repo_root: str = Field(..., min_length=1)
     worker_agent_label: str

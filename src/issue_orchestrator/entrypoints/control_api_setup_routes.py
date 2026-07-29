@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import logging
-from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 from fastapi import APIRouter, Query
 from fastapi.responses import JSONResponse
@@ -15,10 +13,15 @@ from ..contracts.ui_openapi_models import (
     RepositorySetupPreviewPayload,
     RepositorySetupResultPayload,
 )
-from ..control.repository_setup import RepositorySetupCommand
+from ..control.repository_setup import (
+    RepositorySetupCommand,
+    RepositorySetupConflictError,
+    RepositorySetupExecutionError,
+)
+from ..domain.repository_config_name import RepositoryConfigName
+from ..ports.repository_setup import RepositorySetupPlannedFile
 from .control_api_setup_support import ControlApiSetupDependency
 from .setup_wizard_common import (
-    FileCollector,
     build_agent_checks,
     build_any_ai_provider_check,
     build_github_auth_check,
@@ -27,135 +30,52 @@ from .setup_wizard_common import (
     fetch_github_labels,
     find_prompt_candidates,
     load_config_for_repo,
-    plan_setup_labels,
-    render_config_yaml,
     run_git,
-    write_config,
-    write_missing_setup_prompts,
 )
-
-logger = logging.getLogger(__name__)
 
 control_setup_router = APIRouter()
 
 
 def _repository_setup_command(
     payload: RepositorySetupCommandPayload,
+    deps: ControlApiSetupDependency,
 ) -> RepositorySetupCommand:
     """Translate the HTTP command contract into setup-owner policy."""
+    repo_root = deps.validate_repo_root(payload.repo_root)
+    if repo_root is None:
+        raise ValueError("Invalid or missing repo_root")
     return RepositorySetupCommand(
+        repo_root=repo_root,
         repo_name=payload.repo_name,
         worker_agent_label=payload.worker_agent_label,
         model=payload.model,
         configure_tech_lead=payload.configure_tech_lead,
+        config_name=RepositoryConfigName.parse(
+            payload.config_name,
+            default="default.yaml",
+        ),
+        create_prompts=payload.create_prompts is not False,
+        create_labels=payload.create_labels is not False,
+        replace_existing=payload.replace_existing is True,
     )
 
 
-def _preview_prompt_files(
-    config: Mapping[str, Any],
-    repo_root: str | None,
-) -> list[RepositorySetupFilePayload]:
-    """Build prompt-file preview rows without mutating the filesystem."""
-    if repo_root:
-        collector = FileCollector()
-        write_missing_setup_prompts(config, Path(repo_root), file_collector=collector)
-        prompt_rows: list[RepositorySetupFilePayload] = []
-        for write in collector.writes:
-            if write.kind != "prompt":
-                continue
-            prompt_rows.append(
-                RepositorySetupFilePayload(
-                    path=str(write.path),
-                    action=write.action,
-                    type="prompt",
-                    agent=write.agent,
-                )
-            )
-        return prompt_rows
-
-    prompt_rows = []
-    for agent_name, agent_config in (config.get("agents", {}) or {}).items():
-        if not isinstance(agent_config, Mapping):
-            continue
-        prompt_path = agent_config.get("prompt", "")
-        if not isinstance(prompt_path, str) or not prompt_path:
-            continue
-        prompt_rows.append(
-            RepositorySetupFilePayload(
-                path=prompt_path,
-                action="create",
-                type="prompt",
-                agent=agent_name,
-            )
+def _setup_file_payload(
+    planned_file: RepositorySetupPlannedFile,
+) -> RepositorySetupFilePayload:
+    """Translate the setup-owner file plan into the HTTP contract."""
+    if planned_file.kind == "prompt":
+        return RepositorySetupFilePayload(
+            path=str(planned_file.path),
+            action=planned_file.action,
+            type="prompt",
+            agent=planned_file.agent,
         )
-    return prompt_rows
-
-
-def _normalize_config_name(raw: object) -> str:
-    """Normalize a setup-wizard config file name."""
-    config_name = str(raw or "default.yaml")
-    if not config_name.endswith(".yaml"):
-        config_name += ".yaml"
-    return config_name
-
-
-def _persist_setup_config(
-    repo_root: Path,
-    config: Mapping[str, Any],
-    config_name: str,
-) -> Path:
-    """Write the config file and return its path."""
-    from ..infra.config import get_config_dir, get_config_path
-
-    config_dir = get_config_dir(repo_root)
-    config_dir.mkdir(parents=True, exist_ok=True)
-    config_path = get_config_path(repo_root, config_name)
-    write_config(config, config_path, include_header=False)
-    return config_path
-
-
-def _create_setup_prompts(
-    repo_root: Path,
-    config: Mapping[str, Any],
-) -> list[str]:
-    """Create any missing setup-wizard prompt files."""
-    try:
-        return [str(path) for path in write_missing_setup_prompts(config, repo_root)]
-    except Exception as exc:
-        logger.warning("Failed to create setup prompts under %s: %s", repo_root, exc)
-        return []
-
-
-def _create_setup_labels(repo_name: str, config: Mapping[str, Any]) -> list[str]:
-    """Create any missing GitHub labels for the setup config."""
-    try:
-        from ..execution.providers import create_repository_host
-
-        host = create_repository_host(repo=repo_name)
-        existing = {
-            name
-            for label in host.list_labels()
-            if isinstance(label, dict)
-            and isinstance((name := label.get("name")), str)
-        }
-    except Exception as exc:
-        logger.warning("Failed to load setup labels for %s: %s", repo_name, exc)
-        return []
-
-    created_labels: list[str] = []
-    for name, color, desc in plan_setup_labels(
-        config,
-        include_priority_labels=False,
-        include_review_labels_without_default=True,
-    ):
-        if name in existing:
-            continue
-        try:
-            host.create_label(name, color=color, description=desc, force=True)
-            created_labels.append(name)
-        except Exception as exc:
-            logger.warning("Failed to create label %s: %s", name, exc)
-    return created_labels
+    return RepositorySetupFilePayload(
+        path=str(planned_file.path),
+        action=planned_file.action,
+        size=len(planned_file.content),
+    )
 
 
 @control_setup_router.get("/control/setup/prereqs")
@@ -247,35 +167,18 @@ async def setup_preview(
 ) -> RepositorySetupPreviewPayload | JSONResponse:
     """Generate a setup-wizard config preview without saving."""
     try:
-        config = _repository_setup_command(payload).build_config()
+        preview = deps.setup_owner.preview(_repository_setup_command(payload, deps))
     except ValueError as exc:
         return JSONResponse({"error": str(exc)}, status_code=400)
-
-    repo_root = deps.validate_repo_root(payload.repo_root)
-    if repo_root is None:
+    except Exception as exc:
         return JSONResponse(
-            {"error": "Invalid or missing repo_root"},
-            status_code=400,
+            {"error": "Failed to prepare setup preview", "detail": str(exc)},
+            status_code=500,
         )
-    from ..infra.config import get_config_path
-
-    config_path = str(
-        get_config_path(repo_root, _normalize_config_name(payload.config_name))
-    )
-
-    yaml_content = render_config_yaml(config, include_header=False)
-    files_to_create = [
-        RepositorySetupFilePayload(
-            path=config_path,
-            action="overwrite" if Path(config_path).exists() else "create",
-            size=len(yaml_content),
-        )
-    ]
-    files_to_create.extend(_preview_prompt_files(config, str(repo_root)))
 
     return RepositorySetupPreviewPayload(
-        yaml=yaml_content,
-        files=files_to_create,
+        yaml=preview.yaml,
+        files=[_setup_file_payload(file) for file in preview.files],
     )
 
 
@@ -289,43 +192,33 @@ async def setup_save(
 ) -> RepositorySetupResultPayload | JSONResponse:
     """Save a setup-wizard config and create requested setup artifacts."""
     try:
-        config = _repository_setup_command(payload).build_config()
+        result = deps.setup_owner.execute(_repository_setup_command(payload, deps))
     except ValueError as exc:
         return JSONResponse({"error": str(exc)}, status_code=400)
-
-    repo_root = deps.validate_repo_root(payload.repo_root)
-    if repo_root is None:
+    except RepositorySetupConflictError as exc:
         return JSONResponse(
-            {"error": "Invalid or missing repo_root"},
-            status_code=400,
+            {
+                "error": "replace_confirmation_required",
+                "detail": str(exc),
+                "config_path": str(exc.config_path),
+            },
+            status_code=409,
         )
-
-    create_prompts = payload.create_prompts is not False
-    create_labels = payload.create_labels is not False
-    created_files: list[str] = []
-    created_labels: list[str] = []
-    config_name = _normalize_config_name(payload.config_name)
-
-    try:
-        config_path = _persist_setup_config(repo_root, config, config_name)
-        created_files.append(str(config_path))
-    except Exception as exc:
-        return JSONResponse({
-            "error": "Failed to write config",
-            "detail": str(exc),
-        }, status_code=500)
-
-    if create_prompts:
-        created_files.extend(_create_setup_prompts(repo_root, config))
-
-    repo_config = config.get("repo") or {}
-    repo_name = repo_config.get("name") if isinstance(repo_config, Mapping) else repo_config
-    if create_labels and repo_name:
-        created_labels.extend(_create_setup_labels(repo_name, config))
+    except RepositorySetupExecutionError as exc:
+        return JSONResponse(
+            {
+                "error": "repository_setup_failed",
+                "stage": exc.stage,
+                "detail": exc.detail,
+                "applied_files": [str(path) for path in exc.applied_files],
+                "created_labels": list(exc.created_labels),
+            },
+            status_code=500,
+        )
 
     return RepositorySetupResultPayload(
         status="saved",
-        config_path=str(config_path),
-        created_files=created_files,
-        created_labels=created_labels,
+        config_path=str(result.config_path),
+        created_files=[str(path) for path in result.written_files],
+        created_labels=list(result.created_labels),
     )

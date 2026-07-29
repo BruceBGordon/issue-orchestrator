@@ -57,7 +57,9 @@ from sse_starlette.sse import EventSourceResponse
 
 from ..infra import gh_audit
 from ..infra.supervisor import DefaultSupervisorOps, SupervisorOps
+from ..ports import RepositoryHost
 from ..control.goal_pilot import GoalPilot
+from ..control.repository_setup import RepositorySetupOwner
 from ..execution.control_center_actions import ControlCenterActions
 from ._auth_middleware import (
     AuthSurfaceConfig,
@@ -95,10 +97,12 @@ from .control_api_repo_support import (
     install_control_api_repo_dependencies,
 )
 from .control_api_setup_routes import control_setup_router
+from .control_api_setup_files import ControlApiRepositorySetupFileSystem
 from .control_api_setup_support import (
     ControlApiSetupDependencies,
     install_control_api_setup_dependencies,
 )
+from .setup_wizard_common import plan_setup_labels
 from .control_api_shutdown_routes import control_shutdown_router
 from .control_api_shutdown_state import (
     begin_engine_shutdown_operation,
@@ -141,6 +145,24 @@ def _load_config_by_name(repo_root: Path, config_name: str) -> "Config":
     """
     from ..infra.config import Config
     return Config.find_and_load(repo_root, config_name=config_name)
+
+
+def _create_repository_setup_host(repo_name: str) -> RepositoryHost:
+    """Composition-root adapter for setup label mutations."""
+    from ..execution.providers import create_repository_host
+
+    return create_repository_host(repo=repo_name)
+
+
+def _plan_control_api_setup_labels(
+    config: Mapping[str, Any],
+) -> list[tuple[str, str, str]]:
+    """Apply the Control Center label surface to the shared setup label owner."""
+    return plan_setup_labels(
+        config,
+        include_priority_labels=False,
+        include_review_labels_without_default=True,
+    )
 
 
 # Create minimal control API app
@@ -1063,6 +1085,11 @@ install_control_api_setup_dependencies(
     control_app,
     ControlApiSetupDependencies(
         validate_repo_root=_validate_repo_root,
+        setup_owner=RepositorySetupOwner(
+            file_system=ControlApiRepositorySetupFileSystem(),
+            repository_host_factory=_create_repository_setup_host,
+            label_planner=_plan_control_api_setup_labels,
+        ),
     ),
 )
 control_app.include_router(control_orchestrator_router)

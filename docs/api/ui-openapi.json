@@ -2363,9 +2363,15 @@
           },
           "model": {"type": "string", "enum": ["haiku", "sonnet", "opus"]},
           "configure_tech_lead": {"type": "boolean", "default": true},
-          "config_name": {"type": "string", "default": "default.yaml"},
+          "config_name": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^[^/\\\\]+(?:\\.yaml)?$",
+            "default": "default.yaml"
+          },
           "create_prompts": {"type": "boolean", "default": true},
-          "create_labels": {"type": "boolean", "default": true}
+          "create_labels": {"type": "boolean", "default": true},
+          "replace_existing": {"type": "boolean", "default": false}
         }
       },
       "RepositorySetupFilePayload": {
