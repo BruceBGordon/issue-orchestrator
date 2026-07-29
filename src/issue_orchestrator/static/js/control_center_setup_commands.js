@@ -40,11 +40,10 @@
             options.workerAgentLabel,
             'workerAgentLabel',
         );
-        if (!workerAgentLabel.startsWith('agent:')) {
-            throw new Error("workerAgentLabel must start with 'agent:'");
-        }
-        if (workerAgentLabel === 'agent:tech-lead') {
-            throw new Error('workerAgentLabel must identify a worker');
+        if (!/^agent:(?!tech-lead$).+$/u.test(workerAgentLabel)) {
+            throw new Error(
+                "workerAgentLabel must match 'agent:<worker>' and cannot be 'agent:tech-lead'",
+            );
         }
         const model = requiredText(options.model, 'model');
         if (!['haiku', 'sonnet', 'opus'].includes(model)) {

@@ -790,6 +790,20 @@ export interface RepositorySetupCommandPayload {
   worker_agent_label: string;
 }
 
+export interface RepositorySetupConflictPayload {
+  config_path: string;
+  detail: string;
+  error: "replace_confirmation_required";
+}
+
+export interface RepositorySetupFailurePayload {
+  applied_files: string[];
+  created_labels: string[];
+  detail: string;
+  error: "repository_setup_failed";
+  stage: "planning" | "files" | "labels";
+}
+
 export interface RepositorySetupFilePayload {
   action: "create" | "overwrite";
   agent?: string;

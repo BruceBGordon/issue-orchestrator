@@ -493,6 +493,22 @@
                 "schema": {"$ref": "#/components/schemas/RepositorySetupResultPayload"}
               }
             }
+          },
+          "409": {
+            "description": "Existing configuration requires replacement confirmation",
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "#/components/schemas/RepositorySetupConflictPayload"}
+              }
+            }
+          },
+          "500": {
+            "description": "Repository setup stopped after a partial or pre-mutation failure",
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "#/components/schemas/RepositorySetupFailurePayload"}
+              }
+            }
           }
         }
       }
@@ -2372,6 +2388,37 @@
           "create_prompts": {"type": "boolean", "default": true},
           "create_labels": {"type": "boolean", "default": true},
           "replace_existing": {"type": "boolean", "default": false}
+        }
+      },
+      "RepositorySetupConflictPayload": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["error", "detail", "config_path"],
+        "properties": {
+          "error": {"const": "replace_confirmation_required"},
+          "detail": {"type": "string"},
+          "config_path": {"type": "string"}
+        }
+      },
+      "RepositorySetupFailurePayload": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "error",
+          "stage",
+          "detail",
+          "applied_files",
+          "created_labels"
+        ],
+        "properties": {
+          "error": {"const": "repository_setup_failed"},
+          "stage": {
+            "type": "string",
+            "enum": ["planning", "files", "labels"]
+          },
+          "detail": {"type": "string"},
+          "applied_files": {"type": "array", "items": {"type": "string"}},
+          "created_labels": {"type": "array", "items": {"type": "string"}}
         }
       },
       "RepositorySetupFilePayload": {

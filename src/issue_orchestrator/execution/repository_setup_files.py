@@ -1,36 +1,37 @@
-"""Filesystem adapter for Control Center repository setup."""
+"""Filesystem adapter for repository setup execution."""
 
 from __future__ import annotations
 
 from pathlib import Path
 from typing import Any, Mapping
 
+from ..domain.repository_config_name import RepositoryConfigName
 from ..infra.config import get_config_path
 from ..ports.repository_setup import (
     RepositorySetupArtifactPlan,
     RepositorySetupFileSystemError,
     RepositorySetupPlannedFile,
 )
-from .setup_wizard_common import (
-    FileCollector,
-    render_config_yaml,
-    write_missing_setup_prompts,
+from .repository_setup_artifacts import (
+    plan_missing_setup_prompts,
+    render_setup_config_yaml,
 )
 
 
-class ControlApiRepositorySetupFileSystem:
+class RepositorySetupFileSystemAdapter:
     """Plan and apply the config/prompt files produced by setup policy."""
 
     def plan(
         self,
         *,
         repo_root: Path,
-        config_name: str,
+        config_name: RepositoryConfigName,
         config: Mapping[str, Any],
         include_prompts: bool,
     ) -> RepositorySetupArtifactPlan:
-        config_path = get_config_path(repo_root, config_name)
-        config_yaml = render_config_yaml(config, include_header=False)
+        validated_name = RepositoryConfigName(config_name.value)
+        config_path = get_config_path(repo_root, validated_name.value)
+        config_yaml = render_setup_config_yaml(config, include_header=False)
         files = [
             RepositorySetupPlannedFile(
                 path=config_path,
@@ -41,22 +42,15 @@ class ControlApiRepositorySetupFileSystem:
         ]
 
         if include_prompts:
-            collector = FileCollector()
-            write_missing_setup_prompts(
-                config,
-                repo_root,
-                file_collector=collector,
-            )
             files.extend(
                 RepositorySetupPlannedFile(
-                    path=write.path,
-                    content=write.content,
-                    action=write.action,
+                    path=prompt.path,
+                    content=prompt.content,
+                    action="create",
                     kind="prompt",
-                    agent=write.agent,
+                    agent=prompt.agent,
                 )
-                for write in collector.writes
-                if write.kind == "prompt"
+                for prompt in plan_missing_setup_prompts(config, repo_root)
             )
 
         return RepositorySetupArtifactPlan(
@@ -80,4 +74,4 @@ class ControlApiRepositorySetupFileSystem:
         return tuple(applied_paths)
 
 
-__all__ = ["ControlApiRepositorySetupFileSystem"]
+__all__ = ["RepositorySetupFileSystemAdapter"]

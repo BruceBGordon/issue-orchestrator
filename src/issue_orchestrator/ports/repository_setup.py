@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, Mapping, Protocol
 
+from ..domain.repository_config_name import RepositoryConfigName
 from .repository_host import RepositoryHost
 
 RepositorySetupFileAction = Literal["create", "overwrite"]
@@ -50,7 +51,7 @@ class RepositorySetupFileSystem(Protocol):
         self,
         *,
         repo_root: Path,
-        config_name: str,
+        config_name: RepositoryConfigName,
         config: Mapping[str, Any],
         include_prompts: bool,
     ) -> RepositorySetupArtifactPlan: ...

@@ -9,6 +9,8 @@ from fastapi.responses import JSONResponse
 
 from ..contracts.ui_openapi_models import (
     RepositorySetupCommandPayload,
+    RepositorySetupConflictPayload,
+    RepositorySetupFailurePayload,
     RepositorySetupFilePayload,
     RepositorySetupPreviewPayload,
     RepositorySetupResultPayload,
@@ -196,23 +198,25 @@ async def setup_save(
     except ValueError as exc:
         return JSONResponse({"error": str(exc)}, status_code=400)
     except RepositorySetupConflictError as exc:
+        conflict_payload = RepositorySetupConflictPayload(
+            error="replace_confirmation_required",
+            detail=str(exc),
+            config_path=str(exc.config_path),
+        )
         return JSONResponse(
-            {
-                "error": "replace_confirmation_required",
-                "detail": str(exc),
-                "config_path": str(exc.config_path),
-            },
+            conflict_payload.model_dump(mode="json"),
             status_code=409,
         )
     except RepositorySetupExecutionError as exc:
+        failure_payload = RepositorySetupFailurePayload(
+            error="repository_setup_failed",
+            stage=exc.stage,
+            detail=exc.detail,
+            applied_files=[str(path) for path in exc.applied_files],
+            created_labels=list(exc.created_labels),
+        )
         return JSONResponse(
-            {
-                "error": "repository_setup_failed",
-                "stage": exc.stage,
-                "detail": exc.detail,
-                "applied_files": [str(path) for path in exc.applied_files],
-                "created_labels": list(exc.created_labels),
-            },
+            failure_payload.model_dump(mode="json"),
             status_code=500,
         )
 

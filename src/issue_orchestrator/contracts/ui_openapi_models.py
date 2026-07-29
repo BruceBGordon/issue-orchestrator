@@ -6,10 +6,13 @@
 from __future__ import annotations
 
 
+import re
+
+
 from typing import Any, Literal, TypeAlias
 
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 
@@ -797,6 +800,34 @@ class RepositorySetupCommandPayload(BaseModel):
     repo_name: str = Field(..., min_length=1)
     repo_root: str = Field(..., min_length=1)
     worker_agent_label: str
+
+    @field_validator('config_name')
+    @classmethod
+    def _validate_config_name_pattern(cls, value: Any) -> Any:
+        if value is not None and re.search('^[^/\\\\]+(?:\\.yaml)?$', value) is None:
+            raise ValueError("config_name must match '^[^/\\\\\\\\]+(?:\\\\.yaml)?$'")
+        return value
+
+    @field_validator('worker_agent_label')
+    @classmethod
+    def _validate_worker_agent_label_pattern(cls, value: Any) -> Any:
+        if value is not None and re.search('^agent:(?!tech-lead$).+', value) is None:
+            raise ValueError("worker_agent_label must match '^agent:(?!tech-lead$).+'")
+        return value
+
+class RepositorySetupConflictPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    config_path: str
+    detail: str
+    error: Literal['replace_confirmation_required']
+
+class RepositorySetupFailurePayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    applied_files: list[str]
+    created_labels: list[str]
+    detail: str
+    error: Literal['repository_setup_failed']
+    stage: Literal['planning', 'files', 'labels']
 
 class RepositorySetupFilePayload(BaseModel):
     model_config = ConfigDict(extra="forbid")

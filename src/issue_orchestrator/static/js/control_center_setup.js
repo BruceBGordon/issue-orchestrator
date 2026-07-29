@@ -19,6 +19,7 @@
         repoPath: null,
         options: null,
         requiresReplacementConfirmation: false,
+        previewReady: false,
     };
     let returnFocusElement = null;
     let inertSiblings = [];
@@ -33,9 +34,41 @@
     async function responseJson(response, fallbackMessage) {
         const data = await response.json();
         if (!response.ok || data.error) {
-            throw new Error(data.error || fallbackMessage);
+            const error = new Error(data.detail || data.error || fallbackMessage);
+            error.setupPayload = data;
+            throw error;
         }
         return data;
+    }
+
+    function renderSaveFailure(error) {
+        const payload = error.setupPayload || {};
+        let html = '<div class="error-message" role="alert">';
+        html += '<h3 style="margin-top: 0;">Setup did not complete</h3>';
+        html += `<p>${escapeHtml(payload.detail || error.message)}</p>`;
+        if (payload.stage) {
+            html += `<p><strong>Failed stage:</strong> ${escapeHtml(payload.stage)}</p>`;
+        }
+        if (payload.config_path) {
+            html += `<p><strong>Existing config:</strong> <code>${escapeHtml(payload.config_path)}</code></p>`;
+        }
+        if (payload.applied_files?.length) {
+            html += '<p><strong>Files already written:</strong></p><ul>';
+            payload.applied_files.forEach((path) => {
+                html += `<li><code>${escapeHtml(path)}</code></li>`;
+            });
+            html += '</ul>';
+        }
+        if (payload.created_labels?.length) {
+            html += '<p><strong>Labels already created:</strong></p><ul>';
+            payload.created_labels.forEach((label) => {
+                html += `<li><code>${escapeHtml(label)}</code></li>`;
+            });
+            html += '</ul>';
+        }
+        html += '<p>Use <strong>Back</strong> to review the setup and generate a new preview before retrying.</p>';
+        html += '</div>';
+        return html;
     }
 
     function updateSteps() {
@@ -79,6 +112,7 @@
             repoPath,
             options: null,
             requiresReplacementConfirmation: false,
+            previewReady: false,
         };
         returnFocusElement = triggerElement;
         const modal = element('setupWizardModal');
@@ -205,6 +239,7 @@
 
     async function loadStep3() {
         state.options = collectOptions();
+        state.previewReady = false;
         const nextButton = element('setupWizardNext');
         nextButton.disabled = true;
         element('setupContent').innerHTML =
@@ -263,6 +298,7 @@
             element('setupContent').innerHTML = html;
             const replaceConfirmation = document.getElementById('setupConfirmReplace');
             nextButton.disabled = Boolean(replaceConfirmation);
+            state.previewReady = true;
             replaceConfirmation?.addEventListener('change', () => {
                 nextButton.disabled = !replaceConfirmation.checked;
             });
@@ -274,6 +310,7 @@
     }
 
     async function save() {
+        if (!state.previewReady) return;
         const nextButton = element('setupWizardNext');
         const createLabels = element('setupCreateLabels').checked;
         const replaceExisting = state.requiresReplacementConfirmation
@@ -283,6 +320,7 @@
             element('setupConfirmReplace').focus();
             return;
         }
+        state.previewReady = false;
         element('setupContent').innerHTML =
             '<div class="loading-spinner"></div> Saving configuration...';
         nextButton.disabled = true;
@@ -323,9 +361,9 @@
             state.step = 4;
             await loadRepos();
         } catch (error) {
-            element('setupContent').innerHTML =
-                `<div class="error-message">Failed to save configuration: ${escapeHtml(error.message)}</div>`;
-            nextButton.disabled = false;
+            element('setupContent').innerHTML = renderSaveFailure(error);
+            nextButton.disabled = true;
+            element('setupWizardBack').style.display = 'inline-flex';
         }
     }
 
@@ -337,6 +375,8 @@
         element('setupWizardBack').addEventListener('click', async () => {
             if (state.step <= 1) return;
             state.step -= 1;
+            state.previewReady = false;
+            element('setupWizardNext').disabled = false;
             updateSteps();
             if (state.step === 1) await loadStep1();
             else if (state.step === 2) await loadStep2();

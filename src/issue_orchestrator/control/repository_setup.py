@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence
+import re
+from typing import Any, Callable, Literal, Mapping, Sequence
 
 from ..domain.repository_config_name import RepositoryConfigName
 from ..ports.repository_setup import (
@@ -20,7 +21,9 @@ TECH_LEAD_PROMPT_PATH = ".io/tech-lead.md"
 WORKER_PROMPT_PATH = ".io/dev.md"
 
 _SUPPORTED_MODELS = frozenset({"haiku", "sonnet", "opus"})
+_WORKER_AGENT_LABEL_PATTERN = re.compile(r"agent:(?!tech-lead$).+")
 RepositorySetupLabel = tuple[str, str, str]
+RepositorySetupStage = Literal["planning", "files", "labels"]
 RepositorySetupLabelPlanner = Callable[
     [Mapping[str, Any]],
     Sequence[RepositorySetupLabel],
@@ -46,10 +49,11 @@ class RepositorySetupCommand:
             raise ValueError("repo_root must be absolute")
         if not self.repo_name.strip():
             raise ValueError("repo_name is required")
-        if not self.worker_agent_label.startswith("agent:"):
-            raise ValueError("worker_agent_label must start with 'agent:'")
-        if self.worker_agent_label == TECH_LEAD_AGENT_LABEL:
-            raise ValueError("worker_agent_label must identify a worker, not the tech lead")
+        if _WORKER_AGENT_LABEL_PATTERN.fullmatch(self.worker_agent_label) is None:
+            raise ValueError(
+                "worker_agent_label must match 'agent:<worker>' and cannot be "
+                "'agent:tech-lead'"
+            )
         if self.model not in _SUPPORTED_MODELS:
             raise ValueError(
                 f"model must be one of {sorted(_SUPPORTED_MODELS)}, got {self.model!r}"
@@ -121,7 +125,7 @@ class RepositorySetupConflictError(Exception):
 class RepositorySetupExecutionError(Exception):
     """Setup stopped at one stage and reports every mutation already applied."""
 
-    stage: str
+    stage: RepositorySetupStage
     detail: str
     applied_files: tuple[Path, ...] = ()
     created_labels: tuple[str, ...] = ()
@@ -161,7 +165,7 @@ class RepositorySetupOwner:
         try:
             plan = self._file_system.plan(
                 repo_root=command.repo_root,
-                config_name=command.config_name.value,
+                config_name=command.config_name,
                 config=config,
                 include_prompts=command.create_prompts,
             )
@@ -218,7 +222,7 @@ class RepositorySetupOwner:
     def _plan(self, command: RepositorySetupCommand) -> RepositorySetupArtifactPlan:
         return self._file_system.plan(
             repo_root=command.repo_root,
-            config_name=command.config_name.value,
+            config_name=command.config_name,
             config=command.build_config(),
             include_prompts=command.create_prompts,
         )
@@ -271,6 +275,7 @@ __all__ = [
     "RepositorySetupOwner",
     "RepositorySetupPreview",
     "RepositorySetupResult",
+    "RepositorySetupStage",
     "TECH_LEAD_AGENT_LABEL",
     "TECH_LEAD_PROMPT_PATH",
     "WORKER_PROMPT_PATH",

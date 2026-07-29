@@ -166,6 +166,19 @@ test('setup request contract defaults tech lead on and supports explicit opt-out
     assert.equal(disabled.body.replace_existing, false);
 });
 
+test('setup request contract rejects empty and tech-lead worker labels', () => {
+    for (const workerAgentLabel of ['agent:', 'agent:tech-lead']) {
+        assert.throws(
+            () => setupCommands.buildSetupPreviewRequest('/repos/porchpin', {
+                repoName: 'owner/porchpin',
+                workerAgentLabel,
+                model: 'sonnet',
+            }),
+            /workerAgentLabel must match/,
+        );
+    }
+});
+
 test('setup modal completes the default-on preview and save round trip', async () => {
     const document = fakeDocument();
     const fetchCalls = [];
@@ -282,6 +295,90 @@ test('setup modal completes the default-on preview and save round trip', async (
     assert.equal(modal.getAttribute('aria-hidden'), 'true');
     assert.equal(document.background.inert, false);
     assert.equal(trigger.focusCount, 1);
+});
+
+test('partial save failure renders applied mutations and requires a new preview', async () => {
+    const document = fakeDocument();
+    const fetchCalls = [];
+    const detectedRepo = {
+        repo_root: '/repos/porchpin',
+        repo: 'owner/porchpin',
+        existing_config: null,
+    };
+    const responses = [
+        jsonResponse({
+            all_ok: true,
+            checks: { git: { ok: true, detail: 'git version 2' } },
+        }),
+        jsonResponse(detectedRepo),
+        jsonResponse({
+            yaml: 'repo:\n  name: owner/porchpin\n',
+            files: [{
+                path: '/repos/porchpin/.issue-orchestrator/config/default.yaml',
+                action: 'create',
+            }],
+        }),
+        jsonResponse({
+            error: 'repository_setup_failed',
+            stage: 'labels',
+            detail: 'GitHub unavailable',
+            applied_files: [
+                '/repos/porchpin/.issue-orchestrator/config/default.yaml',
+            ],
+            created_labels: ['agent:dev'],
+        }, false),
+        jsonResponse(detectedRepo),
+    ];
+    const fetch = async (...args) => {
+        fetchCalls.push(args);
+        return responses.shift();
+    };
+    const wizard = createSetupWizard({
+        document,
+        fetch,
+        escapeHtml: (value) => String(value),
+        loadRepos: async () => {},
+        setupCommands,
+    });
+    wizard.bind();
+    await wizard.open('/repos/porchpin');
+
+    const next = document.elements.get('setupWizardNext');
+    await next.emit('click');
+    document.elements.set(
+        'setupRepoName',
+        document.makeElement({ value: 'owner/porchpin' }),
+    );
+    document.elements.set(
+        'setupAgentLabel',
+        document.makeElement({ value: 'agent:dev' }),
+    );
+    document.elements.set('setupModel', document.makeElement({ value: 'sonnet' }));
+    document.elements.set(
+        'setupConfigureTechLead',
+        document.makeElement({ checked: true }),
+    );
+    await next.emit('click');
+    await next.emit('click');
+
+    const failureHtml = document.elements.get('setupContent').innerHTML;
+    assert.match(failureHtml, /Setup did not complete/);
+    assert.match(failureHtml, /GitHub unavailable/);
+    assert.match(failureHtml, /Failed stage:<\/strong> labels/);
+    assert.match(failureHtml, /Files already written/);
+    assert.match(failureHtml, /default\.yaml/);
+    assert.match(failureHtml, /Labels already created/);
+    assert.match(failureHtml, /agent:dev/);
+    assert.doesNotMatch(failureHtml, />repository_setup_failed</);
+    assert.equal(next.disabled, true);
+
+    await next.emit('click');
+    assert.equal(fetchCalls.length, 4);
+
+    await document.elements.get('setupWizardBack').emit('click');
+    assert.equal(fetchCalls.length, 5);
+    assert.match(document.elements.get('setupContent').innerHTML, /Configuration/);
+    assert.equal(next.disabled, false);
 });
 
 test('existing config preview requires explicit replacement confirmation before save', async () => {

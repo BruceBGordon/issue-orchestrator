@@ -61,6 +61,7 @@ from ..ports import RepositoryHost
 from ..control.goal_pilot import GoalPilot
 from ..control.repository_setup import RepositorySetupOwner
 from ..execution.control_center_actions import ControlCenterActions
+from ..execution.repository_setup_files import RepositorySetupFileSystemAdapter
 from ._auth_middleware import (
     AuthSurfaceConfig,
     evaluate_request,
@@ -97,7 +98,6 @@ from .control_api_repo_support import (
     install_control_api_repo_dependencies,
 )
 from .control_api_setup_routes import control_setup_router
-from .control_api_setup_files import ControlApiRepositorySetupFileSystem
 from .control_api_setup_support import (
     ControlApiSetupDependencies,
     install_control_api_setup_dependencies,
@@ -1086,7 +1086,7 @@ install_control_api_setup_dependencies(
     ControlApiSetupDependencies(
         validate_repo_root=_validate_repo_root,
         setup_owner=RepositorySetupOwner(
-            file_system=ControlApiRepositorySetupFileSystem(),
+            file_system=RepositorySetupFileSystemAdapter(),
             repository_host_factory=_create_repository_setup_host,
             label_planner=_plan_control_api_setup_labels,
         ),

@@ -7,24 +7,23 @@ from pathlib import Path
 from typing import Self
 
 
+def _require_string(value: object) -> str:
+    if not isinstance(value, str):
+        raise ValueError("Invalid config_name")
+    return value
+
+
 @dataclass(frozen=True, slots=True)
 class RepositoryConfigName:
     """A YAML config name that cannot escape the repository config directory."""
 
     value: str
 
-    @classmethod
-    def parse(
-        cls,
-        raw: object,
-        *,
-        default: str | None = None,
-    ) -> Self:
-        """Normalize one config name or raise for empty/path-like input."""
-        candidate = default if raw is None else raw
+    def __post_init__(self) -> None:
+        """Normalize and enforce the invariant for every construction path."""
+        candidate = _require_string(self.value)
         if (
-            not isinstance(candidate, str)
-            or not candidate
+            not candidate
             or candidate != candidate.strip()
             or "/" in candidate
             or "\\" in candidate
@@ -41,7 +40,18 @@ class RepositoryConfigName:
             or normalized == ".yaml"
         ):
             raise ValueError("Invalid config_name")
-        return cls(normalized)
+        object.__setattr__(self, "value", normalized)
+
+    @classmethod
+    def parse(
+        cls,
+        raw: object,
+        *,
+        default: str | None = None,
+    ) -> Self:
+        """Normalize one config name or raise for empty/path-like input."""
+        candidate = default if raw is None else raw
+        return cls(_require_string(candidate))
 
     @classmethod
     def default(cls) -> Self:

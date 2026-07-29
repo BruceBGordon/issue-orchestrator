@@ -364,6 +364,36 @@ class TestControlCenterSetupRoutes:
         assert response.status_code in {400, 422}
         assert not (tmp_path / "escaped.yaml").exists()
 
+    @pytest.mark.parametrize(
+        "endpoint",
+        ["/control/setup/preview", "/control/setup/save"],
+    )
+    @pytest.mark.parametrize("worker_agent_label", ["agent:", "agent:tech-lead"])
+    def test_setup_routes_reject_non_worker_agent_labels(
+        self,
+        tmp_path,
+        endpoint,
+        worker_agent_label,
+    ):
+        """Generated request validation and command policy share the label rule."""
+        repo_root = tmp_path / "repo"
+        repo_root.mkdir()
+
+        response = TestClient(control_app).post(
+            endpoint,
+            json={
+                "repo_root": str(repo_root),
+                "repo_name": "owner/repo",
+                "worker_agent_label": worker_agent_label,
+                "model": "sonnet",
+                "configure_tech_lead": True,
+                "create_labels": False,
+            },
+        )
+
+        assert response.status_code == 422
+        assert not (repo_root / ".issue-orchestrator").exists()
+
     def test_setup_detect_ignores_non_default_config_files(self, tmp_path):
         """Detect should only surface the legacy default config file."""
         repo_root = tmp_path / "repo"
