@@ -381,6 +381,95 @@ test('partial save failure renders applied mutations and requires a new preview'
     assert.equal(next.disabled, false);
 });
 
+test('detect failure disables forward click and keyboard activation', async () => {
+    const document = fakeDocument();
+    const fetchCalls = [];
+    const responses = [
+        jsonResponse({
+            all_ok: true,
+            checks: { git: { ok: true, detail: 'git version 2' } },
+        }),
+        jsonResponse({ detail: 'repository unavailable' }, false),
+    ];
+    const wizard = createSetupWizard({
+        document,
+        fetch: async (...args) => {
+            fetchCalls.push(args);
+            return responses.shift();
+        },
+        escapeHtml: (value) => String(value),
+        loadRepos: async () => {},
+        setupCommands,
+    });
+    wizard.bind();
+    await wizard.open('/repos/porchpin');
+
+    const next = document.elements.get('setupWizardNext');
+    await next.emit('click', { detail: 1 });
+
+    assert.equal(next.disabled, true);
+    assert.match(document.elements.get('setupContent').innerHTML, /repository unavailable/);
+    assert.match(document.elements.get('setupContent').innerHTML, /Use <strong>Back<\/strong>/);
+
+    await next.emit('click', { detail: 1 });
+    await next.emit('click', { detail: 0 });
+    assert.equal(fetchCalls.length, 2);
+});
+
+test('preview failure disables save click and keyboard activation', async () => {
+    const document = fakeDocument();
+    const fetchCalls = [];
+    const responses = [
+        jsonResponse({
+            all_ok: true,
+            checks: { git: { ok: true, detail: 'git version 2' } },
+        }),
+        jsonResponse({
+            repo_root: '/repos/porchpin',
+            repo: 'owner/porchpin',
+            existing_config: null,
+        }),
+        jsonResponse({ detail: 'preview unavailable' }, false),
+    ];
+    const wizard = createSetupWizard({
+        document,
+        fetch: async (...args) => {
+            fetchCalls.push(args);
+            return responses.shift();
+        },
+        escapeHtml: (value) => String(value),
+        loadRepos: async () => {},
+        setupCommands,
+    });
+    wizard.bind();
+    await wizard.open('/repos/porchpin');
+
+    const next = document.elements.get('setupWizardNext');
+    await next.emit('click');
+    document.elements.set(
+        'setupRepoName',
+        document.makeElement({ value: 'owner/porchpin' }),
+    );
+    document.elements.set(
+        'setupAgentLabel',
+        document.makeElement({ value: 'agent:dev' }),
+    );
+    document.elements.set('setupModel', document.makeElement({ value: 'sonnet' }));
+    document.elements.set(
+        'setupConfigureTechLead',
+        document.makeElement({ checked: true }),
+    );
+    await next.emit('click');
+
+    assert.equal(next.disabled, true);
+    assert.match(document.elements.get('setupContent').innerHTML, /preview unavailable/);
+    assert.match(document.elements.get('setupContent').innerHTML, /Use <strong>Back<\/strong>/);
+
+    await next.emit('click', { detail: 1 });
+    await next.emit('click', { detail: 0 });
+    assert.equal(fetchCalls.length, 3);
+});
+
 test('existing config preview requires explicit replacement confirmation before save', async () => {
     const document = fakeDocument();
     const fetchCalls = [];

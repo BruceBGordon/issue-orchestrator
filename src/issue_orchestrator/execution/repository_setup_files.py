@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from ..domain.repository_config_name import RepositoryConfigName
+from ..infra.atomic_io import atomic_write_bytes
 from ..infra.config import get_config_path
 from ..ports.repository_setup import (
     RepositorySetupArtifactPlan,
@@ -63,7 +64,18 @@ class RepositorySetupFileSystemAdapter:
         for planned_file in plan.files:
             try:
                 planned_file.path.parent.mkdir(parents=True, exist_ok=True)
-                planned_file.path.write_text(planned_file.content, encoding="utf-8")
+                if planned_file.action == "create":
+                    with planned_file.path.open("x", encoding="utf-8") as file:
+                        file.write(planned_file.content)
+                elif planned_file.action == "overwrite":
+                    atomic_write_bytes(
+                        planned_file.path,
+                        planned_file.content.encode("utf-8"),
+                    )
+                else:
+                    raise ValueError(
+                        f"Unsupported repository setup action: {planned_file.action}"
+                    )
             except Exception as exc:
                 raise RepositorySetupFileSystemError(
                     operation=f"write {planned_file.kind} file {planned_file.path}",

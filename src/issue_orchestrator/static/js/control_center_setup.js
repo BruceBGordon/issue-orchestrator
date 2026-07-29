@@ -162,6 +162,8 @@
     }
 
     async function loadStep2() {
+        const nextButton = element('setupWizardNext');
+        nextButton.disabled = true;
         element('setupContent').innerHTML =
             '<div class="loading-spinner"></div> Detecting repository...';
         try {
@@ -222,9 +224,13 @@
                 </div>
             `;
             element('setupContent').innerHTML = html;
+            nextButton.disabled = false;
         } catch (error) {
             element('setupContent').innerHTML =
-                `<div class="error-message">Failed to detect repository: ${escapeHtml(error.message)}</div>`;
+                `<div class="error-message" role="alert">
+                    Failed to detect repository: ${escapeHtml(error.message)}
+                    <p>Use <strong>Back</strong> to return to prerequisites before retrying.</p>
+                </div>`;
         }
     }
 
@@ -238,13 +244,13 @@
     }
 
     async function loadStep3() {
-        state.options = collectOptions();
         state.previewReady = false;
         const nextButton = element('setupWizardNext');
         nextButton.disabled = true;
-        element('setupContent').innerHTML =
-            '<div class="loading-spinner"></div> Generating preview...';
         try {
+            state.options = collectOptions();
+            element('setupContent').innerHTML =
+                '<div class="loading-spinner"></div> Generating preview...';
             const command = setupCommands.buildSetupPreviewRequest(
                 state.repoPath,
                 state.options,
@@ -304,8 +310,10 @@
             });
         } catch (error) {
             element('setupContent').innerHTML =
-                `<div class="error-message">Failed to generate preview: ${escapeHtml(error.message)}</div>`;
-            nextButton.disabled = false;
+                `<div class="error-message" role="alert">
+                    Failed to generate preview: ${escapeHtml(error.message)}
+                    <p>Use <strong>Back</strong> to review the setup before retrying.</p>
+                </div>`;
         }
     }
 
@@ -382,6 +390,7 @@
             else if (state.step === 2) await loadStep2();
         });
         element('setupWizardNext').addEventListener('click', async () => {
+            if (element('setupWizardNext').disabled) return;
             if (state.step === 4) {
                 close();
                 return;

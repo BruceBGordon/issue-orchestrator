@@ -88,6 +88,7 @@ def plan_missing_setup_prompts(
     )
 
     planned: list[PlannedSetupPrompt] = []
+    planned_paths: set[Path] = set()
     for agent_name, agent_config in (config.get("agents", {}) or {}).items():
         if not isinstance(agent_name, str) or not isinstance(agent_config, Mapping):
             continue
@@ -98,7 +99,8 @@ def plan_missing_setup_prompts(
         prompt_path = Path(prompt_rel)
         if not prompt_path.is_absolute():
             prompt_path = repo_root / prompt_path
-        if prompt_path.exists():
+        prompt_path = prompt_path.resolve()
+        if prompt_path.exists() or prompt_path in planned_paths:
             continue
 
         if agent_name == code_review_agent or agent_name.lower() == "agent:reviewer":
@@ -124,6 +126,7 @@ def plan_missing_setup_prompts(
                 agent=agent_name,
             )
         )
+        planned_paths.add(prompt_path)
 
     return tuple(planned)
 

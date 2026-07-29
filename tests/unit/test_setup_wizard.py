@@ -613,6 +613,21 @@ class TestSetupWizardSharedHelpers:
         assert "coding-done completed" in tech_lead_content
         assert "reviewer-done" not in tech_lead_content
 
+    def test_write_missing_setup_prompts_preserves_first_shared_target(self, tmp_path):
+        """Compatibility writes should apply each resolved prompt target once."""
+        config = {
+            "agents": {
+                "agent:frontend": {"prompt": ".io/shared.md"},
+                "agent:backend": {"prompt": ".io/../.io/shared.md"},
+            },
+        }
+
+        created_paths = write_missing_setup_prompts(config, tmp_path)
+
+        shared_path = (tmp_path / ".io" / "shared.md").resolve()
+        assert created_paths == [shared_path]
+        assert "# Frontend Agent Prompt" in shared_path.read_text()
+
     def test_plan_setup_labels_matches_cli_defaults(self):
         """CLI setup should keep priority labels and default-agent review gating."""
         labels = plan_setup_labels({
