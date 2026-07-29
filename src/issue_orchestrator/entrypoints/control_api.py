@@ -57,6 +57,7 @@ from sse_starlette.sse import EventSourceResponse
 
 from ..infra import gh_audit
 from ..infra.supervisor import DefaultSupervisorOps, SupervisorOps
+from ..ports import RepositoryHost
 from ..control.goal_pilot import GoalPilot
 from ..execution.control_center_actions import ControlCenterActions
 from ._auth_middleware import (
@@ -68,6 +69,7 @@ from ._auth_middleware import (
     resolve_browser_page_auth,
 )
 from .brand_assets import read_logo_svg
+from .bootstrap_repository_setup import build_repository_setup_owner
 from .control_api_goal_pilot_routes import control_goal_pilot_router
 from .control_api_goal_pilot_support import (
     ControlApiGoalPilotDependencies,
@@ -141,6 +143,13 @@ def _load_config_by_name(repo_root: Path, config_name: str) -> "Config":
     """
     from ..infra.config import Config
     return Config.find_and_load(repo_root, config_name=config_name)
+
+
+def _create_repository_setup_host(repo_name: str) -> RepositoryHost:
+    """Composition-root adapter for setup label mutations."""
+    from ..execution.providers import create_repository_host
+
+    return create_repository_host(repo=repo_name)
 
 
 # Create minimal control API app
@@ -1063,6 +1072,7 @@ install_control_api_setup_dependencies(
     control_app,
     ControlApiSetupDependencies(
         validate_repo_root=_validate_repo_root,
+        setup_owner=build_repository_setup_owner(_create_repository_setup_host),
     ),
 )
 control_app.include_router(control_orchestrator_router)

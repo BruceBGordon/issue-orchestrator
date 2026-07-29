@@ -18,6 +18,7 @@ const REPO_START_TIMEOUT_MS = 15000;
 let shutdownExpectClose = false;
 let shutdownCloseAttempted = false;
 let doctorModalContext = { repoRoot: null, configName: null, title: null, data: null };
+let setupWizardController = null;
 
 const DISCOVERED_STALE_MS = 5 * 60 * 1000;
 
@@ -331,7 +332,7 @@ function renderDropdownMenu() {
 
     // Attach click handlers
     menu.querySelectorAll('.dropdown-item').forEach(item => {
-        item.addEventListener('click', () => {
+        item.addEventListener('click', async () => {
             const path = item.dataset.path;
             const source = item.dataset.source;
             const isDiscovered = source === 'discovered';
@@ -342,7 +343,7 @@ function renderDropdownMenu() {
             if (isDiscovered && repo?.status === 'needs_setup') {
                 // Open setup wizard for this repo
                 closeDropdown();
-                openSetupWizard(path);
+                await openRepositorySetup(path, item);
                 return;
             }
 
@@ -1362,6 +1363,15 @@ function loadActivityView(repoPath) {
 // ============================================
 // Repository Actions
 // ============================================
+async function openRepositorySetup(path, triggerElement = null) {
+    const command = controlCenterSetupCommands.buildOpenSetupCommand(path);
+    await controlCenterSetupCommands.runOpenSetupCommand(
+        command,
+        setupWizardController,
+        triggerElement,
+    );
+}
+
 async function handleRepoAction(e) {
     const action = e.currentTarget.dataset.action;
     const path = e.currentTarget.dataset.path;
@@ -1389,7 +1399,7 @@ async function handleRepoAction(e) {
             await resumeRepo(path);
             break;
         case 'setup':
-            openSetupWizard(path);
+            await openRepositorySetup(path, e.currentTarget);
             break;
         case 'register':
             await registerDiscoveredRepo(path);
@@ -3308,260 +3318,14 @@ document.addEventListener('DOMContentLoaded', () => {
     });
 
     // Setup Wizard
-    let setupWizardState = {
-        step: 1,
-        repoPath: null,
-        prereqsOk: false,
-        detectedConfig: null,
-        config: null
-    };
-
-    function updateSetupSteps() {
-        document.querySelectorAll('.setup-step').forEach(el => {
-            const step = parseInt(el.dataset.step);
-            el.classList.remove('active', 'done');
-            if (step < setupWizardState.step) el.classList.add('done');
-            else if (step === setupWizardState.step) el.classList.add('active');
-        });
-        document.getElementById('setupWizardBack').style.display = setupWizardState.step > 1 ? 'inline-flex' : 'none';
-        document.getElementById('setupWizardNext').textContent =
-            setupWizardState.step === 3 ? 'Save Configuration' : 'Next';
-    }
-
-    async function openSetupWizard(repoPath) {
-        setupWizardState = { step: 1, repoPath, prereqsOk: false, detectedConfig: null, config: null };
-        document.getElementById('setupWizardModal').classList.add('active');
-        updateSetupSteps();
-        await loadSetupStep1();
-    }
-
-    async function loadSetupStep1() {
-        document.getElementById('setupContent').innerHTML = '<div class="loading-spinner"></div> Checking prerequisites...';
-        try {
-            const response = await fetch(`/control/setup/prereqs?repo_root=${encodeURIComponent(setupWizardState.repoPath)}`);
-            const data = await response.json();
-
-            let html = '<h3 style="margin-top: 0;">Prerequisites</h3>';
-            const checks = data.checks || {};
-            setupWizardState.prereqsOk = data.all_ok;
-
-            for (const [name, check] of Object.entries(checks)) {
-                const isOk = check.ok;
-                html += `<div class="prereq-item ${isOk ? 'ok' : 'fail'}">
-                    <span class="prereq-icon">${isOk ? '✓' : '✗'}</span>
-                    <div>
-                        <div class="prereq-name">${escapeHtml(name)}</div>
-                        <div class="prereq-detail">${escapeHtml(check.detail || (isOk ? 'Found' : 'Not found'))}</div>
-                    </div>
-                </div>`;
-            }
-
-            if (!data.all_ok) {
-                html += '<p style="color: var(--warning-color); margin-top: 16px;">Some prerequisites are missing. You can still continue, but the orchestrator may not work correctly.</p>';
-            }
-
-            document.getElementById('setupContent').innerHTML = html;
-        } catch (error) {
-            document.getElementById('setupContent').innerHTML =
-                `<div class="error-message">Failed to check prerequisites: ${escapeHtml(error.message)}</div>`;
-        }
-    }
-
-    async function loadSetupStep2() {
-        document.getElementById('setupContent').innerHTML = '<div class="loading-spinner"></div> Detecting repository...';
-        try {
-            const response = await fetch(`/control/setup/detect?repo_root=${encodeURIComponent(setupWizardState.repoPath)}`);
-            const data = await response.json();
-
-            if (data.error) {
-                document.getElementById('setupContent').innerHTML = `<div class="error-message">${escapeHtml(data.error)}</div>`;
-                return;
-            }
-
-            setupWizardState.detectedConfig = data.existing_config;
-            const repoName = data.repo?.name || data.repo_root?.split('/').pop() || 'unknown/repo';
-
-            let html = '<h3 style="margin-top: 0;">Configuration</h3>';
-
-            if (data.existing_config) {
-                html += '<p style="color: var(--success-color);">Existing configuration found. You can update it below.</p>';
-                setupWizardState.config = data.existing_config;
-            } else {
-                html += '<p>No configuration found. Creating a new one.</p>';
-                setupWizardState.config = {
-                    repo: { name: repoName },
-                    agents: { 'agent:dev': { prompt: '.io/dev.md', model: 'sonnet' } }
-                };
-            }
-
-            html += `
-                <div class="form-group" style="margin-top: 16px;">
-                    <label class="form-label">Repository Name</label>
-                    <input type="text" id="setupRepoName" class="form-input" value="${escapeHtml(setupWizardState.config.repo?.name || repoName)}" style="width: 100%;">
-                </div>
-                <div class="form-group" style="margin-top: 12px;">
-                    <label class="form-label">Agent Label</label>
-                    <input type="text" id="setupAgentLabel" class="form-input" value="${escapeHtml(Object.keys(setupWizardState.config.agents || {})[0] || 'agent:dev')}" style="width: 100%;">
-                    <div style="font-size: 12px; color: var(--text-muted); margin-top: 4px;">The GitHub label that triggers this agent (e.g., agent:dev, agent:backend)</div>
-                </div>
-                <div class="form-group" style="margin-top: 12px;">
-                    <label class="form-label">Model</label>
-                    <select id="setupModel" class="form-input" style="width: 100%;">
-                        <option value="sonnet" ${(setupWizardState.config.agents?.[Object.keys(setupWizardState.config.agents || {})[0]]?.model || 'sonnet') === 'sonnet' ? 'selected' : ''}>Sonnet (recommended)</option>
-                        <option value="opus" ${(setupWizardState.config.agents?.[Object.keys(setupWizardState.config.agents || {})[0]]?.model) === 'opus' ? 'selected' : ''}>Opus</option>
-                        <option value="haiku" ${(setupWizardState.config.agents?.[Object.keys(setupWizardState.config.agents || {})[0]]?.model) === 'haiku' ? 'selected' : ''}>Haiku</option>
-                    </select>
-                </div>
-            `;
-
-            document.getElementById('setupContent').innerHTML = html;
-        } catch (error) {
-            document.getElementById('setupContent').innerHTML =
-                `<div class="error-message">Failed to detect repository: ${escapeHtml(error.message)}</div>`;
-        }
-    }
-
-    async function loadSetupStep3() {
-        // Gather config from form
-        const repoName = document.getElementById('setupRepoName')?.value || 'unknown/repo';
-        const agentLabel = document.getElementById('setupAgentLabel')?.value || 'agent:dev';
-        const model = document.getElementById('setupModel')?.value || 'sonnet';
-
-        setupWizardState.config = {
-            repo: { name: repoName },
-            agents: {
-                [agentLabel]: { prompt: '.io/dev.md', model: model }
-            }
-        };
-
-        document.getElementById('setupContent').innerHTML = '<div class="loading-spinner"></div> Generating preview...';
-        try {
-            const response = await fetch('/control/setup/preview', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    repo_root: setupWizardState.repoPath,
-                    config: setupWizardState.config
-                })
-            });
-            const data = await response.json();
-
-            if (data.error) {
-                document.getElementById('setupContent').innerHTML = `<div class="error-message">${escapeHtml(data.error)}</div>`;
-                return;
-            }
-
-            let html = '<h3 style="margin-top: 0;">Preview Configuration</h3>';
-            html += '<p>The following configuration will be saved:</p>';
-            html += `<pre style="background: var(--bg-tertiary); padding: 12px; border-radius: 8px; font-size: 12px; overflow-x: auto;">${escapeHtml(data.yaml || '')}</pre>`;
-
-            if (data.files && data.files.length > 0) {
-                html += '<p style="margin-top: 16px;"><strong>Files to create:</strong></p>';
-                html += '<ul style="margin: 8px 0; padding-left: 20px;">';
-                data.files.forEach(f => { html += `<li><code>${escapeHtml(f)}</code></li>`; });
-                html += '</ul>';
-            }
-
-            html += `
-                <div class="form-group" style="margin-top: 16px;">
-                    <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
-                        <input type="checkbox" id="setupCreateLabels" checked>
-                        Create GitHub labels for agent
-                    </label>
-                </div>
-            `;
-
-            document.getElementById('setupContent').innerHTML = html;
-        } catch (error) {
-            document.getElementById('setupContent').innerHTML =
-                `<div class="error-message">Failed to generate preview: ${escapeHtml(error.message)}</div>`;
-        }
-    }
-
-    async function saveSetupConfig() {
-        const createLabels = document.getElementById('setupCreateLabels')?.checked ?? true;
-
-        document.getElementById('setupContent').innerHTML = '<div class="loading-spinner"></div> Saving configuration...';
-        document.getElementById('setupWizardNext').disabled = true;
-
-        try {
-            const response = await fetch('/control/setup/save', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    repo_root: setupWizardState.repoPath,
-                    config: setupWizardState.config,
-                    create_prompts: true,
-                    create_labels: createLabels
-                })
-            });
-            const data = await response.json();
-
-            if (data.error) {
-                document.getElementById('setupContent').innerHTML = `<div class="error-message">${escapeHtml(data.error)}</div>`;
-                document.getElementById('setupWizardNext').disabled = false;
-                return;
-            }
-
-            let html = '<h3 style="margin-top: 0; color: var(--success-color);">Setup Complete!</h3>';
-            html += '<p>Configuration has been saved successfully.</p>';
-
-            if (data.created_files && data.created_files.length > 0) {
-                html += '<p><strong>Created files:</strong></p>';
-                html += '<ul style="margin: 8px 0; padding-left: 20px;">';
-                data.created_files.forEach(f => { html += `<li><code>${escapeHtml(f)}</code></li>`; });
-                html += '</ul>';
-            }
-
-            html += '<p style="margin-top: 16px;">You can now start the repository engine for this repository.</p>';
-
-            document.getElementById('setupContent').innerHTML = html;
-            document.getElementById('setupWizardNext').textContent = 'Done';
-            document.getElementById('setupWizardNext').disabled = false;
-            document.getElementById('setupWizardBack').style.display = 'none';
-
-            // Mark as step 4 (done) so clicking Done closes the modal
-            setupWizardState.step = 4;
-
-            // Reload repos to show the newly configured repo
-            await loadRepos();
-        } catch (error) {
-            document.getElementById('setupContent').innerHTML =
-                `<div class="error-message">Failed to save configuration: ${escapeHtml(error.message)}</div>`;
-            document.getElementById('setupWizardNext').disabled = false;
-        }
-    }
-
-    document.getElementById('closeSetupWizardModal').addEventListener('click', () => {
-        document.getElementById('setupWizardModal').classList.remove('active');
+    setupWizardController = createControlCenterSetupWizard({
+        document,
+        fetch: window.fetch.bind(window),
+        escapeHtml,
+        loadRepos,
+        setupCommands: controlCenterSetupCommands,
     });
-    document.getElementById('setupWizardCancel').addEventListener('click', () => {
-        document.getElementById('setupWizardModal').classList.remove('active');
-    });
-    document.getElementById('setupWizardBack').addEventListener('click', async () => {
-        if (setupWizardState.step > 1) {
-            setupWizardState.step--;
-            updateSetupSteps();
-            if (setupWizardState.step === 1) await loadSetupStep1();
-            else if (setupWizardState.step === 2) await loadSetupStep2();
-        }
-    });
-    document.getElementById('setupWizardNext').addEventListener('click', async () => {
-        if (setupWizardState.step === 4) {
-            // Done state - close modal
-            document.getElementById('setupWizardModal').classList.remove('active');
-            return;
-        }
-        if (setupWizardState.step === 3) {
-            await saveSetupConfig();
-            return;
-        }
-        setupWizardState.step++;
-        updateSetupSteps();
-        if (setupWizardState.step === 2) await loadSetupStep2();
-        else if (setupWizardState.step === 3) await loadSetupStep3();
-    });
-
+    setupWizardController.bind();
     // Sidebar app menu toggle
     document.getElementById('sidebarAppMenuBtn').addEventListener('click', (e) => {
         e.stopPropagation();

@@ -189,9 +189,11 @@ def render_python_models(components: list[ComponentSchema]) -> str:
         "\n",
         "from __future__ import annotations",
         "\n",
+        "import re",
+        "\n",
         "from typing import Any, Literal, TypeAlias",
         "\n",
-        "from pydantic import BaseModel, ConfigDict, Field",
+        "from pydantic import BaseModel, ConfigDict, Field, field_validator",
         "\n",
         "\n",
     ]
@@ -231,6 +233,21 @@ def _render_python_model(component: ComponentSchema) -> list[str]:
             annotation = f"{annotation} | None"
         constraints = _pydantic_field_constraints(prop_schema)
         lines.append(_python_field_line(prop, annotation, constraints, prop in required))
+    for prop in sorted(properties.keys()):
+        pattern = properties[prop].get("pattern")
+        if not isinstance(pattern, str):
+            continue
+        lines.extend(
+            [
+                "",
+                f"    @field_validator({prop!r})",
+                "    @classmethod",
+                f"    def _validate_{prop}_pattern(cls, value: Any) -> Any:",
+                f"        if value is not None and re.search({pattern!r}, value) is None:",
+                f"            raise ValueError({f'{prop} must match {pattern!r}'!r})",
+                "        return value",
+            ]
+        )
     lines.append("")
     return lines
 

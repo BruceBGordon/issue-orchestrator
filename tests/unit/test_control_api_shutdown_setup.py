@@ -276,20 +276,123 @@ class TestControlCenterShutdownEndpoint:
 class TestControlCenterSetupRoutes:
     """Test extracted setup-wizard route behavior."""
 
-    def test_setup_preview_returns_raw_yaml_without_header(self):
-        """Preview should preserve the legacy raw-YAML response."""
+    def test_setup_preview_builds_default_tech_lead_command(self, tmp_path):
+        """Preview renders the validated default-on tech-lead setup command."""
+        repo_root = tmp_path / "repo"
+        repo_root.mkdir()
         client = TestClient(control_app)
 
         response = client.post(
             "/control/setup/preview",
-            json={"config": {"repo": {"name": "owner/repo"}, "agents": {}}},
+            json={
+                "repo_root": str(repo_root),
+                "repo_name": "owner/repo",
+                "worker_agent_label": "agent:dev",
+                "model": "sonnet",
+                "configure_tech_lead": True,
+            },
         )
 
         assert response.status_code == 200
         data = response.json()
-        assert "Issue Orchestrator Configuration" not in data["yaml"]
-        assert data["yaml"].startswith("repo:\n  name: owner/repo\n")
+        assert "Issue Orchestrator Configuration" in data["yaml"]
+        assert "repo:\n  name: owner/repo\n" in data["yaml"]
+        assert "agent:tech-lead" in data["yaml"]
+        assert "tech_lead_follow_up_agent: agent:dev" in data["yaml"]
         assert data["files"][0]["size"] == len(data["yaml"])
+        assert {
+            row["agent"]
+            for row in data["files"]
+            if row.get("type") == "prompt"
+        } == {"agent:dev", "agent:tech-lead"}
+        assert not (repo_root / ".issue-orchestrator").exists()
+
+    def test_setup_preview_marks_existing_config_for_overwrite(self, tmp_path):
+        """Preview must make replacement of an existing config explicit."""
+        repo_root = tmp_path / "repo"
+        config_path = repo_root / ".issue-orchestrator" / "config" / "default.yaml"
+        config_path.parent.mkdir(parents=True)
+        config_path.write_text("repo:\n  name: old/repo\n")
+        client = TestClient(control_app)
+
+        response = client.post(
+            "/control/setup/preview",
+            json={
+                "repo_root": str(repo_root),
+                "repo_name": "owner/repo",
+                "worker_agent_label": "agent:dev",
+                "model": "sonnet",
+                "configure_tech_lead": True,
+            },
+        )
+
+        assert response.status_code == 200
+        assert response.json()["files"][0]["action"] == "overwrite"
+
+    @pytest.mark.parametrize(
+        "config_name",
+        ["", "../escaped", "nested/default", "/tmp/escaped.yaml"],
+    )
+    @pytest.mark.parametrize(
+        "endpoint",
+        ["/control/setup/preview", "/control/setup/save"],
+    )
+    def test_setup_routes_reject_unsafe_config_names(
+        self,
+        tmp_path,
+        endpoint,
+        config_name,
+    ):
+        """Preview and save share one traversal-safe config-name contract."""
+        repo_root = tmp_path / "repo"
+        repo_root.mkdir()
+        client = TestClient(control_app)
+
+        response = client.post(
+            endpoint,
+            json={
+                "repo_root": str(repo_root),
+                "repo_name": "owner/repo",
+                "worker_agent_label": "agent:dev",
+                "model": "sonnet",
+                "configure_tech_lead": True,
+                "config_name": config_name,
+                "create_labels": False,
+            },
+        )
+
+        assert response.status_code in {400, 422}
+        assert not (tmp_path / "escaped.yaml").exists()
+
+    @pytest.mark.parametrize(
+        "endpoint",
+        ["/control/setup/preview", "/control/setup/save"],
+    )
+    @pytest.mark.parametrize("worker_agent_label", ["agent:", "agent:tech-lead"])
+    def test_setup_routes_reject_non_worker_agent_labels(
+        self,
+        tmp_path,
+        endpoint,
+        worker_agent_label,
+    ):
+        """Generated request validation and command policy share the label rule."""
+        repo_root = tmp_path / "repo"
+        repo_root.mkdir()
+
+        response = TestClient(control_app).post(
+            endpoint,
+            json={
+                "repo_root": str(repo_root),
+                "repo_name": "owner/repo",
+                "worker_agent_label": worker_agent_label,
+                "model": "sonnet",
+                "configure_tech_lead": True,
+                "create_labels": False,
+            },
+        )
+
+        assert response.status_code == 422
+        assert not (repo_root / ".issue-orchestrator").exists()
 
     def test_setup_detect_ignores_non_default_config_files(self, tmp_path):
         """Detect should only surface the legacy default config file."""
@@ -310,8 +413,10 @@ class TestControlCenterSetupRoutes:
         assert data["config_path"] is None
         assert data["existing_config"] is None
 
-    def test_setup_save_preserves_legacy_labels_and_raw_yaml(self, tmp_path):
-        """Save should keep the old label set and config-file format."""
+    def test_setup_save_executes_valid_default_tech_lead_command(self, tmp_path):
+        """Save writes a runnable config, prompts, and tech-lead labels."""
+        from issue_orchestrator.infra.config import Config
+
         repo_root = tmp_path / "repo"
         repo_root.mkdir()
         host = MagicMock()
@@ -326,26 +431,74 @@ class TestControlCenterSetupRoutes:
                 "/control/setup/save",
                 json={
                     "repo_root": str(repo_root),
+                    "repo_name": "owner/repo",
+                    "worker_agent_label": "agent:backend",
+                    "model": "sonnet",
+                    "configure_tech_lead": True,
                     "config_name": "default",
-                    "create_prompts": False,
+                    "create_prompts": True,
                     "create_labels": True,
-                    "config": {
-                        "repo": {"name": "owner/repo"},
-                        "agents": {
-                            "agent:backend": {"prompt": ".prompts/backend.md"},
-                        },
-                        "review": {"enabled": True},
-                    },
                 },
             )
 
         assert response.status_code == 200
         data = response.json()
-        assert "priority:high" not in data["created_labels"]
-        assert "needs-code-review" in data["created_labels"]
-        assert "code-reviewed" in data["created_labels"]
+        assert "priority:high" in data["created_labels"]
+        assert "agent:backend" in data["created_labels"]
+        assert "agent:tech-lead" in data["created_labels"]
+        assert "needs-tech-lead-review" in data["created_labels"]
+        assert "tech-lead-reviewed" in data["created_labels"]
 
         config_path = repo_root / ".issue-orchestrator" / "config" / "default.yaml"
         config_text = config_path.read_text()
-        assert "Issue Orchestrator Configuration" not in config_text
-        assert config_text.startswith("repo:\n  name: owner/repo\n")
+        assert "Issue Orchestrator Configuration" in config_text
+        assert "repo:\n  name: owner/repo\n" in config_text
+        assert (repo_root / ".io" / "dev.md").is_file()
+        assert (repo_root / ".io" / "tech-lead.md").is_file()
+        assert Config.load(config_path).validate() == []
+
+    @pytest.mark.parametrize("stage", ["files", "labels"])
+    def test_setup_save_surfaces_required_artifact_failures(
+        self,
+        tmp_path,
+        stage,
+    ):
+        """The HTTP adapter must not convert owner failures into saved results."""
+        from issue_orchestrator.control.repository_setup import (
+            RepositorySetupExecutionError,
+        )
+
+        repo_root = tmp_path / "repo"
+        repo_root.mkdir()
+        dependencies = control_app.state.control_api_setup_dependencies
+        failure = RepositorySetupExecutionError(
+            stage=stage,
+            detail=f"{stage} failed",
+            applied_files=(repo_root / "partial",),
+            created_labels=("agent:dev",) if stage == "labels" else (),
+        )
+
+        with patch.object(
+            dependencies.setup_owner,
+            "execute",
+            side_effect=failure,
+        ):
+            response = TestClient(control_app).post(
+                "/control/setup/save",
+                json={
+                    "repo_root": str(repo_root),
+                    "repo_name": "owner/repo",
+                    "worker_agent_label": "agent:dev",
+                    "model": "sonnet",
+                    "configure_tech_lead": True,
+                },
+            )
+
+        assert response.status_code == 500
+        assert response.json() == {
+            "error": "repository_setup_failed",
+            "stage": stage,
+            "detail": f"{stage} failed",
+            "applied_files": [str(repo_root / "partial")],
+            "created_labels": ["agent:dev"] if stage == "labels" else [],
+        }

@@ -6,10 +6,13 @@
 from __future__ import annotations
 
 
+import re
+
+
 from typing import Any, Literal, TypeAlias
 
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 
@@ -785,6 +788,66 @@ class RecentE2ERunSummaryPayload(BaseModel):
 class RecentE2ERunsPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
     runs: list[RecentE2ERunSummaryPayload]
+
+class RepositorySetupCommandPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    config_name: str | None = Field(default=None, min_length=1)
+    configure_tech_lead: bool
+    create_labels: bool | None = None
+    create_prompts: bool | None = None
+    model: Literal['haiku', 'sonnet', 'opus']
+    replace_existing: bool | None = None
+    repo_name: str = Field(..., min_length=1)
+    repo_root: str = Field(..., min_length=1)
+    worker_agent_label: str
+
+    @field_validator('config_name')
+    @classmethod
+    def _validate_config_name_pattern(cls, value: Any) -> Any:
+        if value is not None and re.search('^[^/\\\\]+(?:\\.yaml)?$', value) is None:
+            raise ValueError("config_name must match '^[^/\\\\\\\\]+(?:\\\\.yaml)?$'")
+        return value
+
+    @field_validator('worker_agent_label')
+    @classmethod
+    def _validate_worker_agent_label_pattern(cls, value: Any) -> Any:
+        if value is not None and re.search('^agent:(?!tech-lead$).+', value) is None:
+            raise ValueError("worker_agent_label must match '^agent:(?!tech-lead$).+'")
+        return value
+
+class RepositorySetupConflictPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    config_path: str
+    detail: str
+    error: Literal['replace_confirmation_required']
+
+class RepositorySetupFailurePayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    applied_files: list[str]
+    created_labels: list[str]
+    detail: str
+    error: Literal['repository_setup_failed']
+    stage: Literal['planning', 'files', 'labels']
+
+class RepositorySetupFilePayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    action: Literal['create', 'overwrite']
+    agent: str | None = None
+    path: str
+    size: int | None = Field(default=None, ge=0, strict=True)
+    type: Literal['prompt'] | None = None
+
+class RepositorySetupPreviewPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    files: list[RepositorySetupFilePayload]
+    yaml: str
+
+class RepositorySetupResultPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    config_path: str
+    created_files: list[str]
+    created_labels: list[str]
+    status: Literal['saved']
 
 class RetrospectiveReviewDecisionPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")

@@ -339,18 +339,18 @@ class TestSetupWizardEndpoints:
         assert "repo_root" in data
         assert "existing_config" in data
 
-    def test_preview_endpoint_exists(self) -> None:
-        """POST /control/setup/preview endpoint exists."""
+    def test_preview_endpoint_executes_setup_command(self, tmp_path: Path) -> None:
+        """POST /control/setup/preview executes the typed setup command."""
         client = TestClient(control_app)
 
         response = client.post(
             "/control/setup/preview",
             json={
-                "repo_root": "/tmp/test",
-                "config": {
-                    "repo": {"name": "test/repo"},
-                    "agents": {"agent:dev": {"prompt": "dev.md", "model": "sonnet"}},
-                },
+                "repo_root": str(tmp_path),
+                "repo_name": "test/repo",
+                "worker_agent_label": "agent:dev",
+                "model": "sonnet",
+                "configure_tech_lead": True,
             },
         )
 
@@ -368,10 +368,10 @@ class TestSetupWizardEndpoints:
             "/control/setup/save",
             json={
                 "repo_root": str(tmp_path),
-                "config": {
-                    "repo": {"name": "test/repo"},
-                    "agents": {"agent:dev": {"prompt": ".io/dev.md", "model": "sonnet"}},
-                },
+                "repo_name": "test/repo",
+                "worker_agent_label": "agent:dev",
+                "model": "sonnet",
+                "configure_tech_lead": True,
                 "create_prompts": True,
                 "create_labels": False,  # Skip GitHub API calls
             },
@@ -415,8 +415,11 @@ agents:
         assert data["existing_config"]["repo"]["name"] == "existing/repo"
         assert "agent:backend" in data["existing_config"]["agents"]
 
-    def test_save_endpoint_updates_existing_config(self, tmp_path: Path) -> None:
-        """POST /control/setup/save can update an existing config file."""
+    def test_save_endpoint_requires_confirmation_to_replace_existing_config(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Existing configs remain unchanged until replacement is confirmed."""
         client = TestClient(control_app)
 
         # Create initial config at new location
@@ -425,18 +428,27 @@ agents:
         initial_config = "repo:\n  name: old/repo\nagents:\n  agent:old: {}\n"
         (config_dir / "default.yaml").write_text(initial_config)
 
-        # Update with new config
+        replacement = {
+            "repo_root": str(tmp_path),
+            "repo_name": "new/repo",
+            "worker_agent_label": "agent:new",
+            "model": "sonnet",
+            "configure_tech_lead": False,
+            "create_prompts": False,
+            "create_labels": False,
+        }
+        unconfirmed = client.post(
+            "/control/setup/save",
+            json=replacement,
+        )
+
+        assert unconfirmed.status_code == 409
+        assert unconfirmed.json()["error"] == "replace_confirmation_required"
+        assert (config_dir / "default.yaml").read_text() == initial_config
+
         response = client.post(
             "/control/setup/save",
-            json={
-                "repo_root": str(tmp_path),
-                "config": {
-                    "repo": {"name": "new/repo"},
-                    "agents": {"agent:new": {"prompt": "new.md", "model": "sonnet"}},
-                },
-                "create_prompts": False,
-                "create_labels": False,
-            },
+            json={**replacement, "replace_existing": True},
         )
 
         assert response.status_code == 200

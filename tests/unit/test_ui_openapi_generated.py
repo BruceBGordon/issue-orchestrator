@@ -105,6 +105,30 @@ def test_ui_openapi_generator_renders_const_enum_and_union_shapes() -> None:
     assert "export type UnionPayload = ConstEnumPayload | null;" in dts_types
 
 
+def test_ui_openapi_generator_preserves_python_regex_patterns() -> None:
+    components = [
+        ComponentSchema(
+            "PatternPayload",
+            {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["worker_agent_label"],
+                "properties": {
+                    "worker_agent_label": {
+                        "type": "string",
+                        "pattern": r"^agent:(?!tech-lead$).+",
+                    },
+                },
+            },
+        ),
+    ]
+
+    python_models = render_python_models(components)
+
+    assert "@field_validator('worker_agent_label')" in python_models
+    assert "re.search('^agent:(?!tech-lead$).+', value)" in python_models
+
+
 def test_ui_openapi_generator_renders_bare_enum_component_as_reusable_alias() -> None:
     """A top-level ``enum`` component (e.g. ``TimelineView``) must render as
     a reusable ``Literal``/``type`` alias, not an empty Pydantic model, and

@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-import io
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Iterable, Mapping
+from typing import TYPE_CHECKING, Any, Iterable, Literal, Mapping
 from urllib.parse import urlparse
 
 import yaml
@@ -15,8 +14,13 @@ from ..control.label_manager import (
     TECH_LEAD_NEEDS_HUMAN_LABEL,
     tech_lead_issue_label_metadata,
 )
+from ..execution.repository_setup_artifacts import (
+    CONFIG_HEADER,
+    plan_missing_setup_prompts,
+    render_setup_config_yaml,
+)
 from ..infra.config_value_rules import resolve_tech_lead_watch_label
-from .setup_wizard_prompts import (
+from ..execution.setup_wizard_prompts import (
     build_code_review_prompt_text,
     build_starter_prompt_text,
     build_tech_lead_review_prompt_text,
@@ -32,7 +36,7 @@ class PlannedWrite:
 
     path: Path
     content: str
-    action: str
+    action: Literal["create", "overwrite"]
     kind: str | None = None
     agent: str | None = None
 
@@ -55,7 +59,7 @@ class FileCollector:
         self,
         path: Path,
         content: str,
-        action: str = "create",
+        action: Literal["create", "overwrite"] = "create",
         *,
         kind: str | None = None,
         agent: str | None = None,
@@ -76,11 +80,11 @@ class FileCollector:
         self.labels.append((name, color, description))
 
 
-def get_repository_host(repo: str):
+def get_repository_host(repo_name: str):
     """Get a RepositoryHost for the given repo."""
     from ..execution.providers import create_repository_host
 
-    return create_repository_host(repo=repo)
+    return create_repository_host(repo=repo_name)
 
 
 def run_git(
@@ -231,47 +235,13 @@ def find_prompt_candidates(start_path: Path | None = None) -> list[Path]:
     return sorted(set(candidates))
 
 
-class _NoAliasDumper(yaml.SafeDumper):
-    """YAML dumper that disables anchors and aliases."""
-
-    def ignore_aliases(self, data: Any) -> bool:
-        return True
-
-
-CONFIG_HEADER = """\
-# Issue Orchestrator Configuration
-#
-# Template variables for initial_prompt and command:
-#   {issue_number}    - GitHub issue number
-#   {issue_title}     - Issue title
-#   {prompt}          - Path to prompt file
-#   {worktree}        - Path to worktree
-#   {model}           - Model name from agent config
-#   {permission_mode} - Claude permission mode
-#   {pr_number}       - PR number (review/rework sessions only)
-#
-# See: https://github.com/anthropics/issue-orchestrator
-
-"""
-
-
 def render_config_yaml(
     config: Mapping[str, Any],
     *,
     include_header: bool = True,
 ) -> str:
     """Render config to YAML with stable formatting."""
-    buffer = io.StringIO()
-    yaml.dump(
-        dict(config),
-        buffer,
-        Dumper=_NoAliasDumper,
-        default_flow_style=False,
-        sort_keys=False,
-        allow_unicode=True,
-    )
-    content = buffer.getvalue()
-    return CONFIG_HEADER + content if include_header else content
+    return render_setup_config_yaml(config, include_header=include_header)
 
 
 def write_config(
@@ -347,58 +317,20 @@ def write_missing_setup_prompts(
     file_collector: FileCollector | None = None,
 ) -> list[Path]:
     """Create or collect any missing prompt files referenced by the config."""
-    review_config = config.get("review", {}) or {}
-    code_review_agent = review_config.get("default")
-    code_review_label = review_config.get("code_review_label", "needs-code-review")
-    code_reviewed_label = review_config.get("code_reviewed_label", "code-reviewed")
-    tech_lead_review_agent = review_config.get("tech_lead_review_agent")
-    tech_lead_reviewed_label = review_config.get("tech_lead_reviewed_label", "tech-lead-reviewed")
-    tech_lead_watch_label = resolve_tech_lead_watch_label(
-        review_config.get("tech_lead_review_label"), code_reviewed_label
-    )
-
-    created_paths: list[Path] = []
-    for agent_name, agent_config in (config.get("agents", {}) or {}).items():
-        if not isinstance(agent_config, Mapping):
-            continue
-        prompt_rel = agent_config.get("prompt", "")
-        if not isinstance(prompt_rel, str) or not prompt_rel:
-            continue
-
-        prompt_path = Path(prompt_rel)
-        if not prompt_path.is_absolute():
-            prompt_path = repo_root / prompt_path
-        if prompt_path.exists():
-            continue
-
-        is_code_review_agent = (
-            agent_name == code_review_agent or agent_name.lower() == "agent:reviewer"
-        )
-        is_tech_lead_review_agent = (
-            agent_name == tech_lead_review_agent or "tech_lead" in agent_name.lower()
-        )
-
-        if is_code_review_agent:
-            create_code_review_prompt(
-                prompt_path,
-                code_review_label,
-                code_reviewed_label,
-                file_collector=file_collector,
-                agent_name=agent_name,
+    planned = plan_missing_setup_prompts(config, repo_root)
+    for prompt in planned:
+        if file_collector is not None:
+            file_collector.add_write(
+                prompt.path,
+                prompt.content,
+                "create",
+                kind="prompt",
+                agent=prompt.agent,
             )
-        elif is_tech_lead_review_agent:
-            create_tech_lead_review_prompt(
-                prompt_path,
-                tech_lead_watch_label,
-                tech_lead_reviewed_label,
-                file_collector=file_collector,
-                agent_name=agent_name,
-            )
-        else:
-            create_starter_prompt(agent_name, prompt_path, file_collector=file_collector)
-        created_paths.append(prompt_path)
-
-    return created_paths
+            continue
+        prompt.path.parent.mkdir(parents=True, exist_ok=True)
+        prompt.path.write_text(prompt.content)
+    return [prompt.path for prompt in planned]
 
 
 def plan_setup_labels(
@@ -497,13 +429,27 @@ def _plan_setup_labels(
         observation_color, observation_description = tech_lead_issue_label_metadata(
             TECH_LEAD_OBSERVATION_LABEL
         )
+        tech_lead_watch_label = resolve_tech_lead_watch_label(
+            review_config.get("tech_lead_review_label"),
+            review_config.get("code_reviewed_label"),
+        )
 
         all_labels.extend(
             [
                 (
+                    tech_lead_watch_label,
+                    "7057FF",
+                    "PR needs tech-lead review",
+                ),
+                (
                     review_config.get("tech_lead_reviewed_label", "tech-lead-reviewed"),
                     "1D76DB",
                     "PR has been tech_lead reviewed",
+                ),
+                (
+                    review_config.get("tech_lead_failed_label", "tech-lead-failed"),
+                    "B60205",
+                    "Tech-lead review failed",
                 ),
                 # Gate label for act-level tech_lead proposals (#6779 R3): a fresh
                 # install must provision it, else a proposal issue is created
@@ -530,7 +476,10 @@ def _plan_setup_labels(
             ]
         )
 
-    return all_labels
+    unique_labels: dict[str, tuple[str, str, str]] = {}
+    for label in all_labels:
+        unique_labels.setdefault(label[0], label)
+    return list(unique_labels.values())
 
 
 def required_repo_labels(config: "Config") -> list[str]:
@@ -567,7 +516,9 @@ def required_repo_labels(config: "Config") -> list[str]:
             label
             for label in (
                 config.tech_lead_review_agent,
+                config.tech_lead_watch_label,
                 config.tech_lead_reviewed_label,
+                config.tech_lead_failed_label,
                 PROPOSED_TECH_LEAD_LABEL,
                 HEALTH_REVIEW_MARKER_LABEL,
                 TECH_LEAD_OBSERVATION_LABEL,

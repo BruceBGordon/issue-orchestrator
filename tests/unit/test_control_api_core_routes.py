@@ -296,6 +296,8 @@ class TestControlCenterTemplate:
         assert 'href="/static/css/control_center.css?v=' in body
         assert 'href="/static/css/control_center_setup.css?v=' in body
         assert 'src="/static/js/browser_auth.js?v=' in body
+        assert 'src="/static/js/control_center_setup_commands.js?v=' in body
+        assert 'src="/static/js/control_center_setup.js?v=' in body
         assert 'src="/static/js/control_center.js?v=' in body
         assert "Closing this window does not stop repository engines" in body
         assert ">Stopped<" not in body
@@ -361,6 +363,12 @@ class TestControlCenterTemplate:
     def test_control_center_static_assets_are_served(self, client_without_orchestrator):
         css_response = client_without_orchestrator.get("/static/css/control_center.css")
         browser_auth_response = client_without_orchestrator.get("/static/js/browser_auth.js")
+        setup_commands_response = client_without_orchestrator.get(
+            "/static/js/control_center_setup_commands.js"
+        )
+        setup_response = client_without_orchestrator.get(
+            "/static/js/control_center_setup.js"
+        )
         js_response = client_without_orchestrator.get("/static/js/control_center.js")
         logo_response = client_without_orchestrator.get("/static/brand/logo.svg")
 
@@ -368,6 +376,10 @@ class TestControlCenterTemplate:
         assert "--sidebar-width" in css_response.text
         assert browser_auth_response.status_code == 200
         assert "openAuthenticatedSseStream" in browser_auth_response.text
+        assert setup_commands_response.status_code == 200
+        assert "buildSetupPreviewRequest" in setup_commands_response.text
+        assert setup_response.status_code == 200
+        assert "createControlCenterSetupWizard" in setup_response.text
         assert js_response.status_code == 200
         assert "start_paused: startPaused" in js_response.text
         assert logo_response.status_code == 200

@@ -778,6 +778,52 @@ export interface RecentE2ERunsPayload {
   runs: RecentE2ERunSummaryPayload[];
 }
 
+export interface RepositorySetupCommandPayload {
+  config_name?: string;
+  configure_tech_lead: boolean;
+  create_labels?: boolean;
+  create_prompts?: boolean;
+  model: "haiku" | "sonnet" | "opus";
+  replace_existing?: boolean;
+  repo_name: string;
+  repo_root: string;
+  worker_agent_label: string;
+}
+
+export interface RepositorySetupConflictPayload {
+  config_path: string;
+  detail: string;
+  error: "replace_confirmation_required";
+}
+
+export interface RepositorySetupFailurePayload {
+  applied_files: string[];
+  created_labels: string[];
+  detail: string;
+  error: "repository_setup_failed";
+  stage: "planning" | "files" | "labels";
+}
+
+export interface RepositorySetupFilePayload {
+  action: "create" | "overwrite";
+  agent?: string;
+  path: string;
+  size?: number;
+  type?: "prompt";
+}
+
+export interface RepositorySetupPreviewPayload {
+  files: RepositorySetupFilePayload[];
+  yaml: string;
+}
+
+export interface RepositorySetupResultPayload {
+  config_path: string;
+  created_files: string[];
+  created_labels: string[];
+  status: "saved";
+}
+
 export interface RetrospectiveReviewDecisionPayload {
   action: string;
   agent_label: string | null;

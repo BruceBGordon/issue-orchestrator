@@ -23,6 +23,11 @@ from issue_orchestrator.contracts.ui_openapi_models import (
     E2ERunTimelinePayload,
     IssueDetailActionPayload,
     IssueDetailPayload,
+    RepositorySetupCommandPayload,
+    RepositorySetupConflictPayload,
+    RepositorySetupFailurePayload,
+    RepositorySetupPreviewPayload,
+    RepositorySetupResultPayload,
     ViewModelSnapshotPayload,
 )
 from issue_orchestrator.domain.issue_key import FakeIssueKey
@@ -196,6 +201,79 @@ def _e2e_timeline_cycle(*events: dict[str, object]) -> dict[str, object]:
         "events": list(events),
         "summary": "E2E execution",
     }
+
+
+def test_repository_setup_command_and_results_match_ui_openapi() -> None:
+    command = {
+        "repo_root": "/repos/porchpin",
+        "repo_name": "owner/porchpin",
+        "worker_agent_label": "agent:dev",
+        "model": "sonnet",
+        "configure_tech_lead": True,
+        "config_name": "default.yaml",
+        "create_prompts": True,
+        "create_labels": True,
+        "replace_existing": False,
+    }
+    preview = {
+        "yaml": "repo:\n  name: owner/porchpin\n",
+        "files": [
+            {
+                "path": "/repos/porchpin/.issue-orchestrator/config/default.yaml",
+                "action": "create",
+                "size": 33,
+            },
+            {
+                "path": "/repos/porchpin/.io/tech-lead.md",
+                "action": "create",
+                "type": "prompt",
+                "agent": "agent:tech-lead",
+            },
+        ],
+    }
+    result = {
+        "status": "saved",
+        "config_path": "/repos/porchpin/.issue-orchestrator/config/default.yaml",
+        "created_files": ["/repos/porchpin/.io/tech-lead.md"],
+        "created_labels": ["agent:tech-lead", "needs-tech-lead-review"],
+    }
+    conflict = {
+        "error": "replace_confirmation_required",
+        "detail": "Replacement confirmation is required",
+        "config_path": "/repos/porchpin/.issue-orchestrator/config/default.yaml",
+    }
+    failure = {
+        "error": "repository_setup_failed",
+        "stage": "labels",
+        "detail": "GitHub unavailable",
+        "applied_files": [
+            "/repos/porchpin/.issue-orchestrator/config/default.yaml",
+        ],
+        "created_labels": ["agent:dev"],
+    }
+
+    for schema_name, model, payload in (
+        ("RepositorySetupCommandPayload", RepositorySetupCommandPayload, command),
+        ("RepositorySetupConflictPayload", RepositorySetupConflictPayload, conflict),
+        ("RepositorySetupFailurePayload", RepositorySetupFailurePayload, failure),
+        ("RepositorySetupPreviewPayload", RepositorySetupPreviewPayload, preview),
+        ("RepositorySetupResultPayload", RepositorySetupResultPayload, result),
+    ):
+        _validator(schema_name).validate(payload)
+        model.model_validate(payload)
+
+    malformed = {**command, "config": {"agents": {}}}
+    with pytest.raises(JsonSchemaValidationError):
+        _validator("RepositorySetupCommandPayload").validate(malformed)
+    with pytest.raises(ValueError):
+        RepositorySetupCommandPayload.model_validate(malformed)
+
+    for invalid_label in ("agent:", "agent:tech-lead"):
+        malformed_label = {**command, "worker_agent_label": invalid_label}
+        with pytest.raises(JsonSchemaValidationError):
+            _validator("RepositorySetupCommandPayload").validate(malformed_label)
+        with pytest.raises(ValueError):
+            RepositorySetupCommandPayload.model_validate(malformed_label)
 
 
 def test_dashboard_view_model_matches_ui_openapi() -> None:

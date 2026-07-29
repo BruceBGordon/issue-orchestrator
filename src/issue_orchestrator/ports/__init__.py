@@ -39,6 +39,38 @@ _EXPORTS = {
     "NullSessionRunner": (".session_runner", "NullSessionRunner"),
     "RepositoryHost": (".repository_host", "RepositoryHost"),
     "RepositoryHostError": (".repository_host", "RepositoryHostError"),
+    "RepositorySetupArtifactPlan": (
+        ".repository_setup",
+        "RepositorySetupArtifactPlan",
+    ),
+    "RepositorySetupConfigTarget": (
+        ".repository_setup",
+        "RepositorySetupConfigTarget",
+    ),
+    "RepositorySetupExplicitConfig": (
+        ".repository_setup",
+        "RepositorySetupExplicitConfig",
+    ),
+    "RepositorySetupFileSystem": (
+        ".repository_setup",
+        "RepositorySetupFileSystem",
+    ),
+    "RepositorySetupFileSystemError": (
+        ".repository_setup",
+        "RepositorySetupFileSystemError",
+    ),
+    "RepositorySetupHostFactory": (
+        ".repository_setup",
+        "RepositorySetupHostFactory",
+    ),
+    "RepositorySetupNamedConfig": (
+        ".repository_setup",
+        "RepositorySetupNamedConfig",
+    ),
+    "RepositorySetupPlannedFile": (
+        ".repository_setup",
+        "RepositorySetupPlannedFile",
+    ),
     "IssueResolver": (".issue_resolver", "IssueResolver"),
     "StackPredecessorFactsProvider": (
         ".stack_predecessor_facts", "StackPredecessorFactsProvider",
@@ -132,6 +164,14 @@ __all__ = (
     "NullSessionRunner",
     "RepositoryHost",
     "RepositoryHostError",
+    "RepositorySetupArtifactPlan",
+    "RepositorySetupConfigTarget",
+    "RepositorySetupExplicitConfig",
+    "RepositorySetupFileSystem",
+    "RepositorySetupFileSystemError",
+    "RepositorySetupHostFactory",
+    "RepositorySetupNamedConfig",
+    "RepositorySetupPlannedFile",
     "IssueResolver",
     "StackPredecessorFactsProvider",
     "BoardSnapshotProvider",

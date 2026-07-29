@@ -613,6 +613,21 @@ class TestSetupWizardSharedHelpers:
         assert "coding-done completed" in tech_lead_content
         assert "reviewer-done" not in tech_lead_content
 
+    def test_write_missing_setup_prompts_preserves_first_shared_target(self, tmp_path):
+        """Compatibility writes should apply each resolved prompt target once."""
+        config = {
+            "agents": {
+                "agent:frontend": {"prompt": ".io/shared.md"},
+                "agent:backend": {"prompt": ".io/../.io/shared.md"},
+            },
+        }
+
+        created_paths = write_missing_setup_prompts(config, tmp_path)
+
+        shared_path = (tmp_path / ".io" / "shared.md").resolve()
+        assert created_paths == [shared_path]
+        assert "# Frontend Agent Prompt" in shared_path.read_text()
+
     def test_plan_setup_labels_matches_cli_defaults(self):
         """CLI setup should keep priority labels and default-agent review gating."""
         labels = plan_setup_labels({
@@ -627,7 +642,9 @@ class TestSetupWizardSharedHelpers:
             },
         })
 
-        label_names = {name for name, _, _ in labels}
+        ordered_label_names = [name for name, _, _ in labels]
+        label_names = set(ordered_label_names)
+        assert len(ordered_label_names) == len(label_names)
         assert "agent:backend" in label_names
         assert "agent:reviewer" in label_names
         assert "priority:high" in label_names
@@ -636,12 +653,18 @@ class TestSetupWizardSharedHelpers:
         assert "needs-code-review" in label_names
         assert "code-reviewed" in label_names
         assert "tech-lead-reviewed" in label_names
+        assert "tech-lead-failed" in label_names
         # R3: a tech-lead-enabled config provisions the act-level proposal gate
         # (raw, never prefixed), health-review marker, and the static blocking
         # observation marker. Dynamic area:* labels are provisioned at apply.
         assert "proposed-tech-lead" in label_names
         assert "tech_lead:health-review" in label_names
         assert "tech-lead-observation" in label_names
+        assert next(label for label in labels if label[0] == "code-reviewed") == (
+            "code-reviewed",
+            "0E8A16",
+            "PR has been code reviewed",
+        )
 
     def test_plan_setup_labels_omits_gate_without_tech_lead(self):
         """No tech lead agent -> no gate label to provision."""
@@ -665,12 +688,17 @@ class TestSetupWizardSharedHelpers:
         config = Config()
         config.agents = {"agent:backend": Mock()}
         config.tech_lead_review_agent = "agent:tech-lead"
+        config.tech_lead_review_label = "needs-tech-lead-review"
         config.tech_lead_reviewed_label = "tech-lead-reviewed"
+        config.tech_lead_failed_label = "tech-lead-failed"
 
         labels = required_repo_labels(config)
 
         assert "proposed-tech-lead" in labels
         assert "agent:tech-lead" in labels
+        assert "needs-tech-lead-review" in labels
+        assert "tech-lead-reviewed" in labels
+        assert "tech-lead-failed" in labels
         assert "tech_lead:health-review" in labels
         assert "tech-lead-observation" in labels
         assert "agent:backend" in labels
@@ -1597,8 +1625,10 @@ class TestRunWizard:
             False,                  # Set up AI provider API keys now?
         ])
 
+        host = Mock()
+        host.list_labels.return_value = []
         with patch("issue_orchestrator.entrypoints.cli_tools.setup_wizard.detect_repo", return_value="owner/repo"):
-            with patch("issue_orchestrator.entrypoints.cli_tools.setup_wizard._get_repository_host", return_value=Mock()):
+            with patch("issue_orchestrator.entrypoints.cli_tools.setup_wizard._get_repository_host", return_value=host):
                 with patch("issue_orchestrator.entrypoints.cli_tools.setup_wizard.offer_readiness_assessment"):
                     run_wizard(target_path=target, prompter=prompter)
 
