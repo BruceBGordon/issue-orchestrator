@@ -77,6 +77,9 @@ def run_doctor(
     result.checks.extend(_timed("repository_config", config_checks.check_repository_config, config))
     result.checks.extend(_timed("worktree_remediation", config_checks.check_worktree_remediation, config))
     result.checks.extend(_timed("milestone_order", milestone_checks.check_milestone_order, config))
+    result.checks.extend(_timed(
+        "foundation_milestone", milestone_checks.check_foundation_milestone, config
+    ))
 
     result.checks.extend(_timed(
         "working_directory", workspace.check_working_directory, runner, config.repo_root
