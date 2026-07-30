@@ -959,7 +959,21 @@ class GitHubHttpClient:
                     response_text=response.text,
                 )
             batch = response.json()
-            if not isinstance(batch, list) or not batch:
+            if not isinstance(batch, list):
+                # A 2xx carrying a non-list body is a contract violation, NOT
+                # exhaustion. Treating it as the end of the list would hand the
+                # caller a silently truncated result under a method that
+                # promises completeness — the exact failure this pager exists to
+                # make impossible. Only an empty list is valid exhaustion.
+                raise GitHubHttpError(
+                    f"GitHub returned a non-list body while paging {what}"
+                    f" (page {page}); refusing to treat it as an exhausted list",
+                    method="GET",
+                    url=path,
+                    status_code=response.status_code,
+                    response_text=response.text,
+                )
+            if not batch:
                 return
             yield batch
             if len(batch) < per_page:  # short page => exhausted, list is complete

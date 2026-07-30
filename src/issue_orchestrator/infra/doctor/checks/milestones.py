@@ -181,7 +181,12 @@ def _unavailable(wants_order: bool, foundation: str, reason: str) -> list[Check]
 def check_milestones(config: Config) -> list[Check]:
     """Evaluate every milestone rule from a single authoritative snapshot."""
     wants_order = bool(config.milestone_order)
-    foundation = (config.foundation_milestone or "").strip()
+    # NOT normalised. Runtime scoping compares config.foundation_milestone by
+    # exact equality, so stripping here would make the doctor agree with a
+    # configuration runtime rejects: `" M0 "` against a real `"M0"` would report
+    # ok while every edge still evaluated CROSS_MILESTONE. A diagnostic that
+    # normalises differently from the code it diagnoses is worse than none.
+    foundation = config.foundation_milestone or ""
     if not wants_order and not foundation:
         return []
 

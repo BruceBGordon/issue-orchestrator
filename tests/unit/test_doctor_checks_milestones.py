@@ -325,3 +325,26 @@ def test_both_rules_share_one_fetch(monkeypatch):
     assert calls == ["list_all_milestones"]
     assert _by_name(checks, "Milestone Order").status == "ok"
     assert _by_name(checks, "Foundation Milestone").status == "ok"
+
+
+def test_foundation_is_not_normalized_before_comparison(monkeypatch):
+    """A padded config value must NOT be reported ok against an unpadded title.
+
+    Runtime scoping compares ``config.foundation_milestone`` by exact equality,
+    so stripping here would make the doctor bless a configuration runtime
+    rejects: ' M0 ' against a real 'M0' would report ok while every dependency
+    edge still evaluated CROSS_MILESTONE. A diagnostic that normalises
+    differently from the code it diagnoses is worse than no diagnostic.
+    """
+    cfg = Config()
+    cfg.repo = "owner/repo"
+    cfg.foundation_milestone = " M0 "
+
+    monkeypatch.setattr(milestone_checks, "build_github_auth", lambda **_kw: object())
+    monkeypatch.setattr(milestone_checks, "GitHubHttpClient", _client_returning(["M0"]))
+
+    check = _by_name(milestone_checks.check_milestones(cfg), "Foundation Milestone")
+
+    assert check.status == "warning"
+    assert check.expandable["configured"] == " M0 "
+    assert check.expandable["suggestion"] == "M0"
