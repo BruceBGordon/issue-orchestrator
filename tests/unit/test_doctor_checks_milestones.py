@@ -1,91 +1,28 @@
 """Unit tests for milestone doctor checks."""
 
+import pytest
+
+from issue_orchestrator.adapters.github.errors import (
+    GitHubHttpError,
+    GitHubTransportError,
+)
 from issue_orchestrator.infra.config import Config
 from issue_orchestrator.infra.doctor.checks import milestones as milestone_checks
 
 
-def test_check_milestone_order_skips_when_empty():
-    cfg = Config()
-    cfg.milestone_order = []
+def _client_returning(titles, *, record=None):
+    """Client stub whose all-milestones read returns *titles*.
 
-    checks = milestone_checks.check_milestone_order(cfg)
-
-    assert checks == []
-
-
-def test_check_milestone_order_errors_without_repo(monkeypatch):
-    cfg = Config()
-    cfg.milestone_order = ["M1"]
-    cfg.repo = None
-
-    def _raise_repo_error():
-        raise milestone_checks.GitRepoError("missing")
-
-    monkeypatch.setattr(milestone_checks, "get_repo_from_git", _raise_repo_error)
-
-    checks = milestone_checks.check_milestone_order(cfg)
-
-    assert checks[0].status == "error"
-    assert "milestones.order" in checks[0].detail
-
-
-def test_check_milestone_order_errors_when_missing(monkeypatch):
-    cfg = Config()
-    cfg.milestone_order = ["M1", "M2"]
-    cfg.repo = "owner/repo"
-
-    monkeypatch.setattr(milestone_checks, "build_github_auth", lambda **_kw: object())
-
+    Mirrors the real contract: ``list_all_milestones`` is the exhaustive,
+    all-state reader, so the stub deliberately exposes only that method.
+    """
     class _Client:
         def __init__(self, _config):
             pass
 
-        def list_milestones(self, state="open"):
-            assert state == "open"
-            return [{"title": "M1", "number": 1}]
-
-        def close(self):
-            pass
-
-    monkeypatch.setattr(milestone_checks, "GitHubHttpClient", _Client)
-
-    checks = milestone_checks.check_milestone_order(cfg)
-
-    assert checks[0].status == "error"
-    assert "M2" in checks[0].detail
-
-
-def test_check_milestone_order_ok_when_all_found(monkeypatch):
-    cfg = Config()
-    cfg.milestone_order = ["M1"]
-    cfg.repo = "owner/repo"
-
-    monkeypatch.setattr(milestone_checks, "build_github_auth", lambda **_kw: object())
-
-    class _Client:
-        def __init__(self, _config):
-            pass
-
-        def list_milestones(self, state="open"):
-            return [{"title": "M1", "number": 1}]
-
-        def close(self):
-            pass
-
-    monkeypatch.setattr(milestone_checks, "GitHubHttpClient", _Client)
-
-    checks = milestone_checks.check_milestone_order(cfg)
-
-    assert checks[0].status == "ok"
-
-
-def _client_returning(titles):
-    class _Client:
-        def __init__(self, _config):
-            pass
-
-        def list_milestones(self, state="open"):
-            assert state == "open"
+        def list_all_milestones(self):
+            if record is not None:
+                record.append("list_all_milestones")
             return [{"title": t, "number": i} for i, t in enumerate(titles, 1)]
 
         def close(self):
@@ -94,7 +31,83 @@ def _client_returning(titles):
     return _Client
 
 
-def test_check_foundation_milestone_ok_when_exact_match(monkeypatch):
+def _client_raising(exc):
+    class _Client:
+        def __init__(self, _config):
+            pass
+
+        def list_all_milestones(self):
+            raise exc
+
+        def close(self):
+            pass
+
+    return _Client
+
+
+def _by_name(checks, name):
+    return next((c for c in checks if c.name == name), None)
+
+
+# --------------------------------------------------------------- order rule
+
+def test_skips_entirely_when_nothing_configured():
+    cfg = Config()
+    cfg.milestone_order = []
+    cfg.foundation_milestone = ""
+
+    assert milestone_checks.check_milestones(cfg) == []
+
+
+def test_order_errors_without_repo(monkeypatch):
+    cfg = Config()
+    cfg.milestone_order = ["M1"]
+    cfg.foundation_milestone = ""
+    cfg.repo = None
+
+    def _raise_repo_error():
+        raise milestone_checks.GitRepoError("missing")
+
+    monkeypatch.setattr(milestone_checks, "get_repo_from_git", _raise_repo_error)
+
+    checks = milestone_checks.check_milestones(cfg)
+
+    assert checks[0].status == "error"
+    assert "without a repository" in checks[0].detail
+
+
+def test_order_errors_when_missing(monkeypatch):
+    cfg = Config()
+    cfg.milestone_order = ["M1", "M2"]
+    cfg.foundation_milestone = ""
+    cfg.repo = "owner/repo"
+
+    monkeypatch.setattr(milestone_checks, "build_github_auth", lambda **_kw: object())
+    monkeypatch.setattr(milestone_checks, "GitHubHttpClient", _client_returning(["M1"]))
+
+    checks = milestone_checks.check_milestones(cfg)
+
+    assert checks[0].status == "error"
+    assert "M2" in checks[0].detail
+
+
+def test_order_ok_when_all_found(monkeypatch):
+    cfg = Config()
+    cfg.milestone_order = ["M1"]
+    cfg.foundation_milestone = ""
+    cfg.repo = "owner/repo"
+
+    monkeypatch.setattr(milestone_checks, "build_github_auth", lambda **_kw: object())
+    monkeypatch.setattr(milestone_checks, "GitHubHttpClient", _client_returning(["M1", "M2"]))
+
+    checks = milestone_checks.check_milestones(cfg)
+
+    assert checks[0].status == "ok"
+
+
+# ---------------------------------------------------------- foundation rule
+
+def test_foundation_ok_when_exact_match(monkeypatch):
     cfg = Config()
     cfg.repo = "owner/repo"
     cfg.foundation_milestone = "M0"
@@ -102,18 +115,53 @@ def test_check_foundation_milestone_ok_when_exact_match(monkeypatch):
     monkeypatch.setattr(milestone_checks, "build_github_auth", lambda **_kw: object())
     monkeypatch.setattr(milestone_checks, "GitHubHttpClient", _client_returning(["M0", "M1"]))
 
-    checks = milestone_checks.check_foundation_milestone(cfg)
-
-    assert checks[0].status == "ok"
+    assert _by_name(milestone_checks.check_milestones(cfg), "Foundation Milestone").status == "ok"
 
 
-def test_check_foundation_milestone_warns_and_suggests_on_suffix_mismatch(monkeypatch):
-    """The realistic failure: config says 'M0', the milestone is 'M0 - Foundation'.
+def test_foundation_ok_when_milestone_is_closed(monkeypatch):
+    """A CLOSED foundation is still valid.
 
-    Exact-equality scoping means this silently blocks every cross-milestone
-    dependency on the intended foundation, so the check must both fire and name
-    the milestone the user probably meant.
+    Milestone scope is evaluated before issue state, so dependency edges into a
+    closed foundation still resolve. Reading only open milestones would report a
+    correct configuration as broken.
     """
+    cfg = Config()
+    cfg.repo = "owner/repo"
+    cfg.foundation_milestone = "M0"
+
+    class _ClosedOnly:
+        def __init__(self, _config):
+            pass
+
+        def list_all_milestones(self):
+            return [{"title": "M0", "number": 1, "state": "closed"}]
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(milestone_checks, "build_github_auth", lambda **_kw: object())
+    monkeypatch.setattr(milestone_checks, "GitHubHttpClient", _ClosedOnly)
+
+    assert _by_name(milestone_checks.check_milestones(cfg), "Foundation Milestone").status == "ok"
+
+
+def test_foundation_found_beyond_first_page(monkeypatch):
+    """The reader is exhaustive, so a title on page 2 must still be found."""
+    cfg = Config()
+    cfg.repo = "owner/repo"
+    cfg.foundation_milestone = "M0 - Foundation"
+
+    # 100 fillers (a full first page) followed by the real foundation.
+    titles = [f"Filler {i}" for i in range(100)] + ["M0 - Foundation"]
+
+    monkeypatch.setattr(milestone_checks, "build_github_auth", lambda **_kw: object())
+    monkeypatch.setattr(milestone_checks, "GitHubHttpClient", _client_returning(titles))
+
+    assert _by_name(milestone_checks.check_milestones(cfg), "Foundation Milestone").status == "ok"
+
+
+def test_foundation_warns_and_suggests_on_suffix_mismatch(monkeypatch):
+    """The realistic failure: config says 'M0', the milestone is 'M0 - Foundation'."""
     cfg = Config()
     cfg.repo = "owner/repo"
     cfg.foundation_milestone = "M0"
@@ -124,15 +172,55 @@ def test_check_foundation_milestone_warns_and_suggests_on_suffix_mismatch(monkey
         _client_returning(["M0 - Foundation", "M1 - Surfaces"]),
     )
 
-    checks = milestone_checks.check_foundation_milestone(cfg)
+    check = _by_name(milestone_checks.check_milestones(cfg), "Foundation Milestone")
 
-    assert checks[0].status == "warning"
-    assert "M0 - Foundation" in checks[0].detail
-    assert "Did you mean" in checks[0].detail
-    assert checks[0].expandable["suggestion"] == "M0 - Foundation"
+    assert check.status == "warning"
+    assert "Did you mean 'M0 - Foundation'?" in check.detail
+    assert check.expandable["suggestion"] == "M0 - Foundation"
 
 
-def test_check_foundation_milestone_warns_without_suggestion_when_nothing_close(monkeypatch):
+def test_foundation_presents_ambiguity_instead_of_guessing(monkeypatch):
+    """Several prefix matches must not become a confident wrong recommendation."""
+    cfg = Config()
+    cfg.repo = "owner/repo"
+    cfg.foundation_milestone = "M0"
+
+    monkeypatch.setattr(milestone_checks, "build_github_auth", lambda **_kw: object())
+    monkeypatch.setattr(
+        milestone_checks, "GitHubHttpClient",
+        _client_returning(["M0 - Foundation", "M0 - Platform"]),
+    )
+
+    check = _by_name(milestone_checks.check_milestones(cfg), "Foundation Milestone")
+
+    assert check.status == "warning"
+    assert "Did you mean" not in check.detail
+    assert "Closest matches:" in check.detail
+    assert check.expandable["suggestion"] is None
+    assert check.expandable["ambiguous_candidates"] == ["M0 - Foundation", "M0 - Platform"]
+
+
+def test_foundation_suggestion_is_deterministic_across_set_orderings(monkeypatch):
+    """Set iteration order must not leak into the suggestion."""
+    cfg = Config()
+    cfg.repo = "owner/repo"
+    cfg.foundation_milestone = "M0"
+
+    monkeypatch.setattr(milestone_checks, "build_github_auth", lambda **_kw: object())
+    results = set()
+    for ordering in (
+        ["M0 - Foundation", "M0 - Platform", "Z"],
+        ["Z", "M0 - Platform", "M0 - Foundation"],
+        ["M0 - Platform", "Z", "M0 - Foundation"],
+    ):
+        monkeypatch.setattr(milestone_checks, "GitHubHttpClient", _client_returning(ordering))
+        check = _by_name(milestone_checks.check_milestones(cfg), "Foundation Milestone")
+        results.add((check.expandable["suggestion"], tuple(check.expandable["ambiguous_candidates"])))
+
+    assert len(results) == 1
+
+
+def test_foundation_warns_without_suggestion_when_nothing_close(monkeypatch):
     cfg = Config()
     cfg.repo = "owner/repo"
     cfg.foundation_milestone = "M0"
@@ -140,14 +228,14 @@ def test_check_foundation_milestone_warns_without_suggestion_when_nothing_close(
     monkeypatch.setattr(milestone_checks, "build_github_auth", lambda **_kw: object())
     monkeypatch.setattr(milestone_checks, "GitHubHttpClient", _client_returning(["Backlog", "Icebox"]))
 
-    checks = milestone_checks.check_foundation_milestone(cfg)
+    check = _by_name(milestone_checks.check_milestones(cfg), "Foundation Milestone")
 
-    assert checks[0].status == "warning"
-    assert "Did you mean" not in checks[0].detail
-    assert checks[0].expandable["suggestion"] is None
+    assert check.status == "warning"
+    assert "Did you mean" not in check.detail
+    assert check.expandable["suggestion"] is None
 
 
-def test_check_foundation_milestone_skips_when_repo_has_no_milestones(monkeypatch):
+def test_foundation_silent_when_repo_has_no_milestones(monkeypatch):
     """A repo that does not use milestones cannot be affected, so stay quiet."""
     cfg = Config()
     cfg.repo = "owner/repo"
@@ -156,24 +244,31 @@ def test_check_foundation_milestone_skips_when_repo_has_no_milestones(monkeypatc
     monkeypatch.setattr(milestone_checks, "build_github_auth", lambda **_kw: object())
     monkeypatch.setattr(milestone_checks, "GitHubHttpClient", _client_returning([]))
 
-    assert milestone_checks.check_foundation_milestone(cfg) == []
+    assert milestone_checks.check_milestones(cfg) == []
 
 
-def test_check_foundation_milestone_silent_without_repo(monkeypatch):
+# ------------------------------------------------------------ failure paths
+
+@pytest.mark.parametrize("exc", [
+    GitHubHttpError("boom", method="GET", url="/milestones", status_code=500),
+    GitHubTransportError("network down", method="GET", url="/milestones"),
+])
+def test_expected_github_failures_are_reported_not_swallowed(monkeypatch, exc):
+    """Returning [] would be indistinguishable from 'configuration is fine'."""
     cfg = Config()
-    cfg.repo = None
+    cfg.repo = "owner/repo"
     cfg.foundation_milestone = "M0"
 
-    def _raise_repo_error():
-        raise milestone_checks.GitRepoError("missing")
+    monkeypatch.setattr(milestone_checks, "build_github_auth", lambda **_kw: object())
+    monkeypatch.setattr(milestone_checks, "GitHubHttpClient", _client_raising(exc))
 
-    monkeypatch.setattr(milestone_checks, "get_repo_from_git", _raise_repo_error)
+    check = _by_name(milestone_checks.check_milestones(cfg), "Foundation Milestone")
 
-    assert milestone_checks.check_foundation_milestone(cfg) == []
+    assert check.status == "warning"
+    assert "Could not verify" in check.detail
 
 
-def test_check_foundation_milestone_silent_on_auth_error(monkeypatch):
-    """Auth problems are reported by the GitHub checks; do not duplicate them."""
+def test_auth_error_is_reported(monkeypatch):
     cfg = Config()
     cfg.repo = "owner/repo"
     cfg.foundation_milestone = "M0"
@@ -183,4 +278,50 @@ def test_check_foundation_milestone_silent_on_auth_error(monkeypatch):
 
     monkeypatch.setattr(milestone_checks, "build_github_auth", _raise_auth)
 
-    assert milestone_checks.check_foundation_milestone(cfg) == []
+    check = _by_name(milestone_checks.check_milestones(cfg), "Foundation Milestone")
+
+    assert check.status == "warning"
+    assert "no token" in check.detail
+
+
+def test_unexpected_exception_propagates(monkeypatch):
+    """A defect in this diagnostic must not masquerade as 'check inapplicable'.
+
+    The whole point of this check is to expose a silent failure; swallowing a
+    TypeError here would make the exposer itself fail silently.
+    """
+    cfg = Config()
+    cfg.repo = "owner/repo"
+    cfg.foundation_milestone = "M0"
+
+    monkeypatch.setattr(milestone_checks, "build_github_auth", lambda **_kw: object())
+    monkeypatch.setattr(
+        milestone_checks, "GitHubHttpClient",
+        _client_raising(TypeError("programming error")),
+    )
+
+    with pytest.raises(TypeError):
+        milestone_checks.check_milestones(cfg)
+
+
+# ----------------------------------------------------------- single snapshot
+
+def test_both_rules_share_one_fetch(monkeypatch):
+    """A1: one bounded owner, one authoritative snapshot, both rules."""
+    cfg = Config()
+    cfg.repo = "owner/repo"
+    cfg.milestone_order = ["M1"]
+    cfg.foundation_milestone = "M0"
+
+    calls: list[str] = []
+    monkeypatch.setattr(milestone_checks, "build_github_auth", lambda **_kw: object())
+    monkeypatch.setattr(
+        milestone_checks, "GitHubHttpClient",
+        _client_returning(["M0", "M1"], record=calls),
+    )
+
+    checks = milestone_checks.check_milestones(cfg)
+
+    assert calls == ["list_all_milestones"]
+    assert _by_name(checks, "Milestone Order").status == "ok"
+    assert _by_name(checks, "Foundation Milestone").status == "ok"
