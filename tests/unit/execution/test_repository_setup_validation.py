@@ -30,7 +30,11 @@ def test_makefile_defaults_run_a_repository_gate_and_catch_failure(
     for variable in ("MAKEFLAGS", "MFLAGS", "GNUMAKEFLAGS", "MAKELEVEL"):
         monkeypatch.delenv(variable, raising=False)
     (tmp_path / "Makefile").write_text(
-        "validate-fast:\n\t@exit 7\n\nvalidate-pr:\n\t@true\n",
+        (
+            "validate-fast:\n\t@exit 7\n\n"
+            "validate-pr-raw:\n\t@true\n\n"
+            "validate-pr:\n\t@false\n"
+        ),
         encoding="utf-8",
     )
     defaults = RepositorySetupValidationDetectorAdapter()(tmp_path)
@@ -57,9 +61,24 @@ def test_makefile_defaults_run_a_repository_gate_and_catch_failure(
     )
 
     assert defaults.quick_command == "make validate-fast"
-    assert defaults.publish_command == "make validate-pr"
+    assert defaults.publish_command == "make validate-pr-raw"
     assert record.passed is False
     assert record.exit_code != 0
+
+
+def test_makefile_detector_never_selects_cache_aware_publish_wrapper(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "Makefile").write_text(
+        "validate-fast:\n\t@true\n\nvalidate-pr:\n\t@true\n",
+        encoding="utf-8",
+    )
+
+    defaults = RepositorySetupValidationDetectorAdapter()(tmp_path)
+
+    assert defaults.quick_command is None
+    assert defaults.publish_command is None
+    assert "Enter quick and publish commands" in defaults.source
 
 
 def test_unknown_repository_requires_explicit_validation_commands(

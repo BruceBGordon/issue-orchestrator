@@ -161,8 +161,10 @@ Notes:
 - You can declare one or both. Resolution order within repo-scoped mode is:
   `repo.github.token` > `repo.github.token_env` > `repo.github.keyring_service` / `keyring_username`
 - Guided Control Center Setup stores a submitted PAT under service
-  `issue-orchestrator` and account `github-token:<owner>/<repo>`, then writes
-  only those two locators to repository YAML.
+  `issue-orchestrator` and account
+  `github-token:<canonical-api-host>:<owner>/<repo>`, then writes only those
+  two locators to repository YAML. Including the host prevents equal repo names
+  on GitHub.com and GitHub Enterprise Server from sharing a credential slot.
 - A credential detected from GitHub CLI remains `detected`; it is re-resolved
   at runtime rather than copied into YAML or Keychain.
 

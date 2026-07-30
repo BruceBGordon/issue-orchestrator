@@ -482,6 +482,16 @@
         };
     }
 
+    function githubWebOrigin(apiUrl) {
+        const parsed = new URL(apiUrl || 'https://api.github.com');
+        if (!['http:', 'https:'].includes(parsed.protocol)) {
+            throw new Error('GitHub API URL must use HTTP or HTTPS');
+        }
+        return parsed.hostname.toLowerCase() === 'api.github.com'
+            ? 'https://github.com'
+            : parsed.origin;
+    }
+
     function appAuthorizationFromForm() {
         return {
             ...authorizationTransport(
@@ -576,7 +586,9 @@
         const appConfigured = authInfo.configured_kind === 'github_app';
         const repoName = state.options.repoName;
         const owner = repoName.includes('/') ? repoName.split('/')[0] : '';
-        const tokenUrl = new URL('https://github.com/settings/personal-access-tokens/new');
+        const webOrigin = githubWebOrigin(existingAuthorization.api_url);
+        const tokenUrl = new URL('/settings/personal-access-tokens/new', webOrigin);
+        const appUrl = new URL('/settings/apps/new', webOrigin);
         tokenUrl.searchParams.set('name', 'Issue Orchestrator');
         tokenUrl.searchParams.set(
             'description',
@@ -680,7 +692,7 @@
                 <h4>Configure a GitHub App</h4>
                 <ol style="padding-left: 20px;">
                     <li>
-                        <a href="https://github.com/settings/apps/new" target="_blank"
+                        <a href="${escapeHtml(appUrl.toString())}" target="_blank"
                            rel="noopener noreferrer">Create a GitHub App</a> owned by the
                         repository owner.
                     </li>

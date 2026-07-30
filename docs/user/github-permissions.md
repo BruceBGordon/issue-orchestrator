@@ -18,7 +18,9 @@ stage is deliberately resumable:
 
 1. Choose **Use my GitHub identity** or **Use a GitHub App**.
 2. Follow the GitHub-side instructions. Setup waits while you create a
-   fine-grained token or App, install the App, and save its private key.
+   fine-grained token or App, install the App, and save its private key. The
+   creation links use the configured GitHub host, including GitHub Enterprise
+   Server.
 3. Return to Setup and select **Verify**.
 4. Review the detected identity, repository, credential source, authorship
    tradeoff, and required permissions.

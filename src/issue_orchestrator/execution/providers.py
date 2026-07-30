@@ -19,6 +19,7 @@ Example:
 
 from pathlib import Path
 from typing import TYPE_CHECKING
+from urllib.parse import urlsplit
 
 if TYPE_CHECKING:
     from ..adapters.github.tokens import TokenValidationResult
@@ -151,7 +152,9 @@ def store_repository_setup_github_token(
 
     if authorization.kind != "personal" or authorization.token is None:
         raise ValueError("Personal token storage requires inline personal authorization")
-    username = f"github-token:{repo}"
+    username = (
+        f"github-token:{_canonical_github_credential_host(authorization.api_url)}:{repo}"
+    )
     store_keyring_token_for(
         authorization.token,
         service=KEYRING_SERVICE,
@@ -163,6 +166,19 @@ def store_repository_setup_github_token(
         keyring_service=KEYRING_SERVICE,
         keyring_username=username,
     )
+
+
+def _canonical_github_credential_host(api_url: str) -> str:
+    """Return one stable host identity for repo-scoped credential storage."""
+    parsed = urlsplit(api_url)
+    if parsed.scheme not in {"http", "https"} or parsed.hostname is None:
+        raise ValueError("GitHub API URL must be an absolute HTTP(S) URL")
+    host = parsed.hostname.rstrip(".").lower()
+    port = parsed.port
+    default_port = (parsed.scheme == "http" and port == 80) or (
+        parsed.scheme == "https" and port == 443
+    )
+    return f"{host}:{port}" if port is not None and not default_port else host
 
 
 def resolve_github_token(

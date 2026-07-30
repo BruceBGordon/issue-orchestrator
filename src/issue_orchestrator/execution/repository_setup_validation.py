@@ -18,7 +18,7 @@ _MAKE_QUICK_TARGETS = (
     "validate",
 )
 _MAKE_PUBLISH_TARGETS = (
-    "validate-pr",
+    "validate-pr-raw",
     "validate",
     "test",
     "check",

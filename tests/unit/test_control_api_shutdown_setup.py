@@ -487,7 +487,11 @@ class TestControlCenterSetupRoutes:
         config_dir.mkdir(parents=True)
         (config_dir / "custom.yaml").write_text("repo:\n  name: owner/repo\n")
         (repo_root / "Makefile").write_text(
-            "validate-fast:\n\t@true\n\nvalidate-pr:\n\t@true\n"
+            (
+                "validate-fast:\n\t@true\n\n"
+                "validate-pr-raw:\n\t@true\n\n"
+                "validate-pr:\n\t@true\n"
+            )
         )
 
         client = TestClient(control_app)
@@ -506,7 +510,7 @@ class TestControlCenterSetupRoutes:
         )
         assert data["validation_defaults"] == {
             "quick_command": "make validate-fast",
-            "publish_command": "make validate-pr",
+            "publish_command": "make validate-pr-raw",
             "source": "Makefile targets",
         }
 
@@ -645,7 +649,7 @@ class TestControlCenterSetupRoutes:
         stored = RepositorySetupGitHubAuthorization(
             kind="personal",
             keyring_service="issue-orchestrator",
-            keyring_username="github-token:owner/repo",
+            keyring_username="github-token:github.example:owner/repo",
             api_url="https://github.example/api/v3",
             http_timeout_seconds=47,
         )
@@ -665,7 +669,10 @@ class TestControlCenterSetupRoutes:
             identity="setup-user",
             repository="owner/repo",
             auth_kind="personal",
-            source="Keyring (issue-orchestrator/github-token:owner/repo)",
+            source=(
+                "Keyring "
+                "(issue-orchestrator/github-token:github.example:owner/repo)"
+            ),
             normalized_authorization=stored,
         )
         dependencies = control_app.state.control_api_setup_dependencies
@@ -698,7 +705,7 @@ class TestControlCenterSetupRoutes:
         assert response.json()["authorization"] == {
             "kind": "personal",
             "keyring_service": "issue-orchestrator",
-            "keyring_username": "github-token:owner/repo",
+            "keyring_username": "github-token:github.example:owner/repo",
             "api_url": "https://github.example/api/v3",
             "http_timeout_seconds": 47,
         }

@@ -597,6 +597,67 @@ test('setup modal completes the default-on preview and save round trip', async (
     assert.equal(trigger.focusCount, 1);
 });
 
+test('GHES setup keeps credential creation links on the configured host', async () => {
+    const document = fakeDocument();
+    const responses = [
+        jsonResponse({
+            all_ok: true,
+            checks: { git: { ok: true, detail: 'git version 2' } },
+            agent_checks: [],
+        }),
+        jsonResponse(repositoryDetection({
+            github_authorization: {
+                authorization: {
+                    kind: 'detected',
+                    api_url: 'https://github.example/api/v3',
+                    http_timeout_seconds: 47,
+                },
+                configured_kind: 'detected',
+                inline_token_migration_required: true,
+            },
+        })),
+    ];
+    const wizard = createSetupWizard({
+        document,
+        fetch: async () => responses.shift(),
+        escapeHtml: (value) => String(value),
+        loadRepos: async () => {},
+        setupCommands,
+    });
+    wizard.bind();
+    await wizard.open('/repos/porchpin');
+
+    const next = document.elements.get('setupWizardNext');
+    await next.emit('click');
+    document.elements.set(
+        'setupRepoName',
+        document.makeElement({ value: 'owner/porchpin' }),
+    );
+    document.elements.set(
+        'setupAgentLabel',
+        document.makeElement({ value: 'agent:dev' }),
+    );
+    document.elements.set(
+        'setupWorkerModel',
+        document.makeElement({ value: 'sonnet' }),
+    );
+    await next.emit('click');
+
+    const authorizationHtml = document.elements.get('setupContent').innerHTML;
+    assert.match(
+        authorizationHtml,
+        /href="https:\/\/github\.example\/settings\/personal-access-tokens\/new\?/,
+    );
+    assert.match(
+        authorizationHtml,
+        /href="https:\/\/github\.example\/settings\/apps\/new"/,
+    );
+    assert.doesNotMatch(
+        authorizationHtml,
+        /https:\/\/github\.com\/settings\//,
+    );
+});
+
 test('focus trap excludes controls beneath hidden or inert ancestors', async () => {
     const document = fakeDocument();
     const wizard = createSetupWizard({
