@@ -451,6 +451,52 @@
         }
       }
     },
+    "/control/setup/prereqs": {
+      "get": {
+        "summary": "Check repository setup prerequisites",
+        "parameters": [
+          {
+            "name": "repo_root",
+            "in": "query",
+            "required": false,
+            "schema": {"type": "string", "minLength": 1}
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Repository setup prerequisite checks",
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "#/components/schemas/RepositorySetupPrerequisitesPayload"}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/control/setup/detect": {
+      "get": {
+        "summary": "Detect repository state and setup defaults",
+        "parameters": [
+          {
+            "name": "repo_root",
+            "in": "query",
+            "required": true,
+            "schema": {"type": "string", "minLength": 1}
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Detected repository setup state",
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "#/components/schemas/RepositorySetupDetectionPayload"}
+              }
+            }
+          }
+        }
+      }
+    },
     "/control/setup/preview": {
       "post": {
         "summary": "Preview a repository setup command",
@@ -468,6 +514,52 @@
             "content": {
               "application/json": {
                 "schema": {"$ref": "#/components/schemas/RepositorySetupPreviewPayload"}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/control/setup/github-auth/verify": {
+      "post": {
+        "summary": "Verify a repository setup GitHub authorization without writing config",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {"$ref": "#/components/schemas/RepositorySetupGitHubVerifyRequestPayload"}
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Verified GitHub identity and durable authorization reference",
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "#/components/schemas/RepositorySetupGitHubVerificationPayload"}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/control/setup/github-auth/store-personal-token": {
+      "post": {
+        "summary": "Verify and store a personal token in a repo-scoped OS keychain entry",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {"$ref": "#/components/schemas/RepositorySetupGitHubTokenPayload"}
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Verified GitHub identity and stored keychain reference",
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "#/components/schemas/RepositorySetupGitHubVerificationPayload"}
               }
             }
           }
@@ -2360,6 +2452,134 @@
           "issues": {"type": "array", "items": {"type": "integer", "minimum": 1}}
         }
       },
+      "RepositorySetupPrerequisiteCheckPayload": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["ok", "detail"],
+        "properties": {
+          "name": {"type": "string", "minLength": 1},
+          "ok": {"type": "boolean"},
+          "detail": {"type": "string", "minLength": 1}
+        }
+      },
+      "RepositorySetupPrerequisitesPayload": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["all_ok", "checks", "agent_checks"],
+        "properties": {
+          "all_ok": {"type": "boolean"},
+          "checks": {
+            "type": "object",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/RepositorySetupPrerequisiteCheckPayload"
+            }
+          },
+          "agent_checks": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RepositorySetupPrerequisiteCheckPayload"
+            }
+          }
+        }
+      },
+      "RepositorySetupGitHubAuthorizationDetectionPayload": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "authorization",
+          "configured_kind",
+          "inline_token_migration_required"
+        ],
+        "properties": {
+          "authorization": {
+            "$ref": "#/components/schemas/RepositorySetupGitHubAuthorizationPayload"
+          },
+          "configured_kind": {
+            "type": "string",
+            "enum": ["detected", "personal", "github_app", "invalid"]
+          },
+          "inline_token_migration_required": {"type": "boolean"},
+          "configuration_error": {"type": "string", "minLength": 1}
+        }
+      },
+      "RepositorySetupValidationDefaultsPayload": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["quick_command", "publish_command", "source"],
+        "properties": {
+          "quick_command": {
+            "oneOf": [
+              {"type": "string", "minLength": 1},
+              {"type": "null"}
+            ]
+          },
+          "publish_command": {
+            "oneOf": [
+              {"type": "string", "minLength": 1},
+              {"type": "null"}
+            ]
+          },
+          "source": {"type": "string", "minLength": 1}
+        }
+      },
+      "RepositorySetupDetectionPayload": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "repo_root",
+          "repo",
+          "existing_config",
+          "config_path",
+          "github_labels",
+          "agent_labels",
+          "prompt_candidates",
+          "worktree_base_default",
+          "worktree_base_resolved",
+          "github_authorization",
+          "validation_defaults"
+        ],
+        "properties": {
+          "repo_root": {"type": "string", "minLength": 1},
+          "repo": {
+            "oneOf": [
+              {"type": "string", "minLength": 1},
+              {"type": "null"}
+            ]
+          },
+          "existing_config": {
+            "oneOf": [
+              {"type": "object", "additionalProperties": true},
+              {"type": "null"}
+            ]
+          },
+          "config_path": {
+            "oneOf": [
+              {"type": "string", "minLength": 1},
+              {"type": "null"}
+            ]
+          },
+          "github_labels": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1}
+          },
+          "agent_labels": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1}
+          },
+          "prompt_candidates": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1}
+          },
+          "worktree_base_default": {"type": "string", "minLength": 1},
+          "worktree_base_resolved": {"type": "string", "minLength": 1},
+          "github_authorization": {
+            "$ref": "#/components/schemas/RepositorySetupGitHubAuthorizationDetectionPayload"
+          },
+          "validation_defaults": {
+            "$ref": "#/components/schemas/RepositorySetupValidationDefaultsPayload"
+          }
+        }
+      },
       "RepositorySetupCommandPayload": {
         "type": "object",
         "additionalProperties": false,
@@ -2368,17 +2588,71 @@
           "repo_name",
           "worker_agent_label",
           "model",
-          "configure_tech_lead"
+          "effort",
+          "configure_reviewer",
+          "reviewer_model",
+          "reviewer_effort",
+          "validation_quick_command",
+          "validation_publish_command",
+          "github_authorization",
+          "configure_tech_lead",
+          "tech_lead_model",
+          "tech_lead_effort",
+          "tech_lead_review_threshold"
         ],
         "properties": {
           "repo_root": {"type": "string", "minLength": 1},
           "repo_name": {"type": "string", "minLength": 1},
           "worker_agent_label": {
             "type": "string",
-            "pattern": "^agent:(?!tech-lead$).+"
+            "pattern": "^agent:(?!(?:reviewer|tech-lead)$).+"
           },
           "model": {"type": "string", "enum": ["haiku", "sonnet", "opus"]},
+          "effort": {
+            "type": "string",
+            "enum": ["low", "medium", "high", "xhigh", "max"],
+            "default": "high"
+          },
+          "configure_reviewer": {"type": "boolean", "default": true},
+          "reviewer_model": {
+            "type": "string",
+            "enum": ["haiku", "sonnet", "opus"],
+            "default": "sonnet"
+          },
+          "reviewer_effort": {
+            "type": "string",
+            "enum": ["low", "medium", "high", "xhigh", "max"],
+            "default": "high"
+          },
+          "validation_quick_command": {
+            "type": "string",
+            "minLength": 1
+          },
+          "validation_publish_command": {
+            "type": "string",
+            "minLength": 1
+          },
+          "worktree_base": {"type": "string", "minLength": 1},
+          "github_authorization": {
+            "$ref": "#/components/schemas/RepositorySetupGitHubAuthorizationPayload"
+          },
           "configure_tech_lead": {"type": "boolean", "default": true},
+          "tech_lead_model": {
+            "type": "string",
+            "enum": ["haiku", "sonnet", "opus"],
+            "default": "sonnet"
+          },
+          "tech_lead_effort": {
+            "type": "string",
+            "enum": ["low", "medium", "high", "xhigh", "max"],
+            "default": "high"
+          },
+          "tech_lead_review_threshold": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 50,
+            "default": 1
+          },
           "config_name": {
             "type": "string",
             "minLength": 1,
@@ -2388,6 +2662,107 @@
           "create_prompts": {"type": "boolean", "default": true},
           "create_labels": {"type": "boolean", "default": true},
           "replace_existing": {"type": "boolean", "default": false}
+        }
+      },
+      "RepositorySetupGitHubAuthorizationPayload": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "api_url", "http_timeout_seconds"],
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": ["detected", "personal", "github_app"]
+          },
+          "token_env": {"type": "string", "minLength": 1},
+          "keyring_service": {"type": "string", "minLength": 1},
+          "keyring_username": {"type": "string", "minLength": 1},
+          "app_client_id": {"type": "string", "minLength": 1},
+          "app_id": {"type": "string", "minLength": 1},
+          "app_installation_id": {"type": "string", "minLength": 1},
+          "app_private_key_path": {"type": "string", "minLength": 1},
+          "app_private_key_env": {"type": "string", "minLength": 1},
+          "api_url": {
+            "type": "string",
+            "minLength": 1,
+            "default": "https://api.github.com"
+          },
+          "http_timeout_seconds": {
+            "type": "number",
+            "exclusiveMinimum": 0,
+            "default": 20.0
+          }
+        }
+      },
+      "RepositorySetupGitHubVerifyRequestPayload": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["repo_root", "repo_name", "authorization"],
+        "properties": {
+          "repo_root": {"type": "string", "minLength": 1},
+          "repo_name": {"type": "string", "minLength": 1},
+          "authorization": {
+            "$ref": "#/components/schemas/RepositorySetupGitHubAuthorizationPayload"
+          }
+        }
+      },
+      "RepositorySetupGitHubTokenPayload": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "repo_root",
+          "repo_name",
+          "token",
+          "api_url",
+          "http_timeout_seconds"
+        ],
+        "properties": {
+          "repo_root": {"type": "string", "minLength": 1},
+          "repo_name": {"type": "string", "minLength": 1},
+          "token": {"type": "string", "minLength": 1},
+          "api_url": {
+            "type": "string",
+            "minLength": 1,
+            "default": "https://api.github.com"
+          },
+          "http_timeout_seconds": {
+            "type": "number",
+            "exclusiveMinimum": 0,
+            "default": 20.0
+          }
+        }
+      },
+      "RepositorySetupGitHubVerificationPayload": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "verified",
+          "identity",
+          "repository",
+          "auth_kind",
+          "source",
+          "authorship_notice",
+          "verification_note",
+          "required_permissions",
+          "authorization"
+        ],
+        "properties": {
+          "verified": {"const": true},
+          "identity": {"type": "string", "minLength": 1},
+          "repository": {"type": "string", "minLength": 1},
+          "auth_kind": {
+            "type": "string",
+            "enum": ["personal", "github_app"]
+          },
+          "source": {"type": "string", "minLength": 1},
+          "authorship_notice": {"type": "string", "minLength": 1},
+          "verification_note": {"type": "string", "minLength": 1},
+          "required_permissions": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1}
+          },
+          "authorization": {
+            "$ref": "#/components/schemas/RepositorySetupGitHubAuthorizationPayload"
+          }
         }
       },
       "RepositorySetupConflictPayload": {
@@ -2414,7 +2789,7 @@
           "error": {"const": "repository_setup_failed"},
           "stage": {
             "type": "string",
-            "enum": ["planning", "files", "labels"]
+            "enum": ["authorization", "planning", "files", "labels"]
           },
           "detail": {"type": "string"},
           "applied_files": {"type": "array", "items": {"type": "string"}},
@@ -2436,9 +2811,13 @@
       "RepositorySetupPreviewPayload": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["yaml", "files"],
+        "required": ["yaml", "worktree_base", "github_authorization", "files"],
         "properties": {
           "yaml": {"type": "string"},
+          "worktree_base": {"type": "string", "minLength": 1},
+          "github_authorization": {
+            "$ref": "#/components/schemas/RepositorySetupGitHubVerificationPayload"
+          },
           "files": {
             "type": "array",
             "items": {"$ref": "#/components/schemas/RepositorySetupFilePayload"}

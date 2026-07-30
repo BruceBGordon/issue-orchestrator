@@ -21,6 +21,11 @@ export ISSUE_ORCH_GITHUB_TOKEN=ghp_...
 
 You can also rely on an existing `gh auth login` session; the orchestrator reads GitHub CLI auth from its normal auth storage. `issue-orchestrator auth store` remains the app-specific keychain fallback. Whatever source you use must be able to access the target repo. See [GitHub Auth and Permissions](github-permissions.md) for details.
 
+If the Control Center already discovered the repository, you can instead select
+**Setup** and complete its guided GitHub stage. It explains the personal-user
+and GitHub App options, waits while you complete GitHub-side steps, and requires
+read-only verification before Preview and Save.
+
 Personal-token auth makes orchestrator PRs appear under that user. If your repo
 requires approvals and you need to approve agent-created PRs yourself, plan for
 the GitHub App protected-branch model in [GitHub Auth and Permissions](github-permissions.md#protected-branch-mode-github-app).
@@ -35,6 +40,22 @@ issue-orchestrator setup
 ```
 
 This creates `.issue-orchestrator/config/default.yaml` with your repo settings and agent definitions. If you prefer to stay elsewhere, run `issue-orchestrator setup /path/to/your/project` instead. You can also copy and edit the [example config](../../examples/config.example.yaml) directly.
+
+Alternatively, in the Control Center select **Setup** for the discovered
+repository. That workflow creates the same repository setup, defaults worktrees
+to the dedicated peer directory `../worktrees/<repository-directory>`, and
+configures a default worker → reviewer/rework → tech-lead pipeline. The
+Configuration step lets you select model and effort for each role, set the
+tech-lead cadence (`1` reviews every approved PR), and confirm detected
+repository-specific quick and publish commands. When setup cannot detect both
+validation gates, it waits for you to enter them. It then walks through GitHub
+authorization before showing the YAML preview. The CLI wizard expects GitHub
+authorization to be available before it starts; the Control Center workflow is
+the guided, wait-and-verify path.
+
+After saving, the workflow points to independent features you might configure
+later, including specialized reviewers, other AI providers, E2E, merge queue,
+Goal Pilot, and tech-lead health automation.
 
 If you choose `codex`, leave the wizard's Codex model prompt blank for the safest first run. That lets the installed Codex CLI choose the right default for your account.
 

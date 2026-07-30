@@ -13,6 +13,9 @@ from issue_orchestrator.domain.repository_config_name import RepositoryConfigNam
 from issue_orchestrator.execution.repository_setup_files import (
     RepositorySetupFileSystemAdapter,
 )
+from issue_orchestrator.execution.repository_setup_github_authorization import (
+    repository_setup_github_authorization_codec,
+)
 from issue_orchestrator.infra.config import Config, get_config_dir
 from issue_orchestrator.ports.repository_setup import RepositorySetupFileSystemError
 from issue_orchestrator.ports.repository_setup import RepositorySetupNamedConfig
@@ -24,6 +27,8 @@ def _command(repo_root: Path) -> RepositorySetupCommand:
         repo_name="owner/repo",
         worker_agent_label="agent:dev",
         model="sonnet",
+        validation_quick_command="make test-quick",
+        validation_publish_command="make validate",
     )
 
 
@@ -36,7 +41,7 @@ def test_setup_file_adapter_plans_and_writes_runnable_contained_artifacts(
     plan = adapter.plan(
         repo_root=tmp_path,
         config_target=RepositorySetupNamedConfig(command.config_name),
-        config=command.build_config(),
+        config=command.build_config(repository_setup_github_authorization_codec),
         include_prompts=True,
     )
 
@@ -45,6 +50,7 @@ def test_setup_file_adapter_plans_and_writes_runnable_contained_artifacts(
     assert config_file.path.name == "default.yaml"
     assert {file.agent for file in plan.files if file.kind == "prompt"} == {
         "agent:dev",
+        "agent:reviewer",
         "agent:tech-lead",
     }
 
@@ -65,7 +71,7 @@ def test_setup_file_adapter_revalidates_forged_config_name(
         RepositorySetupFileSystemAdapter().plan(
             repo_root=tmp_path,
             config_target=RepositorySetupNamedConfig(forged),
-            config=command.build_config(),
+            config=command.build_config(repository_setup_github_authorization_codec),
             include_prompts=False,
         )
 
@@ -79,7 +85,9 @@ def test_setup_file_adapter_refuses_create_when_target_appears_after_plan(
     plan = adapter.plan(
         repo_root=tmp_path,
         config_target=RepositorySetupNamedConfig(RepositoryConfigName("default")),
-        config=_command(tmp_path).build_config(),
+        config=_command(tmp_path).build_config(
+            repository_setup_github_authorization_codec
+        ),
         include_prompts=False,
     )
     config_file = plan.files[0]
@@ -104,7 +112,9 @@ def test_setup_file_adapter_does_not_publish_incomplete_create(
     plan = adapter.plan(
         repo_root=tmp_path,
         config_target=RepositorySetupNamedConfig(RepositoryConfigName("default")),
-        config=_command(tmp_path).build_config(),
+        config=_command(tmp_path).build_config(
+            repository_setup_github_authorization_codec
+        ),
         include_prompts=False,
     )
     config_file = plan.files[0]
@@ -160,7 +170,9 @@ def test_setup_file_adapter_preserves_existing_file_when_atomic_replace_fails(
     plan = adapter.plan(
         repo_root=tmp_path,
         config_target=RepositorySetupNamedConfig(RepositoryConfigName("default")),
-        config=_command(tmp_path).build_config(),
+        config=_command(tmp_path).build_config(
+            repository_setup_github_authorization_codec
+        ),
         include_prompts=False,
     )
     assert plan.files[0].action == "overwrite"
@@ -181,7 +193,9 @@ def test_setup_file_adapter_preserves_existing_file_when_atomic_replace_fails(
 def test_setup_file_adapter_plans_shared_prompt_target_once(
     tmp_path: Path,
 ) -> None:
-    config = _command(tmp_path).build_config()
+    config = _command(tmp_path).build_config(
+        repository_setup_github_authorization_codec
+    )
     config["agents"] = {
         "agent:frontend": {"prompt": ".io/shared.md"},
         "agent:backend": {"prompt": ".io/../.io/shared.md"},

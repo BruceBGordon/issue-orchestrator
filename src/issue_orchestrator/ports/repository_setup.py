@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, Mapping, Protocol
 
+from ..domain.repository_setup_auth import RepositorySetupGitHubAuthorization
 from ..domain.repository_config_name import RepositoryConfigName
 from .repository_host import RepositoryHost
 
@@ -28,12 +29,35 @@ class RepositorySetupExplicitConfig:
 
     def __post_init__(self) -> None:
         if not self.path.is_absolute() or not self.path.name:
-            raise ValueError("Repository setup config path must be an absolute file path")
+            raise ValueError(
+                "Repository setup config path must be an absolute file path"
+            )
 
 
-RepositorySetupConfigTarget = (
-    RepositorySetupNamedConfig | RepositorySetupExplicitConfig
-)
+RepositorySetupConfigTarget = RepositorySetupNamedConfig | RepositorySetupExplicitConfig
+
+
+@dataclass(frozen=True, slots=True)
+class RepositorySetupValidationDefaults:
+    """Repository-meaningful validation commands detected for guided setup."""
+
+    quick_command: str | None
+    publish_command: str | None
+    source: str
+
+    def __post_init__(self) -> None:
+        if bool(self.quick_command) != bool(self.publish_command):
+            raise ValueError(
+                "Repository setup validation defaults require both commands or neither"
+            )
+        if not self.source.strip():
+            raise ValueError("Repository setup validation source is required")
+
+
+class RepositorySetupValidationDetector(Protocol):
+    """Detect repository-native validation gates without executing them."""
+
+    def __call__(self, repo_root: Path) -> RepositorySetupValidationDefaults: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,10 +106,77 @@ class RepositorySetupFileSystem(Protocol):
     def apply(self, plan: RepositorySetupArtifactPlan) -> tuple[Path, ...]: ...
 
 
+class RepositorySetupGitHubAuthorizationCodec(Protocol):
+    """Own every external representation of setup GitHub authorization."""
+
+    def from_config(
+        self,
+        config: Mapping[str, Any],
+    ) -> RepositorySetupGitHubAuthorization: ...
+
+    def to_config(
+        self,
+        authorization: RepositorySetupGitHubAuthorization,
+    ) -> dict[str, Any]: ...
+
+    def from_public(
+        self,
+        payload: Mapping[str, Any],
+    ) -> RepositorySetupGitHubAuthorization: ...
+
+    def to_public(
+        self,
+        authorization: RepositorySetupGitHubAuthorization,
+        *,
+        redact_inline_token: bool = False,
+    ) -> dict[str, Any]: ...
+
+    def adapter_kwargs(
+        self,
+        authorization: RepositorySetupGitHubAuthorization,
+    ) -> dict[str, str | None]: ...
+
+
 class RepositorySetupHostFactory(Protocol):
     """Resolve the repository host used for setup label mutations."""
 
-    def __call__(self, repo_name: str) -> RepositoryHost: ...
+    def __call__(
+        self,
+        repo_name: str,
+        authorization: RepositorySetupGitHubAuthorization,
+    ) -> RepositoryHost: ...
+
+
+@dataclass(frozen=True, slots=True)
+class RepositorySetupGitHubVerification:
+    """Verified, non-secret GitHub identity and source shown during setup."""
+
+    identity: str
+    repository: str
+    auth_kind: Literal["personal", "github_app"]
+    source: str
+    normalized_authorization: RepositorySetupGitHubAuthorization
+
+
+class RepositorySetupGitHubVerifier(Protocol):
+    """Verify a setup authorization without mutating GitHub or repository files."""
+
+    def __call__(
+        self,
+        repo_name: str,
+        authorization: RepositorySetupGitHubAuthorization,
+    ) -> RepositorySetupGitHubVerification: ...
+
+
+class RepositorySetupGitHubTokenStore(Protocol):
+    """Persist a verified personal token at a repo-scoped secret reference."""
+
+    def __call__(
+        self,
+        authorization: RepositorySetupGitHubAuthorization,
+        *,
+        repo: str,
+    ) -> RepositorySetupGitHubAuthorization: ...
 
 
 __all__ = [
@@ -96,7 +187,13 @@ __all__ = [
     "RepositorySetupFileKind",
     "RepositorySetupFileSystem",
     "RepositorySetupFileSystemError",
+    "RepositorySetupGitHubAuthorizationCodec",
+    "RepositorySetupGitHubVerification",
+    "RepositorySetupGitHubTokenStore",
+    "RepositorySetupGitHubVerifier",
     "RepositorySetupHostFactory",
     "RepositorySetupNamedConfig",
     "RepositorySetupPlannedFile",
+    "RepositorySetupValidationDefaults",
+    "RepositorySetupValidationDetector",
 ]

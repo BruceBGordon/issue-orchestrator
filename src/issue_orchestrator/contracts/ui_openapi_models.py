@@ -792,14 +792,25 @@ class RecentE2ERunsPayload(BaseModel):
 class RepositorySetupCommandPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
     config_name: str | None = Field(default=None, min_length=1)
+    configure_reviewer: bool
     configure_tech_lead: bool
     create_labels: bool | None = None
     create_prompts: bool | None = None
+    effort: Literal['low', 'medium', 'high', 'xhigh', 'max']
+    github_authorization: RepositorySetupGitHubAuthorizationPayload
     model: Literal['haiku', 'sonnet', 'opus']
     replace_existing: bool | None = None
     repo_name: str = Field(..., min_length=1)
     repo_root: str = Field(..., min_length=1)
+    reviewer_effort: Literal['low', 'medium', 'high', 'xhigh', 'max']
+    reviewer_model: Literal['haiku', 'sonnet', 'opus']
+    tech_lead_effort: Literal['low', 'medium', 'high', 'xhigh', 'max']
+    tech_lead_model: Literal['haiku', 'sonnet', 'opus']
+    tech_lead_review_threshold: int = Field(..., ge=0, le=50, strict=True)
+    validation_publish_command: str = Field(..., min_length=1)
+    validation_quick_command: str = Field(..., min_length=1)
     worker_agent_label: str
+    worktree_base: str | None = Field(default=None, min_length=1)
 
     @field_validator('config_name')
     @classmethod
@@ -811,8 +822,8 @@ class RepositorySetupCommandPayload(BaseModel):
     @field_validator('worker_agent_label')
     @classmethod
     def _validate_worker_agent_label_pattern(cls, value: Any) -> Any:
-        if value is not None and re.search('^agent:(?!tech-lead$).+', value) is None:
-            raise ValueError("worker_agent_label must match '^agent:(?!tech-lead$).+'")
+        if value is not None and re.search('^agent:(?!(?:reviewer|tech-lead)$).+', value) is None:
+            raise ValueError("worker_agent_label must match '^agent:(?!(?:reviewer|tech-lead)$).+'")
         return value
 
 class RepositorySetupConflictPayload(BaseModel):
@@ -821,13 +832,27 @@ class RepositorySetupConflictPayload(BaseModel):
     detail: str
     error: Literal['replace_confirmation_required']
 
+class RepositorySetupDetectionPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    agent_labels: list[str]
+    config_path: str | None
+    existing_config: dict[str, Any] | None
+    github_authorization: RepositorySetupGitHubAuthorizationDetectionPayload
+    github_labels: list[str]
+    prompt_candidates: list[str]
+    repo: str | None
+    repo_root: str = Field(..., min_length=1)
+    validation_defaults: RepositorySetupValidationDefaultsPayload
+    worktree_base_default: str = Field(..., min_length=1)
+    worktree_base_resolved: str = Field(..., min_length=1)
+
 class RepositorySetupFailurePayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
     applied_files: list[str]
     created_labels: list[str]
     detail: str
     error: Literal['repository_setup_failed']
-    stage: Literal['planning', 'files', 'labels']
+    stage: Literal['authorization', 'planning', 'files', 'labels']
 
 class RepositorySetupFilePayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -837,9 +862,70 @@ class RepositorySetupFilePayload(BaseModel):
     size: int | None = Field(default=None, ge=0, strict=True)
     type: Literal['prompt'] | None = None
 
+class RepositorySetupGitHubAuthorizationDetectionPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    authorization: RepositorySetupGitHubAuthorizationPayload
+    configuration_error: str | None = Field(default=None, min_length=1)
+    configured_kind: Literal['detected', 'personal', 'github_app', 'invalid']
+    inline_token_migration_required: bool
+
+class RepositorySetupGitHubAuthorizationPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    api_url: str = Field(..., min_length=1)
+    app_client_id: str | None = Field(default=None, min_length=1)
+    app_id: str | None = Field(default=None, min_length=1)
+    app_installation_id: str | None = Field(default=None, min_length=1)
+    app_private_key_env: str | None = Field(default=None, min_length=1)
+    app_private_key_path: str | None = Field(default=None, min_length=1)
+    http_timeout_seconds: float = Field(..., gt=0)
+    keyring_service: str | None = Field(default=None, min_length=1)
+    keyring_username: str | None = Field(default=None, min_length=1)
+    kind: Literal['detected', 'personal', 'github_app']
+    token_env: str | None = Field(default=None, min_length=1)
+
+class RepositorySetupGitHubTokenPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    api_url: str = Field(..., min_length=1)
+    http_timeout_seconds: float = Field(..., gt=0)
+    repo_name: str = Field(..., min_length=1)
+    repo_root: str = Field(..., min_length=1)
+    token: str = Field(..., min_length=1)
+
+class RepositorySetupGitHubVerificationPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    auth_kind: Literal['personal', 'github_app']
+    authorization: RepositorySetupGitHubAuthorizationPayload
+    authorship_notice: str = Field(..., min_length=1)
+    identity: str = Field(..., min_length=1)
+    repository: str = Field(..., min_length=1)
+    required_permissions: list[str]
+    source: str = Field(..., min_length=1)
+    verification_note: str = Field(..., min_length=1)
+    verified: Literal[True]
+
+class RepositorySetupGitHubVerifyRequestPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    authorization: RepositorySetupGitHubAuthorizationPayload
+    repo_name: str = Field(..., min_length=1)
+    repo_root: str = Field(..., min_length=1)
+
+class RepositorySetupPrerequisiteCheckPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    detail: str = Field(..., min_length=1)
+    name: str | None = Field(default=None, min_length=1)
+    ok: bool
+
+class RepositorySetupPrerequisitesPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    agent_checks: list[RepositorySetupPrerequisiteCheckPayload]
+    all_ok: bool
+    checks: dict[str, RepositorySetupPrerequisiteCheckPayload]
+
 class RepositorySetupPreviewPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
     files: list[RepositorySetupFilePayload]
+    github_authorization: RepositorySetupGitHubVerificationPayload
+    worktree_base: str = Field(..., min_length=1)
     yaml: str
 
 class RepositorySetupResultPayload(BaseModel):
@@ -848,6 +934,12 @@ class RepositorySetupResultPayload(BaseModel):
     created_files: list[str]
     created_labels: list[str]
     status: Literal['saved']
+
+class RepositorySetupValidationDefaultsPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    publish_command: str | None
+    quick_command: str | None
+    source: str = Field(..., min_length=1)
 
 class RetrospectiveReviewDecisionPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")

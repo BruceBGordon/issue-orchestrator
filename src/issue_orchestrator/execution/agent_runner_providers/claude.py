@@ -131,9 +131,9 @@ class ClaudeCodeProvider(CLIProvider):
         adapter still enforces is against the *agent* — worktree-scoped writes,
         denied secrets/egress, and denied self-modification of the policy files.
         """
-        from .sandbox import build_claude_sandbox_argv
+        from .sandbox import ClaudeSandboxAdapter
 
-        return build_claude_sandbox_argv(scope)
+        return ClaudeSandboxAdapter().apply_scope(scope)
 
     @classmethod
     def _resolve_effort(cls, kwargs: dict[str, str]) -> str | None:

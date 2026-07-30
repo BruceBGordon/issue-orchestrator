@@ -60,6 +60,9 @@ from ..infra.supervisor import DefaultSupervisorOps, SupervisorOps
 from ..ports import RepositoryHost
 from ..control.goal_pilot import GoalPilot
 from ..execution.control_center_actions import ControlCenterActions
+from ..execution.repository_setup_validation import (
+    RepositorySetupValidationDetectorAdapter,
+)
 from ._auth_middleware import (
     AuthSurfaceConfig,
     evaluate_request,
@@ -130,8 +133,10 @@ from .timeline_presentation import (
 _TEMPLATES_DIR = Path(__file__).parent.parent / "templates"
 
 if TYPE_CHECKING:
+    from ..domain.repository_setup_auth import RepositorySetupGitHubAuthorization
     from ..infra.orchestrator import Orchestrator
     from ..infra.config import Config
+    from ..ports.repository_setup import RepositorySetupGitHubVerification
 
 logger = logging.getLogger(__name__)
 _PREFERRED_REPO_ROOT_ENV = "ISSUE_ORCHESTRATOR_CC_REPO_ROOT"
@@ -145,11 +150,35 @@ def _load_config_by_name(repo_root: Path, config_name: str) -> "Config":
     return Config.find_and_load(repo_root, config_name=config_name)
 
 
-def _create_repository_setup_host(repo_name: str) -> RepositoryHost:
+def _create_repository_setup_host(
+    repo_name: str,
+    authorization: "RepositorySetupGitHubAuthorization",
+) -> RepositoryHost:
     """Composition-root adapter for setup label mutations."""
-    from ..execution.providers import create_repository_host
+    from ..execution.providers import create_repository_setup_host
 
-    return create_repository_host(repo=repo_name)
+    return create_repository_setup_host(repo_name, authorization)
+
+
+def _verify_repository_setup_github_authorization(
+    repo_name: str,
+    authorization: "RepositorySetupGitHubAuthorization",
+) -> "RepositorySetupGitHubVerification":
+    """Composition-root adapter for setup GitHub verification."""
+    from ..execution.providers import verify_repository_setup_github_authorization
+
+    return verify_repository_setup_github_authorization(repo_name, authorization)
+
+
+def _store_repository_setup_github_token(
+    authorization: "RepositorySetupGitHubAuthorization",
+    *,
+    repo: str,
+) -> "RepositorySetupGitHubAuthorization":
+    """Composition-root adapter for repo-scoped keychain storage."""
+    from ..execution.providers import store_repository_setup_github_token
+
+    return store_repository_setup_github_token(authorization, repo=repo)
 
 
 # Create minimal control API app
@@ -1072,7 +1101,12 @@ install_control_api_setup_dependencies(
     control_app,
     ControlApiSetupDependencies(
         validate_repo_root=_validate_repo_root,
-        setup_owner=build_repository_setup_owner(_create_repository_setup_host),
+        setup_owner=build_repository_setup_owner(
+            _create_repository_setup_host,
+            _verify_repository_setup_github_authorization,
+        ),
+        github_token_store=_store_repository_setup_github_token,
+        validation_detector=RepositorySetupValidationDetectorAdapter(),
     ),
 )
 control_app.include_router(control_orchestrator_router)

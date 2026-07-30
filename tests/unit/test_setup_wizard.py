@@ -33,6 +33,31 @@ from issue_orchestrator.entrypoints.setup_wizard_common import (
     plan_setup_labels,
     write_missing_setup_prompts,
 )
+from issue_orchestrator.ports.repository_setup import (
+    RepositorySetupGitHubVerification,
+)
+
+
+@pytest.fixture(autouse=True)
+def _verified_setup_github_authorization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _verify(repo_name, authorization):
+        return RepositorySetupGitHubVerification(
+            identity="setup-test-user",
+            repository=repo_name,
+            auth_kind=(
+                "github_app" if authorization.kind == "github_app" else "personal"
+            ),
+            source="test credential",
+            normalized_authorization=authorization,
+        )
+
+    monkeypatch.setattr(
+        setup_wizard_module,
+        "verify_repository_setup_github_authorization",
+        _verify,
+    )
 
 
 class MockPrompter:
@@ -75,7 +100,9 @@ class MockPrompter:
         # Allow string answers
         return answer.lower() in ("y", "yes", "true")
 
-    def choice(self, question: str, choices: list[str], allow_custom: bool = False) -> str:
+    def choice(
+        self, question: str, choices: list[str], allow_custom: bool = False
+    ) -> str:
         return self._get_answer(question)
 
 
@@ -83,7 +110,7 @@ def test_prompt_int_retries_on_invalid_input() -> None:
     """Numeric wizard prompts should recover instead of crashing."""
     prompter = MockPrompter(["oops", "8080"])
 
-    value = setup_wizard_module._prompt_int(
+    value = setup_wizard_module._prompt_int(  # noqa: SLF001
         prompter,
         "Web Dashboard Port",
         8080,
@@ -107,7 +134,9 @@ def test_prompt_claude_session_interactions_enables_rule() -> None:
     }
     prompter = MockPrompter([True])
 
-    setup_wizard_module._prompt_claude_session_interactions(config, prompter)
+    setup_wizard_module._prompt_claude_session_interactions(  # noqa: SLF001
+        config, prompter
+    )
 
     assert config["execution"]["session_interactions"] == {"enabled": True}
     printed = "\n".join(prompter.printed)
@@ -126,7 +155,9 @@ def test_prompt_claude_session_interactions_can_be_declined() -> None:
     }
     prompter = MockPrompter([False])
 
-    setup_wizard_module._prompt_claude_session_interactions(config, prompter)
+    setup_wizard_module._prompt_claude_session_interactions(  # noqa: SLF001
+        config, prompter
+    )
 
     assert "session_interactions" not in config["execution"]
 
@@ -168,7 +199,14 @@ class TestCreateStarterPrompt:
 
 def test_setup_wizard_ui_mode_copy_is_client_neutral() -> None:
     """UI mode copy should not imply localhost-only browser access."""
-    source = Path(__file__).resolve().parents[2] / "src" / "issue_orchestrator" / "entrypoints" / "cli_tools" / "setup_wizard.py"
+    source = (
+        Path(__file__).resolve().parents[2]
+        / "src"
+        / "issue_orchestrator"
+        / "entrypoints"
+        / "cli_tools"
+        / "setup_wizard.py"
+    )
     text = source.read_text(encoding="utf-8")
 
     assert "Browser dashboard (recommended)" in text
@@ -183,7 +221,9 @@ class TestCreateTechLeadReviewPrompt:
         """Test that tech_lead prompt is created with label values substituted."""
         prompt_path = tmp_path / "tech-lead.md"
 
-        create_tech_lead_review_prompt(prompt_path, "needs-tech-lead-review", "tech-lead-reviewed")
+        create_tech_lead_review_prompt(
+            prompt_path, "needs-tech-lead-review", "tech-lead-reviewed"
+        )
 
         assert prompt_path.exists()
         content = prompt_path.read_text()
@@ -198,7 +238,9 @@ class TestCreateTechLeadReviewPrompt:
         """Test the manifest contract: no gh usage, orchestrator labels manifest PRs."""
         prompt_path = tmp_path / "tech-lead.md"
 
-        create_tech_lead_review_prompt(prompt_path, "my-review-label", "my-reviewed-label")
+        create_tech_lead_review_prompt(
+            prompt_path, "my-review-label", "my-reviewed-label"
+        )
 
         content = prompt_path.read_text()
 
@@ -226,13 +268,19 @@ class TestCreateTechLeadReviewPrompt:
 
         repo_root = Path(__file__).resolve().parents[2]
         for example in ("tech-lead-review.md", "tech-lead-data-sources.md"):
-            sources[example] = (repo_root / "examples" / "prompts" / example).read_text()
+            sources[example] = (
+                repo_root / "examples" / "prompts" / example
+            ).read_text()
 
         forbidden = re.compile(r"sessions/\*|head -1|ls -d")
         for name, text in sources.items():
-            assert "ISSUE_ORCHESTRATOR_RUN_DIR" in text, f"{name} must use the run contract"
+            assert "ISSUE_ORCHESTRATOR_RUN_DIR" in text, (
+                f"{name} must use the run contract"
+            )
             match = forbidden.search(text)
-            assert match is None, f"{name} contains run-scan discovery: {match.group(0)!r}"
+            assert match is None, (
+                f"{name} contains run-scan discovery: {match.group(0)!r}"
+            )
 
     def test_includes_flavor_assignment_contract(self, tmp_path):
         """Prompts must lead with the assignment contract (ADR-0031).
@@ -254,7 +302,9 @@ class TestCreateTechLeadReviewPrompt:
             sources[str(variant.relative_to(repo_root))] = variant.read_text()
 
         for name, text in sources.items():
-            assert "tech-lead-assignment.json" in text, f"{name} missing assignment file"
+            assert "tech-lead-assignment.json" in text, (
+                f"{name} missing assignment file"
+            )
             assert "Your Assignment" in text, f"{name} missing assignment section"
             assert "batch_review" in text, f"{name} missing batch flavor"
             assert "failure_investigation" in text, f"{name} missing failure flavor"
@@ -415,7 +465,9 @@ class TestCheckPrerequisites:
     @patch("subprocess.run")
     @patch("issue_orchestrator.execution.providers.resolve_github_token")
     @patch("shutil.which")
-    def test_all_prerequisites_met(self, mock_which, mock_token, mock_subprocess, mock_git):
+    def test_all_prerequisites_met(
+        self, mock_which, mock_token, mock_subprocess, mock_git
+    ):
         """Test when all prerequisites are met."""
         mock_git.return_value = (True, "git version 2.40.0")
         mock_token.return_value = "token"
@@ -575,7 +627,9 @@ class TestFindExistingDefaultConfig:
 class TestSetupWizardSharedHelpers:
     """Test shared setup-wizard extraction helpers."""
 
-    def test_write_missing_setup_prompts_chooses_prompt_type_by_agent_role(self, tmp_path):
+    def test_write_missing_setup_prompts_chooses_prompt_type_by_agent_role(
+        self, tmp_path
+    ):
         """Prompt generation should stay role-aware after extraction."""
         collector = FileCollector()
         config = {
@@ -630,17 +684,19 @@ class TestSetupWizardSharedHelpers:
 
     def test_plan_setup_labels_matches_cli_defaults(self):
         """CLI setup should keep priority labels and default-agent review gating."""
-        labels = plan_setup_labels({
-            "agents": {
-                "agent:backend": {},
-                "agent:reviewer": {},
-            },
-            "labels": {"prefix": "io"},
-            "review": {
-                "default": "agent:reviewer",
-                "tech_lead_review_agent": "agent:tech-lead",
-            },
-        })
+        labels = plan_setup_labels(
+            {
+                "agents": {
+                    "agent:backend": {},
+                    "agent:reviewer": {},
+                },
+                "labels": {"prefix": "io"},
+                "review": {
+                    "default": "agent:reviewer",
+                    "tech_lead_review_agent": "agent:tech-lead",
+                },
+            }
+        )
 
         ordered_label_names = [name for name, _, _ in labels]
         label_names = set(ordered_label_names)
@@ -668,10 +724,12 @@ class TestSetupWizardSharedHelpers:
 
     def test_plan_setup_labels_omits_gate_without_tech_lead(self):
         """No tech lead agent -> no gate label to provision."""
-        labels = plan_setup_labels({
-            "agents": {"agent:backend": {}},
-            "review": {"default": "agent:reviewer"},
-        })
+        labels = plan_setup_labels(
+            {
+                "agents": {"agent:backend": {}},
+                "review": {"default": "agent:reviewer"},
+            }
+        )
         label_names = {name for name, _, _ in labels}
         assert "proposed-tech-lead" not in label_names
         assert "tech-lead-observation" not in label_names
@@ -758,11 +816,13 @@ class TestSetupWizardSharedHelpers:
 
         checks = build_agent_checks(config)
 
-        assert checks == [{
-            "name": "claude CLI",
-            "ok": True,
-            "detail": "claude 1.2.3",
-        }]
+        assert checks == [
+            {
+                "name": "claude CLI",
+                "ok": True,
+                "detail": "claude 1.2.3",
+            }
+        ]
         mock_probe_cli_version.assert_called_once_with(
             "/usr/local/bin/claude",
             fallback="/usr/local/bin/claude",
@@ -798,11 +858,13 @@ class TestSetupWizardSharedHelpers:
 
         checks = build_agent_checks(config)
 
-        assert checks == [{
-            "name": "claude-code CLI",
-            "ok": True,
-            "detail": "2.1.112 (Claude Code) (executable: claude)",
-        }]
+        assert checks == [
+            {
+                "name": "claude-code CLI",
+                "ok": True,
+                "detail": "2.1.112 (Claude Code) (executable: claude)",
+            }
+        ]
 
     def test_build_agent_checks_reports_unknown_provider(self, monkeypatch):
         """Invalid provider names should be surfaced as prereq failures."""
@@ -822,11 +884,13 @@ class TestSetupWizardSharedHelpers:
 
         checks = build_agent_checks(config)
 
-        assert checks == [{
-            "name": "mystery-ai CLI",
-            "ok": False,
-            "detail": "Unknown provider configured for agent:backend: mystery-ai",
-        }]
+        assert checks == [
+            {
+                "name": "mystery-ai CLI",
+                "ok": False,
+                "detail": "Unknown provider configured for agent:backend: mystery-ai",
+            }
+        ]
 
     def test_build_agent_checks_reports_provider_path_context(self, monkeypatch):
         """Missing provider CLIs should include enough PATH/NVM context to debug."""
@@ -843,10 +907,14 @@ class TestSetupWizardSharedHelpers:
             lambda name: Provider(),
         )
         monkeypatch.setenv("NVM_BIN", "/Users/test/.nvm/versions/node/v24.11.1/bin")
-        monkeypatch.setenv("PATH", "/Users/test/.nvm/versions/node/v24.11.1/bin:/usr/bin:/bin")
+        monkeypatch.setenv(
+            "PATH", "/Users/test/.nvm/versions/node/v24.11.1/bin:/usr/bin:/bin"
+        )
         monkeypatch.setattr(
             "issue_orchestrator.infra.provider_cli_diagnostics._find_executable_outside_path",
-            lambda executable: [Path("/Users/test/.nvm/versions/node/v24.14.1/bin/claude")],
+            lambda executable: [
+                Path("/Users/test/.nvm/versions/node/v24.14.1/bin/claude")
+            ],
         )
         config = SimpleNamespace(
             agents={
@@ -860,26 +928,32 @@ class TestSetupWizardSharedHelpers:
 
         checks = build_agent_checks(config)
 
-        assert checks == [{
-            "name": "claude-code CLI",
-            "ok": False,
-            "detail": (
-                "claude-code (expected executable: claude); "
-                "executable 'claude' not found on PATH; "
-                "NVM_BIN=/Users/test/.nvm/versions/node/v24.11.1/bin; "
-                "found outside PATH: /Users/test/.nvm/versions/node/v24.14.1/bin/claude"
-            ),
-        }]
+        assert checks == [
+            {
+                "name": "claude-code CLI",
+                "ok": False,
+                "detail": (
+                    "claude-code (expected executable: claude); "
+                    "executable 'claude' not found on PATH; "
+                    "NVM_BIN=/Users/test/.nvm/versions/node/v24.11.1/bin; "
+                    "found outside PATH: /Users/test/.nvm/versions/node/v24.14.1/bin/claude"
+                ),
+            }
+        ]
 
 
 class TestScanExistingRepo:
     """Test the scan_existing_repo function."""
 
-    @patch("issue_orchestrator.entrypoints.cli_tools.setup_wizard.find_prompt_candidates")
+    @patch(
+        "issue_orchestrator.entrypoints.cli_tools.setup_wizard.find_prompt_candidates"
+    )
     @patch("issue_orchestrator.entrypoints.cli_tools.setup_wizard.find_existing_config")
     @patch("issue_orchestrator.entrypoints.cli_tools.setup_wizard.fetch_github_labels")
     @patch("issue_orchestrator.entrypoints.cli_tools.setup_wizard.detect_repo")
-    def test_scans_repo(self, mock_repo, mock_labels, mock_config, mock_prompts, tmp_path):
+    def test_scans_repo(
+        self, mock_repo, mock_labels, mock_config, mock_prompts, tmp_path
+    ):
         """Test scanning an existing repo."""
         mock_repo.return_value = "owner/repo"
         mock_labels.return_value = ["bug", "agent:web", "agent:backend"]
@@ -892,11 +966,15 @@ class TestScanExistingRepo:
         assert state.agent_labels == ["agent:web", "agent:backend"]
         assert len(state.github_labels) == 3
 
-    @patch("issue_orchestrator.entrypoints.cli_tools.setup_wizard.find_prompt_candidates")
+    @patch(
+        "issue_orchestrator.entrypoints.cli_tools.setup_wizard.find_prompt_candidates"
+    )
     @patch("issue_orchestrator.entrypoints.cli_tools.setup_wizard.find_existing_config")
     @patch("issue_orchestrator.entrypoints.cli_tools.setup_wizard.fetch_github_labels")
     @patch("issue_orchestrator.entrypoints.cli_tools.setup_wizard.detect_repo")
-    def test_handles_no_repo(self, mock_repo, mock_labels, mock_config, mock_prompts, tmp_path):
+    def test_handles_no_repo(
+        self, mock_repo, mock_labels, mock_config, mock_prompts, tmp_path
+    ):
         """Test scanning when repo detection fails."""
         mock_repo.return_value = None
         mock_config.return_value = (None, None)
@@ -926,14 +1004,16 @@ class TestWizardNewProject:
             is_available=lambda: True,
         )
 
-        prompter = MockPrompter([
-            "45",      # timeout
-            "codex",   # provider
-            "",        # model blank => use CLI default
-            False,      # not a review agent
-        ])
+        prompter = MockPrompter(
+            [
+                "45",  # timeout
+                "codex",  # provider
+                "",  # model blank => use CLI default
+                False,  # not a review agent
+            ]
+        )
 
-        config = setup_wizard_module._prompt_agent_config(
+        config = setup_wizard_module._prompt_agent_config(  # noqa: SLF001
             prompter,
             agent_name="agent:backend",
             prompt_path=".prompts/backend.md",
@@ -950,35 +1030,37 @@ class TestWizardNewProject:
         mock_detect_repo.return_value = "owner/repo"
         mock_client_factory.return_value = Mock()
 
-        prompter = MockPrompter([
-            "Advanced setup",       # setup depth
-            "owner/repo",           # repo (accept detected)
-            "agent:backend",        # first agent label
-            ".prompts/backend.md",  # prompt path (accept default)
-            "45",                   # timeout
-            "claude-code",          # agent provider
-            "sonnet",               # model choice
-            "default",              # permission mode
-            False,                  # is this a review agent?
-            "",                     # empty to finish agents
-            "3",                    # max concurrent sessions
-            "due_date",             # milestone sort strategy
-            "",                     # milestone order (optional)
-            "M0",                   # foundation milestone
-            "../",                  # worktree base
-            "",                     # setup commands (empty to skip)
-            True,                   # enable Claude startup interactions
-            "web",                  # ui mode
-            "8080",                 # web port
-            "tmux",                 # terminal backend
-            "io",                   # label prefix
-            "make test",            # quick validation command
-            "make test",            # publish validation command
-            "300",                  # quick validation timeout
-            "1800",                 # publish validation timeout
-            "",                     # filtering label
-            False,                  # disable review
-        ])
+        prompter = MockPrompter(
+            [
+                "Advanced setup",  # setup depth
+                "owner/repo",  # repo (accept detected)
+                "agent:backend",  # first agent label
+                ".prompts/backend.md",  # prompt path (accept default)
+                "45",  # timeout
+                "claude-code",  # agent provider
+                "sonnet",  # model choice
+                "default",  # permission mode
+                False,  # is this a review agent?
+                "",  # empty to finish agents
+                "3",  # max concurrent sessions
+                "due_date",  # milestone sort strategy
+                "",  # milestone order (optional)
+                "M0",  # foundation milestone
+                "../",  # worktree base
+                "",  # setup commands (empty to skip)
+                True,  # enable Claude startup interactions
+                "web",  # ui mode
+                "8080",  # web port
+                "tmux",  # terminal backend
+                "io",  # label prefix
+                "make test",  # quick validation command
+                "make test",  # publish validation command
+                "300",  # quick validation timeout
+                "1800",  # publish validation timeout
+                "",  # filtering label
+                False,  # disable review
+            ]
+        )
 
         config = wizard_new_project(prompter)
 
@@ -1001,40 +1083,44 @@ class TestWizardNewProject:
 
     @patch("issue_orchestrator.entrypoints.cli_tools.setup_wizard.detect_repo")
     @patch("issue_orchestrator.entrypoints.cli_tools.setup_wizard._get_repository_host")
-    def test_review_agent_gets_pr_number_in_prompt(self, mock_client_factory, mock_detect_repo):
+    def test_review_agent_gets_pr_number_in_prompt(
+        self, mock_client_factory, mock_detect_repo
+    ):
         """Test that review agents get initial_prompt with {pr_number}."""
         mock_detect_repo.return_value = "owner/repo"
         mock_client_factory.return_value = Mock()
 
-        prompter = MockPrompter([
-            "Advanced setup",       # setup depth
-            "owner/repo",
-            "agent:reviewer",
-            ".prompts/reviewer.md",
-            "30",                   # timeout
-            "claude-code",          # agent provider
-            "sonnet",               # model
-            "default",              # permission mode
-            True,                   # YES, this IS a review agent
-            "",                     # finish agents
-            "3",
-            "due_date",
-            "",                     # milestone order (optional)
-            "M0",
-            "../",
-            "",                     # setup commands (empty to skip)
-            True,                   # enable Claude startup interactions
-            "web",
-            "8080",
-            "tmux",
-            "io",
-            "make test",            # quick validation command
-            "make test",            # publish validation command
-            "300",                  # quick validation timeout
-            "1800",                 # publish validation timeout
-            "",                     # filtering label
-            False,                  # disable review
-        ])
+        prompter = MockPrompter(
+            [
+                "Advanced setup",  # setup depth
+                "owner/repo",
+                "agent:reviewer",
+                ".prompts/reviewer.md",
+                "30",  # timeout
+                "claude-code",  # agent provider
+                "sonnet",  # model
+                "default",  # permission mode
+                True,  # YES, this IS a review agent
+                "",  # finish agents
+                "3",
+                "due_date",
+                "",  # milestone order (optional)
+                "M0",
+                "../",
+                "",  # setup commands (empty to skip)
+                True,  # enable Claude startup interactions
+                "web",
+                "8080",
+                "tmux",
+                "io",
+                "make test",  # quick validation command
+                "make test",  # publish validation command
+                "300",  # quick validation timeout
+                "1800",  # publish validation timeout
+                "",  # filtering label
+                False,  # disable review
+            ]
+        )
 
         config = wizard_new_project(prompter)
 
@@ -1045,39 +1131,43 @@ class TestWizardNewProject:
 
     @patch("issue_orchestrator.entrypoints.cli_tools.setup_wizard.detect_repo")
     @patch("issue_orchestrator.entrypoints.cli_tools.setup_wizard._get_repository_host")
-    def test_adds_agent_prefix_when_missing(self, mock_client_factory, mock_detect_repo):
+    def test_adds_agent_prefix_when_missing(
+        self, mock_client_factory, mock_detect_repo
+    ):
         """Test that agent: prefix is added when user confirms."""
         mock_detect_repo.return_value = None
         mock_client_factory.return_value = Mock()
 
-        prompter = MockPrompter([
-            "Advanced setup",       # setup depth
-            "owner/repo",           # repo (no detection)
-            "backend",              # agent label without prefix
-            True,                   # yes to add prefix
-            ".prompts/backend.md",
-            "60",                   # timeout
-            "claude-code",          # agent provider
-            "opus",                 # model
-            "default",              # permission mode
-            False,                  # is this a review agent?
-            "",                     # finish agents
-            "2",                    # max concurrent
-            "due_date",             # milestone sort strategy
-            "",                     # milestone order (optional)
-            "M0",                   # foundation milestone
-            "../",
-            "",                     # setup commands (empty to skip)
-            True,                   # enable Claude startup interactions
-            "tmux",                 # ui mode (tmux doesn't need port)
-            "io",                   # label prefix
-            "make test",            # quick validation command
-            "make test",            # publish validation command
-            "300",                  # quick validation timeout
-            "1800",                 # publish validation timeout
-            "",                     # filtering label
-            False,                  # disable review
-        ])
+        prompter = MockPrompter(
+            [
+                "Advanced setup",  # setup depth
+                "owner/repo",  # repo (no detection)
+                "backend",  # agent label without prefix
+                True,  # yes to add prefix
+                ".prompts/backend.md",
+                "60",  # timeout
+                "claude-code",  # agent provider
+                "opus",  # model
+                "default",  # permission mode
+                False,  # is this a review agent?
+                "",  # finish agents
+                "2",  # max concurrent
+                "due_date",  # milestone sort strategy
+                "",  # milestone order (optional)
+                "M0",  # foundation milestone
+                "../",
+                "",  # setup commands (empty to skip)
+                True,  # enable Claude startup interactions
+                "tmux",  # ui mode (tmux doesn't need port)
+                "io",  # label prefix
+                "make test",  # quick validation command
+                "make test",  # publish validation command
+                "300",  # quick validation timeout
+                "1800",  # publish validation timeout
+                "",  # filtering label
+                False,  # disable review
+            ]
+        )
 
         config = wizard_new_project(prompter)
 
@@ -1091,46 +1181,48 @@ class TestWizardNewProject:
         mock_detect_repo.return_value = "owner/repo"
         mock_client_factory.return_value = Mock()
 
-        prompter = MockPrompter([
-            "Advanced setup",       # setup depth
-            "owner/repo",
-            # First agent
-            "agent:frontend",
-            ".prompts/frontend.md",
-            "30",                   # timeout
-            "claude-code",          # agent provider
-            "sonnet",               # model
-            "default",              # permission mode
-            False,                  # is this a review agent?
-            # Second agent
-            "agent:backend",
-            ".prompts/backend.md",
-            "60",                   # timeout
-            "claude-code",          # agent provider
-            "opus",                 # model
-            "bypassPermissions",    # permission mode (different for variety)
-            True,                   # confirm bypassPermissions
-            False,                  # is this a review agent?
-            # Finish
-            "",
-            "5",                    # max concurrent
-            "due_date",             # milestone sort strategy
-            "",                     # milestone order (optional)
-            "M0",                   # foundation milestone
-            "../",
-            "",                     # setup commands (empty to skip)
-            True,                   # enable Claude startup interactions
-            "web",
-            "9000",                 # custom port
-            "tmux",                 # terminal backend
-            "io",                   # label prefix
-            "make test",            # quick validation command
-            "make test",            # publish validation command
-            "300",                  # quick validation timeout
-            "1800",                 # publish validation timeout
-            "",                     # filtering label
-            False,                  # disable review
-        ])
+        prompter = MockPrompter(
+            [
+                "Advanced setup",  # setup depth
+                "owner/repo",
+                # First agent
+                "agent:frontend",
+                ".prompts/frontend.md",
+                "30",  # timeout
+                "claude-code",  # agent provider
+                "sonnet",  # model
+                "default",  # permission mode
+                False,  # is this a review agent?
+                # Second agent
+                "agent:backend",
+                ".prompts/backend.md",
+                "60",  # timeout
+                "claude-code",  # agent provider
+                "opus",  # model
+                "bypassPermissions",  # permission mode (different for variety)
+                True,  # confirm bypassPermissions
+                False,  # is this a review agent?
+                # Finish
+                "",
+                "5",  # max concurrent
+                "due_date",  # milestone sort strategy
+                "",  # milestone order (optional)
+                "M0",  # foundation milestone
+                "../",
+                "",  # setup commands (empty to skip)
+                True,  # enable Claude startup interactions
+                "web",
+                "9000",  # custom port
+                "tmux",  # terminal backend
+                "io",  # label prefix
+                "make test",  # quick validation command
+                "make test",  # publish validation command
+                "300",  # quick validation timeout
+                "1800",  # publish validation timeout
+                "",  # filtering label
+                False,  # disable review
+            ]
+        )
 
         config = wizard_new_project(prompter)
 
@@ -1147,33 +1239,35 @@ class TestWizardNewProject:
         mock_detect_repo.return_value = "owner/repo"
         mock_client_factory.return_value = Mock()
 
-        prompter = MockPrompter([
-            "Advanced setup",       # setup depth
-            "owner/repo",
-            "agent:custom",
-            ".prompts/custom.md",
-            "30",                   # timeout
-            "custom",               # agent type (custom command)
-            "codex exec {prompt}",  # custom command
-            False,                  # is this a review agent?
-            "",                     # finish agents
-            "3",
-            "due_date",             # milestone sort strategy
-            "",                     # milestone order (optional)
-            "M0",                   # foundation milestone
-            "../",
-            "",                     # setup commands (empty to skip)
-            "web",
-            "8080",
-            "tmux",                 # terminal backend
-            "io",                   # label prefix
-            "make test",            # quick validation command
-            "make test",            # publish validation command
-            "300",                  # quick validation timeout
-            "1800",                 # publish validation timeout
-            "",                     # filtering label
-            False,                  # disable review
-        ])
+        prompter = MockPrompter(
+            [
+                "Advanced setup",  # setup depth
+                "owner/repo",
+                "agent:custom",
+                ".prompts/custom.md",
+                "30",  # timeout
+                "custom",  # agent type (custom command)
+                "codex exec {prompt}",  # custom command
+                False,  # is this a review agent?
+                "",  # finish agents
+                "3",
+                "due_date",  # milestone sort strategy
+                "",  # milestone order (optional)
+                "M0",  # foundation milestone
+                "../",
+                "",  # setup commands (empty to skip)
+                "web",
+                "8080",
+                "tmux",  # terminal backend
+                "io",  # label prefix
+                "make test",  # quick validation command
+                "make test",  # publish validation command
+                "300",  # quick validation timeout
+                "1800",  # publish validation timeout
+                "",  # filtering label
+                False,  # disable review
+            ]
+        )
 
         config = wizard_new_project(prompter)
 
@@ -1191,43 +1285,45 @@ class TestWizardNewProject:
         mock_detect_repo.return_value = "owner/repo"
         mock_client_factory.return_value = Mock()
 
-        prompter = MockPrompter([
-            "Advanced setup",       # setup depth
-            "owner/repo",
-            "agent:backend",
-            ".prompts/backend.md",
-            "45",                   # timeout
-            "claude-code",          # agent provider
-            "sonnet",               # model
-            "default",              # permission mode
-            False,                  # is this a review agent?
-            "",                     # finish agents
-            "3",
-            "due_date",             # milestone sort strategy
-            "",                     # milestone order (optional)
-            "M0",                   # foundation milestone
-            "../",
-            "",                     # setup commands (empty to skip)
-            True,                   # enable Claude startup interactions
-            "web",
-            "8080",
-            "tmux",                 # terminal backend
-            "io",                   # label prefix
-            "make test",            # quick validation command
-            "make test",            # publish validation command
-            "300",                  # quick validation timeout
-            "1800",                 # publish validation timeout
-            "",                     # filtering label
-            True,                   # enable code review
-            "agent:reviewer",       # code review agent
-            "needs-code-review",    # code review label
-            "code-reviewed",        # code reviewed label
-            True,                   # enable Stage 2: tech_lead batch review
-            "agent:tech-lead",            # tech_lead review agent
-            "tech-lead-reviewed",         # tech_lead reviewed label
-            "5",                    # threshold
-            "agent:backend",           # tech_lead follow-up worker agent (#6779 R14)
-        ])
+        prompter = MockPrompter(
+            [
+                "Advanced setup",  # setup depth
+                "owner/repo",
+                "agent:backend",
+                ".prompts/backend.md",
+                "45",  # timeout
+                "claude-code",  # agent provider
+                "sonnet",  # model
+                "default",  # permission mode
+                False,  # is this a review agent?
+                "",  # finish agents
+                "3",
+                "due_date",  # milestone sort strategy
+                "",  # milestone order (optional)
+                "M0",  # foundation milestone
+                "../",
+                "",  # setup commands (empty to skip)
+                True,  # enable Claude startup interactions
+                "web",
+                "8080",
+                "tmux",  # terminal backend
+                "io",  # label prefix
+                "make test",  # quick validation command
+                "make test",  # publish validation command
+                "300",  # quick validation timeout
+                "1800",  # publish validation timeout
+                "",  # filtering label
+                True,  # enable code review
+                "agent:reviewer",  # code review agent
+                "needs-code-review",  # code review label
+                "code-reviewed",  # code reviewed label
+                True,  # enable Stage 2: tech_lead batch review
+                "agent:tech-lead",  # tech_lead review agent
+                "tech-lead-reviewed",  # tech_lead reviewed label
+                "5",  # threshold
+                "agent:backend",  # tech_lead follow-up worker agent (#6779 R14)
+            ]
+        )
 
         config = wizard_new_project(prompter)
 
@@ -1252,36 +1348,38 @@ class TestWizardNewProject:
         mock_detect_repo.return_value = "owner/repo"
         mock_client_factory.return_value = Mock()
 
-        prompter = MockPrompter([
-            "Advanced setup",       # setup depth
-            "owner/repo",
-            "",                     # try to finish with no agents
-            "agent:backend",        # now add one
-            ".prompts/backend.md",
-            "45",                   # timeout
-            "claude-code",          # agent provider
-            "sonnet",               # model
-            "default",              # permission mode
-            False,                  # is this a review agent?
-            "",                     # finish
-            "3",
-            "due_date",             # milestone sort strategy
-            "",                     # milestone order (optional)
-            "M0",                   # foundation milestone
-            "../",
-            "",                     # setup commands (empty to skip)
-            True,                   # enable Claude startup interactions
-            "web",
-            "8080",
-            "tmux",                 # terminal backend
-            "io",                   # label prefix
-            "make test",            # quick validation command
-            "make test",            # publish validation command
-            "300",                  # quick validation timeout
-            "1800",                 # publish validation timeout
-            "",                     # filtering label
-            False,                  # disable review
-        ])
+        prompter = MockPrompter(
+            [
+                "Advanced setup",  # setup depth
+                "owner/repo",
+                "",  # try to finish with no agents
+                "agent:backend",  # now add one
+                ".prompts/backend.md",
+                "45",  # timeout
+                "claude-code",  # agent provider
+                "sonnet",  # model
+                "default",  # permission mode
+                False,  # is this a review agent?
+                "",  # finish
+                "3",
+                "due_date",  # milestone sort strategy
+                "",  # milestone order (optional)
+                "M0",  # foundation milestone
+                "../",
+                "",  # setup commands (empty to skip)
+                True,  # enable Claude startup interactions
+                "web",
+                "8080",
+                "tmux",  # terminal backend
+                "io",  # label prefix
+                "make test",  # quick validation command
+                "make test",  # publish validation command
+                "300",  # quick validation timeout
+                "1800",  # publish validation timeout
+                "",  # filtering label
+                False,  # disable review
+            ]
+        )
 
         config = wizard_new_project(prompter)
 
@@ -1308,31 +1406,33 @@ class TestWizardExistingProject:
             prompt_candidates=[],
         )
 
-        prompter = MockPrompter([
-            True,                   # add agent:web to config
-            ".prompts/web.md",      # prompt path
-            "45",                   # timeout
-            "claude-code",          # agent provider
-            "sonnet",               # model
-            "default",              # permission mode
-            False,                  # is this a review agent?
-            "3",                    # max concurrent
-            "due_date",             # milestone sort strategy
-            "",                     # milestone order (optional)
-            "M0",                   # foundation milestone
-            "../",                  # worktree base
-            "",                     # setup commands (empty to skip)
-            True,                   # enable Claude startup interactions
-            "web",                  # ui mode
-            "8080",                 # port
-            "tmux",                 # terminal backend
-            "io",                   # label prefix
-            "make test",            # quick validation command
-            "make test",            # publish validation command
-            "300",                  # quick validation timeout
-            "1800",                 # publish validation timeout
-            False,                  # disable Stage 1 review
-        ])
+        prompter = MockPrompter(
+            [
+                True,  # add agent:web to config
+                ".prompts/web.md",  # prompt path
+                "45",  # timeout
+                "claude-code",  # agent provider
+                "sonnet",  # model
+                "default",  # permission mode
+                False,  # is this a review agent?
+                "3",  # max concurrent
+                "due_date",  # milestone sort strategy
+                "",  # milestone order (optional)
+                "M0",  # foundation milestone
+                "../",  # worktree base
+                "",  # setup commands (empty to skip)
+                True,  # enable Claude startup interactions
+                "web",  # ui mode
+                "8080",  # port
+                "tmux",  # terminal backend
+                "io",  # label prefix
+                "make test",  # quick validation command
+                "make test",  # publish validation command
+                "300",  # quick validation timeout
+                "1800",  # publish validation timeout
+                False,  # disable Stage 1 review
+            ]
+        )
 
         config, _ = wizard_existing_project(state, prompter)
 
@@ -1372,37 +1472,39 @@ class TestWizardExistingProject:
             prompt_candidates=[],
         )
 
-        prompter = MockPrompter([
-            True,                   # update existing config
-            # agent:backend is not in config, so wizard asks about it
-            True,                   # add agent:backend
-            ".prompts/backend.md",  # prompt path
-            "60",                   # timeout
-            "claude-code",          # agent provider
-            "opus",                 # model
-            "default",              # permission mode
-            False,                  # is this a review agent?
-            # No more missing agents
-            # agent:web is in config but let's say it's in github_labels too (no missing labels)
-            # Concurrency already configured - won't ask
-            # Milestone sort not configured - will ask
-            "due_date",             # milestone sort strategy
-            "",                     # milestone order (optional)
-            "M0",                   # foundation milestone
-            # Worktrees needed for backend
-            "../",
-            "",                     # setup commands (empty to skip)
-            True,                   # enable Claude startup interactions
-            # UI mode already configured - won't ask
-            # Label prefix not configured
-            "io",                   # label prefix
-            "make test",            # quick validation command
-            "make test",            # publish validation command
-            "300",                  # quick validation timeout
-            "1800",                 # publish validation timeout
-            # Review not configured
-            False,                  # no review
-        ])
+        prompter = MockPrompter(
+            [
+                True,  # update existing config
+                # agent:backend is not in config, so wizard asks about it
+                True,  # add agent:backend
+                ".prompts/backend.md",  # prompt path
+                "60",  # timeout
+                "claude-code",  # agent provider
+                "opus",  # model
+                "default",  # permission mode
+                False,  # is this a review agent?
+                # No more missing agents
+                # agent:web is in config but let's say it's in github_labels too (no missing labels)
+                # Concurrency already configured - won't ask
+                # Milestone sort not configured - will ask
+                "due_date",  # milestone sort strategy
+                "",  # milestone order (optional)
+                "M0",  # foundation milestone
+                # Worktrees needed for backend
+                "../",
+                "",  # setup commands (empty to skip)
+                True,  # enable Claude startup interactions
+                # UI mode already configured - won't ask
+                # Label prefix not configured
+                "io",  # label prefix
+                "make test",  # quick validation command
+                "make test",  # publish validation command
+                "300",  # quick validation timeout
+                "1800",  # publish validation timeout
+                # Review not configured
+                False,  # no review
+            ]
+        )
 
         config, _ = wizard_existing_project(state, prompter)
 
@@ -1428,7 +1530,11 @@ class TestWizardExistingProject:
             existing_config={
                 "repo": {"name": "owner/repo"},
                 "agents": {
-                    "agent:web": {"prompt": ".prompts/web.md", "model": "sonnet", "timeout_minutes": 45},
+                    "agent:web": {
+                        "prompt": ".prompts/web.md",
+                        "model": "sonnet",
+                        "timeout_minutes": 45,
+                    },
                 },
                 "execution": {"concurrency": {"max_concurrent_sessions": 3}},
             },
@@ -1436,29 +1542,31 @@ class TestWizardExistingProject:
             prompt_candidates=[],
         )
 
-        prompter = MockPrompter([
-            True,                   # update existing config
-            # No unconfigured agents
-            # Milestone sort missing
-            "due_date",             # milestone sort strategy
-            "",                     # milestone order (optional)
-            "M0",                   # foundation milestone
-            # Worktree missing
-            "../",
-            "",                     # setup commands (empty to skip)
-            # UI mode missing
-            "web",
-            "8080",
-            "tmux",
-            # Label prefix
-            "io",                   # label prefix
-            "make test",            # quick validation command
-            "make test",            # publish validation command
-            "300",                  # quick validation timeout
-            "1800",                 # publish validation timeout
-            # Review
-            False,                  # disable Stage 1 review
-        ])
+        prompter = MockPrompter(
+            [
+                True,  # update existing config
+                # No unconfigured agents
+                # Milestone sort missing
+                "due_date",  # milestone sort strategy
+                "",  # milestone order (optional)
+                "M0",  # foundation milestone
+                # Worktree missing
+                "../",
+                "",  # setup commands (empty to skip)
+                # UI mode missing
+                "web",
+                "8080",
+                "tmux",
+                # Label prefix
+                "io",  # label prefix
+                "make test",  # quick validation command
+                "make test",  # publish validation command
+                "300",  # quick validation timeout
+                "1800",  # publish validation timeout
+                # Review
+                False,  # disable Stage 1 review
+            ]
+        )
 
         config, _ = wizard_existing_project(state, prompter)
 
@@ -1477,43 +1585,51 @@ class TestWizardExistingProject:
             agent_labels=["agent:web"],
             existing_config={
                 "repo": {"name": "owner/repo"},
-                "agents": {"agent:old": {"prompt": ".prompts/old.md", "model": "haiku", "timeout_minutes": 30}},
+                "agents": {
+                    "agent:old": {
+                        "prompt": ".prompts/old.md",
+                        "model": "haiku",
+                        "timeout_minutes": 30,
+                    }
+                },
             },
             config_path=Path(".issue-orchestrator.yaml"),
             prompt_candidates=[],
         )
 
-        prompter = MockPrompter([
-            False,                  # DON'T update existing config - start fresh
-            # Now asks about agent:web since we started fresh
-            True,                   # add agent:web
-            ".prompts/web.md",
-            "45",                   # timeout
-            "claude-code",          # agent provider
-            "sonnet",               # model
-            "default",              # permission mode
-            False,                  # is this a review agent?
-            # Concurrency (fresh config needs this)
-            "2",
-            # Milestone sort (fresh config needs this)
-            "due_date",             # milestone sort strategy
-            "",                     # milestone order (optional)
-            "M0",                   # foundation milestone
-            # Worktree
-            "../",
-            "",                     # setup commands (empty to skip)
-            True,                   # enable Claude startup interactions
-            # UI mode (fresh)
-            "tmux",
-            # Label prefix
-            "io",                   # label prefix
-            "make test",            # quick validation command
-            "make test",            # publish validation command
-            "300",                  # quick validation timeout
-            "1800",                 # publish validation timeout
-            # Review
-            False,
-        ])
+        prompter = MockPrompter(
+            [
+                False,  # DON'T update existing config - start fresh
+                # Now asks about agent:web since we started fresh
+                True,  # add agent:web
+                ".prompts/web.md",
+                "45",  # timeout
+                "claude-code",  # agent provider
+                "sonnet",  # model
+                "default",  # permission mode
+                False,  # is this a review agent?
+                # Concurrency (fresh config needs this)
+                "2",
+                # Milestone sort (fresh config needs this)
+                "due_date",  # milestone sort strategy
+                "",  # milestone order (optional)
+                "M0",  # foundation milestone
+                # Worktree
+                "../",
+                "",  # setup commands (empty to skip)
+                True,  # enable Claude startup interactions
+                # UI mode (fresh)
+                "tmux",
+                # Label prefix
+                "io",  # label prefix
+                "make test",  # quick validation command
+                "make test",  # publish validation command
+                "300",  # quick validation timeout
+                "1800",  # publish validation timeout
+                # Review
+                False,
+            ]
+        )
 
         config, _ = wizard_existing_project(state, prompter)
 
@@ -1536,32 +1652,34 @@ class TestWizardExistingProject:
             prompt_candidates=[],
         )
 
-        prompter = MockPrompter([
-            "manual/repo",          # manual repo entry
-            "agent:dev",            # manual agent label
-            ".prompts/dev.md",      # prompt path
-            "45",                   # timeout
-            "claude-code",          # agent provider
-            "sonnet",               # model
-            "default",              # permission mode
-            False,                  # is this a review agent?
-            "3",                    # concurrency
-            "due_date",             # milestone sort strategy
-            "",                     # milestone order (optional)
-            "M0",                   # foundation milestone
-            "../",                  # worktree base (now top-level config)
-            "",                     # setup commands (empty to skip)
-            True,                   # enable Claude startup interactions
-            "web",                  # ui mode
-            "8080",                 # port (since web mode)
-            "tmux",                 # terminal backend
-            "io",                   # label prefix
-            "make test",            # quick validation command
-            "make test",            # publish validation command
-            "300",                  # quick validation timeout
-            "1800",                 # publish validation timeout
-            False,                  # disable Stage 1 review
-        ])
+        prompter = MockPrompter(
+            [
+                "manual/repo",  # manual repo entry
+                "agent:dev",  # manual agent label
+                ".prompts/dev.md",  # prompt path
+                "45",  # timeout
+                "claude-code",  # agent provider
+                "sonnet",  # model
+                "default",  # permission mode
+                False,  # is this a review agent?
+                "3",  # concurrency
+                "due_date",  # milestone sort strategy
+                "",  # milestone order (optional)
+                "M0",  # foundation milestone
+                "../",  # worktree base (now top-level config)
+                "",  # setup commands (empty to skip)
+                True,  # enable Claude startup interactions
+                "web",  # ui mode
+                "8080",  # port (since web mode)
+                "tmux",  # terminal backend
+                "io",  # label prefix
+                "make test",  # quick validation command
+                "make test",  # publish validation command
+                "300",  # quick validation timeout
+                "1800",  # publish validation timeout
+                False,  # disable Stage 1 review
+            ]
+        )
 
         config, _ = wizard_existing_project(state, prompter)
 
@@ -1577,9 +1695,15 @@ class TestRunWizard:
     @patch("issue_orchestrator.entrypoints.cli_tools.setup_wizard.scan_existing_repo")
     @patch("issue_orchestrator.entrypoints.cli_tools.setup_wizard.fetch_github_labels")
     @patch("os.chdir")
-    def test_new_project_flow(self, mock_chdir, mock_labels, mock_scan, mock_prereqs, tmp_path):
+    def test_new_project_flow(
+        self, mock_chdir, mock_labels, mock_scan, mock_prereqs, tmp_path
+    ):
         """Test the full wizard flow for a new project."""
-        mock_prereqs.return_value = {"git": True, "github_auth": True, "any_ai_provider": True}
+        mock_prereqs.return_value = {
+            "git": True,
+            "github_auth": True,
+            "any_ai_provider": True,
+        }
         mock_scan.return_value = DetectedState(repo="owner/repo")
         mock_labels.return_value = []  # No existing labels
 
@@ -1587,111 +1711,149 @@ class TestRunWizard:
         target = tmp_path / "myproject"
         target.mkdir()
 
-        prompter = MockPrompter([
-            # Mode choice (no directory prompt since we pass target_path)
-            "New project - set up from scratch",
-            "Advanced setup",       # setup depth
-            # wizard_new_project answers
-            "owner/repo",
-            "agent:backend",
-            ".prompts/backend.md",
-            "45",                   # timeout
-            "claude-code",          # agent provider
-            "sonnet",               # model
-            "default",              # permission mode
-            False,                  # is this a review agent?
-            "",                     # finish agents
-            "3",
-            "due_date",             # milestone sort strategy
-            "",                     # milestone order (optional)
-            "M0",                   # foundation milestone
-            "../",
-            "",                     # setup commands (empty to skip)
-            True,                   # enable Claude startup interactions
-            "web",
-            "8080",
-            "tmux",
-            "io",                   # label prefix
-            "make test",            # quick validation command
-            "make test",            # publish validation command
-            "300",                  # quick validation timeout
-            "1800",                 # publish validation timeout
-            "",                     # filtering label
-            False,                  # disable review
-            # Post-wizard (new flow)
-            ".issue-orchestrator.yaml",  # config filename
-            True,                   # Apply these changes?
-            False,                  # Install repo-local guardrails and AI agent hooks now?
-            False,                  # Set up AI provider API keys now?
-        ])
+        prompter = MockPrompter(
+            [
+                # Mode choice (no directory prompt since we pass target_path)
+                "New project - set up from scratch",
+                "Advanced setup",  # setup depth
+                # wizard_new_project answers
+                "owner/repo",
+                "agent:backend",
+                ".prompts/backend.md",
+                "45",  # timeout
+                "claude-code",  # agent provider
+                "sonnet",  # model
+                "default",  # permission mode
+                False,  # is this a review agent?
+                "",  # finish agents
+                "3",
+                "due_date",  # milestone sort strategy
+                "",  # milestone order (optional)
+                "M0",  # foundation milestone
+                "../",
+                "",  # setup commands (empty to skip)
+                True,  # enable Claude startup interactions
+                "web",
+                "8080",
+                "tmux",
+                "io",  # label prefix
+                "make test",  # quick validation command
+                "make test",  # publish validation command
+                "300",  # quick validation timeout
+                "1800",  # publish validation timeout
+                "",  # filtering label
+                False,  # disable review
+                # Post-wizard (new flow)
+                ".issue-orchestrator.yaml",  # config filename
+                True,  # Apply these changes?
+                False,  # Install repo-local guardrails and AI agent hooks now?
+                False,  # Set up AI provider API keys now?
+            ]
+        )
 
         host = Mock()
         host.list_labels.return_value = []
-        with patch("issue_orchestrator.entrypoints.cli_tools.setup_wizard.detect_repo", return_value="owner/repo"):
-            with patch("issue_orchestrator.entrypoints.cli_tools.setup_wizard._get_repository_host", return_value=host):
-                with patch("issue_orchestrator.entrypoints.cli_tools.setup_wizard.offer_readiness_assessment"):
+        with patch(
+            "issue_orchestrator.entrypoints.cli_tools.setup_wizard.detect_repo",
+            return_value="owner/repo",
+        ):
+            with patch(
+                "issue_orchestrator.entrypoints.cli_tools.setup_wizard._get_repository_host",
+                return_value=host,
+            ):
+                with patch(
+                    "issue_orchestrator.entrypoints.cli_tools.setup_wizard.offer_readiness_assessment"
+                ):
                     run_wizard(target_path=target, prompter=prompter)
 
         # Verify files were created
-        assert (target / ".issue-orchestrator.yaml").exists() or any("apply" in msg.lower() for msg in prompter.printed)
+        assert (target / ".issue-orchestrator.yaml").exists() or any(
+            "apply" in msg.lower() for msg in prompter.printed
+        )
         printed = "\n".join(prompter.printed)
-        assert "Install repo guardrails + AI hooks (recommended): issue-orchestrator setup-guardrails" in printed
+        assert (
+            "Install repo guardrails + AI hooks (recommended): issue-orchestrator setup-guardrails"
+            in printed
+        )
         assert "Run: issue-orchestrator doctor" in printed
-        assert printed.index("issue-orchestrator setup-guardrails") < printed.index("issue-orchestrator doctor")
-        assert printed.index("issue-orchestrator doctor") < printed.index("issue-orchestrator start")
+        assert printed.index("issue-orchestrator setup-guardrails") < printed.index(
+            "issue-orchestrator doctor"
+        )
+        assert printed.index("issue-orchestrator doctor") < printed.index(
+            "issue-orchestrator start"
+        )
         assert "Trusted session interactions are enabled." in printed
         assert "auto-accept Claude's initial trust prompt" in printed
-        assert "pre-approving the parent directory does not auto-trust child worktrees." in printed
+        assert (
+            "pre-approving the parent directory does not auto-trust child worktrees."
+            in printed
+        )
 
     @patch("issue_orchestrator.entrypoints.cli_tools.setup_wizard.check_prerequisites")
     @patch("issue_orchestrator.entrypoints.cli_tools.setup_wizard.fetch_github_labels")
     @patch("os.chdir")
-    def test_aborts_when_apply_declined(self, mock_chdir, mock_labels, mock_prereqs, tmp_path):
+    def test_aborts_when_apply_declined(
+        self, mock_chdir, mock_labels, mock_prereqs, tmp_path
+    ):
         """Test that wizard aborts when user declines to apply changes."""
-        mock_prereqs.return_value = {"git": True, "github_auth": True, "any_ai_provider": True}
+        mock_prereqs.return_value = {
+            "git": True,
+            "github_auth": True,
+            "any_ai_provider": True,
+        }
         mock_labels.return_value = []  # No existing labels
 
         target = tmp_path / "myproject"
         target.mkdir()
 
-        prompter = MockPrompter([
-            # No directory prompt since we pass target_path
-            "New project - set up from scratch",
-            "Advanced setup",       # setup depth
-            "owner/repo",
-            "agent:backend",
-            ".prompts/backend.md",
-            "45",                   # timeout
-            "claude-code",          # agent provider
-            "sonnet",               # model
-            "default",              # permission mode
-            False,                  # is this a review agent?
-            "",
-            "3",
-            "due_date",             # milestone sort strategy
-            "",                     # milestone order (optional)
-            "M0",                   # foundation milestone
-            "../",
-            "",                     # setup commands (empty to skip)
-            True,                   # enable Claude startup interactions
-            "web",
-            "8080",
-            "tmux",
-            "io",                   # label prefix
-            "make test",            # quick validation command
-            "make test",            # publish validation command
-            "300",                  # quick validation timeout
-            "1800",                 # publish validation timeout
-            "",                     # filtering label
-            False,                  # disable review
-            # Post-wizard (new flow)
-            ".issue-orchestrator.yaml",  # config filename
-            False,                  # DON'T apply changes (exits here)
-        ])
+        prompter = MockPrompter(
+            [
+                # No directory prompt since we pass target_path
+                "New project - set up from scratch",
+                "Advanced setup",  # setup depth
+                "owner/repo",
+                "agent:backend",
+                ".prompts/backend.md",
+                "45",  # timeout
+                "claude-code",  # agent provider
+                "sonnet",  # model
+                "default",  # permission mode
+                False,  # is this a review agent?
+                "",
+                "3",
+                "due_date",  # milestone sort strategy
+                "",  # milestone order (optional)
+                "M0",  # foundation milestone
+                "../",
+                "",  # setup commands (empty to skip)
+                True,  # enable Claude startup interactions
+                "web",
+                "8080",
+                "tmux",
+                "io",  # label prefix
+                "make test",  # quick validation command
+                "make test",  # publish validation command
+                "300",  # quick validation timeout
+                "1800",  # publish validation timeout
+                "",  # filtering label
+                False,  # disable review
+                # Post-wizard (new flow)
+                ".issue-orchestrator.yaml",  # config filename
+                False,  # DON'T apply changes (exits here)
+            ]
+        )
 
-        with patch("issue_orchestrator.entrypoints.cli_tools.setup_wizard.detect_repo", return_value="owner/repo"):
-            with patch("issue_orchestrator.entrypoints.cli_tools.setup_wizard._get_repository_host", return_value=Mock()):
-                with patch("issue_orchestrator.entrypoints.cli_tools.setup_wizard.offer_readiness_assessment"):
+        with patch(
+            "issue_orchestrator.entrypoints.cli_tools.setup_wizard.detect_repo",
+            return_value="owner/repo",
+        ):
+            with patch(
+                "issue_orchestrator.entrypoints.cli_tools.setup_wizard._get_repository_host",
+                return_value=Mock(),
+            ):
+                with patch(
+                    "issue_orchestrator.entrypoints.cli_tools.setup_wizard.offer_readiness_assessment"
+                ):
                     with pytest.raises(SystemExit):
                         run_wizard(target_path=target, prompter=prompter)
 
@@ -1708,23 +1870,29 @@ class TestRunWizard:
         target = tmp_path / "myproject"
         target.mkdir()
 
-        prompter = MockPrompter([
-            # No directory prompt since we pass target_path
-            False,                  # Don't continue without prereqs
-        ])
+        prompter = MockPrompter(
+            [
+                # No directory prompt since we pass target_path
+                False,  # Don't continue without prereqs
+            ]
+        )
 
         with pytest.raises(SystemExit):
             run_wizard(target_path=target, prompter=prompter)
 
         # Check that warning was printed
-        assert any("prerequisites" in msg.lower() or "missing" in msg.lower()
-                  for msg in prompter.printed)
+        assert any(
+            "prerequisites" in msg.lower() or "missing" in msg.lower()
+            for msg in prompter.printed
+        )
         assert any("ISSUE_ORCH_GITHUB_TOKEN" in msg for msg in prompter.printed)
 
     @patch("issue_orchestrator.entrypoints.cli_tools.setup_wizard.check_prerequisites")
     @patch("issue_orchestrator.entrypoints.cli_tools.setup_wizard.fetch_github_labels")
     @patch("os.chdir")
-    def test_continues_despite_missing_prerequisites(self, mock_chdir, mock_labels, mock_prereqs, tmp_path):
+    def test_continues_despite_missing_prerequisites(
+        self, mock_chdir, mock_labels, mock_prereqs, tmp_path
+    ):
         """Test that wizard can continue despite missing prerequisites."""
         mock_prereqs.return_value = {
             "git": True,
@@ -1736,45 +1904,55 @@ class TestRunWizard:
         target = tmp_path / "myproject"
         target.mkdir()
 
-        prompter = MockPrompter([
-            # No directory prompt since we pass target_path
-            True,                   # Continue anyway
-            "New project - set up from scratch",
-            "Advanced setup",       # setup depth
-            "owner/repo",
-            "agent:backend",
-            ".prompts/backend.md",
-            "45",                   # timeout
-            "claude-code",          # agent provider
-            "sonnet",               # model
-            "default",              # permission mode
-            False,                  # is this a review agent?
-            "",
-            "3",
-            "due_date",             # milestone sort strategy
-            "",                     # milestone order (optional)
-            "M0",                   # foundation milestone
-            "../",
-            "",                     # setup commands (empty to skip)
-            True,                   # enable Claude startup interactions
-            "web",
-            "8080",
-            "tmux",
-            "io",                   # label prefix
-            "make test",            # quick validation command
-            "make test",            # publish validation command
-            "300",                  # quick validation timeout
-            "1800",                 # publish validation timeout
-            "",                     # filtering label
-            False,                  # disable review
-            # Post-wizard (new flow)
-            ".issue-orchestrator.yaml",  # config filename
-            False,                  # Don't apply - exits here
-        ])
+        prompter = MockPrompter(
+            [
+                # No directory prompt since we pass target_path
+                True,  # Continue anyway
+                "New project - set up from scratch",
+                "Advanced setup",  # setup depth
+                "owner/repo",
+                "agent:backend",
+                ".prompts/backend.md",
+                "45",  # timeout
+                "claude-code",  # agent provider
+                "sonnet",  # model
+                "default",  # permission mode
+                False,  # is this a review agent?
+                "",
+                "3",
+                "due_date",  # milestone sort strategy
+                "",  # milestone order (optional)
+                "M0",  # foundation milestone
+                "../",
+                "",  # setup commands (empty to skip)
+                True,  # enable Claude startup interactions
+                "web",
+                "8080",
+                "tmux",
+                "io",  # label prefix
+                "make test",  # quick validation command
+                "make test",  # publish validation command
+                "300",  # quick validation timeout
+                "1800",  # publish validation timeout
+                "",  # filtering label
+                False,  # disable review
+                # Post-wizard (new flow)
+                ".issue-orchestrator.yaml",  # config filename
+                False,  # Don't apply - exits here
+            ]
+        )
 
-        with patch("issue_orchestrator.entrypoints.cli_tools.setup_wizard.detect_repo", return_value=None):
-            with patch("issue_orchestrator.entrypoints.cli_tools.setup_wizard._get_repository_host", return_value=Mock()):
-                with patch("issue_orchestrator.entrypoints.cli_tools.setup_wizard.offer_readiness_assessment"):
+        with patch(
+            "issue_orchestrator.entrypoints.cli_tools.setup_wizard.detect_repo",
+            return_value=None,
+        ):
+            with patch(
+                "issue_orchestrator.entrypoints.cli_tools.setup_wizard._get_repository_host",
+                return_value=Mock(),
+            ):
+                with patch(
+                    "issue_orchestrator.entrypoints.cli_tools.setup_wizard.offer_readiness_assessment"
+                ):
                     with pytest.raises(SystemExit):
                         run_wizard(target_path=target, prompter=prompter)
 
@@ -1885,47 +2063,61 @@ class TestDryRunMode:
     @patch("issue_orchestrator.entrypoints.cli_tools.setup_wizard.check_prerequisites")
     @patch("issue_orchestrator.entrypoints.cli_tools.setup_wizard.fetch_github_labels")
     @patch("os.chdir")
-    def test_run_wizard_dry_run_no_files_written(self, mock_chdir, mock_labels, mock_prereqs, tmp_path):
+    def test_run_wizard_dry_run_no_files_written(
+        self, mock_chdir, mock_labels, mock_prereqs, tmp_path
+    ):
         """Test that dry-run mode doesn't write any files."""
-        mock_prereqs.return_value = {"git": True, "github_auth": True, "any_ai_provider": True}
+        mock_prereqs.return_value = {
+            "git": True,
+            "github_auth": True,
+            "any_ai_provider": True,
+        }
         mock_labels.return_value = []
 
         target = tmp_path / "myproject"
         target.mkdir()
 
-        prompter = MockPrompter([
-            "New project - set up from scratch",
-            "Advanced setup",       # setup depth
-            "owner/repo",
-            "agent:backend",
-            ".prompts/backend.md",
-            "45",
-            "claude-code",
-            "sonnet",
-            "default",
-            False,  # is this a review agent?
-            "",  # finish agents
-            "3",
-            "due_date",
-            "",                     # milestone order (optional)
-            "M0",  # foundation milestone
-            "../",
-            "",                     # setup commands (empty to skip)
-            True,                   # enable Claude startup interactions
-            "web",
-            "8080",
-            "tmux",
-            "io",  # label prefix
-            "make test",            # quick validation command
-            "make test",            # publish validation command
-            "300",                  # quick validation timeout
-            "1800",                 # publish validation timeout
-            "",                     # filtering label
-            False,  # disable review
-        ])
+        prompter = MockPrompter(
+            [
+                "New project - set up from scratch",
+                "Advanced setup",  # setup depth
+                "owner/repo",
+                "agent:backend",
+                ".prompts/backend.md",
+                "45",
+                "claude-code",
+                "sonnet",
+                "default",
+                False,  # is this a review agent?
+                "",  # finish agents
+                "3",
+                "due_date",
+                "",  # milestone order (optional)
+                "M0",  # foundation milestone
+                "../",
+                "",  # setup commands (empty to skip)
+                True,  # enable Claude startup interactions
+                "web",
+                "8080",
+                "tmux",
+                "io",  # label prefix
+                "make test",  # quick validation command
+                "make test",  # publish validation command
+                "300",  # quick validation timeout
+                "1800",  # publish validation timeout
+                "",  # filtering label
+                False,  # disable review
+            ]
+        )
 
-        with patch("issue_orchestrator.entrypoints.cli_tools.setup_wizard.detect_repo", return_value="owner/repo"):
-            with patch("issue_orchestrator.entrypoints.cli_tools.setup_wizard._get_repository_host", return_value=Mock()):
+        with patch(
+            "issue_orchestrator.entrypoints.cli_tools.setup_wizard.detect_repo",
+            return_value="owner/repo",
+        ):
+            with patch(
+                "issue_orchestrator.entrypoints.cli_tools.setup_wizard._get_repository_host",
+                return_value=Mock(),
+            ):
                 run_wizard(target_path=target, prompter=prompter, dry_run=True)
 
         # No config file should be created
@@ -1936,47 +2128,61 @@ class TestDryRunMode:
     @patch("issue_orchestrator.entrypoints.cli_tools.setup_wizard.check_prerequisites")
     @patch("issue_orchestrator.entrypoints.cli_tools.setup_wizard.fetch_github_labels")
     @patch("os.chdir")
-    def test_run_wizard_dry_run_shows_summary(self, mock_chdir, mock_labels, mock_prereqs, tmp_path):
+    def test_run_wizard_dry_run_shows_summary(
+        self, mock_chdir, mock_labels, mock_prereqs, tmp_path
+    ):
         """Test that dry-run mode shows summary output."""
-        mock_prereqs.return_value = {"git": True, "github_auth": True, "any_ai_provider": True}
+        mock_prereqs.return_value = {
+            "git": True,
+            "github_auth": True,
+            "any_ai_provider": True,
+        }
         mock_labels.return_value = []
 
         target = tmp_path / "myproject"
         target.mkdir()
 
-        prompter = MockPrompter([
-            "New project - set up from scratch",
-            "Advanced setup",       # setup depth
-            "owner/repo",
-            "agent:backend",
-            ".prompts/backend.md",
-            "45",
-            "claude-code",
-            "sonnet",
-            "default",
-            False,  # is this a review agent?
-            "",     # finish agents
-            "3",
-            "due_date",
-            "",                     # milestone order (optional)
-            "M0",  # foundation milestone
-            "../",
-            "",                     # setup commands (empty to skip)
-            True,                   # enable Claude startup interactions
-            "web",
-            "8080",
-            "tmux",
-            "io",   # label prefix
-            "make test",            # quick validation command
-            "make test",            # publish validation command
-            "300",                  # quick validation timeout
-            "1800",                 # publish validation timeout
-            "",                     # filtering label
-            False,  # disable review
-        ])
+        prompter = MockPrompter(
+            [
+                "New project - set up from scratch",
+                "Advanced setup",  # setup depth
+                "owner/repo",
+                "agent:backend",
+                ".prompts/backend.md",
+                "45",
+                "claude-code",
+                "sonnet",
+                "default",
+                False,  # is this a review agent?
+                "",  # finish agents
+                "3",
+                "due_date",
+                "",  # milestone order (optional)
+                "M0",  # foundation milestone
+                "../",
+                "",  # setup commands (empty to skip)
+                True,  # enable Claude startup interactions
+                "web",
+                "8080",
+                "tmux",
+                "io",  # label prefix
+                "make test",  # quick validation command
+                "make test",  # publish validation command
+                "300",  # quick validation timeout
+                "1800",  # publish validation timeout
+                "",  # filtering label
+                False,  # disable review
+            ]
+        )
 
-        with patch("issue_orchestrator.entrypoints.cli_tools.setup_wizard.detect_repo", return_value="owner/repo"):
-            with patch("issue_orchestrator.entrypoints.cli_tools.setup_wizard._get_repository_host", return_value=Mock()):
+        with patch(
+            "issue_orchestrator.entrypoints.cli_tools.setup_wizard.detect_repo",
+            return_value="owner/repo",
+        ):
+            with patch(
+                "issue_orchestrator.entrypoints.cli_tools.setup_wizard._get_repository_host",
+                return_value=Mock(),
+            ):
                 run_wizard(target_path=target, prompter=prompter, dry_run=True)
 
         # Should show dry run header
