@@ -57,9 +57,12 @@ def create_repository_setup_host(
 ) -> "RepositoryHost":
     """Create the setup host with the exact authorization that was verified."""
     from ..adapters.github import GitHubAdapter, build_github_auth
+    from .repository_setup_github_authorization import (
+        repository_setup_github_authorization_codec,
+    )
 
     auth = build_github_auth(
-        **authorization.auth_kwargs(),
+        **repository_setup_github_authorization_codec.adapter_kwargs(authorization),
         repo=repo_name,
         api_url=authorization.api_url,
         timeout_seconds=authorization.http_timeout_seconds,
@@ -81,9 +84,12 @@ def verify_repository_setup_github_authorization(
     from ..adapters.github.errors import GitHubAuthError
     from ..domain.repository_setup_auth import RepositorySetupGitHubAuthorization
     from ..ports.repository_setup import RepositorySetupGitHubVerification
+    from .repository_setup_github_authorization import (
+        repository_setup_github_authorization_codec,
+    )
 
     auth = build_github_auth(
-        **authorization.auth_kwargs(),
+        **repository_setup_github_authorization_codec.adapter_kwargs(authorization),
         repo=repo_name,
         api_url=authorization.api_url,
         timeout_seconds=authorization.http_timeout_seconds,
@@ -134,22 +140,26 @@ def verify_repository_setup_github_authorization(
 
 
 def store_repository_setup_github_token(
-    token: str,
+    authorization: "RepositorySetupGitHubAuthorization",
     *,
     repo: str,
 ) -> "RepositorySetupGitHubAuthorization":
-    """Store one personal token at a deterministic repo-scoped keychain key."""
-    from ..adapters.github.tokens import KEYRING_SERVICE, store_keyring_token_for
-    from ..domain.repository_setup_auth import RepositorySetupGitHubAuthorization
+    """Store one personal token while preserving its verified transport metadata."""
+    from dataclasses import replace
 
+    from ..adapters.github.tokens import KEYRING_SERVICE, store_keyring_token_for
+
+    if authorization.kind != "personal" or authorization.token is None:
+        raise ValueError("Personal token storage requires inline personal authorization")
     username = f"github-token:{repo}"
     store_keyring_token_for(
-        token,
+        authorization.token,
         service=KEYRING_SERVICE,
         username=username,
     )
-    return RepositorySetupGitHubAuthorization(
-        kind="personal",
+    return replace(
+        authorization,
+        token=None,
         keyring_service=KEYRING_SERVICE,
         keyring_username=username,
     )

@@ -11,6 +11,7 @@ from fastapi.responses import JSONResponse
 from ..contracts.ui_openapi_models import (
     RepositorySetupCommandPayload,
     RepositorySetupConflictPayload,
+    RepositorySetupDetectionPayload,
     RepositorySetupFailurePayload,
     RepositorySetupFilePayload,
     RepositorySetupGitHubAuthorizationPayload,
@@ -18,6 +19,7 @@ from ..contracts.ui_openapi_models import (
     RepositorySetupGitHubVerificationPayload,
     RepositorySetupGitHubVerifyRequestPayload,
     RepositorySetupPreviewPayload,
+    RepositorySetupPrerequisitesPayload,
     RepositorySetupResultPayload,
 )
 from ..control.repository_setup import (
@@ -26,10 +28,7 @@ from ..control.repository_setup import (
     RepositorySetupExecutionError,
     RepositorySetupRequest,
 )
-from ..domain.repository_setup_auth import (
-    RepositorySetupGitHubAuthorization,
-    repository_setup_github_authorization_from_config,
-)
+from ..domain.repository_setup_auth import RepositorySetupGitHubAuthorization
 from ..domain.repository_config_name import RepositoryConfigName
 from ..domain.worktree_paths import (
     default_worktree_base_config,
@@ -62,45 +61,30 @@ _REQUIRED_GITHUB_PERMISSIONS = (
 
 def _authorization_from_payload(
     payload: RepositorySetupGitHubAuthorizationPayload,
+    deps: ControlApiSetupDependency,
 ) -> RepositorySetupGitHubAuthorization:
-    return RepositorySetupGitHubAuthorization(
-        kind=payload.kind,
-        token_env=payload.token_env,
-        keyring_service=payload.keyring_service,
-        keyring_username=payload.keyring_username,
-        app_client_id=payload.app_client_id,
-        app_id=payload.app_id,
-        app_installation_id=payload.app_installation_id,
-        app_private_key_path=payload.app_private_key_path,
-        app_private_key_env=payload.app_private_key_env,
-        api_url=payload.api_url or "https://api.github.com",
+    return deps.setup_owner.authorization_from_public(
+        payload.model_dump(exclude_none=True),
     )
 
 
 def _authorization_payload(
     authorization: RepositorySetupGitHubAuthorization,
+    deps: ControlApiSetupDependency,
+    *,
+    redact_inline_token: bool = False,
 ) -> RepositorySetupGitHubAuthorizationPayload:
-    if authorization.contains_inline_token:
-        raise ValueError(
-            "Browser setup cannot expose repo.github.token; store it in the "
-            "OS keychain or an environment variable first"
+    return RepositorySetupGitHubAuthorizationPayload.model_validate(
+        deps.setup_owner.authorization_to_public(
+            authorization,
+            redact_inline_token=redact_inline_token,
         )
-    return RepositorySetupGitHubAuthorizationPayload(
-        kind=authorization.kind,
-        token_env=authorization.token_env,
-        keyring_service=authorization.keyring_service,
-        keyring_username=authorization.keyring_username,
-        app_client_id=authorization.app_client_id,
-        app_id=authorization.app_id,
-        app_installation_id=authorization.app_installation_id,
-        app_private_key_path=authorization.app_private_key_path,
-        app_private_key_env=authorization.app_private_key_env,
-        api_url=authorization.api_url,
     )
 
 
 def _verification_payload(
     verification: RepositorySetupGitHubVerification,
+    deps: ControlApiSetupDependency,
 ) -> RepositorySetupGitHubVerificationPayload:
     app_auth = verification.auth_kind == "github_app"
     permissions: list[str] = list(_REQUIRED_GITHUB_PERMISSIONS)
@@ -129,7 +113,10 @@ def _verification_payload(
             "they are exercised when the orchestrator performs each operation."
         ),
         required_permissions=permissions,
-        authorization=_authorization_payload(verification.normalized_authorization),
+        authorization=_authorization_payload(
+            verification.normalized_authorization,
+            deps,
+        ),
     )
 
 
@@ -141,7 +128,7 @@ def repository_setup_request_from_payload(
     repo_root = deps.validate_repo_root(payload.repo_root)
     if repo_root is None:
         raise ValueError("Invalid or missing repo_root")
-    return RepositorySetupCommand(
+    command = RepositorySetupCommand(
         repo_root=repo_root,
         repo_name=payload.repo_name,
         worker_agent_label=payload.worker_agent_label,
@@ -153,7 +140,10 @@ def repository_setup_request_from_payload(
         validation_quick_command=payload.validation_quick_command,
         validation_publish_command=payload.validation_publish_command,
         worktree_base=payload.worktree_base,
-        github_authorization=_authorization_from_payload(payload.github_authorization),
+        github_authorization=_authorization_from_payload(
+            payload.github_authorization,
+            deps,
+        ),
         configure_tech_lead=payload.configure_tech_lead,
         tech_lead_model=payload.tech_lead_model,
         tech_lead_effort=payload.tech_lead_effort,
@@ -165,7 +155,8 @@ def repository_setup_request_from_payload(
         create_prompts=payload.create_prompts is not False,
         create_labels=payload.create_labels is not False,
         replace_existing=payload.replace_existing is True,
-    ).to_request()
+    )
+    return deps.setup_owner.request_from_command(command)
 
 
 def _setup_file_payload(
@@ -186,11 +177,14 @@ def _setup_file_payload(
     )
 
 
-@control_setup_router.get("/control/setup/prereqs")
+@control_setup_router.get(
+    "/control/setup/prereqs",
+    response_model=RepositorySetupPrerequisitesPayload,
+)
 async def setup_prereqs(
     deps: ControlApiSetupDependency,
     repo_root: str | None = Query(default=None),
-) -> JSONResponse:
+) -> RepositorySetupPrerequisitesPayload:
     """Check setup prerequisites for a repository."""
     validated_root = deps.validate_repo_root(repo_root) if repo_root else None
     config = load_config_for_repo(validated_root)
@@ -210,20 +204,19 @@ async def setup_prereqs(
         c.get("ok", False) for c in agent_checks
     )
 
-    return JSONResponse(
-        {
-            "all_ok": all_ok,
-            "checks": checks,
-            "agent_checks": agent_checks,
-        }
+    return RepositorySetupPrerequisitesPayload.model_validate(
+        {"all_ok": all_ok, "checks": checks, "agent_checks": agent_checks}
     )
 
 
-@control_setup_router.get("/control/setup/detect")
+@control_setup_router.get(
+    "/control/setup/detect",
+    response_model=RepositorySetupDetectionPayload,
+)
 async def setup_detect(
     deps: ControlApiSetupDependency,
     repo_root: str = Query(...),
-) -> JSONResponse:
+) -> RepositorySetupDetectionPayload | JSONResponse:
     """Detect repository state for the Control Center setup wizard."""
     path = deps.validate_repo_root(repo_root)
     if path is None:
@@ -242,7 +235,10 @@ async def setup_detect(
         "prompt_candidates": [],
         "worktree_base_default": default_worktree_base_config(path),
         "github_authorization": {
-            "authorization": {"kind": "detected"},
+            "authorization": _authorization_payload(
+                RepositorySetupGitHubAuthorization(kind="detected"),
+                deps,
+            ).model_dump(exclude_none=True),
             "configured_kind": "detected",
             "inline_token_migration_required": False,
         },
@@ -264,25 +260,25 @@ async def setup_detect(
         result["existing_config"] = browser_config
 
         try:
-            existing_authorization = repository_setup_github_authorization_from_config(
+            existing_authorization = deps.setup_owner.authorization_from_config(
                 existing_config
             )
             inline_token = existing_authorization.contains_inline_token
-            browser_authorization = (
-                RepositorySetupGitHubAuthorization(kind="detected")
-                if inline_token
-                else existing_authorization
-            )
             result["github_authorization"] = {
                 "authorization": _authorization_payload(
-                    browser_authorization
+                    existing_authorization,
+                    deps,
+                    redact_inline_token=inline_token,
                 ).model_dump(exclude_none=True),
                 "configured_kind": existing_authorization.kind,
                 "inline_token_migration_required": inline_token,
             }
         except (TypeError, ValueError) as exc:
             result["github_authorization"] = {
-                "authorization": {"kind": "detected"},
+                "authorization": _authorization_payload(
+                    RepositorySetupGitHubAuthorization(kind="detected"),
+                    deps,
+                ).model_dump(exclude_none=True),
                 "configured_kind": "invalid",
                 "inline_token_migration_required": False,
                 "configuration_error": str(exc),
@@ -297,6 +293,12 @@ async def setup_detect(
     result["worktree_base_resolved"] = str(
         resolve_worktree_base(configured_worktree_base, path)
     )
+    validation_defaults = deps.validation_detector(path)
+    result["validation_defaults"] = {
+        "quick_command": validation_defaults.quick_command,
+        "publish_command": validation_defaults.publish_command,
+        "source": validation_defaults.source,
+    }
 
     prompt_candidates = []
     for candidate in find_prompt_candidates(path):
@@ -306,7 +308,15 @@ async def setup_detect(
             prompt_candidates.append(str(candidate))
     result["prompt_candidates"] = prompt_candidates[:20]
 
-    return JSONResponse(result)
+    detection = RepositorySetupDetectionPayload.model_validate(result)
+    response = detection.model_dump()
+    response["github_authorization"] = detection.github_authorization.model_dump(
+        exclude_none=True
+    )
+    response["github_authorization"]["authorization"] = (
+        detection.github_authorization.authorization.model_dump(exclude_none=True)
+    )
+    return JSONResponse(response)
 
 
 @control_setup_router.post(
@@ -324,9 +334,9 @@ async def setup_verify_github_authorization(
     try:
         verification = deps.setup_owner.verify_github_authorization(
             payload.repo_name,
-            _authorization_from_payload(payload.authorization),
+            _authorization_from_payload(payload.authorization, deps),
         )
-        return _verification_payload(verification)
+        return _verification_payload(verification, deps)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -344,17 +354,21 @@ async def setup_store_personal_token(
     if deps.validate_repo_root(payload.repo_root) is None:
         raise HTTPException(status_code=400, detail="Invalid or missing repo_root")
     try:
-        inline = RepositorySetupGitHubAuthorization(
-            kind="personal",
-            token=payload.token,
+        inline = deps.setup_owner.authorization_from_public(
+            {
+                "kind": "personal",
+                "token": payload.token,
+                "api_url": payload.api_url,
+                "http_timeout_seconds": payload.http_timeout_seconds,
+            }
         )
         deps.setup_owner.verify_github_authorization(payload.repo_name, inline)
-        stored = deps.github_token_store(payload.token, repo=payload.repo_name)
+        stored = deps.github_token_store(inline, repo=payload.repo_name)
         verification = deps.setup_owner.verify_github_authorization(
             payload.repo_name,
             stored,
         )
-        return _verification_payload(verification)
+        return _verification_payload(verification, deps)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -383,7 +397,10 @@ async def setup_preview(
     return RepositorySetupPreviewPayload(
         yaml=preview.yaml,
         worktree_base=str(preview.worktree_base),
-        github_authorization=_verification_payload(preview.github_authorization),
+        github_authorization=_verification_payload(
+            preview.github_authorization,
+            deps,
+        ),
         files=[_setup_file_payload(file) for file in preview.files],
     )
 

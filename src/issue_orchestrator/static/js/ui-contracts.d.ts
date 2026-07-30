@@ -807,6 +807,20 @@ export interface RepositorySetupConflictPayload {
   error: "replace_confirmation_required";
 }
 
+export interface RepositorySetupDetectionPayload {
+  agent_labels: string[];
+  config_path: string | null;
+  existing_config: Record<string, any> | null;
+  github_authorization: RepositorySetupGitHubAuthorizationDetectionPayload;
+  github_labels: string[];
+  prompt_candidates: string[];
+  repo: string | null;
+  repo_root: string;
+  validation_defaults: RepositorySetupValidationDefaultsPayload;
+  worktree_base_default: string;
+  worktree_base_resolved: string;
+}
+
 export interface RepositorySetupFailurePayload {
   applied_files: string[];
   created_labels: string[];
@@ -823,13 +837,21 @@ export interface RepositorySetupFilePayload {
   type?: "prompt";
 }
 
+export interface RepositorySetupGitHubAuthorizationDetectionPayload {
+  authorization: RepositorySetupGitHubAuthorizationPayload;
+  configuration_error?: string;
+  configured_kind: "detected" | "personal" | "github_app" | "invalid";
+  inline_token_migration_required: boolean;
+}
+
 export interface RepositorySetupGitHubAuthorizationPayload {
-  api_url?: string;
+  api_url: string;
   app_client_id?: string;
   app_id?: string;
   app_installation_id?: string;
   app_private_key_env?: string;
   app_private_key_path?: string;
+  http_timeout_seconds: number;
   keyring_service?: string;
   keyring_username?: string;
   kind: "detected" | "personal" | "github_app";
@@ -837,6 +859,8 @@ export interface RepositorySetupGitHubAuthorizationPayload {
 }
 
 export interface RepositorySetupGitHubTokenPayload {
+  api_url: string;
+  http_timeout_seconds: number;
   repo_name: string;
   repo_root: string;
   token: string;
@@ -860,6 +884,18 @@ export interface RepositorySetupGitHubVerifyRequestPayload {
   repo_root: string;
 }
 
+export interface RepositorySetupPrerequisiteCheckPayload {
+  detail: string;
+  name?: string;
+  ok: boolean;
+}
+
+export interface RepositorySetupPrerequisitesPayload {
+  agent_checks: RepositorySetupPrerequisiteCheckPayload[];
+  all_ok: boolean;
+  checks: Record<string, RepositorySetupPrerequisiteCheckPayload>;
+}
+
 export interface RepositorySetupPreviewPayload {
   files: RepositorySetupFilePayload[];
   github_authorization: RepositorySetupGitHubVerificationPayload;
@@ -872,6 +908,12 @@ export interface RepositorySetupResultPayload {
   created_files: string[];
   created_labels: string[];
   status: "saved";
+}
+
+export interface RepositorySetupValidationDefaultsPayload {
+  publish_command: string | null;
+  quick_command: string | null;
+  source: string;
 }
 
 export interface RetrospectiveReviewDecisionPayload {

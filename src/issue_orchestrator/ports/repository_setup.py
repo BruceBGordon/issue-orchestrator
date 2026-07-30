@@ -38,6 +38,29 @@ RepositorySetupConfigTarget = RepositorySetupNamedConfig | RepositorySetupExplic
 
 
 @dataclass(frozen=True, slots=True)
+class RepositorySetupValidationDefaults:
+    """Repository-meaningful validation commands detected for guided setup."""
+
+    quick_command: str | None
+    publish_command: str | None
+    source: str
+
+    def __post_init__(self) -> None:
+        if bool(self.quick_command) != bool(self.publish_command):
+            raise ValueError(
+                "Repository setup validation defaults require both commands or neither"
+            )
+        if not self.source.strip():
+            raise ValueError("Repository setup validation source is required")
+
+
+class RepositorySetupValidationDetector(Protocol):
+    """Detect repository-native validation gates without executing them."""
+
+    def __call__(self, repo_root: Path) -> RepositorySetupValidationDefaults: ...
+
+
+@dataclass(frozen=True, slots=True)
 class RepositorySetupPlannedFile:
     """One exact filesystem mutation in a repository setup plan."""
 
@@ -83,6 +106,37 @@ class RepositorySetupFileSystem(Protocol):
     def apply(self, plan: RepositorySetupArtifactPlan) -> tuple[Path, ...]: ...
 
 
+class RepositorySetupGitHubAuthorizationCodec(Protocol):
+    """Own every external representation of setup GitHub authorization."""
+
+    def from_config(
+        self,
+        config: Mapping[str, Any],
+    ) -> RepositorySetupGitHubAuthorization: ...
+
+    def to_config(
+        self,
+        authorization: RepositorySetupGitHubAuthorization,
+    ) -> dict[str, Any]: ...
+
+    def from_public(
+        self,
+        payload: Mapping[str, Any],
+    ) -> RepositorySetupGitHubAuthorization: ...
+
+    def to_public(
+        self,
+        authorization: RepositorySetupGitHubAuthorization,
+        *,
+        redact_inline_token: bool = False,
+    ) -> dict[str, Any]: ...
+
+    def adapter_kwargs(
+        self,
+        authorization: RepositorySetupGitHubAuthorization,
+    ) -> dict[str, str | None]: ...
+
+
 class RepositorySetupHostFactory(Protocol):
     """Resolve the repository host used for setup label mutations."""
 
@@ -119,7 +173,7 @@ class RepositorySetupGitHubTokenStore(Protocol):
 
     def __call__(
         self,
-        token: str,
+        authorization: RepositorySetupGitHubAuthorization,
         *,
         repo: str,
     ) -> RepositorySetupGitHubAuthorization: ...
@@ -133,10 +187,13 @@ __all__ = [
     "RepositorySetupFileKind",
     "RepositorySetupFileSystem",
     "RepositorySetupFileSystemError",
+    "RepositorySetupGitHubAuthorizationCodec",
     "RepositorySetupGitHubVerification",
     "RepositorySetupGitHubTokenStore",
     "RepositorySetupGitHubVerifier",
     "RepositorySetupHostFactory",
     "RepositorySetupNamedConfig",
     "RepositorySetupPlannedFile",
+    "RepositorySetupValidationDefaults",
+    "RepositorySetupValidationDetector",
 ]

@@ -20,9 +20,13 @@ def _complete_setup_payload(repo_root, **overrides):
         "configure_reviewer": True,
         "reviewer_model": "sonnet",
         "reviewer_effort": "high",
-        "validation_quick_command": "git diff --check",
-        "validation_publish_command": "git diff --check",
-        "github_authorization": {"kind": "detected"},
+        "validation_quick_command": "make test-quick",
+        "validation_publish_command": "make validate",
+        "github_authorization": {
+            "kind": "detected",
+            "api_url": "https://api.github.com",
+            "http_timeout_seconds": 20,
+        },
         "configure_tech_lead": True,
         "tech_lead_model": "sonnet",
         "tech_lead_effort": "high",
@@ -351,6 +355,21 @@ class TestControlCenterSetupRoutes:
         ):
             yield
 
+    def test_setup_prereqs_matches_typed_response_contract(self, tmp_path):
+        from issue_orchestrator.contracts.ui_openapi_models import (
+            RepositorySetupPrerequisitesPayload,
+        )
+
+        response = TestClient(control_app).get(
+            "/control/setup/prereqs",
+            params={"repo_root": str(tmp_path)},
+        )
+
+        assert response.status_code == 200
+        payload = RepositorySetupPrerequisitesPayload.model_validate(response.json())
+        assert "git" in payload.checks
+        assert payload.agent_checks
+
     def test_setup_preview_builds_complete_default_review_pipeline(self, tmp_path):
         """Preview renders the validated reviewer and tech-lead pipeline."""
         repo_root = tmp_path / "repo"
@@ -467,6 +486,9 @@ class TestControlCenterSetupRoutes:
         config_dir = repo_root / ".issue-orchestrator" / "config"
         config_dir.mkdir(parents=True)
         (config_dir / "custom.yaml").write_text("repo:\n  name: owner/repo\n")
+        (repo_root / "Makefile").write_text(
+            "validate-fast:\n\t@true\n\nvalidate-pr:\n\t@true\n"
+        )
 
         client = TestClient(control_app)
         response = client.get(
@@ -482,6 +504,11 @@ class TestControlCenterSetupRoutes:
         assert data["worktree_base_resolved"] == str(
             repo_root.parent / "worktrees" / repo_root.name
         )
+        assert data["validation_defaults"] == {
+            "quick_command": "make validate-fast",
+            "publish_command": "make validate-pr",
+            "source": "Makefile targets",
+        }
 
     def test_setup_detect_never_returns_existing_inline_token(self, tmp_path):
         """Existing legacy secrets stay server-side until the user replaces them."""
@@ -489,7 +516,12 @@ class TestControlCenterSetupRoutes:
         config_path = repo_root / ".issue-orchestrator/config/default.yaml"
         config_path.parent.mkdir(parents=True)
         config_path.write_text(
-            "repo:\n  name: owner/repo\n  github:\n    token: ghp_super_secret\n"
+            "repo:\n"
+            "  name: owner/repo\n"
+            "  github:\n"
+            "    token: ghp_super_secret\n"
+            "    api_url: https://github.example/api/v3\n"
+            "    http_timeout_seconds: 47\n"
         )
 
         response = TestClient(control_app).get(
@@ -502,7 +534,11 @@ class TestControlCenterSetupRoutes:
         data = response.json()
         assert "token" not in data["existing_config"]["repo"]["github"]
         assert data["github_authorization"] == {
-            "authorization": {"kind": "detected", "api_url": "https://api.github.com"},
+            "authorization": {
+                "kind": "detected",
+                "api_url": "https://github.example/api/v3",
+                "http_timeout_seconds": 47,
+            },
             "configured_kind": "personal",
             "inline_token_migration_required": True,
         }
@@ -517,7 +553,11 @@ class TestControlCenterSetupRoutes:
             json={
                 "repo_root": str(repo_root),
                 "repo_name": "owner/repo",
-                "authorization": {"kind": "detected"},
+                "authorization": {
+                    "kind": "detected",
+                    "api_url": "https://api.github.com",
+                    "http_timeout_seconds": 20,
+                },
             },
         )
 
@@ -529,6 +569,7 @@ class TestControlCenterSetupRoutes:
             "kind": "personal",
             "token_env": "ISSUE_ORCH_GITHUB_TOKEN",
             "api_url": "https://api.github.com",
+            "http_timeout_seconds": 20,
         }
         assert "without making GitHub writes" in data["verification_note"]
         assert "Pull requests: read and write" in data["required_permissions"]
@@ -572,6 +613,8 @@ class TestControlCenterSetupRoutes:
                     "repo_name": "owner/repo",
                     "authorization": {
                         "kind": "github_app",
+                        "api_url": "https://api.github.com",
+                        "http_timeout_seconds": 20,
                         "app_client_id": "Iv23example",
                         "app_installation_id": "145305179",
                         "app_private_key_env": ("ISSUE_ORCH_GITHUB_APP_PRIVATE_KEY"),
@@ -603,6 +646,8 @@ class TestControlCenterSetupRoutes:
             kind="personal",
             keyring_service="issue-orchestrator",
             keyring_username="github-token:owner/repo",
+            api_url="https://github.example/api/v3",
+            http_timeout_seconds=47,
         )
         inline_verification = RepositorySetupGitHubVerification(
             identity="setup-user",
@@ -612,6 +657,8 @@ class TestControlCenterSetupRoutes:
             normalized_authorization=RepositorySetupGitHubAuthorization(
                 kind="personal",
                 token="ghp_super_secret",
+                api_url="https://github.example/api/v3",
+                http_timeout_seconds=47,
             ),
         )
         stored_verification = RepositorySetupGitHubVerification(
@@ -641,6 +688,8 @@ class TestControlCenterSetupRoutes:
                     "repo_root": str(repo_root),
                     "repo_name": "owner/repo",
                     "token": "ghp_super_secret",
+                    "api_url": "https://github.example/api/v3",
+                    "http_timeout_seconds": 47,
                 },
             )
 
@@ -650,10 +699,19 @@ class TestControlCenterSetupRoutes:
             "kind": "personal",
             "keyring_service": "issue-orchestrator",
             "keyring_username": "github-token:owner/repo",
-            "api_url": "https://api.github.com",
+            "api_url": "https://github.example/api/v3",
+            "http_timeout_seconds": 47,
         }
         assert verify.call_count == 2
-        store.assert_called_once_with("ghp_super_secret", repo="owner/repo")
+        store.assert_called_once_with(
+            RepositorySetupGitHubAuthorization(
+                kind="personal",
+                token="ghp_super_secret",
+                api_url="https://github.example/api/v3",
+                http_timeout_seconds=47,
+            ),
+            repo="owner/repo",
+        )
 
     def test_setup_save_executes_complete_default_review_pipeline(self, tmp_path):
         """Save writes runnable worker, reviewer, and tech-lead artifacts."""

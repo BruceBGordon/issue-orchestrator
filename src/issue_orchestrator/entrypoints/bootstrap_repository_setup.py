@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 from ..control.repository_setup import RepositorySetupOwner
+from ..execution.repository_setup_github_authorization import (
+    repository_setup_github_authorization_codec,
+)
 from ..execution.repository_setup_files import RepositorySetupFileSystemAdapter
 from ..ports.repository_setup import (
     RepositorySetupGitHubVerifier,
@@ -20,6 +23,7 @@ def build_repository_setup_owner(
         file_system=RepositorySetupFileSystemAdapter(),
         repository_host_factory=repository_host_factory,
         github_verifier=github_verifier,
+        github_authorization_codec=repository_setup_github_authorization_codec,
         label_planner=plan_setup_labels,
     )
 

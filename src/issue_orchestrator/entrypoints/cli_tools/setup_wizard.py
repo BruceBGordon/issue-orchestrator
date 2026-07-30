@@ -1349,6 +1349,7 @@ def run_wizard(  # noqa: C901, PLR0912 - main wizard entry point with prerequisi
         verify_repository_setup_github_authorization,
     )
     setup_request = build_cli_repository_setup_request(
+        owner=setup_owner,
         config=config,
         repo_root=target_path,
         config_path=output_path,

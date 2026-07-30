@@ -58,10 +58,11 @@ The tech-lead cadence accepts `1` for every approved PR, a larger number for
 batch review, or `0` for manual and failure-triggered review only. Reviewer and
 tech-lead roles can be explicitly disabled.
 
-Setup also writes required quick and publish validation gates. Both initially
-use the portable `git diff --check` command; replace them in the Configuration
-step with the target repository's fast feedback and authoritative pre-publish
-commands when available.
+Setup also requires quick and publish validation gates that exercise repository
+behavior. It detects established Make, package-manager, and test-runner commands
+when possible. If it cannot find both gates, the Configuration step waits for
+you to enter the target repository's fast feedback and authoritative
+pre-publish commands.
 
 After saving, Setup names optional capabilities that were not enabled:
 specialized agent routing, other AI providers, E2E, merge queue, Goal Pilot,

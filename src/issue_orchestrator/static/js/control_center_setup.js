@@ -235,10 +235,15 @@
                 : null;
             const techLeadModel = techLeadEntry?.model || 'sonnet';
             const techLeadEffort = techLeadEntry?.provider_args?.effort || 'high';
+            const detectedValidation = data.validation_defaults || {};
             const validationQuickCommand = existingConfig.validation?.quick?.cmd
-                || 'git diff --check';
+                || detectedValidation.quick_command
+                || '';
             const validationPublishCommand = existingConfig.validation?.publish?.cmd
-                || 'git diff --check';
+                || detectedValidation.publish_command
+                || '';
+            const validationSource = detectedValidation.source
+                || 'No repository-native validation command was detected.';
             const worktreeBase = existingConfig.worktrees?.base
                 || data.worktree_base_default
                 || `../worktrees/${data.repo_root?.split('/').pop() || 'repository'}`;
@@ -286,9 +291,9 @@
                 <fieldset class="setup-role-card setup-validation-card">
                     <legend>Validation gates</legend>
                     <p class="setup-field-help">
-                        These commands run inside each issue worktree. The conservative
-                        default checks Git patch formatting; replace it with the repo’s
-                        test and policy commands when available.
+                        These required commands run inside each issue worktree and must
+                        exercise repository behavior. Setup detected:
+                        <strong>${escapeHtml(validationSource)}</strong>
                     </p>
                     <div class="setup-role-fields">
                         <div class="form-group">
@@ -366,7 +371,21 @@
                 </div>
             `;
             element('setupContent').innerHTML = html;
-            nextButton.disabled = false;
+            const updateValidationReadiness = () => {
+                nextButton.disabled = (
+                    !element('setupValidationQuickCommand').value.trim()
+                    || !element('setupValidationPublishCommand').value.trim()
+                );
+            };
+            element('setupValidationQuickCommand').addEventListener(
+                'input',
+                updateValidationReadiness,
+            );
+            element('setupValidationPublishCommand').addEventListener(
+                'input',
+                updateValidationReadiness,
+            );
+            updateValidationReadiness();
         } catch (error) {
             if (!isCurrentOperation(operation)) return;
             element('setupContent').innerHTML =
@@ -456,8 +475,18 @@
         `;
     }
 
+    function authorizationTransport(authorization = {}) {
+        return {
+            api_url: authorization.api_url || 'https://api.github.com',
+            http_timeout_seconds: authorization.http_timeout_seconds || 20,
+        };
+    }
+
     function appAuthorizationFromForm() {
         return {
+            ...authorizationTransport(
+                state.detected?.github_authorization?.authorization,
+            ),
             kind: 'github_app',
             app_client_id: element('setupGithubAppClientId').value,
             app_id: element('setupGithubAppId').value,
@@ -707,22 +736,29 @@
 
         const personalPanel = element('setupGithubPersonalPanel');
         const appPanel = element('setupGithubAppPanel');
+        personalPanel.inert = appConfigured;
+        appPanel.inert = !appConfigured;
         element('setupGithubPersonal').addEventListener('change', () => {
             personalPanel.hidden = false;
+            personalPanel.inert = false;
             appPanel.hidden = true;
+            appPanel.inert = true;
             setGithubVerificationPending();
         });
         element('setupGithubApp').addEventListener('change', () => {
             personalPanel.hidden = true;
+            personalPanel.inert = true;
             appPanel.hidden = false;
+            appPanel.inert = false;
             setGithubVerificationPending();
         });
         element('setupVerifyDetectedGithub').addEventListener('click', async () => {
+            const transport = authorizationTransport(existingAuthorization);
             const command = setupCommands.buildGithubVerifyRequest(
                 state.repoPath,
                 repoName,
                 existingAuthorization.kind === 'github_app'
-                    ? { kind: 'detected' }
+                    ? { kind: 'detected', ...transport }
                     : existingAuthorization,
             );
             await verifyGithubAuthorization(command);
@@ -734,6 +770,7 @@
                     state.repoPath,
                     repoName,
                     tokenInput.value,
+                    existingAuthorization,
                 );
                 await verifyGithubAuthorization(command);
             } finally {
@@ -975,6 +1012,7 @@
             )).filter((candidate) => (
                 !candidate.disabled
                 && !candidate.hidden
+                && !candidate.closest?.('[hidden], [inert]')
                 && candidate.style?.display !== 'none'
                 && candidate.getAttribute?.('tabindex') !== '-1'
             ));

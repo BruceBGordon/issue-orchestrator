@@ -25,7 +25,9 @@ from issue_orchestrator.contracts.ui_openapi_models import (
     IssueDetailPayload,
     RepositorySetupCommandPayload,
     RepositorySetupConflictPayload,
+    RepositorySetupDetectionPayload,
     RepositorySetupFailurePayload,
+    RepositorySetupPrerequisitesPayload,
     RepositorySetupPreviewPayload,
     RepositorySetupResultPayload,
     ViewModelSnapshotPayload,
@@ -218,7 +220,11 @@ def test_repository_setup_command_and_results_match_ui_openapi() -> None:
         "validation_quick_command": "make validate-quick",
         "validation_publish_command": "make validate-pr-raw",
         "worktree_base": "../worktrees/porchpin",
-        "github_authorization": {"kind": "detected"},
+        "github_authorization": {
+            "kind": "detected",
+            "api_url": "https://api.github.com",
+            "http_timeout_seconds": 20,
+        },
         "configure_tech_lead": True,
         "tech_lead_model": "sonnet",
         "tech_lead_effort": "high",
@@ -249,6 +255,8 @@ def test_repository_setup_command_and_results_match_ui_openapi() -> None:
             "authorization": {
                 "kind": "personal",
                 "token_env": "ISSUE_ORCH_GITHUB_TOKEN",
+                "api_url": "https://api.github.com",
+                "http_timeout_seconds": 20,
             },
         },
         "files": [
@@ -321,6 +329,76 @@ def test_repository_setup_command_and_results_match_ui_openapi() -> None:
             _validator("RepositorySetupCommandPayload").validate(malformed_label)
         with pytest.raises(ValueError):
             RepositorySetupCommandPayload.model_validate(malformed_label)
+
+
+def test_repository_setup_get_payloads_match_ui_openapi() -> None:
+    prereqs = {
+        "all_ok": True,
+        "checks": {
+            "git": {"ok": True, "detail": "git version 2.50"},
+            "ai_provider_clis": {"ok": True, "detail": "Available: claude-code"},
+        },
+        "agent_checks": [
+            {"name": "Agent CLI", "ok": True, "detail": "Config not detected yet"}
+        ],
+    }
+    detection = {
+        "repo_root": "/repos/porchpin",
+        "repo": "owner/porchpin",
+        "existing_config": None,
+        "config_path": None,
+        "github_labels": [],
+        "agent_labels": [],
+        "prompt_candidates": [],
+        "worktree_base_default": "../worktrees/porchpin",
+        "worktree_base_resolved": "/repos/worktrees/porchpin",
+        "github_authorization": {
+            "authorization": {
+                "kind": "detected",
+                "api_url": "https://github.example/api/v3",
+                "http_timeout_seconds": 47,
+            },
+            "configured_kind": "personal",
+            "inline_token_migration_required": True,
+        },
+        "validation_defaults": {
+            "quick_command": "make validate-fast",
+            "publish_command": "make validate-pr",
+            "source": "Makefile targets",
+        },
+    }
+
+    for schema_name, model, payload in (
+        (
+            "RepositorySetupPrerequisitesPayload",
+            RepositorySetupPrerequisitesPayload,
+            prereqs,
+        ),
+        (
+            "RepositorySetupDetectionPayload",
+            RepositorySetupDetectionPayload,
+            detection,
+        ),
+    ):
+        _validator(schema_name).validate(payload)
+        model.model_validate(payload)
+
+
+def test_repository_setup_get_paths_reference_typed_responses() -> None:
+    import json
+
+    contract = json.loads(Path("docs/api/ui-openapi.json").read_text())
+
+    assert contract["paths"]["/control/setup/prereqs"]["get"]["responses"]["200"][
+        "content"
+    ]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/RepositorySetupPrerequisitesPayload"
+    }
+    assert contract["paths"]["/control/setup/detect"]["get"]["responses"]["200"][
+        "content"
+    ]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/RepositorySetupDetectionPayload"
+    }
 
 
 def test_dashboard_view_model_matches_ui_openapi() -> None:

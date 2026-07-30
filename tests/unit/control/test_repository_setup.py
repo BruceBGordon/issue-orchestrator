@@ -18,6 +18,9 @@ from issue_orchestrator.domain.repository_config_name import RepositoryConfigNam
 from issue_orchestrator.domain.repository_setup_auth import (
     RepositorySetupGitHubAuthorization,
 )
+from issue_orchestrator.execution.repository_setup_github_authorization import (
+    repository_setup_github_authorization_codec,
+)
 from issue_orchestrator.ports.repository_setup import (
     RepositorySetupArtifactPlan,
     RepositorySetupConfigTarget,
@@ -26,6 +29,11 @@ from issue_orchestrator.ports.repository_setup import (
     RepositorySetupNamedConfig,
     RepositorySetupPlannedFile,
 )
+
+_VALIDATION_COMMANDS = {
+    "validation_quick_command": "make test-quick",
+    "validation_publish_command": "make validate",
+}
 
 
 def test_setup_command_defaults_to_complete_review_pipeline(
@@ -36,9 +44,10 @@ def test_setup_command_defaults_to_complete_review_pipeline(
         repo_name="owner/repo",
         worker_agent_label="agent:dev",
         model="sonnet",
+        **_VALIDATION_COMMANDS,
     )
 
-    config = command.build_config()
+    config = command.build_config(repository_setup_github_authorization_codec)
 
     assert set(config["agents"]) == {
         "agent:dev",
@@ -71,11 +80,11 @@ def test_setup_command_defaults_to_complete_review_pipeline(
     }
     assert config["validation"] == {
         "quick": {
-            "cmd": "git diff --check",
+            "cmd": "make test-quick",
             "timeout_seconds": 300,
         },
         "publish": {
-            "cmd": "git diff --check",
+            "cmd": "make validate",
             "timeout_seconds": 1800,
             "dirty_check": "tracked",
         },
@@ -92,10 +101,11 @@ def test_setup_command_can_explicitly_disable_tech_lead(tmp_path: Path) -> None:
         repo_name="owner/repo",
         worker_agent_label="agent:dev",
         model="sonnet",
+        **_VALIDATION_COMMANDS,
         configure_tech_lead=False,
     )
 
-    config = command.build_config()
+    config = command.build_config(repository_setup_github_authorization_codec)
 
     assert set(config["agents"]) == {"agent:dev", "agent:reviewer"}
     assert config["agents"]["agent:dev"]["sandbox"] is True
@@ -112,11 +122,12 @@ def test_setup_command_can_explicitly_disable_reviewer_and_tech_lead(
         repo_name="owner/repo",
         worker_agent_label="agent:dev",
         model="sonnet",
+        **_VALIDATION_COMMANDS,
         configure_reviewer=False,
         configure_tech_lead=False,
     )
 
-    config = command.build_config()
+    config = command.build_config(repository_setup_github_authorization_codec)
 
     assert set(config["agents"]) == {"agent:dev"}
     assert config["review"]["enabled"] is False
@@ -132,13 +143,14 @@ def test_setup_command_preserves_role_specific_model_effort_and_cadence(
         repo_name="owner/repo",
         worker_agent_label="agent:dev",
         model="opus",
+        **_VALIDATION_COMMANDS,
         effort="xhigh",
         reviewer_model="haiku",
         reviewer_effort="medium",
         tech_lead_model="sonnet",
         tech_lead_effort="max",
         tech_lead_review_threshold=5,
-    ).build_config()
+    ).build_config(repository_setup_github_authorization_codec)
 
     assert config["agents"]["agent:dev"]["model"] == "opus"
     assert config["agents"]["agent:dev"]["provider_args"] == {"effort": "xhigh"}
@@ -157,8 +169,9 @@ def test_setup_command_preserves_explicit_worktree_base(tmp_path: Path) -> None:
         repo_name="owner/repo",
         worker_agent_label="agent:dev",
         model="sonnet",
+        **_VALIDATION_COMMANDS,
         worktree_base="../agent-worktrees/repo",
-    ).build_config()
+    ).build_config(repository_setup_github_authorization_codec)
 
     assert config["worktrees"]["base"] == "../agent-worktrees/repo"
 
@@ -177,8 +190,9 @@ def test_setup_command_persists_only_personal_keyring_reference(
         repo_name="owner/repo",
         worker_agent_label="agent:dev",
         model="sonnet",
+        **_VALIDATION_COMMANDS,
         github_authorization=authorization,
-    ).build_config()
+    ).build_config(repository_setup_github_authorization_codec)
 
     assert config["repo"]["github"] == {
         "keyring_service": "issue-orchestrator",
@@ -202,8 +216,9 @@ def test_setup_command_persists_only_github_app_key_reference(
         repo_name="owner/repo",
         worker_agent_label="agent:dev",
         model="sonnet",
+        **_VALIDATION_COMMANDS,
         github_authorization=authorization,
-    ).build_config()
+    ).build_config(repository_setup_github_authorization_codec)
 
     assert config["repo"]["github"] == {
         "app": {
@@ -222,6 +237,7 @@ def test_setup_request_detaches_nested_config_from_surface_mutation(
         repo_root=tmp_path,
         repo_name="owner/repo",
         config=config,
+        github_authorization=RepositorySetupGitHubAuthorization(kind="detected"),
     )
 
     config["agents"]["agent:dev"]["model"] = "changed"
@@ -292,6 +308,7 @@ def test_setup_command_rejects_invalid_choices(
         "repo_name": "owner/repo",
         "worker_agent_label": "agent:dev",
         "model": "sonnet",
+        **_VALIDATION_COMMANDS,
     }
     values[field] = value
 
@@ -368,6 +385,7 @@ def _owner(
         file_system=file_system,
         repository_host_factory=lambda _repo_name, _authorization: host,
         github_verifier=lambda _repo_name, _authorization: verification,
+        github_authorization_codec=repository_setup_github_authorization_codec,
         label_planner=lambda _config: labels or [],
     )
 
@@ -378,10 +396,13 @@ def _request(tmp_path: Path, **overrides) -> RepositorySetupRequest:
         "repo_name": "owner/repo",
         "worker_agent_label": "agent:dev",
         "model": "sonnet",
+        **_VALIDATION_COMMANDS,
         "config_name": RepositoryConfigName.default(),
     }
     values.update(overrides)
-    return RepositorySetupCommand(**values).to_request()
+    return RepositorySetupCommand(**values).to_request(
+        repository_setup_github_authorization_codec
+    )
 
 
 def test_setup_owner_preview_is_non_mutating(tmp_path: Path) -> None:
@@ -445,6 +466,7 @@ def test_setup_owner_authorization_failure_precedes_file_planning(
         file_system=file_system,
         repository_host_factory=host_factory,
         github_verifier=MagicMock(side_effect=RuntimeError("token cannot access repo")),
+        github_authorization_codec=repository_setup_github_authorization_codec,
         label_planner=lambda _config: [],
     )
 
@@ -481,6 +503,7 @@ def test_setup_owner_uses_selected_authorization_for_label_mutations(
             received_authorizations.append(selected) or host
         ),
         github_verifier=lambda _repo, _selected: verification,
+        github_authorization_codec=repository_setup_github_authorization_codec,
         label_planner=lambda _config: [("agent:dev", "1D76DB", "worker")],
     )
 

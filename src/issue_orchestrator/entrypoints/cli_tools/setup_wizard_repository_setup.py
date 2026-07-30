@@ -27,6 +27,7 @@ from .setup_wizard_support import Prompter
 
 def build_cli_repository_setup_request(
     *,
+    owner: RepositorySetupOwner,
     config: Mapping[str, Any],
     repo_root: Path,
     config_path: Path,
@@ -43,6 +44,7 @@ def build_cli_repository_setup_request(
         repo_root=repo_root.resolve(),
         repo_name=repo_name,
         config=config,
+        github_authorization=owner.authorization_from_config(config),
         config_target=_config_target(repo_root, config_path),
     )
 

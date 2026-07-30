@@ -10,7 +10,6 @@ from typing import Any, Callable, Literal, Mapping, Sequence
 
 from ..domain.repository_setup_auth import (
     RepositorySetupGitHubAuthorization,
-    repository_setup_github_authorization_from_config,
 )
 from ..domain.repository_config_name import RepositoryConfigName
 from ..domain.worktree_paths import (
@@ -22,6 +21,7 @@ from ..ports.repository_setup import (
     RepositorySetupConfigTarget,
     RepositorySetupFileSystem,
     RepositorySetupFileSystemError,
+    RepositorySetupGitHubAuthorizationCodec,
     RepositorySetupGitHubVerification,
     RepositorySetupGitHubVerifier,
     RepositorySetupHostFactory,
@@ -54,12 +54,12 @@ class RepositorySetupCommand:
     repo_name: str
     worker_agent_label: str
     model: str
+    validation_quick_command: str
+    validation_publish_command: str
     effort: str = "high"
     configure_reviewer: bool = True
     reviewer_model: str = "sonnet"
     reviewer_effort: str = "high"
-    validation_quick_command: str = "git diff --check"
-    validation_publish_command: str = "git diff --check"
     worktree_base: str | None = None
     github_authorization: RepositorySetupGitHubAuthorization = (
         RepositorySetupGitHubAuthorization(kind="detected")
@@ -126,7 +126,10 @@ class RepositorySetupCommand:
             if not command.strip():
                 raise ValueError(f"{field} is required")
 
-    def build_config(self) -> dict[str, Any]:
+    def build_config(
+        self,
+        authorization_codec: RepositorySetupGitHubAuthorizationCodec,
+    ) -> dict[str, Any]:
         """Build the canonical setup config without touching external systems."""
         agents: dict[str, dict[str, Any]] = {
             self.worker_agent_label: self._agent_config(
@@ -136,7 +139,7 @@ class RepositorySetupCommand:
             ),
         }
         repo: dict[str, Any] = {"name": self.repo_name}
-        github = self.github_authorization.github_config()
+        github = authorization_codec.to_config(self.github_authorization)
         if github:
             repo["github"] = github
         config: dict[str, Any] = {
@@ -220,12 +223,15 @@ class RepositorySetupCommand:
             "sandbox": True,
         }
 
-    def to_request(self) -> RepositorySetupRequest:
+    def to_request(
+        self,
+        authorization_codec: RepositorySetupGitHubAuthorizationCodec,
+    ) -> RepositorySetupRequest:
         """Translate simplified setup choices into the shared owner request."""
         return RepositorySetupRequest(
             repo_root=self.repo_root,
             repo_name=self.repo_name,
-            config=self.build_config(),
+            config=self.build_config(authorization_codec),
             github_authorization=self.github_authorization,
             config_target=RepositorySetupNamedConfig(self.config_name),
             create_prompts=self.create_prompts,
@@ -241,7 +247,7 @@ class RepositorySetupRequest:
     repo_root: Path
     repo_name: str
     config: Mapping[str, Any]
-    github_authorization: RepositorySetupGitHubAuthorization | None = None
+    github_authorization: RepositorySetupGitHubAuthorization
     config_target: RepositorySetupConfigTarget = RepositorySetupNamedConfig(
         RepositoryConfigName.default()
     )
@@ -255,12 +261,6 @@ class RepositorySetupRequest:
         if not self.repo_name.strip():
             raise ValueError("repo_name is required")
         object.__setattr__(self, "config", deepcopy(dict(self.config)))
-        if self.github_authorization is None:
-            object.__setattr__(
-                self,
-                "github_authorization",
-                repository_setup_github_authorization_from_config(self.config),
-            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -321,12 +321,47 @@ class RepositorySetupOwner:
         file_system: RepositorySetupFileSystem,
         repository_host_factory: RepositorySetupHostFactory,
         github_verifier: RepositorySetupGitHubVerifier,
+        github_authorization_codec: RepositorySetupGitHubAuthorizationCodec,
         label_planner: RepositorySetupLabelPlanner,
     ) -> None:
         self._file_system = file_system
         self._repository_host_factory = repository_host_factory
         self._github_verifier = github_verifier
+        self._github_authorization_codec = github_authorization_codec
         self._label_planner = label_planner
+
+    def request_from_command(
+        self,
+        command: RepositorySetupCommand,
+    ) -> RepositorySetupRequest:
+        """Encode one typed setup command through the owned authorization codec."""
+        return command.to_request(self._github_authorization_codec)
+
+    def authorization_from_config(
+        self,
+        config: Mapping[str, Any],
+    ) -> RepositorySetupGitHubAuthorization:
+        """Decode YAML-shaped authorization through the owner boundary."""
+        return self._github_authorization_codec.from_config(config)
+
+    def authorization_from_public(
+        self,
+        payload: Mapping[str, Any],
+    ) -> RepositorySetupGitHubAuthorization:
+        """Decode a browser authorization payload through the owner boundary."""
+        return self._github_authorization_codec.from_public(payload)
+
+    def authorization_to_public(
+        self,
+        authorization: RepositorySetupGitHubAuthorization,
+        *,
+        redact_inline_token: bool = False,
+    ) -> dict[str, Any]:
+        """Encode a browser-safe authorization payload through the owner boundary."""
+        return self._github_authorization_codec.to_public(
+            authorization,
+            redact_inline_token=redact_inline_token,
+        )
 
     def preview(self, request: RepositorySetupRequest) -> RepositorySetupPreview:
         """Build the exact filesystem plan without applying it."""
@@ -396,10 +431,6 @@ class RepositorySetupOwner:
         if request.create_labels:
             try:
                 authorization = request.github_authorization
-                if authorization is None:
-                    raise RuntimeError(
-                        "Repository setup GitHub authorization is missing"
-                    )
                 created_labels.extend(
                     self._create_labels(request.repo_name, config, authorization)
                 )
@@ -485,10 +516,10 @@ class RepositorySetupOwner:
         self,
         request: RepositorySetupRequest,
     ) -> RepositorySetupGitHubVerification:
-        authorization = request.github_authorization
-        if authorization is None:
-            raise RuntimeError("Repository setup GitHub authorization is missing")
-        return self._github_verifier(request.repo_name, authorization)
+        return self._github_verifier(
+            request.repo_name,
+            request.github_authorization,
+        )
 
 
 __all__ = [

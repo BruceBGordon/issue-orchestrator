@@ -13,6 +13,7 @@ function fakeElement({
     value = '',
     checked = false,
     ownerDocument = null,
+    parentElement = null,
 } = {}) {
     const classes = new Set();
     const listeners = new Map();
@@ -21,6 +22,7 @@ function fakeElement({
         dataset,
         value,
         checked,
+        parentElement,
         disabled: false,
         hidden: false,
         inert: false,
@@ -44,6 +46,19 @@ function fakeElement({
         },
         contains(candidate) {
             return candidate === this || this.focusableChildren.includes(candidate);
+        },
+        closest(selector) {
+            let current = this;
+            while (current) {
+                if (
+                    selector === '[hidden], [inert]'
+                    && (current.hidden || current.inert)
+                ) {
+                    return current;
+                }
+                current = current.parentElement;
+            }
+            return null;
         },
         focus() {
             this.focusCount += 1;
@@ -191,8 +206,39 @@ function githubVerificationResponse() {
         authorization: {
             kind: 'personal',
             token_env: 'ISSUE_ORCH_GITHUB_TOKEN',
+            api_url: 'https://api.github.com',
+            http_timeout_seconds: 20,
         },
     });
+}
+
+function repositoryDetection(overrides = {}) {
+    return {
+        repo_root: '/repos/porchpin',
+        repo: 'owner/porchpin',
+        existing_config: null,
+        config_path: null,
+        github_labels: [],
+        agent_labels: [],
+        prompt_candidates: [],
+        worktree_base_default: '../worktrees/porchpin',
+        worktree_base_resolved: '/repos/worktrees/porchpin',
+        github_authorization: {
+            authorization: {
+                kind: 'detected',
+                api_url: 'https://api.github.com',
+                http_timeout_seconds: 20,
+            },
+            configured_kind: 'detected',
+            inline_token_migration_required: false,
+        },
+        validation_defaults: {
+            quick_command: 'make test-quick',
+            publish_command: 'make validate',
+            source: 'Makefile targets',
+        },
+        ...overrides,
+    };
 }
 
 function githubPreviewSummary() {
@@ -233,12 +279,16 @@ test('setup request contract defaults the complete review pipeline on', () => {
         repoName: 'owner/porchpin',
         workerAgentLabel: 'agent:dev',
         model: 'sonnet',
+        validationQuickCommand: 'make test-quick',
+        validationPublishCommand: 'make validate',
         worktreeBase: '../worktrees/porchpin',
     });
     const disabled = setupCommands.buildSetupSaveRequest('/repos/porchpin', {
         repoName: 'owner/porchpin',
         workerAgentLabel: 'agent:dev',
         model: 'sonnet',
+        validationQuickCommand: 'make test-quick',
+        validationPublishCommand: 'make validate',
         worktreeBase: '../worktrees/porchpin',
         configureReviewer: false,
         configureTechLead: false,
@@ -251,8 +301,8 @@ test('setup request contract defaults the complete review pipeline on', () => {
     assert.equal(enabled.body.configure_reviewer, true);
     assert.equal(enabled.body.reviewer_model, 'sonnet');
     assert.equal(enabled.body.reviewer_effort, 'high');
-    assert.equal(enabled.body.validation_quick_command, 'git diff --check');
-    assert.equal(enabled.body.validation_publish_command, 'git diff --check');
+    assert.equal(enabled.body.validation_quick_command, 'make test-quick');
+    assert.equal(enabled.body.validation_publish_command, 'make validate');
     assert.equal(enabled.body.configure_tech_lead, true);
     assert.equal(enabled.body.tech_lead_model, 'sonnet');
     assert.equal(enabled.body.tech_lead_effort, 'high');
@@ -285,6 +335,8 @@ test('setup request contract rejects invalid role and validation choices', () =>
         repoName: 'owner/porchpin',
         workerAgentLabel: 'agent:dev',
         model: 'sonnet',
+        validationQuickCommand: 'make test-quick',
+        validationPublishCommand: 'make validate',
         worktreeBase: '../worktrees/porchpin',
     };
 
@@ -311,6 +363,27 @@ test('setup request contract rejects invalid role and validation choices', () =>
     );
 });
 
+test('personal token storage preserves GHES transport metadata', () => {
+    const command = setupCommands.buildGithubTokenStoreRequest(
+        '/repos/porchpin',
+        'owner/porchpin',
+        'ghp_secret',
+        {
+            kind: 'detected',
+            api_url: 'https://github.example/api/v3',
+            http_timeout_seconds: 47,
+        },
+    );
+
+    assert.deepEqual(command.body, {
+        repo_root: '/repos/porchpin',
+        repo_name: 'owner/porchpin',
+        token: 'ghp_secret',
+        api_url: 'https://github.example/api/v3',
+        http_timeout_seconds: 47,
+    });
+});
+
 test('setup modal completes the default-on preview and save round trip', async () => {
     const document = fakeDocument();
     const fetchCalls = [];
@@ -320,11 +393,7 @@ test('setup modal completes the default-on preview and save round trip', async (
             all_ok: true,
             checks: { git: { ok: true, detail: 'git version 2' } },
         }),
-        jsonResponse({
-            repo_root: '/repos/porchpin',
-            repo: 'owner/porchpin',
-            existing_config: null,
-        }),
+        jsonResponse(repositoryDetection()),
         githubVerificationResponse(),
         jsonResponse({
             yaml: 'repo:\n  name: owner/porchpin\n',
@@ -389,6 +458,7 @@ test('setup modal completes the default-on preview and save round trip', async (
     assert.match(configureHtml, /<legend>Validation gates<\/legend>/);
     assert.match(configureHtml, /id="setupValidationQuickCommand"/);
     assert.match(configureHtml, /id="setupValidationPublishCommand"/);
+    assert.match(configureHtml, /Makefile targets/);
     assert.match(configureHtml, /Authoritative gate before push and PR publication/);
     assert.match(configureHtml, /1 reviews every approved PR/);
     assert.match(configureHtml, /id="setupWorktreeBase"/);
@@ -422,6 +492,8 @@ test('setup modal completes the default-on preview and save round trip', async (
     assert.match(authorizationHtml, /<details/);
     assert.match(authorizationHtml, /type="password" id="setupGithubToken"/);
     assert.match(authorizationHtml, /rel="noopener noreferrer"/);
+    assert.equal(document.elements.get('setupGithubPersonalPanel').inert, false);
+    assert.equal(document.elements.get('setupGithubAppPanel').inert, true);
     assert.equal(next.disabled, true);
 
     await document.elements.get('setupVerifyDetectedGithub').emit('click');
@@ -429,6 +501,8 @@ test('setup modal completes the default-on preview and save round trip', async (
     assert.equal(verificationRequest[0], '/control/setup/github-auth/verify');
     assert.deepEqual(JSON.parse(verificationRequest[1].body).authorization, {
         kind: 'detected',
+        api_url: 'https://api.github.com',
+        http_timeout_seconds: 20,
     });
     assert.equal(next.disabled, false);
     assert.match(document.elements.get('setupGithubStatus').innerHTML, /Verified as setup-user/);
@@ -448,15 +522,20 @@ test('setup modal completes the default-on preview and save round trip', async (
     assert.equal(JSON.parse(previewRequest[1].body).tech_lead_review_threshold, 1);
     assert.equal(
         JSON.parse(previewRequest[1].body).validation_quick_command,
-        'git diff --check',
+        'make test-quick',
     );
     assert.equal(
         JSON.parse(previewRequest[1].body).validation_publish_command,
-        'git diff --check',
+        'make validate',
     );
     assert.deepEqual(
         JSON.parse(previewRequest[1].body).github_authorization,
-        { kind: 'personal', token_env: 'ISSUE_ORCH_GITHUB_TOKEN' },
+        {
+            kind: 'personal',
+            token_env: 'ISSUE_ORCH_GITHUB_TOKEN',
+            api_url: 'https://api.github.com',
+            http_timeout_seconds: 20,
+        },
     );
     assert.equal(
         JSON.parse(previewRequest[1].body).worktree_base,
@@ -518,14 +597,88 @@ test('setup modal completes the default-on preview and save round trip', async (
     assert.equal(trigger.focusCount, 1);
 });
 
+test('focus trap excludes controls beneath hidden or inert ancestors', async () => {
+    const document = fakeDocument();
+    const wizard = createSetupWizard({
+        document,
+        fetch: async () => jsonResponse({
+            all_ok: true,
+            checks: { git: { ok: true, detail: 'git version 2' } },
+            agent_checks: [],
+        }),
+        escapeHtml: (value) => String(value),
+        loadRepos: async () => {},
+        setupCommands,
+    });
+    wizard.bind();
+    await wizard.open('/repos/porchpin');
+
+    const visibleFirst = document.makeElement();
+    const visibleLast = document.makeElement();
+    const hiddenPanel = document.makeElement();
+    hiddenPanel.hidden = true;
+    hiddenPanel.inert = true;
+    const hiddenControl = document.makeElement({ parentElement: hiddenPanel });
+    const modal = document.elements.get('setupWizardModal');
+    modal.focusableChildren = [visibleFirst, visibleLast, hiddenControl];
+    document.activeElement = visibleFirst;
+    let prevented = 0;
+
+    await document.emit('keydown', {
+        key: 'Tab',
+        shiftKey: true,
+        preventDefault: () => { prevented += 1; },
+    });
+
+    assert.equal(document.activeElement, visibleLast);
+    assert.equal(hiddenControl.focusCount, 0);
+    assert.equal(prevented, 1);
+});
+
+test('undetected validation gates block forward progress until both are entered', async () => {
+    const document = fakeDocument();
+    const responses = [
+        jsonResponse({
+            all_ok: true,
+            checks: { git: { ok: true, detail: 'git version 2' } },
+            agent_checks: [],
+        }),
+        jsonResponse(repositoryDetection({
+            validation_defaults: {
+                quick_command: null,
+                publish_command: null,
+                source: 'Enter quick and publish commands before continuing.',
+            },
+        })),
+    ];
+    const wizard = createSetupWizard({
+        document,
+        fetch: async () => responses.shift(),
+        escapeHtml: (value) => String(value),
+        loadRepos: async () => {},
+        setupCommands,
+    });
+    wizard.bind();
+    await wizard.open('/repos/porchpin');
+
+    const next = document.elements.get('setupWizardNext');
+    await next.emit('click');
+    const quick = document.elements.get('setupValidationQuickCommand');
+    const publish = document.elements.get('setupValidationPublishCommand');
+    assert.equal(next.disabled, true);
+
+    quick.value = 'make test';
+    await quick.emit('input');
+    assert.equal(next.disabled, true);
+    publish.value = 'make validate';
+    await publish.emit('input');
+    assert.equal(next.disabled, false);
+});
+
 test('partial save failure renders applied mutations and requires a new preview', async () => {
     const document = fakeDocument();
     const fetchCalls = [];
-    const detectedRepo = {
-        repo_root: '/repos/porchpin',
-        repo: 'owner/porchpin',
-        existing_config: null,
-    };
+    const detectedRepo = repositoryDetection();
     const responses = [
         jsonResponse({
             all_ok: true,
@@ -650,11 +803,7 @@ test('preview failure disables save click and keyboard activation', async () => 
             all_ok: true,
             checks: { git: { ok: true, detail: 'git version 2' } },
         }),
-        jsonResponse({
-            repo_root: '/repos/porchpin',
-            repo: 'owner/porchpin',
-            existing_config: null,
-        }),
+        jsonResponse(repositoryDetection()),
         githubVerificationResponse(),
         jsonResponse({ detail: 'preview unavailable' }, false),
     ];
@@ -734,11 +883,7 @@ test('pending detect cannot overwrite prerequisites after Back', async () => {
     const detectClick = next.emit('click');
     await document.elements.get('setupWizardBack').emit('click');
 
-    pendingDetect.resolve(jsonResponse({
-        repo_root: '/repos/porchpin',
-        repo: 'owner/porchpin',
-        existing_config: null,
-    }));
+    pendingDetect.resolve(jsonResponse(repositoryDetection()));
     await detectClick;
 
     const content = document.elements.get('setupContent').innerHTML;
@@ -763,11 +908,7 @@ test('pending preview cannot render after close and reopen for another repositor
                 });
             }
             if (url.startsWith('/control/setup/detect')) {
-                return jsonResponse({
-                    repo_root: '/repos/porchpin',
-                    repo: 'owner/porchpin',
-                    existing_config: null,
-                });
+                return jsonResponse(repositoryDetection());
             }
             if (url === '/control/setup/github-auth/verify') {
                 return githubVerificationResponse();
@@ -835,11 +976,7 @@ test('pending save cannot complete after close and reopen for another repository
                 });
             }
             if (url.startsWith('/control/setup/detect')) {
-                return jsonResponse({
-                    repo_root: '/repos/porchpin',
-                    repo: 'owner/porchpin',
-                    existing_config: null,
-                });
+                return jsonResponse(repositoryDetection());
             }
             if (url === '/control/setup/github-auth/verify') {
                 return githubVerificationResponse();
@@ -909,9 +1046,7 @@ test('existing config preview requires explicit replacement confirmation before 
             all_ok: true,
             checks: { git: { ok: true, detail: 'git version 2' } },
         }),
-        jsonResponse({
-            repo_root: '/repos/porchpin',
-            repo: 'owner/porchpin',
+        jsonResponse(repositoryDetection({
             existing_config: {
                 repo: { name: 'owner/porchpin' },
                 agents: {
@@ -924,7 +1059,7 @@ test('existing config preview requires explicit replacement confirmation before 
                     tech_lead_review_agent: 'agent:tech-lead',
                 },
             },
-        }),
+        })),
         githubVerificationResponse(),
         jsonResponse({
             yaml: 'repo:\n  name: owner/porchpin\n',

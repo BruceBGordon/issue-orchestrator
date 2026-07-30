@@ -33,6 +33,7 @@ from issue_orchestrator.infra.config import get_config_path
 from issue_orchestrator.ports.repository_setup import (
     RepositorySetupExplicitConfig,
     RepositorySetupGitHubVerification,
+    RepositorySetupValidationDefaults,
 )
 
 
@@ -85,10 +86,19 @@ def test_cli_and_http_produce_equivalent_owner_request_and_preview(
     dependencies = ControlApiSetupDependencies(
         validate_repo_root=lambda raw: Path(raw).resolve() if raw else None,
         setup_owner=owner,
-        github_token_store=lambda _token, *, repo: RepositorySetupGitHubAuthorization(
-            kind="personal",
-            keyring_service="issue-orchestrator",
-            keyring_username=f"github-token:{repo}",
+        github_token_store=lambda authorization, *, repo: (
+            RepositorySetupGitHubAuthorization(
+                kind="personal",
+                keyring_service="issue-orchestrator",
+                keyring_username=f"github-token:{repo}",
+                api_url=authorization.api_url,
+                http_timeout_seconds=authorization.http_timeout_seconds,
+            )
+        ),
+        validation_detector=lambda _repo_root: RepositorySetupValidationDefaults(
+            "make test",
+            "make validate",
+            "Makefile targets",
         ),
     )
     payload = RepositorySetupCommandPayload(
@@ -103,7 +113,11 @@ def test_cli_and_http_produce_equivalent_owner_request_and_preview(
         validation_quick_command="make test-quick",
         validation_publish_command="make validate",
         worktree_base="../worktrees/repo",
-        github_authorization={"kind": "detected"},
+        github_authorization={
+            "kind": "detected",
+            "api_url": "https://api.github.com",
+            "http_timeout_seconds": 20,
+        },
         configure_tech_lead=True,
         tech_lead_model="sonnet",
         tech_lead_effort="high",
@@ -116,6 +130,7 @@ def test_cli_and_http_produce_equivalent_owner_request_and_preview(
 
     http_request = repository_setup_request_from_payload(payload, dependencies)
     cli_request = build_cli_repository_setup_request(
+        owner=owner,
         config=http_request.config,
         repo_root=tmp_path,
         config_path=get_config_path(tmp_path, "default.yaml"),
@@ -132,6 +147,7 @@ def test_cli_request_preserves_explicit_legacy_config_path(tmp_path: Path) -> No
     config_path = tmp_path / ".issue-orchestrator.yaml"
 
     request = build_cli_repository_setup_request(
+        owner=build_repository_setup_owner(MagicMock(), MagicMock()),
         config={"repo": {"name": "owner/repo"}, "agents": {}},
         repo_root=tmp_path,
         config_path=config_path,
@@ -150,6 +166,7 @@ def test_cli_surfaces_owner_partial_outcome() -> None:
     )
     prompter = _Prompter()
     request = build_cli_repository_setup_request(
+        owner=owner,
         config={"repo": {"name": "owner/repo"}, "agents": {}},
         repo_root=Path("/repo"),
         config_path=Path("/repo/config.yaml"),

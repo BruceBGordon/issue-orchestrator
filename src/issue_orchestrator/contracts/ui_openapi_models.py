@@ -832,6 +832,20 @@ class RepositorySetupConflictPayload(BaseModel):
     detail: str
     error: Literal['replace_confirmation_required']
 
+class RepositorySetupDetectionPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    agent_labels: list[str]
+    config_path: str | None
+    existing_config: dict[str, Any] | None
+    github_authorization: RepositorySetupGitHubAuthorizationDetectionPayload
+    github_labels: list[str]
+    prompt_candidates: list[str]
+    repo: str | None
+    repo_root: str = Field(..., min_length=1)
+    validation_defaults: RepositorySetupValidationDefaultsPayload
+    worktree_base_default: str = Field(..., min_length=1)
+    worktree_base_resolved: str = Field(..., min_length=1)
+
 class RepositorySetupFailurePayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
     applied_files: list[str]
@@ -848,14 +862,22 @@ class RepositorySetupFilePayload(BaseModel):
     size: int | None = Field(default=None, ge=0, strict=True)
     type: Literal['prompt'] | None = None
 
+class RepositorySetupGitHubAuthorizationDetectionPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    authorization: RepositorySetupGitHubAuthorizationPayload
+    configuration_error: str | None = Field(default=None, min_length=1)
+    configured_kind: Literal['detected', 'personal', 'github_app', 'invalid']
+    inline_token_migration_required: bool
+
 class RepositorySetupGitHubAuthorizationPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    api_url: str | None = Field(default=None, min_length=1)
+    api_url: str = Field(..., min_length=1)
     app_client_id: str | None = Field(default=None, min_length=1)
     app_id: str | None = Field(default=None, min_length=1)
     app_installation_id: str | None = Field(default=None, min_length=1)
     app_private_key_env: str | None = Field(default=None, min_length=1)
     app_private_key_path: str | None = Field(default=None, min_length=1)
+    http_timeout_seconds: float = Field(..., gt=0)
     keyring_service: str | None = Field(default=None, min_length=1)
     keyring_username: str | None = Field(default=None, min_length=1)
     kind: Literal['detected', 'personal', 'github_app']
@@ -863,6 +885,8 @@ class RepositorySetupGitHubAuthorizationPayload(BaseModel):
 
 class RepositorySetupGitHubTokenPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
+    api_url: str = Field(..., min_length=1)
+    http_timeout_seconds: float = Field(..., gt=0)
     repo_name: str = Field(..., min_length=1)
     repo_root: str = Field(..., min_length=1)
     token: str = Field(..., min_length=1)
@@ -885,6 +909,18 @@ class RepositorySetupGitHubVerifyRequestPayload(BaseModel):
     repo_name: str = Field(..., min_length=1)
     repo_root: str = Field(..., min_length=1)
 
+class RepositorySetupPrerequisiteCheckPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    detail: str = Field(..., min_length=1)
+    name: str | None = Field(default=None, min_length=1)
+    ok: bool
+
+class RepositorySetupPrerequisitesPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    agent_checks: list[RepositorySetupPrerequisiteCheckPayload]
+    all_ok: bool
+    checks: dict[str, RepositorySetupPrerequisiteCheckPayload]
+
 class RepositorySetupPreviewPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
     files: list[RepositorySetupFilePayload]
@@ -898,6 +934,12 @@ class RepositorySetupResultPayload(BaseModel):
     created_files: list[str]
     created_labels: list[str]
     status: Literal['saved']
+
+class RepositorySetupValidationDefaultsPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    publish_command: str | None
+    quick_command: str | None
+    source: str = Field(..., min_length=1)
 
 class RetrospectiveReviewDecisionPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")

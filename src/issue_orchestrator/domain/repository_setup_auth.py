@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Literal, Mapping
+from typing import Literal
 
 GitHubAuthorizationKind = Literal["detected", "personal", "github_app"]
 
@@ -113,96 +113,6 @@ class RepositorySetupGitHubAuthorization:
         """Whether this choice would expose a secret in rendered YAML."""
         return self.token is not None
 
-    def github_config(self) -> dict[str, Any]:
-        """Return the YAML-safe ``repo.github`` mapping for this choice."""
-        github = self._auth_config()
-        if self.api_url != "https://api.github.com":
-            github["api_url"] = self.api_url
-        if self.http_timeout_seconds != 20.0:
-            github["http_timeout_seconds"] = self.http_timeout_seconds
-        return github
-
-    def _auth_config(self) -> dict[str, Any]:
-        if self.kind == "personal":
-            return _present_values({
-                "token": self.token,
-                "token_env": self.token_env,
-                "keyring_service": self.keyring_service,
-                "keyring_username": self.keyring_username,
-            })
-        if self.kind == "github_app":
-            return {"app": self._github_app_config()}
-        return {}
-
-    def _github_app_config(self) -> dict[str, str]:
-        app = _present_values({
-            "client_id": self.app_client_id,
-            "app_id": self.app_id,
-            "installation_id": self.app_installation_id,
-            "private_key_path": self.app_private_key_path,
-            "private_key_env": self.app_private_key_env,
-        })
-        return app
-
-    def auth_kwargs(self) -> dict[str, str | None]:
-        """Return keyword arguments accepted by the GitHub auth adapter."""
-        return {
-            "configured_token": self.token,
-            "configured_env": self.token_env,
-            "configured_keyring_service": self.keyring_service,
-            "configured_keyring_username": self.keyring_username,
-            "configured_app_client_id": self.app_client_id,
-            "configured_app_id": self.app_id,
-            "configured_app_installation_id": self.app_installation_id,
-            "configured_app_private_key_path": self.app_private_key_path,
-            "configured_app_private_key_env": self.app_private_key_env,
-        }
-
-
-def repository_setup_github_authorization_from_config(
-    config: Mapping[str, Any],
-) -> RepositorySetupGitHubAuthorization:
-    """Parse the auth-relevant portion of a YAML-shaped repository config."""
-    repo = config.get("repo")
-    github = repo.get("github") if isinstance(repo, Mapping) else None
-    if not isinstance(github, Mapping) or not github:
-        return RepositorySetupGitHubAuthorization(kind="detected")
-
-    app = github.get("app")
-    if isinstance(app, Mapping) and app:
-        return RepositorySetupGitHubAuthorization(
-            kind="github_app",
-            app_client_id=_mapping_text(app, "client_id"),
-            app_id=_mapping_text(app, "app_id"),
-            app_installation_id=_mapping_text(app, "installation_id"),
-            app_private_key_path=_mapping_text(app, "private_key_path"),
-            app_private_key_env=_mapping_text(app, "private_key_env"),
-            api_url=_mapping_text(github, "api_url") or "https://api.github.com",
-            http_timeout_seconds=float(github.get("http_timeout_seconds", 20.0)),
-        )
-
-    personal_fields = {
-        "token": _mapping_text(github, "token"),
-        "token_env": _mapping_text(github, "token_env"),
-        "keyring_service": _mapping_text(github, "keyring_service"),
-        "keyring_username": _mapping_text(github, "keyring_username"),
-    }
-    return RepositorySetupGitHubAuthorization(
-        kind="personal" if any(personal_fields.values()) else "detected",
-        **personal_fields,
-        api_url=_mapping_text(github, "api_url") or "https://api.github.com",
-        http_timeout_seconds=float(github.get("http_timeout_seconds", 20.0)),
-    )
-
-
-def _mapping_text(mapping: Mapping[str, Any], key: str) -> str | None:
-    value = mapping.get(key)
-    if value is None:
-        return None
-    if not isinstance(value, str):
-        raise ValueError(f"repo.github.{key} must be a string")
-    return value
-
 
 _OPTIONAL_TEXT_FIELDS = (
     "token",
@@ -215,14 +125,7 @@ _OPTIONAL_TEXT_FIELDS = (
     "app_private_key_path",
     "app_private_key_env",
 )
-
-
-def _present_values(values: Mapping[str, str | None]) -> dict[str, str]:
-    return {key: value for key, value in values.items() if value is not None}
-
-
 __all__ = [
     "GitHubAuthorizationKind",
     "RepositorySetupGitHubAuthorization",
-    "repository_setup_github_authorization_from_config",
 ]

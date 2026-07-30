@@ -29,7 +29,16 @@
         if (!['detected', 'personal', 'github_app'].includes(kind)) {
             throw new Error(`Unsupported GitHub authorization: ${kind}`);
         }
-        const authorization = { kind };
+        const apiUrl = typeof value.api_url === 'string' ? value.api_url.trim() : '';
+        const timeout = Number(value.http_timeout_seconds ?? 20);
+        if (!Number.isFinite(timeout) || timeout <= 0) {
+            throw new Error('githubAuthorization.http_timeout_seconds must be positive');
+        }
+        const authorization = {
+            kind,
+            api_url: apiUrl || 'https://api.github.com',
+            http_timeout_seconds: timeout,
+        };
         [
             'token_env',
             'keyring_service',
@@ -39,7 +48,6 @@
             'app_installation_id',
             'app_private_key_path',
             'app_private_key_env',
-            'api_url',
         ].forEach((key) => {
             const valueAtKey = typeof value[key] === 'string' ? value[key].trim() : '';
             if (valueAtKey) authorization[key] = valueAtKey;
@@ -124,11 +132,11 @@
             reviewer_model: reviewerModel,
             reviewer_effort: reviewerEffort,
             validation_quick_command: requiredText(
-                options.validationQuickCommand ?? 'git diff --check',
+                options.validationQuickCommand,
                 'validationQuickCommand',
             ),
             validation_publish_command: requiredText(
-                options.validationPublishCommand ?? 'git diff --check',
+                options.validationPublishCommand,
                 'validationPublishCommand',
             ),
             worktree_base: requiredText(options.worktreeBase, 'worktreeBase'),
@@ -152,7 +160,13 @@
         };
     }
 
-    function buildGithubTokenStoreRequest(repoRoot, repoName, token) {
+    function buildGithubTokenStoreRequest(
+        repoRoot,
+        repoName,
+        token,
+        transportAuthorization = { kind: 'detected' },
+    ) {
+        const authorization = githubAuthorization(transportAuthorization);
         return {
             endpoint: '/control/setup/github-auth/store-personal-token',
             method: 'POST',
@@ -160,6 +174,8 @@
                 repo_root: requiredText(repoRoot, 'repoRoot'),
                 repo_name: requiredText(repoName, 'repoName'),
                 token: requiredText(token, 'token'),
+                api_url: authorization.api_url || 'https://api.github.com',
+                http_timeout_seconds: authorization.http_timeout_seconds || 20,
             },
         };
     }

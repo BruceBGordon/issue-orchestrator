@@ -46,12 +46,12 @@ repository. That workflow creates the same repository setup, defaults worktrees
 to the dedicated peer directory `../worktrees/<repository-directory>`, and
 configures a default worker → reviewer/rework → tech-lead pipeline. The
 Configuration step lets you select model and effort for each role, set the
-tech-lead cadence (`1` reviews every approved PR), and replace the portable
-`git diff --check` validation defaults with repository-specific quick and
-publish commands. It then walks through GitHub authorization before showing
-the YAML preview. The CLI wizard expects GitHub authorization to be available
-before it starts; the Control Center workflow is the guided,
-wait-and-verify path.
+tech-lead cadence (`1` reviews every approved PR), and confirm detected
+repository-specific quick and publish commands. When setup cannot detect both
+validation gates, it waits for you to enter them. It then walks through GitHub
+authorization before showing the YAML preview. The CLI wizard expects GitHub
+authorization to be available before it starts; the Control Center workflow is
+the guided, wait-and-verify path.
 
 After saving, the workflow points to independent features you might configure
 later, including specialized reviewers, other AI providers, E2E, merge queue,

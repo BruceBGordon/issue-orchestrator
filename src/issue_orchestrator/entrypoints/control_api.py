@@ -60,6 +60,9 @@ from ..infra.supervisor import DefaultSupervisorOps, SupervisorOps
 from ..ports import RepositoryHost
 from ..control.goal_pilot import GoalPilot
 from ..execution.control_center_actions import ControlCenterActions
+from ..execution.repository_setup_validation import (
+    RepositorySetupValidationDetectorAdapter,
+)
 from ._auth_middleware import (
     AuthSurfaceConfig,
     evaluate_request,
@@ -168,14 +171,14 @@ def _verify_repository_setup_github_authorization(
 
 
 def _store_repository_setup_github_token(
-    token: str,
+    authorization: "RepositorySetupGitHubAuthorization",
     *,
     repo: str,
 ) -> "RepositorySetupGitHubAuthorization":
     """Composition-root adapter for repo-scoped keychain storage."""
     from ..execution.providers import store_repository_setup_github_token
 
-    return store_repository_setup_github_token(token, repo=repo)
+    return store_repository_setup_github_token(authorization, repo=repo)
 
 
 # Create minimal control API app
@@ -1103,6 +1106,7 @@ install_control_api_setup_dependencies(
             _verify_repository_setup_github_authorization,
         ),
         github_token_store=_store_repository_setup_github_token,
+        validation_detector=RepositorySetupValidationDetectorAdapter(),
     ),
 )
 control_app.include_router(control_orchestrator_router)
