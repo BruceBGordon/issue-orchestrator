@@ -104,6 +104,7 @@ from ..ports import (
     make_trace_event,
 )
 from ..ports.session_output import SessionOutput
+from ..ports.review_exchange_approval_gate import ReviewExchangeApprovalGate
 from .persistent_exchange_pair_registry_inmemory import (
     InMemoryPersistentExchangePairRegistry,
     PersistentExchangePair,
@@ -405,6 +406,7 @@ def run_persistent_session_exchange(  # noqa: PLR0913
     require_validation: bool,
     nit_policy: str = "surface",
     initial_validation_record_path: Path | None = None,
+    approval_gate: ReviewExchangeApprovalGate | None = None,
     web_port: int | None = None,
     events: EventSink | None = None,
     event_context: EventContext | None = None,
@@ -773,6 +775,7 @@ def run_persistent_session_exchange(  # noqa: PLR0913
                 max_no_progress=max_no_progress,
                 require_validation=require_validation,
                 nit_policy=_coerce_runtime_nit_policy(nit_policy),
+                approval_gate=approval_gate,
                 coder_provider=_agent_provider(coder_agent),
                 reviewer_provider=_agent_provider(reviewer_agent),
                 before_reviewer_round=_ff_then_caller_hook,
@@ -1484,6 +1487,7 @@ class _ReviewerDecisionResult:
     reviewer: ReviewExchangeResponse
     artifact_pair: ReviewArtifactPair
     addressable_nit_rework: bool
+    policy_rework_feedback: str | None = None
 
 
 def _emit_built_event(
@@ -1502,15 +1506,24 @@ def _finalize_reviewer_decision(
     nit_policy: NitPolicy,
     require_validation: bool,
     pair_validation: _PairValidationMirror,
+    approval_gate: ReviewExchangeApprovalGate | None,
 ) -> _ReviewerDecisionResult:
     validation_error = (
         pair_validation.current_validation_error() if require_validation else None
     )
-    if reviewer.response_type == "ok" and validation_error is not None:
+    approval_error = None
+    if (
+        reviewer.response_type == "ok"
+        and validation_error is None
+        and approval_gate is not None
+    ):
+        approval_error = approval_gate.rejection_reason()
+    policy_rework_feedback = validation_error or approval_error
+    if reviewer.response_type == "ok" and policy_rework_feedback is not None:
         reviewer = ReviewExchangeResponse(
             response_type="changes_requested",
             response_text=(
-                f"{validation_error}. Address the failing checks and continue."
+                f"{policy_rework_feedback} Address it and continue."
             ),
             getting_closer=False,
             raw_json=None,
@@ -1534,6 +1547,7 @@ def _finalize_reviewer_decision(
         reviewer=reviewer,
         artifact_pair=artifact_pair,
         addressable_nit_rework=addressable_nit_rework,
+        policy_rework_feedback=policy_rework_feedback,
     )
 
 
@@ -1592,11 +1606,28 @@ def _coder_rework_reason(
     reviewer: ReviewExchangeResponse,
     decision_result: _ReviewerDecisionResult,
 ) -> str | None:
+    if decision_result.policy_rework_feedback is not None:
+        return "acceptance_gate"
     if decision_result.addressable_nit_rework:
         return "nits"
     if reviewer.response_type == "changes_requested":
         return "changes_requested"
     return None
+
+
+def _coder_reviewer_feedback(
+    decision_result: _ReviewerDecisionResult,
+) -> str:
+    """Render reviewer-authored feedback plus any orchestrator gate rejection."""
+    feedback = decision_result.artifact_pair.report_path.read_text(encoding="utf-8")
+    if decision_result.policy_rework_feedback is None:
+        return feedback
+    return (
+        feedback.rstrip()
+        + "\n\n## Orchestrator acceptance gate\n\n"
+        + decision_result.policy_rework_feedback
+        + "\n"
+    )
 
 
 @dataclass(frozen=True)
@@ -1626,6 +1657,7 @@ class _DriveRoundsCommand:
     max_no_progress: int
     require_validation: bool
     nit_policy: NitPolicy
+    approval_gate: ReviewExchangeApprovalGate | None
     coder_provider: AgentProvider
     reviewer_provider: AgentProvider
     before_reviewer_round: Callable[[int], None] | None
@@ -1664,6 +1696,7 @@ def _drive_rounds(command: _DriveRoundsCommand) -> ReviewExchangeOutcome:
     max_no_progress = command.max_no_progress
     require_validation = command.require_validation
     nit_policy = command.nit_policy
+    approval_gate = command.approval_gate
     coder_provider = command.coder_provider
     reviewer_provider = command.reviewer_provider
     before_reviewer_round = command.before_reviewer_round
@@ -1830,6 +1863,7 @@ def _drive_rounds(command: _DriveRoundsCommand) -> ReviewExchangeOutcome:
                 reviewer_report_path=reviewer_report_path,
                 require_validation=require_validation,
                 pair_validation=pair_validation,
+                approval_gate=approval_gate,
             )
         except ValueError as exc:
             return _build_outcome_for_reviewer_decision_error(
@@ -1893,7 +1927,7 @@ def _drive_rounds(command: _DriveRoundsCommand) -> ReviewExchangeOutcome:
             role=Role.CODER,
             require_validation=require_validation,
             run_dir=run_dir,
-            reviewer_feedback=artifact_pair.report_path.read_text(encoding="utf-8"),
+            reviewer_feedback=_coder_reviewer_feedback(decision_result),
         )
         _persist_turn_packet(exchange_dir, coder_packet)
         coder_response_channel = response_channels.for_role(Role.CODER)

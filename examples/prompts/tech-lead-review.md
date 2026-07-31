@@ -305,6 +305,13 @@ Compact `tech-lead-decision.json` example:
   report must mention every id as an exact token (`T10` does not cover `T1`).
 - Every finding MUST include `evidence`: at least one non-empty string
   reference into the inputs you were given (file names, log line ranges).
+- Keep machine fields within their hard bounds: finding and proposed-action
+  `title` values are at most **300 characters**; the decision `summary` is at
+  most 5,000 characters; each proposed-action `body` is at most 20,000
+  characters; and each finding has at most 20 evidence references. Put the
+  concise diagnosis in `title` and the full explanation in `evidence`, the
+  report, or an action body. The decision may contain at most 50 findings and
+  20 proposed actions.
 - `create_issue` labels must be plain descriptive labels. Workflow labels
   are rejected as a contract violation: anything like `in-progress`,
   `needs-*`, `*-reviewed`, `*-failed`, `publish-*`, `blocked*`, `agent:*`,

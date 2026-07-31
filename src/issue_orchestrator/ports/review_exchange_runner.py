@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     from ..domain.runtime_config import RuntimeConfigReference
     from ..events import EventContext
     from .event_sink import EventSink
+    from .review_exchange_approval_gate import ReviewExchangeApprovalGate
 
 
 class ReviewExchangeRunner(Protocol):
@@ -51,6 +52,7 @@ class ReviewExchangeRunner(Protocol):
         require_validation: bool,
         nit_policy: str = "surface",
         initial_validation_record_path: Path | None = None,
+        approval_gate: "ReviewExchangeApprovalGate | None" = None,
         web_port: int | None = None,
         events: "EventSink | None" = None,
         event_context: "EventContext | None" = None,

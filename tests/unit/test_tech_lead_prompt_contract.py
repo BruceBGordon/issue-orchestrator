@@ -19,7 +19,15 @@ from issue_orchestrator.control.label_manager import LabelManager
 from issue_orchestrator.control.tech_lead_issue_policy import (
     protected_tech_lead_label_violations,
 )
-from issue_orchestrator.domain.tech_lead_artifacts import TechLeadDecision
+from issue_orchestrator.domain.tech_lead_artifacts import (
+    MAX_ACTION_BODY_CHARS,
+    MAX_EVIDENCE_REFS,
+    MAX_SUMMARY_CHARS,
+    MAX_TECH_LEAD_ACTIONS,
+    MAX_TECH_LEAD_FINDINGS,
+    MAX_TITLE_CHARS,
+    TechLeadDecision,
+)
 from issue_orchestrator.entrypoints.setup_wizard_prompts import (
     build_tech_lead_review_prompt_text,
 )
@@ -94,6 +102,24 @@ def test_compact_decision_example_is_contract_valid(variant: str) -> None:
             )
             == []
         ), f"{variant} example proposes protected labels"
+
+
+@pytest.mark.parametrize("variant", sorted(PROMPT_VARIANTS))
+def test_machine_field_bounds_are_documented(variant: str) -> None:
+    """Agent-visible limits must not remain a completion-time surprise."""
+    text = PROMPT_VARIANTS[variant]
+    expected_limits = (
+        MAX_TITLE_CHARS,
+        MAX_SUMMARY_CHARS,
+        MAX_ACTION_BODY_CHARS,
+        MAX_EVIDENCE_REFS,
+        MAX_TECH_LEAD_FINDINGS,
+        MAX_TECH_LEAD_ACTIONS,
+    )
+    for limit in expected_limits:
+        rendered = f"{limit:,}"
+        assert rendered in text, f"{variant} does not document limit {rendered}"
+    assert "full explanation" in text
 
 
 @pytest.mark.parametrize("variant", sorted(PROMPT_VARIANTS))
