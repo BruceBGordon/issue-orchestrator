@@ -905,6 +905,12 @@ class GitHubHttpClient:
     # exceed this cannot prove completeness, so it fails loud instead (R8).
     _LABEL_PAGE_CAP = 20
 
+    # 10 pages * 100/page = 1000 milestones. Same fail-loud contract: a scan
+    # that cannot prove completeness must not answer a negative-existence
+    # question. Lower than labels because milestones are coarse planning units
+    # and a repo with 1000 of them has a different problem.
+    _MILESTONE_PAGE_CAP = 10
+
     def _paginate_fresh(
         self,
         path: str,
@@ -953,7 +959,21 @@ class GitHubHttpClient:
                     response_text=response.text,
                 )
             batch = response.json()
-            if not isinstance(batch, list) or not batch:
+            if not isinstance(batch, list):
+                # A 2xx carrying a non-list body is a contract violation, NOT
+                # exhaustion. Treating it as the end of the list would hand the
+                # caller a silently truncated result under a method that
+                # promises completeness — the exact failure this pager exists to
+                # make impossible. Only an empty list is valid exhaustion.
+                raise GitHubHttpError(
+                    f"GitHub returned a non-list body while paging {what}"
+                    f" (page {page}); refusing to treat it as an exhausted list",
+                    method="GET",
+                    url=path,
+                    status_code=response.status_code,
+                    response_text=response.text,
+                )
+            if not batch:
                 return
             yield batch
             if len(batch) < per_page:  # short page => exhausted, list is complete
@@ -1031,6 +1051,33 @@ class GitHubHttpClient:
             caller="list_milestones",
         )
         return payload if isinstance(payload, list) else []
+
+    def list_all_milestones(self) -> list[dict[str, Any]]:
+        """Fetch EVERY milestone, all states, with exhaustive pagination.
+
+        Unlike :meth:`list_milestones`, which reads a single page of one state,
+        this promises completeness — because its callers make *negative*
+        decisions from the result ("this configured milestone does not exist").
+        A truncated or state-filtered read turns a correct configuration into a
+        false report, which is worse than no check at all.
+
+        ``state="all"`` because milestone scope is evaluated independently of
+        issue state, so a closed milestone is still a valid dependency target.
+
+        Shares the fail-loud pager (:meth:`_paginate_fresh`), which raises on a
+        transport failure, a later-page non-200, or a cap-exhausted scan, so no
+        caller can mistake a partial read for a complete one.
+        """
+        collected: list[dict[str, Any]] = []
+        for batch in self._paginate_fresh(
+            f"/repos/{self._config.repo}/milestones",
+            params={"state": "all", "per_page": 100},
+            start_page=1,
+            page_cap=self._MILESTONE_PAGE_CAP,
+            what="repository milestones",
+        ):
+            collected.extend(batch)
+        return collected
 
     def create_milestone(
         self,

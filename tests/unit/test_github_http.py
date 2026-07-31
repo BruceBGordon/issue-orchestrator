@@ -2199,3 +2199,85 @@ def test_get_commit_check_rollup_neutral_and_skipped_runs_are_passing() -> None:
     rollup = client.get_commit_check_rollup("deadbeef")
     assert rollup.state == "SUCCESS"
     assert rollup.complete is True
+
+
+# ---------------------------------------------------------------------------
+# list_all_milestones: authoritative all-state exhaustive read
+# ---------------------------------------------------------------------------
+
+def test_list_all_milestones_requests_all_states_and_walks_pages() -> None:
+    """The doctor makes a NEGATIVE-existence decision from this list, so the
+    read must cover every state and every page. A state filter would hide a
+    closed foundation milestone; stopping at page 1 would hide a later one.
+    Either omission turns a correct configuration into a false report."""
+    seen: list[dict[str, str]] = []
+    page1 = [{"title": f"M{n}", "number": n} for n in range(100)]
+    page2 = [{"title": "M0 - Foundation", "number": 100, "state": "closed"}]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(
+            {
+                "path": request.url.path,
+                "state": request.url.params.get("state", ""),
+                "per_page": request.url.params.get("per_page", ""),
+                "page": request.url.params.get("page", "1"),
+            }
+        )
+        return httpx.Response(200, json=page1 if seen[-1]["page"] == "1" else page2)
+
+    client = _client_with_transport(httpx.MockTransport(handler))
+    milestones = client.list_all_milestones()
+
+    assert [s["page"] for s in seen] == ["1", "2"]
+    assert {s["state"] for s in seen} == {"all"}
+    assert {s["per_page"] for s in seen} == {"100"}
+    assert all(s["path"].endswith("/milestones") for s in seen)
+    # The page-2 entry survives — this is the one the doctor would otherwise
+    # report as missing.
+    assert {m["title"] for m in milestones} == {m["title"] for m in page1} | {"M0 - Foundation"}
+
+
+def test_list_all_milestones_short_first_page_stops() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=[{"title": "M0", "number": 1}])
+
+    client = _client_with_transport(httpx.MockTransport(handler))
+
+    assert [m["title"] for m in client.list_all_milestones()] == ["M0"]
+
+
+def test_list_all_milestones_empty_list_is_valid_exhaustion() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=[])
+
+    client = _client_with_transport(httpx.MockTransport(handler))
+
+    assert client.list_all_milestones() == []
+
+
+def test_list_all_milestones_non_list_body_fails_loud() -> None:
+    """A 2xx carrying a non-list body is a contract violation, not exhaustion.
+
+    Returning [] here would hand the doctor an empty snapshot, which it reads as
+    "this repo has no milestones" and reports nothing at all — recreating the
+    silent diagnostic failure the fail-loud pager exists to prevent.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"message": "unexpected shape"})
+
+    client = _client_with_transport(httpx.MockTransport(handler))
+    with pytest.raises(GitHubHttpError):
+        client.list_all_milestones()
+
+
+def test_list_all_milestones_later_page_non_200_fails_loud() -> None:
+    page1 = [{"title": f"M{n}", "number": n} for n in range(100)]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.params.get("page", "1") == "1":
+            return httpx.Response(200, json=page1)
+        return httpx.Response(502, text="bad gateway")
+
+    client = _client_with_transport(httpx.MockTransport(handler))
+    with pytest.raises(GitHubHttpError):
+        client.list_all_milestones()

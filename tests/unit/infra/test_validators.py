@@ -131,6 +131,12 @@ class TestReviewWorkflowValidator:
         # Concrete int so the cross-field health-review invariant (#6776) is
         # exercised deterministically (a bare MagicMock compares > 0 truthy).
         config.tech_lead.health_review.interval_minutes = health_review_interval_minutes
+        # Nit policy and retrospective rerun moved onto this validator (#6939 A2),
+        # so a bare MagicMock now trips checks this fixture does not target.
+        # Concrete valid defaults keep each test exercising its own invariant.
+        config.review_nits_default_policy = "address"
+        config.review_nits_by_agent = {}
+        config.retrospective_review_enabled = False
         # Concrete False so the stuck-sweep cross-field invariant (#6823) is off
         # by default here (a bare MagicMock attribute is truthy).
         config.tech_lead.stuck_sweep.enabled = False
