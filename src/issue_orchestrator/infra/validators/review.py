@@ -3,6 +3,7 @@
 from typing import TYPE_CHECKING
 
 from .base import ConfigValidator
+from ..config_value_rules import validate_review_nit_policy
 
 if TYPE_CHECKING:
     from ..config import Config
@@ -48,9 +49,41 @@ class ReviewWorkflowValidator(ConfigValidator):
         exchange_mode = config.review_exchange_mode
         self._validate_exchange_mode(exchange_mode, config, errors)
         self._validate_probe_schedule(config, errors)
+        # Nit policy and retrospective rerun settings are review-workflow
+        # concerns; they lived on Config only for historical reasons (#6939 A2).
+        errors.extend(
+            validate_review_nit_policy(
+                config.review_nits_default_policy, config.review_nits_by_agent
+            )
+        )
+        self._validate_retrospective_review(config, errors)
         # Pair validation is deferred to runtime when the actual coder agent is known.
 
         return errors
+
+    def _validate_retrospective_review(self, config: "Config", errors: list[str]) -> None:
+        """Validate review-first existing-implementation rerun settings."""
+        if not config.retrospective_review_enabled:
+            return
+        if not config.code_review_agent:
+            errors.append("review.retrospective.enabled requires review.default to be configured")
+        elif config.code_review_agent not in config.agents:
+            errors.append(
+                f"review.default '{config.code_review_agent}' not found in agents for"
+                f" retrospective review. Available: {list(config.agents.keys())}"
+            )
+        for attr, yaml_path in (
+            (config.retrospective_review_trigger_label, "review.retrospective.trigger_label"),
+            (config.retrospective_reviewed_label, "review.retrospective.reviewed_label"),
+            (
+                config.retrospective_changes_requested_label,
+                "review.retrospective.changes_requested_label",
+            ),
+        ):
+            if not str(attr or "").strip():
+                errors.append(
+                    f"{yaml_path} must be non-empty when retrospective review is enabled"
+                )
 
     def _validate_review_defaults(self, config: "Config", errors: list[str]) -> None:
         if not config.review_enabled:

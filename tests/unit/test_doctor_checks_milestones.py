@@ -348,3 +348,57 @@ def test_foundation_is_not_normalized_before_comparison(monkeypatch):
     assert check.status == "warning"
     assert check.expandable["configured"] == " M0 "
     assert check.expandable["suggestion"] == "M0"
+
+
+# ------------------------------------------- config contract (#6939 B7 / A2)
+
+def _errs(foundation):
+    cfg = Config()
+    cfg.foundation_milestone = foundation
+    return [e for e in cfg.validate() if "milestones.foundation" in e]
+
+
+def test_config_rejects_padded_foundation_milestone():
+    """Padding is a configuration error, not an alternate value.
+
+    Runtime compares this to GitHub milestone titles by exact equality, so a
+    padded value does not degrade — it silently disables the foundation
+    exemption and blocks every cross-milestone dependent.
+    """
+    assert any("whitespace" in e for e in _errs(" M0 "))
+    assert any("whitespace" in e for e in _errs("M0\t"))
+
+
+def test_config_rejects_blank_or_missing_foundation_milestone():
+    for value in ("", "   ", None):
+        errors = _errs(value)
+        assert errors, f"expected an error for {value!r}"
+        assert any("non-empty" in e for e in errors)
+
+
+def test_config_accepts_interior_spacing():
+    """'M0 - Foundation' is an ordinary title; only padding is rejected."""
+    assert _errs("M0 - Foundation") == []
+    assert _errs("M0") == []
+
+
+def test_yaml_loaded_padded_foundation_is_rejected(tmp_path):
+    """The contract holds through real YAML loading, not just attribute set."""
+    cfg_path = tmp_path / "main.yaml"
+    cfg_path.write_text(
+        "repo:\n"
+        "  name: owner/repo\n"
+        "agents:\n"
+        "  agent:backend:\n"
+        "    prompt: p.md\n"
+        "    provider: claude-code\n"
+        "milestones:\n"
+        '  foundation: "  M0  "\n'
+    )
+
+    cfg = Config.load(cfg_path)
+
+    assert cfg.foundation_milestone == "  M0  "  # not silently trimmed on load
+    assert any(
+        "milestones.foundation" in e and "whitespace" in e for e in cfg.validate()
+    )
