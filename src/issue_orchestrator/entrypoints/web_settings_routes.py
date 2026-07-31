@@ -159,7 +159,7 @@ async def update_settings(
         logger.info("[settings] No settings changed; config file left untouched")
     elif config.config_path:
         try:
-            save_config_document_patch(config, save_plan.apply)
+            save_config_document_patch(config, save_plan.entries)
             logger.info(
                 "[settings] Config saved to %s (paths: %s)",
                 config.config_path,

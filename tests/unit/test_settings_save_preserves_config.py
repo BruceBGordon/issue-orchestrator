@@ -10,7 +10,7 @@ The fix builds a field-granular patch plan and writes only the settings-owned
 that boundary:
 
 * the persistence-policy owner (``build_save_plan`` -> ``SettingsSavePlan``,
-  composed with ``save_config_document_patch`` via ``plan.apply``), and
+  composed with ``save_config_document_patch`` via ``plan.entries``), and
 * the settings HTTP handler (``update_settings``) that wires them together.
 
 They pin the two invariants the field-granular plan protects: an unedited
@@ -60,7 +60,9 @@ repo:
       min_remaining: 100
     audit:
       enabled: true
-    required_scopes: ["repo", "read:org"] # preserve flow style and quoting
+    required_scopes:
+      - repo
+      - read:org
 
 merge_queue:
   enabled: true
@@ -98,6 +100,7 @@ agents:
     initial_prompt: >-
       Keep this hand-wrapped scalar exactly as the operator wrote it when an
       unrelated setting changes.
+...
 """
 
 
@@ -125,7 +128,7 @@ def _save_one_tab_change(config: Config, cfg_path, mutate) -> dict:
     apply_to(tabs, config)
     plan = build_save_plan(snapshot, tabs)
     if not plan.is_empty:
-        save_config_document_patch(config, plan.apply)
+        save_config_document_patch(config, plan.entries)
     return yaml.safe_load(cfg_path.read_text())
 
 
@@ -218,6 +221,11 @@ agents:
     prompt: prompt.txt
     provider: "claude-code"
     initial_prompt: "Keep this deliberately long quoted string on one line when an unrelated setting changes."
+    provider_args: &shared_args
+      effort: "xhigh"
+  agent:reviewer:
+    prompt: prompt.txt
+    provider_args: *shared_args
 
 execution:
   concurrency:
@@ -226,8 +234,8 @@ execution:
     session_timeout_minutes: 120
 
 filtering:
-  exclude_labels: ["proposed-tech-lead", "deferred"] # keep flow style and comment
-"""
+  exclude_labels: [ "proposed-tech-lead",  "deferred" ] # keep custom flow spacing
+""".rstrip("\n")
     cfg_path.write_text(original)
     config = Config.load(cfg_path)
 
@@ -241,6 +249,7 @@ filtering:
         "    max_concurrent_sessions: 2\n",
         "    max_concurrent_sessions: 3\n",
     )
+    assert not cfg_path.read_bytes().endswith(b"\n")
 
 
 def test_partial_save_does_not_expand_env_var_references(tmp_path, monkeypatch):
@@ -323,13 +332,21 @@ def test_save_config_document_patch_starts_from_empty_when_file_missing(tmp_path
 
     save_config_document_patch(
         config,
-        lambda doc: doc.__setitem__("execution", {"concurrency": {"max_concurrent_sessions": 3}}),
+        (
+            types.SimpleNamespace(
+                yaml_path="execution.concurrency.max_concurrent_sessions",
+                value=3,
+            ),
+        ),
         path=target,
     )
 
-    assert yaml.safe_load(target.read_text())["execution"]["concurrency"][
-        "max_concurrent_sessions"
-    ] == 3
+    assert (
+        yaml.safe_load(target.read_text())["execution"]["concurrency"][
+            "max_concurrent_sessions"
+        ]
+        == 3
+    )
 
 
 def test_save_config_document_patch_rejects_non_mapping_document(tmp_path):
@@ -339,14 +356,136 @@ def test_save_config_document_patch_rejects_non_mapping_document(tmp_path):
     target.write_text("- a\n- b\n")
 
     with pytest.raises(ValueError, match="not a mapping"):
-        save_config_document_patch(config, lambda doc: None, path=target)
+        save_config_document_patch(
+            config,
+            (types.SimpleNamespace(yaml_path="execution.concurrency.max", value=3),),
+            path=target,
+        )
 
 
 def test_save_config_document_patch_requires_a_path():
     """No path and no config_path is a hard error."""
     config = Config()
     with pytest.raises(ValueError, match="No path specified"):
-        save_config_document_patch(config, lambda doc: None)
+        save_config_document_patch(
+            config,
+            (types.SimpleNamespace(yaml_path="execution.concurrency.max", value=3),),
+        )
+
+
+def test_save_config_document_patch_inserts_missing_block_path_locally(tmp_path):
+    """Adding a field retains unrelated block indentation and document markers."""
+    config = Config()
+    target = tmp_path / "main.yaml"
+    original = """# operator header
+repo:
+  scopes:
+      - repo
+      - read:org
+execution:
+  concurrency:
+    max_concurrent_sessions: 2
+review: { enabled: true, default: "agent:reviewer" }
+...
+"""
+    target.write_text(original)
+
+    save_config_document_patch(
+        config,
+        (
+            types.SimpleNamespace(
+                yaml_path="execution.concurrency.session_timeout_minutes",
+                value=45,
+            ),
+        ),
+        path=target,
+    )
+
+    assert target.read_text() == original.replace(
+        "    max_concurrent_sessions: 2\n",
+        "    max_concurrent_sessions: 2\n    session_timeout_minutes: 45\n",
+    )
+
+
+def test_save_config_document_patch_inserts_missing_flow_path_locally(tmp_path):
+    """A missing field can be added without normalizing custom flow spacing."""
+    config = Config()
+    target = tmp_path / "main.yaml"
+    original = "execution: { concurrency: { max_concurrent_sessions: 2 } }"
+    target.write_text(original)
+
+    save_config_document_patch(
+        config,
+        (
+            types.SimpleNamespace(
+                yaml_path="execution.concurrency.session_timeout_minutes",
+                value=45,
+            ),
+        ),
+        path=target,
+    )
+
+    assert target.read_text() == (
+        "execution: { concurrency: { max_concurrent_sessions: 2, "
+        '"session_timeout_minutes": 45 } }'
+    )
+
+
+def test_save_config_document_patch_preserves_changed_scalar_anchor(tmp_path):
+    """Changing an anchored scalar keeps aliases elsewhere in the document valid."""
+    config = Config()
+    target = tmp_path / "main.yaml"
+    original = """execution:
+  concurrency:
+    max_concurrent_sessions: &worker_limit 2
+custom:
+  mirrored_limit: *worker_limit
+"""
+    target.write_text(original)
+
+    save_config_document_patch(
+        config,
+        (
+            types.SimpleNamespace(
+                yaml_path="execution.concurrency.max_concurrent_sessions",
+                value=3,
+            ),
+        ),
+        path=target,
+    )
+
+    assert target.read_text() == original.replace(
+        "max_concurrent_sessions: &worker_limit 2",
+        "max_concurrent_sessions: &worker_limit 3",
+    )
+    assert yaml.safe_load(target.read_text())["custom"]["mirrored_limit"] == 3
+
+
+def test_save_config_document_patch_rejects_changed_alias_without_writing(tmp_path):
+    """An alias-owned field fails closed instead of mutating its remote anchor."""
+    config = Config()
+    target = tmp_path / "main.yaml"
+    original = """defaults:
+  worker_limit: &worker_limit 2
+execution:
+  concurrency:
+    max_concurrent_sessions: *worker_limit
+"""
+    target.write_text(original)
+
+    with pytest.raises(ValueError, match="Cannot patch YAML alias"):
+        save_config_document_patch(
+            config,
+            (
+                types.SimpleNamespace(
+                    yaml_path="execution.concurrency.max_concurrent_sessions",
+                    value=3,
+                ),
+            ),
+            path=target,
+        )
+
+    assert target.read_text() == original
 
 
 def test_save_plan_selects_only_changed_fields(loaded_config):
@@ -372,7 +511,9 @@ def test_save_plan_selects_only_changed_fields(loaded_config):
     assert plan.changed_yaml_paths == ("execution.concurrency.max_concurrent_sessions",)
 
 
-def test_save_plan_preserves_unedited_env_var_field_in_changed_tab(tmp_path, monkeypatch):
+def test_save_plan_preserves_unedited_env_var_field_in_changed_tab(
+    tmp_path, monkeypatch
+):
     """A ``${VAR}`` sibling of an edit, in the SAME tab, keeps its literal form.
 
     This is F1: ``Config.load`` expands ``${VAR}``, so ``from_config`` holds the
@@ -446,7 +587,9 @@ async def test_update_settings_route_preserves_operational_config(
 
     # Build the full whole-form payload the browser posts (every tab), then
     # change exactly one Concurrency field -- exactly like the settings UI save.
-    full_payload = {key: model.model_dump() for key, model in from_config(config).items()}
+    full_payload = {
+        key: model.model_dump() for key, model in from_config(config).items()
+    }
     full_payload["concurrency"]["max_concurrent_sessions"] = 8
 
     class _FakeRequest:
@@ -517,7 +660,9 @@ async def test_noop_settings_save_leaves_file_bytes_untouched(tmp_path, monkeypa
 
     original_bytes = cfg_path.read_bytes()
     # The real whole-form payload the browser posts, with NO edits.
-    full_payload = {key: model.model_dump() for key, model in from_config(config).items()}
+    full_payload = {
+        key: model.model_dump() for key, model in from_config(config).items()
+    }
 
     class _FakeRequest:
         async def json(self):

@@ -686,7 +686,7 @@
                     if (result.restart_required) {
                         showStatus('Settings saved. Stop and start the Repository Engine for restart-required changes to take effect.', 'warning');
                     } else {
-                        showStatus('Settings saved and applied to the running Repository Engine.', 'success');
+                        showStatus('Settings saved. Runtime-supported changes are available to the running Repository Engine.', 'success');
                     }
                     originalSettings = getFormValues();
                     checkForChanges();

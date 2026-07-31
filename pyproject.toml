@@ -21,7 +21,6 @@ classifiers = [
 
 dependencies = [
     "pyyaml>=6.0",
-    "ruamel-yaml>=0.19.1,<0.20",  # Round-trip YAML edits preserve comments and quoting
     "rich>=13.0",      # Nice terminal UI
     "textual>=0.40",   # TUI framework with keyboard input
     "fastapi>=0.104",  # Web dashboard

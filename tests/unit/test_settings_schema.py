@@ -770,6 +770,22 @@ class TestApplyTo:
         assert restart is False
         assert cfg.max_concurrent_sessions == 3
 
+    def test_deprecated_browser_session_max_is_not_restart_required(self):
+        """The ignored compatibility field must not promise a restart effect."""
+        cfg = Config()
+        tabs = from_config(cfg)
+        tabs["advanced"] = tabs["advanced"].model_copy(
+            update={"browser_session_max": 2048}
+        )
+
+        restart = apply_to(tabs, cfg)
+
+        field = AdvancedSettings.model_fields["browser_session_max"]
+        assert isinstance(field.json_schema_extra, dict)
+        assert field.json_schema_extra.get("restart_required") is not True
+        assert restart is False
+        assert cfg.browser_session_max == 2048
+
     def test_no_restart_when_unchanged(self):
         """apply_to should return False when no restart-required fields change."""
         cfg = Config()

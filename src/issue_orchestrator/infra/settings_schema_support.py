@@ -302,11 +302,11 @@ class SettingsSavePlan:
 
     Produced by :func:`build_settings_save_plan`. Carries exactly the
     settings-owned ``yaml_path`` entries whose submitted value differs from the
-    current-config snapshot -- never whole tabs. :meth:`apply` writes only those
-    entries into a parsed YAML document, so every unedited field (even a sibling
-    field in the same tab as the edit) keeps its raw on-disk value: a
-    ``${SECRET}`` reference is not rewritten with its ``Config.load``-expanded
-    value, and hand-authored quoting/anchors on untouched keys survive.
+    current-config snapshot -- never whole tabs. Persistence consumes
+    :attr:`entries` directly so every unedited field (even a sibling field in
+    the same tab as the edit) keeps its raw on-disk bytes: a ``${SECRET}``
+    reference is not rewritten with its ``Config.load``-expanded value, and
+    hand-authored comments, quoting, anchors, and layout survive.
 
     :attr:`is_empty` is the explicit no-op outcome: when nothing changed the
     caller must skip the file write entirely so an otherwise-unchanged file

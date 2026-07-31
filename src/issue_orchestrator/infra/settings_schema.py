@@ -1968,7 +1968,6 @@ class AdvancedSettings(BaseModel):
                 "Safe to remove from your config."
             ),
             "section": "Browser Session",
-            "restart_required": True,
             "config_attr": "browser_session_max",
             "yaml_path": "ui.browser_session.max",
         },
