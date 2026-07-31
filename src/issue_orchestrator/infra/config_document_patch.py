@@ -6,7 +6,8 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Protocol
 
-import yaml
+from ruamel.yaml import YAML
+from ruamel.yaml.comments import CommentedMap
 
 
 class ConfigDocumentPatchTarget(Protocol):
@@ -24,42 +25,42 @@ def save_config_document_patch(
 
     This reads the current YAML file, lets ``patch`` mutate the parsed mapping
     in place, and writes it back. Only the keys ``patch`` touches change; every
-    unrelated section, key, and its order is preserved, and the file's leading
-    comment/header block is re-emitted. The document is parsed without
-    ``${VAR}`` expansion so referenced secrets are never materialized.
+    unrelated section, key, comment, quote style, anchor, and ordering choice is
+    preserved by the round-trip YAML representation. The document is parsed
+    without ``${VAR}`` expansion so referenced secrets are never materialized.
     """
     save_path = path or config.config_path
     if save_path is None:
         raise ValueError("No path specified and config_path is not set")
 
-    document, header = _read_yaml_document_with_header(save_path)
+    round_trip_yaml = _build_round_trip_yaml()
+    document = _read_yaml_document(save_path, round_trip_yaml)
     patch(document)
 
     with open(save_path, "w", encoding="utf-8") as f:
-        if header:
-            f.write(header)
-        yaml.dump(
-            document, f, default_flow_style=False, sort_keys=False, allow_unicode=True
-        )
+        round_trip_yaml.dump(document, f)
 
     return save_path
 
 
-def _read_yaml_document_with_header(path: Path) -> tuple[dict[str, Any], str]:
-    """Read a YAML file into a mapping plus its leading comment block."""
+def _build_round_trip_yaml() -> YAML:
+    """Build the comment- and style-preserving YAML document codec."""
+    round_trip_yaml = YAML(typ="rt")
+    round_trip_yaml.preserve_quotes = True
+    # Avoid wrapping an untouched long scalar merely because another field was
+    # edited. Hand-authored line breaks already present in the document remain.
+    round_trip_yaml.width = 4096
+    return round_trip_yaml
+
+
+def _read_yaml_document(path: Path, round_trip_yaml: YAML) -> dict[str, Any]:
+    """Read a YAML mapping without discarding its round-trip presentation."""
     if not path.exists():
-        return {}, ""
-    text = path.read_text(encoding="utf-8")
-    document = yaml.safe_load(text)
+        return CommentedMap()
+    with open(path, encoding="utf-8") as f:
+        document = round_trip_yaml.load(f)
     if document is None:
-        document = {}
+        document = CommentedMap()
     if not isinstance(document, dict):
         raise ValueError(f"Config document at {path} is not a mapping")
-    header_lines: list[str] = []
-    for line in text.splitlines(keepends=True):
-        stripped = line.strip()
-        if stripped == "" or stripped.startswith("#"):
-            header_lines.append(line)
-        else:
-            break
-    return document, "".join(header_lines)
+    return document

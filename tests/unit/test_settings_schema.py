@@ -755,6 +755,21 @@ class TestApplyTo:
         assert restart is True
         assert cfg.web_port == 9090
 
+    def test_concurrency_change_applies_without_repository_engine_restart(self):
+        """Concurrency is read live by the Repository Engine's health gate."""
+        cfg = Config()
+        cfg.max_concurrent_sessions = 2
+
+        tabs = from_config(cfg)
+        tabs["concurrency"] = tabs["concurrency"].model_copy(
+            update={"max_concurrent_sessions": 3}
+        )
+
+        restart = apply_to(tabs, cfg)
+
+        assert restart is False
+        assert cfg.max_concurrent_sessions == 3
+
     def test_no_restart_when_unchanged(self):
         """apply_to should return False when no restart-required fields change."""
         cfg = Config()
@@ -895,6 +910,7 @@ class TestRestartFields:
     def test_non_restart_fields_absent(self):
         fields = get_restart_fields()
         assert "max_concurrent_sessions" not in fields
+        assert "session_timeout_minutes" not in fields
         assert "enabled" not in fields
 
 

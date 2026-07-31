@@ -36,6 +36,13 @@ class MockRateLimitProvider:
         self._snapshot = snapshot
 
 
+class MutableSessionCapacity:
+    """Test capacity owner whose live limit can be changed between checks."""
+
+    def __init__(self, max_concurrent_sessions: int):
+        self.max_concurrent_sessions = max_concurrent_sessions
+
+
 # ============================================================================
 # HealthDecision Tests
 # ============================================================================
@@ -191,6 +198,19 @@ class TestCapacityConstraintBehavior:
         # At 3 sessions, no slots remain
         decision = gate.check(active_sessions=3, paused=False)
         assert decision.can_proceed is False
+
+    def test_capacity_source_changes_are_reflected_on_the_next_check(self):
+        """Settings updates take effect without rebuilding the health gate."""
+        capacity = MutableSessionCapacity(max_concurrent_sessions=2)
+        gate = HealthGate(capacity)
+
+        assert gate.check(active_sessions=2).can_proceed is False
+
+        capacity.max_concurrent_sessions = 3
+
+        assert gate.check(active_sessions=2).can_proceed is True
+        assert gate.available_capacity == 3
+        assert gate.remaining_capacity(active_sessions=2) == 1
 
 
 # ============================================================================

@@ -43,8 +43,9 @@ _OPERATIONAL_CONFIG = """# Issue Orchestrator Configuration
 # Hand-authored operational config -- must survive settings saves.
 
 repo:
-  name: owner/repo
+  name: owner/repo  # inline comments are part of the operator-owned document
   github:
+    # Keep the repo-scoped credential locator documented here.
     token_env: MY_GH_TOKEN
     keyring_service: io-gh
     app:
@@ -59,9 +60,7 @@ repo:
       min_remaining: 100
     audit:
       enabled: true
-    required_scopes:
-      - repo
-      - read:org
+    required_scopes: ["repo", "read:org"] # preserve flow style and quoting
 
 merge_queue:
   enabled: true
@@ -93,6 +92,12 @@ execution:
 agents:
   agent:test:
     prompt: prompt.txt
+    provider: "codex"
+    provider_args:
+      reasoning_effort: 'xhigh'
+    initial_prompt: >-
+      Keep this hand-wrapped scalar exactly as the operator wrote it when an
+      unrelated setting changes.
 """
 
 
@@ -195,6 +200,47 @@ def test_partial_save_preserves_leading_comment_header(loaded_config):
     text = cfg_path.read_text()
     assert text.startswith("# Issue Orchestrator Configuration")
     assert "# Hand-authored operational config" in text
+
+
+def test_single_field_save_preserves_entire_yaml_presentation(tmp_path):
+    """A one-field edit produces a one-line diff in a hand-authored config."""
+    (tmp_path / "prompt.txt").write_text("p")
+    cfg_path = tmp_path / "main.yaml"
+    original = """# Porchpin configuration
+repo:
+  name: porchpin/porchpin
+  github:
+    # Keep the repo-scoped credential locator documented here.
+    keyring_username: "${USER}"
+
+agents:
+  agent:backend:
+    prompt: prompt.txt
+    provider: "claude-code"
+    initial_prompt: "Keep this deliberately long quoted string on one line when an unrelated setting changes."
+
+execution:
+  concurrency:
+    # Tune the worker cap without rewriting this hand-authored document.
+    max_concurrent_sessions: 2
+    session_timeout_minutes: 120
+
+filtering:
+  exclude_labels: ["proposed-tech-lead", "deferred"] # keep flow style and comment
+"""
+    cfg_path.write_text(original)
+    config = Config.load(cfg_path)
+
+    _save_one_tab_change(
+        config,
+        cfg_path,
+        lambda tabs: setattr(tabs["concurrency"], "max_concurrent_sessions", 3),
+    )
+
+    assert cfg_path.read_text() == original.replace(
+        "    max_concurrent_sessions: 2\n",
+        "    max_concurrent_sessions: 3\n",
+    )
 
 
 def test_partial_save_does_not_expand_env_var_references(tmp_path, monkeypatch):
@@ -411,6 +457,14 @@ async def test_update_settings_route_preserves_operational_config(
 
     assert response.status_code == 200
 
+    # This is the regression boundary the original #6686 tests missed: a real
+    # changed save must preserve the whole hand-authored YAML presentation, not
+    # merely parse back to the same data. Only the requested scalar may differ.
+    assert cfg_path.read_text() == _OPERATIONAL_CONFIG.replace(
+        "    max_concurrent_sessions: 2\n",
+        "    max_concurrent_sessions: 8\n",
+    )
+
     saved = yaml.safe_load(cfg_path.read_text())
     assert saved["execution"]["concurrency"]["max_concurrent_sessions"] == 8
     # The operational sections the old save() would have dropped survive.
@@ -434,10 +488,9 @@ async def test_update_settings_route_preserves_operational_config(
 async def test_noop_settings_save_leaves_file_bytes_untouched(tmp_path, monkeypatch):
     """A Save with no changed fields must not rewrite ``main.yaml`` (F2).
 
-    Re-dumping the parsed YAML would strip non-leading comments, anchors, and
-    hand-authored quoting even when nothing changed. The empty-plan path skips
-    the file write entirely, so the bytes -- including a non-leading inline
-    comment a YAML round-trip would drop -- are preserved exactly.
+    Even though changed saves now use a presentation-preserving codec, a no-op
+    should not touch the file at all. The empty-plan path therefore keeps the
+    bytes -- including a non-leading inline comment -- exactly identical.
     """
     from issue_orchestrator.entrypoints import web_settings_routes
 

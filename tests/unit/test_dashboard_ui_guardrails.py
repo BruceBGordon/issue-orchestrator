@@ -1717,6 +1717,24 @@ def test_theme_resolution_uses_shared_embedded_nav_helper() -> None:
     assert "storedTheme === 'system'" not in settings_apply
 
 
+def test_settings_restart_copy_names_repository_engine_lifecycle() -> None:
+    """Restart-required saves must identify which runtime needs restarting."""
+    tmpl = _read(SETTINGS_TEMPLATE)
+
+    assert (
+        "Fields marked Restart Required are saved immediately but apply only after "
+        "you stop and start the Repository Engine."
+    ) in tmpl
+    assert (
+        "Settings saved. Stop and start the Repository Engine for restart-required "
+        "changes to take effect."
+    ) in tmpl
+    assert (
+        "Settings saved and applied to the running Repository Engine."
+    ) in tmpl
+    assert "Changes to ports and worktrees require a restart" not in tmpl
+
+
 SETTINGS_FORM_CONTROLS_JS = (
     ROOT / "src" / "issue_orchestrator" / "static" / "js" / "settings_form_controls.js"
 )

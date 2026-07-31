@@ -747,7 +747,7 @@ def build_orchestrator(
 
     # Create health gate
     health_gate = HealthGate(
-        max_concurrent_sessions=config.max_concurrent_sessions,
+        max_concurrent_sessions=config,
         rate_limit_threshold=getattr(config, "rate_limit_warn_remaining", 100),
     )
 
@@ -1031,7 +1031,7 @@ def build_orchestrator_for_testing(
 
     # Create HealthGate for testing
     health_gate = HealthGate(
-        max_concurrent_sessions=config.max_concurrent_sessions,
+        max_concurrent_sessions=config,
         rate_limit_threshold=100,
     )
 

@@ -309,8 +309,8 @@ class SettingsSavePlan:
     value, and hand-authored quoting/anchors on untouched keys survive.
 
     :attr:`is_empty` is the explicit no-op outcome: when nothing changed the
-    caller must skip the file write entirely rather than round-trip (and thereby
-    reformat / strip non-leading comments from) an otherwise-unchanged file.
+    caller must skip the file write entirely so an otherwise-unchanged file
+    remains byte-for-byte identical without an unnecessary round trip.
     """
 
     entries: tuple[SettingsSavePatchEntry, ...]

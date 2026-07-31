@@ -248,6 +248,10 @@ tech-lead roles. Independent capabilities you may add later include:
 - Tech-lead periodic health review, storm detection, and stuck-session recovery
 
 The web Settings dialog (when `ui.mode: web`) is always available, and you can always edit the raw YAML config file directly.
+Saving a field marked **Restart Required** updates the YAML immediately, but a
+running Repository Engine keeps its startup-time value. Stop and start that
+Repository Engine to apply the change; restarting the Control Center is not a
+substitute.
 If you want to revisit setup, you can rerun the setup wizard on an existing config at any time.
 
 ---
