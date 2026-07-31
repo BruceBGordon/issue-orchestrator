@@ -382,6 +382,47 @@ def test_config_accepts_interior_spacing():
     assert _errs("M0") == []
 
 
+@pytest.mark.parametrize("literal, kind", [
+    ("123", "int"),
+    ("1.5", "float"),
+    ("true", "bool"),
+    ("[a, b]", "list"),
+    ("{k: v}", "dict"),
+])
+def test_yaml_non_string_foundation_is_reported_not_crashed(tmp_path, literal, kind):
+    """A wrong TYPE must be reported, not raised.
+
+    Config.load keeps the raw YAML scalar, so `foundation: 123` reaches the
+    validator as an int. Calling .strip() on it raised AttributeError out of
+    Config.validate() — the validator crashing on exactly the input it exists to
+    reject, which takes down every other check in the same pass.
+    """
+    cfg_path = tmp_path / "main.yaml"
+    cfg_path.write_text(
+        "repo:\n"
+        "  name: owner/repo\n"
+        "agents:\n"
+        "  agent:backend:\n"
+        "    prompt: p.md\n"
+        "    provider: claude-code\n"
+        "milestones:\n"
+        f"  foundation: {literal}\n"
+    )
+
+    cfg = Config.load(cfg_path)
+
+    assert not isinstance(cfg.foundation_milestone, str)
+    errors = cfg.validate()  # must not raise
+    assert any("milestones.foundation" in e and "must be a string" in e for e in errors)
+
+
+def test_config_reports_non_string_foundation_without_raising():
+    for value in (123, 1.5, True, ["a"], {"k": "v"}, object()):
+        errors = _errs(value)
+        assert errors, f"expected an error for {value!r}"
+        assert any("must be a string" in e for e in errors)
+
+
 def test_yaml_loaded_padded_foundation_is_rejected(tmp_path):
     """The contract holds through real YAML loading, not just attribute set."""
     cfg_path = tmp_path / "main.yaml"

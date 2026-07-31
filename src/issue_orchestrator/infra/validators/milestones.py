@@ -12,6 +12,7 @@ class MilestonesValidator(ConfigValidator):
     """Validates milestone settings that runtime compares verbatim.
 
     Checks:
+    - milestones.foundation is a string (YAML scalars arrive unconverted)
     - milestones.foundation is present and non-blank
     - milestones.foundation has no leading or trailing whitespace
     """
@@ -43,7 +44,27 @@ class MilestonesValidator(ConfigValidator):
         ("M0 - Foundation") and must survive untouched.
         """
         foundation = config.foundation_milestone
-        if foundation is None or not str(foundation).strip():
+        # Unset is a missing value, not a wrong type — report it as such.
+        if foundation is None:
+            return [
+                "milestones.foundation must be a non-empty milestone title"
+                f" (got {foundation!r}); it names the one milestone any other"
+                " milestone may depend on"
+            ]
+        # Type before any string operation. Config.load keeps the raw YAML
+        # scalar, so `foundation: 123` arrives as an int and .strip() would
+        # raise AttributeError out of Config.validate() — a validator crashing
+        # on exactly the input it exists to reject, taking every other check in
+        # the same pass down with it (#6939 B8). A wrong type is a configuration
+        # error to report, not an exception to propagate.
+        if not isinstance(foundation, str):
+            return [
+                "milestones.foundation must be a string milestone title (got"
+                f" {type(foundation).__name__}: {foundation!r}); YAML scalars"
+                " are kept unconverted, so quote a title that looks like a"
+                " number or boolean"
+            ]
+        if not foundation.strip():
             return [
                 "milestones.foundation must be a non-empty milestone title"
                 f" (got {foundation!r}); it names the one milestone any other"
