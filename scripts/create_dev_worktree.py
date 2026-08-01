@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 import re
+import shlex
 import subprocess
 import sys
 
@@ -53,6 +55,22 @@ def _default_worktree_path(primary_worktree: Path, branch: str) -> Path:
     return primary_worktree.parent / f"{primary_worktree.name}-wt-{branch_slug}"
 
 
+def _registered_worktree_paths(source_worktree: Path) -> tuple[Path, ...]:
+    completed = subprocess.run(
+        ["git", "worktree", "list", "--porcelain", "-z"],
+        check=True,
+        cwd=source_worktree,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    prefix = "worktree "
+    return tuple(
+        Path(field.removeprefix(prefix)).resolve()
+        for field in completed.stdout.split("\0")
+        if field.startswith(prefix)
+    )
+
+
 def _validate_request(
     *,
     source_worktree: Path,
@@ -90,6 +108,13 @@ def _validate_request(
     )
     if branch_check.returncode == 0:
         raise WorktreeCreationError(f"Local branch {branch!r} already exists")
+
+    for registered_path in _registered_worktree_paths(source_worktree):
+        if worktree_path.is_relative_to(registered_path):
+            raise WorktreeCreationError(
+                f"Worktree path {worktree_path} must be outside existing "
+                f"worktree {registered_path}"
+            )
 
     if worktree_path.exists():
         raise WorktreeCreationError(f"Worktree path already exists: {worktree_path}")
@@ -142,23 +167,22 @@ def create_dev_worktree(
         cwd=source_root,
     )
 
+    setup_command = [make_command, "-C", str(target), "worktree-setup"]
     print(f"Running complete setup in {target}...", flush=True)
     try:
-        subprocess.run(
-            [make_command, "-C", str(target), "worktree-setup"],
-            check=True,
-        )
+        subprocess.run(setup_command, check=True)
     except (FileNotFoundError, subprocess.CalledProcessError):
         print(
             "\nWorktree creation succeeded, but setup failed. "
             "The worktree was preserved.\n"
-            f"Retry with: {make_command} -C {target} worktree-setup",
+            f"Retry with: {shlex.join(setup_command)}",
             file=sys.stderr,
         )
         raise
 
     print(f"\nWorktree ready: {target}")
-    print(f"Activate with: source {target}/.venv/bin/activate")
+    activate_command = ["source", str(target / ".venv" / "bin" / "activate")]
+    print(f"Activate with: {shlex.join(activate_command)}")
     return target
 
 
@@ -167,10 +191,27 @@ def _parser() -> argparse.ArgumentParser:
         description="Create and fully initialize a development worktree."
     )
     parser.add_argument("--repo-root", type=Path, required=True)
-    parser.add_argument("--branch", required=True)
-    parser.add_argument("--base-ref", default="HEAD")
+    parser.add_argument(
+        "--branch",
+        default=os.environ.get(
+            "IO_WORKTREE_CREATE_BRANCH", os.environ.get("BRANCH", "")
+        ),
+    )
+    parser.add_argument(
+        "--base-ref",
+        default=(
+            os.environ.get("IO_WORKTREE_CREATE_BASE_REF")
+            or os.environ.get("BASE_REF")
+            or "HEAD"
+        ),
+    )
     parser.add_argument(
         "--path",
+        default=(
+            os.environ.get("IO_WORKTREE_CREATE_PATH")
+            or os.environ.get("WORKTREE_PATH")
+            or None
+        ),
         help="Target path; defaults to ../<repo>-wt-<branch>",
     )
     parser.add_argument("--make", dest="make_command", default="make")

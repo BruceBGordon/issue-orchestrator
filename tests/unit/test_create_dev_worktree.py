@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
+import shlex
 import shutil
 import subprocess
 import sys
@@ -52,6 +54,19 @@ def _fake_make(path: Path, *, exit_code: int = 0) -> Path:
         'test "$3" = "worktree-setup"\n'
         'touch "$2/.setup-complete"\n'
         f"exit {exit_code}\n"
+    )
+    path.chmod(0o755)
+    return path
+
+
+def _fake_python_environment_reader(path: Path) -> Path:
+    path.write_text(
+        "#!/bin/sh\n"
+        'printf "branch=%s\\n" "$IO_WORKTREE_CREATE_BRANCH"\n'
+        'printf "base_ref=%s\\n" "$IO_WORKTREE_CREATE_BASE_REF"\n'
+        'printf "worktree_path=%s\\n" "$IO_WORKTREE_CREATE_PATH"\n'
+        'printf "originals=%s%s%s\\n" "${BRANCH+x}" "${BASE_REF+x}" '
+        '"${WORKTREE_PATH+x}"\n'
     )
     path.chmod(0o755)
     return path
@@ -137,7 +152,7 @@ def test_invocation_from_linked_worktree_uses_primary_repo_name(
 
 def test_setup_failure_preserves_worktree_and_prints_retry(tmp_path: Path) -> None:
     repo = _init_repo(tmp_path / "project")
-    target = tmp_path / "custom-worktree"
+    target = tmp_path / "custom worktree"
     fake_make = _fake_make(tmp_path / "fake-make", exit_code=17)
 
     result = _create(
@@ -151,7 +166,45 @@ def test_setup_failure_preserves_worktree_and_prints_retry(tmp_path: Path) -> No
     assert (target / ".git").is_file()
     assert (target / ".setup-complete").is_file()
     assert "The worktree was preserved." in result.stderr
-    assert f"Retry with: {fake_make} -C {target} worktree-setup" in result.stderr
+    retry_command = shlex.join(
+        [str(fake_make), "-C", str(target), "worktree-setup"]
+    )
+    assert f"Retry with: {retry_command}" in result.stderr
+
+
+def test_environment_inputs_create_worktree_and_quote_activation(
+    tmp_path: Path,
+) -> None:
+    repo = _init_repo(tmp_path / "project")
+    target = tmp_path / "custom worktree"
+    fake_make = _fake_make(tmp_path / "fake-make")
+    environment = os.environ.copy()
+    environment.update(
+        BRANCH="feature/from-environment",
+        BASE_REF="HEAD",
+        WORKTREE_PATH=str(target),
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--repo-root",
+            str(repo),
+            "--make",
+            str(fake_make),
+        ],
+        capture_output=True,
+        env=environment,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert (target / ".setup-complete").is_file()
+    activate_command = shlex.join(
+        ["source", str(target / ".venv" / "bin" / "activate")]
+    )
+    assert f"Activate with: {activate_command}" in result.stdout
 
 
 def test_existing_branch_fails_before_creating_target(tmp_path: Path) -> None:
@@ -172,31 +225,89 @@ def test_existing_branch_fails_before_creating_target(tmp_path: Path) -> None:
     assert "Local branch 'already-exists' already exists" in result.stderr
 
 
-def test_makefile_exposes_one_shot_target() -> None:
-    make_command = shutil.which("gmake") or shutil.which("make")
-    if make_command is None:
-        pytest.fail("GNU Make is required by the repository")
+def test_rejects_target_nested_in_source_worktree(tmp_path: Path) -> None:
+    repo = _init_repo(tmp_path / "project")
+    target = repo / "nested-worktree"
+    fake_make = _fake_make(tmp_path / "fake-make")
 
-    result = subprocess.run(
-        [
-            make_command,
-            "--no-print-directory",
-            "--dry-run",
-            "worktree-create",
-            "BRANCH=feature/test",
-            "BASE_REF=main",
-            "WORKTREE_PATH=/tmp/test-worktree",
-        ],
-        cwd=REPO_ROOT,
-        check=True,
-        capture_output=True,
-        text=True,
+    result = _create(
+        repo_root=repo,
+        branch="nested",
+        make_command=fake_make,
+        worktree_path=target,
     )
 
-    assert "scripts/create_dev_worktree.py" in result.stdout
-    assert '--branch "feature/test"' in result.stdout
-    assert '--base-ref "main"' in result.stdout
-    assert '--path "/tmp/test-worktree"' in result.stdout
+    assert result.returncode == 2
+    assert not target.exists()
+    assert "must be outside existing worktree" in result.stderr
+    branches = _run(["git", "branch", "--list", "nested"], cwd=repo).stdout
+    assert not branches.strip()
+
+
+def test_rejects_target_nested_in_another_registered_worktree(
+    tmp_path: Path,
+) -> None:
+    repo = _init_repo(tmp_path / "project")
+    linked = tmp_path / "existing-linked-worktree"
+    _run(
+        ["git", "worktree", "add", str(linked), "-b", "existing-work"],
+        cwd=repo,
+    )
+    target = linked / "nested-worktree"
+    fake_make = _fake_make(tmp_path / "fake-make")
+
+    result = _create(
+        repo_root=repo,
+        branch="nested",
+        make_command=fake_make,
+        worktree_path=target,
+    )
+
+    assert result.returncode == 2
+    assert not target.exists()
+    assert f"must be outside existing worktree {linked}" in result.stderr
+
+
+def test_makefile_transports_inputs_without_evaluating_them(tmp_path: Path) -> None:
+    make_commands = {
+        command
+        for name in ("gmake", "make")
+        if (command := shutil.which(name)) is not None
+    }
+    if not make_commands:
+        pytest.fail("GNU Make is required by the repository")
+    fake_python = _fake_python_environment_reader(tmp_path / "fake-python")
+    branch = (
+        'feature/quote"-$dollar-`printf shell-expanded`-'
+        "$(shell printf make-expanded)"
+    )
+    base_ref = 'HEAD-`printf base-expanded`-$(shell printf make-base-expanded)'
+    worktree_path = tmp_path / 'custom " `printf path-expanded` worktree'
+
+    expected_output = [
+        f"branch={branch}",
+        f"base_ref={base_ref}",
+        f"worktree_path={worktree_path}",
+        "originals=",
+    ]
+    for make_command in make_commands:
+        result = subprocess.run(
+            [
+                make_command,
+                "--no-print-directory",
+                "worktree-create",
+                f"SYSTEM_PYTHON={fake_python}",
+                f"BRANCH={branch}",
+                f"BASE_REF={base_ref}",
+                f"WORKTREE_PATH={worktree_path}",
+            ],
+            cwd=REPO_ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        assert result.stdout.splitlines() == expected_output, make_command
 
 
 def test_makefile_reports_missing_branch_without_creating_worktree() -> None:
@@ -204,10 +315,15 @@ def test_makefile_reports_missing_branch_without_creating_worktree() -> None:
     if make_command is None:
         pytest.fail("GNU Make is required by the repository")
 
+    environment = os.environ.copy()
+    for variable in ("BRANCH", "BASE_REF", "WORKTREE_PATH"):
+        environment.pop(variable, None)
+
     result = subprocess.run(
         [make_command, "--no-print-directory", "worktree-create"],
         cwd=REPO_ROOT,
         capture_output=True,
+        env=environment,
         text=True,
     )
 

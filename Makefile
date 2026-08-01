@@ -163,13 +163,16 @@ venv-pip:
 	@echo ""
 	@echo "Done! Activate with: source .venv/bin/activate"
 
+# Keep user-provided values out of Make's exported-variable expansion path.
+unexport BRANCH BASE_REF WORKTREE_PATH
+worktree-create: export IO_WORKTREE_CREATE_BRANCH := $(value BRANCH)
+worktree-create: export IO_WORKTREE_CREATE_BASE_REF := $(value BASE_REF)
+worktree-create: export IO_WORKTREE_CREATE_PATH := $(value WORKTREE_PATH)
+
 # Full worktree setup - use this when setting up a new git worktree
 worktree-create:
 	@$(SYSTEM_PYTHON) scripts/create_dev_worktree.py \
-		--repo-root "$(CURDIR)" \
-		--branch "$(BRANCH)" \
-		--base-ref "$(or $(BASE_REF),HEAD)" \
-		--path "$(WORKTREE_PATH)" \
+		--repo-root . \
 		--make "$(GMAKE)"
 
 worktree-setup: venv-fast
