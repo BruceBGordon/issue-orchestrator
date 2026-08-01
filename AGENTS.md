@@ -7,10 +7,14 @@
 **Before making ANY code changes, create a git worktree.**
 
 ```bash
-git worktree add ../issue-orchestrator-wt-my-branch-name -b my-branch-name
-cd ../issue-orchestrator-wt-my-branch-name
-make worktree-setup  # Set up venv, vscode extensions, and playwright
+make worktree-create BRANCH=my-branch-name
 ```
+
+This one-shot target creates `../issue-orchestrator-wt-my-branch-name` from
+`HEAD` and runs the complete setup there (venv, VS Code extensions, and
+Playwright). Use `BASE_REF=<ref>` or `WORKTREE_PATH=<path>` to override its
+defaults. If setup fails after Git creates the worktree, the command preserves
+it and prints the exact `make -C ... worktree-setup` command to retry.
 
 This is not optional. Do not edit files in the base repo. If the user explicitly says "edit directly" or "no worktree", then and only then may you skip this. Otherwise: **worktree first, then work.**
 

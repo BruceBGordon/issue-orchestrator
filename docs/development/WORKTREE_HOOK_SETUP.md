@@ -126,8 +126,7 @@ if [[ "$REPO_ROOT" == "$BASE_REPO" ]]; then
     echo "STOP: You are in the base issue-orchestrator repository." >&2
     echo "" >&2
     echo "Create a worktree:" >&2
-    echo "  git worktree add ../issue-orchestrator-wt-BRANCH -b BRANCH" >&2
-    echo "  cd ../issue-orchestrator-wt-BRANCH" >&2
+    echo "  make -C \"$BASE_REPO\" worktree-create BRANCH=BRANCH" >&2
     echo "" >&2
     echo "Or enable direct edit for this session:" >&2
     echo "  claude-direct-on" >&2
