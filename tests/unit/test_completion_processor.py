@@ -173,6 +173,25 @@ class _RunningReviewExchangeJobRunner:
         return []
 
 
+class _CapturingReviewExchangeRunner:
+    """Review-exchange port fake that records public ``run`` calls."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def run(self, **kwargs) -> ReviewExchangeOutcome:
+        self.calls.append(dict(kwargs))
+        return _review_exchange_outcome(
+            kwargs["exchange_run"],
+            status="ok",
+            rounds=1,
+            reason="reviewer_ok",
+        )
+
+    def job_timeout_seconds(self, **_kwargs) -> float:
+        return 60.0
+
+
 @pytest.fixture
 def mock_label_adapter():
     """Mock adapter for label operations."""
@@ -238,6 +257,16 @@ def mock_git_adapter():
 def event_bus():
     """EventBus for capturing emitted events."""
     return EventBus()
+
+
+@pytest.fixture
+def tech_lead_authority_store(tmp_path):
+    """Retained launch-authority collaborator for Tech Lead completion tests."""
+    from issue_orchestrator.infra.tech_lead_authority_store import (
+        SqliteTechLeadAuthorityStore,
+    )
+
+    return SqliteTechLeadAuthorityStore.for_repo(tmp_path)
 
 
 @pytest.fixture
@@ -2613,6 +2642,9 @@ class TestTechLeadCompletionEffects:
         mock_pr_adapter,
         mock_git_adapter,
         event_bus,
+        *,
+        review_exchange_runner=None,
+        tech_lead_authority=None,
     ) -> CompletionProcessor:
         prompt = tmp_path / "tech-lead.md"
         prompt.write_text("Tech Lead prompt")
@@ -2623,21 +2655,31 @@ class TestTechLeadCompletionEffects:
             "agent:tech-lead": AgentConfig(prompt_path=prompt),
             "agent:coder": AgentConfig(prompt_path=prompt),
         }
+        if review_exchange_runner is not None:
+            config.review_enabled = True
+            config.review_exchange_mode = "via-local-loop"
+            config.review_exchange_require_validation = False
+            config.code_review_agent = "agent:reviewer"
+            config.config_path = _write_test_config(tmp_path)
+            config.agents["agent:reviewer"] = AgentConfig(prompt_path=prompt)
         mock_git_adapter.default_branch.return_value = "main"
         from issue_orchestrator.infra.tech_lead_authority_store import (
             SqliteTechLeadAuthorityStore,
         )
 
+        if tech_lead_authority is None:
+            tech_lead_authority = SqliteTechLeadAuthorityStore.for_repo(tmp_path)
         return CompletionProcessor(
             agent_callback_endpoint=ready_callback_endpoint(),
             label_adapter=mock_label_adapter,
             pr_adapter=mock_pr_adapter,
             git_adapter=mock_git_adapter,
             session_output=FileSystemSessionOutput(),
+            review_exchange_runner=review_exchange_runner,
             event_bus=event_bus,
             label_config={},
             config=config,
-            tech_lead_authority=SqliteTechLeadAuthorityStore.for_repo(tmp_path),
+            tech_lead_authority=tech_lead_authority,
         )
 
     @staticmethod
@@ -2663,10 +2705,10 @@ class TestTechLeadCompletionEffects:
             agent_label=agent_label,
         )
 
-    def _armed_run_assets(self, processor, worktree):
+    def _armed_run_assets(self, authority_store, worktree):
         """Run assets with launch authority + valid empty-audit pair."""
         run_assets = make_session_run_assets(worktree)
-        self._arm_authority(processor, run_assets)
+        self._record_launch_authority(authority_store, run_assets)
         self._plant_valid_pair(run_assets.run_dir)
         return run_assets
 
@@ -2677,16 +2719,22 @@ class TestTechLeadCompletionEffects:
         mock_pr_adapter,
         mock_git_adapter,
         event_bus,
+        tech_lead_authority_store,
         worktree_with_completion,
     ):
         """No-change audit: NoCommitsBetweenError is success, no labels/comment."""
         processor = self._make_processor(
-            tmp_path, mock_label_adapter, mock_pr_adapter, mock_git_adapter, event_bus
+            tmp_path,
+            mock_label_adapter,
+            mock_pr_adapter,
+            mock_git_adapter,
+            event_bus,
+            tech_lead_authority=tech_lead_authority_store,
         )
         processor._emit_publish_failed = MagicMock()  # noqa: SLF001
         mock_pr_adapter.create_pr.side_effect = self.NO_COMMITS_ERROR
         worktree = worktree_with_completion(self._completed_record())
-        run_assets = self._armed_run_assets(processor, worktree)
+        run_assets = self._armed_run_assets(tech_lead_authority_store, worktree)
 
         result = self._process(
             processor, worktree, agent_label="agent:tech-lead", run_assets=run_assets
@@ -2705,14 +2753,20 @@ class TestTechLeadCompletionEffects:
         mock_pr_adapter,
         mock_git_adapter,
         event_bus,
+        tech_lead_authority_store,
         worktree_with_completion,
     ):
         """Changed audit: PR is created, but the completion comment is dropped."""
         processor = self._make_processor(
-            tmp_path, mock_label_adapter, mock_pr_adapter, mock_git_adapter, event_bus
+            tmp_path,
+            mock_label_adapter,
+            mock_pr_adapter,
+            mock_git_adapter,
+            event_bus,
+            tech_lead_authority=tech_lead_authority_store,
         )
         worktree = worktree_with_completion(self._completed_record())
-        run_assets = self._armed_run_assets(processor, worktree)
+        run_assets = self._armed_run_assets(tech_lead_authority_store, worktree)
 
         result = self._process(
             processor, worktree, agent_label="agent:tech-lead", run_assets=run_assets
@@ -2771,7 +2825,7 @@ class TestTechLeadCompletionEffects:
     # --- #6761 finding 3 + re-review finding 1: processing-path validation --
 
     @staticmethod
-    def _arm_authority(processor, run_assets):
+    def _record_launch_authority(authority_store, run_assets):
         """Record launch authority + matching worktree assignment (empty batch)."""
         import json as _json
 
@@ -2792,7 +2846,7 @@ class TestTechLeadCompletionEffects:
             run_dir / "tech-lead-data" / TECH_LEAD_ASSIGNMENT_FILENAME
         )
         manifest_path.write_text(_json.dumps(manifest))
-        processor._tech_lead_authority.record(  # noqa: SLF001
+        authority_store.record(
             run_id=run_assets.run_id,
             session_name=run_assets.session_name,
             authority=TechLeadLaunchAuthority(
@@ -2826,35 +2880,38 @@ class TestTechLeadCompletionEffects:
         mock_pr_adapter,
         mock_git_adapter,
         event_bus,
+        tech_lead_authority_store,
         worktree_with_completion,
     ):
         """The completion producer classifies Tech Lead sessions and wires a gate."""
         from issue_orchestrator.control.tech_lead_approval_gate import (
             TechLeadDecisionApprovalGate,
         )
-
+        review_runner = _CapturingReviewExchangeRunner()
         processor = self._make_processor(
-            tmp_path, mock_label_adapter, mock_pr_adapter, mock_git_adapter, event_bus
+            tmp_path,
+            mock_label_adapter,
+            mock_pr_adapter,
+            mock_git_adapter,
+            event_bus,
+            review_exchange_runner=review_runner,
+            tech_lead_authority=tech_lead_authority_store,
         )
         worktree = worktree_with_completion(self._completed_record())
-        run_assets = self._armed_run_assets(processor, worktree)
-        review = processor._review_exchange  # noqa: SLF001
+        run_assets = make_session_run_assets(worktree)
+        self._record_launch_authority(tech_lead_authority_store, run_assets)
+        self._plant_valid_pair(run_assets.run_dir)
 
-        with patch.object(
-            review,
-            "prepare_review_exchange",
-            wraps=review.prepare_review_exchange,
-        ) as prepare:
-            result = self._process(
-                processor,
-                worktree,
-                agent_label="agent:tech-lead",
-                run_assets=run_assets,
-            )
+        result = self._process(
+            processor,
+            worktree,
+            agent_label="agent:tech-lead",
+            run_assets=run_assets,
+        )
 
         assert result.success is True
-        prepare.assert_called_once()
-        gate = prepare.call_args.kwargs["approval_gate"]
+        assert len(review_runner.calls) == 1
+        gate = review_runner.calls[0]["approval_gate"]
         assert isinstance(gate, TechLeadDecisionApprovalGate)
         assert gate.rejection_reason() is None
 
@@ -2868,22 +2925,22 @@ class TestTechLeadCompletionEffects:
         worktree_with_completion,
     ):
         """The completion producer must not attach Tech Lead policy to other agents."""
+        review_runner = _CapturingReviewExchangeRunner()
         processor = self._make_processor(
-            tmp_path, mock_label_adapter, mock_pr_adapter, mock_git_adapter, event_bus
+            tmp_path,
+            mock_label_adapter,
+            mock_pr_adapter,
+            mock_git_adapter,
+            event_bus,
+            review_exchange_runner=review_runner,
         )
         worktree = worktree_with_completion(self._completed_record())
-        review = processor._review_exchange  # noqa: SLF001
 
-        with patch.object(
-            review,
-            "prepare_review_exchange",
-            wraps=review.prepare_review_exchange,
-        ) as prepare:
-            result = self._process(processor, worktree, agent_label="agent:coder")
+        result = self._process(processor, worktree, agent_label="agent:coder")
 
         assert result.success is True
-        prepare.assert_called_once()
-        assert prepare.call_args.kwargs["approval_gate"] is None
+        assert len(review_runner.calls) == 1
+        assert review_runner.calls[0]["approval_gate"] is None
 
     def test_completed_tech_lead_session_without_pair_records_critical_error(
         self,
@@ -2892,6 +2949,7 @@ class TestTechLeadCompletionEffects:
         mock_pr_adapter,
         mock_git_adapter,
         event_bus,
+        tech_lead_authority_store,
         worktree_with_completion,
     ):
         """Missing/invalid pair rejects the completion in the PRE-ACTION
@@ -2901,13 +2959,17 @@ class TestTechLeadCompletionEffects:
         from issue_orchestrator.control.completion_types import (
             ERROR_PREFIX_TECH_LEAD_DECISION,
         )
-
         processor = self._make_processor(
-            tmp_path, mock_label_adapter, mock_pr_adapter, mock_git_adapter, event_bus
+            tmp_path,
+            mock_label_adapter,
+            mock_pr_adapter,
+            mock_git_adapter,
+            event_bus,
+            tech_lead_authority=tech_lead_authority_store,
         )
         worktree = worktree_with_completion(self._completed_record())
         run_assets = make_session_run_assets(worktree)
-        self._arm_authority(processor, run_assets)
+        self._record_launch_authority(tech_lead_authority_store, run_assets)
 
         result = processor.process(
             worktree,
@@ -2974,6 +3036,7 @@ class TestTechLeadCompletionEffects:
         mock_pr_adapter,
         mock_git_adapter,
         event_bus,
+        tech_lead_authority_store,
         worktree_with_completion,
     ):
         """A worktree assignment copy that no longer mirrors the recorded
@@ -2987,12 +3050,16 @@ class TestTechLeadCompletionEffects:
             TechLeadAssignment,
             TechLeadSessionFlavor,
         )
-
         processor = self._make_processor(
-            tmp_path, mock_label_adapter, mock_pr_adapter, mock_git_adapter, event_bus
+            tmp_path,
+            mock_label_adapter,
+            mock_pr_adapter,
+            mock_git_adapter,
+            event_bus,
+            tech_lead_authority=tech_lead_authority_store,
         )
         worktree = worktree_with_completion(self._completed_record())
-        run_assets = self._armed_run_assets(processor, worktree)
+        run_assets = self._armed_run_assets(tech_lead_authority_store, worktree)
         # Agent flips its copy from batch review to a focused investigation.
         TechLeadAssignment(
             flavor=TechLeadSessionFlavor.FAILURE_INVESTIGATION,
@@ -3023,18 +3090,23 @@ class TestTechLeadCompletionEffects:
         mock_pr_adapter,
         mock_git_adapter,
         event_bus,
+        tech_lead_authority_store,
         worktree_with_completion,
     ):
         from issue_orchestrator.control.completion_types import (
             ERROR_PREFIX_TECH_LEAD_DECISION,
         )
-
         processor = self._make_processor(
-            tmp_path, mock_label_adapter, mock_pr_adapter, mock_git_adapter, event_bus
+            tmp_path,
+            mock_label_adapter,
+            mock_pr_adapter,
+            mock_git_adapter,
+            event_bus,
+            tech_lead_authority=tech_lead_authority_store,
         )
         worktree = worktree_with_completion(self._completed_record())
         run_assets = make_session_run_assets(worktree)
-        self._arm_authority(processor, run_assets)
+        self._record_launch_authority(tech_lead_authority_store, run_assets)
         self._plant_valid_pair(run_assets.run_dir)
 
         result = processor.process(
