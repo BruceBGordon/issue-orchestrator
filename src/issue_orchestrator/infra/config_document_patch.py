@@ -138,13 +138,23 @@ def _replace_node_source(text: str, node: Node, value: Any) -> str:
     content_end = len(old_fragment.rstrip("\r\n"))
     trailing_newlines = old_fragment[content_end:]
     property_prefix = _scalar_property_prefix(text, node)
-    replacement = property_prefix + _render_yaml_value(value) + trailing_newlines
+    implicit_null_separator = (
+        " " if node.start_mark.index == node.end_mark.index else ""
+    )
+    replacement = (
+        property_prefix
+        + implicit_null_separator
+        + _render_yaml_value(value)
+        + trailing_newlines
+    )
     return text[:start] + replacement + text[end:]
 
 
 def _scalar_property_prefix(text: str, node: Node) -> str:
     """Retain a scalar's tag/anchor properties in either legal order."""
     if not isinstance(node, ScalarNode):
+        return ""
+    if node.start_mark.index == node.end_mark.index:
         return ""
     for token in yaml.scan(text):
         if (
@@ -153,7 +163,9 @@ def _scalar_property_prefix(text: str, node: Node) -> str:
             and token.end_mark.index <= node.end_mark.index
         ):
             return text[node.start_mark.index : token.start_mark.index]
-    raise ValueError("Cannot locate scalar token for YAML value replacement")
+    property_prefix = text[node.start_mark.index : node.end_mark.index]
+    separator = "" if property_prefix.endswith((" ", "\t", "\r", "\n")) else " "
+    return property_prefix + separator
 
 
 def _insert_missing_path(

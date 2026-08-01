@@ -588,6 +588,54 @@ custom:
     assert yaml.safe_load(target.read_text())["custom"]["mirrored_limit"] == 3
 
 
+@pytest.mark.parametrize(
+    ("original", "expected"),
+    [
+        (
+            "worktrees:\n  base_branch_override: # auto-detect\n",
+            'worktrees:\n  base_branch_override: "main" # auto-detect\n',
+        ),
+        (
+            "worktrees:\n  base_branch_override:\n",
+            'worktrees:\n  base_branch_override: "main"\n',
+        ),
+        (
+            "worktrees:\n  base_branch_override: &base\ncustom: *base\n",
+            'worktrees:\n  base_branch_override: &base "main"\ncustom: *base\n',
+        ),
+        (
+            "worktrees:\n  base_branch_override: !!str\n",
+            'worktrees:\n  base_branch_override: !!str "main"\n',
+        ),
+    ],
+    ids=("inline-comment", "plain", "anchor-only", "tag-only"),
+)
+def test_save_config_document_patch_replaces_implicit_empty_scalar(
+    tmp_path, original, expected
+):
+    """Implicit and property-only empty scalars accept a settings value."""
+    config = Config()
+    target = tmp_path / "main.yaml"
+    target.write_text(original)
+
+    save_config_document_patch(
+        config,
+        (
+            types.SimpleNamespace(
+                yaml_path="worktrees.base_branch_override",
+                value="main",
+            ),
+        ),
+        path=target,
+    )
+
+    assert target.read_text() == expected
+    loaded = yaml.safe_load(target.read_text())
+    assert loaded["worktrees"]["base_branch_override"] == "main"
+    if "custom" in loaded:
+        assert loaded["custom"] == "main"
+
+
 def test_save_config_document_patch_rejects_changed_alias_without_writing(tmp_path):
     """An alias-owned field fails closed instead of mutating its remote anchor."""
     config = Config()
