@@ -17,6 +17,7 @@ from yaml.tokens import (
     FlowMappingStartToken,
     FlowSequenceEndToken,
     FlowSequenceStartToken,
+    ScalarToken as YAMLScalarToken,
 )
 
 
@@ -136,10 +137,23 @@ def _replace_node_source(text: str, node: Node, value: Any) -> str:
     old_fragment = text[start:end]
     content_end = len(old_fragment.rstrip("\r\n"))
     trailing_newlines = old_fragment[content_end:]
-    anchor = re.match(r"(&[^\s,\[\]{}]+\s+)", old_fragment)
-    anchor_prefix = anchor.group(1) if anchor else ""
-    replacement = anchor_prefix + _render_yaml_value(value) + trailing_newlines
+    property_prefix = _scalar_property_prefix(text, node)
+    replacement = property_prefix + _render_yaml_value(value) + trailing_newlines
     return text[:start] + replacement + text[end:]
+
+
+def _scalar_property_prefix(text: str, node: Node) -> str:
+    """Retain a scalar's tag/anchor properties in either legal order."""
+    if not isinstance(node, ScalarNode):
+        return ""
+    for token in yaml.scan(text):
+        if (
+            isinstance(token, YAMLScalarToken)
+            and node.start_mark.index <= token.start_mark.index
+            and token.end_mark.index <= node.end_mark.index
+        ):
+            return text[node.start_mark.index : token.start_mark.index]
+    raise ValueError("Cannot locate scalar token for YAML value replacement")
 
 
 def _insert_missing_path(
@@ -260,7 +274,9 @@ def _replace_empty_document(
     start = root.start_mark.index
     end = root.end_mark.index
     if start == end:
-        return text[:start] + rendered + newline + text[end:]
+        prefix = "" if start == 0 or text[:start].endswith(("\n", "\r")) else newline
+        suffix = newline if end < len(text) or text.endswith(("\n", "\r")) else ""
+        return text[:start] + prefix + rendered + suffix + text[end:]
     return text[:start] + rendered + text[end:]
 
 

@@ -481,8 +481,22 @@ def test_save_config_document_patch_inserts_after_flow_trivia(
             "%YAML 1.2\n# operator header\n---\nexecution:\n  concurrency:\n"
             "    max_concurrent_sessions: 3\n...\n",
         ),
+        (
+            "---",
+            "---\nexecution:\n  concurrency:\n    max_concurrent_sessions: 3",
+        ),
+        (
+            "# operator header\n---",
+            "# operator header\n---\nexecution:\n  concurrency:\n"
+            "    max_concurrent_sessions: 3",
+        ),
     ],
-    ids=("document-markers", "directive-comment-preamble"),
+    ids=(
+        "document-markers",
+        "directive-comment-preamble",
+        "bare-start-marker-no-final-newline",
+        "comment-start-marker-no-final-newline",
+    ),
 )
 def test_save_config_document_patch_populates_explicit_empty_document(
     tmp_path, original, expected
@@ -507,6 +521,7 @@ def test_save_config_document_patch_populates_explicit_empty_document(
     assert yaml.safe_load(target.read_text()) == {
         "execution": {"concurrency": {"max_concurrent_sessions": 3}}
     }
+    assert target.read_bytes().endswith(b"\n") == original.endswith("\n")
 
 
 def test_save_config_document_patch_preserves_changed_scalar_anchor(tmp_path):
@@ -536,6 +551,40 @@ custom:
         "max_concurrent_sessions: &worker_limit 2",
         "max_concurrent_sessions: &worker_limit 3",
     )
+    assert yaml.safe_load(target.read_text())["custom"]["mirrored_limit"] == 3
+
+
+@pytest.mark.parametrize(
+    "properties",
+    ("!!int &worker_limit", "&worker_limit !!int"),
+    ids=("tag-before-anchor", "anchor-before-tag"),
+)
+def test_save_config_document_patch_preserves_tagged_scalar_anchor_order(
+    tmp_path, properties
+):
+    """A changed scalar retains its tag and anchor in either legal order."""
+    config = Config()
+    target = tmp_path / "main.yaml"
+    original = f"""execution:
+  concurrency:
+    max_concurrent_sessions: {properties} 2
+custom:
+  mirrored_limit: *worker_limit
+"""
+    target.write_text(original)
+
+    save_config_document_patch(
+        config,
+        (
+            types.SimpleNamespace(
+                yaml_path="execution.concurrency.max_concurrent_sessions",
+                value=3,
+            ),
+        ),
+        path=target,
+    )
+
+    assert target.read_text() == original.replace(f"{properties} 2", f"{properties} 3")
     assert yaml.safe_load(target.read_text())["custom"]["mirrored_limit"] == 3
 
 
