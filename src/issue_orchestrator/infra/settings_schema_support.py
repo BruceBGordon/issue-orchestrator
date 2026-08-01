@@ -270,24 +270,6 @@ def apply_tabs_to_config(tab_definitions: list[dict[str, Any]], tabs: dict[str, 
     return restart
 
 
-def _set_nested_key(document: dict[str, Any], path: str, value: Any) -> None:
-    """Set ``document['a']['b']['c'] = value`` for dotted path ``'a.b.c'``.
-
-    Creates intermediate mappings as needed. A non-mapping intermediate left
-    over from a stale document is replaced with a fresh mapping so a nested
-    settings write can never be blocked by an incompatible scalar.
-    """
-    parts = path.split(".")
-    cursor = document
-    for part in parts[:-1]:
-        nxt = cursor.get(part)
-        if not isinstance(nxt, dict):
-            nxt = {}
-            cursor[part] = nxt
-        cursor = nxt
-    cursor[parts[-1]] = value
-
-
 @dataclass(frozen=True)
 class SettingsSavePatchEntry:
     """One settings-owned YAML field to write during a save."""
@@ -324,12 +306,6 @@ class SettingsSavePlan:
     def changed_yaml_paths(self) -> tuple[str, ...]:
         """The ``yaml_path`` of each field this plan will write (for logging)."""
         return tuple(entry.yaml_path for entry in self.entries)
-
-    def apply(self, document: dict[str, Any]) -> dict[str, Any]:
-        """Write only the changed entries into ``document`` (mutates it)."""
-        for entry in self.entries:
-            _set_nested_key(document, entry.yaml_path, entry.value)
-        return document
 
 
 def build_settings_save_plan(

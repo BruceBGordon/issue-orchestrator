@@ -118,7 +118,7 @@ def _save_one_tab_change(config: Config, cfg_path, mutate) -> dict:
 
     ``mutate`` receives the ``from_config`` tab dict and edits one field, the
     same way the settings POST handler does before persisting. Persistence goes
-    through the real field-granular owner (``build_save_plan`` -> ``plan.apply``)
+    through the real field-granular owner (``build_save_plan`` -> ``plan.entries``)
     so these tests exercise the same seam the route does, and the write is
     skipped for an empty (no-op) plan.
     """
@@ -289,40 +289,33 @@ def test_partial_save_does_not_expand_env_var_references(tmp_path, monkeypatch):
     assert yaml.safe_load(text)["repo"]["github"]["token"] == "${SECRET_GH_TOKEN}"
 
 
-def test_save_plan_apply_only_touches_owned_changed_paths():
-    """The save plan writes only changed owned yaml_paths and nothing else."""
-    document = {
-        "repo": {"name": "owner/repo", "github": {"token_env": "T"}},
-        "custom_operator_section": {"keep": "me"},
-        "execution": {"concurrency": {"max_concurrent_sessions": 2}},
-    }
-
+def test_save_plan_emits_only_owned_changed_paths():
+    """The save plan contains only changed settings-owned paths."""
     # Build tabs from a minimal config, then flip one owned field.
     config = Config()
     snapshot = from_config(config)
     submitted = from_config(config)
     submitted["concurrency"].max_concurrent_sessions = 5
 
-    build_save_plan(snapshot, submitted).apply(document)
+    plan = build_save_plan(snapshot, submitted)
 
-    # Owned path that changed is updated.
-    assert document["execution"]["concurrency"]["max_concurrent_sessions"] == 5
-    # Unowned keys untouched.
-    assert document["repo"]["github"]["token_env"] == "T"
-    assert document["custom_operator_section"] == {"keep": "me"}
+    assert [(entry.yaml_path, entry.value) for entry in plan.entries] == [
+        ("execution.concurrency.max_concurrent_sessions", 5)
+    ]
 
 
-def test_save_plan_apply_reverses_list_ui_transform():
-    """comma-separated display values are written back as YAML lists."""
-    document: dict = {}
+def test_save_plan_entry_reverses_list_ui_transform():
+    """Comma-separated display values become list-valued persistence entries."""
     config = Config()
     snapshot = from_config(config)
     submitted = from_config(config)
     submitted["filtering"].exclude_labels = "test-data, skip"
 
-    build_save_plan(snapshot, submitted).apply(document)
+    plan = build_save_plan(snapshot, submitted)
 
-    assert document["filtering"]["exclude_labels"] == ["test-data", "skip"]
+    assert [(entry.yaml_path, entry.value) for entry in plan.entries] == [
+        ("filtering.exclude_labels", ["test-data", "skip"])
+    ]
 
 
 def test_save_config_document_patch_starts_from_empty_when_file_missing(tmp_path):
@@ -426,9 +419,94 @@ def test_save_config_document_patch_inserts_missing_flow_path_locally(tmp_path):
     )
 
     assert target.read_text() == (
-        "execution: { concurrency: { max_concurrent_sessions: 2, "
-        '"session_timeout_minutes": 45 } }'
+        "execution: { concurrency: { max_concurrent_sessions: 2 , "
+        '"session_timeout_minutes": 45} }'
     )
+
+
+@pytest.mark.parametrize(
+    ("original", "expected"),
+    [
+        (
+            "execution: { concurrency: { max_concurrent_sessions: 2 "
+            "# operator note\n  } }\n",
+            "execution: { concurrency: { max_concurrent_sessions: 2 "
+            '# operator note\n  , "session_timeout_minutes": 45} }\n',
+        ),
+        (
+            "execution: { concurrency: { max_concurrent_sessions: 2, } }\n",
+            "execution: { concurrency: { max_concurrent_sessions: 2, "
+            '"session_timeout_minutes": 45} }\n',
+        ),
+    ],
+    ids=("trailing-comment", "trailing-comma"),
+)
+def test_save_config_document_patch_inserts_after_flow_trivia(
+    tmp_path, original, expected
+):
+    """Flow insertion respects comments/commas and persists the requested value."""
+    config = Config()
+    target = tmp_path / "main.yaml"
+    target.write_text(original)
+
+    save_config_document_patch(
+        config,
+        (
+            types.SimpleNamespace(
+                yaml_path="execution.concurrency.session_timeout_minutes",
+                value=45,
+            ),
+        ),
+        path=target,
+    )
+
+    assert target.read_text() == expected
+    assert (
+        yaml.safe_load(target.read_text())["execution"]["concurrency"][
+            "session_timeout_minutes"
+        ]
+        == 45
+    )
+
+
+@pytest.mark.parametrize(
+    ("original", "expected"),
+    [
+        (
+            "---\n...\n",
+            "---\nexecution:\n  concurrency:\n    max_concurrent_sessions: 3\n...\n",
+        ),
+        (
+            "%YAML 1.2\n# operator header\n---\n...\n",
+            "%YAML 1.2\n# operator header\n---\nexecution:\n  concurrency:\n"
+            "    max_concurrent_sessions: 3\n...\n",
+        ),
+    ],
+    ids=("document-markers", "directive-comment-preamble"),
+)
+def test_save_config_document_patch_populates_explicit_empty_document(
+    tmp_path, original, expected
+):
+    """A marker-framed null document gains its first path inside the markers."""
+    config = Config()
+    target = tmp_path / "main.yaml"
+    target.write_text(original)
+
+    save_config_document_patch(
+        config,
+        (
+            types.SimpleNamespace(
+                yaml_path="execution.concurrency.max_concurrent_sessions",
+                value=3,
+            ),
+        ),
+        path=target,
+    )
+
+    assert target.read_text() == expected
+    assert yaml.safe_load(target.read_text()) == {
+        "execution": {"concurrency": {"max_concurrent_sessions": 3}}
+    }
 
 
 def test_save_config_document_patch_preserves_changed_scalar_anchor(tmp_path):

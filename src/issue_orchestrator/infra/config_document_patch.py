@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from dataclasses import dataclass
 import json
 from pathlib import Path
 import re
@@ -10,6 +11,13 @@ from typing import Any, Protocol
 
 import yaml
 from yaml.nodes import MappingNode, Node, ScalarNode
+from yaml.tokens import (
+    FlowEntryToken,
+    FlowMappingEndToken,
+    FlowMappingStartToken,
+    FlowSequenceEndToken,
+    FlowSequenceStartToken,
+)
 
 
 class ConfigDocumentPatchTarget(Protocol):
@@ -30,6 +38,14 @@ class ConfigDocumentPatchEntry(Protocol):
     def value(self) -> Any:
         """Stored YAML value for the path."""
         ...
+
+
+@dataclass(frozen=True)
+class _FlowMappingLayout:
+    """Token-derived boundary details for one flow mapping."""
+
+    closing_index: int
+    direct_commas: int
 
 
 def save_config_document_patch(
@@ -58,7 +74,7 @@ def save_config_document_patch(
     updated = original
     for entry in patch_entries:
         updated = _patch_yaml_path(updated, entry.yaml_path, entry.value)
-    _validate_mapping_document(updated, save_path)
+    _validate_patched_entries(updated, save_path, patch_entries)
     save_path.write_bytes(updated.encode("utf-8"))
     return save_path
 
@@ -72,6 +88,8 @@ def _patch_yaml_path(text: str, dotted_path: str, value: Any) -> str:
     root = yaml.compose(text)
     if root is None:
         return _append_to_empty_document(text, parts, value)
+    if isinstance(root, ScalarNode) and root.tag == "tag:yaml.org,2002:null":
+        return _replace_empty_document(text, root, parts, value)
     if not isinstance(root, MappingNode):
         raise ValueError("Config document root is not a mapping")
 
@@ -155,28 +173,64 @@ def _insert_into_flow_mapping(
     missing_parts: tuple[str, ...],
     value: Any,
 ) -> str:
-    """Insert a missing descendant before a flow mapping's closing brace."""
-    closing_index = parent.end_mark.index - 1
-    if closing_index < 0 or text[closing_index] != "}":
-        raise ValueError("Cannot locate closing brace for YAML flow mapping")
+    """Insert a missing descendant at the flow mapping's closing token."""
+    closing_index, has_trailing_comma = _flow_mapping_end(text, parent)
     nested_value = value
     for part in reversed(missing_parts[1:]):
         nested_value = {part: nested_value}
-    insertion_index = closing_index
-    while (
-        insertion_index > parent.start_mark.index + 1
-        and text[insertion_index - 1] in " \t\r\n"
-    ):
-        insertion_index -= 1
-    inner = text[parent.start_mark.index + 1 : insertion_index]
-    separator = "" if not inner.strip() else ", "
+    separator = ", " if parent.value and not has_trailing_comma else ""
     addition = (
         separator
         + json.dumps(missing_parts[0], ensure_ascii=False)
         + ": "
         + _render_yaml_value(nested_value)
     )
-    return text[:insertion_index] + addition + text[insertion_index:]
+    return text[:closing_index] + addition + text[closing_index:]
+
+
+def _flow_mapping_end(text: str, parent: MappingNode) -> tuple[int, bool]:
+    """Locate the parent's closing token and detect a direct trailing comma."""
+    layout = _scan_flow_mapping_layout(text, parent)
+    if layout.closing_index != parent.end_mark.index - 1:
+        raise ValueError("Cannot locate closing token for YAML flow mapping")
+
+    entry_count = len(parent.value)
+    expected_commas = max(entry_count - 1, 0)
+    if layout.direct_commas not in {expected_commas, entry_count}:
+        raise ValueError("Unexpected YAML flow mapping separator layout")
+    return layout.closing_index, bool(
+        entry_count and layout.direct_commas == entry_count
+    )
+
+
+def _scan_flow_mapping_layout(text: str, parent: MappingNode) -> _FlowMappingLayout:
+    """Scan collection tokens to find the selected mapping's direct separators."""
+    depth = 0
+    direct_commas = 0
+    started = False
+
+    for token in yaml.scan(text):
+        if not started:
+            if (
+                isinstance(token, FlowMappingStartToken)
+                and token.start_mark.index == parent.start_mark.index
+            ):
+                started = True
+                depth = 1
+            continue
+
+        if isinstance(token, (FlowMappingStartToken, FlowSequenceStartToken)):
+            depth += 1
+        elif isinstance(token, (FlowMappingEndToken, FlowSequenceEndToken)):
+            if depth == 1:
+                if not isinstance(token, FlowMappingEndToken):
+                    raise ValueError("Flow mapping ended with a sequence token")
+                return _FlowMappingLayout(token.start_mark.index, direct_commas)
+            depth -= 1
+        elif isinstance(token, FlowEntryToken) and depth == 1:
+            direct_commas += 1
+
+    raise ValueError("Cannot locate closing token for YAML flow mapping")
 
 
 def _append_to_empty_document(
@@ -192,6 +246,22 @@ def _append_to_empty_document(
     if text.endswith(("\n", "\r")):
         return text + rendered + newline
     return text + newline + rendered
+
+
+def _replace_empty_document(
+    text: str,
+    root: ScalarNode,
+    parts: tuple[str, ...],
+    value: Any,
+) -> str:
+    """Replace an explicit YAML null document while retaining its framing."""
+    newline = _line_separator(text)
+    rendered = _render_block_path(parts, value, 0, newline)
+    start = root.start_mark.index
+    end = root.end_mark.index
+    if start == end:
+        return text[:start] + rendered + newline + text[end:]
+    return text[:start] + rendered + text[end:]
 
 
 def _mapping_indent(mapping: MappingNode) -> int:
@@ -237,8 +307,30 @@ def _line_separator(text: str) -> str:
     return "\r\n" if "\r\n" in text else "\n"
 
 
-def _validate_mapping_document(text: str, path: Path) -> None:
-    """Fail before writing if source patching produced an invalid root shape."""
-    document = yaml.compose(text)
-    if not isinstance(document, MappingNode):
+def _validate_patched_entries(
+    text: str,
+    path: Path,
+    entries: tuple[ConfigDocumentPatchEntry, ...],
+) -> None:
+    """Fail before writing unless every requested path has its requested value."""
+    node = yaml.compose(text)
+    if not isinstance(node, MappingNode):
         raise ValueError(f"Config document at {path} is not a mapping")
+    document = yaml.safe_load(text)
+    if not isinstance(document, dict):
+        raise ValueError(f"Config document at {path} is not a mapping")
+
+    for entry in entries:
+        cursor: Any = document
+        for part in entry.yaml_path.split("."):
+            if not isinstance(cursor, dict) or part not in cursor:
+                raise ValueError(
+                    f"Config patch did not persist requested path {entry.yaml_path!r}"
+                )
+            cursor = cursor[part]
+        expected = json.loads(_render_yaml_value(entry.value))
+        if type(cursor) is not type(expected) or cursor != expected:
+            raise ValueError(
+                f"Config patch persisted {entry.yaml_path!r} as {cursor!r}, "
+                f"expected {expected!r}"
+            )

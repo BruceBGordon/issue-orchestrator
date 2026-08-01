@@ -2196,13 +2196,12 @@ def build_save_plan(
 
     Compose it with
     :func:`~.config_document_patch.save_config_document_patch` via
-    ``plan.apply`` so a save patches only edited fields into the parsed on-disk
-    YAML -- preserving unrelated operational config (``repo.github`` auth,
-    merge queue, hooks, ...) AND unedited settings-owned raw values (a sibling
-    ``${SECRET}`` reference is not expanded) -- and skips the file write
-    entirely for a no-op. See
-    :func:`~.settings_schema_support.build_settings_save_plan` for the full
-    rationale.
+    ``plan.entries`` so a save patches only edited fields in the on-disk YAML --
+    preserving unrelated operational config (``repo.github`` auth, merge queue,
+    hooks, ...) AND unedited settings-owned raw bytes (a sibling ``${SECRET}``
+    reference is not expanded) -- and skips the file write entirely for a
+    no-op. See :func:`~.settings_schema_support.build_settings_save_plan` for
+    the full rationale.
     """
     return build_settings_save_plan(TAB_DEFINITIONS, snapshot, submitted)
 
