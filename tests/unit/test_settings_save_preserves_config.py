@@ -425,6 +425,55 @@ def test_save_config_document_patch_inserts_missing_flow_path_locally(tmp_path):
 
 
 @pytest.mark.parametrize(
+    ("properties", "custom"),
+    [
+        ("&cfg", "custom: *cfg\n"),
+        ("!!map", ""),
+        ("!!map &cfg", "custom: *cfg\n"),
+        ("&cfg !!map", "custom: *cfg\n"),
+    ],
+    ids=("anchor", "tag", "tag-before-anchor", "anchor-before-tag"),
+)
+def test_save_config_document_patch_inserts_into_property_prefixed_flow_mapping(
+    tmp_path, properties, custom
+):
+    """A flow parent's tag/anchor prefix does not hide its collection boundary."""
+    config = Config()
+    target = tmp_path / "main.yaml"
+    original = (
+        "execution:\n"
+        f"  concurrency: {properties} {{max_concurrent_sessions: 2}}\n"
+        f"{custom}"
+    )
+    target.write_text(original)
+
+    save_config_document_patch(
+        config,
+        (
+            types.SimpleNamespace(
+                yaml_path="execution.concurrency.session_timeout_minutes",
+                value=45,
+            ),
+        ),
+        path=target,
+    )
+
+    expected = original.replace(
+        "{max_concurrent_sessions: 2}",
+        '{max_concurrent_sessions: 2, "session_timeout_minutes": 45}',
+    )
+    assert target.read_text() == expected
+    loaded = yaml.safe_load(target.read_text())
+    concurrency = loaded["execution"]["concurrency"]
+    assert concurrency == {
+        "max_concurrent_sessions": 2,
+        "session_timeout_minutes": 45,
+    }
+    if custom:
+        assert loaded["custom"] == concurrency
+
+
+@pytest.mark.parametrize(
     ("original", "expected"),
     [
         (
@@ -634,6 +683,155 @@ def test_save_config_document_patch_replaces_implicit_empty_scalar(
     assert loaded["worktrees"]["base_branch_override"] == "main"
     if "custom" in loaded:
         assert loaded["custom"] == "main"
+
+
+@pytest.mark.parametrize(
+    ("original", "value", "expected", "expected_alias"),
+    [
+        (
+            "worktrees:\n  base_branch_override: !!null\n",
+            "main",
+            'worktrees:\n  base_branch_override: "main"\n',
+            None,
+        ),
+        (
+            'worktrees:\n  base_branch_override: !!str "main"\n',
+            None,
+            "worktrees:\n  base_branch_override: null\n",
+            None,
+        ),
+        (
+            "worktrees:\n  base_branch_override: !!int 3\n",
+            None,
+            "worktrees:\n  base_branch_override: null\n",
+            None,
+        ),
+        (
+            "worktrees:\n  base_branch_override: !!null &base\ncustom: *base\n",
+            "main",
+            'worktrees:\n  base_branch_override: &base "main"\ncustom: *base\n',
+            "main",
+        ),
+        (
+            'worktrees:\n  base_branch_override: &base !!str "main"\ncustom: *base\n',
+            None,
+            "worktrees:\n  base_branch_override: &base null\ncustom: *base\n",
+            None,
+        ),
+        (
+            "worktrees:\n  base_branch_override: !!str # old type\n"
+            '    &base "main"\ncustom: *base\n',
+            None,
+            "worktrees:\n  base_branch_override: # old type\n"
+            "    &base null\ncustom: *base\n",
+            None,
+        ),
+        (
+            "worktrees:\n  base_branch_override: &base # keep anchor\n"
+            '    !!str "main"\ncustom: *base\n',
+            None,
+            "worktrees:\n  base_branch_override: &base # keep anchor\n"
+            "    null\ncustom: *base\n",
+            None,
+        ),
+    ],
+    ids=(
+        "tag-only-null-to-string",
+        "tagged-string-to-null",
+        "tagged-integer-to-null",
+        "tag-before-anchor-null-to-string",
+        "anchor-before-tag-string-to-null",
+        "tag-comment-before-anchor",
+        "anchor-comment-before-tag",
+    ),
+)
+def test_save_config_document_patch_drops_incompatible_explicit_scalar_tag(
+    tmp_path, original, value, expected, expected_alias
+):
+    """An explicit tag cannot force the submitted setting back to its old type."""
+    config = Config()
+    target = tmp_path / "main.yaml"
+    target.write_text(original)
+
+    save_config_document_patch(
+        config,
+        (
+            types.SimpleNamespace(
+                yaml_path="worktrees.base_branch_override",
+                value=value,
+            ),
+        ),
+        path=target,
+    )
+
+    assert target.read_text() == expected
+    loaded = yaml.safe_load(target.read_text())
+    persisted = loaded["worktrees"]["base_branch_override"]
+    assert type(persisted) is type(value)
+    assert persisted == value
+    if "custom" in loaded:
+        assert type(loaded["custom"]) is type(expected_alias)
+        assert loaded["custom"] == expected_alias
+
+
+@pytest.mark.parametrize(
+    ("yaml_path", "value", "original", "expected"),
+    [
+        (
+            "filtering.exclude_labels",
+            ["new", "skip"],
+            'filtering:\n  exclude_labels: !!seq &labels ["old"]\ncustom: *labels\n',
+            'filtering:\n  exclude_labels: !!seq &labels ["new", "skip"]\n'
+            "custom: *labels\n",
+        ),
+        (
+            "filtering.exclude_labels",
+            ["new", "skip"],
+            "filtering:\n  exclude_labels: &labels\n    - old\n    - stale\n"
+            "custom: *labels\n",
+            'filtering:\n  exclude_labels: &labels\n    ["new", "skip"]\n'
+            "custom: *labels\n",
+        ),
+        (
+            "review.nits.by_agent",
+            {"codex": "address", "claude": "ignore"},
+            "review:\n  nits:\n    by_agent: !!map &policies {codex: surface}\n"
+            "custom: *policies\n",
+            'review:\n  nits:\n    by_agent: !!map &policies {"codex": "address", '
+            '"claude": "ignore"}\ncustom: *policies\n',
+        ),
+        (
+            "review.nits.by_agent",
+            {"codex": "address", "claude": "ignore"},
+            "review:\n  nits:\n    by_agent: &policies\n      codex: surface\n"
+            "custom: *policies\n",
+            'review:\n  nits:\n    by_agent: &policies\n      {"codex": "address", '
+            '"claude": "ignore"}\ncustom: *policies\n',
+        ),
+    ],
+    ids=("flow-list", "block-list", "flow-dict", "block-dict"),
+)
+def test_save_config_document_patch_preserves_collection_anchor(
+    tmp_path, yaml_path, value, original, expected
+):
+    """Flow and block collection replacements keep aliases valid."""
+    config = Config()
+    target = tmp_path / "main.yaml"
+    target.write_text(original)
+
+    save_config_document_patch(
+        config,
+        (types.SimpleNamespace(yaml_path=yaml_path, value=value),),
+        path=target,
+    )
+
+    assert target.read_text() == expected
+    loaded = yaml.safe_load(target.read_text())
+    cursor = loaded
+    for part in yaml_path.split("."):
+        cursor = cursor[part]
+    assert cursor == value
+    assert loaded["custom"] == value
 
 
 def test_save_config_document_patch_rejects_changed_alias_without_writing(tmp_path):

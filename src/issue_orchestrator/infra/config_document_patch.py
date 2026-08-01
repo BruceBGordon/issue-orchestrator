@@ -10,14 +10,19 @@ import re
 from typing import Any, Protocol
 
 import yaml
-from yaml.nodes import MappingNode, Node, ScalarNode
+from yaml.nodes import MappingNode, Node, ScalarNode, SequenceNode
 from yaml.tokens import (
+    AnchorToken,
+    BlockMappingStartToken,
+    BlockSequenceStartToken,
     FlowEntryToken,
     FlowMappingEndToken,
     FlowMappingStartToken,
     FlowSequenceEndToken,
     FlowSequenceStartToken,
     ScalarToken as YAMLScalarToken,
+    TagToken,
+    Token,
 )
 
 
@@ -137,35 +142,87 @@ def _replace_node_source(text: str, node: Node, value: Any) -> str:
     old_fragment = text[start:end]
     content_end = len(old_fragment.rstrip("\r\n"))
     trailing_newlines = old_fragment[content_end:]
-    property_prefix = _scalar_property_prefix(text, node)
+    rendered = _render_yaml_value(value)
+    property_prefix = _node_property_prefix(text, node, rendered)
     implicit_null_separator = (
         " " if node.start_mark.index == node.end_mark.index else ""
     )
     replacement = (
-        property_prefix
-        + implicit_null_separator
-        + _render_yaml_value(value)
-        + trailing_newlines
+        property_prefix + implicit_null_separator + rendered + trailing_newlines
     )
     return text[:start] + replacement + text[end:]
 
 
-def _scalar_property_prefix(text: str, node: Node) -> str:
-    """Retain a scalar's tag/anchor properties in either legal order."""
-    if not isinstance(node, ScalarNode):
-        return ""
+def _node_property_prefix(text: str, node: Node, rendered: str) -> str:
+    """Retain anchors and only type-compatible explicit tags for any node."""
     if node.start_mark.index == node.end_mark.index:
         return ""
-    for token in yaml.scan(text):
-        if (
-            isinstance(token, YAMLScalarToken)
-            and node.start_mark.index <= token.start_mark.index
-            and token.end_mark.index <= node.end_mark.index
-        ):
-            return text[node.start_mark.index : token.start_mark.index]
-    property_prefix = text[node.start_mark.index : node.end_mark.index]
+
+    tokens = tuple(_node_tokens(text, node))
+    content_token = next(
+        (token for token in tokens if _is_node_content_token(node, token)), None
+    )
+    prefix_end = (
+        content_token.start_mark.index
+        if content_token is not None
+        else node.end_mark.index
+    )
+    property_prefix = text[node.start_mark.index : prefix_end]
+    property_tokens = tuple(
+        token
+        for token in tokens
+        if isinstance(token, (AnchorToken, TagToken))
+        and token.end_mark.index <= prefix_end
+    )
+    if any(isinstance(token, TagToken) for token in property_tokens):
+        rendered_node = yaml.compose(rendered)
+        if rendered_node is None:
+            raise ValueError("Rendered settings value has no YAML node")
+        if node.tag != rendered_node.tag:
+            property_prefix = _without_explicit_tag(
+                property_prefix, node.start_mark.index, property_tokens
+            )
+
+    if content_token is not None or not property_prefix:
+        return property_prefix
     separator = "" if property_prefix.endswith((" ", "\t", "\r", "\n")) else " "
     return property_prefix + separator
+
+
+def _node_tokens(text: str, node: Node) -> Iterable[Token]:
+    """Yield tokens contained by one composed node's source span."""
+    for token in yaml.scan(text):
+        if (
+            node.start_mark.index <= token.start_mark.index
+            and token.end_mark.index <= node.end_mark.index
+        ):
+            yield token
+
+
+def _is_node_content_token(node: Node, token: Token) -> bool:
+    """Return whether a token begins the node's value rather than its properties."""
+    if isinstance(node, ScalarNode):
+        return isinstance(token, YAMLScalarToken)
+    if isinstance(node, SequenceNode):
+        return isinstance(token, (BlockSequenceStartToken, FlowSequenceStartToken))
+    if isinstance(node, MappingNode):
+        return isinstance(token, (BlockMappingStartToken, FlowMappingStartToken))
+    raise TypeError(f"Unsupported YAML node type: {type(node).__name__}")
+
+
+def _without_explicit_tag(
+    prefix: str, node_start: int, property_tokens: tuple[Token, ...]
+) -> str:
+    """Remove an incompatible tag without consuming comments or newlines."""
+    tags = tuple(token for token in property_tokens if isinstance(token, TagToken))
+    if len(tags) != 1:
+        raise ValueError("Expected exactly one explicit YAML tag")
+    tag = tags[0]
+    tag_start = tag.start_mark.index - node_start
+    tag_end = tag.end_mark.index - node_start
+    while tag_end < len(prefix) and prefix[tag_end] in {" ", "\t"}:
+        tag_end += 1
+    return prefix[:tag_start] + prefix[tag_end:]
 
 
 def _insert_missing_path(
@@ -235,12 +292,9 @@ def _scan_flow_mapping_layout(text: str, parent: MappingNode) -> _FlowMappingLay
     direct_commas = 0
     started = False
 
-    for token in yaml.scan(text):
+    for token in _node_tokens(text, parent):
         if not started:
-            if (
-                isinstance(token, FlowMappingStartToken)
-                and token.start_mark.index == parent.start_mark.index
-            ):
+            if isinstance(token, FlowMappingStartToken):
                 started = True
                 depth = 1
             continue
