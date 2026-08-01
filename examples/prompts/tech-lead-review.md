@@ -308,10 +308,12 @@ Compact `tech-lead-decision.json` example:
 - Keep machine fields within their hard bounds: finding and proposed-action
   `title` values are at most **300 characters**; the decision `summary` is at
   most 5,000 characters; each proposed-action `body` is at most 20,000
-  characters; and each finding has at most 20 evidence references. Put the
-  concise diagnosis in `title` and the full explanation in `evidence`, the
-  report, or an action body. The decision may contain at most 50 findings and
-  20 proposed actions.
+  characters; and each finding has at most 20 evidence references. Each
+  proposed action has at most 10 labels, and each individual label is at most
+  100 characters. `pattern_signature` is at most 200 characters; `area` is at
+  most 50 characters. Put the concise diagnosis in `title` and the full
+  explanation in `evidence`, the report, or an action body. The decision may
+  contain at most 50 findings and 20 proposed actions.
 - `create_issue` labels must be plain descriptive labels. Workflow labels
   are rejected as a contract violation: anything like `in-progress`,
   `needs-*`, `*-reviewed`, `*-failed`, `publish-*`, `blocked*`, `agent:*`,

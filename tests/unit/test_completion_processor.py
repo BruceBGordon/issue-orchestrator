@@ -2819,6 +2819,72 @@ class TestTechLeadCompletionEffects:
         )
         (data_dir / "tech-lead-report.md").write_text("# Report\n\nNothing found.\n")
 
+    def test_tech_lead_completion_supplies_approval_gate_to_review_pipeline(
+        self,
+        tmp_path,
+        mock_label_adapter,
+        mock_pr_adapter,
+        mock_git_adapter,
+        event_bus,
+        worktree_with_completion,
+    ):
+        """The completion producer classifies Tech Lead sessions and wires a gate."""
+        from issue_orchestrator.control.tech_lead_approval_gate import (
+            TechLeadDecisionApprovalGate,
+        )
+
+        processor = self._make_processor(
+            tmp_path, mock_label_adapter, mock_pr_adapter, mock_git_adapter, event_bus
+        )
+        worktree = worktree_with_completion(self._completed_record())
+        run_assets = self._armed_run_assets(processor, worktree)
+        review = processor._review_exchange  # noqa: SLF001
+
+        with patch.object(
+            review,
+            "prepare_review_exchange",
+            wraps=review.prepare_review_exchange,
+        ) as prepare:
+            result = self._process(
+                processor,
+                worktree,
+                agent_label="agent:tech-lead",
+                run_assets=run_assets,
+            )
+
+        assert result.success is True
+        prepare.assert_called_once()
+        gate = prepare.call_args.kwargs["approval_gate"]
+        assert isinstance(gate, TechLeadDecisionApprovalGate)
+        assert gate.rejection_reason() is None
+
+    def test_ordinary_completion_supplies_no_approval_gate(
+        self,
+        tmp_path,
+        mock_label_adapter,
+        mock_pr_adapter,
+        mock_git_adapter,
+        event_bus,
+        worktree_with_completion,
+    ):
+        """The completion producer must not attach Tech Lead policy to other agents."""
+        processor = self._make_processor(
+            tmp_path, mock_label_adapter, mock_pr_adapter, mock_git_adapter, event_bus
+        )
+        worktree = worktree_with_completion(self._completed_record())
+        review = processor._review_exchange  # noqa: SLF001
+
+        with patch.object(
+            review,
+            "prepare_review_exchange",
+            wraps=review.prepare_review_exchange,
+        ) as prepare:
+            result = self._process(processor, worktree, agent_label="agent:coder")
+
+        assert result.success is True
+        prepare.assert_called_once()
+        assert prepare.call_args.kwargs["approval_gate"] is None
+
     def test_completed_tech_lead_session_without_pair_records_critical_error(
         self,
         tmp_path,
