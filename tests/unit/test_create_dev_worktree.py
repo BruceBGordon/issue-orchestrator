@@ -72,6 +72,19 @@ def _fake_python_environment_reader(path: Path) -> Path:
     return path
 
 
+def _isolated_make_environment() -> dict[str, str]:
+    environment = os.environ.copy()
+    for variable in (
+        "GNUMAKEFLAGS",
+        "MAKEFLAGS",
+        "MAKELEVEL",
+        "MAKEOVERRIDES",
+        "MFLAGS",
+    ):
+        environment.pop(variable, None)
+    return environment
+
+
 def _create(
     *,
     repo_root: Path,
@@ -304,6 +317,7 @@ def test_makefile_transports_inputs_without_evaluating_them(tmp_path: Path) -> N
             cwd=REPO_ROOT,
             check=True,
             capture_output=True,
+            env=_isolated_make_environment(),
             text=True,
         )
 
@@ -315,7 +329,7 @@ def test_makefile_reports_missing_branch_without_creating_worktree() -> None:
     if make_command is None:
         pytest.fail("GNU Make is required by the repository")
 
-    environment = os.environ.copy()
+    environment = _isolated_make_environment()
     for variable in ("BRANCH", "BASE_REF", "WORKTREE_PATH"):
         environment.pop(variable, None)
 
