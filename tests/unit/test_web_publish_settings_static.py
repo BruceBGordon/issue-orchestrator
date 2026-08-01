@@ -706,6 +706,42 @@ class TestSettingsEndpoints:
             finally:
                 web._orchestrator = None
 
+    def test_post_settings_concurrency_change_applies_to_running_engine(self):
+        """The API update is visible to the live worker-capacity owner."""
+        from issue_orchestrator.entrypoints import web
+        from issue_orchestrator.control.health_gate import HealthGate
+
+        mock_orch = create_mock_orchestrator()
+        mock_orch.config.max_concurrent_sessions = 2
+        health_gate = HealthGate(mock_orch.config)
+        assert health_gate.check(active_sessions=2).can_proceed is False
+
+        with (
+            patch("issue_orchestrator.infra.doctor.run_doctor") as mock_doctor,
+            patch(_SETTINGS_SAVE_PATCH_TARGET),
+        ):
+            mock_result = MagicMock()
+            mock_result.checks = []
+            mock_doctor.return_value = mock_result
+
+            web._orchestrator = mock_orch
+            try:
+                client = TestClient(app)
+                response = client.post("/api/settings", json={
+                    "concurrency": {
+                        "max_concurrent_sessions": 3,
+                        "session_timeout_minutes": 45,
+                        "queue_refresh_seconds": 600,
+                    }
+                })
+
+                assert response.status_code == 200
+                assert response.json()["restart_required"] is False
+                assert health_gate.check(active_sessions=2).can_proceed is True
+                assert health_gate.available_capacity == 3
+            finally:
+                web._orchestrator = None
+
     def test_post_settings_partial_tabs_preserve_others(self):
         """POST /api/settings with partial tabs preserves unchanged tabs."""
         from issue_orchestrator.entrypoints import web
