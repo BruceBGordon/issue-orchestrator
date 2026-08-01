@@ -1730,8 +1730,7 @@ def test_settings_restart_copy_names_repository_engine_lifecycle() -> None:
         "changes to take effect."
     ) in tmpl
     assert (
-        "Settings saved. Runtime-supported changes are available to the running "
-        "Repository Engine."
+        "Settings saved. No Repository Engine restart is required."
     ) in tmpl
     assert "Changes to ports and worktrees require a restart" not in tmpl
 
