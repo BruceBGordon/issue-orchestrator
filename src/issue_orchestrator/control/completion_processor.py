@@ -104,6 +104,7 @@ from .review_exchange_pr_comment import (
     build_review_exchange_pr_comment_body,
 )
 from .test_skip_guard import scan_added_test_skip_guards
+from .tech_lead_approval_gate import build_tech_lead_decision_approval_gate
 from .tech_lead_completion import tech_lead_decision_processing_error
 from .tech_lead_session_policy import is_benign_tech_lead_no_commits, is_tech_lead_session, shape_requested_actions_for_tech_lead
 from .worktree_head import current_worktree_head_sha
@@ -115,6 +116,7 @@ logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from ..infra.config import Config
     from ..ports.agent_callback_endpoint import AgentCallbackEndpoint
+    from ..ports.review_exchange_approval_gate import ReviewExchangeApprovalGate
     from ..ports.tech_lead_authority import TechLeadAuthorityStore
     from .stack_base import StackBaseDecision
     from .stack_publish_gate import StackBaseGate
@@ -941,6 +943,25 @@ class CompletionProcessor:
             errors=[tech_lead_error],
         )
 
+    def _review_exchange_approval_gate(
+        self,
+        *,
+        agent_label: str | None,
+        run_assets: SessionRunAssets,
+    ) -> "ReviewExchangeApprovalGate | None":
+        """Build the artifact gate used at the terminal reviewer boundary."""
+        return build_tech_lead_decision_approval_gate(
+            self._config,
+            tech_lead_agent=(
+                self._config.tech_lead_review_agent if self._config else None
+            ),
+            agent_label=agent_label,
+            tech_lead_authority=self._tech_lead_authority,
+            run_dir=run_assets.run_dir,
+            run_id=run_assets.run_id,
+            session_name=run_assets.session_name,
+        )
+
     def _check_pre_action_policies(
         self,
         worktree: Path,
@@ -1578,6 +1599,10 @@ class CompletionProcessor:
             errors=errors,
             actions_taken=actions_taken,
             run_review_exchange_loop=self._run_review_exchange_loop,
+            approval_gate=self._review_exchange_approval_gate(
+                agent_label=agent_label,
+                run_assets=run_assets,
+            ),
         )
         if deferred:
             return branch, pr_url, review_exchange_completed, True, None
@@ -2424,6 +2449,7 @@ class CompletionProcessor:
         session_name: str | None,
         agent_label: str | None,
         initial_validation_record_path: Path | None = None,
+        approval_gate: "ReviewExchangeApprovalGate | None" = None,
     ) -> Any:
         return self._review_exchange.run_review_exchange_loop(
             exchange_run=exchange_run,
@@ -2433,6 +2459,7 @@ class CompletionProcessor:
             session_name=session_name,
             agent_label=agent_label,
             initial_validation_record_path=initial_validation_record_path,
+            approval_gate=approval_gate,
             events=self._trace_events,
             event_context=self._event_context,
         )

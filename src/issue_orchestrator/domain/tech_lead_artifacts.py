@@ -91,6 +91,7 @@ MAX_TITLE_CHARS = 300
 MAX_SUMMARY_CHARS = 5_000
 MAX_EVIDENCE_REFS = 20
 MAX_LABELS_PER_ACTION = 10
+MAX_LABEL_CHARS = 100
 # The pattern signature is a dedup KEY (the case-file ledger keys on it,
 # #6781) and lands in an issue title, so it is bounded tighter than bodies.
 MAX_PATTERN_SIGNATURE_CHARS = 200
@@ -521,7 +522,7 @@ def validate_tech_lead_report_links(decision: TechLeadDecision, report_text: str
 def _LABEL_ALLOWED(label: str) -> bool:
     return bool(label) and all(
         ch.isalnum() or ch in "-_:. " for ch in label
-    ) and len(label) <= 100
+    ) and len(label) <= MAX_LABEL_CHARS
 
 
 def _validate_finding_id(finding_id: str) -> None:

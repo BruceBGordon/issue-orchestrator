@@ -19,7 +19,19 @@ from issue_orchestrator.control.label_manager import LabelManager
 from issue_orchestrator.control.tech_lead_issue_policy import (
     protected_tech_lead_label_violations,
 )
-from issue_orchestrator.domain.tech_lead_artifacts import TechLeadDecision
+from issue_orchestrator.domain.tech_lead_artifacts import (
+    MAX_ACTION_BODY_CHARS,
+    MAX_AREA_CHARS,
+    MAX_EVIDENCE_REFS,
+    MAX_LABEL_CHARS,
+    MAX_LABELS_PER_ACTION,
+    MAX_PATTERN_SIGNATURE_CHARS,
+    MAX_SUMMARY_CHARS,
+    MAX_TECH_LEAD_ACTIONS,
+    MAX_TECH_LEAD_FINDINGS,
+    MAX_TITLE_CHARS,
+    TechLeadDecision,
+)
 from issue_orchestrator.entrypoints.setup_wizard_prompts import (
     build_tech_lead_review_prompt_text,
 )
@@ -94,6 +106,27 @@ def test_compact_decision_example_is_contract_valid(variant: str) -> None:
             )
             == []
         ), f"{variant} example proposes protected labels"
+
+
+@pytest.mark.parametrize("variant", sorted(PROMPT_VARIANTS))
+def test_machine_field_bounds_are_documented(variant: str) -> None:
+    """Agent-visible limits must not remain a completion-time surprise."""
+    text = " ".join(PROMPT_VARIANTS[variant].split())
+    expected_phrases = (
+        f"`title` values are at most **{MAX_TITLE_CHARS:,} characters**",
+        f"`summary` is at most {MAX_SUMMARY_CHARS:,} characters",
+        f"`body` is at most {MAX_ACTION_BODY_CHARS:,} characters",
+        f"at most {MAX_EVIDENCE_REFS:,} evidence references",
+        f"at most {MAX_LABELS_PER_ACTION:,} labels",
+        f"label is at most {MAX_LABEL_CHARS:,} characters",
+        f"`pattern_signature` is at most {MAX_PATTERN_SIGNATURE_CHARS:,} characters",
+        f"`area` is at most {MAX_AREA_CHARS:,} characters",
+        f"at most {MAX_TECH_LEAD_FINDINGS:,} findings",
+        f"{MAX_TECH_LEAD_ACTIONS:,} proposed actions",
+    )
+    for phrase in expected_phrases:
+        assert phrase in text, f"{variant} does not document bound: {phrase}"
+    assert "full explanation" in text
 
 
 @pytest.mark.parametrize("variant", sorted(PROMPT_VARIANTS))

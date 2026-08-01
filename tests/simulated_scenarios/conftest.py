@@ -185,6 +185,7 @@ def _stub_persistent_review_exchange_setup(monkeypatch, request):
         max_no_progress,
         require_validation,
         initial_validation_record_path=None,
+        approval_gate=None,
         web_port=None,  # noqa: ARG001
         nit_policy="surface",
         events=None,
@@ -268,6 +269,13 @@ def _stub_persistent_review_exchange_setup(monkeypatch, request):
                 response_type = "changes_requested"
                 response_text = "Validation record missing or failed"
                 getting_closer = False
+
+            if response_type == "ok" and approval_gate is not None:
+                rejection_reason = approval_gate.rejection_reason()
+                if rejection_reason is not None:
+                    response_type = "changes_requested"
+                    response_text = f"{rejection_reason} Address it and continue."
+                    getting_closer = False
 
             reviewer = ReviewExchangeResponse(
                 response_type=response_type,

@@ -406,6 +406,54 @@ def test_first_pass_submits_background_job_and_returns_deferred(tmp_path: Path) 
     assert job_runner.submitted[0][0] == "review-exchange:230:coding-1:coding-run-1"
 
 
+def test_background_job_forwards_approval_gate_to_loop(tmp_path: Path) -> None:
+    """The async closure must carry the producer's gate to the runner unchanged."""
+    job_runner = _FakeJobRunner()
+    review, _ = _build(tmp_path, job_runner, [], [])
+    calls: list[dict[str, Any]] = []
+
+    class _ApprovalGate:
+        def rejection_reason(self) -> str | None:
+            return None
+
+    approval_gate = _ApprovalGate()
+
+    def fake_loop(**kwargs: Any) -> ReviewExchangeOutcome:
+        calls.append(kwargs)
+        exchange_run = kwargs["exchange_run"]
+        return ReviewExchangeOutcome(
+            status="ok",
+            rounds=1,
+            reason="reviewer_ok",
+            run_assets=exchange_run.assets,
+            summary=_summary(status="ok", reason="reviewer_ok", rounds=1),
+        )
+
+    (_, _, _, _, _, deferred) = review.prepare_review_exchange(
+        requested_actions=(RequestedAction.CREATE_PR,),
+        worktree=tmp_path,
+        issue_number=230,
+        issue_title="Example",
+        session_name="coding-1",
+        run_id="coding-run-1",
+        agent_label="agent:backend",
+        record=_make_record(),
+        errors=[],
+        actions_taken=[],
+        run_review_exchange_loop=fake_loop,
+        approval_gate=approval_gate,
+    )
+
+    assert deferred is True
+    assert calls == []
+
+    _job_id, submitted_fn = job_runner.submitted[0]
+    submitted_fn()
+
+    assert len(calls) == 1
+    assert calls[0]["approval_gate"] is approval_gate
+
+
 def test_background_deadline_is_derived_from_runner_port(tmp_path: Path) -> None:
     class _TimeoutRunner(_FakeReviewExchangeRunner):
         def __init__(self) -> None:
