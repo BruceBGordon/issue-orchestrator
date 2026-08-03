@@ -102,6 +102,7 @@ from issue_orchestrator.execution.agent_runner_providers.sandbox import (
     build_claude_sandbox_argv,
 )
 from issue_orchestrator.execution.agent_runner_providers.codex import CodexProvider
+from tests.process_group_run import run_in_process_group
 from tests.sandbox_probe_retry import ProbeRun, run_until_paths_created
 
 pytestmark = [
@@ -148,6 +149,13 @@ def _run(
     timeout: int,
     extra_env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
+    """Run one agent invocation, killing its whole process tree on timeout.
+
+    ``run_in_process_group`` (not ``subprocess.run``) because the agent CLI
+    spawns tool subprocesses: killing only the session leader leaves them
+    running, and a surviving Bash tool could write a result file after the
+    retry harness reset the previous attempt's evidence.
+    """
     env = dict(os.environ)
     # claude -p returns empty output when nested inside a running Claude Code
     # session; match production, which starts outside one.
@@ -155,15 +163,7 @@ def _run(
     env.pop("CLAUDE_CODE_ENTRYPOINT", None)
     if extra_env:
         env.update(extra_env)
-    return subprocess.run(
-        cmd,
-        cwd=str(cwd),
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-        env=env,
-        start_new_session=True,
-    )
+    return run_in_process_group(cmd, cwd=cwd, timeout=timeout, env=env)
 
 
 def _run_probe(

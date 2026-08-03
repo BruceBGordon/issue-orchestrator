@@ -125,9 +125,20 @@ export interface McpError {
   type?: string;
 }
 
+/**
+ * Mirrors `LaunchStatus` in `src/issue_orchestrator/infra/launcher.py`. The
+ * server rejects any status outside this set rather than reporting it as a
+ * success, so the union is closed on the wire too.
+ */
+export type LaunchStatus =
+  | "ok"
+  | "doctor_warning"
+  | "already_running"
+  | "doctor_error"
+  | "launch_error";
+
 export interface LaunchResult {
-  /** "ok" | "doctor_warning" | "already_running" | "doctor_error" | "launch_error" */
-  status: string;
+  status: LaunchStatus;
   launched: boolean;
   doctor?: DoctorReport;
   error?: string;

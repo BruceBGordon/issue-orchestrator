@@ -43,27 +43,26 @@ if TYPE_CHECKING:
 from ..infra import supervisor
 from ..infra.config import Config, get_config_path
 from ..infra.client_urls import resolve_client_base_url
+from ..infra.launcher import LaunchStatus
 from ..execution.orchestrator_http_api import OrchestratorAsyncHttpApi
 
 logger = logging.getLogger(__name__)
 
 _REPOS_ALLOWLIST_ENV = "ISSUE_ORCHESTRATOR_MCP_REPOS_ALLOWLIST"
 
-# The launcher statuses that mean ``orchestrator.start`` failed, and the
-# ``error.type`` each maps to. Everything else is a success:
+# The ``error.type`` each failing launcher status maps to. Keyed by the shared
+# ``LaunchStatus`` vocabulary rather than raw strings, and asserted exhaustive
+# against ``LaunchStatus.is_failure`` in ``tests/unit/test_mcp_server.py`` — a
+# new failure status must not be able to slip through as a success.
 #
-#   ``ok``              — doctor clean, subprocess launched
-#   ``doctor_warning``  — doctor raised warnings, subprocess launched anyway
-#   ``already_running`` — lost a start race; the orchestrator IS running
-#
-# ``launch_error`` carries the exception text in ``LaunchResult.error``;
-# ``doctor_error`` carries none, so the message is built from the failing
+# ``LAUNCH_ERROR`` carries the exception text in ``LaunchResult.error``;
+# ``DOCTOR_ERROR`` carries none, so the message is built from the failing
 # checks. Both must surface as the top-level structured error that
 # ``docs/user/mcp.md`` documents and the VS Code start command consumes —
 # otherwise an ordinary failed launch reads as success to every client.
-_LAUNCH_FAILURE_ERROR_TYPES: dict[str, str] = {
-    "doctor_error": "DoctorError",
-    "launch_error": "LaunchError",
+LAUNCH_FAILURE_ERROR_TYPES: dict[LaunchStatus, str] = {
+    LaunchStatus.DOCTOR_ERROR: "DoctorError",
+    LaunchStatus.LAUNCH_ERROR: "LaunchError",
 }
 
 
@@ -80,19 +79,19 @@ def _doctor_error_message(launch_result: "LaunchResult") -> str:
     return f"Doctor checks failed — {detail}"
 
 
-def _launch_failure_message(launch_result: "LaunchResult") -> str:
+def _launch_failure_message(
+    launch_result: "LaunchResult", status: LaunchStatus
+) -> str:
     """Always a non-empty description of why the launch failed.
 
     Emptiness matters: clients test the presence of a message to decide a start
     failed, so an empty one would read as success and silently drop the
     operator back into a "started" UI.
     """
-    if launch_result.status == "doctor_error":
+    if status is LaunchStatus.DOCTOR_ERROR:
         return _doctor_error_message(launch_result)
     launcher_message = (launch_result.error or "").strip()
-    return launcher_message or (
-        f"Orchestrator failed to start ({launch_result.status})"
-    )
+    return launcher_message or f"Orchestrator failed to start ({status.value})"
 
 
 def launch_failure_error(launch_result: "LaunchResult") -> dict[str, str] | None:
@@ -102,11 +101,19 @@ def launch_failure_error(launch_result: "LaunchResult") -> dict[str, str] | None
     mapping. Callers must not re-derive failure from ``status`` or ``launched``
     themselves; the VS Code consumer likewise keys off the returned top-level
     ``error`` rather than reinterpreting the nested launch payload.
+
+    The classification is exhaustive over ``LaunchStatus``: an unrecognised
+    status raises ``UnknownLaunchStatusError`` rather than defaulting to
+    success. ``orchestrator.start`` runs inside ``_safe``, so the caller still
+    receives a structured error — never a silent "started".
     """
-    error_type = _LAUNCH_FAILURE_ERROR_TYPES.get(launch_result.status)
-    if error_type is None:
+    status = LaunchStatus.parse(launch_result.status)
+    if not status.is_failure:
         return None
-    return {"message": _launch_failure_message(launch_result), "type": error_type}
+    return {
+        "message": _launch_failure_message(launch_result, status),
+        "type": LAUNCH_FAILURE_ERROR_TYPES[status],
+    }
 
 
 def _mcp_repos_allowlist() -> list[Path] | None:
@@ -186,7 +193,7 @@ class OrchestratorHttpClient:
             config_name=self._settings.config_path.name,
             instance_id=self._settings.instance_id,
         )
-        if result.status == "already_running":
+        if LaunchStatus.parse(result.status) is LaunchStatus.ALREADY_RUNNING:
             if result.supervisor and "port" in result.supervisor:
                 self._cached_port = result.supervisor["port"]
             return supervisor.status(self._settings.repo_root, instance_id=self._settings.instance_id)

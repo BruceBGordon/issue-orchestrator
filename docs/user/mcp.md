@@ -169,6 +169,11 @@ alone — never by re-reading `launch.status`.
 | `doctor_error` | A doctor check failed; nothing was started. | `{"message": "Doctor checks failed — <check>: <detail>; …", "type": "DoctorError"}` |
 | `launch_error` | Doctor passed, the subprocess failed to start. | `{"message": "<launcher error>", "type": "LaunchError"}` |
 
+That table is the complete vocabulary. The classification is exhaustive, not
+"anything unrecognised is fine": a status outside the five above is reported as
+an `UnknownLaunchStatusError`, never as a success. A client can therefore trust
+`error` without also validating `launch.status`.
+
 The `launch` object is always returned when this call ran the launcher — it
 carries the full doctor report and the launcher's own `status`/`launched`
 fields for display. Treat it as operator detail, not as the success signal.

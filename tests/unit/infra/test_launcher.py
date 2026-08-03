@@ -5,6 +5,8 @@ from unittest.mock import MagicMock
 
 from issue_orchestrator.infra.launcher import (
     LaunchResult,
+    LaunchStatus,
+    UnknownLaunchStatusError,
     launch_preflight_only,
     launch_subprocess,
     preflight,
@@ -43,10 +45,43 @@ def _mock_supervisor():
     return sv
 
 
+class TestLaunchStatus:
+    """The shared vocabulary every consumer classifies outcomes with."""
+
+    def test_only_doctor_and_launch_errors_are_failures(self):
+        assert {status for status in LaunchStatus if status.is_failure} == {
+            LaunchStatus.DOCTOR_ERROR,
+            LaunchStatus.LAUNCH_ERROR,
+        }
+
+    def test_a_warning_or_lost_race_still_means_the_orchestrator_is_up(self):
+        assert not LaunchStatus.OK.is_failure
+        assert not LaunchStatus.DOCTOR_WARNING.is_failure
+        assert not LaunchStatus.ALREADY_RUNNING.is_failure
+
+    @pytest.mark.parametrize(
+        "value",
+        ["ok", "doctor_warning", "already_running", "doctor_error", "launch_error"],
+    )
+    def test_parse_accepts_every_wire_value(self, value):
+        assert LaunchStatus.parse(value).value == value
+
+    def test_parse_is_idempotent_for_members(self):
+        assert LaunchStatus.parse(LaunchStatus.OK) is LaunchStatus.OK
+
+    @pytest.mark.parametrize("value", ["doctor_eror", "supervisor_error", "", "OK"])
+    def test_parse_rejects_anything_else(self, value):
+        """An unknown status must never quietly take a consumer's happy path."""
+        with pytest.raises(UnknownLaunchStatusError) as excinfo:
+            LaunchStatus.parse(value)
+
+        assert repr(value) in str(excinfo.value)
+
+
 class TestLaunchResult:
     def test_to_dict_minimal(self):
         doctor = DoctorResult(checks=[Check(name="Test", status="ok", detail="good")])
-        result = LaunchResult(doctor=doctor, launched=False, status="ok")
+        result = LaunchResult(doctor=doctor, launched=False, status=LaunchStatus.OK)
         d = result.to_dict()
         assert d["launched"] is False
         assert d["status"] == "ok"
@@ -57,7 +92,10 @@ class TestLaunchResult:
     def test_to_dict_with_error(self):
         doctor = DoctorResult(checks=[Check(name="Test", status="error", detail="bad")])
         result = LaunchResult(
-            doctor=doctor, launched=False, status="doctor_error", error="check failed"
+            doctor=doctor,
+            launched=False,
+            status=LaunchStatus.DOCTOR_ERROR,
+            error="check failed",
         )
         d = result.to_dict()
         assert d["error"] == "check failed"
@@ -68,7 +106,7 @@ class TestLaunchResult:
         result = LaunchResult(
             doctor=doctor,
             launched=True,
-            status="ok",
+            status=LaunchStatus.OK,
             supervisor={"pid": 123, "port": 8080},
         )
         d = result.to_dict()

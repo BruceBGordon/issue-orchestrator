@@ -6,7 +6,6 @@ and that the command escaping works correctly in real shells.
 
 import os
 import pytest
-import signal
 from collections.abc import Mapping
 
 pytestmark = [
@@ -22,6 +21,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from issue_orchestrator.infra.env import ENV_PREFIX
+from tests.process_group_run import run_in_process_group
 from tests.unit.session_run_helpers import make_session_run_assets
 
 from .conftest import xdist_timeout
@@ -80,47 +80,12 @@ def _run_claude_once(
     cwd: str | None,
     env: Mapping[str, str] | None,
 ) -> subprocess.CompletedProcess:
-    process = subprocess.Popen(
-        argv,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        cwd=cwd,
-        env=env,
-        start_new_session=True,
-    )
-    try:
-        stdout, stderr = process.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired as exc:
-        stdout, stderr = _terminate_claude_process(process)
-        raise subprocess.TimeoutExpired(
-            cmd=argv,
-            timeout=timeout,
-            output=stdout or exc.stdout,
-            stderr=stderr or exc.stderr,
-        ) from exc
-    return subprocess.CompletedProcess(argv, process.returncode, stdout, stderr)
+    """Run claude once, killing its whole process tree if it stalls.
 
-
-def _terminate_claude_process(
-    process: subprocess.Popen[str],
-) -> tuple[str | None, str | None]:
-    _signal_process_group(process, signal.SIGTERM)
-    try:
-        return process.communicate(timeout=5)
-    except subprocess.TimeoutExpired:
-        _signal_process_group(process, signal.SIGKILL)
-        return process.communicate()
-
-
-def _signal_process_group(
-    process: subprocess.Popen[str],
-    sig: signal.Signals,
-) -> None:
-    try:
-        os.killpg(process.pid, sig)
-    except ProcessLookupError:
-        return
+    Process-tree cleanup is owned by ``tests/process_group_run`` so the live
+    probes cannot drift apart on it.
+    """
+    return run_in_process_group(argv, cwd=cwd, timeout=timeout, env=env)
 
 
 @pytest.fixture

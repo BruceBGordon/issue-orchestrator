@@ -17,6 +17,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -40,13 +41,64 @@ def _default_command_runner() -> CommandRunner:
     return LocalCommandRunner()
 
 
+class UnknownLaunchStatusError(ValueError):
+    """A launcher status outside the shared vocabulary reached a consumer.
+
+    Deliberately loud. Consumers classify statuses to decide whether startup
+    succeeded; an unrecognised one silently taking the success branch is how a
+    failed launch gets reported to operators as "started".
+    """
+
+
+class LaunchStatus(StrEnum):
+    """The complete vocabulary a :class:`LaunchResult` may report.
+
+    Shared so every consumer — CLI, Control API, MCP — classifies outcomes the
+    same way instead of comparing raw strings. ``is_failure`` is the single
+    definition of "startup did not happen": a warning still starts the
+    orchestrator, and ``ALREADY_RUNNING`` means it is up (we merely lost the
+    race to start it).
+    """
+
+    OK = "ok"
+    DOCTOR_WARNING = "doctor_warning"
+    ALREADY_RUNNING = "already_running"
+    DOCTOR_ERROR = "doctor_error"
+    LAUNCH_ERROR = "launch_error"
+
+    @property
+    def is_failure(self) -> bool:
+        return self in _FAILURE_STATUSES
+
+    @classmethod
+    def parse(cls, value: "LaunchStatus | str") -> "LaunchStatus":
+        """Return the member for ``value``, or fail loudly.
+
+        ``LaunchResult`` is a plain dataclass, so a raw string can still reach
+        it from an older caller or a test double. Consumers should route every
+        status through here rather than defaulting unknown values to success.
+        """
+        try:
+            return cls(value)
+        except ValueError:
+            raise UnknownLaunchStatusError(
+                f"unknown launcher status {value!r}; expected one of "
+                f"{sorted(member.value for member in cls)}"
+            ) from None
+
+
+_FAILURE_STATUSES = frozenset(
+    {LaunchStatus.DOCTOR_ERROR, LaunchStatus.LAUNCH_ERROR}
+)
+
+
 @dataclass
 class LaunchResult:
     """Result of a launcher operation."""
 
     doctor: DoctorResult
     launched: bool
-    status: str  # "ok" | "doctor_error" | "doctor_warning" | "launch_error"
+    status: LaunchStatus
     error: Optional[str] = None
     supervisor: Optional[dict[str, Any]] = None
 
@@ -54,7 +106,7 @@ class LaunchResult:
         result: dict[str, Any] = {
             "doctor": self.doctor.to_dict(),
             "launched": self.launched,
-            "status": self.status,
+            "status": LaunchStatus.parse(self.status).value,
         }
         if self.error is not None:
             result["error"] = self.error
@@ -67,8 +119,8 @@ def _run_preflight(
     config: Config,
     runner: Optional[CommandRunner] = None,
     doctor_fn: Optional[DoctorFn] = None,
-) -> tuple[DoctorResult, str]:
-    """Run doctor checks and return (result, status_string).
+) -> tuple[DoctorResult, LaunchStatus]:
+    """Run doctor checks and return ``(result, status)``.
 
     Args:
         doctor_fn: Callable to use instead of ``run_doctor``.
@@ -76,11 +128,11 @@ def _run_preflight(
             (needed by integration tests that spawn subprocesses).
 
     Returns:
-        (doctor_result, status) where status is "ok", "doctor_warning",
-        or "doctor_error".
+        ``(doctor_result, status)`` where status is ``OK``, ``DOCTOR_WARNING``,
+        or ``DOCTOR_ERROR``.
     """
     if os.environ.get("ISSUE_ORCHESTRATOR_SKIP_DOCTOR") == "1":
-        return DoctorResult(checks=[]), "ok"
+        return DoctorResult(checks=[]), LaunchStatus.OK
     fn = doctor_fn or run_doctor
     doctor_start = time.time()
     doctor_result = fn(config=config, runner=runner)
@@ -91,10 +143,10 @@ def _run_preflight(
         len(doctor_result.checks),
     )
     if doctor_result.overall == "error":
-        return doctor_result, "doctor_error"
+        return doctor_result, LaunchStatus.DOCTOR_ERROR
     if doctor_result.overall == "warning":
-        return doctor_result, "doctor_warning"
-    return doctor_result, "ok"
+        return doctor_result, LaunchStatus.DOCTOR_WARNING
+    return doctor_result, LaunchStatus.OK
 
 
 def preflight(
@@ -223,7 +275,7 @@ def launch_subprocess(
         return LaunchResult(
             doctor=doctor_result,
             launched=False,
-            status="doctor_error",
+            status=LaunchStatus.DOCTOR_ERROR,
         )
 
     # Doctor passed (ok or warning) — start the orchestrator subprocess
@@ -261,7 +313,7 @@ def launch_subprocess(
         return LaunchResult(
             doctor=doctor_result,
             launched=False,
-            status="already_running",
+            status=LaunchStatus.ALREADY_RUNNING,
             error="Orchestrator already running",
             supervisor=supervisor_data,
         )
@@ -270,6 +322,6 @@ def launch_subprocess(
         return LaunchResult(
             doctor=doctor_result,
             launched=False,
-            status="launch_error",
+            status=LaunchStatus.LAUNCH_ERROR,
             error=str(exc),
         )

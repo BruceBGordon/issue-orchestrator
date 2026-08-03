@@ -159,13 +159,14 @@ def cmd_start(args: argparse.Namespace) -> int:  # noqa: C901, PLR0912 - CLI ent
             return 1
 
         # Run doctor checks including guardrails - fail fast if environment is broken
-        from ..infra.launcher import launch_preflight_only
+        from ..infra.launcher import LaunchStatus, launch_preflight_only
         from ..execution.command_runner import LocalCommandRunner
 
         launch_result = launch_preflight_only(
             config=config, runner=LocalCommandRunner()
         )
-        if launch_result.status == "doctor_error":
+        launch_status = LaunchStatus.parse(launch_result.status)
+        if launch_status is LaunchStatus.DOCTOR_ERROR:
             console.print("[red]Startup checks failed:[/red]")
             for check in launch_result.doctor.checks:
                 if check.status == "error":
@@ -175,7 +176,7 @@ def cmd_start(args: argparse.Namespace) -> int:  # noqa: C901, PLR0912 - CLI ent
                 "\n[yellow]Run 'issue-orchestrator doctor' for full diagnostics[/yellow]"
             )
             return 1
-        elif launch_result.status == "doctor_warning":
+        elif launch_status is LaunchStatus.DOCTOR_WARNING:
             for check in launch_result.doctor.checks:
                 if check.status == "warning":
                     console.print(f"  [yellow]⚠ {check.name}: {check.detail}[/yellow]")
