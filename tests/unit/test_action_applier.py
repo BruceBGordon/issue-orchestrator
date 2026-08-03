@@ -2204,13 +2204,25 @@ class TestRecoverTerminalIssueAction:
             close_issue=True,
         )
 
-    def test_close_on_merge_closes_issue_before_finalizing_history(
+    def test_close_on_merge_close_is_first_mutation_then_comment_then_shed(
         self, mock_labels, mock_sessions, mock_events, mock_repository_host,
         real_label_manager,
     ):
-        """Close-on-merge fallback (porchpin #81): a merged PR whose issue is
-        still open gets the issue closed, with an explanatory comment, before
-        the history entry terminalizes."""
+        """F1 ordered-call regression (porchpin #81): the close is the FIRST
+        mutation after the owner gates — before the label shed, so a shed/
+        history failure after a successful close is safe (a closed issue
+        cannot re-enter the queue). The audit comment posts only AFTER the
+        successful close, and history terminalizes last."""
+        order: list[str] = []
+        mock_repository_host.update_issue_state.side_effect = (
+            lambda *a, **k: order.append("close")
+        )
+        mock_repository_host.add_comment.side_effect = (
+            lambda *a, **k: order.append("comment")
+        )
+        mock_labels.remove_label.side_effect = (
+            lambda *a, **k: order.append("shed")
+        )
         entry = self._awaiting_merge_entry()
         applier = self._make_applier(
             mock_labels, mock_sessions, mock_events, mock_repository_host,
@@ -2226,18 +2238,22 @@ class TestRecoverTerminalIssueAction:
         mock_repository_host.update_issue_state.assert_called_once_with(
             228, "closed",
         )
+        assert order[:2] == ["close", "comment"]
+        assert "shed" in order and order.index("shed") > 1
         comment_body = mock_repository_host.add_comment.call_args.args[1]
         assert "https://github.com/test/repo/pull/318" in comment_body
         assert "no closing reference" in comment_body
         assert entry.status == "merged"
 
-    def test_close_on_merge_failure_leaves_history_reconcilable(
+    def test_close_on_merge_failure_leaves_labels_and_history_untouched(
         self, mock_labels, mock_sessions, mock_events, mock_repository_host,
         real_label_manager,
     ):
-        """A failed close must NOT terminalize history: an open issue with
-        terminal merged history is exactly the relaunch-after-restart bug this
-        fallback exists to prevent. Leave the entry reconcilable for retry."""
+        """A failed close must NOT shed labels, post the audit comment, or
+        terminalize history: labels-shed-but-open across a restart is exactly
+        the relaunch window this fallback exists to eliminate, and a comment
+        claiming the close happened would be a false audit trail repeated on
+        every retry. The entry stays reconcilable for the next pass."""
         mock_repository_host.update_issue_state.side_effect = Exception(
             "GitHub 502 closing issue"
         )
@@ -2253,6 +2269,8 @@ class TestRecoverTerminalIssueAction:
 
         assert not result.success
         assert "close-on-merge" in (result.error or "")
+        mock_labels.remove_label.assert_not_called()
+        mock_repository_host.add_comment.assert_not_called()
         # Entry stays in its reconcilable status for the next discovery pass.
         assert entry.status == "completed"
 

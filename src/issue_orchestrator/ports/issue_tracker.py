@@ -169,6 +169,31 @@ class IssueTracker(Protocol):
         """
         ...
 
+    def issue_closed_on_or_after(self, issue_number: int, timestamp: str) -> bool:
+        """Report whether the issue has a ``closed`` event at/after ``timestamp``.
+
+        Typed transition evidence for the close-on-merge fallback: a ``closed``
+        event at/after a PR's merge proves GitHub's closing-keyword auto-close
+        (or an equivalent close) already fired for that merge — a currently
+        open issue was therefore deliberately reopened and must not be
+        re-closed. ``False`` means the issue was never closed since
+        ``timestamp``.
+
+        Args:
+            issue_number: The issue number to read close events for.
+            timestamp: ISO-8601 UTC timestamp (as provided by the tracker's
+                own payloads, e.g. a PR's ``merged_at``).
+
+        Returns:
+            ``True`` if a ``closed`` event exists at/after ``timestamp``.
+
+        Raises:
+            RepositoryError: If there's an error accessing the data source.
+                Callers deciding a destructive write on this fact must treat
+                the error as "evidence unavailable", not as either answer.
+        """
+        ...
+
     def search_issues_by_title(
         self,
         query_terms: list[str],

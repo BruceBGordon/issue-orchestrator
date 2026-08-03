@@ -38,21 +38,31 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def merged_issue_still_open(
+def should_close_merged_issue(
     *,
     get_issue: "Callable[[int], Issue | None]",
+    closed_on_or_after: "Callable[[int, str], bool]",
     state: "OrchestratorState",
     entry: "SessionHistoryEntry",
+    merged_at: str | None,
     now: float,
 ) -> bool | None:
-    """Whether the issue behind a just-merged PR is still open on GitHub.
+    """Whether the issue behind a just-merged PR needs the fallback close.
 
-    Returns None when the issue state cannot be determined (transient
-    repository-host error), so the caller can leave the history entry
-    reconcilable instead of finalizing it against a guessed state: fail-open
-    recreates the relaunch bug, and raising aborts the whole gather tick. An
-    issue the host reports as missing is treated as not-open — there is
-    nothing to close, and holding the entry hostage would strand it.
+    True only on positive evidence of the failure this fallback exists for:
+    the issue is open AND no ``closed`` event exists at/after the PR's
+    ``merged_at`` — i.e. GitHub's auto-close never fired for this merge. An
+    open issue that HAS a close event since the merge was auto-closed and then
+    deliberately reopened; it is never re-closed. A missing ``merged_at``
+    means no evidence either way — never infer a destructive close from
+    ``state == open`` alone.
+
+    Returns None when the evidence cannot be read (transient repository-host
+    error), so the caller can leave the history entry reconcilable instead of
+    finalizing it against a guessed state: fail-open recreates the relaunch
+    bug, and raising aborts the whole gather tick. An issue the host reports
+    as missing is treated as not-open — there is nothing to close, and
+    holding the entry hostage would strand it.
     """
     try:
         issue = get_issue(entry.issue_number)
@@ -66,7 +76,33 @@ def merged_issue_still_open(
     if issue is None:
         return False
     record_issue_refreshes(state, {entry.issue_number}, now)
-    return normalized_state(issue.state) != "closed"
+    if normalized_state(issue.state) == "closed":
+        return False
+    if not merged_at:
+        logger.warning(
+            "Merged PR for issue #%d carries no merged_at; skipping close-on-"
+            "merge fallback — open state alone is not evidence of a failed "
+            "auto-close",
+            entry.issue_number,
+        )
+        return False
+    try:
+        auto_close_fired = closed_on_or_after(entry.issue_number, merged_at)
+    except RepositoryHostError:
+        logger.warning(
+            "Unable to read close events for merged PR close fallback: "
+            "issue=#%d; leaving entry reconcilable for retry",
+            entry.issue_number,
+        )
+        return None
+    if auto_close_fired:
+        logger.info(
+            "Issue #%d was closed at/after its PR merge and deliberately "
+            "reopened; close-on-merge fallback will not re-close it",
+            entry.issue_number,
+        )
+        return False
+    return True
 
 
 def close_on_merge_comment(pr_url: str, pr_number: int) -> str:

@@ -20,9 +20,9 @@ from ..history import latest_history_entries_by_issue
 from ..ports.repository_host import RepositoryHostError
 from .awaiting_merge_drift_policy import classify_pr_set_drift
 from .close_on_merge import (
-    merged_issue_still_open,
     pr_terminal_reason,
     reconciliation_fact,
+    should_close_merged_issue,
 )
 from .awaiting_merge_post_publish_policy import (
     POST_PUBLISH_VALIDATION_COMMENT_MARKER,
@@ -284,16 +284,20 @@ class AwaitingMergeReconciler:
                         pr_number=pr_number,
                     )
                 else:
-                    # PR merged: did GitHub's closing keyword actually close
-                    # the issue? See close_on_merge module (porchpin #81).
-                    # None = state unreadable; leave the entry reconcilable.
-                    open_check = merged_issue_still_open(
+                    # PR merged: did GitHub's auto-close actually fire for
+                    # this merge? See close_on_merge module (porchpin #81).
+                    # None = evidence unreadable; leave the entry reconcilable.
+                    close_check = should_close_merged_issue(
                         get_issue=self._get_issue,
-                        state=state, entry=entry, now=self.clock(),
+                        closed_on_or_after=(
+                            self.repository_host.issue_closed_on_or_after
+                        ),
+                        state=state, entry=entry,
+                        merged_at=pr.merged_at, now=self.clock(),
                     )
-                    if open_check is None:
+                    if close_check is None:
                         return AwaitingMergeEntryDiscovery("skipped")
-                    issue_open = open_check
+                    issue_open = close_check
                 return AwaitingMergeEntryDiscovery(
                     "terminal",
                     reconciliation=reconciliation_fact(

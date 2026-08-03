@@ -1869,6 +1869,21 @@ class TestRepositoryOperations:
             42, "<!-- io:marker -->"
         )
 
+
+    def test_issue_closed_on_or_after_forwards_to_client(
+        self, adapter, mock_http_client
+    ):
+        """The close-event evidence read delegates to the paginating client
+        method so callers get the fail-loud full-scan contract."""
+        mock_http_client.issue_closed_on_or_after.return_value = True
+
+        closed = adapter.issue_closed_on_or_after(45, "2026-08-03T13:52:09Z")
+
+        assert closed is True
+        mock_http_client.issue_closed_on_or_after.assert_called_once_with(
+            45, "2026-08-03T13:52:09Z"
+        )
+
     def test_list_labels(self, adapter, mock_http_client):
         """Test listing repository labels."""
         mock_http_client.list_labels.return_value = [

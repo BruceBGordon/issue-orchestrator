@@ -74,6 +74,9 @@ def _label_manager() -> LabelManager:
     return LabelManager(Config())
 
 
+_MERGED_AT = "2026-08-03T13:52:09Z"
+
+
 def _pr(
     state: str,
     *,
@@ -92,6 +95,7 @@ def _pr(
         labels=labels or [],
         mergeable_state=mergeable_state,
         status_check_rollup=status_check_rollup,  # type: ignore[arg-type]
+        merged_at=_MERGED_AT if state == "merged" else None,
     )
 
 
@@ -247,18 +251,21 @@ def test_recovered_awaiting_merge_entry_reconciles_when_pr_is_merged() -> None:
     # close-on-merge fallback (porchpin #81). This is once per PR lifecycle at
     # the terminal transition — not the per-tick polling #6600 removed.
     repository_host.get_issue.assert_called_once_with(228)
+    # A closed issue needs no transition evidence — the events read is skipped.
+    repository_host.issue_closed_on_or_after.assert_not_called()
 
 
 def test_merged_pr_with_open_issue_flags_close_on_merge_fallback() -> None:
-    """A merged PR whose issue is still open means GitHub's closing-keyword
-    auto-close did not fire (word-boundary-defeated reference or none at
-    all). The fact must carry issue_open=True so the planner orders the
-    close-on-merge fallback (porchpin case file #81)."""
+    """A merged PR whose issue is open AND was never closed since the merge
+    means GitHub's closing-keyword auto-close did not fire (word-boundary-
+    defeated reference or none at all). The fact must carry issue_open=True so
+    the planner orders the close-on-merge fallback (porchpin case file #81)."""
     entry = _history_entry()
     state = OrchestratorState(session_history=[entry])
     repository_host = MagicMock()
     repository_host.get_pr.return_value = _pr("merged")
     repository_host.get_issue.return_value = _issue("open")
+    repository_host.issue_closed_on_or_after.return_value = False
 
     result = AwaitingMergeReconciler(
         repository_host,
@@ -268,6 +275,71 @@ def test_merged_pr_with_open_issue_flags_close_on_merge_fallback() -> None:
     assert result.discovered == 1
     assert result.reconciliations[0].status == "merged"
     assert result.reconciliations[0].issue_open is True
+    repository_host.issue_closed_on_or_after.assert_called_once_with(
+        228, _MERGED_AT,
+    )
+
+
+def test_merged_then_reopened_issue_is_never_reclosed() -> None:
+    """F2 regression: merge → auto-close → human reopen → first reconcile.
+    The issue is open but a close event exists at/after the merge, proving the
+    auto-close DID fire — the open state is a deliberate reopen and must not
+    be re-closed. state == open alone is not evidence."""
+    entry = _history_entry()
+    state = OrchestratorState(session_history=[entry])
+    repository_host = MagicMock()
+    repository_host.get_pr.return_value = _pr("merged")
+    repository_host.get_issue.return_value = _issue("open")
+    repository_host.issue_closed_on_or_after.return_value = True
+
+    result = AwaitingMergeReconciler(
+        repository_host,
+        clock=lambda: 1234.5,
+    ).discover(state)
+
+    assert result.discovered == 1
+    assert result.reconciliations[0].status == "merged"
+    assert result.reconciliations[0].issue_open is False
+
+
+def test_merged_pr_events_read_error_leaves_entry_reconcilable() -> None:
+    """Evidence unavailable is not either answer: no guessed finalization
+    (fail-open recreates the relaunch bug) and no aborted gather tick."""
+    entry = _history_entry()
+    state = OrchestratorState(session_history=[entry])
+    repository_host = MagicMock()
+    repository_host.get_pr.return_value = _pr("merged")
+    repository_host.get_issue.return_value = _issue("open")
+    repository_host.issue_closed_on_or_after.side_effect = RepositoryHostError(
+        "boom"
+    )
+
+    result = AwaitingMergeReconciler(
+        repository_host,
+        clock=lambda: 1234.5,
+    ).discover(state)
+
+    assert result.discovered == 0
+    assert result.skipped == 1
+
+
+def test_merged_pr_without_merged_at_never_closes() -> None:
+    """No merge timestamp = no transition evidence; a destructive close is
+    never inferred from open state alone."""
+    entry = _history_entry()
+    state = OrchestratorState(session_history=[entry])
+    repository_host = MagicMock()
+    repository_host.get_pr.return_value = replace(_pr("merged"), merged_at=None)
+    repository_host.get_issue.return_value = _issue("open")
+
+    result = AwaitingMergeReconciler(
+        repository_host,
+        clock=lambda: 1234.5,
+    ).discover(state)
+
+    assert result.discovered == 1
+    assert result.reconciliations[0].issue_open is False
+    repository_host.issue_closed_on_or_after.assert_not_called()
 
 
 def test_merged_pr_issue_fetch_error_leaves_entry_reconcilable() -> None:
