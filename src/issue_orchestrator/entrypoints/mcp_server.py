@@ -51,9 +51,11 @@ logger = logging.getLogger(__name__)
 _REPOS_ALLOWLIST_ENV = "ISSUE_ORCHESTRATOR_MCP_REPOS_ALLOWLIST"
 
 # The ``error.type`` each failing launcher status maps to. Keyed by the shared
-# ``LaunchStatus`` vocabulary rather than raw strings, and asserted exhaustive
-# against ``LaunchStatus.is_failure`` in ``tests/unit/test_mcp_server.py`` — a
-# new failure status must not be able to slip through as a success.
+# ``LaunchStatus`` vocabulary rather than raw strings, and asserted in
+# ``tests/unit/test_mcp_server.py`` to cover exactly
+# ``LaunchStatus.failure_statuses()`` — which the launcher in turn proves is a
+# partition of the enum, so a new failure status cannot slip through as a
+# success by being omitted from both sets.
 #
 # ``LAUNCH_ERROR`` carries the exception text in ``LaunchResult.error``;
 # ``DOCTOR_ERROR`` carries none, so the message is built from the failing
@@ -102,9 +104,10 @@ def launch_failure_error(launch_result: "LaunchResult") -> dict[str, str] | None
     themselves; the VS Code consumer likewise keys off the returned top-level
     ``error`` rather than reinterpreting the nested launch payload.
 
-    The classification is exhaustive over ``LaunchStatus``: an unrecognised
-    status raises ``UnknownLaunchStatusError`` rather than defaulting to
-    success. ``orchestrator.start`` runs inside ``_safe``, so the caller still
+    The classification is total, with no default-to-success branch anywhere: a
+    status outside the enum raises ``UnknownLaunchStatusError``, and an enum
+    member with no declared disposition raises ``UnclassifiedLaunchStatusError``.
+    ``orchestrator.start`` runs inside ``_safe``, so either way the caller
     receives a structured error — never a silent "started".
     """
     status = LaunchStatus.parse(launch_result.status)

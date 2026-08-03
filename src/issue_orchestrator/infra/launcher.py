@@ -50,14 +50,29 @@ class UnknownLaunchStatusError(ValueError):
     """
 
 
+class UnclassifiedLaunchStatusError(ValueError):
+    """A :class:`LaunchStatus` member declares no success/failure disposition.
+
+    The counterpart to :class:`UnknownLaunchStatusError`, which guards the
+    *wire*. This one guards the *enum*: adding a member without also placing it
+    in exactly one of the disposition sets would otherwise let a real failure be
+    classified as a successful start, because "not a known failure" is not the
+    same statement as "startup succeeded".
+    """
+
+
 class LaunchStatus(StrEnum):
     """The complete vocabulary a :class:`LaunchResult` may report.
 
     Shared so every consumer — CLI, Control API, MCP — classifies outcomes the
-    same way instead of comparing raw strings. ``is_failure`` is the single
-    definition of "startup did not happen": a warning still starts the
-    orchestrator, and ``ALREADY_RUNNING`` means it is up (we merely lost the
-    race to start it).
+    same way instead of comparing raw strings.
+
+    Classification is *total*, not opt-in. Every member must be declared in
+    either :meth:`success_statuses` or :meth:`failure_statuses`; membership of
+    neither is an error rather than an implicit success. That distinction is the
+    whole point: with an opt-in failure set, a member added later inherits the
+    success branch by omission, and a launch that did not happen is reported to
+    every MCP client as "started".
     """
 
     OK = "ok"
@@ -66,9 +81,38 @@ class LaunchStatus(StrEnum):
     DOCTOR_ERROR = "doctor_error"
     LAUNCH_ERROR = "launch_error"
 
+    @classmethod
+    def success_statuses(cls) -> frozenset["LaunchStatus"]:
+        """The statuses that mean the orchestrator is up.
+
+        A warning still starts it, and ``ALREADY_RUNNING`` means it is already
+        up — we merely lost the race to start it.
+        """
+        return _SUCCESS_STATUSES
+
+    @classmethod
+    def failure_statuses(cls) -> frozenset["LaunchStatus"]:
+        """The statuses that mean startup did not happen."""
+        return _FAILURE_STATUSES
+
     @property
     def is_failure(self) -> bool:
-        return self in _FAILURE_STATUSES
+        """Whether startup did not happen.
+
+        Raises:
+            UnclassifiedLaunchStatusError: if this member appears in neither
+                disposition set. Never defaults to ``False``.
+        """
+        cls = type(self)
+        if self in cls.failure_statuses():
+            return True
+        if self in cls.success_statuses():
+            return False
+        raise UnclassifiedLaunchStatusError(
+            f"launcher status {self.value!r} is in neither the success nor the "
+            "failure set; classify it explicitly rather than letting it read "
+            "as a successful start"
+        )
 
     @classmethod
     def parse(cls, value: "LaunchStatus | str") -> "LaunchStatus":
@@ -87,9 +131,35 @@ class LaunchStatus(StrEnum):
             ) from None
 
 
-_FAILURE_STATUSES = frozenset(
-    {LaunchStatus.DOCTOR_ERROR, LaunchStatus.LAUNCH_ERROR}
+_SUCCESS_STATUSES = frozenset(
+    {LaunchStatus.OK, LaunchStatus.DOCTOR_WARNING, LaunchStatus.ALREADY_RUNNING}
 )
+_FAILURE_STATUSES = frozenset({LaunchStatus.DOCTOR_ERROR, LaunchStatus.LAUNCH_ERROR})
+
+
+def _verify_every_status_is_classified() -> None:
+    """Fail at import if the disposition sets do not partition ``LaunchStatus``.
+
+    Import time is the right moment: a member added without a disposition then
+    breaks the CLI, the Control API, and the MCP server immediately and
+    identically, instead of surfacing later as a failed launch that a client
+    renders as a successful one.
+    """
+    overlapping = _SUCCESS_STATUSES & _FAILURE_STATUSES
+    if overlapping:
+        raise UnclassifiedLaunchStatusError(
+            "launcher statuses classified as both success and failure: "
+            f"{sorted(status.value for status in overlapping)}"
+        )
+    unclassified = set(LaunchStatus) - _SUCCESS_STATUSES - _FAILURE_STATUSES
+    if unclassified:
+        raise UnclassifiedLaunchStatusError(
+            "launcher statuses with no success/failure disposition: "
+            f"{sorted(status.value for status in unclassified)}"
+        )
+
+
+_verify_every_status_is_classified()
 
 
 @dataclass

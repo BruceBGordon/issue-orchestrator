@@ -21,6 +21,7 @@ from issue_orchestrator.infra.doctor.types import Check, DoctorResult
 from issue_orchestrator.infra.launcher import (
     LaunchResult,
     LaunchStatus,
+    UnclassifiedLaunchStatusError,
     UnknownLaunchStatusError,
 )
 
@@ -271,10 +272,64 @@ def test_launch_failure_error_never_produces_a_blank_message(blank: str | None) 
 
 
 def test_the_failure_type_map_covers_exactly_the_failure_statuses() -> None:
-    """A new failure status must not silently fall through as a success."""
-    assert set(LAUNCH_FAILURE_ERROR_TYPES) == {
-        status for status in LaunchStatus if status.is_failure
-    }
+    """A new failure status must not silently fall through as a success.
+
+    Grounded in ``failure_statuses()`` rather than in a scan over ``is_failure``:
+    the launcher separately proves the two disposition sets partition the enum,
+    so a member omitted from both cannot satisfy this assertion by being
+    invisible to it.
+    """
+    assert set(LAUNCH_FAILURE_ERROR_TYPES) == LaunchStatus.failure_statuses()
+
+
+def test_every_launch_status_is_explicitly_classified_by_the_mapping() -> None:
+    """Walk the whole enum: each member is a mapped failure or a real success."""
+    for status in LaunchStatus:
+        error = launch_failure_error(_launch_result(status, launched=False))
+        if status in LaunchStatus.failure_statuses():
+            assert error is not None, f"{status.value} produced no MCP error"
+            assert error["type"] == LAUNCH_FAILURE_ERROR_TYPES[status]
+            assert error["message"].strip()
+        else:
+            assert status in LaunchStatus.success_statuses()
+            assert error is None
+
+
+def test_an_unclassified_enum_member_fails_loudly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A future status added without a disposition must not read as success."""
+    monkeypatch.setattr(
+        LaunchStatus, "failure_statuses", classmethod(lambda cls: frozenset())
+    )
+    monkeypatch.setattr(
+        LaunchStatus, "success_statuses", classmethod(lambda cls: frozenset())
+    )
+
+    with pytest.raises(UnclassifiedLaunchStatusError):
+        launch_failure_error(_launch_result(LaunchStatus.DOCTOR_ERROR, launched=False))
+
+
+def test_tool_start_reports_an_unclassified_status_as_an_error_not_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End to end: the client sees a failure, never a silent "started"."""
+    app = McpApp(_settings())
+    app.override_port(19080)
+    _patch_launch(
+        monkeypatch, _launch_result(LaunchStatus.LAUNCH_ERROR, launched=False)
+    )
+    monkeypatch.setattr(
+        LaunchStatus, "failure_statuses", classmethod(lambda cls: frozenset())
+    )
+    monkeypatch.setattr(
+        LaunchStatus, "success_statuses", classmethod(lambda cls: frozenset())
+    )
+
+    result = asyncio.run(app.tool_start())
+
+    assert result["error"]["type"] == "UnclassifiedLaunchStatusError"
+    assert "launch_error" in result["error"]["message"]
 
 
 @pytest.mark.parametrize("unknown", ["doctor_eror", "supervisor_error", "", "OK"])

@@ -169,10 +169,14 @@ alone — never by re-reading `launch.status`.
 | `doctor_error` | A doctor check failed; nothing was started. | `{"message": "Doctor checks failed — <check>: <detail>; …", "type": "DoctorError"}` |
 | `launch_error` | Doctor passed, the subprocess failed to start. | `{"message": "<launcher error>", "type": "LaunchError"}` |
 
-That table is the complete vocabulary. The classification is exhaustive, not
-"anything unrecognised is fine": a status outside the five above is reported as
-an `UnknownLaunchStatusError`, never as a success. A client can therefore trust
-`error` without also validating `launch.status`.
+That table is the complete vocabulary, and the classification is total rather
+than "anything unrecognised is fine". There is no default-to-success branch on
+either side of it: a status outside the five above is reported as an
+`UnknownLaunchStatusError`, and a status added to the server's vocabulary
+without being declared a success or a failure is refused at startup and reported
+as an `UnclassifiedLaunchStatusError`. Neither can reach a client as a started
+orchestrator, so a client can trust `error` without also validating
+`launch.status`.
 
 The `launch` object is always returned when this call ran the launcher — it
 carries the full doctor report and the launcher's own `status`/`launched`

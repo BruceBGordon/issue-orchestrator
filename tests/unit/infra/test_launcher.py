@@ -6,6 +6,7 @@ from unittest.mock import MagicMock
 from issue_orchestrator.infra.launcher import (
     LaunchResult,
     LaunchStatus,
+    UnclassifiedLaunchStatusError,
     UnknownLaunchStatusError,
     launch_preflight_only,
     launch_subprocess,
@@ -58,6 +59,36 @@ class TestLaunchStatus:
         assert not LaunchStatus.OK.is_failure
         assert not LaunchStatus.DOCTOR_WARNING.is_failure
         assert not LaunchStatus.ALREADY_RUNNING.is_failure
+
+    def test_every_status_declares_a_success_or_failure_disposition(self):
+        """The guard: a member added to the enum cannot stay unclassified.
+
+        Compared against ``set(LaunchStatus)`` — the enum itself — rather than
+        against either disposition set, so adding ``SUPERVISOR_ERROR`` and
+        forgetting to classify it fails here instead of quietly reading as a
+        successful start at every consumer.
+        """
+        successes = LaunchStatus.success_statuses()
+        failures = LaunchStatus.failure_statuses()
+
+        assert successes | failures == set(LaunchStatus)
+        assert not successes & failures
+
+    def test_is_failure_never_defaults_to_success_for_an_unclassified_member(
+        self, monkeypatch
+    ):
+        """Omission must raise, because "not a known failure" is not "started"."""
+        monkeypatch.setattr(
+            LaunchStatus, "failure_statuses", classmethod(lambda cls: frozenset())
+        )
+        monkeypatch.setattr(
+            LaunchStatus, "success_statuses", classmethod(lambda cls: frozenset())
+        )
+
+        with pytest.raises(UnclassifiedLaunchStatusError) as excinfo:
+            LaunchStatus.DOCTOR_ERROR.is_failure
+
+        assert "doctor_error" in str(excinfo.value)
 
     @pytest.mark.parametrize(
         "value",
