@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
 
 import pytest
 
@@ -195,3 +196,72 @@ def test_mcp_repos_allowlist_empty_forbids_everything(
     monkeypatch.setenv("ISSUE_ORCHESTRATOR_MCP_REPOS_ALLOWLIST", "   ")
 
     assert _mcp_repos_allowlist() == []
+
+
+# ---------------------------------------------------------------------------
+# Documentation drift guard — see #6463.
+#
+# docs/user/mcp.md is the public tool reference for the MCP server. It is the
+# only place a client author can learn what the server exposes, so a tool
+# added to ``McpApp.register`` without a matching doc entry is a real defect,
+# not a formatting nit.
+# ---------------------------------------------------------------------------
+
+MCP_DOC_PATH = Path(__file__).resolve().parents[2] / "docs" / "user" / "mcp.md"
+
+# Tools the doc names deliberately even though they are not registered. Each
+# entry needs a documented reason for its absence; ``session.send`` is the
+# prompt-injection primitive removed in #5987 (F4).
+INTENTIONALLY_UNREGISTERED_TOOLS = {"orchestrator.session.send"}
+
+_DOCUMENTED_TOOL_PATTERN = re.compile(r"`(orchestrator\.[A-Za-z0-9_.]+)`")
+
+
+def _documented_tool_names() -> set[str]:
+    text = MCP_DOC_PATH.read_text(encoding="utf-8")
+    return {
+        match.group(1).rstrip(".")
+        for match in _DOCUMENTED_TOOL_PATTERN.finditer(text)
+    }
+
+
+def _registered_tool_names() -> set[str]:
+    app = McpApp(_settings())
+    fake = _FakeMcpServer()
+    app.register(fake)  # type: ignore[arg-type]
+    return set(fake.registered)
+
+
+def test_every_registered_tool_is_documented() -> None:
+    undocumented = sorted(_registered_tool_names() - _documented_tool_names())
+
+    assert not undocumented, (
+        "MCP tools registered but missing from docs/user/mcp.md: "
+        f"{undocumented}. Add a row (purpose, arguments, return shape) to the "
+        "tool reference."
+    )
+
+
+def test_doc_does_not_advertise_unregistered_tools() -> None:
+    registered = _registered_tool_names()
+    phantom = sorted(
+        _documented_tool_names() - registered - INTENTIONALLY_UNREGISTERED_TOOLS
+    )
+
+    assert not phantom, (
+        "docs/user/mcp.md documents tools the server does not register: "
+        f"{phantom}."
+    )
+    assert not (registered & INTENTIONALLY_UNREGISTERED_TOOLS), (
+        "A tool documented as intentionally omitted is now registered. "
+        "Re-review the security posture in the mcp_server module docstring "
+        "and docs/user/mcp.md before allowing this."
+    )
+
+
+def test_doc_records_why_session_send_is_absent() -> None:
+    """The omission is a security decision; it must stay explained in the doc."""
+    text = MCP_DOC_PATH.read_text(encoding="utf-8")
+
+    assert "orchestrator.session.send" in text
+    assert "prompt-injection" in text

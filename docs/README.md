@@ -15,6 +15,7 @@ Getting started with Issue Orchestrator:
 - [E2E Test Runner](user/e2e.md) - Async test execution
 - [Goal Pilot](user/goal_pilot.md) *(planned)* - Autonomous goal-driven orchestration
 - [VS Code Integration](user/vscode.md) - IDE integration via MCP
+- [MCP Server](user/mcp.md) - Connect any MCP client to the orchestrator
 - [FAQ](user/faq.md)
 
 ## For Developers

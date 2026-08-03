@@ -6,6 +6,7 @@ This extension gives you a native VS Code experience for Issue Orchestrator: liv
 
 1. **Install Issue Orchestrator (Python package)** so the MCP entrypoint exists on your PATH:
    - You should be able to run `issue-orchestrator-mcp --help`.
+   - See [MCP Server](mcp.md) for what that entrypoint is and what it exposes.
 2. **Create a repo config** in your repo:
    - `.issue-orchestrator/config/default.yaml`
    - Start from `examples/config.example.yaml` if you’re new.
@@ -66,13 +67,18 @@ The Control Center runs in a VS Code terminal and serves the web UI.
 
 ## MCP Server (Optional)
 
-You can run the MCP server manually:
+The extension drives the same MCP server you can connect any other MCP client
+to. You can run it manually:
 
 ```bash
 issue-orchestrator-mcp --repo-root /path/to/repo --auto-start
 ```
 
 The extension will detect and use it if running.
+
+For the full flag list, the `orchestrator.*` tool reference, a copy-paste
+client config, and the security posture (stdio-only transport, the repos
+allowlist, confirm-gated shutdown), see [MCP Server](mcp.md).
 
 ## Extension Tests
 

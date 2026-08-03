@@ -76,6 +76,12 @@ def _clean_git_env() -> dict[str, str]:
     env = os.environ.copy()
     for var in _GIT_ENV_STRIP:
         env.pop(var, None)
+    # Allow git push to the local bare repo this fixture creates under
+    # tmp_path when running inside an orchestrator session (the
+    # orchestrator's git wrapper blocks pushes by default). Same
+    # allowance as tests/integration/test_ai_gate_hooks.py and
+    # tests/simulated_scenarios/test_foreign_repo_lifecycle.py.
+    env["ORCHESTRATOR_GH_AUTH"] = "agent-done-authorized"
     return env
 
 
