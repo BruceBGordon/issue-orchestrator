@@ -21,6 +21,8 @@ from ..infra.runtime_artifacts import filter_orchestrator_untracked_planted
 from ..ports.git import Git, GitError, GitResult
 from ..ports.working_copy import (
     BranchPathsResult,
+    BranchTextFile,
+    BranchTextFilesResult,
     CommitInfo,
     BranchStatus,
     DiffResult,
@@ -273,6 +275,26 @@ class GitWorkingCopy:
                 error,
             )
             return DiffResult(success=False, error=error)
+
+    def read_branch_text_files(
+        self, worktree: Path, paths: tuple[str, ...]
+    ) -> BranchTextFilesResult:
+        """Return exact tracked ``HEAD`` content for selected text files."""
+
+        files: list[BranchTextFile] = []
+        try:
+            for path in paths:
+                result = self._run_git(worktree, ["show", f"HEAD:{path}"])
+                files.append(BranchTextFile(path=path, content=result.stdout))
+            return BranchTextFilesResult(success=True, files=tuple(files))
+        except GitError as exc:
+            error = _git_error_output(exc)
+            logger.warning(
+                "Failed to read branch-tip text files in %s: %s",
+                worktree,
+                error,
+            )
+            return BranchTextFilesResult(success=False, error=error)
 
     def branch_post_image_paths_against_base(
         self, worktree: Path, base_ref: str

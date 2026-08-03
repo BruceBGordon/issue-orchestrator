@@ -6,6 +6,8 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+from ..ports.working_copy import BranchTextFile
+
 
 _HUNK_RE = re.compile(r"@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
 _QUOTED_NESTED_DIFF_RE = re.compile(r"(?i)^(?:[rubf]{0,3})?[\"']{1,3}[+-]")
@@ -20,17 +22,6 @@ class AddedDiffLine:
     path: str
     line_number: int
     text: str
-
-
-@dataclass(frozen=True)
-class _NewDiffLine:
-    """One line from the new side of a unified-diff hunk."""
-
-    path: str
-    hunk: int
-    line_number: int
-    text: str
-    added: bool
 
 
 @dataclass(frozen=True)
@@ -80,53 +71,88 @@ _BANNED_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
 )
 
 
-def scan_added_test_skip_guards(diff_text: str) -> TestSkipGuardResult:
-    """Scan branch diff text for newly added test-skip constructs."""
+def added_test_paths(diff_text: str) -> tuple[str, ...]:
+    """Return test paths with added source lines that require lexical scanning."""
+
+    return tuple(dict.fromkeys(added.path for added in _test_additions(diff_text)))
+
+
+def scan_added_test_skip_guards(
+    diff_text: str, branch_files: tuple[BranchTextFile, ...]
+) -> TestSkipGuardResult:
+    """Scan added test lines using complete branch-tip source for lexical state."""
+
+    additions = _test_additions_by_path(diff_text)
+    files_by_path = {branch_file.path: branch_file for branch_file in branch_files}
+    if len(files_by_path) != len(branch_files):
+        raise ValueError("Branch-tip test file content contains duplicate paths")
+
+    missing_paths = additions.keys() - files_by_path.keys()
+    if missing_paths:
+        missing = ", ".join(sorted(missing_paths))
+        raise ValueError(f"Missing branch-tip test file content for: {missing}")
 
     violations: list[TestSkipGuardViolation] = []
-    current_hunk: tuple[str, int] | None = None
-    masker: _LiteralMasker | None = None
-    for line in _iter_new_diff_lines(diff_text):
-        if not _is_test_path(line.path):
-            continue
-        hunk = (line.path, line.hunk)
-        if hunk != current_hunk:
-            current_hunk = hunk
-            masker = _LiteralMasker(line.path)
-        assert masker is not None
-        code_text = masker.mask_line(line.text)
-        if not line.added or _looks_like_nested_diff_fixture(line.text):
-            continue
-        for label, pattern in _BANNED_PATTERNS:
-            if pattern.search(code_text):
-                violations.append(
-                    TestSkipGuardViolation(
-                        path=line.path,
-                        line_number=line.line_number,
-                        pattern=label,
-                        text=line.text,
-                    )
+    for path, added_lines in additions.items():
+        masker = _LiteralMasker(path)
+        remaining_line_numbers = set(added_lines)
+        for line_number, source_text in enumerate(
+            files_by_path[path].content.splitlines(), start=1
+        ):
+            code_text = masker.mask_line(source_text)
+            added = added_lines.get(line_number)
+            if added is None:
+                continue
+            if source_text != added.text:
+                raise ValueError(
+                    f"Branch-tip content does not match diff at {path}:{line_number}"
                 )
+            remaining_line_numbers.remove(line_number)
+            for label, pattern in _BANNED_PATTERNS:
+                if pattern.search(code_text):
+                    violations.append(
+                        TestSkipGuardViolation(
+                            path=path,
+                            line_number=line_number,
+                            pattern=label,
+                            text=source_text,
+                        )
+                    )
+        if remaining_line_numbers:
+            missing = ", ".join(str(number) for number in sorted(remaining_line_numbers))
+            raise ValueError(f"Branch-tip content is missing {path} line(s): {missing}")
     return TestSkipGuardResult(violations=tuple(violations))
+
+
+def _test_additions_by_path(
+    diff_text: str,
+) -> dict[str, dict[int, AddedDiffLine]]:
+    additions: dict[str, dict[int, AddedDiffLine]] = {}
+    for added in _test_additions(diff_text):
+        path_additions = additions.setdefault(added.path, {})
+        if added.line_number in path_additions:
+            raise ValueError(
+                f"Diff contains duplicate added line {added.path}:{added.line_number}"
+            )
+        path_additions[added.line_number] = added
+    return additions
+
+
+def _test_additions(diff_text: str) -> tuple[AddedDiffLine, ...]:
+    return tuple(
+        added
+        for added in iter_added_diff_lines(diff_text)
+        if _is_test_path(added.path)
+        and not _looks_like_nested_diff_fixture(added.text)
+    )
 
 
 def iter_added_diff_lines(diff_text: str) -> tuple[AddedDiffLine, ...]:
     """Return added lines from a unified diff with new-file line numbers."""
 
-    return tuple(
-        AddedDiffLine(path=line.path, line_number=line.line_number, text=line.text)
-        for line in _iter_new_diff_lines(diff_text)
-        if line.added
-    )
-
-
-def _iter_new_diff_lines(diff_text: str) -> tuple[_NewDiffLine, ...]:
-    """Return context and additions, preserving new-side lexical order."""
-
-    lines: list[_NewDiffLine] = []
+    added: list[AddedDiffLine] = []
     current_path: str | None = None
     new_line: int | None = None
-    hunk = 0
     for raw in diff_text.splitlines():
         if raw.startswith("diff --git "):
             current_path = None
@@ -137,53 +163,28 @@ def _iter_new_diff_lines(diff_text: str) -> tuple[_NewDiffLine, ...]:
             new_line = None
             continue
         if raw.startswith("@@"):
-            new_line = _parse_hunk_start(raw)
-            hunk += 1
+            match = _HUNK_RE.search(raw)
+            new_line = int(match.group(1)) if match else None
             continue
         if new_line is None:
             continue
-        if raw.startswith("+"):
-            _append_new_diff_line(
-                lines, current_path, hunk, new_line, raw[1:], added=True
-            )
+        if raw.startswith("+") and not raw.startswith("+++"):
+            if current_path is not None:
+                added.append(
+                    AddedDiffLine(
+                        path=current_path,
+                        line_number=new_line,
+                        text=raw[1:],
+                    )
+                )
             new_line += 1
             continue
-        if raw.startswith("-"):
+        if raw.startswith("-") and not raw.startswith("---"):
             continue
         if raw.startswith("\\ No newline at end of file"):
             continue
-        _append_new_diff_line(
-            lines, current_path, hunk, new_line, raw.removeprefix(" "), added=False
-        )
         new_line += 1
-    return tuple(lines)
-
-
-def _append_new_diff_line(
-    lines: list[_NewDiffLine],
-    path: str | None,
-    hunk: int,
-    line_number: int,
-    text: str,
-    *,
-    added: bool,
-) -> None:
-    if path is None:
-        return
-    lines.append(
-        _NewDiffLine(
-            path=path,
-            hunk=hunk,
-            line_number=line_number,
-            text=text,
-            added=added,
-        )
-    )
-
-
-def _parse_hunk_start(line: str) -> int | None:
-    match = _HUNK_RE.search(line)
-    return int(match.group(1)) if match else None
+    return tuple(added)
 
 
 def _parse_new_path(line: str) -> str | None:
@@ -235,6 +236,7 @@ class _LiteralFrame:
     delimiter: str
     interpolated: bool
     multiline: bool
+    line_start: int
 
 
 @dataclass
@@ -251,6 +253,86 @@ _LexicalFrame = _LiteralFrame | _InterpolationFrame | _BlockCommentFrame
 _PYTHON_SUFFIXES = {".py", ".pyi"}
 _JAVASCRIPT_SUFFIXES = {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".mts", ".cts"}
 _KOTLIN_SUFFIXES = {".kt", ".kts"}
+_JS_REGEX_PREFIX_KEYWORDS = {
+    "await",
+    "case",
+    "default",
+    "delete",
+    "do",
+    "else",
+    "extends",
+    "in",
+    "instanceof",
+    "new",
+    "of",
+    "return",
+    "throw",
+    "typeof",
+    "void",
+    "yield",
+}
+_JS_CONTROL_HEADER_KEYWORDS = {"catch", "for", "if", "switch", "while", "with"}
+
+
+def _js_closes_control_header(prefix: str) -> bool:
+    depth = 0
+    for index in range(len(prefix) - 1, -1, -1):
+        char = prefix[index]
+        if char == ")":
+            depth += 1
+            continue
+        if char != "(":
+            continue
+        depth -= 1
+        if depth != 0:
+            continue
+        header = re.search(r"(?:[^\W\d]|[$_])[\w$]*$", prefix[:index].rstrip())
+        return header is not None and header.group() in _JS_CONTROL_HEADER_KEYWORDS
+    return False
+
+
+def _js_closes_statement_block(prefix: str) -> bool:
+    depth = 0
+    opening_index: int | None = None
+    for index in range(len(prefix) - 1, -1, -1):
+        char = prefix[index]
+        if char == "}":
+            depth += 1
+        elif char == "{":
+            depth -= 1
+            if depth == 0:
+                opening_index = index
+                break
+    if opening_index is None:
+        return False
+
+    header = prefix[:opening_index].rstrip()
+    if not header:
+        return True
+    if header.endswith(")") and _js_closes_control_header(header):
+        return True
+
+    keyword = re.search(r"(?:[^\W\d]|[$_])[\w$]*$", header)
+    if keyword is not None and keyword.group() in {"do", "else", "finally", "try"}:
+        before_keyword = header[: keyword.start()].rstrip()
+        if not before_keyword.endswith((".", "#")):
+            return True
+
+    statement_start = r"(?:^|[;{}])\s*"
+    identifier = r"(?:[^\W\d]|[$_])[\w$]*"
+    function_header = (
+        rf"{statement_start}(?:(?:export\s+(?:default\s+)?)|async\s+)?"
+        rf"function\s*\*?\s*(?:{identifier})?.*\)\s*$"
+    )
+    class_header = (
+        rf"{statement_start}(?:export\s+(?:default\s+)?)?"
+        rf"class(?:\s+{identifier})?(?:\s+extends\s+.+)?\s*$"
+    )
+    label_header = rf"{statement_start}{identifier}\s*:\s*$"
+    return any(
+        re.search(pattern, header, re.DOTALL)
+        for pattern in (function_header, class_header, label_header)
+    )
 
 
 class _LiteralMasker:
@@ -266,6 +348,9 @@ class _LiteralMasker:
     def mask_line(self, text: str) -> str:
         """Mask one line and retain only genuinely multiline lexical state."""
 
+        for frame in self._frames:
+            if isinstance(frame, _LiteralFrame) and not frame.multiline:
+                frame.line_start = 0
         masked = list(text)
         index = 0
         while index < len(text):
@@ -284,7 +369,7 @@ class _LiteralMasker:
                 continue
             index = self._mask_code_token(text, masked, index)
 
-        self._discard_uncontinued_literal(text)
+        self._discard_uncontinued_literal(text, masked)
         return "".join(masked)
 
     def _mask_block_comment(self, text: str, masked: list[str], index: int) -> int:
@@ -348,7 +433,7 @@ class _LiteralMasker:
             return len(text)
         if not self._python and text.startswith("/*", index):
             return self._start_block_comment(text, masked, index)
-        regex_end = self._regex_end(text, index)
+        regex_end = self._regex_end(text, masked, index)
         if regex_end is not None:
             self._blank(masked, index, regex_end)
             return regex_end
@@ -368,18 +453,27 @@ class _LiteralMasker:
         self._blank(masked, index, end + 2)
         return end + 2
 
-    def _regex_end(self, text: str, index: int) -> int | None:
+    def _regex_end(
+        self, text: str, masked: list[str], index: int
+    ) -> int | None:
         if not self._javascript or text[index] != "/":
             return None
-        if not self._starts_js_regex(text, index):
+        if not self._starts_js_regex("".join(masked[:index])):
             return None
         return self._js_regex_end(text, index)
 
-    def _discard_uncontinued_literal(self, text: str) -> None:
+    def _discard_uncontinued_literal(self, text: str, masked: list[str]) -> None:
         if self._line_continues(text):
             return
-        for frame_index, frame in enumerate(self._frames):
+        for frame_index in range(len(self._frames) - 1, -1, -1):
+            frame = self._frames[frame_index]
             if isinstance(frame, _LiteralFrame) and not frame.multiline:
+                if any(
+                    isinstance(nested, _InterpolationFrame)
+                    for nested in self._frames[frame_index + 1 :]
+                ):
+                    continue
+                masked[frame.line_start :] = text[frame.line_start :]
                 del self._frames[frame_index:]
                 return
 
@@ -388,24 +482,33 @@ class _LiteralMasker:
         if quote not in {"'", '"', "`"}:
             return None
         if quote == "`":
-            return _LiteralFrame("`", self._javascript, multiline=True)
+            return _LiteralFrame(
+                "`", self._javascript, multiline=True, line_start=index
+            )
 
         delimiter = quote * 3 if text.startswith(quote * 3, index) else quote
         multiline = len(delimiter) == 3
         prefix = self._python_prefix(text, index) if self._python else ""
-        interpolated = (self._python and "f" in prefix.lower()) or (
+        interpolated = (
+            self._python and any(marker in prefix.lower() for marker in ("f", "t"))
+        ) or (
             self._kotlin and quote == '"'
         )
         return _LiteralFrame(
             delimiter,
             interpolated,
             multiline=multiline,
+            line_start=index,
         )
 
     @staticmethod
     def _python_prefix(text: str, quote_index: int) -> str:
         start = quote_index
-        while start > 0 and quote_index - start < 3 and text[start - 1] in "rRuUbBfF":
+        while (
+            start > 0
+            and quote_index - start < 3
+            and text[start - 1] in "rRuUbBfFtT"
+        ):
             start -= 1
         if start > 0 and (text[start - 1].isalnum() or text[start - 1] == "_"):
             return ""
@@ -421,13 +524,23 @@ class _LiteralMasker:
         return "${" if text.startswith("${", index) else None
 
     @staticmethod
-    def _starts_js_regex(text: str, index: int) -> bool:
-        prefix = text[:index].rstrip()
+    def _starts_js_regex(prefix: str) -> bool:
+        prefix = prefix.rstrip()
         if not prefix:
             return True
-        if prefix.endswith(("return", "case", "throw", "yield", "=>")):
+        if prefix.endswith("=>"):
             return True
-        return prefix[-1] in "([{=,:;!&|?+-*%^~<>"
+        identifier = re.search(r"(?:[^\W\d]|[$_])[\w$]*$", prefix)
+        if identifier is not None:
+            if identifier.group() not in _JS_REGEX_PREFIX_KEYWORDS:
+                return False
+            before_identifier = prefix[: identifier.start()].rstrip()
+            return not before_identifier.endswith((".", "#"))
+        if prefix.endswith(")") and _js_closes_control_header(prefix):
+            return True
+        if prefix.endswith("}") and _js_closes_statement_block(prefix):
+            return True
+        return prefix[-1] in "([{=,:;!&|?+-*/%^~<>"
 
     @staticmethod
     def _js_regex_end(text: str, start: int) -> int | None:
