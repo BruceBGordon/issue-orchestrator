@@ -45,7 +45,9 @@ def test_scan_added_test_skip_guards_flags_junit_assumption_in_test_path() -> No
     assert "Newly added test-skip guard" in result.reason()
 
 
-def test_scan_added_test_skip_guards_flags_test_file_name_without_test_directory() -> None:
+def test_scan_added_test_skip_guards_flags_test_file_name_without_test_directory() -> (
+    None
+):
     diff = """diff --git a/inventory-impl/src/main/kotlin/RepoTest.kt b/inventory-impl/src/main/kotlin/RepoTest.kt
 --- a/inventory-impl/src/main/kotlin/RepoTest.kt
 +++ b/inventory-impl/src/main/kotlin/RepoTest.kt
@@ -59,7 +61,9 @@ def test_scan_added_test_skip_guards_flags_test_file_name_without_test_directory
     assert result.violations[0].path == "inventory-impl/src/main/kotlin/RepoTest.kt"
 
 
-def test_scan_added_test_skip_guards_does_not_match_test_substrings_in_regular_files() -> None:
+def test_scan_added_test_skip_guards_does_not_match_test_substrings_in_regular_files() -> (
+    None
+):
     diff = """diff --git a/src/latest.py b/src/latest.py
 --- a/src/latest.py
 +++ b/src/latest.py
@@ -139,3 +143,101 @@ def test_scan_added_test_skip_guards_still_flags_code_after_a_literal() -> None:
 
     assert not result.ok
     assert result.violations[0].pattern == "JS test skip"
+
+
+def test_scan_added_test_skip_guards_flags_js_template_interpolation() -> None:
+    diff = """diff --git a/tests/guard.test.ts b/tests/guard.test.ts
+--- a/tests/guard.test.ts
++++ b/tests/guard.test.ts
+@@ -1,0 +2,1 @@
++const message = `result: ${test.skip("real skip", () => {})}`;
+"""
+
+    result = scan_added_test_skip_guards(diff)
+
+    assert not result.ok
+    assert result.violations[0].pattern == "JS test skip"
+
+
+def test_scan_added_test_skip_guards_flags_python_f_string_interpolation() -> None:
+    diff = """diff --git a/tests/test_guard.py b/tests/test_guard.py
+--- a/tests/test_guard.py
++++ b/tests/test_guard.py
+@@ -1,0 +2,1 @@
++message = f"result: {pytest.skip('real skip')}"
+"""
+
+    result = scan_added_test_skip_guards(diff)
+
+    assert not result.ok
+    assert result.violations[0].pattern == "pytest.skip"
+
+
+def test_scan_added_test_skip_guards_ignores_escaped_python_f_string_braces() -> None:
+    diff = """diff --git a/tests/test_guard.py b/tests/test_guard.py
+--- a/tests/test_guard.py
++++ b/tests/test_guard.py
+@@ -1,0 +2,1 @@
++message = f"example: {{pytest.skip('not executable')}}"
+"""
+
+    assert scan_added_test_skip_guards(diff).ok
+
+
+def test_scan_added_test_skip_guards_does_not_treat_js_regex_apostrophe_as_quote() -> (
+    None
+):
+    diff = """diff --git a/tests/guard.test.ts b/tests/guard.test.ts
+--- a/tests/guard.test.ts
++++ b/tests/guard.test.ts
+@@ -1,0 +2,1 @@
++const contraction = /don't/; test.skip("real skip", () => {});
+"""
+
+    result = scan_added_test_skip_guards(diff)
+
+    assert not result.ok
+    assert result.violations[0].pattern == "JS test skip"
+
+
+def test_scan_added_test_skip_guards_ignores_all_added_multiline_literal() -> None:
+    diff = '''diff --git a/tests/test_guard.py b/tests/test_guard.py
+--- a/tests/test_guard.py
++++ b/tests/test_guard.py
+@@ -1,0 +2,3 @@
++fixture = """documentation
++pytest.skip("not executable")
++"""
+'''
+
+    assert scan_added_test_skip_guards(diff).ok
+
+
+def test_scan_added_test_skip_guards_uses_context_opened_multiline_literal() -> None:
+    diff = '''diff --git a/tests/test_guard.py b/tests/test_guard.py
+--- a/tests/test_guard.py
++++ b/tests/test_guard.py
+@@ -10,2 +10,3 @@
+ fixture = """documentation
++pytest.skip("not executable")
+ """
+'''
+
+    assert scan_added_test_skip_guards(diff).ok
+
+
+def test_scan_added_test_skip_guards_flags_code_after_multiline_literal() -> None:
+    diff = '''diff --git a/tests/test_guard.py b/tests/test_guard.py
+--- a/tests/test_guard.py
++++ b/tests/test_guard.py
+@@ -1,0 +2,4 @@
++fixture = """documentation
++pytest.skip("not executable")
++"""
++pytest.skip("executable")
+'''
+
+    result = scan_added_test_skip_guards(diff)
+
+    assert not result.ok
+    assert [violation.line_number for violation in result.violations] == [5]
