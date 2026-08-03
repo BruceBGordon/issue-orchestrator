@@ -38,8 +38,11 @@ ordinary cooperative path on the platform these probes run on.
 Known limit: a descendant that leaves the process group on purpose (``setsid``)
 is unreachable by ``killpg`` and is not covered here.
 
-POSIX only — ``os.killpg`` has no Windows equivalent. The probes that use this
-already skip on native Windows.
+POSIX only — ``os.killpg`` has no Windows equivalent. Rather than degrade
+quietly there, :func:`run_in_process_group` refuses before it spawns anything:
+see :func:`supports_process_groups` and :class:`ProcessGroupUnsupportedError`.
+That refusal is asserted behavior, not skipped coverage — the unit suite pins it
+on every platform.
 """
 
 from __future__ import annotations
@@ -74,6 +77,26 @@ class ProcessGroupCleanupError(AssertionError):
     Subclasses ``AssertionError`` so pytest reports it as a failure rather than
     an infrastructure error.
     """
+
+
+class ProcessGroupUnsupportedError(NotImplementedError):
+    """Raised when this platform cannot contain a timed-out process tree.
+
+    Refusing is the point. The containment guarantee here rests entirely on
+    POSIX process groups, and a probe that ran without it would look like it
+    passed while leaving descendants free to write evidence after the harness
+    moved on. A loud refusal is the honest outcome; a quiet degraded run is not.
+    """
+
+
+def supports_process_groups() -> bool:
+    """Whether this platform has the primitives the containment guarantee needs.
+
+    ``os.killpg`` signals a whole group and ``os.waitid`` observes the leader's
+    exit without reaping it — the two operations the timeout path is built on.
+    Neither exists on native Windows.
+    """
+    return hasattr(os, "killpg") and hasattr(os, "waitid")
 
 
 def _signal_group(pgid: int, sig: signal.Signals) -> None:
@@ -158,10 +181,19 @@ def run_in_process_group(
             pipes before cleanup is declared failed.
 
     Raises:
+        ProcessGroupUnsupportedError: if this platform has no process groups.
+            Checked before anything is spawned, so a caller that ignores it
+            never gets a running child it cannot contain.
         subprocess.TimeoutExpired: after the whole process group has been
             killed and drained. Carries whatever output was captured.
         ProcessGroupCleanupError: if the group could not be proven dead.
     """
+    if not supports_process_groups():
+        raise ProcessGroupUnsupportedError(
+            f"cannot run {list(cmd)!r} under containment: this platform has no "
+            "os.killpg/os.waitid, so a timed-out process tree could not be "
+            "killed and its descendants could keep writing after the timeout"
+        )
     process = subprocess.Popen(  # noqa: S603
         list(cmd),
         stdout=subprocess.PIPE,

@@ -8,27 +8,75 @@ writing after the harness has moved on. A fake cannot demonstrate that.
 from __future__ import annotations
 
 import contextlib
+import functools
 import os
 import signal
 import subprocess
-import sys
 import time
 from collections.abc import Callable
 from pathlib import Path
 
 import pytest
 
-from tests.process_group_run import ProcessGroupCleanupError, run_in_process_group
+from tests import process_group_run
+from tests.process_group_run import (
+    ProcessGroupCleanupError,
+    ProcessGroupUnsupportedError,
+    run_in_process_group,
+)
 from tests.sandbox_probe_retry import decode_stream, run_until_paths_created
 
-pytestmark = pytest.mark.skipif(
-    sys.platform.startswith("win"),
-    reason="process-group signalling (os.killpg) is POSIX-only",
-)
+
+def containment_behavior(test: Callable[..., None]) -> Callable[..., None]:
+    """Assert this platform's real containment behavior, whichever it is.
+
+    Deliberately not ``skipif``. A platform without process groups is not a
+    platform where this module has nothing to say — it is one where the runner
+    must *refuse*, and that refusal is the containment guarantee doing its job.
+    Skipping would report the suite as absent on exactly the platform whose
+    behavior most needs pinning, so the unsupported outcome is asserted instead
+    and no test here is ever reported as skipped.
+    """
+
+    @functools.wraps(test)
+    def wrapper(**kwargs: object) -> None:
+        if process_group_run.supports_process_groups():
+            test(**kwargs)
+            return
+        tmp_path = kwargs["tmp_path"]
+        assert isinstance(tmp_path, Path)
+        with pytest.raises(ProcessGroupUnsupportedError):
+            run_in_process_group(["cmd", "/c", "exit"], cwd=tmp_path, timeout=1)
+
+    return wrapper
+
 
 # Long enough that the probe is unambiguously killed mid-flight rather than
 # finishing on its own.
 _BLOCK_SECONDS = 300
+
+
+def test_a_platform_without_process_groups_refuses_before_spawning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The unsupported branch, asserted on every platform rather than skipped.
+
+    Simulated rather than waiting for a Windows host, so the refusal is covered
+    on the machines that actually run this suite. The ordering is the point:
+    refusing *after* spawning would leave a live child under a runner that has
+    already admitted it cannot contain one.
+    """
+    monkeypatch.setattr(process_group_run, "supports_process_groups", lambda: False)
+    monkeypatch.setattr(
+        process_group_run.subprocess,
+        "Popen",
+        lambda *a, **kw: pytest.fail("spawned a child it cannot contain"),
+    )
+
+    with pytest.raises(ProcessGroupUnsupportedError) as excinfo:
+        run_in_process_group(["/bin/sh", "-c", "true"], cwd=tmp_path, timeout=1)
+
+    assert "os.killpg" in str(excinfo.value)
 
 
 def _pid_has_exited(pid: int, *, deadline_seconds: float = 10.0) -> bool:
@@ -105,6 +153,7 @@ _GRANDCHILD_SCRIPTS = pytest.mark.parametrize(
 _TERMINATE_GRACE = 0.5
 
 
+@containment_behavior
 def test_returns_the_completed_process_for_a_normal_command(tmp_path: Path) -> None:
     result = run_in_process_group(
         ["/bin/sh", "-c", "echo hello; echo oops >&2"], cwd=tmp_path, timeout=30
@@ -115,12 +164,14 @@ def test_returns_the_completed_process_for_a_normal_command(tmp_path: Path) -> N
     assert result.stderr.strip() == "oops"
 
 
+@containment_behavior
 def test_propagates_a_non_zero_exit_without_raising(tmp_path: Path) -> None:
     result = run_in_process_group(["/bin/sh", "-c", "exit 3"], cwd=tmp_path, timeout=30)
 
     assert result.returncode == 3
 
 
+@containment_behavior
 def test_passes_the_environment_through(tmp_path: Path) -> None:
     result = run_in_process_group(
         ["/bin/sh", "-c", "echo $PROBE_MARKER"],
@@ -132,6 +183,7 @@ def test_passes_the_environment_through(tmp_path: Path) -> None:
     assert result.stdout.strip() == "MARKER_5f2a"
 
 
+@containment_behavior
 def test_timeout_raises_with_the_captured_output(tmp_path: Path) -> None:
     with pytest.raises(subprocess.TimeoutExpired) as excinfo:
         run_in_process_group(
@@ -144,6 +196,7 @@ def test_timeout_raises_with_the_captured_output(tmp_path: Path) -> None:
 
 
 @_GRANDCHILD_SCRIPTS
+@containment_behavior
 def test_a_grandchild_cannot_outlive_the_timeout_cleanup(
     tmp_path: Path, build_script: Callable[..., str]
 ) -> None:
@@ -179,6 +232,7 @@ def test_a_grandchild_cannot_outlive_the_timeout_cleanup(
 
 
 @_GRANDCHILD_SCRIPTS
+@containment_behavior
 def test_a_surviving_grandchild_cannot_supply_the_next_attempt_s_evidence(
     tmp_path: Path, build_script: Callable[..., str]
 ) -> None:
@@ -224,6 +278,7 @@ def test_a_surviving_grandchild_cannot_supply_the_next_attempt_s_evidence(
     assert not expected.exists()
 
 
+@containment_behavior
 def test_sigkill_is_sent_even_when_the_pipes_have_already_gone_quiet(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -265,6 +320,7 @@ def test_sigkill_is_sent_even_when_the_pipes_have_already_gone_quiet(
     )
 
 
+@containment_behavior
 def test_a_descendant_that_survives_sigkill_fails_loudly(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

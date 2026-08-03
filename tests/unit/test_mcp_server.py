@@ -804,6 +804,100 @@ def test_tool_reference_rows_span_every_subsection_table() -> None:
     }
 
 
+# Claims the repository tools cannot support. They read the persistent registry
+# plus the server's own working directory — there is no process enumeration and
+# no lock-file scan — so any of these phrases is a factual overclaim about what
+# a token-less client can see, wherever in the page it appears.
+_HOST_WIDE_DISCOVERY_CLAIMS = (
+    "every repository on the host",
+    "all repositories on the host",
+    "repositories across the host",
+    "enumerate every repository",
+    "scans the host",
+    "every git checkout",
+)
+
+_REPO_SCOPE_ANCHOR = "#scope-of-the-repository-tools"
+
+
+def _heading_depths(text: str) -> list[tuple[int, str]]:
+    """``(line index, heading)`` for every real heading.
+
+    Fence-aware: a shell comment inside a ``` block starts with ``#`` but is not
+    a heading, and treating one as a section boundary silently truncates the
+    section under inspection.
+    """
+    headings: list[tuple[int, str]] = []
+    in_fence = False
+    for index, line in enumerate(text.splitlines()):
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            in_fence = not in_fence
+            continue
+        if not in_fence and stripped.startswith("#"):
+            headings.append((index, stripped))
+    return headings
+
+
+def _doc_section(text: str, heading: str) -> str:
+    """The body of ``heading``, up to the next heading of the same or higher level."""
+    lines = text.splitlines()
+    headings = _heading_depths(text)
+    start = next(index for index, found in headings if found == heading)
+    depth = len(heading) - len(heading.lstrip("#"))
+    for index, found in headings:
+        if index > start and len(found) - len(found.lstrip("#")) <= depth:
+            return "\n".join(lines[start:index])
+    return "\n".join(lines[start:])
+
+
+def test_doc_never_claims_host_wide_repository_discovery() -> None:
+    """The summaries must not outgrow the scope section they summarise.
+
+    The page states the real scope in one place; a security or authentication
+    summary that promises host-wide enumeration contradicts it and overstates
+    what a client without a bearer token can actually see.
+    """
+    text = MCP_DOC_PATH.read_text(encoding="utf-8").lower()
+
+    overclaims = [claim for claim in _HOST_WIDE_DISCOVERY_CLAIMS if claim in text]
+
+    assert not overclaims, (
+        f"docs/user/mcp.md claims host-wide repository discovery: {overclaims}. "
+        "The repository tools read the registry plus the server's working "
+        "directory; see the 'Scope of the repository tools' section."
+    )
+
+
+@pytest.mark.parametrize(
+    "heading",
+    ["### Authentication to the Control API", "## Security and Operational Notes"],
+)
+def test_doc_summaries_point_at_the_repository_scope(heading: str) -> None:
+    """Both summaries must route the reader to the authoritative scope.
+
+    They describe what a token-less client can see, so they cannot be read
+    safely without the limits that section sets out.
+    """
+    section = _doc_section(MCP_DOC_PATH.read_text(encoding="utf-8"), heading)
+
+    assert _REPO_SCOPE_ANCHOR in section, (
+        f"{heading!r} describes token-free disclosure without linking "
+        f"{_REPO_SCOPE_ANCHOR}"
+    )
+
+
+def test_the_repository_scope_anchor_resolves() -> None:
+    """A link the summaries depend on must not silently rot."""
+    text = MCP_DOC_PATH.read_text(encoding="utf-8")
+    anchors = {
+        "#" + heading.lstrip("#").strip().lower().replace(" ", "-").replace("`", "")
+        for _, heading in _heading_depths(text)
+    }
+
+    assert _REPO_SCOPE_ANCHOR in anchors
+
+
 def test_doc_records_why_session_send_is_absent() -> None:
     """The omission is a security decision; it must stay explained in the doc."""
     text = MCP_DOC_PATH.read_text(encoding="utf-8")

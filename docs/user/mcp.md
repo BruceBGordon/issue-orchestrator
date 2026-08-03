@@ -116,7 +116,10 @@ running engine need one too. Not every tool does. A large part of the surface
 runs entirely inside the MCP process — supervisor, launcher, doctor, and
 repository detection — and never presents a token at all. A client that cannot
 authenticate to any Control API can still start and stop orchestrators, run
-diagnostics, and enumerate every repository on the host. See
+diagnostics, and list the repositories visible to
+[the repository tools](#scope-of-the-repository-tools) — the ones in the
+persistent registry, plus the server's own working directory when it is an
+eligible Git checkout. That is a registry lookup, not a machine-wide sweep. See
 [Security and Operational Notes](#security-and-operational-notes) for the full
 split.
 
@@ -335,9 +338,13 @@ Two consequences worth being explicit about:
 - The bound-repository `orchestrator.start`/`orchestrator.stop` are just as
   token-free as the multi-repository pair. A client with no usable token can
   stop the orchestrator this server is bound to, not only ones it names by path.
-- `orchestrator.repos` and `orchestrator.state` enumerate orchestrators and
-  repositories across the host, so the local half discloses more than the bound
-  repository.
+- `orchestrator.repos` and `orchestrator.state` disclose more than the bound
+  repository — but only what
+  [the repository tools can see](#scope-of-the-repository-tools): registered
+  repositories plus the server's eligible working directory, with their
+  running state, PID, and port. A repository that is neither registered nor the
+  server's working directory stays invisible, so this is not host-wide
+  discovery.
 
 Stopping is not a privilege escalation, so the worst outcome remains a denial
 of service — but it is a denial of service available to any client that can
