@@ -160,6 +160,47 @@ def _run(
     )
 
 
+_TIMEOUT_RETURNCODE = 124
+
+
+def _decoded(stream: str | bytes | None) -> str:
+    if stream is None:
+        return ""
+    if isinstance(stream, bytes):
+        return stream.decode("utf-8", errors="replace")
+    return stream
+
+
+def _run_attempt(
+    cmd: list[str],
+    *,
+    cwd: Path,
+    timeout: int,
+) -> subprocess.CompletedProcess[str]:
+    """Run one probe attempt, treating a timeout as a failed attempt.
+
+    The probe drives a live CLI, so under a loaded parallel run it can blow
+    the deadline without the sandbox having misbehaved. Letting
+    ``TimeoutExpired`` escape aborts the whole test and skips the very retry
+    ``run_until_paths_created`` exists to provide. Returning a failed attempt
+    keeps the retry, and keeps every breach assertion running against
+    whatever evidence the attempt did leave on disk. If the retry also fails
+    to produce the expected paths, the caller's assertions still fail — with
+    the timeout text included in the reported output.
+    """
+    try:
+        return _run(cmd, cwd=cwd, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        return subprocess.CompletedProcess(
+            args=cmd,
+            returncode=_TIMEOUT_RETURNCODE,
+            stdout=_decoded(exc.stdout),
+            stderr=(
+                f"probe timed out after {timeout}s\n{_decoded(exc.stderr)}"
+            ),
+        )
+
+
 def run_until_paths_created(
     cmd: list[str],
     *,
@@ -175,7 +216,7 @@ def run_until_paths_created(
     """Retry an incomplete interaction and snapshot every attempt's evidence."""
     outputs: list[str] = []
     snapshots: list[dict[Path, bytes | None]] = []
-    result = _run(cmd, cwd=cwd, timeout=timeout)
+    result = _run_attempt(cmd, cwd=cwd, timeout=timeout)
     for attempt in range(1, 3):
         combined = (result.stdout or "") + (result.stderr or "")
         outputs.append(f"attempt {attempt}:\n{combined}")
@@ -186,7 +227,7 @@ def run_until_paths_created(
         if all(path.exists() for path in expected_paths):
             break
         if attempt < 2:
-            result = _run(cmd, cwd=cwd, timeout=timeout)
+            result = _run_attempt(cmd, cwd=cwd, timeout=timeout)
     return result, "\n".join(outputs), tuple(snapshots)
 
 
