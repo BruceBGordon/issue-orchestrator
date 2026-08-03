@@ -221,6 +221,7 @@ def test_recovered_awaiting_merge_entry_reconciles_when_pr_is_merged() -> None:
     state = OrchestratorState(session_history=[entry])
     repository_host = MagicMock()
     repository_host.get_pr.return_value = _pr("merged")
+    repository_host.get_issue.return_value = _issue("closed")
 
     result = AwaitingMergeReconciler(
         repository_host,
@@ -234,13 +235,78 @@ def test_recovered_awaiting_merge_entry_reconciles_when_pr_is_merged() -> None:
     assert result.reconciliations[0].status == "merged"
     assert result.reconciliations[0].status_reason == "PR merged; awaiting merge reconciled"
     assert result.reconciliations[0].source == "pull_request"
+    # GitHub's closing keyword auto-closed the issue — no fallback needed.
+    assert result.reconciliations[0].issue_open is False
     assert entry.pr_url == "https://github.com/owner/repo/pull/318"
     repository_host.get_pr.assert_called_once_with(318)
     # A terminal PR must NOT be status-rollup-polled — that GraphQL round-trip
     # (and its permission-wall exposure) is exactly the per-tick noise #6600
     # removes.
     repository_host.read_pr_status_check_rollup.assert_not_called()
-    repository_host.get_issue.assert_not_called()
+    # The merged transition reads the issue exactly once, to decide the
+    # close-on-merge fallback (porchpin #81). This is once per PR lifecycle at
+    # the terminal transition — not the per-tick polling #6600 removed.
+    repository_host.get_issue.assert_called_once_with(228)
+
+
+def test_merged_pr_with_open_issue_flags_close_on_merge_fallback() -> None:
+    """A merged PR whose issue is still open means GitHub's closing-keyword
+    auto-close did not fire (word-boundary-defeated reference or none at
+    all). The fact must carry issue_open=True so the planner orders the
+    close-on-merge fallback (porchpin case file #81)."""
+    entry = _history_entry()
+    state = OrchestratorState(session_history=[entry])
+    repository_host = MagicMock()
+    repository_host.get_pr.return_value = _pr("merged")
+    repository_host.get_issue.return_value = _issue("open")
+
+    result = AwaitingMergeReconciler(
+        repository_host,
+        clock=lambda: 1234.5,
+    ).discover(state)
+
+    assert result.discovered == 1
+    assert result.reconciliations[0].status == "merged"
+    assert result.reconciliations[0].issue_open is True
+
+
+def test_merged_pr_issue_fetch_error_leaves_entry_reconcilable() -> None:
+    """When the issue state cannot be read, the entry must NOT be finalized
+    against a guessed state: fail-open recreates the relaunch bug and raising
+    aborts the gather tick. Skip and retry next pass."""
+    entry = _history_entry()
+    state = OrchestratorState(session_history=[entry])
+    repository_host = MagicMock()
+    repository_host.get_pr.return_value = _pr("merged")
+    repository_host.get_issue.side_effect = RepositoryHostError("boom")
+
+    result = AwaitingMergeReconciler(
+        repository_host,
+        clock=lambda: 1234.5,
+    ).discover(state)
+
+    assert result.discovered == 0
+    assert result.skipped == 1
+    assert result.reconciliations == ()
+
+
+def test_merged_pr_with_missing_issue_reconciles_without_close() -> None:
+    """A host that reports the issue missing has nothing to close; holding the
+    entry hostage would strand it, so it finalizes without the fallback."""
+    entry = _history_entry()
+    state = OrchestratorState(session_history=[entry])
+    repository_host = MagicMock()
+    repository_host.get_pr.return_value = _pr("merged")
+    repository_host.get_issue.return_value = None
+
+    result = AwaitingMergeReconciler(
+        repository_host,
+        clock=lambda: 1234.5,
+    ).discover(state)
+
+    assert result.discovered == 1
+    assert result.reconciliations[0].status == "merged"
+    assert result.reconciliations[0].issue_open is False
 
 
 def test_recovered_entry_reconciles_when_linked_issue_is_closed() -> None:

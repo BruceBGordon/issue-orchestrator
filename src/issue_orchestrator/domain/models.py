@@ -1398,6 +1398,12 @@ class DiscoveredAwaitingMergeReconciliation:
     status_reason: str
     source: AwaitingMergeReconciliationSource
     issue_key: str = ""  # stable_id; falls back to str(issue_number) when empty
+    # True when the PR merged but the GitHub issue is still open — i.e. no
+    # closing reference registered on the PR (GitHub's closing-keyword parse is
+    # word-boundary sensitive and easily defeated), so auto-close never fired.
+    # The Planner turns this into a close-on-merge fallback so the closing
+    # keyword is a redundancy, not the sole close mechanism.
+    issue_open: bool = False
 
 
 @dataclass(frozen=True)

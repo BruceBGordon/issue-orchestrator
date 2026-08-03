@@ -612,9 +612,10 @@ class SupersedePullRequestAction(Action):
 
 @dataclass(frozen=True)
 class CloseIssueAction(Action):
-    """Close an issue through the repository host."""
+    """Close an issue; a ``comment`` posts first (best-effort, never blocks)."""
 
     issue_number: int = 0
+    comment: str = ""
     action_type: ActionType = field(default=ActionType.CLOSE_ISSUE, init=False)
 
 
@@ -673,19 +674,14 @@ class RecoverTerminalIssueAction(Action):
     awaiting-merge history — one owner command for the terminal-recovery
     ordering invariant.
 
-    Terminal recovery must shed the transient workflow labels (``pr-pending``,
-    ``publish-failed``, ``publish-fail-count-N``, blocking labels) from GitHub +
-    the local ``label_store`` *before* the history entry transitions to its
-    terminal status. The applier sheds first and finalizes history only on
-    success: if the (best-effort, GitHub-write) shed fails, the history entry is
-    left in its reconcilable awaiting-merge status so the next awaiting-merge
-    discovery pass re-finds and retries the cleanup, instead of terminalizing
-    the entry and stranding exactly the labels this P0 removes (#6431).
-
-    The exact label set is decided at apply time from the issue's live labels,
-    so the planner need not know the (usually closed/merged) issue's labels.
-    The inherited ``reason`` is the audit/shed reason; ``status_reason`` is the
-    status reason persisted to history.
+    Terminal recovery sheds the transient workflow labels (``pr-pending``,
+    ``publish-failed``, ``publish-fail-count-N``, blocking labels) from GitHub
+    + the local ``label_store`` *before* the history entry terminalizes: a
+    failed shed (or close, below) leaves the entry reconcilable so the next
+    discovery pass retries, instead of stranding the labels this P0 removes
+    (#6431). The label set is decided at apply time from live labels. The
+    inherited ``reason`` is the audit/shed reason; ``status_reason`` is
+    persisted to history.
     """
 
     issue_number: int = 0
@@ -695,6 +691,11 @@ class RecoverTerminalIssueAction(Action):
     source: AwaitingMergeReconciliationSource = "pull_request"
     status_reason: str = ""
     issue_key: str = ""  # stable_id for SSE events; falls back to str(issue_number) when empty
+    # Close-on-merge fallback: PR merged but the issue is still open (no
+    # closing reference registered, so GitHub's auto-close never fired). The
+    # applier closes it between the label shed and the history finalization —
+    # rationale and ordering invariant in the close_on_merge module.
+    close_issue: bool = False
     action_type: ActionType = field(
         default=ActionType.RECOVER_TERMINAL_ISSUE, init=False
     )

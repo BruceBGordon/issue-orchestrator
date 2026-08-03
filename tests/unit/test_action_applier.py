@@ -2191,6 +2191,124 @@ class TestRecoverTerminalIssueAction:
         assert entry.status == "merged"
         assert entry.status_reason == "PR merged; awaiting merge reconciled"
 
+    def _close_on_merge_action(self):
+        return RecoverTerminalIssueAction(
+            issue_number=228,
+            pr_number=318,
+            pr_url="https://github.com/test/repo/pull/318",
+            status="merged",
+            source="pull_request",
+            status_reason="PR merged; awaiting merge reconciled",
+            issue_key="M1-228",
+            reason="awaiting-merge terminal: merged",
+            close_issue=True,
+        )
+
+    def test_close_on_merge_closes_issue_before_finalizing_history(
+        self, mock_labels, mock_sessions, mock_events, mock_repository_host,
+        real_label_manager,
+    ):
+        """Close-on-merge fallback (porchpin #81): a merged PR whose issue is
+        still open gets the issue closed, with an explanatory comment, before
+        the history entry terminalizes."""
+        entry = self._awaiting_merge_entry()
+        applier = self._make_applier(
+            mock_labels, mock_sessions, mock_events, mock_repository_host,
+            real_label_manager,
+            github_labels=["pr-pending", "agent:backend"],
+            history_entry=entry,
+        )
+
+        result = applier.apply(self._close_on_merge_action())
+
+        assert result.success
+        assert result.details["closed_issue"] is True
+        mock_repository_host.update_issue_state.assert_called_once_with(
+            228, "closed",
+        )
+        comment_body = mock_repository_host.add_comment.call_args.args[1]
+        assert "https://github.com/test/repo/pull/318" in comment_body
+        assert "no closing reference" in comment_body
+        assert entry.status == "merged"
+
+    def test_close_on_merge_failure_leaves_history_reconcilable(
+        self, mock_labels, mock_sessions, mock_events, mock_repository_host,
+        real_label_manager,
+    ):
+        """A failed close must NOT terminalize history: an open issue with
+        terminal merged history is exactly the relaunch-after-restart bug this
+        fallback exists to prevent. Leave the entry reconcilable for retry."""
+        mock_repository_host.update_issue_state.side_effect = Exception(
+            "GitHub 502 closing issue"
+        )
+        entry = self._awaiting_merge_entry()
+        applier = self._make_applier(
+            mock_labels, mock_sessions, mock_events, mock_repository_host,
+            real_label_manager,
+            github_labels=["pr-pending", "agent:backend"],
+            history_entry=entry,
+        )
+
+        result = applier.apply(self._close_on_merge_action())
+
+        assert not result.success
+        assert "close-on-merge" in (result.error or "")
+        # Entry stays in its reconcilable status for the next discovery pass.
+        assert entry.status == "completed"
+
+    def test_close_on_merge_comment_failure_still_closes(
+        self, mock_labels, mock_sessions, mock_events, mock_repository_host,
+        real_label_manager,
+    ):
+        """The comment is best-effort; the close is the safety-critical write."""
+        mock_repository_host.add_comment.side_effect = Exception("comment 502")
+        entry = self._awaiting_merge_entry()
+        applier = self._make_applier(
+            mock_labels, mock_sessions, mock_events, mock_repository_host,
+            real_label_manager,
+            github_labels=["pr-pending", "agent:backend"],
+            history_entry=entry,
+        )
+
+        result = applier.apply(self._close_on_merge_action())
+
+        assert result.success
+        mock_repository_host.update_issue_state.assert_called_once_with(
+            228, "closed",
+        )
+        assert entry.status == "merged"
+
+    def test_no_close_without_close_issue_flag(
+        self, mock_labels, mock_sessions, mock_events, mock_repository_host,
+        real_label_manager,
+    ):
+        """Default recovery (issue already closed, or closed-unmerged PR)
+        must never touch the issue's open/closed state."""
+        entry = self._awaiting_merge_entry()
+        applier = self._make_applier(
+            mock_labels, mock_sessions, mock_events, mock_repository_host,
+            real_label_manager,
+            github_labels=["pr-pending", "agent:backend"],
+            history_entry=entry,
+        )
+        action = RecoverTerminalIssueAction(
+            issue_number=228,
+            pr_number=318,
+            pr_url="https://github.com/test/repo/pull/318",
+            status="merged",
+            source="pull_request",
+            status_reason="PR merged; awaiting merge reconciled",
+            issue_key="M1-228",
+            reason="awaiting-merge terminal: merged",
+        )
+
+        result = applier.apply(action)
+
+        assert result.success
+        assert result.details["closed_issue"] is False
+        mock_repository_host.update_issue_state.assert_not_called()
+        assert entry.status == "merged"
+
     def test_shed_failure_leaves_history_reconcilable(
         self, mock_labels, mock_sessions, mock_events, mock_repository_host,
         real_label_manager,

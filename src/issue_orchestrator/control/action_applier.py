@@ -580,6 +580,17 @@ class ActionApplier:
         self._require_expected(action, action.issue_number)
         self._verify_claim_before_write(action, action.issue_number)
 
+        if action.comment:
+            # Best-effort: the close is the safety-critical write; a failed
+            # comment must never strand an issue open.
+            try:
+                self.repository_host.add_comment(action.issue_number, action.comment)
+            except Exception as e:
+                logger.warning(
+                    issue_log(action.issue_number, "Failed to post close comment: %s"),
+                    e,
+                )
+
         try:
             self.repository_host.update_issue_state(action.issue_number, "closed")
             logger.info(issue_log(action.issue_number, "Issue closed"))
@@ -1358,6 +1369,37 @@ Maximum rework cycles ({action.max_rework_cycles}) exceeded.
                 pr_number=action.pr_number,
             )
 
+        if action.close_issue:
+            # Close-on-merge fallback (porchpin #81): the PR merged but no
+            # closing reference registered, so GitHub never auto-closed the
+            # issue. Close it BEFORE finalizing history, under the same
+            # ordering invariant as the shed: a failed close leaves the entry
+            # reconcilable so the next discovery pass retries, instead of
+            # terminalizing the history and leaving an open issue that the
+            # first planning pass after a restart would relaunch. If the close
+            # succeeds but history finalization fails, the next pass reconciles
+            # terminal-via-issue-closure — the fallback is idempotent.
+            close_result = self._apply_close_issue(CloseIssueAction(
+                issue_number=action.issue_number,
+                comment=(
+                    f"Closing: {action.pr_url or f'PR #{action.pr_number}'} "
+                    "merged this issue's work, but the PR registered no "
+                    "closing reference, so GitHub did not auto-close the "
+                    "issue. The orchestrator closed it during awaiting-merge "
+                    "reconciliation. If this issue was intentionally left "
+                    "open for remaining scope, reopen it."
+                ),
+                reason=action.status_reason or action.reason,
+            ))
+            if not close_result.success:
+                return ActionResult.fail(
+                    action,
+                    "close-on-merge fallback failed; awaiting-merge history "
+                    f"left reconcilable for retry: {close_result.error}",
+                    issue_number=action.issue_number,
+                    pr_number=action.pr_number,
+                )
+
         history_result = self._apply_reconcile_history_entry(
             ReconcileHistoryEntryAction(
                 issue_number=action.issue_number,
@@ -1382,6 +1424,7 @@ Maximum rework cycles ({action.max_rework_cycles}) exceeded.
             pr_number=action.pr_number,
             status=action.status,
             shed_removed=list(shed_result.details.get("removed", [])),
+            closed_issue=action.close_issue,
         )
 
     def _apply_queue_review(self, action: Action) -> ActionResult:
