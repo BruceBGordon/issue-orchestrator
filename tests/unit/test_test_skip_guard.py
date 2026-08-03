@@ -316,6 +316,41 @@ def test_scan_added_test_skip_guards_tracks_multiline_python_interpolation() -> 
     assert [violation.line_number for violation in result.violations] == [2]
 
 
+def test_scan_added_test_skip_guards_masks_inert_python_format_spec_text() -> None:
+    diff = '''diff --git a/tests/test_guard.py b/tests/test_guard.py
+--- a/tests/test_guard.py
++++ b/tests/test_guard.py
+@@ -0,0 +1,2 @@
++inert = f"{value:pytest.skip('format text')}"
++executable = f"{value:{pytest.skip('nested field')}}"
+'''
+
+    result = _scan(diff)
+
+    assert [violation.line_number for violation in result.violations] == [2]
+
+
+def test_scan_added_test_skip_guards_fails_closed_for_unknown_literal_syntax() -> None:
+    diff = '''diff --git a/tests/GuardSpec.scala b/tests/GuardSpec.scala
+--- a/tests/GuardSpec.scala
++++ b/tests/GuardSpec.scala
+@@ -0,0 +1,1 @@
++val message = s"${assumeTrue(false)}"
+diff --git a/tests/GuardSpec.groovy b/tests/GuardSpec.groovy
+--- a/tests/GuardSpec.groovy
++++ b/tests/GuardSpec.groovy
+@@ -0,0 +1,1 @@
++def message = "${assumeFalse(false)}"
+'''
+
+    result = _scan(diff)
+
+    assert [(violation.path, violation.pattern) for violation in result.violations] == [
+        ("tests/GuardSpec.scala", "JUnit assumeTrue"),
+        ("tests/GuardSpec.groovy", "JUnit assumeFalse"),
+    ]
+
+
 def test_scan_added_test_skip_guards_ignores_all_added_multiline_literal() -> None:
     diff = '''diff --git a/tests/test_guard.py b/tests/test_guard.py
 --- a/tests/test_guard.py
