@@ -239,13 +239,13 @@
     "test": "npm run compile && node ./dist/test/runTest.js"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@modelcontextprotocol/sdk": "^1.30.0",
     "eventsource": "^4.1.0"
   },
   "devDependencies": {
-    "@vscode/test-electron": "^3.0.0",
+    "@vscode/test-electron": "^3.1.0",
     "@types/eventsource": "^3.0.0",
-    "@types/node": "^26.1.1",
+    "@types/node": "^26.1.2",
     "@types/vscode": "~1.100.0",
     "@types/mocha": "^10.0.10",
     "glob": "^13.0.6",
