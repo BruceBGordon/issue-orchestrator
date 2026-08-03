@@ -242,6 +242,9 @@ class _LiteralFrame:
 @dataclass
 class _InterpolationFrame:
     depth: int = 1
+    paren_depth: int = 0
+    bracket_depth: int = 0
+    format_spec: bool = False
 
 
 @dataclass
@@ -253,6 +256,7 @@ _LexicalFrame = _LiteralFrame | _InterpolationFrame | _BlockCommentFrame
 _PYTHON_SUFFIXES = {".py", ".pyi"}
 _JAVASCRIPT_SUFFIXES = {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".mts", ".cts"}
 _KOTLIN_SUFFIXES = {".kt", ".kts"}
+_JAVA_SUFFIXES = {".java"}
 _JS_REGEX_PREFIX_KEYWORDS = {
     "await",
     "case",
@@ -343,11 +347,19 @@ class _LiteralMasker:
         self._python = suffix in _PYTHON_SUFFIXES
         self._javascript = suffix in _JAVASCRIPT_SUFFIXES
         self._kotlin = suffix in _KOTLIN_SUFFIXES
+        self._literals_supported = (
+            self._python
+            or self._javascript
+            or self._kotlin
+            or suffix in _JAVA_SUFFIXES
+        )
         self._frames: list[_LexicalFrame] = []
 
     def mask_line(self, text: str) -> str:
         """Mask one line and retain only genuinely multiline lexical state."""
 
+        if not self._literals_supported:
+            return text
         for frame in self._frames:
             if isinstance(frame, _LiteralFrame) and not frame.multiline:
                 frame.line_start = 0
@@ -413,6 +425,10 @@ class _LiteralMasker:
     ) -> int | None:
         if interpolation is None:
             return None
+        if self._python:
+            return self._advance_python_interpolation(
+                text, masked, index, interpolation
+            )
         if text[index] == "{":
             interpolation.depth += 1
             return index + 1
@@ -423,6 +439,74 @@ class _LiteralMasker:
             masked[index] = " "
             self._frames.pop()
         return index + 1
+
+    def _advance_python_interpolation(
+        self,
+        text: str,
+        masked: list[str],
+        index: int,
+        interpolation: _InterpolationFrame,
+    ) -> int:
+        """Retain Python replacement expressions but blank inert format specs."""
+
+        if interpolation.format_spec:
+            return self._advance_python_format_spec(text, masked, index)
+
+        char = text[index]
+        if self._advance_python_expression_delimiter(
+            char, masked, index, interpolation
+        ):
+            return index + 1
+        if (
+            char == ":"
+            and interpolation.depth == 1
+            and interpolation.paren_depth == 0
+            and interpolation.bracket_depth == 0
+        ):
+            masked[index] = " "
+            interpolation.format_spec = True
+        return index + 1
+
+    def _advance_python_format_spec(
+        self, text: str, masked: list[str], index: int
+    ) -> int:
+        """Blank format-spec text while entering nested replacement fields."""
+
+        char = text[index]
+        masked[index] = " "
+        if char == "{":
+            self._frames.append(_InterpolationFrame())
+        elif char == "}":
+            self._frames.pop()
+        return index + 1
+
+    def _advance_python_expression_delimiter(
+        self,
+        char: str,
+        masked: list[str],
+        index: int,
+        interpolation: _InterpolationFrame,
+    ) -> bool:
+        """Update grouping depth for one Python replacement expression."""
+
+        if char == "(":
+            interpolation.paren_depth += 1
+        elif char == ")" and interpolation.paren_depth:
+            interpolation.paren_depth -= 1
+        elif char == "[":
+            interpolation.bracket_depth += 1
+        elif char == "]" and interpolation.bracket_depth:
+            interpolation.bracket_depth -= 1
+        elif char == "{":
+            interpolation.depth += 1
+        elif char == "}":
+            interpolation.depth -= 1
+            if interpolation.depth == 0:
+                masked[index] = " "
+                self._frames.pop()
+        else:
+            return False
+        return True
 
     def _mask_code_token(self, text: str, masked: list[str], index: int) -> int:
         if self._python and text[index] == "#":
