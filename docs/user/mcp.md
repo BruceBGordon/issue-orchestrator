@@ -26,7 +26,10 @@ stream.
 
 Each server process is bound to **one repository** (`--repo-root`) and one
 config file. The `orchestrator.repos*` and `orchestrator.state` tools are the
-exception: they inspect every orchestrator on the machine.
+exception: they report on the repositories in the machine-wide registry, not
+just the bound one. See
+[Scope of the repository tools](#scope-of-the-repository-tools) for exactly
+what that covers.
 
 ## Prerequisites
 
@@ -137,10 +140,18 @@ they return:
 { "error": { "message": "Orchestrator not running", "type": "RuntimeError" } }
 ```
 
-`orchestrator.start` may additionally return a `ui_hint` object
-(`{"kind": "doctor", "url": "…"}`) pointing at the doctor report.
-`orchestrator.repos.start` and `orchestrator.repos.stop` report validation
-failures as a plain string in `error` rather than an object.
+Two tools deviate from that shape:
+
+- `orchestrator.start` adds a `ui_hint` object alongside `error` when it
+  fails — `{"kind": "doctor", "url": "…"}`, where `url` is present only once a
+  port is known. It points at the doctor report so a client can surface the
+  reason the launch failed.
+- `orchestrator.repos.start` reports its failures as a plain string in `error`
+  (`{"error": "Repository path … is not a git checkout"}`) rather than an
+  object. That covers both path validation and a failed launch. Every other
+  tool uses the `{message, type}` object above — including
+  `orchestrator.repos.stop`, which has no plain-string path at all and reports
+  a refused stop through its `status` field instead.
 
 ### Lifecycle
 
@@ -172,14 +183,40 @@ server is bound to.
 
 ### Repositories
 
-These tools see every orchestrator on the machine, not just `--repo-root`.
+These tools are **not** scoped to `--repo-root` — see
+[Scope of the repository tools](#scope-of-the-repository-tools) below for what
+they do and do not see.
 
 | Tool | Arguments | Returns |
 |------|-----------|---------|
 | `orchestrator.state` | *(none)* | `{"dashboard": {"running", "pid", "port", "started_at"}, "repos": [...], "current_directory", "is_orchestrator_codebase", "cwd_is_git_repo"}` — the full system state behind the unified dashboard. |
 | `orchestrator.repos` | *(none)* | `{"repos": [{"path", "name", "config_status", "orchestrator_state", "orchestrator_pid", "orchestrator_port", "configs", "selected_config", "is_current_dir"}]}`. |
-| `orchestrator.repos.start` | `repo_path: str`, `config_name: str = "default.yaml"` | `{"status": "started", "pid", "port"}`, or `{"error": "…"}` when the path fails validation (see below). |
+| `orchestrator.repos.start` | `repo_path: str`, `config_name: str = "default.yaml"` | `{"status": "started", "pid", "port"}`, or a plain-string `{"error": "…"}` when the path fails validation (see below) or the launch fails. |
 | `orchestrator.repos.stop` | `repo_path: str`, `force: bool = false` | `{"status": "stopped" \| "failed"}`. |
+
+#### Scope of the repository tools
+
+`orchestrator.state` and `orchestrator.repos` build their repository list from
+exactly two sources, and nothing else:
+
+1. **The persistent repo registry** — `~/.config/issue-orchestrator/repos.json`
+   (or `$XDG_CONFIG_HOME/issue-orchestrator/repos.json`). Registered paths that
+   no longer exist on disk are dropped from the result.
+2. **The MCP process's own current working directory**, added at the front of
+   the list when it is a Git checkout and isn't the orchestrator's own source
+   tree. That is the directory the *client* spawned the server in — it is
+   unrelated to `--repo-root`, which only scopes the engine-level and session
+   tools.
+
+For each of those repositories, the running/stopped state, PID, and port come
+from the supervisor state for that path.
+
+This is a registry lookup, not a machine-wide sweep. There is no process
+enumeration and no scan for orchestrator lock files, so an orchestrator running
+in a repository that is neither registered nor the server's working directory
+**will not appear**. Register it first — the Control Center's *Add Repository*
+button, or `POST /control/repos` on the Control API — if you want it visible
+here.
 
 ### Diagnostics
 
@@ -233,6 +270,11 @@ Semantics:
 | set but empty | **Every** path is rejected — a kill switch for `repos.start`. |
 
 Set the allowlist whenever the MCP client is something you don't fully control.
+
+The guard covers `repos.start` only. `orchestrator.repos.stop` takes the same
+caller-supplied `repo_path` without that validation — stopping is not a
+privilege escalation, so the worst outcome is a denial of service against an
+orchestrator you already had the token to talk to.
 
 **Control API token handling.** The bearer token authorizes every Control API
 route. Clients that forward their whole environment to the MCP subprocess also

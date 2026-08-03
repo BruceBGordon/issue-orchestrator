@@ -268,21 +268,20 @@ class McpApp:
         return await self._safe("orchestrator.status", self.status)
 
     async def tool_start(self) -> dict[str, Any]:
-        try:
-            return await self._safe("orchestrator.start", self.start)
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("MCP tool orchestrator.start failed")
-            ui_hint: dict[str, Any] = {"kind": "doctor"}
-            doctor_url = self._client.doctor_url()
-            if doctor_url:
-                ui_hint["url"] = doctor_url
-            return {
-                "error": {
-                    "message": str(exc),
-                    "type": exc.__class__.__name__,
-                },
-                "ui_hint": ui_hint,
-            }
+        """Start the orchestrator, pointing failures at the doctor report.
+
+        ``_safe`` already turns any exception into the structured ``error``
+        object, so the hint is attached by inspecting that result rather than
+        by catching — an outer ``except`` here would never fire.
+        """
+        result = await self._safe("orchestrator.start", self.start)
+        if "error" not in result:
+            return result
+        ui_hint: dict[str, Any] = {"kind": "doctor"}
+        doctor_url = self._client.doctor_url()
+        if doctor_url:
+            ui_hint["url"] = doctor_url
+        return {**result, "ui_hint": ui_hint}
 
     async def tool_stop(self, force: bool = False) -> dict[str, Any]:
         return await self._safe("orchestrator.stop", lambda: self.stop(force))

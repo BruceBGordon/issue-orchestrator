@@ -68,13 +68,20 @@ The Control Center runs in a VS Code terminal and serves the web UI.
 ## MCP Server (Optional)
 
 The extension drives the same MCP server you can connect any other MCP client
-to. You can run it manually:
+to. You can run it manually as a smoke check that the entrypoint resolves and
+your config loads:
 
 ```bash
 issue-orchestrator-mcp --repo-root /path/to/repo --auto-start
 ```
 
-The extension will detect and use it if running.
+It will then sit waiting for MCP traffic on stdin; press `Ctrl-C` to stop it.
+
+The extension does **not** attach to a process you started yourself. The
+transport is stdio, so the extension always spawns its own
+`issue-orchestrator-mcp` subprocess (the command is the
+`issueOrchestrator.mcpCommand` setting) and talks to it over that pipe. Leaving
+a manual one running is harmless but unused.
 
 For the full flag list, the `orchestrator.*` tool reference, a copy-paste
 client config, and the security posture (stdio-only transport, the repos

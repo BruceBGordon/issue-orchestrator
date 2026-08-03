@@ -15,7 +15,6 @@ via ``git worktree add``, and verify:
 from __future__ import annotations
 
 import json
-import os
 import shutil
 import subprocess
 import sys
@@ -32,6 +31,7 @@ from issue_orchestrator.execution.terminal_subprocess import SubprocessPlugin
 from issue_orchestrator.execution.worktree_adapter import GitWorktreeManager
 from issue_orchestrator.infra.config import Config
 from issue_orchestrator.infra.env import ENV_PREFIX
+from tests.git_push_authorization import authorized_local_fixture_git_env
 
 from .conftest import (
     ScriptSessionRunner,
@@ -98,7 +98,7 @@ def _init_foreign_repo(tmp_path: Path) -> Path:
         check=True,
         capture_output=True,
     )
-    push_env = {**os.environ, "ORCHESTRATOR_GH_AUTH": "agent-done-authorized"}
+    push_env = authorized_local_fixture_git_env()
     subprocess.run(
         ["git", "push", "-u", "origin", "main"],
         cwd=str(clone),
