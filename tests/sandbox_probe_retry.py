@@ -57,10 +57,16 @@ class ProbeAttempt:
     result: subprocess.CompletedProcess[str]
     timed_out: bool
     snapshot: Mapping[Path, bytes | None]
+    produced_expected_paths: bool
 
     @property
     def combined_output(self) -> str:
         return (self.result.stdout or "") + (self.result.stderr or "")
+
+    @property
+    def is_complete_evidence(self) -> bool:
+        """Whether this attempt alone ran to completion and produced its outputs."""
+        return not self.timed_out and self.produced_expected_paths
 
 
 @dataclass(frozen=True)
@@ -91,12 +97,30 @@ class ProbeRun:
             for attempt in self.attempts
         )
 
+    @property
+    def completed_attempt(self) -> ProbeAttempt | None:
+        """The single attempt whose own evidence the caller may rely on.
+
+        ``None`` when no attempt both ran to completion and produced every
+        expected path. Because the expected paths are cleared before each
+        retry, this is never satisfied by files a killed attempt left behind.
+        """
+        for attempt in self.attempts:
+            if attempt.is_complete_evidence:
+                return attempt
+        return None
+
     def require_completed(self) -> None:
         """Fail loudly if the run never produced a non-timed-out attempt.
 
         Call this *after* asserting on :attr:`snapshots`, so a breach captured
         by a timed-out attempt is still reported as a breach rather than being
         masked by the timeout failure.
+
+        This guards the timeout case only. "The probe completed but produced
+        nothing" is left to the caller's own positive-control assertion, which
+        carries a far more specific message — and which cannot be satisfied by
+        a stale file, since the expected paths are cleared before each retry.
         """
         if not self.timed_out:
             return
@@ -111,6 +135,17 @@ def _snapshot(observed_paths: Sequence[Path]) -> dict[Path, bytes | None]:
     return {
         path: path.read_bytes() if path.exists() else None for path in observed_paths
     }
+
+
+def _clear(expected_paths: Sequence[Path]) -> None:
+    """Delete the attempt-owned outputs so the next attempt must recreate them.
+
+    Only ``expected_paths`` are cleared. Planted fixture files and breach
+    markers live in ``observed_paths`` and are deliberately left alone: the
+    caller still asserts on their final state after the run.
+    """
+    for path in expected_paths:
+        path.unlink(missing_ok=True)
 
 
 def _timed_out_result(
@@ -131,15 +166,23 @@ def run_until_paths_created(
     observed_paths: Sequence[Path],
     max_attempts: int = 2,
 ) -> ProbeRun:
-    """Retry ``run_attempt`` until it completes and created ``expected_paths``.
+    """Retry ``run_attempt`` until one attempt completes and creates every path.
+
+    Success evidence is isolated per attempt: ``expected_paths`` are deleted
+    before each retry, so the accepted attempt must have created all of them
+    itself. Without that, a killed attempt's leftover files would satisfy the
+    success check for a retry that exited normally without redoing the work.
 
     Args:
         run_attempt: Runs one probe invocation. It may raise
             ``subprocess.TimeoutExpired``; that is recorded as a timed-out
             attempt rather than aborting the retry.
-        expected_paths: Paths a *completed* attempt must have created.
+        expected_paths: The attempt-owned outputs a *completed* attempt must
+            create. These are removed before each retry, so pass only paths
+            the probe itself writes — never planted fixture files.
         observed_paths: Paths to snapshot after every attempt, so breach
-            assertions can inspect what each attempt left behind.
+            assertions can inspect what each attempt left behind. These are
+            never cleared.
         max_attempts: How many invocations to allow.
 
     Returns:
@@ -151,22 +194,27 @@ def run_until_paths_created(
 
     attempts: list[ProbeAttempt] = []
     for number in range(1, max_attempts + 1):
+        if number > 1:
+            # Clear before the retry, after the previous attempt's snapshot was
+            # taken — the breach evidence is preserved, the success evidence is
+            # not inherited.
+            _clear(expected_paths)
         timed_out = False
         try:
             result = run_attempt()
         except subprocess.TimeoutExpired as exc:
             timed_out = True
             result = _timed_out_result(exc)
-        attempts.append(
-            ProbeAttempt(
-                number=number,
-                result=result,
-                timed_out=timed_out,
-                snapshot=_snapshot(observed_paths),
-            )
+        attempt = ProbeAttempt(
+            number=number,
+            result=result,
+            timed_out=timed_out,
+            snapshot=_snapshot(observed_paths),
+            produced_expected_paths=all(path.exists() for path in expected_paths),
         )
-        # A timed-out attempt can leave every expected path behind — it was
-        # killed mid-run, not finished — so it never counts as success.
-        if not timed_out and all(path.exists() for path in expected_paths):
+        attempts.append(attempt)
+        # A timed-out attempt never counts, even when every expected path is
+        # present: it was killed mid-run, so its side effects prove nothing.
+        if attempt.is_complete_evidence:
             break
     return ProbeRun(attempts=tuple(attempts))

@@ -145,7 +145,8 @@ Two tools deviate from that shape:
 - `orchestrator.start` adds a `ui_hint` object alongside `error` when it
   fails — `{"kind": "doctor", "url": "…"}`, where `url` is present only once a
   port is known. It points at the doctor report so a client can surface the
-  reason the launch failed.
+  reason the launch failed. See
+  [Start results](#start-results) for the full mapping.
 - `orchestrator.repos.start` reports its failures as a plain string in `error`
   (`{"error": "Repository path … is not a git checkout"}`) rather than an
   object. That covers both path validation and a failed launch. Every other
@@ -153,12 +154,35 @@ Two tools deviate from that shape:
   `orchestrator.repos.stop`, which has no plain-string path at all and reports
   a refused stop through its `status` field instead.
 
+#### Start results
+
+Starting can fail two ways: an exception, or an ordinary launcher result that
+reports the orchestrator did not come up. **Both** are normalised onto the same
+top-level `error`, so a client decides success or failure by looking at `error`
+alone — never by re-reading `launch.status`.
+
+| `launch.status` | Meaning | Top-level `error` |
+|-----------------|---------|-------------------|
+| `ok` | Doctor clean, orchestrator started. | *(none)* |
+| `doctor_warning` | Doctor raised warnings; started anyway. | *(none)* |
+| `already_running` | Lost a start race — it is already up. | *(none)* |
+| `doctor_error` | A doctor check failed; nothing was started. | `{"message": "Doctor checks failed — <check>: <detail>; …", "type": "DoctorError"}` |
+| `launch_error` | Doctor passed, the subprocess failed to start. | `{"message": "<launcher error>", "type": "LaunchError"}` |
+
+The `launch` object is always returned when this call ran the launcher — it
+carries the full doctor report and the launcher's own `status`/`launched`
+fields for display. Treat it as operator detail, not as the success signal.
+
+An unexpected exception (a missing config file, an unreadable state directory)
+produces the ordinary `{message, type}` error with the exception's class name
+as `type`, plus the same `ui_hint`.
+
 ### Lifecycle
 
 | Tool | Arguments | Returns |
 |------|-----------|---------|
 | `orchestrator.status` | *(none)* | `{"supervisor": {"state", "pid", "port", "started_at", "recovered", "error"}}`. When the engine is running, also `"status"` (paused flag, active sessions, queue, pending reviews, tick info) and `"info"` (version, repo, commit, session counts, startup status). |
-| `orchestrator.start` | *(none)* | If already running: `{"supervisor": {…}}`. Otherwise `{"launch": {"doctor", "launched", "status", "error"?, "supervisor"?}}` where `status` is `ok`, `doctor_error`, `doctor_warning`, or `launch_error`. |
+| `orchestrator.start` | *(none)* | If already running: `{"supervisor": {…}}`. Otherwise `{"launch": {"doctor", "launched", "status", "error"?, "supervisor"?}}`, plus a top-level `error` and `ui_hint` when the launch failed — see [Start results](#start-results). |
 | `orchestrator.stop` | `force: bool = false` | `{"stopped": bool}`. Stops the supervisor-managed orchestrator for this server's `--repo-root`. |
 | `orchestrator.pause` | *(none)* | `{"status": "paused"}`. No new sessions launch; running sessions continue. |
 | `orchestrator.resume` | *(none)* | `{"status": "resumed"}`. |

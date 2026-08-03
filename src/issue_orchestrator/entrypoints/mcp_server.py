@@ -33,9 +33,12 @@ import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Awaitable
+from typing import TYPE_CHECKING, Any, Callable, Awaitable
 import inspect
 from mcp.server.fastmcp import FastMCP
+
+if TYPE_CHECKING:
+    from ..infra.launcher import LaunchResult
 
 from ..infra import supervisor
 from ..infra.config import Config, get_config_path
@@ -45,6 +48,65 @@ from ..execution.orchestrator_http_api import OrchestratorAsyncHttpApi
 logger = logging.getLogger(__name__)
 
 _REPOS_ALLOWLIST_ENV = "ISSUE_ORCHESTRATOR_MCP_REPOS_ALLOWLIST"
+
+# The launcher statuses that mean ``orchestrator.start`` failed, and the
+# ``error.type`` each maps to. Everything else is a success:
+#
+#   ``ok``              — doctor clean, subprocess launched
+#   ``doctor_warning``  — doctor raised warnings, subprocess launched anyway
+#   ``already_running`` — lost a start race; the orchestrator IS running
+#
+# ``launch_error`` carries the exception text in ``LaunchResult.error``;
+# ``doctor_error`` carries none, so the message is built from the failing
+# checks. Both must surface as the top-level structured error that
+# ``docs/user/mcp.md`` documents and the VS Code start command consumes —
+# otherwise an ordinary failed launch reads as success to every client.
+_LAUNCH_FAILURE_ERROR_TYPES: dict[str, str] = {
+    "doctor_error": "DoctorError",
+    "launch_error": "LaunchError",
+}
+
+
+def _doctor_error_message(launch_result: "LaunchResult") -> str:
+    failing = [
+        check for check in launch_result.doctor.checks if check.status == "error"
+    ]
+    if not failing:
+        return "Doctor checks failed"
+    detail = "; ".join(
+        f"{check.name}: {check.detail}" if check.detail else check.name
+        for check in failing
+    )
+    return f"Doctor checks failed — {detail}"
+
+
+def _launch_failure_message(launch_result: "LaunchResult") -> str:
+    """Always a non-empty description of why the launch failed.
+
+    Emptiness matters: clients test the presence of a message to decide a start
+    failed, so an empty one would read as success and silently drop the
+    operator back into a "started" UI.
+    """
+    if launch_result.status == "doctor_error":
+        return _doctor_error_message(launch_result)
+    launcher_message = (launch_result.error or "").strip()
+    return launcher_message or (
+        f"Orchestrator failed to start ({launch_result.status})"
+    )
+
+
+def launch_failure_error(launch_result: "LaunchResult") -> dict[str, str] | None:
+    """Map a launcher outcome onto the MCP error object, or ``None`` on success.
+
+    This is the single owner of the ``LaunchResult`` → ``orchestrator.start``
+    mapping. Callers must not re-derive failure from ``status`` or ``launched``
+    themselves; the VS Code consumer likewise keys off the returned top-level
+    ``error`` rather than reinterpreting the nested launch payload.
+    """
+    error_type = _LAUNCH_FAILURE_ERROR_TYPES.get(launch_result.status)
+    if error_type is None:
+        return None
+    return {"message": _launch_failure_message(launch_result), "type": error_type}
 
 
 def _mcp_repos_allowlist() -> list[Path] | None:
@@ -270,9 +332,12 @@ class McpApp:
     async def tool_start(self) -> dict[str, Any]:
         """Start the orchestrator, pointing failures at the doctor report.
 
-        ``_safe`` already turns any exception into the structured ``error``
-        object, so the hint is attached by inspecting that result rather than
-        by catching — an outer ``except`` here would never fire.
+        Both failure routes land on a top-level ``error`` before they get
+        here: ``_safe`` converts exceptions, and ``start`` normalises a failed
+        ``LaunchResult`` via ``launch_failure_error``. So the hint is attached
+        by inspecting the result rather than by catching — an outer ``except``
+        here would never fire, and a returned doctor/launch failure would
+        never reach one anyway.
         """
         result = await self._safe("orchestrator.start", self.start)
         if "error" not in result:
@@ -457,22 +522,29 @@ class McpApp:
 
     def start(self) -> dict[str, Any]:
         status = self._client.status()
-        if status.state != "running":
-            from ..infra.launcher import launch_subprocess
+        if status.state == "running":
+            return {"supervisor": status.to_dict()}
 
-            config = Config.load(self._settings.config_path)
-            launch_result = launch_subprocess(
-                repo_root=self._settings.repo_root,
-                config=config,
-                config_name=self._settings.config_path.name,
-                instance_id=self._settings.instance_id,
-            )
-            result: dict[str, Any] = {"launch": launch_result.to_dict()}
-            # Update cached port from supervisor data
-            if launch_result.supervisor and "port" in launch_result.supervisor:
-                self._client.update_port(launch_result.supervisor["port"])
-            return result
-        return {"supervisor": status.to_dict()}
+        from ..infra.launcher import launch_subprocess
+
+        config = Config.load(self._settings.config_path)
+        launch_result = launch_subprocess(
+            repo_root=self._settings.repo_root,
+            config=config,
+            config_name=self._settings.config_path.name,
+            instance_id=self._settings.instance_id,
+        )
+        # Update cached port from supervisor data
+        if launch_result.supervisor and "port" in launch_result.supervisor:
+            self._client.update_port(launch_result.supervisor["port"])
+        result: dict[str, Any] = {"launch": launch_result.to_dict()}
+        # A doctor/launch failure is an ordinary return value, not an
+        # exception, so normalise it onto the documented top-level error here.
+        # ``tool_start`` then attaches the doctor ui_hint uniformly.
+        error = launch_failure_error(launch_result)
+        if error is not None:
+            result["error"] = error
+        return result
 
     def stop(
         self,

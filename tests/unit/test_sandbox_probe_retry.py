@@ -103,7 +103,7 @@ def test_timed_out_attempt_with_all_paths_present_is_not_success(
     def run_attempt() -> subprocess.CompletedProcess[str]:
         nonlocal attempts
         attempts += 1
-        completed.write_text("done", encoding="utf-8")
+        completed.write_text(f"attempt {attempts}", encoding="utf-8")
         if attempts == 1:
             raise _timeout()
         return _completed()
@@ -117,6 +117,83 @@ def test_timed_out_attempt_with_all_paths_present_is_not_success(
     assert attempts == 2, "a timed-out attempt must never satisfy the success check"
     assert not probe.timed_out
     probe.require_completed()
+    # The accepted evidence is attempt 2's own, not the killed attempt's.
+    assert probe.completed_attempt is not None
+    assert probe.completed_attempt.number == 2
+    assert completed.read_text(encoding="utf-8") == "attempt 2"
+
+
+def test_retry_cannot_inherit_the_timed_out_attempt_s_files(tmp_path: Path) -> None:
+    """The stale-artifact false pass: attempt 2 completes but redoes nothing.
+
+    Attempt 1 creates every expected path and is then killed. Attempt 2 exits
+    normally without touching anything — a live agent CLI can return without
+    reissuing the tool calls. The leftover files must NOT be accepted as that
+    attempt's evidence.
+    """
+    completed = tmp_path / "completed.txt"
+    attempts = 0
+
+    def run_attempt() -> subprocess.CompletedProcess[str]:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            completed.write_text("written by the killed attempt", encoding="utf-8")
+            raise _timeout()
+        return _completed("second attempt did nothing")
+
+    probe = run_until_paths_created(
+        run_attempt,
+        expected_paths=(completed,),
+        observed_paths=(completed,),
+    )
+
+    assert attempts == 2
+    assert not probe.timed_out  # it did not end on a timeout...
+    assert probe.completed_attempt is None, (
+        "no attempt produced complete evidence, so the run must not be accepted"
+    )
+    # The killed attempt's file was cleared, so the caller's positive control
+    # (`assert path.exists()`) fails instead of passing on a stale artifact.
+    assert not completed.exists()
+    assert probe.attempts[0].produced_expected_paths
+    assert not probe.attempts[1].produced_expected_paths
+
+
+def test_clearing_is_limited_to_the_attempt_owned_outputs(tmp_path: Path) -> None:
+    """Planted fixture files and breach markers survive the reset.
+
+    ``observed_paths`` covers evidence the probe must NOT have touched (a
+    planted policy file) and evidence that must never appear (an escaped
+    write). Clearing those between attempts would destroy the fixture and hide
+    a breach from the caller's post-run assertions.
+    """
+    completed = tmp_path / "completed.txt"
+    planted = tmp_path / "policy.json"
+    planted.write_text("ORIGINAL", encoding="utf-8")
+    escaped = tmp_path / "escaped.txt"
+    attempts = 0
+
+    def run_attempt() -> subprocess.CompletedProcess[str]:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            escaped.write_text("ESCAPED", encoding="utf-8")
+            raise _timeout()
+        completed.write_text("done", encoding="utf-8")
+        return _completed()
+
+    probe = run_until_paths_created(
+        run_attempt,
+        expected_paths=(completed,),
+        observed_paths=(completed, planted, escaped),
+    )
+
+    probe.require_completed()
+    assert planted.read_text(encoding="utf-8") == "ORIGINAL"
+    # The breach from attempt 1 is still on disk for the caller's final check.
+    assert escaped.read_text(encoding="utf-8") == "ESCAPED"
+    assert probe.snapshots[0][escaped] == b"ESCAPED"
 
 
 def test_two_timeouts_exhaust_and_fail_loudly(tmp_path: Path) -> None:
@@ -188,4 +265,5 @@ def test_missing_expected_paths_without_timeout_does_not_raise(tmp_path: Path) -
 
     assert not probe.timed_out
     assert probe.snapshots == ({completed: None}, {completed: None})
+    assert probe.completed_attempt is None
     probe.require_completed()

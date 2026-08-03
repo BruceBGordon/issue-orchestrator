@@ -176,9 +176,15 @@ def _run_probe(
 ) -> ProbeRun:
     """Retry an incomplete interaction and snapshot every attempt's evidence.
 
-    Timeout handling lives in ``tests/sandbox_probe_retry`` so a timed-out
-    attempt can never masquerade as a completed one; the caller must call
+    Retry policy lives in ``tests/sandbox_probe_retry`` so a timed-out attempt
+    can never masquerade as a completed one; the caller must call
     ``ProbeRun.require_completed()`` before trusting the run.
+
+    ``expected_paths`` are the probe's own result sinks and are deleted before
+    each retry, so a retry that returns without reissuing its tool calls can't
+    pass on the killed attempt's leftovers. Planted fixture files (the secret,
+    the marker, the policy file) and breach markers belong in
+    ``observed_paths`` only — those are never cleared.
     """
     return run_until_paths_created(
         lambda: _run(cmd, cwd=cwd, timeout=timeout),

@@ -11,10 +11,13 @@ from issue_orchestrator.entrypoints.mcp_server import (
     McpApp,
     McpSettings,
     OrchestratorHttpClient,
+    launch_failure_error,
     _mcp_repos_allowlist,
     _validate_repo_start_path,
 )
 from issue_orchestrator.infra import supervisor
+from issue_orchestrator.infra.doctor.types import Check, DoctorResult
+from issue_orchestrator.infra.launcher import LaunchResult
 
 
 def _settings(*, host: str = "127.0.0.1") -> McpSettings:
@@ -168,6 +171,182 @@ def test_start_success_carries_no_ui_hint(monkeypatch: pytest.MonkeyPatch) -> No
 
     assert result == {"supervisor": {"state": "running"}}
     assert "ui_hint" not in result
+
+
+# --- LaunchResult mapping ---------------------------------------------------
+#
+# A doctor/launch failure is an ordinary return value, not an exception, so it
+# never reaches ``_safe``. These pin the full status mapping against real
+# ``LaunchResult`` values.
+
+
+def _launch_result(
+    status: str,
+    *,
+    launched: bool,
+    error: str | None = None,
+    checks: list[Check] | None = None,
+    supervisor: dict | None = None,
+) -> LaunchResult:
+    return LaunchResult(
+        doctor=DoctorResult(checks=checks or []),
+        launched=launched,
+        status=status,
+        error=error,
+        supervisor=supervisor,
+    )
+
+
+@pytest.mark.parametrize(
+    ("status", "launched", "supervisor"),
+    [
+        ("ok", True, {"pid": 1, "port": 19080}),
+        ("doctor_warning", True, {"pid": 1, "port": 19080}),
+        ("already_running", False, {"pid": 1, "port": 19080}),
+    ],
+)
+def test_launch_failure_error_is_none_for_successful_outcomes(
+    status: str, launched: bool, supervisor: dict
+) -> None:
+    """Warnings and a lost start race mean the orchestrator is running."""
+    result = _launch_result(
+        status,
+        launched=launched,
+        error="Orchestrator already running" if status == "already_running" else None,
+        supervisor=supervisor,
+    )
+
+    assert launch_failure_error(result) is None
+
+
+def test_launch_failure_error_builds_a_message_from_failing_doctor_checks() -> None:
+    """``doctor_error`` carries no ``error`` string, so the checks supply it."""
+    result = _launch_result(
+        "doctor_error",
+        launched=False,
+        checks=[
+            Check(name="github_auth", status="error", detail="token expired"),
+            Check(name="worktrees", status="ok", detail="fine"),
+            Check(name="hooks", status="error", detail=""),
+        ],
+    )
+
+    error = launch_failure_error(result)
+
+    assert error == {
+        "message": "Doctor checks failed — github_auth: token expired; hooks",
+        "type": "DoctorError",
+    }
+
+
+def test_launch_failure_error_uses_the_launcher_message_for_launch_error() -> None:
+    result = _launch_result("launch_error", launched=False, error="port already bound")
+
+    assert launch_failure_error(result) == {
+        "message": "port already bound",
+        "type": "LaunchError",
+    }
+
+
+@pytest.mark.parametrize("blank", [None, "", "   "])
+def test_launch_failure_error_never_produces_a_blank_message(blank: str | None) -> None:
+    """A blank message would read as success to clients that test for one."""
+    result = _launch_result("launch_error", launched=False, error=blank)
+
+    error = launch_failure_error(result)
+
+    assert error is not None
+    assert error["message"] == "Orchestrator failed to start (launch_error)"
+
+
+def _patch_launch(monkeypatch: pytest.MonkeyPatch, result: LaunchResult) -> None:
+    """Make ``McpApp.start`` observe ``result`` from the real launcher seam."""
+    monkeypatch.setattr(
+        "issue_orchestrator.entrypoints.mcp_server.supervisor.status",
+        lambda repo_root, instance_id=None: supervisor.SupervisorStatus(
+            state="stopped", pid=None, port=None, started_at=None, instance_id=None
+        ),
+    )
+    monkeypatch.setattr(
+        "issue_orchestrator.infra.config.Config.load", staticmethod(lambda path: None)
+    )
+    monkeypatch.setattr(
+        "issue_orchestrator.infra.launcher.launch_subprocess",
+        lambda **kwargs: result,
+    )
+
+
+def test_tool_start_surfaces_doctor_error_with_a_ui_hint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The failure path a client actually hits: a returned LaunchResult."""
+    app = McpApp(_settings())
+    app.override_port(19080)
+    _patch_launch(
+        monkeypatch,
+        _launch_result(
+            "doctor_error",
+            launched=False,
+            checks=[Check(name="github_auth", status="error", detail="token expired")],
+        ),
+    )
+
+    result = asyncio.run(app.tool_start())
+
+    assert result["error"] == {
+        "message": "Doctor checks failed — github_auth: token expired",
+        "type": "DoctorError",
+    }
+    assert result["ui_hint"] == {
+        "kind": "doctor",
+        "url": "http://127.0.0.1:19080/api/doctor",
+    }
+    # The nested launch payload is still returned for detail.
+    assert result["launch"]["status"] == "doctor_error"
+    assert result["launch"]["launched"] is False
+
+
+def test_tool_start_surfaces_launch_error_with_a_ui_hint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = McpApp(_settings())
+    app.override_port(19080)
+    _patch_launch(
+        monkeypatch,
+        _launch_result("launch_error", launched=False, error="port already bound"),
+    )
+
+    result = asyncio.run(app.tool_start())
+
+    assert result["error"] == {
+        "message": "port already bound",
+        "type": "LaunchError",
+    }
+    assert result["ui_hint"]["kind"] == "doctor"
+
+
+@pytest.mark.parametrize("status", ["ok", "doctor_warning", "already_running"])
+def test_tool_start_reports_no_error_for_successful_launches(
+    monkeypatch: pytest.MonkeyPatch, status: str
+) -> None:
+    app = McpApp(_settings())
+    _patch_launch(
+        monkeypatch,
+        _launch_result(
+            status,
+            launched=status != "already_running",
+            error="Orchestrator already running"
+            if status == "already_running"
+            else None,
+            supervisor={"pid": 4242, "port": 19081},
+        ),
+    )
+
+    result = asyncio.run(app.tool_start())
+
+    assert "error" not in result
+    assert "ui_hint" not in result
+    assert result["launch"]["status"] == status
 
 
 def test_repos_start_returns_plain_string_error_for_invalid_path(

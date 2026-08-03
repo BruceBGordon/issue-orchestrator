@@ -13,7 +13,8 @@ import type { OrchestratorClient } from "./orchestratorClient.js";
 import { normalizeClientCapabilities, sessionActionMode } from "./clientCapabilities.js";
 import { showDoctorPanel, updateDoctorPanel } from "./doctorView.js";
 import type { DoctorAction } from "./doctorView.js";
-import type { DoctorReport, StartResponse } from "./types.js";
+import { runStartCommand } from "./startCommand.js";
+import type { DoctorReport } from "./types.js";
 
 type EventSource = import("eventsource").default;
 type IssueDetail = {
@@ -175,17 +176,12 @@ function registerCommands(
     }),
     vscode.commands.registerCommand("issueOrchestrator.start", async () => {
       await runCommand(async () => {
-        const result = await client.startOrchestrator();
-        if (hasStartError(result)) {
-          const errorMessage = `Orchestrator failed to start: ${result.error.message}`;
-          output.appendLine(errorMessage);
-          await openDoctorPanel(client, output, {
-            errorMessage,
-            doctorUrl: result.ui_hint?.url,
-          });
-          return;
-        }
-        await provider.refresh();
+        await runStartCommand({
+          start: () => client.startOrchestrator(),
+          refresh: () => provider.refresh(),
+          openDoctor: (options) => openDoctorPanel(client, output, options),
+          log: (message) => output.appendLine(message),
+        });
       }, output, "Start failed");
     }),
     vscode.commands.registerCommand("issueOrchestrator.stop", async () => {
@@ -1067,10 +1063,6 @@ function inferRepoRoot(configPath: string): string | null {
 function resolveRepoRoot(): string | null {
   const config = vscode.workspace.getConfiguration("issueOrchestrator");
   return config.get<string>("repoRoot") || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || null;
-}
-
-function hasStartError(result: StartResponse | null | undefined): result is StartResponse & { error: { message: string } } {
-  return Boolean(result && result.error && result.error.message);
 }
 
 async function warnIfConfigMissing(): Promise<void> {

@@ -125,8 +125,24 @@ export interface McpError {
   type?: string;
 }
 
+export interface LaunchResult {
+  /** "ok" | "doctor_warning" | "already_running" | "doctor_error" | "launch_error" */
+  status: string;
+  launched: boolean;
+  doctor?: DoctorReport;
+  error?: string;
+  supervisor?: Record<string, unknown>;
+}
+
 export interface StartResponse {
   supervisor?: SupervisorStatus;
+  /**
+   * Present when this call ran the launcher. Operator detail only — do NOT
+   * decide success from `launch.status`. The server normalises every failure
+   * (thrown or returned) onto the top-level `error` below; reading the nested
+   * status here would duplicate that mapping on the client.
+   */
+  launch?: LaunchResult;
   error?: McpError;
   ui_hint?: UiHint;
 }
