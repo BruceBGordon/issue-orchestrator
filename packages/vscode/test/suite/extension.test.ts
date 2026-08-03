@@ -128,6 +128,55 @@ suite("Start command", () => {
     assert.strictEqual(recorded.doctorCalls.length, 1);
   });
 
+  test("a malformed success member fails closed and never refreshes", async () => {
+    // `callTool<T>()` casts an unvalidated JSON parse to `T`, so a
+    // version-skewed server can deliver any of these typed as a StartResponse.
+    const malformed = [
+      { launch: null },
+      { supervisor: null },
+      { launch: false },
+      { supervisor: "running" },
+      { launch: {} },
+      { supervisor: {} },
+      { launch: { status: "ok" } },
+      { launch: { status: "ok", launched: "yes" } },
+      { supervisor: { state: 1 } },
+    ];
+
+    for (const result of malformed) {
+      // `as unknown as` on purpose: the compiler rejects a direct cast, which
+      // is the whole point — these shapes are unreachable statically and
+      // reachable at runtime only because `callTool<T>()` casts an unvalidated
+      // parse. That is the gap this check closes.
+      const recorded = await runStart(result as unknown as StartResponse);
+
+      assert.strictEqual(
+        recorded.refreshed,
+        0,
+        `refreshed on ${JSON.stringify(result)}`
+      );
+      assert.strictEqual(
+        recorded.doctorCalls.length,
+        1,
+        `did not open doctor on ${JSON.stringify(result)}`
+      );
+    }
+  });
+
+  test("a well-formed success member still refreshes", async () => {
+    // Non-vacuity for the check above: the shapes the server really sends
+    // must keep working.
+    for (const result of [
+      { supervisor: { state: "running" } },
+      { launch: { status: "ok", launched: true } },
+    ]) {
+      const recorded = await runStart(result as StartResponse);
+
+      assert.strictEqual(recorded.refreshed, 1, `did not refresh on ${JSON.stringify(result)}`);
+      assert.deepStrictEqual(recorded.doctorCalls, []);
+    }
+  });
+
   test("decideStartOutcome ignores launch.status and keys off the top-level error", () => {
     // The server owns the mapping; a nested failure status without a
     // normalised top-level error must not be re-derived on the client.
@@ -138,6 +187,15 @@ suite("Start command", () => {
     assert.deepStrictEqual(
       decideStartOutcome({
         launch: { status: "ok", launched: true },
+      } as StartResponse),
+      { kind: "refresh" }
+    );
+    // The structural check must not become a back door into classification: a
+    // failure status the server did not normalise onto `error` is still the
+    // server's call, not ours.
+    assert.deepStrictEqual(
+      decideStartOutcome({
+        launch: { status: "doctor_error", launched: false },
       } as StartResponse),
       { kind: "refresh" }
     );

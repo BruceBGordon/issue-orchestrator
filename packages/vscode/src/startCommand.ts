@@ -24,13 +24,17 @@ export interface StartCommandDeps {
  * never inspect it. `launch` is detail for the operator, not a signal.
  *
  * Validating the *envelope* is a different question, and it belongs here. A
- * response that carries neither `supervisor` nor `launch` is not a start result
- * the server produced under this contract — `McpClient.callTool` returns `{}`
- * for empty MCP content, and a dropped or malformed reply arrives as
- * `null`/`undefined`. Refreshing on those treats absence of evidence as
- * evidence the orchestrator started, which is the one reading that leaves the
- * operator with a green tree and a dead orchestrator. So the envelope check
- * fails closed: anything that is not a recognisable success opens the doctor.
+ * response is only a success when it actually carries a start result the server
+ * could have produced — not merely when a `supervisor` or `launch` key exists.
+ * Both absence and malformation are reachable at runtime: `McpClient.callTool`
+ * returns `{}` for empty MCP content, a dropped reply arrives as
+ * `null`/`undefined`, and because `callTool<T>()` casts an unvalidated
+ * JSON parse to `T`, a version-skewed server can deliver `{launch: null}` or
+ * `{supervisor: "running"}` typed as a `StartResponse`. Refreshing on any of
+ * those treats absence of evidence as evidence the orchestrator started, which
+ * is the one reading that leaves the operator with a green tree and a dead
+ * orchestrator. So the check fails closed: anything that is not a recognisable
+ * success opens the doctor.
  */
 export type StartOutcome =
   | { kind: "refresh" }
@@ -38,30 +42,75 @@ export type StartOutcome =
 
 const INVALID_RESPONSE_MESSAGE =
   "the MCP server returned no recognisable start result";
+const NO_MESSAGE = "the MCP server reported an error with no message";
+
+/**
+ * Nothing here can trust its input's declared type.
+ *
+ * `McpClient.callTool<T>()` JSON-parses whatever came back over stdio and
+ * casts it to `T`. The cast is a compile-time assertion, not a runtime one, so
+ * a malformed or version-skewed payload arrives typed as `StartResponse` while
+ * being any shape at all. These checks are therefore written against `unknown`.
+ */
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Whether the response carries a start result the server could have produced.
+ *
+ * Shape only. `launch.status` is checked for being a string, never for *which*
+ * string: the server owns what a status means, and re-deriving that here is
+ * exactly the duplication this command avoids. The point is narrower — that a
+ * member is actually there and actually a start result, so `{launch: null}` and
+ * `{supervisor: "running"}` cannot pass for one.
+ */
+function hasRecognisableStartResult(envelope: Record<string, unknown>): boolean {
+  const supervisor = envelope.supervisor;
+  if (isRecord(supervisor) && typeof supervisor.state === "string") {
+    return true;
+  }
+  const launch = envelope.launch;
+  return (
+    isRecord(launch) &&
+    typeof launch.status === "string" &&
+    typeof launch.launched === "boolean"
+  );
+}
+
+function readDoctorUrl(envelope: Record<string, unknown> | null): string | undefined {
+  const hint = envelope?.ui_hint;
+  if (isRecord(hint) && typeof hint.url === "string") {
+    return hint.url;
+  }
+  return undefined;
+}
 
 export function decideStartOutcome(
   result: StartResponse | null | undefined
 ): StartOutcome {
+  const envelope = isRecord(result) ? result : null;
   const doctor = (reason: string): StartOutcome => ({
     kind: "doctor",
     errorMessage: `Orchestrator failed to start: ${reason}`,
-    doctorUrl: result?.ui_hint?.url,
+    doctorUrl: readDoctorUrl(envelope),
   });
 
-  if (!result || typeof result !== "object") {
+  if (envelope === null) {
     return doctor(INVALID_RESPONSE_MESSAGE);
   }
 
-  const message = result.error?.message;
-  if (message) {
-    return doctor(message);
+  const error = envelope.error;
+  if (error !== undefined) {
+    // An error the server could not describe is still an error: only the
+    // explanation is missing, not the failure.
+    const message = isRecord(error) ? error.message : undefined;
+    return doctor(
+      typeof message === "string" && message.trim() ? message : NO_MESSAGE
+    );
   }
-  if (result.error !== undefined) {
-    // An error object the server could not describe is still an error. Only
-    // the explanation is missing, not the failure.
-    return doctor("the MCP server reported an error with no message");
-  }
-  if (result.supervisor === undefined && result.launch === undefined) {
+
+  if (!hasRecognisableStartResult(envelope)) {
     return doctor(INVALID_RESPONSE_MESSAGE);
   }
   return { kind: "refresh" };
