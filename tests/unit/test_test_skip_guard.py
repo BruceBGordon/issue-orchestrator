@@ -111,3 +111,31 @@ def test_scan_added_test_skip_guards_ignores_quoted_nested_diff_fixture_lines() 
 """
 
     assert scan_added_test_skip_guards(diff).ok
+
+
+def test_scan_added_test_skip_guards_ignores_skip_constructs_in_literals() -> None:
+    diff = """diff --git a/audit/checks.test.ts b/audit/checks.test.ts
+--- a/audit/checks.test.ts
++++ b/audit/checks.test.ts
+@@ -1409,0 +1410,4 @@
++    const fixture = "describe.skip('forbidden', () => {})";
++    expect(report).toContain('describe.skip()');
++    const junitExample = "@Disabled";
++    const pythonExample = 'pytest.skip("not executable")';
+"""
+
+    assert scan_added_test_skip_guards(diff).ok
+
+
+def test_scan_added_test_skip_guards_still_flags_code_after_a_literal() -> None:
+    diff = """diff --git a/audit/checks.test.ts b/audit/checks.test.ts
+--- a/audit/checks.test.ts
++++ b/audit/checks.test.ts
+@@ -1,0 +2,1 @@
++    log("checking suite"); describe.skip('suite', () => {});
+"""
+
+    result = scan_added_test_skip_guards(diff)
+
+    assert not result.ok
+    assert result.violations[0].pattern == "JS test skip"
