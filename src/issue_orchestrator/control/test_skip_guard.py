@@ -78,8 +78,9 @@ def scan_added_test_skip_guards(diff_text: str) -> TestSkipGuardResult:
             continue
         if _looks_like_nested_diff_fixture(added.text):
             continue
+        code_text = _mask_literals(added.text)
         for label, pattern in _BANNED_PATTERNS:
-            if pattern.search(added.text):
+            if pattern.search(code_text):
                 violations.append(
                     TestSkipGuardViolation(
                         path=added.path,
@@ -171,3 +172,31 @@ def _is_test_file_name(name: str) -> bool:
 def _looks_like_nested_diff_fixture(text: str) -> bool:
     stripped = text.lstrip()
     return stripped.startswith(("+", "-")) or bool(_QUOTED_NESTED_DIFF_RE.search(stripped))
+
+
+def _mask_literals(text: str) -> str:
+    """Preserve executable text while blanking quoted string literals."""
+
+    masked = list(text)
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if char in {"'", '"', "`"}:
+            end = _literal_end(text, index, char)
+            masked[index:end] = " " * (end - index)
+            index = end
+            continue
+        index += 1
+    return "".join(masked)
+
+
+def _literal_end(text: str, start: int, quote: str) -> int:
+    index = start + 1
+    while index < len(text):
+        if text[index] == "\\":
+            index += 2
+            continue
+        if text[index] == quote:
+            return index + 1
+        index += 1
+    return len(text)
