@@ -17,6 +17,7 @@ from issue_orchestrator.execution.agent_runner import AgentRunner, AgentSpec
 from issue_orchestrator.ports.working_copy import (
     BranchPathsResult,
     BranchStatus,
+    BranchTextFilesResult,
     CommitInfo,
     DiffResult,
     PreflightResult,
@@ -634,6 +635,11 @@ class StubWorkingCopy:
 
     def diff_against_base(self, worktree: Path, base_ref: str) -> DiffResult:
         return DiffResult(success=True, diff_text="")
+
+    def read_branch_text_files(
+        self, worktree: Path, paths: tuple[str, ...]
+    ) -> BranchTextFilesResult:
+        return BranchTextFilesResult(success=True)
 
     def branch_post_image_paths_against_base(
         self, worktree: Path, base_ref: str

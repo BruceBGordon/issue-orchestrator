@@ -69,6 +69,23 @@ class DiffResult:
 
 
 @dataclass(frozen=True)
+class BranchTextFile:
+    """Exact tracked text content for one file at the branch tip."""
+
+    path: str
+    content: str
+
+
+@dataclass(frozen=True)
+class BranchTextFilesResult:
+    """Result of reading selected tracked text files from the branch tip."""
+
+    success: bool
+    files: tuple[BranchTextFile, ...] = ()
+    error: str | None = None
+
+
+@dataclass(frozen=True)
 class BranchPathsResult:
     """Branch-tip post-image paths for a diff against base.
 
@@ -272,6 +289,18 @@ class WorkingCopy(Protocol):
 
         Implementations should use merge-base semantics (``base_ref...HEAD``)
         so callers scan exactly what the branch contributes.
+        """
+        ...
+
+    def read_branch_text_files(
+        self, worktree: Path, paths: tuple[str, ...]
+    ) -> BranchTextFilesResult:
+        """Return exact tracked ``HEAD`` text for the requested repository paths.
+
+        Implementations must read branch-tip objects rather than mutable
+        filesystem paths so callers receive content from the same ``HEAD`` used
+        by :meth:`diff_against_base`. Any missing or undecodable path must fail
+        the complete request rather than returning a partial result.
         """
         ...
 

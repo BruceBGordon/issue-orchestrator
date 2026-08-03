@@ -1,9 +1,35 @@
 """Tests for branch-diff test skip guard."""
 
 from issue_orchestrator.control.test_skip_guard import (
+    TestSkipGuardResult as SkipGuardResult,
+    added_test_paths,
     iter_added_diff_lines,
     scan_added_test_skip_guards,
 )
+from issue_orchestrator.ports.working_copy import BranchTextFile
+
+
+def _branch_files_from_added_lines(diff: str) -> tuple[BranchTextFile, ...]:
+    lines_by_path: dict[str, list[str]] = {}
+    for added in iter_added_diff_lines(diff):
+        lines = lines_by_path.setdefault(added.path, [])
+        lines.extend("" for _ in range(added.line_number - len(lines)))
+        lines[added.line_number - 1] = added.text
+    return tuple(
+        BranchTextFile(path=path, content="\n".join(lines))
+        for path, lines in lines_by_path.items()
+    )
+
+
+def _scan(
+    diff: str, branch_files: tuple[BranchTextFile, ...] | None = None
+) -> SkipGuardResult:
+    return scan_added_test_skip_guards(
+        diff,
+        branch_files
+        if branch_files is not None
+        else _branch_files_from_added_lines(diff),
+    )
 
 
 def test_iter_added_diff_lines_tracks_new_file_line_numbers() -> None:
@@ -35,7 +61,7 @@ def test_scan_added_test_skip_guards_flags_junit_assumption_in_test_path() -> No
 +        assumeTrue(PostgresTestSupport.isAvailable(), PostgresTestSupport.skipReason())
 """
 
-    result = scan_added_test_skip_guards(diff)
+    result = _scan(diff)
 
     assert not result.ok
     assert len(result.violations) == 1
@@ -55,7 +81,7 @@ def test_scan_added_test_skip_guards_flags_test_file_name_without_test_directory
 +        assumeTrue(PostgresTestSupport.isAvailable())
 """
 
-    result = scan_added_test_skip_guards(diff)
+    result = _scan(diff)
 
     assert not result.ok
     assert result.violations[0].path == "inventory-impl/src/main/kotlin/RepoTest.kt"
@@ -81,7 +107,7 @@ diff --git a/pytest.ini b/pytest.ini
 +note = "pytest.skip appears in docs"
 """
 
-    assert scan_added_test_skip_guards(diff).ok
+    assert _scan(diff).ok
 
 
 def test_scan_added_test_skip_guards_ignores_documentation_mentions() -> None:
@@ -92,7 +118,7 @@ def test_scan_added_test_skip_guards_ignores_documentation_mentions() -> None:
 +Document why assumeTrue is not allowed in tests.
 """
 
-    assert scan_added_test_skip_guards(diff).ok
+    assert _scan(diff).ok
 
 
 def test_scan_added_test_skip_guards_ignores_nested_diff_fixture_lines() -> None:
@@ -103,7 +129,7 @@ def test_scan_added_test_skip_guards_ignores_nested_diff_fixture_lines() -> None
 ++        assumeTrue(PostgresTestSupport.isAvailable())
 """
 
-    assert scan_added_test_skip_guards(diff).ok
+    assert _scan(diff).ok
 
 
 def test_scan_added_test_skip_guards_ignores_quoted_nested_diff_fixture_lines() -> None:
@@ -114,7 +140,7 @@ def test_scan_added_test_skip_guards_ignores_quoted_nested_diff_fixture_lines() 
 +                "+        assumeTrue(PostgresTestSupport.isAvailable())\\n"
 """
 
-    assert scan_added_test_skip_guards(diff).ok
+    assert _scan(diff).ok
 
 
 def test_scan_added_test_skip_guards_ignores_skip_constructs_in_literals() -> None:
@@ -128,7 +154,7 @@ def test_scan_added_test_skip_guards_ignores_skip_constructs_in_literals() -> No
 +    const pythonExample = 'pytest.skip("not executable")';
 """
 
-    assert scan_added_test_skip_guards(diff).ok
+    assert _scan(diff).ok
 
 
 def test_scan_added_test_skip_guards_still_flags_code_after_a_literal() -> None:
@@ -139,7 +165,7 @@ def test_scan_added_test_skip_guards_still_flags_code_after_a_literal() -> None:
 +    log("checking suite"); describe.skip('suite', () => {});
 """
 
-    result = scan_added_test_skip_guards(diff)
+    result = _scan(diff)
 
     assert not result.ok
     assert result.violations[0].pattern == "JS test skip"
@@ -153,7 +179,7 @@ def test_scan_added_test_skip_guards_flags_js_template_interpolation() -> None:
 +const message = `result: ${test.skip("real skip", () => {})}`;
 """
 
-    result = scan_added_test_skip_guards(diff)
+    result = _scan(diff)
 
     assert not result.ok
     assert result.violations[0].pattern == "JS test skip"
@@ -167,7 +193,7 @@ def test_scan_added_test_skip_guards_flags_python_f_string_interpolation() -> No
 +message = f"result: {pytest.skip('real skip')}"
 """
 
-    result = scan_added_test_skip_guards(diff)
+    result = _scan(diff)
 
     assert not result.ok
     assert result.violations[0].pattern == "pytest.skip"
@@ -181,7 +207,7 @@ def test_scan_added_test_skip_guards_ignores_escaped_python_f_string_braces() ->
 +message = f"example: {{pytest.skip('not executable')}}"
 """
 
-    assert scan_added_test_skip_guards(diff).ok
+    assert _scan(diff).ok
 
 
 def test_scan_added_test_skip_guards_does_not_treat_js_regex_apostrophe_as_quote() -> (
@@ -194,10 +220,100 @@ def test_scan_added_test_skip_guards_does_not_treat_js_regex_apostrophe_as_quote
 +const contraction = /don't/; test.skip("real skip", () => {});
 """
 
-    result = scan_added_test_skip_guards(diff)
+    result = _scan(diff)
 
     assert not result.ok
     assert result.violations[0].pattern == "JS test skip"
+
+
+def test_scan_added_test_skip_guards_does_not_treat_division_as_js_regex() -> None:
+    diff = """diff --git a/tests/guard.test.ts b/tests/guard.test.ts
+--- a/tests/guard.test.ts
++++ b/tests/guard.test.ts
+@@ -1,0 +2,1 @@
++const ratio = obj.return / test.skip("real skip", () => {}) / 2;
+"""
+
+    result = _scan(diff)
+
+    assert not result.ok
+    assert result.violations[0].pattern == "JS test skip"
+
+
+def test_scan_added_test_skip_guards_handles_regex_after_js_statement_blocks() -> None:
+    diff = """diff --git a/tests/guard.test.ts b/tests/guard.test.ts
+--- a/tests/guard.test.ts
++++ b/tests/guard.test.ts
+@@ -0,0 +1,4 @@
++{} /don't/.test(value); test.skip("plain block", () => {});
++if (ready) {} /don't/.test(value); test.skip("control block", () => {});
++function helper() {} /don't/.test(value); test.skip("function", () => {});
++class Helper {} /don't/.test(value); test.skip("class", () => {});
+"""
+
+    result = _scan(diff)
+
+    assert [violation.line_number for violation in result.violations] == [1, 2, 3, 4]
+
+
+def test_scan_added_test_skip_guards_fails_closed_on_ambiguous_js_regex() -> None:
+    diff = """diff --git a/tests/guard.test.ts b/tests/guard.test.ts
+--- a/tests/guard.test.ts
++++ b/tests/guard.test.ts
+@@ -0,0 +1,2 @@
++function helper() {
++} /don't/.test(value); test.skip("after multiline block", () => {});
+"""
+
+    result = _scan(diff)
+
+    assert [violation.line_number for violation in result.violations] == [2]
+
+
+def test_scan_added_test_skip_guards_preserves_division_after_js_expressions() -> None:
+    diff = """diff --git a/tests/guard.test.ts b/tests/guard.test.ts
+--- a/tests/guard.test.ts
++++ b/tests/guard.test.ts
+@@ -0,0 +1,2 @@
++const functionRatio = function () {} / test.skip("function", () => {}) / 2;
++const classRatio = class {} / test.skip("class", () => {}) / 2;
+"""
+
+    result = _scan(diff)
+
+    assert [violation.line_number for violation in result.violations] == [1, 2]
+
+
+def test_scan_added_test_skip_guards_flags_python_template_interpolation() -> None:
+    diff = """diff --git a/tests/test_guard.py b/tests/test_guard.py
+--- a/tests/test_guard.py
++++ b/tests/test_guard.py
+@@ -1,0 +2,1 @@
++message = t"result: {pytest.skip('real skip')}"
+"""
+
+    result = _scan(diff)
+
+    assert not result.ok
+    assert result.violations[0].pattern == "pytest.skip"
+
+
+def test_scan_added_test_skip_guards_tracks_multiline_python_interpolation() -> None:
+    diff = '''diff --git a/tests/test_guard.py b/tests/test_guard.py
+--- a/tests/test_guard.py
++++ b/tests/test_guard.py
+@@ -0,0 +1,6 @@
++executable = f"{(
++    pytest.skip('real skip')
++)}"
++inert = f"{(
++    value
++)} pytest.skip('fixture text')"
+'''
+
+    result = _scan(diff)
+
+    assert [violation.line_number for violation in result.violations] == [2]
 
 
 def test_scan_added_test_skip_guards_ignores_all_added_multiline_literal() -> None:
@@ -210,20 +326,30 @@ def test_scan_added_test_skip_guards_ignores_all_added_multiline_literal() -> No
 +"""
 '''
 
-    assert scan_added_test_skip_guards(diff).ok
+    assert _scan(diff).ok
 
 
-def test_scan_added_test_skip_guards_uses_context_opened_multiline_literal() -> None:
+def test_scan_added_test_skip_guards_uses_post_image_for_existing_literal() -> None:
     diff = '''diff --git a/tests/test_guard.py b/tests/test_guard.py
 --- a/tests/test_guard.py
 +++ b/tests/test_guard.py
-@@ -10,2 +10,3 @@
- fixture = """documentation
+@@ -10,0 +11,1 @@
 +pytest.skip("not executable")
- """
 '''
+    post_image = "\n".join(
+        [
+            *([""] * 9),
+            'fixture = """documentation',
+            'pytest.skip("not executable")',
+            '"""',
+        ]
+    )
 
-    assert scan_added_test_skip_guards(diff).ok
+    assert added_test_paths(diff) == ("tests/test_guard.py",)
+    assert _scan(
+        diff,
+        (BranchTextFile(path="tests/test_guard.py", content=post_image),),
+    ).ok
 
 
 def test_scan_added_test_skip_guards_flags_code_after_multiline_literal() -> None:
@@ -237,7 +363,7 @@ def test_scan_added_test_skip_guards_flags_code_after_multiline_literal() -> Non
 +pytest.skip("executable")
 '''
 
-    result = scan_added_test_skip_guards(diff)
+    result = _scan(diff)
 
     assert not result.ok
     assert [violation.line_number for violation in result.violations] == [5]
