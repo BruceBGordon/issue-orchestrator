@@ -112,7 +112,14 @@ Two things worth knowing when the connection doesn't come up:
 ### Authentication to the Control API
 
 Every Control API route requires a bearer token, so engine-level tools need one
-too. The server resolves it in this order:
+too. Supervisor-level tools — `orchestrator.repos.start` and
+`orchestrator.repos.stop` — do not: they drive process lifecycle from inside the
+MCP process and never present a token. A client that cannot authenticate to any
+Control API can still start and stop orchestrators. See
+[Security and Operational Notes](#security-and-operational-notes) for the full
+split.
+
+The server resolves the token in this order:
 
 1. `ISSUE_ORCHESTRATOR_API_TOKEN` from the environment.
 2. `~/.issue-orchestrator/api-token`, if the file already exists.
@@ -305,9 +312,26 @@ Semantics:
 Set the allowlist whenever the MCP client is something you don't fully control.
 
 The guard covers `repos.start` only. `orchestrator.repos.stop` takes the same
-caller-supplied `repo_path` without that validation — stopping is not a
-privilege escalation, so the worst outcome is a denial of service against an
-orchestrator you already had the token to talk to.
+caller-supplied `repo_path` without that validation, and it is **not** bearer-
+token gated: it does not call the Control API at all. It invokes the supervisor
+inside the MCP process, so the authority it requires is access to this stdio
+server plus ordinary same-user OS permissions — nothing more. A client with no
+usable Control API token can still stop any orchestrator whose path it can
+name.
+
+That is the distinction to hold on to when assessing what an MCP client can
+actually do:
+
+| Authority | What it gates | What grants it |
+|-----------|---------------|----------------|
+| Supervisor-level | Process lifecycle: `repos.start`, `repos.stop` | Talking to this stdio MCP server as the same OS user |
+| Engine-level | Everything routed to a running orchestrator's Control API | The bearer token below |
+
+Stopping is not a privilege escalation, so the worst outcome remains a denial
+of service — but it is a denial of service available to any client that can
+reach the stdio server, not only to one already trusted with the token. If that
+is not acceptable, do not hand the MCP transport to a client you do not
+control.
 
 **Control API token handling.** The bearer token authorizes every Control API
 route. Clients that forward their whole environment to the MCP subprocess also

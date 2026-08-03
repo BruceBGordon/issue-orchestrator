@@ -13,7 +13,9 @@ interface RecordedStartRun {
   logged: string[];
 }
 
-async function runStart(result: StartResponse | null): Promise<RecordedStartRun> {
+async function runStart(
+  result: StartResponse | null | undefined
+): Promise<RecordedStartRun> {
   const recorded: RecordedStartRun = { refreshed: 0, doctorCalls: [], logged: [] };
   await runStartCommand({
     start: async () => result,
@@ -106,11 +108,24 @@ suite("Start command", () => {
     assert.strictEqual(recorded.doctorCalls[0].doctorUrl, undefined);
   });
 
-  test("a null result is treated as success, not a silent failure path", async () => {
-    const recorded = await runStart(null);
+  test("a missing response fails closed and never refreshes", async () => {
+    // Refreshing here would show a green tree for an orchestrator that may
+    // not be running: absence of evidence is not evidence of a start.
+    for (const empty of [null, undefined]) {
+      const recorded = await runStart(empty);
 
-    assert.strictEqual(recorded.refreshed, 1);
-    assert.deepStrictEqual(recorded.doctorCalls, []);
+      assert.strictEqual(recorded.refreshed, 0);
+      assert.strictEqual(recorded.doctorCalls.length, 1);
+    }
+  });
+
+  test("an unrecognisable envelope fails closed and never refreshes", async () => {
+    // `McpClient.callTool` returns `{}` for empty MCP content, so this is a
+    // reachable response, not a hypothetical one.
+    const recorded = await runStart({} as StartResponse);
+
+    assert.strictEqual(recorded.refreshed, 0);
+    assert.strictEqual(recorded.doctorCalls.length, 1);
   });
 
   test("decideStartOutcome ignores launch.status and keys off the top-level error", () => {
@@ -121,8 +136,32 @@ suite("Start command", () => {
       { kind: "refresh" }
     );
     assert.deepStrictEqual(
-      decideStartOutcome({ error: { message: "" } } as StartResponse),
+      decideStartOutcome({
+        launch: { status: "ok", launched: true },
+      } as StartResponse),
       { kind: "refresh" }
+    );
+  });
+
+  test("decideStartOutcome rejects an error object with no message", () => {
+    // The failure is real even when the server could not describe it; only
+    // the explanation is missing.
+    const outcome = decideStartOutcome({
+      error: { message: "" },
+    } as StartResponse);
+
+    assert.strictEqual(outcome.kind, "doctor");
+  });
+
+  test("decideStartOutcome still surfaces the doctor URL for an invalid envelope", () => {
+    const outcome = decideStartOutcome({
+      ui_hint: { kind: "doctor", url: "http://127.0.0.1:19080/api/doctor" },
+    } as StartResponse);
+
+    assert.strictEqual(outcome.kind, "doctor");
+    assert.strictEqual(
+      outcome.kind === "doctor" ? outcome.doctorUrl : undefined,
+      "http://127.0.0.1:19080/api/doctor"
     );
   });
 });

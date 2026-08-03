@@ -43,10 +43,18 @@ The extension starts the MCP server and (by default) auto-starts the orchestrato
 
 - See **Active**, **Queue**, **Blocked**, and **History** sessions.
 - Open worktrees, PRs, issues, and logs.
-- Open a live **session console** and send messages to running agents.
+- Open a read-only **session console** for a running agent, or **focus** its
+  terminal when the client supports it, and drive the agent from that terminal
+  directly.
 - Pause/Resume/Stop the orchestrator without leaving VS Code.
 - Open the web **Dashboard** inside VS Code or in your browser.
 - Run diagnostics in the **Doctor** panel (re-run, copy report, open Control Center/Dashboard) and surface issues in the Problems panel.
+
+The extension deliberately cannot inject text into a running agent's prompt.
+The MCP server does not register a session-send tool, because any client
+holding the transport could use it to steer an agent — see
+[the MCP security notes](mcp.md#security-and-operational-notes). Focusing the terminal keeps
+that in your hands rather than the client's.
 
 ## Settings You’ll Actually Use
 

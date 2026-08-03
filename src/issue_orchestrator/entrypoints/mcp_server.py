@@ -348,15 +348,43 @@ class McpApp:
         by inspecting the result rather than by catching — an outer ``except``
         here would never fire, and a returned doctor/launch failure would
         never reach one anyway.
+
+        Attaching the hint must not be able to undo that. It runs after
+        ``_safe`` has already produced the structured error, so anything raised
+        while building it would escape the tool and cross the protocol boundary
+        as a transport-level exception — losing the very error the contract
+        promises. :meth:`_doctor_ui_hint` therefore cannot raise.
         """
         result = await self._safe("orchestrator.start", self.start)
         if "error" not in result:
             return result
-        ui_hint: dict[str, Any] = {"kind": "doctor"}
-        doctor_url = self._client.doctor_url()
+        return {**result, "ui_hint": self._doctor_ui_hint()}
+
+    def _doctor_ui_hint(self) -> dict[str, Any]:
+        """Build the doctor hint for a failed start. Never raises.
+
+        The URL is a convenience for opening the doctor panel, and resolving it
+        re-reads supervisor state — the same read that may have just failed the
+        start. An unreadable lock or state directory would then raise here,
+        *after* the structured error was built, and destroy it.
+
+        This is not a fallback that hides a problem: the failure being reported
+        is unchanged and the exception is logged. Only the optional URL is
+        dropped, and a hint without one still routes the operator to the doctor
+        panel, which is where the underlying fault will be diagnosed anyway.
+        """
+        hint: dict[str, Any] = {"kind": "doctor"}
+        try:
+            doctor_url = self._client.doctor_url()
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "resolving the doctor URL failed; returning the start error "
+                "with a URL-less doctor hint"
+            )
+            return hint
         if doctor_url:
-            ui_hint["url"] = doctor_url
-        return {**result, "ui_hint": ui_hint}
+            hint["url"] = doctor_url
+        return hint
 
     async def tool_stop(self, force: bool = False) -> dict[str, Any]:
         return await self._safe("orchestrator.stop", lambda: self.stop(force))

@@ -381,6 +381,37 @@ def _patch_launch(monkeypatch: pytest.MonkeyPatch, result: LaunchResult) -> None
     )
 
 
+def test_tool_start_survives_a_doctor_url_lookup_that_also_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unreadable state directory fails the start *and* the hint lookup.
+
+    Resolving the doctor URL re-reads supervisor state, so the read that broke
+    the start breaks the hint too — and it runs after ``_safe`` has already
+    built the structured error. If it were allowed to raise, the exception
+    would cross the protocol boundary and the client would lose the error
+    entirely. No ``override_port`` here on purpose: a cached port would let
+    ``doctor_url`` answer without touching supervisor state and the second
+    failure would never happen.
+    """
+    app = McpApp(_settings())
+
+    def unreadable_state(repo_root, instance_id=None):
+        raise OSError(13, "Permission denied: .issue-orchestrator/state")
+
+    monkeypatch.setattr(
+        "issue_orchestrator.entrypoints.mcp_server.supervisor.status", unreadable_state
+    )
+
+    result = asyncio.run(app.tool_start())
+
+    assert result["error"]["type"] == "PermissionError"
+    assert "Permission denied" in result["error"]["message"]
+    # The hint still routes the operator to the doctor panel; only the
+    # optional URL is missing.
+    assert result["ui_hint"] == {"kind": "doctor"}
+
+
 def test_tool_start_surfaces_doctor_error_with_a_ui_hint(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
