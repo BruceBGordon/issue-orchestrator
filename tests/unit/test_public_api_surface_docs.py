@@ -404,25 +404,117 @@ def test_versioned_tier_is_backed_by_a_real_runtime_version_field() -> None:
     assert enriched["tick_id"] == 7
 
 
-def test_contracted_http_payloads_do_not_advertise_a_runtime_version() -> None:
-    """``Contracted`` is the honest tier only while responses carry no version.
+def _contracted_response_schema_names(document: dict) -> set[str]:
+    """Component schema names referenced by a contracted 200 JSON response."""
+    referenced: set[str] = set()
+    for operations in document["paths"].values():
+        for operation in operations.values():
+            if not isinstance(operation, dict):
+                continue
+            content = (
+                operation.get("responses", {})
+                .get("200", {})
+                .get("content", {})
+                .get("application/json", {})
+            )
+            ref = content.get("schema", {}).get("$ref")
+            if isinstance(ref, str) and ref.startswith("#/components/schemas/"):
+                referenced.add(ref.rsplit("/", 1)[-1])
+    return referenced
 
-    If a version field is ever added to the HTTP responses, this fails and the
-    surface should be promoted to ``Versioned`` rather than quietly under-sold.
+
+def test_http_surface_has_no_surface_wide_response_version() -> None:
+    """``Contracted`` is honest only while no *surface-wide* version exists.
+
+    The distinction that matters is not "no field whose name contains version" -
+    ``E2ETimelineEventPayload`` already carries ``timeline_schema_version``, and
+    a per-payload version is not a surface guarantee. What would make this
+    surface ``Versioned`` is a version field on *every* contracted response, the
+    way ``schema`` rides on every SSE event. Assert that no such field exists;
+    when one appears, promote the tier instead of under-selling it.
     """
     document = json.loads(UI_OPENAPI.read_text(encoding="utf-8"))
     schemas = document.get("components", {}).get("schemas", {})
+    response_models = _contracted_response_schema_names(document)
 
-    versioned_models = sorted(
-        name
-        for name, schema in schemas.items()
-        if "schema_version" in schema.get("properties", {})
+    assert response_models, "no contracted JSON responses found - format changed?"
+
+    property_sets = [
+        set(schemas.get(name, {}).get("properties", {})) for name in response_models
+    ]
+    common_properties = set.intersection(*property_sets) if property_sets else set()
+    surface_wide_version = sorted(
+        name for name in common_properties if "version" in name.lower()
     )
 
-    assert not versioned_models, (
-        "UI OpenAPI response models now carry a version field: "
-        f"{versioned_models}. Promote the HTTP surface to Versioned in "
-        f"{STABILITY_DOC.name} instead of leaving it Contracted."
+    assert not surface_wide_version, (
+        "Every contracted HTTP response now carries "
+        f"{surface_wide_version}, which is a surface-wide version. Promote the "
+        f"HTTP surface to Versioned in {STABILITY_DOC.name} instead of leaving "
+        "it Contracted."
+    )
+
+
+def test_per_payload_versions_do_not_make_the_http_surface_versioned() -> None:
+    """Guard the distinction itself, using the real per-payload version field."""
+    document = json.loads(UI_OPENAPI.read_text(encoding="utf-8"))
+    schemas = document.get("components", {}).get("schemas", {})
+    timeline = schemas.get("E2ETimelineEventPayload", {}).get("properties", {})
+
+    assert "timeline_schema_version" in timeline, (
+        "E2ETimelineEventPayload lost timeline_schema_version; the stability doc "
+        "cites it as the example of a per-payload (not surface-wide) version."
+    )
+    assert "timeline_schema_version" in _stability_doc_text(), (
+        f"{STABILITY_DOC.name} must keep naming the per-payload version as the "
+        "counter-example, or the Contracted-vs-Versioned distinction reads as an "
+        "oversight rather than a decision."
+    )
+
+
+def test_sse_payload_inventory_matches_the_contracted_subset() -> None:
+    """The Contracted claim must cover exactly the schema-backed SSE events.
+
+    ``PUBLIC_CONTRACTS`` covers a selected subset of a 160+ event catalog, so a
+    blanket "the data inside the envelope is schema-owned" claim would be false.
+    """
+    from issue_orchestrator.contracts.public import PUBLIC_CONTRACTS
+
+    documented = _inventory_table(_stability_doc_text(), "sse-payloads")
+    contracted = {
+        key[len("sse.") :] for key in PUBLIC_CONTRACTS if key.startswith("sse.")
+    }
+
+    _assert_same_set(set(documented), contracted, anchor="sse-payloads")
+
+
+def test_sse_payload_inventory_points_at_committed_artifacts() -> None:
+    documented = _inventory_table(_stability_doc_text(), "sse-payloads")
+
+    missing = sorted(
+        row[0].strip("`")
+        for row in documented.values()
+        if not (REPO_ROOT / row[0].strip("`")).exists()
+    )
+
+    assert not missing, f"SSE payload rows cite missing schema artifacts: {missing}"
+
+
+def test_uncontracted_sse_events_are_not_claimed_as_contracted() -> None:
+    """Sanity: the catalog really is much larger than the contracted subset."""
+    from issue_orchestrator.contracts.public import PUBLIC_CONTRACTS
+    from issue_orchestrator.events.catalog import EventName
+
+    contracted = {
+        key[len("sse.") :] for key in PUBLIC_CONTRACTS if key.startswith("sse.")
+    }
+    uncontracted = {event.value for event in EventName} - contracted
+
+    assert uncontracted, "every event is contracted - update the doc's claim"
+    assert "Every other event on the stream is `Experimental`." in _stability_doc_text(), (
+        f"{len(uncontracted)} of {len(EventName)} events have no committed payload "
+        f"schema, so {STABILITY_DOC.name} must classify the remainder explicitly "
+        "instead of implying the whole stream is Contracted."
     )
 
 

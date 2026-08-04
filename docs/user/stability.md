@@ -25,7 +25,7 @@ is visible from the releases page, not just from prose.
 | `Versioned` | The payload itself carries a schema version, so a consumer can detect a version it does not understand at runtime instead of misparsing it. A breaking change bumps that version. |
 | `Contracted` | The shape is owned by a checked-in schema artifact and a drift test fails when code and artifact disagree, so a breaking change is visible in review. The payload carries **no** runtime version — you find out at review time, not at request time. |
 | `Supported` | Intended for external use and documented. May change between minor versions; changes are called out in release notes. |
-| `Deprecated` | Still present and still works, but superseded and slated for removal. Do not build anything new on it. |
+| `Retired` | The capability is **gone**. The name is still accepted so an old script gets a clear pointer to the replacement instead of an "invalid choice" error, but every invocation fails. Nothing to migrate to a newer flag — migrate off the command. |
 | `Experimental` | Usable, but names, arguments, and return shapes may change or be removed in any release without notice. Do not build automation you cannot re-point. |
 | `Internal` | Not for third-party use. No compatibility promise of any kind, including within a patch release. Reachable does not mean supported. |
 | `First-party coupled` | Ships from this repo and is expected to move in lockstep with the Python package. Version skew is not supported. |
@@ -42,8 +42,9 @@ artifact but served without a version field.
 | CLI (`issue-orchestrator …`) | [`entrypoints/cli_parser.py`](../../src/issue_orchestrator/entrypoints/cli_parser.py) | Yes | Supported (per-command tiers below) |
 | Agent completion contracts (`coding-done`, `reviewer-done`) | [`entrypoints/cli_tools/`](../../src/issue_orchestrator/entrypoints/cli_tools/) | Yes (agent-facing) | Supported |
 | MCP server tools (`orchestrator.*`) | [`entrypoints/mcp_server.py`](../../src/issue_orchestrator/entrypoints/mcp_server.py) | Yes | **Experimental** |
-| SSE event envelope (`schema`, `run_id`, `tick_id`) | [`events/catalog.py`](../../src/issue_orchestrator/events/catalog.py), [`events/context.py`](../../src/issue_orchestrator/events/context.py) | Yes | **Versioned** |
-| SSE event payloads and dashboard view models | [`contracts/public/`](../../contracts/public/), [`contracts/public.py`](../../src/issue_orchestrator/contracts/public.py) | Yes | Contracted |
+| SSE event envelope (`schema` on every event) | [`events/sse_envelope.py`](../../src/issue_orchestrator/events/sse_envelope.py), [`events/catalog.py`](../../src/issue_orchestrator/events/catalog.py) | Yes | **Versioned** |
+| Schema-backed SSE payloads and view models | [`contracts/public/`](../../contracts/public/), [`contracts/public.py`](../../src/issue_orchestrator/contracts/public.py) | Yes | Contracted (subset listed below) |
+| All other SSE event payloads | [`events/catalog.py`](../../src/issue_orchestrator/events/catalog.py) | Yes | Experimental |
 | Contracted HTTP routes | [`docs/api/ui-openapi.json`](../api/ui-openapi.json) | Yes | Contracted |
 | All other `/api/*` and `/control/*` routes | [`entrypoints/control_api.py`](../../src/issue_orchestrator/entrypoints/control_api.py), [`entrypoints/web.py`](../../src/issue_orchestrator/entrypoints/web.py) | No | Internal |
 | Python package (`import issue_orchestrator`) | [`src/issue_orchestrator/`](../../src/issue_orchestrator/) | No | Internal |
@@ -76,10 +77,10 @@ and this table is the same set with the tier each command carries:
 |---|---|---|
 | `start` | Runtime | Supported |
 | `status` | Runtime | Supported |
-| `attach` | Runtime | Deprecated |
-| `switch` | Runtime | Deprecated |
-| `dashboard` | Runtime | Deprecated |
-| `output` | Runtime | Supported |
+| `attach` | Runtime | Retired |
+| `switch` | Runtime | Retired |
+| `dashboard` | Runtime | Retired |
+| `output` | Runtime | Retired |
 | `pause` | Runtime | Supported |
 | `resume` | Runtime | Supported |
 | `tech_lead` | Runtime | Supported |
@@ -104,10 +105,19 @@ Supported command names are stable within a minor version; flags may change
 between minor versions. Prefer `--config` and `--set path=value` over positional
 coupling in scripts.
 
-`attach`, `switch`, and `dashboard` predate the web dashboard and print a
-deprecation notice; use the dashboard instead. `test-reset` and `e2e-reset`
-operate on test and E2E state and carry no compatibility promise of any kind —
-they are reachable, not supported.
+`attach`, `switch`, `dashboard`, and `output` are `Retired`: the parser still
+accepts them, but each one prints where to go instead and **exits non-zero**.
+They predate the web dashboard and the session recordings that replaced them.
+Do not treat a `Retired` command as working — if a script calls one, it is
+already failing.
+
+`test-reset` and `e2e-reset` operate on test and E2E state and carry no
+compatibility promise of any kind — they are reachable, not supported.
+
+`tests/unit/test_cli.py::TestRetiredCommandStubs` pins these tiers to the
+handlers: it invokes every `Retired` command and requires a non-zero exit, and
+it fails if any command declared otherwise is in fact a failing stub. The tier
+cannot drift from the behavior again.
 
 The console scripts installed by the package:
 
@@ -179,17 +189,28 @@ issue #6463; see [VS Code Integration](vscode.md) for client setup today.
 This is the only surface that promises runtime version detection, and it is the
 model the others should grow toward.
 
-Every structured event published to the SSE stream is wrapped in an envelope
-that carries:
+**Every event on the SSE stream carries `schema`**, the `EVENT_SCHEMA_VERSION`
+from [`events/catalog.py`](../../src/issue_orchestrator/events/catalog.py). A
+breaking change to the envelope bumps it, so a consumer can refuse a version it
+does not understand instead of misparsing it.
 
-- `schema` — `EVENT_SCHEMA_VERSION` from
-  [`events/catalog.py`](../../src/issue_orchestrator/events/catalog.py), added by
-  `EventContext.enrich()` in
-  [`events/context.py`](../../src/issue_orchestrator/events/context.py). A
-  breaking change to the envelope bumps it, so a consumer can refuse a version
-  it does not understand instead of misparsing it.
-- `run_id` and `tick_id` — which orchestrator run and control tick produced the
-  event.
+That is a guarantee rather than a convention because the field is applied by a
+single owner at the broadcast boundary —
+[`events/sse_envelope.py`](../../src/issue_orchestrator/events/sse_envelope.py),
+called from `broadcast_event()` — not by each producer. Events emitted as plain
+dictionaries (the observer, direct broadcasts such as `startup_complete`) get
+the same envelope as events built through `EventContext`, because nothing
+reaches a subscriber without passing through that function.
+`tests/unit/test_sse_envelope.py` covers both producer paths end to end and
+fails if any other code starts enqueueing to subscribers directly.
+
+**`run_id` and `tick_id` are narrower**, and deliberately so: they identify an
+orchestrator run and control tick, which a direct broadcast like
+`startup_complete` has no meaningful value for. They are added by
+`EventContext.enrich()` in
+[`events/context.py`](../../src/issue_orchestrator/events/context.py) and are
+present on control-loop events only. **Do not assume every event has them** —
+read them when present, and key on `schema` for version handling.
 
 Event names come from the `EventName` enum, not ad-hoc strings, and
 `tests/unit/test_event_catalog.py` guards the catalog.
@@ -199,22 +220,55 @@ are for humans and change freely.
 
 ### SSE payloads and dashboard view models — contracted
 
-The data *inside* the envelope, and the dashboard view models, are owned by
-committed schema artifacts rather than a runtime version:
+The `Contracted` tier applies to the payload *shapes* that have a committed
+schema artifact — which is a **selected subset** of the event stream, not all of
+it:
 
 - Pydantic contracts in
   [`contracts/public.py`](../../src/issue_orchestrator/contracts/public.py) are
-  the source of truth.
+  the source of truth (`PUBLIC_CONTRACTS`).
 - Generated JSON Schema artifacts are committed under
   [`contracts/public/`](../../contracts/public/) (regenerate with
   `python scripts/generate_public_contracts.py`).
 - `tests/unit/test_public_contract_schemas.py` fails when the code and the
   committed schemas disagree, so a payload change cannot ship silently.
 
-**These payloads carry no version field of their own.** A breaking change is
-visible in the schema diff during review; it is not detectable by a client at
-runtime. That is why they are `Contracted` and not `Versioned` — pin to a
-release, and read the schema artifacts when you upgrade.
+These SSE events have a committed payload schema:
+
+<!-- inventory:sse-payloads -->
+
+| Event | Payload schema |
+|---|---|
+| `session.started` | `contracts/public/sse.session.started.json` |
+| `session.completed` | `contracts/public/sse.session.completed.json` |
+| `orchestrator.paused` | `contracts/public/sse.orchestrator.paused.json` |
+| `orchestrator.resumed` | `contracts/public/sse.orchestrator.resumed.json` |
+| `queue.changed` | `contracts/public/sse.queue.changed.json` |
+| `dependency.blocked` | `contracts/public/sse.dependency.blocked.json` |
+| `dependency.unblocked` | `contracts/public/sse.dependency.unblocked.json` |
+| `stale.in_progress_detected` | `contracts/public/sse.stale.in_progress_detected.json` |
+| `stale.in_progress_cleared` | `contracts/public/sse.stale.in_progress_cleared.json` |
+| `stale.persistent_detected` | `contracts/public/sse.stale.persistent_detected.json` |
+| `history.reconciled` | `contracts/public/sse.history.reconciled.json` |
+| `startup_complete` | `contracts/public/sse.startup_complete.json` |
+| `shutdown_requested` | `contracts/public/sse.shutdown_requested.json` |
+
+Non-SSE payloads on the same tier: `dashboard.view_model`, `timeline.issue`, and
+`stack.dependency_gate_view`.
+
+`tests/unit/test_public_api_surface_docs.py` asserts this table equals the
+`sse.*` entries of `PUBLIC_CONTRACTS` exactly, in both directions.
+
+**Every other event on the stream is `Experimental`.** The `EventName` catalog
+has well over a hundred entries; the ones above are the payloads that have been
+promoted to a committed contract. The rest still arrive with a versioned
+envelope and a stable name, but their payload fields may change in any release.
+If you depend on one, say so on an issue and it can be promoted.
+
+**No payload on this tier carries a version field of its own.** A breaking
+change is visible in the schema artifact diff during review; it is not
+detectable by a client at runtime. That is why these are `Contracted` and not
+`Versioned` — pin to a release, and read the artifact diff when you upgrade.
 
 ### HTTP routes — a contracted subset, internal remainder
 
@@ -278,9 +332,18 @@ and auth semantics change whenever the internal lifecycle needs them to.
 Reachable is not supported. For third-party automation, use the CLI or the MCP
 tools, not an uncontracted route.
 
-Note also that `info.version` in the OpenAPI document describes the *document*,
-not the responses. No HTTP response payload carries a version field, which is
-why this surface is `Contracted` rather than `Versioned`.
+Note that `info.version` in the OpenAPI document describes the *document*, not
+the responses: it is not delivered on the wire and a client cannot read it off a
+response. **There is no surface-wide HTTP contract version** — no field that
+every contracted response carries and that a breaking change would bump. That is
+precisely what separates `Contracted` from `Versioned` here.
+
+Individual payloads may still version themselves; `E2ETimelineEventPayload`
+carries `timeline_schema_version`, for example. That is a per-payload detail, not
+a surface guarantee, and it does not make the HTTP surface `Versioned`.
+`tests/unit/test_public_api_surface_docs.py` checks for the surface-wide form —
+a version field common to *every* contracted response — and fails if one
+appears, so this section gets promoted rather than quietly under-selling itself.
 
 ### Python package — internal
 
@@ -355,7 +418,7 @@ graduating:
 2. **Config schema stops renaming keys** — additive-only within a major, with a
    documented deprecation path for anything that must move.
 3. **CLI flags stabilize** — command and flag names become additive-only within
-   a major, and the `Deprecated` commands are removed.
+   a major, and the `Retired` command stubs are deleted outright.
 4. **Plugin hook signatures stabilize** — the port set settles enough that
    third-party plugins survive a minor upgrade.
 5. **`Contracted` HTTP payloads become `Versioned`** — the contracted route set
@@ -378,6 +441,7 @@ equality** against the code, in both directions:
 | `inventory:console-scripts` | `[project.scripts]` in `pyproject.toml` |
 | `inventory:mcp-tools` | `MCP_TOOLS` in `entrypoints/mcp_server.py` |
 | `inventory:http-routes` | the path set in `docs/api/ui-openapi.json` |
+| `inventory:sse-payloads` | the `sse.*` entries of `PUBLIC_CONTRACTS` |
 | `inventory:tiers` | every tier any inventory table uses |
 
 So adding a surface fails the build until it is classified here, removing one

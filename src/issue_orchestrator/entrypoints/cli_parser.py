@@ -52,7 +52,7 @@ class CLIStability(StrEnum):
     """
 
     SUPPORTED = "Supported"
-    DEPRECATED = "Deprecated"
+    RETIRED = "Retired"
     INTERNAL = "Internal"
 
 
@@ -84,10 +84,14 @@ CLI_COMMAND_SURFACE: tuple[CLICommandSpec, ...] = (
     # Runtime
     CLICommandSpec("start", CLIGroup.RUNTIME, CLIStability.SUPPORTED),
     CLICommandSpec("status", CLIGroup.RUNTIME, CLIStability.SUPPORTED),
-    CLICommandSpec("attach", CLIGroup.RUNTIME, CLIStability.DEPRECATED),
-    CLICommandSpec("switch", CLIGroup.RUNTIME, CLIStability.DEPRECATED),
-    CLICommandSpec("dashboard", CLIGroup.RUNTIME, CLIStability.DEPRECATED),
-    CLICommandSpec("output", CLIGroup.RUNTIME, CLIStability.SUPPORTED),
+    # Retired: the parser still accepts these so an old script gets a pointer
+    # instead of an argparse error, but every one of them fails. See
+    # ``tests/unit/test_cli.py::TestRetiredCommandStubs``, which pins the tier
+    # to the handlers' actual behavior.
+    CLICommandSpec("attach", CLIGroup.RUNTIME, CLIStability.RETIRED),
+    CLICommandSpec("switch", CLIGroup.RUNTIME, CLIStability.RETIRED),
+    CLICommandSpec("dashboard", CLIGroup.RUNTIME, CLIStability.RETIRED),
+    CLICommandSpec("output", CLIGroup.RUNTIME, CLIStability.RETIRED),
     CLICommandSpec("pause", CLIGroup.RUNTIME, CLIStability.SUPPORTED),
     CLICommandSpec("resume", CLIGroup.RUNTIME, CLIStability.SUPPORTED),
     CLICommandSpec("tech_lead", CLIGroup.RUNTIME, CLIStability.SUPPORTED),
@@ -285,7 +289,7 @@ def _register_runtime_commands(subparsers, handlers: CLICommandHandlers) -> None
     status_parser.set_defaults(func=handlers.status)
 
     attach_parser = subparsers.add_parser(
-        "attach", help="(deprecated) Use web dashboard instead"
+        "attach", help="(retired) Always fails - use the web dashboard instead"
     )
     attach_parser.add_argument(
         "issue_number",
@@ -297,7 +301,7 @@ def _register_runtime_commands(subparsers, handlers: CLICommandHandlers) -> None
     attach_parser.set_defaults(func=handlers.attach)
 
     switch_parser = subparsers.add_parser(
-        "switch", help="(deprecated) Use web dashboard instead"
+        "switch", help="(retired) Always fails - use the web dashboard instead"
     )
     switch_parser.add_argument(
         "issue_number", type=int, help="GitHub issue number to switch to"
@@ -305,12 +309,13 @@ def _register_runtime_commands(subparsers, handlers: CLICommandHandlers) -> None
     switch_parser.set_defaults(func=handlers.switch)
 
     dashboard_parser = subparsers.add_parser(
-        "dashboard", help="(deprecated) Use web dashboard instead"
+        "dashboard", help="(retired) Always fails - use the web dashboard instead"
     )
     dashboard_parser.set_defaults(func=handlers.dashboard)
 
     output_parser = subparsers.add_parser(
-        "output", help="Show recent output from an issue's session"
+        "output",
+        help="(retired) Always fails - read the session terminal recording instead",
     )
     output_parser.add_argument("issue_number", type=int, help="GitHub issue number")
     output_parser.add_argument(

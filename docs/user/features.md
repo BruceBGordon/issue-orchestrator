@@ -153,8 +153,10 @@ automation, or AI assistant.
   `docs/api/ui-openapi.json`, for clients and automations. The remaining
   `/api/*` and `/control/*` routes are internal engine transport with no
   compatibility promise — see [Stability & API Surface](stability.md).
-- Provides an MCP server entry point for editor and agent integrations, which is
-  the supported route for automation.
+- Provides an MCP server entry point for editor and agent integrations. This is
+  the intended external route for automation, but it is still **experimental**
+  during `0.x` — tool names, arguments, and return shapes may change in any
+  release.
 - Supports pause, resume, stop, diagnostics, and guardrail repair controls from
   configured clients.
 

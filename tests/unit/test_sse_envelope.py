@@ -1,0 +1,174 @@
+"""The public SSE envelope must be applied at the boundary, not by producers.
+
+``docs/user/stability.md`` publishes the SSE stream as the project's only
+``Versioned`` surface. That promise is only true if every event reaches the wire
+carrying ``schema`` — including events from producers that never touch
+``EventContext.enrich`` — so these tests exercise the boundary rather than the
+helper.
+"""
+
+from __future__ import annotations
+
+import ast
+import asyncio
+import inspect
+from pathlib import Path
+from uuid import UUID
+
+import pytest
+
+from issue_orchestrator.entrypoints import web
+from issue_orchestrator.entrypoints.web import (
+    add_event_subscriber,
+    broadcast_event,
+    remove_event_subscriber,
+)
+from issue_orchestrator.events import EventContext
+from issue_orchestrator.events.catalog import EVENT_SCHEMA_VERSION
+from issue_orchestrator.events.sse_envelope import (
+    SSE_SCHEMA_FIELD,
+    SseEvent,
+    apply_sse_envelope,
+)
+from issue_orchestrator.execution.lifecycle_sse import LifecycleSSEPlugin
+
+
+class TestApplySseEnvelope:
+    """Unit behavior of the envelope owner itself."""
+
+    def test_stamps_the_schema_version_on_a_raw_payload(self):
+        event = apply_sse_envelope("session.started", {"issue_number": 42})
+
+        assert event == SseEvent(
+            type="session.started",
+            data={"issue_number": 42, SSE_SCHEMA_FIELD: EVENT_SCHEMA_VERSION},
+        )
+        assert event.schema_version == EVENT_SCHEMA_VERSION
+
+    def test_stamps_the_schema_version_on_an_empty_payload(self):
+        event = apply_sse_envelope("startup_complete", None)
+
+        assert event.data == {SSE_SCHEMA_FIELD: EVENT_SCHEMA_VERSION}
+
+    def test_preserves_context_fields_from_an_enriched_payload(self):
+        run_id = UUID("00000000-0000-0000-0000-0000000000ab")
+        enriched = EventContext(run_id=run_id, tick_id=9).enrich({"issue_number": 42})
+
+        event = apply_sse_envelope("session.started", enriched)
+
+        assert event.data == {
+            SSE_SCHEMA_FIELD: EVENT_SCHEMA_VERSION,
+            "run_id": str(run_id),
+            "tick_id": 9,
+            "issue_number": 42,
+        }
+
+    def test_does_not_mutate_the_callers_payload(self):
+        payload = {"issue_number": 42}
+
+        apply_sse_envelope("session.started", payload)
+
+        assert payload == {"issue_number": 42}
+
+    def test_rejects_a_payload_declaring_a_different_schema_version(self):
+        """One live version exists; a hand-written mismatch is a bug, not a hint."""
+        with pytest.raises(ValueError, match="envelope version"):
+            apply_sse_envelope(
+                "session.started",
+                {"issue_number": 42, SSE_SCHEMA_FIELD: EVENT_SCHEMA_VERSION + 1},
+            )
+
+
+class TestBoundaryAppliesEnvelopeForEveryProducer:
+    """Producer-to-SSE-output coverage for both paths into the stream."""
+
+    @pytest.mark.asyncio
+    async def test_raw_trace_event_producer_reaches_the_wire_versioned(self):
+        """A producer that never calls ``enrich`` still yields a versioned event.
+
+        This is the path the observer uses: ``events.publish(TraceEvent(...))``
+        with a plain dict, through the pluggy hook, into the SSE broadcast.
+        """
+        queue: asyncio.Queue = asyncio.Queue(maxsize=100)
+        add_event_subscriber(queue)
+        try:
+            LifecycleSSEPlugin().on_trace_event(
+                "observation.completion_detected",
+                {"issue_number": 42, "outcome": "completed"},
+            )
+            await asyncio.sleep(0)  # let the scheduled broadcast task run
+
+            event = queue.get_nowait()
+        finally:
+            remove_event_subscriber(queue)
+
+        assert event["type"] == "observation.completion_detected"
+        assert event["data"] == {
+            "issue_number": 42,
+            "outcome": "completed",
+            SSE_SCHEMA_FIELD: EVENT_SCHEMA_VERSION,
+        }
+
+    @pytest.mark.asyncio
+    async def test_direct_broadcast_reaches_the_wire_versioned(self):
+        """``startup_complete`` is broadcast directly, bypassing trace events."""
+        queue: asyncio.Queue = asyncio.Queue(maxsize=100)
+        add_event_subscriber(queue)
+        try:
+            await broadcast_event("startup_complete", {"elapsed_seconds": 1.5})
+
+            event = queue.get_nowait()
+        finally:
+            remove_event_subscriber(queue)
+
+        assert event["data"] == {
+            "elapsed_seconds": 1.5,
+            SSE_SCHEMA_FIELD: EVENT_SCHEMA_VERSION,
+        }
+
+    @pytest.mark.asyncio
+    async def test_enriched_producer_keeps_run_and_tick_context(self):
+        run_id = UUID("00000000-0000-0000-0000-0000000000cd")
+        queue: asyncio.Queue = asyncio.Queue(maxsize=100)
+        add_event_subscriber(queue)
+        try:
+            await broadcast_event(
+                "session.started",
+                EventContext(run_id=run_id, tick_id=3).enrich({"issue_number": 7}),
+            )
+
+            event = queue.get_nowait()
+        finally:
+            remove_event_subscriber(queue)
+
+        assert event["data"]["run_id"] == str(run_id)
+        assert event["data"]["tick_id"] == 3
+        assert event["data"][SSE_SCHEMA_FIELD] == EVENT_SCHEMA_VERSION
+
+
+def test_broadcast_event_is_the_only_way_to_enqueue_an_sse_event():
+    """No producer may bypass the envelope owner.
+
+    The envelope is only a guarantee if every event reaches subscriber queues
+    through ``broadcast_event``. If another function starts enqueueing directly,
+    the promise silently becomes conditional again - so fail here instead.
+    """
+    module_source = Path(inspect.getfile(web)).read_text(encoding="utf-8")
+    tree = ast.parse(module_source)
+
+    enqueuing_functions = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for inner in ast.walk(node):
+            if (
+                isinstance(inner, ast.Call)
+                and isinstance(inner.func, ast.Attribute)
+                and inner.func.attr == "put_nowait"
+            ):
+                enqueuing_functions.add(node.name)
+
+    assert enqueuing_functions == {"broadcast_event"}, (
+        "Only broadcast_event may enqueue SSE events, because it is where the "
+        f"public envelope is applied. Also enqueueing: {sorted(enqueuing_functions)}."
+    )

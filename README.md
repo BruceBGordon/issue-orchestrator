@@ -115,19 +115,20 @@ mechanics, and the path to `1.0` are in
 | CLI (`issue-orchestrator …`) | Yes | Supported - flags may change between minors |
 | Agent completion contracts (`coding-done`, `reviewer-done`) | Yes (agent-facing) | Supported - subcommand/flag shape may change |
 | MCP server tools (`orchestrator.*`) | Yes | **Experimental** - names, args, and returns may change in any release |
-| SSE event envelope (`schema`, `run_id`, `tick_id`) | Yes | **Versioned** - a breaking change bumps the schema version |
-| SSE payloads and view models (`contracts/public/*.json`) | Yes | Contracted - committed artifacts + drift tests, no runtime version |
+| SSE event envelope (`schema` on every event) | Yes | **Versioned** - a breaking change bumps the schema version |
+| Schema-backed SSE payloads and view models (`contracts/public/*.json`) | Yes | Contracted - committed artifacts + drift tests, no runtime version |
+| All other SSE event payloads | Yes | Experimental - versioned envelope and stable name, but fields may change |
 | Contracted HTTP routes (`docs/api/ui-openapi.json`) | Yes | Contracted - generated and drift-tested, no runtime version |
 | All other `/api/*` and `/control/*` routes | No | Internal - bearer-token engine transport, not a third-party API |
 | Python package (`import issue_orchestrator`) | No | Internal - refactored freely |
 | Plugin entry points (`issue_orchestrator.plugins`, `…ai_provider_keys`) | Yes | Experimental - hook signatures may change |
 | VS Code extension (`packages/vscode`) | First-party | Run it from the same commit as the installed package |
 
-Only the SSE event envelope is `Versioned` - it carries a `schema` field a
-client can check at runtime. `Contracted` surfaces are backed by committed JSON
-Schema artifacts and drift tests, so a break is visible in review, but nothing in
-the payload lets a client detect it. That gap is what the other surfaces grow
-toward closing.
+Only the SSE event envelope is `Versioned` - a single owner stamps `schema` onto
+every event at the broadcast boundary, so a client can check it at runtime.
+`Contracted` surfaces are backed by committed JSON Schema artifacts and drift
+tests, so a break is visible in review, but nothing in the payload lets a client
+detect it. That gap is what the other surfaces grow toward closing.
 
 ## Documentation
 
