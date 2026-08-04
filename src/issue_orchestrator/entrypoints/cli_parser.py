@@ -3,6 +3,7 @@
 import argparse
 from collections.abc import Callable
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 
 CommandHandler = Callable[[argparse.Namespace], int]
@@ -43,44 +44,87 @@ class CLICommandHandlers:
     trace: CommandHandler
 
 
-# The public CLI command surface, declared as data. ``build_parser`` verifies
-# the registered commands match this tuple exactly, so the surface cannot drift
-# silently; ``docs/user/stability.md`` publishes it with a stability tier per
-# command and ``tests/unit/test_public_api_surface_docs.py`` enforces that.
-CLI_COMMANDS: tuple[str, ...] = (
+class CLIStability(StrEnum):
+    """Stability tier a CLI command carries during ``0.x``.
+
+    Values are the exact strings ``docs/user/stability.md`` publishes, so the
+    doc cannot disagree with the code about what a command promises.
+    """
+
+    SUPPORTED = "Supported"
+    DEPRECATED = "Deprecated"
+    INTERNAL = "Internal"
+
+
+class CLIGroup(StrEnum):
+    """Grouping a CLI command is published under in the surface inventory."""
+
+    RUNTIME = "Runtime"
+    SETUP = "Setup"
+    CREDENTIALS = "Credentials"
+    DIAGNOSTICS = "Diagnostics"
+    DEVELOPMENT = "Development"
+
+
+@dataclass(frozen=True)
+class CLICommandSpec:
+    """One published CLI command: its name, grouping, and stability tier."""
+
+    name: str
+    group: CLIGroup
+    stability: CLIStability
+
+
+# The public CLI command surface, declared as data with the tier each command
+# actually carries. ``build_parser`` verifies the registered commands match this
+# declaration exactly, so the surface cannot drift silently, and
+# ``tests/unit/test_public_api_surface_docs.py`` requires the inventory table in
+# ``docs/user/stability.md`` to match it name-for-name, group, and tier.
+CLI_COMMAND_SURFACE: tuple[CLICommandSpec, ...] = (
     # Runtime
-    "start",
-    "status",
-    "attach",
-    "switch",
-    "dashboard",
-    "output",
-    "pause",
-    "resume",
-    "tech_lead",
-    "health-review",
-    "refresh",
-    "restart",
+    CLICommandSpec("start", CLIGroup.RUNTIME, CLIStability.SUPPORTED),
+    CLICommandSpec("status", CLIGroup.RUNTIME, CLIStability.SUPPORTED),
+    CLICommandSpec("attach", CLIGroup.RUNTIME, CLIStability.DEPRECATED),
+    CLICommandSpec("switch", CLIGroup.RUNTIME, CLIStability.DEPRECATED),
+    CLICommandSpec("dashboard", CLIGroup.RUNTIME, CLIStability.DEPRECATED),
+    CLICommandSpec("output", CLIGroup.RUNTIME, CLIStability.SUPPORTED),
+    CLICommandSpec("pause", CLIGroup.RUNTIME, CLIStability.SUPPORTED),
+    CLICommandSpec("resume", CLIGroup.RUNTIME, CLIStability.SUPPORTED),
+    CLICommandSpec("tech_lead", CLIGroup.RUNTIME, CLIStability.SUPPORTED),
+    CLICommandSpec("health-review", CLIGroup.RUNTIME, CLIStability.SUPPORTED),
+    CLICommandSpec("refresh", CLIGroup.RUNTIME, CLIStability.SUPPORTED),
+    CLICommandSpec("restart", CLIGroup.RUNTIME, CLIStability.SUPPORTED),
     # Setup
-    "setup",
-    "init",
-    "test-reset",
-    "e2e-reset",
-    "audit",
-    # Hooks and guardrails
-    "verify",
-    "setup-hooks",
-    "setup-guardrails",
+    CLICommandSpec("setup", CLIGroup.SETUP, CLIStability.SUPPORTED),
+    CLICommandSpec("init", CLIGroup.SETUP, CLIStability.SUPPORTED),
+    CLICommandSpec("verify", CLIGroup.SETUP, CLIStability.SUPPORTED),
+    CLICommandSpec("setup-hooks", CLIGroup.SETUP, CLIStability.SUPPORTED),
+    CLICommandSpec("setup-guardrails", CLIGroup.SETUP, CLIStability.SUPPORTED),
     # Credentials
-    "auth",
-    "keys",
+    CLICommandSpec("auth", CLIGroup.CREDENTIALS, CLIStability.SUPPORTED),
+    CLICommandSpec("keys", CLIGroup.CREDENTIALS, CLIStability.SUPPORTED),
     # Diagnostics
-    "doctor",
-    "demo",
-    "trace",
+    CLICommandSpec("doctor", CLIGroup.DIAGNOSTICS, CLIStability.SUPPORTED),
+    CLICommandSpec("audit", CLIGroup.DIAGNOSTICS, CLIStability.SUPPORTED),
+    CLICommandSpec("trace", CLIGroup.DIAGNOSTICS, CLIStability.SUPPORTED),
+    CLICommandSpec("demo", CLIGroup.DIAGNOSTICS, CLIStability.SUPPORTED),
+    # Development only - these operate on test and E2E state and carry no
+    # compatibility promise of any kind.
+    CLICommandSpec("test-reset", CLIGroup.DEVELOPMENT, CLIStability.INTERNAL),
+    CLICommandSpec("e2e-reset", CLIGroup.DEVELOPMENT, CLIStability.INTERNAL),
 )
 
-__all__ = ["CLICommandHandlers", "CLI_COMMANDS", "build_parser"]
+CLI_COMMANDS: tuple[str, ...] = tuple(spec.name for spec in CLI_COMMAND_SURFACE)
+
+__all__ = [
+    "CLICommandHandlers",
+    "CLICommandSpec",
+    "CLIGroup",
+    "CLIStability",
+    "CLI_COMMANDS",
+    "CLI_COMMAND_SURFACE",
+    "build_parser",
+]
 
 
 def build_parser(handlers: CLICommandHandlers) -> argparse.ArgumentParser:
@@ -113,9 +157,9 @@ def build_parser(handlers: CLICommandHandlers) -> argparse.ArgumentParser:
 
 
 def _verify_declared_command_surface(subparsers) -> None:
-    """Fail fast when the registered commands drift from ``CLI_COMMANDS``.
+    """Fail fast when the registered commands drift from ``CLI_COMMAND_SURFACE``.
 
-    The declared tuple is what the stability doc publishes, so a command that
+    The declared surface is what the stability doc publishes, so a command that
     exists but is undeclared (or vice versa) is a bug, not a nuance to discover
     later from a user report.
     """
@@ -124,10 +168,10 @@ def _verify_declared_command_surface(subparsers) -> None:
     if registered == declared:
         return
     raise RuntimeError(
-        "CLI command surface drifted from CLI_COMMANDS. "
+        "CLI command surface drifted from CLI_COMMAND_SURFACE. "
         f"Registered but undeclared: {sorted(registered - declared)}; "
         f"declared but not registered: {sorted(declared - registered)}. "
-        "Update CLI_COMMANDS and docs/user/stability.md together."
+        "Update CLI_COMMAND_SURFACE and docs/user/stability.md together."
     )
 
 

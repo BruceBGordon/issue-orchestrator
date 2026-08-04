@@ -11,31 +11,41 @@ page owns the **inventory and the policy**.
 ## The short version
 
 While the version starts with `0.`, the public API is **not stable**. Any
-surface on this page may change in a minor release, except the versioned
-Web/SSE contracts. Every `0.x` release is published as a GitHub *pre-release*
-so that instability is visible from the releases page, not just from prose.
+surface on this page may change in a minor release, except the SSE event
+envelope, whose schema version makes a breaking change detectable at runtime.
+Every `0.x` release is published as a GitHub *pre-release* so that instability
+is visible from the releases page, not just from prose.
 
 ## Stability tiers
 
+<!-- inventory:tiers -->
+
 | Tier | What it means during `0.x` |
 |---|---|
-| **Versioned** | Changes are explicit and detectable: the payload carries a schema version, generated schema artifacts are checked in, and a drift test fails when the shape changes without regeneration. Breaking changes bump the version. |
-| **Supported** | Intended for external use and documented. May change between minor versions; changes are called out in release notes. |
-| **Experimental** | Usable, but names, arguments, and return shapes may change or be removed in any release without notice. Do not build automation you cannot re-point. |
-| **Internal** | Not for third-party use. No compatibility promise of any kind, including within a patch release. Reachable does not mean supported. |
-| **First-party coupled** | Ships from this repo and is expected to move in lockstep with the Python package. Version skew is not supported. |
+| `Versioned` | The payload itself carries a schema version, so a consumer can detect a version it does not understand at runtime instead of misparsing it. A breaking change bumps that version. |
+| `Contracted` | The shape is owned by a checked-in schema artifact and a drift test fails when code and artifact disagree, so a breaking change is visible in review. The payload carries **no** runtime version — you find out at review time, not at request time. |
+| `Supported` | Intended for external use and documented. May change between minor versions; changes are called out in release notes. |
+| `Deprecated` | Still present and still works, but superseded and slated for removal. Do not build anything new on it. |
+| `Experimental` | Usable, but names, arguments, and return shapes may change or be removed in any release without notice. Do not build automation you cannot re-point. |
+| `Internal` | Not for third-party use. No compatibility promise of any kind, including within a patch release. Reachable does not mean supported. |
+| `First-party coupled` | Ships from this repo and is expected to move in lockstep with the Python package. Version skew is not supported. |
+
+Only `Versioned` promises runtime detectability. `Contracted` is deliberately
+weaker and is the honest label for everything generated from a committed schema
+artifact but served without a version field.
 
 ## Surface inventory
 
 | Surface | Where | Public? | Tier during `0.x` |
 |---|---|---|---|
 | Config YAML schema | [`infra/settings_schema.py`](../../src/issue_orchestrator/infra/settings_schema.py), [Configuration Reference](configuration_reference.md) | Yes | Supported |
-| CLI (`issue-orchestrator …`) | [`entrypoints/cli_parser.py`](../../src/issue_orchestrator/entrypoints/cli_parser.py) | Yes | Supported |
+| CLI (`issue-orchestrator …`) | [`entrypoints/cli_parser.py`](../../src/issue_orchestrator/entrypoints/cli_parser.py) | Yes | Supported (per-command tiers below) |
 | Agent completion contracts (`coding-done`, `reviewer-done`) | [`entrypoints/cli_tools/`](../../src/issue_orchestrator/entrypoints/cli_tools/) | Yes (agent-facing) | Supported |
 | MCP server tools (`orchestrator.*`) | [`entrypoints/mcp_server.py`](../../src/issue_orchestrator/entrypoints/mcp_server.py) | Yes | **Experimental** |
-| Web / SSE public contracts | [`contracts/public/`](../../contracts/public/), [`contracts/public.py`](../../src/issue_orchestrator/contracts/public.py) | Yes | **Versioned** |
-| UI OpenAPI contract | [`docs/api/ui-openapi.json`](../api/ui-openapi.json) | Yes | Versioned |
-| Control API (HTTP, default `:19080`) | [`entrypoints/control_api.py`](../../src/issue_orchestrator/entrypoints/control_api.py) | No | Internal |
+| SSE event envelope (`schema`, `run_id`, `tick_id`) | [`events/catalog.py`](../../src/issue_orchestrator/events/catalog.py), [`events/context.py`](../../src/issue_orchestrator/events/context.py) | Yes | **Versioned** |
+| SSE event payloads and dashboard view models | [`contracts/public/`](../../contracts/public/), [`contracts/public.py`](../../src/issue_orchestrator/contracts/public.py) | Yes | Contracted |
+| Contracted HTTP routes | [`docs/api/ui-openapi.json`](../api/ui-openapi.json) | Yes | Contracted |
+| All other `/api/*` and `/control/*` routes | [`entrypoints/control_api.py`](../../src/issue_orchestrator/entrypoints/control_api.py), [`entrypoints/web.py`](../../src/issue_orchestrator/entrypoints/web.py) | No | Internal |
 | Python package (`import issue_orchestrator`) | [`src/issue_orchestrator/`](../../src/issue_orchestrator/) | No | Internal |
 | Plugin entry points | [`infra/hooks/hookspec.py`](../../src/issue_orchestrator/infra/hooks/hookspec.py), [`infra/ai_keys.py`](../../src/issue_orchestrator/infra/ai_keys.py) | Yes | Experimental |
 | VS Code extension ↔ package | [`packages/vscode`](../../packages/vscode), [VS Code Integration](vscode.md) | First-party | First-party coupled |
@@ -55,25 +65,53 @@ upgrading.
 
 ### CLI — supported
 
-`issue-orchestrator --help` is authoritative for flags; the top-level command
-set is:
+`issue-orchestrator --help` is authoritative for flags. The top-level command
+set is declared as data in `CLI_COMMAND_SURFACE`
+([`entrypoints/cli_parser.py`](../../src/issue_orchestrator/entrypoints/cli_parser.py)),
+and this table is the same set with the tier each command carries:
 
-**Runtime:** `start` · `status` · `pause` · `resume` · `refresh` · `restart` ·
-`attach` · `switch` · `dashboard` · `output` · `tech_lead` · `health-review`
+<!-- inventory:cli-commands -->
 
-**Setup:** `setup` · `init` · `setup-hooks` · `setup-guardrails` · `verify`
+| Command | Group | Tier |
+|---|---|---|
+| `start` | Runtime | Supported |
+| `status` | Runtime | Supported |
+| `attach` | Runtime | Deprecated |
+| `switch` | Runtime | Deprecated |
+| `dashboard` | Runtime | Deprecated |
+| `output` | Runtime | Supported |
+| `pause` | Runtime | Supported |
+| `resume` | Runtime | Supported |
+| `tech_lead` | Runtime | Supported |
+| `health-review` | Runtime | Supported |
+| `refresh` | Runtime | Supported |
+| `restart` | Runtime | Supported |
+| `setup` | Setup | Supported |
+| `init` | Setup | Supported |
+| `verify` | Setup | Supported |
+| `setup-hooks` | Setup | Supported |
+| `setup-guardrails` | Setup | Supported |
+| `auth` | Credentials | Supported |
+| `keys` | Credentials | Supported |
+| `doctor` | Diagnostics | Supported |
+| `audit` | Diagnostics | Supported |
+| `trace` | Diagnostics | Supported |
+| `demo` | Diagnostics | Supported |
+| `test-reset` | Development | Internal |
+| `e2e-reset` | Development | Internal |
 
-**Credentials:** `auth` · `keys`
+Supported command names are stable within a minor version; flags may change
+between minor versions. Prefer `--config` and `--set path=value` over positional
+coupling in scripts.
 
-**Diagnostics:** `doctor` · `audit` · `trace` · `demo`
+`attach`, `switch`, and `dashboard` predate the web dashboard and print a
+deprecation notice; use the dashboard instead. `test-reset` and `e2e-reset`
+operate on test and E2E state and carry no compatibility promise of any kind —
+they are reachable, not supported.
 
-**Internal / development only:** `test-reset` · `e2e-reset` — these operate on
-test and E2E state and carry no compatibility promise.
+The console scripts installed by the package:
 
-Command names are supported; flags may change between minor versions. Prefer
-`--config` and `--set path=value` over positional coupling in scripts.
-
-The additional console scripts installed by the package:
+<!-- inventory:console-scripts -->
 
 | Script | Audience | Tier |
 |---|---|---|
@@ -99,6 +137,8 @@ may gain options between minors. See
 
 The MCP server (`issue-orchestrator-mcp`, stdio transport only) exposes these
 tools. **Names, arguments, and return shapes may change in any `0.x` release.**
+
+<!-- inventory:mcp-tools -->
 
 | Tool | Purpose |
 |---|---|
@@ -134,9 +174,33 @@ text into a running agent session (a prompt-injection primitive), and the
 transport is stdio only. Detailed usage documentation is tracked separately in
 issue #6463; see [VS Code Integration](vscode.md) for client setup today.
 
-### Web / SSE public contracts — versioned (the model to follow)
+### SSE event envelope — versioned
 
-This is the surface other surfaces should grow toward:
+This is the only surface that promises runtime version detection, and it is the
+model the others should grow toward.
+
+Every structured event published to the SSE stream is wrapped in an envelope
+that carries:
+
+- `schema` — `EVENT_SCHEMA_VERSION` from
+  [`events/catalog.py`](../../src/issue_orchestrator/events/catalog.py), added by
+  `EventContext.enrich()` in
+  [`events/context.py`](../../src/issue_orchestrator/events/context.py). A
+  breaking change to the envelope bumps it, so a consumer can refuse a version
+  it does not understand instead of misparsing it.
+- `run_id` and `tick_id` — which orchestrator run and control tick produced the
+  event.
+
+Event names come from the `EventName` enum, not ad-hoc strings, and
+`tests/unit/test_event_catalog.py` guards the catalog.
+
+Consumers should react to events and contract fields, never to log text. Logs
+are for humans and change freely.
+
+### SSE payloads and dashboard view models — contracted
+
+The data *inside* the envelope, and the dashboard view models, are owned by
+committed schema artifacts rather than a runtime version:
 
 - Pydantic contracts in
   [`contracts/public.py`](../../src/issue_orchestrator/contracts/public.py) are
@@ -146,26 +210,77 @@ This is the surface other surfaces should grow toward:
   `python scripts/generate_public_contracts.py`).
 - `tests/unit/test_public_contract_schemas.py` fails when the code and the
   committed schemas disagree, so a payload change cannot ship silently.
-- Every structured event payload carries a `schema` field
-  (`EVENT_SCHEMA_VERSION` in
-  [`events/catalog.py`](../../src/issue_orchestrator/events/catalog.py)) plus
-  `run_id` and `tick_id`, so consumers can detect a version they do not
-  understand instead of misparsing it.
-- Event names come from the `EventName` enum, not ad-hoc strings.
 
-Consumers should react to events and contract fields, never to log text. Logs
-are for humans and change freely.
+**These payloads carry no version field of their own.** A breaking change is
+visible in the schema diff during review; it is not detectable by a client at
+runtime. That is why they are `Contracted` and not `Versioned` — pin to a
+release, and read the schema artifacts when you upgrade.
 
-The UI HTTP surface is described by [`docs/api/ui-openapi.json`](../api/ui-openapi.json),
-generated from the canonical schema and drift-tested the same way.
+### HTTP routes — a contracted subset, internal remainder
 
-### Control API — internal
+Two HTTP scopes exist, and they are not the same thing:
 
-The Control API on port `19080` (`/api/*`, `/control/*`) is how the Control
-Center, the supervisor, and orchestrator-managed agents talk to a running
-engine. It is bearer-token authenticated and **not a third-party integration
-point**: routes, payloads, and auth semantics change whenever the internal
-lifecycle needs them to. Use the CLI or the MCP tools instead.
+- **Control Center** — the local UI shell that manages repository engines.
+  Listens on `:19080` by default and serves the `/control/*` routes.
+- **Repository Engine** — one long-lived runtime per repository, serving its own
+  browser dashboard and the `/api/*` routes. Its ports come from `ui.web_port`
+  and `ui.control_api_port` (`0` = auto-assign a free port), so do not hardcode
+  them; ask the CLI (`issue-orchestrator status`) or the
+  `orchestrator.urls` MCP tool. Each engine dashboard also mounts the
+  `/control/*` routes, so reaching a route says nothing about its scope.
+
+The **contracted** HTTP surface is exactly the path set in
+[`docs/api/ui-openapi.json`](../api/ui-openapi.json). That document is the
+canonical schema:
+[`contracts/ui_openapi_models.py`](../../src/issue_orchestrator/contracts/ui_openapi_models.py)
+is generated from it, `tests/unit/test_ui_openapi_generated.py` fails when the
+two disagree, and the `ui_openapi_routes` quality guardrail fails when a
+contracted route goes missing or stops using its generated response model.
+
+<!-- inventory:http-routes -->
+
+| Path | Scope |
+|---|---|
+| `/api/dialog/blocked-issues` | Repository Engine |
+| `/api/dialog/config` | Repository Engine |
+| `/api/dialog/debug` | Repository Engine |
+| `/api/dialog/doctor` | Repository Engine |
+| `/api/dialog/info` | Repository Engine |
+| `/api/dialog/phase/{issue_number}` | Repository Engine |
+| `/api/dialog/session-diagnostics/{issue_number}` | Repository Engine |
+| `/api/dialog/validation-failure/{issue_number}` | Repository Engine |
+| `/api/e2e-run-detail/{run_id}` | Repository Engine |
+| `/api/e2e-run/{run_id}/issue-detail/{issue_number}` | Repository Engine |
+| `/api/e2e-run/{run_id}/test-output` | Repository Engine |
+| `/api/e2e-runs/recent` | Repository Engine |
+| `/api/issue-detail/{issue_number}` | Repository Engine |
+| `/api/issue-rows` | Repository Engine |
+| `/api/retrospective-review` | Repository Engine |
+| `/api/retrospective-review/preflight` | Repository Engine |
+| `/api/view-model` | Repository Engine |
+| `/api/view-model-snapshot` | Repository Engine |
+| `/control/e2e/run/{run_id}/timeline` | Control Center |
+| `/control/setup/detect` | Control Center |
+| `/control/setup/github-auth/store-personal-token` | Control Center |
+| `/control/setup/github-auth/verify` | Control Center |
+| `/control/setup/preview` | Control Center |
+| `/control/setup/prereqs` | Control Center |
+| `/control/setup/save` | Control Center |
+
+`tests/unit/test_public_api_surface_docs.py` asserts this table equals the
+OpenAPI path set exactly, so contracting a new route cannot leave it classified
+as internal by prose.
+
+**Every other `/api/*` and `/control/*` route is internal.** The uncontracted
+remainder is how the Control Center, the supervisor, and orchestrator-managed
+agents drive a running engine: bearer-token authenticated, and routes, payloads,
+and auth semantics change whenever the internal lifecycle needs them to.
+Reachable is not supported. For third-party automation, use the CLI or the MCP
+tools, not an uncontracted route.
+
+Note also that `info.version` in the OpenAPI document describes the *document*,
+not the responses. No HTTP response payload carries a version field, which is
+why this surface is `Contracted` rather than `Versioned`.
 
 ### Python package — internal
 
@@ -203,14 +318,17 @@ when extension commands fail. See [VS Code Integration](vscode.md).
 for initial development and the public API should not be considered stable.
 Concretely, during `0.x`:
 
-- **Minor** (`0.10.0` → `0.11.0`) may break any surface on this page except the
-  versioned contracts. Config keys may be renamed, CLI flags may change, MCP
-  tools may disappear.
+- **Minor** (`0.10.0` → `0.11.0`) may break any surface on this page. Config
+  keys may be renamed, CLI flags may change, MCP tools may disappear.
 - **Patch** (`0.10.0` → `0.10.1`) is reserved for fixes that do not intend to
   break a documented surface.
-- **Versioned contracts** are the exception: a breaking change to a public
-  contract payload bumps its schema version, and the committed schema artifacts
-  make the change reviewable in the diff.
+- **The `Versioned` SSE envelope** is the one surface whose breakage is
+  detectable at runtime: a breaking envelope change bumps `EVENT_SCHEMA_VERSION`,
+  so a client can reject a version it does not understand.
+- **`Contracted` surfaces** can still break in a minor. What they guarantee is
+  that the break is *reviewable*: the committed schema artifacts change in the
+  same diff, and the drift tests fail if they do not. Read the artifact diff
+  when you upgrade — a client cannot detect the change at runtime.
 
 **Every `0.x` release is a GitHub pre-release.** `make release VERSION=v0.11.0`
 publishes with `gh release create … --prerelease`, so `0.x` tags carry the
@@ -232,22 +350,38 @@ Dropping the leading `0` is a promise, so it waits on the experimental surfaces
 graduating:
 
 1. **MCP tools become supported** — the tool set stops moving, arguments and
-   return payloads are contract-typed and drift-tested the way the Web/SSE
-   payloads already are, and usage documentation exists (#6463).
+   return payloads are contract-typed and drift-tested the way the SSE payloads
+   already are, and usage documentation exists (#6463).
 2. **Config schema stops renaming keys** — additive-only within a major, with a
    documented deprecation path for anything that must move.
 3. **CLI flags stabilize** — command and flag names become additive-only within
-   a major.
+   a major, and the `Deprecated` commands are removed.
 4. **Plugin hook signatures stabilize** — the port set settles enough that
    third-party plugins survive a minor upgrade.
+5. **`Contracted` HTTP payloads become `Versioned`** — the contracted route set
+   carries a version a client can read at runtime, rather than only a schema
+   artifact a human can diff.
 
 Surfaces marked Internal stay internal after `1.0`; they are not on the list
 because stability there is not a goal.
 
 ## Keeping this page honest
 
-This inventory is enforced, not aspirational.
-`tests/unit/test_public_api_surface_docs.py` fails when a console script, an
-MCP tool, or a CLI command exists in the code but is not classified here (and
-when this page names one that no longer exists). Adding a surface means
-declaring its tier in the same change.
+This inventory is enforced, not aspirational. The tables marked with an
+`<!-- inventory:… -->` comment are parsed by
+`tests/unit/test_public_api_surface_docs.py` and compared for **exact set
+equality** against the code, in both directions:
+
+| Table | Compared against |
+|---|---|
+| `inventory:cli-commands` | `CLI_COMMAND_SURFACE` — name, group, and tier |
+| `inventory:console-scripts` | `[project.scripts]` in `pyproject.toml` |
+| `inventory:mcp-tools` | `MCP_TOOLS` in `entrypoints/mcp_server.py` |
+| `inventory:http-routes` | the path set in `docs/api/ui-openapi.json` |
+| `inventory:tiers` | every tier any inventory table uses |
+
+So adding a surface fails the build until it is classified here, removing one
+fails the build until it is deleted from here, and a tier this page invents but
+never defines fails too. Mentioning a name in prose does not classify it — only
+a row in the anchored table counts. Relative links on this page are checked to
+resolve as well, so a moved file cannot leave a dangling promise behind.

@@ -52,7 +52,7 @@ Timeline artifact buttons open details such as reviewer feedback, review reports
 
 Session recordings let you see exactly what an agent did: terminal output rendered in an emulator replay. This is useful for debugging failures, auditing completion claims, and understanding why an issue moved to rework or needs-human.
 
-Any client can connect: browser, VS Code ([MCP integration](docs/user/vscode.md)), or AI agents via the REST API.
+Any client can connect: browser, VS Code ([MCP integration](docs/user/vscode.md)), or AI agents via the MCP tools. There is also a contracted subset of HTTP routes described by [`docs/api/ui-openapi.json`](docs/api/ui-openapi.json); the remaining routes are internal engine transport. See [Stability & API Surface](docs/user/stability.md) before integrating against HTTP.
 
 ## Guardrails
 
@@ -104,9 +104,9 @@ Issue-Orchestrator dogfoods the same discipline it expects from target repos: he
 ## Stability & API surface
 
 Issue-Orchestrator is `0.x`, so the public API is explicitly **not stable**: a
-minor release may break any surface below except the versioned contracts, and
-every `0.x` release is published as a GitHub pre-release. Full tier
-definitions, per-surface detail, release mechanics, and the path to `1.0` are in
+minor release may break any surface below, and every `0.x` release is published
+as a GitHub pre-release. Full tier definitions, per-surface detail, release
+mechanics, and the path to `1.0` are in
 **[Stability & API Surface](docs/user/stability.md)**.
 
 | Surface | Public? | Tier during `0.x` |
@@ -115,16 +115,19 @@ definitions, per-surface detail, release mechanics, and the path to `1.0` are in
 | CLI (`issue-orchestrator …`) | Yes | Supported - flags may change between minors |
 | Agent completion contracts (`coding-done`, `reviewer-done`) | Yes (agent-facing) | Supported - subcommand/flag shape may change |
 | MCP server tools (`orchestrator.*`) | Yes | **Experimental** - names, args, and returns may change in any release |
-| Web / SSE public contracts (`contracts/public/*.json`) | Yes | **Versioned** - schema version + committed artifacts + drift tests |
-| UI OpenAPI contract (`docs/api/ui-openapi.json`) | Yes | Versioned - generated and drift-tested |
-| Control API (HTTP, `:19080`) | No | Internal - bearer-token engine transport, not a third-party API |
+| SSE event envelope (`schema`, `run_id`, `tick_id`) | Yes | **Versioned** - a breaking change bumps the schema version |
+| SSE payloads and view models (`contracts/public/*.json`) | Yes | Contracted - committed artifacts + drift tests, no runtime version |
+| Contracted HTTP routes (`docs/api/ui-openapi.json`) | Yes | Contracted - generated and drift-tested, no runtime version |
+| All other `/api/*` and `/control/*` routes | No | Internal - bearer-token engine transport, not a third-party API |
 | Python package (`import issue_orchestrator`) | No | Internal - refactored freely |
 | Plugin entry points (`issue_orchestrator.plugins`, `…ai_provider_keys`) | Yes | Experimental - hook signatures may change |
 | VS Code extension (`packages/vscode`) | First-party | Run it from the same commit as the installed package |
 
-The versioned Web/SSE contracts are the model the other surfaces grow toward:
-Pydantic source of truth, committed JSON Schema artifacts, a `schema` version on
-every event payload, and drift tests that fail when code and artifacts disagree.
+Only the SSE event envelope is `Versioned` - it carries a `schema` field a
+client can check at runtime. `Contracted` surfaces are backed by committed JSON
+Schema artifacts and drift tests, so a break is visible in review, but nothing in
+the payload lets a client detect it. That gap is what the other surfaces grow
+toward closing.
 
 ## Documentation
 

@@ -193,6 +193,48 @@ def test_publish_release_creates_prerelease_for_0x_version(
     ]
 
 
+@pytest.mark.parametrize(
+    ("tag_name", "expected_command"),
+    [
+        ("v0.11.0", "gh release create v0.11.0 --generate-notes --prerelease"),
+        ("v1.0.0", "gh release create v1.0.0 --generate-notes"),
+    ],
+)
+def test_publish_release_prints_exact_recovery_command_when_gh_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tag_name: str,
+    expected_command: str,
+) -> None:
+    """The tag is pushed and ``gh`` failed: recovery must not rely on memory.
+
+    This is the one path where the release command cannot simply be rerun, so
+    an operator typing ``gh release create`` by hand is exactly how a ``0.x``
+    tag ends up published as a normal release.
+    """
+    paths = prepare_release.ReleasePaths.from_root(tmp_path)
+    pushed: list[list[str]] = []
+
+    def fail_on_gh(command, cwd=None):
+        pushed.append(list(command))
+        if command[0] == "gh":
+            raise prepare_release.ReleasePrepError("Command failed with exit code 1")
+
+    monkeypatch.setattr(prepare_release, "run_command", fail_on_gh)
+
+    with pytest.raises(prepare_release.ReleasePrepError):
+        prepare_release.publish_release(
+            paths, tag_name, _workflow_options(dry_run=False)
+        )
+
+    assert pushed[0][:2] == ["git", "push"]
+    stderr = capsys.readouterr().err
+    assert expected_command in stderr
+    assert "already exists" in stderr
+    assert ("--prerelease" in stderr) is tag_name.startswith("v0.")
+
+
 def test_parse_command_rejects_empty_command() -> None:
     with pytest.raises(prepare_release.ReleasePrepError, match="empty"):
         prepare_release.parse_command("")

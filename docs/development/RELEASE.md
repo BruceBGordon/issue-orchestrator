@@ -107,11 +107,21 @@ prep command when you intentionally want to edit, commit, push, and open the PR
 yourself.
 
 If `gh release create` fails after the tag push, do not rerun the full release
-command unchanged because the remote tag now exists. Create the GitHub release
-from the pushed tag:
+command unchanged because the remote tag now exists. The failing run prints the
+exact recovery command to stderr — copy that line rather than retyping one,
+because it is built by the same `github_release_command()` that the release
+itself uses and therefore carries the correct pre-release marking:
 
-```bash
-gh release create v1.0.0 --generate-notes
 ```
+The v0.11.0 tag was pushed but the GitHub release was not created.
+Do not rerun the release command; the remote tag already exists. Create the
+release from the pushed tag with exactly:
+  gh release create v0.11.0 --generate-notes --prerelease
+```
+
+During `0.x` the `--prerelease` flag is not optional: omitting it publishes the
+release as a normal one and hands it the "Latest" pointer, contradicting the
+[0.x pre-release guarantee](../user/stability.md). From `1.0.0` onward the
+printed command omits the flag.
 
 For automation, use `ARGS=--yes` to skip the exact-tag confirmation prompt.
