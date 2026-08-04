@@ -608,6 +608,92 @@ def test_scan_added_test_skip_guards_ignores_form_feed_before_java_fixture() -> 
     assert _scan(diff, branch_files).ok
 
 
+_BACKSLASH = "\\"
+# Raw backslash sequences placed immediately before ``u0022``, paired with
+# whether that ``u0022`` becomes the quote that closes the string literal and
+# leaves the rest of the line executable. Every row was confirmed against javac
+# (JDK 22): a sequence "closes" exactly when the compiled program reaches the
+# call after the literal. Eligibility is the parity of the contiguous
+# backslashes already emitted, and a backslash produced by an earlier Unicode
+# escape counts just like a raw one -- which is why those rows shift parity.
+_JAVA_ESCAPE_ELIGIBILITY = (
+    (_BACKSLASH, True),
+    (_BACKSLASH * 2, False),
+    (_BACKSLASH * 3, True),
+    (_BACKSLASH + "u005c" + _BACKSLASH, False),
+    (_BACKSLASH + "u005c" + _BACKSLASH * 2, True),
+    (_BACKSLASH + "u005c" + _BACKSLASH * 3, False),
+)
+
+
+@pytest.mark.parametrize(("sequence", "closes_literal"), _JAVA_ESCAPE_ELIGIBILITY)
+def test_scan_added_test_skip_guards_matches_java_escape_eligibility(
+    sequence: str, closes_literal: bool
+) -> None:
+    source_line = f'        String fixture = "{sequence}u0022; assumeTrue(false); //";'
+    diff = f"""diff --git a/src/test/java/GuardTest.java b/src/test/java/GuardTest.java
+--- a/src/test/java/GuardTest.java
++++ b/src/test/java/GuardTest.java
+@@ -0,0 +1,1 @@
++{source_line}
+"""
+    branch_files = (
+        BranchTextFile(path="src/test/java/GuardTest.java", content=source_line),
+    )
+
+    result = _scan(diff, branch_files)
+
+    assert [
+        (violation.line_number, violation.pattern) for violation in result.violations
+    ] == ([(1, "JUnit assumeTrue")] if closes_literal else [])
+
+
+def test_scan_added_test_skip_guards_keeps_lone_carriage_return_in_one_record() -> None:
+    # Git emits a single patch record for this line, so the branch-tip side has
+    # to agree; the masker is what recognises the CR as a Java line terminator.
+    source_line = "// note\rassumeTrue(false);"
+    diff = f"""diff --git a/src/test/java/GuardTest.java b/src/test/java/GuardTest.java
+--- a/src/test/java/GuardTest.java
++++ b/src/test/java/GuardTest.java
+@@ -0,0 +1,1 @@
++{source_line}
+"""
+    branch_files = (
+        BranchTextFile(path="src/test/java/GuardTest.java", content=source_line),
+    )
+
+    result = _scan(diff, branch_files)
+
+    assert [
+        (violation.line_number, violation.pattern) for violation in result.violations
+    ] == [(1, "JUnit assumeTrue")]
+
+
+def test_scan_added_test_skip_guards_aligns_crlf_diff_and_branch_tip_lines() -> None:
+    fixture_line = 'String fixture = "assumeTrue(false)";'
+    skip_line = "assumeTrue(false);"
+    diff = (
+        "diff --git a/src/test/java/GuardTest.java b/src/test/java/GuardTest.java\n"
+        "--- a/src/test/java/GuardTest.java\n"
+        "+++ b/src/test/java/GuardTest.java\n"
+        "@@ -0,0 +1,2 @@\n"
+        f"+{fixture_line}\r\n"
+        f"+{skip_line}\r\n"
+    )
+    branch_files = (
+        BranchTextFile(
+            path="src/test/java/GuardTest.java",
+            content=f"{fixture_line}\r\n{skip_line}\r\n",
+        ),
+    )
+
+    result = _scan(diff, branch_files)
+
+    assert [
+        (violation.line_number, violation.pattern) for violation in result.violations
+    ] == [(2, "JUnit assumeTrue")]
+
+
 def test_scan_added_test_skip_guards_ends_java_literal_at_trailing_backslash() -> None:
     diff = '''diff --git a/src/test/java/GuardTest.java b/src/test/java/GuardTest.java
 --- a/src/test/java/GuardTest.java

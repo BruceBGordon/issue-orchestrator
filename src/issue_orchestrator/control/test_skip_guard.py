@@ -11,9 +11,33 @@ from .lexical_masking import LiteralMasker
 
 
 _HUNK_RE = re.compile(r"@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
-_PHYSICAL_LINE_TERMINATOR = re.compile(r"\r\n|[\r\n]")
 _TEST_PATH_SEGMENTS = {"test", "tests", "spec", "specs", "__tests__"}
 _TEST_NAME_SEGMENTS = {"test", "tests", "spec", "specs"}
+
+
+def _physical_lines(text: str) -> list[str]:
+    """Split patch or source text the way Git delimits lines.
+
+    Git delimits patch records and file lines with LF alone, and shows a CRLF
+    file's carriage return as the last character of the record. Trailing
+    behaviour matches ``str.splitlines()``, but the boundary set is
+    deliberately narrower: ``str.splitlines()`` also breaks on form feed,
+    vertical tab, NEL and the Unicode separators, none of which Git treats as a
+    line boundary and all of which are ordinary in-line characters to the
+    modelled languages -- form feed is plain whitespace in Java (JLS 3.6).
+    Breaking there detaches source from its leading ``+`` and drops the
+    addition from the scan entirely.
+
+    The diff side and the branch-tip side must share this one rule. If they
+    disagree, their line numbering diverges and additions stop lining up with
+    the source they were taken from. Line terminators that a *language*
+    recognises inside such a line are the masker's concern, not this function's.
+    """
+
+    lines = [line.removesuffix("\r") for line in text.split("\n")]
+    if lines and not lines[-1]:
+        lines.pop()
+    return lines
 
 
 @dataclass(frozen=True)
@@ -98,7 +122,7 @@ def scan_added_test_skip_guards(
         masker = LiteralMasker(path)
         remaining_line_numbers = set(added_lines)
         for line_number, source_text in enumerate(
-            _PHYSICAL_LINE_TERMINATOR.split(files_by_path[path].content), start=1
+            _physical_lines(files_by_path[path].content), start=1
         ):
             code_text = masker.mask_line(source_text)
             added = added_lines.get(line_number)
@@ -170,12 +194,7 @@ def iter_added_diff_lines(diff_text: str) -> tuple[AddedDiffLine, ...]:
     added: list[AddedDiffLine] = []
     current_path: str | None = None
     new_line: int | None = None
-    # Unified-diff records are LF-delimited. ``str.splitlines()`` recognizes
-    # additional Unicode separators such as form feed; treating one of those
-    # source characters as a patch boundary can detach code from its leading
-    # ``+`` and silently drop an addition from the guard.
-    for record in diff_text.split("\n"):
-        raw = record.removesuffix("\r")
+    for raw in _physical_lines(diff_text):
         if raw.startswith("diff --git "):
             current_path = None
             new_line = None

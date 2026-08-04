@@ -79,10 +79,13 @@ _JSX_CLOSING_TAG = r"</[ \t]*(?:(?:[^\W\d]|[$_])[\w$.:-]*[ \t]*)?>"
 _JSX_CLOSING_TAG_AT = re.compile(_JSX_CLOSING_TAG)
 _JSX_CLOSING_TAG_END = re.compile(_JSX_CLOSING_TAG + r"$")
 _JAVA_UNICODE_ESCAPE = re.compile(r"u+([0-9a-fA-F]{4})")
-# JLS 3.4 LineTerminator: LF, CR, or CRLF. Deliberately narrower than
-# ``str.splitlines()``, which also breaks on form feed and other characters
-# Java treats as ordinary whitespace inside a line.
-_JAVA_LINE_TERMINATOR = re.compile(r"\r\n|\r|\n")
+# Terminators that end a line comment or a single-line literal in the modelled
+# languages: LF, CR and CRLF (JLS 3.4; Kotlin and Python agree). Deliberately
+# narrower than ``str.splitlines()``, which also breaks on form feed and other
+# characters all four languages treat as ordinary in-line whitespace.
+_LINE_TERMINATOR = re.compile(r"\r\n|[\r\n]")
+# ECMA-262 additionally terminates a line at LINE/PARAGRAPH SEPARATOR.
+_JS_LINE_TERMINATOR = re.compile("\\r\\n|[\\r\\n\u2028\u2029]")
 
 
 def _translate_java_unicode_escapes(text: str) -> str:
@@ -90,10 +93,15 @@ def _translate_java_unicode_escapes(text: str) -> str:
 
     Java translates eligible ``\\uXXXX`` escapes over the whole raw input
     *before* comments and literals are recognised, so ``"\\u0022"`` closes a
-    string rather than sitting inertly inside one. Eligibility depends on both
-    the parity of contiguous result backslashes and whether the immediately
-    preceding result character came from an escape. An escape-produced
-    character is emitted once and is never reconsidered as another escape.
+    string rather than sitting inertly inside one.
+
+    Eligibility is the parity of the contiguous backslashes already *emitted*,
+    and the origin of those backslashes is immaterial: a backslash produced by
+    an earlier ``\\u005c`` counts exactly like a raw one. Grouping only the
+    current raw run gets mixed-origin input wrong -- in ``"\\u005c\\\\u0022"``
+    the escape emits a backslash, so the second raw backslash sits at an even
+    offset, is eligible, and closes the literal. An escape-produced character
+    is emitted once and never rescanned as the start of another escape.
 
     Escapes that cannot be modelled -- a malformed ``\\u`` with fewer than four
     hex digits -- are left as raw text. Java rejects those at compile time, so
@@ -101,33 +109,32 @@ def _translate_java_unicode_escapes(text: str) -> str:
     """
 
     translated: list[str] = []
-    contiguous_backslashes = 0
-    preceding_from_escape = False
+    emitted_backslashes = 0
     index = 0
     while index < len(text):
         char = text[index]
         if char != "\\":
             translated.append(char)
-            contiguous_backslashes = 0
-            preceding_from_escape = False
+            emitted_backslashes = 0
             index += 1
             continue
 
-        eligible = preceding_from_escape or contiguous_backslashes % 2 == 0
-        escape = _JAVA_UNICODE_ESCAPE.match(text, index + 1) if eligible else None
+        escape = (
+            _JAVA_UNICODE_ESCAPE.match(text, index + 1)
+            if emitted_backslashes % 2 == 0
+            else None
+        )
         if escape is None:
             translated.append(char)
-            contiguous_backslashes += 1
-            preceding_from_escape = False
+            emitted_backslashes += 1
             index += 1
             continue
 
-        char = chr(int(escape.group(1), 16))
-        translated.append(char)
-        contiguous_backslashes = (
-            contiguous_backslashes + 1 if char == "\\" else 0
+        produced = chr(int(escape.group(1), 16))
+        translated.append(produced)
+        emitted_backslashes = (
+            emitted_backslashes + 1 if produced == "\\" else 0
         )
-        preceding_from_escape = True
         index = escape.end()
     return "".join(translated)
 
@@ -218,29 +225,32 @@ class LiteralMasker:
         self._literals_supported = (
             self._python or self._javascript or self._kotlin or self._java
         )
+        self._line_terminator = (
+            _JS_LINE_TERMINATOR if self._javascript else _LINE_TERMINATOR
+        )
         self._frames: list[_LexicalFrame] = []
         self._js_code_context = ""
         self._js_line_offset = 0
         self._js_last_value_end = 0
 
     def mask_line(self, text: str) -> str:
-        """Mask one raw branch-tip line, returning one result per raw line.
+        """Mask one physical branch-tip line, returning one result per line.
 
-        Java's Unicode-escape phase can translate one raw line into several
-        logical lines -- ``\\u000A`` ends a comment, exposing executable code
-        after it. Those logical lines are lexed in order and rejoined, so the
-        caller keeps its raw line numbering while seeing the code Java would
-        actually compile.
+        A physical line as Git delimits it can hold more than one *logical*
+        line. A bare carriage return is one for every modelled language, and
+        Java's Unicode-escape phase can produce another -- ``\\u000A`` ends a
+        comment, exposing executable code after it. Each logical line is lexed
+        in order and the results are rejoined, so the caller keeps its physical
+        line numbering while seeing the code the language would actually run.
         """
 
         if not self._literals_supported:
             return text
-        if not self._java:
-            return self._mask_logical_line(text)
-        translated = _translate_java_unicode_escapes(text)
+        if self._java:
+            text = _translate_java_unicode_escapes(text)
         return "\n".join(
             self._mask_logical_line(logical)
-            for logical in _JAVA_LINE_TERMINATOR.split(translated)
+            for logical in self._line_terminator.split(text)
         )
 
     def _mask_logical_line(self, text: str) -> str:
