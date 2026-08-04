@@ -8,6 +8,7 @@ CLI command must classify it in the doc, and removing one must remove it there.
 
 from __future__ import annotations
 
+import re
 import tomllib
 from pathlib import Path
 
@@ -19,6 +20,8 @@ from issue_orchestrator.entrypoints.mcp_server import MCP_TOOL_NAMES, McpApp, Mc
 REPO_ROOT = Path(__file__).resolve().parents[2]
 STABILITY_DOC = REPO_ROOT / "docs" / "user" / "stability.md"
 README = REPO_ROOT / "README.md"
+# Backticked tool names in the doc; the `orchestrator.*` glob is not a tool.
+_DOCUMENTED_MCP_TOOL = re.compile(r"`(orchestrator\.[a-z_][a-z_.]*)`")
 
 
 def _stability_doc_text() -> str:
@@ -51,14 +54,15 @@ def test_stability_doc_declares_every_mcp_tool() -> None:
 
 
 def test_stability_doc_does_not_document_removed_mcp_tools() -> None:
-    """The doc must not advertise a tool the server no longer registers."""
-    text = _stability_doc_text()
-    stale = sorted(
-        name
-        for name in ("orchestrator.session.send",)
-        if f"`{name}`" in text and name not in MCP_TOOL_NAMES
-    )
+    """The doc must not advertise a tool the server no longer registers.
 
+    ``orchestrator.session.send`` was removed as a prompt-injection primitive;
+    a doc that still promised it would be worse than no doc at all.
+    """
+    documented = set(_DOCUMENTED_MCP_TOOL.findall(_stability_doc_text()))
+    stale = sorted(documented - set(MCP_TOOL_NAMES))
+
+    assert documented, "no MCP tool names found in the doc - has the format changed?"
     assert not stale, (
         f"{STABILITY_DOC.name} documents MCP tools that are not registered: {stale}."
     )
