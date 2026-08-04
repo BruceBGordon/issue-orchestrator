@@ -246,6 +246,24 @@ class _LiteralFrame:
     multiline: bool
     line_start: int
     escapes: bool = True
+    close_absorbs_quote: bool = False
+
+    def closing_length(self, text: str, index: int) -> int | None:
+        """Return how many characters close this literal at ``index``.
+
+        Kotlin's ``TRIPLE_QUOTE_CLOSE`` is an optional quote followed by the
+        triple quote, so a run of four quotes is one content quote plus the
+        delimiter. Reading it as the delimiter followed by a new string literal
+        would leave a spurious frame open across the rest of the line.
+        """
+
+        if not text.startswith(self.delimiter, index):
+            return None
+        if self.close_absorbs_quote and text.startswith(
+            self.delimiter + self.delimiter[0], index
+        ):
+            return len(self.delimiter) + 1
+        return len(self.delimiter)
 
 
 @dataclass
@@ -416,8 +434,9 @@ class _LiteralMasker:
     def _mask_literal(
         self, text: str, masked: list[str], index: int, frame: _LiteralFrame
     ) -> int:
-        if text.startswith(frame.delimiter, index):
-            end = index + len(frame.delimiter)
+        closing = frame.closing_length(text, index)
+        if closing is not None:
+            end = index + closing
             self._blank(masked, index, end)
             self._frames.pop()
             self._note_value_end(end)
@@ -607,17 +626,19 @@ class _LiteralMasker:
         ) or (
             self._kotlin and quote == '"'
         )
-        # Kotlin triple-quoted strings are raw: a backslash before the closing
-        # delimiter is literal text, so honouring it as an escape would swallow
-        # the delimiter and leave the frame open over executable code. Python's
-        # ``r`` prefix and Java text blocks still escape at the token level.
-        escapes = not (self._kotlin and multiline)
+        # Kotlin triple-quoted strings are raw, and differ from every other
+        # modeled literal in two ways: a backslash is literal text rather than
+        # an escape, and the closing delimiter absorbs a preceding quote.
+        # Python's ``r`` prefix and Java text blocks still escape at the token
+        # level, so both traits stay off for them.
+        kotlin_raw = self._kotlin and multiline
         return _LiteralFrame(
             delimiter,
             interpolated,
             multiline=multiline,
             line_start=index,
-            escapes=escapes,
+            escapes=not kotlin_raw,
+            close_absorbs_quote=kotlin_raw,
         )
 
     @staticmethod
@@ -679,6 +700,11 @@ class _LiteralMasker:
                 break
             prefix = prefix[: -len(postfix)].rstrip()
 
+        if prefix.endswith("/>"):
+            # A self-closing JSX element is an expression, so the slash after
+            # its ``/>`` divides. Matching the pair rather than the bare ``>``
+            # keeps a regex literal after a relational operator masked.
+            return True
         identifier = re.search(r"(?:[^\W\d]|[$_])[\w$]*$", prefix)
         if identifier is not None:
             if identifier.group() not in _JS_REGEX_PREFIX_KEYWORDS:
