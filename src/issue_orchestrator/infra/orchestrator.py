@@ -668,7 +668,7 @@ class Orchestrator:
             manager.stop(orchestrator_id, self.config.repo_root)
 
     def _check_health(self) -> HealthDecision:
-        return cast(HealthDecision, _check_health(self.deps.health_gate, len(self.state.active_sessions), self.state.paused))
+        return cast(HealthDecision, _check_health(self.deps.health_gate, self.state.paused))
 
     def _process_active_sessions(self) -> None:
         try:

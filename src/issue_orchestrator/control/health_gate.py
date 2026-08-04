@@ -1,21 +1,21 @@
-"""HealthGate - System health checks for session launching.
+"""HealthGate - System-wide checks that gate orchestration planning.
 
-This module provides a HealthGate service that encapsulates all health
-checks that must pass before launching new sessions. Per architecture
-objective: "move policies into small, testable services."
+This module provides a HealthGate service for conditions that make the whole
+planning cycle unsafe. Session-capacity policy deliberately does not live here:
+the planner's ``worker_budget`` owner understands worker, reserved tech-lead,
+and E2E budgets and is the only authority that may suppress launch actions.
 
 Health Checks:
-- Capacity: Are we under the max concurrent sessions limit?
 - Rate Limit: Do we have sufficient GitHub API quota remaining?
 - Paused: Is the orchestrator paused?
 
 Usage:
-    gate = HealthGate(config)
-    decision = gate.check(active_sessions=5, paused=False)
+    gate = HealthGate()
+    decision = gate.check(paused=False)
     if decision.can_proceed:
-        # Launch new session
+        # Gather facts and ask the planner for actions
     else:
-        # Skip, log decision.reason
+        # Skip this planning cycle and log decision.reason
 """
 
 from __future__ import annotations
@@ -63,25 +63,15 @@ class RateLimitProvider(Protocol):
         ...
 
 
-class SessionCapacitySource(Protocol):
-    """Live source of the Repository Engine's worker-session limit."""
-
-    max_concurrent_sessions: int
-
-
-@dataclass(frozen=True)
-class _FixedSessionCapacity:
-    """Value owner for standalone callers that supply a fixed limit."""
-
-    max_concurrent_sessions: int
-
-
 class HealthGate:
-    """Service for checking system health before launching sessions.
+    """Service for checking system health before orchestration planning.
 
-    This service encapsulates all the health checks that must pass
-    before the orchestrator can launch new sessions. By extracting
-    this into a separate service:
+    This service encapsulates global checks that must pass before the
+    orchestrator may plan or apply actions. Launch capacity remains in the
+    planner because capacity does not block non-launch actions and the planner
+    owns multiple independent session budgets.
+
+    By extracting global health checks into a separate service:
 
     1. The orchestrator becomes thinner (just a mediator)
     2. Health checks are testable in isolation
@@ -90,36 +80,26 @@ class HealthGate:
 
     def __init__(
         self,
-        max_concurrent_sessions: int | SessionCapacitySource,
         rate_limit_threshold: int = 100,
         rate_limit_provider: RateLimitProvider | None = None,
     ) -> None:
         """Initialize the health gate.
 
         Args:
-            max_concurrent_sessions: A fixed limit, or the live configuration
-                owner whose current limit should be read on every check.
             rate_limit_threshold: Minimum remaining API calls before blocking.
             rate_limit_provider: Provider for rate limit info (e.g., gh_audit).
         """
-        self._capacity = (
-            _FixedSessionCapacity(max_concurrent_sessions)
-            if isinstance(max_concurrent_sessions, int)
-            else max_concurrent_sessions
-        )
         self._rate_limit_threshold = rate_limit_threshold
         self._rate_limit_provider = rate_limit_provider
 
     def check(
         self,
         *,
-        active_sessions: int,
         paused: bool = False,
     ) -> HealthDecision:
-        """Check if the system is healthy enough to launch new sessions.
+        """Check if the system is healthy enough to run a planning cycle.
 
         Args:
-            active_sessions: Number of currently active sessions.
             paused: Whether the orchestrator is paused.
 
         Returns:
@@ -129,17 +109,7 @@ class HealthGate:
         if paused:
             return HealthDecision.blocked("paused", paused=True)
 
-        # Check 2: Capacity. Read once so one decision is internally
-        # consistent even if the settings owner changes between ticks.
-        max_concurrent = self._capacity.max_concurrent_sessions
-        if active_sessions >= max_concurrent:
-            return HealthDecision.blocked(
-                "at_capacity",
-                active_sessions=active_sessions,
-                max_concurrent=max_concurrent,
-            )
-
-        # Check 3: Rate limit (optional)
+        # Check 2: Rate limit (optional)
         if self._rate_limit_provider is not None:
             rate_decision = self._check_rate_limit()
             if not rate_decision.can_proceed:
@@ -178,28 +148,12 @@ class HealthGate:
 
         return HealthDecision.ok()
 
-    @property
-    def available_capacity(self) -> int:
-        """Get the total capacity (for planning)."""
-        return self._capacity.max_concurrent_sessions
-
-    def remaining_capacity(self, active_sessions: int) -> int:
-        """Get remaining capacity given current active sessions.
-
-        Args:
-            active_sessions: Number of currently active sessions.
-
-        Returns:
-            Number of additional sessions that can be launched.
-        """
-        return max(0, self._capacity.max_concurrent_sessions - active_sessions)
-
 
 def create_health_gate_from_config(config: Config) -> HealthGate:
     """Create a HealthGate from config.
 
     Args:
-        config: Config object with max_concurrent_sessions, etc.
+        config: Runtime config containing the GitHub rate-limit threshold.
 
     Returns:
         Configured HealthGate instance.
@@ -208,7 +162,6 @@ def create_health_gate_from_config(config: Config) -> HealthGate:
 
     # gh_audit implements RateLimitProvider protocol
     return HealthGate(
-        max_concurrent_sessions=config,
         rate_limit_threshold=getattr(config, "rate_limit_warn_remaining", 100),
         rate_limit_provider=gh_audit,
     )

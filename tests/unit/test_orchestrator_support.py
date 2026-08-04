@@ -1307,11 +1307,10 @@ class TestCheckHealth:
 
     def test_returns_ok_when_healthy(self):
         """check_health returns OK decision when system is healthy."""
-        health_gate = HealthGate(max_concurrent_sessions=3)
+        health_gate = HealthGate()
 
         decision = check_health(
             health_gate=health_gate,
-            active_sessions_count=1,
             paused=False,
         )
 
@@ -1319,29 +1318,15 @@ class TestCheckHealth:
 
     def test_returns_blocked_when_paused(self):
         """check_health returns blocked when orchestrator is paused."""
-        health_gate = HealthGate(max_concurrent_sessions=3)
+        health_gate = HealthGate()
 
         decision = check_health(
             health_gate=health_gate,
-            active_sessions_count=0,
             paused=True,
         )
 
         assert decision.can_proceed is False
         assert "paused" in decision.reason
-
-    def test_returns_blocked_when_at_capacity(self):
-        """check_health returns blocked when at maximum capacity."""
-        health_gate = HealthGate(max_concurrent_sessions=2)
-
-        decision = check_health(
-            health_gate=health_gate,
-            active_sessions_count=2,
-            paused=False,
-        )
-
-        assert decision.can_proceed is False
-        assert "at_capacity" in decision.reason
 
 
 # =============================================================================
@@ -2699,10 +2684,10 @@ class TestRunTick:
 
         assert not [e for e in mock_event_sink.events if e.name == EventName.TICK_SLOW]
 
-    def test_skips_planning_when_health_check_fails(
+    def test_skips_planning_when_global_health_check_fails(
         self, sample_orchestrator_state, mock_event_sink, sample_event_context
     ):
-        """run_tick skips planning when health gate blocks."""
+        """run_tick skips planning for a system-wide health blocker."""
         inflight = {}
         planning_fn = Mock()
 
@@ -2714,7 +2699,7 @@ class TestRunTick:
             events=mock_event_sink,
             shutdown_requested=False,
             process_active_sessions_fn=Mock(),
-            check_health_fn=Mock(return_value=HealthDecision.blocked("at_capacity")),
+            check_health_fn=Mock(return_value=HealthDecision.blocked("rate_limit_low")),
             run_planning_cycle_fn=planning_fn,
             emit_heartbeat_fn=Mock(),
         )
@@ -2725,6 +2710,35 @@ class TestRunTick:
         # Should emit PLAN_NOOP event
         event_names = [e.name for e in mock_event_sink.events]
         assert EventName.PLAN_NOOP in event_names
+
+    def test_worker_saturation_does_not_skip_planning(
+        self, sample_orchestrator_state, mock_event_sink, sample_event_context
+    ):
+        """Capacity is planner-owned, so an active worker cannot suppress the
+        planning cycle that may launch a reserved tech lead."""
+        sample_orchestrator_state.active_sessions.append(MagicMock())
+        planning_fn = Mock()
+        health_gate = HealthGate()
+
+        run_tick(
+            loop_iteration=1,
+            event_context=sample_event_context,
+            inflight_stable_ids={},
+            state=sample_orchestrator_state,
+            events=mock_event_sink,
+            shutdown_requested=False,
+            process_active_sessions_fn=Mock(),
+            check_health_fn=lambda: check_health(
+                health_gate=health_gate,
+                paused=sample_orchestrator_state.paused,
+            ),
+            run_planning_cycle_fn=planning_fn,
+            emit_heartbeat_fn=Mock(),
+        )
+
+        planning_fn.assert_called_once_with()
+        event_names = [e.name for e in mock_event_sink.events]
+        assert EventName.PLAN_NOOP not in event_names
 
     def test_manual_refresh_runs_while_paused(
         self, sample_orchestrator_state, mock_event_sink, sample_event_context
