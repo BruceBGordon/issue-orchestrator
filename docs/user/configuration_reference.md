@@ -1,7 +1,12 @@
 # Configuration Reference
 
 This is the full configuration reference auto-generated from the settings schema.
-For a short onboarding guide, see `docs/user/configuration.md`.
+For a short onboarding guide, see [Configuration](configuration.md).
+
+For task-oriented guidance on the `validation.*` and `e2e.*` fields below —
+which surface to use, how to emit JUnit XML, how to capture artifacts, and the
+path rules those globs must obey — see
+[Client Test Integrations](test-integrations.md).
 
 <!-- BEGIN AUTO-GENERATED CONFIG REFERENCE — regenerate via: pytest tests/unit/test_settings_schema.py::TestDriftDetection::test_config_reference_not_stale -->
 # Settings Reference
@@ -37,7 +42,7 @@ _Auto-generated from settings schema._
 | `e2e.runner_kind` | string | `pytest` | Execution adapter used for E2E runs | `pytest`, `command` | Use pytest for live test events and retries; use command for arbitrary test runners that emit JUnit XML. |
 | `e2e.pytest_args` | string | `tests/e2e -v` | Space-separated pytest arguments used when Runner Kind is pytest | `tests/e2e -v`, `tests/e2e -v --junitxml=.issue-orchestrator/e2e-results/pytest-junit.xml` | Used only when runner_kind=pytest. Add --junitxml and mirror the same path in junit_xml_paths when you want structured Results coverage in the dashboard. |
 | `e2e.command` | string | `` | Space-separated command used when Runner Kind is command | `./scripts/run-e2e-suite.sh`, `npm run test:e2e -- --reporter=junit` | Used when runner_kind=command. The command runs inside the E2E worktree. |
-| `e2e.junit_xml_paths` | string | `` | Relative JUnit XML files or globs to ingest after the run (one per line) | `.issue-orchestrator/e2e-results/pytest-junit.xml`, `test-results/junit.xml` | Leave empty for log-only runs. Missing configured reports fail the run loudly. Use the same path you passed to pytest --junitxml or your external test runner. |
+| `e2e.junit_xml_paths` | string | `` | Relative JUnit XML files or globs to ingest after the run (one per line) | `.issue-orchestrator/e2e-results/pytest-junit.xml`, `test-results/junit.xml` | Leave empty for log-only runs. The run fails loudly when this list as a whole resolves to no fresh files; a single non-matching entry is tolerated when another entry here matched. Use the same path you passed to pytest --junitxml or your external test runner. |
 | `e2e.artifact_paths` | string | `` | Additional report or artifact files to expose in the UI (one per line) | `playwright-report/index.html`, `test-results/**/*.zip`, `reports/**/*.html` | Paths are resolved relative to the E2E worktree after the run completes. Use this for native HTML reports, traces, screenshots, and similar debugging artifacts. |
 | `e2e.allow_retry_once` | boolean | `True` | Retry failing tests to reduce flakiness | `true`, `false` | Applies to runner_kind=pytest. Command runners ignore this and report the original command result. |
 | `e2e.stop_on_first_failure` | boolean | `False` | Add -x flag to stop test run on first failure | `true`, `false` | Applies to runner_kind=pytest. |
@@ -55,7 +60,7 @@ _Auto-generated from settings schema._
 | `validation.publish.cmd` | string (optional) | `None` | Authoritative command run before push/publish | `./scripts/validate-pr.sh`, `./scripts/validate-pr-suite.sh` | This should match the repo's authoritative local PR/pre-push gate. If make validate-pr wraps the cache-aware verify hook, configure a private non-recursive suite command instead. |
 | `validation.publish.timeout_seconds` | integer | `1800` | Timeout for publish validation | `600`, `1800`, `3600` | Allow enough time for the deeper publish gate. |
 | `validation.publish.dirty_check` | string | `tracked` | Dirty-tree policy enforced before push actions | `tracked`, `unstaged`, `all`, `off` | Use tracked for normal agent worktrees. Use off only when another guard owns dirty-tree safety. |
-| `validation.junit_xml_paths` | string | `` | Relative JUnit XML files or globs emitted by validation commands | `test-results.xml`, `build/test-results/test/*.xml` | When set, failed validations render a structured test-results view in the dashboard. |
+| `validation.junit_xml_paths` | string | `` | Relative JUnit XML files or globs emitted by validation commands | `test-results.xml`, `build/test-results/test/*.xml` | When set, failed validations render a structured test-results view in the dashboard. Evidence only: reports that do not resolve or cannot be parsed leave the view empty without changing the validation command's own outcome. |
 
 ## Filtering
 

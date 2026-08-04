@@ -57,6 +57,8 @@ result ready to review or publish?"
 - Shows validation failures as failure rows in the timeline, with links to the
   diagnostic artifacts.
 
+Setup: [Client Test Integrations](test-integrations.md).
+
 ## Turn Review Feedback Into Bounded Rework
 
 Use this when you want an agent review loop, but still need the loop to stop
@@ -138,6 +140,9 @@ results visible in the same control surface as issue work.
 - Shows E2E run history and run details in the dashboard.
 - Links E2E evidence back to related issue sessions when the run was driven by
   orchestrated work.
+
+Setup: [Client Test Integrations](test-integrations.md). Runner behavior:
+[E2E Test Runner](e2e.md).
 
 ## Work From the Control Surface That Fits You
 

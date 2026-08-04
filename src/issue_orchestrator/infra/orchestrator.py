@@ -637,7 +637,10 @@ class Orchestrator:
         """Clean up E2E runner on orchestrator shutdown.
 
         Behavior depends on survive_restart config:
-        - True (default): Let worker continue, mark run as 'interrupted' (resumable)
+        - True (default): Leave the worker and its 'running' row untouched so the
+          detached worker can finish the run. Nothing is marked 'interrupted'
+          here; that only happens later, in E2EDB.start_run(), if the worker
+          turns out to have died (stale 'running' row with a dead PID).
         - False: Stop worker and mark run as canceled
         """
         if not self.config.e2e.enabled:
@@ -652,8 +655,9 @@ class Orchestrator:
             return
 
         if self.config.e2e.survive_restart:
-            # Let worker continue - on next startup, orchestrator will detect
-            # the running worker OR (if worker dies) mark as interrupted and resume
+            # Let the worker continue and leave its run row alone. If the worker
+            # later dies, the next start_run() sees the dead PID and marks that
+            # orphaned row interrupted (resumable for the pytest runner).
             logger.info(
                 "E2E worker pid=%s continuing (survive_restart=True)",
                 status["pid"],

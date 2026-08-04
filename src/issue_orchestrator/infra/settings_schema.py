@@ -371,7 +371,7 @@ class E2ESettings(BaseModel):
                 ".issue-orchestrator/e2e-results/pytest-junit.xml",
                 "test-results/junit.xml",
             ],
-            "doc_notes": "Leave empty for log-only runs. Missing configured reports fail the run loudly. Use the same path you passed to pytest --junitxml or your external test runner.",
+            "doc_notes": "Leave empty for log-only runs. The run fails loudly when this list as a whole resolves to no fresh files; a single non-matching entry is tolerated when another entry here matched. Use the same path you passed to pytest --junitxml or your external test runner.",
             "config_attr": "e2e.junit_xml_paths",
             "yaml_path": "e2e.junit_xml_paths",
             "ui_transform": "newline_separated_list",
@@ -567,7 +567,7 @@ class ValidationSettings(BaseModel):
         description="Relative JUnit XML files or globs emitted by validation commands",
         json_schema_extra={
             "doc_examples": ["test-results.xml", "build/test-results/test/*.xml"],
-            "doc_notes": "When set, failed validations render a structured test-results view in the dashboard.",
+            "doc_notes": "When set, failed validations render a structured test-results view in the dashboard. Evidence only: reports that do not resolve or cannot be parsed leave the view empty without changing the validation command's own outcome.",
             "section": "Evidence",
             "config_attr": "validation.junit_xml_paths",
             "yaml_path": "validation.junit_xml_paths",
