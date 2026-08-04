@@ -131,6 +131,12 @@ This matters because many E2E suites will not create issues on every failing tes
 - does not attempt pytest-style resume semantics
 - interrupted runs restart fresh
 
+### Orchestrator restarts
+
+The E2E worker is a detached subprocess, so it can outlive an orchestrator restart.
+
+`e2e.survive_restart` (default `true`) leaves a running worker alone on shutdown. The run is marked `interrupted` and, for the pytest runner, is resumable on the next startup. Set it to `false` to stop the worker on shutdown and mark the run canceled instead.
+
 ## Quarantine
 
 `e2e.quarantine_file` names a plain-text file of test node IDs, one per line, with `#` comment lines allowed. It is read from the E2E worktree, so the path is a normal repository-relative path such as `tests/e2e/quarantine.txt`.
