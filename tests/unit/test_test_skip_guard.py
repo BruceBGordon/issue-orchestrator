@@ -122,14 +122,45 @@ def test_scan_added_test_skip_guards_ignores_documentation_mentions() -> None:
 
 
 def test_scan_added_test_skip_guards_ignores_nested_diff_fixture_lines() -> None:
-    diff = """diff --git a/tests/unit/test_guard.py b/tests/unit/test_guard.py
+    diff = '''diff --git a/tests/unit/test_guard.py b/tests/unit/test_guard.py
 --- a/tests/unit/test_guard.py
 +++ b/tests/unit/test_guard.py
-@@ -1,0 +2,1 @@
+@@ -0,0 +1,4 @@
++fixture_diff = """@@ -25,0 +26,1 @@
 ++        assumeTrue(PostgresTestSupport.isAvailable())
-"""
++"""
++run_guard(fixture_diff)
+'''
 
     assert _scan(diff).ok
+
+
+def test_scan_added_test_skip_guards_flags_unary_prefixed_skip_calls() -> None:
+    diff = """diff --git a/tests/unit/guard.test.ts b/tests/unit/guard.test.ts
+--- a/tests/unit/guard.test.ts
++++ b/tests/unit/guard.test.ts
+@@ -0,0 +1,1 @@
+++test.skip("real skip", () => {});
+diff --git a/tests/unit/test_guard.py b/tests/unit/test_guard.py
+--- a/tests/unit/test_guard.py
++++ b/tests/unit/test_guard.py
+@@ -0,0 +1,1 @@
++-pytest.skip("real skip")
+"""
+
+    result = _scan(diff)
+
+    assert added_test_paths(diff) == (
+        "tests/unit/guard.test.ts",
+        "tests/unit/test_guard.py",
+    )
+    assert [
+        (violation.path, violation.line_number, violation.pattern)
+        for violation in result.violations
+    ] == [
+        ("tests/unit/guard.test.ts", 1, "JS test skip"),
+        ("tests/unit/test_guard.py", 1, "pytest.skip"),
+    ]
 
 
 def test_scan_added_test_skip_guards_ignores_quoted_nested_diff_fixture_lines() -> None:
@@ -256,7 +287,7 @@ def test_scan_added_test_skip_guards_handles_regex_after_js_statement_blocks() -
     assert [violation.line_number for violation in result.violations] == [1, 2, 3, 4]
 
 
-def test_scan_added_test_skip_guards_fails_closed_on_ambiguous_js_regex() -> None:
+def test_scan_added_test_skip_guards_tracks_js_statement_blocks_across_lines() -> None:
     diff = """diff --git a/tests/guard.test.ts b/tests/guard.test.ts
 --- a/tests/guard.test.ts
 +++ b/tests/guard.test.ts
@@ -268,6 +299,49 @@ def test_scan_added_test_skip_guards_fails_closed_on_ambiguous_js_regex() -> Non
     result = _scan(diff)
 
     assert [violation.line_number for violation in result.violations] == [2]
+
+
+def test_scan_added_test_skip_guards_flags_division_continued_onto_next_line() -> None:
+    diff = """diff --git a/tests/guard.test.ts b/tests/guard.test.ts
+--- a/tests/guard.test.ts
++++ b/tests/guard.test.ts
+@@ -0,0 +1,2 @@
++const ratio = value
++/ test.skip("real skip", () => {}) / 2;
+"""
+
+    result = _scan(diff)
+
+    assert [violation.line_number for violation in result.violations] == [2]
+    assert result.violations[0].pattern == "JS test skip"
+
+
+def test_scan_added_test_skip_guards_flags_division_after_string_and_template() -> None:
+    diff = """diff --git a/tests/guard.test.ts b/tests/guard.test.ts
+--- a/tests/guard.test.ts
++++ b/tests/guard.test.ts
+@@ -0,0 +1,3 @@
++const first = "seed" / test.skip("string divisor", () => {}) / 2;
++const second = `seed`
++/ test.skip("template divisor", () => {}) / 2;
+"""
+
+    result = _scan(diff)
+
+    assert [violation.line_number for violation in result.violations] == [1, 3]
+
+
+def test_scan_added_test_skip_guards_ignores_regex_literal_starting_a_line() -> None:
+    diff = """diff --git a/tests/guard.test.ts b/tests/guard.test.ts
+--- a/tests/guard.test.ts
++++ b/tests/guard.test.ts
+@@ -0,0 +1,3 @@
++const pattern =
++  /test.skip("fixture", () => {})/;
++expect(source).toMatch(pattern);
+"""
+
+    assert _scan(diff).ok
 
 
 def test_scan_added_test_skip_guards_preserves_division_after_js_expressions() -> None:

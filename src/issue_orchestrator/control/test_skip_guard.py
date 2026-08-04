@@ -10,7 +10,6 @@ from ..ports.working_copy import BranchTextFile
 
 
 _HUNK_RE = re.compile(r"@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
-_QUOTED_NESTED_DIFF_RE = re.compile(r"(?i)^(?:[rubf]{0,3})?[\"']{1,3}[+-]")
 _TEST_PATH_SEGMENTS = {"test", "tests", "spec", "specs", "__tests__"}
 _TEST_NAME_SEGMENTS = {"test", "tests", "spec", "specs"}
 
@@ -139,11 +138,17 @@ def _test_additions_by_path(
 
 
 def _test_additions(diff_text: str) -> tuple[AddedDiffLine, ...]:
+    """Return every added test-path line, leaving fixture detection to lexing.
+
+    A leading ``+``/``-`` is not proof that a line is nested-diff fixture data;
+    both are valid unary operators, so ``+test.skip(...)`` executes. Only the
+    branch-tip lexical scan can tell fixture text from executable source.
+    """
+
     return tuple(
         added
         for added in iter_added_diff_lines(diff_text)
         if _is_test_path(added.path)
-        and not _looks_like_nested_diff_fixture(added.text)
     )
 
 
@@ -222,13 +227,6 @@ def _is_test_file_name(name: str) -> bool:
     ):
         return True
     return stem.endswith(("Test", "Tests", "Spec", "Specs"))
-
-
-def _looks_like_nested_diff_fixture(text: str) -> bool:
-    stripped = text.lstrip()
-    return stripped.startswith(("+", "-")) or bool(
-        _QUOTED_NESTED_DIFF_RE.search(stripped)
-    )
 
 
 @dataclass
@@ -354,12 +352,16 @@ class _LiteralMasker:
             or suffix in _JAVA_SUFFIXES
         )
         self._frames: list[_LexicalFrame] = []
+        self._js_code_context = ""
+        self._js_line_offset = 0
+        self._js_last_value_end = 0
 
     def mask_line(self, text: str) -> str:
         """Mask one line and retain only genuinely multiline lexical state."""
 
         if not self._literals_supported:
             return text
+        self._js_line_offset = len(self._js_code_context)
         for frame in self._frames:
             if isinstance(frame, _LiteralFrame) and not frame.multiline:
                 frame.line_start = 0
@@ -382,7 +384,10 @@ class _LiteralMasker:
             index = self._mask_code_token(text, masked, index)
 
         self._discard_uncontinued_literal(text, masked)
-        return "".join(masked)
+        line = "".join(masked)
+        if self._javascript:
+            self._js_code_context += line + "\n"
+        return line
 
     def _mask_block_comment(self, text: str, masked: list[str], index: int) -> int:
         end = text.find("*/", index)
@@ -400,6 +405,7 @@ class _LiteralMasker:
             end = index + len(frame.delimiter)
             self._blank(masked, index, end)
             self._frames.pop()
+            self._note_value_end(end)
             return end
         if frame.interpolated and self._python and text.startswith(("{{", "}}"), index):
             self._blank(masked, index, index + 2)
@@ -520,6 +526,7 @@ class _LiteralMasker:
         regex_end = self._regex_end(text, masked, index)
         if regex_end is not None:
             self._blank(masked, index, regex_end)
+            self._note_value_end(regex_end)
             return regex_end
         literal = self._literal_at(text, index)
         if literal is None:
@@ -537,12 +544,19 @@ class _LiteralMasker:
         self._blank(masked, index, end + 2)
         return end + 2
 
+    def _note_value_end(self, index: int) -> None:
+        """Record where a completed literal ends so a later slash reads as division."""
+
+        if self._javascript:
+            self._js_last_value_end = self._js_line_offset + index
+
     def _regex_end(
         self, text: str, masked: list[str], index: int
     ) -> int | None:
         if not self._javascript or text[index] != "/":
             return None
-        if not self._starts_js_regex("".join(masked[:index])):
+        prefix = self._js_code_context + "".join(masked[:index])
+        if not self._starts_js_regex(prefix):
             return None
         return self._js_regex_end(text, index)
 
@@ -607,9 +621,17 @@ class _LiteralMasker:
             return "{" if text[index] == "{" else None
         return "${" if text.startswith("${", index) else None
 
-    @staticmethod
-    def _starts_js_regex(prefix: str) -> bool:
+    def _starts_js_regex(self, prefix: str) -> bool:
+        """Classify a slash using masked code from every preceding line.
+
+        ``prefix`` spans the whole file so far, because JavaScript never inserts
+        a semicolon before a slash: a line-leading ``/`` continues the previous
+        expression as division whenever that expression can end a value.
+        """
+
         prefix = prefix.rstrip()
+        if self._js_last_value_end > len(prefix):
+            return False
         if not prefix:
             return True
         if prefix.endswith("=>"):
