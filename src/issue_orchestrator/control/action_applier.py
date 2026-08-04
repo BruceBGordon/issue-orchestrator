@@ -49,6 +49,7 @@ if TYPE_CHECKING:
     from ..ports.persistent_exchange_pair_registry import (
         PersistentExchangePairRegistry,
     )
+    from ..ports.promotion_target import PromotionTargetHost
     from ..ports.tech_lead_authority import TechLeadAuthorityStore
     from .retry_history_state import ExpediteLane
     from .session_history import SessionHistoryOwner
@@ -69,7 +70,6 @@ from .actions import (
     Action,
     ActionResult,
     ActionType,
-    TECH_LEAD_ISSUE_CREATION_ACTION_TYPES,
     AddLabelAction,
     RemoveLabelAction,
     SyncLabelsAction,
@@ -94,9 +94,10 @@ from .actions import (
     ResetRetryIssueAction,
 )
 from .session_manager import SessionManager, SessionRef, SessionType, SessionContext
+from .tech_lead_applier_handlers import tech_lead_action_handlers
 from .tech_lead_issue_creation import apply_create_tech_lead_issue
 from .history_reconciliation import apply_history_reconciliation
-from .tech_lead_proposals import apply_discard_terminal_tech_lead_proposal_ops, execute_approved_tech_lead_op
+from .tech_lead_proposals import execute_approved_tech_lead_op
 from .tech_lead_reset_retry import apply_surface_tech_lead_proposal
 
 logger = logging.getLogger(__name__)
@@ -221,6 +222,10 @@ class ActionApplier:
     tech_lead_reset_retry: Optional["TechLeadResetRetryExecutor"] = None
     tech_lead_kill_session: Optional["TechLeadKillSessionExecutor"] = None
     tech_lead_ops: Optional["TechLeadAuthorityStore"] = None
+    # Cross-repo filing seam for the finding-promotion lane (#6957). Unwired
+    # means promotion actions fail loudly instead of silently no-oping — the
+    # lane is only ever planned when tech_lead.findings is enabled.
+    promotion_target: Optional["PromotionTargetHost"] = None
     # Expedite-lane owner seam (#6870), wired post-construction; unwired = no-op.
     expedite_lane: Optional["ExpediteLane"] = None
     _active_label_mutation_stats: _LabelMutationStats | None = field(
@@ -296,15 +301,16 @@ class ActionApplier:
             ActionType.QUEUE_TECH_LEAD: self._apply_queue_operation,
             ActionType.ESCALATE_TO_HUMAN: self._apply_escalate,
             ActionType.ENQUEUE_TO_MERGE_QUEUE: self._apply_enqueue_to_merge_queue,
-            # All tech-lead-authored issues share one apply-time creation owner.
-            **dict.fromkeys(TECH_LEAD_ISSUE_CREATION_ACTION_TYPES, self._apply_create_tech_lead_issue),
-            # Tech Lead decision proposals - event-only, no GitHub calls (ADR-0031)
-            ActionType.SURFACE_TECH_LEAD_PROPOSAL: self._apply_surface_tech_lead_proposal,
-            # Act-level tech_lead execution via the reset owner (#6764)
-            ActionType.RESET_RETRY_ISSUE: self._apply_reset_retry_issue,
-            # Approved kill_hung_session ops via the termination owner (#6778)
-            ActionType.KILL_HUNG_SESSION: self._apply_kill_hung_session,
-            ActionType.DISCARD_TERMINAL_TECH_LEAD_PROPOSAL_OPS: lambda action: apply_discard_terminal_tech_lead_proposal_ops(action, tracker=self.repository_host, authority=self.tech_lead_ops),
+            # Every tech-lead action type -> its extracted apply-time owner.
+            **tech_lead_action_handlers(
+                create_tech_lead_issue=self._apply_create_tech_lead_issue,
+                surface_proposal=self._apply_surface_tech_lead_proposal,
+                reset_retry=self._apply_reset_retry_issue,
+                kill_hung_session=self._apply_kill_hung_session,
+                repository_host=self.repository_host,
+                authority=self.tech_lead_ops,
+                promotion_target=self.promotion_target,
+            ),
             # Cleanup operations
             ActionType.CLEANUP_SESSION: self._apply_cleanup_session,
             ActionType.REMOVE_WORKTREE: self._apply_remove_worktree,

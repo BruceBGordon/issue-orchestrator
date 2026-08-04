@@ -16,6 +16,10 @@ from typing import Any, Literal, Optional, TYPE_CHECKING
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from ..domain.tech_lead_findings import (
+    FINDING_PROMOTION_GATED,
+    VALID_FINDING_PROMOTION_MODES,
+)
 from ..domain.tech_lead_naming import TECH_LEAD_DISPLAY_NAME
 from .config_models import (
     MERGE_QUEUE_PROVIDERS,
@@ -1243,6 +1247,69 @@ class ReviewSettings(BaseModel):
             "section": _TECH_LEAD_SECTION,
             "config_attr": "tech_lead.authority.kill_hung_session",
             "yaml_path": "tech_lead.authority.kill_hung_session",
+        },
+    )
+    tech_lead_findings_promote: str = Field(
+        FINDING_PROMOTION_GATED,
+        title=f"{TECH_LEAD_DISPLAY_NAME} Finding Promotion",
+        description="Promote accrued pattern case files to runnable issues",
+        json_schema_extra={
+            "enum": list(VALID_FINDING_PROMOTION_MODES),
+            "doc_examples": ["gated", "off", "auto"],
+            "doc_notes": (
+                "The finding-promotion lane (#6957) turns a pattern case file "
+                "that crossed its evidence threshold into a runnable issue in "
+                "the repo that owns the fix. gated (default) files it carrying "
+                "the proposed-tech-lead label, so operator approval is exactly "
+                "one action — removing the label; auto files it ungated, "
+                "immediately runnable in the target repo's own pipeline; off "
+                "disables the lane entirely (no promotion issues and no "
+                "loop-closure reads). Only findings the tech lead classified "
+                "fix:code are ever promoted. Routing is YAML-only: "
+                "tech_lead.findings.route maps an area label to 'self' or an "
+                "owner/repo target, with route.default as the catch-all. "
+                "Allowed values: off, gated, auto."
+            ),
+            "section": _TECH_LEAD_SECTION,
+            "config_attr": "tech_lead.findings.promote",
+            "yaml_path": "tech_lead.findings.promote",
+        },
+    )
+    tech_lead_findings_min_evidence: int = Field(
+        2,
+        title="Finding Promotion: Minimum Evidence",
+        description="Observations a pattern must accrue before it can be promoted",
+        ge=1,
+        json_schema_extra={
+            "doc_examples": ["2", "3"],
+            "doc_notes": (
+                "Counted from the orchestrator-owned pattern ledger, not from "
+                "case-file comments, so human comments on a case file can never "
+                "inflate it. A signature becomes promotable on the tick its "
+                "observation count reaches this value."
+            ),
+            "section": _TECH_LEAD_SECTION,
+            "config_attr": "tech_lead.findings.min_evidence",
+            "yaml_path": "tech_lead.findings.min_evidence",
+        },
+    )
+    tech_lead_findings_max_open_promoted: int = Field(
+        3,
+        title="Finding Promotion: Max Open Per Target",
+        description="Cap on in-flight promoted issues per target repository",
+        ge=1,
+        json_schema_extra={
+            "doc_examples": ["3", "1"],
+            "doc_notes": (
+                "Storm backpressure: excess eligible signatures wait behind "
+                "merges rather than flooding a repo. It also bounds the lane's "
+                "GitHub reads — loop closure polls at most this many issues per "
+                "target. Set tech_lead.findings.promote: off to disable the "
+                "lane instead of setting this to 0."
+            ),
+            "section": _TECH_LEAD_SECTION,
+            "config_attr": "tech_lead.findings.max_open_promoted",
+            "yaml_path": "tech_lead.findings.max_open_promoted",
         },
     )
     tech_lead_health_review_interval_minutes: int = Field(

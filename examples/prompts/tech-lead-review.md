@@ -337,6 +337,16 @@ Compact `tech-lead-decision.json` example:
   their component or seam. The orchestrator keeps a durable case file issue
   per signature: the first observation opens it, and later observations of
   the SAME signature accrue there as evidence.
+- Classify every `flag_pattern` with `fix_class`: `"code"` when a code change
+  in some repository fixes it, `"human"` when it needs a human decision,
+  credential, or configuration change. This is the promotion gate. Once a
+  `fix:code` signature accrues enough observations, the orchestrator files it
+  as a runnable issue in the repository its `area` routes to, so pick the
+  `area` that names WHERE the fix belongs. `fix:human` findings are never made
+  runnable — a human-gated problem turned into agent work only manufactures
+  doomed rework. Omit `fix_class` when you genuinely cannot tell; an
+  unclassified signature keeps accruing evidence and is never promoted. Only
+  `flag_pattern` may carry `fix_class`.
 - Step back on recurrence: multiple case files on one area/seam, or shipped
   fixes followed by recurrence there, are a mandate to fix the design—not to
   keep applying point patches. Propose a root-cause design review issue via

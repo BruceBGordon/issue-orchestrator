@@ -98,6 +98,15 @@ deny_attr_calls:
       # their add_comment calls are the same applier IO boundary as
       # action_applier.py's own.
       - src/issue_orchestrator/control/tech_lead_proposals.py
+      # Same rationale for the two other tech-lead applier boundaries extracted
+      # for the applier line budget: apply_append_pattern_observation (#6781/
+      # #6957) and apply_promote_tech_lead_finding /
+      # apply_settle_tech_lead_promotion (#6957) run ONLY inside applier
+      # handlers, so their add_comment calls are the same applier IO boundary
+      # as action_applier.py's own. Both target orchestrator-owned case-file
+      # issues, never a claimed coding issue.
+      - src/issue_orchestrator/control/tech_lead_case_files.py
+      - src/issue_orchestrator/control/tech_lead_finding_promotion.py
   - name: entrypoints_no_direct_label_mutations
     description: "Entrypoint handlers must apply label/comment mutations via ActionApplier"
     deny_in:

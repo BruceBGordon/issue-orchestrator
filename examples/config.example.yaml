@@ -420,6 +420,34 @@ tech_lead:
   #   interval_minutes: 240
   #   storm_threshold: 3
   #   storm_window_minutes: 5
+  # Finding promotion (#6957): a pattern case file whose evidence firms up
+  # becomes a runnable issue in the repo that owns the fix, instead of a dead
+  # end a human has to hand-carry. The lane only ever promotes findings the
+  # tech lead classified `fix:code` - a human-gated problem made runnable just
+  # manufactures doomed rework.
+  #   promote: off | gated | auto
+  #     gated (default) files the issue carrying `proposed-tech-lead`, so
+  #       operator approval is exactly one action: removing the label. Closing
+  #       the issue while gated declines it permanently (never re-filed).
+  #     auto files it ungated - immediately runnable in the target's pipeline.
+  #     off disables the lane entirely (no issues filed, no follow-up reads).
+  #   min_evidence: observations a signature must accrue before it is eligible.
+  #     Counted in the orchestrator-owned pattern ledger, so comments on the
+  #     case file cannot inflate it.
+  #   max_open_promoted: cap on in-flight promoted issues PER TARGET REPO.
+  #     Storm backpressure - excess eligible signatures wait behind merges.
+  #   route: area label -> the repo that owns the fix. `self` means this repo
+  #     (and such issues face this repo's own scope gates - promotion never
+  #     bypasses them). `default` is the catch-all. Every non-`self` target is
+  #     checked for issue-write access at startup, not at promotion time.
+  # findings:
+  #   promote: "gated"
+  #   min_evidence: 2
+  #   max_open_promoted: 3
+  #   route:
+  #     completion-pipeline: "issue-orchestrator/issue-orchestrator"
+  #     review-exchange: "issue-orchestrator/issue-orchestrator"
+  #     default: "self"
 
 scheduling:
   default_priority_tier: 1

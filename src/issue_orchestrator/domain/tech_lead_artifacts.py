@@ -30,6 +30,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
+from .tech_lead_findings import VALID_FINDING_FIX_CLASSES
+
 
 TechLeadActionType = Literal[
     "post_comment",
@@ -96,6 +98,16 @@ MAX_LABEL_CHARS = 100
 # #6781) and lands in an issue title, so it is bounded tighter than bodies.
 MAX_PATTERN_SIGNATURE_CHARS = 200
 MAX_AREA_CHARS = 50
+
+# Optional action fields that are meaningful on exactly ONE action type, as
+# (field name, owning action type, issue reference). One table so a new
+# type-scoped field cannot be added without declaring where it belongs, and so
+# the "set on the wrong type is a contract violation" rule has a single owner.
+_TYPE_SCOPED_ACTION_FIELDS: tuple[tuple[str, str, str], ...] = (
+    ("expedite", "create_issue", "#6870"),
+    ("duplicate_of", "create_issue", "#6878"),
+    ("fix_class", "flag_pattern", "#6957"),
+)
 
 
 @dataclass(frozen=True)
@@ -164,7 +176,10 @@ class ProposedTechLeadAction:
       case-file ledger (#6781) — the same signature always names the same
       pattern, so repeated observations accrue as evidence comments on one
       case-file issue. Optional ``area`` names the component/seam the
-      pattern clusters on (it becomes the case file's ``area:*`` tag).
+      pattern clusters on (it becomes the case file's ``area:*`` tag, and
+      routes promotion to the repo that owns the fix). Optional ``fix_class``
+      (``"code"`` / ``"human"``) is the promotion classification (#6957): only
+      ``"code"`` findings are ever promoted to runnable issues.
     * ``reset_retry`` / ``kill_hung_session`` — ``target_number`` + ``body``
       (the rationale); act-level, gated by ``tech_lead.authority``. Under
       ``propose`` the op is filed as a gated proposal that runs on operator
@@ -183,6 +198,15 @@ class ProposedTechLeadAction:
     finding_ids: tuple[str, ...] = ()
     pattern_signature: str | None = None
     area: str | None = None
+    # Fix classification for the promotion lane (#6957): the tech lead states
+    # at FLAG time whether the pattern is fixable by a code change
+    # (``"code"``) or requires a human decision/config change (``"human"``).
+    # Only ``flag_pattern`` may carry it — ``validate()`` rejects it elsewhere.
+    # Absent (None) means UNCLASSIFIED, which is never promotable: promotion is
+    # opt-in evidence, and promoting a human-gated problem manufactures doomed
+    # rework. The classification rides the durable case-file ledger, so a later
+    # observation can classify a signature the first one left unclassified.
+    fix_class: str | None = None
     # Urgency signal for the expedite lane (#6870): when the tech lead wants a
     # follow-up worked SOONER, it sets ``expedite: true`` on a ``create_issue``
     # action. Only meaningful for ``create_issue`` — ``validate()`` rejects it
@@ -247,6 +271,7 @@ class ProposedTechLeadAction:
         area = _optional_bounded_str(
             data.get("area"), MAX_AREA_CHARS, f"proposed action {action_id} area"
         )
+        fix_class = _optional_str(data.get("fix_class"))
         duplicate_of = data.get("duplicate_of")
         if duplicate_of is not None and not _is_valid_issue_number(duplicate_of):
             raise ValueError(
@@ -264,6 +289,7 @@ class ProposedTechLeadAction:
             finding_ids=_string_tuple(data.get("finding_ids")),
             pattern_signature=signature,
             area=area,
+            fix_class=fix_class,
             expedite=_required_bool(
                 data.get("expedite", _MISSING),
                 f"proposed action {action_id} expedite",
@@ -280,33 +306,43 @@ class ProposedTechLeadAction:
     def validate(self) -> None:
         context = f"proposed action {self.id} ({self.action_type})"
         _validate_action_id(self.id)
-        # Expedite is a create_issue-only urgency signal (#6870): urgency for a
-        # comment, escalation, pattern flag or act-level op is meaningless, so a
-        # decision that sets it elsewhere is a contract violation, never silently
-        # honored. Mirrors the per-action-type field discipline below.
-        if self.expedite and self.action_type != "create_issue":
+        self._validate_type_scoped_fields(context)
+        self._validate_optional_field_shapes(context)
+        self._validate_required_fields(context)
+
+    def _validate_type_scoped_fields(self, context: str) -> None:
+        """Reject optional fields set on an action type that cannot use them.
+
+        Each of these is meaningful on exactly ONE action type — urgency for a
+        pattern flag, a dedup target for an escalation, or a fix classification
+        for a comment are all meaningless. A decision that sets one elsewhere is
+        a contract violation, never something to silently honor. Absence is
+        falsy for every one of them (``False``/``None``), and no valid value is
+        falsy, so one presence test covers the table.
+        """
+        for name, owner_type, reference in _TYPE_SCOPED_ACTION_FIELDS:
+            if not getattr(self, name):
+                continue
             _require(
-                False,
-                f"{context} sets expedite=true, which is only valid on"
-                " create_issue actions (#6870)",
+                self.action_type == owner_type,
+                f"{context} sets {name}, which is only valid on"
+                f" {owner_type} actions ({reference})",
             )
-        # duplicate_of is a create_issue-only dedup intent (#6878): "this
-        # proposal already exists as #N". Meaningless — and a contract
-        # violation — on any other action type. A positive-int bound is enforced
-        # at parse time; direct construction is re-checked here.
+
+    def _validate_optional_field_shapes(self, context: str) -> None:
+        """Bound every optional field's VALUE (not just where it may appear).
+
+        Direct construction bypasses ``from_mapping``'s normalization, so each
+        bound is re-checked here. ``area`` lands in an ``area:*`` GitHub label
+        and so obeys label constraints; an out-of-vocabulary ``fix_class`` must
+        fail loudly rather than degrade to "unclassified", which would make a
+        code-fixable pattern permanently unpromotable with no signal (#6957).
+        """
         if self.duplicate_of is not None:
-            _require(
-                self.action_type == "create_issue",
-                f"{context} sets duplicate_of, which is only valid on"
-                " create_issue actions (#6878)",
-            )
             _require(
                 _is_valid_issue_number(self.duplicate_of),
                 f"{context} duplicate_of must be a positive issue number",
             )
-        # pattern_signature/area must be meaningful whenever present —
-        # direct construction bypasses from_mapping's normalization, and the
-        # area lands in an `area:*` label, so it obeys label constraints.
         if self.pattern_signature is not None:
             _require(
                 bool(self.pattern_signature.strip())
@@ -322,6 +358,15 @@ class ProposedTechLeadAction:
                 f"{context} area must be a non-empty label-safe string"
                 f" of at most {MAX_AREA_CHARS} characters when present",
             )
+        if self.fix_class is not None:
+            _require(
+                self.fix_class in VALID_FINDING_FIX_CLASSES,
+                f"{context} fix_class must be one of"
+                f" {sorted(VALID_FINDING_FIX_CLASSES)}, got {self.fix_class!r}",
+            )
+
+    def _validate_required_fields(self, context: str) -> None:
+        """Per-action-type required fields (see the class docstring)."""
         if self.action_type == "post_comment":
             _require(self.target_number is not None, f"{context} requires target_number")
             _require(bool(self.body), f"{context} requires body")
@@ -362,6 +407,7 @@ class ProposedTechLeadAction:
             ("finding_ids", list(self.finding_ids)),
             ("pattern_signature", self.pattern_signature),
             ("area", self.area),
+            ("fix_class", self.fix_class),
             ("expedite", self.expedite),
             ("duplicate_of", self.duplicate_of),
         )

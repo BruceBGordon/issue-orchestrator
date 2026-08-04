@@ -1,0 +1,709 @@
+"""Finding promotion: case file -> gated runnable issue -> shipped fix (#6957).
+
+Behavioral coverage of the lane's acceptance criteria: eligibility, dedup, the
+per-target cap, permanent decline, the fix:human exclusion, restart resume of
+the durable ledger, and loop closure.
+"""
+
+from unittest.mock import Mock
+
+import pytest
+
+from issue_orchestrator.control.actions import (
+    PromoteTechLeadFindingAction,
+    SettleTechLeadPromotionAction,
+)
+from issue_orchestrator.control.tech_lead_finding_promotion import (
+    apply_promote_tech_lead_finding,
+    apply_settle_tech_lead_promotion,
+    classify_promotion_outcomes,
+    plan_finding_promotions,
+    plan_promotion_settlements,
+    promotion_issue_labels,
+    resolve_route_target,
+    select_promotable_findings,
+)
+from issue_orchestrator.domain.tech_lead_findings import (
+    PROMOTION_STATE_DECLINED,
+    PROMOTION_STATE_SHIPPED,
+    PatternEvidence,
+    PromotableFinding,
+    PromotedFinding,
+    promotion_issue_title,
+)
+from issue_orchestrator.domain.tech_lead_session import PROPOSED_TECH_LEAD_LABEL
+from issue_orchestrator.infra.config import Config
+from issue_orchestrator.ports.promotion_target import (
+    InMemoryPromotionTargetHost,
+    PromotedIssueOutcome,
+)
+from issue_orchestrator.ports.tech_lead_authority import (
+    InMemoryTechLeadAuthorityStore,
+    TechLeadPromotionConflictError,
+)
+
+UPSTREAM = "issue-orchestrator/issue-orchestrator"
+
+
+def _config(**findings_overrides) -> Config:
+    config = Config()
+    config.repo = "porchpin/porchpin"
+    config.agents = {"agent:backend": Mock()}
+    config.tech_lead_follow_up_agent = "agent:backend"
+    for key, value in findings_overrides.items():
+        setattr(config.tech_lead.findings, key, value)
+    return config
+
+
+def _evidence(
+    signature: str,
+    *,
+    observations: int = 2,
+    fix_class: str = "code",
+    area: str = "",
+    case_file: int = 65,
+) -> PatternEvidence:
+    return PatternEvidence(
+        signature=signature,
+        case_file_issue_number=case_file,
+        observation_count=observations,
+        fix_class=fix_class,
+        area=area,
+    )
+
+
+def _promotion(
+    signature: str,
+    *,
+    repo: str = UPSTREAM,
+    issue: int = 500,
+    state: str = "promoted",
+    case_file: int = 65,
+) -> PromotedFinding:
+    return PromotedFinding(
+        signature=signature,
+        case_file_issue_number=case_file,
+        target_repo=repo,
+        target_issue_number=issue,
+        state=state,  # type: ignore[arg-type]
+    )
+
+
+# ---------------------------------------------------------------------------
+# Eligibility
+# ---------------------------------------------------------------------------
+
+
+class TestEligibility:
+    def test_signature_at_min_evidence_is_promotable(self):
+        config = _config()
+        selected = select_promotable_findings(
+            config, evidence=[_evidence("anchor-close-buries-escalation")], promotions=[]
+        )
+        assert [item.evidence.signature for item in selected] == [
+            "anchor-close-buries-escalation"
+        ]
+        assert selected[0].target_repo == "porchpin/porchpin"
+
+    def test_below_min_evidence_is_not_promotable(self):
+        config = _config()
+        selected = select_promotable_findings(
+            config, evidence=[_evidence("sig", observations=1)], promotions=[]
+        )
+        assert selected == ()
+
+    def test_fix_human_finding_is_never_promoted(self):
+        """A human-gated problem made runnable manufactures doomed rework."""
+        config = _config()
+        selected = select_promotable_findings(
+            config,
+            evidence=[_evidence("config-lock-misroute", fix_class="human", observations=9)],
+            promotions=[],
+        )
+        assert selected == ()
+
+    def test_unclassified_finding_is_never_promoted(self):
+        config = _config()
+        selected = select_promotable_findings(
+            config,
+            evidence=[_evidence("unclassified", fix_class="", observations=9)],
+            promotions=[],
+        )
+        assert selected == ()
+
+    def test_promote_off_disables_the_lane(self):
+        config = _config(promote="off")
+        selected = select_promotable_findings(
+            config, evidence=[_evidence("sig", observations=9)], promotions=[]
+        )
+        assert selected == ()
+
+    def test_best_evidenced_signatures_are_selected_first(self):
+        config = _config(max_open_promoted=1)
+        selected = select_promotable_findings(
+            config,
+            evidence=[
+                _evidence("thin", observations=2),
+                _evidence("thick", observations=7),
+            ],
+            promotions=[],
+        )
+        assert [item.evidence.signature for item in selected] == ["thick"]
+
+
+class TestDedupAndDecline:
+    def test_already_promoted_signature_is_not_refiled(self):
+        config = _config()
+        selected = select_promotable_findings(
+            config,
+            evidence=[_evidence("sig", observations=9)],
+            promotions=[_promotion("sig")],
+        )
+        assert selected == ()
+
+    def test_declined_signature_is_never_refiled(self):
+        """Closing a gated promotion is a rejection; it must be permanent."""
+        config = _config()
+        selected = select_promotable_findings(
+            config,
+            evidence=[_evidence("sig", observations=99)],
+            promotions=[_promotion("sig", state=PROMOTION_STATE_DECLINED)],
+        )
+        assert selected == ()
+
+    def test_shipped_signature_is_not_refiled(self):
+        config = _config()
+        selected = select_promotable_findings(
+            config,
+            evidence=[_evidence("sig", observations=99)],
+            promotions=[_promotion("sig", state=PROMOTION_STATE_SHIPPED)],
+        )
+        assert selected == ()
+
+    def test_declined_promotion_does_not_consume_cap(self):
+        """Terminal rows are not work in flight, so they must not block others."""
+        config = _config(max_open_promoted=1)
+        selected = select_promotable_findings(
+            config,
+            evidence=[_evidence("fresh")],
+            promotions=[
+                _promotion("old", repo="porchpin/porchpin", state=PROMOTION_STATE_DECLINED)
+            ],
+        )
+        assert [item.evidence.signature for item in selected] == ["fresh"]
+
+
+class TestStormBackpressure:
+    def test_storm_of_eligible_signatures_files_at_most_the_cap(self):
+        config = _config(max_open_promoted=3)
+        evidence = [_evidence(f"sig-{index}", observations=5) for index in range(10)]
+
+        selected = select_promotable_findings(config, evidence=evidence, promotions=[])
+
+        assert len(selected) == 3
+
+    def test_cap_counts_in_flight_promotions_per_target(self):
+        config = _config(
+            max_open_promoted=2,
+            route={"upstream": UPSTREAM, "default": "self"},
+        )
+        evidence = [
+            _evidence("up-1", area="upstream"),
+            _evidence("up-2", area="upstream"),
+            _evidence("local-1"),
+        ]
+        promotions = [_promotion("already", repo=UPSTREAM)]
+
+        selected = select_promotable_findings(
+            config, evidence=evidence, promotions=promotions
+        )
+
+        by_repo = [item.target_repo for item in selected]
+        # One upstream slot left (2 - 1 in flight), self is untouched by it.
+        assert by_repo.count(UPSTREAM) == 1
+        assert by_repo.count("porchpin/porchpin") == 1
+
+
+class TestRouting:
+    def test_area_routes_to_the_repo_that_owns_the_fix(self):
+        config = _config(route={"completion-pipeline": UPSTREAM, "default": "self"})
+        assert resolve_route_target(config, area="completion-pipeline") == UPSTREAM
+
+    def test_unrouted_area_falls_back_to_the_default(self):
+        config = _config(route={"completion-pipeline": UPSTREAM, "default": "self"})
+        assert resolve_route_target(config, area="ui") == "porchpin/porchpin"
+
+    def test_area_matching_is_case_insensitive(self):
+        """The area rides an area:* GitHub label, and GitHub folds label names."""
+        config = _config(route={"Completion-Pipeline": UPSTREAM, "default": "self"})
+        assert resolve_route_target(config, area="completion-pipeline") == UPSTREAM
+
+    def test_self_route_without_a_configured_repo_fails_loudly(self):
+        config = _config()
+        config.repo = None
+        with pytest.raises(ValueError, match="no repository is configured"):
+            resolve_route_target(config, area="")
+
+
+class TestPromotionIssueComposition:
+    def test_gated_promotion_carries_the_gate_and_agent_labels(self):
+        config = _config()
+        labels = promotion_issue_labels(config, area="completion-pipeline")
+        assert PROPOSED_TECH_LEAD_LABEL in labels
+        assert "agent:backend" in labels
+        assert "area:completion-pipeline" in labels
+
+    def test_auto_promotion_is_ungated(self):
+        config = _config(promote="auto")
+        labels = promotion_issue_labels(config, area="")
+        assert PROPOSED_TECH_LEAD_LABEL not in labels
+        assert "agent:backend" in labels
+
+    def test_gated_promotion_is_never_runnable_in_the_target_planner(self):
+        """The gate must actually block pickup, not just be present: a promoted
+        issue is inert until an operator removes exactly that one label."""
+        from issue_orchestrator.control.label_manager import LabelManager
+
+        config = _config()
+        labels = LabelManager(config)
+        gated = promotion_issue_labels(config, area="completion-pipeline")
+
+        assert labels.is_blocking_any(list(gated))
+        # Removing the gate — the operator's single action — leaves an ordinary,
+        # schedulable issue carrying its agent and area labels.
+        ungated = [name for name in gated if name != PROPOSED_TECH_LEAD_LABEL]
+        assert not labels.is_blocking_any(ungated)
+        assert "agent:backend" in ungated
+
+    def test_auto_promotion_is_runnable_immediately(self):
+        from issue_orchestrator.control.label_manager import LabelManager
+
+        config = _config(promote="auto")
+
+        assert not LabelManager(config).is_blocking_any(
+            list(promotion_issue_labels(config, area=""))
+        )
+
+    def test_title_names_the_source_repo_and_signature(self):
+        assert (
+            promotion_issue_title(source_repo="porchpin/porchpin", signature="anchor-close")
+            == "[tech-lead:porchpin] anchor-close"
+        )
+
+    def test_planned_action_links_the_case_file_as_the_evidence_ledger(self):
+        config = _config()
+        [action] = plan_finding_promotions(
+            config,
+            promotable=(
+                PromotableFinding(
+                    evidence=_evidence("anchor-close", case_file=65),
+                    target_repo=UPSTREAM,
+                ),
+            ),
+        )
+        assert isinstance(action, PromoteTechLeadFindingAction)
+        assert action.target_repo == UPSTREAM
+        assert action.case_file_issue_number == 65
+        assert "porchpin/porchpin#65" in action.body
+        assert PROPOSED_TECH_LEAD_LABEL in action.labels
+
+
+# ---------------------------------------------------------------------------
+# Filing (apply boundary) + at-most-once
+# ---------------------------------------------------------------------------
+
+
+def _promote_action(signature: str = "anchor-close") -> PromoteTechLeadFindingAction:
+    config = _config()
+    [action] = plan_finding_promotions(
+        config,
+        promotable=(
+            PromotableFinding(
+                evidence=_evidence(signature, case_file=65), target_repo=UPSTREAM
+            ),
+        ),
+    )
+    assert isinstance(action, PromoteTechLeadFindingAction)
+    return action
+
+
+class TestFiling:
+    def test_filing_records_the_ledger_row_and_returns_the_issue(self):
+        target = InMemoryPromotionTargetHost()
+        authority = InMemoryTechLeadAuthorityStore()
+
+        result = apply_promote_tech_lead_finding(
+            _promote_action(),
+            target=target,
+            authority=authority,
+            now_iso="2026-08-04T00:00:00+00:00",
+        )
+
+        assert result.success
+        assert len(target.filed) == 1
+        row = authority.load_promotion(signature="anchor-close")
+        assert row is not None
+        assert row.target_repo == UPSTREAM
+        assert row.target_issue_number == result.details["issue_number"]
+        assert row.is_open
+
+    def test_a_failed_filing_leaves_the_ledger_untouched(self):
+        """A phantom row would block the signature forever; retry must be clean."""
+        target = InMemoryPromotionTargetHost()
+        target.file_error = RuntimeError("403 no write access")
+        authority = InMemoryTechLeadAuthorityStore()
+
+        result = apply_promote_tech_lead_finding(
+            _promote_action(), target=target, authority=authority, now_iso="t"
+        )
+
+        assert not result.success
+        assert authority.load_promotion(signature="anchor-close") is None
+
+    def test_a_stale_plan_never_files_a_second_issue(self):
+        target = InMemoryPromotionTargetHost()
+        authority = InMemoryTechLeadAuthorityStore()
+        action = _promote_action()
+        apply_promote_tech_lead_finding(
+            action, target=target, authority=authority, now_iso="t"
+        )
+
+        again = apply_promote_tech_lead_finding(
+            action, target=target, authority=authority, now_iso="t"
+        )
+
+        assert again.success
+        assert again.details["deduplicated"] is True
+        assert len(target.filed) == 1
+
+    def test_unwired_promotion_target_fails_loudly(self):
+        result = apply_promote_tech_lead_finding(
+            _promote_action(),
+            target=None,
+            authority=InMemoryTechLeadAuthorityStore(),
+            now_iso="t",
+        )
+        assert not result.success
+
+
+class TestLedgerRestartResume:
+    def test_ledger_survives_restart_and_still_blocks_refiling(self, tmp_path):
+        """The promotion ledger is durable: a restart must not re-file work."""
+        from issue_orchestrator.infra.tech_lead_authority_store import (
+            SqliteTechLeadAuthorityStore,
+        )
+
+        db = tmp_path / "authority.sqlite"
+        store = SqliteTechLeadAuthorityStore(db)
+        store.record_pattern(
+            signature="anchor-close", issue_number=65, fix_class="code", area="cp"
+        )
+        store.note_pattern_observation(signature="anchor-close")
+        store.record_promotion(promotion=_promotion("anchor-close"))
+
+        reopened = SqliteTechLeadAuthorityStore(db)
+        evidence = reopened.list_pattern_evidence()
+        assert [(row.signature, row.observation_count, row.fix_class) for row in evidence] == [
+            ("anchor-close", 2, "code")
+        ]
+        assert (
+            select_promotable_findings(
+                _config(), evidence=evidence, promotions=reopened.list_promotions()
+            )
+            == ()
+        )
+
+    def test_a_second_promotion_for_one_signature_is_a_conflict(self, tmp_path):
+        from issue_orchestrator.infra.tech_lead_authority_store import (
+            SqliteTechLeadAuthorityStore,
+        )
+
+        store = SqliteTechLeadAuthorityStore(tmp_path / "authority.sqlite")
+        store.record_promotion(promotion=_promotion("sig", issue=1))
+        store.record_promotion(promotion=_promotion("sig", issue=1))  # idempotent
+
+        with pytest.raises(TechLeadPromotionConflictError):
+            store.record_promotion(promotion=_promotion("sig", issue=2))
+
+    def test_observation_count_is_orchestrator_owned(self, tmp_path):
+        from issue_orchestrator.infra.tech_lead_authority_store import (
+            SqliteTechLeadAuthorityStore,
+        )
+
+        store = SqliteTechLeadAuthorityStore(tmp_path / "authority.sqlite")
+        store.record_pattern(signature="sig", issue_number=7, observations=1)
+        store.note_pattern_observation(signature="sig", fix_class="code")
+        store.note_pattern_observation(signature="sig")
+
+        [row] = store.list_pattern_evidence()
+        assert row.observation_count == 3
+        # A later observation can classify what the first one left unclassified.
+        assert row.fix_class == "code"
+
+
+# ---------------------------------------------------------------------------
+# Loop closure
+# ---------------------------------------------------------------------------
+
+
+class TestLoopClosure:
+    def test_open_promotion_produces_no_settlement_fact(self):
+        target = InMemoryPromotionTargetHost()
+        assert classify_promotion_outcomes([_promotion("sig")], target=target) == ()
+
+    def test_closed_with_a_merged_pr_is_shipped(self):
+        target = InMemoryPromotionTargetHost()
+        target.outcomes[(UPSTREAM, 500)] = PromotedIssueOutcome(
+            state="closed", merged_pr_url="https://github.com/x/y/pull/6956"
+        )
+
+        [settled] = classify_promotion_outcomes([_promotion("sig")], target=target)
+
+        assert settled.shipped is True
+        assert settled.merged_pr_url.endswith("/6956")
+
+    def test_closed_without_a_merged_pr_is_declined(self):
+        target = InMemoryPromotionTargetHost()
+        target.outcomes[(UPSTREAM, 500)] = PromotedIssueOutcome(state="closed")
+
+        [settled] = classify_promotion_outcomes([_promotion("sig")], target=target)
+
+        assert settled.shipped is False
+
+    def test_unreachable_target_leaves_the_promotion_in_flight(self):
+        """A temporarily unreachable repo must never read as a decline."""
+
+        class Unreachable(InMemoryPromotionTargetHost):
+            def read_outcome(self, *, repo, issue_number):
+                raise RuntimeError("connection reset")
+
+        assert classify_promotion_outcomes([_promotion("sig")], target=Unreachable()) == ()
+
+    def test_unknown_outcome_leaves_the_promotion_in_flight(self):
+        target = InMemoryPromotionTargetHost()
+        target.outcomes[(UPSTREAM, 500)] = None
+        assert classify_promotion_outcomes([_promotion("sig")], target=target) == ()
+
+    def test_terminal_promotions_are_not_re_read(self):
+        target = InMemoryPromotionTargetHost()
+        settled = classify_promotion_outcomes(
+            [_promotion("sig", state=PROMOTION_STATE_SHIPPED)], target=target
+        )
+        assert settled == ()
+
+
+class TestSettlement:
+    def _settle(self, *, shipped: bool, merged_pr_url: str = ""):
+        target = InMemoryPromotionTargetHost()
+        if shipped:
+            target.outcomes[(UPSTREAM, 500)] = PromotedIssueOutcome(
+                state="closed", merged_pr_url=merged_pr_url
+            )
+        else:
+            target.outcomes[(UPSTREAM, 500)] = PromotedIssueOutcome(state="closed")
+        authority = InMemoryTechLeadAuthorityStore()
+        authority.record_promotion(promotion=_promotion("anchor-close"))
+        facts = classify_promotion_outcomes(
+            authority.list_promotions(), target=target
+        )
+        [action] = plan_promotion_settlements(facts)
+        assert isinstance(action, SettleTechLeadPromotionAction)
+        repository_host = Mock()
+        result = apply_settle_tech_lead_promotion(
+            action, repository_host=repository_host, authority=authority
+        )
+        return result, repository_host, authority
+
+    def test_shipped_records_the_fix_and_closes_the_case_file(self):
+        result, repository_host, authority = self._settle(
+            shipped=True, merged_pr_url="https://github.com/x/y/pull/6956"
+        )
+
+        assert result.success
+        # tech_lead_shipped_fixes finally gets a row.
+        [fix] = authority.list_recent_shipped_fixes(limit=5)
+        assert fix.pr_url.endswith("/6956")
+        repository_host.update_issue_state.assert_called_once_with(65, "closed")
+        comment = repository_host.add_comment.call_args[0][1]
+        assert f"{UPSTREAM}#500" in comment
+        assert authority.load_promotion(signature="anchor-close").state == (
+            PROMOTION_STATE_SHIPPED
+        )
+
+    def test_declined_leaves_the_case_file_open_and_blocks_refiling(self):
+        result, repository_host, authority = self._settle(shipped=False)
+
+        assert result.success
+        repository_host.update_issue_state.assert_not_called()
+        assert authority.load_promotion(signature="anchor-close").state == (
+            PROMOTION_STATE_DECLINED
+        )
+        assert authority.list_recent_shipped_fixes(limit=5) == ()
+        assert (
+            select_promotable_findings(
+                _config(),
+                evidence=[_evidence("anchor-close", observations=99)],
+                promotions=authority.list_promotions(),
+            )
+            == ()
+        )
+
+    def test_shipped_settlement_requires_the_merged_pr_evidence(self):
+        with pytest.raises(ValueError, match="merged"):
+            SettleTechLeadPromotionAction(
+                signature="sig",
+                case_file_issue_number=65,
+                target_repo=UPSTREAM,
+                target_issue_number=500,
+                shipped=True,
+            )
+
+
+# ---------------------------------------------------------------------------
+# Fact gathering + planning integration
+# ---------------------------------------------------------------------------
+
+
+def _fact_gatherer(config: Config, authority, target=None):
+    from unittest.mock import MagicMock
+
+    from issue_orchestrator.control.fact_gatherer import FactGatherer
+
+    repository_host = MagicMock()
+    repository_host.list_issues.return_value = []
+    repository_host.get_prs_with_label.return_value = []
+    return FactGatherer(
+        config=config,
+        repository_host=repository_host,
+        tech_lead_authority=authority,
+        promotion_target=target,
+    )
+
+
+def _state():
+    from issue_orchestrator.domain.models import OrchestratorState
+
+    return OrchestratorState()
+
+
+class TestFactGatheringAndPlanning:
+    def test_promotion_arms_independently_of_the_batch_and_health_triggers(self):
+        """A promotable finding must reach the planner on a tick where nothing
+        else about tech_lead is armed — otherwise the lane only ever fires when
+        some unrelated trigger happens to be due."""
+        config = _config()
+        config.tech_lead_review_agent = "agent:tech-lead"
+        config.tech_lead_review_threshold = 0  # batch disabled
+        authority = InMemoryTechLeadAuthorityStore()
+        authority.record_pattern(
+            signature="anchor-close", issue_number=65, fix_class="code", observations=2
+        )
+
+        facts = _fact_gatherer(config, authority).gather_tech_lead_facts(_state())
+
+        assert facts is not None
+        assert [item.evidence.signature for item in facts.promotable_findings] == [
+            "anchor-close"
+        ]
+
+    def test_disabled_lane_gathers_no_promotion_facts_and_makes_no_reads(self):
+        config = _config(promote="off")
+        config.tech_lead_review_agent = "agent:tech-lead"
+        config.tech_lead_review_threshold = 0
+        authority = InMemoryTechLeadAuthorityStore()
+        authority.record_pattern(
+            signature="sig", issue_number=65, fix_class="code", observations=9
+        )
+        target = InMemoryPromotionTargetHost()
+        authority.record_promotion(promotion=_promotion("other"))
+
+        facts = _fact_gatherer(config, authority, target).gather_tech_lead_facts(
+            _state()
+        )
+
+        # Nothing armed: no facts at all, and no cross-repo read was attempted.
+        assert facts is None
+
+    def test_gathered_facts_become_filing_and_settlement_actions(self):
+        from issue_orchestrator.control.tech_lead_finding_promotion import (
+            plan_finding_promotion_actions,
+        )
+        from issue_orchestrator.domain.models import TechLeadFacts
+        from issue_orchestrator.domain.tech_lead_findings import SettledPromotion
+
+        actions = plan_finding_promotion_actions(
+            _config(),
+            TechLeadFacts(
+                promotable_findings=(
+                    PromotableFinding(
+                        evidence=_evidence("anchor-close"), target_repo=UPSTREAM
+                    ),
+                ),
+                settled_promotions=(
+                    SettledPromotion(
+                        promotion=_promotion("older"),
+                        shipped=True,
+                        merged_pr_url="https://github.com/x/y/pull/1",
+                    ),
+                ),
+            ),
+        )
+
+        assert [type(action) for action in actions] == [
+            PromoteTechLeadFindingAction,
+            SettleTechLeadPromotionAction,
+        ]
+
+    def test_planning_is_a_no_op_without_tech_lead_facts(self):
+        from issue_orchestrator.control.tech_lead_finding_promotion import (
+            plan_finding_promotion_actions,
+        )
+
+        assert plan_finding_promotion_actions(_config(), None) == []
+
+
+class TestObservationCountBoundary:
+    """The durable count promotion reads is written by the case-file owner."""
+
+    def test_repeat_observation_comments_and_increments(self):
+        from issue_orchestrator.control.actions import AppendPatternObservationAction
+        from issue_orchestrator.control.tech_lead_case_files import (
+            apply_append_pattern_observation,
+        )
+
+        authority = InMemoryTechLeadAuthorityStore()
+        authority.record_pattern(signature="sig", issue_number=65)
+        repository_host = Mock()
+
+        result = apply_append_pattern_observation(
+            AppendPatternObservationAction(
+                issue_number=65,
+                pattern_signature="sig",
+                comment="observed again",
+                fix_class="code",
+            ),
+            repository_host=repository_host,
+            authority=authority,
+        )
+
+        assert result.success
+        repository_host.add_comment.assert_called_once_with(65, "observed again")
+        [row] = authority.list_pattern_evidence()
+        assert row.observation_count == 2
+        assert row.fix_class == "code"
+
+    def test_observation_for_an_unknown_signature_fails_loudly(self):
+        from issue_orchestrator.control.actions import AppendPatternObservationAction
+        from issue_orchestrator.control.tech_lead_case_files import (
+            apply_append_pattern_observation,
+        )
+
+        result = apply_append_pattern_observation(
+            AppendPatternObservationAction(
+                issue_number=65, pattern_signature="never-recorded", comment="c"
+            ),
+            repository_host=Mock(),
+            authority=InMemoryTechLeadAuthorityStore(),
+        )
+
+        assert not result.success

@@ -23,6 +23,7 @@ if TYPE_CHECKING:
     from ..ports.timeline_reader import TimelineReader
     from ..ports.timeline_store import TimelineStore
     from ..ports.timeline_writer import TimelineWriter
+    from ..ports.promotion_target import PromotionTargetHost
     from ..ports.tech_lead_authority import TechLeadAuthorityStore
     from .open_issue_corpus import OpenIssueCorpusManager
     from .background_job_supervisor import BackgroundJobSupervisor
@@ -56,6 +57,9 @@ class InfraServices:
     tech_lead_authority: "TechLeadAuthorityStore"
     # Rebuildable GitHub open-issue corpus owner (#6881).
     open_issue_corpus: "OpenIssueCorpusManager"
+    # Cross-repo filing seam for the finding-promotion lane (#6957). None when
+    # the repository host is not a real GitHub adapter (offline/testing).
+    promotion_target: "PromotionTargetHost | None" = None
     pair_registry: "PersistentExchangePairRegistry | None" = None
     turn_mailbox: "TurnMailbox | None" = None
     background_job_supervisor: "BackgroundJobSupervisor | None" = None

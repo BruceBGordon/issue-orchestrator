@@ -547,3 +547,38 @@ def test_all_variants_teach_the_duplicate_of_dedup_field(variant: str) -> None:
     assert (
         "instead of filing a duplicate" not in clause
     ), f"{variant} dedup clause still promises unconditional comment routing"
+
+
+def _fix_class_clause(text: str) -> str:
+    """The bounded flag_pattern fix-classification paragraph, lowercased."""
+    start = text.index("Classify every `flag_pattern` with `fix_class`")
+    marker = "may carry `fix_class`"
+    end = text.index(marker, start) + len(marker)
+    return text[start:end].lower()
+
+
+@pytest.mark.parametrize("variant", sorted(PROMPT_VARIANTS))
+def test_all_variants_teach_the_fix_class_promotion_gate(variant: str) -> None:
+    """#6957: promotion only ever acts on findings the tech lead classified
+    fix:code, so every prompt variant must teach the field, both values, that
+    fix:human is never promoted, and that omitting it is the honest default.
+    Asserted within the bounded clause so unrelated prose can't satisfy it."""
+    clause = _fix_class_clause(PROMPT_VARIANTS[variant])
+    assert "fix_class" in clause
+    assert '"code"' in clause and '"human"' in clause
+    assert "flag_pattern" in clause, f"{variant} does not scope fix_class to flag_pattern"
+    assert "never" in clause, f"{variant} omits the fix:human promotion exclusion"
+    assert "omit" in clause, f"{variant} does not teach omitting an unknown classification"
+
+
+@pytest.mark.parametrize("variant", sorted(PROMPT_VARIANTS))
+def test_fix_class_values_match_the_domain_contract(variant: str) -> None:
+    """The prompt's vocabulary must be exactly what the artifact parser accepts —
+    a value taught here but rejected there is a guaranteed contract violation."""
+    from issue_orchestrator.domain.tech_lead_findings import (
+        VALID_FINDING_FIX_CLASSES,
+    )
+
+    clause = _fix_class_clause(PROMPT_VARIANTS[variant])
+    for value in VALID_FINDING_FIX_CLASSES:
+        assert f'`"{value}"`' in clause, f"{variant} omits fix_class value {value}"

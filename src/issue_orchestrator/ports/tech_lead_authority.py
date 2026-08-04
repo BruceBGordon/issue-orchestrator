@@ -20,6 +20,11 @@ from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
     from ..domain.models import DiscoveredFailure
+    from ..domain.tech_lead_findings import (
+        PatternEvidence,
+        PromotedFinding,
+        PromotionState,
+    )
     from ..domain.tech_lead_session import (
         StoredTechLeadOp,
         TechLeadLaunchAuthority,
@@ -45,6 +50,14 @@ class TechLeadPatternConflictError(RuntimeError):
 
 class TechLeadShippedFixConflictError(RuntimeError):
     """Different shipped-fix evidence already exists for an issue."""
+
+
+class TechLeadPromotionConflictError(RuntimeError):
+    """A different promotion already exists for this pattern signature."""
+
+
+class UnknownTechLeadPatternError(KeyError):
+    """An observation was recorded for a signature with no case-file row."""
 
 
 class TechLeadAuthorityStore(Protocol):
@@ -180,13 +193,40 @@ class TechLeadAuthorityStore(Protocol):
     # one. Rows are never discarded by the orchestrator — the case file IS
     # the accumulating artifact (graduation happens on GitHub).
 
-    def record_pattern(self, *, signature: str, issue_number: int) -> None:
+    def record_pattern(
+        self,
+        *,
+        signature: str,
+        issue_number: int,
+        fix_class: str = "",
+        area: str = "",
+        observations: int = 1,
+    ) -> None:
         """Persist the case-file issue for one signature (create-once).
 
         Recording the same issue for an existing signature is a no-op;
         recording a DIFFERENT issue must raise
         :class:`TechLeadPatternConflictError` — the signature keys exactly one
         evidence trail, which must never silently move.
+
+        ``fix_class``/``area`` are the promotion facts the case file was opened
+        with (#6957) and ``observations`` is how many observations the creating
+        decision carried (>= 1). The observation COUNT is orchestrator-owned so
+        promotion eligibility cannot be inflated by editing the case-file issue
+        or by unrelated human comments on it.
+        """
+        ...
+
+    def note_pattern_observation(
+        self, *, signature: str, fix_class: str = "", area: str = ""
+    ) -> None:
+        """Record a REPEAT observation of a known signature (#6957).
+
+        Increments the durable observation count and upgrades a previously
+        unclassified row with a later ``fix_class``/``area``. An unknown
+        signature must raise :class:`UnknownTechLeadPatternError` — the caller
+        appended evidence to a case file with no ledger row, which is a bug in
+        the case-file owner, not something to silently create.
         """
         ...
 
@@ -196,6 +236,54 @@ class TechLeadAuthorityStore(Protocol):
 
     def list_patterns(self) -> tuple[tuple[str, int], ...]:
         """All (signature, case_file_issue_number) rows — the pattern ledger."""
+        ...
+
+    def list_pattern_evidence(self) -> tuple["PatternEvidence", ...]:
+        """All case-file rows with their promotion facts (#6957).
+
+        The promotion trigger's ONLY input for eligibility: durable observation
+        counts plus the tech lead's fix classification, with zero GitHub reads.
+        """
+        ...
+
+    # -- Promoted findings (#6957) ------------------------------------------
+    #
+    # One row per PROMOTED pattern signature, create-once at filing time. The
+    # row is the at-most-once guarantee in both directions: a signature with a
+    # row is never re-filed (later observations comment on the promoted issue),
+    # and a ``declined`` row is never re-filed at all. Rows are never deleted —
+    # ``declined``/``shipped`` are permanent terminal states that must survive
+    # restarts, or the lane would re-file work an operator already rejected.
+
+    def record_promotion(self, *, promotion: "PromotedFinding") -> None:
+        """Persist a promoted finding (create-once by signature).
+
+        An identical row is a no-op; a DIFFERENT target repo/issue for an
+        existing signature must raise :class:`TechLeadPromotionConflictError` —
+        a signature promotes to exactly one issue, ever.
+        """
+        ...
+
+    def load_promotion(self, *, signature: str) -> "PromotedFinding | None":
+        """Return a signature's promotion row, or None when never promoted."""
+        ...
+
+    def list_promotions(self) -> tuple["PromotedFinding", ...]:
+        """All promotion rows — the dedup, cap, and loop-closure ledger read."""
+        ...
+
+    def settle_promotion(
+        self,
+        *,
+        signature: str,
+        state: "PromotionState",
+        shipped_pr_url: str = "",
+    ) -> None:
+        """Move a promotion to a terminal state (``declined``/``shipped``).
+
+        Idempotent for a row already in *state*. An unknown signature raises
+        :class:`UnknownTechLeadPatternError`.
+        """
         ...
 
     # -- Shipped-fix operational memory (#6781 amendment) -----------------
@@ -220,6 +308,8 @@ class InMemoryTechLeadAuthorityStore:
         self._rows: dict[tuple[str, str], "TechLeadLaunchAuthority"] = {}
         self._ops: dict[int, "StoredTechLeadOp"] = {}
         self._patterns: dict[str, int] = {}
+        self._evidence: dict[str, "PatternEvidence"] = {}
+        self._promotions: dict[str, "PromotedFinding"] = {}
         self._shipped_fixes: dict[int, "TechLeadShippedFixSummary"] = {}
         self._storm_cohorts: dict[int, tuple["DiscoveredFailure", ...]] = {}
 
@@ -290,7 +380,17 @@ class InMemoryTechLeadAuthorityStore:
     ) -> tuple[tuple[int, tuple["DiscoveredFailure", ...]], ...]:
         return tuple(sorted(self._storm_cohorts.items()))
 
-    def record_pattern(self, *, signature: str, issue_number: int) -> None:
+    def record_pattern(
+        self,
+        *,
+        signature: str,
+        issue_number: int,
+        fix_class: str = "",
+        area: str = "",
+        observations: int = 1,
+    ) -> None:
+        from ..domain.tech_lead_findings import PatternEvidence
+
         existing = self._patterns.get(signature)
         if existing is not None:
             if existing == issue_number:
@@ -300,12 +400,77 @@ class InMemoryTechLeadAuthorityStore:
                 f" case-file issue #{existing}"
             )
         self._patterns[signature] = issue_number
+        self._evidence[signature] = PatternEvidence(
+            signature=signature,
+            case_file_issue_number=issue_number,
+            observation_count=max(1, observations),
+            fix_class=fix_class,
+            area=area,
+        )
+
+    def note_pattern_observation(
+        self, *, signature: str, fix_class: str = "", area: str = ""
+    ) -> None:
+        from dataclasses import replace
+
+        row = self._evidence.get(signature)
+        if row is None:
+            raise UnknownTechLeadPatternError(
+                f"no pattern case file is recorded for signature {signature!r}"
+            )
+        self._evidence[signature] = replace(
+            row,
+            observation_count=row.observation_count + 1,
+            fix_class=fix_class or row.fix_class,
+            area=area or row.area,
+        )
 
     def lookup_pattern(self, *, signature: str) -> int | None:
         return self._patterns.get(signature)
 
     def list_patterns(self) -> tuple[tuple[str, int], ...]:
         return tuple(sorted(self._patterns.items()))
+
+    def list_pattern_evidence(self) -> tuple["PatternEvidence", ...]:
+        return tuple(self._evidence[key] for key in sorted(self._evidence))
+
+    def record_promotion(self, *, promotion: "PromotedFinding") -> None:
+        existing = self._promotions.get(promotion.signature)
+        if existing is not None:
+            if (
+                existing.target_repo == promotion.target_repo
+                and existing.target_issue_number == promotion.target_issue_number
+            ):
+                return
+            raise TechLeadPromotionConflictError(
+                f"pattern signature {promotion.signature!r} is already promoted to"
+                f" {existing.target_repo}#{existing.target_issue_number}"
+            )
+        self._promotions[promotion.signature] = promotion
+
+    def load_promotion(self, *, signature: str) -> "PromotedFinding | None":
+        return self._promotions.get(signature)
+
+    def list_promotions(self) -> tuple["PromotedFinding", ...]:
+        return tuple(self._promotions[key] for key in sorted(self._promotions))
+
+    def settle_promotion(
+        self,
+        *,
+        signature: str,
+        state: "PromotionState",
+        shipped_pr_url: str = "",
+    ) -> None:
+        from dataclasses import replace
+
+        row = self._promotions.get(signature)
+        if row is None:
+            raise UnknownTechLeadPatternError(
+                f"no promotion is recorded for signature {signature!r}"
+            )
+        self._promotions[signature] = replace(
+            row, state=state, shipped_pr_url=shipped_pr_url or row.shipped_pr_url
+        )
 
     def record_shipped_fix(
         self, *, issue_number: int, title: str, pr_url: str, area: str

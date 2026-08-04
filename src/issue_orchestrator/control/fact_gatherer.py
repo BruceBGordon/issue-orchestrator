@@ -37,10 +37,12 @@ from .health_review_trigger import (
     health_review_decision,
     health_review_interval_minutes,
 )
+from .tech_lead_finding_promotion import gather_finding_promotion_facts
 from .tech_lead_reaction import storm_possible
 
 if TYPE_CHECKING:
     from ..ports.issue import Issue
+    from ..ports.promotion_target import PromotionTargetHost
     from ..ports.queue_cache_store import QueueCacheStore
     from ..ports.tech_lead_authority import TechLeadAuthorityStore
     from ..domain.models import (
@@ -87,6 +89,10 @@ class FactGatherer:
     # projection + refreshing the tech_lead board file) and makes no decisions.
     # Optional so unrelated tests need not wire it.
     board_publisher: Optional["TechLeadBoardPublisher"] = None
+    # Cross-repo filing/read seam for the finding-promotion lane (#6957).
+    # Optional so unrelated tests need not wire it; without it the lane gathers
+    # no loop-closure facts (promotions simply stay in flight).
+    promotion_target: Optional["PromotionTargetHost"] = None
     # Durable store for the tech-lead stuck sweep's timer + recovery counters
     # (#6823). Optional so unrelated tests need not wire it; without it the
     # sweep still runs but its counters do not survive a restart.
@@ -323,7 +329,24 @@ class FactGatherer:
             if tech_lead_agent_configured and self.tech_lead_authority is not None
             else {}
         )
-        if not batch_armed and not health_armed and not ops and not storm_armed:
+        # The finding-promotion lane (#6957) arms INDEPENDENTLY of the batch,
+        # health, storm, and proposal triggers: it reads the durable pattern and
+        # promotion ledgers, not the anchor scan. Eligibility is pure local math
+        # (zero GitHub calls, so a board with nothing promotable costs nothing);
+        # only loop closure reads, and only for promotions actually in flight.
+        promotable, settled = gather_finding_promotion_facts(
+            self.config,
+            authority=self.tech_lead_authority,
+            target=self.promotion_target,
+        )
+        if (
+            not batch_armed
+            and not health_armed
+            and not ops
+            and not storm_armed
+            and not promotable
+            and not settled
+        ):
             return None
 
         # The decision carries the board it was decided on, so anchor creation
@@ -382,6 +405,8 @@ class FactGatherer:
             absent_proposal_op_candidates=absent_op_candidates,
             open_case_files=case_files,
             case_files_scanned=case_files_scanned,
+            promotable_findings=promotable,
+            settled_promotions=settled,
         )
         if self.board_publisher is not None:
             self.board_publisher.publish(

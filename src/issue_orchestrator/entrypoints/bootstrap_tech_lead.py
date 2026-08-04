@@ -32,6 +32,7 @@ if TYPE_CHECKING:
     from ..infra.config import Config
     from ..infra.orchestrator import Orchestrator
     from ..ports import EventSink, RepositoryHost
+    from ..ports.promotion_target import PromotionTargetHost
     from ..ports.queue_cache_store import QueueCacheStore
     from ..ports.timeline_store import TimelineStore
     from ..ports.tech_lead_authority import TechLeadAuthorityStore
@@ -49,6 +50,10 @@ class TechLeadComposition:
     open_issue_corpus: "OpenIssueCorpusManager"
     board_publisher: "TechLeadBoardPublisher | None"
     fact_gatherer: "FactGatherer | None"
+    # Cross-repo filing seam for the finding-promotion lane (#6957). None when
+    # the repository host is not a real GitHub adapter (offline/testing), which
+    # leaves promotion actions failing loudly rather than silently no-oping.
+    promotion_target: "PromotionTargetHost | None" = None
 
 
 def create_tech_lead_authority_store(config: "Config") -> "TechLeadAuthorityStore":
@@ -88,6 +93,7 @@ def wire_tech_lead_act_executors(orchestrator: "Orchestrator") -> None:
     applier.tech_lead_reset_retry = build_tech_lead_reset_retry_executor(orchestrator)
     applier.tech_lead_kill_session = build_tech_lead_kill_session_executor(orchestrator)
     applier.tech_lead_ops = orchestrator.deps.services.tech_lead_authority
+    applier.promotion_target = orchestrator.deps.services.promotion_target
     applier.expedite_lane = build_expedite_lane(orchestrator)
 
 
@@ -180,6 +186,7 @@ def create_tech_lead_fact_gatherer(
     board_publisher: "TechLeadBoardPublisher | None",
     queue_cache_store: "QueueCacheStore | None" = None,
     provider_resilience: "ProviderResilienceManager | None" = None,
+    promotion_target: "PromotionTargetHost | None" = None,
 ) -> "FactGatherer | None":
     """Wire the read-only tech_lead ledgers and projections as one unit.
 
@@ -199,6 +206,7 @@ def create_tech_lead_fact_gatherer(
         events=events,
         tech_lead_authority=authority,
         board_publisher=board_publisher,
+        promotion_target=promotion_target,
         queue_cache_store=queue_cache_store,
         # First-class E2E workload observation feed (e2e.occupies_session_slot).
         # Always wired; a no-op that touches nothing while the flag is off.
@@ -222,6 +230,7 @@ def create_tech_lead_composition(
     """Build the tech_lead store and ensure both projections share one publisher."""
     authority = create_tech_lead_authority_store(config)
     open_issue_corpus = create_open_issue_corpus_store(config)
+    promotion_target = create_promotion_target_host(repository_host)
     from ..control.open_issue_corpus import OpenIssueCorpusManager
 
     open_issue_corpus_manager = OpenIssueCorpusManager(
@@ -239,14 +248,30 @@ def create_tech_lead_composition(
     if fact_gatherer is None:
         fact_gatherer = create_tech_lead_fact_gatherer(
             config, repository_host, events, authority, board_publisher,
-            queue_cache_store, provider_resilience,
+            queue_cache_store, provider_resilience, promotion_target,
         )
     return TechLeadComposition(
         authority=authority,
         open_issue_corpus=open_issue_corpus_manager,
         board_publisher=board_publisher,
         fact_gatherer=fact_gatherer,
+        promotion_target=promotion_target,
     )
+
+
+def create_promotion_target_host(
+    repository_host: "RepositoryHost | None",
+) -> "PromotionTargetHost | None":
+    """The cross-repo filing seam for finding promotion (#6957).
+
+    Delegates adapter construction to the provider factory so this composition
+    helper depends on the ``execution`` seam, not the GitHub adapter package.
+    """
+    from ..execution.providers import (
+        create_promotion_target_host as build_promotion_target_host,
+    )
+
+    return build_promotion_target_host(repository_host)
 
 
 def create_board_snapshot_builder(

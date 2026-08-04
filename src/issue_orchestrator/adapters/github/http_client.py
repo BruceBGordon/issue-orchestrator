@@ -1286,6 +1286,23 @@ class GitHubHttpClient:
 
     # -------------------- Git refs / commits --------------------
 
+    def get_repository(self) -> dict[str, Any]:
+        """The repository payload (default branch, permissions, feature flags).
+
+        Used by finding promotion's startup writability check (#6957): the
+        ``permissions`` block reports what the token can actually do, so a
+        misrouted or unauthorized target fails at startup rather than on the
+        tick a pattern finally becomes promotable.
+        """
+        payload = self._request_json(
+            "GET",
+            f"/repos/{self._config.repo}",
+            caller="get_repository",
+        )
+        if not isinstance(payload, dict):
+            raise GitHubHttpError("GitHub repository payload was not an object")
+        return payload
+
     def get_default_branch(self) -> str:
         payload = self._request_json(
             "GET",

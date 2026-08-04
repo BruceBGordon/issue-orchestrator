@@ -96,6 +96,7 @@ from .tech_lead_gate_notes import (
     outcome_gate_note,
 )
 from .tech_lead_case_files import (
+    build_append_observation_action,
     build_case_file_evidence_comment,
     build_case_file_issue_action,
 )
@@ -389,23 +390,18 @@ class _DecisionActionPlanner:
         assert signature is not None  # enforced by validate()
         existing = self.pattern_ledger.get(signature)
         if existing is not None:
+            # Comment AND durable count under one owner (#6957): the count is
+            # what promotion's min_evidence reads, so it can never be left to
+            # GitHub comment cadence.
             self.actions.append(
-                AddCommentAction(
-                    number=existing,
-                    comment=build_case_file_evidence_comment(
-                        proposed,
-                        anchor_issue_number=self._anchor_number,
-                        findings=self.findings,
-                        source_run_id=self.source_run_id,
-                        source_session_name=self.source_session_name,
-                        observed_at=self.observed_at,
-                    ),
-                    is_pr=False,
-                    reason=(
-                        f"tech_lead decision action {proposed.id}: pattern"
-                        f" {signature!r} observed again; appending evidence"
-                        f" to case file #{existing} (#6781)"
-                    ),
+                build_append_observation_action(
+                    proposed,
+                    case_file_issue_number=existing,
+                    anchor_issue_number=self._anchor_number,
+                    findings=self.findings,
+                    source_run_id=self.source_run_id,
+                    source_session_name=self.source_session_name,
+                    observed_at=self.observed_at,
                     expected=self.expected,
                 )
             )

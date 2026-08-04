@@ -1,0 +1,412 @@
+"""Tech-lead action dataclasses (ADR-0031 / #6778 / #6781 / #6957).
+
+Split out of ``actions`` for cohesion and its line budget as the tech-lead
+surface grew: gated proposal issues, pattern case files, act-level ops, and the
+finding-promotion lane. The split is ONE-WAY — this module imports the
+:class:`~.actions.Action` base and :class:`~.actions.ActionType` enum, never the
+reverse — and ``actions`` re-exports every name here, so importers are
+unaffected.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
+
+from ..domain.models import DiscoveredFailure
+from ..domain.tech_lead_milestone import TechLeadMilestoneIntent
+from ..domain.tech_lead_session import TechLeadSessionFlavor
+from .actions import Action, ActionType
+
+if TYPE_CHECKING:
+    from ..domain.tech_lead_session import StoredTechLeadOp
+
+
+# These actions deliberately share one apply-time owner: all create a
+# tech-lead-authored issue, while proposal and case-file variants additionally
+# finalize their respective authority-ledger record.
+TECH_LEAD_ISSUE_CREATION_ACTION_TYPES: frozenset[ActionType] = frozenset(
+    {
+        ActionType.CREATE_TECH_LEAD_ISSUE,
+        ActionType.CREATE_TECH_LEAD_PROPOSAL_ISSUE,
+        ActionType.CREATE_TECH_LEAD_CASE_FILE_ISSUE,
+    }
+)
+
+
+@dataclass(frozen=True)
+class CreateTechLeadIssueAction(Action):
+    """Create a tech_lead review issue when PR threshold is met.
+
+    The Planner produces this when tech_lead_facts.pr_count >= threshold.
+    The orchestrator applies it by creating the GitHub issue. Both creation
+    paths — the planner's batch tracking issue and decision-driven follow-up
+    issues — share this one action, so the applier is the single milestone
+    resolution boundary.
+    """
+
+    title: str = ""
+    body: str = ""
+    labels: tuple[str, ...] = field(default_factory=tuple)
+    pr_count: int = 0
+    milestone: TechLeadMilestoneIntent = field(default_factory=TechLeadMilestoneIntent)
+    # Non-empty only for an immediate problem-storm health review. Preserves
+    # the exact discovery facts across create -> durable ledger -> pending
+    # queue -> launch, so the cohort the anchor is authorized over is the one
+    # that was actually discovered. The board snapshot's failure list is
+    # deliberately broader board context and is never the authority (#6780).
+    storm_problems: tuple[DiscoveredFailure, ...] = ()
+    # The lifecycle variant this anchor is authored as. The owner that decides
+    # to create the anchor (health-review trigger vs batch planning) states it
+    # here, so the applier reports the decision instead of re-deriving it from
+    # marker labels at the creation boundary (#6780).
+    flavor: TechLeadSessionFlavor = TechLeadSessionFlavor.BATCH_REVIEW
+    # The board fingerprint the health-review trigger fired on, carried to the
+    # post-creation stamp so "reviewed" records what justified the review, not a
+    # recompute against a board that by then holds this anchor. "" (batch, or no
+    # facts) means never-reviewed: fails toward reviewing (ADR-0031 §4, #6793).
+    health_review_fingerprint: str = ""
+    # Expedite-lane intent (#6870): set for a decision-driven create_issue the
+    # tech lead marked urgent. The applier's create boundary reads it (with the
+    # gate presence) to front-queue the new issue via the expedite owner.
+    expedite: bool = False
+    action_type: ActionType = field(default=ActionType.CREATE_TECH_LEAD_ISSUE, init=False)
+
+
+@dataclass(frozen=True)
+class CreateTechLeadProposalIssueAction(CreateTechLeadIssueAction):
+    """Create a GATED act-level tech_lead proposal issue (#6778, ADR-0031 §2).
+
+    A ``CreateTechLeadIssueAction`` that additionally carries the typed
+    :class:`StoredTechLeadOp`. The applier creates the issue AND records the op
+    create-once in the orchestrator-owned authority store, keyed by the new
+    issue number, then links the proposal from the session's anchor issue.
+    The issue body is human documentation only — execution consumes the
+    stored op, never the body (tamper boundary).
+    """
+
+    op: "StoredTechLeadOp" = field(kw_only=True)
+    anchor_issue_number: int = 0
+    action_type: ActionType = field(
+        default=ActionType.CREATE_TECH_LEAD_PROPOSAL_ISSUE, init=False
+    )
+
+    def __post_init__(self) -> None:
+        from ..domain.tech_lead_session import PROPOSED_TECH_LEAD_LABEL
+
+        # Self-validating type: an ungated proposal issue would be
+        # schedulable before any approval. (Baseline note: this branch is an
+        # accepted control_policy_branch_sites entry — the invariant is
+        # inherently about the gate label, not scattered policy.)
+        if PROPOSED_TECH_LEAD_LABEL not in self.labels:
+            raise ValueError(
+                "CreateTechLeadProposalIssueAction must carry the"
+                f" {PROPOSED_TECH_LEAD_LABEL!r} gate label"
+            )
+        if self.anchor_issue_number <= 0:
+            raise ValueError(
+                "CreateTechLeadProposalIssueAction requires a positive"
+                " anchor_issue_number"
+            )
+
+
+@dataclass(frozen=True)
+class CreateTechLeadCaseFileIssueAction(CreateTechLeadIssueAction):
+    """Create a pattern CASE-FILE issue for a flag_pattern proposal (#6781).
+
+    A ``CreateTechLeadIssueAction`` that additionally carries the pattern
+    signature (the durable ledger key) and optional area. The applier
+    creates the issue AND records the (signature -> issue) ledger row
+    create-once in the orchestrator-owned authority store; later
+    flag_pattern proposals with the same signature comment evidence onto
+    the recorded issue instead of filing a second one. The issue body is
+    human documentation only — dedup consults the ledger, never the body
+    (tamper boundary).
+    """
+
+    pattern_signature: str = ""
+    area: str | None = None
+    dedup_comment: str = ""
+    additional_observation_comments: tuple[str, ...] = ()
+    # The tech lead's promotion classification for this signature (#6957):
+    # "code", "human", or "" for unclassified. Recorded on the ledger row at
+    # creation so promotion eligibility never has to parse the issue body.
+    fix_class: str = ""
+    action_type: ActionType = field(
+        default=ActionType.CREATE_TECH_LEAD_CASE_FILE_ISSUE, init=False
+    )
+
+    def __post_init__(self) -> None:
+        from ..domain.tech_lead_session import require_case_file_observation_label
+
+        # Self-validating type: an empty signature could never accrue
+        # evidence. The observation-label invariant is delegated to its
+        # domain owner (an unlabeled case file would be schedulable work).
+        if not self.pattern_signature.strip():
+            raise ValueError(
+                "CreateTechLeadCaseFileIssueAction requires a non-empty"
+                " pattern_signature (the ledger key)"
+            )
+        if not self.dedup_comment.strip():
+            raise ValueError(
+                "CreateTechLeadCaseFileIssueAction requires a non-empty"
+                " dedup_comment for apply-time ledger reconciliation"
+            )
+        require_case_file_observation_label(self.labels)
+
+
+@dataclass(frozen=True)
+class SurfaceTechLeadProposalAction(Action):
+    """Surface a tech_lead decision proposal without executing it (ADR-0031).
+
+    Emitted for propose-mode (shadow) authority, ``flag_pattern`` records,
+    and rejected decision artifacts. The applier only publishes a trace
+    event (``TECH_LEAD_ACTION_PROPOSED``, or ``TECH_LEAD_DECISION_REJECTED`` when
+    ``mode == "rejected"``) — it makes NO GitHub calls.
+
+    ``mode`` values:
+    - ``"shadow"`` — propose-mode authority: recorded as would-have-done.
+    - ``"pattern"`` — a ``flag_pattern`` proposal (its execution IS the record).
+    - ``"rejected"`` — the decision artifact pair failed validation;
+      ``proposal_type`` is ``"decision"`` and ``body_preview`` carries the
+      failure detail.
+    """
+
+    issue_number: int = 0  # The tech_lead session's anchor issue
+    action_id: str = ""
+    proposal_type: str = ""
+    target_number: int = 0  # 0 = no target
+    target_is_pr: bool = False
+    title: str = ""
+    body_preview: str = ""  # Capped at 500 chars by the construction site
+    finding_ids: tuple[str, ...] = ()
+    mode: str = ""  # "shadow" | "pattern" | "rejected"
+    action_type: ActionType = field(
+        default=ActionType.SURFACE_TECH_LEAD_PROPOSAL, init=False
+    )
+
+
+@dataclass(frozen=True)
+class ResetRetryIssueAction(Action):
+    """Execute a tech_lead ``reset_retry`` proposal via the reset owner (#6764).
+
+    Planned by ``plan_tech_lead_decision_actions`` ONLY when
+    ``tech_lead.authority.reset_retry`` is ``execute``. Proposals are
+    stale-checkable facts, not commands (ADR-0031 §2): the applier's owner
+    re-validates the recorded preconditions against current state at
+    execution time and downgrades to a surfaced proposal
+    (``TECH_LEAD_ACTION_PROPOSED``, ``mode="stale_downgrade"``) when the board
+    has moved — no mutations are posted on the downgrade path.
+
+    ``anchor_issue_number`` is the tech_lead session's anchor issue — the event
+    surface a downgrade is reported against, mirroring
+    :class:`SurfaceTechLeadProposalAction`. For failure investigations and
+    health reviews the immutable launch scope forces
+    ``issue_number == anchor_issue_number``.
+    """
+
+    issue_number: int = 0  # The issue to scratch-reset (the proposal's target)
+    rationale: str = ""  # The agent's recorded rationale (proposal body)
+    proposal_id: str = ""  # The decision artifact action id (A<n>)
+    finding_ids: tuple[str, ...] = ()
+    anchor_issue_number: int = 0
+    # Set (>0) when this execution consumes an APPROVED gated proposal's
+    # stored op (#6778): the applier then finalizes the proposal issue
+    # (outcome comment + close + discard_op). 0 = direct execute-authority.
+    proposal_issue_number: int = 0
+    action_type: ActionType = field(default=ActionType.RESET_RETRY_ISSUE, init=False)
+
+    def __post_init__(self) -> None:
+        if self.issue_number <= 0:
+            raise ValueError("ResetRetryIssueAction requires a positive issue_number")
+        if not self.proposal_id:
+            raise ValueError("ResetRetryIssueAction requires the proposal id")
+
+
+@dataclass(frozen=True)
+class KillHungSessionAction(Action):
+    """Execute an APPROVED ``kill_hung_session`` proposal op (#6778).
+
+    Planned ONLY from an approved gated proposal's :class:`StoredTechLeadOp`
+    (there is no direct execute-authority tier yet — startup rejects
+    ``tech_lead.authority.kill_hung_session: execute``). The applier's owner
+    (``tech_lead_kill_session``) re-validates that the target issue still has an
+    active session and applies the issue-runtime termination boundary — the
+    same ``terminate_issue_runtime`` the reset owner uses, WITHOUT the reset.
+    Stale proposals downgrade with no mutations, mirroring ``reset_retry``.
+    """
+
+    issue_number: int = 0  # The issue whose runtime is terminated (op target)
+    rationale: str = ""  # The agent's recorded rationale (stored op)
+    proposal_id: str = ""  # The decision artifact action id (A<n>)
+    finding_ids: tuple[str, ...] = ()
+    anchor_issue_number: int = 0  # Event surface: the proposal issue
+    proposal_issue_number: int = 0  # The gated proposal issue to finalize
+    # The active session run id the proposal bound its consent to (#6779 R1).
+    # The applier's kill owner refuses to terminate unless the target issue's
+    # LIVE session still matches this id, so a replacement session started
+    # before approval is never killed.
+    target_session_id: str = ""
+    action_type: ActionType = field(default=ActionType.KILL_HUNG_SESSION, init=False)
+
+    def __post_init__(self) -> None:
+        if self.issue_number <= 0:
+            raise ValueError("KillHungSessionAction requires a positive issue_number")
+        if not self.proposal_id:
+            raise ValueError("KillHungSessionAction requires the proposal id")
+        if self.proposal_issue_number <= 0:
+            raise ValueError(
+                "KillHungSessionAction requires the gated proposal issue number"
+                " (there is no direct execute tier for kill_hung_session)"
+            )
+
+
+@dataclass(frozen=True)
+class DiscardTerminalTechLeadProposalOpsAction(Action):
+    """Confirm-and-discard terminal gated-proposal ledger rows (#6779 R7/R10).
+
+    Emitted by the planner from a read-only fact (``candidate_issue_numbers``):
+    ledger op rows whose proposal issue was ABSENT from the exhaustive open
+    scan. Absence alone is not proof of terminality — an exhaustive-scan
+    truncation (a later-page API failure, or a >2000-issue repo) can drop a
+    still-open proposal from the scan. So the applier's owner CONFIRMS each
+    candidate with a fresh targeted issue read before discarding: a deleted or
+    closed issue is terminal and its op is discarded; a still-open issue was a
+    pagination gap and its live op is preserved. This keeps fact gathering
+    read-only while routing the (formerly scattered) discard mutation through
+    one invariant-enforcing boundary.
+    """
+
+    candidate_issue_numbers: tuple[int, ...] = ()
+    action_type: ActionType = field(
+        default=ActionType.DISCARD_TERMINAL_TECH_LEAD_PROPOSAL_OPS, init=False
+    )
+
+
+@dataclass(frozen=True)
+class AppendPatternObservationAction(Action):
+    """Append a REPEAT observation to an existing pattern case file (#6781/#6957).
+
+    Replaces the bare comment the repeat-observation path used to plan. The
+    comment alone left the observation count derivable only from GitHub comment
+    cadence — which humans also write to — so promotion eligibility would have
+    been forgeable by commenting on a case file. This action makes the applier
+    do both halves under one owner: post the evidence comment AND increment the
+    orchestrator-owned durable observation count, which is the only thing
+    ``min_evidence`` ever reads.
+
+    ``fix_class``/``area`` upgrade a row the first observation left
+    unclassified; empty values preserve whatever is already recorded.
+    """
+
+    issue_number: int = 0  # The case-file issue
+    pattern_signature: str = ""
+    comment: str = ""
+    fix_class: str = ""
+    area: str = ""
+    action_type: ActionType = field(
+        default=ActionType.APPEND_PATTERN_OBSERVATION, init=False
+    )
+
+    def __post_init__(self) -> None:
+        if self.issue_number <= 0:
+            raise ValueError(
+                "AppendPatternObservationAction requires the case-file issue number"
+            )
+        if not self.pattern_signature.strip():
+            raise ValueError(
+                "AppendPatternObservationAction requires the pattern signature"
+                " (the ledger key whose observation count it increments)"
+            )
+        if not self.comment.strip():
+            raise ValueError(
+                "AppendPatternObservationAction requires the evidence comment"
+            )
+
+
+@dataclass(frozen=True)
+class PromoteTechLeadFindingAction(Action):
+    """File a promotable pattern finding as a gated issue in its routed repo.
+
+    The finding-promotion lane's ONE filing action (#6957). The target repo is
+    frequently NOT the managed repo, so the applier routes it through the
+    ``PromotionTargetHost`` port rather than ``RepositoryHost``. The applier
+    files first and records the (signature -> promotion) ledger row second, so
+    at-most-once filing survives a crash in either order.
+
+    ``labels`` carries the ``proposed-tech-lead`` gate in ``gated`` mode; the
+    self-validation below makes an ungated filing an explicit, typed decision
+    (``promote: auto``) rather than something a composition bug can produce.
+    """
+
+    signature: str = ""
+    case_file_issue_number: int = 0
+    target_repo: str = ""
+    title: str = ""
+    body: str = ""
+    labels: tuple[str, ...] = ()
+    area: str = ""
+    action_type: ActionType = field(
+        default=ActionType.PROMOTE_TECH_LEAD_FINDING, init=False
+    )
+
+    def __post_init__(self) -> None:
+        if not self.signature.strip():
+            raise ValueError(
+                "PromoteTechLeadFindingAction requires the pattern signature"
+                " (the promotion ledger key)"
+            )
+        if self.case_file_issue_number <= 0:
+            raise ValueError(
+                "PromoteTechLeadFindingAction requires the source case-file issue"
+                " number (the evidence ledger it promotes)"
+            )
+        if "/" not in self.target_repo:
+            raise ValueError(
+                "PromoteTechLeadFindingAction requires a concrete owner/repo"
+                f" target, got {self.target_repo!r}"
+            )
+        if not self.title.strip() or not self.body.strip():
+            raise ValueError(
+                "PromoteTechLeadFindingAction requires a title and body"
+            )
+
+
+@dataclass(frozen=True)
+class SettleTechLeadPromotionAction(Action):
+    """Close the loop on a promoted finding that went terminal (#6957).
+
+    ``shipped`` distinguishes the two terminal outcomes the applier must handle
+    differently: closed by a MERGED PR (record the shipped fix, comment and
+    close the case file) versus closed without one, which is the operator
+    declining (mark the signature declined forever, leave the case file open to
+    keep accruing evidence). Every write this action performs lands in the
+    SOURCE repo — only the read that produced the fact crossed repos.
+    """
+
+    signature: str = ""
+    case_file_issue_number: int = 0
+    target_repo: str = ""
+    target_issue_number: int = 0
+    shipped: bool = False
+    merged_pr_url: str = ""
+    area: str = ""
+    title: str = ""
+    action_type: ActionType = field(
+        default=ActionType.SETTLE_TECH_LEAD_PROMOTION, init=False
+    )
+
+    def __post_init__(self) -> None:
+        if not self.signature.strip():
+            raise ValueError(
+                "SettleTechLeadPromotionAction requires the pattern signature"
+            )
+        if self.case_file_issue_number <= 0:
+            raise ValueError(
+                "SettleTechLeadPromotionAction requires the case-file issue number"
+            )
+        if self.shipped and not self.merged_pr_url.strip():
+            raise ValueError(
+                "SettleTechLeadPromotionAction marked shipped requires the merged"
+                " PR url — that url IS the shipped-fix evidence"
+            )

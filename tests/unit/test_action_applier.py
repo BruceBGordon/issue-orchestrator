@@ -2959,10 +2959,24 @@ class TestClaimGateAudit:
     #   (#6779 R7/R10) - confirms each absent proposal with a targeted READ
     #   (get_issue_state) and discards only the local authority-store op row;
     #   it never writes GitHub state and never touches a claimed coding issue.
+    # - APPEND_PATTERN_OBSERVATION: comments on an orchestrator-owned pattern
+    #   case file and increments its durable observation count (#6781/#6957);
+    #   case files are observation-labeled evidence ledgers that are never
+    #   agent work items, so they are never claimed.
+    # - PROMOTE_TECH_LEAD_FINDING: creates a NEW gated issue in the ROUTED repo
+    #   (#6957) and records the promotion ledger row; it modifies nothing that
+    #   exists, let alone a claimed coding issue.
+    # - SETTLE_TECH_LEAD_PROMOTION: comments on / closes the orchestrator-owned
+    #   case file and writes the local shipped-fix + promotion ledger rows
+    #   (#6957); like APPEND_PATTERN_OBSERVATION the only GitHub target is a
+    #   case file, which is never claimed.
     # - CLEANUP_SESSION: post-completion cleanup
     # - RECONCILE_HISTORY_ENTRY: local session history mutation + event only
     # - CREATE_PR: not implemented in action_applier
     EXEMPT_ACTIONS = {
+        ActionType.APPEND_PATTERN_OBSERVATION,
+        ActionType.PROMOTE_TECH_LEAD_FINDING,
+        ActionType.SETTLE_TECH_LEAD_PROMOTION,
         ActionType.LAUNCH_SESSION,
         ActionType.LAUNCH_VALIDATION_RETRY,
         ActionType.STOP_SESSION,

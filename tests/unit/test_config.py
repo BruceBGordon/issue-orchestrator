@@ -3045,6 +3045,93 @@ tech_lead:
 
         assert any("tech_lead.dedup.similarity_threshold" in error for error in errors)
 
+    def test_finding_promotion_defaults(self):
+        """#6957: the lane ships ON but gated, so promotion needs one approval."""
+        findings = Config().tech_lead.findings
+
+        assert findings.promote == "gated"
+        assert findings.min_evidence == 2
+        assert findings.max_open_promoted == 3
+        assert findings.route == {"default": "self"}
+        assert findings.enabled is True
+        assert findings.gated is True
+
+    def test_finding_promotion_from_yaml(self, tmp_path):
+        config_file = tmp_path / ".issue-orchestrator.yaml"
+        config_file.write_text(
+            """
+tech_lead:
+  findings:
+    promote: auto
+    min_evidence: 4
+    max_open_promoted: 1
+    route:
+      completion-pipeline: issue-orchestrator/issue-orchestrator
+      default: self
+"""
+        )
+
+        findings = Config.load(config_file).tech_lead.findings
+
+        assert findings.promote == "auto"
+        assert findings.gated is False
+        assert findings.min_evidence == 4
+        assert findings.max_open_promoted == 1
+        assert findings.route_for("completion-pipeline") == (
+            "issue-orchestrator/issue-orchestrator"
+        )
+        assert findings.route_for("ui") == "self"
+        assert findings.target_repos() == ("issue-orchestrator/issue-orchestrator",)
+
+    def test_finding_promotion_route_defaults_to_self_when_omitted(self, tmp_path):
+        config_file = tmp_path / ".issue-orchestrator.yaml"
+        config_file.write_text(
+            """
+tech_lead:
+  findings:
+    route:
+      completion-pipeline: owner/repo
+"""
+        )
+
+        findings = Config.load(config_file).tech_lead.findings
+
+        assert findings.route_for("anything-else") == "self"
+
+    def test_promote_off_disables_the_lane(self):
+        config = Config()
+        config.tech_lead.findings.promote = "off"
+
+        assert config.tech_lead.findings.enabled is False
+        assert config.validate() == [] or not any(
+            "tech_lead.findings" in error for error in config.validate()
+        )
+
+    @pytest.mark.parametrize(
+        "attr,value,fragment",
+        (
+            ("promote", "sometimes", "tech_lead.findings.promote"),
+            ("min_evidence", 0, "tech_lead.findings.min_evidence"),
+            ("max_open_promoted", 0, "tech_lead.findings.max_open_promoted"),
+        ),
+    )
+    def test_invalid_finding_promotion_settings_fail_startup(
+        self, attr: str, value, fragment: str
+    ):
+        """Fail-loud: a misconfigured lane must never silently never-promote."""
+        config = Config()
+        setattr(config.tech_lead.findings, attr, value)
+
+        assert any(fragment in error for error in config.validate())
+
+    def test_malformed_route_target_fails_startup(self):
+        config = Config()
+        config.tech_lead.findings.route = {"default": "not-a-repo"}
+
+        errors = config.validate()
+
+        assert any("tech_lead.findings.route" in error for error in errors)
+
     def test_tech_lead_config_from_yaml(self, tmp_path):
         """Test loading tech_lead config from YAML."""
         config_content = """
@@ -3268,6 +3355,12 @@ tech_lead:
         assert result["tech_lead"]["dedup"] == {
             "enabled": True,
             "similarity_threshold": 0.72,
+        }
+        assert result["tech_lead"]["findings"] == {
+            "promote": "gated",
+            "min_evidence": 2,
+            "max_open_promoted": 3,
+            "route": {"default": "self"},
         }
         assert (
             result["tech_lead"]["milestone_strategy"]["inherit_from_issues"] == "latest"

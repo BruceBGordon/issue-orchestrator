@@ -130,11 +130,21 @@ def _creation_preflight(
         try:
             existing = ops.lookup_pattern(signature=action.pattern_signature)
             if existing is not None:
+                # The ledger already holds this signature (a concurrent tick or
+                # a crash-retry beat us to it), so every observation this action
+                # carried becomes a repeat observation on the existing case file
+                # — comment AND durable count, exactly like the planned repeat
+                # path, so promotion evidence is never silently dropped (#6957).
                 for comment in (
                     action.dedup_comment,
                     *action.additional_observation_comments,
                 ):
                     add_comment(existing, comment)
+                    ops.note_pattern_observation(
+                        signature=action.pattern_signature,
+                        fix_class=action.fix_class,
+                        area=action.area or "",
+                    )
                 return ActionResult.ok(
                     action,
                     issue_number=existing,
@@ -287,8 +297,15 @@ def _finalize_ledger_backed_creation(
             )
         elif isinstance(action, CreateTechLeadCaseFileIssueAction):
             assert ops is not None
+            # The issue body IS observation #1; each additional comment is one
+            # more observation from the same decision, so the durable count the
+            # promotion lane reads starts at the real total (#6957).
             ops.record_pattern(
-                signature=action.pattern_signature, issue_number=issue_number
+                signature=action.pattern_signature,
+                issue_number=issue_number,
+                fix_class=action.fix_class,
+                area=action.area or "",
+                observations=1 + len(action.additional_observation_comments),
             )
             for comment in action.additional_observation_comments:
                 add_comment(issue_number, comment)

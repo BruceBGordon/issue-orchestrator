@@ -14,6 +14,7 @@ from .config_models import (
     TechLeadAuthorityConfig,
     TechLeadConfig,
     TechLeadDedupConfig,
+    TechLeadFindingsConfig,
     TechLeadHealthReviewConfig,
 )
 
@@ -51,4 +52,5 @@ def parse_tech_lead_config(data: dict) -> TechLeadConfig:
             data.get("health_review", {}) or {}
         ),
         stuck_sweep=StuckSweepConfig.from_mapping(data.get("stuck_sweep", {}) or {}),
+        findings=TechLeadFindingsConfig.from_mapping(data.get("findings", {}) or {}),
     )

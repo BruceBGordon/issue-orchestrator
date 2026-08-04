@@ -31,6 +31,7 @@ case-file lifecycle, mirroring ``tech_lead_proposals`` (#6778) piece for piece:
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Iterable, Mapping, Sequence
 
 from ..domain.tech_lead_session import (
@@ -39,14 +40,23 @@ from ..domain.tech_lead_session import (
     is_tech_lead_observation_label,
     tech_lead_area_from_labels,
 )
-from .actions import CreateTechLeadCaseFileIssueAction
+from .actions import (
+    Action,
+    ActionResult,
+    AppendPatternObservationAction,
+    CreateTechLeadCaseFileIssueAction,
+)
 from .tech_lead_issue_policy import case_file_issue_labels
 
 if TYPE_CHECKING:
     from ..domain.tech_lead_artifacts import ProposedTechLeadAction, TechLeadFinding
     from ..infra.config import Config
+    from ..ports import RepositoryHost
     from ..ports.issue import Issue
+    from ..ports.tech_lead_authority import TechLeadAuthorityStore
     from .reconciliation import ExpectedState
+
+logger = logging.getLogger(__name__)
 
 CASE_FILE_TITLE_PREFIX = "Pattern case file: "
 
@@ -95,6 +105,7 @@ def _observation_body(
         "|---|---|",
         f"| Signature | `{proposed.pattern_signature}` |",
         f"| Area | {proposed.area or 'unclassified'} |",
+        f"| Fix class | {f'`fix:{proposed.fix_class}`' if proposed.fix_class else 'unclassified'} |",
         f"| Observed at | {observed_at} |",
         (
             f"| Observed by | session `{source_session_name}`"
@@ -154,6 +165,7 @@ def build_case_file_issue_action(
         pr_count=0,
         pattern_signature=proposed.pattern_signature,
         area=proposed.area,
+        fix_class=proposed.fix_class or "",
         dedup_comment=build_case_file_evidence_comment(
             proposed,
             anchor_issue_number=anchor_issue_number,
@@ -191,6 +203,88 @@ def build_case_file_evidence_comment(
             observed_at=observed_at,
         )
     )
+
+
+def build_append_observation_action(
+    proposed: "ProposedTechLeadAction",
+    *,
+    case_file_issue_number: int,
+    anchor_issue_number: int,
+    findings: Mapping[str, "TechLeadFinding"],
+    source_run_id: str,
+    source_session_name: str,
+    observed_at: str,
+    expected: "ExpectedState",
+) -> AppendPatternObservationAction:
+    """Plan a REPEAT observation of a known signature (comment + count).
+
+    The count is the promotion lane's ``min_evidence`` input (#6957), so the
+    comment and the increment must be one action with one owner — a bare
+    comment would leave the count derivable only from GitHub comment cadence,
+    which humans also write to.
+    """
+    assert proposed.pattern_signature is not None  # enforced by validate()
+    return AppendPatternObservationAction(
+        issue_number=case_file_issue_number,
+        pattern_signature=proposed.pattern_signature,
+        comment=build_case_file_evidence_comment(
+            proposed,
+            anchor_issue_number=anchor_issue_number,
+            findings=findings,
+            source_run_id=source_run_id,
+            source_session_name=source_session_name,
+            observed_at=observed_at,
+        ),
+        fix_class=proposed.fix_class or "",
+        area=proposed.area or "",
+        reason=(
+            f"tech_lead decision action {proposed.id}: pattern"
+            f" {proposed.pattern_signature!r} observed again; appending evidence"
+            f" to case file #{case_file_issue_number} (#6781)"
+        ),
+        expected=expected,
+    )
+
+
+def apply_append_pattern_observation(
+    action: "Action",
+    *,
+    repository_host: "RepositoryHost | None",
+    authority: "TechLeadAuthorityStore | None",
+) -> "ActionResult":
+    """Post a repeat observation and increment its durable count (#6781/#6957).
+
+    Comment FIRST, count second: the comment is the operator-visible evidence
+    and the count is what gates promotion, so a crash between them under-counts
+    (delaying a promotion by one observation) rather than promoting on evidence
+    nobody can read.
+
+    Like every other tech-lead applier boundary (case-file creation, proposal
+    finalization), this writes without the applier's reconciliation guard: the
+    target is an orchestrator-owned case file, never a claimed coding issue, so
+    there is no concurrent owner whose state could have moved underneath it.
+    """
+    assert isinstance(action, AppendPatternObservationAction)
+    if repository_host is None or authority is None:
+        return ActionResult.fail(
+            action,
+            "pattern observation append requires repository_host and the"
+            " TechLeadAuthorityStore wired into this applier",
+        )
+    try:
+        repository_host.add_comment(action.issue_number, action.comment)
+        authority.note_pattern_observation(
+            signature=action.pattern_signature,
+            fix_class=action.fix_class,
+            area=action.area,
+        )
+    except Exception as exc:
+        logger.exception(
+            "Failed to append pattern observation for signature %r",
+            action.pattern_signature,
+        )
+        return ActionResult.fail(action, str(exc))
+    return ActionResult.ok(action, issue_number=action.issue_number)
 
 
 def build_case_file_summary(issue: "Issue") -> TechLeadCaseFileSummary:

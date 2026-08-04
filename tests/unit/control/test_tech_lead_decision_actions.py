@@ -4,6 +4,7 @@ import pytest
 
 from issue_orchestrator.control.actions import (
     AddCommentAction,
+    AppendPatternObservationAction,
     AddLabelAction,
     CreateTechLeadCaseFileIssueAction,
     CreateTechLeadIssueAction,
@@ -692,27 +693,33 @@ def test_flag_pattern_execute_surfaces_as_pattern_and_opens_case_file() -> None:
 
 def test_flag_pattern_execute_known_signature_comments_evidence() -> None:
     """A repeat observation of a recorded signature appends evidence to the
-    existing case file instead of filing a second issue (#6781)."""
+    existing case file instead of filing a second issue (#6781), carrying the
+    durable observation count promotion reads (#6957)."""
     action = ProposedTechLeadAction(
         id="A4",
         action_type="flag_pattern",
         body="Seen again in two more sessions.",
         pattern_signature="github-422-batch",
         finding_ids=("T1",),
+        fix_class="code",
+        area="completion-pipeline",
     )
 
-    surfaced, comment = _plan(
+    surfaced, observation = _plan(
         _decision(action), pattern_ledger={"github-422-batch": 777}
     )
 
     assert isinstance(surfaced, SurfaceTechLeadProposalAction)
     assert surfaced.mode == "pattern"
-    assert isinstance(comment, AddCommentAction)
-    assert comment.number == 777
-    assert comment.is_pr is False
-    assert "observed again" in comment.reason
+    assert isinstance(observation, AppendPatternObservationAction)
+    assert observation.issue_number == 777
+    assert observation.pattern_signature == "github-422-batch"
+    assert observation.fix_class == "code"
+    assert observation.area == "completion-pipeline"
+    assert "observed again" in observation.reason
     assert not any(
-        isinstance(a, CreateTechLeadCaseFileIssueAction) for a in (surfaced, comment)
+        isinstance(a, CreateTechLeadCaseFileIssueAction)
+        for a in (surfaced, observation)
     )
 
 
