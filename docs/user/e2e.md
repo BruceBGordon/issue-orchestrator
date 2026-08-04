@@ -82,7 +82,7 @@ The live onboarding acceptance is collection-gated behind `E2E_AGENT_GUIDED_ONBO
 | Suite definition | `e2e.pytest_args` | `e2e.command` |
 | Structured results | JUnit XML ingested after the run | JUnit XML ingested after the run |
 
-Both modes execute inside the E2E worktree, always capture raw output, and ingest `junit_xml_paths` / `artifact_paths` after the process exits. Missing configured JUnit or artifact paths fail the run loudly.
+Both modes execute inside the E2E worktree, always capture raw output, and ingest `junit_xml_paths` / `artifact_paths` after the process exits. Ingestion is loud on this surface: the run fails when the configured JUnit list as a whole resolves to no fresh files, or when the artifact list as a whole resolves to nothing. Matching is per field rather than per entry, so one non-matching glob is tolerated while another entry in the same field matches — see [the surface matrix](test-integrations.md#path-and-glob-rules) for the exact contract.
 
 Pytest resume works best when long workflows are split into discrete test functions, so already-passing nodeids can be deselected after an interruption.
 
@@ -135,7 +135,9 @@ This matters because many E2E suites will not create issues on every failing tes
 
 The E2E worker is a detached subprocess, so it can outlive an orchestrator restart.
 
-`e2e.survive_restart` (default `true`) leaves a running worker alone on shutdown. The run is marked `interrupted` and, for the pytest runner, is resumable on the next startup. Set it to `false` to stop the worker on shutdown and mark the run canceled instead.
+`e2e.survive_restart` (default `true`) leaves a running worker alone on shutdown: neither the worker nor its `running` row is touched, so the detached worker keeps going and finishes the run normally. A restart is not a run boundary. Set it to `false` to stop the worker on shutdown and mark the running row canceled instead.
+
+Orphan recovery is a separate, conditional path. If a surviving worker dies before finishing — machine reboot, OOM kill, manual `kill` — the row stays `running` with a PID that no longer exists. The next attempt to start a run detects that dead PID, marks the stale row `interrupted`, and proceeds. For `runner_kind=pytest`, an `interrupted` run is the one that can resume by deselecting already-passing nodeids. So a restart alone does not end and resume the in-flight run; only a worker that actually died does.
 
 ## Quarantine
 

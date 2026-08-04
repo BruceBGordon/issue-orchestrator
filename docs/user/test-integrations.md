@@ -327,8 +327,11 @@ The E2E worktree is force-checked-out to the orchestrator's current `HEAD` and
 
 Consequences worth planning for:
 
-- **Untracked dependency trees are wiped between runs.** `node_modules`,
-  `.gradle`, build caches, and downloaded browsers do not survive. Your command
+- **Untracked dependency trees inside the worktree are wiped between runs.**
+  Repo-local `node_modules`, `.gradle`, build caches, and browsers installed into
+  the tree do not survive. The clean runs only inside the E2E worktree, so
+  user-level caches outside it — `~/.gradle`, `~/.cache/ms-playwright`, a global
+  npm cache — are untouched and will still speed up your bootstrap. Your command
   must be able to bootstrap what it needs, or you should keep that bootstrap
   inside your wrapper script.
 - **Writes to tracked files do not persist.** The next run's forced checkout
@@ -341,19 +344,43 @@ Consequences worth planning for:
 - Raw run logs live in the **base repo**, not the worktree:
   `.issue-orchestrator/logs/e2e/run_<timestamp>.log`.
 
-### Glob rules (both surfaces)
+### Path and glob rules
+
+Resolution and deduplication work the same way on both surfaces:
 
 - Paths are **relative to the worktree root** for that surface. Absolute paths are
   accepted but tie the config to one machine.
 - `**` recursive globs are supported (`test-results/**/*.zip`).
 - Directories that match a glob are skipped; only files are ingested.
-- A path that resolves outside the worktree root is a hard error.
 - Duplicate matches across patterns are deduplicated.
 - One path or glob per line in the YAML list; blank lines are ignored, so a
   trailing newline does not read as "configured".
-- **E2E only:** a configured `junit_xml_paths` or `artifact_paths` entry that
-  matches nothing fails the run loudly. This is deliberate — a silently missing
-  report looks identical to a passing suite.
+- Matching is evaluated **per field, not per entry.** `junit_xml_paths` resolves
+  as one group and `artifact_paths` as another. A single entry that matches
+  nothing is tolerated as long as some other entry in the same field matched.
+  That is what makes optional trace/screenshot/video globs safe to list next to
+  a report that is always produced.
+
+What a discovery problem *does*, however, differs by surface:
+
+| Condition | Validation (`validation.junit_xml_paths`) | E2E (`e2e.junit_xml_paths`, `e2e.artifact_paths`) |
+|---|---|---|
+| The whole `junit_xml_paths` group matches no files | No structured cases; the validation command's own pass/fail outcome is unchanged | Run fails |
+| The whole group matches only files older than the run | No structured cases; outcome unchanged | Run fails |
+| The whole `artifact_paths` group matches no files | n/a — validation has no `artifact_paths` | Run fails |
+| One entry matches nothing, another in the same field matches | Tolerated | Tolerated |
+| A matched path resolves outside the worktree root | No structured cases; outcome unchanged | Run fails |
+| A matched report is malformed or rejected by the parser | No structured cases; outcome unchanged | Run fails |
+
+Read that as two different jobs. On **E2E**, report discovery is load-bearing, so
+it is loud by design — a silently missing report looks identical to a passing
+suite. On **validation**, structured cases are best-effort evidence layered on
+top of a command that already has its own exit status: a validation command that
+fails during typecheck, before its test step ever writes a report, still reports
+that real failure. It just has no per-case view to render.
+
+Path escapes and malformed reports therefore fail *the run* only on E2E. Both
+surfaces still refuse to ingest them.
 
 ---
 
@@ -366,16 +393,22 @@ multi-suite reports both work.
 |---------------------|---------|
 | `testcase@name` (required, non-empty) | Display name |
 | `testcase@classname` | Suite name; combined as `classname::name` for the case ID |
-| `testcase@time` | Duration in seconds |
+| `testcase@time` | Duration in seconds. Optional, but when present and non-empty it must be float-like — a non-numeric value is a parse rejection, not a dropped duration |
 | `<failure>` child | Outcome `failed`, with `message` + body as failure details |
 | `<error>` child | Outcome `error` |
 | `<skipped>` child | Outcome `skipped` |
 | none of the above | Outcome `passed` |
 | `<system-out>` / `<system-err>` | Captured output, truncated at 100,000 characters per channel |
 
-A report is rejected — and, on the E2E runner, fails the run — when the file is
-missing, is not well-formed XML, contains zero `<testcase>` entries, or has a
-`testcase` with an empty `name`.
+A report is rejected when the file is missing, is not well-formed XML, contains
+zero `<testcase>` entries, has a `testcase` with an empty `name`, or carries a
+typed attribute it cannot parse — a non-numeric `testcase@time` is the one you
+are most likely to hit. Treat that list as illustrative rather than exhaustive:
+anything the parser cannot turn into a typed case is a rejection.
+
+What a rejection costs you depends on the surface, per the matrix above. On the
+E2E runner it fails the run. On validation it yields no structured cases and
+leaves the validation command's own outcome alone.
 
 ---
 
@@ -406,9 +439,14 @@ Why it is not a client extension point yet:
   manifest and register at load time. There is no manifest, dynamic loading, or
   per-repo registry a target repo could hook into without patching
   Issue-Orchestrator's source.
-- There is no marker protocol for third-party runners to inject extras. The
-  orchestrator's own parser is the only producer, and generic JUnit ingestion
-  always yields `extras: []`.
+- There is no marker protocol or payload contract for third-party runners to
+  inject extras. Today `extras` is populated only by Issue-Orchestrator-owned
+  payload/view-model translators — the built-in `io.agent-context` entry is
+  synthesized by the dashboard's E2E canonical-payload translator from
+  linked-issue data the orchestrator already holds. Generic JUnit ingestion
+  produces none: the JUnit parser has no `extras` concept at all, and view-model
+  normalization emits `extras: []` for cases that arrive without one. Nothing a
+  client runner can write into a report reaches this slot.
 - Namespaces are flat strings with no version negotiation, so the payload shape
   is free to change without notice.
 
@@ -444,12 +482,13 @@ section of [E2E Test Runner](e2e.md#debugging).
 | Symptom | Cause | Fix |
 |---------|-------|-----|
 | Results tab shows only `Raw Output` | No JUnit emitted or path did not resolve | Verify the file exists after a manual run; mirror the exact path into `junit_xml_paths` |
-| Run fails: "Configured JUnit XML paths did not resolve to any files" | The glob matched nothing | Fix the emitted path or the glob. Check the path is worktree-relative |
-| Run fails: "…did not resolve to any fresh files" | The only matches predate this run | Your command is not rewriting the report. Delete stale reports at start-of-run |
-| Run fails: "Configured artifact paths did not resolve to any files" | An `artifact_paths` glob matched nothing | Remove the entry, or make the command always produce it |
-| Run fails: "JUnit XML did not contain any `<testcase>` entries" | The suite collected zero tests, or the reporter wrote a stub | Fix test selection; confirm the reporter ran |
-| Run fails: "E2E report path resolves outside repo root" | The path escapes the worktree (`../`, or a symlink out) | Write reports inside the worktree |
-| Validation event has no structured cases | Validation exited before the test step, or the report was stale | Check the validation stdout log for where the command stopped |
+| E2E run fails: "Configured JUnit XML paths did not resolve to any files" | No entry in `e2e.junit_xml_paths` matched | Fix the emitted path or the glob. Check the path is worktree-relative |
+| E2E run fails: "…did not resolve to any fresh files" | Every match predates this run | Your command is not rewriting the report. Delete stale reports at start-of-run |
+| E2E run fails: "Configured artifact paths did not resolve to any files" | No entry in `e2e.artifact_paths` matched | Remove the entry, or make the command always produce it |
+| E2E run fails: "JUnit XML did not contain any `<testcase>` entries" | The suite collected zero tests, or the reporter wrote a stub | Fix test selection; confirm the reporter ran |
+| E2E run fails: "E2E report path resolves outside repo root" | The path escapes the worktree (`../`, or a symlink out) | Write reports inside the worktree |
+| One optional E2E glob never matches, but the run still passes | Matching is per field, not per entry — another entry in that field matched | Working as designed. Split truly required reports into a field where they are the only entry |
+| Validation event has no structured cases | Validation exited before the test step, the report was stale, or the report was unreadable | Check the validation stdout log for where the command stopped. Validation never fails *because of* discovery — the command's own exit status stands |
 | Dependencies missing on every E2E run | The worktree is `git clean -fdx`'d between runs | Install inside your command or wrapper script |
 | Auto-quarantine entries keep disappearing | The forced checkout restores tracked files | Commit quarantine entries to the repository |
 
