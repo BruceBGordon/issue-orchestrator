@@ -176,6 +176,16 @@ Each recipe assumes `runner_kind: command` unless stated otherwise, and shows th
 two things you must produce: a JUnit report and any native artifacts worth
 keeping.
 
+One rule governs every recipe below. `artifact_paths` is evaluated as a single
+group, so **if you configure it at all, at least one pattern in it must be
+guaranteed to match on a green run.** Most framework artifacts are conditional —
+screenshots and traces usually exist only for failures, videos only when
+recording is enabled — and a group where every pattern is conditional turns a
+passing suite into a failed run. Anchor the group with something written
+unconditionally (an HTML report is the usual choice), or leave `artifact_paths`
+unset until you have such an output. The same applies to `junit_xml_paths`, but
+a report you always write is the point of that field anyway.
+
 ### pytest
 
 `runner_kind: pytest` is the better fit here — you also get live per-test events,
@@ -255,9 +265,18 @@ e2e:
   junit_xml_paths:
     - "cypress/results/*.xml"
   artifact_paths:
-    - "cypress/screenshots/**/*.png"
+    # Requires video: true — see the warning below before keeping this field.
     - "cypress/videos/**/*.mp4"
+    - "cypress/screenshots/**/*.png"
 ```
+
+Cypress is the recipe most likely to trip the artifact-group rule. It writes
+screenshots **only for failing tests**, and writes videos **only when `video:
+true` is set** in `cypress.config.js`. With video off, a green run matches
+neither pattern, the whole artifact group is empty, and the run fails even though
+the JUnit group resolved perfectly. Either enable video so the group always has a
+member, or drop `artifact_paths` and rely on the JUnit report alone —
+screenshots on a failing run are not worth a false failure on every passing one.
 
 Configure `mocha-junit-reporter` with a per-spec filename
 (`mochaFile: cypress/results/results-[hash].xml`) so parallel specs do not
@@ -298,13 +317,30 @@ e2e:
     - "test-results/**/*.log"
 ```
 
-Two rules make wrapper scripts behave:
+Three rules make wrapper scripts behave:
 
-1. **Do not swallow the exit code.** The run's status is the command's exit code.
-   Capture it before any cleanup and re-exit with it.
+1. **Do not swallow the exit code.** Capture it before any cleanup and re-exit
+   with it. The exit code is an *input* to run status, not the status itself —
+   the orchestrator combines it with the parsed JUnit outcomes and the quarantine
+   list. Two overrides are worth knowing:
+   - A command that exits `0` while its JUnit report contains failing cases still
+     produces a **failed** run, annotated with "Command exited 0 but JUnit XML
+     reported failing tests". You cannot make a run pass by inventing a zero.
+   - When the only failing cases are quarantined, a non-zero exit is cleared to
+     `0` and the run completes as **warning**. So a non-zero command does not
+     always mean a failed run either.
+
+   A discovery or parser error finishes the run as **error** regardless of exit
+   code. Reporting the true exit code is what keeps all of these decisions
+   correct.
 2. **Always write the reports, even on failure.** A script that short-circuits on
    failure before copying reports produces a run with a loud "did not resolve to
    any files" error instead of the failure detail you wanted.
+3. **Make the artifact group survivable.** The `cp ... || true` lines above
+   deliberately tolerate a missing file, which means a run that fails early can
+   leave `artifact_paths` matching nothing and fail on ingestion rather than on
+   the real problem. Either guarantee one of those artifacts (write a stub HTML
+   report when the real one is absent) or leave `artifact_paths` unset.
 
 ---
 
@@ -470,7 +506,10 @@ which is a design document, not setup documentation.
    open the run's **Results** tab.
 4. Confirm you see structured cases, not only `Raw Output`. Only-raw-output means
    your JUnit path did not resolve or the file was not fresh.
-5. Confirm artifact buttons appear for each `artifact_paths` entry.
+5. Confirm artifact buttons appear for the files your patterns actually matched.
+   Count files, not config lines: one `artifact_paths` entry is a path or glob
+   and may produce zero, one, or many buttons. What matters is that the group
+   produced something and that the artifacts you rely on are among them.
 
 For per-run SQL checks against `.issue-orchestrator/e2e.db`, see the debugging
 section of [E2E Test Runner](e2e.md#debugging).
@@ -487,7 +526,8 @@ section of [E2E Test Runner](e2e.md#debugging).
 | E2E run fails: "Configured artifact paths did not resolve to any files" | No entry in `e2e.artifact_paths` matched | Remove the entry, or make the command always produce it |
 | E2E run fails: "JUnit XML did not contain any `<testcase>` entries" | The suite collected zero tests, or the reporter wrote a stub | Fix test selection; confirm the reporter ran |
 | E2E run fails: "E2E report path resolves outside repo root" | The path escapes the worktree (`../`, or a symlink out) | Write reports inside the worktree |
-| One optional E2E glob never matches, but the run still passes | Matching is per field, not per entry — another entry in that field matched | Working as designed. Split truly required reports into a field where they are the only entry |
+| One optional E2E glob never matches, but the run still passes | Matching is per field, not per entry — another entry in that field matched | Working as designed. Config cannot mark a single entry required; there is exactly one `junit_xml_paths` group and one `artifact_paths` group. If a specific file is mandatory, check for it in your command or wrapper script and exit non-zero when it is missing |
+| E2E run fails on a green suite, but passes when tests fail | Every `artifact_paths` pattern is conditional (failure-only screenshots, disabled video), so a passing run leaves the group empty | Anchor the group with an artifact written unconditionally, or unset `artifact_paths` |
 | Validation event has no structured cases | Validation exited before the test step, the report was stale, or the report was unreadable | Check the validation stdout log for where the command stopped. Validation never fails *because of* discovery — the command's own exit status stands |
 | Dependencies missing on every E2E run | The worktree is `git clean -fdx`'d between runs | Install inside your command or wrapper script |
 | Auto-quarantine entries keep disappearing | The forced checkout restores tracked files | Commit quarantine entries to the repository |

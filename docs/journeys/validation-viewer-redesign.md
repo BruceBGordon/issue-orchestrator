@@ -102,14 +102,28 @@ function renderPluginExtras(testCase) { ... }  // iterates case.extras
 
 **The first and only Phase-0 plugin**: `io.agent-context`.  When a test
 case was driven by the orchestrator on an issue (currently: E2E tests in
-our own suite), the parser attaches
+our own suite), something attaches
 `{namespace: "io.agent-context", payload: {issue_number, run_id, ...}}`
 to that case's `extras`.  The plugin renders the linked-issue subtree —
 runs → cycles → events with full nested expansion.
 
-**Generic consumers don't populate `extras`.** tixmeup's validation
-parser sets `extras = []` on every case, so `renderPluginExtras` is a
-no-op there.  The viewer is unaware that "linked issues" exist.
+> **As implemented, that producer is not the parser.**  This section was
+> written expecting the backend JUnit parser to populate `extras`.  It
+> does not, and has no `extras` concept at all.  The built-in entry is
+> synthesized client-side by `_extrasForTest()` in
+> `static/js/dashboard/e2e_canonical_payload.js`, which builds it from
+> the `existing_issue` linked-issue data already on the test record;
+> cases that arrive without extras are normalized to `[]` in
+> `view_models/dialogs.py`.  The conclusion below is unaffected — the
+> producer is still Issue-Orchestrator-owned code, and no external JUnit
+> producer can inject extras — but the seam sits in the payload
+> translator, not the parser.
+
+**Generic consumers don't populate `extras`.** A plain validation run —
+tixmeup's, or any repo's JUnit ingested through the generic path —
+carries no extras at all; normalization emits `[]` on every case, so
+`renderPluginExtras` is a no-op there.  The viewer is unaware that
+"linked issues" exist.
 
 ### What the plugin registry is NOT (Phase 0 scope hard limits)
 
@@ -117,8 +131,10 @@ no-op there.  The viewer is unaware that "linked issues" exist.
   the typed case payload, not as `<<<plugin:foo:begin>>>` markers in
   `<system-out>`.  The marker protocol is the upgrade we'd make when we
   have writers we don't own (third-party runners injecting extensions
-  without modifying our parser).  Not needed when our parser is the
-  single producer.
+  without modifying our code).  Not needed while an Issue-Orchestrator-owned
+  payload translator is the single producer — as shipped, that is the E2E
+  canonical-payload translator rather than the parser this section
+  originally assumed.
 - **No plugin manifest.**  Plugin modules are statically imported and
   call `registerValidationPlugin()` at boot.  No YAML config, no dynamic
   loading, no per-tenant registries.
@@ -223,7 +239,7 @@ tree of `treeitem`s with consistent depth labels.
 
 | PR | Scope |
 |---|---|
-| A. Foundation | Canonical viewer JS component, plugin registry, linked-issue plugin module, OpenAPI schema for `case.extras`, backend parser populates extras, JS-vm + Python unit tests. The new viewer replaces the old `renderValidationDialog` body so the modal entry point exercises the new code without UI restructuring yet. |
+| A. Foundation | Canonical viewer JS component, plugin registry, linked-issue plugin module, OpenAPI schema for `case.extras`, extras populated for orchestrated cases (planned as backend-parser work; shipped in the E2E canonical-payload translator — see the note above), JS-vm + Python unit tests. The new viewer replaces the old `renderValidationDialog` body so the modal entry point exercises the new code without UI restructuring yet. |
 | B. Drawer integration | Per-issue drawer's cycle rows restructure to the single-idiom tree.  Cycle events become individually expandable.  Validation event hosts the canonical viewer inline.  Modal entry point deleted. |
 | C. E2E view | Strip orchestrator-workflow chrome.  Mount canonical viewer.  Failed-test linked-issue subtree via the plugin. |
 | D. Accessibility | ARIA + keyboard nav + focus styling + Playwright a11y assertions. |
