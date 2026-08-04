@@ -11,24 +11,30 @@ import pytest
 
 from issue_orchestrator.control.actions import (
     PromoteTechLeadFindingAction,
+    ReportPromotedFindingEvidenceAction,
     SettleTechLeadPromotionAction,
 )
 from issue_orchestrator.control.tech_lead_finding_promotion import (
     apply_promote_tech_lead_finding,
+    apply_report_promoted_finding_evidence,
     apply_settle_tech_lead_promotion,
     classify_promotion_outcomes,
     plan_finding_promotions,
+    plan_promotion_updates,
     plan_promotion_settlements,
     promotion_issue_labels,
     resolve_route_target,
+    select_promotion_updates,
     select_promotable_findings,
 )
 from issue_orchestrator.domain.tech_lead_findings import (
     PROMOTION_STATE_DECLINED,
     PROMOTION_STATE_SHIPPED,
     PatternEvidence,
+    PromotionUpdate,
     PromotableFinding,
     PromotedFinding,
+    promotion_issue_marker,
     promotion_issue_title,
 )
 from issue_orchestrator.domain.tech_lead_session import PROPOSED_TECH_LEAD_LABEL
@@ -62,6 +68,7 @@ def _evidence(
     fix_class: str = "code",
     area: str = "",
     case_file: int = 65,
+    diagnosis: str = "",
 ) -> PatternEvidence:
     return PatternEvidence(
         signature=signature,
@@ -69,6 +76,7 @@ def _evidence(
         observation_count=observations,
         fix_class=fix_class,
         area=area,
+        diagnosis=diagnosis,
     )
 
 
@@ -79,6 +87,7 @@ def _promotion(
     issue: int = 500,
     state: str = "promoted",
     case_file: int = 65,
+    reported: int = 0,
 ) -> PromotedFinding:
     return PromotedFinding(
         signature=signature,
@@ -86,6 +95,7 @@ def _promotion(
         target_repo=repo,
         target_issue_number=issue,
         state=state,  # type: ignore[arg-type]
+        reported_observations=reported,
     )
 
 
@@ -98,7 +108,9 @@ class TestEligibility:
     def test_signature_at_min_evidence_is_promotable(self):
         config = _config()
         selected = select_promotable_findings(
-            config, evidence=[_evidence("anchor-close-buries-escalation")], promotions=[]
+            config,
+            evidence=[_evidence("anchor-close-buries-escalation")],
+            promotions=[],
         )
         assert [item.evidence.signature for item in selected] == [
             "anchor-close-buries-escalation"
@@ -117,7 +129,9 @@ class TestEligibility:
         config = _config()
         selected = select_promotable_findings(
             config,
-            evidence=[_evidence("config-lock-misroute", fix_class="human", observations=9)],
+            evidence=[
+                _evidence("config-lock-misroute", fix_class="human", observations=9)
+            ],
             promotions=[],
         )
         assert selected == ()
@@ -187,7 +201,9 @@ class TestDedupAndDecline:
             config,
             evidence=[_evidence("fresh")],
             promotions=[
-                _promotion("old", repo="porchpin/porchpin", state=PROMOTION_STATE_DECLINED)
+                _promotion(
+                    "old", repo="porchpin/porchpin", state=PROMOTION_STATE_DECLINED
+                )
             ],
         )
         assert [item.evidence.signature for item in selected] == ["fresh"]
@@ -222,6 +238,20 @@ class TestStormBackpressure:
         # One upstream slot left (2 - 1 in flight), self is untouched by it.
         assert by_repo.count(UPSTREAM) == 1
         assert by_repo.count("porchpin/porchpin") == 1
+
+    def test_cap_folds_repository_case(self):
+        config = _config(
+            max_open_promoted=1,
+            route={"upstream": UPSTREAM.upper(), "default": "self"},
+        )
+
+        selected = select_promotable_findings(
+            config,
+            evidence=[_evidence("new", area="upstream")],
+            promotions=[_promotion("already", repo=UPSTREAM)],
+        )
+
+        assert selected == ()
 
 
 class TestRouting:
@@ -286,7 +316,9 @@ class TestPromotionIssueComposition:
 
     def test_title_names_the_source_repo_and_signature(self):
         assert (
-            promotion_issue_title(source_repo="porchpin/porchpin", signature="anchor-close")
+            promotion_issue_title(
+                source_repo="porchpin/porchpin", signature="anchor-close"
+            )
             == "[tech-lead:porchpin] anchor-close"
         )
 
@@ -306,6 +338,24 @@ class TestPromotionIssueComposition:
         assert action.case_file_issue_number == 65
         assert "porchpin/porchpin#65" in action.body
         assert PROPOSED_TECH_LEAD_LABEL in action.labels
+
+    def test_planned_action_carries_the_original_diagnosis_and_suggested_fix(self):
+        finding = PromotableFinding(
+            evidence=_evidence(
+                "anchor-close",
+                diagnosis=(
+                    "Mechanism: anchor closure drops a pending escalation.\n\n"
+                    "Suggested fix: preserve the escalation until acknowledged."
+                ),
+            ),
+            target_repo=UPSTREAM,
+        )
+
+        [action] = plan_finding_promotions(_config(), promotable=(finding,))
+
+        assert "### Diagnosis and suggested fix" in action.body
+        assert "anchor closure drops a pending escalation" in action.body
+        assert "preserve the escalation until acknowledged" in action.body
 
 
 # ---------------------------------------------------------------------------
@@ -346,6 +396,9 @@ class TestFiling:
         assert row.target_repo == UPSTREAM
         assert row.target_issue_number == result.details["issue_number"]
         assert row.is_open
+        # The issue body already carries the observations present at filing;
+        # the next tick must not misreport them as later evidence.
+        assert row.reported_observations == 2
 
     def test_a_failed_filing_leaves_the_ledger_untouched(self):
         """A phantom row would block the signature forever; retry must be clean."""
@@ -376,6 +429,63 @@ class TestFiling:
         assert again.details["deduplicated"] is True
         assert len(target.filed) == 1
 
+    def test_restart_after_remote_create_before_ledger_write_recovers_one_issue(self):
+        """The exact cross-system crash window must not duplicate the filing."""
+
+        class FailFirstLedgerWrite(InMemoryTechLeadAuthorityStore):
+            def __init__(self) -> None:
+                super().__init__()
+                self.fail_next_record = True
+
+            def record_promotion(self, *, promotion):
+                if self.fail_next_record:
+                    self.fail_next_record = False
+                    raise RuntimeError("process died before the ledger commit")
+                super().record_promotion(promotion=promotion)
+
+        target = InMemoryPromotionTargetHost()
+        authority = FailFirstLedgerWrite()
+        action = _promote_action()
+
+        with pytest.raises(RuntimeError, match="before the ledger commit"):
+            apply_promote_tech_lead_finding(
+                action,
+                target=target,
+                authority=authority,
+                now_iso="t1",
+            )
+        assert len(target.filed) == 1
+        assert authority.load_promotion(signature=action.signature) is None
+
+        recovered = apply_promote_tech_lead_finding(
+            action,
+            target=target,
+            authority=authority,
+            now_iso="t2",
+        )
+
+        assert recovered.success
+        assert len(target.filed) == 1
+        assert recovered.details["issue_number"] == 1001
+        assert (
+            authority.load_promotion(signature=action.signature).target_issue_number
+            == 1001
+        )
+
+    def test_promotion_action_carries_stable_marker_in_remote_body(self):
+        action = _promote_action("signature-with--html-risk")
+
+        expected = promotion_issue_marker(
+            source_repo="porchpin/porchpin",
+            signature="signature-with--html-risk",
+        )
+        assert action.idempotency_marker == expected
+        assert expected in action.body
+        assert expected == promotion_issue_marker(
+            source_repo="PORCHPIN/PORCHPIN",
+            signature="signature-with--html-risk",
+        )
+
     def test_unwired_promotion_target_fails_loudly(self):
         result = apply_promote_tech_lead_finding(
             _promote_action(),
@@ -403,9 +513,9 @@ class TestLedgerRestartResume:
 
         reopened = SqliteTechLeadAuthorityStore(db)
         evidence = reopened.list_pattern_evidence()
-        assert [(row.signature, row.observation_count, row.fix_class) for row in evidence] == [
-            ("anchor-close", 2, "code")
-        ]
+        assert [
+            (row.signature, row.observation_count, row.fix_class) for row in evidence
+        ] == [("anchor-close", 2, "code")]
         assert (
             select_promotable_findings(
                 _config(), evidence=evidence, promotions=reopened.list_promotions()
@@ -439,6 +549,139 @@ class TestLedgerRestartResume:
         assert row.observation_count == 3
         # A later observation can classify what the first one left unclassified.
         assert row.fix_class == "code"
+
+    def test_reported_observation_watermark_survives_restart(self, tmp_path):
+        from issue_orchestrator.infra.tech_lead_authority_store import (
+            SqliteTechLeadAuthorityStore,
+        )
+
+        db = tmp_path / "authority.sqlite"
+        store = SqliteTechLeadAuthorityStore(db)
+        store.record_promotion(promotion=_promotion("sig", reported=2))
+        store.note_promotion_reported(signature="sig", observations=4)
+
+        reopened = SqliteTechLeadAuthorityStore(db)
+
+        assert reopened.load_promotion(signature="sig").reported_observations == 4
+
+
+# ---------------------------------------------------------------------------
+# Later evidence on the one promoted issue
+# ---------------------------------------------------------------------------
+
+
+class TestPromotedEvidenceReporting:
+    def test_new_evidence_selects_one_update(self):
+        updates = select_promotion_updates(
+            evidence=[_evidence("sig", observations=4)],
+            promotions=[_promotion("sig", reported=2)],
+        )
+
+        assert updates == (
+            PromotionUpdate(
+                promotion=_promotion("sig", reported=2), observation_count=4
+            ),
+        )
+        assert updates[0].new_observations == 2
+
+    def test_already_reported_evidence_selects_no_update(self):
+        assert (
+            select_promotion_updates(
+                evidence=[_evidence("sig", observations=4)],
+                promotions=[_promotion("sig", reported=4)],
+            )
+            == ()
+        )
+
+    @pytest.mark.parametrize(
+        "state", [PROMOTION_STATE_DECLINED, PROMOTION_STATE_SHIPPED]
+    )
+    def test_terminal_promotion_is_not_revived_by_later_evidence(self, state):
+        assert (
+            select_promotion_updates(
+                evidence=[_evidence("sig", observations=9)],
+                promotions=[_promotion("sig", state=state, reported=2)],
+            )
+            == ()
+        )
+
+    def test_target_settling_this_tick_is_not_also_updated(self):
+        assert (
+            select_promotion_updates(
+                evidence=[_evidence("sig", observations=4)],
+                promotions=[_promotion("sig", reported=2)],
+                settling_signatures=frozenset({"sig"}),
+            )
+            == ()
+        )
+
+    def test_reporting_comments_then_advances_the_watermark(self):
+        authority = InMemoryTechLeadAuthorityStore()
+        authority.record_promotion(promotion=_promotion("sig", reported=2))
+        target = InMemoryPromotionTargetHost()
+        [action] = plan_promotion_updates(
+            _config(),
+            updates=(
+                PromotionUpdate(
+                    promotion=_promotion("sig", reported=2), observation_count=4
+                ),
+            ),
+        )
+
+        result = apply_report_promoted_finding_evidence(
+            action, target=target, authority=authority
+        )
+
+        assert result.success
+        assert target.comments == [
+            (UPSTREAM, 500, action.comment),
+        ]
+        assert "now 4 observations" in action.comment
+        assert authority.load_promotion(signature="sig").reported_observations == 4
+
+    def test_stale_retry_does_not_repeat_the_comment(self):
+        authority = InMemoryTechLeadAuthorityStore()
+        authority.record_promotion(promotion=_promotion("sig", reported=4))
+        target = InMemoryPromotionTargetHost()
+        action = ReportPromotedFindingEvidenceAction(
+            signature="sig",
+            case_file_issue_number=65,
+            target_repo=UPSTREAM,
+            target_issue_number=500,
+            comment="later evidence",
+            observation_count=4,
+        )
+
+        result = apply_report_promoted_finding_evidence(
+            action, target=target, authority=authority
+        )
+
+        assert result.success
+        assert result.details["deduplicated"] is True
+        assert target.comments == []
+
+    def test_failed_comment_does_not_advance_the_watermark(self):
+        class FailingTarget(InMemoryPromotionTargetHost):
+            def add_comment(self, *, repo, issue_number, body):
+                raise RuntimeError("target unavailable")
+
+        authority = InMemoryTechLeadAuthorityStore()
+        authority.record_promotion(promotion=_promotion("sig", reported=2))
+        [action] = plan_promotion_updates(
+            _config(),
+            updates=(
+                PromotionUpdate(
+                    promotion=_promotion("sig", reported=2), observation_count=3
+                ),
+            ),
+        )
+
+        result = apply_report_promoted_finding_evidence(
+            action, target=FailingTarget(), authority=authority
+        )
+
+        assert not result.success
+        assert authority.load_promotion(signature="sig").reported_observations == 2
 
 
 # ---------------------------------------------------------------------------
@@ -477,7 +720,9 @@ class TestLoopClosure:
             def read_outcome(self, *, repo, issue_number):
                 raise RuntimeError("connection reset")
 
-        assert classify_promotion_outcomes([_promotion("sig")], target=Unreachable()) == ()
+        assert (
+            classify_promotion_outcomes([_promotion("sig")], target=Unreachable()) == ()
+        )
 
     def test_unknown_outcome_leaves_the_promotion_in_flight(self):
         target = InMemoryPromotionTargetHost()
@@ -503,9 +748,7 @@ class TestSettlement:
             target.outcomes[(UPSTREAM, 500)] = PromotedIssueOutcome(state="closed")
         authority = InMemoryTechLeadAuthorityStore()
         authority.record_promotion(promotion=_promotion("anchor-close"))
-        facts = classify_promotion_outcomes(
-            authority.list_promotions(), target=target
-        )
+        facts = classify_promotion_outcomes(authority.list_promotions(), target=target)
         [action] = plan_promotion_settlements(facts)
         assert isinstance(action, SettleTechLeadPromotionAction)
         repository_host = Mock()
@@ -624,7 +867,7 @@ class TestFactGatheringAndPlanning:
         # Nothing armed: no facts at all, and no cross-repo read was attempted.
         assert facts is None
 
-    def test_gathered_facts_become_filing_and_settlement_actions(self):
+    def test_gathered_facts_become_filing_update_and_settlement_actions(self):
         from issue_orchestrator.control.tech_lead_finding_promotion import (
             plan_finding_promotion_actions,
         )
@@ -639,6 +882,12 @@ class TestFactGatheringAndPlanning:
                         evidence=_evidence("anchor-close"), target_repo=UPSTREAM
                     ),
                 ),
+                promotion_updates=(
+                    PromotionUpdate(
+                        promotion=_promotion("repeat", reported=2),
+                        observation_count=3,
+                    ),
+                ),
                 settled_promotions=(
                     SettledPromotion(
                         promotion=_promotion("older"),
@@ -651,8 +900,30 @@ class TestFactGatheringAndPlanning:
 
         assert [type(action) for action in actions] == [
             PromoteTechLeadFindingAction,
+            ReportPromotedFindingEvidenceAction,
             SettleTechLeadPromotionAction,
         ]
+
+    def test_later_evidence_arms_facts_without_other_tech_lead_triggers(self):
+        config = _config()
+        config.tech_lead_review_agent = "agent:tech-lead"
+        config.tech_lead_review_threshold = 0
+        authority = InMemoryTechLeadAuthorityStore()
+        authority.record_pattern(
+            signature="sig", issue_number=65, fix_class="code", observations=3
+        )
+        authority.record_promotion(promotion=_promotion("sig", reported=2))
+
+        facts = _fact_gatherer(
+            config, authority, InMemoryPromotionTargetHost()
+        ).gather_tech_lead_facts(_state())
+
+        assert facts is not None
+        assert facts.promotion_updates == (
+            PromotionUpdate(
+                promotion=_promotion("sig", reported=2), observation_count=3
+            ),
+        )
 
     def test_planning_is_a_no_op_without_tech_lead_facts(self):
         from issue_orchestrator.control.tech_lead_finding_promotion import (

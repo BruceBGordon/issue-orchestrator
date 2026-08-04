@@ -3098,6 +3098,28 @@ tech_lead:
 
         assert findings.route_for("anything-else") == "self"
 
+    def test_finding_promotion_default_route_is_case_insensitive(self, tmp_path):
+        config_file = tmp_path / ".issue-orchestrator.yaml"
+        config_file.write_text(
+            """
+tech_lead:
+  findings:
+    route:
+      Default: owner/repo
+"""
+        )
+
+        findings = Config.load(config_file).tech_lead.findings
+
+        assert findings.route == {"default": "owner/repo"}
+        assert findings.route_for("anything-else") == "owner/repo"
+
+    def test_finding_promotion_target_repos_fold_repository_case(self):
+        findings = Config().tech_lead.findings
+        findings.route = {"one": "Owner/Repo", "two": "owner/repo"}
+
+        assert findings.target_repos() == ("Owner/Repo",)
+
     def test_promote_off_disables_the_lane(self):
         config = Config()
         config.tech_lead.findings.promote = "off"
@@ -3131,6 +3153,28 @@ tech_lead:
         errors = config.validate()
 
         assert any("tech_lead.findings.route" in error for error in errors)
+
+    @pytest.mark.parametrize(
+        "route_yaml,fragment",
+        (
+            ("'': owner/repo", "keys must be non-empty"),
+            ("completion-pipeline: ''", "must not be empty"),
+            (
+                "Queue: owner/one\n      queue: owner/two",
+                "duplicate case-insensitive area",
+            ),
+        ),
+    )
+    def test_blank_or_ambiguous_finding_routes_fail_load(
+        self, tmp_path, route_yaml: str, fragment: str
+    ):
+        config_file = tmp_path / ".issue-orchestrator.yaml"
+        config_file.write_text(
+            f"tech_lead:\n  findings:\n    route:\n      {route_yaml}\n"
+        )
+
+        with pytest.raises(ValueError, match=fragment):
+            Config.load(config_file)
 
     def test_tech_lead_config_from_yaml(self, tmp_path):
         """Test loading tech_lead config from YAML."""

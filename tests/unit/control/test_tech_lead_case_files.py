@@ -91,6 +91,7 @@ def test_build_case_file_issue_action_first_observation() -> None:
     assert action.title == f"{CASE_FILE_TITLE_PREFIX}db-timeout"
     assert action.pattern_signature == "db-timeout"
     assert action.area == "db"
+    assert action.diagnosis == _proposed().body
     # Labels keep it in the anchor scan, in scope, non-pickup, area-tagged.
     assert "agent:tech-lead" in action.labels
     assert "io-scope" in action.labels

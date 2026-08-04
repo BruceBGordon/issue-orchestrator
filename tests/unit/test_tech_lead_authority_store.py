@@ -45,10 +45,13 @@ def test_round_trip_keyed_by_run_identity(tmp_path: Path) -> None:
     assert store.load(run_id="r1", session_name="issue-8") is None
 
 
-@pytest.mark.parametrize("make_store", [
-    lambda tmp_path: SqliteTechLeadAuthorityStore.for_repo(tmp_path),
-    lambda _tmp_path: InMemoryTechLeadAuthorityStore(),
-])
+@pytest.mark.parametrize(
+    "make_store",
+    [
+        lambda tmp_path: SqliteTechLeadAuthorityStore.for_repo(tmp_path),
+        lambda _tmp_path: InMemoryTechLeadAuthorityStore(),
+    ],
+)
 def test_record_identical_payload_is_noop(tmp_path: Path, make_store) -> None:
     """Create-once: re-recording the same payload is silently accepted."""
     store = make_store(tmp_path)
@@ -61,10 +64,13 @@ def test_record_identical_payload_is_noop(tmp_path: Path, make_store) -> None:
     assert loaded.manifest_pr_numbers == (1,)
 
 
-@pytest.mark.parametrize("make_store", [
-    lambda tmp_path: SqliteTechLeadAuthorityStore.for_repo(tmp_path),
-    lambda _tmp_path: InMemoryTechLeadAuthorityStore(),
-])
+@pytest.mark.parametrize(
+    "make_store",
+    [
+        lambda tmp_path: SqliteTechLeadAuthorityStore.for_repo(tmp_path),
+        lambda _tmp_path: InMemoryTechLeadAuthorityStore(),
+    ],
+)
 def test_record_conflicting_payload_fails_loudly(tmp_path: Path, make_store) -> None:
     """The authority constrains mutation scope: it must never silently
     change or expand for an existing (run_id, session_name) (#6769 r4)."""
@@ -219,7 +225,9 @@ def test_health_review_authority_targets_only_its_anchor() -> None:
 # --- Gated proposal ops (#6778) ------------------------------------------
 
 
-def _op(target: int = 13, *, op_type: str = "reset_retry", rationale: str = "r") -> "StoredTechLeadOp":
+def _op(
+    target: int = 13, *, op_type: str = "reset_retry", rationale: str = "r"
+) -> "StoredTechLeadOp":
     return StoredTechLeadOp(
         op_type=op_type,
         target_issue_number=target,
@@ -325,11 +333,19 @@ def test_stored_op_dict_round_trip() -> None:
 @pytest.mark.parametrize("make_store", OP_STORES)
 def test_pattern_round_trip(tmp_path: Path, make_store) -> None:
     store = make_store(tmp_path)
-    store.record_pattern(signature="db-timeout", issue_number=600)
+    store.record_pattern(
+        signature="db-timeout",
+        issue_number=600,
+        diagnosis="Mechanism: leaked DB connection. Suggested fix: close it.",
+    )
 
     assert store.lookup_pattern(signature="db-timeout") == 600
     assert store.lookup_pattern(signature="absent") is None
     assert store.list_patterns() == (("db-timeout", 600),)
+    [evidence] = store.list_pattern_evidence()
+    assert evidence.diagnosis == (
+        "Mechanism: leaked DB connection. Suggested fix: close it."
+    )
 
 
 @pytest.mark.parametrize("make_store", OP_STORES)
@@ -446,9 +462,7 @@ def test_record_conflicting_storm_cohort_fails_loudly(
     store.record_storm_cohort(anchor_issue_number=999, cohort=_cohort())
 
     with pytest.raises(TechLeadStormCohortConflictError):
-        store.record_storm_cohort(
-            anchor_issue_number=999, cohort=_cohort((41, 42, 43))
-        )
+        store.record_storm_cohort(anchor_issue_number=999, cohort=_cohort((41, 42, 43)))
 
     assert store.load_storm_cohort(anchor_issue_number=999) == _cohort()
 
@@ -622,6 +636,53 @@ def test_existing_authority_database_adds_shipped_fix_ledger(tmp_path: Path) -> 
     )
 
     assert store.list_recent_shipped_fixes(limit=10)[0].issue_number == 600
+    assert store.list_pattern_evidence() == ()
+
+
+def test_existing_pattern_ledger_adds_empty_diagnosis_column(tmp_path: Path) -> None:
+    db_path = state_dir(tmp_path) / "tech_lead_authority.sqlite"
+    db_path.parent.mkdir(parents=True)
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "CREATE TABLE tech_lead_patterns ("
+            "signature TEXT PRIMARY KEY, issue_number INTEGER NOT NULL, "
+            "recorded_at TEXT NOT NULL, observation_count INTEGER NOT NULL, "
+            "fix_class TEXT NOT NULL, area TEXT NOT NULL)"
+        )
+        connection.execute(
+            "INSERT INTO tech_lead_patterns VALUES "
+            "('legacy', 65, 'now', 2, 'code', 'queue')"
+        )
+
+    [evidence] = SqliteTechLeadAuthorityStore.for_repo(tmp_path).list_pattern_evidence()
+
+    assert evidence.signature == "legacy"
+    assert evidence.diagnosis == ""
+
+
+def test_existing_promotion_ledger_adds_reported_observation_watermark(
+    tmp_path: Path,
+) -> None:
+    """Opening an earlier #6957 database applies the additive column migration."""
+    db_path = state_dir(tmp_path) / "tech_lead_authority.sqlite"
+    db_path.parent.mkdir(parents=True)
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "CREATE TABLE tech_lead_promoted_findings ("
+            "signature TEXT PRIMARY KEY, case_file_issue_number INTEGER NOT NULL, "
+            "target_repo TEXT NOT NULL, target_issue_number INTEGER NOT NULL, "
+            "state TEXT NOT NULL, area TEXT NOT NULL DEFAULT '', "
+            "title TEXT NOT NULL DEFAULT '', shipped_pr_url TEXT NOT NULL DEFAULT '', "
+            "recorded_at TEXT NOT NULL)"
+        )
+        connection.execute(
+            "INSERT INTO tech_lead_promoted_findings VALUES "
+            "('sig', 65, 'o/r', 99, 'promoted', '', '', '', 'now')"
+        )
+
+    store = SqliteTechLeadAuthorityStore.for_repo(tmp_path)
+
+    assert store.load_promotion(signature="sig").reported_observations == 0
 
 
 def test_shipped_fix_methods_satisfy_the_port() -> None:

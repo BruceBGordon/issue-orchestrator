@@ -50,6 +50,7 @@ from .tech_lead_actions import (
     DiscardTerminalTechLeadProposalOpsAction as DiscardTerminalTechLeadProposalOpsAction,
     KillHungSessionAction as KillHungSessionAction,
     PromoteTechLeadFindingAction as PromoteTechLeadFindingAction,
+    ReportPromotedFindingEvidenceAction as ReportPromotedFindingEvidenceAction,
     ResetRetryIssueAction as ResetRetryIssueAction,
     SettleTechLeadPromotionAction as SettleTechLeadPromotionAction,
     SurfaceTechLeadProposalAction as SurfaceTechLeadProposalAction,

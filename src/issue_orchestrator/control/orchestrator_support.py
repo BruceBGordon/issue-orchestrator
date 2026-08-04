@@ -40,7 +40,7 @@ from .queue_cache import (
 )
 from .blocked_front_queue import front_queue_newly_unblocked, release_blocked_front_on_launch
 from .dependency_gate_snapshot import build_refresh_snapshot
-from .fact_gatherer import clear_discovered_facts
+from .tech_lead_artifact_retention import clear_discovered_facts
 from .issue_fetch_resilience import IssueFetchResilience, TransientIssueFetchError
 from .reconciliation import ReconciliationRequired, get_pause_label
 from .tick_telemetry import report_slow_tick

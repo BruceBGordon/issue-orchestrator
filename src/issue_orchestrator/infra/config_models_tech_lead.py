@@ -292,11 +292,30 @@ class TechLeadFindingsConfig:
                 "tech_lead.findings.route must be a mapping of area -> repo, got "
                 f"{type(raw_route).__name__}"
             )
-        route = {
-            str(area).strip(): str(target).strip()
-            for area, target in raw_route.items()
-            if str(area).strip() and str(target).strip()
-        }
+        route: dict[str, str] = {}
+        folded_areas: set[str] = set()
+        for raw_area, raw_target in raw_route.items():
+            area = str(raw_area).strip()
+            target = str(raw_target).strip()
+            if not area:
+                raise ValueError(
+                    "tech_lead.findings.route keys must be non-empty area names"
+                )
+            if not target:
+                raise ValueError(
+                    f"tech_lead.findings.route[{area!r}] must not be empty; use"
+                    " 'self' or 'owner/repo'"
+                )
+            folded = area.casefold()
+            if folded in folded_areas:
+                raise ValueError(
+                    "tech_lead.findings.route contains duplicate case-insensitive"
+                    f" area {area!r}"
+                )
+            folded_areas.add(folded)
+            if folded == PROMOTION_ROUTE_DEFAULT_KEY:
+                area = PROMOTION_ROUTE_DEFAULT_KEY
+            route[area] = target
         route.setdefault(PROMOTION_ROUTE_DEFAULT_KEY, PROMOTION_ROUTE_SELF)
         return cls(
             promote=str(data.get("promote", FINDING_PROMOTION_GATED)).strip(),
@@ -330,11 +349,11 @@ class TechLeadFindingsConfig:
 
     def target_repos(self) -> tuple[str, ...]:
         """Distinct non-``self`` route targets, for startup writability checks."""
-        seen: dict[str, None] = {}
+        seen: dict[str, str] = {}
         for target in self.route.values():
             if target and target != PROMOTION_ROUTE_SELF:
-                seen.setdefault(target, None)
-        return tuple(seen)
+                seen.setdefault(target.casefold(), target)
+        return tuple(seen.values())
 
     def startup_errors(self) -> list[str]:
         """Fail-loud own-block validation (#6957 guardrail).
@@ -401,7 +420,9 @@ class TechLeadConfig:
     explicit_labels: list[str] = field(default_factory=list)
 
     # Milestone assignment strategy
-    milestone_strategy: MilestoneStrategyConfig = field(default_factory=MilestoneStrategyConfig)
+    milestone_strategy: MilestoneStrategyConfig = field(
+        default_factory=MilestoneStrategyConfig
+    )
 
     # Optional explicit priority label
     priority: Optional[str] = None
@@ -429,7 +450,9 @@ class TechLeadConfig:
     dedup: TechLeadDedupConfig = field(default_factory=TechLeadDedupConfig)
 
     # Periodic health-review trigger (ADR-0031 §4)
-    health_review: TechLeadHealthReviewConfig = field(default_factory=TechLeadHealthReviewConfig)
+    health_review: TechLeadHealthReviewConfig = field(
+        default_factory=TechLeadHealthReviewConfig
+    )
 
     # Tech-lead attention sweep for stuck issues (ADR-0031, #6823)
     stuck_sweep: StuckSweepConfig = field(default_factory=StuckSweepConfig)

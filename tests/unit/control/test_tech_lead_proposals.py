@@ -446,6 +446,7 @@ def _case_file_action(
         labels=tuple(labels),
         pr_count=0,
         pattern_signature=signature,
+        diagnosis="Pool exhaustion comes from a leaked connection.",
         dedup_comment="first observation",
         additional_observation_comments=additional_comments,
     )
@@ -469,6 +470,9 @@ def test_apply_case_file_creation_records_pattern_ledger() -> None:
     assert result.success
     host.create_issue.assert_called_once()
     assert ops.lookup_pattern(signature="db-timeout") == 600
+    assert ops.list_pattern_evidence()[0].diagnosis == (
+        "Pool exhaustion comes from a leaked connection."
+    )
     # Case files do not record ops and post no anchor-link comment.
     assert ops.list_ops() == ()
     host.add_comment.assert_not_called()

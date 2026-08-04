@@ -414,7 +414,9 @@ Compact `tech-lead-decision.json` example:
   root-cause/design-review `create_issue` actions may carry an `area` naming
   their component or seam. The orchestrator keeps a durable case file issue
   per signature: the first observation opens it, and later observations of
-  the SAME signature accrue there as evidence.
+  the SAME signature accrue there as evidence. Its `body` must explain the
+  causal mechanism and the suggested fix; that diagnosis is copied into any
+  routed promotion so the target issue is actionable without hidden context.
 - Classify every `flag_pattern` with `fix_class`: `"code"` when a code change
   in some repository fixes it, `"human"` when it needs a human decision,
   credential, or configuration change. This is the promotion gate. Once a

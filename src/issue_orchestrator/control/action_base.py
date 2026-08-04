@@ -72,8 +72,10 @@ class ActionType(Enum):
     APPEND_PATTERN_OBSERVATION = "append_pattern_observation"
 
     # Finding promotion (#6957): file a case file's diagnosis as a gated
-    # runnable issue in the routed repo, and settle it when it goes terminal.
+    # runnable issue in the routed repo, report later evidence onto that one
+    # issue, and settle it when it goes terminal.
     PROMOTE_TECH_LEAD_FINDING = "promote_tech_lead_finding"
+    REPORT_PROMOTED_FINDING_EVIDENCE = "report_promoted_finding_evidence"
     SETTLE_TECH_LEAD_PROMOTION = "settle_tech_lead_promotion"
 
     # Escalation

@@ -5,6 +5,8 @@ Discovering it at promotion time means losing the actuation on the exact tick a
 pattern finally crossed its evidence threshold.
 """
 
+from unittest.mock import patch
+
 import pytest
 
 from issue_orchestrator.infra.config import Config
@@ -104,3 +106,33 @@ def test_each_distinct_target_is_probed_exactly_once():
 
     assert [check.status for check in checks] == ["ok"]
     assert sorted(probed) == sorted([UPSTREAM, "other/repo"])
+
+
+def test_route_host_construction_failure_is_an_error():
+    config = _config(route={"cp": UPSTREAM})
+    with patch(
+        "issue_orchestrator.execution.providers.create_repository_host",
+        side_effect=RuntimeError("auth unavailable"),
+    ):
+        checks = check_tech_lead_finding_routes(config)
+
+    assert [check.status for check in checks] == ["error"]
+    assert "Could not verify" in checks[0].detail
+
+
+def test_unsupported_route_host_is_an_error():
+    config = _config(route={"cp": UPSTREAM})
+    with (
+        patch(
+            "issue_orchestrator.execution.providers.create_repository_host",
+            return_value=object(),
+        ),
+        patch(
+            "issue_orchestrator.execution.providers.create_promotion_target_host",
+            return_value=None,
+        ),
+    ):
+        checks = check_tech_lead_finding_routes(config)
+
+    assert [check.status for check in checks] == ["error"]
+    assert "must be proven" in checks[0].detail

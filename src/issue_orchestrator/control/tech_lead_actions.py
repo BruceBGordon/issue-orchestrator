@@ -132,6 +132,9 @@ class CreateTechLeadCaseFileIssueAction(CreateTechLeadIssueAction):
     # "code", "human", or "" for unclassified. Recorded on the ledger row at
     # creation so promotion eligibility never has to parse the issue body.
     fix_class: str = ""
+    # Original flag_pattern diagnosis/recommended fix. This is persisted with
+    # the pattern facts so a later cross-repo promotion is self-contained.
+    diagnosis: str = ""
     action_type: ActionType = field(
         default=ActionType.CREATE_TECH_LEAD_CASE_FILE_ISSUE, init=False
     )
@@ -331,8 +334,9 @@ class PromoteTechLeadFindingAction(Action):
     The finding-promotion lane's ONE filing action (#6957). The target repo is
     frequently NOT the managed repo, so the applier routes it through the
     ``PromotionTargetHost`` port rather than ``RepositoryHost``. The applier
-    files first and records the (signature -> promotion) ledger row second, so
-    at-most-once filing survives a crash in either order.
+    files first and records the (signature -> promotion) ledger row second. A
+    deterministic ``idempotency_marker`` lets the target recover the remote
+    issue if the process dies between those writes.
 
     ``labels`` carries the ``proposed-tech-lead`` gate in ``gated`` mode; the
     self-validation below makes an ungated filing an explicit, typed decision
@@ -346,6 +350,8 @@ class PromoteTechLeadFindingAction(Action):
     body: str = ""
     labels: tuple[str, ...] = ()
     area: str = ""
+    observation_count: int = 0
+    idempotency_marker: str = ""
     action_type: ActionType = field(
         default=ActionType.PROMOTE_TECH_LEAD_FINDING, init=False
     )
@@ -367,8 +373,70 @@ class PromoteTechLeadFindingAction(Action):
                 f" target, got {self.target_repo!r}"
             )
         if not self.title.strip() or not self.body.strip():
+            raise ValueError("PromoteTechLeadFindingAction requires a title and body")
+        if self.observation_count <= 0:
             raise ValueError(
-                "PromoteTechLeadFindingAction requires a title and body"
+                "PromoteTechLeadFindingAction requires the observation count"
+                " already represented in the promoted issue body"
+            )
+        if not self.idempotency_marker.strip() or (
+            self.idempotency_marker not in self.body
+        ):
+            raise ValueError(
+                "PromoteTechLeadFindingAction requires its idempotency marker"
+                " in the promoted issue body"
+            )
+
+
+@dataclass(frozen=True)
+class ReportPromotedFindingEvidenceAction(Action):
+    """Report NEW evidence onto an already-promoted finding issue (#6957).
+
+    The dedup mirror of the promotion filing: one promoted issue per signature,
+    ever, so later observations are reported onto it instead of filing a second
+    one. The applier comments through the ``PromotionTargetHost`` (the target
+    repo is frequently not the managed one) and then advances the promotion's
+    reported-observation high-water mark, so the same evidence is never
+    reported twice.
+    """
+
+    signature: str = ""
+    case_file_issue_number: int = 0
+    target_repo: str = ""
+    target_issue_number: int = 0
+    comment: str = ""
+    observation_count: int = 0
+    action_type: ActionType = field(
+        default=ActionType.REPORT_PROMOTED_FINDING_EVIDENCE, init=False
+    )
+
+    def __post_init__(self) -> None:
+        if not self.signature.strip():
+            raise ValueError(
+                "ReportPromotedFindingEvidenceAction requires the pattern signature"
+            )
+        if self.case_file_issue_number <= 0:
+            raise ValueError(
+                "ReportPromotedFindingEvidenceAction requires the source case-file"
+                " issue number"
+            )
+        if "/" not in self.target_repo:
+            raise ValueError(
+                "ReportPromotedFindingEvidenceAction requires a concrete owner/repo"
+                f" target, got {self.target_repo!r}"
+            )
+        if self.target_issue_number <= 0:
+            raise ValueError(
+                "ReportPromotedFindingEvidenceAction requires the promoted issue number"
+            )
+        if not self.comment.strip():
+            raise ValueError(
+                "ReportPromotedFindingEvidenceAction requires the evidence comment"
+            )
+        if self.observation_count <= 0:
+            raise ValueError(
+                "ReportPromotedFindingEvidenceAction requires the observation count"
+                " it advances the promotion's high-water mark to"
             )
 
 

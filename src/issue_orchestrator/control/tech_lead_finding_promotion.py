@@ -49,9 +49,11 @@ from ..domain.tech_lead_findings import (
     PROMOTION_STATE_DECLINED,
     PROMOTION_STATE_SHIPPED,
     PatternEvidence,
+    PromotionUpdate,
     PromotableFinding,
     PromotedFinding,
     SettledPromotion,
+    promotion_issue_marker,
     promotion_issue_title,
 )
 from ..domain.tech_lead_session import (
@@ -62,6 +64,7 @@ from .actions import (
     Action,
     ActionResult,
     PromoteTechLeadFindingAction,
+    ReportPromotedFindingEvidenceAction,
     SettleTechLeadPromotionAction,
 )
 from .reconciliation import build_expected_for_mutation
@@ -147,7 +150,8 @@ def select_promotable_findings(
     in_flight: dict[str, int] = {}
     for row in promotions:
         if row.is_open:
-            in_flight[row.target_repo] = in_flight.get(row.target_repo, 0) + 1
+            target_key = row.target_repo.casefold()
+            in_flight[target_key] = in_flight.get(target_key, 0) + 1
 
     candidates = sorted(
         (
@@ -162,19 +166,50 @@ def select_promotable_findings(
     selected: list[PromotableFinding] = []
     for row in candidates:
         target = resolve_route_target(config, area=row.area)
-        if in_flight.get(target, 0) >= findings.max_open_promoted:
+        target_key = target.casefold()
+        if in_flight.get(target_key, 0) >= findings.max_open_promoted:
             logger.info(
                 "[tech_lead] Promotion of %r deferred: %s already has %d in-flight"
                 " promoted issue(s) (tech_lead.findings.max_open_promoted=%d)",
                 row.signature,
                 target,
-                in_flight.get(target, 0),
+                in_flight.get(target_key, 0),
                 findings.max_open_promoted,
             )
             continue
-        in_flight[target] = in_flight.get(target, 0) + 1
+        in_flight[target_key] = in_flight.get(target_key, 0) + 1
         selected.append(PromotableFinding(evidence=row, target_repo=target))
     return tuple(selected)
+
+
+def select_promotion_updates(
+    *,
+    evidence: Sequence[PatternEvidence],
+    promotions: Sequence[PromotedFinding],
+    settling_signatures: frozenset[str] = frozenset(),
+) -> tuple[PromotionUpdate, ...]:
+    """Select in-flight promotions that have unreported later evidence.
+
+    The durable watermark makes this a pure, restart-safe ledger join. Initial
+    evidence is seeded when the promotion is recorded, so only a strictly newer
+    observation count produces an update. A target found terminal on this tick
+    is excluded so settlement never races a comment onto an already-closed issue.
+    """
+    evidence_by_signature = {row.signature: row for row in evidence}
+    updates: list[PromotionUpdate] = []
+    for promotion in promotions:
+        if not promotion.is_open or promotion.signature in settling_signatures:
+            continue
+        row = evidence_by_signature.get(promotion.signature)
+        if row is None or row.observation_count <= promotion.reported_observations:
+            continue
+        updates.append(
+            PromotionUpdate(
+                promotion=promotion,
+                observation_count=row.observation_count,
+            )
+        )
+    return tuple(updates)
 
 
 def build_promotion_issue_body(
@@ -185,6 +220,15 @@ def build_promotion_issue_body(
 ) -> str:
     """Human documentation for a promoted finding issue (never authority)."""
     case_file = f"{source_repo}#{finding.evidence.case_file_issue_number}"
+    marker = promotion_issue_marker(
+        source_repo=source_repo,
+        signature=finding.evidence.signature,
+    )
+    diagnosis = finding.evidence.diagnosis.strip() or (
+        f"See the evidence ledger at {case_file} for the original diagnosis"
+        " and suggested fix (this is a legacy case-file row recorded before"
+        " promotion narratives were persisted)."
+    )
     approval = (
         (
             f"**Remove the `{PROPOSED_TECH_LEAD_LABEL}` label** to approve this"
@@ -211,12 +255,16 @@ orchestrator promoted it here — the repo its area routes to.
 | | |
 |---|---|
 | Signature | `{finding.evidence.signature}` |
-| Area | {finding.evidence.area or 'unclassified'} |
+| Area | {finding.evidence.area or "unclassified"} |
 | Observations | {finding.evidence.observation_count} |
 | Fix class | `fix:{finding.evidence.fix_class}` |
 | Evidence ledger | {case_file} |
 
-### Mechanism and evidence
+### Diagnosis and suggested fix
+
+{diagnosis}
+
+### Evidence
 
 The case file {case_file} is the accumulating evidence ledger: every
 observation of this signature lands there as a comment, with the mechanism,
@@ -231,11 +279,16 @@ starting — it is the diagnosis this issue exists to act on.
 > in `{source_repo}` keyed by its pattern signature; editing this issue has no
 > effect on that ledger, and promotion never approves, merges, or executes
 > anything.
+
+{marker}
 """
 
 
 def build_repeat_observation_comment(
-    *, signature: str, observation_count: int, case_file_issue_number: int,
+    *,
+    signature: str,
+    observation_count: int,
+    case_file_issue_number: int,
     source_repo: str,
 ) -> str:
     """Comment for a further observation of an already-promoted signature.
@@ -263,6 +316,10 @@ def plan_finding_promotions(
     gated = config.tech_lead.findings.gated
     actions: list[Action] = []
     for finding in promotable:
+        marker = promotion_issue_marker(
+            source_repo=source_repo,
+            signature=finding.evidence.signature,
+        )
         actions.append(
             PromoteTechLeadFindingAction(
                 signature=finding.evidence.signature,
@@ -276,6 +333,8 @@ def plan_finding_promotions(
                 ),
                 labels=promotion_issue_labels(config, area=finding.evidence.area),
                 area=finding.evidence.area,
+                observation_count=finding.evidence.observation_count,
+                idempotency_marker=marker,
                 reason=(
                     f"tech_lead finding {finding.evidence.signature!r} crossed"
                     f" {config.tech_lead.findings.min_evidence} observations:"
@@ -298,7 +357,11 @@ def gather_finding_promotion_facts(
     *,
     authority: "TechLeadAuthorityStore | None",
     target: "PromotionTargetHost | None",
-) -> tuple[tuple[PromotableFinding, ...], tuple[SettledPromotion, ...]]:
+) -> tuple[
+    tuple[PromotableFinding, ...],
+    tuple[PromotionUpdate, ...],
+    tuple[SettledPromotion, ...],
+]:
     """Promotion eligibility + loop-closure facts for one tick (READ-ONLY).
 
     The lane's fact-gathering owner, so the fact gatherer stays a thin seam that
@@ -309,16 +372,23 @@ def gather_finding_promotion_facts(
     lane's work-in-progress bounds its API cost too.
     """
     if authority is None or not config.tech_lead.findings.enabled:
-        return (), ()
+        return (), (), ()
+    evidence = authority.list_pattern_evidence()
     promotions = authority.list_promotions()
     promotable = select_promotable_findings(
         config,
-        evidence=authority.list_pattern_evidence(),
+        evidence=evidence,
         promotions=promotions,
     )
     if target is None:
-        return promotable, ()
-    return promotable, classify_promotion_outcomes(promotions, target=target)
+        return promotable, (), ()
+    settled = classify_promotion_outcomes(promotions, target=target)
+    updates = select_promotion_updates(
+        evidence=evidence,
+        promotions=promotions,
+        settling_signatures=frozenset(item.promotion.signature for item in settled),
+    )
+    return promotable, updates, settled
 
 
 def plan_finding_promotion_actions(
@@ -335,7 +405,41 @@ def plan_finding_promotion_actions(
     if facts is None:
         return []
     actions = plan_finding_promotions(config, promotable=facts.promotable_findings)
+    actions.extend(plan_promotion_updates(config, updates=facts.promotion_updates))
     actions.extend(plan_promotion_settlements(facts.settled_promotions))
+    return actions
+
+
+def plan_promotion_updates(
+    config: "Config", *, updates: Sequence[PromotionUpdate]
+) -> list[Action]:
+    """Turn unreported evidence facts into typed target-comment actions."""
+    actions: list[Action] = []
+    source_repo = config.repo or ""
+    for update in updates:
+        promotion = update.promotion
+        actions.append(
+            ReportPromotedFindingEvidenceAction(
+                signature=promotion.signature,
+                case_file_issue_number=promotion.case_file_issue_number,
+                target_repo=promotion.target_repo,
+                target_issue_number=promotion.target_issue_number,
+                observation_count=update.observation_count,
+                comment=build_repeat_observation_comment(
+                    signature=promotion.signature,
+                    observation_count=update.observation_count,
+                    case_file_issue_number=promotion.case_file_issue_number,
+                    source_repo=source_repo,
+                ),
+                reason=(
+                    f"tech_lead finding {promotion.signature!r} accrued"
+                    f" {update.new_observations} new observation(s): report on"
+                    f" {promotion.target_repo}#{promotion.target_issue_number}"
+                    " (#6957)"
+                ),
+                expected=build_expected_for_mutation(),
+            )
+        )
     return actions
 
 
@@ -427,8 +531,8 @@ def apply_promote_tech_lead_finding(
     Order matters: file FIRST, record SECOND. A filing that raises leaves the
     ledger untouched so the next tick retries cleanly; a recorded row makes the
     signature permanently ineligible, so it must only exist for an issue that
-    actually exists. The ledger's create-once contract absorbs a crash between
-    the two (a re-file would conflict on signature and be surfaced loudly).
+    actually exists. The target's deterministic marker lookup absorbs a crash
+    between the two by returning the already-created remote issue on retry.
     """
     assert isinstance(action, PromoteTechLeadFindingAction)
     if target is None or authority is None:
@@ -452,6 +556,7 @@ def apply_promote_tech_lead_finding(
             title=action.title,
             body=action.body,
             labels=list(action.labels),
+            idempotency_marker=action.idempotency_marker,
         )
     except Exception as exc:
         logger.exception(
@@ -469,6 +574,7 @@ def apply_promote_tech_lead_finding(
             area=action.area,
             title=action.title,
             recorded_at=now_iso or _utc_now_iso(),
+            reported_observations=action.observation_count,
         )
     )
     logger.info(
@@ -483,6 +589,73 @@ def apply_promote_tech_lead_finding(
         issue_number=filed.number,
         target_repo=action.target_repo,
         url=filed.url,
+    )
+
+
+def apply_report_promoted_finding_evidence(
+    action: Action,
+    *,
+    target: "PromotionTargetHost | None",
+    authority: "TechLeadAuthorityStore | None",
+) -> ActionResult:
+    """Comment later evidence on the one promoted issue, then mark it reported.
+
+    The write order fails toward a duplicate comment after a crash, never toward
+    silently losing evidence: only a successful target comment advances the
+    durable high-water mark. The apply-time ledger read also makes a stale plan
+    harmless after another tick already reported or settled the promotion.
+    """
+    assert isinstance(action, ReportPromotedFindingEvidenceAction)
+    if target is None or authority is None:
+        return ActionResult.fail(
+            action,
+            "reporting promoted finding evidence requires a PromotionTargetHost"
+            " and the TechLeadAuthorityStore wired into this applier",
+        )
+    promotion = authority.load_promotion(signature=action.signature)
+    if promotion is None:
+        return ActionResult.fail(
+            action,
+            f"no promotion is recorded for signature {action.signature!r}",
+        )
+    if (
+        promotion.target_repo != action.target_repo
+        or promotion.target_issue_number != action.target_issue_number
+    ):
+        return ActionResult.fail(
+            action,
+            f"promotion target changed for signature {action.signature!r}:"
+            f" ledger has {promotion.target_repo}#{promotion.target_issue_number},"
+            f" action has {action.target_repo}#{action.target_issue_number}",
+        )
+    if not promotion.is_open or (
+        promotion.reported_observations >= action.observation_count
+    ):
+        return ActionResult.ok(
+            action,
+            issue_number=promotion.target_issue_number,
+            deduplicated=True,
+        )
+    try:
+        target.add_comment(
+            repo=action.target_repo,
+            issue_number=action.target_issue_number,
+            body=action.comment,
+        )
+        authority.note_promotion_reported(
+            signature=action.signature,
+            observations=action.observation_count,
+        )
+    except Exception as exc:
+        logger.exception(
+            "Failed to report later evidence for promoted finding %r",
+            action.signature,
+        )
+        return ActionResult.fail(action, str(exc))
+    return ActionResult.ok(
+        action,
+        issue_number=action.target_issue_number,
+        observation_count=action.observation_count,
     )
 
 
@@ -548,16 +721,16 @@ def apply_settle_tech_lead_promotion(
             repository_host.add_comment(
                 action.case_file_issue_number, _shipped_case_file_comment(action)
             )
-            repository_host.update_issue_state(
-                action.case_file_issue_number, "closed"
-            )
+            repository_host.update_issue_state(action.case_file_issue_number, "closed")
         else:
             repository_host.add_comment(
                 action.case_file_issue_number, _declined_case_file_comment(action)
             )
         authority.settle_promotion(
             signature=action.signature,
-            state=PROMOTION_STATE_SHIPPED if action.shipped else PROMOTION_STATE_DECLINED,
+            state=PROMOTION_STATE_SHIPPED
+            if action.shipped
+            else PROMOTION_STATE_DECLINED,
             shipped_pr_url=action.merged_pr_url,
         )
     except Exception as exc:

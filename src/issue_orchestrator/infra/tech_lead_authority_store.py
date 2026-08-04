@@ -68,9 +68,7 @@ logger = logging.getLogger(__name__)
 
 def _cohort_from_payload(payload: str) -> tuple[DiscoveredFailure, ...]:
     """Rehydrate a stored cohort payload into typed failure facts."""
-    return tuple(
-        DiscoveredFailure.from_dict(item) for item in json.loads(payload)
-    )
+    return tuple(DiscoveredFailure.from_dict(item) for item in json.loads(payload))
 
 
 def _promotion_from_row(row: sqlite3.Row) -> PromotedFinding:
@@ -91,7 +89,9 @@ def _promotion_from_row(row: sqlite3.Row) -> PromotedFinding:
         title=str(row["title"]),
         shipped_pr_url=str(row["shipped_pr_url"]),
         recorded_at=str(row["recorded_at"]),
+        reported_observations=int(row["reported_observations"]),
     )
+
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS tech_lead_launch_authority (
@@ -112,7 +112,8 @@ CREATE TABLE IF NOT EXISTS tech_lead_patterns (
     recorded_at TEXT NOT NULL,
     observation_count INTEGER NOT NULL DEFAULT 1,
     fix_class TEXT NOT NULL DEFAULT '',
-    area TEXT NOT NULL DEFAULT ''
+    area TEXT NOT NULL DEFAULT '',
+    diagnosis TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS tech_lead_promoted_findings (
     signature TEXT PRIMARY KEY,
@@ -123,7 +124,8 @@ CREATE TABLE IF NOT EXISTS tech_lead_promoted_findings (
     area TEXT NOT NULL DEFAULT '',
     title TEXT NOT NULL DEFAULT '',
     shipped_pr_url TEXT NOT NULL DEFAULT '',
-    recorded_at TEXT NOT NULL
+    recorded_at TEXT NOT NULL,
+    reported_observations INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS tech_lead_shipped_fixes (
     issue_number INTEGER PRIMARY KEY,
@@ -175,19 +177,30 @@ class SqliteTechLeadAuthorityStore:
         unclassified — therefore not promotable until the tech lead classifies
         the signature on a later observation).
         """
-        columns = {
+        pattern_columns = {
             str(row[1]) for row in conn.execute("PRAGMA table_info(tech_lead_patterns)")
         }
         additions = (
             ("observation_count", "INTEGER NOT NULL DEFAULT 1"),
             ("fix_class", "TEXT NOT NULL DEFAULT ''"),
             ("area", "TEXT NOT NULL DEFAULT ''"),
+            ("diagnosis", "TEXT NOT NULL DEFAULT ''"),
         )
         added = False
         for name, ddl in additions:
-            if name not in columns:
+            if name not in pattern_columns:
                 conn.execute(f"ALTER TABLE tech_lead_patterns ADD COLUMN {name} {ddl}")
                 added = True
+        promotion_columns = {
+            str(row[1])
+            for row in conn.execute("PRAGMA table_info(tech_lead_promoted_findings)")
+        }
+        if "reported_observations" not in promotion_columns:
+            conn.execute(
+                "ALTER TABLE tech_lead_promoted_findings ADD COLUMN"
+                " reported_observations INTEGER NOT NULL DEFAULT 0"
+            )
+            added = True
         if added:
             conn.commit()
 
@@ -255,9 +268,7 @@ class SqliteTechLeadAuthorityStore:
             list(authority.problem_issue_numbers),
         )
 
-    def load(
-        self, *, run_id: str, session_name: str
-    ) -> TechLeadLaunchAuthority | None:
+    def load(self, *, run_id: str, session_name: str) -> TechLeadLaunchAuthority | None:
         """Load the launch authority for a session run, or None when absent.
 
         Malformed stored content raises ValueError loudly — the store is
@@ -361,7 +372,10 @@ class SqliteTechLeadAuthorityStore:
             "SELECT issue_number, op FROM tech_lead_proposal_ops ORDER BY issue_number",
         ).fetchall()
         return tuple(
-            (int(row["issue_number"]), StoredTechLeadOp.from_dict(json.loads(row["op"])))
+            (
+                int(row["issue_number"]),
+                StoredTechLeadOp.from_dict(json.loads(row["op"])),
+            )
             for row in rows
         )
 
@@ -375,6 +389,7 @@ class SqliteTechLeadAuthorityStore:
         fix_class: str = "",
         area: str = "",
         observations: int = 1,
+        diagnosis: str = "",
     ) -> None:
         """Persist a signature's case-file issue (create-once).
 
@@ -397,8 +412,8 @@ class SqliteTechLeadAuthorityStore:
                 )
             tx.execute(
                 "INSERT INTO tech_lead_patterns (signature, issue_number,"
-                " recorded_at, observation_count, fix_class, area)"
-                " VALUES (?, ?, ?, ?, ?, ?)",
+                " recorded_at, observation_count, fix_class, area, diagnosis)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (
                     signature,
                     issue_number,
@@ -406,6 +421,7 @@ class SqliteTechLeadAuthorityStore:
                     max(1, observations),
                     fix_class,
                     area,
+                    diagnosis,
                 ),
             )
         logger.info(
@@ -462,15 +478,14 @@ class SqliteTechLeadAuthorityStore:
         rows = conn.execute(
             "SELECT signature, issue_number FROM tech_lead_patterns ORDER BY signature",
         ).fetchall()
-        return tuple(
-            (str(row["signature"]), int(row["issue_number"])) for row in rows
-        )
+        return tuple((str(row["signature"]), int(row["issue_number"])) for row in rows)
 
     def list_pattern_evidence(self) -> tuple[PatternEvidence, ...]:
         """All case-file rows with their promotion facts (#6957)."""
         conn = self._get_connection()
         rows = conn.execute(
-            "SELECT signature, issue_number, observation_count, fix_class, area"
+            "SELECT signature, issue_number, observation_count, fix_class, area,"
+            " diagnosis"
             " FROM tech_lead_patterns ORDER BY signature",
         ).fetchall()
         return tuple(
@@ -480,6 +495,7 @@ class SqliteTechLeadAuthorityStore:
                 observation_count=int(row["observation_count"]),
                 fix_class=str(row["fix_class"]),
                 area=str(row["area"]),
+                diagnosis=str(row["diagnosis"]),
             )
             for row in rows
         )
@@ -507,8 +523,8 @@ class SqliteTechLeadAuthorityStore:
             tx.execute(
                 "INSERT INTO tech_lead_promoted_findings (signature,"
                 " case_file_issue_number, target_repo, target_issue_number, state,"
-                " area, title, shipped_pr_url, recorded_at)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " area, title, shipped_pr_url, recorded_at, reported_observations)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     promotion.signature,
                     promotion.case_file_issue_number,
@@ -518,8 +534,8 @@ class SqliteTechLeadAuthorityStore:
                     promotion.area,
                     promotion.title,
                     promotion.shipped_pr_url,
-                    promotion.recorded_at
-                    or datetime.now(timezone.utc).isoformat(),
+                    promotion.recorded_at or datetime.now(timezone.utc).isoformat(),
+                    promotion.reported_observations,
                 ),
             )
         logger.info(
@@ -530,6 +546,30 @@ class SqliteTechLeadAuthorityStore:
             promotion.target_issue_number,
             promotion.case_file_issue_number,
         )
+
+    def note_promotion_reported(self, *, signature: str, observations: int) -> None:
+        """Advance a promotion's reported-observation high-water mark (#6957).
+
+        Written AFTER the evidence comment lands on the promoted issue, so a
+        crash between the two repeats one comment rather than silently dropping
+        evidence the promoted issue was never told about. ``max`` keeps the mark
+        monotonic against an out-of-order retry.
+        """
+        with self._transaction() as tx:
+            row = tx.execute(
+                "SELECT reported_observations FROM tech_lead_promoted_findings"
+                " WHERE signature = ?",
+                (signature,),
+            ).fetchone()
+            if row is None:
+                raise UnknownTechLeadPatternError(
+                    f"no promotion is recorded for signature {signature!r}"
+                )
+            tx.execute(
+                "UPDATE tech_lead_promoted_findings SET reported_observations = ?"
+                " WHERE signature = ?",
+                (max(int(row["reported_observations"]), observations), signature),
+            )
 
     def load_promotion(self, *, signature: str) -> PromotedFinding | None:
         """Return a signature's promotion row, or None when never promoted."""
@@ -590,9 +630,7 @@ class SqliteTechLeadAuthorityStore:
         review's act-level authority and the retention scope for the members'
         run artifacts, so it must never silently change after creation.
         """
-        payload = json.dumps(
-            [problem.to_dict() for problem in cohort], sort_keys=True
-        )
+        payload = json.dumps([problem.to_dict() for problem in cohort], sort_keys=True)
         with self._transaction() as tx:
             row = tx.execute(
                 "SELECT cohort FROM tech_lead_storm_cohorts"
@@ -669,10 +707,7 @@ class SqliteTechLeadAuthorityStore:
                 (issue_number,),
             ).fetchone()
             if row is not None:
-                if (
-                    str(row["pr_url"]) == pr_url
-                    and str(row["area"]) == area
-                ):
+                if str(row["pr_url"]) == pr_url and str(row["area"]) == area:
                     return
                 raise TechLeadShippedFixConflictError(
                     f"different shipped-fix evidence is already recorded for"
@@ -703,12 +738,16 @@ class SqliteTechLeadAuthorityStore:
         """Return the newest durable shipped-fix facts."""
         if limit <= 0:
             raise ValueError("shipped-fix limit must be positive")
-        rows = self._get_connection().execute(
-            "SELECT issue_number, title, pr_url, area, merged_at "
-            "FROM tech_lead_shipped_fixes "
-            "ORDER BY merged_at DESC, issue_number DESC LIMIT ?",
-            (limit,),
-        ).fetchall()
+        rows = (
+            self._get_connection()
+            .execute(
+                "SELECT issue_number, title, pr_url, area, merged_at "
+                "FROM tech_lead_shipped_fixes "
+                "ORDER BY merged_at DESC, issue_number DESC LIMIT ?",
+                (limit,),
+            )
+            .fetchall()
+        )
         return tuple(
             TechLeadShippedFixSummary(
                 issue_number=int(row["issue_number"]),

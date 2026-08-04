@@ -166,6 +166,7 @@ def build_case_file_issue_action(
         pattern_signature=proposed.pattern_signature,
         area=proposed.area,
         fix_class=proposed.fix_class or "",
+        diagnosis=proposed.body or "",
         dedup_comment=build_case_file_evidence_comment(
             proposed,
             anchor_issue_number=anchor_issue_number,

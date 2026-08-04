@@ -201,6 +201,7 @@ class TechLeadAuthorityStore(Protocol):
         fix_class: str = "",
         area: str = "",
         observations: int = 1,
+        diagnosis: str = "",
     ) -> None:
         """Persist the case-file issue for one signature (create-once).
 
@@ -210,8 +211,9 @@ class TechLeadAuthorityStore(Protocol):
         evidence trail, which must never silently move.
 
         ``fix_class``/``area`` are the promotion facts the case file was opened
-        with (#6957) and ``observations`` is how many observations the creating
-        decision carried (>= 1). The observation COUNT is orchestrator-owned so
+        with (#6957), ``diagnosis`` is its original mechanism/recommended fix,
+        and ``observations`` is how many observations the creating decision
+        carried (>= 1). The observation COUNT is orchestrator-owned so
         promotion eligibility cannot be inflated by editing the case-file issue
         or by unrelated human comments on it.
         """
@@ -270,6 +272,15 @@ class TechLeadAuthorityStore(Protocol):
 
     def list_promotions(self) -> tuple["PromotedFinding", ...]:
         """All promotion rows — the dedup, cap, and loop-closure ledger read."""
+        ...
+
+    def note_promotion_reported(self, *, signature: str, observations: int) -> None:
+        """Advance a promotion's reported-observation high-water mark.
+
+        Called after later evidence is reported onto an already-promoted issue,
+        so the same observations are never reported twice. Monotonic; an
+        unknown signature raises :class:`UnknownTechLeadPatternError`.
+        """
         ...
 
     def settle_promotion(
@@ -388,6 +399,7 @@ class InMemoryTechLeadAuthorityStore:
         fix_class: str = "",
         area: str = "",
         observations: int = 1,
+        diagnosis: str = "",
     ) -> None:
         from ..domain.tech_lead_findings import PatternEvidence
 
@@ -406,6 +418,7 @@ class InMemoryTechLeadAuthorityStore:
             observation_count=max(1, observations),
             fix_class=fix_class,
             area=area,
+            diagnosis=diagnosis,
         )
 
     def note_pattern_observation(
@@ -453,6 +466,19 @@ class InMemoryTechLeadAuthorityStore:
 
     def list_promotions(self) -> tuple["PromotedFinding", ...]:
         return tuple(self._promotions[key] for key in sorted(self._promotions))
+
+    def note_promotion_reported(self, *, signature: str, observations: int) -> None:
+        from dataclasses import replace
+
+        row = self._promotions.get(signature)
+        if row is None:
+            raise UnknownTechLeadPatternError(
+                f"no promotion is recorded for signature {signature!r}"
+            )
+        self._promotions[signature] = replace(
+            row,
+            reported_observations=max(row.reported_observations, observations),
+        )
 
     def settle_promotion(
         self,

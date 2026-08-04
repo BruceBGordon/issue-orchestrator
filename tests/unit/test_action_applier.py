@@ -2966,6 +2966,10 @@ class TestClaimGateAudit:
     # - PROMOTE_TECH_LEAD_FINDING: creates a NEW gated issue in the ROUTED repo
     #   (#6957) and records the promotion ledger row; it modifies nothing that
     #   exists, let alone a claimed coding issue.
+    # - REPORT_PROMOTED_FINDING_EVIDENCE: comments on the routed promotion issue
+    #   and advances its local evidence watermark (#6957); that target is an
+    #   orchestrator-authored issue in the promotion lane, not a claimed coding
+    #   issue in this repository.
     # - SETTLE_TECH_LEAD_PROMOTION: comments on / closes the orchestrator-owned
     #   case file and writes the local shipped-fix + promotion ledger rows
     #   (#6957); like APPEND_PATTERN_OBSERVATION the only GitHub target is a
@@ -2976,6 +2980,7 @@ class TestClaimGateAudit:
     EXEMPT_ACTIONS = {
         ActionType.APPEND_PATTERN_OBSERVATION,
         ActionType.PROMOTE_TECH_LEAD_FINDING,
+        ActionType.REPORT_PROMOTED_FINDING_EVIDENCE,
         ActionType.SETTLE_TECH_LEAD_PROMOTION,
         ActionType.LAUNCH_SESSION,
         ActionType.LAUNCH_VALIDATION_RETRY,

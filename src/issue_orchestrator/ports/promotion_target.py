@@ -14,8 +14,9 @@ blast radius of "the orchestrator can write to another repo" stays visible:
   configured route target is reachable AND writable. A route the token cannot
   file issues in must fail loudly at startup, never silently at promotion time.
 * :meth:`PromotionTargetHost.file_issue` — create the gated promotion issue,
-  provisioning its labels first so GitHub cannot silently drop the gate and
-  leave a schedulable issue behind.
+  or recover the same marker-owned issue after a crash, provisioning its labels
+  first so GitHub cannot silently drop the gate and leave a schedulable issue
+  behind.
 * :meth:`PromotionTargetHost.add_comment` — route a later observation onto the
   already-promoted issue instead of filing a second one.
 * :meth:`PromotionTargetHost.read_outcome` — the loop-closure read: is the
@@ -39,6 +40,14 @@ class FiledIssue:
 
     number: int
     url: str = ""
+
+
+def validate_promotion_issue_marker(*, body: str, marker: str) -> None:
+    """Reject a filing that cannot be recovered after its local ledger write fails."""
+    if not marker.strip() or marker not in body:
+        raise ValueError(
+            "a promotion issue's non-empty idempotency marker must appear in its body"
+        )
 
 
 @dataclass(frozen=True)
@@ -79,12 +88,15 @@ class PromotionTargetHost(Protocol):
         title: str,
         body: str,
         labels: Sequence[str],
+        idempotency_marker: str,
     ) -> FiledIssue:
-        """Create a gated issue in *repo*, provisioning *labels* first.
+        """Create or recover one marker-owned gated issue in *repo*.
 
         Raises on failure — a promotion that cannot be filed must leave the
         ledger untouched so the next tick retries, never record a phantom
-        promotion that blocks the signature forever.
+        promotion that blocks the signature forever. ``idempotency_marker`` is
+        present in ``body`` and must recover an issue created before a crash
+        that prevented the local ledger write.
         """
         ...
 
@@ -120,6 +132,7 @@ class InMemoryPromotionTargetHost:
         self.outcomes: dict[tuple[str, int], PromotedIssueOutcome | None] = {}
         self.next_issue_number = 1000
         self.file_error: Exception | None = None
+        self._filed_by_marker: dict[str, FiledIssue] = {}
 
     def check_writable(self, *, repo: str) -> str | None:
         return None if self.writable else f"{repo}: {self.unwritable_reason}"
@@ -131,15 +144,22 @@ class InMemoryPromotionTargetHost:
         title: str,
         body: str,
         labels: Sequence[str],
+        idempotency_marker: str,
     ) -> FiledIssue:
+        validate_promotion_issue_marker(body=body, marker=idempotency_marker)
+        existing = self._filed_by_marker.get(idempotency_marker)
+        if existing is not None:
+            return existing
         if self.file_error is not None:
             raise self.file_error
         self.filed.append((repo, title, body, tuple(labels)))
         self.next_issue_number += 1
-        return FiledIssue(
+        filed = FiledIssue(
             number=self.next_issue_number,
             url=f"https://example.invalid/{repo}/issues/{self.next_issue_number}",
         )
+        self._filed_by_marker[idempotency_marker] = filed
+        return filed
 
     def add_comment(self, *, repo: str, issue_number: int, body: str) -> None:
         self.comments.append((repo, issue_number, body))
@@ -147,4 +167,6 @@ class InMemoryPromotionTargetHost:
     def read_outcome(
         self, *, repo: str, issue_number: int
     ) -> PromotedIssueOutcome | None:
-        return self.outcomes.get((repo, issue_number), PromotedIssueOutcome(state="open"))
+        return self.outcomes.get(
+            (repo, issue_number), PromotedIssueOutcome(state="open")
+        )

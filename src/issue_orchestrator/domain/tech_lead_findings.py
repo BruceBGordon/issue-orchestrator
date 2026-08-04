@@ -22,6 +22,7 @@ The types are infrastructure-agnostic: no GitHub, no config, no ports.
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from typing import Literal
 
@@ -83,6 +84,10 @@ class PatternEvidence:
     # "" = unclassified. Only FINDING_FIX_CLASS_CODE is promotable.
     fix_class: str = ""
     area: str = ""
+    # Original tech-lead diagnosis/recommended fix from the first flag_pattern
+    # observation. Stored with the trigger facts so a routed promotion carries
+    # the actionable mechanism instead of only pointing back to the case file.
+    diagnosis: str = ""
 
     @property
     def is_code_fix(self) -> bool:
@@ -110,6 +115,11 @@ class PromotedFinding:
     # Merged PR that closed the loop; set only in the ``shipped`` state.
     shipped_pr_url: str = ""
     recorded_at: str = ""
+    # High-water mark of the signature's observation count that has already been
+    # reported onto the promoted issue. Later observations are DEDUPED against
+    # this rather than re-filed: the gap between it and the live count is
+    # exactly the new evidence the promoted issue has not been told about yet.
+    reported_observations: int = 0
 
     @property
     def is_open(self) -> bool:
@@ -123,6 +133,28 @@ class PromotableFinding:
 
     evidence: PatternEvidence
     target_repo: str
+
+
+@dataclass(frozen=True)
+class PromotionUpdate:
+    """New evidence accrued on a signature with an in-flight promotion.
+
+    The dedup mirror of :class:`PromotableFinding`: one promoted issue per
+    signature, so further observations are reported ONTO that issue instead of
+    filing a second one. ``observation_count`` is the signature's live count,
+    which becomes the promotion's new high-water mark once reported.
+
+    Terminal promotions are deliberately excluded: after a finding ships or an
+    operator declines it, later evidence continues to accrue on the case file
+    without reviving a closed target issue.
+    """
+
+    promotion: PromotedFinding
+    observation_count: int
+
+    @property
+    def new_observations(self) -> int:
+        return self.observation_count - self.promotion.reported_observations
 
 
 @dataclass(frozen=True)
@@ -149,3 +181,17 @@ def promotion_issue_title(*, source_repo: str, signature: str) -> str:
     """
     name = source_repo.rsplit("/", 1)[-1] if source_repo else "unknown"
     return f"[tech-lead:{name}] {signature}"
+
+
+def promotion_issue_marker(*, source_repo: str, signature: str) -> str:
+    """Stable remote provenance key for crash-safe promotion filing.
+
+    The local ledger is recorded after GitHub confirms creation.  If the
+    process dies between those two writes, the next attempt uses this marker
+    to recover the already-created issue instead of filing a duplicate.  A
+    digest keeps arbitrary agent-authored signatures out of HTML-comment
+    syntax while still making the key deterministic across restarts.
+    """
+    identity = f"{source_repo.casefold()}\0{signature}".encode()
+    digest = hashlib.sha256(identity).hexdigest()
+    return f"<!-- issue-orchestrator:tech-lead-promotion:v1:{digest} -->"

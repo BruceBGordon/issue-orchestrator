@@ -113,7 +113,7 @@ def check_tech_lead_finding_routes(
             return [
                 Check(
                     name="Tech Lead Finding Routes",
-                    status="warning",
+                    status="error",
                     detail=f"Could not verify promotion route targets: {exc}",
                 )
             ]
@@ -121,9 +121,10 @@ def check_tech_lead_finding_routes(
         return [
             Check(
                 name="Tech Lead Finding Routes",
-                status="warning",
+                status="error",
                 detail=(
-                    "Promotion routes cannot be verified for this repository host"
+                    "Promotion routes cannot be verified for this repository host;"
+                    " issue-write access must be proven before startup"
                 ),
             )
         ]

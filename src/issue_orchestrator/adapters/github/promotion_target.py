@@ -18,7 +18,11 @@ import logging
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Iterator, Sequence
 
-from ...ports.promotion_target import FiledIssue, PromotedIssueOutcome
+from ...ports.promotion_target import (
+    FiledIssue,
+    PromotedIssueOutcome,
+    validate_promotion_issue_marker,
+)
 from .errors import GitHubHttpError
 from .http_client import GitHubHttpClient, GitHubHttpConfig
 
@@ -63,13 +67,12 @@ class GitHubPromotionTargetHost:
     def check_writable(self, *, repo: str) -> str | None:
         """None when the token can create issues in *repo*, else the reason.
 
-        GitHub reports effective permissions on the repository payload, so this
-        is one cheap read per configured route target at startup — far better
-        than discovering the problem on the tick a pattern finally crosses its
-        evidence threshold. A repo whose payload omits ``permissions`` (some
-        token kinds) is treated as writable: the applier's filing failure is
-        still loud, and refusing to start on an inconclusive read would be
-        worse than a late error.
+        GitHub reports effective repository roles on the repository payload, so
+        this is one cheap read per configured route target at startup — far
+        better than discovering the problem on the tick a pattern finally
+        crosses its evidence threshold. An inconclusive permissions payload
+        fails closed: #6957 explicitly requires route writability to be proven
+        before startup, not guessed and retried late.
         """
         try:
             with self._client_for(repo) as client:
@@ -88,8 +91,13 @@ class GitHubPromotionTargetHost:
         if payload.get("has_issues") is False:
             return f"{repo} has issues disabled, so findings cannot be filed there"
         permissions = payload.get("permissions")
-        if isinstance(permissions, dict) and not (
-            permissions.get("push") or permissions.get("admin")
+        if not isinstance(permissions, dict):
+            return (
+                f"{repo} did not report effective repository permissions; cannot"
+                " prove the token has issue-write access"
+            )
+        if not any(
+            permissions.get(role) for role in ("triage", "push", "maintain", "admin")
         ):
             return (
                 f"{repo} is readable but not writable by this token; finding"
@@ -104,15 +112,26 @@ class GitHubPromotionTargetHost:
         title: str,
         body: str,
         labels: Sequence[str],
+        idempotency_marker: str,
     ) -> FiledIssue:
-        """Create the promotion issue, provisioning its labels first.
+        """Create or recover the promotion issue, provisioning labels first.
 
         Provisioning precedes creation for the same reason the tech-lead issue
         creation boundary does it: GitHub silently DROPS unknown labels, and a
         promotion whose gate label was dropped would be an immediately
-        schedulable issue nobody approved.
+        schedulable issue nobody approved. The fresh marker lookup closes the
+        remote-create/local-ledger crash window: a retry returns the issue the
+        previous process created rather than filing a second one.
         """
+        validate_promotion_issue_marker(body=body, marker=idempotency_marker)
         with self._client_for(repo) as client:
+            existing = self._find_marker_issue(
+                client,
+                title=title,
+                marker=idempotency_marker,
+            )
+            if existing is not None:
+                return existing
             self._ensure_labels(client, repo=repo, labels=labels)
             result = client.create_issue(title=title, body=body, labels=list(labels))
         if not isinstance(result, dict) or not result.get("number"):
@@ -125,14 +144,56 @@ class GitHubPromotionTargetHost:
         )
 
     @staticmethod
+    def _find_marker_issue(
+        client: GitHubHttpClient, *, title: str, marker: str
+    ) -> FiledIssue | None:
+        """Find a prior marker-owned filing without trusting cached/search-only data.
+
+        GitHub search indexing can lag a successful create, so the newest 100
+        repository issues are checked fresh first. Title search is the fallback
+        for an older interrupted filing that has fallen out of that window.
+        Candidate bodies, not mutable labels or titles, carry ownership.
+        """
+        recent = client.list_issues(
+            state="all",
+            limit=100,
+            use_cache=False,
+        )
+        for payload in recent:
+            filed = GitHubPromotionTargetHost._filed_from_marker(payload, marker)
+            if filed is not None:
+                return filed
+        for payload in client.search_issues_by_title(
+            [title],
+            limit=30,
+            use_cache=False,
+        ):
+            filed = GitHubPromotionTargetHost._filed_from_marker(payload, marker)
+            if filed is not None:
+                return filed
+        return None
+
+    @staticmethod
+    def _filed_from_marker(payload: object, marker: str) -> FiledIssue | None:
+        if not isinstance(payload, dict):
+            return None
+        body = payload.get("body")
+        number = payload.get("number")
+        if not isinstance(body, str) or marker not in body or not number:
+            return None
+        return FiledIssue(
+            number=int(number),
+            url=str(payload.get("html_url") or ""),
+        )
+
+    @staticmethod
     def _ensure_labels(
         client: GitHubHttpClient, *, repo: str, labels: Sequence[str]
     ) -> None:
         existing = {
             name.casefold()
             for entry in client.list_all_labels()
-            if isinstance(entry, dict)
-            and isinstance((name := entry.get("name")), str)
+            if isinstance(entry, dict) and isinstance((name := entry.get("name")), str)
         }
         for label in labels:
             if label.casefold() in existing:

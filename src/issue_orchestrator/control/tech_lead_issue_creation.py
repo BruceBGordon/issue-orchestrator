@@ -306,6 +306,7 @@ def _finalize_ledger_backed_creation(
                 fix_class=action.fix_class,
                 area=action.area or "",
                 observations=1 + len(action.additional_observation_comments),
+                diagnosis=action.diagnosis,
             )
             for comment in action.additional_observation_comments:
                 add_comment(issue_number, comment)

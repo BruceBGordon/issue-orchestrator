@@ -25,6 +25,7 @@ from .actions import (
 from .tech_lead_case_files import apply_append_pattern_observation
 from .tech_lead_finding_promotion import (
     apply_promote_tech_lead_finding,
+    apply_report_promoted_finding_evidence,
     apply_settle_tech_lead_promotion,
 )
 from .tech_lead_proposals import apply_discard_terminal_tech_lead_proposal_ops
@@ -71,6 +72,11 @@ def tech_lead_action_handlers(
         # Finding promotion: file in the routed repo, then close the loop (#6957).
         ActionType.PROMOTE_TECH_LEAD_FINDING: (
             lambda action: apply_promote_tech_lead_finding(
+                action, target=promotion_target, authority=authority
+            )
+        ),
+        ActionType.REPORT_PROMOTED_FINDING_EVIDENCE: (
+            lambda action: apply_report_promoted_finding_evidence(
                 action, target=promotion_target, authority=authority
             )
         ),

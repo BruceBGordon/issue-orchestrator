@@ -17,6 +17,7 @@ from issue_orchestrator.adapters.github.promotion_target import (
 )
 
 REPO = "porchpin/porchpin"
+MARKER = "<!-- issue-orchestrator:tech-lead-promotion:v1:test -->"
 
 
 @pytest.fixture
@@ -28,6 +29,8 @@ def http_client():
         "html_url": "https://github.com/porchpin/porchpin/issues/501",
     }
     client.get_prs_for_issue.return_value = []
+    client.list_issues.return_value = []
+    client.search_issues_by_title.return_value = []
     return client
 
 
@@ -54,8 +57,9 @@ class TestFiling:
         filed = target.file_issue(
             repo=REPO,
             title="t",
-            body="b",
+            body=f"b\n{MARKER}",
             labels=["proposed-tech-lead", "agent:backend"],
+            idempotency_marker=MARKER,
         )
 
         assert filed.number == 501
@@ -64,13 +68,83 @@ class TestFiling:
         assert calls == ["label:proposed-tech-lead", "issue"]
 
     def test_existing_labels_are_not_recreated(self, target, http_client):
-        target.file_issue(repo=REPO, title="t", body="b", labels=["agent:backend"])
+        target.file_issue(
+            repo=REPO,
+            title="t",
+            body=f"b\n{MARKER}",
+            labels=["agent:backend"],
+            idempotency_marker=MARKER,
+        )
         http_client.create_label.assert_not_called()
 
     def test_a_creation_without_an_issue_number_raises(self, target, http_client):
         http_client.create_issue.return_value = {}
         with pytest.raises(GitHubHttpError):
-            target.file_issue(repo=REPO, title="t", body="b", labels=[])
+            target.file_issue(
+                repo=REPO,
+                title="t",
+                body=f"b\n{MARKER}",
+                labels=[],
+                idempotency_marker=MARKER,
+            )
+
+    def test_marker_must_be_present_in_the_body(self, target, http_client):
+        with pytest.raises(ValueError, match="idempotency marker"):
+            target.file_issue(
+                repo=REPO,
+                title="t",
+                body="body without marker",
+                labels=[],
+                idempotency_marker=MARKER,
+            )
+        http_client.list_issues.assert_not_called()
+
+    def test_a_marker_owned_recent_issue_is_recovered_without_refiling(
+        self, target, http_client
+    ):
+        http_client.list_issues.return_value = [
+            {
+                "number": 444,
+                "html_url": "https://github.com/porchpin/porchpin/issues/444",
+                "body": f"prior body\n\n{MARKER}",
+            }
+        ]
+
+        filed = target.file_issue(
+            repo=REPO,
+            title="changed title does not matter",
+            body=f"new body\n\n{MARKER}",
+            labels=["proposed-tech-lead"],
+            idempotency_marker=MARKER,
+        )
+
+        assert filed.number == 444
+        http_client.create_issue.assert_not_called()
+        http_client.list_all_labels.assert_not_called()
+        http_client.list_issues.assert_called_once_with(
+            state="all", limit=100, use_cache=False
+        )
+
+    def test_title_search_recovers_an_older_marker_owned_issue(
+        self, target, http_client
+    ):
+        http_client.search_issues_by_title.return_value = [
+            {"number": 333, "html_url": "u", "body": MARKER}
+        ]
+
+        filed = target.file_issue(
+            repo=REPO,
+            title="the signature title",
+            body=MARKER,
+            labels=[],
+            idempotency_marker=MARKER,
+        )
+
+        assert filed.number == 333
+        http_client.search_issues_by_title.assert_called_once_with(
+            ["the signature title"], limit=30, use_cache=False
+        )
+        http_client.create_issue.assert_not_called()
 
 
 class TestOutcomeReads:
@@ -98,9 +172,7 @@ class TestOutcomeReads:
         assert outcome.closed
         assert outcome.merged_pr_url == "https://github.com/x/y/pull/6956"
 
-    def test_closed_without_a_merged_pr_reports_no_merge_url(
-        self, target, http_client
-    ):
+    def test_closed_without_a_merged_pr_reports_no_merge_url(self, target, http_client):
         http_client.get_issue.return_value = {"state": "closed"}
         http_client.get_prs_for_issue.return_value = [
             {"html_url": "https://github.com/x/y/pull/1", "pull_request": {}}
@@ -146,10 +218,14 @@ class TestWritability:
 
         assert reason is not None and "not found" in reason
 
-    def test_a_payload_without_permissions_is_treated_as_writable(
-        self, target, http_client
-    ):
-        """Some token kinds omit permissions; an inconclusive read must not
-        block startup — the applier's filing failure is still loud."""
+    def test_a_payload_without_permissions_fails_closed(self, target, http_client):
         http_client.get_repository.return_value = {"name": "porchpin"}
+        reason = target.check_writable(repo=REPO)
+        assert reason is not None and "cannot prove" in reason
+
+    @pytest.mark.parametrize("role", ("triage", "push", "maintain", "admin"))
+    def test_every_issue_writable_repository_role_passes(
+        self, target, http_client, role
+    ):
+        http_client.get_repository.return_value = {"permissions": {role: True}}
         assert target.check_writable(repo=REPO) is None
