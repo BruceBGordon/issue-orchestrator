@@ -3,17 +3,29 @@ from pathlib import Path
 import pytest
 
 from issue_orchestrator.adapters.git.git_cli import GitCLI
+from issue_orchestrator.ports.command_runner import OutputNewlines
 from issue_orchestrator.ports.git import GitError
 
 
 class FakeRunner:
     def __init__(self):
         self.calls = []
+        self.newlines = []
         self.next_result = (0, "OK\n", "")
         self.timed_out = False
 
-    def run(self, command, *, cwd=None, env=None, timeout_seconds=None, shell=False):
+    def run(
+        self,
+        command,
+        *,
+        cwd=None,
+        env=None,
+        timeout_seconds=None,
+        shell=False,
+        newlines=OutputNewlines.TRANSLATED,
+    ):
         self.calls.append((command, cwd, env, timeout_seconds, shell))
+        self.newlines.append(newlines)
         return type(
             "Result",
             (),
@@ -37,6 +49,16 @@ def test_git_cli_builds_git_c_command():
     assert shell is False
     assert timeout_seconds == git.default_timeout_s
     assert "GIT_DIR" not in env
+    assert runner.newlines == [OutputNewlines.TRANSLATED]
+
+
+def test_git_cli_forwards_requested_newline_policy():
+    runner = FakeRunner()
+    git = GitCLI(runner=runner)
+
+    git.run(Path("/tmp/repo"), ["show", "HEAD:a.txt"], newlines=OutputNewlines.PRESERVED)
+
+    assert runner.newlines == [OutputNewlines.PRESERVED]
 
 
 def test_git_cli_raises_typed_error_on_failure():

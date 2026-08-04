@@ -5,7 +5,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-from ...ports.command_runner import CommandRunner, CommandResult
+from ...ports.command_runner import CommandRunner, CommandResult, OutputNewlines
 from ...ports.git import Git, GitError, GitResult
 
 
@@ -30,30 +30,33 @@ class SubprocessCommandRunner:
         env: dict[str, str] | None = None,
         timeout_seconds: int | None = None,
         shell: bool = False,
+        newlines: OutputNewlines = OutputNewlines.TRANSLATED,
     ) -> CommandResult:
         try:
             result = subprocess.run(
                 command,
                 cwd=str(cwd) if cwd else None,
                 capture_output=True,
-                text=True,
+                # Text mode is where universal-newline translation happens, so
+                # a byte-exact capture has to decode the output itself.
+                text=not newlines.capture_bytes,
                 timeout=timeout_seconds,
                 env=env,
                 shell=shell,
             )
             return CommandResult(
                 returncode=result.returncode,
-                stdout=result.stdout or "",
-                stderr=result.stderr or "",
+                stdout=newlines.decode(result.stdout),
+                stderr=newlines.decode(result.stderr),
                 timed_out=False,
             )
         except subprocess.TimeoutExpired as exc:
-            stdout = exc.stdout if isinstance(exc.stdout, str) else (exc.stdout.decode() if exc.stdout else "")
-            stderr = exc.stderr if isinstance(exc.stderr, str) else (exc.stderr.decode() if exc.stderr else "")
+            # A timed-out capture can end mid-character, and its output is only
+            # ever diagnostic, so replace here instead of losing the result.
             return CommandResult(
                 returncode=-1,
-                stdout=stdout,
-                stderr=stderr,
+                stdout=newlines.decode(exc.stdout, errors="replace"),
+                stderr=newlines.decode(exc.stderr, errors="replace"),
                 timed_out=True,
             )
         except FileNotFoundError as exc:
@@ -87,6 +90,7 @@ class GitCLI(Git):
         timeout_s: int | None = None,
         env: dict[str, str] | None = None,
         check: bool = True,
+        newlines: OutputNewlines = OutputNewlines.TRANSLATED,
     ) -> GitResult:
         cmd = ["git", "-C", str(repo)] + argv
         result = self.runner.run(
@@ -95,6 +99,7 @@ class GitCLI(Git):
             env=env if env is not None else self.clean_env(),
             timeout_seconds=timeout_s or self.default_timeout_s,
             shell=False,
+            newlines=newlines,
         )
         git_result = GitResult(
             argv=cmd,

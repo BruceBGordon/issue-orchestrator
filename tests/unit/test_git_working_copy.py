@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, call, patch
 import pytest
 
 from issue_orchestrator.execution.git_working_copy import GitWorkingCopy
+from issue_orchestrator.ports.command_runner import OutputNewlines
 from issue_orchestrator.ports.git import GitError, GitResult
 from issue_orchestrator.ports.working_copy import (
     BranchPathsResult,
@@ -1544,8 +1545,16 @@ class TestReadBranchTextFiles:
             ),
         )
         assert mock_run.call_args_list == [
-            call(worktree_path, ["show", "HEAD:tests/test_first.py"]),
-            call(worktree_path, ["show", "HEAD:tests/test_second.py"]),
+            call(
+                worktree_path,
+                ["show", "HEAD:tests/test_first.py"],
+                newlines=OutputNewlines.PRESERVED,
+            ),
+            call(
+                worktree_path,
+                ["show", "HEAD:tests/test_second.py"],
+                newlines=OutputNewlines.PRESERVED,
+            ),
         ]
 
     def test_git_error_fails_complete_request(self, git_wc, worktree_path):
@@ -1644,6 +1653,7 @@ class TestBranchPostImagePathsAgainstBase:
                     "--diff-filter=ACMRT",
                     "origin/main...HEAD",
                 ],
+                newlines=OutputNewlines.PRESERVED,
             )
 
     def test_git_error_fails_closed(self, git_wc, worktree_path):

@@ -115,6 +115,7 @@ from issue_orchestrator.ports import (
     NullBoardSnapshotProvider,
     NullManifestDownloader,
 )
+from issue_orchestrator.ports.command_runner import OutputNewlines
 from issue_orchestrator.ports.board_snapshot_provider import BoardSnapshotProvider
 from issue_orchestrator.control.board_snapshot_builder import (
     BoardSnapshotBuilder,
@@ -340,6 +341,7 @@ class MockCommandRunner:
         env: dict[str, str] | None = None,
         timeout_seconds: int | None = None,
         shell: bool = False,
+        newlines: OutputNewlines = OutputNewlines.TRANSLATED,
     ) -> CommandResult:
         self.run_calls.append({"command": command, "cwd": cwd, "env": env, "shell": shell})
         if self._result_index < len(self.results):

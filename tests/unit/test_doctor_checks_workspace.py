@@ -5,7 +5,7 @@ from pathlib import Path
 
 from issue_orchestrator.domain.models import AgentConfig
 from issue_orchestrator.infra.config import Config, DefaultAgentConfig
-from issue_orchestrator.ports.command_runner import CommandResult
+from issue_orchestrator.ports.command_runner import CommandResult, OutputNewlines
 from issue_orchestrator.infra.doctor.checks.workspace import check_agents
 
 
@@ -227,6 +227,7 @@ def test_agent_prompts_use_injected_runner(monkeypatch, tmp_path: Path):
             env: dict[str, str] | None = None,
             timeout_seconds: int | None = None,
             shell: bool = False,
+            newlines: OutputNewlines = OutputNewlines.TRANSLATED,
         ) -> CommandResult:
             assert isinstance(command, list)
             self.commands.append(command)

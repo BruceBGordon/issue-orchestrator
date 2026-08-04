@@ -285,10 +285,17 @@ class WorkingCopy(Protocol):
         ...
 
     def diff_against_base(self, worktree: Path, base_ref: str) -> DiffResult:
-        """Return unified diff for changes from *base_ref* to HEAD.
+        r"""Return unified diff for changes from *base_ref* to HEAD.
 
         Implementations should use merge-base semantics (``base_ref...HEAD``)
         so callers scan exactly what the branch contributes.
+
+        ``diff_text`` must reproduce the patch byte-for-byte. Records are
+        LF-delimited, so a bare ``\r`` inside one is content: transports that
+        translate newlines split that record in two, stripping the ``+`` from
+        the trailing half and dropping a real addition from every caller's
+        scan. :meth:`read_branch_text_files` must be lossless on the same
+        terms, or the two sides number lines differently.
         """
         ...
 
@@ -299,8 +306,11 @@ class WorkingCopy(Protocol):
 
         Implementations must read branch-tip objects rather than mutable
         filesystem paths so callers receive content from the same ``HEAD`` used
-        by :meth:`diff_against_base`. Any missing or undecodable path must fail
-        the complete request rather than returning a partial result.
+        by :meth:`diff_against_base`, and must reproduce the stored blob
+        byte-for-byte -- newline translation anywhere in the transport breaks
+        the line-for-line correspondence with that diff. Any missing or
+        undecodable path must fail the complete request rather than returning a
+        partial result.
         """
         ...
 

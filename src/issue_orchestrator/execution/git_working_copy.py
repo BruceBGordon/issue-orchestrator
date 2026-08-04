@@ -18,6 +18,7 @@ from ..execution import git_push_operations as git_push_ops
 from ..execution.command_runner import LocalCommandRunner
 from ..execution.git_push_operations import GitAuthEnvProvider
 from ..infra.runtime_artifacts import filter_orchestrator_untracked_planted
+from ..ports.command_runner import OutputNewlines
 from ..ports.git import Git, GitError, GitResult
 from ..ports.working_copy import (
     BranchPathsResult,
@@ -53,6 +54,7 @@ class GitWorkingCopy:
         check: bool = True,
         timeout_s: int | None = None,
         env: dict[str, str] | None = None,
+        newlines: OutputNewlines = OutputNewlines.TRANSLATED,
     ) -> GitResult:
         """Run a git command in the worktree context.
 
@@ -61,6 +63,8 @@ class GitWorkingCopy:
             args: Git command arguments (without 'git').
             check: Whether to raise on non-zero exit.
             capture_output: Whether to capture stdout/stderr.
+            newlines: Transport newline fidelity. Prefer
+                :meth:`_run_git_line_exact` over passing this directly.
 
         Returns:
             GitResult with results.
@@ -72,7 +76,23 @@ class GitWorkingCopy:
             check=check,
             timeout_s=timeout_s,
             env=env,
+            newlines=newlines,
         )
+
+    def _run_git_line_exact(self, worktree: Path, args: list[str]) -> GitResult:
+        r"""Run a git read whose output keeps Git's own line terminators.
+
+        Git delimits patch records, ``-z`` path lists and blob lines with LF
+        alone, so a bare ``\r`` inside any of them is in-line content. The
+        default universal-newline transport rewrites that ``\r`` to ``\n`` and
+        splits one record into two, which detaches added source from the ``+``
+        that marks it and hides it from content guards. Every read whose caller
+        applies Git's physical-line rule must go through here, so the diff side
+        and the branch-tip side cannot drift into different transport
+        semantics.
+        """
+
+        return self._run_git(worktree, args, newlines=OutputNewlines.PRESERVED)
 
     def _clear_stale_remote_ref(self, worktree: Path, remote: str, branch: str) -> None:
         """Clear stale remote-tracking refs when the remote branch is missing."""
@@ -253,9 +273,12 @@ class GitWorkingCopy:
         This is execution-only: callers own any policy decisions made from
         the diff. A command failure is a first-class result so control code can
         fail closed with a useful operator-facing message.
+
+        Read byte-exactly: patch records are LF-delimited, so a carriage return
+        Git emitted inside one must survive to the caller.
         """
         try:
-            result = self._run_git(
+            result = self._run_git_line_exact(
                 worktree,
                 [
                     "diff",
@@ -279,12 +302,17 @@ class GitWorkingCopy:
     def read_branch_text_files(
         self, worktree: Path, paths: tuple[str, ...]
     ) -> BranchTextFilesResult:
-        """Return exact tracked ``HEAD`` content for selected text files."""
+        """Return exact tracked ``HEAD`` content for selected text files.
+
+        Read byte-exactly, on the same terms as :meth:`diff_against_base`, so
+        blob content and the patch text it is matched against agree on where
+        every line ends.
+        """
 
         files: list[BranchTextFile] = []
         try:
             for path in paths:
-                result = self._run_git(worktree, ["show", f"HEAD:{path}"])
+                result = self._run_git_line_exact(worktree, ["show", f"HEAD:{path}"])
                 files.append(BranchTextFile(path=path, content=result.stdout))
             return BranchTextFilesResult(success=True, files=tuple(files))
         except GitError as exc:
@@ -305,9 +333,12 @@ class GitWorkingCopy:
         name for renames/copies) excluding deletions, intact through spaces.
         Unlike a unified-diff parser it sees no-hunk and binary changes, so
         committed runtime artifacts cannot slip past path-based guards.
+
+        Read byte-exactly: NUL-delimited records make every other byte part of
+        a path, including a carriage return a filename is allowed to contain.
         """
         try:
-            result = self._run_git(
+            result = self._run_git_line_exact(
                 worktree,
                 [
                     "diff",
