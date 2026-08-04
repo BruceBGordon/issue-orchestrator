@@ -153,7 +153,17 @@ def _test_additions(diff_text: str) -> tuple[AddedDiffLine, ...]:
 
 
 def iter_added_diff_lines(diff_text: str) -> tuple[AddedDiffLine, ...]:
-    """Return added lines from a unified diff with new-file line numbers."""
+    """Return added lines from a unified diff with new-file line numbers.
+
+    Header recognition is state-aware. ``+++``/``---`` name files only outside
+    an active hunk; inside one, every leading ``+`` is an addition. Source such
+    as ``++pytest.skip(...)`` — two unary-plus operators — is therefore scanned
+    instead of being mistaken for the ``+++`` file header it resembles.
+
+    Raises:
+        ValueError: If a hunk header cannot be parsed. Silently dropping the
+            hunk would hide its additions from the scan.
+    """
 
     added: list[AddedDiffLine] = []
     current_path: str | None = None
@@ -163,17 +173,17 @@ def iter_added_diff_lines(diff_text: str) -> tuple[AddedDiffLine, ...]:
             current_path = None
             new_line = None
             continue
-        if raw.startswith("+++ "):
-            current_path = _parse_new_path(raw)
-            new_line = None
-            continue
         if raw.startswith("@@"):
             match = _HUNK_RE.search(raw)
-            new_line = int(match.group(1)) if match else None
+            if match is None:
+                raise ValueError(f"Unparsable diff hunk header: {raw}")
+            new_line = int(match.group(1))
             continue
         if new_line is None:
+            if raw.startswith("+++ "):
+                current_path = _parse_new_path(raw)
             continue
-        if raw.startswith("+") and not raw.startswith("+++"):
+        if raw.startswith("+"):
             if current_path is not None:
                 added.append(
                     AddedDiffLine(
@@ -184,7 +194,7 @@ def iter_added_diff_lines(diff_text: str) -> tuple[AddedDiffLine, ...]:
                 )
             new_line += 1
             continue
-        if raw.startswith("-") and not raw.startswith("---"):
+        if raw.startswith("-"):
             continue
         if raw.startswith("\\ No newline at end of file"):
             continue
@@ -631,6 +641,11 @@ class _LiteralMasker:
 
         prefix = prefix.rstrip()
         if self._js_last_value_end > len(prefix):
+            return False
+        if prefix.endswith(("++", "--")):
+            # Only a postfix operator can sit at the end of an expression, so
+            # its operand is a value and the slash divides it. A prefix ``+``
+            # or ``-`` leaves a single trailing operator character instead.
             return False
         if not prefix:
             return True

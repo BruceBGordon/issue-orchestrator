@@ -1125,7 +1125,18 @@ class CompletionProcessor:
                 run_assets=run_assets,
             )
 
-        test_paths = added_test_paths(diff_result.diff_text)
+        try:
+            test_paths = added_test_paths(diff_result.diff_text)
+        except ValueError as exc:
+            return self._handle_gate_failure(
+                worktree,
+                record,
+                session_name,
+                issue_number,
+                f"Could not parse branch diff for banned test skips: {exc}",
+                gate_record=None,
+                run_assets=run_assets,
+            )
         if not test_paths:
             return None
         branch_files_result = self.git_adapter.read_branch_text_files(

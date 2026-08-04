@@ -4375,6 +4375,85 @@ class TestCompletionProcessorPublishGate:
         assert expected_message in result.message
         mock_git_adapter.push.assert_not_called()
 
+    def test_test_skip_guard_unparsable_diff_fails_closed(
+        self,
+        processor,
+        mock_git_adapter,
+        worktree_with_completion,
+    ):
+        mock_git_adapter.diff_against_base.return_value = DiffResult(
+            success=True,
+            diff_text=(
+                "diff --git a/tests/test_guard.py b/tests/test_guard.py\n"
+                "--- a/tests/test_guard.py\n"
+                "+++ b/tests/test_guard.py\n"
+                "@@@ -1,1 -1,1 +1,1 @@@\n"
+                '+pytest.skip("real skip")\n'
+            ),
+        )
+        record = make_record(
+            outcome=CompletionOutcome.COMPLETED,
+            requested_actions=[RequestedAction.PUSH_BRANCH],
+        )
+        worktree = worktree_with_completion(record)
+
+        result = processor.process(
+            worktree,
+            run_assets=make_session_run_assets(worktree),
+            issue_number=123,
+            issue_title="Test",
+        )
+
+        assert not result.success
+        assert "Could not parse branch diff for banned test skips" in result.message
+        mock_git_adapter.read_branch_text_files.assert_not_called()
+        mock_git_adapter.push.assert_not_called()
+
+    def test_test_skip_guard_scans_source_resembling_diff_headers(
+        self,
+        processor,
+        mock_git_adapter,
+        worktree_with_completion,
+    ):
+        mock_git_adapter.diff_against_base.return_value = DiffResult(
+            success=True,
+            diff_text=(
+                "diff --git a/tests/test_guard.py b/tests/test_guard.py\n"
+                "--- a/tests/test_guard.py\n"
+                "+++ b/tests/test_guard.py\n"
+                "@@ -0,0 +1,1 @@\n"
+                '+++pytest.skip("real skip")\n'
+            ),
+        )
+        mock_git_adapter.read_branch_text_files.return_value = BranchTextFilesResult(
+            success=True,
+            files=(
+                BranchTextFile(
+                    path="tests/test_guard.py",
+                    content='++pytest.skip("real skip")\n',
+                ),
+            ),
+        )
+        record = make_record(
+            outcome=CompletionOutcome.COMPLETED,
+            requested_actions=[RequestedAction.PUSH_BRANCH],
+        )
+        worktree = worktree_with_completion(record)
+
+        result = processor.process(
+            worktree,
+            run_assets=make_session_run_assets(worktree),
+            issue_number=123,
+            issue_title="Test",
+        )
+
+        assert not result.success
+        assert "Newly added test-skip guard" in result.message
+        mock_git_adapter.read_branch_text_files.assert_called_once_with(
+            worktree, ("tests/test_guard.py",)
+        )
+        mock_git_adapter.push.assert_not_called()
+
     def test_pre_publish_gate_failure_reroutes_back_into_review_exchange(
         self,
         tmp_path,
