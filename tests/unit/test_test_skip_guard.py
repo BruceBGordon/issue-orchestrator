@@ -635,3 +635,16 @@ def test_scan_added_test_skip_guards_flags_code_after_multiline_literal() -> Non
 
     assert not result.ok
     assert [violation.line_number for violation in result.violations] == [5]
+
+
+def test_scan_added_test_skip_guards_ignores_nested_kotlin_block_comment() -> None:
+    diff = '''diff --git a/tests/GuardTest.kt b/tests/GuardTest.kt
+--- a/tests/GuardTest.kt
++++ b/tests/GuardTest.kt
+@@ -0,0 +1,3 @@
++/* outer
++   /* inner */ assumeTrue(false)
++*/
+'''
+
+    assert _scan(diff).ok

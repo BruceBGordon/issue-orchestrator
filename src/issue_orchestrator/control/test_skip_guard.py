@@ -183,23 +183,29 @@ def iter_added_diff_lines(diff_text: str) -> tuple[AddedDiffLine, ...]:
             if raw.startswith("+++ "):
                 current_path = _parse_new_path(raw)
             continue
-        if raw.startswith("+"):
-            if current_path is not None:
-                added.append(
-                    AddedDiffLine(
-                        path=current_path,
-                        line_number=new_line,
-                        text=raw[1:],
-                    )
-                )
-            new_line += 1
-            continue
-        if raw.startswith("-"):
-            continue
-        if raw.startswith("\\ No newline at end of file"):
-            continue
-        new_line += 1
+        new_line, addition = _advance_new_side_hunk_line(
+            raw, current_path=current_path, new_line=new_line
+        )
+        if addition is not None:
+            added.append(addition)
     return tuple(added)
+
+
+def _advance_new_side_hunk_line(
+    raw: str, *, current_path: str | None, new_line: int
+) -> tuple[int, AddedDiffLine | None]:
+    """Consume one hunk line and advance its branch-tip line position."""
+
+    if raw.startswith("+"):
+        addition = (
+            AddedDiffLine(path=current_path, line_number=new_line, text=raw[1:])
+            if current_path is not None
+            else None
+        )
+        return new_line + 1, addition
+    if raw.startswith("-") or raw.startswith("\\ No newline at end of file"):
+        return new_line, None
+    return new_line + 1, None
 
 
 def _parse_new_path(line: str) -> str | None:
@@ -276,7 +282,7 @@ class _InterpolationFrame:
 
 @dataclass
 class _BlockCommentFrame:
-    pass
+    depth: int = 0
 
 
 _LexicalFrame = _LiteralFrame | _InterpolationFrame | _BlockCommentFrame
@@ -423,6 +429,8 @@ class _LiteralMasker:
         return line
 
     def _mask_block_comment(self, text: str, masked: list[str], index: int) -> int:
+        if self._kotlin:
+            return self._mask_kotlin_block_comment(text, masked, index)
         end = text.find("*/", index)
         if end < 0:
             self._blank(masked, index, len(text))
@@ -430,6 +438,34 @@ class _LiteralMasker:
         self._blank(masked, index, end + 2)
         self._frames.pop()
         return end + 2
+
+    def _mask_kotlin_block_comment(
+        self, text: str, masked: list[str], index: int
+    ) -> int:
+        """Mask Kotlin's nestable block comments without ending at an inner close."""
+
+        frame = self._frames[-1]
+        assert isinstance(frame, _BlockCommentFrame)
+        cursor = index
+        while cursor < len(text):
+            opening = text.find("/*", cursor)
+            closing = text.find("*/", cursor)
+            if opening >= 0 and (closing < 0 or opening < closing):
+                frame.depth += 1
+                cursor = opening + 2
+                continue
+            if closing >= 0:
+                frame.depth -= 1
+                cursor = closing + 2
+                if frame.depth == 0:
+                    self._blank(masked, index, cursor)
+                    self._frames.pop()
+                    return cursor
+                continue
+            self._blank(masked, index, len(text))
+            return len(text)
+        self._blank(masked, index, len(text))
+        return len(text)
 
     def _mask_literal(
         self, text: str, masked: list[str], index: int, frame: _LiteralFrame
@@ -570,6 +606,9 @@ class _LiteralMasker:
         return index + len(literal.delimiter)
 
     def _start_block_comment(self, text: str, masked: list[str], index: int) -> int:
+        if self._kotlin:
+            self._frames.append(_BlockCommentFrame())
+            return self._mask_block_comment(text, masked, index)
         end = text.find("*/", index + 2)
         if end < 0:
             self._blank(masked, index, len(text))
