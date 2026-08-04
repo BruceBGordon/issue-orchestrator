@@ -94,21 +94,79 @@ class TestApplySseEnvelope:
             SSE_SCHEMA_FIELD: EVENT_SCHEMA_VERSION,
         }
 
+    @pytest.mark.parametrize(
+        "declared",
+        [
+            pytest.param(True, id="bool-true-equals-1-but-serializes-as-true"),
+            pytest.param(1.0, id="float-equals-1-but-serializes-as-1.0"),
+            pytest.param(None, id="explicit-none-is-a-declaration-not-absence"),
+            pytest.param("1", id="string"),
+            pytest.param(EVENT_SCHEMA_VERSION + 1, id="different-int"),
+        ],
+    )
+    def test_rejects_any_producer_declared_version_that_is_not_the_published_one(
+        self, declared
+    ):
+        """Equality alone is too weak on the only runtime-versioned surface.
+
+        ``True`` and ``1.0`` compare equal to ``1`` but reach a consumer as JSON
+        ``true`` and ``1.0``, which no client matching the published integer
+        would recognize. An explicit ``None`` is a declaration of something
+        invalid, not an absent field, so it must fail rather than be replaced.
+        """
+        with pytest.raises(ValueError, match="envelope version"):
+            apply_sse_envelope(
+                "session.started",
+                {"issue_number": 42, SSE_SCHEMA_FIELD: declared},
+            )
+
+    def test_accepted_wire_version_is_the_canonical_integer(self):
+        event = apply_sse_envelope("session.started", {"issue_number": 42})
+        wire_version = event.data[SSE_SCHEMA_FIELD]
+
+        assert type(wire_version) is int
+        assert wire_version == EVENT_SCHEMA_VERSION
+
 
 class TestSseEventInvariant:
     """Invalid envelope states must be unrepresentable, not merely undocumented."""
 
     def test_cannot_be_constructed_without_a_schema_version(self):
         with pytest.raises(TypeError):
-            SseEvent(type="session.started")  # type: ignore[call-arg]
+            SseEvent(type="session.started")
 
-    def test_cannot_be_constructed_with_an_unpublished_schema_version(self):
+    @pytest.mark.parametrize(
+        "schema_version",
+        [
+            pytest.param(True, id="bool-true-equals-1-but-serializes-as-true"),
+            pytest.param(1.0, id="float-equals-1-but-serializes-as-1.0"),
+            pytest.param(None, id="none"),
+            pytest.param("1", id="string"),
+            pytest.param(EVENT_SCHEMA_VERSION + 1, id="different-int"),
+        ],
+    )
+    def test_cannot_be_constructed_with_an_unpublished_schema_version(
+        self, schema_version
+    ):
+        """Exact type and value - the exported owner must not admit look-alikes.
+
+        ``SseEvent`` is exported from ``events``, so direct construction is part
+        of the surface. Accepting ``True`` here would put JSON ``true`` on the
+        stream this project calls its only runtime-versioned contract.
+        """
         with pytest.raises(ValueError, match="published envelope version"):
             SseEvent(
                 type="session.started",
-                schema_version=EVENT_SCHEMA_VERSION + 1,
+                schema_version=schema_version,
                 payload={"issue_number": 42},
             )
+
+    def test_constructed_wire_version_is_the_canonical_integer(self):
+        event = SseEvent(
+            type="session.started", schema_version=EVENT_SCHEMA_VERSION
+        )
+
+        assert type(event.data[SSE_SCHEMA_FIELD]) is int
 
     def test_data_always_carries_the_version_even_for_an_empty_payload(self):
         event = SseEvent(type="orchestrator.paused", schema_version=EVENT_SCHEMA_VERSION)

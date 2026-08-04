@@ -32,7 +32,27 @@ from .catalog import EVENT_SCHEMA_VERSION
 #: Payload key carrying the public schema version on the wire.
 SSE_SCHEMA_FIELD = "schema"
 
+#: Distinguishes "the producer did not declare a version" from an explicit
+#: ``{"schema": None}``, which is a declaration of something invalid and must
+#: be rejected rather than quietly replaced.
+_MISSING = object()
+
 __all__ = ["SSE_SCHEMA_FIELD", "SseEvent", "apply_sse_envelope"]
+
+
+def _is_published_schema_version(value: object) -> bool:
+    """Whether ``value`` is *exactly* the published envelope version.
+
+    Exact runtime type, not just equality. Python treats ``True == 1`` and
+    ``1.0 == 1`` as true, but they serialize to JSON as ``true`` and ``1.0`` —
+    neither of which a consumer comparing against the published integer would
+    recognize. On the project's only runtime-versioned surface, a version a
+    client cannot match is worse than a loud failure here.
+
+    Shared by :class:`SseEvent` and :func:`apply_sse_envelope` so the value
+    object and the producer-facing parser cannot disagree about what counts.
+    """
+    return type(value) is int and value == EVENT_SCHEMA_VERSION
 
 
 @dataclass(frozen=True)
@@ -44,8 +64,10 @@ class SseEvent:
 
     - ``schema_version`` is a required field with no default, so an event
       cannot be constructed without one.
-    - It is validated against :data:`EVENT_SCHEMA_VERSION`, so it cannot carry a
-      version the project does not publish.
+    - It is validated by exact type *and* value against
+      :data:`EVENT_SCHEMA_VERSION`, so it cannot carry a version the project
+      does not publish — including ``True`` or ``1.0``, which compare equal to
+      ``1`` but serialize as ``true`` and ``1.0``.
     - ``payload`` is copied into a read-only mapping at construction, so a
       caller cannot mutate an event after the fact.
     - :attr:`data` composes the wire payload from both, so the version cannot be
@@ -61,11 +83,12 @@ class SseEvent:
     payload: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        if self.schema_version != EVENT_SCHEMA_VERSION:
+        if not _is_published_schema_version(self.schema_version):
             raise ValueError(
                 f"SSE event {self.type!r} declares schema version "
-                f"{self.schema_version!r}, but the published envelope version is "
-                f"{EVENT_SCHEMA_VERSION!r}."
+                f"{self.schema_version!r} ({type(self.schema_version).__name__}), "
+                f"but the published envelope version is {EVENT_SCHEMA_VERSION!r} "
+                f"({type(EVENT_SCHEMA_VERSION).__name__})."
             )
         object.__setattr__(self, "payload", MappingProxyType(dict(self.payload)))
 
@@ -93,17 +116,20 @@ def apply_sse_envelope(event_type: str, data: Mapping[str, Any] | None) -> SseEv
         copied, never mutated.
 
     Raises:
-        ValueError: If the payload already declares a *different* schema
-            version. There is exactly one live version, so a mismatch means a
-            producer is hand-writing the field — a bug worth failing on rather
-            than silently overwriting and shipping a mislabelled event.
+        ValueError: If the payload declares anything other than exactly the
+            current schema version. There is one live version, so a mismatch
+            means a producer is hand-writing the field — a bug worth failing on
+            rather than silently overwriting and shipping a mislabelled event.
+            An explicit ``{"schema": None}`` is a declaration too, and is
+            rejected rather than treated as absence.
     """
     payload = dict(data or {})
-    declared = payload.pop(SSE_SCHEMA_FIELD, None)
-    if declared is not None and declared != EVENT_SCHEMA_VERSION:
+    declared = payload.pop(SSE_SCHEMA_FIELD, _MISSING)
+    if declared is not _MISSING and not _is_published_schema_version(declared):
         raise ValueError(
-            f"SSE event {event_type!r} declares {SSE_SCHEMA_FIELD}={declared!r}, "
-            f"but the current envelope version is {EVENT_SCHEMA_VERSION!r}. "
+            f"SSE event {event_type!r} declares {SSE_SCHEMA_FIELD}={declared!r} "
+            f"({type(declared).__name__}), but the current envelope version is "
+            f"{EVENT_SCHEMA_VERSION!r} ({type(EVENT_SCHEMA_VERSION).__name__}). "
             "Producers must not set the envelope version themselves."
         )
     return SseEvent(
