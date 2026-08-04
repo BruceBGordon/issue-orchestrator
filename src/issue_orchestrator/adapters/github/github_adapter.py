@@ -31,6 +31,7 @@ from .http_client import (
     build_github_auth,
     classify_github_http_failure,
 )
+from .marker_recovery import find_marker_issue
 from .repo import get_repo_from_git, GitRepoError
 from .cache import GitHubCache
 from .adapter_cache import GitHubAdapterCacheSupport
@@ -545,6 +546,16 @@ class GitHubAdapter:
         """
         raw = self._client.search_issues_by_title(query_terms, limit=limit)
         return self._raw_issues_to_issues(raw)
+
+    def find_issue_by_marker(self, *, title: str, marker: str) -> int | None:
+        """Recover an issue this orchestrator created, by its body marker.
+
+        The ``RepositoryHost`` half of the shared crash-window recovery the
+        promotion target adapter already uses (``marker_recovery``): fresh reads
+        only, body-marker ownership, title as a narrowing hint.
+        """
+        found = find_marker_issue(self._client, title=title, marker=marker)
+        return found.number if found is not None else None
 
     def get_default_branch(self) -> str:
         """The repository's real default branch (cached; GitHub is authoritative)."""

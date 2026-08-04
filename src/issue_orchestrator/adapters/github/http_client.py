@@ -1949,13 +1949,19 @@ class GitHubHttpClient:
         Returns ``{"url", "number", "merged"}`` for that PR, or None when the
         issue is open, was closed by a human/commit/another issue, or the
         closing event carries no pull request.
+
+        Only the NEWEST ``ClosedEvent`` is consulted — the one that produced the
+        issue's current closed state. An issue can be closed by a merged PR,
+        reopened, and later closed by hand; falling back to the older PR-backed
+        close would report that stale merge as the outcome and mark a manual
+        decline as shipped (#6957 round-2 review F4).
         """
         owner, repo = self._config.repo.split("/", 1)
         query = """
         query($owner: String!, $repo: String!, $number: Int!) {
             repository(owner: $owner, name: $repo) {
                 issue(number: $number) {
-                    timelineItems(last: 10, itemTypes: [CLOSED_EVENT]) {
+                    timelineItems(last: 1, itemTypes: [CLOSED_EVENT]) {
                         nodes {
                             ... on ClosedEvent {
                                 closer {
@@ -1981,20 +1987,20 @@ class GitHubHttpClient:
             (result.get("data") or {}).get("repository", {}) or {}
         ).get("issue") or {}
         nodes = (issue.get("timelineItems") or {}).get("nodes") or []
-        # An issue can be closed and reopened repeatedly; the LAST close is the
-        # one that left it closed, so scan newest-first.
-        for node in reversed(nodes):
-            if not isinstance(node, dict):
-                continue
-            closer = node.get("closer")
-            if not isinstance(closer, dict) or not closer.get("number"):
-                continue
-            return {
-                "number": int(closer["number"]),
-                "url": str(closer.get("url") or ""),
-                "merged": bool(closer.get("merged")),
-            }
-        return None
+        if not nodes:
+            return None
+        # ``last: 1`` already asks GitHub for only the newest close; index
+        # defensively in case a caller/mock supplies more, and NEVER fall
+        # through to an older event when this one has no PR closer.
+        newest = nodes[-1]
+        closer = newest.get("closer") if isinstance(newest, dict) else None
+        if not isinstance(closer, dict) or not closer.get("number"):
+            return None
+        return {
+            "number": int(closer["number"]),
+            "url": str(closer.get("url") or ""),
+            "merged": bool(closer.get("merged")),
+        }
 
     def get_prs_for_issue(self, issue_number: int) -> list[dict[str, Any]]:
         # GitHub's search API rejects queries without an `is:` qualifier with

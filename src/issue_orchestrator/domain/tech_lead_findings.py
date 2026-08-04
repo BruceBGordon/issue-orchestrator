@@ -349,6 +349,24 @@ def promotion_issue_title(*, source_repo: str, signature: str) -> str:
     return f"[tech-lead:{name}] {signature}"
 
 
+def case_file_issue_marker(signature: str) -> str:
+    """Stable remote provenance key for crash-safe CASE-FILE filing (#6781).
+
+    The mirror of :func:`promotion_issue_marker`, for the same reason and the
+    same crash window: the case file is created on GitHub first and its ledger
+    row written second, so a process that dies in between leaves a real issue
+    with no row — and the next attempt would file a SECOND case file for one
+    signature, splitting the evidence that gates promotion (#6957 round-2
+    review F10). This marker is what makes the already-created issue
+    recoverable instead.
+
+    A digest keeps arbitrary agent-authored signatures out of HTML-comment
+    syntax while keeping the key deterministic across restarts.
+    """
+    digest = hashlib.sha256(signature.encode()).hexdigest()
+    return f"<!-- issue-orchestrator:tech-lead-case-file:v1:{digest} -->"
+
+
 def promotion_issue_marker(*, source_repo: str, signature: str) -> str:
     """Stable remote provenance key for crash-safe promotion filing.
 

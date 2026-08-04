@@ -431,6 +431,9 @@ tech_lead:
   #       the issue while gated declines it permanently (never re-filed).
   #     auto files it ungated - immediately runnable in the target's pipeline.
   #     off disables the lane entirely (no issues filed, no follow-up reads).
+  #     The lane is also inert without review.tech_lead_review_agent - it
+  #     actuates tech-lead findings, so removing the tech lead turns it off
+  #     completely. Durable rows are kept, so re-adding the agent resumes it.
   #   min_evidence: observations a signature must accrue before it is eligible.
   #     Counted in the orchestrator-owned pattern ledger, so comments on the
   #     case file cannot inflate it.

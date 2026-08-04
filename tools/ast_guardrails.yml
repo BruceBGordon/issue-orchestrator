@@ -106,7 +106,8 @@ deny_attr_calls:
       # as action_applier.py's own. Both target orchestrator-owned case-file
       # issues, never a claimed coding issue.
       - src/issue_orchestrator/control/tech_lead_case_files.py
-      - src/issue_orchestrator/control/tech_lead_finding_promotion.py
+      - src/issue_orchestrator/control/tech_lead_case_file_owner.py
+      - src/issue_orchestrator/control/tech_lead_promotion_appliers.py
   - name: entrypoints_no_direct_label_mutations
     description: "Entrypoint handlers must apply label/comment mutations via ActionApplier"
     deny_in:

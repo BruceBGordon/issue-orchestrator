@@ -17,6 +17,7 @@ to provide.
 from typing import TYPE_CHECKING
 
 from ..types import Check
+from ...tech_lead_promotion_activation import promotion_lane_readiness
 
 if TYPE_CHECKING:
     from ....ports.promotion_target import PromotionTargetHost
@@ -79,18 +80,23 @@ def check_tech_lead_finding_routes(
 
     Only NON-``self`` targets are probed: a ``self`` route lands in the managed
     repo, whose writability is already covered by the auth/repo checks. One read
-    per distinct target, and none at all when the lane is off or every route is
-    ``self`` — GitHub API discipline.
+    per distinct target, and none at all when the lane is inactive or every
+    route is ``self`` — GitHub API discipline.
+
+    Whether the lane is active is NOT decided here: it comes from
+    :func:`promotion_lane_readiness`, the same owner configuration validation
+    and fact gathering consume. Deciding it locally is what let doctor skip
+    these probes while the runtime went on promoting anyway (round-2 review F9).
 
     ``target_host`` is injectable so this check is testable without a live
     GitHub; production leaves it None and the host is built from config.
     """
-    if config is None or not config.tech_lead_review_agent or not config.repo:
+    if config is None:
         return []
-    findings = config.tech_lead.findings
-    if not findings.enabled:
+    readiness = promotion_lane_readiness(config)
+    if not readiness.active:
         return []
-    targets = findings.target_repos()
+    targets = readiness.probe_targets
     if not targets:
         return [
             Check(
@@ -106,6 +112,9 @@ def check_tech_lead_finding_routes(
                 create_repository_host,
             )
 
+            # An ACTIVE lane always has a configured repo (the readiness owner
+            # makes that part of activation), so this narrowing cannot fail.
+            assert config.repo is not None
             target_host = create_promotion_target_host(
                 create_repository_host(repo=config.repo, config=config)
             )

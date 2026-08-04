@@ -118,6 +118,7 @@ from .tech_lead_proposals import (
 
 if TYPE_CHECKING:
     from ..domain.tech_lead_artifacts import TechLeadFinding
+    from ..domain.tech_lead_findings import PatternEvidence
     from ..infra.config import Config
     from .reconciliation import ExpectedState
 
@@ -269,7 +270,7 @@ def plan_tech_lead_decision_actions(
     anchor_issue: Issue,
     expected: "ExpectedState",
     op_ledger: Mapping[tuple[str, int], int],
-    pattern_ledger: Mapping[str, int],
+    pattern_ledger: Mapping[str, "PatternEvidence"],
     source_run_id: str,
     source_session_name: str,
     observed_at: str,
@@ -344,7 +345,10 @@ class _DecisionActionPlanner:
     anchor_issue: Issue
     expected: "ExpectedState"
     op_ledger: Mapping[tuple[str, int], int]
-    pattern_ledger: Mapping[str, int]
+    # signature -> its FULL durable row: planning preflights a new
+    # observation's classification against it, which a bare issue number
+    # cannot support (#6957 round-2 review F3).
+    pattern_ledger: Mapping[str, "PatternEvidence"]
     findings: Mapping[str, "TechLeadFinding"]
     source_run_id: str
     source_session_name: str
@@ -360,6 +364,13 @@ class _DecisionActionPlanner:
     shadow: list[SurfaceTechLeadProposalAction] = field(default_factory=list)
     _planned_ops: set[tuple[str, int]] = field(default_factory=set)
     _planned_patterns: dict[str, int] = field(default_factory=dict)
+    # signature -> the (fix_class, area) every observation seen so far in
+    # THIS decision reconciled to, seeded from the durable row. Two
+    # observations that disagree conflict with each other, not just with
+    # what is recorded (#6957 round-2 review F3).
+    _pattern_classification: dict[str, tuple[str, str]] = field(
+        default_factory=dict
+    )
     # (action_id, title, body) of EVERY create_issue intent this decision has
     # processed — whether it filed a new issue or routed onto an existing one.
     # The persisted-corpus gate cannot see them (they have no issue number yet),
@@ -403,31 +414,78 @@ class _DecisionActionPlanner:
         )
         self._plan_pattern_case_file(proposed)
 
+    def _classification_for(
+        self, signature: str, proposed: ProposedTechLeadAction
+    ) -> tuple[str, str]:
+        """The signature's merged ``(fix_class, area)``, or raise on conflict.
+
+        The classification PREFLIGHT (#6957 round-2 review F3). It reconciles
+        this observation against everything already known about the signature —
+        the DURABLE row first, then whatever earlier observations in this same
+        decision merged into — using the one rule the store enforces.
+
+        Running it here, before any action is produced, is what makes a conflict
+        externally invisible: the raise unwinds into the whole-decision
+        rejection in :func:`plan_tech_lead_decision_actions`, so no evidence
+        comment, surface action, or sibling mutation is ever applied. Reconciling
+        only at apply time published the conflicting comment first and left the
+        durable row disagreeing with it.
+        """
+        merged = self._pattern_classification.get(signature)
+        if merged is None:
+            recorded = self.pattern_ledger.get(signature)
+            merged = (
+                (recorded.fix_class, recorded.area) if recorded is not None else ("", "")
+            )
+        fix_class = reconcile_pattern_classification(
+            field="fix_class",
+            signature=signature,
+            existing=merged[0],
+            incoming=proposed.fix_class or "",
+        )
+        area = reconcile_pattern_classification(
+            field="area",
+            signature=signature,
+            existing=merged[1],
+            incoming=proposed.area or "",
+        )
+        self._pattern_classification[signature] = (fix_class, area)
+        return fix_class, area
+
     def _plan_pattern_case_file(self, proposed: ProposedTechLeadAction) -> None:
         """Durable flag_pattern execution (#6781): create or append."""
         signature = proposed.pattern_signature
         assert signature is not None  # enforced by validate()
+        # Preflight FIRST: a classification conflict must reject the decision
+        # before this method produces any mutating action (#6957 R2 F3).
+        fix_class, area = self._classification_for(signature, proposed)
         existing = self.pattern_ledger.get(signature)
         if existing is not None:
             # Comment AND durable count under one owner (#6957): the count is
             # what promotion's min_evidence reads, so it can never be left to
-            # GitHub comment cadence.
+            # GitHub comment cadence. The action carries the MERGED
+            # classification, so the store's own reconcile is an upgrade or a
+            # no-op — never a conflict discovered mid-write.
             self.actions.append(
                 build_append_observation_action(
                     proposed,
-                    case_file_issue_number=existing,
+                    case_file_issue_number=existing.case_file_issue_number,
                     anchor_issue_number=self._anchor_number,
                     findings=self.findings,
                     source_run_id=self.source_run_id,
                     source_session_name=self.source_session_name,
                     observed_at=self.observed_at,
                     expected=self.expected,
+                    fix_class=fix_class,
+                    area=area,
                 )
             )
             return
         planned_index = self._planned_patterns.get(signature)
         if planned_index is not None:
-            self._coalesce_planned_case_file(planned_index, proposed)
+            self._coalesce_planned_case_file(
+                planned_index, proposed, fix_class=fix_class, area=area
+            )
             return
         self._planned_patterns[signature] = len(self.actions)
         self.actions.append(
@@ -444,34 +502,24 @@ class _DecisionActionPlanner:
         )
 
     def _coalesce_planned_case_file(
-        self, planned_index: int, proposed: ProposedTechLeadAction
+        self,
+        planned_index: int,
+        proposed: ProposedTechLeadAction,
+        *,
+        fix_class: str,
+        area: str,
     ) -> None:
         """Fold a second first-seen observation into the pending creation.
 
         One case file per signature, so a second observation of a signature this
         decision is already creating rides the SAME action as an extra
-        identified observation. Its classification and area merge through
-        :func:`reconcile_pattern_classification` — the identical rule the
-        durable store applies across decisions. Retaining only the first
-        action's values silently lost an ``unclassified -> code`` upgrade (and
-        an area that decides routing) whenever both observations arrived in one
-        decision (#6957 review F3).
+        identified observation, carrying the classification the preflight
+        already merged. Retaining only the first action's values silently lost
+        an ``unclassified -> code`` upgrade (and an area that decides routing)
+        whenever both observations arrived in one decision (#6957 review F3).
         """
         creation = self.actions[planned_index]
         assert isinstance(creation, CreateTechLeadCaseFileIssueAction)
-        signature = creation.pattern_signature
-        fix_class = reconcile_pattern_classification(
-            field="fix_class",
-            signature=signature,
-            existing=creation.fix_class,
-            incoming=proposed.fix_class or "",
-        )
-        area = reconcile_pattern_classification(
-            field="area",
-            signature=signature,
-            existing=creation.area or "",
-            incoming=proposed.area or "",
-        )
         self.actions[planned_index] = replace(
             creation,
             observations=(

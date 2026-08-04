@@ -24,10 +24,10 @@ from .actions import (
     CreateTechLeadProposalIssueAction,
 )
 from .label_manager import tech_lead_issue_label_metadata
+from .tech_lead_case_file_owner import PatternCaseFileOwner
 from .tech_lead_issue_policy import resolve_tech_lead_milestone_number
 
 if TYPE_CHECKING:
-    from ..domain.tech_lead_findings import PatternObservation
     from ..ports import EventSink, RepositoryHost
     from ..ports.tech_lead_authority import TechLeadAuthorityStore
     from .retry_history_state import ExpediteLane
@@ -96,38 +96,6 @@ def _required_label_provisioning_error(
         existing.add(folded)
     return None
 
-def _append_observation(
-    ops: "TechLeadAuthorityStore",
-    *,
-    signature: str,
-    issue_number: int,
-    observation: "PatternObservation",
-    fix_class: str,
-    area: str,
-    add_comment: Callable[[int, str], str],
-) -> None:
-    """Post one observation's evidence and count it create-once (#6957 F1).
-
-    The same ordering the planned repeat path uses
-    (``tech_lead_case_files.apply_append_pattern_observation``), shared so
-    creation-reconciliation and the append lane can never drift: skip entirely
-    when this identity is already counted (a local ledger read), otherwise
-    comment and then record. A crash in between repeats at most one comment;
-    the durable count never moves twice for one observation.
-    """
-    if ops.has_pattern_observation(
-        signature=signature, observation_id=observation.observation_id
-    ):
-        return
-    add_comment(issue_number, observation.comment)
-    ops.note_pattern_observation(
-        signature=signature,
-        observation_id=observation.observation_id,
-        fix_class=fix_class,
-        area=area,
-    )
-
-
 def _proposal_link_comment(
     action: CreateTechLeadProposalIssueAction, issue_number: int
 ) -> str:
@@ -146,7 +114,7 @@ def _creation_preflight(
     *,
     repository_host: "RepositoryHost",
     ops: "TechLeadAuthorityStore | None",
-    add_comment: Callable[[int, str], str],
+    case_files: "PatternCaseFileOwner | None",
 ) -> ActionResult | None:
     """Validate ledger-backed creation and reconcile an inflight case file."""
     is_proposal = isinstance(action, CreateTechLeadProposalIssueAction)
@@ -159,31 +127,15 @@ def _creation_preflight(
         )
     if is_case_file:
         assert isinstance(action, CreateTechLeadCaseFileIssueAction)
-        assert ops is not None
+        assert case_files is not None
         try:
-            existing = ops.lookup_pattern(signature=action.pattern_signature)
+            # "Does a case file already exist for this signature?" is the
+            # owner's question, not this boundary's: it checks the ledger AND
+            # recovers an issue a previous attempt created before dying, so one
+            # signature can never end up with two case files (#6957 R2 F10).
+            existing = case_files.resolve(action)
             if existing is not None:
-                # The ledger already holds this signature (a concurrent tick or
-                # a crash-retry beat us to it), so every observation this action
-                # carried becomes a repeat observation on the existing case file
-                # — comment AND durable count, exactly like the planned repeat
-                # path, so promotion evidence is never silently dropped (#6957).
-                #
-                # Each observation is keyed by its own identity, so a retry that
-                # reaches this path after a partial write counts only the
-                # observations that never landed. Without that the SAME action's
-                # observations were re-counted on every retry, inflating
-                # min_evidence off a single tech-lead decision (review F1).
-                for observation in action.observations:
-                    _append_observation(
-                        ops,
-                        signature=action.pattern_signature,
-                        issue_number=existing,
-                        observation=observation,
-                        fix_class=action.fix_class,
-                        area=action.area or "",
-                        add_comment=add_comment,
-                    )
+                case_files.adopt(action, issue_number=existing)
                 return ActionResult.ok(
                     action,
                     issue_number=existing,
@@ -221,11 +173,23 @@ def apply_create_tech_lead_issue(
     expedite_lane: "ExpediteLane | None" = None,
 ) -> ActionResult:
     """Create a tech_lead issue and finalize its optional authority ledger."""
+    # Case-file identity (ledger lookup, remote recovery, observation accrual)
+    # belongs to ONE owner; this boundary owns milestone resolution, the GitHub
+    # create, and the trace event, and asks the owner for outcomes (#6957 R2 A1).
+    case_files = (
+        PatternCaseFileOwner(
+            authority=ops,
+            repository_host=repository_host,
+            add_comment=add_comment,
+        )
+        if ops is not None
+        else None
+    )
     preflight = _creation_preflight(
         action,
         repository_host=repository_host,
         ops=ops,
-        add_comment=add_comment,
+        case_files=case_files,
     )
     if preflight is not None:
         return preflight
@@ -282,6 +246,7 @@ def apply_create_tech_lead_issue(
         action,
         issue_number=issue_number,
         ops=ops,
+        case_files=case_files,
         add_comment=add_comment,
     )
     if finalization_error is not None:
@@ -323,6 +288,7 @@ def _finalize_ledger_backed_creation(
     *,
     issue_number: int,
     ops: "TechLeadAuthorityStore | None",
+    case_files: "PatternCaseFileOwner | None",
     add_comment: Callable[[int, str], str],
 ) -> str | None:
     """Record a proposal/case-file ledger row; return a failure message."""
@@ -335,32 +301,8 @@ def _finalize_ledger_backed_creation(
                 _proposal_link_comment(action, issue_number),
             )
         elif isinstance(action, CreateTechLeadCaseFileIssueAction):
-            assert ops is not None
-            # The issue body IS the first observation, so the ledger row is
-            # created carrying exactly that one identity. Every FURTHER
-            # observation from the same decision is then appended one at a time
-            # — comment, then count create-once — rather than pre-counted here.
-            # Pre-counting them was the #6957 review F1 defect: a crash before
-            # (or during) the comment loop left a count that claimed evidence
-            # nobody had posted, and the retry counted it all again.
-            ops.record_pattern(
-                signature=action.pattern_signature,
-                issue_number=issue_number,
-                observation_id=action.body_observation.observation_id,
-                fix_class=action.fix_class,
-                area=action.area or "",
-                diagnosis=action.diagnosis,
-            )
-            for observation in action.additional_observations:
-                _append_observation(
-                    ops,
-                    signature=action.pattern_signature,
-                    issue_number=issue_number,
-                    observation=observation,
-                    fix_class=action.fix_class,
-                    area=action.area or "",
-                    add_comment=add_comment,
-                )
+            assert case_files is not None
+            case_files.open(action, issue_number=issue_number)
     except Exception as exc:
         logger.exception("Failed to finalize ledger-backed tech_lead issue #%d", issue_number)
         return str(exc)

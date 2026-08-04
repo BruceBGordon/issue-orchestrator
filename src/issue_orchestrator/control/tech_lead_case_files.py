@@ -35,7 +35,9 @@ import logging
 from typing import TYPE_CHECKING, Iterable, Mapping, Sequence
 
 from ..domain.tech_lead_findings import (
+    PatternEvidence,
     PatternObservation,
+    case_file_issue_marker,
     pattern_observation_id,
     pattern_observation_marker,
 )
@@ -51,6 +53,7 @@ from .actions import (
     AppendPatternObservationAction,
     CreateTechLeadCaseFileIssueAction,
 )
+from .tech_lead_case_file_owner import PatternCaseFileOwner
 from .tech_lead_issue_policy import case_file_issue_labels
 
 if TYPE_CHECKING:
@@ -67,15 +70,21 @@ CASE_FILE_TITLE_PREFIX = "Pattern case file: "
 
 
 def build_pattern_ledger(
-    patterns: Iterable[tuple[str, int]],
-) -> dict[str, int]:
-    """Project the store's pattern rows to a signature -> issue map.
+    evidence: Iterable[PatternEvidence],
+) -> dict[str, PatternEvidence]:
+    """Project the store's pattern rows to a signature -> evidence map.
 
     Rows are created with the case-file issue and never discarded — the
     case file IS the accumulating artifact — so this ledger enforces one
     case file per signature without a GitHub read.
+
+    It carries the FULL durable row, not just the issue number: planning has to
+    preflight a new observation's ``fix_class``/``area`` against what is already
+    recorded, and it cannot do that from a number alone. Without it a
+    conflicting classification was only discovered at apply time, AFTER the
+    evidence comment had already been published (#6957 round-2 review F3).
     """
-    return dict(patterns)
+    return {row.signature: row for row in evidence}
 
 
 def _evidence_lines(
@@ -141,6 +150,12 @@ def build_case_file_issue_action(
 ) -> CreateTechLeadCaseFileIssueAction:
     """Compose the case-file creation for a signature's FIRST observation."""
     assert proposed.pattern_signature is not None  # enforced by validate()
+    # Deterministic remote provenance key. The case file is created on GitHub
+    # BEFORE its ledger row is written, so a process that dies in between would
+    # otherwise file a second case file for one signature on retry, splitting
+    # the evidence promotion reads (#6957 round-2 review F10). The applier's
+    # case-file owner recovers the existing issue by this marker instead.
+    marker = case_file_issue_marker(proposed.pattern_signature)
     body = (
         f"## Pattern case file (#6781)\n\n"
         "A tech_lead session flagged a recurring cross-job pattern. This issue"
@@ -162,6 +177,7 @@ def build_case_file_issue_action(
         f" never picked up as agent work (`{TECH_LEAD_OBSERVATION_LABEL}`)."
         " Graduation: link a root-cause work issue (or relabel into"
         " actionable work) when the pattern firms up."
+        f"\n\n{marker}"
     )
     return CreateTechLeadCaseFileIssueAction(
         title=f"{CASE_FILE_TITLE_PREFIX}{proposed.pattern_signature}",
@@ -172,6 +188,7 @@ def build_case_file_issue_action(
         area=proposed.area,
         fix_class=proposed.fix_class or "",
         diagnosis=proposed.body or "",
+        idempotency_marker=marker,
         observations=(
             build_pattern_observation(
                 proposed,
@@ -259,6 +276,8 @@ def build_append_observation_action(
     source_session_name: str,
     observed_at: str,
     expected: "ExpectedState",
+    fix_class: str,
+    area: str,
 ) -> AppendPatternObservationAction:
     """Plan a REPEAT observation of a known signature (comment + count).
 
@@ -266,6 +285,12 @@ def build_append_observation_action(
     comment and the increment must be one action with one owner — a bare
     comment would leave the count derivable only from GitHub comment cadence,
     which humans also write to.
+
+    ``fix_class``/``area`` are the values the PLANNER already reconciled against
+    the durable row (and against earlier observations in the same decision), not
+    this proposal's raw claim: a conflict has to reject the decision before any
+    action exists, so what reaches the store here can only be an upgrade or a
+    no-op (#6957 round-2 review F3).
     """
     assert proposed.pattern_signature is not None  # enforced by validate()
     return AppendPatternObservationAction(
@@ -279,8 +304,8 @@ def build_append_observation_action(
             source_session_name=source_session_name,
             observed_at=observed_at,
         ),
-        fix_class=proposed.fix_class or "",
-        area=proposed.area or "",
+        fix_class=fix_class,
+        area=area,
         reason=(
             f"tech_lead decision action {proposed.id}: pattern"
             f" {proposed.pattern_signature!r} observed again; appending evidence"
@@ -298,19 +323,14 @@ def apply_append_pattern_observation(
 ) -> "ActionResult":
     """Post a repeat observation and count it create-once (#6781/#6957).
 
-    The observation identity is what makes replay safe, so this is a two-step
-    with an ordering chosen deliberately:
+    Delegates the comment/count ordering to :class:`PatternCaseFileOwner`, the
+    same owner the creation boundary uses, so the two paths cannot drift on
+    "already recorded means do nothing; otherwise comment, then count".
 
-    1. If the identity is ALREADY recorded, a previous attempt got all the way
-       through — do nothing. That is a purely local ledger read, no GitHub call.
-    2. Otherwise comment FIRST, then record the observation create-once. A
-       crash between the two repeats one comment on the retry (cosmetic, and the
-       comment carries the observation marker so it is recognizable as the same
-       observation); it can NEVER advance the durable count twice, because the
-       count only moves when the identity is newly inserted (#6957 review F1).
-
-    Evidence is therefore never lost and never inflated — the two failure modes
-    that matter, since the count alone gates promotion.
+    Classification conflicts never reach here: the planner preflights every
+    observation against the durable row and rejects the whole decision instead
+    (#6957 round-2 review F3). The store still enforces the rule as a last line
+    of defence, which fails this action rather than reclassifying a signature.
 
     Like every other tech-lead applier boundary (case-file creation, proposal
     finalization), this writes without the applier's reconciliation guard: the
@@ -326,17 +346,14 @@ def apply_append_pattern_observation(
         )
     assert action.observation is not None  # enforced by the action's __post_init__
     try:
-        if authority.has_pattern_observation(
+        outcome = PatternCaseFileOwner(
+            authority=authority,
+            repository_host=repository_host,
+            add_comment=repository_host.add_comment,
+        ).append_observations(
             signature=action.pattern_signature,
-            observation_id=action.observation.observation_id,
-        ):
-            return ActionResult.ok(
-                action, issue_number=action.issue_number, deduplicated=True
-            )
-        repository_host.add_comment(action.issue_number, action.comment)
-        authority.note_pattern_observation(
-            signature=action.pattern_signature,
-            observation_id=action.observation.observation_id,
+            issue_number=action.issue_number,
+            observations=(action.observation,),
             fix_class=action.fix_class,
             area=action.area,
         )
@@ -346,6 +363,10 @@ def apply_append_pattern_observation(
             action.pattern_signature,
         )
         return ActionResult.fail(action, str(exc))
+    if outcome.deduplicated:
+        return ActionResult.ok(
+            action, issue_number=action.issue_number, deduplicated=True
+        )
     return ActionResult.ok(action, issue_number=action.issue_number)
 
 

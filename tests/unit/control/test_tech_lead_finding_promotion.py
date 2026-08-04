@@ -71,8 +71,11 @@ def _route(**entries) -> dict[str, PromotionRouteTarget]:
 def _config(**findings_overrides) -> Config:
     config = Config()
     config.repo = "porchpin/porchpin"
-    config.agents = {"agent:backend": Mock()}
+    config.agents = {"agent:backend": Mock(), "agent:tech-lead": Mock()}
     config.tech_lead_follow_up_agent = "agent:backend"
+    # The lane's single activation owner requires a tech lead agent: promotion
+    # actuates tech-lead findings, so it is inert without one (#6957 R2 F9).
+    config.tech_lead_review_agent = "agent:tech-lead"
     for key, value in findings_overrides.items():
         setattr(config.tech_lead.findings, key, value)
     return config

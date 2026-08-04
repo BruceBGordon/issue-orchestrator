@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING
 
 from .base import ConfigValidator
 from ..config_value_rules import validate_review_nit_policy
+from ..tech_lead_promotion_activation import promotion_lane_readiness
 
 if TYPE_CHECKING:
     from ..config import Config
@@ -21,6 +22,8 @@ class ReviewWorkflowValidator(ConfigValidator):
     - Tech Lead authority modes are valid; act-level 'execute' rejected (#6764)
     - Tech Lead health-review interval is non-negative (0 = disabled, #6763)
     - A positive health-review interval requires a tech lead agent (#6776)
+    - An ACTIVE finding-promotion lane has every dependency its routes need
+      (#6957); the activation predicate itself lives in one owner
     """
 
     def validate(self, config: "Config") -> list[str]:
@@ -45,6 +48,11 @@ class ReviewWorkflowValidator(ConfigValidator):
         # is a startup error, enforced by TechLeadConfig.startup_errors so the
         # settings-form bound (le=...) and startup agree.
         errors.extend(config.tech_lead.startup_errors())
+        # Finding promotion (#6957): the lane's ACTIVATION and its remaining
+        # dependencies come from one owner, the same one doctor, fact
+        # gathering, and route resolution consume — so a config can never
+        # pass validation and then fail on a tick (round-2 review F9).
+        errors.extend(promotion_lane_readiness(config).problems)
 
         exchange_mode = config.review_exchange_mode
         self._validate_exchange_mode(exchange_mode, config, errors)

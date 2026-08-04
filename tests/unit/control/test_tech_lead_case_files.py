@@ -20,7 +20,9 @@ from issue_orchestrator.control.tech_lead_case_files import (
     split_tech_lead_case_file_issues,
 )
 from issue_orchestrator.domain.tech_lead_findings import (
+    PatternEvidence,
     PatternObservation,
+    case_file_issue_marker,
     pattern_observation_marker,
 )
 from issue_orchestrator.domain.models import Issue
@@ -69,8 +71,20 @@ def _findings() -> dict[str, TechLeadFinding]:
 
 
 def test_build_pattern_ledger_projects_rows_to_signature_map() -> None:
-    ledger = build_pattern_ledger([("sig-a", 500), ("sig-b", 501)])
-    assert ledger == {"sig-a": 500, "sig-b": 501}
+    ledger = build_pattern_ledger(
+        [
+            PatternEvidence(
+                signature="sig-a", case_file_issue_number=500, observation_count=1
+            ),
+            PatternEvidence(
+                signature="sig-b", case_file_issue_number=501, observation_count=1
+            ),
+        ]
+    )
+    assert {sig: row.case_file_issue_number for sig, row in ledger.items()} == {
+        "sig-a": 500,
+        "sig-b": 501,
+    }
 
 
 def test_build_pattern_ledger_empty() -> None:
@@ -212,49 +226,73 @@ def test_case_file_creation_carries_its_body_observation() -> None:
 # --- Case-file action self-validation -------------------------------------
 
 
+MARKER = case_file_issue_marker("sig")
+
+
+def _case_file_action(**overrides) -> CreateTechLeadCaseFileIssueAction:
+    kwargs = dict(
+        title="t",
+        body=f"b\n\n{MARKER}",
+        labels=("agent:tech-lead", TECH_LEAD_OBSERVATION_LABEL),
+        pattern_signature="sig",
+        idempotency_marker=MARKER,
+        observations=(PatternObservation(observation_id="o1", comment="e"),),
+    )
+    kwargs.update(overrides)
+    return CreateTechLeadCaseFileIssueAction(**kwargs)
+
+
 def test_case_file_action_requires_observation_label() -> None:
     with pytest.raises(ValueError, match="observation label"):
-        CreateTechLeadCaseFileIssueAction(
-            title="t", body="b", labels=("agent:tech-lead",),
-            pattern_signature="sig",
-            observations=(PatternObservation(observation_id="o1", comment="e"),),
-        )
+        _case_file_action(labels=("agent:tech-lead",))
 
 
 def test_case_file_action_requires_nonempty_signature() -> None:
     with pytest.raises(ValueError, match="pattern_signature"):
-        CreateTechLeadCaseFileIssueAction(
-            title="t",
-            body="b",
-            labels=("agent:tech-lead", TECH_LEAD_OBSERVATION_LABEL),
-            pattern_signature="   ",
-            observations=(PatternObservation(observation_id="o1", comment="e"),),
-        )
+        _case_file_action(pattern_signature="   ")
 
 
 def test_case_file_action_requires_an_identified_observation() -> None:
     """An unidentified observation could not be counted create-once (#6957 F1)."""
     with pytest.raises(ValueError, match="identified observation"):
-        CreateTechLeadCaseFileIssueAction(
-            title="t",
-            body="b",
-            labels=("agent:tech-lead", TECH_LEAD_OBSERVATION_LABEL),
-            pattern_signature="sig",
-        )
+        _case_file_action(observations=())
 
 
 def test_case_file_action_rejects_repeated_observation_identities() -> None:
     with pytest.raises(ValueError, match="distinct identities"):
-        CreateTechLeadCaseFileIssueAction(
-            title="t",
-            body="b",
-            labels=("agent:tech-lead", TECH_LEAD_OBSERVATION_LABEL),
-            pattern_signature="sig",
+        _case_file_action(
             observations=(
                 PatternObservation(observation_id="o1", comment="e"),
                 PatternObservation(observation_id="o1", comment="e2"),
-            ),
+            )
         )
+
+
+def test_case_file_action_requires_a_recoverable_marker() -> None:
+    """Without it an interrupted creation files a SECOND case file (#6957 F10)."""
+    with pytest.raises(ValueError, match="idempotency_marker"):
+        _case_file_action(idempotency_marker="")
+
+
+def test_case_file_action_marker_must_appear_in_the_body() -> None:
+    with pytest.raises(ValueError, match="must\\n? appear in the issue body|appear in the issue body"):
+        _case_file_action(body="no marker here")
+
+
+def test_composed_case_file_carries_its_recovery_marker() -> None:
+    action = build_case_file_issue_action(
+        _proposed(),
+        config=_config(),
+        anchor_issue_number=99,
+        findings=_findings(),
+        source_run_id="run-1",
+        source_session_name="issue-99",
+        observed_at="2026-07-11T00:00:00+00:00",
+        expected=EXPECTED,
+    )
+
+    assert action.idempotency_marker == case_file_issue_marker("db-timeout")
+    assert action.idempotency_marker in action.body
 
 
 # --- Anchor-scan partition (classification) -------------------------------

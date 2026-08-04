@@ -29,6 +29,7 @@ from issue_orchestrator.domain.tech_lead_artifacts import (
     TechLeadDecision,
     TechLeadFinding,
 )
+from issue_orchestrator.domain.tech_lead_findings import PatternEvidence
 from issue_orchestrator.domain.tech_lead_session import (
     PROPOSED_TECH_LEAD_LABEL,
     TECH_LEAD_OBSERVATION_LABEL,
@@ -87,13 +88,33 @@ def _anchor(number: int = 99, **overrides) -> Issue:
     return Issue(**fields)
 
 
+def _ledger(
+    signature: str,
+    issue_number: int,
+    *,
+    fix_class: str = "",
+    area: str = "",
+    observations: int = 1,
+) -> dict[str, PatternEvidence]:
+    """A durable pattern ledger row, as planning now receives it (#6957 F3)."""
+    return {
+        signature: PatternEvidence(
+            signature=signature,
+            case_file_issue_number=issue_number,
+            observation_count=observations,
+            fix_class=fix_class,
+            area=area,
+        )
+    }
+
+
 def _plan(
     decision: TechLeadDecision,
     config: Config | None = None,
     anchor: Issue | None = None,
     op_ledger: dict[tuple[str, int], int] | None = None,
     active_session_run_id=lambda _n: None,
-    pattern_ledger: dict[str, int] | None = None,
+    pattern_ledger: dict[str, PatternEvidence] | None = None,
     dedup_corpus: OpenIssueCorpus | None = None,
     dedup_grant: DuplicateTargetGrant | None = None,
 ):
@@ -706,7 +727,7 @@ def test_flag_pattern_execute_known_signature_comments_evidence() -> None:
     )
 
     surfaced, observation = _plan(
-        _decision(action), pattern_ledger={"github-422-batch": 777}
+        _decision(action), pattern_ledger=_ledger("github-422-batch", 777)
     )
 
     assert isinstance(surfaced, SurfaceTechLeadProposalAction)
@@ -833,6 +854,135 @@ def test_same_decision_conflicting_area_rejects_the_decision() -> None:
     ]
 
 
+class TestClassificationConflictWithAnEarlierDecision:
+    """#6957 round-2 review F3: a conflict must be caught BEFORE any mutation.
+
+    Planning used to receive only signature -> issue number, so a new
+    observation's classification was first compared against the durable row at
+    APPLY time — after the evidence comment had already been published, leaving
+    a case file claiming ``fix:code`` while the ledger kept ``fix:human``, and
+    re-publishing it on every replay. The preflight now rejects the whole
+    decision instead.
+    """
+
+    @staticmethod
+    def _observation(**overrides) -> ProposedTechLeadAction:
+        base = dict(
+            id="A1",
+            action_type="flag_pattern",
+            body="observed again",
+            pattern_signature="sig-x",
+        )
+        base.update(overrides)
+        return ProposedTechLeadAction(**base)
+
+    def _plan_against(self, recorded: dict, proposed_kwargs: dict):
+        return _plan(
+            _decision(self._observation(**proposed_kwargs)),
+            pattern_ledger=_ledger("sig-x", 777, **recorded),
+        )
+
+    def test_fix_class_conflict_produces_only_a_rejection(self) -> None:
+        planned = self._plan_against(
+            {"fix_class": "human"}, {"fix_class": "code"}
+        )
+
+        [rejection] = planned
+        assert isinstance(rejection, SurfaceTechLeadProposalAction)
+        assert rejection.mode == "rejected"
+        assert "pattern_classification_conflict" in rejection.reason
+        # Nothing that would touch the case file was planned...
+        assert not any(
+            isinstance(a, AppendPatternObservationAction) for a in planned
+        )
+        assert not any(isinstance(a, AddCommentAction) for a in planned)
+
+    def test_area_conflict_produces_only_a_rejection(self) -> None:
+        planned = self._plan_against({"area": "db"}, {"area": "ui"})
+
+        assert [type(a) for a in planned] == [SurfaceTechLeadProposalAction]
+        assert planned[0].mode == "rejected"
+
+    def test_sibling_effects_of_the_same_decision_are_rejected_too(self) -> None:
+        """Whole-decision rejection: a sibling comment must not slip through.
+
+        ``ActionApplier.apply_all`` continues past a failed action, so rejecting
+        only the conflicting one would still apply everything around it.
+        """
+        sibling = ProposedTechLeadAction(
+            id="A0",
+            action_type="post_comment",
+            target_number=42,
+            body="unrelated diagnosis",
+        )
+        conflicting = self._observation(id="A1", fix_class="code")
+
+        planned = _plan(
+            _decision(sibling, conflicting),
+            pattern_ledger=_ledger("sig-x", 777, fix_class="human"),
+        )
+
+        assert [type(a) for a in planned] == [SurfaceTechLeadProposalAction]
+        assert planned[0].mode == "rejected"
+
+    def test_replanning_the_same_conflict_stays_side_effect_free(self) -> None:
+        """The ledger never moved, so a replay reproduces the same rejection."""
+        ledger = _ledger("sig-x", 777, fix_class="human")
+
+        first = _plan(
+            _decision(self._observation(fix_class="code")), pattern_ledger=ledger
+        )
+        replay = _plan(
+            _decision(self._observation(fix_class="code")), pattern_ledger=ledger
+        )
+
+        assert [type(a) for a in first] == [SurfaceTechLeadProposalAction]
+        assert [type(a) for a in replay] == [SurfaceTechLeadProposalAction]
+
+    def test_an_agreeing_observation_still_appends(self) -> None:
+        """The preflight rejects conflicts, not repeat evidence."""
+        planned = self._plan_against(
+            {"fix_class": "code", "area": "db"}, {"fix_class": "code"}
+        )
+
+        [append] = [
+            a for a in planned if isinstance(a, AppendPatternObservationAction)
+        ]
+        assert append.issue_number == 777
+        # It carries the MERGED classification, so the store sees an upgrade or
+        # a no-op — never a conflict discovered mid-write.
+        assert (append.fix_class, append.area) == ("code", "db")
+
+    def test_an_unclassified_observation_inherits_the_recorded_values(self) -> None:
+        planned = self._plan_against({"fix_class": "code", "area": "db"}, {})
+
+        [append] = [
+            a for a in planned if isinstance(a, AppendPatternObservationAction)
+        ]
+        assert (append.fix_class, append.area) == ("code", "db")
+
+    def test_a_later_observation_upgrades_an_unclassified_row(self) -> None:
+        planned = self._plan_against({}, {"fix_class": "code", "area": "db"})
+
+        [append] = [
+            a for a in planned if isinstance(a, AppendPatternObservationAction)
+        ]
+        assert (append.fix_class, append.area) == ("code", "db")
+
+    def test_two_same_decision_observations_conflict_with_each_other(self) -> None:
+        """Both agree with the (unclassified) row but not with each other."""
+        planned = _plan(
+            _decision(
+                self._observation(id="A1", fix_class="code"),
+                self._observation(id="A2", fix_class="human"),
+            ),
+            pattern_ledger=_ledger("sig-x", 777),
+        )
+
+        assert [type(a) for a in planned] == [SurfaceTechLeadProposalAction]
+        assert planned[0].mode == "rejected"
+
+
 def test_different_signatures_open_distinct_case_files() -> None:
     first = ProposedTechLeadAction(
         id="A1", action_type="flag_pattern", body="obs1", pattern_signature="sig-a"
@@ -855,7 +1005,7 @@ def test_case_file_ledger_for_other_signature_does_not_dedup() -> None:
     )
 
     _surface, case_file = _plan(
-        _decision(action), pattern_ledger={"sig-other": 321}
+        _decision(action), pattern_ledger=_ledger("sig-other", 321)
     )
 
     assert isinstance(case_file, CreateTechLeadCaseFileIssueAction)

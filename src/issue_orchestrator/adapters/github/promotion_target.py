@@ -25,6 +25,7 @@ from ...ports.promotion_target import (
 )
 from .errors import GitHubHttpError
 from .http_client import GitHubHttpClient, GitHubHttpConfig
+from .marker_recovery import find_marker_issue
 
 if TYPE_CHECKING:
     from .github_adapter import GitHubAdapter
@@ -149,42 +150,12 @@ class GitHubPromotionTargetHost:
     ) -> FiledIssue | None:
         """Find a prior marker-owned filing without trusting cached/search-only data.
 
-        GitHub search indexing can lag a successful create, so the newest 100
-        repository issues are checked fresh first. Title search is the fallback
-        for an older interrupted filing that has fallen out of that window.
-        Candidate bodies, not mutable labels or titles, carry ownership.
+        Delegates to the shared :mod:`marker_recovery` policy, which the source
+        repo's case-file boundary uses for the identical crash window — one
+        recovery rule for both, so they cannot drift.
         """
-        recent = client.list_issues(
-            state="all",
-            limit=100,
-            use_cache=False,
-        )
-        for payload in recent:
-            filed = GitHubPromotionTargetHost._filed_from_marker(payload, marker)
-            if filed is not None:
-                return filed
-        for payload in client.search_issues_by_title(
-            [title],
-            limit=30,
-            use_cache=False,
-        ):
-            filed = GitHubPromotionTargetHost._filed_from_marker(payload, marker)
-            if filed is not None:
-                return filed
-        return None
-
-    @staticmethod
-    def _filed_from_marker(payload: object, marker: str) -> FiledIssue | None:
-        if not isinstance(payload, dict):
-            return None
-        body = payload.get("body")
-        number = payload.get("number")
-        if not isinstance(body, str) or marker not in body or not number:
-            return None
-        return FiledIssue(
-            number=int(number),
-            url=str(payload.get("html_url") or ""),
-        )
+        found = find_marker_issue(client, title=title, marker=marker)
+        return FiledIssue(number=found.number, url=found.url) if found else None
 
     @staticmethod
     def _ensure_labels(

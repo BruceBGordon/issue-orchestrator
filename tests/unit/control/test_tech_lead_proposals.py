@@ -46,7 +46,10 @@ from issue_orchestrator.domain.tech_lead_session import (
     StoredTechLeadOp,
 )
 from issue_orchestrator.infra.config import Config
-from issue_orchestrator.domain.tech_lead_findings import PatternObservation
+from issue_orchestrator.domain.tech_lead_findings import (
+    PatternObservation,
+    case_file_issue_marker,
+)
 from issue_orchestrator.ports.tech_lead_authority import InMemoryTechLeadAuthorityStore
 
 EXPECTED = build_expected_for_mutation()
@@ -109,6 +112,8 @@ def _issue(number: int, labels: list[str], title: str = "t") -> Issue:
 def _host(created_number: int = 500) -> MagicMock:
     host = MagicMock()
     host.create_issue.return_value = {"number": created_number}
+    # No orphaned remote case file unless a test says otherwise (#6957 F10).
+    host.find_issue_by_marker.return_value = None
     host.list_milestones.return_value = []
     # The gate must be provisioned or the applier refuses to create (#6779 R3).
     host.list_labels.return_value = [
@@ -452,13 +457,15 @@ def _case_file_action(
             for index, comment in enumerate(additional_comments, start=2)
         ),
     )
+    marker = case_file_issue_marker(signature)
     return CreateTechLeadCaseFileIssueAction(
         title=f"Pattern case file: {signature}",
-        body="documentation only",
+        body=f"documentation only\n\n{marker}",
         labels=tuple(labels),
         pr_count=0,
         pattern_signature=signature,
         diagnosis="Pool exhaustion comes from a leaked connection.",
+        idempotency_marker=marker,
         observations=observations,
     )
 
@@ -550,6 +557,12 @@ def test_apply_case_file_provisions_labels_before_blocking_area_tagged_issue() -
 
     assert result.success
     assert host.method_calls == [
+        # Recovery first: "has a previous attempt already created this case
+        # file?" must be answered before anything is provisioned or created,
+        # or a crash-retry files a second one (#6957 R2 F10).
+        call.find_issue_by_marker(
+            title=action.title, marker=action.idempotency_marker
+        ),
         call.list_labels(),
         call.create_label(
             TECH_LEAD_OBSERVATION_LABEL,
@@ -750,6 +763,96 @@ def test_replaying_a_repeat_observation_append_never_double_counts() -> None:
     [evidence] = ops.list_pattern_evidence()
     assert evidence.observation_count == 2
     host.add_comment.assert_called_once_with(600, "observed again")
+
+
+# --- Case-file creation crash window (#6957 round-2 review F10) ------------
+
+
+def test_crash_after_remote_create_recovers_instead_of_filing_a_second() -> None:
+    """The remote issue exists but the ledger row was never written.
+
+    A case file is created on GitHub BEFORE its ledger row lands. A process that
+    dies in that window used to leave the retry seeing no signature — so it
+    filed a SECOND case file, splitting the evidence that gates promotion.
+    """
+    action = _case_file_action("db-timeout", additional_comments=("second",))
+    ops = InMemoryTechLeadAuthorityStore()
+
+    # Attempt 1: GitHub creates #600, then the local ledger write blows up.
+    first_host = _host(600)
+    ops_failing = InMemoryTechLeadAuthorityStore()
+    original_record = ops_failing.record_pattern
+
+    def explode(**kwargs):
+        raise RuntimeError("sqlite went away")
+
+    ops_failing.record_pattern = explode  # type: ignore[method-assign]
+    failed = _apply_case_file(action, ops=ops_failing, host=first_host)
+
+    assert not failed.success
+    first_host.create_issue.assert_called_once()
+    assert ops_failing.lookup_pattern(signature="db-timeout") is None
+    ops_failing.record_pattern = original_record  # type: ignore[method-assign]
+
+    # Attempt 2 (a fresh process, so a fresh store): the orphaned issue is
+    # still on GitHub and carries the action's marker.
+    retry_host = _host(999)  # a NEW number, to prove nothing was created
+    retry_host.find_issue_by_marker.return_value = 600
+
+    retry = _apply_case_file(action, ops=ops, host=retry_host)
+
+    assert retry.success
+    assert retry.details["deduplicated"] is True
+    # Exactly one GitHub issue exists: the retry created nothing.
+    retry_host.create_issue.assert_not_called()
+    # ...and the ORIGINAL issue number is what the ledger now records.
+    assert ops.lookup_pattern(signature="db-timeout") == 600
+
+
+def test_recovered_case_file_records_the_right_count_and_classification() -> None:
+    action = _case_file_action("db-timeout", additional_comments=("second",))
+    ops = InMemoryTechLeadAuthorityStore()
+    host = _host(999)
+    host.find_issue_by_marker.return_value = 600
+
+    assert _apply_case_file(action, ops=ops, host=host).success
+
+    [evidence] = ops.list_pattern_evidence()
+    assert evidence.case_file_issue_number == 600
+    # Body observation + the one additional observation, counted once each.
+    assert evidence.observation_count == 2
+    assert evidence.diagnosis == "Pool exhaustion comes from a leaked connection."
+    # The body already carries observation 1 (the dead process wrote it), so
+    # only the additional observation is posted as a comment.
+    assert host.add_comment.call_args_list == [call(600, "second")]
+
+
+def test_recovery_is_attempted_only_when_the_ledger_has_no_row() -> None:
+    """The common path costs no GitHub call (API discipline)."""
+    ops = InMemoryTechLeadAuthorityStore()
+    ops.record_pattern(
+        signature="db-timeout", issue_number=600, observation_id="prior:obs"
+    )
+    host = _host(601)
+
+    assert _apply_case_file(_case_file_action("db-timeout"), ops=ops, host=host).success
+
+    host.find_issue_by_marker.assert_not_called()
+
+
+def test_a_failed_recovery_lookup_never_files_a_duplicate() -> None:
+    """"Unknown" must not be mistaken for "no case file exists"."""
+    host = _host(601)
+    host.find_issue_by_marker.side_effect = RuntimeError("GitHub unreachable")
+
+    result = _apply_case_file(
+        _case_file_action("db-timeout"),
+        ops=InMemoryTechLeadAuthorityStore(),
+        host=host,
+    )
+
+    assert not result.success
+    host.create_issue.assert_not_called()
 
 
 def test_apply_plain_tech_lead_issue_records_no_op() -> None:

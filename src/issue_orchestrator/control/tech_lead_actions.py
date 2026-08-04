@@ -137,6 +137,12 @@ class CreateTechLeadCaseFileIssueAction(CreateTechLeadIssueAction):
     # action after a partial write re-posts at most a duplicate comment and can
     # never advance the durable evidence count twice (#6957 review F1).
     observations: tuple["PatternObservation", ...] = ()
+    # Deterministic remote provenance key, present in ``body``. The case file is
+    # created on GitHub before its ledger row is written; this is what lets the
+    # applier's case-file owner RECOVER the already-created issue after a crash
+    # in that window instead of filing a second one for the same signature
+    # (#6957 round-2 review F10).
+    idempotency_marker: str = ""
     # The tech lead's promotion classification for this signature (#6957):
     # "code", "human", or "" for unclassified. Recorded on the ledger row at
     # creation so promotion eligibility never has to parse the issue body.
@@ -169,6 +175,17 @@ class CreateTechLeadCaseFileIssueAction(CreateTechLeadIssueAction):
             raise ValueError(
                 "CreateTechLeadCaseFileIssueAction observations must have"
                 f" distinct identities, got {identities}"
+            )
+        if not self.idempotency_marker.strip():
+            raise ValueError(
+                "CreateTechLeadCaseFileIssueAction requires a non-empty"
+                " idempotency_marker so an interrupted creation is recoverable"
+            )
+        if self.idempotency_marker not in self.body:
+            raise ValueError(
+                "CreateTechLeadCaseFileIssueAction idempotency_marker must"
+                " appear in the issue body; a marker the created issue does not"
+                " carry cannot recover it after a crash"
             )
         require_case_file_observation_label(self.labels)
 

@@ -299,16 +299,25 @@ is a decline, recorded permanently so it is never re-filed. When a promoted
 issue closes and the pull request GitHub records as its CLOSER is merged, the
 source orchestrator writes the `tech_lead_shipped_fixes` row, comments the fix
 reference on the case file, and closes it. Merely being mentioned by a merged
-PR is not closing linkage and never counts as a shipped fix.
+PR is not closing linkage and never counts as a shipped fix — and only the
+NEWEST close counts, so an issue closed by a merge, reopened, then closed by
+hand is a decline.
 
 `min_evidence` counts DISTINCT observations. Each `flag_pattern` observation
 carries a stable identity — its source run, session, and decision action — and
 the durable ledger records it create-once, so replaying a partially applied
 decision after a crash can repeat an evidence comment but can never advance the
-count twice. A signature's `fix_class` and `area` are likewise immutable once
-recorded: an unclassified row may be upgraded once, identical values are
-idempotent, and a conflicting classification fails loudly rather than letting
-observation order decide whether a finding is promotable and where it routes.
+count twice. Case files carry a deterministic signature marker for the same
+reason: the issue is created on GitHub before its ledger row is written, and the
+marker is what lets a retry recover that issue instead of filing a second case
+file for one signature.
+
+A signature's `fix_class` and `area` are immutable once recorded: an
+unclassified row may be upgraded once, identical values are idempotent, and a
+conflicting classification is rejected — before any action is produced, so no
+evidence comment or sibling effect from that decision is ever applied. Planning
+receives the full durable row precisely so the conflict is caught there rather
+than mid-write.
 
 Constraints that make this safe to leave on:
 
@@ -331,6 +340,14 @@ Constraints that make this safe to leave on:
 - **Route targets are validated at startup**, not at promotion time: a target
   the token cannot file issues in is a loud doctor error rather than a lost
   actuation on the tick a pattern finally firms up.
+- **One activation/readiness decision**, consumed by configuration validation,
+  doctor, fact gathering, and route resolution alike. The lane is active only
+  with a promotion mode other than `off`, a configured repository, AND a
+  configured tech-lead agent — removing the tech lead turns the lane off
+  completely, including its cross-repo reads, and the durable rows are kept so
+  re-enabling resumes where it stopped. An active lane's remaining dependencies
+  (a follow-up worker agent for any route that carries this repo's label) are
+  startup errors, never tick-time exceptions.
 - **`self`-routed promotions face the managed repo's own gates.** They carry
   its scope label so they are discoverable, and every other gate (dependencies,
   claims, review) applies unchanged. Promotion files issues, full stop.
