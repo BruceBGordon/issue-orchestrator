@@ -24,11 +24,12 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Any
 
 from .catalog import EVENT_SCHEMA_VERSION
 
-#: Payload key carrying the public schema version.
+#: Payload key carrying the public schema version on the wire.
 SSE_SCHEMA_FIELD = "schema"
 
 __all__ = ["SSE_SCHEMA_FIELD", "SseEvent", "apply_sse_envelope"]
@@ -38,19 +39,46 @@ __all__ = ["SSE_SCHEMA_FIELD", "SseEvent", "apply_sse_envelope"]
 class SseEvent:
     """One enveloped event, ready for the SSE transport to serialize.
 
-    A typed value object rather than a loose dict so the envelope is a contract
-    the type system can see: ``data`` is guaranteed to carry
-    :data:`SSE_SCHEMA_FIELD` because :func:`apply_sse_envelope` is the only
-    place that constructs one.
+    The invariant this type exists to guarantee — a version on every event — is
+    encoded rather than described:
+
+    - ``schema_version`` is a required field with no default, so an event
+      cannot be constructed without one.
+    - It is validated against :data:`EVENT_SCHEMA_VERSION`, so it cannot carry a
+      version the project does not publish.
+    - ``payload`` is copied into a read-only mapping at construction, so a
+      caller cannot mutate an event after the fact.
+    - :attr:`data` composes the wire payload from both, so the version cannot be
+      removed by editing a dictionary.
+
+    Direct construction is therefore safe; there is no invalid state to reach.
+    :func:`apply_sse_envelope` remains the intended entry point because it also
+    rejects producer-declared versions.
     """
 
     type: str
-    data: dict[str, Any] = field(default_factory=dict)
+    schema_version: int
+    payload: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.schema_version != EVENT_SCHEMA_VERSION:
+            raise ValueError(
+                f"SSE event {self.type!r} declares schema version "
+                f"{self.schema_version!r}, but the published envelope version is "
+                f"{EVENT_SCHEMA_VERSION!r}."
+            )
+        object.__setattr__(self, "payload", MappingProxyType(dict(self.payload)))
 
     @property
-    def schema_version(self) -> int:
-        """The envelope version this event was published with."""
-        return self.data[SSE_SCHEMA_FIELD]
+    def data(self) -> Mapping[str, Any]:
+        """The wire payload: producer fields plus the envelope version.
+
+        A fresh read-only mapping each call, so no caller can strip the version
+        out of a shared object.
+        """
+        return MappingProxyType(
+            {**self.payload, SSE_SCHEMA_FIELD: self.schema_version}
+        )
 
 
 def apply_sse_envelope(event_type: str, data: Mapping[str, Any] | None) -> SseEvent:
@@ -61,8 +89,8 @@ def apply_sse_envelope(event_type: str, data: Mapping[str, Any] | None) -> SseEv
         data: Payload fields. ``None`` is treated as an empty payload.
 
     Returns:
-        The event with ``schema`` stamped into its payload. The caller's mapping
-        is copied, never mutated.
+        The event carrying the current envelope version. The caller's mapping is
+        copied, never mutated.
 
     Raises:
         ValueError: If the payload already declares a *different* schema
@@ -71,12 +99,15 @@ def apply_sse_envelope(event_type: str, data: Mapping[str, Any] | None) -> SseEv
             than silently overwriting and shipping a mislabelled event.
     """
     payload = dict(data or {})
-    declared = payload.get(SSE_SCHEMA_FIELD)
+    declared = payload.pop(SSE_SCHEMA_FIELD, None)
     if declared is not None and declared != EVENT_SCHEMA_VERSION:
         raise ValueError(
             f"SSE event {event_type!r} declares {SSE_SCHEMA_FIELD}={declared!r}, "
             f"but the current envelope version is {EVENT_SCHEMA_VERSION!r}. "
             "Producers must not set the envelope version themselves."
         )
-    payload[SSE_SCHEMA_FIELD] = EVENT_SCHEMA_VERSION
-    return SseEvent(type=event_type, data=payload)
+    return SseEvent(
+        type=event_type,
+        schema_version=EVENT_SCHEMA_VERSION,
+        payload=payload,
+    )

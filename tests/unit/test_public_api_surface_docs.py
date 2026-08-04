@@ -15,6 +15,7 @@ a stale row fails just as loudly as a missing one.
 
 from __future__ import annotations
 
+import ast
 import json
 import re
 import tomllib
@@ -24,6 +25,7 @@ import pytest
 
 from issue_orchestrator.entrypoints.cli_parser import CLI_COMMAND_SURFACE
 from issue_orchestrator.entrypoints.mcp_server import MCP_TOOL_NAMES, McpApp, McpSettings
+from issue_orchestrator.events.sse_envelope import SSE_SCHEMA_FIELD
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 STABILITY_DOC = REPO_ROOT / "docs" / "user" / "stability.md"
@@ -423,6 +425,36 @@ def _contracted_response_schema_names(document: dict) -> set[str]:
     return referenced
 
 
+def _is_contract_version_field(name: str) -> bool:
+    """Whether a response property would function as a contract version.
+
+    Substring matching on "version" alone is not enough: this repository's own
+    versioned surface names the field ``schema`` (``SSE_SCHEMA_FIELD``), so a
+    check that missed it would go green on exactly the change that should
+    promote the HTTP surface to ``Versioned``.
+    """
+    lowered = name.lower()
+    return lowered == SSE_SCHEMA_FIELD or "version" in lowered
+
+
+def _surface_wide_version_fields(
+    schemas: dict, response_models: set[str]
+) -> list[str]:
+    """Version fields carried by *every* response model, i.e. by the surface.
+
+    A version on one payload is a per-payload detail. A version on all of them
+    is a surface-wide mechanism a client could rely on - which is what separates
+    ``Contracted`` from ``Versioned``.
+    """
+    if not response_models:
+        return []
+    property_sets = [
+        set(schemas.get(name, {}).get("properties", {})) for name in response_models
+    ]
+    common_properties = set.intersection(*property_sets)
+    return sorted(name for name in common_properties if _is_contract_version_field(name))
+
+
 def test_http_surface_has_no_surface_wide_response_version() -> None:
     """``Contracted`` is honest only while no *surface-wide* version exists.
 
@@ -439,13 +471,7 @@ def test_http_surface_has_no_surface_wide_response_version() -> None:
 
     assert response_models, "no contracted JSON responses found - format changed?"
 
-    property_sets = [
-        set(schemas.get(name, {}).get("properties", {})) for name in response_models
-    ]
-    common_properties = set.intersection(*property_sets) if property_sets else set()
-    surface_wide_version = sorted(
-        name for name in common_properties if "version" in name.lower()
-    )
+    surface_wide_version = _surface_wide_version_fields(schemas, response_models)
 
     assert not surface_wide_version, (
         "Every contracted HTTP response now carries "
@@ -453,6 +479,48 @@ def test_http_surface_has_no_surface_wide_response_version() -> None:
         f"HTTP surface to Versioned in {STABILITY_DOC.name} instead of leaving "
         "it Contracted."
     )
+
+
+@pytest.mark.parametrize(
+    ("case", "schemas", "expected"),
+    [
+        (
+            "a common `schema` field - this repo's canonical version name",
+            {
+                "A": {"properties": {"schema": {}, "rows": {}}},
+                "B": {"properties": {"schema": {}, "total": {}}},
+            },
+            ["schema"],
+        ),
+        (
+            "a common explicit *_version field",
+            {
+                "A": {"properties": {"schema_version": {}, "rows": {}}},
+                "B": {"properties": {"schema_version": {}, "total": {}}},
+            },
+            ["schema_version"],
+        ),
+        (
+            "a version present on only one payload is not surface-wide",
+            {
+                "A": {"properties": {"timeline_schema_version": {}, "rows": {}}},
+                "B": {"properties": {"total": {}}},
+            },
+            [],
+        ),
+        (
+            "a common field that is not a version",
+            {
+                "A": {"properties": {"issue_number": {}}},
+                "B": {"properties": {"issue_number": {}}},
+            },
+            [],
+        ),
+    ],
+)
+def test_surface_wide_version_detection(case: str, schemas: dict, expected: list) -> None:
+    """Prove both sides of the Contracted-versus-Versioned distinction."""
+    assert _surface_wide_version_fields(schemas, set(schemas)) == expected, case
 
 
 def test_per_payload_versions_do_not_make_the_http_surface_versioned() -> None:
@@ -469,6 +537,122 @@ def test_per_payload_versions_do_not_make_the_http_surface_versioned() -> None:
         f"{STABILITY_DOC.name} must keep naming the per-payload version as the "
         "counter-example, or the Contracted-vs-Versioned distinction reads as an "
         "oversight rather than a decision."
+    )
+
+
+ENTRYPOINTS_DIR = REPO_ROOT / "src" / "issue_orchestrator" / "entrypoints"
+
+
+def _discovered_sse_endpoints() -> dict[str, str]:
+    """Every SSE endpoint in the source, as ``dotted.handler`` -> route path.
+
+    Found structurally (a function returning ``EventSourceResponse``) rather
+    than from a hand-maintained list, so a newly added stream shows up here and
+    forces a classification instead of quietly inheriting a public promise.
+    """
+    endpoints: dict[str, str] = {}
+    for path in sorted(ENTRYPOINTS_DIR.glob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            returns_sse = any(
+                isinstance(inner, ast.Return)
+                and isinstance(inner.value, ast.Call)
+                and isinstance(inner.value.func, ast.Name)
+                and inner.value.func.id == "EventSourceResponse"
+                for inner in ast.walk(node)
+            )
+            if not returns_sse:
+                continue
+            route = _decorator_route(node)
+            assert route is not None, (
+                f"{path.name}:{node.name} returns EventSourceResponse but its "
+                "route path is not a string literal, so it cannot be classified"
+            )
+            dotted = f"issue_orchestrator.entrypoints.{path.stem}.{node.name}"
+            endpoints[dotted] = route
+    return endpoints
+
+
+def _decorator_route(node) -> str | None:
+    """The literal path from a ``@router.get("/x")``-style decorator."""
+    for decorator in node.decorator_list:
+        if not isinstance(decorator, ast.Call) or not decorator.args:
+            continue
+        first = decorator.args[0]
+        if isinstance(first, ast.Constant) and isinstance(first.value, str):
+            return first.value
+    return None
+
+
+def test_sse_stream_inventory_matches_the_endpoints_in_the_source() -> None:
+    """Every SSE endpoint must be classified - none may be silently public."""
+    documented = _inventory_table(_stability_doc_text(), "sse-streams")
+
+    _assert_same_set(
+        set(documented), set(_discovered_sse_endpoints()), anchor="sse-streams"
+    )
+
+
+def test_sse_stream_inventory_publishes_the_real_route_for_each_endpoint() -> None:
+    documented = _inventory_table(_stability_doc_text(), "sse-streams")
+    discovered = _discovered_sse_endpoints()
+
+    mismatched = sorted(
+        f"{handler}: doc says {row[0]}, source says `{discovered[handler]}`"
+        for handler, row in documented.items()
+        if row[0] != f"`{discovered[handler]}`"
+    )
+
+    assert not mismatched, "SSE streams published under the wrong route:\n" + "\n".join(
+        mismatched
+    )
+
+
+def test_exactly_one_sse_stream_is_versioned_and_it_owns_the_envelope() -> None:
+    """The public row must name the endpoint that actually applies the envelope.
+
+    Two of the three SSE endpoints serialize their own wire objects without a
+    version. If the ``Versioned`` row ever pointed at one of those, the page
+    would promise runtime version detection on a stream that has none.
+    """
+    documented = _inventory_table(_stability_doc_text(), "sse-streams")
+    versioned = sorted(
+        handler for handler, row in documented.items() if row[-1] == "Versioned"
+    )
+
+    assert len(versioned) == 1, (
+        f"expected exactly one Versioned SSE stream, found {versioned}"
+    )
+
+    module_name = versioned[0].rsplit(".", 1)[0]
+    module_path = ENTRYPOINTS_DIR / f"{module_name.rsplit('.', 1)[-1]}.py"
+    assert "apply_sse_envelope" in module_path.read_text(encoding="utf-8"), (
+        f"{versioned[0]} is published Versioned but {module_path.name} does not "
+        "apply the SSE envelope."
+    )
+
+
+def test_internal_sse_streams_do_not_apply_the_public_envelope() -> None:
+    """The other direction: an Internal row must not silently be versioned.
+
+    If one of these starts applying the envelope it has become part of the
+    public promise and needs re-tiering, not an unnoticed upgrade.
+    """
+    documented = _inventory_table(_stability_doc_text(), "sse-streams")
+
+    misclassified = []
+    for handler, row in documented.items():
+        if row[-1] != "Internal":
+            continue
+        module_file = ENTRYPOINTS_DIR / f"{handler.rsplit('.', 2)[-2]}.py"
+        if "apply_sse_envelope" in module_file.read_text(encoding="utf-8"):
+            misclassified.append(handler)
+
+    assert not misclassified, (
+        f"Streams tiered Internal now apply the public envelope: {misclassified}. "
+        f"Re-tier them in {STABILITY_DOC.name} or stop enveloping them."
     )
 
 
@@ -531,3 +715,34 @@ def test_stability_doc_relative_links_resolve() -> None:
             broken.append(target)
 
     assert not broken, f"{STABILITY_DOC.name} has dangling relative links: {broken}"
+
+
+def _heading_slug(heading: str) -> str:
+    """GitHub's anchor slug for a markdown heading."""
+    slug = heading.strip().lower()
+    slug = re.sub(r"[^\w\s-]", "", slug)
+    return re.sub(r"\s", "-", slug)
+
+
+def test_stability_doc_internal_anchors_resolve() -> None:
+    """Cross-references between sections must not rot when a heading is retitled.
+
+    The tier carve-outs point at each other by anchor; a stale one sends a
+    reader looking for the exception straight past it.
+    """
+    text = _stability_doc_text()
+    slugs = {
+        _heading_slug(line.lstrip("#").strip())
+        for line in text.splitlines()
+        if line.startswith("#")
+    }
+    broken = sorted(
+        target
+        for target in _MARKDOWN_LINK.findall(text)
+        if target.startswith("#") and target[1:] not in slugs
+    )
+
+    assert not broken, (
+        f"{STABILITY_DOC.name} has dangling section anchors: {broken}. "
+        f"Available: {sorted(slugs)}"
+    )

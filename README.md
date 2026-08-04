@@ -115,17 +115,20 @@ mechanics, and the path to `1.0` are in
 | CLI (`issue-orchestrator …`) | Yes | Supported - flags may change between minors |
 | Agent completion contracts (`coding-done`, `reviewer-done`) | Yes (agent-facing) | Supported - subcommand/flag shape may change |
 | MCP server tools (`orchestrator.*`) | Yes | **Experimental** - names, args, and returns may change in any release |
-| SSE event envelope (`schema` on every event) | Yes | **Versioned** - a breaking change bumps the schema version |
+| Repository Engine dashboard event stream (`GET /api/events`) | Yes | **Versioned** - `schema` on every event; a breaking change bumps it |
 | Schema-backed SSE payloads and view models (`contracts/public/*.json`) | Yes | Contracted - committed artifacts + drift tests, no runtime version |
-| All other SSE event payloads | Yes | Experimental - versioned envelope and stable name, but fields may change |
+| All other SSE event payloads | Yes | Experimental - versioned envelope, but names and fields may change |
+| Other SSE streams (Control API, Control Center repo status) | No | Internal - no envelope version, not a third-party stream |
 | Contracted HTTP routes (`docs/api/ui-openapi.json`) | Yes | Contracted - generated and drift-tested, no runtime version |
 | All other `/api/*` and `/control/*` routes | No | Internal - bearer-token engine transport, not a third-party API |
 | Python package (`import issue_orchestrator`) | No | Internal - refactored freely |
 | Plugin entry points (`issue_orchestrator.plugins`, `…ai_provider_keys`) | Yes | Experimental - hook signatures may change |
 | VS Code extension (`packages/vscode`) | First-party | Run it from the same commit as the installed package |
 
-Only the SSE event envelope is `Versioned` - a single owner stamps `schema` onto
-every event at the broadcast boundary, so a client can check it at runtime.
+Only the Repository Engine dashboard event stream is `Versioned` - a single
+owner stamps `schema` onto every event at that broadcast boundary, so a client
+can check it at runtime. The other two SSE endpoints are internal and carry no
+envelope version.
 `Contracted` surfaces are backed by committed JSON Schema artifacts and drift
 tests, so a break is visible in review, but nothing in the payload lets a client
 detect it. That gap is what the other surfaces grow toward closing.

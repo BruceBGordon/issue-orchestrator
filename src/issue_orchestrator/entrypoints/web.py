@@ -231,7 +231,9 @@ async def broadcast_event(event_type: str, data: dict | None = None) -> None:
         data: Optional data to include with the event
     """
     enveloped = apply_sse_envelope(event_type, data)
-    event = {"type": enveloped.type, "data": enveloped.data}
+    # ``data`` is a read-only mapping; copy it into a plain dict so the
+    # transport can JSON-serialize it.
+    event = {"type": enveloped.type, "data": dict(enveloped.data)}
     dead_subscribers = []
 
     for queue in _event_subscribers:

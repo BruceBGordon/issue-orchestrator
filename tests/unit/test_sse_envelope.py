@@ -41,9 +41,13 @@ class TestApplySseEnvelope:
 
         assert event == SseEvent(
             type="session.started",
-            data={"issue_number": 42, SSE_SCHEMA_FIELD: EVENT_SCHEMA_VERSION},
+            schema_version=EVENT_SCHEMA_VERSION,
+            payload={"issue_number": 42},
         )
-        assert event.schema_version == EVENT_SCHEMA_VERSION
+        assert event.data == {
+            "issue_number": 42,
+            SSE_SCHEMA_FIELD: EVENT_SCHEMA_VERSION,
+        }
 
     def test_stamps_the_schema_version_on_an_empty_payload(self):
         event = apply_sse_envelope("startup_complete", None)
@@ -78,17 +82,90 @@ class TestApplySseEnvelope:
                 {"issue_number": 42, SSE_SCHEMA_FIELD: EVENT_SCHEMA_VERSION + 1},
             )
 
+    def test_accepts_a_payload_redeclaring_the_current_version(self):
+        """``EventContext.enrich()`` already sets it; that must not double-count."""
+        event = apply_sse_envelope(
+            "session.started",
+            {"issue_number": 42, SSE_SCHEMA_FIELD: EVENT_SCHEMA_VERSION},
+        )
+
+        assert event.data == {
+            "issue_number": 42,
+            SSE_SCHEMA_FIELD: EVENT_SCHEMA_VERSION,
+        }
+
+
+class TestSseEventInvariant:
+    """Invalid envelope states must be unrepresentable, not merely undocumented."""
+
+    def test_cannot_be_constructed_without_a_schema_version(self):
+        with pytest.raises(TypeError):
+            SseEvent(type="session.started")  # type: ignore[call-arg]
+
+    def test_cannot_be_constructed_with_an_unpublished_schema_version(self):
+        with pytest.raises(ValueError, match="published envelope version"):
+            SseEvent(
+                type="session.started",
+                schema_version=EVENT_SCHEMA_VERSION + 1,
+                payload={"issue_number": 42},
+            )
+
+    def test_data_always_carries_the_version_even_for_an_empty_payload(self):
+        event = SseEvent(type="orchestrator.paused", schema_version=EVENT_SCHEMA_VERSION)
+
+        assert event.data == {SSE_SCHEMA_FIELD: EVENT_SCHEMA_VERSION}
+
+    def test_stored_payload_cannot_be_mutated_after_construction(self):
+        source = {"issue_number": 42}
+        event = SseEvent(
+            type="session.started",
+            schema_version=EVENT_SCHEMA_VERSION,
+            payload=source,
+        )
+
+        with pytest.raises(TypeError):
+            event.payload["issue_number"] = 99
+        source["issue_number"] = 7  # the constructor copied, so this is inert
+
+        assert event.data["issue_number"] == 42
+
+    def test_mutating_the_wire_payload_cannot_strip_the_version(self):
+        event = apply_sse_envelope("session.started", {"issue_number": 42})
+
+        with pytest.raises(TypeError):
+            del event.data[SSE_SCHEMA_FIELD]
+
+        assert event.data[SSE_SCHEMA_FIELD] == EVENT_SCHEMA_VERSION
+
 
 class TestBoundaryAppliesEnvelopeForEveryProducer:
     """Producer-to-SSE-output coverage for both paths into the stream."""
 
     @pytest.mark.asyncio
-    async def test_raw_trace_event_producer_reaches_the_wire_versioned(self):
+    async def test_raw_trace_event_producer_reaches_the_wire_versioned(
+        self, monkeypatch
+    ):
         """A producer that never calls ``enrich`` still yields a versioned event.
 
         This is the path the observer uses: ``events.publish(TraceEvent(...))``
         with a plain dict, through the pluggy hook, into the SSE broadcast.
+
+        ``on_trace_event`` schedules the broadcast as a task, so readiness is
+        signalled explicitly by an ``asyncio.Event`` set by a wrapper around the
+        real ``broadcast_event``. No sleeping or yield-counting: the wait ends
+        when the broadcast has actually happened.
         """
+        broadcast_finished = asyncio.Event()
+        real_broadcast = web.broadcast_event
+
+        async def signalling_broadcast(event_type, data=None):
+            try:
+                await real_broadcast(event_type, data)
+            finally:
+                broadcast_finished.set()
+
+        monkeypatch.setattr(web, "broadcast_event", signalling_broadcast)
+
         queue: asyncio.Queue = asyncio.Queue(maxsize=100)
         add_event_subscriber(queue)
         try:
@@ -96,7 +173,7 @@ class TestBoundaryAppliesEnvelopeForEveryProducer:
                 "observation.completion_detected",
                 {"issue_number": 42, "outcome": "completed"},
             )
-            await asyncio.sleep(0)  # let the scheduled broadcast task run
+            await broadcast_finished.wait()
 
             event = queue.get_nowait()
         finally:

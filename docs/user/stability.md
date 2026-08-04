@@ -42,7 +42,8 @@ artifact but served without a version field.
 | CLI (`issue-orchestrator …`) | [`entrypoints/cli_parser.py`](../../src/issue_orchestrator/entrypoints/cli_parser.py) | Yes | Supported (per-command tiers below) |
 | Agent completion contracts (`coding-done`, `reviewer-done`) | [`entrypoints/cli_tools/`](../../src/issue_orchestrator/entrypoints/cli_tools/) | Yes (agent-facing) | Supported |
 | MCP server tools (`orchestrator.*`) | [`entrypoints/mcp_server.py`](../../src/issue_orchestrator/entrypoints/mcp_server.py) | Yes | **Experimental** |
-| SSE event envelope (`schema` on every event) | [`events/sse_envelope.py`](../../src/issue_orchestrator/events/sse_envelope.py), [`events/catalog.py`](../../src/issue_orchestrator/events/catalog.py) | Yes | **Versioned** |
+| Repository Engine dashboard event stream (`GET /api/events`) | [`entrypoints/web.py`](../../src/issue_orchestrator/entrypoints/web.py), [`events/sse_envelope.py`](../../src/issue_orchestrator/events/sse_envelope.py) | Yes | **Versioned** |
+| Other SSE streams (Control API, Control Center repo status) | [`entrypoints/control_api.py`](../../src/issue_orchestrator/entrypoints/control_api.py), [`entrypoints/control_api_repo_routes.py`](../../src/issue_orchestrator/entrypoints/control_api_repo_routes.py) | No | Internal |
 | Schema-backed SSE payloads and view models | [`contracts/public/`](../../contracts/public/), [`contracts/public.py`](../../src/issue_orchestrator/contracts/public.py) | Yes | Contracted (subset listed below) |
 | All other SSE event payloads | [`events/catalog.py`](../../src/issue_orchestrator/events/catalog.py) | Yes | Experimental |
 | Contracted HTTP routes | [`docs/api/ui-openapi.json`](../api/ui-openapi.json) | Yes | Contracted |
@@ -184,13 +185,43 @@ text into a running agent session (a prompt-injection primitive), and the
 transport is stdio only. Detailed usage documentation is tracked separately in
 issue #6463; see [VS Code Integration](vscode.md) for client setup today.
 
-### SSE event envelope — versioned
+### Repository Engine dashboard event stream — versioned
 
-This is the only surface that promises runtime version detection, and it is the
-model the others should grow toward.
+**This tier applies to exactly one endpoint: `GET /api/events` as served by a
+Repository Engine's dashboard app**, implemented by `entrypoints.web.events`.
+That is the stream the browser dashboard consumes and the one the
+[contracted payload schemas](#sse-payloads-and-dashboard-view-models--contracted)
+describe. It is the only surface that promises runtime version detection, and
+the model the others should grow toward.
 
-**Every event on the SSE stream carries `schema`**, the `EVENT_SCHEMA_VERSION`
-from [`events/catalog.py`](../../src/issue_orchestrator/events/catalog.py). A
+This repository serves three SSE endpoints, and only the first is public:
+
+<!-- inventory:sse-streams -->
+
+| Endpoint | Route | Scope | Tier |
+|---|---|---|---|
+| `issue_orchestrator.entrypoints.web.events` | `/api/events` | Repository Engine dashboard | Versioned |
+| `issue_orchestrator.entrypoints.control_api.events` | `/api/events` | Control API (Control Center) | Internal |
+| `issue_orchestrator.entrypoints.control_api_repo_routes.control_events` | `/control/events` | Control Center repo status | Internal |
+
+The two `/api/events` rows are different implementations at the same path on
+different apps, which is exactly why the promise is bound to the handler and not
+to the path. The dashboard app registers its own routes before mounting the
+Control API, so on an engine dashboard `/api/events` is the versioned stream; on
+the Control Center it is the internal EventHub stream, whose wire object
+(`event_id`, `type`, `issue_key`, `payload`) carries no envelope version and
+exists for test automation. `/control/events` streams Control Center repo-status
+snapshots and is likewise internal.
+
+`tests/unit/test_public_api_surface_docs.py` discovers every SSE endpoint in the
+source, requires this table to match that set exactly, and asserts that the row
+tiered `Versioned` is the handler whose module actually applies the envelope —
+so the public row cannot drift onto an unversioned stream, and a new stream
+cannot be added without classifying it.
+
+**Every event on the versioned stream carries `schema`**, the
+`EVENT_SCHEMA_VERSION` from
+[`events/catalog.py`](../../src/issue_orchestrator/events/catalog.py). A
 breaking change to the envelope bumps it, so a consumer can refuse a version it
 does not understand instead of misparsing it.
 
@@ -212,8 +243,12 @@ orchestrator run and control tick, which a direct broadcast like
 present on control-loop events only. **Do not assume every event has them** —
 read them when present, and key on `schema` for version handling.
 
-Event names come from the `EventName` enum, not ad-hoc strings, and
-`tests/unit/test_event_catalog.py` guards the catalog.
+Most event names come from the `EventName` enum
+([`events/catalog.py`](../../src/issue_orchestrator/events/catalog.py), guarded
+by `tests/unit/test_event_catalog.py`). Two direct broadcasts are the exception
+and use literal names not in the enum: `startup_complete` and
+`shutdown_requested`. Both have committed payload schemas, so they are listed
+below with the rest of the contracted set.
 
 Consumers should react to events and contract fields, never to log text. Logs
 are for humans and change freely.
@@ -261,9 +296,12 @@ Non-SSE payloads on the same tier: `dashboard.view_model`, `timeline.issue`, and
 
 **Every other event on the stream is `Experimental`.** The `EventName` catalog
 has well over a hundred entries; the ones above are the payloads that have been
-promoted to a committed contract. The rest still arrive with a versioned
-envelope and a stable name, but their payload fields may change in any release.
-If you depend on one, say so on an issue and it can be promoted.
+promoted to a committed contract. The rest still arrive inside the versioned
+envelope — that part of the promise is unconditional — but per the
+`Experimental` tier **both their payload fields and their names may change or
+disappear in any release**. Only the events listed above have a name and shape
+you can hold the project to. If you depend on another one, say so on an issue
+and it can be promoted.
 
 **No payload on this tier carries a version field of its own.** A breaking
 change is visible in the schema artifact diff during review; it is not
@@ -325,12 +363,20 @@ contracted route goes missing or stops using its generated response model.
 OpenAPI path set exactly, so contracting a new route cannot leave it classified
 as internal by prose.
 
-**Every other `/api/*` and `/control/*` route is internal.** The uncontracted
-remainder is how the Control Center, the supervisor, and orchestrator-managed
-agents drive a running engine: bearer-token authenticated, and routes, payloads,
-and auth semantics change whenever the internal lifecycle needs them to.
-Reachable is not supported. For third-party automation, use the CLI or the MCP
-tools, not an uncontracted route.
+**Every other `/api/*` and `/control/*` route is internal, with one carve-out.**
+The exception is the Repository Engine dashboard's `GET /api/events`, which is
+public and `Versioned` — see
+[the SSE stream table](#repository-engine-dashboard-event-stream--versioned).
+It is absent from the OpenAPI contract because that document describes JSON
+request/response operations, not an event stream; its payload shapes are
+contracted separately under [`contracts/public/`](../../contracts/public/).
+
+The uncontracted remainder — including the *other* two SSE endpoints — is how
+the Control Center, the supervisor, and orchestrator-managed agents drive a
+running engine: bearer-token authenticated, and routes, payloads, and auth
+semantics change whenever the internal lifecycle needs them to. Reachable is not
+supported. For third-party automation, use the CLI or the MCP tools, not an
+uncontracted route.
 
 Note that `info.version` in the OpenAPI document describes the *document*, not
 the responses: it is not delivered on the wire and a client cannot read it off a
@@ -442,6 +488,7 @@ equality** against the code, in both directions:
 | `inventory:mcp-tools` | `MCP_TOOLS` in `entrypoints/mcp_server.py` |
 | `inventory:http-routes` | the path set in `docs/api/ui-openapi.json` |
 | `inventory:sse-payloads` | the `sse.*` entries of `PUBLIC_CONTRACTS` |
+| `inventory:sse-streams` | every endpoint returning `EventSourceResponse` |
 | `inventory:tiers` | every tier any inventory table uses |
 
 So adding a surface fails the build until it is classified here, removing one
