@@ -521,6 +521,68 @@ def test_scan_added_test_skip_guards_closes_kotlin_raw_string_ending_in_backslas
     assert result.violations[0].pattern == "JUnit assumeTrue"
 
 
+def test_scan_added_test_skip_guards_flags_java_unicode_escaped_quote() -> None:
+    diff = '''diff --git a/src/test/java/GuardTest.java b/src/test/java/GuardTest.java
+--- a/src/test/java/GuardTest.java
++++ b/src/test/java/GuardTest.java
+@@ -0,0 +1,1 @@
++        String fixture = "\\u0022; assumeTrue(false); //";
+'''
+
+    result = _scan(diff)
+
+    assert [
+        (violation.line_number, violation.pattern) for violation in result.violations
+    ] == [(1, "JUnit assumeTrue")]
+
+
+def test_scan_added_test_skip_guards_ignores_inert_java_fixture_strings() -> None:
+    diff = '''diff --git a/src/test/java/GuardTest.java b/src/test/java/GuardTest.java
+--- a/src/test/java/GuardTest.java
++++ b/src/test/java/GuardTest.java
+@@ -0,0 +1,3 @@
++        String plain = "assumeTrue(false) stays inert";
++        String escaped = "\\\\u0022 assumeTrue(false) stays inert";
++        String unicode = "\\u0061ssumeTrue(false) stays inert";
+'''
+
+    assert _scan(diff).ok
+
+
+def test_scan_added_test_skip_guards_flags_java_unicode_escaped_line_terminator() -> (
+    None
+):
+    diff = '''diff --git a/src/test/java/GuardTest.java b/src/test/java/GuardTest.java
+--- a/src/test/java/GuardTest.java
++++ b/src/test/java/GuardTest.java
+@@ -0,0 +1,2 @@
++        // fixture \\u000A assumeTrue(false);
++        int after = 1;
+'''
+
+    result = _scan(diff)
+
+    assert [
+        (violation.line_number, violation.pattern) for violation in result.violations
+    ] == [(1, "JUnit assumeTrue")]
+
+
+def test_scan_added_test_skip_guards_ends_java_literal_at_trailing_backslash() -> None:
+    diff = '''diff --git a/src/test/java/GuardTest.java b/src/test/java/GuardTest.java
+--- a/src/test/java/GuardTest.java
++++ b/src/test/java/GuardTest.java
+@@ -0,0 +1,2 @@
++        String fixture = "path\\u005C
++        assumeTrue(false);
+'''
+
+    result = _scan(diff)
+
+    assert [
+        (violation.line_number, violation.pattern) for violation in result.violations
+    ] == [(2, "JUnit assumeTrue")]
+
+
 def test_scan_added_test_skip_guards_keeps_escapes_in_kotlin_quoted_strings() -> None:
     diff = '''diff --git a/src/test/kotlin/GuardTest.kt b/src/test/kotlin/GuardTest.kt
 --- a/src/test/kotlin/GuardTest.kt

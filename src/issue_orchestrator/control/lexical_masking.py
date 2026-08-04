@@ -78,6 +78,52 @@ _JS_VALUE_BLOCKING_CHARS = "([{=,:;!&|?+-*/%^~<>"
 _JSX_CLOSING_TAG = r"</[ \t]*(?:(?:[^\W\d]|[$_])[\w$.:-]*[ \t]*)?>"
 _JSX_CLOSING_TAG_AT = re.compile(_JSX_CLOSING_TAG)
 _JSX_CLOSING_TAG_END = re.compile(_JSX_CLOSING_TAG + r"$")
+_JAVA_UNICODE_ESCAPE = re.compile(r"\\u+([0-9a-fA-F]{4})")
+# JLS 3.4 LineTerminator: LF, CR, or CRLF. Deliberately narrower than
+# ``str.splitlines()``, which also breaks on form feed and other characters
+# Java treats as ordinary whitespace inside a line.
+_JAVA_LINE_TERMINATOR = re.compile(r"\r\n|\r|\n")
+
+
+def _translate_java_unicode_escapes(text: str) -> str:
+    """Apply the Unicode-escape phase that precedes Java lexing (JLS 3.2-3.3).
+
+    Java translates eligible ``\\uXXXX`` escapes over the whole raw input
+    *before* comments and literals are recognised, so ``"\\u0022"`` closes a
+    string rather than sitting inertly inside one. A backslash is eligible only
+    when an even number of contiguous backslashes precede it, which makes the
+    last backslash of an odd-length run the only one that can open an escape:
+    ``\\u0022`` is a quote, while ``\\\\u0022`` is an escaped backslash
+    followed by literal ``u0022`` text.
+
+    Escapes that cannot be modelled -- a malformed ``\\u`` with fewer than four
+    hex digits -- are left as raw text. Java rejects those at compile time, so
+    the surrounding source cannot execute a skip either way.
+    """
+
+    translated: list[str] = []
+    index = 0
+    while index < len(text):
+        if text[index] != "\\":
+            translated.append(text[index])
+            index += 1
+            continue
+        run_end = index
+        while run_end < len(text) and text[run_end] == "\\":
+            run_end += 1
+        escape = (
+            _JAVA_UNICODE_ESCAPE.match(text, run_end - 1)
+            if (run_end - index) % 2 == 1
+            else None
+        )
+        if escape is None:
+            translated.append(text[index:run_end])
+            index = run_end
+            continue
+        translated.append(text[index : run_end - 1])
+        translated.append(chr(int(escape.group(1), 16)))
+        index = escape.end()
+    return "".join(translated)
 
 
 def _opens_jsx_closing_tag(prefix: str, text: str, index: int) -> bool:
@@ -162,11 +208,9 @@ class LiteralMasker:
         self._python = suffix in _PYTHON_SUFFIXES
         self._javascript = suffix in _JAVASCRIPT_SUFFIXES
         self._kotlin = suffix in _KOTLIN_SUFFIXES
+        self._java = suffix in _JAVA_SUFFIXES
         self._literals_supported = (
-            self._python
-            or self._javascript
-            or self._kotlin
-            or suffix in _JAVA_SUFFIXES
+            self._python or self._javascript or self._kotlin or self._java
         )
         self._frames: list[_LexicalFrame] = []
         self._js_code_context = ""
@@ -174,10 +218,28 @@ class LiteralMasker:
         self._js_last_value_end = 0
 
     def mask_line(self, text: str) -> str:
-        """Mask one line and retain only genuinely multiline lexical state."""
+        """Mask one raw branch-tip line, returning one result per raw line.
+
+        Java's Unicode-escape phase can translate one raw line into several
+        logical lines -- ``\\u000A`` ends a comment, exposing executable code
+        after it. Those logical lines are lexed in order and rejoined, so the
+        caller keeps its raw line numbering while seeing the code Java would
+        actually compile.
+        """
 
         if not self._literals_supported:
             return text
+        if not self._java:
+            return self._mask_logical_line(text)
+        translated = _translate_java_unicode_escapes(text)
+        return "\n".join(
+            self._mask_logical_line(logical)
+            for logical in _JAVA_LINE_TERMINATOR.split(translated)
+        )
+
+    def _mask_logical_line(self, text: str) -> str:
+        """Mask one logical line and retain only genuinely multiline state."""
+
         self._js_line_offset = len(self._js_code_context)
         for frame in self._frames:
             if isinstance(frame, _LiteralFrame) and not frame.multiline:
@@ -557,8 +619,17 @@ class LiteralMasker:
             index += 1
         return None
 
-    @staticmethod
-    def _line_continues(text: str) -> bool:
+    def _line_continues(self, text: str) -> bool:
+        """Report whether a trailing backslash continues a literal onto the next line.
+
+        Only Python and JavaScript define a backslash-newline continuation
+        inside a literal. Java and Kotlin do not, so a trailing backslash there
+        must not hold a frame open and mask the executable lines that follow --
+        reachable in Java through a translated ``\\u005C``.
+        """
+
+        if not (self._python or self._javascript):
+            return False
         trailing = len(text) - len(text.rstrip("\\"))
         return trailing % 2 == 1
 
