@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any, Iterator, Sequence
 from ...ports.promotion_target import (
     FiledIssue,
     PromotedIssueOutcome,
+    PromotionFilingContract,
     validate_promotion_issue_marker,
 )
 from .errors import GitHubHttpError
@@ -37,6 +38,14 @@ logger = logging.getLogger(__name__)
 # managed repo; a foreign repo gets a neutral, self-describing entry.
 _PROMOTION_LABEL_COLOR = "ededed"
 _PROMOTION_LABEL_DESCRIPTION = "Applied by issue-orchestrator finding promotion"
+
+# GitHub's repository-role matrix, split by the two capabilities filing needs.
+# ``triage`` may APPLY an existing label but cannot create, edit, or delete one:
+# https://docs.github.com/en/organizations/managing-user-access-to-your-organizations-repositories/managing-repository-roles-for-an-organization#permissions-for-each-role
+# That distinction is the whole point of checking the contract rather than the
+# repo — provisioning is the first thing ``file_issue`` does (#6957 round-6 F2).
+_ISSUE_WRITE_ROLES = ("triage", "push", "maintain", "admin")
+_LABEL_WRITE_ROLES = ("push", "maintain", "admin")
 
 
 class GitHubPromotionTargetHost:
@@ -65,46 +74,86 @@ class GitHubPromotionTargetHost:
         finally:
             client.close()
 
-    def check_writable(self, *, repo: str) -> str | None:
-        """None when the token can create issues in *repo*, else the reason.
+    def check_filing_ready(self, contract: PromotionFilingContract) -> str | None:
+        """None when the token can run the FILING COMMAND, else the reason.
 
-        GitHub reports effective repository roles on the repository payload, so
-        this is one cheap read per configured route target at startup — far
-        better than discovering the problem on the tick a pattern finally
-        crosses its evidence threshold. An inconclusive permissions payload
-        fails closed: #6957 explicitly requires route writability to be proven
-        before startup, not guessed and retried late.
+        Proves the whole contract ``file_issue`` consumes, not the weaker "can
+        this token open an issue here": provisioning any missing label is the
+        first thing filing does, and ``triage`` — an issue-writable role — is
+        explicitly not allowed to create labels. A doctor that accepted triage
+        approved a route whose first promotion with a missing label dies late,
+        which is the exact failure this check exists to prevent (#6957 round-6
+        review F2/A1).
+
+        Cost is one repository read per distinct target, plus a label list only
+        when the token cannot provision (the case where the gap matters). An
+        inconclusive permissions payload fails closed: #6957 requires route
+        writability to be PROVEN before startup, not guessed and retried late.
         """
         try:
-            with self._client_for(repo) as client:
-                payload = client.get_repository()
+            return self._filing_problem(contract)
         except GitHubHttpError as exc:
             if exc.status_code == 404:
                 return (
-                    f"{repo} was not found (or the token cannot see it);"
+                    f"{contract.repo} was not found (or the token cannot see it);"
                     " check the route target and the token's repo access"
                 )
-            return f"{repo} could not be read: {exc}"
+            return f"{contract.repo} could not be read: {exc}"
         except Exception as exc:  # transport/auth failures
-            return f"{repo} could not be read: {exc}"
-        if not isinstance(payload, dict):
-            return f"{repo} returned an unexpected repository payload"
-        if payload.get("has_issues") is False:
-            return f"{repo} has issues disabled, so findings cannot be filed there"
-        permissions = payload.get("permissions")
-        if not isinstance(permissions, dict):
+            return f"{contract.repo} could not be read: {exc}"
+
+    def _filing_problem(self, contract: PromotionFilingContract) -> str | None:
+        """The reads behind :meth:`check_filing_ready`; raises on read failure."""
+        repo = contract.repo
+        with self._client_for(repo) as client:
+            payload = client.get_repository()
+            if not isinstance(payload, dict):
+                return f"{repo} returned an unexpected repository payload"
+            if payload.get("has_issues") is False:
+                return f"{repo} has issues disabled, so findings cannot be filed there"
+            permissions = payload.get("permissions")
+            if not isinstance(permissions, dict):
+                return (
+                    f"{repo} did not report effective repository permissions; cannot"
+                    " prove the token has issue-write access"
+                )
+            if not any(permissions.get(role) for role in _ISSUE_WRITE_ROLES):
+                return (
+                    f"{repo} is readable but not writable by this token; finding"
+                    " promotion needs issue-write access"
+                )
+            if any(permissions.get(role) for role in _LABEL_WRITE_ROLES):
+                # Provisioning covers every gap, known or not.
+                return None
+            if contract.provisions_unknown_labels:
+                return (
+                    f"{repo} owns the catch-all 'default' promotion route, whose"
+                    " findings carry an area label that is not knowable until the"
+                    " tech lead classifies them — so filing there needs permission"
+                    " to CREATE labels, and this token only has the 'triage' role"
+                    " (which may apply existing labels but never create them)."
+                    " Grant write access, or route each area to an explicit target"
+                )
+            missing = self._missing_labels(client, labels=contract.labels)
+        if missing:
             return (
-                f"{repo} did not report effective repository permissions; cannot"
-                " prove the token has issue-write access"
-            )
-        if not any(
-            permissions.get(role) for role in ("triage", "push", "maintain", "admin")
-        ):
-            return (
-                f"{repo} is readable but not writable by this token; finding"
-                " promotion needs issue-write access"
+                f"{repo} is missing the promotion label(s) {', '.join(missing)} and"
+                " this token only has the 'triage' role, which may apply existing"
+                " labels but cannot create them; filing provisions missing labels"
+                " before it creates the issue, so the first promotion would fail."
+                " Create the label(s) in the target repo, or grant write access"
             )
         return None
+
+    @staticmethod
+    def _missing_labels(
+        client: GitHubHttpClient, *, labels: Sequence[str]
+    ) -> tuple[str, ...]:
+        """Contract labels the target repo does not already have."""
+        if not labels:
+            return ()
+        existing = _existing_label_names(client)
+        return tuple(label for label in labels if label.casefold() not in existing)
 
     def file_issue(
         self,
@@ -198,11 +247,7 @@ class GitHubPromotionTargetHost:
     def _ensure_labels(
         client: GitHubHttpClient, *, repo: str, labels: Sequence[str]
     ) -> None:
-        existing = {
-            name.casefold()
-            for entry in client.list_all_labels()
-            if isinstance(entry, dict) and isinstance((name := entry.get("name")), str)
-        }
+        existing = set(_existing_label_names(client))
         for label in labels:
             if label.casefold() in existing:
                 continue
@@ -267,6 +312,19 @@ class GitHubPromotionTargetHost:
             return ""
         url = closer.get("url")
         return str(url) if isinstance(url, str) else ""
+
+
+def _existing_label_names(client: GitHubHttpClient) -> frozenset[str]:
+    """Case-folded names of every label the target repo already has.
+
+    Shared by the readiness probe and the filing-time provisioner so "does this
+    label exist" cannot mean two different things on the two paths.
+    """
+    return frozenset(
+        name.casefold()
+        for entry in client.list_all_labels()
+        if isinstance(entry, dict) and isinstance((name := entry.get("name")), str)
+    )
 
 
 def build_promotion_target_host(repository_host: Any) -> Any:

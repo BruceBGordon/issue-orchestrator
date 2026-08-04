@@ -185,6 +185,9 @@ def build_case_file_issue_action(
         labels=case_file_issue_labels(config, area=proposed.area),
         pr_count=0,
         pattern_signature=proposed.pattern_signature,
+        # Retained, not just rendered into the body: it is the issue this
+        # creation's reconciliation gate reads before any write (#6957 F3/A3).
+        anchor_issue_number=anchor_issue_number,
         area=proposed.area,
         fix_class=proposed.fix_class or "",
         diagnosis=proposed.body or "",

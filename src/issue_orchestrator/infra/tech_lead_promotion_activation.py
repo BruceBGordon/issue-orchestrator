@@ -52,8 +52,12 @@ class PromotionLaneReadiness:
     # inactive lane's missing dependencies are irrelevant, so switching the lane
     # off is always a way out of a misconfiguration.
     problems: tuple[str, ...] = ()
-    # Distinct foreign repos doctor must prove issue-writable before startup.
-    probe_targets: tuple[str, ...] = ()
+    # NOTE: what doctor must PROVE about each foreign target is deliberately not
+    # here. A repo-name list is a weaker statement than the filing command makes
+    # (it also provisions labels), and having a second owner state it is what let
+    # doctor approve a route whose first promotion would fail (#6957 round-6
+    # review F2/A1). ``promotion_filing_contracts`` — built on the one route
+    # resolver — owns the probe list, and consults this readiness for activation.
 
     @property
     def ready(self) -> bool:
@@ -105,8 +109,4 @@ def promotion_lane_readiness(config: "Config") -> PromotionLaneReadiness:
             " each foreign route its own agent_label, or set"
             " tech_lead.findings.promote: off"
         )
-    return PromotionLaneReadiness(
-        active=True,
-        problems=tuple(problems),
-        probe_targets=findings.target_repos(),
-    )
+    return PromotionLaneReadiness(active=True, problems=tuple(problems))

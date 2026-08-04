@@ -10,9 +10,11 @@ promotion depends on this narrow behavior-level port instead of teaching every
 It exposes exactly the four things the lane needs and nothing else, so the
 blast radius of "the orchestrator can write to another repo" stays visible:
 
-* :meth:`PromotionTargetHost.check_writable` — startup/doctor validation that a
-  configured route target is reachable AND writable. A route the token cannot
-  file issues in must fail loudly at startup, never silently at promotion time.
+* :meth:`PromotionTargetHost.check_filing_ready` — startup/doctor validation
+  that a configured route target can run the FILING COMMAND: reachable, issues
+  enabled, issue-writable, and carrying (or able to provision) every label that
+  route's promotions require. A route the token cannot file issues in must fail
+  loudly at startup, never silently at promotion time.
 * :meth:`PromotionTargetHost.file_issue` — create the gated promotion issue,
   or recover the same marker-owned issue after a crash, provisioning its labels
   first so GitHub cannot silently drop the gate and leave a schedulable issue
@@ -32,6 +34,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Protocol, Sequence
+
+from ..domain.tech_lead_findings import PromotionFilingContract
+
+__all__ = [
+    "FiledIssue",
+    "InMemoryPromotionTargetHost",
+    "PromotedIssueOutcome",
+    "PromotionFilingContract",
+    "PromotionTargetHost",
+    "validate_promotion_issue_marker",
+]
 
 
 @dataclass(frozen=True)
@@ -79,13 +92,19 @@ class PromotedIssueOutcome:
 class PromotionTargetHost(Protocol):
     """Cross-repo filing/read seam for the finding-promotion lane."""
 
-    def check_writable(self, *, repo: str) -> str | None:
-        """None when *repo* is reachable and issue-writable, else the reason.
+    def check_filing_ready(self, contract: PromotionFilingContract) -> str | None:
+        """None when *contract* can be FILED as specified, else the reason.
 
         Called by config/doctor validation at startup so a misrouted or
         unauthorized target is a loud configuration error rather than a
         promotion that fails on the tick a pattern finally crosses its
         evidence threshold.
+
+        The whole contract is the argument on purpose: :meth:`file_issue`
+        provisions any missing label BEFORE it creates the issue, so a check
+        that only proved "this token can open an issue here" would approve a
+        route whose very first promotion dies provisioning a label (#6957
+        round-6 review F2/A1). Readiness must cover exactly what filing needs.
         """
         ...
 
@@ -152,6 +171,9 @@ class InMemoryPromotionTargetHost:
     ) -> None:
         self.writable = writable
         self.unwritable_reason = unwritable_reason
+        # Every contract readiness was asked about, so tests can assert the
+        # probe covered the labels filing will actually require.
+        self.filing_checks: list[PromotionFilingContract] = []
         self.filed: list[tuple[str, str, str, tuple[str, ...]]] = []
         self.comments: list[tuple[str, int, str]] = []
         self.outcomes: dict[tuple[str, int], PromotedIssueOutcome | None] = {}
@@ -162,8 +184,11 @@ class InMemoryPromotionTargetHost:
         # different routes is two different issues.
         self._filed_by_marker: dict[tuple[str, str], FiledIssue] = {}
 
-    def check_writable(self, *, repo: str) -> str | None:
-        return None if self.writable else f"{repo}: {self.unwritable_reason}"
+    def check_filing_ready(self, contract: PromotionFilingContract) -> str | None:
+        self.filing_checks.append(contract)
+        if self.writable:
+            return None
+        return f"{contract.repo}: {self.unwritable_reason}"
 
     def file_issue(
         self,

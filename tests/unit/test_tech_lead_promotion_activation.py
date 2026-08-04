@@ -107,16 +107,18 @@ class TestActivation:
 
         assert not promotion_lane_readiness(config).active
 
-    def test_probe_targets_are_the_distinct_foreign_repos(self):
-        config = _config(
-            route={
-                "a": PromotionRouteTarget(repo=UPSTREAM),
-                "b": PromotionRouteTarget(repo=UPSTREAM),
-                "default": PromotionRouteTarget(repo="self"),
-            }
+    def test_readiness_does_not_own_the_probe_list(self):
+        """The probe list is a filing CONTRACT, not a repo-name list (R6 A1).
+
+        A second, weaker owner of "what must be proven about a target" is what
+        let doctor approve a route whose first promotion would fail, so the
+        activation owner deliberately no longer answers that question.
+        """
+        readiness = promotion_lane_readiness(
+            _config(route={"a": PromotionRouteTarget(repo=UPSTREAM)})
         )
 
-        assert promotion_lane_readiness(config).probe_targets == (UPSTREAM,)
+        assert not hasattr(readiness, "probe_targets")
 
 
 class TestReadinessProblems:
@@ -203,7 +205,7 @@ class TestBoundariesConsumeTheSameDecision:
         config.tech_lead_review_agent = None
 
         class Exploding(InMemoryPromotionTargetHost):
-            def check_writable(self, *, repo: str) -> str | None:
+            def check_filing_ready(self, contract) -> str | None:
                 raise AssertionError("an inactive lane must make no cross-repo read")
 
         assert check_tech_lead_finding_routes(config, target_host=Exploding()) == []

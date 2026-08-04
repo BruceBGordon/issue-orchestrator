@@ -8,10 +8,11 @@ guard.
 
 The finding-promotion lane (#6957) adds a second precondition: every configured
 ``tech_lead.findings.route`` target must be a repo this token can actually file
-issues in. That is verified here rather than at promotion time, because a
-promotion fires on the tick a pattern finally crosses its evidence threshold —
-discovering a misrouted target then means losing the actuation the lane exists
-to provide.
+that route's promotions in — the whole filing contract, labels included, since
+``file_issue`` provisions any missing label before it creates the issue. That is
+verified here rather than at promotion time, because a promotion fires on the
+tick a pattern finally crosses its evidence threshold — discovering a misrouted
+target then means losing the actuation the lane exists to provide.
 """
 
 from typing import TYPE_CHECKING
@@ -76,17 +77,21 @@ def check_tech_lead_finding_routes(
     *,
     target_host: "PromotionTargetHost | None" = None,
 ) -> list[Check]:
-    """Verify every finding-promotion route target is writable (#6957).
+    """Verify every finding-promotion route can actually be FILED into (#6957).
 
     Only NON-``self`` targets are probed: a ``self`` route lands in the managed
-    repo, whose writability is already covered by the auth/repo checks. One read
-    per distinct target, and none at all when the lane is inactive or every
-    route is ``self`` — GitHub API discipline.
+    repo, whose writability and label provisioning are already covered by the
+    auth/repo/label checks. One probe per distinct target, and none at all when
+    the lane is inactive or every route is ``self`` — GitHub API discipline.
 
-    Whether the lane is active is NOT decided here: it comes from
+    Neither half of the question is decided here. Activation comes from
     :func:`promotion_lane_readiness`, the same owner configuration validation
-    and fact gathering consume. Deciding it locally is what let doctor skip
+    and fact gathering consume — deciding it locally is what let doctor skip
     these probes while the runtime went on promoting anyway (round-2 review F9).
+    WHAT must be proven comes from ``promotion_filing_contracts``, built on the
+    lane's one route resolver — deriving a weaker permission check locally is
+    what let doctor approve a route whose first promotion would die provisioning
+    a label (round-6 review F2/A1).
 
     ``target_host`` is injectable so this check is testable without a live
     GitHub; production leaves it None and the host is built from config.
@@ -96,8 +101,35 @@ def check_tech_lead_finding_routes(
     readiness = promotion_lane_readiness(config)
     if not readiness.active:
         return []
-    targets = readiness.probe_targets
-    if not targets:
+    if readiness.problems:
+        # An active-but-unready lane cannot even be routed, so there is nothing
+        # to probe yet. Report the same strings startup validation reports.
+        return [
+            Check(
+                name="Tech Lead Finding Routes",
+                status="error",
+                detail=(
+                    "tech_lead.findings is configured but not startable: "
+                    + "; ".join(readiness.problems)
+                ),
+            )
+        ]
+    try:
+        from ....control.tech_lead_finding_promotion import promotion_filing_contracts
+
+        contracts = promotion_filing_contracts(config)
+    except Exception as exc:
+        # A route that cannot even be RESOLVED (e.g. no follow-up worker agent
+        # for a route that inherits one) is a startup error, reported here
+        # rather than raised on the tick a pattern crosses its threshold.
+        return [
+            Check(
+                name="Tech Lead Finding Routes",
+                status="error",
+                detail=f"Promotion route(s) could not be resolved: {exc}",
+            )
+        ]
+    if not contracts:
         return [
             Check(
                 name="Tech Lead Finding Routes",
@@ -139,8 +171,8 @@ def check_tech_lead_finding_routes(
         ]
     problems = [
         reason
-        for repo in targets
-        if (reason := target_host.check_writable(repo=repo)) is not None
+        for contract in contracts
+        if (reason := target_host.check_filing_ready(contract)) is not None
     ]
     if problems:
         return [
@@ -148,7 +180,7 @@ def check_tech_lead_finding_routes(
                 name="Tech Lead Finding Routes",
                 status="error",
                 detail=(
-                    "tech_lead.findings.route target(s) are not writable: "
+                    "tech_lead.findings.route target(s) cannot be filed into: "
                     + "; ".join(problems)
                 ),
             )
@@ -157,6 +189,9 @@ def check_tech_lead_finding_routes(
         Check(
             name="Tech Lead Finding Routes",
             status="ok",
-            detail=f"Promotion route target(s) writable: {', '.join(targets)}",
+            detail=(
+                "Promotion route target(s) ready to file: "
+                + ", ".join(contract.repo for contract in contracts)
+            ),
         )
     ]

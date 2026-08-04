@@ -443,8 +443,15 @@ tech_lead:
   #     promotions are already in flight than the current cap, they are polled
   #     in rotation over several ticks rather than all at once.
   #   route: area label -> the target that owns the fix. `default` is the
-  #     catch-all. Every non-`self` target is checked for issue-write access at
-  #     startup, not at promotion time.
+  #     catch-all. Every non-`self` target is checked at STARTUP, not at
+  #     promotion time, and the check covers the whole filing contract: the repo
+  #     must be reachable with issues enabled, and this token must be able to
+  #     apply that route's labels - plus CREATE any it is missing, since filing
+  #     provisions labels before it opens the issue. GitHub's `triage` role can
+  #     apply labels but never create them, so a triage-only token is only
+  #     accepted for a target that already has every label the route needs. A
+  #     foreign `default` route always needs label-creation access: its area
+  #     tag is not knowable until the tech lead classifies the finding.
   #     A route value is either a repo string or a mapping declaring the
   #     target's QUEUE CONTRACT - a promoted issue is only runnable where it
   #     carries that target's scheduling labels:

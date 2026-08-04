@@ -50,7 +50,9 @@ import logging
 from typing import TYPE_CHECKING, Iterable, Sequence
 
 from ..domain.tech_lead_findings import (
+    PROMOTION_ROUTE_DEFAULT_KEY,
     PatternEvidence,
+    PromotionFilingContract,
     PromotionRoute,
     PromotionUpdate,
     PromotableFinding,
@@ -153,6 +155,43 @@ def promotion_issue_labels(config: "Config", *, area: str) -> tuple[str, ...]:
             PROPOSED_TECH_LEAD_LABEL if config.tech_lead.findings.gated else ""
         ),
     )
+
+
+def promotion_filing_contracts(config: "Config") -> tuple[PromotionFilingContract, ...]:
+    """What startup must prove about every FOREIGN promotion target (#6957).
+
+    Doctor's probe list, derived from the ONE route-resolution owner rather than
+    re-derived as a weaker "can this token see the repo" permission check
+    (#6957 round-6 review F2/A1). Each contract carries the exact labels a
+    filing into that repo will require, so the readiness probe can prove the
+    same bounded capability ``file_issue`` consumes — including its provisioning
+    step, which the ``triage`` repository role cannot perform.
+
+    ``self`` routes are excluded: they land in the managed repo, whose
+    writability and label provisioning the auth/repo/label checks already cover.
+    Several areas routing to one repo produce ONE merged contract, so the lane
+    keeps its one-read-per-distinct-target cost.
+    """
+    contracts: dict[str, PromotionFilingContract] = {}
+    for area, target in config.tech_lead.findings.route.items():
+        if target.is_self:
+            continue
+        # The catch-all route's findings carry the area label of whatever area
+        # the tech lead classified them into — not knowable here, so the
+        # contract records that filing there must be able to CREATE labels
+        # rather than pretending to enumerate them.
+        is_default = area.casefold() == PROMOTION_ROUTE_DEFAULT_KEY
+        contract = PromotionFilingContract(
+            repo=target.repo,
+            labels=promotion_issue_labels(config, area="" if is_default else area),
+            provisions_unknown_labels=is_default,
+        )
+        key = target.repo.casefold()
+        previous = contracts.get(key)
+        contracts[key] = (
+            contract if previous is None else previous.merged_with(contract)
+        )
+    return tuple(contracts.values())
 
 
 def select_promotable_findings(
@@ -363,6 +402,9 @@ def plan_finding_promotions(
                 area=finding.evidence.area,
                 observation_count=finding.evidence.observation_count,
                 idempotency_marker=marker,
+                # The approval mode this filing was planned under, stated by the
+                # command instead of inferred from a label (#6957 round-6 A2).
+                gated=gated,
                 reason=(
                     f"tech_lead finding {finding.evidence.signature!r} crossed"
                     f" {config.tech_lead.findings.min_evidence} observations:"

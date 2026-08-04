@@ -24,6 +24,7 @@ from issue_orchestrator.control.tech_lead_finding_promotion import (
     plan_finding_promotions,
     plan_promotion_updates,
     plan_promotion_settlements,
+    promotion_filing_contracts,
     promotion_issue_labels,
     resolve_promotion_route,
     select_promotion_updates,
@@ -340,6 +341,97 @@ class TestRouting:
         config.repo = None
         with pytest.raises(ValueError, match="no repository is configured"):
             resolve_promotion_route(config, area="")
+
+
+class TestFilingContracts:
+    """Startup must probe the FILING contract, not a repo name (R6 F2/A1)."""
+
+    def test_self_routes_are_not_probed(self):
+        assert promotion_filing_contracts(_config()) == ()
+
+    def test_a_foreign_route_carries_the_labels_its_promotions_need(self):
+        config = _config(route=_route(**{"ui": UPSTREAM, "default": "self"}))
+
+        [contract] = promotion_filing_contracts(config)
+
+        assert contract.repo == UPSTREAM
+        assert contract.labels == promotion_issue_labels(config, area="ui")
+        assert PROPOSED_TECH_LEAD_LABEL in contract.labels
+        assert not contract.provisions_unknown_labels
+
+    def test_a_foreign_catch_all_route_declares_unknowable_labels(self):
+        """`default` promotions carry the area tag of an unclassified future."""
+        config = _config(route=_route(default=UPSTREAM))
+
+        [contract] = promotion_filing_contracts(config)
+
+        assert contract.provisions_unknown_labels
+        # No area:* label is invented for a route whose areas are not knowable.
+        assert not any(label.startswith("area:") for label in contract.labels)
+
+    def test_areas_sharing_a_repo_merge_into_one_contract(self):
+        config = _config(
+            route=_route(**{"ui": UPSTREAM, "cp": UPSTREAM, "default": "self"})
+        )
+
+        [contract] = promotion_filing_contracts(config)
+
+        assert "area:ui" in contract.labels and "area:cp" in contract.labels
+
+    def test_an_auto_route_requires_no_gate_label(self):
+        config = _config(
+            promote="auto", route=_route(**{"ui": UPSTREAM, "default": "self"})
+        )
+
+        [contract] = promotion_filing_contracts(config)
+
+        assert PROPOSED_TECH_LEAD_LABEL not in contract.labels
+
+
+class TestPromotionCommandEncodesItsApprovalMode:
+    """R6 A2: the applier can tell `promote: auto` from a dropped gate label."""
+
+    MARKER = "<!-- issue-orchestrator:tech-lead-promotion:v1:abc -->"
+
+    def _action(self, **overrides) -> PromoteTechLeadFindingAction:
+        kwargs = dict(
+            signature="sig",
+            case_file_issue_number=65,
+            target_repo=UPSTREAM,
+            title="[tech-lead:porchpin/porchpin] sig",
+            body=f"body\n\n{self.MARKER}",
+            labels=("agent:backend", PROPOSED_TECH_LEAD_LABEL),
+            observation_count=2,
+            idempotency_marker=self.MARKER,
+            gated=True,
+        )
+        kwargs.update(overrides)
+        return PromoteTechLeadFindingAction(**kwargs)  # type: ignore[arg-type]
+
+    def test_a_gated_command_without_its_gate_label_fails_closed(self):
+        with pytest.raises(ValueError, match="must carry the"):
+            self._action(labels=("agent:backend",))
+
+    def test_an_auto_command_carrying_the_gate_label_fails_closed(self):
+        with pytest.raises(ValueError, match="must NOT carry"):
+            self._action(gated=False)
+
+    def test_both_consistent_modes_construct(self):
+        assert self._action().gated
+        assert not self._action(gated=False, labels=("agent:backend",)).gated
+
+    def test_the_planner_states_the_configured_mode(self):
+        for promote, gated in (("gated", True), ("auto", False)):
+            config = _config(promote=promote)
+            [action] = plan_finding_promotions(
+                config,
+                promotable=(
+                    PromotableFinding(
+                        evidence=_evidence("sig"), target_repo="porchpin/porchpin"
+                    ),
+                ),
+            )
+            assert action.gated is gated
 
 
 class TestPromotionIssueComposition:

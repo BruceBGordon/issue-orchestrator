@@ -474,6 +474,7 @@ def _case_file_action(
         labels=tuple(labels),
         pr_count=0,
         pattern_signature=signature,
+        anchor_issue_number=42,
         area=area,
         fix_class=fix_class,
         diagnosis="Pool exhaustion comes from a leaked connection.",

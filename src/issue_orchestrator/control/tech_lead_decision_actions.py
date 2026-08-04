@@ -212,6 +212,9 @@ def _concrete_actions(
                     area=action.area,
                 ),
                 pr_count=0,
+                # The anchor this decision came from — the issue whose pause
+                # label gates the creation (#6957 F3/A3).
+                anchor_issue_number=anchor_issue.number,
                 milestone=tech_lead_issue_milestone_intent(config, anchor_milestones),
                 # Expedite intent (#6870) rides the action so the applier's
                 # create boundary can front-queue the new issue. It composes

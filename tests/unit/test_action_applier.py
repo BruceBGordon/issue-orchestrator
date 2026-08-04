@@ -3187,3 +3187,182 @@ class TestTechLeadMutationsCrossTheReconciliationGate:
 
         assert result.success
         authority.has_pattern_observation.assert_called_once()
+
+
+class TestTechLeadIssueCreationCrossesTheReconciliationGate:
+    """#6957 round-6 review F3/A3: creation is guarded like every other mutation.
+
+    The first fix wrapped the four commands whose subjects the dispatch table
+    happened to spell out by hand, and issue CREATION — a remote issue, its
+    labels, a ledger row and anchor comments, the largest mutation of the lot —
+    kept sailing past the gate. So a source anchor paused behind
+    ``io:needs-reconcile`` could still cause a brand-new case file or gated
+    proposal issue.
+    """
+
+    ANCHOR = 77
+
+    @pytest.fixture
+    def guarded(self, mock_labels, mock_sessions, mock_events, mock_repository_host):
+        """An applier with reconciliation live and the ANCHOR issue PAUSED."""
+        from issue_orchestrator.control.action_applier import ActionApplier
+
+        reader = MagicMock()
+        reader.read_issue_labels.return_value = ["tech-lead", "io:needs-reconcile"]
+        authority = MagicMock()
+        applier = ActionApplier(
+            labels=mock_labels,
+            sessions=mock_sessions,
+            events=mock_events,
+            repository_host=mock_repository_host,
+            fresh_issue_reader=reader,
+            reconcile=True,
+            tech_lead_ops=authority,
+        )
+        return applier, authority, mock_repository_host
+
+    @classmethod
+    def _creations(cls):
+        from issue_orchestrator.control.actions import (
+            CreateTechLeadCaseFileIssueAction,
+            CreateTechLeadProposalIssueAction,
+        )
+        from issue_orchestrator.control.reconciliation import (
+            build_expected_for_mutation,
+        )
+        from issue_orchestrator.domain.tech_lead_findings import PatternObservation
+        from issue_orchestrator.domain.tech_lead_session import StoredTechLeadOp
+
+        expected = build_expected_for_mutation()
+        marker = "<!-- issue-orchestrator:tech-lead-case-file:v1:abc -->"
+        return [
+            CreateTechLeadCaseFileIssueAction(
+                title="Pattern case file: sig",
+                body=f"documentation only\n\n{marker}",
+                labels=("agent:tech-lead", "tech-lead-observation"),
+                pattern_signature="sig",
+                anchor_issue_number=cls.ANCHOR,
+                idempotency_marker=marker,
+                observations=(
+                    PatternObservation(observation_id="r1:s:A1", comment="observed"),
+                ),
+                expected=expected,
+            ),
+            CreateTechLeadProposalIssueAction(
+                title="Tech Lead proposal: reset_retry #12",
+                body="documentation only",
+                labels=("agent:tech-lead", "proposed-tech-lead"),
+                anchor_issue_number=cls.ANCHOR,
+                op=StoredTechLeadOp(
+                    op_type="reset_retry",
+                    target_issue_number=12,
+                    rationale="stuck",
+                    source_run_id="r1",
+                    source_session_name="s",
+                    source_action_id="A1",
+                    created_at="2026-08-04T00:00:00Z",
+                ),
+                expected=expected,
+            ),
+        ]
+
+    def test_a_paused_anchor_creates_nothing_anywhere(self, guarded):
+        from issue_orchestrator.control.reconciliation import ReconciliationRequired
+
+        applier, authority, repository_host = guarded
+
+        for action in self._creations():
+            with pytest.raises(ReconciliationRequired):
+                applier.apply(action)
+
+        # No remote issue, no label provisioning, no ledger row, no comment.
+        repository_host.create_issue.assert_not_called()
+        repository_host.add_comment.assert_not_called()
+        assert authority.method_calls == []
+
+    def test_the_gate_checks_the_anchor_the_creation_was_decided_from(self, guarded):
+        from issue_orchestrator.control.reconciliation import ReconciliationRequired
+
+        applier, _authority, _repository_host = guarded
+        reader = applier.fresh_issue_reader
+
+        for action in self._creations():
+            reader.read_issue_labels.reset_mock()
+            with pytest.raises(ReconciliationRequired):
+                applier.apply(action)
+            assert reader.read_issue_labels.call_args[0][0] == self.ANCHOR
+
+    def test_an_unpaused_anchor_reaches_the_creation_owner(
+        self, mock_labels, mock_sessions, mock_events, mock_repository_host
+    ):
+        """The gate blocks a PAUSED anchor, not every tech-lead creation."""
+        from issue_orchestrator.control.action_applier import ActionApplier
+        from issue_orchestrator.ports.tech_lead_authority import (
+            InMemoryTechLeadAuthorityStore,
+        )
+
+        reader = MagicMock()
+        reader.read_issue_labels.return_value = ["tech-lead"]
+        mock_repository_host.find_issue_by_marker.return_value = None
+        mock_repository_host.list_labels.return_value = [
+            {"name": "agent:tech-lead"},
+            {"name": "tech-lead-observation"},
+        ]
+        mock_repository_host.create_issue.return_value = {"number": 900}
+        applier = ActionApplier(
+            labels=mock_labels,
+            sessions=mock_sessions,
+            events=mock_events,
+            repository_host=mock_repository_host,
+            fresh_issue_reader=reader,
+            reconcile=True,
+            tech_lead_ops=InMemoryTechLeadAuthorityStore(),
+        )
+
+        [case_file, _proposal] = self._creations()
+        result = applier.apply(case_file)
+
+        assert result.success, result.error
+        mock_repository_host.create_issue.assert_called_once()
+
+    def test_an_anchor_authoring_creation_needs_no_subject(self, guarded):
+        """The batch/health-review anchor IS the first issue — nothing to gate on."""
+        from issue_orchestrator.control.actions import CreateTechLeadIssueAction
+
+        applier, _authority, repository_host = guarded
+        repository_host.create_issue.return_value = 901
+
+        applier.apply(
+            CreateTechLeadIssueAction(
+                title="Tech Lead Batch Review",
+                body="b",
+                labels=("agent:tech-lead",),
+                pr_count=3,
+            )
+        )
+
+        repository_host.create_issue.assert_called_once()
+        # ...and it cost no reconciliation read, because there is no subject.
+        applier.fresh_issue_reader.read_issue_labels.assert_not_called()
+
+    def test_expectations_without_a_subject_refuse_to_write(self, guarded):
+        """A dropped subject must fail closed, never run unguarded."""
+        from issue_orchestrator.control.actions import CreateTechLeadIssueAction
+        from issue_orchestrator.control.reconciliation import (
+            build_expected_for_mutation,
+        )
+
+        applier, _authority, repository_host = guarded
+
+        result = applier.apply(
+            CreateTechLeadIssueAction(
+                title="follow-up",
+                body="b",
+                labels=("agent:backend",),
+                anchor_issue_number=0,  # dropped in composition
+                expected=build_expected_for_mutation(),
+            )
+        )
+
+        assert not result.success
+        repository_host.create_issue.assert_not_called()

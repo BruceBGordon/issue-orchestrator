@@ -14,7 +14,7 @@ direction.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 from ..domain.models import DiscoveredFailure
 from ..domain.tech_lead_milestone import TechLeadMilestoneIntent
@@ -36,6 +36,52 @@ TECH_LEAD_ISSUE_CREATION_ACTION_TYPES: frozenset[ActionType] = frozenset(
         ActionType.CREATE_TECH_LEAD_CASE_FILE_ISSUE,
     }
 )
+
+#: A command whose reconciliation subject is "no managed-repo issue at all".
+#: Only two tech-lead mutations legitimately have none: creating the ANCHOR
+#: issue itself (there is nothing yet to reconcile against) and discarding
+#: terminal ledger rows (a purely orchestrator-side write). Anything else with
+#: this subject is a composition bug, and the dispatch guard fails it closed.
+NO_RECONCILIATION_SUBJECT = 0
+
+
+@runtime_checkable
+class TechLeadMutation(Protocol):
+    """A tech-lead command that MUTATES, and names what it reconciles against.
+
+    Every mutating tech-lead command crosses the applier's optimistic-concurrency
+    gate before it writes, and that gate needs an issue to read labels from. The
+    dispatch table used to supply those subjects by hand for the four commands
+    someone remembered, which is exactly why issue creation kept slipping past
+    it: a case file or proposal could still be filed against a source anchor
+    paused behind ``io:needs-reconcile`` (#6957 round-6 review F3/A3).
+
+    So the SUBJECT is part of each command's own contract, not a lookup table
+    the registry has to keep in sync. A command that mutates and does not
+    implement this protocol cannot be dispatched.
+    """
+
+    def reconciliation_subject(self) -> int:
+        """The managed-repo issue whose current labels gate this mutation.
+
+        :data:`NO_RECONCILIATION_SUBJECT` when the command genuinely has none.
+        """
+        ...
+
+
+def reconciliation_subject_for(action: Action) -> int:
+    """The managed-repo issue *action*'s mutation is checked against.
+
+    Fails loudly for a mutating tech-lead command that never declared one:
+    silently skipping the gate is the failure mode this replaces.
+    """
+    if not isinstance(action, TechLeadMutation):
+        raise TypeError(
+            f"{type(action).__name__} is dispatched as a mutating tech-lead"
+            " command but does not implement TechLeadMutation; every mutating"
+            " command must name the issue its reconciliation is checked against"
+        )
+    return action.reconciliation_subject()
 
 
 @dataclass(frozen=True)
@@ -74,7 +120,17 @@ class CreateTechLeadIssueAction(Action):
     # tech lead marked urgent. The applier's create boundary reads it (with the
     # gate presence) to front-queue the new issue via the expedite owner.
     expedite: bool = False
+    # The tech-lead session anchor this creation was decided from, and therefore
+    # the issue its reconciliation gate reads (#6957 round-6 review F3/A3). 0 for
+    # the two planner-side creations that AUTHOR an anchor (batch review, health
+    # review): there is no prior issue to reconcile against, and they carry no
+    # ``expected`` either — the dispatch guard enforces that pairing.
+    anchor_issue_number: int = 0
     action_type: ActionType = field(default=ActionType.CREATE_TECH_LEAD_ISSUE, init=False)
+
+    def reconciliation_subject(self) -> int:
+        """The anchor issue whose pause label gates this creation."""
+        return self.anchor_issue_number
 
 
 @dataclass(frozen=True)
@@ -90,7 +146,6 @@ class CreateTechLeadProposalIssueAction(CreateTechLeadIssueAction):
     """
 
     op: "StoredTechLeadOp" = field(kw_only=True)
-    anchor_issue_number: int = 0
     action_type: ActionType = field(
         default=ActionType.CREATE_TECH_LEAD_PROPOSAL_ISSUE, init=False
     )
@@ -175,6 +230,13 @@ class CreateTechLeadCaseFileIssueAction(CreateTechLeadIssueAction):
             raise ValueError(
                 "CreateTechLeadCaseFileIssueAction observations must have"
                 f" distinct identities, got {identities}"
+            )
+        if self.anchor_issue_number <= 0:
+            raise ValueError(
+                "CreateTechLeadCaseFileIssueAction requires the positive"
+                " anchor_issue_number it was decided from; without it the"
+                " creation has no reconciliation subject and could file a case"
+                " file against an anchor paused behind io:needs-reconcile"
             )
         if not self.idempotency_marker.strip():
             raise ValueError(
@@ -267,6 +329,10 @@ class ResetRetryIssueAction(Action):
         if not self.proposal_id:
             raise ValueError("ResetRetryIssueAction requires the proposal id")
 
+    def reconciliation_subject(self) -> int:
+        """The issue this reset mutates."""
+        return self.issue_number
+
 
 @dataclass(frozen=True)
 class KillHungSessionAction(Action):
@@ -305,6 +371,10 @@ class KillHungSessionAction(Action):
                 " (there is no direct execute tier for kill_hung_session)"
             )
 
+    def reconciliation_subject(self) -> int:
+        """The issue whose runtime this termination mutates."""
+        return self.issue_number
+
 
 @dataclass(frozen=True)
 class DiscardTerminalTechLeadProposalOpsAction(Action):
@@ -326,6 +396,14 @@ class DiscardTerminalTechLeadProposalOpsAction(Action):
     action_type: ActionType = field(
         default=ActionType.DISCARD_TERMINAL_TECH_LEAD_PROPOSAL_OPS, init=False
     )
+
+    def reconciliation_subject(self) -> int:
+        """None: this writes only orchestrator-owned ledger rows.
+
+        Its candidates are issues that are already gone or closed, so there is
+        no live managed-repo issue whose labels could gate it.
+        """
+        return NO_RECONCILIATION_SUBJECT
 
 
 @dataclass(frozen=True)
@@ -375,6 +453,10 @@ class AppendPatternObservationAction(Action):
                 " observation it appends (identity + evidence comment)"
             )
 
+    def reconciliation_subject(self) -> int:
+        """The case file this comments on and counts against."""
+        return self.issue_number
+
     @property
     def comment(self) -> str:
         """The evidence comment posted onto the case file."""
@@ -393,9 +475,14 @@ class PromoteTechLeadFindingAction(Action):
     deterministic ``idempotency_marker`` lets the target recover the remote
     issue if the process dies between those writes.
 
-    ``labels`` carries the ``proposed-tech-lead`` gate in ``gated`` mode; the
-    self-validation below makes an ungated filing an explicit, typed decision
-    (``promote: auto``) rather than something a composition bug can produce.
+    ``gated`` is the approval mode this filing was PLANNED under, and the
+    self-validation below makes it agree with ``labels``. Carrying the mode was
+    the missing half: the command's claim to make ungated filing "an explicit
+    typed decision" was empty while the only evidence of the decision was a
+    label's presence, so the applier could not tell a deliberate
+    ``promote: auto`` filing from a gated one whose gate label a composition bug
+    dropped — and a dropped gate is an immediately schedulable issue nobody
+    approved (#6957 round-6 review A2).
     """
 
     signature: str = ""
@@ -407,11 +494,27 @@ class PromoteTechLeadFindingAction(Action):
     area: str = ""
     observation_count: int = 0
     idempotency_marker: str = ""
+    # tech_lead.findings.promote == "gated" at planning time. Deliberately NOT
+    # defaulted to the safe-looking True: the default must be the one that fails
+    # closed, and a `gated` command is invalid unless the gate label is really
+    # present, so a caller that forgets the field gets a loud auto/gate mismatch
+    # rather than a silently gated-looking filing.
+    gated: bool = False
     action_type: ActionType = field(
         default=ActionType.PROMOTE_TECH_LEAD_FINDING, init=False
     )
 
+    def reconciliation_subject(self) -> int:
+        """The SOURCE case file this promotion is filed on behalf of.
+
+        The promoted issue lives in another repository, which this
+        reconciliation model does not span.
+        """
+        return self.case_file_issue_number
+
     def __post_init__(self) -> None:
+        from ..domain.tech_lead_session import PROPOSED_TECH_LEAD_LABEL
+
         if not self.signature.strip():
             raise ValueError(
                 "PromoteTechLeadFindingAction requires the pattern signature"
@@ -440,6 +543,23 @@ class PromoteTechLeadFindingAction(Action):
             raise ValueError(
                 "PromoteTechLeadFindingAction requires its idempotency marker"
                 " in the promoted issue body"
+            )
+        # Self-validating type, both directions. A gated command missing the
+        # gate would file schedulable work nobody approved; an auto command
+        # CARRYING the gate would file work nobody can start without noticing
+        # a label the operator was never told about.
+        has_gate = PROPOSED_TECH_LEAD_LABEL in self.labels
+        if self.gated and not has_gate:
+            raise ValueError(
+                "PromoteTechLeadFindingAction planned as gated must carry the"
+                f" {PROPOSED_TECH_LEAD_LABEL!r} label; filing it without the gate"
+                " creates immediately schedulable work nobody approved"
+            )
+        if not self.gated and has_gate:
+            raise ValueError(
+                "PromoteTechLeadFindingAction planned as ungated"
+                " (tech_lead.findings.promote: auto) must NOT carry the"
+                f" {PROPOSED_TECH_LEAD_LABEL!r} label"
             )
 
 
@@ -494,6 +614,10 @@ class ReportPromotedFindingEvidenceAction(Action):
                 " it advances the promotion's high-water mark to"
             )
 
+    def reconciliation_subject(self) -> int:
+        """The SOURCE case file whose evidence this reports."""
+        return self.case_file_issue_number
+
 
 @dataclass(frozen=True)
 class SettleTechLeadPromotionAction(Action):
@@ -533,3 +657,7 @@ class SettleTechLeadPromotionAction(Action):
                 "SettleTechLeadPromotionAction marked shipped requires the merged"
                 " PR url — that url IS the shipped-fix evidence"
             )
+
+    def reconciliation_subject(self) -> int:
+        """The SOURCE case file every write of this settlement lands on."""
+        return self.case_file_issue_number

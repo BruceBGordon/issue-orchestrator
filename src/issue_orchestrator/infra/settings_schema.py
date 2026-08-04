@@ -1274,6 +1274,11 @@ class ReviewSettings(BaseModel):
                 "({repo, scope_label, agent_label}) declaring the target's "
                 "scheduling labels; a 'self' route inherits filtering.label and "
                 "review.tech_lead_follow_up_agent and must not redeclare them. "
+                "Every foreign target is proven FILEABLE at startup, not at "
+                "promotion time: reachable, issues enabled, and able to apply "
+                "that route's labels plus create any it lacks (filing "
+                "provisions labels before it opens the issue, and GitHub's "
+                "triage role cannot create them). "
                 "Allowed values: off, gated, auto."
             ),
             "section": _TECH_LEAD_SECTION,

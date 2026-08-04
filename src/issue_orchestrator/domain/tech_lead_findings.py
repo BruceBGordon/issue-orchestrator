@@ -214,6 +214,56 @@ class PromotionRoute:
         )
 
 
+@dataclass(frozen=True)
+class PromotionFilingContract:
+    """Everything a filing into ONE target repo requires of that repo (#6957).
+
+    Startup readiness has to prove the operation the lane will actually perform,
+    not a weaker proxy for it. ``check_writable(repo=...)`` was that weaker
+    proxy: it accepted the ``triage`` repository role, which may APPLY labels
+    but cannot CREATE them — while ``file_issue`` provisions every missing label
+    before it creates the issue. Doctor could therefore pass a route whose first
+    promotion fails, which is the exact late failure the check exists to prevent
+    (#6957 round-6 review F2/A1). So the readiness operation takes this whole
+    contract instead of a bare repo name.
+
+    ``labels`` are the labels that route's promotions are KNOWN to need (worker
+    agent, target scope, the approval gate, and the ``area:*`` tag of every
+    explicitly routed area). ``provisions_unknown_labels`` is True when the repo
+    also owns the catch-all ``default`` route: findings routed there carry the
+    ``area:*`` tag of whatever area the tech lead classified them into, which is
+    not enumerable at startup — so filing there REQUIRES the ability to create
+    labels, not merely to apply the known ones.
+    """
+
+    repo: str
+    labels: tuple[str, ...] = ()
+    provisions_unknown_labels: bool = False
+
+    def __post_init__(self) -> None:
+        if not self.repo.strip():
+            raise ValueError("a PromotionFilingContract requires a target repository")
+
+    def merged_with(self, other: "PromotionFilingContract") -> "PromotionFilingContract":
+        """Union of two contracts for the SAME repo — one probe, not two.
+
+        Several areas routing to one repo is one target with one combined label
+        requirement, so the lane keeps its "one read per distinct target" cost.
+        """
+        if self.repo.casefold() != other.repo.casefold():
+            raise ValueError(
+                "promotion filing contracts merge only within one repo, got"
+                f" {self.repo!r} and {other.repo!r}"
+            )
+        return PromotionFilingContract(
+            repo=self.repo,
+            labels=_deduped_labels((*self.labels, *other.labels)),
+            provisions_unknown_labels=(
+                self.provisions_unknown_labels or other.provisions_unknown_labels
+            ),
+        )
+
+
 def _deduped_labels(labels: Sequence[str]) -> tuple[str, ...]:
     """Order-preserving, case-insensitive dedup of non-empty label names."""
     seen: set[str] = set()

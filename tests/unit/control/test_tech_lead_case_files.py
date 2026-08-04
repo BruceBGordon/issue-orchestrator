@@ -235,11 +235,18 @@ def _case_file_action(**overrides) -> CreateTechLeadCaseFileIssueAction:
         body=f"b\n\n{MARKER}",
         labels=("agent:tech-lead", TECH_LEAD_OBSERVATION_LABEL),
         pattern_signature="sig",
+        anchor_issue_number=42,
         idempotency_marker=MARKER,
         observations=(PatternObservation(observation_id="o1", comment="e"),),
     )
     kwargs.update(overrides)
     return CreateTechLeadCaseFileIssueAction(**kwargs)
+
+
+def test_case_file_action_requires_its_anchor_as_reconciliation_subject() -> None:
+    """Without it the creation has nothing to check io:needs-reconcile against."""
+    with pytest.raises(ValueError, match="anchor_issue_number"):
+        _case_file_action(anchor_issue_number=0)
 
 
 def test_case_file_action_requires_observation_label() -> None:

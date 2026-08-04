@@ -15,6 +15,7 @@ from issue_orchestrator.adapters.github.errors import GitHubHttpError
 from issue_orchestrator.adapters.github.promotion_target import (
     GitHubPromotionTargetHost,
 )
+from issue_orchestrator.ports.promotion_target import PromotionFilingContract
 
 REPO = "porchpin/porchpin"
 MARKER = "<!-- issue-orchestrator:tech-lead-promotion:v1:test -->"
@@ -333,16 +334,27 @@ class TestOutcomeReads:
         assert target.read_outcome(repo=REPO, issue_number=501) is None
 
 
-class TestWritability:
+def _contract(**overrides) -> PromotionFilingContract:
+    return PromotionFilingContract(repo=REPO, **overrides)
+
+
+class TestFilingReadiness:
+    """Readiness must prove the FILING command, not a weaker proxy (R6 F2/A1).
+
+    ``file_issue`` provisions every missing label before it creates the issue,
+    so a check that stopped at "this token can open an issue here" approved
+    routes whose first promotion dies on a label GitHub never let it create.
+    """
+
     def test_a_writable_repo_reports_no_reason(self, target, http_client):
         http_client.get_repository.return_value = {"permissions": {"push": True}}
-        assert target.check_writable(repo=REPO) is None
+        assert target.check_filing_ready(_contract()) is None
 
     def test_a_read_only_repo_reports_the_reason(self, target, http_client):
         http_client.get_repository.return_value = {
             "permissions": {"push": False, "admin": False}
         }
-        reason = target.check_writable(repo=REPO)
+        reason = target.check_filing_ready(_contract())
         assert reason is not None and "not writable" in reason
 
     def test_issues_disabled_reports_the_reason(self, target, http_client):
@@ -350,7 +362,7 @@ class TestWritability:
             "has_issues": False,
             "permissions": {"push": True},
         }
-        reason = target.check_writable(repo=REPO)
+        reason = target.check_filing_ready(_contract())
         assert reason is not None and "issues disabled" in reason
 
     def test_a_missing_repo_reports_the_reason(self, target, http_client):
@@ -358,18 +370,83 @@ class TestWritability:
         error.status_code = 404
         http_client.get_repository.side_effect = error
 
-        reason = target.check_writable(repo=REPO)
+        reason = target.check_filing_ready(_contract())
 
         assert reason is not None and "not found" in reason
 
     def test_a_payload_without_permissions_fails_closed(self, target, http_client):
         http_client.get_repository.return_value = {"name": "porchpin"}
-        reason = target.check_writable(repo=REPO)
+        reason = target.check_filing_ready(_contract())
         assert reason is not None and "cannot prove" in reason
 
-    @pytest.mark.parametrize("role", ("triage", "push", "maintain", "admin"))
-    def test_every_issue_writable_repository_role_passes(
+    @pytest.mark.parametrize("role", ("push", "maintain", "admin"))
+    def test_a_label_writing_role_covers_any_label_gap(
         self, target, http_client, role
     ):
+        """These roles may CREATE labels, so provisioning closes every gap."""
         http_client.get_repository.return_value = {"permissions": {role: True}}
-        assert target.check_writable(repo=REPO) is None
+
+        reason = target.check_filing_ready(
+            _contract(labels=("agent:backend", "proposed-tech-lead"))
+        )
+
+        assert reason is None
+        # No point listing labels the token can create on demand.
+        http_client.list_all_labels.assert_not_called()
+
+    def test_triage_passes_when_every_required_label_already_exists(
+        self, target, http_client
+    ):
+        """Triage may APPLY labels, so an already-provisioned target is fine."""
+        http_client.get_repository.return_value = {"permissions": {"triage": True}}
+        http_client.list_all_labels.return_value = [
+            {"name": "agent:backend"},
+            {"name": "Proposed-Tech-Lead"},  # GitHub folds label names
+        ]
+
+        reason = target.check_filing_ready(
+            _contract(labels=("agent:backend", "proposed-tech-lead"))
+        )
+
+        assert reason is None
+
+    def test_triage_with_a_missing_required_label_is_not_ready(
+        self, target, http_client
+    ):
+        """The regression: doctor used to approve exactly this route.
+
+        The triage role may apply an existing label but cannot create one, and
+        filing provisions before it creates — so the first promotion carrying
+        the missing gate would fail, cross-repo and late.
+        """
+        http_client.get_repository.return_value = {"permissions": {"triage": True}}
+        http_client.list_all_labels.return_value = [{"name": "agent:backend"}]
+
+        reason = target.check_filing_ready(
+            _contract(labels=("agent:backend", "proposed-tech-lead"))
+        )
+
+        assert reason is not None
+        assert "proposed-tech-lead" in reason
+        assert "triage" in reason
+
+    def test_triage_cannot_serve_a_route_with_unknowable_labels(
+        self, target, http_client
+    ):
+        """A catch-all route's area tag is not enumerable — provisioning is required."""
+        http_client.get_repository.return_value = {"permissions": {"triage": True}}
+        http_client.list_all_labels.return_value = [{"name": "agent:backend"}]
+
+        reason = target.check_filing_ready(
+            _contract(labels=("agent:backend",), provisions_unknown_labels=True)
+        )
+
+        assert reason is not None and "CREATE labels" in reason
+
+    def test_a_label_read_failure_fails_closed(self, target, http_client):
+        http_client.get_repository.return_value = {"permissions": {"triage": True}}
+        http_client.list_all_labels.side_effect = GitHubHttpError("rate limited")
+
+        reason = target.check_filing_ready(_contract(labels=("agent:backend",)))
+
+        assert reason is not None and "could not be read" in reason
