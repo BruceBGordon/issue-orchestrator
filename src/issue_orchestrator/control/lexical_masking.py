@@ -78,7 +78,7 @@ _JS_VALUE_BLOCKING_CHARS = "([{=,:;!&|?+-*/%^~<>"
 _JSX_CLOSING_TAG = r"</[ \t]*(?:(?:[^\W\d]|[$_])[\w$.:-]*[ \t]*)?>"
 _JSX_CLOSING_TAG_AT = re.compile(_JSX_CLOSING_TAG)
 _JSX_CLOSING_TAG_END = re.compile(_JSX_CLOSING_TAG + r"$")
-_JAVA_UNICODE_ESCAPE = re.compile(r"\\u+([0-9a-fA-F]{4})")
+_JAVA_UNICODE_ESCAPE = re.compile(r"u+([0-9a-fA-F]{4})")
 # JLS 3.4 LineTerminator: LF, CR, or CRLF. Deliberately narrower than
 # ``str.splitlines()``, which also breaks on form feed and other characters
 # Java treats as ordinary whitespace inside a line.
@@ -90,11 +90,10 @@ def _translate_java_unicode_escapes(text: str) -> str:
 
     Java translates eligible ``\\uXXXX`` escapes over the whole raw input
     *before* comments and literals are recognised, so ``"\\u0022"`` closes a
-    string rather than sitting inertly inside one. A backslash is eligible only
-    when an even number of contiguous backslashes precede it, which makes the
-    last backslash of an odd-length run the only one that can open an escape:
-    ``\\u0022`` is a quote, while ``\\\\u0022`` is an escaped backslash
-    followed by literal ``u0022`` text.
+    string rather than sitting inertly inside one. Eligibility depends on both
+    the parity of contiguous result backslashes and whether the immediately
+    preceding result character came from an escape. An escape-produced
+    character is emitted once and is never reconsidered as another escape.
 
     Escapes that cannot be modelled -- a malformed ``\\u`` with fewer than four
     hex digits -- are left as raw text. Java rejects those at compile time, so
@@ -102,26 +101,33 @@ def _translate_java_unicode_escapes(text: str) -> str:
     """
 
     translated: list[str] = []
+    contiguous_backslashes = 0
+    preceding_from_escape = False
     index = 0
     while index < len(text):
-        if text[index] != "\\":
-            translated.append(text[index])
+        char = text[index]
+        if char != "\\":
+            translated.append(char)
+            contiguous_backslashes = 0
+            preceding_from_escape = False
             index += 1
             continue
-        run_end = index
-        while run_end < len(text) and text[run_end] == "\\":
-            run_end += 1
-        escape = (
-            _JAVA_UNICODE_ESCAPE.match(text, run_end - 1)
-            if (run_end - index) % 2 == 1
-            else None
-        )
+
+        eligible = preceding_from_escape or contiguous_backslashes % 2 == 0
+        escape = _JAVA_UNICODE_ESCAPE.match(text, index + 1) if eligible else None
         if escape is None:
-            translated.append(text[index:run_end])
-            index = run_end
+            translated.append(char)
+            contiguous_backslashes += 1
+            preceding_from_escape = False
+            index += 1
             continue
-        translated.append(text[index : run_end - 1])
-        translated.append(chr(int(escape.group(1), 16)))
+
+        char = chr(int(escape.group(1), 16))
+        translated.append(char)
+        contiguous_backslashes = (
+            contiguous_backslashes + 1 if char == "\\" else 0
+        )
+        preceding_from_escape = True
         index = escape.end()
     return "".join(translated)
 

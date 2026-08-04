@@ -525,25 +525,32 @@ def test_scan_added_test_skip_guards_flags_java_unicode_escaped_quote() -> None:
     diff = '''diff --git a/src/test/java/GuardTest.java b/src/test/java/GuardTest.java
 --- a/src/test/java/GuardTest.java
 +++ b/src/test/java/GuardTest.java
-@@ -0,0 +1,1 @@
+@@ -0,0 +1,3 @@
 +        String fixture = "\\u0022; assumeTrue(false); //";
++        assume\\u0054rue(false);
++        String escaped = "\\u005c\\\\u0022; assumeFalse(true); //";
 '''
 
     result = _scan(diff)
 
     assert [
         (violation.line_number, violation.pattern) for violation in result.violations
-    ] == [(1, "JUnit assumeTrue")]
+    ] == [
+        (1, "JUnit assumeTrue"),
+        (2, "JUnit assumeTrue"),
+        (3, "JUnit assumeFalse"),
+    ]
 
 
 def test_scan_added_test_skip_guards_ignores_inert_java_fixture_strings() -> None:
     diff = '''diff --git a/src/test/java/GuardTest.java b/src/test/java/GuardTest.java
 --- a/src/test/java/GuardTest.java
 +++ b/src/test/java/GuardTest.java
-@@ -0,0 +1,3 @@
+@@ -0,0 +1,4 @@
 +        String plain = "assumeTrue(false) stays inert";
 +        String escaped = "\\\\u0022 assumeTrue(false) stays inert";
 +        String unicode = "\\u0061ssumeTrue(false) stays inert";
++        \\u002f\\u002f assumeFalse(true);
 '''
 
     assert _scan(diff).ok
