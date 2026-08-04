@@ -445,6 +445,49 @@ def test_scan_added_test_skip_guards_flags_division_after_self_closing_jsx() -> 
     assert {violation.pattern for violation in result.violations} == {"JS test skip"}
 
 
+def test_scan_added_test_skip_guards_ignores_fixtures_after_paired_jsx() -> None:
+    diff = """diff --git a/tests/guard.test.tsx b/tests/guard.test.tsx
+--- a/tests/guard.test.tsx
++++ b/tests/guard.test.tsx
+@@ -0,0 +1,5 @@
++const view = <Widget></Widget>; expect(/it.skip("fixture")/.test(source));
++const named = <A.B></A.B>; expect(/describe.skip("fixture")/.test(source));
++const dashed = <my-el></my-el>; expect(/test.skip("fixture")/.test(source));
++const frag = <></>; expect(/test.skip("fixture")/.test(source));
++const quoted = <Widget></Widget>; const fixture = "a/b test.skip(inert)";
+"""
+
+    assert _scan(diff).ok
+
+
+def test_scan_added_test_skip_guards_flags_executable_skips_around_paired_jsx() -> None:
+    diff = """diff --git a/tests/guard.test.tsx b/tests/guard.test.tsx
+--- a/tests/guard.test.tsx
++++ b/tests/guard.test.tsx
+@@ -0,0 +1,3 @@
++const view = <Widget></Widget>; test.skip("real skip", () => {});
++const ratio = <Widget></Widget> / (it.skip("real skip"), 1) / 2;
++const inert = left > /test.skip("fixture", () => {})/.test(source);
+"""
+
+    result = _scan(diff)
+
+    assert [violation.line_number for violation in result.violations] == [1, 2]
+    assert {violation.pattern for violation in result.violations} == {"JS test skip"}
+
+
+def test_scan_added_test_skip_guards_keeps_compact_relational_regex() -> None:
+    diff = """diff --git a/tests/guard.test.ts b/tests/guard.test.ts
+--- a/tests/guard.test.ts
++++ b/tests/guard.test.ts
+@@ -0,0 +1,2 @@
++const compact = value</pytest.mark.skip>/.test(source);
++const escaped = value</\\d+ test.skip("fixture")>/.test(source);
+"""
+
+    assert _scan(diff).ok
+
+
 def test_scan_added_test_skip_guards_closes_kotlin_four_quote_raw_string() -> None:
     diff = '''diff --git a/src/test/kotlin/GuardTest.kt b/src/test/kotlin/GuardTest.kt
 --- a/src/test/kotlin/GuardTest.kt
