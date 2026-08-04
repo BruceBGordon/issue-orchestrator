@@ -413,6 +413,52 @@ def test_scan_added_test_skip_guards_ignores_regex_after_prefix_operators() -> N
     assert _scan(diff).ok
 
 
+def test_scan_added_test_skip_guards_flags_division_after_non_null_assertion() -> None:
+    diff = """diff --git a/tests/guard.test.ts b/tests/guard.test.ts
+--- a/tests/guard.test.ts
++++ b/tests/guard.test.ts
+@@ -0,0 +1,3 @@
++const value: number | undefined = 2;
++value! / test.skip("real skip", () => {}) / 2;
++const negated = !/test.skip("fixture", () => {})/.test(source);
+"""
+
+    result = _scan(diff)
+
+    assert [violation.line_number for violation in result.violations] == [2]
+    assert result.violations[0].pattern == "JS test skip"
+
+
+def test_scan_added_test_skip_guards_closes_kotlin_raw_string_ending_in_backslash() -> (
+    None
+):
+    diff = '''diff --git a/src/test/kotlin/GuardTest.kt b/src/test/kotlin/GuardTest.kt
+--- a/src/test/kotlin/GuardTest.kt
++++ b/src/test/kotlin/GuardTest.kt
+@@ -0,0 +1,3 @@
++val fixture = """assumeTrue(false) at C:\\fixtures\\"""
++val inert = fixture
++assumeTrue(false)
+'''
+
+    result = _scan(diff)
+
+    assert [violation.line_number for violation in result.violations] == [3]
+    assert result.violations[0].pattern == "JUnit assumeTrue"
+
+
+def test_scan_added_test_skip_guards_keeps_escapes_in_kotlin_quoted_strings() -> None:
+    diff = '''diff --git a/src/test/kotlin/GuardTest.kt b/src/test/kotlin/GuardTest.kt
+--- a/src/test/kotlin/GuardTest.kt
++++ b/src/test/kotlin/GuardTest.kt
+@@ -0,0 +1,2 @@
++val quoted = "escaped \\" assumeTrue(false) still inert"
++val plain = 1
+'''
+
+    assert _scan(diff).ok
+
+
 def test_scan_added_test_skip_guards_ignores_regex_literal_starting_a_line() -> None:
     diff = """diff --git a/tests/guard.test.ts b/tests/guard.test.ts
 --- a/tests/guard.test.ts

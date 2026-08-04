@@ -245,6 +245,7 @@ class _LiteralFrame:
     interpolated: bool
     multiline: bool
     line_start: int
+    escapes: bool = True
 
 
 @dataclass
@@ -284,6 +285,10 @@ _JS_REGEX_PREFIX_KEYWORDS = {
     "yield",
 }
 _JS_CONTROL_HEADER_KEYWORDS = {"catch", "for", "if", "switch", "while", "with"}
+# Longest first: each is stripped off to expose the token it was applied to.
+_JS_POSTFIX_OPERATORS = ("++", "--", "!")
+# Punctuation that cannot end a value, so a following slash opens a regex.
+_JS_VALUE_BLOCKING_CHARS = "([{=,:;!&|?+-*/%^~<>"
 
 
 def _js_closes_control_header(prefix: str) -> bool:
@@ -425,7 +430,7 @@ class _LiteralMasker:
             self._blank(masked, index, index + len(marker))
             self._frames.append(_InterpolationFrame())
             return index + len(marker)
-        if text[index] == "\\":
+        if frame.escapes and text[index] == "\\":
             end = min(index + 2, len(text))
             self._blank(masked, index, end)
             return end
@@ -602,11 +607,17 @@ class _LiteralMasker:
         ) or (
             self._kotlin and quote == '"'
         )
+        # Kotlin triple-quoted strings are raw: a backslash before the closing
+        # delimiter is literal text, so honouring it as an escape would swallow
+        # the delimiter and leave the frame open over executable code. Python's
+        # ``r`` prefix and Java text blocks still escape at the token level.
+        escapes = not (self._kotlin and multiline)
         return _LiteralFrame(
             delimiter,
             interpolated,
             multiline=multiline,
             line_start=index,
+            escapes=escapes,
         )
 
     @staticmethod
@@ -639,29 +650,46 @@ class _LiteralMasker:
         expression as division whenever that expression can end a value.
         """
 
+        return not self._ends_js_value(prefix)
+
+    def _ends_js_value(self, prefix: str) -> bool:
+        """Report whether the masked code so far ends a complete value.
+
+        Postfix syntax is resolved against the token it follows rather than by
+        its own punctuation, because the same character reads as a prefix
+        operator elsewhere: ``value!`` is a TypeScript non-null assertion on a
+        value, while ``= !`` is logical negation awaiting one.
+        """
+
         prefix = prefix.rstrip()
-        if self._js_last_value_end > len(prefix):
-            return False
-        if prefix.endswith(("++", "--")):
-            # Only a postfix operator can sit at the end of an expression, so
-            # its operand is a value and the slash divides it. A prefix ``+``
-            # or ``-`` leaves a single trailing operator character instead.
-            return False
-        if not prefix:
-            return True
-        if prefix.endswith("=>"):
-            return True
+        while True:
+            if self._js_last_value_end > len(prefix):
+                return True
+            if not prefix:
+                return False
+            postfix = next(
+                (
+                    operator
+                    for operator in _JS_POSTFIX_OPERATORS
+                    if prefix.endswith(operator)
+                ),
+                None,
+            )
+            if postfix is None:
+                break
+            prefix = prefix[: -len(postfix)].rstrip()
+
         identifier = re.search(r"(?:[^\W\d]|[$_])[\w$]*$", prefix)
         if identifier is not None:
             if identifier.group() not in _JS_REGEX_PREFIX_KEYWORDS:
-                return False
+                return True
             before_identifier = prefix[: identifier.start()].rstrip()
-            return not before_identifier.endswith((".", "#"))
-        if prefix.endswith(")") and _js_closes_control_header(prefix):
-            return True
-        if prefix.endswith("}") and _js_closes_statement_block(prefix):
-            return True
-        return prefix[-1] in "([{=,:;!&|?+-*/%^~<>"
+            return before_identifier.endswith((".", "#"))
+        if prefix.endswith(")"):
+            return not _js_closes_control_header(prefix)
+        if prefix.endswith("}"):
+            return not _js_closes_statement_block(prefix)
+        return prefix[-1] not in _JS_VALUE_BLOCKING_CHARS
 
     @staticmethod
     def _js_regex_end(text: str, start: int) -> int | None:
