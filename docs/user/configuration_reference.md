@@ -1,7 +1,12 @@
 # Configuration Reference
 
 This is the full configuration reference auto-generated from the settings schema.
-For a short onboarding guide, see `docs/user/configuration.md`.
+For a short onboarding guide, see [Configuration](configuration.md).
+
+For task-oriented guidance on the `validation.*` and `e2e.*` fields below —
+which surface to use, how to emit JUnit XML, how to capture artifacts, and the
+path rules those globs must obey — see
+[Client Test Integrations](test-integrations.md).
 
 <!-- BEGIN AUTO-GENERATED CONFIG REFERENCE — regenerate via: pytest tests/unit/test_settings_schema.py::TestDriftDetection::test_config_reference_not_stale -->
 # Settings Reference

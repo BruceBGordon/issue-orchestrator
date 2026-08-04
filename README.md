@@ -58,7 +58,7 @@ Any client can connect: browser, VS Code ([MCP integration](docs/user/vscode.md)
 
 The operating rule is agent intent, orchestrator authority. Agents report what they did and what they want; the orchestrator re-observes GitHub, worktrees, validation records, and review output before changing state.
 
-Agents cannot merge PRs. Humans merge. Validation runs automatically before code can advance, and it can include tests, linting, type checks, architecture checks, and repo-specific policy scans.
+Agents cannot merge PRs. Humans merge. Validation runs automatically before code can advance, and it can include tests, linting, type checks, architecture checks, and repo-specific policy scans. See [Client Test Integrations](docs/user/test-integrations.md) for how to expose your repo's test results, reports, and artifacts in the dashboard.
 
 [Multi-layer hooks](docs/architecture/hooks.md) enforce these rules at the AI-agent level, git level, orchestrator level, and CI. The guardrails are installed and verified, not just described. See [Guardrails & Safety Model](docs/design/guardrails.md) for the guarantee and limitation boundaries.
 
@@ -115,7 +115,7 @@ Reference docs:
 - **User:** [Installation](docs/user/installation.md) · [Tutorial](docs/user/tutorial.md) · [Configuration](docs/user/configuration.md) · [Configuration Reference](docs/user/configuration_reference.md) · [FAQ](docs/user/faq.md)
 - **Architecture:** [Overview](docs/architecture/README.md) · [Internal Architecture](docs/architecture/internal-architecture.md) · [ADRs](docs/architecture/ADR/README.md) · [Guardrails](docs/design/guardrails.md) · [Hooks](docs/architecture/hooks.md)
 - **Development:** [Testing](docs/development/TESTING.md) · [Creating Guardrails](docs/development/CREATE_GUARDRAILS.md) · [Troubleshooting](docs/development/TROUBLESHOOTING.md) · [Review Workflow](docs/development/REVIEW_WORKFLOW.md)
-- **Features:** [Feature List](docs/user/features.md) · [E2E Runner](docs/user/e2e.md) · [VS Code](docs/user/vscode.md)
+- **Features:** [Feature List](docs/user/features.md) · [Test Integrations](docs/user/test-integrations.md) · [E2E Runner](docs/user/e2e.md) · [VS Code](docs/user/vscode.md)
 
 ## License and contributions
 

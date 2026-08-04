@@ -1,5 +1,14 @@
 # Validation viewer redesign
 
+> **Design history, not setup documentation.** This page records why the
+> validation viewer and its plugin registry have the shape they do. It is not a
+> guide to integrating a target repo's tests, and the plugin registry it
+> describes is an internal extension point — not a supported client one.
+>
+> If you own a target repo and want your tests visible in Issue-Orchestrator,
+> read [Client Test Integrations](../user/test-integrations.md) instead. The
+> supported surface is JUnit XML plus artifacts.
+
 Status: design + mockups committed. Implementation in progress across four
 PRs (foundation → drawer integration → E2E view → accessibility).
 
