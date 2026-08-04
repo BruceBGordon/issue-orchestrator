@@ -193,3 +193,32 @@ class TestCreationOriginHasExactlyTwoValidStates:
             TechLeadCreationOrigin(
                 kind=TechLeadCreationKind.AUTHORS_ANCHOR, anchor_issue_number=77
             )
+
+    @pytest.mark.parametrize(
+        "kind", ("derived_from_anchor", "unexpected", None, 1, TechLeadCreationKind)
+    )
+    def test_a_kind_outside_the_enum_is_rejected(self, kind) -> None:
+        """#6957 R3 F8/A7: the closed model must be closed at RUNTIME.
+
+        Branching on ``kind is AUTHORS_ANCHOR`` and treating everything else as
+        derived accepted a third family of states — including the enum's own
+        *value* string, which reads as the right thing and is not the enum.
+        Handled conservatively today, but the abstraction's promise was false
+        and future branching could read it differently.
+        """
+        with pytest.raises(ValueError, match="must be a TechLeadCreationKind"):
+            TechLeadCreationOrigin(kind=kind, anchor_issue_number=7)
+
+    def test_the_kind_is_required(self) -> None:
+        """Omission is a TypeError, not a defaulted guess at authority."""
+        with pytest.raises(TypeError):
+            TechLeadCreationOrigin()  # type: ignore[call-arg]
+
+    @pytest.mark.parametrize("anchor", (True, False, "7", 7.0, None))
+    def test_a_non_int_anchor_is_rejected(self, anchor) -> None:
+        """``bool`` is an ``int`` subclass, so ``True`` would have read as #1."""
+        with pytest.raises(ValueError, match="must be an int"):
+            TechLeadCreationOrigin(
+                kind=TechLeadCreationKind.DERIVED_FROM_ANCHOR,
+                anchor_issue_number=anchor,
+            )

@@ -16,6 +16,7 @@ from issue_orchestrator.domain.models import (
 )
 from issue_orchestrator.infra.config import Config
 from issue_orchestrator.ports import PRInfo
+from issue_orchestrator.ports.fresh_issue_reader import FreshIssueReadError
 from issue_orchestrator.domain.issue_key import FakeIssueKey
 from issue_orchestrator.domain.session_key import SessionKey, TaskKind
 from tests.unit.session_run_helpers import make_session_run_assets
@@ -887,9 +888,60 @@ class TestCheckSessionExceptionHandling:
         mock_repository_host.get_prs_for_branch.return_value = []
         mock_fresh_issue_reader.read_issue_labels.side_effect = Exception("API error")
 
-        # Should not raise, should use fallback (empty labels -> FAILED)
+        # This session's issue carries no status labels, so the fallback and a
+        # fabricated empty set are indistinguishable here — which is exactly why
+        # the two tests below exist.
         status = monitor.check_session(sample_session)
         assert status == SessionStatus.FAILED
+
+    @pytest.mark.parametrize(
+        "last_known,expected",
+        [
+            ("blocked", SessionStatus.BLOCKED),
+            ("needs-human", SessionStatus.NEEDS_HUMAN),
+        ],
+    )
+    def test_an_unreadable_issue_preserves_its_last_known_classification(
+        self,
+        monitor,
+        sample_agent_config,
+        tmp_path,
+        mock_session_runner,
+        mock_repository_host,
+        mock_fresh_issue_reader,
+        last_known,
+        expected,
+    ):
+        """#6957 R3 F7: the fallback must PRESERVE status, not flatten to FAILED.
+
+        The adapter now raises instead of fabricating ``[]`` (#6957 round-2 F4),
+        so this path runs in production for the first time. An empty set would
+        classify a genuinely blocked or needs-human session as a plain FAILURE,
+        which sends it down a different recovery lane; the last-known labels are
+        the honest answer when GitHub cannot be read.
+        """
+        issue = Issue(
+            number=321,
+            title="Blocked work",
+            labels=["agent:web", last_known],
+            body="",
+        )
+        session = Session(
+            key=SessionKey(issue=FakeIssueKey(name="321"), task=TaskKind.CODE),
+            issue=issue,
+            agent_config=sample_agent_config,
+            terminal_id="issue-321",
+            worktree_path=tmp_path,
+            branch_name="issue-321-test",
+            run_assets=make_session_run_assets(tmp_path, session_name="issue-321"),
+        )
+        mock_session_runner.session_exists_by_name.return_value = False
+        mock_repository_host.get_prs_for_branch.return_value = []
+        mock_fresh_issue_reader.read_issue_labels.side_effect = FreshIssueReadError(
+            "could not read fresh labels for issue #321: rate limited"
+        )
+
+        assert monitor.check_session(session) == expected
 
 
 class TestCheckAllSessionsExceptionHandling:

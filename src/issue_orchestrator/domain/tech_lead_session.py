@@ -150,6 +150,14 @@ class TechLeadCreationOrigin:
     * ``(AUTHORS_ANCHOR, no subject)`` — nothing to reconcile against;
     * ``(DERIVED_FROM_ANCHOR, positive subject)`` — reconcile against it.
 
+    "No others" is enforced at RUNTIME, not merely annotated. Branching on
+    ``kind is AUTHORS_ANCHOR`` and treating everything else as derived would let
+    an untyped caller or a ``cast`` construct a third family of states that
+    happens to be handled conservatively today and could be branched on
+    differently tomorrow — the abstraction's central promise would be false
+    (#6957 round-3 review F8/A7). Same reason ``StoredTechLeadOp`` re-checks its
+    own annotations below.
+
     ``requires_expected_state`` carries the other half of the invariant to the
     command that owns it: a derived creation without an ``ExpectedState`` would
     cross the gate as a no-op, so the command rejects that combination too.
@@ -159,6 +167,21 @@ class TechLeadCreationOrigin:
     anchor_issue_number: int = 0
 
     def __post_init__(self) -> None:
+        # Runtime re-checks: annotations carry no runtime guarantee, and this
+        # type's whole value is that its state space really is closed.
+        kind = cast(object, self.kind)
+        if not isinstance(kind, TechLeadCreationKind):
+            raise ValueError(
+                "a TechLeadCreationOrigin kind must be a TechLeadCreationKind"
+                f" ({[member.value for member in TechLeadCreationKind]}), got"
+                f" {kind!r}"
+            )
+        anchor = cast(object, self.anchor_issue_number)
+        if isinstance(anchor, bool) or not isinstance(anchor, int):
+            raise ValueError(
+                "a TechLeadCreationOrigin anchor_issue_number must be an int,"
+                f" got {anchor!r}"
+            )
         if self.kind is TechLeadCreationKind.AUTHORS_ANCHOR:
             if self.anchor_issue_number:
                 raise ValueError(

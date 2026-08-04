@@ -1512,6 +1512,24 @@ class ReviewSettings(BaseModel):
             )
         return value
 
+    @field_validator("tech_lead_findings_promote")
+    @classmethod
+    def _validate_finding_promotion_mode(cls, value: str) -> str:
+        """Close the promotion mode at the SCHEMA boundary (#6957 R3 F9).
+
+        ``json_schema_extra={"enum": ...}`` only shapes the generated select; it
+        does not make Pydantic reject anything. Without this, a tampered POST
+        body was applied to live config and only rejected later by the doctor
+        pass — after the write, and as a whole-config error rather than a
+        field-scoped one the form can attach to the offending input.
+        """
+        if value not in VALID_FINDING_PROMOTION_MODES:
+            raise ValueError(
+                "tech_lead.findings.promote must be one of"
+                f" {list(VALID_FINDING_PROMOTION_MODES)}, got {value!r}"
+            )
+        return value
+
     @model_validator(mode="after")
     def _health_review_interval_requires_tech_lead_agent(self) -> "ReviewSettings":
         # Cross-field invariant (#6763/#6776): a positive health-review

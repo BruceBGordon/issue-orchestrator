@@ -3492,3 +3492,24 @@ class TestTechLeadIssueCreationCrossesTheReconciliationGate:
                 origin=TechLeadCreationOrigin.derived_from_anchor(self.ANCHOR),
             )
         repository_host.create_issue.assert_not_called()
+
+    def test_the_creation_command_cannot_omit_its_origin(self):
+        """The origin is required, not defaulted — omission is a TypeError.
+
+        This is what makes the two-field omission unrepresentable rather than
+        merely rejected: there is no value the caller can leave out and have
+        the command guess authority from (#6957 round-2 F6/A6).
+        """
+        from issue_orchestrator.control.actions import (
+            CreateTechLeadCaseFileIssueAction,
+            CreateTechLeadIssueAction,
+            CreateTechLeadProposalIssueAction,
+        )
+
+        for command in (
+            CreateTechLeadIssueAction,
+            CreateTechLeadProposalIssueAction,
+            CreateTechLeadCaseFileIssueAction,
+        ):
+            with pytest.raises(TypeError, match="origin"):
+                command(title="t", body="b", labels=("agent:backend",))  # type: ignore[call-arg]
