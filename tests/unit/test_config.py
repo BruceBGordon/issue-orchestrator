@@ -4,6 +4,7 @@ import pytest
 import yaml
 from pathlib import Path
 from issue_orchestrator.infra.config import Config
+from issue_orchestrator.infra.config_models import PromotionRouteTarget
 
 
 class TestConfig:
@@ -3052,7 +3053,7 @@ tech_lead:
         assert findings.promote == "gated"
         assert findings.min_evidence == 2
         assert findings.max_open_promoted == 3
-        assert findings.route == {"default": "self"}
+        assert findings.route == {"default": PromotionRouteTarget(repo="self")}
         assert findings.enabled is True
         assert findings.gated is True
 
@@ -3077,10 +3078,10 @@ tech_lead:
         assert findings.gated is False
         assert findings.min_evidence == 4
         assert findings.max_open_promoted == 1
-        assert findings.route_for("completion-pipeline") == (
+        assert findings.route_for("completion-pipeline").repo == (
             "issue-orchestrator/issue-orchestrator"
         )
-        assert findings.route_for("ui") == "self"
+        assert findings.route_for("ui").repo == "self"
         assert findings.target_repos() == ("issue-orchestrator/issue-orchestrator",)
 
     def test_finding_promotion_route_defaults_to_self_when_omitted(self, tmp_path):
@@ -3096,7 +3097,7 @@ tech_lead:
 
         findings = Config.load(config_file).tech_lead.findings
 
-        assert findings.route_for("anything-else") == "self"
+        assert findings.route_for("anything-else").repo == "self"
 
     def test_finding_promotion_default_route_is_case_insensitive(self, tmp_path):
         config_file = tmp_path / ".issue-orchestrator.yaml"
@@ -3111,12 +3112,15 @@ tech_lead:
 
         findings = Config.load(config_file).tech_lead.findings
 
-        assert findings.route == {"default": "owner/repo"}
-        assert findings.route_for("anything-else") == "owner/repo"
+        assert findings.route == {"default": PromotionRouteTarget(repo="owner/repo")}
+        assert findings.route_for("anything-else").repo == "owner/repo"
 
     def test_finding_promotion_target_repos_fold_repository_case(self):
         findings = Config().tech_lead.findings
-        findings.route = {"one": "Owner/Repo", "two": "owner/repo"}
+        findings.route = {
+            "one": PromotionRouteTarget(repo="Owner/Repo"),
+            "two": PromotionRouteTarget(repo="owner/repo"),
+        }
 
         assert findings.target_repos() == ("Owner/Repo",)
 
@@ -3148,7 +3152,9 @@ tech_lead:
 
     def test_malformed_route_target_fails_startup(self):
         config = Config()
-        config.tech_lead.findings.route = {"default": "not-a-repo"}
+        config.tech_lead.findings.route = {
+            "default": PromotionRouteTarget(repo="not-a-repo")
+        }
 
         errors = config.validate()
 
@@ -3163,6 +3169,15 @@ tech_lead:
                 "Queue: owner/one\n      queue: owner/two",
                 "duplicate case-insensitive area",
             ),
+            ("completion-pipeline: []", "must be 'self', 'owner/repo'"),
+            ("completion-pipeline: 3", "must be 'self', 'owner/repo'"),
+            ("completion-pipeline:\n        nope: x", "unknown key"),
+            ("completion-pipeline:\n        scope_label: x", "requires a non-empty"),
+            (
+                "completion-pipeline:\n        repo: owner/repo\n"
+                "        scope_label: [1]",
+                "must be a label string",
+            ),
         ),
     )
     def test_blank_or_ambiguous_finding_routes_fail_load(
@@ -3175,6 +3190,82 @@ tech_lead:
 
         with pytest.raises(ValueError, match=fragment):
             Config.load(config_file)
+
+    @pytest.mark.parametrize("value", ("[]", "''", "false", "0"))
+    def test_falsy_non_mapping_route_is_rejected_not_defaulted(
+        self, tmp_path, value: str
+    ):
+        """#6957 review F6: an explicitly supplied non-mapping must fail loudly.
+
+        ``data.get("route") or {}`` accepted every falsy value and silently
+        replaced it with ``default: self`` — quietly redirecting a cross-repo
+        routing feature into the managed repo.
+        """
+        config_file = tmp_path / ".issue-orchestrator.yaml"
+        config_file.write_text(
+            f"tech_lead:\n  findings:\n    route: {value}\n"
+        )
+
+        with pytest.raises(ValueError, match="route must be a mapping"):
+            Config.load(config_file)
+
+    @pytest.mark.parametrize("value", ("", "null"))
+    def test_omitted_or_null_route_takes_the_default(self, tmp_path, value: str):
+        """Omission and an explicit null are the only accepted 'no route table'."""
+        config_file = tmp_path / ".issue-orchestrator.yaml"
+        config_file.write_text(
+            "tech_lead:\n  findings:\n    min_evidence: 3\n"
+            + (f"    route: {value}\n" if value else "")
+        )
+
+        findings = Config.load(config_file).tech_lead.findings
+
+        assert findings.route == {"default": PromotionRouteTarget(repo="self")}
+
+    def test_foreign_route_declares_the_targets_scheduling_labels(self, tmp_path):
+        """#6957 review F2: a route owns the target's whole queue contract."""
+        config_file = tmp_path / ".issue-orchestrator.yaml"
+        config_file.write_text(
+            """
+tech_lead:
+  findings:
+    route:
+      completion-pipeline:
+        repo: owner/repo
+        scope_label: upstream-scope
+        agent_label: agent:platform
+      default: self
+"""
+        )
+
+        findings = Config.load(config_file).tech_lead.findings
+
+        target = findings.route_for("completion-pipeline")
+        assert target.repo == "owner/repo"
+        assert target.scope_label == "upstream-scope"
+        assert target.agent_label == "agent:platform"
+        assert findings.target_repos() == ("owner/repo",)
+
+    def test_self_route_may_not_redeclare_the_managed_repos_contract(self):
+        """The managed repo's scheduling labels come from its own config."""
+        config = Config()
+        config.tech_lead.findings.route = {
+            "default": PromotionRouteTarget(repo="self", scope_label="something")
+        }
+
+        errors = config.validate()
+
+        assert any("routes to 'self'" in error for error in errors)
+
+    def test_foreign_route_with_a_blank_agent_label_fails_startup(self):
+        config = Config()
+        config.tech_lead.findings.route = {
+            "default": PromotionRouteTarget(repo="owner/repo", agent_label="")
+        }
+
+        errors = config.validate()
+
+        assert any("agent_label" in error for error in errors)
 
     def test_tech_lead_config_from_yaml(self, tmp_path):
         """Test loading tech_lead config from YAML."""
@@ -3404,7 +3495,13 @@ tech_lead:
             "promote": "gated",
             "min_evidence": 2,
             "max_open_promoted": 3,
-            "route": {"default": "self"},
+            "route": {
+                "default": {
+                    "repo": "self",
+                    "scope_label": None,
+                    "agent_label": None,
+                }
+            },
         }
         assert (
             result["tech_lead"]["milestone_strategy"]["inherit_from_issues"] == "latest"

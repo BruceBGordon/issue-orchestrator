@@ -28,7 +28,7 @@ def http_client():
         "number": 501,
         "html_url": "https://github.com/porchpin/porchpin/issues/501",
     }
-    client.get_prs_for_issue.return_value = []
+    client.get_closing_pull_request.return_value = None
     client.list_issues.return_value = []
     client.search_issues_by_title.return_value = []
     return client
@@ -154,17 +154,15 @@ class TestOutcomeReads:
         outcome = target.read_outcome(repo=REPO, issue_number=501)
 
         assert outcome is not None and not outcome.closed
-        http_client.get_prs_for_issue.assert_not_called()
+        http_client.get_closing_pull_request.assert_not_called()
 
-    def test_closed_with_a_merged_pr_reports_the_merge_url(self, target, http_client):
+    def test_closed_by_a_merged_pr_reports_the_merge_url(self, target, http_client):
         http_client.get_issue.return_value = {"state": "closed"}
-        http_client.get_prs_for_issue.return_value = [
-            {"html_url": "https://github.com/x/y/pull/1", "pull_request": {}},
-            {
-                "html_url": "https://github.com/x/y/pull/6956",
-                "pull_request": {"merged_at": "2026-08-03T00:00:00Z"},
-            },
-        ]
+        http_client.get_closing_pull_request.return_value = {
+            "number": 6956,
+            "url": "https://github.com/x/y/pull/6956",
+            "merged": True,
+        }
 
         outcome = target.read_outcome(repo=REPO, issue_number=501)
 
@@ -172,16 +170,55 @@ class TestOutcomeReads:
         assert outcome.closed
         assert outcome.merged_pr_url == "https://github.com/x/y/pull/6956"
 
-    def test_closed_without_a_merged_pr_reports_no_merge_url(self, target, http_client):
+    def test_closed_with_no_closing_pr_reports_no_merge_url(self, target, http_client):
         http_client.get_issue.return_value = {"state": "closed"}
-        http_client.get_prs_for_issue.return_value = [
-            {"html_url": "https://github.com/x/y/pull/1", "pull_request": {}}
-        ]
+        http_client.get_closing_pull_request.return_value = None
 
         outcome = target.read_outcome(repo=REPO, issue_number=501)
 
         assert outcome is not None
         assert outcome.closed
+        assert outcome.merged_pr_url == ""
+
+    def test_a_merged_pr_that_only_mentions_the_issue_is_a_decline(
+        self, target, http_client
+    ):
+        """#6957 review F4: mention != closing linkage.
+
+        A merged PR that merely writes ``#501`` in its body used to satisfy the
+        broad ``get_prs_for_issue`` search, so an operator closing #501 as a
+        decline wrote shipped-fix memory and permanently closed the source case
+        file. Only the PR GitHub records as the CLOSER counts.
+        """
+        http_client.get_issue.return_value = {"state": "closed"}
+        # No ClosedEvent closer: the issue was closed by a human, not by a PR.
+        http_client.get_closing_pull_request.return_value = None
+        # ...even though merged PRs referencing the number exist.
+        http_client.get_prs_for_issue.return_value = [
+            {
+                "html_url": "https://github.com/x/y/pull/999",
+                "pull_request": {"merged_at": "2026-08-03T00:00:00Z"},
+            }
+        ]
+
+        outcome = target.read_outcome(repo=REPO, issue_number=501)
+
+        assert outcome is not None and outcome.closed
+        assert outcome.merged_pr_url == ""
+        http_client.get_prs_for_issue.assert_not_called()
+
+    def test_closed_by_an_unmerged_pr_is_a_decline(self, target, http_client):
+        """A PR can close an issue and then be closed unmerged — not a fix."""
+        http_client.get_issue.return_value = {"state": "closed"}
+        http_client.get_closing_pull_request.return_value = {
+            "number": 42,
+            "url": "https://github.com/x/y/pull/42",
+            "merged": False,
+        }
+
+        outcome = target.read_outcome(repo=REPO, issue_number=501)
+
+        assert outcome is not None and outcome.closed
         assert outcome.merged_pr_url == ""
 
     def test_missing_issue_reads_as_unknown(self, target, http_client):

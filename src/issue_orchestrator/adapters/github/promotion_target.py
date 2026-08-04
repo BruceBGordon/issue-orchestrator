@@ -220,7 +220,7 @@ class GitHubPromotionTargetHost:
         """State of a promoted issue, plus the merged PR that closed it (if any).
 
         Costs ONE read while the issue is open — the common case — and a second
-        (the linked-PR search) only once it has closed, so following a
+        (the closing-event lookup) only once it has closed, so following a
         promotion is cheap for its whole in-flight lifetime.
         """
         with self._client_for(repo) as client:
@@ -239,28 +239,26 @@ class GitHubPromotionTargetHost:
 
     @staticmethod
     def _merged_pr_url(client: GitHubHttpClient, issue_number: int) -> str:
-        """URL of a MERGED pull request referencing the issue, else "".
+        """URL of the MERGED pull request that CLOSED the issue, else "".
 
         Merged-ness is the whole distinction the loop closure turns on: closed
-        with a merged PR is a shipped fix; closed without one is the operator
-        declining. A search failure yields "" — which classifies as declined —
-        so it is deliberately not swallowed here; the caller's read wrapper
-        treats a raised error as "unknown this tick" and leaves the promotion
-        in flight instead.
+        by a merged PR is a shipped fix; closed any other way is the operator
+        declining. Both halves of that sentence have to be proven, so this asks
+        GitHub which PR actually closed the issue rather than which PRs mention
+        its number: a merged PR that merely writes ``#501`` in its body is not
+        evidence that #501 was fixed, and treating it as such would write
+        shipped-fix memory and permanently close the source case file off an
+        unrelated merge (#6957 review F4).
+
+        A read failure raises — it must NOT degrade to "" (which classifies as
+        declined). The caller's read wrapper treats a raised error as "unknown
+        this tick" and leaves the promotion in flight instead.
         """
-        for item in client.get_prs_for_issue(issue_number):
-            if not isinstance(item, dict):
-                continue
-            pull_request = item.get("pull_request")
-            merged_at = (
-                pull_request.get("merged_at")
-                if isinstance(pull_request, dict)
-                else None
-            )
-            if merged_at:
-                url = item.get("html_url")
-                return str(url) if isinstance(url, str) else ""
-        return ""
+        closer = client.get_closing_pull_request(issue_number)
+        if not isinstance(closer, dict) or not closer.get("merged"):
+            return ""
+        url = closer.get("url")
+        return str(url) if isinstance(url, str) else ""
 
 
 def build_promotion_target_host(repository_host: Any) -> Any:

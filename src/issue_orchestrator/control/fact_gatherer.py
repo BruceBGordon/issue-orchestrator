@@ -24,7 +24,7 @@ import logging
 import re
 import time
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Optional, TYPE_CHECKING
 
 from ..infra.config import Config
@@ -37,7 +37,10 @@ from .health_review_trigger import (
     health_review_decision,
     health_review_interval_minutes,
 )
-from .tech_lead_finding_promotion import gather_finding_promotion_facts
+from .tech_lead_finding_promotion import (
+    PromotionReadBudget,
+    gather_finding_promotion_facts,
+)
 from .tech_lead_artifact_retention import (
     clear_discovered_facts as _clear_discovered_facts,
     tech_lead_problem_artifact_hold_issue_numbers,
@@ -118,6 +121,13 @@ class FactGatherer:
     # unrelated tests need not wire it; without it every provider-unavailable
     # issue is conservatively treated as owned (the pre-#6824 skip).
     provider_circuit_open: Optional[Callable[["Issue"], bool]] = None
+    # Per-target read budget for finding-promotion loop closure (#6957 F5). Owned
+    # here because the budget is a fact-gathering concern (it bounds this
+    # component's cross-repo reads per tick) and rotates across ticks, so it must
+    # outlive a single call.
+    promotion_read_budget: PromotionReadBudget = field(
+        default_factory=PromotionReadBudget
+    )
 
     def fetch_issues(
         self,
@@ -347,6 +357,7 @@ class FactGatherer:
             self.config,
             authority=self.tech_lead_authority,
             target=self.promotion_target,
+            read_budget=self.promotion_read_budget,
         )
         if (
             not batch_armed

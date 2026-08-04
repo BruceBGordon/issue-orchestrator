@@ -45,6 +45,7 @@ from ..domain.tech_lead_findings import (
     PatternEvidence,
     PromotedFinding,
     PromotionState,
+    reconcile_pattern_classification,
 )
 from ..domain.tech_lead_session import (
     StoredTechLeadOp,
@@ -62,6 +63,7 @@ from ..ports.tech_lead_authority import (
 )
 from .repo_identity import state_dir
 from .sqlite_connection import open_sqlite
+from .tech_lead_authority_schema import initialize_tech_lead_authority_schema
 
 logger = logging.getLogger(__name__)
 
@@ -93,55 +95,6 @@ def _promotion_from_row(row: sqlite3.Row) -> PromotedFinding:
     )
 
 
-_SCHEMA = """
-CREATE TABLE IF NOT EXISTS tech_lead_launch_authority (
-    run_id TEXT NOT NULL,
-    session_name TEXT NOT NULL,
-    authority TEXT NOT NULL,
-    recorded_at TEXT NOT NULL,
-    PRIMARY KEY (run_id, session_name)
-);
-CREATE TABLE IF NOT EXISTS tech_lead_proposal_ops (
-    issue_number INTEGER PRIMARY KEY,
-    op TEXT NOT NULL,
-    recorded_at TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS tech_lead_patterns (
-    signature TEXT PRIMARY KEY,
-    issue_number INTEGER NOT NULL,
-    recorded_at TEXT NOT NULL,
-    observation_count INTEGER NOT NULL DEFAULT 1,
-    fix_class TEXT NOT NULL DEFAULT '',
-    area TEXT NOT NULL DEFAULT '',
-    diagnosis TEXT NOT NULL DEFAULT ''
-);
-CREATE TABLE IF NOT EXISTS tech_lead_promoted_findings (
-    signature TEXT PRIMARY KEY,
-    case_file_issue_number INTEGER NOT NULL,
-    target_repo TEXT NOT NULL,
-    target_issue_number INTEGER NOT NULL,
-    state TEXT NOT NULL,
-    area TEXT NOT NULL DEFAULT '',
-    title TEXT NOT NULL DEFAULT '',
-    shipped_pr_url TEXT NOT NULL DEFAULT '',
-    recorded_at TEXT NOT NULL,
-    reported_observations INTEGER NOT NULL DEFAULT 0
-);
-CREATE TABLE IF NOT EXISTS tech_lead_shipped_fixes (
-    issue_number INTEGER PRIMARY KEY,
-    title TEXT NOT NULL,
-    pr_url TEXT NOT NULL,
-    area TEXT NOT NULL,
-    merged_at TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS tech_lead_storm_cohorts (
-    anchor_issue_number INTEGER PRIMARY KEY,
-    cohort TEXT NOT NULL,
-    recorded_at TEXT NOT NULL
-);
-"""
-
-
 class SqliteTechLeadAuthorityStore:
     """Persists per-run tech_lead launch authority across restarts."""
 
@@ -162,47 +115,7 @@ class SqliteTechLeadAuthorityStore:
 
     def initialize(self) -> None:
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
-        conn = self._get_connection()
-        conn.executescript(_SCHEMA)
-        self._migrate_pattern_promotion_columns(conn)
-
-    @staticmethod
-    def _migrate_pattern_promotion_columns(conn: sqlite3.Connection) -> None:
-        """Add the #6957 promotion columns to a pre-existing pattern ledger.
-
-        ``CREATE TABLE IF NOT EXISTS`` leaves an already-created table alone, so
-        a store written before the promotion lane shipped keeps the old three
-        columns. Promotion eligibility reads them, so backfill in place: the
-        defaults preserve the old meaning exactly (one recorded observation,
-        unclassified — therefore not promotable until the tech lead classifies
-        the signature on a later observation).
-        """
-        pattern_columns = {
-            str(row[1]) for row in conn.execute("PRAGMA table_info(tech_lead_patterns)")
-        }
-        additions = (
-            ("observation_count", "INTEGER NOT NULL DEFAULT 1"),
-            ("fix_class", "TEXT NOT NULL DEFAULT ''"),
-            ("area", "TEXT NOT NULL DEFAULT ''"),
-            ("diagnosis", "TEXT NOT NULL DEFAULT ''"),
-        )
-        added = False
-        for name, ddl in additions:
-            if name not in pattern_columns:
-                conn.execute(f"ALTER TABLE tech_lead_patterns ADD COLUMN {name} {ddl}")
-                added = True
-        promotion_columns = {
-            str(row[1])
-            for row in conn.execute("PRAGMA table_info(tech_lead_promoted_findings)")
-        }
-        if "reported_observations" not in promotion_columns:
-            conn.execute(
-                "ALTER TABLE tech_lead_promoted_findings ADD COLUMN"
-                " reported_observations INTEGER NOT NULL DEFAULT 0"
-            )
-            added = True
-        if added:
-            conn.commit()
+        initialize_tech_lead_authority_schema(self._get_connection())
 
     def _get_connection(self) -> sqlite3.Connection:
         conn = getattr(self._local, "conn", None)
@@ -386,9 +299,9 @@ class SqliteTechLeadAuthorityStore:
         *,
         signature: str,
         issue_number: int,
+        observation_id: str,
         fix_class: str = "",
         area: str = "",
-        observations: int = 1,
         diagnosis: str = "",
     ) -> None:
         """Persist a signature's case-file issue (create-once).
@@ -396,8 +309,16 @@ class SqliteTechLeadAuthorityStore:
         Same issue for an existing signature: no-op. Different issue:
         :class:`TechLeadPatternConflictError` — a signature keys exactly one
         evidence trail, which must never silently move. ``fix_class``/``area``
-        and the observation count are the promotion facts (#6957).
+        are the promotion facts (#6957), and ``observation_id`` is the identity
+        of the single observation the issue BODY records; the count starts at
+        one and every further observation advances it through
+        :meth:`note_pattern_observation`, create-once by identity.
         """
+        if not observation_id.strip():
+            raise ValueError(
+                "record_pattern requires the identity of the observation the"
+                " case-file body records"
+            )
         with self._transaction() as tx:
             row = tx.execute(
                 "SELECT issue_number FROM tech_lead_patterns WHERE signature = ?",
@@ -410,38 +331,51 @@ class SqliteTechLeadAuthorityStore:
                     f"pattern signature {signature!r} is already recorded for"
                     f" case-file issue #{int(row[0])}"
                 )
+            now = datetime.now(timezone.utc).isoformat()
             tx.execute(
                 "INSERT INTO tech_lead_patterns (signature, issue_number,"
                 " recorded_at, observation_count, fix_class, area, diagnosis)"
                 " VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (
-                    signature,
-                    issue_number,
-                    datetime.now(timezone.utc).isoformat(),
-                    max(1, observations),
-                    fix_class,
-                    area,
-                    diagnosis,
-                ),
+                (signature, issue_number, now, 1, fix_class, area, diagnosis),
+            )
+            tx.execute(
+                "INSERT INTO tech_lead_pattern_observations (signature,"
+                " observation_id, recorded_at) VALUES (?, ?, ?)",
+                (signature, observation_id, now),
             )
         logger.info(
             "[tech_lead] Recorded pattern case file: signature=%r issue=#%d"
-            " observations=%d fix_class=%r",
+            " observation=%s fix_class=%r",
             signature,
             issue_number,
-            max(1, observations),
+            observation_id,
             fix_class,
         )
 
     def note_pattern_observation(
-        self, *, signature: str, fix_class: str = "", area: str = ""
-    ) -> None:
-        """Increment a signature's durable observation count (#6957).
+        self,
+        *,
+        signature: str,
+        observation_id: str,
+        fix_class: str = "",
+        area: str = "",
+    ) -> bool:
+        """Record ONE observation create-once and advance the count (#6957).
 
-        A later observation may also CLASSIFY a signature the first one left
-        unclassified (and vice versa for the area), so a non-empty value
-        upgrades the row; an empty one preserves what is already recorded.
+        The count is what ``min_evidence`` reads, so it is keyed by WHICH
+        observation produced it, never by how many times the orchestrator
+        replayed the write: the identity row and the increment land in ONE
+        transaction, so a replayed action finds its identity present and returns
+        False without touching the count (review F1).
+
+        Classification/area are merged by the shared reconcile rule, which
+        raises on a conflicting non-empty value rather than letting a later
+        observation silently reclassify or reroute the signature (review F3).
         """
+        if not observation_id.strip():
+            raise ValueError(
+                "note_pattern_observation requires a stable observation identity"
+            )
         with self._transaction() as tx:
             row = tx.execute(
                 "SELECT observation_count, fix_class, area FROM tech_lead_patterns"
@@ -452,16 +386,48 @@ class SqliteTechLeadAuthorityStore:
                 raise UnknownTechLeadPatternError(
                     f"no pattern case file is recorded for signature {signature!r}"
                 )
+            # Reconciled before the create-once check so a conflict is reported
+            # identically on the first attempt and on a replay.
+            merged_fix_class = reconcile_pattern_classification(
+                field="fix_class",
+                signature=signature,
+                existing=str(row["fix_class"]),
+                incoming=fix_class,
+            )
+            merged_area = reconcile_pattern_classification(
+                field="area",
+                signature=signature,
+                existing=str(row["area"]),
+                incoming=area,
+            )
+            inserted = tx.execute(
+                "INSERT OR IGNORE INTO tech_lead_pattern_observations (signature,"
+                " observation_id, recorded_at) VALUES (?, ?, ?)",
+                (signature, observation_id, datetime.now(timezone.utc).isoformat()),
+            ).rowcount
+            if not inserted:
+                return False
             tx.execute(
                 "UPDATE tech_lead_patterns SET observation_count = ?, fix_class = ?,"
                 " area = ? WHERE signature = ?",
                 (
                     int(row["observation_count"]) + 1,
-                    fix_class or str(row["fix_class"]),
-                    area or str(row["area"]),
+                    merged_fix_class,
+                    merged_area,
                     signature,
                 ),
             )
+        return True
+
+    def has_pattern_observation(self, *, signature: str, observation_id: str) -> bool:
+        """True when this exact observation is already recorded (local read)."""
+        conn = self._get_connection()
+        row = conn.execute(
+            "SELECT 1 FROM tech_lead_pattern_observations WHERE signature = ?"
+            " AND observation_id = ?",
+            (signature, observation_id),
+        ).fetchone()
+        return row is not None
 
     def lookup_pattern(self, *, signature: str) -> int | None:
         """Return the case-file issue for a signature, or None when absent."""

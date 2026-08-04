@@ -435,18 +435,37 @@ tech_lead:
   #     Counted in the orchestrator-owned pattern ledger, so comments on the
   #     case file cannot inflate it.
   #   max_open_promoted: cap on in-flight promoted issues PER TARGET REPO.
-  #     Storm backpressure - excess eligible signatures wait behind merges.
-  #   route: area label -> the repo that owns the fix. `self` means this repo
-  #     (and such issues face this repo's own scope gates - promotion never
-  #     bypasses them). `default` is the catch-all. Every non-`self` target is
-  #     checked for issue-write access at startup, not at promotion time.
+  #     Storm backpressure - excess eligible signatures wait behind merges. It
+  #     also caps the lane's loop-closure reads per target per tick; when more
+  #     promotions are already in flight than the current cap, they are polled
+  #     in rotation over several ticks rather than all at once.
+  #   route: area label -> the target that owns the fix. `default` is the
+  #     catch-all. Every non-`self` target is checked for issue-write access at
+  #     startup, not at promotion time.
+  #     A route value is either a repo string or a mapping declaring the
+  #     target's QUEUE CONTRACT - a promoted issue is only runnable where it
+  #     carries that target's scheduling labels:
+  #       "self"        - this repo. Inherits filtering.label and
+  #                       review.tech_lead_follow_up_agent, so removing the gate
+  #                       is genuinely the whole approval. Such issues face this
+  #                       repo's own scope gates; promotion never bypasses them.
+  #                       A `self` route must NOT declare scope_label or
+  #                       agent_label - they would drift from this repo's config.
+  #       "owner/repo"  - a foreign repo with no scope filter, using this repo's
+  #                       follow-up agent label.
+  #       {repo:, scope_label:, agent_label:} - a foreign repo whose queue
+  #                       filters on labels this config knows nothing about.
+  #                       Use scope_label: "" for "that target has none".
   # findings:
   #   promote: "gated"
   #   min_evidence: 2
   #   max_open_promoted: 3
   #   route:
   #     completion-pipeline: "issue-orchestrator/issue-orchestrator"
-  #     review-exchange: "issue-orchestrator/issue-orchestrator"
+  #     review-exchange:
+  #       repo: "issue-orchestrator/issue-orchestrator"
+  #       scope_label: "io-scope"
+  #       agent_label: "agent:backend"
   #     default: "self"
 
 scheduling:

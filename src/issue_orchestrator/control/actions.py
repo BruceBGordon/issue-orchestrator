@@ -33,8 +33,9 @@ from .action_base import Action as Action, ActionType as ActionType
 # Tech-lead action types live in their own module for cohesion and line budget;
 # re-exported here (including the domain value objects their fields use) so
 # every existing ``from .actions import CreateTechLeadIssueAction`` keeps
-# working. The split is one-way: tech_lead_actions imports this module's Action
-# base and ActionType enum, never the reverse.
+# working. The split is one-way and ``action_base`` is the dependency ROOT:
+# tech_lead_actions imports Action/ActionType from action_base directly, so this
+# module can import it without a cycle through a partially initialized module.
 from ..domain.tech_lead_milestone import (
     TechLeadMilestoneIntent as TechLeadMilestoneIntent,
 )

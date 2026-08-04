@@ -10,12 +10,17 @@ from unittest.mock import patch
 import pytest
 
 from issue_orchestrator.infra.config import Config
+from issue_orchestrator.infra.config_models import PromotionRouteTarget
 from issue_orchestrator.infra.doctor.checks.tech_lead import (
     check_tech_lead_finding_routes,
 )
 from issue_orchestrator.ports.promotion_target import InMemoryPromotionTargetHost
 
 UPSTREAM = "issue-orchestrator/issue-orchestrator"
+
+
+def _route(**entries) -> dict[str, PromotionRouteTarget]:
+    return {area: PromotionRouteTarget(repo=repo) for area, repo in entries.items()}
 
 
 def _config(**findings_overrides) -> Config:
@@ -29,7 +34,7 @@ def _config(**findings_overrides) -> Config:
 
 def test_writable_route_targets_pass():
     checks = check_tech_lead_finding_routes(
-        _config(route={"cp": UPSTREAM, "default": "self"}),
+        _config(route=_route(cp=UPSTREAM, default="self")),
         target_host=InMemoryPromotionTargetHost(writable=True),
     )
 
@@ -39,7 +44,7 @@ def test_writable_route_targets_pass():
 
 def test_unwritable_route_target_is_an_error():
     checks = check_tech_lead_finding_routes(
-        _config(route={"cp": UPSTREAM, "default": "self"}),
+        _config(route=_route(cp=UPSTREAM, default="self")),
         target_host=InMemoryPromotionTargetHost(
             writable=False, unwritable_reason="not writable by this token"
         ),
@@ -72,7 +77,7 @@ def test_disabled_lane_reports_nothing(overrides):
 
 
 def test_no_tech_lead_agent_reports_nothing():
-    config = _config(route={"cp": UPSTREAM})
+    config = _config(route=_route(cp=UPSTREAM))
     config.tech_lead_review_agent = None
 
     assert (
@@ -94,12 +99,14 @@ def test_each_distinct_target_is_probed_exactly_once():
 
     checks = check_tech_lead_finding_routes(
         _config(
-            route={
-                "completion-pipeline": UPSTREAM,
-                "review-exchange": UPSTREAM,
-                "ui": "other/repo",
-                "default": "self",
-            }
+            route=_route(
+                **{
+                    "completion-pipeline": UPSTREAM,
+                    "review-exchange": UPSTREAM,
+                    "ui": "other/repo",
+                    "default": "self",
+                }
+            )
         ),
         target_host=Counting(),
     )
@@ -109,7 +116,7 @@ def test_each_distinct_target_is_probed_exactly_once():
 
 
 def test_route_host_construction_failure_is_an_error():
-    config = _config(route={"cp": UPSTREAM})
+    config = _config(route=_route(cp=UPSTREAM))
     with patch(
         "issue_orchestrator.execution.providers.create_repository_host",
         side_effect=RuntimeError("auth unavailable"),
@@ -121,7 +128,7 @@ def test_route_host_construction_failure_is_an_error():
 
 
 def test_unsupported_route_host_is_an_error():
-    config = _config(route={"cp": UPSTREAM})
+    config = _config(route=_route(cp=UPSTREAM))
     with (
         patch(
             "issue_orchestrator.execution.providers.create_repository_host",

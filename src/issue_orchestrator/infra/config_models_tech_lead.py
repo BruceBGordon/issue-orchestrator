@@ -8,7 +8,7 @@ so importers are unaffected.
 """
 
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional
 
 from ..domain.tech_lead_artifacts import UNWIRED_ACT_LEVEL_TECH_LEAD_ACTIONS
 from ..domain.tech_lead_findings import (
@@ -258,6 +258,85 @@ class StuckSweepConfig:
         return errors
 
 
+@dataclass(frozen=True)
+class PromotionRouteTarget:
+    """One ``tech_lead.findings.route`` entry: a repo AND its queue contract.
+
+    A promoted issue is only runnable in its target when it carries that
+    target's scheduling labels, so a route entry declares them (#6957 review
+    F2). Two YAML spellings:
+
+    * a bare string — ``self`` or ``owner/repo``;
+    * a mapping — ``{repo:, scope_label:, agent_label:}`` for a foreign target
+      whose queue filters on labels this repo's config knows nothing about.
+
+    ``None`` on ``scope_label``/``agent_label`` means "not declared, derive it";
+    an explicit empty string means "this target has no such label". The
+    derivation itself belongs to the route resolver in the promotion owner, not
+    here — config models stay pure data.
+    """
+
+    repo: str
+    scope_label: Optional[str] = None
+    agent_label: Optional[str] = None
+
+    @property
+    def is_self(self) -> bool:
+        return self.repo == PROMOTION_ROUTE_SELF
+
+    @classmethod
+    def from_value(cls, *, area: str, value: Any) -> "PromotionRouteTarget":
+        """Parse one route value, rejecting every shape that is not a route."""
+        if isinstance(value, str):
+            return cls(repo=value.strip())
+        if not isinstance(value, dict):
+            raise ValueError(
+                f"tech_lead.findings.route[{area!r}] must be 'self', 'owner/repo',"
+                " or a mapping with a 'repo' key, got "
+                f"{type(value).__name__}"
+            )
+        unknown = sorted(set(value) - {"repo", "scope_label", "agent_label"})
+        if unknown:
+            raise ValueError(
+                f"tech_lead.findings.route[{area!r}] has unknown key(s)"
+                f" {', '.join(unknown)}; supported keys are repo, scope_label,"
+                " agent_label"
+            )
+        raw_repo = value.get("repo")
+        if not isinstance(raw_repo, str) or not raw_repo.strip():
+            raise ValueError(
+                f"tech_lead.findings.route[{area!r}] requires a non-empty 'repo'"
+                " ('self' or 'owner/repo')"
+            )
+        return cls(
+            repo=raw_repo.strip(),
+            scope_label=_optional_label(area=area, key="scope_label", value=value),
+            agent_label=_optional_label(area=area, key="agent_label", value=value),
+        )
+
+    def to_event_dict(self) -> dict:
+        return {
+            "repo": self.repo,
+            "scope_label": self.scope_label,
+            "agent_label": self.agent_label,
+        }
+
+
+def _optional_label(*, area: str, key: str, value: dict) -> Optional[str]:
+    """Parse an optional route label: absent -> None, present -> exact string."""
+    if key not in value:
+        return None
+    raw = value[key]
+    if raw is None:
+        return None
+    if not isinstance(raw, str):
+        raise ValueError(
+            f"tech_lead.findings.route[{area!r}].{key} must be a label string"
+            f" (use '' for 'this target has none'), got {type(raw).__name__}"
+        )
+    return raw.strip()
+
+
 @dataclass
 class TechLeadFindingsConfig:
     """Finding-promotion lane settings (#6957): case file -> gated issue.
@@ -272,39 +351,46 @@ class TechLeadFindingsConfig:
     is eligible, ``max_open_promoted`` bounds in-flight promoted issues PER
     TARGET REPO (storm backpressure: excess eligible signatures queue behind
     merges rather than flooding a repo), and ``route`` maps an area label to the
-    repo that owns the fix. ``route['default']`` is the catch-all; ``self``
-    means the managed repo itself.
+    :class:`PromotionRouteTarget` that owns the fix. ``route['default']`` is the
+    catch-all; ``self`` means the managed repo itself.
     """
 
     promote: str = FINDING_PROMOTION_GATED
     min_evidence: int = 2
     max_open_promoted: int = 3
-    route: dict[str, str] = field(
-        default_factory=lambda: {PROMOTION_ROUTE_DEFAULT_KEY: PROMOTION_ROUTE_SELF}
+    route: dict[str, PromotionRouteTarget] = field(
+        default_factory=lambda: {
+            PROMOTION_ROUTE_DEFAULT_KEY: PromotionRouteTarget(repo=PROMOTION_ROUTE_SELF)
+        }
     )
 
     @classmethod
     def from_mapping(cls, data: dict) -> "TechLeadFindingsConfig":
-        """Parse the ``tech_lead.findings`` YAML sub-dict."""
-        raw_route = data.get("route") or {}
+        """Parse the ``tech_lead.findings`` YAML sub-dict.
+
+        The route table is validated STRICTLY by shape, not by truthiness: a
+        falsy non-mapping (``route: []``, ``route: ""``, ``route: false``,
+        ``route: 0``) is an explicitly supplied invalid value, and silently
+        replacing it with ``default: self`` would redirect a cross-repo routing
+        feature into the managed repo without a word (#6957 review F6). Only an
+        absent key or an explicit ``null`` counts as omission.
+        """
+        raw_route = data.get("route", None)
+        if raw_route is None:
+            raw_route = {}
         if not isinstance(raw_route, dict):
             raise ValueError(
                 "tech_lead.findings.route must be a mapping of area -> repo, got "
-                f"{type(raw_route).__name__}"
+                f"{type(raw_route).__name__} ({raw_route!r}); remove the key or set"
+                " it to null to accept the default 'default: self' route"
             )
-        route: dict[str, str] = {}
+        route: dict[str, PromotionRouteTarget] = {}
         folded_areas: set[str] = set()
         for raw_area, raw_target in raw_route.items():
             area = str(raw_area).strip()
-            target = str(raw_target).strip()
             if not area:
                 raise ValueError(
                     "tech_lead.findings.route keys must be non-empty area names"
-                )
-            if not target:
-                raise ValueError(
-                    f"tech_lead.findings.route[{area!r}] must not be empty; use"
-                    " 'self' or 'owner/repo'"
                 )
             folded = area.casefold()
             if folded in folded_areas:
@@ -315,8 +401,16 @@ class TechLeadFindingsConfig:
             folded_areas.add(folded)
             if folded == PROMOTION_ROUTE_DEFAULT_KEY:
                 area = PROMOTION_ROUTE_DEFAULT_KEY
+            target = PromotionRouteTarget.from_value(area=area, value=raw_target)
+            if not target.repo:
+                raise ValueError(
+                    f"tech_lead.findings.route[{area!r}] must not be empty; use"
+                    " 'self' or 'owner/repo'"
+                )
             route[area] = target
-        route.setdefault(PROMOTION_ROUTE_DEFAULT_KEY, PROMOTION_ROUTE_SELF)
+        route.setdefault(
+            PROMOTION_ROUTE_DEFAULT_KEY, PromotionRouteTarget(repo=PROMOTION_ROUTE_SELF)
+        )
         return cls(
             promote=str(data.get("promote", FINDING_PROMOTION_GATED)).strip(),
             min_evidence=int(data.get("min_evidence", 2)),
@@ -334,8 +428,8 @@ class TechLeadFindingsConfig:
         """True when promoted issues carry the operator-approval gate label."""
         return self.promote == FINDING_PROMOTION_GATED
 
-    def route_for(self, area: str | None) -> str:
-        """The repo that owns the fix for *area* (``self`` = the managed repo).
+    def route_for(self, area: str | None) -> PromotionRouteTarget:
+        """The route entry that owns the fix for *area*.
 
         Area matching is case-insensitive because the area rides an ``area:*``
         GitHub label, and GitHub folds label names.
@@ -345,14 +439,16 @@ class TechLeadFindingsConfig:
             for key, target in self.route.items():
                 if key.casefold() == folded:
                     return target
-        return self.route.get(PROMOTION_ROUTE_DEFAULT_KEY, PROMOTION_ROUTE_SELF)
+        return self.route.get(
+            PROMOTION_ROUTE_DEFAULT_KEY, PromotionRouteTarget(repo=PROMOTION_ROUTE_SELF)
+        )
 
     def target_repos(self) -> tuple[str, ...]:
-        """Distinct non-``self`` route targets, for startup writability checks."""
+        """Distinct non-``self`` route repos, for startup writability checks."""
         seen: dict[str, str] = {}
         for target in self.route.values():
-            if target and target != PROMOTION_ROUTE_SELF:
-                seen.setdefault(target.casefold(), target)
+            if target.repo and not target.is_self:
+                seen.setdefault(target.repo.casefold(), target.repo)
         return tuple(seen.values())
 
     def startup_errors(self) -> list[str]:
@@ -378,12 +474,38 @@ class TechLeadFindingsConfig:
                 f"to disable the lane), got {self.max_open_promoted}"
             )
         for area, target in sorted(self.route.items()):
-            if target == PROMOTION_ROUTE_SELF:
+            if target.is_self:
+                # A ``self`` route's queue contract is the managed repo's own
+                # config (filtering.label + the follow-up worker agent).
+                # Declaring it twice invites silent drift between the two, and
+                # a promotion that carries a scope label the scheduler does not
+                # query is invisible work.
+                declared = [
+                    key
+                    for key, value in (
+                        ("scope_label", target.scope_label),
+                        ("agent_label", target.agent_label),
+                    )
+                    if value is not None
+                ]
+                if declared:
+                    errors.append(
+                        f"tech_lead.findings.route[{area!r}] routes to 'self', so"
+                        f" it must not declare {', '.join(declared)} — the managed"
+                        " repo's scheduling contract comes from filtering.label"
+                        " and review.tech_lead_follow_up_agent"
+                    )
                 continue
-            if target.count("/") != 1 or not all(target.split("/")):
+            if target.repo.count("/") != 1 or not all(target.repo.split("/")):
                 errors.append(
                     f"tech_lead.findings.route[{area!r}] must be 'self' or "
-                    f"'owner/repo', got {target!r}"
+                    f"'owner/repo', got {target.repo!r}"
+                )
+            if target.agent_label == "":
+                errors.append(
+                    f"tech_lead.findings.route[{area!r}].agent_label must name the"
+                    " target's worker agent label; an issue with no agent label is"
+                    " never picked up by any pipeline"
                 )
         return errors
 
@@ -392,7 +514,9 @@ class TechLeadFindingsConfig:
             "promote": self.promote,
             "min_evidence": self.min_evidence,
             "max_open_promoted": self.max_open_promoted,
-            "route": dict(self.route),
+            "route": {
+                area: target.to_event_dict() for area, target in self.route.items()
+            },
         }
 
 

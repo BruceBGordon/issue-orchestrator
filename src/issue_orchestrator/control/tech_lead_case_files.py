@@ -34,6 +34,11 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Iterable, Mapping, Sequence
 
+from ..domain.tech_lead_findings import (
+    PatternObservation,
+    pattern_observation_id,
+    pattern_observation_marker,
+)
 from ..domain.tech_lead_session import (
     TECH_LEAD_OBSERVATION_LABEL,
     TechLeadCaseFileSummary,
@@ -167,19 +172,55 @@ def build_case_file_issue_action(
         area=proposed.area,
         fix_class=proposed.fix_class or "",
         diagnosis=proposed.body or "",
-        dedup_comment=build_case_file_evidence_comment(
-            proposed,
-            anchor_issue_number=anchor_issue_number,
-            findings=findings,
-            source_run_id=source_run_id,
-            source_session_name=source_session_name,
-            observed_at=observed_at,
+        observations=(
+            build_pattern_observation(
+                proposed,
+                anchor_issue_number=anchor_issue_number,
+                findings=findings,
+                source_run_id=source_run_id,
+                source_session_name=source_session_name,
+                observed_at=observed_at,
+            ),
         ),
         reason=(
             f"tech_lead decision action {proposed.id}: open pattern case file"
             f" for signature {proposed.pattern_signature!r} (#6781)"
         ),
         expected=expected,
+    )
+
+
+def build_pattern_observation(
+    proposed: "ProposedTechLeadAction",
+    *,
+    anchor_issue_number: int,
+    findings: Mapping[str, "TechLeadFinding"],
+    source_run_id: str,
+    source_session_name: str,
+    observed_at: str,
+) -> PatternObservation:
+    """One identified observation: its stable identity + its evidence comment.
+
+    The identity is what makes the durable count create-once (#6957 review F1),
+    and it is embedded in the comment so a duplicate posted by a crash-retry is
+    recognizable as the SAME observation rather than fresh evidence.
+    """
+    observation_id = pattern_observation_id(
+        source_run_id=source_run_id,
+        source_session_name=source_session_name,
+        action_id=proposed.id,
+    )
+    return PatternObservation(
+        observation_id=observation_id,
+        comment=build_case_file_evidence_comment(
+            proposed,
+            anchor_issue_number=anchor_issue_number,
+            findings=findings,
+            source_run_id=source_run_id,
+            source_session_name=source_session_name,
+            observed_at=observed_at,
+            observation_id=observation_id,
+        ),
     )
 
 
@@ -191,6 +232,7 @@ def build_case_file_evidence_comment(
     source_run_id: str,
     source_session_name: str,
     observed_at: str,
+    observation_id: str,
 ) -> str:
     """The evidence comment for a REPEAT observation of a known signature."""
     return (
@@ -203,6 +245,7 @@ def build_case_file_evidence_comment(
             source_session_name=source_session_name,
             observed_at=observed_at,
         )
+        + f"\n\n{pattern_observation_marker(observation_id)}"
     )
 
 
@@ -228,7 +271,7 @@ def build_append_observation_action(
     return AppendPatternObservationAction(
         issue_number=case_file_issue_number,
         pattern_signature=proposed.pattern_signature,
-        comment=build_case_file_evidence_comment(
+        observation=build_pattern_observation(
             proposed,
             anchor_issue_number=anchor_issue_number,
             findings=findings,
@@ -253,12 +296,21 @@ def apply_append_pattern_observation(
     repository_host: "RepositoryHost | None",
     authority: "TechLeadAuthorityStore | None",
 ) -> "ActionResult":
-    """Post a repeat observation and increment its durable count (#6781/#6957).
+    """Post a repeat observation and count it create-once (#6781/#6957).
 
-    Comment FIRST, count second: the comment is the operator-visible evidence
-    and the count is what gates promotion, so a crash between them under-counts
-    (delaying a promotion by one observation) rather than promoting on evidence
-    nobody can read.
+    The observation identity is what makes replay safe, so this is a two-step
+    with an ordering chosen deliberately:
+
+    1. If the identity is ALREADY recorded, a previous attempt got all the way
+       through — do nothing. That is a purely local ledger read, no GitHub call.
+    2. Otherwise comment FIRST, then record the observation create-once. A
+       crash between the two repeats one comment on the retry (cosmetic, and the
+       comment carries the observation marker so it is recognizable as the same
+       observation); it can NEVER advance the durable count twice, because the
+       count only moves when the identity is newly inserted (#6957 review F1).
+
+    Evidence is therefore never lost and never inflated — the two failure modes
+    that matter, since the count alone gates promotion.
 
     Like every other tech-lead applier boundary (case-file creation, proposal
     finalization), this writes without the applier's reconciliation guard: the
@@ -272,10 +324,19 @@ def apply_append_pattern_observation(
             "pattern observation append requires repository_host and the"
             " TechLeadAuthorityStore wired into this applier",
         )
+    assert action.observation is not None  # enforced by the action's __post_init__
     try:
+        if authority.has_pattern_observation(
+            signature=action.pattern_signature,
+            observation_id=action.observation.observation_id,
+        ):
+            return ActionResult.ok(
+                action, issue_number=action.issue_number, deduplicated=True
+            )
         repository_host.add_comment(action.issue_number, action.comment)
         authority.note_pattern_observation(
             signature=action.pattern_signature,
+            observation_id=action.observation.observation_id,
             fix_class=action.fix_class,
             area=action.area,
         )

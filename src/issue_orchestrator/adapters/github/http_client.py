@@ -1936,6 +1936,66 @@ class GitHubHttpClient:
 
         return all_prs
 
+    def get_closing_pull_request(self, issue_number: int) -> dict[str, Any] | None:
+        """The pull request GitHub records as having CLOSED *issue_number*.
+
+        Authoritative linkage, not text association: the issue's ``ClosedEvent``
+        names its ``closer``, which is a pull request only when GitHub itself
+        resolved a closing keyword (or an equivalent link). ``get_prs_for_issue``
+        cannot answer this — it is a search for PRs that merely MENTION the
+        number, so any merged PR quoting ``#501`` would look like the fix that
+        shipped it (#6957 review F4).
+
+        Returns ``{"url", "number", "merged"}`` for that PR, or None when the
+        issue is open, was closed by a human/commit/another issue, or the
+        closing event carries no pull request.
+        """
+        owner, repo = self._config.repo.split("/", 1)
+        query = """
+        query($owner: String!, $repo: String!, $number: Int!) {
+            repository(owner: $owner, name: $repo) {
+                issue(number: $number) {
+                    timelineItems(last: 10, itemTypes: [CLOSED_EVENT]) {
+                        nodes {
+                            ... on ClosedEvent {
+                                closer {
+                                    ... on PullRequest {
+                                        number
+                                        url
+                                        merged
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        """
+        result = self._graphql(
+            query,
+            {"owner": owner, "repo": repo, "number": issue_number},
+            caller="get_closing_pull_request",
+        )
+        issue = (
+            (result.get("data") or {}).get("repository", {}) or {}
+        ).get("issue") or {}
+        nodes = (issue.get("timelineItems") or {}).get("nodes") or []
+        # An issue can be closed and reopened repeatedly; the LAST close is the
+        # one that left it closed, so scan newest-first.
+        for node in reversed(nodes):
+            if not isinstance(node, dict):
+                continue
+            closer = node.get("closer")
+            if not isinstance(closer, dict) or not closer.get("number"):
+                continue
+            return {
+                "number": int(closer["number"]),
+                "url": str(closer.get("url") or ""),
+                "merged": bool(closer.get("merged")),
+            }
+        return None
+
     def get_prs_for_issue(self, issue_number: int) -> list[dict[str, Any]]:
         # GitHub's search API rejects queries without an `is:` qualifier with
         # 422 ("Query must include 'is:issue' or 'is:pull-request'"). The

@@ -2,10 +2,13 @@
 
 Split out of ``actions`` for cohesion and its line budget as the tech-lead
 surface grew: gated proposal issues, pattern case files, act-level ops, and the
-finding-promotion lane. The split is ONE-WAY — this module imports the
-:class:`~.actions.Action` base and :class:`~.actions.ActionType` enum, never the
-reverse — and ``actions`` re-exports every name here, so importers are
-unaffected.
+finding-promotion lane. The split is ONE-WAY and the dependency ROOT is
+``action_base``: this module imports :class:`~.action_base.Action` and
+:class:`~.action_base.ActionType` from there directly — never from ``actions``,
+which imports THIS module and would therefore be only partially initialized
+(#6957 review F7). ``actions`` re-exports every name here, so importers are
+unaffected. ``tests/unit/control/test_action_module_boundaries.py`` pins the
+direction.
 """
 
 from __future__ import annotations
@@ -16,9 +19,10 @@ from typing import TYPE_CHECKING
 from ..domain.models import DiscoveredFailure
 from ..domain.tech_lead_milestone import TechLeadMilestoneIntent
 from ..domain.tech_lead_session import TechLeadSessionFlavor
-from .actions import Action, ActionType
+from .action_base import Action, ActionType
 
 if TYPE_CHECKING:
+    from ..domain.tech_lead_findings import PatternObservation
     from ..domain.tech_lead_session import StoredTechLeadOp
 
 
@@ -126,8 +130,13 @@ class CreateTechLeadCaseFileIssueAction(CreateTechLeadIssueAction):
 
     pattern_signature: str = ""
     area: str | None = None
-    dedup_comment: str = ""
-    additional_observation_comments: tuple[str, ...] = ()
+    # Every observation of this signature the creating decision carried, in
+    # order. ``observations[0]`` is the one the issue BODY records; its comment
+    # form is what the apply-time reconcile path posts when the ledger already
+    # holds the signature. Each carries its own identity, so replaying this
+    # action after a partial write re-posts at most a duplicate comment and can
+    # never advance the durable evidence count twice (#6957 review F1).
+    observations: tuple["PatternObservation", ...] = ()
     # The tech lead's promotion classification for this signature (#6957):
     # "code", "human", or "" for unclassified. Recorded on the ledger row at
     # creation so promotion eligibility never has to parse the issue body.
@@ -150,12 +159,28 @@ class CreateTechLeadCaseFileIssueAction(CreateTechLeadIssueAction):
                 "CreateTechLeadCaseFileIssueAction requires a non-empty"
                 " pattern_signature (the ledger key)"
             )
-        if not self.dedup_comment.strip():
+        if not self.observations:
             raise ValueError(
-                "CreateTechLeadCaseFileIssueAction requires a non-empty"
-                " dedup_comment for apply-time ledger reconciliation"
+                "CreateTechLeadCaseFileIssueAction requires at least one"
+                " identified observation (the one its body records)"
+            )
+        identities = [item.observation_id for item in self.observations]
+        if len(set(identities)) != len(identities):
+            raise ValueError(
+                "CreateTechLeadCaseFileIssueAction observations must have"
+                f" distinct identities, got {identities}"
             )
         require_case_file_observation_label(self.labels)
+
+    @property
+    def body_observation(self) -> "PatternObservation":
+        """The observation the case-file issue BODY records."""
+        return self.observations[0]
+
+    @property
+    def additional_observations(self) -> tuple["PatternObservation", ...]:
+        """Observations from the same decision that append as comments."""
+        return self.observations[1:]
 
 
 @dataclass(frozen=True)
@@ -299,12 +324,18 @@ class AppendPatternObservationAction(Action):
     ``min_evidence`` ever reads.
 
     ``fix_class``/``area`` upgrade a row the first observation left
-    unclassified; empty values preserve whatever is already recorded.
+    unclassified; empty values preserve what is recorded, and a CONFLICTING
+    non-empty value is rejected by the store rather than silently reclassifying
+    the signature (#6957 review F3).
+
+    ``observation`` carries the identity that makes the increment create-once:
+    replaying a completed action after a crash re-posts at most a duplicate
+    comment and can never advance the count twice (review F1).
     """
 
     issue_number: int = 0  # The case-file issue
     pattern_signature: str = ""
-    comment: str = ""
+    observation: "PatternObservation | None" = None
     fix_class: str = ""
     area: str = ""
     action_type: ActionType = field(
@@ -321,10 +352,17 @@ class AppendPatternObservationAction(Action):
                 "AppendPatternObservationAction requires the pattern signature"
                 " (the ledger key whose observation count it increments)"
             )
-        if not self.comment.strip():
+        if self.observation is None:
             raise ValueError(
-                "AppendPatternObservationAction requires the evidence comment"
+                "AppendPatternObservationAction requires the identified"
+                " observation it appends (identity + evidence comment)"
             )
+
+    @property
+    def comment(self) -> str:
+        """The evidence comment posted onto the case file."""
+        assert self.observation is not None  # enforced by __post_init__
+        return self.observation.comment
 
 
 @dataclass(frozen=True)

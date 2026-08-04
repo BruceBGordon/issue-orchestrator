@@ -15,8 +15,13 @@ from issue_orchestrator.control.tech_lead_case_files import (
     build_case_file_issue_action,
     build_case_file_summary,
     build_pattern_ledger,
+    build_pattern_observation,
     case_file_area_counts,
     split_tech_lead_case_file_issues,
+)
+from issue_orchestrator.domain.tech_lead_findings import (
+    PatternObservation,
+    pattern_observation_marker,
 )
 from issue_orchestrator.domain.models import Issue
 from issue_orchestrator.domain.tech_lead_artifacts import ProposedTechLeadAction, TechLeadFinding
@@ -139,6 +144,7 @@ def test_build_case_file_evidence_comment_repeat_observation() -> None:
         source_run_id="run-2",
         source_session_name="issue-77",
         observed_at="2026-07-11T01:00:00+00:00",
+        observation_id="run-2:issue-77:A4",
     )
 
     assert comment.startswith("## 📌 Pattern observed again")
@@ -158,8 +164,49 @@ def test_evidence_block_omitted_when_no_findings_linked() -> None:
         source_run_id="run-2",
         source_session_name="issue-77",
         observed_at="2026-07-11T01:00:00+00:00",
+        observation_id="run-2:issue-77:A4",
     )
     assert "### Evidence" not in comment
+
+
+def test_observation_identity_is_stable_and_marks_its_comment() -> None:
+    """The identity that makes the durable count create-once (#6957 F1).
+
+    Two runs observing the SAME decision action produce different identities,
+    while replaying one observation reproduces its identity exactly — and the
+    identity is embedded in the comment so a crash-retry duplicate is
+    recognizable as the same observation rather than fresh evidence.
+    """
+    kwargs = dict(
+        anchor_issue_number=77,
+        findings=_findings(),
+        source_session_name="issue-77",
+        observed_at="2026-07-11T01:00:00+00:00",
+    )
+    first = build_pattern_observation(_proposed(), source_run_id="run-2", **kwargs)
+    replay = build_pattern_observation(_proposed(), source_run_id="run-2", **kwargs)
+    other_run = build_pattern_observation(_proposed(), source_run_id="run-3", **kwargs)
+
+    assert first.observation_id == replay.observation_id
+    assert first.observation_id != other_run.observation_id
+    assert pattern_observation_marker(first.observation_id) in first.comment
+    assert pattern_observation_marker(first.observation_id) not in other_run.comment
+
+
+def test_case_file_creation_carries_its_body_observation() -> None:
+    action = build_case_file_issue_action(
+        _proposed(),
+        config=_config(),
+        anchor_issue_number=99,
+        findings=_findings(),
+        source_run_id="run-1",
+        source_session_name="issue-99",
+        observed_at="2026-07-11T00:00:00+00:00",
+        expected=EXPECTED,
+    )
+
+    assert action.body_observation.observation_id == "run-1:issue-99:A4"
+    assert action.additional_observations == ()
 
 
 # --- Case-file action self-validation -------------------------------------
@@ -169,7 +216,8 @@ def test_case_file_action_requires_observation_label() -> None:
     with pytest.raises(ValueError, match="observation label"):
         CreateTechLeadCaseFileIssueAction(
             title="t", body="b", labels=("agent:tech-lead",),
-            pattern_signature="sig", dedup_comment="evidence",
+            pattern_signature="sig",
+            observations=(PatternObservation(observation_id="o1", comment="e"),),
         )
 
 
@@ -180,7 +228,32 @@ def test_case_file_action_requires_nonempty_signature() -> None:
             body="b",
             labels=("agent:tech-lead", TECH_LEAD_OBSERVATION_LABEL),
             pattern_signature="   ",
-            dedup_comment="evidence",
+            observations=(PatternObservation(observation_id="o1", comment="e"),),
+        )
+
+
+def test_case_file_action_requires_an_identified_observation() -> None:
+    """An unidentified observation could not be counted create-once (#6957 F1)."""
+    with pytest.raises(ValueError, match="identified observation"):
+        CreateTechLeadCaseFileIssueAction(
+            title="t",
+            body="b",
+            labels=("agent:tech-lead", TECH_LEAD_OBSERVATION_LABEL),
+            pattern_signature="sig",
+        )
+
+
+def test_case_file_action_rejects_repeated_observation_identities() -> None:
+    with pytest.raises(ValueError, match="distinct identities"):
+        CreateTechLeadCaseFileIssueAction(
+            title="t",
+            body="b",
+            labels=("agent:tech-lead", TECH_LEAD_OBSERVATION_LABEL),
+            pattern_signature="sig",
+            observations=(
+                PatternObservation(observation_id="o1", comment="e"),
+                PatternObservation(observation_id="o1", comment="e2"),
+            ),
         )
 
 

@@ -5,7 +5,7 @@ per-target cap, permanent decline, the fix:human exclusion, restart resume of
 the durable ledger, and loop closure.
 """
 
-from unittest.mock import Mock
+from unittest.mock import MagicMock, Mock
 
 import pytest
 
@@ -15,15 +15,17 @@ from issue_orchestrator.control.actions import (
     SettleTechLeadPromotionAction,
 )
 from issue_orchestrator.control.tech_lead_finding_promotion import (
+    PromotionReadBudget,
     apply_promote_tech_lead_finding,
     apply_report_promoted_finding_evidence,
     apply_settle_tech_lead_promotion,
     classify_promotion_outcomes,
+    gather_finding_promotion_facts,
     plan_finding_promotions,
     plan_promotion_updates,
     plan_promotion_settlements,
     promotion_issue_labels,
-    resolve_route_target,
+    resolve_promotion_route,
     select_promotion_updates,
     select_promotable_findings,
 )
@@ -39,6 +41,7 @@ from issue_orchestrator.domain.tech_lead_findings import (
 )
 from issue_orchestrator.domain.tech_lead_session import PROPOSED_TECH_LEAD_LABEL
 from issue_orchestrator.infra.config import Config
+from issue_orchestrator.infra.config_models import PromotionRouteTarget
 from issue_orchestrator.ports.promotion_target import (
     InMemoryPromotionTargetHost,
     PromotedIssueOutcome,
@@ -49,6 +52,20 @@ from issue_orchestrator.ports.tech_lead_authority import (
 )
 
 UPSTREAM = "issue-orchestrator/issue-orchestrator"
+
+
+def _route(**entries) -> dict[str, PromotionRouteTarget]:
+    """Route table from the terse ``area="repo"`` / ``area=(repo, scope, agent)``."""
+    table: dict[str, PromotionRouteTarget] = {}
+    for area, value in entries.items():
+        if isinstance(value, tuple):
+            repo, scope_label, agent_label = value
+            table[area] = PromotionRouteTarget(
+                repo=repo, scope_label=scope_label, agent_label=agent_label
+            )
+        else:
+            table[area] = PromotionRouteTarget(repo=value)
+    return table
 
 
 def _config(**findings_overrides) -> Config:
@@ -77,6 +94,52 @@ def _evidence(
         fix_class=fix_class,
         area=area,
         diagnosis=diagnosis,
+    )
+
+
+def _record_case_file(
+    authority,
+    *,
+    signature: str,
+    issue_number: int = 65,
+    observations: int = 1,
+    fix_class: str = "code",
+    area: str = "",
+) -> None:
+    """Open a case file and accrue *observations* distinct observations."""
+    authority.record_pattern(
+        signature=signature,
+        issue_number=issue_number,
+        observation_id=f"{signature}:obs-1",
+        fix_class=fix_class,
+        area=area,
+    )
+    for index in range(2, observations + 1):
+        authority.note_pattern_observation(
+            signature=signature, observation_id=f"{signature}:obs-{index}"
+        )
+
+
+def _append_action(
+    signature: str,
+    observation_id: str,
+    *,
+    issue_number: int = 65,
+    comment: str = "observed again",
+    fix_class: str = "",
+    area: str = "",
+):
+    from issue_orchestrator.control.actions import AppendPatternObservationAction
+    from issue_orchestrator.domain.tech_lead_findings import PatternObservation
+
+    return AppendPatternObservationAction(
+        issue_number=issue_number,
+        pattern_signature=signature,
+        observation=PatternObservation(
+            observation_id=observation_id, comment=comment
+        ),
+        fix_class=fix_class,
+        area=area,
     )
 
 
@@ -221,7 +284,7 @@ class TestStormBackpressure:
     def test_cap_counts_in_flight_promotions_per_target(self):
         config = _config(
             max_open_promoted=2,
-            route={"upstream": UPSTREAM, "default": "self"},
+            route=_route(upstream=UPSTREAM, default="self"),
         )
         evidence = [
             _evidence("up-1", area="upstream"),
@@ -242,7 +305,7 @@ class TestStormBackpressure:
     def test_cap_folds_repository_case(self):
         config = _config(
             max_open_promoted=1,
-            route={"upstream": UPSTREAM.upper(), "default": "self"},
+            route=_route(upstream=UPSTREAM.upper(), default="self"),
         )
 
         selected = select_promotable_findings(
@@ -256,23 +319,23 @@ class TestStormBackpressure:
 
 class TestRouting:
     def test_area_routes_to_the_repo_that_owns_the_fix(self):
-        config = _config(route={"completion-pipeline": UPSTREAM, "default": "self"})
-        assert resolve_route_target(config, area="completion-pipeline") == UPSTREAM
+        config = _config(route=_route(**{"completion-pipeline": UPSTREAM, "default": "self"}))
+        assert resolve_promotion_route(config, area="completion-pipeline").target_repo == UPSTREAM
 
     def test_unrouted_area_falls_back_to_the_default(self):
-        config = _config(route={"completion-pipeline": UPSTREAM, "default": "self"})
-        assert resolve_route_target(config, area="ui") == "porchpin/porchpin"
+        config = _config(route=_route(**{"completion-pipeline": UPSTREAM, "default": "self"}))
+        assert resolve_promotion_route(config, area="ui").target_repo == "porchpin/porchpin"
 
     def test_area_matching_is_case_insensitive(self):
         """The area rides an area:* GitHub label, and GitHub folds label names."""
-        config = _config(route={"Completion-Pipeline": UPSTREAM, "default": "self"})
-        assert resolve_route_target(config, area="completion-pipeline") == UPSTREAM
+        config = _config(route=_route(**{"Completion-Pipeline": UPSTREAM, "default": "self"}))
+        assert resolve_promotion_route(config, area="completion-pipeline").target_repo == UPSTREAM
 
     def test_self_route_without_a_configured_repo_fails_loudly(self):
         config = _config()
         config.repo = None
         with pytest.raises(ValueError, match="no repository is configured"):
-            resolve_route_target(config, area="")
+            resolve_promotion_route(config, area="")
 
 
 class TestPromotionIssueComposition:
@@ -313,6 +376,69 @@ class TestPromotionIssueComposition:
         assert not LabelManager(config).is_blocking_any(
             list(promotion_issue_labels(config, area=""))
         )
+
+    def test_self_route_carries_the_managed_repos_scope_label(self):
+        """#6957 review F2: the scope label is part of being RUNNABLE.
+
+        Discovery queries ``filtering.label`` alongside the agent label, so a
+        promotion that omits it is invisible to the scheduler — approval that
+        actuates nothing.
+        """
+        config = _config()
+        config.filtering.label = "io-scope"
+
+        labels = promotion_issue_labels(config, area="completion-pipeline")
+
+        assert "io-scope" in labels
+
+    def test_self_route_with_no_scope_label_configured_adds_none(self):
+        config = _config()
+        config.filtering.label = ""
+
+        assert promotion_issue_labels(config, area="") == (
+            "agent:backend",
+            PROPOSED_TECH_LEAD_LABEL,
+        )
+
+    def test_foreign_route_carries_the_targets_declared_contract(self):
+        """A foreign repo's queue contract comes from its route entry, never
+        from the source repo's own scope label — which means nothing there."""
+        config = _config(
+            route=_route(
+                **{
+                    "completion-pipeline": (
+                        UPSTREAM,
+                        "upstream-scope",
+                        "agent:platform",
+                    ),
+                    "default": "self",
+                }
+            )
+        )
+        config.filtering.label = "io-scope"
+
+        labels = promotion_issue_labels(config, area="completion-pipeline")
+
+        assert "agent:platform" in labels
+        assert "upstream-scope" in labels
+        assert "io-scope" not in labels
+        assert "agent:backend" not in labels
+
+    def test_undeclared_foreign_route_uses_no_scope_and_the_source_agent(self):
+        config = _config(route=_route(**{"cp": UPSTREAM, "default": "self"}))
+        config.filtering.label = "io-scope"
+
+        route = resolve_promotion_route(config, area="cp")
+
+        assert route.target_repo == UPSTREAM
+        assert route.scope_label == ""
+        assert route.agent_label == "agent:backend"
+
+    def test_a_route_without_an_agent_label_is_rejected(self):
+        from issue_orchestrator.domain.tech_lead_findings import PromotionRoute
+
+        with pytest.raises(ValueError, match="no worker agent label"):
+            PromotionRoute(target_repo=UPSTREAM, agent_label="")
 
     def test_title_names_the_source_repo_and_signature(self):
         assert (
@@ -506,9 +632,15 @@ class TestLedgerRestartResume:
         db = tmp_path / "authority.sqlite"
         store = SqliteTechLeadAuthorityStore(db)
         store.record_pattern(
-            signature="anchor-close", issue_number=65, fix_class="code", area="cp"
+            signature="anchor-close",
+            issue_number=65,
+            observation_id="run-1:sess:a1",
+            fix_class="code",
+            area="cp",
         )
-        store.note_pattern_observation(signature="anchor-close")
+        store.note_pattern_observation(
+            signature="anchor-close", observation_id="run-2:sess:a1"
+        )
         store.record_promotion(promotion=_promotion("anchor-close"))
 
         reopened = SqliteTechLeadAuthorityStore(db)
@@ -541,9 +673,13 @@ class TestLedgerRestartResume:
         )
 
         store = SqliteTechLeadAuthorityStore(tmp_path / "authority.sqlite")
-        store.record_pattern(signature="sig", issue_number=7, observations=1)
-        store.note_pattern_observation(signature="sig", fix_class="code")
-        store.note_pattern_observation(signature="sig")
+        store.record_pattern(
+            signature="sig", issue_number=7, observation_id="run-1:sess:a1"
+        )
+        store.note_pattern_observation(
+            signature="sig", observation_id="run-2:sess:a1", fix_class="code"
+        )
+        store.note_pattern_observation(signature="sig", observation_id="run-3:sess:a1")
 
         [row] = store.list_pattern_evidence()
         assert row.observation_count == 3
@@ -808,7 +944,6 @@ class TestSettlement:
 
 
 def _fact_gatherer(config: Config, authority, target=None):
-    from unittest.mock import MagicMock
 
     from issue_orchestrator.control.fact_gatherer import FactGatherer
 
@@ -838,8 +973,8 @@ class TestFactGatheringAndPlanning:
         config.tech_lead_review_agent = "agent:tech-lead"
         config.tech_lead_review_threshold = 0  # batch disabled
         authority = InMemoryTechLeadAuthorityStore()
-        authority.record_pattern(
-            signature="anchor-close", issue_number=65, fix_class="code", observations=2
+        _record_case_file(
+            authority, signature="anchor-close", issue_number=65, observations=2
         )
 
         facts = _fact_gatherer(config, authority).gather_tech_lead_facts(_state())
@@ -854,9 +989,7 @@ class TestFactGatheringAndPlanning:
         config.tech_lead_review_agent = "agent:tech-lead"
         config.tech_lead_review_threshold = 0
         authority = InMemoryTechLeadAuthorityStore()
-        authority.record_pattern(
-            signature="sig", issue_number=65, fix_class="code", observations=9
-        )
+        _record_case_file(authority, signature="sig", issue_number=65, observations=9)
         target = InMemoryPromotionTargetHost()
         authority.record_promotion(promotion=_promotion("other"))
 
@@ -909,9 +1042,7 @@ class TestFactGatheringAndPlanning:
         config.tech_lead_review_agent = "agent:tech-lead"
         config.tech_lead_review_threshold = 0
         authority = InMemoryTechLeadAuthorityStore()
-        authority.record_pattern(
-            signature="sig", issue_number=65, fix_class="code", observations=3
-        )
+        _record_case_file(authority, signature="sig", issue_number=65, observations=3)
         authority.record_promotion(promotion=_promotion("sig", reported=2))
 
         facts = _fact_gatherer(
@@ -933,26 +1064,193 @@ class TestFactGatheringAndPlanning:
         assert plan_finding_promotion_actions(_config(), None) == []
 
 
+class TestPromotedIssueIsDiscoverableByTheScheduler:
+    """Producer -> scheduler proof for #6957 review F2.
+
+    ``LabelManager.is_blocking_any`` only proves the gate blocks; it cannot
+    prove the issue is DISCOVERABLE, because discovery queries the scope label
+    too. These tests run the composed labels through the real fetch path.
+    """
+
+    @staticmethod
+    def _discover(config, labels: tuple[str, ...]) -> list[int]:
+        from issue_orchestrator.control.fact_gatherer import FactGatherer
+        from issue_orchestrator.control.github_workflow import GitHubWorkflow
+        from issue_orchestrator.domain.models import Issue
+        from issue_orchestrator.events import EventContext
+
+        promoted = Issue(
+            number=501, title="promoted", labels=list(labels), repo=config.repo
+        )
+
+        class LabelFilteringHost(MagicMock):
+            def list_issues(self, *, labels, **_kwargs):
+                # GitHub's label filter is an AND across every requested label.
+                requested = {name.casefold() for name in labels}
+                carried = {name.casefold() for name in promoted.labels}
+                return [promoted] if requested <= carried else []
+
+        host = LabelFilteringHost()
+        workflow = GitHubWorkflow(
+            config=config,
+            events=MagicMock(),
+            repository_host=host,
+            fact_gatherer=FactGatherer(config=config, repository_host=host),
+            pr_scanner=MagicMock(),
+            label_sync=None,
+            event_context=EventContext(run_id="r", tick_id=0),
+        )
+        return [issue.number for issue in workflow.fetch_all_issues(None)]
+
+    def test_gate_removal_alone_makes_a_gated_self_route_discoverable(self):
+        config = _config()
+        config.filtering.label = "io-scope"
+        gated = promotion_issue_labels(config, area="completion-pipeline")
+
+        # Gated: present in the repo but blocked, so the scheduler must not run
+        # it even though discovery can see it.
+        from issue_orchestrator.control.label_manager import LabelManager
+
+        assert LabelManager(config).is_blocking_any(list(gated))
+
+        ungated = tuple(
+            name for name in gated if name != PROPOSED_TECH_LEAD_LABEL
+        )
+        assert not LabelManager(config).is_blocking_any(list(ungated))
+        # Removing the gate is the operator's WHOLE approval: nothing else is
+        # missing for the scheduler's own discovery query to return it.
+        assert self._discover(config, ungated) == [501]
+
+    def test_auto_self_route_is_discoverable_immediately(self):
+        config = _config(promote="auto")
+        config.filtering.label = "io-scope"
+
+        labels = promotion_issue_labels(config, area="")
+
+        assert self._discover(config, labels) == [501]
+
+    def test_a_promotion_without_the_scope_label_is_invisible(self):
+        """The regression itself: the pre-fix label set is never discovered."""
+        config = _config(promote="auto")
+        config.filtering.label = "io-scope"
+
+        assert self._discover(config, ("agent:backend", "area:cp")) == []
+
+
+class TestLoopClosureReadBudget:
+    """#6957 review F5: the configured cap must bound the reads, not just the
+    work in flight. The durable ledger outlives the setting."""
+
+    @staticmethod
+    def _counting_target():
+        class Counting(InMemoryPromotionTargetHost):
+            def __init__(self):
+                super().__init__()
+                self.reads: list[int] = []
+
+            def read_outcome(self, *, repo: str, issue_number: int):
+                self.reads.append(issue_number)
+                return super().read_outcome(repo=repo, issue_number=issue_number)
+
+        return Counting()
+
+    def _authority_with(self, open_promotions: int, *, repo: str = UPSTREAM):
+        authority = InMemoryTechLeadAuthorityStore()
+        for index in range(open_promotions):
+            authority.record_promotion(
+                promotion=_promotion(f"sig-{index:02d}", repo=repo, issue=500 + index)
+            )
+        return authority
+
+    def test_reads_are_capped_per_tick_when_the_cap_is_lowered(self):
+        """A cohort filed under max_open_promoted=5, then the cap drops to 2."""
+        config = _config(max_open_promoted=2)
+        authority = self._authority_with(5)
+        target = self._counting_target()
+
+        gather_finding_promotion_facts(
+            config,
+            authority=authority,
+            target=target,
+            read_budget=PromotionReadBudget(),
+        )
+
+        assert len(target.reads) == 2
+
+    def test_every_durable_promotion_is_eventually_polled(self):
+        """Rotation, not a fixed prefix: rows beyond the window cannot starve."""
+        config = _config(max_open_promoted=2)
+        authority = self._authority_with(5)
+        target = self._counting_target()
+        budget = PromotionReadBudget()
+
+        for _ in range(3):  # ceil(5 / 2) ticks covers the whole ledger
+            gather_finding_promotion_facts(
+                config, authority=authority, target=target, read_budget=budget
+            )
+
+        assert sorted(set(target.reads)) == [500, 501, 502, 503, 504]
+        assert len(target.reads) == 6  # still 2 per tick, never 5
+
+    def test_the_budget_is_per_target_repository(self):
+        config = _config(
+            max_open_promoted=1,
+            route=_route(upstream=UPSTREAM, default="self"),
+        )
+        authority = InMemoryTechLeadAuthorityStore()
+        authority.record_promotion(promotion=_promotion("a", repo=UPSTREAM, issue=1))
+        authority.record_promotion(promotion=_promotion("b", repo=UPSTREAM, issue=2))
+        authority.record_promotion(
+            promotion=_promotion("c", repo="porchpin/porchpin", issue=3)
+        )
+        target = self._counting_target()
+
+        gather_finding_promotion_facts(
+            config,
+            authority=authority,
+            target=target,
+            read_budget=PromotionReadBudget(),
+        )
+
+        # One read for each of the two targets, not one read overall.
+        assert len(target.reads) == 2
+        assert 3 in target.reads
+
+    def test_terminal_promotions_are_never_read(self):
+        config = _config(max_open_promoted=5)
+        authority = InMemoryTechLeadAuthorityStore()
+        authority.record_promotion(
+            promotion=_promotion("shipped", issue=1, state=PROMOTION_STATE_SHIPPED)
+        )
+        authority.record_promotion(
+            promotion=_promotion("declined", issue=2, state=PROMOTION_STATE_DECLINED)
+        )
+        target = self._counting_target()
+
+        gather_finding_promotion_facts(
+            config,
+            authority=authority,
+            target=target,
+            read_budget=PromotionReadBudget(),
+        )
+
+        assert target.reads == []
+
+
 class TestObservationCountBoundary:
     """The durable count promotion reads is written by the case-file owner."""
 
     def test_repeat_observation_comments_and_increments(self):
-        from issue_orchestrator.control.actions import AppendPatternObservationAction
         from issue_orchestrator.control.tech_lead_case_files import (
             apply_append_pattern_observation,
         )
 
         authority = InMemoryTechLeadAuthorityStore()
-        authority.record_pattern(signature="sig", issue_number=65)
+        _record_case_file(authority, signature="sig", issue_number=65, fix_class="")
         repository_host = Mock()
 
         result = apply_append_pattern_observation(
-            AppendPatternObservationAction(
-                issue_number=65,
-                pattern_signature="sig",
-                comment="observed again",
-                fix_class="code",
-            ),
+            _append_action("sig", "obs-2", comment="observed again", fix_class="code"),
             repository_host=repository_host,
             authority=authority,
         )
@@ -964,15 +1262,12 @@ class TestObservationCountBoundary:
         assert row.fix_class == "code"
 
     def test_observation_for_an_unknown_signature_fails_loudly(self):
-        from issue_orchestrator.control.actions import AppendPatternObservationAction
         from issue_orchestrator.control.tech_lead_case_files import (
             apply_append_pattern_observation,
         )
 
         result = apply_append_pattern_observation(
-            AppendPatternObservationAction(
-                issue_number=65, pattern_signature="never-recorded", comment="c"
-            ),
+            _append_action("never-recorded", "obs-1"),
             repository_host=Mock(),
             authority=InMemoryTechLeadAuthorityStore(),
         )

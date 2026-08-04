@@ -27,6 +27,7 @@ from .label_manager import tech_lead_issue_label_metadata
 from .tech_lead_issue_policy import resolve_tech_lead_milestone_number
 
 if TYPE_CHECKING:
+    from ..domain.tech_lead_findings import PatternObservation
     from ..ports import EventSink, RepositoryHost
     from ..ports.tech_lead_authority import TechLeadAuthorityStore
     from .retry_history_state import ExpediteLane
@@ -95,6 +96,38 @@ def _required_label_provisioning_error(
         existing.add(folded)
     return None
 
+def _append_observation(
+    ops: "TechLeadAuthorityStore",
+    *,
+    signature: str,
+    issue_number: int,
+    observation: "PatternObservation",
+    fix_class: str,
+    area: str,
+    add_comment: Callable[[int, str], str],
+) -> None:
+    """Post one observation's evidence and count it create-once (#6957 F1).
+
+    The same ordering the planned repeat path uses
+    (``tech_lead_case_files.apply_append_pattern_observation``), shared so
+    creation-reconciliation and the append lane can never drift: skip entirely
+    when this identity is already counted (a local ledger read), otherwise
+    comment and then record. A crash in between repeats at most one comment;
+    the durable count never moves twice for one observation.
+    """
+    if ops.has_pattern_observation(
+        signature=signature, observation_id=observation.observation_id
+    ):
+        return
+    add_comment(issue_number, observation.comment)
+    ops.note_pattern_observation(
+        signature=signature,
+        observation_id=observation.observation_id,
+        fix_class=fix_class,
+        area=area,
+    )
+
+
 def _proposal_link_comment(
     action: CreateTechLeadProposalIssueAction, issue_number: int
 ) -> str:
@@ -135,15 +168,21 @@ def _creation_preflight(
                 # carried becomes a repeat observation on the existing case file
                 # — comment AND durable count, exactly like the planned repeat
                 # path, so promotion evidence is never silently dropped (#6957).
-                for comment in (
-                    action.dedup_comment,
-                    *action.additional_observation_comments,
-                ):
-                    add_comment(existing, comment)
-                    ops.note_pattern_observation(
+                #
+                # Each observation is keyed by its own identity, so a retry that
+                # reaches this path after a partial write counts only the
+                # observations that never landed. Without that the SAME action's
+                # observations were re-counted on every retry, inflating
+                # min_evidence off a single tech-lead decision (review F1).
+                for observation in action.observations:
+                    _append_observation(
+                        ops,
                         signature=action.pattern_signature,
+                        issue_number=existing,
+                        observation=observation,
                         fix_class=action.fix_class,
                         area=action.area or "",
+                        add_comment=add_comment,
                     )
                 return ActionResult.ok(
                     action,
@@ -297,19 +336,31 @@ def _finalize_ledger_backed_creation(
             )
         elif isinstance(action, CreateTechLeadCaseFileIssueAction):
             assert ops is not None
-            # The issue body IS observation #1; each additional comment is one
-            # more observation from the same decision, so the durable count the
-            # promotion lane reads starts at the real total (#6957).
+            # The issue body IS the first observation, so the ledger row is
+            # created carrying exactly that one identity. Every FURTHER
+            # observation from the same decision is then appended one at a time
+            # — comment, then count create-once — rather than pre-counted here.
+            # Pre-counting them was the #6957 review F1 defect: a crash before
+            # (or during) the comment loop left a count that claimed evidence
+            # nobody had posted, and the retry counted it all again.
             ops.record_pattern(
                 signature=action.pattern_signature,
                 issue_number=issue_number,
+                observation_id=action.body_observation.observation_id,
                 fix_class=action.fix_class,
                 area=action.area or "",
-                observations=1 + len(action.additional_observation_comments),
                 diagnosis=action.diagnosis,
             )
-            for comment in action.additional_observation_comments:
-                add_comment(issue_number, comment)
+            for observation in action.additional_observations:
+                _append_observation(
+                    ops,
+                    signature=action.pattern_signature,
+                    issue_number=issue_number,
+                    observation=observation,
+                    fix_class=action.fix_class,
+                    area=action.area or "",
+                    add_comment=add_comment,
+                )
     except Exception as exc:
         logger.exception("Failed to finalize ledger-backed tech_lead issue #%d", issue_number)
         return str(exc)

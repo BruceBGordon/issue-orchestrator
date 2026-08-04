@@ -271,22 +271,44 @@ tech_lead:
     promote: gated            # off | gated | auto   (default: gated)
     min_evidence: 2           # observations before promotion eligibility
     max_open_promoted: 3      # per target repo, cap on in-flight promotions
-    route:                    # area label -> repo that owns the fix
+    route:                    # area label -> target that owns the fix
       completion-pipeline: issue-orchestrator/issue-orchestrator
+      review-exchange:        # a target whose queue filters on its own labels
+        repo: issue-orchestrator/issue-orchestrator
+        scope_label: io-scope
+        agent_label: agent:backend
       default: self
 ```
+
+A route names more than a repository: an issue is only RUNNABLE in its target
+when it carries that target's scheduling labels. A `self` route inherits the
+managed repo's own contract (`filtering.label` plus
+`review.tech_lead_follow_up_agent`) and may not redeclare it; a foreign target
+declares its own, because the source repo's scope label means nothing there.
 
 Lifecycle: **flag** (unchanged) → **promote** → **gate** → **run** (the target
 repo's own pipeline, unchanged) → **close the loop**.
 
 On the tick a signature crosses `min_evidence`, has no promotion row, fits its
 routed target's cap, and is classified `fix:code`, the orchestrator files ONE
-issue in the routed repo carrying `proposed-tech-lead` plus the implementation
-agent and area labels. Removing the gate label is the operator's whole
-approval; closing the issue is a decline, recorded permanently so it is never
-re-filed. When a promoted issue closes with a MERGED pull request, the source
-orchestrator writes the `tech_lead_shipped_fixes` row, comments the fix
-reference on the case file, and closes it.
+issue in the routed repo carrying `proposed-tech-lead` plus the route's full
+scheduling contract (worker agent + scope label) and the area label. Removing
+the gate label is the operator's whole approval — the issue is then discoverable
+by the target's unchanged pipeline with nothing else missing. Closing the issue
+is a decline, recorded permanently so it is never re-filed. When a promoted
+issue closes and the pull request GitHub records as its CLOSER is merged, the
+source orchestrator writes the `tech_lead_shipped_fixes` row, comments the fix
+reference on the case file, and closes it. Merely being mentioned by a merged
+PR is not closing linkage and never counts as a shipped fix.
+
+`min_evidence` counts DISTINCT observations. Each `flag_pattern` observation
+carries a stable identity — its source run, session, and decision action — and
+the durable ledger records it create-once, so replaying a partially applied
+decision after a crash can repeat an evidence comment but can never advance the
+count twice. A signature's `fix_class` and `area` are likewise immutable once
+recorded: an unclassified row may be upgraded once, identical values are
+idempotent, and a conflicting classification fails loudly rather than letting
+observation order decide whether a finding is promotable and where it routes.
 
 Constraints that make this safe to leave on:
 
@@ -298,7 +320,10 @@ Constraints that make this safe to leave on:
   observations comment on the promoted issue rather than re-filing.
 - **`max_open_promoted` is per-target work-in-progress backpressure**, and it
   bounds the lane's API cost too — loop closure polls at most that many issues
-  per target.
+  per target PER TICK, enforced by a read budget rather than implied by the
+  cap. The durable ledger outlives the setting, so lowering the cap (or
+  restarting after a larger cohort was filed) slows coverage — the budget
+  rotates so no in-flight promotion starves — instead of exceeding the budget.
 - **Only reads cross repositories.** Every write the source orchestrator makes
   (case-file comment/close, shipped-fix memory, ledger state) lands in its own
   repo; the cross-repo writes are exactly two — create the issue, comment on
@@ -306,8 +331,9 @@ Constraints that make this safe to leave on:
 - **Route targets are validated at startup**, not at promotion time: a target
   the token cannot file issues in is a loud doctor error rather than a lost
   actuation on the tick a pattern finally firms up.
-- **`self`-routed promotions face the managed repo's own gates.** Promotion
-  files issues, full stop.
+- **`self`-routed promotions face the managed repo's own gates.** They carry
+  its scope label so they are discoverable, and every other gate (dependencies,
+  claims, review) applies unchanged. Promotion files issues, full stop.
 
 ### 5. Sequencing and scope boundaries
 

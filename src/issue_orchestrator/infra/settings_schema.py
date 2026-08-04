@@ -1267,7 +1267,11 @@ class ReviewSettings(BaseModel):
                 "loop-closure reads). Only findings the tech lead classified "
                 "fix:code are ever promoted. Routing is YAML-only: "
                 "tech_lead.findings.route maps an area label to 'self' or an "
-                "owner/repo target, with route.default as the catch-all. "
+                "owner/repo target, with route.default as the catch-all. A "
+                "route entry may also be a mapping "
+                "({repo, scope_label, agent_label}) declaring the target's "
+                "scheduling labels; a 'self' route inherits filtering.label and "
+                "review.tech_lead_follow_up_agent and must not redeclare them. "
                 "Allowed values: off, gated, auto."
             ),
             "section": _TECH_LEAD_SECTION,
@@ -1304,8 +1308,10 @@ class ReviewSettings(BaseModel):
                 "Storm backpressure: excess eligible signatures wait behind "
                 "merges rather than flooding a repo. It also bounds the lane's "
                 "GitHub reads — loop closure polls at most this many issues per "
-                "target. Set tech_lead.findings.promote: off to disable the "
-                "lane instead of setting this to 0."
+                "target per tick, rotating across the durable ledger so lowering "
+                "the cap after a larger cohort was filed slows coverage instead "
+                "of exceeding the budget. Set tech_lead.findings.promote: off to "
+                "disable the lane instead of setting this to 0."
             ),
             "section": _TECH_LEAD_SECTION,
             "config_attr": "tech_lead.findings.max_open_promoted",

@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, Sequence
 
 # The tech lead's fix classification on a ``flag_pattern`` action. A finding
 # with NO classification is unclassified and never promotable — promotion is
@@ -66,6 +66,172 @@ VALID_PROMOTION_STATES: frozenset[str] = frozenset(
         PROMOTION_STATE_SHIPPED,
     )
 )
+
+
+class PatternClassificationConflictError(ValueError):
+    """Two observations disagree about a signature's ``fix_class``/``area``.
+
+    Raised by :func:`reconcile_pattern_classification`, the SINGLE owner of the
+    upgrade rule. A signature's classification decides whether it is promotable
+    at all (``fix:human`` is excluded) and which repo it routes to, so a later
+    observation must never silently overwrite an established value — that would
+    make a human-gated finding runnable, or reroute one signature's fix to a
+    different repository depending on observation order (#6957 review F3).
+    """
+
+
+def reconcile_pattern_classification(
+    *, field: str, signature: str, existing: str, incoming: str
+) -> str:
+    """Merge an incoming classification value into the recorded one.
+
+    The whole rule, in one place, applied identically by the durable store, the
+    in-memory port fake, and same-decision coalescing in the planner:
+
+    * an EMPTY incoming value preserves what is recorded (an unclassified later
+      observation never erases an established classification);
+    * an empty recorded value is UPGRADED once by a non-empty incoming value;
+    * identical values (case-insensitively — these ride GitHub label text) are
+      idempotent;
+    * two different non-empty values are a CONFLICT and raise. Reclassification
+      is a reviewed decision, not a side effect of the next observation.
+    """
+    if not incoming:
+        return existing
+    if not existing:
+        return incoming
+    if existing.casefold() == incoming.casefold():
+        return existing
+    raise PatternClassificationConflictError(
+        f"pattern signature {signature!r} is already recorded with"
+        f" {field}={existing!r}; a later observation claims {incoming!r}."
+        " Promotion classification and routing are immutable once recorded —"
+        " reclassify deliberately instead of letting observation order decide"
+    )
+
+
+def pattern_observation_id(
+    *, source_run_id: str, source_session_name: str, action_id: str
+) -> str:
+    """Stable identity for ONE ``flag_pattern`` observation.
+
+    The durable observation count is what ``min_evidence`` reads, so it must be
+    keyed by WHICH observation produced it, not by how many times the
+    orchestrator replayed the write. A tech-lead decision action is observed
+    exactly once by exactly one session run, so (run, session, action) is that
+    identity — replaying a completed action after a crash reproduces the same
+    id and the store records it create-once (#6957 review F1).
+    """
+    parts = (source_run_id.strip(), source_session_name.strip(), action_id.strip())
+    if not all(parts):
+        raise ValueError(
+            "a pattern observation identity requires a non-empty source run id,"
+            f" session name, and decision action id, got {parts!r}"
+        )
+    return ":".join(parts)
+
+
+def pattern_observation_marker(observation_id: str) -> str:
+    """Provenance marker embedded in an observation's case-file comment.
+
+    Makes a comment traceable to the observation identity that owns it, so a
+    duplicate posted by a crash-retry is identifiable as the same observation
+    rather than looking like fresh evidence. A digest keeps arbitrary
+    agent-authored ids out of HTML-comment syntax.
+    """
+    digest = hashlib.sha256(observation_id.encode()).hexdigest()
+    return f"<!-- issue-orchestrator:tech-lead-observation:v1:{digest} -->"
+
+
+@dataclass(frozen=True)
+class PatternObservation:
+    """One observation of a signature: its identity and its evidence comment.
+
+    Carried on the case-file actions so the applier can record the observation
+    create-once and post its comment under one owner. ``comment`` already
+    embeds :func:`pattern_observation_marker`.
+    """
+
+    observation_id: str
+    comment: str
+
+    def __post_init__(self) -> None:
+        if not self.observation_id.strip():
+            raise ValueError("a PatternObservation requires a non-empty identity")
+        if not self.comment.strip():
+            raise ValueError(
+                "a PatternObservation requires its non-empty evidence comment"
+            )
+
+
+@dataclass(frozen=True)
+class PromotionRoute:
+    """The full queue contract of the repo a finding's area routes to (#6957).
+
+    A route identifies more than a repository: an issue is only RUNNABLE in its
+    target when it carries that target's scheduling labels. The managed repo's
+    own discovery, for instance, queries ``filtering.label`` AND a worker agent
+    label, so a promotion missing the scope label is invisible to the scheduler
+    even after the operator removes the gate — approval that actuates nothing
+    (#6957 review F2). This value object owns that whole contract, so the label
+    set is derived in ONE place for self-routed and foreign targets alike.
+
+    ``scope_label`` may legitimately be empty (a target whose queue has no scope
+    filter); ``agent_label`` never is — an issue with no agent label is
+    unschedulable everywhere.
+    """
+
+    target_repo: str
+    agent_label: str
+    scope_label: str = ""
+    is_self: bool = False
+
+    def __post_init__(self) -> None:
+        if not self.target_repo.strip():
+            raise ValueError("a PromotionRoute requires a target repository")
+        if not self.agent_label.strip():
+            raise ValueError(
+                f"the promotion route to {self.target_repo!r} has no worker agent"
+                " label; a promoted issue with no agent label is never picked up"
+                " by any pipeline"
+            )
+
+    def issue_labels(self, *, area: str, gate_label: str = "") -> tuple[str, ...]:
+        """Every label a promoted issue must carry to be runnable in this target.
+
+        Order is stable for the sake of readable diffs and assertions: worker
+        agent, target scope, area tag, then the approval gate (when gated) —
+        which is the ONLY blocking one, so removing it is the operator's whole
+        approval.
+        """
+        return _deduped_labels(
+            (
+                self.agent_label,
+                self.scope_label,
+                f"{_AREA_LABEL_PREFIX}{area}" if area else "",
+                gate_label,
+            )
+        )
+
+
+def _deduped_labels(labels: Sequence[str]) -> tuple[str, ...]:
+    """Order-preserving, case-insensitive dedup of non-empty label names."""
+    seen: set[str] = set()
+    result: list[str] = []
+    for label in labels:
+        folded = label.casefold()
+        if label and folded not in seen:
+            seen.add(folded)
+            result.append(label)
+    return tuple(result)
+
+
+# Duplicated from ``tech_lead_session.TECH_LEAD_AREA_LABEL_PREFIX``
+# deliberately: importing it here would close a cycle (tech_lead_session ->
+# tech_lead_artifacts -> tech_lead_findings) for one string constant. The
+# guardrail test ``test_area_label_prefix_agrees_with_session_vocabulary`` pins
+# the two spellings together.
+_AREA_LABEL_PREFIX = "area:"
 
 
 @dataclass(frozen=True)

@@ -740,8 +740,97 @@ def test_two_same_signature_observations_open_one_case_file() -> None:
     ]
     assert len(creations) == 1
     assert creations[0].pattern_signature == "sig-x"
-    assert len(creations[0].additional_observation_comments) == 1
-    assert "obs2" in creations[0].additional_observation_comments[0]
+    assert len(creations[0].additional_observations) == 1
+    assert "obs2" in creations[0].additional_observations[0].comment
+    # Each observation keeps its own identity, so the applier counts them
+    # create-once rather than pre-counting a total it may never post (#6957 F1).
+    assert len({item.observation_id for item in creations[0].observations}) == 2
+
+
+def test_same_decision_observations_upgrade_an_unclassified_signature() -> None:
+    """`unclassified -> code` must survive same-decision coalescing (#6957 F3).
+
+    The upgrade already worked across decisions; retaining only the first
+    action's classification silently dropped it when both observations arrived
+    in one decision — which decides whether the finding is promotable at all.
+    """
+    first = ProposedTechLeadAction(
+        id="A1", action_type="flag_pattern", body="obs1", pattern_signature="sig-x"
+    )
+    second = ProposedTechLeadAction(
+        id="A2",
+        action_type="flag_pattern",
+        body="obs2",
+        pattern_signature="sig-x",
+        fix_class="code",
+        area="db",
+    )
+
+    planned = _plan(_decision(first, second))
+
+    [creation] = [
+        a for a in planned if isinstance(a, CreateTechLeadCaseFileIssueAction)
+    ]
+    assert creation.fix_class == "code"
+    assert creation.area == "db"
+    # The upgraded area retags the case file, so its labels are recomposed.
+    assert "area:db" in creation.labels
+
+
+def test_same_decision_conflicting_classification_rejects_the_decision() -> None:
+    """A decision that claims two fix classes for one signature is rejected.
+
+    Classification decides promotability and routing, so the orchestrator
+    refuses to pick a winner: nothing partially planned is applied (#6957 F3).
+    """
+    first = ProposedTechLeadAction(
+        id="A1",
+        action_type="flag_pattern",
+        body="obs1",
+        pattern_signature="sig-x",
+        fix_class="human",
+    )
+    second = ProposedTechLeadAction(
+        id="A2",
+        action_type="flag_pattern",
+        body="obs2",
+        pattern_signature="sig-x",
+        fix_class="code",
+    )
+
+    planned = _plan(_decision(first, second))
+
+    assert not any(
+        isinstance(a, CreateTechLeadCaseFileIssueAction) for a in planned
+    )
+    [rejection] = planned
+    assert isinstance(rejection, SurfaceTechLeadProposalAction)
+    assert rejection.mode == "rejected"
+    assert "pattern_classification_conflict" in rejection.reason
+
+
+def test_same_decision_conflicting_area_rejects_the_decision() -> None:
+    """Area decides which repository owns the fix, so it is equally immutable."""
+    first = ProposedTechLeadAction(
+        id="A1",
+        action_type="flag_pattern",
+        body="obs1",
+        pattern_signature="sig-x",
+        area="db",
+    )
+    second = ProposedTechLeadAction(
+        id="A2",
+        action_type="flag_pattern",
+        body="obs2",
+        pattern_signature="sig-x",
+        area="ui",
+    )
+
+    planned = _plan(_decision(first, second))
+
+    assert [a.mode for a in planned if isinstance(a, SurfaceTechLeadProposalAction)] == [
+        "rejected"
+    ]
 
 
 def test_different_signatures_open_distinct_case_files() -> None:

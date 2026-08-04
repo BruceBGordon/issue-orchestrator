@@ -46,6 +46,7 @@ from issue_orchestrator.domain.tech_lead_session import (
     StoredTechLeadOp,
 )
 from issue_orchestrator.infra.config import Config
+from issue_orchestrator.domain.tech_lead_findings import PatternObservation
 from issue_orchestrator.ports.tech_lead_authority import InMemoryTechLeadAuthorityStore
 
 EXPECTED = build_expected_for_mutation()
@@ -440,6 +441,17 @@ def _case_file_action(
     labels = ["tech-lead-agent", TECH_LEAD_OBSERVATION_LABEL]
     if area is not None:
         labels.append(f"area:{area}")
+    observations = (
+        PatternObservation(
+            observation_id=f"{signature}:obs-1", comment="first observation"
+        ),
+        *(
+            PatternObservation(
+                observation_id=f"{signature}:obs-{index}", comment=comment
+            )
+            for index, comment in enumerate(additional_comments, start=2)
+        ),
+    )
     return CreateTechLeadCaseFileIssueAction(
         title=f"Pattern case file: {signature}",
         body="documentation only",
@@ -447,8 +459,7 @@ def _case_file_action(
         pr_count=0,
         pattern_signature=signature,
         diagnosis="Pool exhaustion comes from a leaked connection.",
-        dedup_comment="first observation",
-        additional_observation_comments=additional_comments,
+        observations=observations,
     )
 
 
@@ -593,7 +604,9 @@ def test_apply_case_file_creation_posts_same_decision_observations() -> None:
 def test_apply_case_file_rechecks_ledger_and_comments_inflight_duplicate() -> None:
     host = _host(601)
     ops = InMemoryTechLeadAuthorityStore()
-    ops.record_pattern(signature="db-timeout", issue_number=600)
+    ops.record_pattern(
+        signature="db-timeout", issue_number=600, observation_id="prior:obs"
+    )
     result = apply_create_tech_lead_issue(
         _case_file_action("db-timeout", additional_comments=("follow-up",)),
         repository_host=host,
@@ -608,6 +621,135 @@ def test_apply_case_file_rechecks_ledger_and_comments_inflight_duplicate() -> No
     assert host.add_comment.call_args_list == [
         call(600, "first observation"), call(600, "follow-up")
     ]
+    # Two distinct observations landed on the pre-existing case file.
+    [evidence] = ops.list_pattern_evidence()
+    assert evidence.observation_count == 3
+
+
+# --- Replay after each partial write (#6957 review F1) ---------------------
+#
+# The lane's evidence count gates promotion, so every crash window between a
+# GitHub write and the durable count has to be replay-safe: a retry may repeat
+# a comment, but it must never count one observation twice.
+
+
+def _apply_case_file(action, *, ops, host):
+    return apply_create_tech_lead_issue(
+        action,
+        repository_host=host,
+        events=MagicMock(),
+        ops=ops,
+        add_comment=host.add_comment,
+        emit_labels_changed=lambda *_: None,
+    )
+
+
+def test_replay_after_ledger_creation_does_not_recount_its_observations() -> None:
+    """Crash right after ``record_pattern``: the retry reconciles onto the row.
+
+    Before the fix this counted the body observation AND every additional
+    comment all over again — a two-observation action reached count 4 after one
+    retry and could cross ``min_evidence`` without distinct evidence.
+    """
+    action = _case_file_action("db-timeout", additional_comments=("second",))
+    ops = InMemoryTechLeadAuthorityStore()
+
+    first = _apply_case_file(action, ops=ops, host=_host(600))
+    assert first.success
+    [after_first] = ops.list_pattern_evidence()
+    assert after_first.observation_count == 2
+
+    # The process dies before the action is marked applied; the next tick
+    # replays the SAME action.
+    replay_host = _host(600)
+    replay = _apply_case_file(action, ops=ops, host=replay_host)
+
+    assert replay.success
+    assert replay.details["deduplicated"] is True
+    [after_replay] = ops.list_pattern_evidence()
+    assert after_replay.observation_count == 2
+    # Nothing is re-posted either: both identities are already recorded.
+    replay_host.add_comment.assert_not_called()
+
+
+def test_replay_after_one_additional_comment_counts_only_what_is_missing() -> None:
+    """Crash between two additional comments: only the unposted one is added."""
+    action = _case_file_action(
+        "db-timeout", additional_comments=("second", "third")
+    )
+    ops = InMemoryTechLeadAuthorityStore()
+    host = _host(600)
+    # Fail while posting the SECOND additional comment (the third observation
+    # of the decision), after the first one and its count already landed.
+    host.add_comment.side_effect = [None, RuntimeError("network died")]
+
+    failed = _apply_case_file(action, ops=ops, host=host)
+
+    assert not failed.success
+    [partial] = ops.list_pattern_evidence()
+    assert partial.observation_count == 2  # body + the one comment that landed
+
+    replay_host = _host(600)
+    replay = _apply_case_file(action, ops=ops, host=replay_host)
+
+    assert replay.success
+    [final] = ops.list_pattern_evidence()
+    assert final.observation_count == 3
+    # Exactly the observation that never landed is re-posted.
+    assert replay_host.add_comment.call_args_list == [call(600, "third")]
+
+
+def test_replay_after_a_lost_comment_repeats_it_rather_than_losing_evidence()  -> None:
+    """The comment is posted BEFORE its count, so a crash between them repeats
+    the comment (cosmetic) instead of counting evidence nobody can read."""
+    action = _case_file_action("db-timeout", additional_comments=("second",))
+    ops = InMemoryTechLeadAuthorityStore()
+    host = _host(600)
+    host.add_comment.side_effect = RuntimeError("network died")
+
+    assert not _apply_case_file(action, ops=ops, host=host).success
+    [partial] = ops.list_pattern_evidence()
+    assert partial.observation_count == 1
+
+    replay_host = _host(600)
+    assert _apply_case_file(action, ops=ops, host=replay_host).success
+
+    [final] = ops.list_pattern_evidence()
+    assert final.observation_count == 2
+    assert replay_host.add_comment.call_args_list == [call(600, "second")]
+
+
+def test_replaying_a_repeat_observation_append_never_double_counts() -> None:
+    from issue_orchestrator.control.actions import AppendPatternObservationAction
+    from issue_orchestrator.control.tech_lead_case_files import (
+        apply_append_pattern_observation,
+    )
+
+    ops = InMemoryTechLeadAuthorityStore()
+    ops.record_pattern(
+        signature="db-timeout", issue_number=600, observation_id="r1:s:A1"
+    )
+    action = AppendPatternObservationAction(
+        issue_number=600,
+        pattern_signature="db-timeout",
+        observation=PatternObservation(
+            observation_id="r2:s:A1", comment="observed again"
+        ),
+    )
+    host = MagicMock()
+
+    assert apply_append_pattern_observation(
+        action, repository_host=host, authority=ops
+    ).success
+    replay = apply_append_pattern_observation(
+        action, repository_host=host, authority=ops
+    )
+
+    assert replay.success
+    assert replay.details["deduplicated"] is True
+    [evidence] = ops.list_pattern_evidence()
+    assert evidence.observation_count == 2
+    host.add_comment.assert_called_once_with(600, "observed again")
 
 
 def test_apply_plain_tech_lead_issue_records_no_op() -> None:

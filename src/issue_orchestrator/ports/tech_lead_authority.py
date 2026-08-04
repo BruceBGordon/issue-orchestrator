@@ -198,9 +198,9 @@ class TechLeadAuthorityStore(Protocol):
         *,
         signature: str,
         issue_number: int,
+        observation_id: str,
         fix_class: str = "",
         area: str = "",
-        observations: int = 1,
         diagnosis: str = "",
     ) -> None:
         """Persist the case-file issue for one signature (create-once).
@@ -211,24 +211,52 @@ class TechLeadAuthorityStore(Protocol):
         evidence trail, which must never silently move.
 
         ``fix_class``/``area`` are the promotion facts the case file was opened
-        with (#6957), ``diagnosis`` is its original mechanism/recommended fix,
-        and ``observations`` is how many observations the creating decision
-        carried (>= 1). The observation COUNT is orchestrator-owned so
-        promotion eligibility cannot be inflated by editing the case-file issue
-        or by unrelated human comments on it.
+        with (#6957) and ``diagnosis`` is its original mechanism/recommended
+        fix. ``observation_id`` identifies the ONE observation the issue body
+        records (the creating decision's remaining observations are appended
+        afterwards through :meth:`note_pattern_observation`, each with its own
+        identity, so a crash mid-append cannot double-count). The observation
+        COUNT is orchestrator-owned so promotion eligibility cannot be inflated
+        by editing the case-file issue or by unrelated human comments on it.
         """
         ...
 
     def note_pattern_observation(
-        self, *, signature: str, fix_class: str = "", area: str = ""
-    ) -> None:
-        """Record a REPEAT observation of a known signature (#6957).
+        self,
+        *,
+        signature: str,
+        observation_id: str,
+        fix_class: str = "",
+        area: str = "",
+    ) -> bool:
+        """Record ONE observation of a known signature create-once (#6957).
 
-        Increments the durable observation count and upgrades a previously
-        unclassified row with a later ``fix_class``/``area``. An unknown
-        signature must raise :class:`UnknownTechLeadPatternError` — the caller
-        appended evidence to a case file with no ledger row, which is a bug in
-        the case-file owner, not something to silently create.
+        Returns True when *observation_id* was newly recorded (and the durable
+        count therefore advanced by exactly one), False when this exact
+        observation was already recorded — a replay after a crash, which must
+        never advance the count a second time (review F1). The identity comes
+        from :func:`~..domain.tech_lead_findings.pattern_observation_id`.
+
+        ``fix_class``/``area`` are reconciled through
+        :func:`~..domain.tech_lead_findings.reconcile_pattern_classification`:
+        an empty value preserves what is recorded, an empty recorded value is
+        upgraded once, and two different non-empty values raise
+        :class:`~..domain.tech_lead_findings.PatternClassificationConflictError`
+        rather than letting observation order decide whether a signature is
+        promotable and where it routes (review F3).
+
+        An unknown signature must raise :class:`UnknownTechLeadPatternError` —
+        the caller appended evidence to a case file with no ledger row, which is
+        a bug in the case-file owner, not something to silently create.
+        """
+        ...
+
+    def has_pattern_observation(self, *, signature: str, observation_id: str) -> bool:
+        """True when this exact observation is already recorded.
+
+        A purely LOCAL read (no GitHub call) that lets the case-file appliers
+        skip re-posting an evidence comment whose observation the previous
+        attempt already committed.
         """
         ...
 
@@ -320,6 +348,8 @@ class InMemoryTechLeadAuthorityStore:
         self._ops: dict[int, "StoredTechLeadOp"] = {}
         self._patterns: dict[str, int] = {}
         self._evidence: dict[str, "PatternEvidence"] = {}
+        # signature -> the observation identities already counted (create-once).
+        self._observations: dict[str, set[str]] = {}
         self._promotions: dict[str, "PromotedFinding"] = {}
         self._shipped_fixes: dict[int, "TechLeadShippedFixSummary"] = {}
         self._storm_cohorts: dict[int, tuple["DiscoveredFailure", ...]] = {}
@@ -396,13 +426,18 @@ class InMemoryTechLeadAuthorityStore:
         *,
         signature: str,
         issue_number: int,
+        observation_id: str,
         fix_class: str = "",
         area: str = "",
-        observations: int = 1,
         diagnosis: str = "",
     ) -> None:
         from ..domain.tech_lead_findings import PatternEvidence
 
+        if not observation_id.strip():
+            raise ValueError(
+                "record_pattern requires the identity of the observation the"
+                " case-file body records"
+            )
         existing = self._patterns.get(signature)
         if existing is not None:
             if existing == issue_number:
@@ -412,31 +447,62 @@ class InMemoryTechLeadAuthorityStore:
                 f" case-file issue #{existing}"
             )
         self._patterns[signature] = issue_number
+        self._observations[signature] = {observation_id}
         self._evidence[signature] = PatternEvidence(
             signature=signature,
             case_file_issue_number=issue_number,
-            observation_count=max(1, observations),
+            observation_count=1,
             fix_class=fix_class,
             area=area,
             diagnosis=diagnosis,
         )
 
     def note_pattern_observation(
-        self, *, signature: str, fix_class: str = "", area: str = ""
-    ) -> None:
+        self,
+        *,
+        signature: str,
+        observation_id: str,
+        fix_class: str = "",
+        area: str = "",
+    ) -> bool:
         from dataclasses import replace
 
+        from ..domain.tech_lead_findings import reconcile_pattern_classification
+
+        if not observation_id.strip():
+            raise ValueError(
+                "note_pattern_observation requires a stable observation identity"
+            )
         row = self._evidence.get(signature)
         if row is None:
             raise UnknownTechLeadPatternError(
                 f"no pattern case file is recorded for signature {signature!r}"
             )
+        # Classification is reconciled even for a replayed observation, so a
+        # conflict is reported identically on the first attempt and the retry.
+        merged_fix_class = reconcile_pattern_classification(
+            field="fix_class",
+            signature=signature,
+            existing=row.fix_class,
+            incoming=fix_class,
+        )
+        merged_area = reconcile_pattern_classification(
+            field="area", signature=signature, existing=row.area, incoming=area
+        )
+        recorded = self._observations.setdefault(signature, set())
+        if observation_id in recorded:
+            return False
+        recorded.add(observation_id)
         self._evidence[signature] = replace(
             row,
             observation_count=row.observation_count + 1,
-            fix_class=fix_class or row.fix_class,
-            area=area or row.area,
+            fix_class=merged_fix_class,
+            area=merged_area,
         )
+        return True
+
+    def has_pattern_observation(self, *, signature: str, observation_id: str) -> bool:
+        return observation_id in self._observations.get(signature, set())
 
     def lookup_pattern(self, *, signature: str) -> int | None:
         return self._patterns.get(signature)

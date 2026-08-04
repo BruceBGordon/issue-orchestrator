@@ -70,6 +70,10 @@ from ..domain.tech_lead_artifacts import (
     ProposedTechLeadAction,
     TechLeadDecision,
 )
+from ..domain.tech_lead_findings import (
+    PatternClassificationConflictError,
+    reconcile_pattern_classification,
+)
 from ..ports.issue import Issue
 from .actions import (
     Action,
@@ -97,11 +101,12 @@ from .tech_lead_gate_notes import (
 )
 from .tech_lead_case_files import (
     build_append_observation_action,
-    build_case_file_evidence_comment,
     build_case_file_issue_action,
+    build_pattern_observation,
 )
 from .tech_lead_issue_policy import (
     apply_tech_lead_priority_prefix,
+    case_file_issue_labels,
     decision_issue_labels,
     tech_lead_follow_up_agent_label,
     tech_lead_issue_milestone_intent,
@@ -303,8 +308,22 @@ def plan_tech_lead_decision_actions(
         dedup_corpus=dedup_corpus,
         dedup_grant=dedup_grant,
     )
-    for proposed in decision.proposed_actions:
-        planner.plan(proposed)
+    try:
+        for proposed in decision.proposed_actions:
+            planner.plan(proposed)
+    except PatternClassificationConflictError as exc:
+        # One decision claimed two different fix classes (or areas) for one
+        # pattern signature. Classification decides whether a finding is
+        # promotable at all and which repo it routes to, so the orchestrator
+        # refuses to pick a winner: the whole decision is rejected as a contract
+        # violation and nothing partially planned is applied (#6957 review F3).
+        return [
+            plan_tech_lead_rejection_action(
+                anchor_issue_number=anchor_issue.number,
+                failure="pattern_classification_conflict",
+                detail=str(exc),
+            )
+        ]
     if planner.shadow:
         planner.actions.append(
             _shadow_digest_comment(
@@ -406,25 +425,9 @@ class _DecisionActionPlanner:
                 )
             )
             return
-        comment = build_case_file_evidence_comment(
-            proposed,
-            anchor_issue_number=self._anchor_number,
-            findings=self.findings,
-            source_run_id=self.source_run_id,
-            source_session_name=self.source_session_name,
-            observed_at=self.observed_at,
-        )
         planned_index = self._planned_patterns.get(signature)
         if planned_index is not None:
-            creation = self.actions[planned_index]
-            assert isinstance(creation, CreateTechLeadCaseFileIssueAction)
-            self.actions[planned_index] = replace(
-                creation,
-                additional_observation_comments=(
-                    *creation.additional_observation_comments,
-                    comment,
-                ),
-            )
+            self._coalesce_planned_case_file(planned_index, proposed)
             return
         self._planned_patterns[signature] = len(self.actions)
         self.actions.append(
@@ -438,6 +441,56 @@ class _DecisionActionPlanner:
                 observed_at=self.observed_at,
                 expected=self.expected,
             )
+        )
+
+    def _coalesce_planned_case_file(
+        self, planned_index: int, proposed: ProposedTechLeadAction
+    ) -> None:
+        """Fold a second first-seen observation into the pending creation.
+
+        One case file per signature, so a second observation of a signature this
+        decision is already creating rides the SAME action as an extra
+        identified observation. Its classification and area merge through
+        :func:`reconcile_pattern_classification` — the identical rule the
+        durable store applies across decisions. Retaining only the first
+        action's values silently lost an ``unclassified -> code`` upgrade (and
+        an area that decides routing) whenever both observations arrived in one
+        decision (#6957 review F3).
+        """
+        creation = self.actions[planned_index]
+        assert isinstance(creation, CreateTechLeadCaseFileIssueAction)
+        signature = creation.pattern_signature
+        fix_class = reconcile_pattern_classification(
+            field="fix_class",
+            signature=signature,
+            existing=creation.fix_class,
+            incoming=proposed.fix_class or "",
+        )
+        area = reconcile_pattern_classification(
+            field="area",
+            signature=signature,
+            existing=creation.area or "",
+            incoming=proposed.area or "",
+        )
+        self.actions[planned_index] = replace(
+            creation,
+            observations=(
+                *creation.observations,
+                build_pattern_observation(
+                    proposed,
+                    anchor_issue_number=self._anchor_number,
+                    findings=self.findings,
+                    source_run_id=self.source_run_id,
+                    source_session_name=self.source_session_name,
+                    observed_at=self.observed_at,
+                ),
+            ),
+            fix_class=fix_class,
+            area=area or None,
+            # An upgraded area changes the case file's ``area:*`` tag, so the
+            # labels are recomposed by their policy owner rather than left
+            # describing the first observation only.
+            labels=case_file_issue_labels(self.config, area=area or None),
         )
 
     def _plan_gated_op(self, proposed: ProposedTechLeadAction) -> None:

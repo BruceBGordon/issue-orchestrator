@@ -12,10 +12,14 @@ policy owner for the lane that connects them, mirroring
   or shipped — all three block re-filing), and its ROUTED target repo has cap
   room. Excess eligible signatures simply wait for the next tick; the cap is
   storm backpressure, not a queue.
-* **Routing** — the ``tech_lead.findings.route`` table maps an area to the repo
-  that owns the fix, with ``self`` meaning the managed repo. Self-routed
-  promotions are ordinary issues in the source repo and face its own scope
-  gates; promotion never bypasses them.
+* **Routing** — the ``tech_lead.findings.route`` table maps an area to the
+  target that owns the fix, and :func:`resolve_promotion_route` turns an entry
+  into a :class:`PromotionRoute`: the repo AND its scheduling contract. That
+  contract is what makes a promotion RUNNABLE — the managed repo's discovery
+  queries ``filtering.label`` alongside the agent label, so a self-routed
+  promotion inherits both and removing the gate really is the operator's whole
+  approval. Self-routed promotions are otherwise ordinary issues in the source
+  repo and face its own gates; promotion never bypasses them.
 * **Composition** — :func:`build_promotion_issue_body` renders the case file's
   mechanism into human documentation ONLY. The ledger is the authority; editing
   the promoted issue has zero effect on it (the same tamper boundary op
@@ -25,13 +29,15 @@ policy owner for the lane that connects them, mirroring
   port, then records the ledger row create-once; a filing that raises leaves
   the ledger untouched so the next tick retries, and a recorded row can never
   file a second issue.
-* **Loop closure** — :func:`classify_promotion_outcomes` turns the target-repo
-  reads into typed :class:`SettledPromotion` facts (read-only), and
-  :func:`apply_settle_tech_lead_promotion` performs the writes: a merged-PR
-  close records the ``tech_lead_shipped_fixes`` row, comments ``fixed by
-  <target>#N`` on the case file and closes it; a close WITHOUT a merged PR is
-  the operator declining, which marks the signature declined forever and
-  leaves the case file open to keep accruing evidence.
+* **Loop closure** — :class:`PromotionReadBudget` decides WHICH in-flight
+  promotions are polled this tick (at most ``max_open_promoted`` per target,
+  rotating), :func:`classify_promotion_outcomes` turns those target-repo reads
+  into typed :class:`SettledPromotion` facts (read-only), and
+  :func:`apply_settle_tech_lead_promotion` performs the writes: a close whose
+  CLOSING pull request merged records the ``tech_lead_shipped_fixes`` row,
+  comments ``fixed by <target>#N`` on the case file and closes it; any other
+  close is the operator declining, which marks the signature declined forever
+  and leaves the case file open to keep accruing evidence.
 
 Promotion FILES issues, full stop. Nothing here approves, merges, labels, or
 executes anything in the target repo — the target's own orchestrator runs the
@@ -45,10 +51,10 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Iterable, Sequence
 
 from ..domain.tech_lead_findings import (
-    PROMOTION_ROUTE_SELF,
     PROMOTION_STATE_DECLINED,
     PROMOTION_STATE_SHIPPED,
     PatternEvidence,
+    PromotionRoute,
     PromotionUpdate,
     PromotableFinding,
     PromotedFinding,
@@ -56,10 +62,7 @@ from ..domain.tech_lead_findings import (
     promotion_issue_marker,
     promotion_issue_title,
 )
-from ..domain.tech_lead_session import (
-    PROPOSED_TECH_LEAD_LABEL,
-    TECH_LEAD_AREA_LABEL_PREFIX,
-)
+from ..domain.tech_lead_session import PROPOSED_TECH_LEAD_LABEL
 from .actions import (
     Action,
     ActionResult,
@@ -69,6 +72,11 @@ from .actions import (
 )
 from .reconciliation import build_expected_for_mutation
 from .tech_lead_issue_policy import tech_lead_follow_up_agent_label
+# The lane's cross-tick read budget lives in its own module (it is the only
+# MUTABLE state here); re-exported so callers keep one import site.
+from .tech_lead_promotion_read_budget import (
+    PromotionReadBudget as PromotionReadBudget,
+)
 
 if TYPE_CHECKING:
     from ..domain.models import TechLeadFacts
@@ -80,50 +88,67 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def resolve_route_target(config: "Config", *, area: str) -> str:
-    """The concrete ``owner/repo`` a finding's area routes to.
+def resolve_promotion_route(config: "Config", *, area: str) -> PromotionRoute:
+    """The full queue contract of the repo a finding's area routes to.
 
-    ``self`` resolves to the managed repo, so downstream code never has to
-    special-case the sentinel. Fails loudly when the orchestrator has no
-    configured repo at all — a promotion with nowhere to land is a bug, not a
-    silent skip.
+    The ONE owner of route resolution (#6957 review F2). A promoted issue is
+    only runnable when it carries its target's scheduling labels, so this
+    resolves the repo AND those labels together — callers never assemble a
+    label set from config internals themselves.
+
+    * ``self`` resolves to the managed repo and INHERITS its own scheduling
+      contract: ``filtering.label`` (the scope label normal discovery queries
+      alongside the agent label) and ``review.tech_lead_follow_up_agent``. Under
+      ``auto`` such an issue is immediately discoverable; under ``gated``
+      removing the gate is genuinely the operator's whole approval.
+    * A foreign target declares its own contract in the route entry. Undeclared
+      values fall back to "no scope label" and the source's follow-up agent
+      label — the source repo's scope label is meaningless there, and applying
+      it would tag a foreign issue with an unrelated filter.
+
+    Fails loudly when a ``self`` route has no configured repo at all: a
+    promotion with nowhere to land is a bug, not a silent skip.
     """
     target = config.tech_lead.findings.route_for(area)
-    if target != PROMOTION_ROUTE_SELF:
-        return target
+    if not target.is_self:
+        return PromotionRoute(
+            target_repo=target.repo,
+            agent_label=(
+                target.agent_label
+                if target.agent_label is not None
+                else tech_lead_follow_up_agent_label(config)
+            ),
+            scope_label=target.scope_label or "",
+        )
     if not config.repo:
         raise ValueError(
             "tech_lead.findings routes to 'self' but no repository is configured;"
             " set `repo: owner/name` or route the area to an explicit repo"
         )
-    return config.repo
+    return PromotionRoute(
+        target_repo=config.repo,
+        agent_label=tech_lead_follow_up_agent_label(config),
+        scope_label=config.filtering.label or "",
+        is_self=True,
+    )
 
 
 def promotion_issue_labels(config: "Config", *, area: str) -> tuple[str, ...]:
-    """Labels for a promoted finding issue.
+    """Labels for a promoted finding issue, from its resolved route.
 
     Mirrors :func:`~.tech_lead_proposals.proposal_issue_labels` and
-    :func:`~.tech_lead_issue_policy.case_file_issue_labels`: the target repo's
-    implementation agent label makes the issue schedulable the moment the gate
-    comes off, the ``area:*`` tag keeps evidence clusters queryable, and the
-    gate label (in ``gated`` mode) blocks pickup and IS the approval affordance
-    — removing it is the operator's single action. The gate is
-    orchestrator-attached and exempt from the agent-label allowlist here and
-    ONLY here.
-
-    The filtering scope label is deliberately NOT applied: a promotion may land
-    in a foreign repo whose scope label means something else entirely, and a
-    self-routed promotion must face the managed repo's own scope gates rather
-    than smuggle itself past them.
+    :func:`~.tech_lead_issue_policy.case_file_issue_labels`: the target's worker
+    agent label plus its scope label make the issue DISCOVERABLE the moment the
+    gate comes off, the ``area:*`` tag keeps evidence clusters queryable, and
+    the gate label (in ``gated`` mode) is the only blocking one — removing it is
+    the operator's single action. The gate is orchestrator-attached and exempt
+    from the agent-label allowlist here and ONLY here.
     """
-    return tuple(
-        value
-        for value in (
-            tech_lead_follow_up_agent_label(config),
-            f"{TECH_LEAD_AREA_LABEL_PREFIX}{area}" if area else None,
-            PROPOSED_TECH_LEAD_LABEL if config.tech_lead.findings.gated else None,
-        )
-        if value
+    return resolve_promotion_route(config, area=area).issue_labels(
+        area=area,
+        gate_label=(
+            PROPOSED_TECH_LEAD_LABEL if config.tech_lead.findings.gated else ""
+        ),
     )
 
 
@@ -165,7 +190,7 @@ def select_promotable_findings(
     )
     selected: list[PromotableFinding] = []
     for row in candidates:
-        target = resolve_route_target(config, area=row.area)
+        target = resolve_promotion_route(config, area=row.area).target_repo
         target_key = target.casefold()
         if in_flight.get(target_key, 0) >= findings.max_open_promoted:
             logger.info(
@@ -357,6 +382,7 @@ def gather_finding_promotion_facts(
     *,
     authority: "TechLeadAuthorityStore | None",
     target: "PromotionTargetHost | None",
+    read_budget: PromotionReadBudget,
 ) -> tuple[
     tuple[PromotableFinding, ...],
     tuple[PromotionUpdate, ...],
@@ -367,9 +393,11 @@ def gather_finding_promotion_facts(
     The lane's fact-gathering owner, so the fact gatherer stays a thin seam that
     knows only "ask the promotion owner". Eligibility is pure ledger math with
     ZERO GitHub calls, so a disabled lane or a board with nothing promotable is
-    free. Loop closure is the only reader that crosses repos, and it reads at
-    most ``max_open_promoted`` issues per target — the cap that bounds the
-    lane's work-in-progress bounds its API cost too.
+    free. Loop closure is the only reader that crosses repos, and
+    ``read_budget`` enforces the ADR's promise that it reads at most
+    ``max_open_promoted`` issues per target per tick — the cap that bounds the
+    lane's work-in-progress bounds its API cost too, whatever the durable ledger
+    accumulated before the cap was lowered.
     """
     if authority is None or not config.tech_lead.findings.enabled:
         return (), (), ()
@@ -382,7 +410,13 @@ def gather_finding_promotion_facts(
     )
     if target is None:
         return promotable, (), ()
-    settled = classify_promotion_outcomes(promotions, target=target)
+    settled = classify_promotion_outcomes(
+        read_budget.select(
+            promotions,
+            per_target_limit=config.tech_lead.findings.max_open_promoted,
+        ),
+        target=target,
+    )
     updates = select_promotion_updates(
         evidence=evidence,
         promotions=promotions,
@@ -448,7 +482,11 @@ def classify_promotion_outcomes(
     *,
     target: "PromotionTargetHost",
 ) -> tuple[SettledPromotion, ...]:
-    """Read each in-flight promotion's target issue and classify terminality.
+    """Read each supplied promotion's target issue and classify terminality.
+
+    Callers pass the read budget's selection, not the whole ledger: the
+    per-target cap on in-flight promotions is also the per-tick cap on these
+    cross-repo reads (:class:`PromotionReadBudget`).
 
     READ-ONLY (the fact-gathering contract): the writes happen later in the
     applier off a planned action. An unreadable target — deleted issue, a repo
