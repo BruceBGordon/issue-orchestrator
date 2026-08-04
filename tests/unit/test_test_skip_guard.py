@@ -2,6 +2,9 @@
 
 import pytest
 
+from issue_orchestrator.control.lexical_masking import (
+    _translate_java_unicode_escapes,
+)
 from issue_orchestrator.control.test_skip_guard import (
     TestSkipGuardResult as SkipGuardResult,
     added_test_paths,
@@ -613,9 +616,9 @@ _BACKSLASH = "\\"
 # whether that ``u0022`` becomes the quote that closes the string literal and
 # leaves the rest of the line executable. Every row was confirmed against javac
 # (JDK 22): a sequence "closes" exactly when the compiled program reaches the
-# call after the literal. Eligibility is the parity of the contiguous
-# backslashes already emitted, and a backslash produced by an earlier Unicode
-# escape counts just like a raw one -- which is why those rows shift parity.
+# call after the literal. Eligibility combines escape provenance with the
+# parity of contiguous emitted backslashes, including backslashes produced by
+# an earlier Unicode escape -- which is why those rows shift parity.
 _JAVA_ESCAPE_ELIGIBILITY = (
     (_BACKSLASH, True),
     (_BACKSLASH * 2, False),
@@ -624,6 +627,21 @@ _JAVA_ESCAPE_ELIGIBILITY = (
     (_BACKSLASH + "u005c" + _BACKSLASH * 2, True),
     (_BACKSLASH + "u005c" + _BACKSLASH * 3, False),
 )
+
+
+@pytest.mark.parametrize(
+    ("raw", "translated"),
+    (
+        (r"\u005c\u005c", "\\\\"),
+        (r"\u005cu005a", r"\u005a"),
+        (r"\\u005a", r"\\u005a"),
+        (r"\\\u006e", "\\\\n"),
+    ),
+)
+def test_java_unicode_translation_matches_jls_companion_examples(
+    raw: str, translated: str
+) -> None:
+    assert _translate_java_unicode_escapes(raw) == translated
 
 
 @pytest.mark.parametrize(("sequence", "closes_literal"), _JAVA_ESCAPE_ELIGIBILITY)

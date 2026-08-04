@@ -95,13 +95,14 @@ def _translate_java_unicode_escapes(text: str) -> str:
     *before* comments and literals are recognised, so ``"\\u0022"`` closes a
     string rather than sitting inertly inside one.
 
-    Eligibility is the parity of the contiguous backslashes already *emitted*,
-    and the origin of those backslashes is immaterial: a backslash produced by
-    an earlier ``\\u005c`` counts exactly like a raw one. Grouping only the
-    current raw run gets mixed-origin input wrong -- in ``"\\u005c\\\\u0022"``
-    the escape emits a backslash, so the second raw backslash sits at an even
-    offset, is eligible, and closes the literal. An escape-produced character
-    is emitted once and never rescanned as the start of another escape.
+    Eligibility follows the emitted stream. An ASCII backslash is eligible
+    immediately after any escape-produced character; otherwise eligibility is
+    the parity of the contiguous emitted backslashes, regardless of their
+    origin. Grouping only the current raw run gets mixed-origin input wrong --
+    in ``"\\u005c\\\\u0022"`` the escape emits a backslash, so the second raw
+    backslash sits at an even offset, is eligible, and closes the literal. An
+    escape-produced character is emitted once and never rescanned as the start
+    of another escape.
 
     Escapes that cannot be modelled -- a malformed ``\\u`` with fewer than four
     hex digits -- are left as raw text. Java rejects those at compile time, so
@@ -110,23 +111,25 @@ def _translate_java_unicode_escapes(text: str) -> str:
 
     translated: list[str] = []
     emitted_backslashes = 0
+    preceding_from_escape = False
     index = 0
     while index < len(text):
         char = text[index]
         if char != "\\":
             translated.append(char)
             emitted_backslashes = 0
+            preceding_from_escape = False
             index += 1
             continue
 
+        eligible = preceding_from_escape or emitted_backslashes % 2 == 0
         escape = (
-            _JAVA_UNICODE_ESCAPE.match(text, index + 1)
-            if emitted_backslashes % 2 == 0
-            else None
+            _JAVA_UNICODE_ESCAPE.match(text, index + 1) if eligible else None
         )
         if escape is None:
             translated.append(char)
             emitted_backslashes += 1
+            preceding_from_escape = False
             index += 1
             continue
 
@@ -135,6 +138,7 @@ def _translate_java_unicode_escapes(text: str) -> str:
         emitted_backslashes = (
             emitted_backslashes + 1 if produced == "\\" else 0
         )
+        preceding_from_escape = True
         index = escape.end()
     return "".join(translated)
 
