@@ -11,6 +11,7 @@ from .lexical_masking import LiteralMasker
 
 
 _HUNK_RE = re.compile(r"@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+_PHYSICAL_LINE_TERMINATOR = re.compile(r"\r\n|[\r\n]")
 _TEST_PATH_SEGMENTS = {"test", "tests", "spec", "specs", "__tests__"}
 _TEST_NAME_SEGMENTS = {"test", "tests", "spec", "specs"}
 
@@ -97,7 +98,7 @@ def scan_added_test_skip_guards(
         masker = LiteralMasker(path)
         remaining_line_numbers = set(added_lines)
         for line_number, source_text in enumerate(
-            files_by_path[path].content.splitlines(), start=1
+            _PHYSICAL_LINE_TERMINATOR.split(files_by_path[path].content), start=1
         ):
             code_text = masker.mask_line(source_text)
             added = added_lines.get(line_number)
@@ -169,7 +170,12 @@ def iter_added_diff_lines(diff_text: str) -> tuple[AddedDiffLine, ...]:
     added: list[AddedDiffLine] = []
     current_path: str | None = None
     new_line: int | None = None
-    for raw in diff_text.splitlines():
+    # Unified-diff records are LF-delimited. ``str.splitlines()`` recognizes
+    # additional Unicode separators such as form feed; treating one of those
+    # source characters as a patch boundary can detach code from its leading
+    # ``+`` and silently drop an addition from the guard.
+    for record in diff_text.split("\n"):
+        raw = record.removesuffix("\r")
         if raw.startswith("diff --git "):
             current_path = None
             new_line = None

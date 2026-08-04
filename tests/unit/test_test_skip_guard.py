@@ -574,6 +574,40 @@ def test_scan_added_test_skip_guards_flags_java_unicode_escaped_line_terminator(
     ] == [(1, "JUnit assumeTrue")]
 
 
+def test_scan_added_test_skip_guards_preserves_form_feed_in_java_added_line() -> None:
+    source_line = "\fassumeTrue(false);"
+    diff = f"""diff --git a/src/test/java/GuardTest.java b/src/test/java/GuardTest.java
+--- a/src/test/java/GuardTest.java
++++ b/src/test/java/GuardTest.java
+@@ -0,0 +1,1 @@
++{source_line}
+"""
+    branch_files = (
+        BranchTextFile(path="src/test/java/GuardTest.java", content=source_line),
+    )
+
+    result = _scan(diff, branch_files)
+
+    assert [
+        (violation.line_number, violation.pattern) for violation in result.violations
+    ] == [(1, "JUnit assumeTrue")]
+
+
+def test_scan_added_test_skip_guards_ignores_form_feed_before_java_fixture() -> None:
+    source_line = '\fString fixture = "assumeTrue(false)";'
+    diff = f"""diff --git a/src/test/java/GuardTest.java b/src/test/java/GuardTest.java
+--- a/src/test/java/GuardTest.java
++++ b/src/test/java/GuardTest.java
+@@ -0,0 +1,1 @@
++{source_line}
+"""
+    branch_files = (
+        BranchTextFile(path="src/test/java/GuardTest.java", content=source_line),
+    )
+
+    assert _scan(diff, branch_files).ok
+
+
 def test_scan_added_test_skip_guards_ends_java_literal_at_trailing_backslash() -> None:
     diff = '''diff --git a/src/test/java/GuardTest.java b/src/test/java/GuardTest.java
 --- a/src/test/java/GuardTest.java
