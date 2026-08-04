@@ -509,6 +509,20 @@ def _promote_action(
     return action
 
 
+def _rerouted(
+    action: PromoteTechLeadFindingAction, repo: str
+) -> PromoteTechLeadFindingAction:
+    """The same planned action as it looked under a DIFFERENT configured route.
+
+    Only the target repo moves: the signature, its area, its title and its
+    marker are all route-independent, which is exactly why an operator editing
+    ``tech_lead.findings.route`` reaches the mismatch without any area change.
+    """
+    from dataclasses import replace
+
+    return replace(action, target_repo=repo)
+
+
 class TestFiling:
     def test_filing_records_the_ledger_row_and_returns_the_issue(self):
         target = InMemoryPromotionTargetHost()
@@ -699,32 +713,183 @@ class TestFiling:
             == 4
         )
 
-    def test_a_rerouted_in_flight_filing_refuses_to_file_a_second_issue(self):
-        """Unreachable while areas are immutable, but never guessed at."""
-        from issue_orchestrator.domain.tech_lead_findings import PendingPromotion
+class TestRouteChangedWhileFilingWasInFlight:
+    """#6957 round-4 review F12: a re-routed signature must still settle.
 
+    ``tech_lead.findings.route`` is ordinary user-editable YAML and the pending
+    intent is deliberately durable across restarts, so an operator re-pointing
+    an area between ticks reaches this WITHOUT the signature's area changing.
+    Refusing to act stranded the signature forever: every later tick rebuilt the
+    same action from the new route, hit the same mismatch, and failed again.
+    """
+
+    OTHER = "someone/else"
+
+    @staticmethod
+    def _crashed_filing(target, *, repo, observations=2):
+        """Leave a durable intent for a filing whose ledger write died."""
+
+        class FailFirstLedgerWrite(InMemoryTechLeadAuthorityStore):
+            def __init__(self) -> None:
+                super().__init__()
+                self.fail_next_record = True
+
+            def record_promotion(self, *, promotion):
+                if self.fail_next_record:
+                    self.fail_next_record = False
+                    raise RuntimeError("process died before the ledger commit")
+                super().record_promotion(promotion=promotion)
+
+        authority = FailFirstLedgerWrite()
+        action = _promote_action(observations=observations)
+        crashed = apply_promote_tech_lead_finding(
+            _rerouted(action, repo),
+            target=target,
+            authority=authority,
+            now_iso="t1",
+        )
+        assert not crashed.success
+        pending = authority.load_pending_promotion(signature=action.signature)
+        assert pending is not None and pending.target_repo == repo
+        return authority
+
+    def test_the_old_target_stays_authoritative_when_its_issue_exists(self):
+        """One signature promotes exactly once: the filed issue IS the promotion."""
         target = InMemoryPromotionTargetHost()
-        authority = InMemoryTechLeadAuthorityStore()
-        action = _promote_action()
-        authority.record_pending_promotion(
-            pending=PendingPromotion(
-                signature=action.signature,
-                case_file_issue_number=65,
-                target_repo="somewhere/else",
-                title=action.title,
-                idempotency_marker=action.idempotency_marker,
-                body_observations=2,
-            )
+        authority = self._crashed_filing(target, repo=self.OTHER)
+        assert len(target.filed) == 1
+
+        # The operator re-points the area; the next tick plans against the new
+        # route while the old route's issue already exists.
+        result = apply_promote_tech_lead_finding(
+            _promote_action(observations=3),
+            target=target,
+            authority=authority,
+            now_iso="t2",
         )
 
+        assert result.success
+        assert len(target.filed) == 1  # no second issue, in either repo
+        assert result.details["recovered"] is True
+        assert result.details["target_repo"] == self.OTHER
+        promotion = authority.load_promotion(signature="anchor-close")
+        assert promotion.target_repo == self.OTHER
+        # The intent's watermark still rules, so later evidence is not lost.
+        assert promotion.reported_observations == 2
+        assert authority.load_pending_promotion(signature="anchor-close") is None
+
+    def test_a_proven_absent_old_issue_lets_the_new_route_take_over(self):
+        """That create never happened, so nothing is orphaned."""
+        target = InMemoryPromotionTargetHost()
+        target.file_error = RuntimeError("the old route rejected it")
+        authority = InMemoryTechLeadAuthorityStore()
+        assert not apply_promote_tech_lead_finding(
+            _rerouted(_promote_action(), self.OTHER),
+            target=target,
+            authority=authority,
+            now_iso="t1",
+        ).success
+        assert target.filed == []
+        assert authority.load_pending_promotion(signature="anchor-close") is not None
+
+        target.file_error = None
         result = apply_promote_tech_lead_finding(
-            action, target=target, authority=authority, now_iso="t"
+            _promote_action(),
+            target=target,
+            authority=authority,
+            now_iso="t2",
+        )
+
+        assert result.success
+        # Filed exactly once, in the CURRENT route.
+        assert [repo for repo, *_ in target.filed] == [UPSTREAM]
+        assert result.details["recovered"] is False
+        assert result.details["target_repo"] == UPSTREAM
+        assert (
+            authority.load_promotion(signature="anchor-close").target_repo == UPSTREAM
+        )
+        # ...and the stale intent is retired, not left to strand the next tick.
+        assert authority.load_pending_promotion(signature="anchor-close") is None
+
+    def test_an_unreadable_old_target_creates_nothing_and_retries_later(self):
+        """"Unknown" is never "absent": that is what files a second issue."""
+        target = InMemoryPromotionTargetHost()
+        authority = self._crashed_filing(target, repo=self.OTHER)
+        target.find_error = RuntimeError("the old repo is unreachable")
+
+        result = apply_promote_tech_lead_finding(
+            _promote_action(),
+            target=target,
+            authority=authority,
+            now_iso="t2",
         )
 
         assert not result.success
-        assert "refusing to file a second issue" in (result.error or "")
-        assert target.filed == []
+        assert len(target.filed) == 1  # nothing new was created anywhere
+        assert authority.load_promotion(signature="anchor-close") is None
+        # The intent survives, so a later tick can still settle it.
+        assert authority.load_pending_promotion(signature="anchor-close") is not None
 
+        target.find_error = None
+        recovered = apply_promote_tech_lead_finding(
+            _promote_action(),
+            target=target,
+            authority=authority,
+            now_iso="t3",
+        )
+
+        assert recovered.success
+        assert len(target.filed) == 1
+        assert recovered.details["target_repo"] == self.OTHER
+
+
+class TestFilingRecoveryIsReportedHonestly:
+    """``recovered`` describes the REMOTE outcome, not watermark drift (A5)."""
+
+    def test_the_same_action_recovering_reports_recovered(self):
+        target = InMemoryPromotionTargetHost()
+        authority = InMemoryTechLeadAuthorityStore()
+        action = _promote_action(observations=2)
+        assert apply_promote_tech_lead_finding(
+            action, target=target, authority=authority, now_iso="t1"
+        ).success
+        # Same action, same watermark: the old inference said "not recovered".
+        authority.discard_pending_promotion(signature=action.signature)
+
+        target_only = InMemoryTechLeadAuthorityStore()
+        again = apply_promote_tech_lead_finding(
+            action, target=target, authority=target_only, now_iso="t2"
+        )
+
+        assert again.success
+        assert again.details["recovered"] is True
+
+    def test_a_fresh_create_reports_not_recovered_even_after_a_stale_intent(self):
+        target = InMemoryPromotionTargetHost()
+        target.file_error = RuntimeError("transient")
+        authority = InMemoryTechLeadAuthorityStore()
+        assert not apply_promote_tech_lead_finding(
+            _promote_action(observations=2),
+            target=target,
+            authority=authority,
+            now_iso="t1",
+        ).success
+
+        # An older intent exists, but this call really does create the first
+        # remote issue — the old inference would have said "recovered".
+        target.file_error = None
+        result = apply_promote_tech_lead_finding(
+            _promote_action(observations=3),
+            target=target,
+            authority=authority,
+            now_iso="t2",
+        )
+
+        assert result.success
+        assert result.details["recovered"] is False
+
+
+class TestPromotionMarker:
     def test_promotion_action_carries_stable_marker_in_remote_body(self):
         action = _promote_action("signature-with--html-risk")
 

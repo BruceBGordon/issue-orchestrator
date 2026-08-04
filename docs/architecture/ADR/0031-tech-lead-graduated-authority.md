@@ -322,6 +322,15 @@ recovering action is then handled separately, as an ordinary append. An orphan
 with no intent is durable-state loss rather than a crash window, and the lane
 stops rather than guessing its metadata.
 
+Because the intent is durable and `route` is ordinary editable configuration, an
+operator can re-point an area while a filing is in flight — without the
+signature's area changing at all. A recovery-only lookup in the intent's own
+repo settles that: if the old route's issue exists it IS the promotion (one
+signature promotes exactly once, so the recorded target stays authoritative and
+the new route does not apply to it); if it is proven absent the stale intent is
+retired and the current route takes over; if the lookup fails, nothing is
+created and the next tick tries again. A re-routed signature is never stranded.
+
 A signature's `fix_class` and `area` are immutable once recorded: an
 unclassified row may be upgraded once, identical values are idempotent, and a
 conflicting classification is rejected — before any action is produced, so no

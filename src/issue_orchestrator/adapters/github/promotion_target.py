@@ -142,7 +142,26 @@ class GitHubPromotionTargetHost:
         return FiledIssue(
             number=int(result["number"]),
             url=str(result.get("html_url") or ""),
+            recovered=False,
         )
+
+    def find_filed_issue(
+        self, *, repo: str, title: str, idempotency_marker: str
+    ) -> FiledIssue | None:
+        """The marker-owned issue in *repo*, or None when proven absent.
+
+        The recovery half of :meth:`file_issue`, exposed on its own so the
+        filing owner can ask whether an interrupted filing left an issue behind
+        in a repo the route no longer points at — without risking a create there
+        (#6957 round-4 review F12/A5). Failures propagate: an unreadable repo is
+        "unknown", never "absent".
+        """
+        if not idempotency_marker.strip():
+            raise ValueError("recovering a promotion filing needs its marker")
+        with self._client_for(repo) as client:
+            return self._find_marker_issue(
+                client, title=title, marker=idempotency_marker
+            )
 
     @staticmethod
     def _find_marker_issue(
@@ -155,7 +174,11 @@ class GitHubPromotionTargetHost:
         recovery rule for both, so they cannot drift.
         """
         found = find_marker_issue(client, title=title, marker=marker)
-        return FiledIssue(number=found.number, url=found.url) if found else None
+        return (
+            FiledIssue(number=found.number, url=found.url, recovered=True)
+            if found
+            else None
+        )
 
     @staticmethod
     def _ensure_labels(

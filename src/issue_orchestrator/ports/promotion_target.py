@@ -36,10 +36,18 @@ from typing import Protocol, Sequence
 
 @dataclass(frozen=True)
 class FiledIssue:
-    """The issue a promotion created in its target repo."""
+    """The issue a promotion filed in its target repo.
+
+    ``recovered`` distinguishes "this call created the issue" from "this call
+    found one an earlier, interrupted attempt had already created". The filing
+    owner needs the difference to report honestly and to reason about which
+    payload the remote body actually carries; inferring it from watermark drift
+    was wrong in both directions (#6957 round-4 review A5).
+    """
 
     number: int
     url: str = ""
+    recovered: bool = False
 
 
 def validate_promotion_issue_marker(*, body: str, marker: str) -> None:
@@ -100,6 +108,23 @@ class PromotionTargetHost(Protocol):
         """
         ...
 
+    def find_filed_issue(
+        self, *, repo: str, title: str, idempotency_marker: str
+    ) -> FiledIssue | None:
+        """The marker-owned issue in *repo*, or None when PROVEN absent.
+
+        Recovery only: this never creates. ``file_issue`` conflates "find" with
+        "create", which leaves the filing owner unable to ask whether an
+        interrupted filing left an issue behind in a repo it no longer routes to
+        (#6957 round-4 review F12/A5) — the one question it must answer before
+        deciding whether a re-routed signature may take a new target.
+
+        Raises when the lookup cannot be performed. "Unknown" must never be
+        mistaken for "absent": that is what files a second issue for a signature
+        that already has one.
+        """
+        ...
+
     def add_comment(self, *, repo: str, issue_number: int, body: str) -> None:
         """Comment on an already-promoted issue in *repo*."""
         ...
@@ -132,7 +157,10 @@ class InMemoryPromotionTargetHost:
         self.outcomes: dict[tuple[str, int], PromotedIssueOutcome | None] = {}
         self.next_issue_number = 1000
         self.file_error: Exception | None = None
-        self._filed_by_marker: dict[str, FiledIssue] = {}
+        self.find_error: Exception | None = None
+        # Markers are scoped to a repo: the same signature filed into two
+        # different routes is two different issues.
+        self._filed_by_marker: dict[tuple[str, str], FiledIssue] = {}
 
     def check_writable(self, *, repo: str) -> str | None:
         return None if self.writable else f"{repo}: {self.unwritable_reason}"
@@ -147,7 +175,7 @@ class InMemoryPromotionTargetHost:
         idempotency_marker: str,
     ) -> FiledIssue:
         validate_promotion_issue_marker(body=body, marker=idempotency_marker)
-        existing = self._filed_by_marker.get(idempotency_marker)
+        existing = self._filed_by_marker.get((repo, idempotency_marker))
         if existing is not None:
             return existing
         if self.file_error is not None:
@@ -158,8 +186,17 @@ class InMemoryPromotionTargetHost:
             number=self.next_issue_number,
             url=f"https://example.invalid/{repo}/issues/{self.next_issue_number}",
         )
-        self._filed_by_marker[idempotency_marker] = filed
+        self._filed_by_marker[(repo, idempotency_marker)] = FiledIssue(
+            number=filed.number, url=filed.url, recovered=True
+        )
         return filed
+
+    def find_filed_issue(
+        self, *, repo: str, title: str, idempotency_marker: str
+    ) -> FiledIssue | None:
+        if self.find_error is not None:
+            raise self.find_error
+        return self._filed_by_marker.get((repo, idempotency_marker))
 
     def add_comment(self, *, repo: str, issue_number: int, body: str) -> None:
         self.comments.append((repo, issue_number, body))

@@ -63,6 +63,7 @@ class TestFiling:
         )
 
         assert filed.number == 501
+        assert filed.recovered is False  # this call really did create it
         # The gate label was provisioned FIRST; a dropped gate would leave an
         # ungated, immediately schedulable promotion.
         assert calls == ["label:proposed-tech-lead", "issue"]
@@ -119,6 +120,9 @@ class TestFiling:
         )
 
         assert filed.number == 444
+        # Reported, not inferred: the filing owner needs the difference between
+        # "I created this" and "this already existed" (#6957 round-4 A5).
+        assert filed.recovered is True
         http_client.create_issue.assert_not_called()
         http_client.list_all_labels.assert_not_called()
         http_client.list_issues.assert_called_once_with(
@@ -145,6 +149,62 @@ class TestFiling:
             ["the signature title"], limit=30, use_cache=False
         )
         http_client.create_issue.assert_not_called()
+
+
+class TestRecoveryOnlyLookup:
+    """#6957 round-4 review F12/A5: find WITHOUT create.
+
+    The filing owner has to ask whether an interrupted filing left an issue in a
+    repo the route no longer points at. Answering that with ``file_issue`` would
+    risk creating one there.
+    """
+
+    def test_finds_the_marker_owned_issue_without_creating(self, target, http_client):
+        http_client.list_issues.return_value = [
+            {"number": 77, "body": f"stuff {MARKER}", "html_url": "u"}
+        ]
+
+        found = target.find_filed_issue(
+            repo=REPO, title="t", idempotency_marker=MARKER
+        )
+
+        assert found is not None
+        assert (found.number, found.recovered) == (77, True)
+        http_client.create_issue.assert_not_called()
+        http_client.create_label.assert_not_called()
+
+    def test_proven_absent_returns_none_and_creates_nothing(
+        self, target, http_client
+    ):
+        assert (
+            target.find_filed_issue(repo=REPO, title="t", idempotency_marker=MARKER)
+            is None
+        )
+        http_client.create_issue.assert_not_called()
+
+    def test_an_unreadable_repo_propagates_rather_than_reporting_absent(
+        self, target, http_client
+    ):
+        http_client.list_issues.side_effect = GitHubHttpError("repo unreachable")
+
+        with pytest.raises(GitHubHttpError):
+            target.find_filed_issue(repo=REPO, title="t", idempotency_marker=MARKER)
+
+    def test_a_body_without_the_marker_is_not_this_signature(
+        self, target, http_client
+    ):
+        http_client.list_issues.return_value = [
+            {"number": 77, "body": "an unrelated issue", "html_url": "u"}
+        ]
+
+        assert (
+            target.find_filed_issue(repo=REPO, title="t", idempotency_marker=MARKER)
+            is None
+        )
+
+    def test_a_marker_is_required(self, target):
+        with pytest.raises(ValueError, match="needs its marker"):
+            target.find_filed_issue(repo=REPO, title="t", idempotency_marker="  ")
 
 
 class TestOutcomeReads:

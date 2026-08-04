@@ -95,15 +95,18 @@ def apply_promote_tech_lead_finding(
     logger.info(
         "[tech_lead] Promoted finding %r -> %s#%d (case file #%d)%s",
         action.signature,
-        action.target_repo,
+        filed.target_repo,
         filed.issue_number,
         action.case_file_issue_number,
-        " [resumed an interrupted filing]" if filed.recovered else "",
+        " [recovered an interrupted filing]" if filed.recovered else "",
     )
     return ActionResult.ok(
         action,
         issue_number=filed.issue_number,
-        target_repo=action.target_repo,
+        # Where it ACTUALLY landed: a filing interrupted before its ledger write
+        # keeps the route it was filed against, even if the route has since
+        # moved (the owner reconciles that, #6957 round-4 review F12).
+        target_repo=filed.target_repo,
         url=filed.url,
         recovered=filed.recovered,
     )
