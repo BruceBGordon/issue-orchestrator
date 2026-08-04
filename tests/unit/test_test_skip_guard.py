@@ -429,6 +429,37 @@ def test_scan_added_test_skip_guards_flags_division_after_non_null_assertion() -
     assert result.violations[0].pattern == "JS test skip"
 
 
+def test_scan_added_test_skip_guards_flags_division_after_self_closing_jsx() -> None:
+    diff = """diff --git a/tests/guard.test.tsx b/tests/guard.test.tsx
+--- a/tests/guard.test.tsx
++++ b/tests/guard.test.tsx
+@@ -0,0 +1,3 @@
++const ratio = <Widget /> / (test.skip("real skip", () => {}), 1) / 2;
++const attrs = <Widget a={x} b="y" {...rest} /> / (it.skip("attrs"), 1) / 2;
++const inert = left > /test.skip("fixture", () => {})/.test(source);
+"""
+
+    result = _scan(diff)
+
+    assert [violation.line_number for violation in result.violations] == [1, 2]
+    assert {violation.pattern for violation in result.violations} == {"JS test skip"}
+
+
+def test_scan_added_test_skip_guards_closes_kotlin_four_quote_raw_string() -> None:
+    diff = '''diff --git a/src/test/kotlin/GuardTest.kt b/src/test/kotlin/GuardTest.kt
+--- a/src/test/kotlin/GuardTest.kt
++++ b/src/test/kotlin/GuardTest.kt
+@@ -0,0 +1,1 @@
++val fixture = """assumeTrue(false) stays inert""""; assumeFalse(true, "reason")
+'''
+
+    result = _scan(diff)
+
+    assert [
+        (violation.line_number, violation.pattern) for violation in result.violations
+    ] == [(1, "JUnit assumeFalse")]
+
+
 def test_scan_added_test_skip_guards_closes_kotlin_raw_string_ending_in_backslash() -> (
     None
 ):
