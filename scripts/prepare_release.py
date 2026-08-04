@@ -79,6 +79,32 @@ class ReleasePrOptions:
     uv_executable: str | None
 
 
+def is_prerelease_version(version: str) -> bool:
+    """Return True when ``version`` is a pre-1.0 (``0.x``) release.
+
+    While the project is in ``0.x`` the public API is explicitly unstable
+    (SemVer clause 4), so every release is published as a GitHub pre-release.
+    That keeps the "Latest" pointer free for the first stable ``1.0.0`` and
+    makes the instability visible on the releases page rather than only in
+    prose. See ``docs/user/stability.md``.
+    """
+    normalized = version[1:] if version[:1].lower() == "v" else version
+    major, _, _ = normalized.partition(".")
+    return major == "0"
+
+
+def github_release_command(tag_name: str) -> list[str]:
+    """Return the ``gh release create`` command for ``tag_name``.
+
+    Single owner for the release-publishing command so the dry-run preview and
+    the real invocation cannot disagree about the pre-release marking.
+    """
+    command = ["gh", "release", "create", tag_name, "--generate-notes"]
+    if is_prerelease_version(tag_name):
+        command.append("--prerelease")
+    return command
+
+
 def normalize_release_version(raw_version: str) -> str:
     """Return a stable SemVer release version without a leading ``v``."""
     version = raw_version.strip()
@@ -641,7 +667,7 @@ def print_dry_run_commands(
             f"+ git push {RELEASE_REMOTE} refs/tags/{tag_name}:refs/tags/{tag_name}"
         )
     if options.create_github_release:
-        print(f"+ gh release create {tag_name} --generate-notes")
+        print("+ " + " ".join(github_release_command(tag_name)))
 
 
 def default_release_pr_branch_name(tag_name: str) -> str:
@@ -962,6 +988,29 @@ def create_release_tag(paths: ReleasePaths, tag_name: str) -> None:
     )
 
 
+def print_github_release_recovery_hint(tag_name: str) -> None:
+    """Print the exact command that finishes a release after ``gh`` failed.
+
+    The tag is already pushed at this point, so the full release command cannot
+    be rerun. The operator has to create the GitHub release by hand — which is
+    exactly the path where a remembered-by-hand ``--prerelease`` flag goes
+    missing and a ``0.x`` tag publishes as a normal release. Emitting the
+    command from ``github_release_command`` keeps the version-derived
+    pre-release policy in charge of recovery too.
+    """
+    printable = " ".join(shlex.quote(part) for part in github_release_command(tag_name))
+    print(
+        f"\nThe {tag_name} tag was pushed but the GitHub release was not created.",
+        file=sys.stderr,
+    )
+    print(
+        "Do not rerun the release command; the remote tag already exists. "
+        "Create the release from the pushed tag with exactly:",
+        file=sys.stderr,
+    )
+    print(f"  {printable}", file=sys.stderr)
+
+
 def publish_release(
     paths: ReleasePaths, tag_name: str, options: ReleaseWorkflowOptions
 ) -> None:
@@ -980,9 +1029,11 @@ def publish_release(
         print("Skipped push; tag remains local.")
 
     if options.create_github_release:
-        run_command(
-            ["gh", "release", "create", tag_name, "--generate-notes"], cwd=paths.root
-        )
+        try:
+            run_command(github_release_command(tag_name), cwd=paths.root)
+        except ReleasePrepError:
+            print_github_release_recovery_hint(tag_name)
+            raise
     else:
         print("Skipped GitHub release creation.")
 

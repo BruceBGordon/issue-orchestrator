@@ -1,5 +1,9 @@
 # Release Process
 
+Version numbers follow SemVer, and what a given bump is allowed to break is
+defined in [Stability & API Surface](../user/stability.md). Read that first if
+you are deciding between a patch and a minor.
+
 Use the release scripts in two operator steps so the version bump goes through
 normal branch protection before the tag is published.
 
@@ -49,6 +53,29 @@ The full release flow:
 `VERSION` may be passed with or without the leading `v`; package metadata stores
 the plain form (`1.0.0`) and release tags use the prefixed form (`v1.0.0`).
 
+## Pre-release tagging during `0.x`
+
+While the project is in `0.x`, the public API is explicitly unstable, so every
+release is published as a GitHub **pre-release**: step 10 runs
+`gh release create <tag> --generate-notes --prerelease`. `0.x` tags therefore
+carry the pre-release badge and do not claim the "Latest" pointer, which stays
+free until the first `1.0.0`.
+
+This is derived from the version itself — any `0.y.z` tag is marked as a
+pre-release, and `1.0.0` onward publishes as a normal release. There is no flag
+to remember and no way for the real invocation to disagree with the dry-run
+preview; both build the command through `github_release_command()` in
+`scripts/prepare_release.py`.
+
+SemVer pre-release identifiers (`v0.11.0-beta.1`) are *not* supported by the
+release tooling today: `normalize_release_version()` requires a stable `X.Y.Z`
+version so package metadata, `uv.lock`, and the tag cannot drift apart. Adding
+them is a deliberate change to that validator, not something to work around.
+
+Which surfaces `0.x` lets a minor release break, and what must graduate before
+the `0` is dropped, is documented in
+[Stability & API Surface](../user/stability.md).
+
 The Control Center footer renders `v{{ version }}` from
 `importlib.metadata.version("issue-orchestrator")` via
 `resolve_runtime_identity()`. `make release-pr` refreshes `uv.lock`, runs
@@ -80,11 +107,21 @@ prep command when you intentionally want to edit, commit, push, and open the PR
 yourself.
 
 If `gh release create` fails after the tag push, do not rerun the full release
-command unchanged because the remote tag now exists. Create the GitHub release
-from the pushed tag:
+command unchanged because the remote tag now exists. The failing run prints the
+exact recovery command to stderr — copy that line rather than retyping one,
+because it is built by the same `github_release_command()` that the release
+itself uses and therefore carries the correct pre-release marking:
 
-```bash
-gh release create v1.0.0 --generate-notes
 ```
+The v0.11.0 tag was pushed but the GitHub release was not created.
+Do not rerun the release command; the remote tag already exists. Create the
+release from the pushed tag with exactly:
+  gh release create v0.11.0 --generate-notes --prerelease
+```
+
+During `0.x` the `--prerelease` flag is not optional: omitting it publishes the
+release as a normal one and hands it the "Latest" pointer, contradicting the
+[0.x pre-release guarantee](../user/stability.md). From `1.0.0` onward the
+printed command omits the flag.
 
 For automation, use `ARGS=--yes` to skip the exact-tag confirmation prompt.

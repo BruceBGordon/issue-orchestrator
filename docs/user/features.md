@@ -149,8 +149,14 @@ automation, or AI assistant.
 - Provides a browser dashboard for monitoring and controlling issue flow.
 - Provides a VS Code integration for queues, sessions, diagnostics, worktree
   links, and dashboard access.
-- Exposes REST API endpoints for clients and automations.
-- Provides an MCP server entry point for editor and agent integrations.
+- Exposes a contracted subset of HTTP routes, described by
+  `docs/api/ui-openapi.json`, for clients and automations. The remaining
+  `/api/*` and `/control/*` routes are internal engine transport with no
+  compatibility promise — see [Stability & API Surface](stability.md).
+- Provides an MCP server entry point for editor and agent integrations. This is
+  the intended external route for automation, but it is still **experimental**
+  during `0.x` — tool names, arguments, and return shapes may change in any
+  release.
 - Supports pause, resume, stop, diagnostics, and guardrail repair controls from
   configured clients.
 

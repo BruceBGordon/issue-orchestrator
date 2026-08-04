@@ -2128,10 +2128,10 @@
       "rule_id": "ruff_noqa_suppressions",
       "value": 1
     },
-    "ruff_noqa_suppressions:src/issue_orchestrator/entrypoints/mcp_server.py:25d30ad79690:line-273": {
-      "detail": "line 273: # noqa: BLE001",
+    "ruff_noqa_suppressions:src/issue_orchestrator/entrypoints/mcp_server.py:25d30ad79690:line-291": {
+      "detail": "line 291: # noqa: BLE001",
       "kind": "ruff_noqa_suppression",
-      "metric_id": "src/issue_orchestrator/entrypoints/mcp_server.py:25d30ad79690:line-273",
+      "metric_id": "src/issue_orchestrator/entrypoints/mcp_server.py:25d30ad79690:line-291",
       "path": "src/issue_orchestrator/entrypoints/mcp_server.py",
       "rule_id": "ruff_noqa_suppressions",
       "value": 1

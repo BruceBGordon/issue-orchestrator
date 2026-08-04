@@ -26,6 +26,7 @@ from issue_orchestrator.entrypoints.cli import (
     _run_test_setup,
     _load_config,
 )
+from issue_orchestrator.entrypoints import cli, cli_parser
 from issue_orchestrator.entrypoints.cli_parser import CLICommandHandlers, build_parser
 from issue_orchestrator.domain.models import AgentConfig
 from issue_orchestrator.infra.config import Config
@@ -291,6 +292,117 @@ class TestCmdStatus:
             result = cmd_status(args)
 
             assert result == 0  # Status returns 0 even without config
+
+
+class TestDeclaredCommandSurface:
+    """``CLI_COMMANDS`` is the published surface, so drift must fail loudly."""
+
+    @staticmethod
+    def _handlers() -> CLICommandHandlers:
+        def noop(_args: argparse.Namespace) -> int:
+            return 0
+
+        return CLICommandHandlers(
+            **{field.name: noop for field in fields(CLICommandHandlers)}
+        )
+
+    def test_build_parser_accepts_declared_commands_and_rejects_others(self):
+        parser = build_parser(self._handlers())
+
+        assert parser.parse_args(["status"]).command == "status"
+        assert parser.parse_args(["health-review"]).command == "health-review"
+        with pytest.raises(SystemExit):
+            parser.parse_args(["teleport"])
+
+    def test_build_parser_rejects_a_command_missing_from_the_declared_surface(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(cli_parser, "CLI_COMMANDS", ("start",))
+
+        with pytest.raises(RuntimeError, match="Registered but undeclared"):
+            build_parser(self._handlers())
+
+    def test_build_parser_rejects_a_declared_command_that_is_not_registered(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(
+            cli_parser, "CLI_COMMANDS", (*cli_parser.CLI_COMMANDS, "teleport")
+        )
+
+        with pytest.raises(RuntimeError, match="declared but not registered"):
+            build_parser(self._handlers())
+
+
+class TestRetiredCommandStubs:
+    """The published tier must match what the handler actually does.
+
+    A command classified ``Supported`` whose handler only prints "no longer
+    available" and returns 1 is a false promise on a page whose whole job is
+    telling people what they can depend on. These assertions pin the declared
+    tier to the handlers in both directions.
+    """
+
+    @staticmethod
+    def _handler(command: str):
+        return getattr(cli, f"cmd_{command.replace('-', '_')}")
+
+    @staticmethod
+    def _delegates_to_retired_owner(command: str) -> bool:
+        """Whether the handler routes through the shared retired-stub owner."""
+        source = inspect.getsource(TestRetiredCommandStubs._handler(command))
+        return "retired_command(" in source
+
+    def test_declared_retired_commands_are_exactly_the_failing_stubs(self):
+        declared = {
+            spec.name
+            for spec in cli_parser.CLI_COMMAND_SURFACE
+            if spec.stability is cli_parser.CLIStability.RETIRED
+        }
+        actual = {
+            spec.name
+            for spec in cli_parser.CLI_COMMAND_SURFACE
+            if self._delegates_to_retired_owner(spec.name)
+        }
+
+        assert declared == actual, (
+            "Retired tier drifted from handler behavior. "
+            f"Declared Retired but not a failing stub: {sorted(declared - actual)}; "
+            f"a failing stub but not declared Retired: {sorted(actual - declared)}."
+        )
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            spec.name
+            for spec in cli_parser.CLI_COMMAND_SURFACE
+            if spec.stability is cli_parser.CLIStability.RETIRED
+        ],
+    )
+    def test_every_retired_command_fails_and_points_somewhere(self, command, capsys):
+        result = self._handler(command)(argparse.Namespace())
+
+        assert result == 1, f"{command} is published Retired but exited 0"
+        output = capsys.readouterr().out
+        assert "no longer available" in output
+        assert command in output
+
+    def test_output_is_not_published_as_supported(self):
+        """Regression: ``output`` shipped as ``Supported`` while always failing."""
+        spec = next(
+            spec for spec in cli_parser.CLI_COMMAND_SURFACE if spec.name == "output"
+        )
+
+        assert spec.stability is cli_parser.CLIStability.RETIRED
+
+    def test_every_declared_command_has_a_handler(self):
+        """The name-to-handler mapping the assertions above rely on must hold."""
+        missing = [
+            spec.name
+            for spec in cli_parser.CLI_COMMAND_SURFACE
+            if not hasattr(cli, f"cmd_{spec.name.replace('-', '_')}")
+        ]
+
+        assert not missing, f"Declared commands with no cmd_* handler: {missing}"
 
 
 class TestCmdSetupGuardrails:

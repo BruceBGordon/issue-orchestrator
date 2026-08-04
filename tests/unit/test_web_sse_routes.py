@@ -2,6 +2,7 @@
 
 # ruff: noqa: F403,F405,SLF001
 
+from issue_orchestrator.events.catalog import EVENT_SCHEMA_VERSION
 from tests.unit import test_web as _support
 from tests.unit.route_helpers import iter_route_paths
 from tests.unit.test_web import *  # noqa: F403
@@ -117,7 +118,7 @@ class TestSSEFunctionality:
             assert not test_queue.empty()
             event = test_queue.get_nowait()
             assert event["type"] == "test_event"
-            assert event["data"] == {"key": "value"}
+            assert event["data"] == {"key": "value", "schema": EVENT_SCHEMA_VERSION}
         finally:
             remove_event_subscriber(test_queue)
 
@@ -135,7 +136,7 @@ class TestSSEFunctionality:
 
             event = test_queue.get_nowait()
             assert event["type"] == "empty_event"
-            assert event["data"] == {}
+            assert event["data"] == {"schema": EVENT_SCHEMA_VERSION}
         finally:
             remove_event_subscriber(test_queue)
 
@@ -377,7 +378,13 @@ class TestSSEEventStreamFormat:
 
             assert chunk["event"] == "session.started"
             payload = json.loads(chunk["data"])
-            assert payload == {"issue_number": 123, "status": "active"}
+            # The broadcast boundary stamps the public envelope, so a raw
+            # producer's payload reaches the wire versioned (issue #6464).
+            assert payload == {
+                "issue_number": 123,
+                "status": "active",
+                "schema": EVENT_SCHEMA_VERSION,
+            }
 
 
 class TestIssueRowsEndpoint:

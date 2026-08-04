@@ -349,36 +349,50 @@ def cmd_status(args: argparse.Namespace) -> int:
         return 0
 
 
-def cmd_attach(args: argparse.Namespace) -> int:
-    """Attach to session (deprecated - use web dashboard)."""
-    console.print("[yellow]The 'attach' command is no longer available.[/yellow]")
-    console.print("Use the web dashboard to view sessions: issue-orchestrator start")
+def retired_command(name: str, guidance: str) -> int:
+    """Report a retired command uniformly and fail.
+
+    Single owner for the retired-stub behavior. These commands are kept only so
+    an old script gets a pointer to the replacement instead of an argparse
+    "invalid choice" error — the capability itself is gone, so they always exit
+    non-zero. ``CLIStability.RETIRED`` in
+    :mod:`issue_orchestrator.entrypoints.cli_parser` is the published tier, and
+    ``tests/unit/test_cli.py::TestRetiredCommandStubs`` pins that tier to which
+    handlers delegate here, so a tier and its behavior cannot drift apart.
+    """
+    console.print(f"[yellow]The '{name}' command is no longer available.[/yellow]")
+    console.print(guidance)
     return 1
+
+
+def cmd_attach(args: argparse.Namespace) -> int:
+    """Attach to session (retired - use the web dashboard)."""
+    return retired_command(
+        "attach", "Use the web dashboard to view sessions: issue-orchestrator start"
+    )
 
 
 def cmd_switch(args: argparse.Namespace) -> int:
-    """Switch to session (deprecated - use web dashboard)."""
-    console.print("[yellow]The 'switch' command is no longer available.[/yellow]")
-    console.print("Use the web dashboard to view sessions: issue-orchestrator start")
-    return 1
+    """Switch to session (retired - use the web dashboard)."""
+    return retired_command(
+        "switch", "Use the web dashboard to view sessions: issue-orchestrator start"
+    )
 
 
 def cmd_dashboard(args: argparse.Namespace) -> int:
-    """Switch to dashboard (deprecated - use web dashboard)."""
-    console.print("[yellow]The 'dashboard' command is no longer available.[/yellow]")
-    console.print(
-        "Start the orchestrator to access the web dashboard: issue-orchestrator start"
+    """Switch to dashboard (retired - use the web dashboard)."""
+    return retired_command(
+        "dashboard",
+        "Start the orchestrator to access the web dashboard: issue-orchestrator start",
     )
-    return 1
 
 
 def cmd_output(args: argparse.Namespace) -> int:
-    """Show recent output from an issue's session."""
-    console.print("[yellow]The 'output' command is no longer available.[/yellow]")
-    console.print(
-        "View session recordings in .issue-orchestrator/sessions/<run>/terminal-recording.jsonl"
+    """Show recent session output (retired - read the terminal recording)."""
+    return retired_command(
+        "output",
+        "View session recordings in .issue-orchestrator/sessions/<run>/terminal-recording.jsonl",
     )
-    return 1
 
 
 def cmd_pause(args: argparse.Namespace) -> int:
