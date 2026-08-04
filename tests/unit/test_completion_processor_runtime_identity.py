@@ -20,6 +20,7 @@ from issue_orchestrator.execution.session_output_adapter import FileSystemSessio
 from issue_orchestrator.ports.pull_request_tracker import PRInfo
 from issue_orchestrator.ports.working_copy import (
     BranchPathsResult,
+    BranchTextFilesResult,
     DiffResult,
     PushResult,
 )
@@ -44,6 +45,9 @@ def _make_git_adapter() -> Mock:
     adapter.has_tracked_changes = Mock(return_value=False)
     adapter.list_dirty_files = Mock(return_value=[])
     adapter.diff_against_base = Mock(return_value=DiffResult(success=True, diff_text=""))
+    adapter.read_branch_text_files = Mock(
+        return_value=BranchTextFilesResult(success=True)
+    )
     adapter.branch_post_image_paths_against_base = Mock(
         return_value=BranchPathsResult(success=True, paths=())
     )

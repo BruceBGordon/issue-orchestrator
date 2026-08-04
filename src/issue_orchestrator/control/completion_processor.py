@@ -103,7 +103,7 @@ from .review_exchange_pr_comment import (
     GITHUB_COMMENT_BODY_LIMIT,
     build_review_exchange_pr_comment_body,
 )
-from .test_skip_guard import scan_added_test_skip_guards
+from .test_skip_guard import added_test_paths, scan_added_test_skip_guards
 from .tech_lead_approval_gate import build_tech_lead_decision_approval_gate
 from .tech_lead_completion import tech_lead_decision_processing_error
 from .tech_lead_session_policy import is_benign_tech_lead_no_commits, is_tech_lead_session, shape_requested_actions_for_tech_lead
@@ -1125,7 +1125,50 @@ class CompletionProcessor:
                 run_assets=run_assets,
             )
 
-        scan = scan_added_test_skip_guards(diff_result.diff_text)
+        try:
+            test_paths = added_test_paths(diff_result.diff_text)
+        except ValueError as exc:
+            return self._handle_gate_failure(
+                worktree,
+                record,
+                session_name,
+                issue_number,
+                f"Could not parse branch diff for banned test skips: {exc}",
+                gate_record=None,
+                run_assets=run_assets,
+            )
+        if not test_paths:
+            return None
+        branch_files_result = self.git_adapter.read_branch_text_files(
+            worktree, test_paths
+        )
+        if not branch_files_result.success:
+            return self._handle_gate_failure(
+                worktree,
+                record,
+                session_name,
+                issue_number,
+                (
+                    "Could not read branch-tip test files for banned test-skip "
+                    f"scan: {branch_files_result.error or 'unknown git error'}"
+                ),
+                gate_record=None,
+                run_assets=run_assets,
+            )
+        try:
+            scan = scan_added_test_skip_guards(
+                diff_result.diff_text, branch_files_result.files
+            )
+        except ValueError as exc:
+            return self._handle_gate_failure(
+                worktree,
+                record,
+                session_name,
+                issue_number,
+                f"Could not scan branch-tip test files for banned test skips: {exc}",
+                gate_record=None,
+                run_assets=run_assets,
+            )
         if scan.ok:
             return None
         return self._handle_gate_failure(

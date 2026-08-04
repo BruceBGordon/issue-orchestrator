@@ -60,6 +60,8 @@ from issue_orchestrator.ports.review_artifact_reader import (
 )
 from issue_orchestrator.ports.working_copy import (
     BranchPathsResult,
+    BranchTextFile,
+    BranchTextFilesResult,
     DiffResult,
     PushResult,
 )
@@ -246,6 +248,9 @@ def mock_git_adapter():
     adapter.list_dirty_files = Mock(return_value=[])
     adapter.diff_against_base = Mock(
         return_value=DiffResult(success=True, diff_text="")
+    )
+    adapter.read_branch_text_files = Mock(
+        return_value=BranchTextFilesResult(success=True)
     )
     adapter.branch_post_image_paths_against_base = Mock(
         return_value=BranchPathsResult(success=True, paths=())
@@ -4216,6 +4221,18 @@ class TestCompletionProcessorPublishGate:
                 "+        assumeTrue(PostgresTestSupport.isAvailable())\n"
             ),
         )
+        mock_git_adapter.read_branch_text_files.return_value = BranchTextFilesResult(
+            success=True,
+            files=(
+                BranchTextFile(
+                    path="src/test/kotlin/FooTest.kt",
+                    content=(
+                        "\n" * 20
+                        + "        assumeTrue(PostgresTestSupport.isAvailable())\n"
+                    ),
+                ),
+            ),
+        )
         processor = CompletionProcessor(
             agent_callback_endpoint=ready_callback_endpoint(),
             label_adapter=mock_label_adapter,
@@ -4241,10 +4258,201 @@ class TestCompletionProcessorPublishGate:
         assert not result.success
         assert result.failure_kind == "validation_failed"
         assert "Newly added test-skip guard" in result.message
+        mock_git_adapter.read_branch_text_files.assert_called_once_with(
+            worktree, ("src/test/kotlin/FooTest.kt",)
+        )
         mock_publish_gate.check.assert_not_called()
         mock_git_adapter.push.assert_not_called()
         mock_pr_adapter.create_pr.assert_not_called()
         mock_label_adapter.add_label.assert_called_once_with(123, "validation-failed")
+
+    def test_test_skip_guard_uses_branch_tip_multiline_context(
+        self,
+        processor,
+        mock_git_adapter,
+        worktree_with_completion,
+    ):
+        mock_git_adapter.diff_against_base.return_value = DiffResult(
+            success=True,
+            diff_text=(
+                "diff --git a/tests/test_guard.py b/tests/test_guard.py\n"
+                "--- a/tests/test_guard.py\n"
+                "+++ b/tests/test_guard.py\n"
+                "@@ -10,0 +11,1 @@\n"
+                '+pytest.skip("fixture text")\n'
+            ),
+        )
+        mock_git_adapter.read_branch_text_files.return_value = BranchTextFilesResult(
+            success=True,
+            files=(
+                BranchTextFile(
+                    path="tests/test_guard.py",
+                    content=(
+                        "\n" * 9
+                        + 'fixture = """documentation\n'
+                        + 'pytest.skip("fixture text")\n'
+                        + '"""\n'
+                    ),
+                ),
+            ),
+        )
+        record = make_record(
+            outcome=CompletionOutcome.COMPLETED,
+            requested_actions=[RequestedAction.PUSH_BRANCH],
+        )
+        worktree = worktree_with_completion(record)
+
+        result = processor.process(
+            worktree,
+            run_assets=make_session_run_assets(worktree),
+            issue_number=123,
+            issue_title="Test",
+        )
+
+        assert result.success
+        mock_git_adapter.read_branch_text_files.assert_called_once_with(
+            worktree, ("tests/test_guard.py",)
+        )
+        mock_git_adapter.push.assert_called_once()
+
+    @pytest.mark.parametrize(
+        ("branch_files_result", "expected_message"),
+        [
+            (
+                BranchTextFilesResult(
+                    success=False,
+                    error="fatal: path missing from HEAD",
+                ),
+                "Could not read branch-tip test files",
+            ),
+            (
+                BranchTextFilesResult(
+                    success=True,
+                    files=(
+                        BranchTextFile(
+                            path="tests/test_guard.py",
+                            content='\npytest.skip("different text")\n',
+                        ),
+                    ),
+                ),
+                "Branch-tip content does not match diff",
+            ),
+        ],
+    )
+    def test_test_skip_guard_branch_tip_failure_fails_closed(
+        self,
+        processor,
+        mock_git_adapter,
+        worktree_with_completion,
+        branch_files_result,
+        expected_message,
+    ):
+        mock_git_adapter.diff_against_base.return_value = DiffResult(
+            success=True,
+            diff_text=(
+                "diff --git a/tests/test_guard.py b/tests/test_guard.py\n"
+                "--- a/tests/test_guard.py\n"
+                "+++ b/tests/test_guard.py\n"
+                "@@ -1,0 +2,1 @@\n"
+                '+pytest.skip("real skip")\n'
+            ),
+        )
+        mock_git_adapter.read_branch_text_files.return_value = branch_files_result
+        record = make_record(
+            outcome=CompletionOutcome.COMPLETED,
+            requested_actions=[RequestedAction.PUSH_BRANCH],
+        )
+        worktree = worktree_with_completion(record)
+
+        result = processor.process(
+            worktree,
+            run_assets=make_session_run_assets(worktree),
+            issue_number=123,
+            issue_title="Test",
+        )
+
+        assert not result.success
+        assert expected_message in result.message
+        mock_git_adapter.push.assert_not_called()
+
+    def test_test_skip_guard_unparsable_diff_fails_closed(
+        self,
+        processor,
+        mock_git_adapter,
+        worktree_with_completion,
+    ):
+        mock_git_adapter.diff_against_base.return_value = DiffResult(
+            success=True,
+            diff_text=(
+                "diff --git a/tests/test_guard.py b/tests/test_guard.py\n"
+                "--- a/tests/test_guard.py\n"
+                "+++ b/tests/test_guard.py\n"
+                "@@@ -1,1 -1,1 +1,1 @@@\n"
+                '+pytest.skip("real skip")\n'
+            ),
+        )
+        record = make_record(
+            outcome=CompletionOutcome.COMPLETED,
+            requested_actions=[RequestedAction.PUSH_BRANCH],
+        )
+        worktree = worktree_with_completion(record)
+
+        result = processor.process(
+            worktree,
+            run_assets=make_session_run_assets(worktree),
+            issue_number=123,
+            issue_title="Test",
+        )
+
+        assert not result.success
+        assert "Could not parse branch diff for banned test skips" in result.message
+        mock_git_adapter.read_branch_text_files.assert_not_called()
+        mock_git_adapter.push.assert_not_called()
+
+    def test_test_skip_guard_scans_source_resembling_diff_headers(
+        self,
+        processor,
+        mock_git_adapter,
+        worktree_with_completion,
+    ):
+        mock_git_adapter.diff_against_base.return_value = DiffResult(
+            success=True,
+            diff_text=(
+                "diff --git a/tests/test_guard.py b/tests/test_guard.py\n"
+                "--- a/tests/test_guard.py\n"
+                "+++ b/tests/test_guard.py\n"
+                "@@ -0,0 +1,1 @@\n"
+                '+++pytest.skip("real skip")\n'
+            ),
+        )
+        mock_git_adapter.read_branch_text_files.return_value = BranchTextFilesResult(
+            success=True,
+            files=(
+                BranchTextFile(
+                    path="tests/test_guard.py",
+                    content='++pytest.skip("real skip")\n',
+                ),
+            ),
+        )
+        record = make_record(
+            outcome=CompletionOutcome.COMPLETED,
+            requested_actions=[RequestedAction.PUSH_BRANCH],
+        )
+        worktree = worktree_with_completion(record)
+
+        result = processor.process(
+            worktree,
+            run_assets=make_session_run_assets(worktree),
+            issue_number=123,
+            issue_title="Test",
+        )
+
+        assert not result.success
+        assert "Newly added test-skip guard" in result.message
+        mock_git_adapter.read_branch_text_files.assert_called_once_with(
+            worktree, ("tests/test_guard.py",)
+        )
+        mock_git_adapter.push.assert_not_called()
 
     def test_pre_publish_gate_failure_reroutes_back_into_review_exchange(
         self,
