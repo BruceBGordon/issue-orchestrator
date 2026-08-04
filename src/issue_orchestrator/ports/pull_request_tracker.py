@@ -196,6 +196,10 @@ class PRInfo:
             decisions can confirm an existing PR targets the branch the stack
             publish gate requires (ADR-0029 / #6596). `None` when the source did
             not provide it.
+        merged_at: ISO-8601 merge timestamp for a merged PR. Carried so the
+            close-on-merge fallback can ask for close-event evidence at/after
+            the merge instead of inferring from issue state alone. `None` when
+            unmerged or when the source did not provide it.
     """
 
     number: int
@@ -209,6 +213,7 @@ class PRInfo:
     mergeable_state: str | None = None
     status_check_rollup: StatusCheckRollupState | None = None
     base_branch: str | None = None
+    merged_at: str | None = None
 
     @property
     def is_closed_unmerged(self) -> bool:

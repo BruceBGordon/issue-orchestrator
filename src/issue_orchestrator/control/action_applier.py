@@ -64,6 +64,7 @@ from .review_exchange_lifecycle import (
     cancel_issue_review_exchange,
     terminate_issue_runtime,
 )
+from .close_on_merge import run_close_on_merge_fallback
 from .actions import (
     Action,
     ActionResult,
@@ -583,6 +584,23 @@ class ActionApplier:
         try:
             self.repository_host.update_issue_state(action.issue_number, "closed")
             logger.info(issue_log(action.issue_number, "Issue closed"))
+            if action.comment:
+                # Only after a successful close — a comment claiming "the
+                # orchestrator closed it" before the close would leave a false
+                # audit trail on failure and repeat on every retry. Best-effort:
+                # a failed comment must never fail an already-applied close.
+                try:
+                    self.repository_host.add_comment(
+                        action.issue_number, action.comment,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        issue_log(
+                            action.issue_number,
+                            "Failed to post close comment: %s",
+                        ),
+                        e,
+                    )
             return ActionResult.ok(
                 action,
                 issue_number=action.issue_number,
@@ -1341,6 +1359,26 @@ Maximum rework cycles ({action.max_rework_cycles}) exceeded.
         # explicit guard that this command writes only to a still-claimed issue.
         self._verify_claim_before_write(action, action.issue_number)
 
+        close_applied = False
+        if action.close_issue:
+            # Close-on-merge fallback (porchpin #81): revalidation ordering
+            # and rationale live in run_close_on_merge_fallback — the module
+            # owns the destructive precondition; the planner's bit is advisory.
+            close_applied, close_error = run_close_on_merge_fallback(
+                repository_host=self.repository_host,
+                action=action,
+                close=self._apply_close_issue,
+            )
+            if close_error is not None:
+                # Fail without any further mutation (no shed, no history);
+                # the entry stays reconcilable for retry.
+                return ActionResult.fail(
+                    action,
+                    close_error,
+                    issue_number=action.issue_number,
+                    pr_number=action.pr_number,
+                )
+
         shed_result = self._apply_shed_recovered_workflow_labels(
             ShedRecoveredWorkflowLabelsAction(
                 issue_number=action.issue_number,
@@ -1382,6 +1420,7 @@ Maximum rework cycles ({action.max_rework_cycles}) exceeded.
             pr_number=action.pr_number,
             status=action.status,
             shed_removed=list(shed_result.details.get("removed", [])),
+            closed_issue=close_applied,
         )
 
     def _apply_queue_review(self, action: Action) -> ActionResult:

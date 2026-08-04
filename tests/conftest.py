@@ -1,6 +1,7 @@
 """Shared fixtures and configuration for tests."""
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import os
 import pytest
 from pathlib import Path
@@ -235,6 +236,14 @@ class MockGitHubAdapter:
         self.labels: dict[int, set[str]] = {}  # issue_number -> labels
         self.prs: dict[str, list[PRInfo]] = {}  # branch -> PRs
         self.comments: list[dict] = []
+        # (issue_number, ISO-8601Z timestamp) per close, mirroring GitHub's
+        # /issues/{n}/events "closed" entries for issue_closed_on_or_after.
+        # Timestamps are DETERMINISTIC (tests/AGENTS.md: never the real
+        # clock): a fixed far-future base plus a per-event counter, so any
+        # close recorded during a scenario sorts after any fixture merged_at.
+        # Tests needing precise ordering seed issue_close_events directly.
+        self.issue_close_events: list[tuple[int, str]] = []
+        self._close_event_seq = 0
         self.pr_reviews: dict[int, list[dict]] = {}  # pr_number -> reviews
         self.close_pr_calls: list[int] = []
         # pr_number -> current merge queue entry (None/absent = not enqueued)
@@ -523,6 +532,27 @@ class MockGitHubAdapter:
         issue = self.get_issue(issue_number)
         if issue is not None:
             issue.state = state
+            if state == "closed":
+                self._close_event_seq += 1
+                seq = self._close_event_seq
+                self.issue_close_events.append((
+                    issue_number,
+                    f"9999-01-01T00:{seq // 60:02d}:{seq % 60:02d}Z",
+                ))
+
+    def issue_closed_on_or_after(self, issue_number: int, timestamp: str) -> bool:
+        """Whether a recorded close event exists at/after ``timestamp`` (mock).
+
+        Mirrors the GitHub adapter's typed close-event evidence read. The mock
+        does not simulate GitHub's closing-keyword auto-close, so scenarios
+        that merge a PR without closing its issue genuinely have no close
+        event — the close-on-merge fallback then behaves exactly as it would
+        against real GitHub.
+        """
+        return any(
+            number == issue_number and closed_at >= timestamp
+            for number, closed_at in self.issue_close_events
+        )
 
 
 @pytest.fixture

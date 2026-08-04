@@ -1595,6 +1595,7 @@ class GitHubAdapter:
             base_branch=(pr.get("base") or {}).get("ref")
             or pr.get("baseRefName")
             or None,
+            merged_at=pr.get("merged_at") or None,
         )
 
     def _fetch_pr_info_from_search(self, pr: dict[str, Any]) -> PRInfo | None:
@@ -1779,6 +1780,16 @@ class GitHubAdapter:
         orchestrator-authored marker comments before re-posting them.
         """
         return self._client.issue_comment_marker_present(issue_number, marker)
+
+    def issue_closed_on_or_after(self, issue_number: int, timestamp: str) -> bool:
+        """Return True if the issue has a ``closed`` event at/after ``timestamp``.
+
+        Typed transition evidence for the close-on-merge fallback: proves
+        whether an auto-close already fired for a given merge, so a deliberate
+        human reopen is never re-closed. Scans all event pages, fail-loud on
+        truncated or malformed reads.
+        """
+        return self._client.issue_closed_on_or_after(issue_number, timestamp)
 
     def get_pr_reviews(self, pr_number: int) -> list[dict[str, Any]]:
         """Get all reviews on a pull request.

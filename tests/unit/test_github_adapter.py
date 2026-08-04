@@ -1558,6 +1558,33 @@ class TestCacheBehavior:
         assert pr_info.branch == "feature"
         assert pr_info.labels == ["bug", "feature"]
 
+    def test_merged_pr_cache_round_trip_preserves_merged_at(
+        self, adapter, cache
+    ):
+        """F3 regression: merged_at is close-on-merge transition evidence; the
+        port contract must not depend on whether the adapter hit its cache. A
+        merged PR cached and re-read through the public API keeps its merge
+        timestamp."""
+        from issue_orchestrator.ports.pull_request_tracker import PRInfo
+
+        merged = PRInfo(
+            number=69,
+            title="audit scaffold",
+            url="https://github.com/owner/repo/pull/69",
+            branch="audit-scaffold",
+            body="",
+            state="merged",
+            labels=[],
+            merged_at="2026-08-03T13:52:09Z",
+        )
+        adapter._adapter_cache.cache_pr_info(merged)  # noqa: SLF001 - seed cache
+
+        prs = adapter.get_prs_for_branch("audit-scaffold", state="merged")
+
+        assert len(prs) == 1
+        assert prs[0].state == "merged"
+        assert prs[0].merged_at == "2026-08-03T13:52:09Z"
+
     def test_empty_cache_returns_no_prs(self, adapter, mock_http_client):
         """Test that empty cache falls through to API."""
         mock_http_client.get_prs_for_branch.return_value = []
@@ -1867,6 +1894,21 @@ class TestRepositoryOperations:
         assert present is True
         mock_http_client.issue_comment_marker_present.assert_called_once_with(
             42, "<!-- io:marker -->"
+        )
+
+
+    def test_issue_closed_on_or_after_forwards_to_client(
+        self, adapter, mock_http_client
+    ):
+        """The close-event evidence read delegates to the paginating client
+        method so callers get the fail-loud full-scan contract."""
+        mock_http_client.issue_closed_on_or_after.return_value = True
+
+        closed = adapter.issue_closed_on_or_after(45, "2026-08-03T13:52:09Z")
+
+        assert closed is True
+        mock_http_client.issue_closed_on_or_after.assert_called_once_with(
+            45, "2026-08-03T13:52:09Z"
         )
 
     def test_list_labels(self, adapter, mock_http_client):

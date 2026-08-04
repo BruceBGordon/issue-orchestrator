@@ -2191,6 +2191,241 @@ class TestRecoverTerminalIssueAction:
         assert entry.status == "merged"
         assert entry.status_reason == "PR merged; awaiting merge reconciled"
 
+    _CLOSE_MERGED_AT = "2026-08-03T13:52:09Z"
+
+    def _close_on_merge_action(self):
+        return RecoverTerminalIssueAction(
+            issue_number=228,
+            pr_number=318,
+            pr_url="https://github.com/test/repo/pull/318",
+            status="merged",
+            source="pull_request",
+            status_reason="PR merged; awaiting merge reconciled",
+            issue_key="M1-228",
+            reason="awaiting-merge terminal: merged",
+            close_issue=True,
+            merged_at=self._CLOSE_MERGED_AT,
+        )
+
+    @staticmethod
+    def _stub_close_evidence(
+        mock_repository_host, *, issue_state="open", auto_close_fired=False,
+    ):
+        """Wire the apply-time revalidation reads (F4/A2): the live issue
+        state and the close-event evidence since the merge."""
+        mock_repository_host.get_issue.return_value = MagicMock(
+            state=issue_state,
+        )
+        mock_repository_host.issue_closed_on_or_after.return_value = (
+            auto_close_fired
+        )
+
+    def test_close_on_merge_close_is_first_mutation_then_comment_then_shed(
+        self, mock_labels, mock_sessions, mock_events, mock_repository_host,
+        real_label_manager,
+    ):
+        """F1 ordered-call regression (porchpin #81): the close is the FIRST
+        mutation after the owner gates — before the label shed, so a shed/
+        history failure after a successful close is safe (a closed issue
+        cannot re-enter the queue). The audit comment posts only AFTER the
+        successful close, and history terminalizes last."""
+        order: list[str] = []
+        mock_repository_host.update_issue_state.side_effect = (
+            lambda *a, **k: order.append("close")
+        )
+        mock_repository_host.add_comment.side_effect = (
+            lambda *a, **k: order.append("comment")
+        )
+        mock_labels.remove_label.side_effect = (
+            lambda *a, **k: order.append("shed")
+        )
+        self._stub_close_evidence(mock_repository_host)
+        entry = self._awaiting_merge_entry()
+        applier = self._make_applier(
+            mock_labels, mock_sessions, mock_events, mock_repository_host,
+            real_label_manager,
+            github_labels=["pr-pending", "agent:backend"],
+            history_entry=entry,
+        )
+
+        result = applier.apply(self._close_on_merge_action())
+
+        assert result.success
+        assert result.details["closed_issue"] is True
+        # Revalidation consulted the live evidence at the owner boundary.
+        mock_repository_host.issue_closed_on_or_after.assert_called_once_with(
+            228, self._CLOSE_MERGED_AT,
+        )
+        mock_repository_host.update_issue_state.assert_called_once_with(
+            228, "closed",
+        )
+        assert order[:2] == ["close", "comment"]
+        assert "shed" in order and order.index("shed") > 1
+        comment_body = mock_repository_host.add_comment.call_args.args[1]
+        assert "https://github.com/test/repo/pull/318" in comment_body
+        assert "no closing reference" in comment_body
+        assert entry.status == "merged"
+
+    def test_close_on_merge_failure_leaves_labels_and_history_untouched(
+        self, mock_labels, mock_sessions, mock_events, mock_repository_host,
+        real_label_manager,
+    ):
+        """A failed close must NOT shed labels, post the audit comment, or
+        terminalize history: labels-shed-but-open across a restart is exactly
+        the relaunch window this fallback exists to eliminate, and a comment
+        claiming the close happened would be a false audit trail repeated on
+        every retry. The entry stays reconcilable for the next pass."""
+        mock_repository_host.update_issue_state.side_effect = Exception(
+            "GitHub 502 closing issue"
+        )
+        self._stub_close_evidence(mock_repository_host)
+        entry = self._awaiting_merge_entry()
+        applier = self._make_applier(
+            mock_labels, mock_sessions, mock_events, mock_repository_host,
+            real_label_manager,
+            github_labels=["pr-pending", "agent:backend"],
+            history_entry=entry,
+        )
+
+        result = applier.apply(self._close_on_merge_action())
+
+        assert not result.success
+        assert "close-on-merge" in (result.error or "")
+        mock_labels.remove_label.assert_not_called()
+        mock_repository_host.add_comment.assert_not_called()
+        # Entry stays in its reconcilable status for the next discovery pass.
+        assert entry.status == "completed"
+
+    def test_apply_time_revalidation_preserves_human_reopen(
+        self, mock_labels, mock_sessions, mock_events, mock_repository_host,
+        real_label_manager,
+    ):
+        """F4/A2 regression: discovery planned close_issue=True, then a human
+        closed AND reopened the issue before apply. The owner command re-reads
+        the live evidence, sees a close event since the merge, and must NOT
+        close the intentional reopen — while shed + history still proceed."""
+        self._stub_close_evidence(mock_repository_host, auto_close_fired=True)
+        entry = self._awaiting_merge_entry()
+        applier = self._make_applier(
+            mock_labels, mock_sessions, mock_events, mock_repository_host,
+            real_label_manager,
+            github_labels=["pr-pending", "agent:backend"],
+            history_entry=entry,
+        )
+
+        result = applier.apply(self._close_on_merge_action())
+
+        assert result.success
+        assert result.details["closed_issue"] is False
+        mock_repository_host.update_issue_state.assert_not_called()
+        mock_repository_host.add_comment.assert_not_called()
+        # Recovery itself still completes: labels shed, history terminalized.
+        assert entry.status == "merged"
+
+    def test_apply_time_revalidation_skips_close_when_already_closed(
+        self, mock_labels, mock_sessions, mock_events, mock_repository_host,
+        real_label_manager,
+    ):
+        """A human closed the issue in the discovery→apply gap: nothing to
+        close; shed + history proceed."""
+        self._stub_close_evidence(mock_repository_host, issue_state="closed")
+        entry = self._awaiting_merge_entry()
+        applier = self._make_applier(
+            mock_labels, mock_sessions, mock_events, mock_repository_host,
+            real_label_manager,
+            github_labels=["pr-pending", "agent:backend"],
+            history_entry=entry,
+        )
+
+        result = applier.apply(self._close_on_merge_action())
+
+        assert result.success
+        assert result.details["closed_issue"] is False
+        mock_repository_host.update_issue_state.assert_not_called()
+        assert entry.status == "merged"
+
+    def test_apply_time_revalidation_unreadable_fails_without_mutation(
+        self, mock_labels, mock_sessions, mock_events, mock_repository_host,
+        real_label_manager,
+    ):
+        """Unreadable revalidation is not either answer: no close, no shed,
+        no history — the entry stays reconcilable for retry."""
+        from issue_orchestrator.ports.repository_host import (
+            RepositoryHostError,
+        )
+        mock_repository_host.get_issue.side_effect = RepositoryHostError(
+            "boom"
+        )
+        entry = self._awaiting_merge_entry()
+        applier = self._make_applier(
+            mock_labels, mock_sessions, mock_events, mock_repository_host,
+            real_label_manager,
+            github_labels=["pr-pending", "agent:backend"],
+            history_entry=entry,
+        )
+
+        result = applier.apply(self._close_on_merge_action())
+
+        assert not result.success
+        assert "revalidation unreadable" in (result.error or "")
+        mock_repository_host.update_issue_state.assert_not_called()
+        mock_labels.remove_label.assert_not_called()
+        assert entry.status == "completed"
+
+    def test_close_on_merge_comment_failure_still_closes(
+        self, mock_labels, mock_sessions, mock_events, mock_repository_host,
+        real_label_manager,
+    ):
+        """The comment is best-effort; the close is the safety-critical write."""
+        mock_repository_host.add_comment.side_effect = Exception("comment 502")
+        self._stub_close_evidence(mock_repository_host)
+        entry = self._awaiting_merge_entry()
+        applier = self._make_applier(
+            mock_labels, mock_sessions, mock_events, mock_repository_host,
+            real_label_manager,
+            github_labels=["pr-pending", "agent:backend"],
+            history_entry=entry,
+        )
+
+        result = applier.apply(self._close_on_merge_action())
+
+        assert result.success
+        mock_repository_host.update_issue_state.assert_called_once_with(
+            228, "closed",
+        )
+        assert entry.status == "merged"
+
+    def test_no_close_without_close_issue_flag(
+        self, mock_labels, mock_sessions, mock_events, mock_repository_host,
+        real_label_manager,
+    ):
+        """Default recovery (issue already closed, or closed-unmerged PR)
+        must never touch the issue's open/closed state."""
+        entry = self._awaiting_merge_entry()
+        applier = self._make_applier(
+            mock_labels, mock_sessions, mock_events, mock_repository_host,
+            real_label_manager,
+            github_labels=["pr-pending", "agent:backend"],
+            history_entry=entry,
+        )
+        action = RecoverTerminalIssueAction(
+            issue_number=228,
+            pr_number=318,
+            pr_url="https://github.com/test/repo/pull/318",
+            status="merged",
+            source="pull_request",
+            status_reason="PR merged; awaiting merge reconciled",
+            issue_key="M1-228",
+            reason="awaiting-merge terminal: merged",
+        )
+
+        result = applier.apply(action)
+
+        assert result.success
+        assert result.details["closed_issue"] is False
+        mock_repository_host.update_issue_state.assert_not_called()
+        assert entry.status == "merged"
+
     def test_shed_failure_leaves_history_reconcilable(
         self, mock_labels, mock_sessions, mock_events, mock_repository_host,
         real_label_manager,

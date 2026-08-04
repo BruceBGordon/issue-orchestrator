@@ -2281,3 +2281,71 @@ def test_list_all_milestones_later_page_non_200_fails_loud() -> None:
     client = _client_with_transport(httpx.MockTransport(handler))
     with pytest.raises(GitHubHttpError):
         client.list_all_milestones()
+
+
+def test_issue_closed_on_or_after_true_at_exact_merge_timestamp() -> None:
+    """GitHub's auto-close event lands at (or just after) the merge moment;
+    the boundary must count as evidence the auto-close fired."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=[
+            {"event": "labeled", "created_at": "2026-08-03T13:00:00Z"},
+            {"event": "closed", "created_at": "2026-08-03T13:52:09Z"},
+        ])
+
+    client = _client_with_transport(httpx.MockTransport(handler))
+
+    assert client.issue_closed_on_or_after(45, "2026-08-03T13:52:09Z") is True
+
+
+def test_issue_closed_on_or_after_ignores_pre_merge_closures() -> None:
+    """A close that happened (and was reopened) BEFORE the merge is not
+    evidence the merge's auto-close fired."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=[
+            {"event": "closed", "created_at": "2026-08-01T10:00:00Z"},
+            {"event": "reopened", "created_at": "2026-08-01T11:00:00Z"},
+        ])
+
+    client = _client_with_transport(httpx.MockTransport(handler))
+
+    assert client.issue_closed_on_or_after(45, "2026-08-03T13:52:09Z") is False
+
+
+def test_issue_closed_on_or_after_finds_event_beyond_first_page() -> None:
+    """The close event may sit past the first 100 timeline events."""
+    pages_requested: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        page = int(request.url.params.get("page", "1"))
+        pages_requested.append(page)
+        if page == 1:
+            return httpx.Response(
+                200,
+                json=[
+                    {"event": "labeled", "created_at": "2026-08-03T12:00:00Z"}
+                    for _ in range(100)
+                ],
+            )
+        return httpx.Response(200, json=[
+            {"event": "closed", "created_at": "2026-08-03T14:00:00Z"},
+        ])
+
+    client = _client_with_transport(httpx.MockTransport(handler))
+
+    assert client.issue_closed_on_or_after(45, "2026-08-03T13:52:09Z") is True
+    assert pages_requested == [1, 2]
+
+
+def test_issue_closed_on_or_after_fails_loud_on_non_list_payload() -> None:
+    """A malformed 2xx body is a read error, not evidence of absence — the
+    caller decides a destructive close on this fact."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"message": "unexpected"})
+
+    client = _client_with_transport(httpx.MockTransport(handler))
+
+    with pytest.raises(GitHubHttpError):
+        client.issue_closed_on_or_after(45, "2026-08-03T13:52:09Z")

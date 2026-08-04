@@ -1235,6 +1235,55 @@ class GitHubHttpClient:
                     issue_number=issue_number,
                 )
 
+    def issue_closed_on_or_after(self, issue_number: int, timestamp: str) -> bool:
+        """Return True if the issue has a ``closed`` event at/after ``timestamp``.
+
+        Paginates ``/issues/{n}/events`` with the same fail-loud contract as
+        ``issue_comment_marker_present``: a short/empty page is the only clean
+        "no such event" answer; a malformed body or a scan that exceeds the
+        page cap raises rather than reporting absence from a truncated read —
+        the caller decides a destructive write (close-on-merge fallback) on
+        this fact. Timestamps are GitHub's own ISO-8601 UTC strings on both
+        sides, so lexicographic comparison is chronological. Not ETag-cached:
+        transition evidence must not come from a stale page.
+        """
+        page = 1
+        while True:
+            payload = self._request_json(
+                "GET",
+                f"/repos/{self._config.repo}/issues/{issue_number}/events",
+                params={"per_page": 100, "page": page},
+                caller="issue_closed_on_or_after",
+                use_cache=False,
+            )
+            if not isinstance(payload, list):
+                raise GitHubHttpError(
+                    f"Event listing for #{issue_number} page {page} was not a "
+                    f"list ({type(payload).__name__}); cannot confirm close-"
+                    f"event absence",
+                    issue_number=issue_number,
+                )
+            if not payload:
+                return False
+            for event in payload:
+                if not isinstance(event, dict):
+                    continue
+                if event.get("event") != "closed":
+                    continue
+                created_at = event.get("created_at")
+                if isinstance(created_at, str) and created_at >= timestamp:
+                    return True
+            if len(payload) < 100:
+                return False
+            page += 1
+            if page > _MARKER_SCAN_PAGE_CAP:
+                raise GitHubHttpError(
+                    f"Issue event scan for #{issue_number} exceeded "
+                    f"{_MARKER_SCAN_PAGE_CAP} pages without reaching the final "
+                    f"page; cannot confirm close-event absence",
+                    issue_number=issue_number,
+                )
+
     # -------------------- Git refs / commits --------------------
 
     def get_default_branch(self) -> str:

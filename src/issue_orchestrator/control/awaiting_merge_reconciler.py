@@ -9,8 +9,6 @@ from typing import TYPE_CHECKING, Callable, Literal
 from urllib.parse import urlparse
 
 from ..domain.models import (
-    AwaitingMergeReconciliationSource,
-    AwaitingMergeTerminalStatus,
     DiscoveredAwaitingMergeDrift,
     DiscoveredAwaitingMergeEscalation,
     DiscoveredAwaitingMergeReconciliation,
@@ -21,6 +19,11 @@ from ..domain.models import (
 from ..history import latest_history_entries_by_issue
 from ..ports.repository_host import RepositoryHostError
 from .awaiting_merge_drift_policy import classify_pr_set_drift
+from .close_on_merge import (
+    pr_terminal_reason,
+    reconciliation_fact,
+    should_close_merged_issue,
+)
 from .awaiting_merge_post_publish_policy import (
     POST_PUBLISH_VALIDATION_COMMENT_MARKER,
     POST_PUBLISH_VALIDATION_SOURCE,
@@ -272,6 +275,7 @@ class AwaitingMergeReconciler:
                 )
                 state.awaiting_merge_rollup_scan_timestamps.pop(pr_number, None)
                 drift = None
+                issue_open = False
                 if pr.is_closed_unmerged:
                     drift = self._discover_terminal_pr_issue_drift(
                         state=state,
@@ -279,14 +283,31 @@ class AwaitingMergeReconciler:
                         pr=pr,
                         pr_number=pr_number,
                     )
+                else:
+                    # PR merged: did GitHub's auto-close actually fire for
+                    # this merge? See close_on_merge module (porchpin #81).
+                    # None = evidence unreadable; leave the entry reconcilable.
+                    close_check = should_close_merged_issue(
+                        get_issue=self._get_issue,
+                        closed_on_or_after=(
+                            self.repository_host.issue_closed_on_or_after
+                        ),
+                        state=state, entry=entry,
+                        merged_at=pr.merged_at, now=self.clock(),
+                    )
+                    if close_check is None:
+                        return AwaitingMergeEntryDiscovery("skipped")
+                    issue_open = close_check
                 return AwaitingMergeEntryDiscovery(
                     "terminal",
-                    reconciliation=_reconciliation_fact(
+                    reconciliation=reconciliation_fact(
                         entry=entry,
                         pr_number=pr_number,
                         status=pr_state,
-                        reason=_pr_terminal_reason(pr_state),
+                        reason=pr_terminal_reason(pr_state),
                         source="pull_request",
+                        issue_open=issue_open,
+                        merged_at=pr.merged_at,
                     ),
                     drift=drift,
                 )
@@ -321,7 +342,7 @@ class AwaitingMergeReconciler:
             state.awaiting_merge_rollup_scan_timestamps.pop(pr_number, None)
             return AwaitingMergeEntryDiscovery(
                 "terminal",
-                reconciliation=_reconciliation_fact(
+                reconciliation=reconciliation_fact(
                     entry=entry,
                     pr_number=pr_number,
                     status="closed",
@@ -907,24 +928,6 @@ def pr_number_from_url(pr_url: str) -> int | None:
     return None
 
 
-def _reconciliation_fact(
-    *,
-    entry: SessionHistoryEntry,
-    pr_number: int,
-    status: AwaitingMergeTerminalStatus,
-    reason: str,
-    source: AwaitingMergeReconciliationSource,
-) -> DiscoveredAwaitingMergeReconciliation:
-    return DiscoveredAwaitingMergeReconciliation(
-        issue_number=entry.issue_number,
-        pr_number=pr_number,
-        pr_url=entry.pr_url or "",
-        status=status,
-        status_reason=reason,
-        source=source,
-    )
-
-
 def _drift_fact(
     *,
     issue_number: int,
@@ -957,7 +960,3 @@ def _recent_label_drift_scan(
     return last_scanned_at > 0 and (now - last_scanned_at) < interval_seconds
 
 
-def _pr_terminal_reason(status: AwaitingMergeTerminalStatus) -> str:
-    if status == "merged":
-        return "PR merged; awaiting merge reconciled"
-    return "PR closed; awaiting merge reconciled"
