@@ -35,7 +35,7 @@ from ..domain.models import (
 )
 from ..domain.post_publish_escalation import build_post_publish_escalation_comment
 from ..domain.tech_lead_naming import TECH_LEAD_DISPLAY_NAME
-from ..domain.tech_lead_session import TechLeadSessionFlavor
+from ..domain.tech_lead_session import TechLeadCreationOrigin, TechLeadSessionFlavor
 
 if TYPE_CHECKING:
     from .provider_resilience import ProviderResilienceManager
@@ -65,7 +65,6 @@ from .actions import (
     QueueRetrospectiveReviewAction,
     QueueReworkAction,
     CreateTechLeadIssueAction,
-    DiscardTerminalTechLeadProposalOpsAction,
     EnqueueToMergeQueueAction,
     EscalateToHumanAction,
     CleanupSessionAction,
@@ -81,7 +80,7 @@ from .awaiting_merge_post_publish_policy import (
 from .queue_decision_log import QueueDecisionLog
 from .reactive_tech_lead_planning import plan_reactive_tech_lead
 from .tech_lead_launch_log import TechLeadLaunchLog
-from .tech_lead_proposals import plan_approved_tech_lead_op_executions
+from .tech_lead_ledger_planning import plan_tech_lead_ledger_actions
 from .tech_lead_reaction import TechLeadReactionPolicy
 from .worker_budget import (
     TechLeadSlotAvailability,
@@ -297,34 +296,14 @@ class Planner:
         if tech_lead_create_action:
             actions.append(tech_lead_create_action)
 
-        # 1f3. Execute APPROVED gated tech_lead proposals (#6778): the operator
-        # removed the proposed-tech-lead label, so the fact scan classified the
-        # stored op as approved. Policy lives in tech_lead_proposals; the
-        # appliers re-validate preconditions and finalize the proposal issue.
-        if snapshot.tech_lead_facts and snapshot.tech_lead_facts.approved_tech_lead_ops:
-            actions.extend(
-                plan_approved_tech_lead_op_executions(
-                    snapshot.tech_lead_facts.approved_tech_lead_ops
-                )
-            )
-
-        # 1f4. Confirm-and-discard terminal gated-proposal ledger rows (#6779
-        # R7/R10): fact gathering only CLASSIFIED ledger rows absent from the
-        # exhaustive scan as cleanup candidates (it stays read-only). Emit the
-        # cleanup action so the applier re-reads each proposal issue before
-        # discarding — absence from a possibly-truncated scan must never delete
-        # a live op.
-        candidates = (
-            snapshot.tech_lead_facts.absent_proposal_op_candidates
-            if snapshot.tech_lead_facts
-            else ()
+        # 1f3. Everything the tech-lead DURABLE LEDGERS drive this tick:
+        # approved gated proposals, terminal-op cleanup candidates, and finding
+        # promotion/settlement. All three read facts the gatherer classified
+        # read-only; the single owner turns them into actions (see
+        # tech_lead_ledger_planning).
+        actions.extend(
+            plan_tech_lead_ledger_actions(self.config, snapshot.tech_lead_facts)
         )
-        if candidates:
-            actions.append(
-                DiscardTerminalTechLeadProposalOpsAction(
-                    candidate_issue_numbers=candidates
-                )
-            )
 
         # 1g. Process cleanups for reviewed PRs
         cleanup_actions = self._plan_cleanups(snapshot)
@@ -837,6 +816,8 @@ class Planner:
         return CreateTechLeadIssueAction(
             title=title, body=body, labels=labels, pr_count=facts.pr_count,
             milestone=milestone, reason=f"threshold met: {facts.pr_count} >= {facts.threshold}",
+            # This IS the anchor: no prior issue to reconcile against (#6957 F6).
+            origin=TechLeadCreationOrigin.authors_anchor(),
         )
 
     def _should_create_tech_lead_issue(self, facts: "TechLeadFacts") -> bool:

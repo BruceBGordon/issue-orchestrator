@@ -20,6 +20,7 @@ from .sandbox_scope import (
     compute_session_scope,
 )
 from .session_run import SessionRunAssets
+from .tech_lead_findings import PromotionUpdate, PromotableFinding, SettledPromotion
 from .tech_lead_session import (
     ApprovedTechLeadOp,
     TechLeadCaseFileSummary,
@@ -1474,6 +1475,22 @@ class TechLeadFacts:
     # scan actually ran, so durable case-file evidence survives between scans
     # instead of being wiped by a frugal tick.
     case_files_scanned: bool = False
+    # Finding-promotion lane facts (#6957), both derived by the promotion owner
+    # from the DURABLE ledgers rather than from the anchor scan, so they arm
+    # independently of the batch/health/storm triggers.
+    #   * promotable_findings — signatures that crossed min_evidence, are
+    #     classified fix:code, have no promotion row, and fit their routed
+    #     repo's in-flight cap. Computed with ZERO GitHub reads.
+    #   * promotion_updates — in-flight signatures whose durable evidence count
+    #     advanced after filing. The planner reports only the unseen suffix to
+    #     the target issue and advances a monotonic watermark after success.
+    #   * settled_promotions — in-flight promotions whose target issue was
+    #     observed CLOSED (shipped when a merged PR closed it, declined
+    #     otherwise). An unreadable target yields no fact, so a temporarily
+    #     unreachable repo leaves the promotion in flight instead of settling it.
+    promotable_findings: tuple["PromotableFinding", ...] = field(default_factory=tuple)
+    promotion_updates: tuple["PromotionUpdate", ...] = field(default_factory=tuple)
+    settled_promotions: tuple["SettledPromotion", ...] = field(default_factory=tuple)
 
 
 @dataclass(frozen=True)

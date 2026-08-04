@@ -24,6 +24,7 @@ from .actions import (
     CreateTechLeadProposalIssueAction,
 )
 from .label_manager import tech_lead_issue_label_metadata
+from .tech_lead_case_file_owner import CaseFileState, PatternCaseFileOwner
 from .tech_lead_issue_policy import resolve_tech_lead_milestone_number
 
 if TYPE_CHECKING:
@@ -113,7 +114,7 @@ def _creation_preflight(
     *,
     repository_host: "RepositoryHost",
     ops: "TechLeadAuthorityStore | None",
-    add_comment: Callable[[int, str], str],
+    case_files: "PatternCaseFileOwner | None",
 ) -> ActionResult | None:
     """Validate ledger-backed creation and reconcile an inflight case file."""
     is_proposal = isinstance(action, CreateTechLeadProposalIssueAction)
@@ -126,20 +127,24 @@ def _creation_preflight(
         )
     if is_case_file:
         assert isinstance(action, CreateTechLeadCaseFileIssueAction)
-        assert ops is not None
+        assert case_files is not None
         try:
-            existing = ops.lookup_pattern(signature=action.pattern_signature)
-            if existing is not None:
-                for comment in (
-                    action.dedup_comment,
-                    *action.additional_observation_comments,
-                ):
-                    add_comment(existing, comment)
+            # "Does a case file already exist for this signature?" is the
+            # owner's question, not this boundary's: it checks the ledger AND
+            # recovers an issue a previous attempt created before dying, so one
+            # signature can never end up with two case files (#6957 R2 F10).
+            resolution = case_files.resolve(action)
+            if resolution.issue_number is not None:
+                # Committed or just recovered: either way this action's
+                # observations are appends onto the existing case file, with
+                # their classification reconciled before anything is posted.
+                case_files.adopt(action, issue_number=resolution.issue_number)
                 return ActionResult.ok(
                     action,
-                    issue_number=existing,
+                    issue_number=resolution.issue_number,
                     pr_count=action.pr_count,
                     deduplicated=True,
+                    recovered=resolution.state is CaseFileState.RECOVERED,
                 )
         except Exception as exc:
             logger.exception(
@@ -172,11 +177,23 @@ def apply_create_tech_lead_issue(
     expedite_lane: "ExpediteLane | None" = None,
 ) -> ActionResult:
     """Create a tech_lead issue and finalize its optional authority ledger."""
+    # Case-file identity (ledger lookup, remote recovery, observation accrual)
+    # belongs to ONE owner; this boundary owns milestone resolution, the GitHub
+    # create, and the trace event, and asks the owner for outcomes (#6957 R2 A1).
+    case_files = (
+        PatternCaseFileOwner(
+            authority=ops,
+            repository_host=repository_host,
+            add_comment=add_comment,
+        )
+        if ops is not None
+        else None
+    )
     preflight = _creation_preflight(
         action,
         repository_host=repository_host,
         ops=ops,
-        add_comment=add_comment,
+        case_files=case_files,
     )
     if preflight is not None:
         return preflight
@@ -184,6 +201,12 @@ def apply_create_tech_lead_issue(
         milestone = resolve_tech_lead_milestone_number(
             action.milestone, repository_host.list_milestones
         )
+        if isinstance(action, CreateTechLeadCaseFileIssueAction):
+            # Durable creation intent BEFORE the remote create, so an
+            # interrupted creation stays attributable to THIS command rather
+            # than to whichever later action recovers it (#6957 R3 F10).
+            assert case_files is not None
+            case_files.begin(action)
         result = repository_host.create_issue(
             title=action.title,
             body=action.body,
@@ -233,6 +256,7 @@ def apply_create_tech_lead_issue(
         action,
         issue_number=issue_number,
         ops=ops,
+        case_files=case_files,
         add_comment=add_comment,
     )
     if finalization_error is not None:
@@ -274,6 +298,7 @@ def _finalize_ledger_backed_creation(
     *,
     issue_number: int,
     ops: "TechLeadAuthorityStore | None",
+    case_files: "PatternCaseFileOwner | None",
     add_comment: Callable[[int, str], str],
 ) -> str | None:
     """Record a proposal/case-file ledger row; return a failure message."""
@@ -286,12 +311,8 @@ def _finalize_ledger_backed_creation(
                 _proposal_link_comment(action, issue_number),
             )
         elif isinstance(action, CreateTechLeadCaseFileIssueAction):
-            assert ops is not None
-            ops.record_pattern(
-                signature=action.pattern_signature, issue_number=issue_number
-            )
-            for comment in action.additional_observation_comments:
-                add_comment(issue_number, comment)
+            assert case_files is not None
+            case_files.open(action, issue_number=issue_number)
     except Exception as exc:
         logger.exception("Failed to finalize ledger-backed tech_lead issue #%d", issue_number)
         return str(exc)

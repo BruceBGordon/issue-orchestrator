@@ -24,7 +24,7 @@ import logging
 import re
 import time
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Optional, TYPE_CHECKING
 
 from ..infra.config import Config
@@ -37,10 +37,24 @@ from .health_review_trigger import (
     health_review_decision,
     health_review_interval_minutes,
 )
+from .tech_lead_finding_promotion import (
+    PromotionReadBudget,
+    gather_finding_promotion_facts,
+)
+from .tech_lead_artifact_retention import (
+    clear_discovered_facts as _clear_discovered_facts,
+    tech_lead_problem_artifact_hold_issue_numbers,
+)
 from .tech_lead_reaction import storm_possible
+
+# Compatibility export: this policy lived in fact_gatherer before it gained a
+# dedicated owner module. Keep existing callers stable while new code imports
+# from tech_lead_artifact_retention directly.
+clear_discovered_facts = _clear_discovered_facts
 
 if TYPE_CHECKING:
     from ..ports.issue import Issue
+    from ..ports.promotion_target import PromotionTargetHost
     from ..ports.queue_cache_store import QueueCacheStore
     from ..ports.tech_lead_authority import TechLeadAuthorityStore
     from ..domain.models import (
@@ -87,6 +101,10 @@ class FactGatherer:
     # projection + refreshing the tech_lead board file) and makes no decisions.
     # Optional so unrelated tests need not wire it.
     board_publisher: Optional["TechLeadBoardPublisher"] = None
+    # Cross-repo filing/read seam for the finding-promotion lane (#6957).
+    # Optional so unrelated tests need not wire it; without it the lane gathers
+    # no loop-closure facts (promotions simply stay in flight).
+    promotion_target: Optional["PromotionTargetHost"] = None
     # Durable store for the tech-lead stuck sweep's timer + recovery counters
     # (#6823). Optional so unrelated tests need not wire it; without it the
     # sweep still runs but its counters do not survive a restart.
@@ -103,6 +121,13 @@ class FactGatherer:
     # unrelated tests need not wire it; without it every provider-unavailable
     # issue is conservatively treated as owned (the pre-#6824 skip).
     provider_circuit_open: Optional[Callable[["Issue"], bool]] = None
+    # Per-target read budget for finding-promotion loop closure (#6957 F5). Owned
+    # here because the budget is a fact-gathering concern (it bounds this
+    # component's cross-repo reads per tick) and rotates across ticks, so it must
+    # outlive a single call.
+    promotion_read_budget: PromotionReadBudget = field(
+        default_factory=PromotionReadBudget
+    )
 
     def fetch_issues(
         self,
@@ -323,7 +348,26 @@ class FactGatherer:
             if tech_lead_agent_configured and self.tech_lead_authority is not None
             else {}
         )
-        if not batch_armed and not health_armed and not ops and not storm_armed:
+        # The finding-promotion lane (#6957) arms INDEPENDENTLY of the batch,
+        # health, storm, and proposal triggers: it reads the durable pattern and
+        # promotion ledgers, not the anchor scan. Eligibility is pure local math
+        # (zero GitHub calls, so a board with nothing promotable costs nothing);
+        # only loop closure reads, and only for promotions actually in flight.
+        promotable, promotion_updates, settled = gather_finding_promotion_facts(
+            self.config,
+            authority=self.tech_lead_authority,
+            target=self.promotion_target,
+            read_budget=self.promotion_read_budget,
+        )
+        if (
+            not batch_armed
+            and not health_armed
+            and not ops
+            and not storm_armed
+            and not promotable
+            and not promotion_updates
+            and not settled
+        ):
             return None
 
         # The decision carries the board it was decided on, so anchor creation
@@ -382,6 +426,9 @@ class FactGatherer:
             absent_proposal_op_candidates=absent_op_candidates,
             open_case_files=case_files,
             case_files_scanned=case_files_scanned,
+            promotable_findings=promotable,
+            promotion_updates=promotion_updates,
+            settled_promotions=settled,
         )
         if self.board_publisher is not None:
             self.board_publisher.publish(
@@ -633,139 +680,3 @@ class FactGatherer:
                 state, self.config, self.tech_lead_authority
             ),
         )
-
-
-def tech_lead_problem_artifact_hold_issue_numbers(
-    state: "OrchestratorState",
-    config: Config,
-    tech_lead_authority: "Optional[TechLeadAuthorityStore]" = None,
-) -> frozenset[int]:
-    """Issues whose failed-session run assets must be held from cleanup.
-
-    Owner of the single lifecycle rule for "tech_lead problem artifacts currently
-    referenced by pending or active tech_lead work". A failed session records its
-    ``ImmediateCleanup`` in the same pass that records the
-    ``DiscoveredFailure``, but the tech_lead work that reads those artifacts
-    launches on a LATER tick — removing the worktree first deletes every
-    artifact hint the work was queued to read (#6771 round 3). The rule is
-    evaluated fresh from state at both consuming seams (``gather_cleanup_facts``
-    so the Planner skips held cleanups, and ``clear_discovered_facts`` so held
-    entries survive the end-of-tick fact clear).
-
-    A problem's artifacts are referenced while ANY of these hold:
-
-    - it was discovered this tick (tech-lead-on-failure will queue it);
-    - a queued failure investigation targets it;
-    - a queued health review carries it in its ``problem_cohort`` — a storm
-      collapses the per-issue investigations into ONE anchor, so after that
-      collapse the cohort is the only thing still naming those artifacts
-      (#6780: holding only failure investigations let the collapsed
-      members' worktrees be cleaned up before the review could read them);
-    - an active tech_lead session is investigating it; or
-    - an active health review OWNS it via the durable storm-cohort ledger.
-      A launched review's queue item is gone, so the ledger is what proves
-      its run still references the members' artifacts.
-
-    Ledger rows are intersected with anchors that are actually pending or
-    active, which is what keeps this owner's release semantics intact: the
-    hold releases by re-evaluation, with no dedicated release seam. Once the
-    tech_lead work completes — or is dropped on exhaustion, or its queue action
-    fails — nothing matches and the retained cleanup is planned normally on
-    the next tick, even if a row outlived its anchor.
-    """
-    from ..domain.tech_lead_session import TechLeadSessionFlavor
-    from .tech_lead_session_policy import is_tech_lead_session
-
-    if not (config.tech_lead_review_on_failure and config.tech_lead_review_agent):
-        return frozenset()
-    held = {failure.issue_number for failure in state.discovered_failures}
-    referenced_anchors: set[int] = set()
-    for item in state.pending_tech_lead_reviews:
-        if item.flavor is TechLeadSessionFlavor.FAILURE_INVESTIGATION:
-            held.add(item.issue_number)
-        # The item's in-memory ``problem_cohort`` is deliberately NOT read
-        # here. It is non-empty only when the ledger write succeeded (intake
-        # stamps it from the same persisted tuple; recovery sources it FROM the
-        # ledger), so the row this anchor references below already holds every
-        # member. Reading both would give the same answer from two sources and
-        # invite them to drift.
-        referenced_anchors.add(item.issue_number)
-    for session in state.active_sessions:
-        if is_tech_lead_session(config.tech_lead_review_agent, session.issue.agent_type):
-            held.add(session.issue.number)
-            referenced_anchors.add(session.issue.number)
-    if tech_lead_authority is not None:
-        for anchor, cohort in tech_lead_authority.list_storm_cohorts():
-            if anchor in referenced_anchors:
-                held.update(problem.issue_number for problem in cohort)
-    return frozenset(held)
-
-
-# Tick-scoped fact buffers: recorded by discovery/completion seams, consumed
-# by one planning pass, cleared after the plan is applied.
-_DISCOVERED_FACT_ATTRS: tuple[str, ...] = (
-    "discovered_reviews",
-    "discovered_retrospective_reviews",
-    "discovered_awaiting_merge_reconciliations",
-    "discovered_awaiting_merge_drifts",
-    "discovered_awaiting_merge_escalations",
-    "discovered_merge_queue_enqueues",
-    "discovered_reworks",
-    "discovered_escalations",
-    "discovered_failures",
-    "stuck_sweep_escalations",
-    "immediate_cleanups",
-)
-
-
-def clear_discovered_facts(
-    state: "OrchestratorState",
-    config: Config,
-    tech_lead_authority: "Optional[TechLeadAuthorityStore]" = None,
-    *,
-    tick_paused: bool,
-) -> None:
-    """Clear tick-scoped fact buffers, retaining held immediate cleanups.
-
-    Immediate cleanups referenced by pending/active tech_lead work are retained
-    across the clear (#6771 round 3): the Planner skipped them this tick via
-    ``CleanupFacts.held_issue_numbers``, and dropping them here would leak the
-    worktree forever once the hold releases. Both seams read the SAME owner
-    (:func:`tech_lead_problem_artifact_hold_issue_numbers`), so the plan-time
-    skip and the end-of-tick retention can never disagree about which
-    artifacts are still referenced.
-
-    A PAUSED tick retains every fact. The clear exists to drop facts the tick
-    consumed, but a paused tick consumes none: the Planner returns an empty
-    plan and ``apply_plan`` refuses to apply actions while paused. Clearing
-    would silently discard problems that nothing recorded — a session that
-    fails while paused is discovered exactly once, so a dropped storm cohort
-    could never be recovered, even after resume.
-
-    ``tick_paused`` MUST be the tick's own ``snapshot.paused`` — the same read
-    the Planner decided from — and never a fresh read of live ``state.paused``.
-    The two differ: ``state.paused`` is mutated from the web thread, and this
-    call is separated from the snapshot by a network fetch, planning and apply.
-    Re-reading it would decide retention from one tick's plan and another
-    tick's pause state, in both directions: an operator resuming mid-tick would
-    wipe facts the empty plan never consumed, and one pausing mid-apply would
-    retain facts a partially-applied plan already collapsed into an anchor —
-    re-queuing every cohort member individually on resume while the anchor
-    still owns it.
-    """
-    if tick_paused:
-        return
-    held = tech_lead_problem_artifact_hold_issue_numbers(state, config, tech_lead_authority)
-    # Retain (a) cleanups still referenced by tech_lead work — the Planner skipped
-    # them this tick — and (b) DISPOSABLE scratch-worktree cleanups (#6824 F8):
-    # a disposable cleanup is pruned on SUCCESS by ``_handle_cleanup_session``,
-    # so any that survive to here had their removal FAIL and must be re-planned
-    # next tick rather than dropped (which would leak the scratch worktree).
-    retained = [
-        c
-        for c in state.immediate_cleanups
-        if c.issue_number in held or c.scratch_worktree
-    ]
-    for attr in _DISCOVERED_FACT_ATTRS:
-        getattr(state, attr).clear()
-    state.immediate_cleanups.extend(retained)

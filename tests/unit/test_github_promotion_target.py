@@ -1,0 +1,452 @@
+"""GitHub adapter for the finding-promotion target port (#6957).
+
+Covers the two behaviors the lane's correctness turns on: a promotion issue is
+never created before its labels exist (GitHub silently drops unknown labels,
+which would leave an ungated, immediately schedulable issue), and "closed by a
+merged PR" is distinguished from "closed" — that distinction is what separates
+a shipped fix from an operator decline.
+"""
+
+from unittest.mock import Mock
+
+import pytest
+
+from issue_orchestrator.adapters.github.errors import GitHubHttpError
+from issue_orchestrator.adapters.github.promotion_target import (
+    GitHubPromotionTargetHost,
+)
+from issue_orchestrator.ports.promotion_target import PromotionFilingContract
+
+REPO = "porchpin/porchpin"
+MARKER = "<!-- issue-orchestrator:tech-lead-promotion:v1:test -->"
+
+
+@pytest.fixture
+def http_client():
+    client = Mock()
+    client.list_all_labels.return_value = [{"name": "agent:backend"}]
+    client.create_issue.return_value = {
+        "number": 501,
+        "html_url": "https://github.com/porchpin/porchpin/issues/501",
+    }
+    client.get_closing_pull_request.return_value = None
+    client.list_issues.return_value = []
+    client.search_issues_by_title.return_value = []
+    return client
+
+
+@pytest.fixture
+def target(http_client):
+    adapter = Mock()
+    adapter.repo = REPO
+    adapter.http_client = http_client
+    return GitHubPromotionTargetHost(adapter)
+
+
+class TestFiling:
+    def test_missing_labels_are_provisioned_before_the_issue_is_created(
+        self, target, http_client
+    ):
+        calls: list[str] = []
+        http_client.create_label.side_effect = lambda name, **_: calls.append(
+            f"label:{name}"
+        )
+        http_client.create_issue.side_effect = lambda **_: (
+            calls.append("issue") or {"number": 501, "html_url": "u"}
+        )
+
+        filed = target.file_issue(
+            repo=REPO,
+            title="t",
+            body=f"b\n{MARKER}",
+            labels=["proposed-tech-lead", "agent:backend"],
+            idempotency_marker=MARKER,
+        )
+
+        assert filed.number == 501
+        assert filed.recovered is False  # this call really did create it
+        # The gate label was provisioned FIRST; a dropped gate would leave an
+        # ungated, immediately schedulable promotion.
+        assert calls == ["label:proposed-tech-lead", "issue"]
+
+    def test_existing_labels_are_not_recreated(self, target, http_client):
+        target.file_issue(
+            repo=REPO,
+            title="t",
+            body=f"b\n{MARKER}",
+            labels=["agent:backend"],
+            idempotency_marker=MARKER,
+        )
+        http_client.create_label.assert_not_called()
+
+    def test_a_creation_without_an_issue_number_raises(self, target, http_client):
+        http_client.create_issue.return_value = {}
+        with pytest.raises(GitHubHttpError):
+            target.file_issue(
+                repo=REPO,
+                title="t",
+                body=f"b\n{MARKER}",
+                labels=[],
+                idempotency_marker=MARKER,
+            )
+
+    def test_marker_must_be_present_in_the_body(self, target, http_client):
+        with pytest.raises(ValueError, match="idempotency marker"):
+            target.file_issue(
+                repo=REPO,
+                title="t",
+                body="body without marker",
+                labels=[],
+                idempotency_marker=MARKER,
+            )
+        http_client.list_issues.assert_not_called()
+
+    def test_a_marker_owned_recent_issue_is_recovered_without_refiling(
+        self, target, http_client
+    ):
+        http_client.list_issues.return_value = [
+            {
+                "number": 444,
+                "html_url": "https://github.com/porchpin/porchpin/issues/444",
+                "body": f"prior body\n\n{MARKER}",
+            }
+        ]
+
+        filed = target.file_issue(
+            repo=REPO,
+            title="changed title does not matter",
+            body=f"new body\n\n{MARKER}",
+            labels=["proposed-tech-lead"],
+            idempotency_marker=MARKER,
+        )
+
+        assert filed.number == 444
+        # Reported, not inferred: the filing owner needs the difference between
+        # "I created this" and "this already existed" (#6957 round-4 A5).
+        assert filed.recovered is True
+        http_client.create_issue.assert_not_called()
+        http_client.list_all_labels.assert_not_called()
+        http_client.list_issues.assert_called_once_with(
+            state="all", limit=100, use_cache=False
+        )
+
+    def test_title_search_recovers_an_older_marker_owned_issue(
+        self, target, http_client
+    ):
+        http_client.search_issues_by_title.return_value = [
+            {"number": 333, "html_url": "u", "body": MARKER}
+        ]
+
+        filed = target.file_issue(
+            repo=REPO,
+            title="the signature title",
+            body=MARKER,
+            labels=[],
+            idempotency_marker=MARKER,
+        )
+
+        assert filed.number == 333
+        http_client.search_issues_by_title.assert_called_once_with(
+            ["the signature title"], limit=30, use_cache=False
+        )
+        http_client.create_issue.assert_not_called()
+
+
+class TestRecoveryOnlyLookup:
+    """#6957 round-4 F12/A5 + round-5 F13: find WITHOUT create, and PROVE absence.
+
+    The filing owner asks whether an interrupted filing left an issue in a repo
+    the route no longer points at, and RETIRES a durable creation intent on a
+    negative answer. Answering that with ``file_issue`` would risk creating one
+    there; answering it with a bounded, title-scoped search would retire the
+    intent wrongly and file a second issue for a signature that already has one.
+    """
+
+    def test_finds_the_marker_owned_issue_without_creating(self, target, http_client):
+        http_client.list_issues.return_value = [
+            {"number": 77, "body": f"stuff {MARKER}", "html_url": "u"}
+        ]
+
+        found = target.find_filed_issue(
+            repo=REPO, title="t", idempotency_marker=MARKER
+        )
+
+        assert found is not None
+        assert (found.number, found.recovered) == (77, True)
+        http_client.create_issue.assert_not_called()
+        http_client.create_label.assert_not_called()
+
+    def test_the_scan_is_exhaustive_and_never_title_scoped(self, target, http_client):
+        """The lookup that must PROVE absence cannot depend on a title (F13)."""
+        target.find_filed_issue(repo=REPO, title="t", idempotency_marker=MARKER)
+
+        http_client.list_issues.assert_called_once()
+        kwargs = http_client.list_issues.call_args.kwargs
+        assert kwargs["state"] == "all"
+        assert kwargs["use_cache"] is False
+        # The repository's one fail-loud completeness contract (#6779 R8/R17):
+        # a short page ends it, a cap or page failure raises.
+        assert kwargs["exhaustive"] is True
+        assert kwargs["limit"] > 100
+        http_client.search_issues_by_title.assert_not_called()
+
+    def test_an_aged_out_retitled_issue_is_still_found(self, target, http_client):
+        """The exact miss F13 describes: outside the recent window, retitled.
+
+        A bounded scan plus an ``in:title`` fallback reported this as absent,
+        which retired the intent and filed a duplicate.
+        """
+        http_client.list_issues.return_value = [
+            *({"number": n, "body": "unrelated", "html_url": "u"} for n in range(200)),
+            {"number": 999, "body": f"body kept its marker {MARKER}", "html_url": "u"},
+        ]
+        # The title no longer matches anything the caller knows.
+        http_client.search_issues_by_title.return_value = []
+
+        found = target.find_filed_issue(
+            repo=REPO, title="a title that was since edited", idempotency_marker=MARKER
+        )
+
+        assert found is not None and found.number == 999
+
+    def test_proven_absent_returns_none_and_creates_nothing(
+        self, target, http_client
+    ):
+        assert (
+            target.find_filed_issue(repo=REPO, title="t", idempotency_marker=MARKER)
+            is None
+        )
+        http_client.create_issue.assert_not_called()
+
+    def test_an_unreadable_repo_propagates_rather_than_reporting_absent(
+        self, target, http_client
+    ):
+        http_client.list_issues.side_effect = GitHubHttpError("repo unreachable")
+
+        with pytest.raises(GitHubHttpError):
+            target.find_filed_issue(repo=REPO, title="t", idempotency_marker=MARKER)
+
+    def test_an_unprovable_scan_propagates_rather_than_reporting_absent(
+        self, target, http_client
+    ):
+        """Cap exhaustion is "unknown", not "absent" (F13)."""
+        http_client.list_issues.side_effect = GitHubHttpError(
+            "refusing to treat the partial repository issues as complete"
+        )
+
+        with pytest.raises(GitHubHttpError):
+            target.find_filed_issue(repo=REPO, title="t", idempotency_marker=MARKER)
+        http_client.create_issue.assert_not_called()
+
+    def test_a_body_without_the_marker_is_not_this_signature(
+        self, target, http_client
+    ):
+        http_client.list_issues.return_value = [
+            {"number": 77, "body": "an unrelated issue", "html_url": "u"}
+        ]
+
+        assert (
+            target.find_filed_issue(repo=REPO, title="t", idempotency_marker=MARKER)
+            is None
+        )
+
+    def test_a_marker_is_required(self, target):
+        with pytest.raises(ValueError, match="needs its marker"):
+            target.find_filed_issue(repo=REPO, title="t", idempotency_marker="  ")
+
+
+class TestOutcomeReads:
+    def test_open_issue_costs_one_read(self, target, http_client):
+        http_client.get_issue.return_value = {"state": "open"}
+
+        outcome = target.read_outcome(repo=REPO, issue_number=501)
+
+        assert outcome is not None and not outcome.closed
+        http_client.get_closing_pull_request.assert_not_called()
+
+    def test_closed_by_a_merged_pr_reports_the_merge_url(self, target, http_client):
+        http_client.get_issue.return_value = {"state": "closed"}
+        http_client.get_closing_pull_request.return_value = {
+            "number": 6956,
+            "url": "https://github.com/x/y/pull/6956",
+            "merged": True,
+        }
+
+        outcome = target.read_outcome(repo=REPO, issue_number=501)
+
+        assert outcome is not None
+        assert outcome.closed
+        assert outcome.merged_pr_url == "https://github.com/x/y/pull/6956"
+
+    def test_closed_with_no_closing_pr_reports_no_merge_url(self, target, http_client):
+        http_client.get_issue.return_value = {"state": "closed"}
+        http_client.get_closing_pull_request.return_value = None
+
+        outcome = target.read_outcome(repo=REPO, issue_number=501)
+
+        assert outcome is not None
+        assert outcome.closed
+        assert outcome.merged_pr_url == ""
+
+    def test_a_merged_pr_that_only_mentions_the_issue_is_a_decline(
+        self, target, http_client
+    ):
+        """#6957 review F4: mention != closing linkage.
+
+        A merged PR that merely writes ``#501`` in its body used to satisfy the
+        broad ``get_prs_for_issue`` search, so an operator closing #501 as a
+        decline wrote shipped-fix memory and permanently closed the source case
+        file. Only the PR GitHub records as the CLOSER counts.
+        """
+        http_client.get_issue.return_value = {"state": "closed"}
+        # No ClosedEvent closer: the issue was closed by a human, not by a PR.
+        http_client.get_closing_pull_request.return_value = None
+        # ...even though merged PRs referencing the number exist.
+        http_client.get_prs_for_issue.return_value = [
+            {
+                "html_url": "https://github.com/x/y/pull/999",
+                "pull_request": {"merged_at": "2026-08-03T00:00:00Z"},
+            }
+        ]
+
+        outcome = target.read_outcome(repo=REPO, issue_number=501)
+
+        assert outcome is not None and outcome.closed
+        assert outcome.merged_pr_url == ""
+        http_client.get_prs_for_issue.assert_not_called()
+
+    def test_closed_by_an_unmerged_pr_is_a_decline(self, target, http_client):
+        """A PR can close an issue and then be closed unmerged — not a fix."""
+        http_client.get_issue.return_value = {"state": "closed"}
+        http_client.get_closing_pull_request.return_value = {
+            "number": 42,
+            "url": "https://github.com/x/y/pull/42",
+            "merged": False,
+        }
+
+        outcome = target.read_outcome(repo=REPO, issue_number=501)
+
+        assert outcome is not None and outcome.closed
+        assert outcome.merged_pr_url == ""
+
+    def test_missing_issue_reads_as_unknown(self, target, http_client):
+        http_client.get_issue.return_value = None
+        assert target.read_outcome(repo=REPO, issue_number=501) is None
+
+
+def _contract(**overrides) -> PromotionFilingContract:
+    return PromotionFilingContract(repo=REPO, **overrides)
+
+
+class TestFilingReadiness:
+    """Readiness must prove the FILING command, not a weaker proxy (R6 F2/A1).
+
+    ``file_issue`` provisions every missing label before it creates the issue,
+    so a check that stopped at "this token can open an issue here" approved
+    routes whose first promotion dies on a label GitHub never let it create.
+    """
+
+    def test_a_writable_repo_reports_no_reason(self, target, http_client):
+        http_client.get_repository.return_value = {"permissions": {"push": True}}
+        assert target.check_filing_ready(_contract()) is None
+
+    def test_a_read_only_repo_reports_the_reason(self, target, http_client):
+        http_client.get_repository.return_value = {
+            "permissions": {"push": False, "admin": False}
+        }
+        reason = target.check_filing_ready(_contract())
+        assert reason is not None and "not writable" in reason
+
+    def test_issues_disabled_reports_the_reason(self, target, http_client):
+        http_client.get_repository.return_value = {
+            "has_issues": False,
+            "permissions": {"push": True},
+        }
+        reason = target.check_filing_ready(_contract())
+        assert reason is not None and "issues disabled" in reason
+
+    def test_a_missing_repo_reports_the_reason(self, target, http_client):
+        error = GitHubHttpError("not found")
+        error.status_code = 404
+        http_client.get_repository.side_effect = error
+
+        reason = target.check_filing_ready(_contract())
+
+        assert reason is not None and "not found" in reason
+
+    def test_a_payload_without_permissions_fails_closed(self, target, http_client):
+        http_client.get_repository.return_value = {"name": "porchpin"}
+        reason = target.check_filing_ready(_contract())
+        assert reason is not None and "cannot prove" in reason
+
+    @pytest.mark.parametrize("role", ("push", "maintain", "admin"))
+    def test_a_label_writing_role_covers_any_label_gap(
+        self, target, http_client, role
+    ):
+        """These roles may CREATE labels, so provisioning closes every gap."""
+        http_client.get_repository.return_value = {"permissions": {role: True}}
+
+        reason = target.check_filing_ready(
+            _contract(labels=("agent:backend", "proposed-tech-lead"))
+        )
+
+        assert reason is None
+        # No point listing labels the token can create on demand.
+        http_client.list_all_labels.assert_not_called()
+
+    def test_triage_passes_when_every_required_label_already_exists(
+        self, target, http_client
+    ):
+        """Triage may APPLY labels, so an already-provisioned target is fine."""
+        http_client.get_repository.return_value = {"permissions": {"triage": True}}
+        http_client.list_all_labels.return_value = [
+            {"name": "agent:backend"},
+            {"name": "Proposed-Tech-Lead"},  # GitHub folds label names
+        ]
+
+        reason = target.check_filing_ready(
+            _contract(labels=("agent:backend", "proposed-tech-lead"))
+        )
+
+        assert reason is None
+
+    def test_triage_with_a_missing_required_label_is_not_ready(
+        self, target, http_client
+    ):
+        """The regression: doctor used to approve exactly this route.
+
+        The triage role may apply an existing label but cannot create one, and
+        filing provisions before it creates — so the first promotion carrying
+        the missing gate would fail, cross-repo and late.
+        """
+        http_client.get_repository.return_value = {"permissions": {"triage": True}}
+        http_client.list_all_labels.return_value = [{"name": "agent:backend"}]
+
+        reason = target.check_filing_ready(
+            _contract(labels=("agent:backend", "proposed-tech-lead"))
+        )
+
+        assert reason is not None
+        assert "proposed-tech-lead" in reason
+        assert "triage" in reason
+
+    def test_triage_cannot_serve_a_route_with_unknowable_labels(
+        self, target, http_client
+    ):
+        """A catch-all route's area tag is not enumerable — provisioning is required."""
+        http_client.get_repository.return_value = {"permissions": {"triage": True}}
+        http_client.list_all_labels.return_value = [{"name": "agent:backend"}]
+
+        reason = target.check_filing_ready(
+            _contract(labels=("agent:backend",), provisions_unknown_labels=True)
+        )
+
+        assert reason is not None and "CREATE labels" in reason
+
+    def test_a_label_read_failure_fails_closed(self, target, http_client):
+        http_client.get_repository.return_value = {"permissions": {"triage": True}}
+        http_client.list_all_labels.side_effect = GitHubHttpError("rate limited")
+
+        reason = target.check_filing_ready(_contract(labels=("agent:backend",)))
+
+        assert reason is not None and "could not be read" in reason

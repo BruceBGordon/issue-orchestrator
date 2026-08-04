@@ -90,6 +90,7 @@ def run_doctor(
     result.checks.extend(_timed("schema_checks", schema_checks.run_schema_checks, config))
     result.checks.extend(_timed("code_review", review.check_code_review, config))
     result.checks.extend(_timed("tech_lead_labels", tech_lead_checks.check_tech_lead_labels, config))
+    result.checks.extend(_timed("tech_lead_finding_routes", tech_lead_checks.check_tech_lead_finding_routes, config))
     result.checks.extend(_timed("e2e_runner", e2e.check_e2e_runner, config))
     result.checks.extend(_timed("guardrails", guardrails.check_guardrails, config, runner))
     result.checks.extend(_timed("clock_sync", clock_sync.check_clock_sync, config, runner))

@@ -63,19 +63,20 @@ is stopped and no other labels are touched.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable, Mapping
 
 from ..domain.tech_lead_artifacts import (
     ProposedTechLeadAction,
     TechLeadDecision,
 )
+from ..domain.tech_lead_findings import PatternClassificationConflictError
+from ..domain.tech_lead_session import TechLeadCreationOrigin
 from ..ports.issue import Issue
 from .actions import (
     Action,
     AddCommentAction,
     AddLabelAction,
-    CreateTechLeadCaseFileIssueAction,
     CreateTechLeadIssueAction,
     ResetRetryIssueAction,
     SurfaceTechLeadProposalAction,
@@ -95,10 +96,7 @@ from .tech_lead_gate_notes import (
     compose_gate_note,
     outcome_gate_note,
 )
-from .tech_lead_case_files import (
-    build_case_file_evidence_comment,
-    build_case_file_issue_action,
-)
+from .tech_lead_case_files import PatternCaseFilePlanner
 from .tech_lead_issue_policy import (
     apply_tech_lead_priority_prefix,
     decision_issue_labels,
@@ -112,6 +110,7 @@ from .tech_lead_proposals import (
 
 if TYPE_CHECKING:
     from ..domain.tech_lead_artifacts import TechLeadFinding
+    from ..domain.tech_lead_findings import PatternEvidence
     from ..infra.config import Config
     from .reconciliation import ExpectedState
 
@@ -205,6 +204,10 @@ def _concrete_actions(
                     area=action.area,
                 ),
                 pr_count=0,
+                # DECIDED by a session working this anchor — so the anchor's
+                # pause label gates the creation, and the ExpectedState below is
+                # what the gate checks (#6957 F3/A3, R2 F6/A6).
+                origin=TechLeadCreationOrigin.derived_from_anchor(anchor_issue.number),
                 milestone=tech_lead_issue_milestone_intent(config, anchor_milestones),
                 # Expedite intent (#6870) rides the action so the applier's
                 # create boundary can front-queue the new issue. It composes
@@ -263,7 +266,7 @@ def plan_tech_lead_decision_actions(
     anchor_issue: Issue,
     expected: "ExpectedState",
     op_ledger: Mapping[tuple[str, int], int],
-    pattern_ledger: Mapping[str, int],
+    pattern_ledger: Mapping[str, "PatternEvidence"],
     source_run_id: str,
     source_session_name: str,
     observed_at: str,
@@ -302,8 +305,22 @@ def plan_tech_lead_decision_actions(
         dedup_corpus=dedup_corpus,
         dedup_grant=dedup_grant,
     )
-    for proposed in decision.proposed_actions:
-        planner.plan(proposed)
+    try:
+        for proposed in decision.proposed_actions:
+            planner.plan(proposed)
+    except PatternClassificationConflictError as exc:
+        # One decision claimed two different fix classes (or areas) for one
+        # pattern signature. Classification decides whether a finding is
+        # promotable at all and which repo it routes to, so the orchestrator
+        # refuses to pick a winner: the whole decision is rejected as a contract
+        # violation and nothing partially planned is applied (#6957 review F3).
+        return [
+            plan_tech_lead_rejection_action(
+                anchor_issue_number=anchor_issue.number,
+                failure="pattern_classification_conflict",
+                detail=str(exc),
+            )
+        ]
     if planner.shadow:
         planner.actions.append(
             _shadow_digest_comment(
@@ -324,7 +341,10 @@ class _DecisionActionPlanner:
     anchor_issue: Issue
     expected: "ExpectedState"
     op_ledger: Mapping[tuple[str, int], int]
-    pattern_ledger: Mapping[str, int]
+    # signature -> its FULL durable row: planning preflights a new
+    # observation's classification against it, which a bare issue number
+    # cannot support (#6957 round-2 review F3).
+    pattern_ledger: Mapping[str, "PatternEvidence"]
     findings: Mapping[str, "TechLeadFinding"]
     source_run_id: str
     source_session_name: str
@@ -339,7 +359,6 @@ class _DecisionActionPlanner:
     actions: list[Action] = field(default_factory=list)
     shadow: list[SurfaceTechLeadProposalAction] = field(default_factory=list)
     _planned_ops: set[tuple[str, int]] = field(default_factory=set)
-    _planned_patterns: dict[str, int] = field(default_factory=dict)
     # (action_id, title, body) of EVERY create_issue intent this decision has
     # processed — whether it filed a new issue or routed onto an existing one.
     # The persisted-corpus gate cannot see them (they have no issue number yet),
@@ -347,6 +366,23 @@ class _DecisionActionPlanner:
     # independent primary action (two files, or two comments on the same issue)
     # under execute — intra-decision dedup closes that for every create intent.
     _seen_create_intents: list[tuple[str, str, str]] = field(default_factory=list)
+    # The case-file half of an executed flag_pattern, with its own per-decision
+    # bookkeeping. Built in __post_init__ over the SAME action list, because
+    # coalescing replaces a creation already planned in it.
+    _case_files: PatternCaseFilePlanner = field(init=False)
+
+    def __post_init__(self) -> None:
+        self._case_files = PatternCaseFilePlanner(
+            config=self.config,
+            actions=self.actions,
+            anchor_issue_number=self._anchor_number,
+            pattern_ledger=self.pattern_ledger,
+            findings=self.findings,
+            source_run_id=self.source_run_id,
+            source_session_name=self.source_session_name,
+            observed_at=self.observed_at,
+            expected=self.expected,
+        )
 
     @property
     def _anchor_number(self) -> int:
@@ -381,68 +417,7 @@ class _DecisionActionPlanner:
                 mode="pattern",
             )
         )
-        self._plan_pattern_case_file(proposed)
-
-    def _plan_pattern_case_file(self, proposed: ProposedTechLeadAction) -> None:
-        """Durable flag_pattern execution (#6781): create or append."""
-        signature = proposed.pattern_signature
-        assert signature is not None  # enforced by validate()
-        existing = self.pattern_ledger.get(signature)
-        if existing is not None:
-            self.actions.append(
-                AddCommentAction(
-                    number=existing,
-                    comment=build_case_file_evidence_comment(
-                        proposed,
-                        anchor_issue_number=self._anchor_number,
-                        findings=self.findings,
-                        source_run_id=self.source_run_id,
-                        source_session_name=self.source_session_name,
-                        observed_at=self.observed_at,
-                    ),
-                    is_pr=False,
-                    reason=(
-                        f"tech_lead decision action {proposed.id}: pattern"
-                        f" {signature!r} observed again; appending evidence"
-                        f" to case file #{existing} (#6781)"
-                    ),
-                    expected=self.expected,
-                )
-            )
-            return
-        comment = build_case_file_evidence_comment(
-            proposed,
-            anchor_issue_number=self._anchor_number,
-            findings=self.findings,
-            source_run_id=self.source_run_id,
-            source_session_name=self.source_session_name,
-            observed_at=self.observed_at,
-        )
-        planned_index = self._planned_patterns.get(signature)
-        if planned_index is not None:
-            creation = self.actions[planned_index]
-            assert isinstance(creation, CreateTechLeadCaseFileIssueAction)
-            self.actions[planned_index] = replace(
-                creation,
-                additional_observation_comments=(
-                    *creation.additional_observation_comments,
-                    comment,
-                ),
-            )
-            return
-        self._planned_patterns[signature] = len(self.actions)
-        self.actions.append(
-            build_case_file_issue_action(
-                proposed,
-                config=self.config,
-                anchor_issue_number=self._anchor_number,
-                findings=self.findings,
-                source_run_id=self.source_run_id,
-                source_session_name=self.source_session_name,
-                observed_at=self.observed_at,
-                expected=self.expected,
-            )
-        )
+        self._case_files.plan(proposed)
 
     def _plan_gated_op(self, proposed: ProposedTechLeadAction) -> None:
         """Gated proposal issue for an act-level intent (#6778)."""

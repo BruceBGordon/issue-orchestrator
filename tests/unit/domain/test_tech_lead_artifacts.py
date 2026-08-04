@@ -659,3 +659,67 @@ class TestProposedActionDuplicateOf:
         assert decision.proposed_actions[0].duplicate_of == 77
         again = TechLeadDecision.from_agent_payload(decision.to_dict())
         assert again.proposed_actions[0].duplicate_of == 77
+
+
+class TestFixClassPromotionField:
+    """#6957: flag_pattern's fix:code / fix:human promotion classification."""
+
+    @staticmethod
+    def _flag_pattern(**overrides):
+        payload = {
+            "id": "A1",
+            "action_type": "flag_pattern",
+            "body": "Anchor close buries the needs-human escalation.",
+            "pattern_signature": "anchor-close-buries-needs-human-escalation",
+        }
+        payload.update(overrides)
+        return payload
+
+    def test_absent_fix_class_is_unclassified(self):
+        action = ProposedTechLeadAction.from_mapping(self._flag_pattern(), index=1)
+        assert action.fix_class is None
+        assert "fix_class" not in action.to_dict()
+
+    @pytest.mark.parametrize("value", ("code", "human"))
+    def test_fix_class_parses_and_round_trips(self, value: str):
+        action = ProposedTechLeadAction.from_mapping(
+            self._flag_pattern(fix_class=value), index=1
+        )
+        assert action.fix_class == value
+        payload = action.to_dict()
+        assert payload["fix_class"] == value
+        assert (
+            ProposedTechLeadAction.from_mapping(payload, index=1).fix_class == value
+        )
+
+    @pytest.mark.parametrize("bad", ("codefix", "CODE", "unknown", "fix:code"))
+    def test_out_of_vocabulary_fix_class_is_rejected(self, bad: str):
+        """A typo must fail loudly, not silently make a pattern unpromotable."""
+        with pytest.raises(ValueError, match="fix_class"):
+            ProposedTechLeadAction.from_mapping(
+                self._flag_pattern(fix_class=bad), index=1
+            )
+
+    def test_fix_class_rejected_on_non_flag_pattern_actions(self):
+        with pytest.raises(ValueError, match="only valid on flag_pattern"):
+            ProposedTechLeadAction.from_mapping(
+                {
+                    "id": "A1",
+                    "action_type": "create_issue",
+                    "title": "t",
+                    "body": "b",
+                    "fix_class": "code",
+                },
+                index=1,
+            )
+
+    def test_fix_class_rejected_on_direct_construction_bypass(self):
+        action = ProposedTechLeadAction(
+            id="A1",
+            action_type="post_comment",
+            target_number=5,
+            body="b",
+            fix_class="code",
+        )
+        with pytest.raises(ValueError, match="only valid on flag_pattern"):
+            action.validate()

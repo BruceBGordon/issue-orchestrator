@@ -26,6 +26,7 @@ if TYPE_CHECKING:
     from ..domain.repository_setup_auth import RepositorySetupGitHubAuthorization
     from ..infra.config import Config
     from ..ports import RepositoryHost
+    from ..ports.promotion_target import PromotionTargetHost
     from ..ports.repository_setup import RepositorySetupGitHubVerification
 
 
@@ -50,6 +51,24 @@ def create_repository_host(
     from ..adapters.github import GitHubAdapter
 
     return GitHubAdapter(repo=repo, config=config)
+
+
+def create_promotion_target_host(
+    repository_host: "RepositoryHost | None",
+) -> "PromotionTargetHost | None":
+    """Adapt a repository host to the finding-promotion target port (#6957).
+
+    The provider factory owns the adapter construction so composition-root
+    helpers and the doctor check depend on this seam rather than importing the
+    GitHub adapter package themselves. Returns None when the host is not a real
+    GitHub adapter (offline/testing), which leaves the promotion lane unwired —
+    its actions then fail loudly instead of silently no-oping.
+    """
+    from ..adapters.github.promotion_target import build_promotion_target_host
+
+    if repository_host is None:
+        return None
+    return build_promotion_target_host(repository_host)
 
 
 def create_repository_setup_host(

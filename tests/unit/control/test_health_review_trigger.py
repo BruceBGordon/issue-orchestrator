@@ -20,6 +20,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from issue_orchestrator.domain.tech_lead_session import TechLeadCreationOrigin
 from issue_orchestrator.adapters.github.errors import GitHubHttpError
 from issue_orchestrator.control.actions import ActionResult, CreateTechLeadIssueAction
 from issue_orchestrator.control.health_review_trigger import (
@@ -167,6 +168,7 @@ class TestPersistFailureReconciliation:
         action = CreateTechLeadIssueAction(
             title=HEALTH_REVIEW_ISSUE_TITLE,
             labels=health_review_issue_labels(config),
+            origin=TechLeadCreationOrigin.authors_anchor(),
         )
 
         # Must not raise even though the store persist fails.
@@ -186,6 +188,7 @@ class TestPersistFailureReconciliation:
         action = CreateTechLeadIssueAction(
             title=HEALTH_REVIEW_ISSUE_TITLE,
             labels=health_review_issue_labels(config),
+            origin=TechLeadCreationOrigin.authors_anchor(),
         )
 
         live = OrchestratorState()
@@ -444,6 +447,7 @@ class TestFingerprintStampAndHydrate:
             title=HEALTH_REVIEW_ISSUE_TITLE,
             labels=health_review_issue_labels(config),
             health_review_fingerprint=fingerprint,
+            origin=TechLeadCreationOrigin.authors_anchor(),
         )
 
     def test_creation_records_the_decisions_fingerprint_verbatim(self) -> None:
@@ -537,6 +541,7 @@ class TestGateSuppressesAcrossRealCreation:
             title=HEALTH_REVIEW_ISSUE_TITLE,
             labels=health_review_issue_labels(config),
             health_review_fingerprint=decision.fingerprint,
+            origin=TechLeadCreationOrigin.authors_anchor(),
         )
         intake_created_tech_lead_anchor(action, 900, state, store)
         state.last_health_review_at = T0  # intake stamps wall-clock time.time()
@@ -567,6 +572,7 @@ class TestGateSuppressesAcrossRealCreation:
             title=HEALTH_REVIEW_ISSUE_TITLE,
             labels=health_review_issue_labels(config),
             health_review_fingerprint=decision.fingerprint,
+            origin=TechLeadCreationOrigin.authors_anchor(),
         )
         intake_created_tech_lead_anchor(action, 900, state, store)
         state.last_health_review_at = T0
@@ -584,6 +590,7 @@ class TestGateSuppressesAcrossRealCreation:
         action = CreateTechLeadIssueAction(
             title=HEALTH_REVIEW_ISSUE_TITLE,
             labels=health_review_issue_labels(config),
+            origin=TechLeadCreationOrigin.authors_anchor(),
         )
         intake_created_tech_lead_anchor(action, 900, state, store)
         state.last_health_review_at = 100_000.0

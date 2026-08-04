@@ -21,7 +21,6 @@ republish is dispatched to the runner rather than run inline.
 from __future__ import annotations
 
 import logging
-import shutil
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -39,7 +38,7 @@ from ..domain.models import OrchestratorState
 from ..domain.pr_attempt_scope import scope_prs_to_active_issue_branch
 from ..domain.publish_retry import PublishRetryLocators
 from ..ports.background_job import BackgroundJobRunner, CompletedJob
-from ..ports.fresh_issue_reader import FreshIssueReader
+from ..ports.fresh_issue_reader import FreshIssueReadError, FreshIssueReader
 from ..ports.publish_retry_locator_store import PublishRetryLocatorStore
 from ..ports.pull_request_tracker import PRInfo
 from ..ports.tech_lead_authority import TechLeadAuthorityStore
@@ -48,6 +47,12 @@ from .completion_types import (
     ERROR_PREFIX_PUBLISH_BLOCKED,
     ERROR_PREFIX_PUSH,
 )
+from .publish_retry_admission import (
+    board_block_reason,
+    locator_block_reason,
+    restore_completion_record,
+)
+from .publish_retry_drain import classify_drained_retry
 from .publish_retry_finalize import RetryReviewRouting, RetrySuccessFinalizer
 from .republish_job_id import RepublishJobId
 
@@ -259,26 +264,45 @@ class PublishRecoveryService:
         locators = decision.locators
         existing_pr = self._matching_open_pr(issue_number, locators.branch_name)
         if existing_pr is not None:
-            self._finalizer.finalize(
-                state=state,
-                issue_number=issue_number,
-                issue_title=decision.issue_title,
-                agent_label=decision.agent_label,
-                pr_url=existing_pr.url,
-                pr_number=existing_pr.number,
-                worktree_path=locators.worktree_path,
-                history_reason="Recovered awaiting-merge state from existing PR",
-                routing=RetryReviewRouting(
-                    branch_name=locators.branch_name,
-                    skip_review=locators.skip_review,
-                    # Recovering an already-open PR runs no fresh completion, so
-                    # honor the ORIGINAL completion's review-exchange outcome: if
-                    # it already completed/halted a local review exchange, the PR
-                    # must not be requeued for review.
-                    review_exchange_completed=locators.review_exchange_completed,
-                    review_exchange_halted=locators.review_exchange_halted,
-                ),
-            )
+            try:
+                self._finalizer.finalize(
+                    state=state,
+                    issue_number=issue_number,
+                    issue_title=decision.issue_title,
+                    agent_label=decision.agent_label,
+                    pr_url=existing_pr.url,
+                    pr_number=existing_pr.number,
+                    worktree_path=locators.worktree_path,
+                    history_reason="Recovered awaiting-merge state from existing PR",
+                    routing=RetryReviewRouting(
+                        branch_name=locators.branch_name,
+                        skip_review=locators.skip_review,
+                        # Recovering an already-open PR runs no fresh completion,
+                        # so honor the ORIGINAL completion's review-exchange
+                        # outcome: if it already completed/halted a local review
+                        # exchange, the PR must not be requeued for review.
+                        review_exchange_completed=locators.review_exchange_completed,
+                        review_exchange_halted=locators.review_exchange_halted,
+                    ),
+                )
+            except FreshIssueReadError as exc:
+                # Finalizing composes label cleanup from CURRENT labels; it
+                # reads them first and applies nothing before that read, so an
+                # unreadable issue leaves the retry state exactly as it was
+                # (#6957 round-2 review F4). Report it instead of 500ing the
+                # operator's retry request.
+                logger.warning(
+                    "[publish-retry] Could not finalize recovered PR for issue=%s: %s",
+                    issue_number,
+                    exc,
+                )
+                return RetryPublishResult(
+                    status="rejected",
+                    message=(
+                        f"Could not read current labels for issue #{issue_number};"
+                        " the issue is unchanged and still retryable"
+                    ),
+                )
             self._clear_retry_terminal_state(issue_number)
             logger.info(
                 "[publish-retry] Recovered existing PR for issue=%s pr=%s branch=%s",
@@ -433,57 +457,45 @@ class PublishRecoveryService:
                 # A stale/abandoned/already-drained submission — ignore. (The
                 # newer submission stays pending and reconciles on its own drain.)
                 continue
-            if job.error is not None:
-                logger.error(
-                    "[publish-retry] Republish job for issue=%s raised: %s",
+            outcome = classify_drained_retry(job_error=job.error, result=result)
+            if not outcome.may_finalize:
+                logger.log(
+                    logging.ERROR if outcome.faulted else logging.INFO,
+                    "[publish-retry] Issue=%s stays retryable: %s",
                     issue_number,
-                    job.error,
+                    outcome.reason,
                 )
                 continue
-            if result is None:
-                logger.error(
-                    "[publish-retry] Republish job for issue=%s finished without a result",
-                    issue_number,
+            assert result is not None  # only a successful result may finalize
+            try:
+                self.reconcile_retry_publish_success(
+                    state=state,
+                    issue_number=issue_number,
+                    issue_title=context.issue_title,
+                    agent_label=context.agent_label,
+                    pr_url=result.pr_url,
+                    pr_number=self._extract_pr_number(result.pr_url),
+                    worktree_path=context.worktree_path,
+                    review_routing=RetryReviewRouting(
+                        branch_name=context.branch_name,
+                        skip_review=context.skip_review,
+                        review_exchange_completed=result.review_exchange_completed,
+                        review_exchange_halted=result.review_exchange_halted,
+                    ),
                 )
-                continue
-            if result.is_non_terminal:
-                # The republish started/continued a background review exchange
-                # (or rerouted a validation failure). Publish has NOT completed:
-                # the live path keeps such a completion RUNNING and resumes on a
-                # later tick. Retry-publish has no resume loop, so leave the
-                # publish-failed label + locators intact — the issue stays
-                # retryable and the operator can retry once the exchange settles.
-                logger.info(
-                    "[publish-retry] Republish for issue=%s is non-terminal "
-                    "(review_exchange_deferred=%s validation_failed_rerouted=%s); "
-                    "leaving issue retryable without finalizing",
-                    issue_number,
-                    result.review_exchange_deferred,
-                    result.validation_failed_rerouted,
-                )
-                continue
-            if not result.success:
+            except FreshIssueReadError as exc:
+                # This drain runs on the tick thread. Finalizing reads current
+                # labels before it applies anything, so an unreadable issue
+                # leaves the retry state intact — same shape as the other
+                # "leaving issue retryable" branches above, and it must not
+                # abort the remaining jobs in this drain (#6957 R2 F4).
                 logger.warning(
-                    "[publish-retry] Republish for issue=%s failed: %s",
+                    "[publish-retry] Could not finalize republish for issue=%s;"
+                    " leaving it retryable: %s",
                     issue_number,
-                    result.message,
+                    exc,
                 )
                 continue
-            self.reconcile_retry_publish_success(
-                state=state,
-                issue_number=issue_number,
-                issue_title=context.issue_title,
-                agent_label=context.agent_label,
-                pr_url=result.pr_url,
-                pr_number=self._extract_pr_number(result.pr_url),
-                worktree_path=context.worktree_path,
-                review_routing=RetryReviewRouting(
-                    branch_name=context.branch_name,
-                    skip_review=context.skip_review,
-                    review_exchange_completed=result.review_exchange_completed,
-                    review_exchange_halted=result.review_exchange_halted,
-                ),
-            )
             self._clear_retry_terminal_state(issue_number)
 
     def reconcile_retry_publish_success(
@@ -618,7 +630,21 @@ class PublishRecoveryService:
         if issue is None:
             return _RetryDecision(False, f"Issue #{issue_number} not found")
 
-        labels = tuple(self._current_labels(issue_number))
+        try:
+            labels = tuple(self._current_labels(issue_number))
+        except FreshIssueReadError as exc:
+            # The gate below is a correctness check against CURRENT labels, so
+            # an unreadable issue is "cannot decide", not "no blocking labels"
+            # (#6957 round-2 review F4). Rejecting keeps the retry available:
+            # the operator can retry once GitHub answers again.
+            logger.warning(
+                "[publish-retry] Cannot decide retry for issue=%s: %s",
+                issue_number,
+                exc,
+            )
+            return _RetryDecision(
+                False, f"Could not read current labels for issue #{issue_number}"
+            )
         block_reason = self._retry_state_block_reason(issue_number, state, labels)
         if block_reason:
             return _RetryDecision(False, block_reason)
@@ -627,7 +653,7 @@ class PublishRecoveryService:
         if locators is None:
             return _RetryDecision(False, "No publish-retry locators found for issue")
 
-        locator_reason = self._retry_locator_block_reason(locators)
+        locator_reason = locator_block_reason(locators)
         if locator_reason:
             return _RetryDecision(False, locator_reason)
 
@@ -647,10 +673,14 @@ class PublishRecoveryService:
         state: OrchestratorState,
         labels: tuple[str, ...],
     ) -> str | None:
-        if self._lm.publish_failed not in labels:
-            return "Issue is not blocked by a publish failure"
-        if any(session.issue.number == issue_number for session in state.active_sessions):
-            return "Issue has an active session"
+        board_reason = board_block_reason(
+            issue_number=issue_number,
+            state=state,
+            labels=labels,
+            publish_failed_label=self._lm.publish_failed,
+        )
+        if board_reason:
+            return board_reason
         # Owner state, not the worker's alive bit: a submission stays "pending"
         # until its job is drained, so a completed-but-undrained retry still
         # blocks a duplicate. The authoritative gate is the atomic reserve in
@@ -658,19 +688,6 @@ class PublishRecoveryService:
         with self._lock:
             if issue_number in self._pending:
                 return "Issue already has a pending publish retry"
-        return None
-
-    def _retry_locator_block_reason(self, locators: PublishRetryLocators) -> str | None:
-        worktree = Path(locators.worktree_path)
-        if not worktree.exists():
-            return "Retry worktree no longer exists"
-        # The live completion path preserves a run-scoped copy and then deletes
-        # the agent's original completion file, so a real publish failure leaves
-        # only the durable copy. Either source is a valid retry input.
-        completion_path = worktree / locators.completion_path
-        durable_copy = locators.run_assets.completion_record_copy.path
-        if not completion_path.exists() and not durable_copy.exists():
-            return "Completion record for retry is missing"
         return None
 
     # ------------------------------------------------------------------
@@ -709,7 +726,7 @@ class PublishRecoveryService:
         job_id = RepublishJobId(issue_number, token).encode()
 
         def run() -> None:
-            self._restore_completion_record(locators)
+            restore_completion_record(locators)
             result = self._completion_processor.process(
                 Path(locators.worktree_path),
                 issue_number,
@@ -729,32 +746,6 @@ class PublishRecoveryService:
                 self._pending.pop(issue_number, None)
             return None
         return job_id
-
-    @staticmethod
-    def _restore_completion_record(locators: PublishRetryLocators) -> None:
-        """Put a completion record back where ``process`` reads it.
-
-        ``CompletionProcessor.process`` re-reads ``worktree / completion_path``,
-        but the live completion path deletes that original agent file after
-        preserving a run-scoped copy. Restore the durable copy to the worktree
-        location so the republish has a valid input. No-op when the original is
-        still present or the durable copy is gone (the processor then fails
-        loudly on a genuinely missing record, keeping the issue retryable).
-        """
-        target = Path(locators.worktree_path) / locators.completion_path
-        if target.exists():
-            return
-        durable_copy = locators.run_assets.completion_record_copy.path
-        if not durable_copy.exists():
-            return
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(durable_copy, target)
-        logger.info(
-            "[publish-retry] Restored durable completion record for issue=%s "
-            "from %s",
-            locators.issue_number,
-            durable_copy,
-        )
 
     @staticmethod
     def _extract_pr_number(pr_url: str | None) -> int | None:

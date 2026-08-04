@@ -9,6 +9,8 @@ from issue_orchestrator.domain.tech_lead_session import (
     TECH_LEAD_ASSIGNMENT_FILENAME,
     TECH_LEAD_OBSERVATION_LABEL,
     TechLeadAssignment,
+    TechLeadCreationKind,
+    TechLeadCreationOrigin,
     TechLeadSessionFlavor,
     require_case_file_observation_label,
 )
@@ -147,3 +149,76 @@ class TestTechLeadAssignmentValidation:
 
         with pytest.raises(json.JSONDecodeError):
             TechLeadAssignment.read(path)
+
+
+class TestCreationOriginHasExactlyTwoValidStates:
+    """#6957 round-2 review F6/A6: authority is stated, never inferred.
+
+    A tech-lead issue creation either AUTHORS its session's anchor or was
+    DECIDED by a session already working one. The second must reconcile against
+    that anchor before it writes. Encoding the difference as a defaulted
+    ``anchor_issue_number: int = 0`` meant composition that dropped the value
+    produced a follow-up indistinguishable from legitimate anchor authoring —
+    and it wrote unguarded. These pin the states the type admits.
+    """
+
+    def test_anchor_authoring_has_no_subject_and_expects_nothing(self) -> None:
+        origin = TechLeadCreationOrigin.authors_anchor()
+
+        assert origin.kind is TechLeadCreationKind.AUTHORS_ANCHOR
+        assert origin.authors_new_anchor
+        assert origin.reconciliation_subject == 0
+        assert not origin.requires_expected_state
+
+    def test_a_derived_creation_names_its_anchor_and_expects_state(self) -> None:
+        origin = TechLeadCreationOrigin.derived_from_anchor(77)
+
+        assert origin.kind is TechLeadCreationKind.DERIVED_FROM_ANCHOR
+        assert not origin.authors_new_anchor
+        assert origin.reconciliation_subject == 77
+        assert origin.requires_expected_state
+
+    @pytest.mark.parametrize("dropped", (0, -1))
+    def test_a_derived_creation_without_its_anchor_is_rejected(self, dropped) -> None:
+        """The dropped-subject case that used to read as anchor authoring."""
+        with pytest.raises(ValueError, match="requires that anchor"):
+            TechLeadCreationOrigin(
+                kind=TechLeadCreationKind.DERIVED_FROM_ANCHOR,
+                anchor_issue_number=dropped,
+            )
+
+    def test_anchor_authoring_may_not_claim_a_subject(self) -> None:
+        """The mirror: naming an anchor means the creation did not author it."""
+        with pytest.raises(ValueError, match="must not name one"):
+            TechLeadCreationOrigin(
+                kind=TechLeadCreationKind.AUTHORS_ANCHOR, anchor_issue_number=77
+            )
+
+    @pytest.mark.parametrize(
+        "kind", ("derived_from_anchor", "unexpected", None, 1, TechLeadCreationKind)
+    )
+    def test_a_kind_outside_the_enum_is_rejected(self, kind) -> None:
+        """#6957 R3 F8/A7: the closed model must be closed at RUNTIME.
+
+        Branching on ``kind is AUTHORS_ANCHOR`` and treating everything else as
+        derived accepted a third family of states — including the enum's own
+        *value* string, which reads as the right thing and is not the enum.
+        Handled conservatively today, but the abstraction's promise was false
+        and future branching could read it differently.
+        """
+        with pytest.raises(ValueError, match="must be a TechLeadCreationKind"):
+            TechLeadCreationOrigin(kind=kind, anchor_issue_number=7)
+
+    def test_the_kind_is_required(self) -> None:
+        """Omission is a TypeError, not a defaulted guess at authority."""
+        with pytest.raises(TypeError):
+            TechLeadCreationOrigin()  # type: ignore[call-arg]
+
+    @pytest.mark.parametrize("anchor", (True, False, "7", 7.0, None))
+    def test_a_non_int_anchor_is_rejected(self, anchor) -> None:
+        """``bool`` is an ``int`` subclass, so ``True`` would have read as #1."""
+        with pytest.raises(ValueError, match="must be an int"):
+            TechLeadCreationOrigin(
+                kind=TechLeadCreationKind.DERIVED_FROM_ANCHOR,
+                anchor_issue_number=anchor,
+            )

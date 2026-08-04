@@ -2349,3 +2349,90 @@ def test_issue_closed_on_or_after_fails_loud_on_non_list_payload() -> None:
 
     with pytest.raises(GitHubHttpError):
         client.issue_closed_on_or_after(45, "2026-08-03T13:52:09Z")
+
+
+# -------------------- Closing-PR linkage (#6957) --------------------
+
+
+def _closing_pr_client(nodes: list[dict]) -> tuple[GitHubHttpClient, list[dict]]:
+    """A client whose GraphQL endpoint replays *nodes* as CLOSED_EVENTs."""
+    requests_seen: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests_seen.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    "repository": {"issue": {"timelineItems": {"nodes": nodes}}}
+                }
+            },
+        )
+
+    return _client_with_transport(httpx.MockTransport(handler)), requests_seen
+
+
+def test_closing_pull_request_reports_the_merged_closer() -> None:
+    client, _ = _closing_pr_client(
+        [{"closer": {"number": 42, "url": "https://x/pull/42", "merged": True}}]
+    )
+
+    assert client.get_closing_pull_request(501) == {
+        "number": 42,
+        "url": "https://x/pull/42",
+        "merged": True,
+    }
+
+
+def test_closing_pull_request_only_asks_for_the_newest_close() -> None:
+    """The query itself is bounded to the close that left the issue closed."""
+    client, requests_seen = _closing_pr_client([])
+
+    client.get_closing_pull_request(501)
+
+    assert "last: 1" in requests_seen[0]["query"]
+    assert requests_seen[0]["variables"] == {
+        "owner": "owner",
+        "repo": "repo",
+        "number": 501,
+    }
+
+
+def test_a_newer_manual_close_supersedes_an_older_merged_pr_close() -> None:
+    """#6957 round-2 review F4: reopened-then-manually-closed is a DECLINE.
+
+    An issue closed by a merged PR, reopened, then closed by hand has two
+    ClosedEvents. Scanning backward for *any* PR-backed close returned the stale
+    merge and recorded a manual decline as shipped, permanently closing the
+    source case file. Only the newest close counts.
+    """
+    client, _ = _closing_pr_client(
+        [
+            # Older: closed by a merged PR...
+            {"closer": {"number": 42, "url": "https://x/pull/42", "merged": True}},
+            # ...reopened, then most recently closed by a human.
+            {"closer": None},
+        ]
+    )
+
+    assert client.get_closing_pull_request(501) is None
+
+
+def test_a_newer_unmerged_pr_close_supersedes_an_older_merged_one() -> None:
+    client, _ = _closing_pr_client(
+        [
+            {"closer": {"number": 42, "url": "https://x/pull/42", "merged": True}},
+            {"closer": {"number": 43, "url": "https://x/pull/43", "merged": False}},
+        ]
+    )
+
+    outcome = client.get_closing_pull_request(501)
+
+    assert outcome is not None
+    assert outcome["number"] == 43 and outcome["merged"] is False
+
+
+def test_never_closed_issue_has_no_closing_pull_request() -> None:
+    client, _ = _closing_pr_client([])
+
+    assert client.get_closing_pull_request(501) is None

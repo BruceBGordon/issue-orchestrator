@@ -2198,3 +2198,69 @@ class TestMergeQueue:
         )
         with pytest.raises(GitHubHttpError):
             adapter.enqueue_to_merge_queue(318)
+
+
+class TestMarkerRecoveryContracts:
+    """#6957 round-5 review F13: which lookup runs, and what its "no" means.
+
+    ``find_issue_by_marker`` answers "did a previous process already create this
+    issue?" for two callers with different stakes, so it carries two contracts.
+    Getting the negative one wrong is what files a second issue for a signature
+    that already has one.
+    """
+
+    MARKER = "<!-- issue-orchestrator:tech-lead-case-file:v1:abc -->"
+
+    def test_authoritative_absence_is_proven_by_a_title_independent_walk(
+        self, adapter, mock_http_client
+    ):
+        """The exact miss F13 describes: aged out of the window AND retitled."""
+        mock_http_client.list_issues.return_value = [
+            *({"number": n, "body": "unrelated", "html_url": "u"} for n in range(200)),
+            {"number": 999, "body": f"kept its marker {self.MARKER}", "html_url": "u"},
+        ]
+        # Nothing matches the title the caller remembers.
+        mock_http_client.search_issues_by_title.return_value = []
+
+        found = adapter.find_issue_by_marker(
+            title="a title that was since edited",
+            marker=self.MARKER,
+            authoritative=True,
+        )
+
+        assert found == 999
+        kwargs = mock_http_client.list_issues.call_args.kwargs
+        # Fresh, all states, and under the fail-loud completeness contract
+        # (#6779 R17) rather than a bounded best-effort read.
+        assert kwargs["state"] == "all"
+        assert kwargs["use_cache"] is False
+        assert kwargs["exhaustive"] is True
+        assert kwargs["limit"] > 100
+        mock_http_client.search_issues_by_title.assert_not_called()
+
+    def test_an_unprovable_authoritative_scan_raises_rather_than_saying_absent(
+        self, adapter, mock_http_client
+    ):
+        """Cap exhaustion / a later-page failure is "unknown", never "absent"."""
+        mock_http_client.list_issues.side_effect = GitHubHttpError(
+            "refusing to treat the partial issue set as complete", status_code=500
+        )
+
+        with pytest.raises(GitHubHttpError):
+            adapter.find_issue_by_marker(
+                title="t", marker=self.MARKER, authoritative=True
+            )
+
+    def test_the_default_lookup_stays_bounded_and_best_effort(
+        self, adapter, mock_http_client
+    ):
+        """A miss here only risks a duplicate another invariant already blocks,
+        so it must not pay for an exhaustive walk on every new case file."""
+        mock_http_client.list_issues.return_value = []
+        mock_http_client.search_issues_by_title.return_value = []
+
+        assert adapter.find_issue_by_marker(title="t", marker=self.MARKER) is None
+
+        kwargs = mock_http_client.list_issues.call_args.kwargs
+        assert kwargs.get("exhaustive", False) is False
+        assert kwargs["limit"] == 100

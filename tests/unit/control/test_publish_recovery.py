@@ -34,6 +34,7 @@ from issue_orchestrator.execution.json_publish_retry_locator_store import (
 )
 from issue_orchestrator.infra.config import Config
 from issue_orchestrator.ports.background_job import CompletedJob
+from issue_orchestrator.ports.fresh_issue_reader import FreshIssueReadError
 from issue_orchestrator.ports.pull_request_tracker import PRInfo
 
 BRANCH = "4057-scratch-1"
@@ -1193,3 +1194,210 @@ def test_abandon_issue_discards_tech_lead_authority_row(make_session, tmp_path) 
         is None
     )
     assert authority_store.load_storm_cohort(anchor_issue_number=4057) is None
+
+
+# ---------------------------------------------------------------------------
+# Command surface G: an unreadable issue is UNKNOWN, never "no blocking labels"
+# ---------------------------------------------------------------------------
+#
+# The fresh reader now raises instead of fabricating `[]` (#6957 round-2 F4), so
+# this service has three new outcomes. All three share one rule: an unreadable
+# issue must leave the retry EXACTLY as retryable as it was — never submitted on
+# a guess, never half-finalized, and never able to abort the rest of a drain.
+
+
+@dataclass
+class _UnreadableRepo(_Repo):
+    """A repo whose fresh label read fails for a named set of issues."""
+
+    unreadable: set[int] = field(default_factory=set)
+    label_reads: list[int] = field(default_factory=list)
+
+    def read_issue_labels(self, issue_number: int) -> list[str]:
+        self.label_reads.append(issue_number)
+        if issue_number in self.unreadable:
+            raise FreshIssueReadError(
+                f"could not read fresh labels for issue #{issue_number}: rate limited"
+            )
+        return super().read_issue_labels(issue_number)
+
+
+def test_retry_admission_rejects_when_the_issue_cannot_be_read(
+    make_session, tmp_path
+) -> None:
+    """Unreadable is not "not blocked": admission must not submit on a guess."""
+    lm = LabelManager(_config(tmp_path))
+    repo = _UnreadableRepo(issue=_issue(lm), labels=list(_issue(lm).labels))
+    service, store, runner = _service(tmp_path, repo, lm)
+    _record_failure(service, make_session, tmp_path)
+    repo.unreadable = {4057}
+    state = OrchestratorState()
+
+    result = service.retry_publish(4057, state)
+
+    assert result.status == "rejected"
+    assert "labels" in result.message
+    # Nothing was submitted, and the issue stays exactly as retryable as before:
+    # durable locators intact, labels untouched.
+    assert runner.running_ids() == set()
+    assert store.get(4057) is not None
+    assert repo.added == [] and repo.removed == []
+    # ...and the same request succeeds once GitHub answers again.
+    repo.unreadable = set()
+    assert service.retry_publish(4057, state).status == "submitted"
+
+
+def test_can_retry_publish_reports_false_rather_than_raising(
+    make_session, tmp_path
+) -> None:
+    """This one renders the issue-detail page; it must not surface an exception."""
+    lm = LabelManager(_config(tmp_path))
+    repo = _UnreadableRepo(issue=_issue(lm), labels=list(_issue(lm).labels))
+    service, _store, _runner = _service(tmp_path, repo, lm)
+    _record_failure(service, make_session, tmp_path)
+    repo.unreadable = {4057}
+
+    assert service.can_retry_publish(4057, OrchestratorState()) is False
+
+
+def test_existing_pr_recovery_stays_retryable_when_the_read_fails(
+    make_session, tmp_path
+) -> None:
+    """Recovery finalizes off CURRENT labels; an unreadable issue changes nothing."""
+    lm = LabelManager(_config(tmp_path))
+    issue = _issue(lm)
+    repo = _UnreadableRepo(
+        issue=issue,
+        labels=list(issue.labels),
+        prs=[
+            PRInfo(
+                number=5453,
+                title="#4057: UI: Surface provider status",
+                url=PR_URL,
+                branch=BRANCH,
+                body="",
+                state="open",
+                labels=[],
+            )
+        ],
+    )
+    service, store, runner = _service(tmp_path, repo, lm)
+    _record_failure(service, make_session, tmp_path)
+    state = OrchestratorState()
+    # Admission reads labels first, then finalization reads them again. Only the
+    # SECOND read fails, so the request reaches the recovery path it must not
+    # half-apply.
+    calls = {"n": 0}
+    original = repo.read_issue_labels
+
+    def _fail_on_finalize(issue_number: int) -> list[str]:
+        calls["n"] += 1
+        if calls["n"] > 1:
+            raise FreshIssueReadError("rate limited")
+        return original(issue_number)
+
+    repo.read_issue_labels = _fail_on_finalize  # type: ignore[method-assign]
+
+    result = service.retry_publish(4057, state)
+
+    assert result.status == "rejected"
+    assert "retryable" in result.message
+    # No partial state change: publish-failed labels intact, locators kept, no
+    # history entry, no review queued, nothing submitted to the runner.
+    assert repo.added == [] and repo.removed == []
+    assert lm.publish_failed in repo.labels
+    assert store.get(4057) is not None
+    assert state.session_history == []
+    assert state.discovered_reviews == []
+    assert runner.running_ids() == set()
+
+
+@dataclass
+class _TwoIssueRepo:
+    """Two independently-labelled issues, so ONE drain can hold two jobs.
+
+    ``_Repo`` is single-issue by construction, which cannot express the thing
+    that matters here: an unreadable issue must not strand the OTHER completed
+    jobs sharing its drain.
+    """
+
+    issues: dict[int, Issue]
+    labels: dict[int, list[str]]
+    unreadable: set[int] = field(default_factory=set)
+    added: list[tuple[int, str]] = field(default_factory=list)
+    removed: list[tuple[int, str]] = field(default_factory=list)
+
+    def get_issue(self, issue_number: int) -> Issue | None:
+        return self.issues.get(issue_number)
+
+    def read_issue_labels(self, issue_number: int) -> list[str]:
+        if issue_number in self.unreadable:
+            raise FreshIssueReadError(
+                f"could not read fresh labels for issue #{issue_number}: rate limited"
+            )
+        return list(self.labels.get(issue_number, []))
+
+    def add_label(self, issue_number: int, label: str) -> None:
+        labels = self.labels.setdefault(issue_number, [])
+        if label not in labels:
+            labels.append(label)
+        self.added.append((issue_number, label))
+
+    def remove_label(self, issue_number: int, label: str) -> None:
+        self.labels[issue_number] = [
+            current for current in self.labels.get(issue_number, []) if current != label
+        ]
+        self.removed.append((issue_number, label))
+
+    def get_prs_for_issue(self, issue_number: int, state: str = "open") -> list[PRInfo]:
+        return []
+
+
+def test_a_finalize_read_failure_does_not_abort_the_rest_of_the_drain(
+    make_session, tmp_path
+) -> None:
+    """The drain runs on the TICK thread, so one unreadable issue must not
+    strand every other completed job sharing that drain."""
+    lm = LabelManager(_config(tmp_path))
+    unreadable_issue = _issue(lm)  # #4057
+    healthy_issue = Issue(
+        number=4058,
+        title="Second retry",
+        labels=["agent:web", lm.publish_failed, lm.publish_fail_count_label(2)],
+    )
+    repo = _TwoIssueRepo(
+        issues={4057: unreadable_issue, 4058: healthy_issue},
+        labels={
+            4057: list(unreadable_issue.labels),
+            4058: list(healthy_issue.labels),
+        },
+    )
+    service, store, runner = _service(tmp_path, repo, lm)  # type: ignore[arg-type]
+    state = OrchestratorState()
+    for number, title in ((4057, "UI: Surface provider status"), (4058, "Second retry")):
+        session = make_session(
+            issue_number=number, issue_title=title, branch_name=f"{number}-scratch-1"
+        )
+        completion_file = session.worktree_path / session.completion_path
+        completion_file.parent.mkdir(parents=True, exist_ok=True)
+        completion_file.write_text("{}")
+        service.record_publish_failure(
+            session, ["push_branch: Push failed: remote rejected"]
+        )
+        assert service.retry_publish(number, state).status == "submitted"
+    runner.run_all()
+    # #4057 becomes unreadable AFTER both republishes completed, so both jobs
+    # are waiting in the same drain and the failing one is drained first.
+    repo.unreadable = {4057}
+
+    service.drain_completed_retries(state)
+
+    # The unreadable issue is exactly as retryable as before: locators kept,
+    # publish-failed intact, nothing finalized.
+    assert store.get(4057) is not None
+    assert lm.publish_failed in repo.labels[4057]
+    assert not [entry for entry in repo.removed if entry[0] == 4057]
+    # ...and the healthy issue in the SAME drain still finalized.
+    assert store.get(4058) is None
+    assert (4058, lm.publish_failed) in repo.removed
+    assert [entry.issue_number for entry in state.session_history] == [4058]

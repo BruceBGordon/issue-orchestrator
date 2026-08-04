@@ -813,6 +813,7 @@ def build_orchestrator(
         goal_pilot_store=goal_pilot_store,
         attempt_store=attempt_store,
         tech_lead_authority=tech_lead_authority,
+        promotion_target=tech_lead.promotion_target,
         open_issue_corpus=tech_lead.open_issue_corpus,
         pair_registry=pair_registry,
         turn_mailbox=turn_mailbox,
@@ -1085,6 +1086,7 @@ def build_orchestrator_for_testing(
         action_applier.pair_registry = pair_registry_for_testing
         action_applier.background_job_supervisor = background_job_supervisor
         action_applier.tech_lead_ops = tech_lead_authority_for_testing
+        action_applier.promotion_target = tech_lead.promotion_target
 
     def _cancel_review_exchange_for_testing(
         issue_number: int,
@@ -1193,6 +1195,7 @@ def build_orchestrator_for_testing(
         goal_pilot_store=goal_pilot_store,
         attempt_store=attempt_store,
         tech_lead_authority=tech_lead_authority_for_testing,
+        promotion_target=tech_lead.promotion_target,
         open_issue_corpus=tech_lead.open_issue_corpus,
         pair_registry=pair_registry_for_testing,
         turn_mailbox=turn_mailbox,
