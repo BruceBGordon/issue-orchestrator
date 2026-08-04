@@ -44,9 +44,22 @@ has one, so this path requires the AUTHORITATIVE lookup (#6957 round-5 F13).
 ``tech_lead.findings.route`` is ordinary user-editable configuration, so an
 operator can also re-point an area between ticks while a filing is in flight.
 That does not change the question above — it only changes what a proven absence
-permits: with the route unchanged the intent stands and is filed under, and with
-it re-pointed the stale intent is retired so the current route can take over. A
-found issue outranks both: one signature promotes exactly once.
+permits: with the route re-pointed the stale intent is retired so the current
+route can take over, and with it unchanged the intent stands. A found issue
+outranks both: one signature promotes exactly once.
+
+Standing is not the same as standing VERBATIM, though, and that distinction is
+the second thing this owner exists for. The ledger row is committed from the
+intent while the remote issue is created from the action in hand, so any
+metadata the two describe differently is persisted wrong — a signature still
+unclassified when the first attempt died, then upgraded to a real area by a
+later observation that routes to the same repo, filed an issue tagged
+``area:db`` and recorded ``PromotedFinding.area = ""``. Settlement copies that
+area into the shipped-fix row, so operational memory learned the wrong
+classification (#6957 round-4 review F10). On proven absence the intent is
+therefore RESTATED to describe the payload about to be filed; only its
+watermark survives. On recovery it is not restated at all — the remote issue
+already carries the original metadata, and it IS the promotion.
 """
 
 from __future__ import annotations
@@ -122,12 +135,26 @@ class PromotionFilingOwner:
             )
             self._authority.record_pending_promotion(pending=pending)
 
+        # ONE source for the create. The ledger row is committed from the
+        # intent, so anything the create describes differently is persisted
+        # wrong (#6957 round-4 review F10) — the intent supplies every field it
+        # holds, and the two it does not (body, labels) are checked against it
+        # rather than trusted. By construction the intent was either just built
+        # from this action or restated to describe it, so a mismatch here is a
+        # composition bug and fails loudly instead of splitting the record.
+        if pending.area != action.area:
+            raise ValueError(
+                f"promotion intent for {action.signature!r} describes area"
+                f" {pending.area!r} but the issue about to be filed carries"
+                f" {action.area!r}; refusing to record a ledger row the promoted"
+                " issue does not match"
+            )
         filed = self._target.file_issue(
             repo=pending.target_repo,
-            title=action.title,
+            title=pending.title,
             body=action.body,
             labels=list(action.labels),
-            idempotency_marker=action.idempotency_marker,
+            idempotency_marker=pending.idempotency_marker,
         )
         return self._commit(
             pending,
@@ -219,8 +246,17 @@ class PromotionFilingOwner:
         current route. Refusing instead stranded the signature forever — every
         later tick rebuilt the same action and hit the same mismatch.
 
-        With the route unchanged there is nothing stale about it, so the intent
-        stands and its older watermark keeps ruling the ledger row.
+        With the route unchanged the intent stands, but it does NOT stand
+        verbatim. The ledger row is committed from the intent while the remote
+        issue is created from the current action's body and labels, so every
+        piece of metadata those two describe differently is persisted wrong. A
+        signature still unclassified when the first attempt died, then upgraded
+        to a real area by a later observation routing to the SAME repo, filed an
+        issue tagged ``area:db`` and recorded ``PromotedFinding.area = ""`` —
+        and settlement copies that area into the shipped-fix row, so operational
+        memory learned the wrong classification (#6957 round-4 review F10). So
+        the intent is restated to describe the payload about to be filed, and
+        only its watermark survives from the old attempt.
         """
         if pending.target_repo != action.target_repo:
             logger.warning(
@@ -235,6 +271,31 @@ class PromotionFilingOwner:
             )
             self._authority.discard_pending_promotion(signature=action.signature)
             return None
+        restated = pending.describing_the_payload(
+            case_file_issue_number=action.case_file_issue_number,
+            title=action.title,
+            idempotency_marker=action.idempotency_marker,
+            area=action.area,
+        )
+        if restated != pending:
+            logger.warning(
+                "[tech_lead] Signature %r changed from area %r to %r while its"
+                " filing was in flight, and no issue carries its marker in %s —"
+                " that create never happened. Restating the intent to describe"
+                " what is about to be filed, so the ledger row cannot record"
+                " metadata the promoted issue does not carry",
+                action.signature,
+                pending.area,
+                action.area,
+                pending.target_repo,
+            )
+            # Replaced rather than mutated: the intent is create-once. Crashing
+            # between the two writes leaves NO intent, and the next tick records
+            # a fresh one from the current action — body and ledger still agree;
+            # only the older, deliberately conservative watermark is lost, which
+            # is the same "repeat a comment" direction as everything else here.
+            self._authority.discard_pending_promotion(signature=action.signature)
+            self._authority.record_pending_promotion(pending=restated)
         logger.warning(
             "[tech_lead] Resuming an interrupted promotion filing for signature"
             " %r in %s; its create is proven not to have happened, so the body"
@@ -244,9 +305,9 @@ class PromotionFilingOwner:
             action.signature,
             pending.target_repo,
             action.observation_count,
-            pending.body_observations,
+            restated.body_observations,
         )
-        return pending
+        return restated
 
     def _commit(
         self,

@@ -405,6 +405,44 @@ class PendingPromotion:
             if not str(getattr(self, name)).strip():
                 raise ValueError(f"a PendingPromotion requires a non-empty {name}")
 
+    def describing_the_payload(
+        self,
+        *,
+        case_file_issue_number: int,
+        title: str,
+        idempotency_marker: str,
+        area: str,
+    ) -> "PendingPromotion":
+        """This intent restated to describe the payload about to be FILED.
+
+        Only reachable once the old create is proven ABSENT: the ledger row is
+        committed from the intent while the remote issue is created from the
+        current action's body and labels, so any metadata those two disagree on
+        is persisted wrong. A signature whose area was still unclassified when
+        the first attempt died, then upgraded by a later observation that routes
+        to the same repo, filed an issue tagged ``area:db`` and recorded
+        ``PromotedFinding.area = ""`` — and settlement copies that into the
+        shipped-fix row, mis-classifying operational memory (#6957 round-4
+        review F10).
+
+        ``body_observations`` is deliberately NOT refreshed. It is the one fact
+        this type exists to carry across the crash window: the evidence count
+        the filed body documents. Keeping the older value means at worst one
+        evidence comment is repeated, which is the direction this fails in on
+        purpose — see the module docstring of ``tech_lead_promotion_filing``.
+        ``target_repo`` is not refreshed either; a re-pointed route retires the
+        intent outright rather than restating it.
+        """
+        return PendingPromotion(
+            signature=self.signature,
+            case_file_issue_number=case_file_issue_number,
+            target_repo=self.target_repo,
+            title=title,
+            idempotency_marker=idempotency_marker,
+            area=area,
+            body_observations=self.body_observations,
+        )
+
 
 @dataclass(frozen=True)
 class PromotableFinding:

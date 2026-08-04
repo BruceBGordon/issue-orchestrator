@@ -942,6 +942,166 @@ class TestRouteChangedWhileFilingWasInFlight:
         assert recovered.details["target_repo"] == self.OTHER
 
 
+class TestAreaUpgradedWhileFilingWasInFlight:
+    """#6957 round-4 review F10: the ledger row cannot describe a different
+    issue than the one that was filed.
+
+    The ledger row is committed from the durable INTENT while the remote issue
+    is created from the action in hand, so any metadata the two disagree on is
+    persisted wrong. A signature is unclassified when its first filing dies, a
+    later observation upgrades its area, and the upgraded area routes to the
+    SAME repo — so the re-route escape hatch never fires and the stale intent is
+    reused verbatim. The filed issue then carries ``area:db`` while
+    ``PromotedFinding.area`` stays ``""``, and settlement copies THAT into the
+    shipped-fix row.
+    """
+
+    @staticmethod
+    def _action(*, area: str, observations: int) -> PromoteTechLeadFindingAction:
+        """A planned action for one signature at a given area/evidence count."""
+        [action] = plan_finding_promotions(
+            _config(),
+            promotable=(
+                PromotableFinding(
+                    evidence=_evidence(
+                        "anchor-close",
+                        case_file=65,
+                        observations=observations,
+                        area=area,
+                    ),
+                    target_repo=UPSTREAM,
+                ),
+            ),
+        )
+        assert isinstance(action, PromoteTechLeadFindingAction)
+        return action
+
+    def _interrupted_unclassified_filing(self, target):
+        """An intent left by a failed filing, recorded while area was still ''."""
+        authority = InMemoryTechLeadAuthorityStore()
+        target.file_error = RuntimeError("transient")
+        assert not apply_promote_tech_lead_finding(
+            self._action(area="", observations=2),
+            target=target,
+            authority=authority,
+            now_iso="t1",
+        ).success
+        target.file_error = None
+        pending = authority.load_pending_promotion(signature="anchor-close")
+        assert pending is not None and pending.area == ""
+        assert target.filed == []  # proven absent on the retry
+        return authority
+
+    def test_the_ledger_row_matches_the_issue_that_was_actually_filed(self):
+        target = InMemoryPromotionTargetHost()
+        authority = self._interrupted_unclassified_filing(target)
+
+        upgraded = self._action(area="db", observations=3)
+        result = apply_promote_tech_lead_finding(
+            upgraded, target=target, authority=authority, now_iso="t2"
+        )
+
+        assert result.success
+        # What was actually filed: body and labels both carry the upgraded area.
+        [(_repo, _title, body, labels)] = target.filed
+        assert "area:db" in labels
+        assert "| Area | db |" in body
+        # ...and the durable row agrees with it.
+        promotion = authority.load_promotion(signature="anchor-close")
+        assert promotion.area == "db"
+        # The watermark is still the intent's, deliberately: the conservative
+        # direction repeats one comment rather than suppressing one.
+        assert promotion.reported_observations == 2
+
+    def test_the_shipped_fix_is_recorded_under_the_filed_area(self):
+        """The end the corruption was observable at: operational memory."""
+        target = InMemoryPromotionTargetHost()
+        authority = self._interrupted_unclassified_filing(target)
+        filed = apply_promote_tech_lead_finding(
+            self._action(area="db", observations=3),
+            target=target,
+            authority=authority,
+            now_iso="t2",
+        )
+        assert filed.success
+        issue_number = filed.details["issue_number"]
+        target.outcomes[(UPSTREAM, issue_number)] = PromotedIssueOutcome(
+            state="closed", merged_pr_url="https://github.com/x/y/pull/6956"
+        )
+
+        settled = classify_promotion_outcomes(
+            authority.list_promotions(), target=target
+        )
+        [action] = plan_promotion_settlements(settled)
+        assert isinstance(action, SettleTechLeadPromotionAction)
+        assert action.area == "db"
+        assert apply_settle_tech_lead_promotion(
+            action, repository_host=Mock(), authority=authority
+        ).success
+
+        [fix] = authority.list_recent_shipped_fixes(limit=5)
+        assert fix.area == "db"
+
+    def test_the_restated_intent_is_durable_across_another_crash(self):
+        """A second crash must resume from the RESTATED intent, not the stale one."""
+        target = InMemoryPromotionTargetHost()
+        authority = self._interrupted_unclassified_filing(target)
+        upgraded = self._action(area="db", observations=3)
+
+        class FailTheLedgerWrite(type(authority)):  # type: ignore[misc]
+            def record_promotion(self, *, promotion):
+                raise RuntimeError("process died before the ledger commit")
+
+        authority.__class__ = FailTheLedgerWrite
+        assert not apply_promote_tech_lead_finding(
+            upgraded, target=target, authority=authority, now_iso="t2"
+        ).success
+
+        pending = authority.load_pending_promotion(signature="anchor-close")
+        assert pending is not None
+        assert pending.area == "db"  # restated, not the stale ""
+        assert pending.body_observations == 2  # ...but the watermark survives
+
+    def test_a_recovered_issue_keeps_its_original_area(self):
+        """The mirror: a create that DID happen carries the original metadata,
+        so the intent stays authoritative and must NOT be restated."""
+        target = InMemoryPromotionTargetHost()
+        authority = InMemoryTechLeadAuthorityStore()
+
+        class FailFirstLedgerWrite(InMemoryTechLeadAuthorityStore):
+            def __init__(self) -> None:
+                super().__init__()
+                self.fail_next_record = True
+
+            def record_promotion(self, *, promotion):
+                if self.fail_next_record:
+                    self.fail_next_record = False
+                    raise RuntimeError("process died before the ledger commit")
+                super().record_promotion(promotion=promotion)
+
+        authority = FailFirstLedgerWrite()
+        assert not apply_promote_tech_lead_finding(
+            self._action(area="", observations=2),
+            target=target,
+            authority=authority,
+            now_iso="t1",
+        ).success
+        assert len(target.filed) == 1  # the create DID happen, tagged area ""
+
+        result = apply_promote_tech_lead_finding(
+            self._action(area="db", observations=3),
+            target=target,
+            authority=authority,
+            now_iso="t2",
+        )
+
+        assert result.success and result.details["recovered"] is True
+        assert len(target.filed) == 1  # no second issue
+        # The remote issue documents the ORIGINAL area, so the row must too.
+        promotion = authority.load_promotion(signature="anchor-close")
+        assert promotion.area == ""
+
+
 class TestUnprovableRecoveryNeverRetiresTheIntent:
     """#6957 round-5 review F13 at the owner level.
 
