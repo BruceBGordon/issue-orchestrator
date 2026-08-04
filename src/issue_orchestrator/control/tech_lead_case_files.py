@@ -24,6 +24,12 @@ case-file lifecycle, mirroring ``tech_lead_proposals`` (#6778) piece for piece:
   the board snapshot and can never be mistaken for batch/health anchors.
   Startup recovery uses the same split so a case file is never requeued as
   an anchor.
+* **Per-decision planning** — :class:`PatternCaseFilePlanner` owns the whole
+  create-vs-append-vs-coalesce decision for ONE tech-lead decision, plus the
+  classification preflight that must run before any of them. That state
+  (signature -> merged classification, signature -> the creation already
+  planned this decision) exists only to serve case files, so it belongs here
+  rather than mixed into the general decision planner's fields.
 * **No terminal handling** — observations are not ops; there is nothing to
   execute or discard. Graduation is native: a firmed-up pattern gets a
   linked root-cause work issue, evidence trail intact.
@@ -32,6 +38,7 @@ case-file lifecycle, mirroring ``tech_lead_proposals`` (#6778) piece for piece:
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Iterable, Mapping, Sequence
 
 from ..domain.tech_lead_findings import (
@@ -40,6 +47,7 @@ from ..domain.tech_lead_findings import (
     case_file_issue_marker,
     pattern_observation_id,
     pattern_observation_marker,
+    reconcile_pattern_classification,
 )
 from ..domain.tech_lead_session import (
     TECH_LEAD_OBSERVATION_LABEL,
@@ -316,6 +324,166 @@ def build_append_observation_action(
         ),
         expected=expected,
     )
+
+
+@dataclass
+class PatternCaseFilePlanner:
+    """Plans the DURABLE half of one executed ``flag_pattern`` decision.
+
+    Extracted from the general decision planner, whose fields it was the only
+    consumer of: the merged-classification map and the "already planned this
+    decision" index are case-file bookkeeping, and keeping them beside the
+    create/append/coalesce rules puts the whole per-decision case-file policy
+    under one owner (#6957 round-6 final abstraction pass).
+
+    It appends into the decision's shared ``actions`` list because coalescing
+    REPLACES a creation already planned in it — the position matters, so the
+    list is the collaboration, not a return value.
+    """
+
+    config: "Config"
+    actions: list["Action"]
+    anchor_issue_number: int
+    # signature -> its FULL durable row: planning preflights a new observation's
+    # classification against it, which a bare issue number cannot support.
+    pattern_ledger: Mapping[str, PatternEvidence]
+    findings: Mapping[str, "TechLeadFinding"]
+    source_run_id: str
+    source_session_name: str
+    observed_at: str
+    expected: "ExpectedState"
+    # signature -> the (fix_class, area) every observation seen so far in THIS
+    # decision reconciled to, seeded from the durable row. Two observations that
+    # disagree conflict with each other, not just with what is recorded
+    # (#6957 round-2 review F3).
+    _classification: dict[str, tuple[str, str]] = field(default_factory=dict)
+    # signature -> index in ``actions`` of the creation this decision planned.
+    _planned: dict[str, int] = field(default_factory=dict)
+
+    def plan(self, proposed: "ProposedTechLeadAction") -> None:
+        """Create, append to, or coalesce into this signature's case file."""
+        signature = proposed.pattern_signature
+        assert signature is not None  # enforced by validate()
+        # Preflight FIRST: a classification conflict must reject the decision
+        # before this produces any mutating action (#6957 R2 F3).
+        fix_class, area = self.classification_for(signature, proposed)
+        existing = self.pattern_ledger.get(signature)
+        if existing is not None:
+            # Comment AND durable count under one owner (#6957): the count is
+            # what promotion's min_evidence reads, so it can never be left to
+            # GitHub comment cadence. The action carries the MERGED
+            # classification, so the store's own reconcile is an upgrade or a
+            # no-op — never a conflict discovered mid-write.
+            self.actions.append(
+                build_append_observation_action(
+                    proposed,
+                    case_file_issue_number=existing.case_file_issue_number,
+                    anchor_issue_number=self.anchor_issue_number,
+                    findings=self.findings,
+                    source_run_id=self.source_run_id,
+                    source_session_name=self.source_session_name,
+                    observed_at=self.observed_at,
+                    expected=self.expected,
+                    fix_class=fix_class,
+                    area=area,
+                )
+            )
+            return
+        planned_index = self._planned.get(signature)
+        if planned_index is not None:
+            self._coalesce(planned_index, proposed, fix_class=fix_class, area=area)
+            return
+        self._planned[signature] = len(self.actions)
+        self.actions.append(
+            build_case_file_issue_action(
+                proposed,
+                config=self.config,
+                anchor_issue_number=self.anchor_issue_number,
+                findings=self.findings,
+                source_run_id=self.source_run_id,
+                source_session_name=self.source_session_name,
+                observed_at=self.observed_at,
+                expected=self.expected,
+            )
+        )
+
+    def classification_for(
+        self, signature: str, proposed: "ProposedTechLeadAction"
+    ) -> tuple[str, str]:
+        """The signature's merged ``(fix_class, area)``, or raise on conflict.
+
+        The classification PREFLIGHT (#6957 round-2 review F3). It reconciles
+        this observation against everything already known about the signature —
+        the DURABLE row first, then whatever earlier observations in this same
+        decision merged into — using the one rule the store enforces.
+
+        Running it before any action is produced is what makes a conflict
+        externally invisible: the raise unwinds into the whole-decision
+        rejection in ``plan_tech_lead_decision_actions``, so no evidence
+        comment, surface action, or sibling mutation is ever applied.
+        Reconciling only at apply time published the conflicting comment first
+        and left the durable row disagreeing with it.
+        """
+        merged = self._classification.get(signature)
+        if merged is None:
+            recorded = self.pattern_ledger.get(signature)
+            merged = (
+                (recorded.fix_class, recorded.area) if recorded is not None else ("", "")
+            )
+        fix_class = reconcile_pattern_classification(
+            field="fix_class",
+            signature=signature,
+            existing=merged[0],
+            incoming=proposed.fix_class or "",
+        )
+        area = reconcile_pattern_classification(
+            field="area",
+            signature=signature,
+            existing=merged[1],
+            incoming=proposed.area or "",
+        )
+        self._classification[signature] = (fix_class, area)
+        return fix_class, area
+
+    def _coalesce(
+        self,
+        planned_index: int,
+        proposed: "ProposedTechLeadAction",
+        *,
+        fix_class: str,
+        area: str,
+    ) -> None:
+        """Fold a second first-seen observation into the pending creation.
+
+        One case file per signature, so a second observation of a signature this
+        decision is already creating rides the SAME action as an extra
+        identified observation, carrying the classification the preflight
+        already merged. Retaining only the first action's values silently lost
+        an ``unclassified -> code`` upgrade (and an area that decides routing)
+        whenever both observations arrived in one decision (#6957 review F3).
+        """
+        creation = self.actions[planned_index]
+        assert isinstance(creation, CreateTechLeadCaseFileIssueAction)
+        self.actions[planned_index] = replace(
+            creation,
+            observations=(
+                *creation.observations,
+                build_pattern_observation(
+                    proposed,
+                    anchor_issue_number=self.anchor_issue_number,
+                    findings=self.findings,
+                    source_run_id=self.source_run_id,
+                    source_session_name=self.source_session_name,
+                    observed_at=self.observed_at,
+                ),
+            ),
+            fix_class=fix_class,
+            area=area or None,
+            # An upgraded area changes the case file's ``area:*`` tag, so the
+            # labels are recomposed by their policy owner rather than left
+            # describing the first observation only.
+            labels=case_file_issue_labels(self.config, area=area or None),
+        )
 
 
 def apply_append_pattern_observation(
