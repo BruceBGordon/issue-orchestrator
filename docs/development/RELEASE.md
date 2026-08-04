@@ -1,5 +1,9 @@
 # Release Process
 
+Version numbers follow SemVer, and what a given bump is allowed to break is
+defined in [Stability & API Surface](../user/stability.md). Read that first if
+you are deciding between a patch and a minor.
+
 Use the release scripts in two operator steps so the version bump goes through
 normal branch protection before the tag is published.
 
@@ -48,6 +52,29 @@ The full release flow:
 
 `VERSION` may be passed with or without the leading `v`; package metadata stores
 the plain form (`1.0.0`) and release tags use the prefixed form (`v1.0.0`).
+
+## Pre-release tagging during `0.x`
+
+While the project is in `0.x`, the public API is explicitly unstable, so every
+release is published as a GitHub **pre-release**: step 10 runs
+`gh release create <tag> --generate-notes --prerelease`. `0.x` tags therefore
+carry the pre-release badge and do not claim the "Latest" pointer, which stays
+free until the first `1.0.0`.
+
+This is derived from the version itself — any `0.y.z` tag is marked as a
+pre-release, and `1.0.0` onward publishes as a normal release. There is no flag
+to remember and no way for the real invocation to disagree with the dry-run
+preview; both build the command through `github_release_command()` in
+`scripts/prepare_release.py`.
+
+SemVer pre-release identifiers (`v0.11.0-beta.1`) are *not* supported by the
+release tooling today: `normalize_release_version()` requires a stable `X.Y.Z`
+version so package metadata, `uv.lock`, and the tag cannot drift apart. Adding
+them is a deliberate change to that validator, not something to work around.
+
+Which surfaces `0.x` lets a minor release break, and what must graduate before
+the `0` is dropped, is documented in
+[Stability & API Surface](../user/stability.md).
 
 The Control Center footer renders `v{{ version }}` from
 `importlib.metadata.version("issue-orchestrator")` via

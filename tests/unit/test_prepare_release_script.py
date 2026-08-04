@@ -147,6 +147,52 @@ def test_confirm_release_requires_exact_tag() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    ("tag_name", "expects_prerelease"),
+    [
+        ("v0.1.0", True),
+        ("v0.10.0", True),
+        ("0.11.0", True),
+        ("v1.0.0", False),
+        ("v2.3.4", False),
+    ],
+)
+def test_github_release_command_marks_0x_releases_as_prerelease(
+    tag_name: str, expects_prerelease: bool
+) -> None:
+    """0.x is explicitly unstable, so those releases must not claim 'Latest'."""
+    command = prepare_release.github_release_command(tag_name)
+
+    assert command[:4] == ["gh", "release", "create", tag_name]
+    assert ("--prerelease" in command) is expects_prerelease
+
+
+def test_publish_release_creates_prerelease_for_0x_version(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = prepare_release.ReleasePaths.from_root(tmp_path)
+    commands: list[list[str]] = []
+
+    monkeypatch.setattr(
+        prepare_release,
+        "run_command",
+        lambda command, cwd=None: commands.append(list(command)),
+    )
+
+    prepare_release.publish_release(
+        paths, "v0.11.0", _workflow_options(dry_run=False)
+    )
+
+    assert commands[-1] == [
+        "gh",
+        "release",
+        "create",
+        "v0.11.0",
+        "--generate-notes",
+        "--prerelease",
+    ]
+
+
 def test_parse_command_rejects_empty_command() -> None:
     with pytest.raises(prepare_release.ReleasePrepError, match="empty"):
         prepare_release.parse_command("")
@@ -185,7 +231,7 @@ def test_full_release_dry_run_prints_single_workflow_without_mutating_files(
     assert "+ git ls-remote --exit-code origin refs/heads/main" in output
     assert "+ make validate-pr" in output
     assert "+ git push origin refs/tags/v0.9.0:refs/tags/v0.9.0" in output
-    assert "+ gh release create v0.9.0 --generate-notes" in output
+    assert "+ gh release create v0.9.0 --generate-notes --prerelease" in output
     assert "git commit" not in output
     assert "HEAD:main" not in output
     assert preflight_calls == ["v0.9.0"]

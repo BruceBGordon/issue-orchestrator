@@ -26,6 +26,7 @@ from issue_orchestrator.entrypoints.cli import (
     _run_test_setup,
     _load_config,
 )
+from issue_orchestrator.entrypoints import cli_parser
 from issue_orchestrator.entrypoints.cli_parser import CLICommandHandlers, build_parser
 from issue_orchestrator.domain.models import AgentConfig
 from issue_orchestrator.infra.config import Config
@@ -291,6 +292,45 @@ class TestCmdStatus:
             result = cmd_status(args)
 
             assert result == 0  # Status returns 0 even without config
+
+
+class TestDeclaredCommandSurface:
+    """``CLI_COMMANDS`` is the published surface, so drift must fail loudly."""
+
+    @staticmethod
+    def _handlers() -> CLICommandHandlers:
+        def noop(_args: argparse.Namespace) -> int:
+            return 0
+
+        return CLICommandHandlers(
+            **{field.name: noop for field in fields(CLICommandHandlers)}
+        )
+
+    def test_build_parser_accepts_declared_commands_and_rejects_others(self):
+        parser = build_parser(self._handlers())
+
+        assert parser.parse_args(["status"]).command == "status"
+        assert parser.parse_args(["health-review"]).command == "health-review"
+        with pytest.raises(SystemExit):
+            parser.parse_args(["teleport"])
+
+    def test_build_parser_rejects_a_command_missing_from_the_declared_surface(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(cli_parser, "CLI_COMMANDS", ("start",))
+
+        with pytest.raises(RuntimeError, match="Registered but undeclared"):
+            build_parser(self._handlers())
+
+    def test_build_parser_rejects_a_declared_command_that_is_not_registered(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(
+            cli_parser, "CLI_COMMANDS", (*cli_parser.CLI_COMMANDS, "teleport")
+        )
+
+        with pytest.raises(RuntimeError, match="declared but not registered"):
+            build_parser(self._handlers())
 
 
 class TestCmdSetupGuardrails:

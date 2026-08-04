@@ -79,6 +79,32 @@ class ReleasePrOptions:
     uv_executable: str | None
 
 
+def is_prerelease_version(version: str) -> bool:
+    """Return True when ``version`` is a pre-1.0 (``0.x``) release.
+
+    While the project is in ``0.x`` the public API is explicitly unstable
+    (SemVer clause 4), so every release is published as a GitHub pre-release.
+    That keeps the "Latest" pointer free for the first stable ``1.0.0`` and
+    makes the instability visible on the releases page rather than only in
+    prose. See ``docs/user/stability.md``.
+    """
+    normalized = version[1:] if version[:1].lower() == "v" else version
+    major, _, _ = normalized.partition(".")
+    return major == "0"
+
+
+def github_release_command(tag_name: str) -> list[str]:
+    """Return the ``gh release create`` command for ``tag_name``.
+
+    Single owner for the release-publishing command so the dry-run preview and
+    the real invocation cannot disagree about the pre-release marking.
+    """
+    command = ["gh", "release", "create", tag_name, "--generate-notes"]
+    if is_prerelease_version(tag_name):
+        command.append("--prerelease")
+    return command
+
+
 def normalize_release_version(raw_version: str) -> str:
     """Return a stable SemVer release version without a leading ``v``."""
     version = raw_version.strip()
@@ -641,7 +667,7 @@ def print_dry_run_commands(
             f"+ git push {RELEASE_REMOTE} refs/tags/{tag_name}:refs/tags/{tag_name}"
         )
     if options.create_github_release:
-        print(f"+ gh release create {tag_name} --generate-notes")
+        print("+ " + " ".join(github_release_command(tag_name)))
 
 
 def default_release_pr_branch_name(tag_name: str) -> str:
@@ -980,9 +1006,7 @@ def publish_release(
         print("Skipped push; tag remains local.")
 
     if options.create_github_release:
-        run_command(
-            ["gh", "release", "create", tag_name, "--generate-notes"], cwd=paths.root
-        )
+        run_command(github_release_command(tag_name), cwd=paths.root)
     else:
         print("Skipped GitHub release creation.")
 

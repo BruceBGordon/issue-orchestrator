@@ -43,7 +43,44 @@ class CLICommandHandlers:
     trace: CommandHandler
 
 
-__all__ = ["CLICommandHandlers", "build_parser"]
+# The public CLI command surface, declared as data. ``build_parser`` verifies
+# the registered commands match this tuple exactly, so the surface cannot drift
+# silently; ``docs/user/stability.md`` publishes it with a stability tier per
+# command and ``tests/unit/test_public_api_surface_docs.py`` enforces that.
+CLI_COMMANDS: tuple[str, ...] = (
+    # Runtime
+    "start",
+    "status",
+    "attach",
+    "switch",
+    "dashboard",
+    "output",
+    "pause",
+    "resume",
+    "tech_lead",
+    "health-review",
+    "refresh",
+    "restart",
+    # Setup
+    "setup",
+    "init",
+    "test-reset",
+    "e2e-reset",
+    "audit",
+    # Hooks and guardrails
+    "verify",
+    "setup-hooks",
+    "setup-guardrails",
+    # Credentials
+    "auth",
+    "keys",
+    # Diagnostics
+    "doctor",
+    "demo",
+    "trace",
+)
+
+__all__ = ["CLICommandHandlers", "CLI_COMMANDS", "build_parser"]
 
 
 def build_parser(handlers: CLICommandHandlers) -> argparse.ArgumentParser:
@@ -70,8 +107,28 @@ def build_parser(handlers: CLICommandHandlers) -> argparse.ArgumentParser:
     _register_hook_commands(subparsers, handlers)
     _register_auth_commands(subparsers, handlers)
     _register_utility_commands(subparsers, handlers)
+    _verify_declared_command_surface(subparsers)
 
     return parser
+
+
+def _verify_declared_command_surface(subparsers) -> None:
+    """Fail fast when the registered commands drift from ``CLI_COMMANDS``.
+
+    The declared tuple is what the stability doc publishes, so a command that
+    exists but is undeclared (or vice versa) is a bug, not a nuance to discover
+    later from a user report.
+    """
+    registered = set(subparsers.choices)
+    declared = set(CLI_COMMANDS)
+    if registered == declared:
+        return
+    raise RuntimeError(
+        "CLI command surface drifted from CLI_COMMANDS. "
+        f"Registered but undeclared: {sorted(registered - declared)}; "
+        f"declared but not registered: {sorted(declared - registered)}. "
+        "Update CLI_COMMANDS and docs/user/stability.md together."
+    )
 
 
 def _register_runtime_commands(subparsers, handlers: CLICommandHandlers) -> None:
