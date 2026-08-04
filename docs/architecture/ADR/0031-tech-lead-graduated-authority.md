@@ -307,10 +307,20 @@ hand is a decline.
 carries a stable identity — its source run, session, and decision action — and
 the durable ledger records it create-once, so replaying a partially applied
 decision after a crash can repeat an evidence comment but can never advance the
-count twice. Case files carry a deterministic signature marker for the same
-reason: the issue is created on GitHub before its ledger row is written, and the
-marker is what lets a retry recover that issue instead of filing a second case
-file for one signature.
+count twice.
+
+Both cross-system creations — a case file, and a promotion filing — record a
+durable **creation intent before the remote create** and finalize from THAT.
+The GitHub issue exists before its ledger row does, and a marker lookup can find
+the orphan again but cannot say which command wrote it; the retry is not
+guaranteed to be the same command, because an ordinary finalization failure is
+just a failed action and the next observation of that signature can be the one
+that recovers it. So the intent carries what only the original command knew: for
+a case file, the body's observation identity, classification, area, and
+diagnosis; for a promotion, the evidence watermark its body documents. The
+recovering action is then handled separately, as an ordinary append. An orphan
+with no intent is durable-state loss rather than a crash window, and the lane
+stops rather than guessing its metadata.
 
 A signature's `fix_class` and `area` are immutable once recorded: an
 unclassified row may be upgraded once, identical values are idempotent, and a

@@ -294,6 +294,69 @@ class PromotedFinding:
 
 
 @dataclass(frozen=True)
+class PendingCaseFile:
+    """A case-file creation recorded BEFORE its GitHub issue exists (#6957).
+
+    The remote issue is created first and its ledger row second, so a crash in
+    between leaves an issue nothing knows about. A marker lookup can find that
+    issue again, but it cannot say WHICH command wrote it — and the retry may
+    be a different, later observation of the same signature. Adopting the
+    orphan with the retrying action's metadata therefore recorded the wrong
+    body observation, and could rewrite a ``fix:human`` finding as ``fix:code``
+    without any durable row for the classification preflight to defend
+    (#6957 round-3 review F10).
+
+    This is that missing authority: written before the create, it carries
+    everything finalization needs, so recovery finalizes from the ORIGINAL
+    command and the retrying action is handled separately, as an ordinary
+    append. Discarded as soon as the ledger row lands, so it exists only inside
+    the crash window.
+    """
+
+    signature: str
+    title: str
+    idempotency_marker: str
+    # Identity of the observation the ISSUE BODY records — the one fact the
+    # retrying action cannot supply, because it wrote a different body.
+    body_observation_id: str
+    fix_class: str = ""
+    area: str = ""
+    diagnosis: str = ""
+
+    def __post_init__(self) -> None:
+        for name in ("signature", "title", "idempotency_marker", "body_observation_id"):
+            if not str(getattr(self, name)).strip():
+                raise ValueError(f"a PendingCaseFile requires a non-empty {name}")
+
+
+@dataclass(frozen=True)
+class PendingPromotion:
+    """A promotion filing recorded BEFORE its target issue exists (#6957).
+
+    The case-file mirror, for the same crash window and the same reason. The
+    fact only this can carry is ``body_observations``: the evidence count the
+    filed issue's BODY actually documents. Seeding the promotion's high-water
+    mark from the retrying action instead recorded a count the target was never
+    told about, and ``select_promotion_updates`` then never emitted the
+    intervening evidence comment — evidence suppressed permanently (#6957
+    round-3 review F11).
+    """
+
+    signature: str
+    case_file_issue_number: int
+    target_repo: str
+    title: str
+    idempotency_marker: str
+    area: str = ""
+    body_observations: int = 0
+
+    def __post_init__(self) -> None:
+        for name in ("signature", "target_repo", "title", "idempotency_marker"):
+            if not str(getattr(self, name)).strip():
+                raise ValueError(f"a PendingPromotion requires a non-empty {name}")
+
+
+@dataclass(frozen=True)
 class PromotableFinding:
     """A signature eligible for promotion this tick, with its resolved route."""
 

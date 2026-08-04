@@ -8,6 +8,8 @@ import pytest
 from issue_orchestrator.domain.models import DiscoveredFailure
 from issue_orchestrator.domain.tech_lead_findings import (
     PatternClassificationConflictError,
+    PendingCaseFile,
+    PendingPromotion,
 )
 from issue_orchestrator.domain.tech_lead_session import (
     StoredTechLeadOp,
@@ -20,6 +22,7 @@ from issue_orchestrator.ports.tech_lead_authority import (
     TechLeadAuthorityConflictError,
     TechLeadOpConflictError,
     TechLeadPatternConflictError,
+    TechLeadPendingIntentConflictError,
     TechLeadShippedFixConflictError,
     TechLeadStormCohortConflictError,
 )
@@ -661,6 +664,139 @@ def test_identical_classification_is_idempotent(tmp_path: Path, make_store) -> N
         "DB",
         2,
     )
+
+
+# --- In-flight creation intents (#6957 round-3 review F10/F11) -------------
+
+
+def _pending_case_file(**overrides) -> PendingCaseFile:
+    fields = dict(
+        signature="db-timeout",
+        title="Pattern case file: db-timeout",
+        idempotency_marker="<!-- marker -->",
+        body_observation_id="r1:s:A1",
+        fix_class="human",
+        area="database",
+        diagnosis="Mechanism: leaked DB connection.",
+    )
+    fields.update(overrides)
+    return PendingCaseFile(**fields)
+
+
+def _pending_promotion(**overrides) -> PendingPromotion:
+    fields = dict(
+        signature="db-timeout",
+        case_file_issue_number=600,
+        target_repo="owner/upstream",
+        title="[tech-lead:repo] db-timeout",
+        idempotency_marker="<!-- marker -->",
+        area="database",
+        body_observations=2,
+    )
+    fields.update(overrides)
+    return PendingPromotion(**fields)
+
+
+@pytest.mark.parametrize("make_store", OP_STORES)
+def test_pending_case_file_round_trip(tmp_path: Path, make_store) -> None:
+    store = make_store(tmp_path)
+    store.record_pending_case_file(pending=_pending_case_file())
+
+    assert store.load_pending_case_file(signature="db-timeout") == _pending_case_file()
+    assert store.load_pending_case_file(signature="absent") is None
+
+    store.discard_pending_case_file(signature="db-timeout")
+    assert store.load_pending_case_file(signature="db-timeout") is None
+    store.discard_pending_case_file(signature="db-timeout")  # idempotent
+
+
+@pytest.mark.parametrize("make_store", OP_STORES)
+def test_pending_case_file_is_create_once(tmp_path: Path, make_store) -> None:
+    """A later command must never silently replace an earlier one's authority."""
+    store = make_store(tmp_path)
+    store.record_pending_case_file(pending=_pending_case_file())
+    store.record_pending_case_file(pending=_pending_case_file())  # identical: no-op
+
+    with pytest.raises(TechLeadPendingIntentConflictError):
+        store.record_pending_case_file(
+            pending=_pending_case_file(body_observation_id="r2:s:B1", fix_class="code")
+        )
+
+    assert store.load_pending_case_file(signature="db-timeout") == _pending_case_file()
+
+
+@pytest.mark.parametrize("make_store", OP_STORES)
+def test_pending_promotion_round_trip_and_create_once(
+    tmp_path: Path, make_store
+) -> None:
+    store = make_store(tmp_path)
+    store.record_pending_promotion(pending=_pending_promotion())
+    store.record_pending_promotion(pending=_pending_promotion())
+
+    assert store.load_pending_promotion(signature="db-timeout") == _pending_promotion()
+
+    with pytest.raises(TechLeadPendingIntentConflictError):
+        store.record_pending_promotion(pending=_pending_promotion(body_observations=3))
+
+    store.discard_pending_promotion(signature="db-timeout")
+    assert store.load_pending_promotion(signature="db-timeout") is None
+
+
+def test_pending_intents_survive_reopen(tmp_path: Path) -> None:
+    """They only help if they outlive the process that crashed."""
+    store = SqliteTechLeadAuthorityStore.for_repo(tmp_path)
+    store.record_pending_case_file(pending=_pending_case_file())
+    store.record_pending_promotion(pending=_pending_promotion())
+
+    reopened = SqliteTechLeadAuthorityStore.for_repo(tmp_path)
+
+    assert reopened.load_pending_case_file(signature="db-timeout") == (
+        _pending_case_file()
+    )
+    assert reopened.load_pending_promotion(signature="db-timeout") == (
+        _pending_promotion()
+    )
+
+
+@pytest.mark.parametrize("make_store", OP_STORES)
+def test_load_pattern_evidence_reads_one_signature(tmp_path: Path, make_store) -> None:
+    store = make_store(tmp_path)
+    store.record_pattern(
+        signature="db-timeout",
+        issue_number=600,
+        observation_id="r1:s:A1",
+        fix_class="code",
+        area="database",
+    )
+
+    row = store.load_pattern_evidence(signature="db-timeout")
+
+    assert row is not None
+    assert (row.case_file_issue_number, row.fix_class, row.area) == (
+        600,
+        "code",
+        "database",
+    )
+    assert store.load_pattern_evidence(signature="absent") is None
+
+
+def test_pending_intent_methods_satisfy_the_port() -> None:
+    from issue_orchestrator.ports.tech_lead_authority import (
+        TechLeadAuthorityStore as TechLeadAuthorityStorePort,
+    )
+
+    for method in (
+        "record_pending_case_file",
+        "load_pending_case_file",
+        "discard_pending_case_file",
+        "record_pending_promotion",
+        "load_pending_promotion",
+        "discard_pending_promotion",
+        "load_pattern_evidence",
+    ):
+        assert callable(getattr(SqliteTechLeadAuthorityStore, method))
+        assert callable(getattr(InMemoryTechLeadAuthorityStore, method))
+        assert callable(getattr(TechLeadAuthorityStorePort, method))
 
 
 def test_pattern_methods_satisfy_the_port() -> None:

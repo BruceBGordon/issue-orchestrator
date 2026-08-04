@@ -22,6 +22,8 @@ if TYPE_CHECKING:
     from ..domain.models import DiscoveredFailure
     from ..domain.tech_lead_findings import (
         PatternEvidence,
+        PendingCaseFile,
+        PendingPromotion,
         PromotedFinding,
         PromotionState,
     )
@@ -54,6 +56,17 @@ class TechLeadShippedFixConflictError(RuntimeError):
 
 class TechLeadPromotionConflictError(RuntimeError):
     """A different promotion already exists for this pattern signature."""
+
+
+class TechLeadPendingIntentConflictError(RuntimeError):
+    """A different in-flight creation is already recorded for this signature.
+
+    The in-flight intent is the authority for an issue that exists remotely but
+    has no ledger row yet, so a later command must never silently replace it —
+    that is exactly how a retry came to attribute an older issue body to itself
+    (#6957 round-3 review F10/F11). The owner discards a proven-stale intent
+    explicitly instead.
+    """
 
 
 class UnknownTechLeadPatternError(KeyError):
@@ -264,6 +277,41 @@ class TechLeadAuthorityStore(Protocol):
         """Return the case-file issue for a signature, or None when absent."""
         ...
 
+    def load_pattern_evidence(self, *, signature: str) -> "PatternEvidence | None":
+        """One signature's durable row, or None when it has no case file.
+
+        The single-signature read the apply-time classification preflight needs:
+        an evidence comment must never be published before its classification is
+        reconciled against what is recorded (#6957 round-3 review F10).
+        """
+        ...
+
+    # -- In-flight case-file creations (#6957 round-3 review F10) -----------
+    #
+    # A case file's GitHub issue is created BEFORE its ledger row. This is the
+    # durable record of what that in-flight creation MEANT, written before the
+    # remote create and discarded once the row lands, so a retry finalizes from
+    # the original command instead of inferring it from whichever later action
+    # happened to recover the orphan.
+
+    def record_pending_case_file(self, *, pending: "PendingCaseFile") -> None:
+        """Persist an in-flight case-file creation (create-once).
+
+        An identical payload is a no-op; a DIFFERENT payload for an existing
+        signature must raise :class:`TechLeadPendingIntentConflictError`. The
+        owner discards a proven-stale intent explicitly rather than letting a
+        later command silently overwrite the authority of an earlier one.
+        """
+        ...
+
+    def load_pending_case_file(self, *, signature: str) -> "PendingCaseFile | None":
+        """Return a signature's in-flight creation, or None when absent."""
+        ...
+
+    def discard_pending_case_file(self, *, signature: str) -> None:
+        """Remove an in-flight creation row. No-op if absent."""
+        ...
+
     def list_patterns(self) -> tuple[tuple[str, int], ...]:
         """All (signature, case_file_issue_number) rows — the pattern ledger."""
         ...
@@ -292,6 +340,25 @@ class TechLeadAuthorityStore(Protocol):
         existing signature must raise :class:`TechLeadPromotionConflictError` —
         a signature promotes to exactly one issue, ever.
         """
+        ...
+
+    # -- In-flight promotion filings (#6957 round-3 review F11) -------------
+    #
+    # The promotion mirror of the pending case file, for the same crash window.
+    # Its load-bearing field is the evidence watermark the FILED BODY documents:
+    # seeding it from a later retrying action recorded evidence the target was
+    # never told about, permanently suppressing that comment.
+
+    def record_pending_promotion(self, *, pending: "PendingPromotion") -> None:
+        """Persist an in-flight promotion filing (create-once)."""
+        ...
+
+    def load_pending_promotion(self, *, signature: str) -> "PendingPromotion | None":
+        """Return a signature's in-flight filing, or None when absent."""
+        ...
+
+    def discard_pending_promotion(self, *, signature: str) -> None:
+        """Remove an in-flight filing row. No-op if absent."""
         ...
 
     def load_promotion(self, *, signature: str) -> "PromotedFinding | None":
@@ -351,6 +418,8 @@ class InMemoryTechLeadAuthorityStore:
         # signature -> the observation identities already counted (create-once).
         self._observations: dict[str, set[str]] = {}
         self._promotions: dict[str, "PromotedFinding"] = {}
+        self._pending_case_files: dict[str, "PendingCaseFile"] = {}
+        self._pending_promotions: dict[str, "PendingPromotion"] = {}
         self._shipped_fixes: dict[int, "TechLeadShippedFixSummary"] = {}
         self._storm_cohorts: dict[int, tuple["DiscoveredFailure", ...]] = {}
 
@@ -506,6 +575,43 @@ class InMemoryTechLeadAuthorityStore:
 
     def lookup_pattern(self, *, signature: str) -> int | None:
         return self._patterns.get(signature)
+
+    def load_pattern_evidence(self, *, signature: str) -> "PatternEvidence | None":
+        return self._evidence.get(signature)
+
+    def record_pending_case_file(self, *, pending: "PendingCaseFile") -> None:
+        existing = self._pending_case_files.get(pending.signature)
+        if existing is not None:
+            if existing == pending:
+                return
+            raise TechLeadPendingIntentConflictError(
+                f"a different in-flight case file is already recorded for"
+                f" signature {pending.signature!r}"
+            )
+        self._pending_case_files[pending.signature] = pending
+
+    def load_pending_case_file(self, *, signature: str) -> "PendingCaseFile | None":
+        return self._pending_case_files.get(signature)
+
+    def discard_pending_case_file(self, *, signature: str) -> None:
+        self._pending_case_files.pop(signature, None)
+
+    def record_pending_promotion(self, *, pending: "PendingPromotion") -> None:
+        existing = self._pending_promotions.get(pending.signature)
+        if existing is not None:
+            if existing == pending:
+                return
+            raise TechLeadPendingIntentConflictError(
+                f"a different in-flight promotion is already recorded for"
+                f" signature {pending.signature!r}"
+            )
+        self._pending_promotions[pending.signature] = pending
+
+    def load_pending_promotion(self, *, signature: str) -> "PendingPromotion | None":
+        return self._pending_promotions.get(signature)
+
+    def discard_pending_promotion(self, *, signature: str) -> None:
+        self._pending_promotions.pop(signature, None)
 
     def list_patterns(self) -> tuple[tuple[str, int], ...]:
         return tuple(sorted(self._patterns.items()))

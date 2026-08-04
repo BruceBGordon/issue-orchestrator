@@ -25,7 +25,6 @@ from typing import TYPE_CHECKING
 from ..domain.tech_lead_findings import (
     PROMOTION_STATE_DECLINED,
     PROMOTION_STATE_SHIPPED,
-    PromotedFinding,
 )
 from .actions import (
     Action,
@@ -34,6 +33,7 @@ from .actions import (
     ReportPromotedFindingEvidenceAction,
     SettleTechLeadPromotionAction,
 )
+from .tech_lead_promotion_filing import PromotionFilingOwner
 
 if TYPE_CHECKING:
     from ..ports import RepositoryHost
@@ -56,11 +56,13 @@ def apply_promote_tech_lead_finding(
 ) -> ActionResult:
     """File a promoted finding issue and record its ledger row create-once.
 
-    Order matters: file FIRST, record SECOND. A filing that raises leaves the
-    ledger untouched so the next tick retries cleanly; a recorded row makes the
-    signature permanently ineligible, so it must only exist for an issue that
-    actually exists. The target's deterministic marker lookup absorbs a crash
-    between the two by returning the already-created remote issue on retry.
+    The whole filing transaction belongs to :class:`PromotionFilingOwner`:
+    durable intent, then the remote create (or recovery of an interrupted one),
+    then the ledger row. A filing that raises leaves no promotion row, so the
+    next tick retries cleanly; a recorded row makes the signature permanently
+    ineligible, so it must only exist for an issue that actually exists — and
+    its evidence watermark must be the one the FILED BODY documents, never the
+    retrying action's live count (#6957 round-3 review F11).
     """
     assert isinstance(action, PromoteTechLeadFindingAction)
     if target is None or authority is None:
@@ -69,23 +71,20 @@ def apply_promote_tech_lead_finding(
             "tech_lead finding promotion requires a PromotionTargetHost and the"
             " TechLeadAuthorityStore wired into this applier",
         )
+    filing = PromotionFilingOwner(authority=authority, target=target)
     existing = authority.load_promotion(signature=action.signature)
     if existing is not None:
         # Belt-and-braces against a stale plan: the ledger is the authority on
-        # at-most-once, not the planning snapshot it was derived from.
+        # at-most-once, not the planning snapshot it was derived from. An intent
+        # left behind by a crash after the row landed is inert; retire it.
+        filing.forget_pending(action.signature)
         return ActionResult.ok(
             action,
             issue_number=existing.target_issue_number,
             deduplicated=True,
         )
     try:
-        filed = target.file_issue(
-            repo=action.target_repo,
-            title=action.title,
-            body=action.body,
-            labels=list(action.labels),
-            idempotency_marker=action.idempotency_marker,
-        )
+        filed = filing.file(action, recorded_at=now_iso or _utc_now_iso())
     except Exception as exc:
         logger.exception(
             "Failed to file promoted tech_lead finding %r in %s",
@@ -93,30 +92,20 @@ def apply_promote_tech_lead_finding(
             action.target_repo,
         )
         return ActionResult.fail(action, str(exc))
-    authority.record_promotion(
-        promotion=PromotedFinding(
-            signature=action.signature,
-            case_file_issue_number=action.case_file_issue_number,
-            target_repo=action.target_repo,
-            target_issue_number=filed.number,
-            area=action.area,
-            title=action.title,
-            recorded_at=now_iso or _utc_now_iso(),
-            reported_observations=action.observation_count,
-        )
-    )
     logger.info(
-        "[tech_lead] Promoted finding %r -> %s#%d (case file #%d)",
+        "[tech_lead] Promoted finding %r -> %s#%d (case file #%d)%s",
         action.signature,
         action.target_repo,
-        filed.number,
+        filed.issue_number,
         action.case_file_issue_number,
+        " [resumed an interrupted filing]" if filed.recovered else "",
     )
     return ActionResult.ok(
         action,
-        issue_number=filed.number,
+        issue_number=filed.issue_number,
         target_repo=action.target_repo,
         url=filed.url,
+        recovered=filed.recovered,
     )
 
 

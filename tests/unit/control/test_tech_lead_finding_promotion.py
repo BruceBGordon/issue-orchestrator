@@ -492,13 +492,16 @@ class TestPromotionIssueComposition:
 # ---------------------------------------------------------------------------
 
 
-def _promote_action(signature: str = "anchor-close") -> PromoteTechLeadFindingAction:
+def _promote_action(
+    signature: str = "anchor-close", *, observations: int = 2
+) -> PromoteTechLeadFindingAction:
     config = _config()
     [action] = plan_finding_promotions(
         config,
         promotable=(
             PromotableFinding(
-                evidence=_evidence(signature, case_file=65), target_repo=UPSTREAM
+                evidence=_evidence(signature, case_file=65, observations=observations),
+                target_repo=UPSTREAM,
             ),
         ),
     )
@@ -576,15 +579,18 @@ class TestFiling:
         authority = FailFirstLedgerWrite()
         action = _promote_action()
 
-        with pytest.raises(RuntimeError, match="before the ledger commit"):
-            apply_promote_tech_lead_finding(
-                action,
-                target=target,
-                authority=authority,
-                now_iso="t1",
-            )
+        crashed = apply_promote_tech_lead_finding(
+            action,
+            target=target,
+            authority=authority,
+            now_iso="t1",
+        )
+        assert not crashed.success
         assert len(target.filed) == 1
         assert authority.load_promotion(signature=action.signature) is None
+        # The durable creation intent survives, and it is what the retry
+        # finalizes from (#6957 round-3 review F11).
+        assert authority.load_pending_promotion(signature=action.signature) is not None
 
         recovered = apply_promote_tech_lead_finding(
             action,
@@ -600,6 +606,124 @@ class TestFiling:
             authority.load_promotion(signature=action.signature).target_issue_number
             == 1001
         )
+        # The intent is retired once the ledger row lands.
+        assert authority.load_pending_promotion(signature=action.signature) is None
+
+    def test_recovery_keeps_the_watermark_the_filed_body_documents(self):
+        """#6957 round-3 review F11: evidence must not be suppressed.
+
+        A count-2 promotion is filed, its ledger write fails, the case file then
+        reaches count 3, and a count-3 action recovers the SAME remote issue.
+        Seeding reported_observations from that later action recorded evidence
+        the target was never told, so select_promotion_updates never emitted the
+        count-3 comment — permanently.
+        """
+
+        class FailFirstLedgerWrite(InMemoryTechLeadAuthorityStore):
+            def __init__(self) -> None:
+                super().__init__()
+                self.fail_next_record = True
+
+            def record_promotion(self, *, promotion):
+                if self.fail_next_record:
+                    self.fail_next_record = False
+                    raise RuntimeError("process died before the ledger commit")
+                super().record_promotion(promotion=promotion)
+
+        target = InMemoryPromotionTargetHost()
+        authority = FailFirstLedgerWrite()
+
+        # 1. Filed at count 2; the ledger write dies.
+        crashed = apply_promote_tech_lead_finding(
+            _promote_action(observations=2),
+            target=target,
+            authority=authority,
+            now_iso="t1",
+        )
+        assert not crashed.success
+        assert len(target.filed) == 1
+        assert (
+            authority.load_pending_promotion(
+                signature="anchor-close"
+            ).body_observations
+            == 2
+        )
+
+        # 2. The case file accrues a third observation, so the next tick plans a
+        #    count-3 filing action, which recovers the same remote issue.
+        recovered = apply_promote_tech_lead_finding(
+            _promote_action(observations=3),
+            target=target,
+            authority=authority,
+            now_iso="t2",
+        )
+
+        assert recovered.success
+        assert len(target.filed) == 1  # no second issue
+        assert recovered.details["recovered"] is True
+        promotion = authority.load_promotion(signature="anchor-close")
+        # The watermark is the count the FILED BODY documents, not the action's.
+        assert promotion.reported_observations == 2
+
+        # 3. ...so the count-3 evidence comment is still planned, and only the
+        #    successful target comment advances the watermark.
+        [update] = select_promotion_updates(
+            evidence=[_evidence("anchor-close", observations=3)],
+            promotions=[promotion],
+        )
+        assert update.observation_count == 3
+        [report] = plan_promotion_updates(_config(), updates=(update,))
+        assert apply_report_promoted_finding_evidence(
+            report, target=target, authority=authority
+        ).success
+        assert len(target.comments) == 1
+        assert (
+            authority.load_promotion(signature="anchor-close").reported_observations
+            == 3
+        )
+
+    def test_a_fresh_filing_seeds_the_watermark_from_its_own_body(self):
+        target = InMemoryPromotionTargetHost()
+        authority = InMemoryTechLeadAuthorityStore()
+
+        result = apply_promote_tech_lead_finding(
+            _promote_action(observations=4),
+            target=target,
+            authority=authority,
+            now_iso="t",
+        )
+
+        assert result.success and result.details["recovered"] is False
+        assert (
+            authority.load_promotion(signature="anchor-close").reported_observations
+            == 4
+        )
+
+    def test_a_rerouted_in_flight_filing_refuses_to_file_a_second_issue(self):
+        """Unreachable while areas are immutable, but never guessed at."""
+        from issue_orchestrator.domain.tech_lead_findings import PendingPromotion
+
+        target = InMemoryPromotionTargetHost()
+        authority = InMemoryTechLeadAuthorityStore()
+        action = _promote_action()
+        authority.record_pending_promotion(
+            pending=PendingPromotion(
+                signature=action.signature,
+                case_file_issue_number=65,
+                target_repo="somewhere/else",
+                title=action.title,
+                idempotency_marker=action.idempotency_marker,
+                body_observations=2,
+            )
+        )
+
+        result = apply_promote_tech_lead_finding(
+            action, target=target, authority=authority, now_iso="t"
+        )
+
+        assert not result.success
+        assert "refusing to file a second issue" in (result.error or "")
+        assert target.filed == []
 
     def test_promotion_action_carries_stable_marker_in_remote_body(self):
         action = _promote_action("signature-with--html-risk")

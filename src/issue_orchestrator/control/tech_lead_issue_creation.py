@@ -24,7 +24,7 @@ from .actions import (
     CreateTechLeadProposalIssueAction,
 )
 from .label_manager import tech_lead_issue_label_metadata
-from .tech_lead_case_file_owner import PatternCaseFileOwner
+from .tech_lead_case_file_owner import CaseFileState, PatternCaseFileOwner
 from .tech_lead_issue_policy import resolve_tech_lead_milestone_number
 
 if TYPE_CHECKING:
@@ -133,14 +133,18 @@ def _creation_preflight(
             # owner's question, not this boundary's: it checks the ledger AND
             # recovers an issue a previous attempt created before dying, so one
             # signature can never end up with two case files (#6957 R2 F10).
-            existing = case_files.resolve(action)
-            if existing is not None:
-                case_files.adopt(action, issue_number=existing)
+            resolution = case_files.resolve(action)
+            if resolution.issue_number is not None:
+                # Committed or just recovered: either way this action's
+                # observations are appends onto the existing case file, with
+                # their classification reconciled before anything is posted.
+                case_files.adopt(action, issue_number=resolution.issue_number)
                 return ActionResult.ok(
                     action,
-                    issue_number=existing,
+                    issue_number=resolution.issue_number,
                     pr_count=action.pr_count,
                     deduplicated=True,
+                    recovered=resolution.state is CaseFileState.RECOVERED,
                 )
         except Exception as exc:
             logger.exception(
@@ -197,6 +201,12 @@ def apply_create_tech_lead_issue(
         milestone = resolve_tech_lead_milestone_number(
             action.milestone, repository_host.list_milestones
         )
+        if isinstance(action, CreateTechLeadCaseFileIssueAction):
+            # Durable creation intent BEFORE the remote create, so an
+            # interrupted creation stays attributable to THIS command rather
+            # than to whichever later action recovers it (#6957 R3 F10).
+            assert case_files is not None
+            case_files.begin(action)
         result = repository_host.create_issue(
             title=action.title,
             body=action.body,

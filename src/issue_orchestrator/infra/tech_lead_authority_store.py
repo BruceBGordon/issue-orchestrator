@@ -43,6 +43,8 @@ from ..domain.models import DiscoveredFailure
 from ..domain.tech_lead_findings import (
     VALID_PROMOTION_STATES,
     PatternEvidence,
+    PendingCaseFile,
+    PendingPromotion,
     PromotedFinding,
     PromotionState,
     reconcile_pattern_classification,
@@ -62,6 +64,7 @@ from ..ports.tech_lead_authority import (
     UnknownTechLeadPatternError,
 )
 from .repo_identity import state_dir
+from . import tech_lead_pending_intents as pending_intents
 from .sqlite_connection import open_sqlite
 from .tech_lead_authority_schema import initialize_tech_lead_authority_schema
 
@@ -71,6 +74,22 @@ logger = logging.getLogger(__name__)
 def _cohort_from_payload(payload: str) -> tuple[DiscoveredFailure, ...]:
     """Rehydrate a stored cohort payload into typed failure facts."""
     return tuple(DiscoveredFailure.from_dict(item) for item in json.loads(payload))
+
+
+def _pattern_evidence_from_row(row: sqlite3.Row) -> PatternEvidence:
+    """Project one pattern row onto its typed domain value (#6781/#6957)."""
+    return PatternEvidence(
+        signature=str(row["signature"]),
+        case_file_issue_number=int(row["issue_number"]),
+        observation_count=int(row["observation_count"]),
+        fix_class=str(row["fix_class"]),
+        area=str(row["area"]),
+        diagnosis=str(row["diagnosis"]),
+    )
+
+
+
+
 
 
 def _promotion_from_row(row: sqlite3.Row) -> PromotedFinding:
@@ -438,6 +457,50 @@ class SqliteTechLeadAuthorityStore:
         ).fetchone()
         return int(row["issue_number"]) if row is not None else None
 
+    def load_pattern_evidence(self, *, signature: str) -> PatternEvidence | None:
+        """One signature's durable row, or None when it has no case file."""
+        conn = self._get_connection()
+        row = conn.execute(
+            "SELECT signature, issue_number, observation_count, fix_class, area,"
+            " diagnosis FROM tech_lead_patterns WHERE signature = ?",
+            (signature,),
+        ).fetchone()
+        return _pattern_evidence_from_row(row) if row is not None else None
+
+    # -- In-flight creations (#6957 round-3 review F10/F11) ------------------
+    #
+    # The crash-window outbox. Its SQL lives in ``tech_lead_pending_intents``
+    # (same shape, same lifetime, distinct from the durable ledgers); this store
+    # owns the connection and the transaction boundary those functions run in.
+
+    def record_pending_case_file(self, *, pending: PendingCaseFile) -> None:
+        """Persist an in-flight case-file creation (create-once)."""
+        with self._transaction() as tx:
+            pending_intents.insert_case_file(tx, pending)
+
+    def load_pending_case_file(self, *, signature: str) -> PendingCaseFile | None:
+        """Return a signature's in-flight creation, or None when absent."""
+        return pending_intents.select_case_file(self._get_connection(), signature)
+
+    def discard_pending_case_file(self, *, signature: str) -> None:
+        """Remove an in-flight creation row. No-op if absent."""
+        with self._transaction() as tx:
+            pending_intents.delete_case_file(tx, signature)
+
+    def record_pending_promotion(self, *, pending: PendingPromotion) -> None:
+        """Persist an in-flight promotion filing (create-once)."""
+        with self._transaction() as tx:
+            pending_intents.insert_promotion(tx, pending)
+
+    def load_pending_promotion(self, *, signature: str) -> PendingPromotion | None:
+        """Return a signature's in-flight filing, or None when absent."""
+        return pending_intents.select_promotion(self._get_connection(), signature)
+
+    def discard_pending_promotion(self, *, signature: str) -> None:
+        """Remove an in-flight filing row. No-op if absent."""
+        with self._transaction() as tx:
+            pending_intents.delete_promotion(tx, signature)
+
     def list_patterns(self) -> tuple[tuple[str, int], ...]:
         """All (signature, case_file_issue_number) rows — the pattern ledger."""
         conn = self._get_connection()
@@ -454,17 +517,7 @@ class SqliteTechLeadAuthorityStore:
             " diagnosis"
             " FROM tech_lead_patterns ORDER BY signature",
         ).fetchall()
-        return tuple(
-            PatternEvidence(
-                signature=str(row["signature"]),
-                case_file_issue_number=int(row["issue_number"]),
-                observation_count=int(row["observation_count"]),
-                fix_class=str(row["fix_class"]),
-                area=str(row["area"]),
-                diagnosis=str(row["diagnosis"]),
-            )
-            for row in rows
-        )
+        return tuple(_pattern_evidence_from_row(row) for row in rows)
 
     # -- Promoted findings (#6957) ------------------------------------------
 

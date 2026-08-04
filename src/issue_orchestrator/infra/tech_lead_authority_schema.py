@@ -44,6 +44,26 @@ CREATE TABLE IF NOT EXISTS tech_lead_pattern_observations (
     recorded_at TEXT NOT NULL,
     PRIMARY KEY (signature, observation_id)
 );
+CREATE TABLE IF NOT EXISTS tech_lead_pending_case_files (
+    signature TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    idempotency_marker TEXT NOT NULL,
+    body_observation_id TEXT NOT NULL,
+    fix_class TEXT NOT NULL DEFAULT '',
+    area TEXT NOT NULL DEFAULT '',
+    diagnosis TEXT NOT NULL DEFAULT '',
+    recorded_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS tech_lead_pending_promotions (
+    signature TEXT PRIMARY KEY,
+    case_file_issue_number INTEGER NOT NULL,
+    target_repo TEXT NOT NULL,
+    title TEXT NOT NULL,
+    idempotency_marker TEXT NOT NULL,
+    area TEXT NOT NULL DEFAULT '',
+    body_observations INTEGER NOT NULL DEFAULT 0,
+    recorded_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS tech_lead_promoted_findings (
     signature TEXT PRIMARY KEY,
     case_file_issue_number INTEGER NOT NULL,
