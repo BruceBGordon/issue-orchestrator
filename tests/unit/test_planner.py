@@ -9,6 +9,7 @@ import logging
 from pathlib import Path
 from unittest.mock import Mock, MagicMock
 
+from issue_orchestrator.domain.tech_lead_session import TechLeadCreationOrigin
 from issue_orchestrator.infra.config import Config
 from issue_orchestrator.control.planner import (
     Planner,
@@ -3244,6 +3245,7 @@ class TestStormCohortCleanupLifecycle:
                 labels=("agent:tech-lead", HEALTH_REVIEW_MARKER_LABEL),
                 pr_count=0,
                 storm_problems=tuple(cohort),
+                origin=TechLeadCreationOrigin.authors_anchor(),
             ),
             999,
             state,

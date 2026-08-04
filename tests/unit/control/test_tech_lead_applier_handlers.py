@@ -42,6 +42,7 @@ from issue_orchestrator.domain.tech_lead_session import (
     PROPOSED_TECH_LEAD_LABEL,
     StoredTechLeadOp,
     TECH_LEAD_OBSERVATION_LABEL,
+    TechLeadCreationOrigin,
 )
 
 ANCHOR = 77
@@ -73,7 +74,7 @@ def _mutating_actions() -> dict[ActionType, tuple[Action, int]]:
                 title="follow-up",
                 body="b",
                 labels=("agent:backend",),
-                anchor_issue_number=ANCHOR,
+                origin=TechLeadCreationOrigin.derived_from_anchor(ANCHOR),
                 expected=expected,
             ),
             ANCHOR,
@@ -83,7 +84,7 @@ def _mutating_actions() -> dict[ActionType, tuple[Action, int]]:
                 title="Tech Lead proposal",
                 body="b",
                 labels=("agent:tech-lead", PROPOSED_TECH_LEAD_LABEL),
-                anchor_issue_number=ANCHOR,
+                origin=TechLeadCreationOrigin.derived_from_anchor(ANCHOR),
                 op=_op(),
                 expected=expected,
             ),
@@ -95,7 +96,7 @@ def _mutating_actions() -> dict[ActionType, tuple[Action, int]]:
                 body=f"b\n\n{CASE_FILE_MARKER}",
                 labels=("agent:tech-lead", TECH_LEAD_OBSERVATION_LABEL),
                 pattern_signature="sig",
-                anchor_issue_number=ANCHOR,
+                origin=TechLeadCreationOrigin.derived_from_anchor(ANCHOR),
                 idempotency_marker=CASE_FILE_MARKER,
                 observations=(
                     PatternObservation(observation_id="r1:s:A1", comment="observed"),

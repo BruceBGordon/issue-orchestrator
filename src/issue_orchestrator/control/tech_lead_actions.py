@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 from ..domain.models import DiscoveredFailure
 from ..domain.tech_lead_milestone import TechLeadMilestoneIntent
-from ..domain.tech_lead_session import TechLeadSessionFlavor
+from ..domain.tech_lead_session import TechLeadCreationOrigin, TechLeadSessionFlavor
 from .action_base import Action, ActionType
 
 if TYPE_CHECKING:
@@ -120,17 +120,44 @@ class CreateTechLeadIssueAction(Action):
     # tech lead marked urgent. The applier's create boundary reads it (with the
     # gate presence) to front-queue the new issue via the expedite owner.
     expedite: bool = False
-    # The tech-lead session anchor this creation was decided from, and therefore
-    # the issue its reconciliation gate reads (#6957 round-6 review F3/A3). 0 for
-    # the two planner-side creations that AUTHOR an anchor (batch review, health
-    # review): there is no prior issue to reconcile against, and they carry no
-    # ``expected`` either — the dispatch guard enforces that pairing.
-    anchor_issue_number: int = 0
+    # WHY this creation exists, and therefore what its reconciliation gate reads
+    # (#6957 round-2 review F6/A6). Required and keyword-only ON PURPOSE: this
+    # type serves two materially different commands — authoring a batch/health
+    # anchor (no subject, no expectations) and creating something a session
+    # DECIDED while working an anchor (positive subject, expectations required).
+    # Encoding that as a pair of defaulted fields meant composition which
+    # dropped both produced a follow-up that looked like anchor authoring and
+    # wrote unguarded. Omitting this field is now a TypeError, not a default.
+    origin: "TechLeadCreationOrigin" = field(kw_only=True)
     action_type: ActionType = field(default=ActionType.CREATE_TECH_LEAD_ISSUE, init=False)
+
+    def __post_init__(self) -> None:
+        # The other half of the invariant the origin cannot see: a derived
+        # creation whose ExpectedState was dropped would still reach the gate,
+        # which returns immediately when ``expected is None`` — a guard that
+        # checks nothing. Reject the combination at construction instead.
+        if self.origin.requires_expected_state and self.expected is None:
+            raise ValueError(
+                f"{type(self).__name__} derived from anchor"
+                f" #{self.origin.anchor_issue_number} must carry an ExpectedState;"
+                " without one the reconciliation gate passes unconditionally and"
+                " a paused anchor can still spawn issues"
+            )
+        if not self.origin.requires_expected_state and self.expected is not None:
+            raise ValueError(
+                f"{type(self).__name__} authors its own anchor, so it has no"
+                " issue to check an ExpectedState against; carrying one means"
+                " the reconciliation subject was dropped in composition"
+            )
+
+    @property
+    def anchor_issue_number(self) -> int:
+        """The anchor this creation was decided from (0 when it authors one)."""
+        return self.origin.anchor_issue_number
 
     def reconciliation_subject(self) -> int:
         """The anchor issue whose pause label gates this creation."""
-        return self.anchor_issue_number
+        return self.origin.reconciliation_subject
 
 
 @dataclass(frozen=True)
@@ -153,6 +180,7 @@ class CreateTechLeadProposalIssueAction(CreateTechLeadIssueAction):
     def __post_init__(self) -> None:
         from ..domain.tech_lead_session import PROPOSED_TECH_LEAD_LABEL
 
+        super().__post_init__()
         # Self-validating type: an ungated proposal issue would be
         # schedulable before any approval. (Baseline note: this branch is an
         # accepted control_policy_branch_sites entry — the invariant is
@@ -162,10 +190,13 @@ class CreateTechLeadProposalIssueAction(CreateTechLeadIssueAction):
                 "CreateTechLeadProposalIssueAction must carry the"
                 f" {PROPOSED_TECH_LEAD_LABEL!r} gate label"
             )
-        if self.anchor_issue_number <= 0:
+        # A gated proposal is always something a session DECIDED; it can never
+        # be the anchor. The positive anchor number itself is guaranteed by the
+        # origin, so this only rules out the wrong KIND.
+        if self.origin.authors_new_anchor:
             raise ValueError(
-                "CreateTechLeadProposalIssueAction requires a positive"
-                " anchor_issue_number"
+                "CreateTechLeadProposalIssueAction is always derived from the"
+                " tech-lead session's anchor; it never authors one"
             )
 
 
@@ -212,6 +243,15 @@ class CreateTechLeadCaseFileIssueAction(CreateTechLeadIssueAction):
     def __post_init__(self) -> None:
         from ..domain.tech_lead_session import require_case_file_observation_label
 
+        super().__post_init__()
+        # A case file is always something a session DECIDED while working its
+        # anchor; it never authors one. The positive anchor number itself is
+        # guaranteed by the origin, so this only rules out the wrong KIND.
+        if self.origin.authors_new_anchor:
+            raise ValueError(
+                "CreateTechLeadCaseFileIssueAction is always derived from the"
+                " tech-lead session's anchor; it never authors one"
+            )
         # Self-validating type: an empty signature could never accrue
         # evidence. The observation-label invariant is delegated to its
         # domain owner (an unlabeled case file would be schedulable work).
@@ -230,13 +270,6 @@ class CreateTechLeadCaseFileIssueAction(CreateTechLeadIssueAction):
             raise ValueError(
                 "CreateTechLeadCaseFileIssueAction observations must have"
                 f" distinct identities, got {identities}"
-            )
-        if self.anchor_issue_number <= 0:
-            raise ValueError(
-                "CreateTechLeadCaseFileIssueAction requires the positive"
-                " anchor_issue_number it was decided from; without it the"
-                " creation has no reconciliation subject and could file a case"
-                " file against an anchor paused behind io:needs-reconcile"
             )
         if not self.idempotency_marker.strip():
             raise ValueError(

@@ -634,6 +634,10 @@ class SessionObserver:
                 issue_log(session.issue.number, "Fresh labels: %s"), current_labels
             )
         except Exception as e:
+            # The reader RAISES on an incomplete read rather than returning an
+            # empty list (#6957 round-2 review F4/A4), so this fallback is what
+            # keeps a timeout from classifying a blocked/needs-human session as
+            # plain FAILED: last-known labels beat a fabricated empty set.
             logger.warning(
                 issue_log(session.issue.number, "Failed to fetch labels: %s"), e
             )

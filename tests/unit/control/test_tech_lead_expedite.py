@@ -15,7 +15,9 @@ from unittest.mock import Mock
 
 import pytest
 
+from issue_orchestrator.domain.tech_lead_session import TechLeadCreationOrigin
 from issue_orchestrator.control.actions import CreateTechLeadIssueAction
+from issue_orchestrator.control.reconciliation import build_expected_for_mutation
 from issue_orchestrator.control.retry_history_state import (
     ExpediteEligibility,
     ExpediteLane,
@@ -43,7 +45,15 @@ def _apply_create(state, *, labels, expedite, issue_number=100, lane=None,
     repo = Mock()
     repo.create_issue.return_value = {"number": issue_number}
     action = CreateTechLeadIssueAction(
-        title="Fix it", body="Body", labels=tuple(labels), expedite=expedite
+        title="Fix it",
+        body="Body",
+        labels=tuple(labels),
+        expedite=expedite,
+        # Expedite intent only ever rides a DECISION-driven create_issue, so
+        # this creation is derived from its session's anchor and carries the
+        # expectations that anchor's gate checks (#6957 R2 F6).
+        origin=TechLeadCreationOrigin.derived_from_anchor(77),
+        expected=build_expected_for_mutation(),
     )
     result = apply_create_tech_lead_issue(
         action,

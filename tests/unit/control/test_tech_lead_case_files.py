@@ -30,6 +30,7 @@ from issue_orchestrator.domain.tech_lead_artifacts import ProposedTechLeadAction
 from issue_orchestrator.domain.tech_lead_session import (
     TECH_LEAD_OBSERVATION_LABEL,
     TechLeadCaseFileSummary,
+    TechLeadCreationOrigin,
 )
 from issue_orchestrator.infra.config import Config
 
@@ -235,7 +236,8 @@ def _case_file_action(**overrides) -> CreateTechLeadCaseFileIssueAction:
         body=f"b\n\n{MARKER}",
         labels=("agent:tech-lead", TECH_LEAD_OBSERVATION_LABEL),
         pattern_signature="sig",
-        anchor_issue_number=42,
+        origin=TechLeadCreationOrigin.derived_from_anchor(42),
+        expected=build_expected_for_mutation(),
         idempotency_marker=MARKER,
         observations=(PatternObservation(observation_id="o1", comment="e"),),
     )
@@ -243,10 +245,18 @@ def _case_file_action(**overrides) -> CreateTechLeadCaseFileIssueAction:
     return CreateTechLeadCaseFileIssueAction(**kwargs)
 
 
-def test_case_file_action_requires_its_anchor_as_reconciliation_subject() -> None:
-    """Without it the creation has nothing to check io:needs-reconcile against."""
-    with pytest.raises(ValueError, match="anchor_issue_number"):
-        _case_file_action(anchor_issue_number=0)
+def test_case_file_action_is_always_derived_from_its_anchor() -> None:
+    """A case file is DECIDED by a session; it can never author the anchor."""
+    with pytest.raises(ValueError, match="never authors one"):
+        _case_file_action(
+            origin=TechLeadCreationOrigin.authors_anchor(), expected=None
+        )
+
+
+def test_case_file_action_requires_the_expectations_its_gate_checks() -> None:
+    """A derived creation with no ExpectedState crosses a gate that checks nothing."""
+    with pytest.raises(ValueError, match="must carry an ExpectedState"):
+        _case_file_action(expected=None)
 
 
 def test_case_file_action_requires_observation_label() -> None:

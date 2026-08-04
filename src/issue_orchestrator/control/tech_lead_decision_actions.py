@@ -71,6 +71,7 @@ from ..domain.tech_lead_artifacts import (
     TechLeadDecision,
 )
 from ..domain.tech_lead_findings import PatternClassificationConflictError
+from ..domain.tech_lead_session import TechLeadCreationOrigin
 from ..ports.issue import Issue
 from .actions import (
     Action,
@@ -203,9 +204,10 @@ def _concrete_actions(
                     area=action.area,
                 ),
                 pr_count=0,
-                # The anchor this decision came from — the issue whose pause
-                # label gates the creation (#6957 F3/A3).
-                anchor_issue_number=anchor_issue.number,
+                # DECIDED by a session working this anchor — so the anchor's
+                # pause label gates the creation, and the ExpectedState below is
+                # what the gate checks (#6957 F3/A3, R2 F6/A6).
+                origin=TechLeadCreationOrigin.derived_from_anchor(anchor_issue.number),
                 milestone=tech_lead_issue_milestone_intent(config, anchor_milestones),
                 # Expedite intent (#6870) rides the action so the applier's
                 # create boundary can front-queue the new issue. It composes

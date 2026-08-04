@@ -12,6 +12,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, Mock, patch, PropertyMock
 from typing import Optional
 
+from issue_orchestrator.domain.tech_lead_session import TechLeadCreationOrigin
 from issue_orchestrator.control.orchestrator_support import (
     OrchestratorSupport,
     log_transition,
@@ -2080,6 +2081,7 @@ class TestUpdateStateAfterAction:
             body="Review these PRs",
             labels=("agent:tech-lead",),
             pr_count=5,
+            origin=TechLeadCreationOrigin.authors_anchor(),
         )
         result = MagicMock(success=True, details={"issue_number": 999})
 
@@ -2158,6 +2160,7 @@ class TestUpdateStateAfterAction:
             body="Review these PRs",
             labels=("agent:tech-lead",),
             pr_count=5,
+            origin=TechLeadCreationOrigin.authors_anchor(),
         )
         result = MagicMock(success=True, details={"issue_number": 999})
 
@@ -2177,6 +2180,7 @@ class TestUpdateStateAfterAction:
             body="Review these PRs",
             labels=("agent:tech-lead",),
             pr_count=5,
+            origin=TechLeadCreationOrigin.authors_anchor(),
         )
 
         self._apply_via_plan(support_with_state, [action], issue_number=999)
@@ -2204,6 +2208,7 @@ class TestUpdateStateAfterAction:
             body="Walk the floor",
             labels=("agent:tech-lead", HEALTH_REVIEW_MARKER_LABEL),
             pr_count=0,
+            origin=TechLeadCreationOrigin.authors_anchor(),
         )
 
         before = time.time()
@@ -2246,6 +2251,7 @@ class TestUpdateStateAfterAction:
             labels=("agent:tech-lead", HEALTH_REVIEW_MARKER_LABEL),
             pr_count=0,
             storm_problems=cohort,
+            origin=TechLeadCreationOrigin.authors_anchor(),
         )
 
         self._apply_via_plan(support_with_state, [action], issue_number=1000)
@@ -2531,6 +2537,7 @@ class TestUpdateStateAfterAction:
             body="Walk the floor",
             labels=(HEALTH_REVIEW_MARKER_LABEL,),
             pr_count=0,
+            origin=TechLeadCreationOrigin.authors_anchor(),
         )
 
         with caplog.at_level("WARNING"):

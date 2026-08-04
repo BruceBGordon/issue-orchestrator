@@ -44,6 +44,7 @@ from issue_orchestrator.domain.tech_lead_session import (
     TECH_LEAD_OBSERVATION_LABEL,
     ApprovedTechLeadOp,
     StoredTechLeadOp,
+    TechLeadCreationOrigin,
 )
 from issue_orchestrator.infra.config import Config
 from issue_orchestrator.domain.tech_lead_findings import (
@@ -141,7 +142,12 @@ def test_proposal_action_carries_gate_label_and_scan_labels() -> None:
 def test_proposal_action_requires_gate_label() -> None:
     with pytest.raises(ValueError, match="gate label"):
         CreateTechLeadProposalIssueAction(
-            title="t", body="b", labels=("x",), op=_op(), anchor_issue_number=99
+            title="t",
+            body="b",
+            labels=("x",),
+            op=_op(),
+            origin=TechLeadCreationOrigin.derived_from_anchor(99),
+            expected=build_expected_for_mutation(),
         )
 
 
@@ -474,7 +480,8 @@ def _case_file_action(
         labels=tuple(labels),
         pr_count=0,
         pattern_signature=signature,
-        anchor_issue_number=42,
+        origin=TechLeadCreationOrigin.derived_from_anchor(42),
+        expected=build_expected_for_mutation(),
         area=area,
         fix_class=fix_class,
         diagnosis="Pool exhaustion comes from a leaked connection.",
@@ -1021,7 +1028,13 @@ def test_apply_plain_tech_lead_issue_records_no_op() -> None:
     ops = InMemoryTechLeadAuthorityStore()
 
     result = apply_create_tech_lead_issue(
-        CreateTechLeadIssueAction(title="t", body="b", labels=("x",), pr_count=2),
+        CreateTechLeadIssueAction(
+            title="t",
+            body="b",
+            labels=("x",),
+            pr_count=2,
+            origin=TechLeadCreationOrigin.authors_anchor(),
+        ),
         repository_host=host,
         events=MagicMock(),
         ops=ops,

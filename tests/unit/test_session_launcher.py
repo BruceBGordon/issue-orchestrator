@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Optional, cast
 from unittest.mock import MagicMock, patch
 
+from issue_orchestrator.domain.tech_lead_session import TechLeadCreationOrigin
 from issue_orchestrator.control.session_completion import (
     _apply_completed_decisions,
     _record_provider_resilience_effects,
@@ -3852,6 +3853,7 @@ class TestLaunchTechLeadIssueSessionFlavors:
                     body="Walk the floor",
                     labels=("agent:tech-lead", HEALTH_REVIEW_MARKER_LABEL),
                     pr_count=0,
+                    origin=TechLeadCreationOrigin.authors_anchor(),
                 )
             ],
             issue_number=905,
@@ -4541,6 +4543,7 @@ class TestTechLeadProducerToLaunchBoundary:
                     body="Review these PRs",
                     labels=("agent:tech-lead",),
                     pr_count=5,
+                    origin=TechLeadCreationOrigin.authors_anchor(),
                 )
             ],
             issue_number=903,
@@ -4818,6 +4821,7 @@ class TestTechLeadProducerToLaunchBoundary:
                 labels=("agent:tech-lead", HEALTH_REVIEW_MARKER_LABEL),
                 pr_count=0,
                 storm_problems=cohort,
+                origin=TechLeadCreationOrigin.authors_anchor(),
             ),
             905,
             pre_crash_state,

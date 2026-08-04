@@ -35,7 +35,7 @@ from ..domain.models import (
 )
 from ..domain.post_publish_escalation import build_post_publish_escalation_comment
 from ..domain.tech_lead_naming import TECH_LEAD_DISPLAY_NAME
-from ..domain.tech_lead_session import TechLeadSessionFlavor
+from ..domain.tech_lead_session import TechLeadCreationOrigin, TechLeadSessionFlavor
 
 if TYPE_CHECKING:
     from .provider_resilience import ProviderResilienceManager
@@ -816,6 +816,8 @@ class Planner:
         return CreateTechLeadIssueAction(
             title=title, body=body, labels=labels, pr_count=facts.pr_count,
             milestone=milestone, reason=f"threshold met: {facts.pr_count} >= {facts.threshold}",
+            # This IS the anchor: no prior issue to reconcile against (#6957 F6).
+            origin=TechLeadCreationOrigin.authors_anchor(),
         )
 
     def _should_create_tech_lead_issue(self, facts: "TechLeadFacts") -> bool:

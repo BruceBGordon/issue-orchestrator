@@ -55,11 +55,8 @@ if TYPE_CHECKING:
     from .session_history import SessionHistoryOwner
     from .tech_lead_kill_session import TechLeadKillSessionExecutor
     from .tech_lead_reset_retry import TechLeadResetRetryExecutor
-from .reconciliation import (
-    ExternalSnapshot,
-    ReconciliationRequired,
-    require_reconciliation,
-)
+from .mutation_gate import ReconciliationGate
+from .reconciliation import ReconciliationRequired
 from .claim_gate import ClaimGate, ClaimLostError
 from .review_exchange_lifecycle import (
     cancel_issue_review_exchange,
@@ -649,65 +646,30 @@ class ActionApplier:
             )
             return ActionResult.fail(action, str(e), issue_number=action.issue_number)
 
-    def _fetch_current_labels(self, issue_number: int) -> set[str] | None:
-        """Fetch current labels for an issue if fresh_issue_reader is available.
+    @property
+    def _gate(self) -> ReconciliationGate:
+        """The owner that decides whether a mutation may happen at all.
 
-        Returns:
-            Set of label names, or None if fresh_issue_reader not configured
+        Extracted so "unknown is not empty, and unknown fails closed" lives in
+        one named place instead of two methods inside this dispatcher (#6957
+        round-2 review F4/A5). Built per access from the applier's own
+        collaborators, which tests reassign after construction.
         """
-        if self.fresh_issue_reader is None:
-            return None
-        try:
-            labels = self.fresh_issue_reader.read_issue_labels(issue_number)
-            return set(labels)
-        except Exception as e:
-            logger.warning(
-                issue_log(issue_number, "Failed to fetch labels for reconciliation: %s"),
-                e,
-            )
-            return None
+        return ReconciliationGate(
+            fresh_issue_reader=self.fresh_issue_reader, reconcile=self.reconcile
+        )
+
+    def _fetch_current_labels(self, issue_number: int) -> set[str] | None:
+        """Current labels, or None when they could not be OBSERVED."""
+        return self._gate.current_labels(issue_number)
 
     def _require_expected(self, action: Action, issue_number: int) -> None:
-        """Enforce reconciliation before a mutation if action has expected state.
-
-        This is the hard gate for optimistic concurrency control. If the action
-        has an ExpectedState attached, we fetch current state and verify it
-        satisfies the constraints. If not, we raise ReconciliationRequired.
-
-        Args:
-            action: The action being applied (checks action.expected)
-            issue_number: The issue/PR number to check
+        """Refuse the mutation unless the board still satisfies its expectations.
 
         Raises:
-            ReconciliationRequired: If current state doesn't satisfy expected
+            ReconciliationRequired: the expectation is violated, or unverifiable.
         """
-        if action.expected is None:
-            # No expected state attached - allow (for backwards compatibility)
-            return
-
-        if not self.reconcile:
-            # Reconciliation disabled - skip enforcement
-            return
-
-        # Fetch current state
-        current_labels = self._fetch_current_labels(issue_number)
-        if current_labels is None:
-            # Can't verify - fail closed (require fresh_issue_reader for reconciliation)
-            logger.warning(
-                issue_log(issue_number, "Reconciliation required but cannot fetch labels - failing closed"),
-            )
-            raise ReconciliationRequired(
-                entity_type="issue",
-                entity_id=issue_number,
-                expected=ExternalSnapshot.for_issue(issue_number, set(action.expected.required_labels)),
-                actual=ExternalSnapshot.for_issue(issue_number, set()),
-                reason="Cannot fetch current labels to verify expected state",
-            )
-
-        actual = ExternalSnapshot.for_issue(issue_number, current_labels)
-
-        # This raises ReconciliationRequired if constraints not satisfied
-        require_reconciliation(action.expected, actual, entity_type="issue")
+        self._gate.require_expected(action, issue_number)
 
     def _verify_claim_before_write(self, action: Action, issue_number: int) -> None:
         """Verify claim ownership before a write operation.
@@ -1531,9 +1493,14 @@ Maximum rework cycles ({action.max_rework_cycles}) exceeded.
         apply_fn: "Callable[[_TechLeadOpAction], ActionResult] | None",
         op_type: str,
     ) -> ActionResult:
-        # Reconciliation pause gate first (raises ReconciliationRequired) — a
-        # paused issue must never be mutated from an agent proposal.
-        self._require_expected(action, action.issue_number)
+        # NO reconciliation gate here. Every mutating tech-lead command now
+        # crosses it in exactly one place — the typed dispatch wrapper in
+        # ``tech_lead_applier_handlers`` — which reads this same subject
+        # (``ResetRetryIssueAction``/``KillHungSessionAction`` name
+        # ``issue_number``). Keeping the old call as well made an allowed
+        # reset/kill perform TWO cache-bypassing GitHub reads per dispatch and
+        # left mutation policy owned in two places (#6957 round-2 review F5/A5).
+        # This executor owns operation-specific preconditions and execution only.
         if apply_fn is None:
             return ActionResult.fail(
                 action,

@@ -44,7 +44,12 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING, Callable, Iterable, Optional, Protocol, Sequence
 
-from ..domain.tech_lead_session import HEALTH_REVIEW_MARKER_LABEL, TechLeadSessionFlavor
+from .health_review_body import PERIODIC_HEALTH_REVIEW_BODY, problem_storm_body
+from ..domain.tech_lead_session import (
+    HEALTH_REVIEW_MARKER_LABEL,
+    TechLeadCreationOrigin,
+    TechLeadSessionFlavor,
+)
 from .actions import CreateTechLeadIssueAction
 from .board_review_fingerprint import board_review_fingerprint
 from .tech_lead_issue_policy import (
@@ -90,41 +95,6 @@ HEALTH_REVIEW_ISSUE_TITLE = "Health Review — walk the floor"
 # proposals share the tech-lead-agent label and could crowd an older anchor past
 # a fixed first page (#6763 findings 4 and 7).
 _ANCHOR_SCAN_LIMIT = 100
-
-_HEALTH_REVIEW_ISSUE_BODY = """## Periodic Health Review (ADR-0031 §4)
-
-Walk the floor: review the orchestrator board holistically instead of
-auditing a PR batch. Your session receives a board snapshot
-(`tech-lead-data/board-snapshot.json`) with active sessions, pending/blocked
-queues, recent failures, timeline extracts, and an orchestrator log tail.
-
-Look for hung or aging sessions, queue pile-ups, repeated failures, and
-cross-job patterns. Report findings and propose actions through the tech_lead
-decision artifact; the orchestrator closes this issue when the review lands.
-"""
-
-
-def _problem_storm_issue_body(
-    problems: Sequence["DiscoveredFailure"],
-) -> str:
-    cohort = "\n".join(
-        f"- #{problem.issue_number}: {problem.issue_title} "
-        f"(`{problem.failure_reason}`)"
-        for problem in problems
-    )
-    return f"""## Immediate Problem-Storm Health Review (ADR-0031)
-
-The orchestrator observed {len(problems)} blocked/failed problem issues inside
-the configured settle window and escalated them as one cohort instead of
-launching per-issue investigations:
-
-{cohort}
-
-Walk the floor using `tech-lead-data/board-snapshot.json`. Diagnose shared root
-causes and propose group remediation through the tech_lead decision artifact.
-Each act-level proposal remains individually gated and re-validated.
-"""
-
 
 def health_review_interval_minutes(config: "Config") -> int:
     """Effective health-review interval; 0 when disabled or no tech lead agent."""
@@ -431,9 +401,9 @@ def build_health_review_anchor_action(
     return CreateTechLeadIssueAction(
         title=title,
         body=(
-            _problem_storm_issue_body(storm_problems)
+            problem_storm_body(storm_problems)
             if storm_problems
-            else _HEALTH_REVIEW_ISSUE_BODY
+            else PERIODIC_HEALTH_REVIEW_BODY
         ),
         labels=labels,
         pr_count=0,
@@ -444,6 +414,8 @@ def build_health_review_anchor_action(
         # crash-safe restatement of the same decision for recovery/intake.
         flavor=TechLeadSessionFlavor.HEALTH_REVIEW,
         health_review_fingerprint=fingerprint,
+        # This IS the anchor: no prior issue to reconcile against (#6957 F6).
+        origin=TechLeadCreationOrigin.authors_anchor(),
     )
 
 

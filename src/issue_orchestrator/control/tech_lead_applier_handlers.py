@@ -99,6 +99,14 @@ def _guarded(guard: ExpectedStateGuard, handler: ActionHandler) -> ActionHandler
     check them against is refused before any write: that pairing means the
     subject was dropped somewhere in composition, and running it unguarded is
     exactly the bug this wrapper exists to make impossible.
+
+    This registry-level check is a BACKSTOP, not the primary defence. The
+    creation commands now make the invalid state unrepresentable at
+    construction (``TechLeadCreationOrigin``, #6957 round-2 review F6/A6),
+    because a wrapper that only rejects "expectations without a subject" still
+    waves through a follow-up whose subject AND expectations were both dropped —
+    it looks exactly like legitimate anchor authoring from here. Commands that
+    have no such value object (the ledger-only discard) are still covered here.
     """
 
     def run(action: Action) -> ActionResult:

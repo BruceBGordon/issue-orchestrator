@@ -40,6 +40,8 @@ from ..domain.tech_lead_milestone import (
     TechLeadMilestoneIntent as TechLeadMilestoneIntent,
 )
 from ..domain.tech_lead_session import (
+    TechLeadCreationKind as TechLeadCreationKind,
+    TechLeadCreationOrigin as TechLeadCreationOrigin,
     TechLeadSessionFlavor as TechLeadSessionFlavor,
 )
 from .tech_lead_actions import (

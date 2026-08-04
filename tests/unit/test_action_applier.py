@@ -5,6 +5,7 @@ import pytest
 from unittest.mock import MagicMock, Mock, patch
 from pathlib import Path
 
+from issue_orchestrator.domain.tech_lead_session import TechLeadCreationOrigin
 from issue_orchestrator.control.action_applier import ActionApplier
 from issue_orchestrator.control.claim_gate import ClaimGate, ClaimLostError
 from issue_orchestrator.control.actions import (
@@ -1422,6 +1423,7 @@ class TestCreateTechLeadIssueAction:
             body="Review these PRs...",
             labels=("agent:tech-lead",),
             pr_count=5,
+            origin=TechLeadCreationOrigin.authors_anchor(),
         )
 
         result = applier.apply(action)
@@ -1447,6 +1449,7 @@ class TestCreateTechLeadIssueAction:
             ),
             reason=trigger,
             flavor=TechLeadSessionFlavor.HEALTH_REVIEW,
+            origin=TechLeadCreationOrigin.authors_anchor(),
         )
 
         result = applier.apply(action)
@@ -1487,6 +1490,7 @@ class TestCreateTechLeadIssueAction:
             labels=(HEALTH_REVIEW_MARKER_LABEL,),
             reason="trigger",
             flavor=flavor,
+            origin=TechLeadCreationOrigin.authors_anchor(),
         )
 
         assert applier.apply(action).success
@@ -1506,6 +1510,7 @@ class TestCreateTechLeadIssueAction:
             body="Review these PRs...",
             labels=("agent:tech-lead",),
             pr_count=5,
+            origin=TechLeadCreationOrigin.authors_anchor(),
         )
 
         result = applier.apply(action)
@@ -1520,7 +1525,7 @@ class TestCreateTechLeadIssueAction:
         mock_repository_host.create_issue.return_value = {"number": 100}
 
         result = applier.apply(
-            CreateTechLeadIssueAction(title="T", body="B", labels=(), pr_count=1)
+            CreateTechLeadIssueAction(title="T", body="B", labels=(), pr_count=1, origin=TechLeadCreationOrigin.authors_anchor())
         )
 
         assert result.success
@@ -1547,6 +1552,7 @@ class TestCreateTechLeadIssueAction:
                 labels=(),
                 pr_count=1,
                 milestone=TechLeadMilestoneIntent(explicit_name="M5"),
+                origin=TechLeadCreationOrigin.authors_anchor(),
             )
         )
 
@@ -1572,6 +1578,7 @@ class TestCreateTechLeadIssueAction:
                 labels=(),
                 pr_count=1,
                 milestone=TechLeadMilestoneIntent(explicit_name="Nope"),
+                origin=TechLeadCreationOrigin.authors_anchor(),
             )
         )
 
@@ -3189,6 +3196,107 @@ class TestTechLeadMutationsCrossTheReconciliationGate:
         authority.has_pattern_observation.assert_called_once()
 
 
+class TestActLevelOpsCrossTheGateExactlyOnce:
+    """#6957 round-2 review F5/A5: one reconciliation owner, one fresh read.
+
+    The centralized dispatch wrapper now gates every mutating tech-lead command,
+    but ``_apply_tech_lead_op`` kept its own ``_require_expected`` call. Since
+    the fresh reader deliberately bypasses every cache, an allowed reset or kill
+    performed TWO correctness-critical GitHub reads per dispatch — against this
+    repo's limited-API discipline — and left mutation policy owned in two
+    places. The registry test substitutes inert handlers, so only a boundary
+    test on the composed applier can see the duplicate.
+    """
+
+    TARGET = 12
+    PROPOSAL = 800
+
+    @pytest.fixture
+    def counted(self, mock_labels, mock_sessions, mock_events, mock_repository_host):
+        from issue_orchestrator.control.action_applier import ActionApplier
+        from issue_orchestrator.control.actions import ActionResult
+
+        reader = MagicMock()
+        # No pause label: the gate ALLOWS these, which is the case that used to
+        # pay for two reads. A blocked gate short-circuits after one either way.
+        reader.read_issue_labels.return_value = ["in-progress"]
+        # The kill path re-confirms consent through the repository host (a
+        # different port), so it never contributes to the fresh-read count.
+        mock_repository_host.get_issue.return_value = Issue(
+            number=self.PROPOSAL, title="Tech Lead proposal", labels=["agent:tech-lead"]
+        )
+        executor = MagicMock()
+        executor.apply.side_effect = lambda action: ActionResult.ok(action)
+        applier = ActionApplier(
+            labels=mock_labels,
+            sessions=mock_sessions,
+            events=mock_events,
+            repository_host=mock_repository_host,
+            fresh_issue_reader=reader,
+            reconcile=True,
+            tech_lead_ops=MagicMock(),
+            tech_lead_reset_retry=executor,
+            tech_lead_kill_session=executor,
+        )
+        return applier, reader, executor
+
+    def _reset(self):
+        from issue_orchestrator.control.actions import ResetRetryIssueAction
+        from issue_orchestrator.control.reconciliation import (
+            build_expected_for_mutation,
+        )
+
+        return ResetRetryIssueAction(
+            issue_number=self.TARGET,
+            proposal_id="A1",
+            expected=build_expected_for_mutation(),
+        )
+
+    def _kill(self):
+        from issue_orchestrator.control.actions import KillHungSessionAction
+        from issue_orchestrator.control.reconciliation import (
+            build_expected_for_mutation,
+        )
+
+        return KillHungSessionAction(
+            issue_number=self.TARGET,
+            proposal_id="A1",
+            proposal_issue_number=self.PROPOSAL,
+            expected=build_expected_for_mutation(),
+        )
+
+    def test_an_allowed_reset_reads_fresh_labels_once(self, counted):
+        applier, reader, executor = counted
+
+        applier.apply(self._reset())
+
+        assert reader.read_issue_labels.call_count == 1
+        assert reader.read_issue_labels.call_args[0][0] == self.TARGET
+        executor.apply.assert_called_once()
+
+    def test_an_allowed_kill_reads_fresh_labels_once(self, counted):
+        applier, reader, executor = counted
+
+        applier.apply(self._kill())
+
+        assert reader.read_issue_labels.call_count == 1
+        assert reader.read_issue_labels.call_args[0][0] == self.TARGET
+        executor.apply.assert_called_once()
+
+    @pytest.mark.parametrize("op", ("reset", "kill"))
+    def test_a_paused_target_still_stops_the_executor(self, counted, op):
+        """Removing the duplicate must not remove the gate itself."""
+        from issue_orchestrator.control.reconciliation import ReconciliationRequired
+
+        applier, reader, executor = counted
+        reader.read_issue_labels.return_value = ["in-progress", "io:needs-reconcile"]
+
+        with pytest.raises(ReconciliationRequired):
+            applier.apply(self._reset() if op == "reset" else self._kill())
+
+        executor.apply.assert_not_called()
+
+
 class TestTechLeadIssueCreationCrossesTheReconciliationGate:
     """#6957 round-6 review F3/A3: creation is guarded like every other mutation.
 
@@ -3231,9 +3339,13 @@ class TestTechLeadIssueCreationCrossesTheReconciliationGate:
             build_expected_for_mutation,
         )
         from issue_orchestrator.domain.tech_lead_findings import PatternObservation
-        from issue_orchestrator.domain.tech_lead_session import StoredTechLeadOp
+        from issue_orchestrator.domain.tech_lead_session import (
+            StoredTechLeadOp,
+            TechLeadCreationOrigin,
+        )
 
         expected = build_expected_for_mutation()
+        origin = TechLeadCreationOrigin.derived_from_anchor(cls.ANCHOR)
         marker = "<!-- issue-orchestrator:tech-lead-case-file:v1:abc -->"
         return [
             CreateTechLeadCaseFileIssueAction(
@@ -3241,7 +3353,7 @@ class TestTechLeadIssueCreationCrossesTheReconciliationGate:
                 body=f"documentation only\n\n{marker}",
                 labels=("agent:tech-lead", "tech-lead-observation"),
                 pattern_signature="sig",
-                anchor_issue_number=cls.ANCHOR,
+                origin=origin,
                 idempotency_marker=marker,
                 observations=(
                     PatternObservation(observation_id="r1:s:A1", comment="observed"),
@@ -3252,7 +3364,7 @@ class TestTechLeadIssueCreationCrossesTheReconciliationGate:
                 title="Tech Lead proposal: reset_retry #12",
                 body="documentation only",
                 labels=("agent:tech-lead", "proposed-tech-lead"),
-                anchor_issue_number=cls.ANCHOR,
+                origin=origin,
                 op=StoredTechLeadOp(
                     op_type="reset_retry",
                     target_issue_number=12,
@@ -3338,6 +3450,7 @@ class TestTechLeadIssueCreationCrossesTheReconciliationGate:
                 body="b",
                 labels=("agent:tech-lead",),
                 pr_count=3,
+                origin=TechLeadCreationOrigin.authors_anchor(),
             )
         )
 
@@ -3345,24 +3458,37 @@ class TestTechLeadIssueCreationCrossesTheReconciliationGate:
         # ...and it cost no reconciliation read, because there is no subject.
         applier.fresh_issue_reader.read_issue_labels.assert_not_called()
 
-    def test_expectations_without_a_subject_refuse_to_write(self, guarded):
-        """A dropped subject must fail closed, never run unguarded."""
+    def test_a_dropped_subject_cannot_be_dispatched_at_all(self, guarded):
+        """A follow-up whose guard fields were dropped is unrepresentable.
+
+        The applier-level backstop only ever saw "expectations, no subject". A
+        composition that dropped BOTH looked exactly like anchor authoring and
+        wrote unguarded, so the command boundary is what rejects it now (#6957
+        round-2 review F6/A6) — before an action object exists to dispatch.
+        """
         from issue_orchestrator.control.actions import CreateTechLeadIssueAction
         from issue_orchestrator.control.reconciliation import (
             build_expected_for_mutation,
         )
 
-        applier, _authority, repository_host = guarded
+        _applier, _authority, repository_host = guarded
 
-        result = applier.apply(
+        # One field dropped: the subject is gone but the expectations remain.
+        with pytest.raises(ValueError, match="reconciliation subject was dropped"):
             CreateTechLeadIssueAction(
                 title="follow-up",
                 body="b",
                 labels=("agent:backend",),
-                anchor_issue_number=0,  # dropped in composition
+                origin=TechLeadCreationOrigin.authors_anchor(),
                 expected=build_expected_for_mutation(),
             )
-        )
-
-        assert not result.success
+        # Both dropped: the follow-up keeps its origin, so the missing
+        # ExpectedState is caught instead of passing as anchor authoring.
+        with pytest.raises(ValueError, match="must carry an ExpectedState"):
+            CreateTechLeadIssueAction(
+                title="follow-up",
+                body="b",
+                labels=("agent:backend",),
+                origin=TechLeadCreationOrigin.derived_from_anchor(self.ANCHOR),
+            )
         repository_host.create_issue.assert_not_called()

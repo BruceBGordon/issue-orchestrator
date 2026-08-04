@@ -52,6 +52,7 @@ from ..domain.tech_lead_findings import (
 from ..domain.tech_lead_session import (
     TECH_LEAD_OBSERVATION_LABEL,
     TechLeadCaseFileSummary,
+    TechLeadCreationOrigin,
     is_tech_lead_observation_label,
     tech_lead_area_from_labels,
 )
@@ -193,9 +194,11 @@ def build_case_file_issue_action(
         labels=case_file_issue_labels(config, area=proposed.area),
         pr_count=0,
         pattern_signature=proposed.pattern_signature,
-        # Retained, not just rendered into the body: it is the issue this
-        # creation's reconciliation gate reads before any write (#6957 F3/A3).
-        anchor_issue_number=anchor_issue_number,
+        # Retained, not just rendered into the body: the anchor is the issue
+        # this creation's reconciliation gate reads before any write, and the
+        # origin makes "derived, therefore guarded" a state the command can
+        # actually represent (#6957 F3/A3, R2 F6/A6).
+        origin=TechLeadCreationOrigin.derived_from_anchor(anchor_issue_number),
         area=proposed.area,
         fix_class=proposed.fix_class or "",
         diagnosis=proposed.body or "",
