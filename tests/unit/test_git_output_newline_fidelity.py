@@ -1,13 +1,16 @@
-"""Newline fidelity from real Git output through to the test-skip guard.
+"""Newline fidelity from the command runners up through Git-output consumers.
 
-The guard reads two Git outputs -- unified diff text and branch-tip blob
-content -- and applies Git's own LF-delimited physical-line rule to both. Tests
-that hand-build those two strings prove the parser, not the transport: they
-cannot see that a universal-newline capture rewrote a bare carriage return to a
-line feed before the parser ever ran, splitting one patch record in two and
-stripping the ``+`` from the half that carried the banned call. These tests
-drive the production wiring instead -- ``GitWorkingCopy`` over ``GitCLI`` and
-``LocalCommandRunner`` -- against a real repository.
+Git parses its own output by delimiters it chose: LF for patch records and blob
+lines, NUL for path lists. Everything else is content -- a bare carriage return
+inside a source line, or inside a filename, which POSIX permits. A
+universal-newline capture rewrites that ``\\r`` to ``\\n`` before any parser
+runs, which splits one patch record in two (stripping the ``+`` from the half
+that carried the banned call) and silently mutates a path.
+
+Tests that hand-build those strings prove the parser, not the transport, so
+these drive the production wiring instead -- ``GitWorkingCopy`` over ``GitCLI``
+over ``LocalCommandRunner`` -- against real repositories, and hold both
+concrete ``CommandRunner`` implementations to the port's newline contract.
 """
 
 import subprocess
@@ -20,6 +23,7 @@ from issue_orchestrator.control.test_skip_guard import (
     added_test_paths,
     scan_added_test_skip_guards,
 )
+from issue_orchestrator.adapters.git.git_cli import SubprocessCommandRunner
 from issue_orchestrator.execution.command_runner import LocalCommandRunner
 from issue_orchestrator.execution.git_working_copy import GitWorkingCopy
 from issue_orchestrator.ports.command_runner import OutputNewlines
@@ -123,15 +127,60 @@ def test_guard_sees_skip_hidden_behind_bare_carriage_return_through_real_git(
     ] == [(3, "JUnit assumeTrue"), (5, "JUnit @Disabled")]
 
 
-def test_local_command_runner_translates_newlines_by_default():
-    result = LocalCommandRunner().run(_echo_bytes(b"a\rb\r\nc\n"))
+# Every concrete CommandRunner advertises the same newline contract, and each
+# implements the capture independently, so both are held to it here.
+@pytest.mark.parametrize(
+    "runner_factory", [LocalCommandRunner, SubprocessCommandRunner]
+)
+def test_command_runner_translates_newlines_by_default(runner_factory):
+    result = runner_factory().run(_echo_bytes(b"a\rb\r\nc\n"))
 
     assert result.stdout == "a\nb\nc\n"
 
 
-def test_local_command_runner_preserves_newlines_on_request():
-    result = LocalCommandRunner().run(
+@pytest.mark.parametrize(
+    "runner_factory", [LocalCommandRunner, SubprocessCommandRunner]
+)
+def test_command_runner_preserves_newlines_on_request(runner_factory):
+    result = runner_factory().run(
         _echo_bytes(b"a\rb\r\nc\n"), newlines=OutputNewlines.PRESERVED
     )
 
     assert result.stdout == "a\rb\r\nc\n"
+
+
+# A carriage return is legal in a POSIX filename, and NUL-delimited path lists
+# make every non-NUL byte part of a path. A translated capture rewrites that
+# ``\r`` to ``\n``, so the dirty-file guard would report a path that does not
+# exist -- and would not report the one that does.
+CR_NAME = "we\rird.txt"
+
+
+@pytest.mark.parametrize(
+    ("mode", "stage"),
+    [("unstaged", "unstaged"), ("tracked", "staged"), ("all", "untracked")],
+)
+def test_list_dirty_files_keeps_carriage_return_in_filenames(tmp_path, mode, stage):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    _git(repo, "config", "user.email", "test@example.com")
+    _git(repo, "config", "user.name", "Test User")
+    _git(repo, "config", "commit.gpgsign", "false")
+    (repo / "README.md").write_text("base\n")
+    if stage != "untracked":
+        # Tracked paths must exist at HEAD before they can be dirty.
+        (repo / CR_NAME).write_text("original\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "base")
+
+    if stage == "untracked":
+        (repo / CR_NAME).write_text("new\n")
+    else:
+        (repo / CR_NAME).write_text("changed\n")
+    if stage == "staged":
+        _git(repo, "add", "--", CR_NAME)
+
+    dirty = GitWorkingCopy().list_dirty_files(repo, mode)
+
+    assert dirty == [CR_NAME]

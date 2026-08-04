@@ -252,6 +252,7 @@ class TestListDirtyFiles:
             mock_run.assert_called_once_with(
                 worktree_path,
                 ["diff", "--name-only", "-z"],
+                newlines=OutputNewlines.PRESERVED,
             )
 
     def test_list_dirty_files_tracked_mode(self, git_wc, worktree_path):

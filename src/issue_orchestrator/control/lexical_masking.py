@@ -156,6 +156,18 @@ def _opens_jsx_closing_tag(prefix: str, text: str, index: int) -> bool:
     return _JSX_CLOSING_TAG_AT.match(text, index - 1) is not None
 
 
+def _js_names_a_member(prefix: str, identifier: re.Match[str]) -> bool:
+    """Report whether *identifier* is a property or private-member name.
+
+    JavaScript allows reserved words as member names, so ``obj.if`` and
+    ``this.#for`` are ordinary accessors that happen to spell a keyword. Every
+    rule here that keys off a keyword has to exclude them, or an executable
+    line gets read as syntax it is not.
+    """
+
+    return prefix[: identifier.start()].rstrip().endswith((".", "#"))
+
+
 def _js_closes_control_header(prefix: str) -> bool:
     depth = 0
     for index in range(len(prefix) - 1, -1, -1):
@@ -168,8 +180,13 @@ def _js_closes_control_header(prefix: str) -> bool:
         depth -= 1
         if depth != 0:
             continue
-        header = re.search(r"(?:[^\W\d]|[$_])[\w$]*$", prefix[:index].rstrip())
-        return header is not None and header.group() in _JS_CONTROL_HEADER_KEYWORDS
+        before_parens = prefix[:index].rstrip()
+        header = re.search(r"(?:[^\W\d]|[$_])[\w$]*$", before_parens)
+        if header is None or header.group() not in _JS_CONTROL_HEADER_KEYWORDS:
+            return False
+        # ``obj.if()`` is a call returning a value, not a control header, so
+        # the slash after it divides rather than opening a regex.
+        return not _js_names_a_member(before_parens, header)
     return False
 
 
@@ -196,8 +213,7 @@ def _js_closes_statement_block(prefix: str) -> bool:
 
     keyword = re.search(r"(?:[^\W\d]|[$_])[\w$]*$", header)
     if keyword is not None and keyword.group() in {"do", "else", "finally", "try"}:
-        before_keyword = header[: keyword.start()].rstrip()
-        if not before_keyword.endswith((".", "#")):
+        if not _js_names_a_member(header, keyword):
             return True
 
     statement_start = r"(?:^|[;{}])\s*"
@@ -610,8 +626,7 @@ class LiteralMasker:
         if identifier is not None:
             if identifier.group() not in _JS_REGEX_PREFIX_KEYWORDS:
                 return True
-            before_identifier = prefix[: identifier.start()].rstrip()
-            return before_identifier.endswith((".", "#"))
+            return _js_names_a_member(prefix, identifier)
         if prefix.endswith(")"):
             return not _js_closes_control_header(prefix)
         if prefix.endswith("}"):

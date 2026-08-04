@@ -326,6 +326,41 @@ def test_scan_added_test_skip_guards_does_not_treat_division_as_js_regex() -> No
     assert result.violations[0].pattern == "JS test skip"
 
 
+def test_scan_added_test_skip_guards_flags_division_after_reserved_word_member_call() -> (
+    None
+):
+    # JavaScript allows reserved words as member and private-field names, so
+    # these are ordinary calls whose value the next slash divides. Reading them
+    # as control headers would open a regex and mask the skip that follows.
+    diff = """diff --git a/tests/guard.test.ts b/tests/guard.test.ts
+--- a/tests/guard.test.ts
++++ b/tests/guard.test.ts
+@@ -0,0 +1,2 @@
++const ratio = obj.if() / test.skip("real skip", () => {}) / 2;
++const privateRatio = this.#while() / test.skip("private skip", () => {}) / 2;
+"""
+
+    result = _scan(diff)
+
+    assert [violation.line_number for violation in result.violations] == [1, 2]
+
+
+def test_scan_added_test_skip_guards_keeps_regex_after_genuine_control_header() -> None:
+    # The companion to the case above: a bare keyword really does open a
+    # control header, so the slash after it starts a regex and the skip text
+    # inside that regex is inert.
+    diff = """diff --git a/tests/guard.test.ts b/tests/guard.test.ts
+--- a/tests/guard.test.ts
++++ b/tests/guard.test.ts
+@@ -0,0 +1,1 @@
++if (ready) /test.skip("inert", () => {})/.test(value);
+"""
+
+    result = _scan(diff)
+
+    assert result.violations == ()
+
+
 def test_scan_added_test_skip_guards_handles_regex_after_js_statement_blocks() -> None:
     diff = """diff --git a/tests/guard.test.ts b/tests/guard.test.ts
 --- a/tests/guard.test.ts

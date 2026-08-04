@@ -64,7 +64,7 @@ class GitWorkingCopy:
             check: Whether to raise on non-zero exit.
             capture_output: Whether to capture stdout/stderr.
             newlines: Transport newline fidelity. Prefer
-                :meth:`_run_git_line_exact` over passing this directly.
+                :meth:`_run_git_output_exact` over passing this directly.
 
         Returns:
             GitResult with results.
@@ -79,20 +79,31 @@ class GitWorkingCopy:
             newlines=newlines,
         )
 
-    def _run_git_line_exact(self, worktree: Path, args: list[str]) -> GitResult:
-        r"""Run a git read whose output keeps Git's own line terminators.
+    def _run_git_output_exact(self, worktree: Path, args: list[str]) -> GitResult:
+        r"""Run a git read whose output keeps the delimiters Git wrote.
 
-        Git delimits patch records, ``-z`` path lists and blob lines with LF
-        alone, so a bare ``\r`` inside any of them is in-line content. The
-        default universal-newline transport rewrites that ``\r`` to ``\n`` and
-        splits one record into two, which detaches added source from the ``+``
-        that marks it and hides it from content guards. Every read whose caller
-        applies Git's physical-line rule must go through here, so the diff side
-        and the branch-tip side cannot drift into different transport
-        semantics.
+        Git delimits patch records and blob lines with LF alone and path lists
+        with NUL, so a bare ``\r`` anywhere in that output is content: inside a
+        source line, or inside a filename, which POSIX permits. The default
+        universal-newline transport rewrites it to ``\n``, which splits one
+        patch record in two -- detaching added source from the ``+`` that marks
+        it -- and silently mutates a path. Every read parsed by Git's own
+        delimiter rules must go through here, so no two of them can drift into
+        different transport semantics.
         """
 
         return self._run_git(worktree, args, newlines=OutputNewlines.PRESERVED)
+
+    def _run_git_nul_paths(self, worktree: Path, args: list[str]) -> list[str]:
+        """Run a NUL-delimited git path query and return its paths.
+
+        Reading and parsing are one step on purpose: NUL-delimited output is
+        only safe to split when the transport left it byte-exact, so there is
+        no parse-only entry point a translated read could reach.
+        """
+
+        result = self._run_git_output_exact(worktree, args)
+        return [path for path in result.stdout.split("\0") if path]
 
     def _clear_stale_remote_ref(self, worktree: Path, remote: str, branch: str) -> None:
         """Clear stale remote-tracking refs when the remote branch is missing."""
@@ -218,10 +229,6 @@ class GitWorkingCopy:
             logger.warning("Failed to check tracked changes in %s", worktree)
             return True  # Assume dirty on error (safer)
 
-    def _list_paths_from_nul_output(self, output: str) -> list[str]:
-        """Parse NUL-delimited path output from git commands."""
-        return [path for path in output.split("\0") if path]
-
     def list_dirty_files(self, worktree: Path, mode: str) -> list[str] | None:
         """List dirty file paths for guard diagnostics.
 
@@ -240,19 +247,22 @@ class GitWorkingCopy:
         try:
             files: set[str] = set()
 
-            unstaged = self._run_git(worktree, ["diff", "--name-only", "-z"])
-            files.update(self._list_paths_from_nul_output(unstaged.stdout))
+            files.update(
+                self._run_git_nul_paths(worktree, ["diff", "--name-only", "-z"])
+            )
 
             if mode in {"tracked", "all"}:
-                staged = self._run_git(worktree, ["diff", "--cached", "--name-only", "-z"])
-                files.update(self._list_paths_from_nul_output(staged.stdout))
+                files.update(
+                    self._run_git_nul_paths(
+                        worktree, ["diff", "--cached", "--name-only", "-z"]
+                    )
+                )
 
             if mode == "all":
-                untracked = self._run_git(
+                untracked_paths = self._run_git_nul_paths(
                     worktree,
                     ["ls-files", "--others", "--exclude-standard", "-z"],
                 )
-                untracked_paths = self._list_paths_from_nul_output(untracked.stdout)
                 # ``sync_cli_tools`` plants files into every worktree. In a
                 # foreign repo they appear here as untracked and must not
                 # count as dirty. The filter is scoped to this untracked
@@ -278,7 +288,7 @@ class GitWorkingCopy:
         Git emitted inside one must survive to the caller.
         """
         try:
-            result = self._run_git_line_exact(
+            result = self._run_git_output_exact(
                 worktree,
                 [
                     "diff",
@@ -312,7 +322,7 @@ class GitWorkingCopy:
         files: list[BranchTextFile] = []
         try:
             for path in paths:
-                result = self._run_git_line_exact(worktree, ["show", f"HEAD:{path}"])
+                result = self._run_git_output_exact(worktree, ["show", f"HEAD:{path}"])
                 files.append(BranchTextFile(path=path, content=result.stdout))
             return BranchTextFilesResult(success=True, files=tuple(files))
         except GitError as exc:
@@ -338,7 +348,7 @@ class GitWorkingCopy:
         a path, including a carriage return a filename is allowed to contain.
         """
         try:
-            result = self._run_git_line_exact(
+            paths = self._run_git_nul_paths(
                 worktree,
                 [
                     "diff",
@@ -349,10 +359,7 @@ class GitWorkingCopy:
                     f"{base_ref}...HEAD",
                 ],
             )
-            return BranchPathsResult(
-                success=True,
-                paths=tuple(self._list_paths_from_nul_output(result.stdout)),
-            )
+            return BranchPathsResult(success=True, paths=tuple(paths))
         except GitError as exc:
             error = _git_error_output(exc)
             logger.warning(
