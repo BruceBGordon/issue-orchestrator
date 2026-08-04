@@ -40,6 +40,7 @@ from issue_orchestrator.domain.tech_lead_findings import (
     promotion_issue_title,
 )
 from issue_orchestrator.domain.tech_lead_session import PROPOSED_TECH_LEAD_LABEL
+from issue_orchestrator.adapters.github.errors import GitHubHttpError
 from issue_orchestrator.infra.config import Config
 from issue_orchestrator.infra.config_models import PromotionRouteTarget
 from issue_orchestrator.ports.promotion_target import (
@@ -509,6 +510,12 @@ def _promote_action(
     return action
 
 
+def _exploding_file(target):
+    """A target whose create fails, leaving a durable intent behind."""
+    target.file_error = RuntimeError("transient")
+    return target
+
+
 def _rerouted(
     action: PromoteTechLeadFindingAction, repo: str
 ) -> PromoteTechLeadFindingAction:
@@ -841,6 +848,49 @@ class TestRouteChangedWhileFilingWasInFlight:
         assert recovered.success
         assert len(target.filed) == 1
         assert recovered.details["target_repo"] == self.OTHER
+
+
+class TestUnprovableRecoveryNeverRetiresTheIntent:
+    """#6957 round-5 review F13 at the owner level.
+
+    The owner retires a durable creation intent on a NEGATIVE lookup. If the
+    adapter answered "absent" from a bounded, title-scoped search, the intent
+    would be retired wrongly and a second issue filed for a signature that
+    already has one. An inconclusive lookup must therefore raise, and the owner
+    must leave everything untouched when it does.
+    """
+
+    def test_an_unprovable_lookup_leaves_the_intent_and_files_nothing(self):
+        target = InMemoryPromotionTargetHost()
+        authority = InMemoryTechLeadAuthorityStore()
+        # An intent exists (an interrupted filing), and the proof cannot be had.
+        assert not apply_promote_tech_lead_finding(
+            _promote_action(),
+            target=_exploding_file(target),
+            authority=authority,
+            now_iso="t1",
+        ).success
+        pending_before = authority.load_pending_promotion(signature="anchor-close")
+        assert pending_before is not None
+        # Clear the create failure so the ONLY thing that can stop this attempt
+        # is the inconclusive lookup.
+        target.file_error = None
+        target.find_error = GitHubHttpError(
+            "refusing to treat the partial repository issues as complete"
+        )
+
+        result = apply_promote_tech_lead_finding(
+            _promote_action(), target=target, authority=authority, now_iso="t2"
+        )
+
+        assert not result.success
+        assert target.filed == []
+        assert authority.load_promotion(signature="anchor-close") is None
+        # Crucially: the intent SURVIVES, so a later tick can still settle it
+        # against the issue that may already exist.
+        assert authority.load_pending_promotion(signature="anchor-close") == (
+            pending_before
+        )
 
 
 class TestFilingRecoveryIsReportedHonestly:

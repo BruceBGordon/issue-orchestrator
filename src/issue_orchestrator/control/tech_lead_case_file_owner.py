@@ -165,8 +165,17 @@ class PatternCaseFileOwner:
         pending = self._authority.load_pending_case_file(
             signature=action.pattern_signature
         )
+        # Which lookup depends on what a NEGATIVE answer will be used for
+        # (#6957 round-5 review F13). With an intent present, a miss retires
+        # that intent and lets a fresh issue be created — load-bearing, so it
+        # must be PROVEN. With no intent, a miss only means "carry on and
+        # create", which is already the right move unless the authority store
+        # was lost; a bounded best-effort scan is the proportionate safety net
+        # there, since the exhaustive one would run on every new case file.
         found = self._repository_host.find_issue_by_marker(
-            title=action.title, marker=action.idempotency_marker
+            title=action.title,
+            marker=action.idempotency_marker,
+            authoritative=pending is not None,
         )
         if pending is None:
             if found is None:

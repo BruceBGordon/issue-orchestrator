@@ -572,8 +572,12 @@ def test_apply_case_file_provisions_labels_before_blocking_area_tagged_issue() -
         # Recovery first: "has a previous attempt already created this case
         # file?" must be answered before anything is provisioned or created,
         # or a crash-retry files a second one (#6957 R2 F10).
+        # Best-effort here: with no creation intent, a miss just means "carry
+        # on and create", so this does NOT pay for the exhaustive scan (F13).
         call.find_issue_by_marker(
-            title=action.title, marker=action.idempotency_marker
+            title=action.title,
+            marker=action.idempotency_marker,
+            authoritative=False,
         ),
         call.list_labels(),
         call.create_label(
@@ -942,6 +946,27 @@ def test_a_stale_intent_with_no_remote_issue_creates_fresh() -> None:
     retry_host.create_issue.assert_called_once()
     assert ops.lookup_pattern(signature="db-timeout") == 700
     assert ops.load_pending_case_file(signature="db-timeout") is None
+
+
+def test_retiring_an_intent_demands_a_lookup_whose_no_is_proof() -> None:
+    """#6957 round-5 review F13, case-file lane.
+
+    The negative answer above is load-bearing: it RETIRES a durable creation
+    intent and files a fresh case file. A bounded, title-scoped search reports
+    "absent" for an issue that merely aged out of the recent window or was
+    retitled, so answering this question with one creates a second case file for
+    a signature that already has one. Only the authoritative lookup may be asked.
+    """
+    action = _case_file_action("db-timeout")
+    ops = InMemoryTechLeadAuthorityStore()
+    failing_host = _host(600)
+    failing_host.create_issue.side_effect = RuntimeError("GitHub rejected it")
+    assert not _apply_case_file(action, ops=ops, host=failing_host).success
+
+    retry_host = _host(700)
+    _apply_case_file(action, ops=ops, host=retry_host)
+
+    assert retry_host.find_issue_by_marker.call_args.kwargs["authoritative"] is True
 
 
 def test_an_orphan_with_no_creation_intent_stops_instead_of_guessing() -> None:

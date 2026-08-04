@@ -10,6 +10,25 @@ instead of scattered across the table.
 
 The applier still owns the four handlers that need its own collaborators
 (sessions, events, expedite lane); they are passed in rather than reached for.
+
+It also still owns MUTATION POLICY. Every action carries an optional
+``ExpectedState``, and ``ActionApplier`` enforces it as a hard optimistic-
+concurrency gate before it writes — but a handler that reaches its owner
+directly never crosses that gate, so ``Action.expected`` silently meant nothing
+on this dispatch branch. A case file paused behind ``io:needs-reconcile`` could
+still have a promotion issue filed against it, receive evidence comments, or be
+settled (#6957 round-5 review F15/A6). So every MUTATING tech-lead command is
+wrapped here in the applier's own guard, with the typed reconciliation subject
+each one acts on:
+
+* the three promotion lifecycle actions act on the SOURCE repo's case file, so
+  ``case_file_issue_number`` is the subject — the promoted issue lives in
+  another repository, which this reconciliation model does not span;
+* ``APPEND_PATTERN_OBSERVATION`` comments on and counts against the case file
+  itself, so its subject is ``issue_number``.
+
+The guard is passed in as one callback rather than reimplemented per owner, so
+the label read and the fail-closed rule stay in exactly one place.
 """
 
 from __future__ import annotations
@@ -36,6 +55,29 @@ if TYPE_CHECKING:
     from ..ports.tech_lead_authority import TechLeadAuthorityStore
 
 ActionHandler = Callable[[Action], ActionResult]
+#: ``(action, issue_number) -> None``; raises when the mutation must not proceed.
+ExpectedStateGuard = Callable[[Action, int], None]
+#: The managed-repo issue an action's reconciliation is checked against.
+ReconciliationSubject = Callable[[Action], int]
+
+
+def _guarded(
+    guard: ExpectedStateGuard,
+    subject: ReconciliationSubject,
+    handler: ActionHandler,
+) -> ActionHandler:
+    """Run *handler* only after the applier's expected-state gate allows it.
+
+    The gate raises (``ReconciliationRequired``) rather than returning, so a
+    paused issue produces zero writes: no target-host call, no repository-host
+    call, no authority-store row.
+    """
+
+    def run(action: Action) -> ActionResult:
+        guard(action, subject(action))
+        return handler(action)
+
+    return run
 
 
 def tech_lead_action_handlers(
@@ -44,6 +86,7 @@ def tech_lead_action_handlers(
     surface_proposal: ActionHandler,
     reset_retry: ActionHandler,
     kill_hung_session: ActionHandler,
+    require_expected: ExpectedStateGuard,
     repository_host: "RepositoryHost | None",
     authority: "TechLeadAuthorityStore | None",
     promotion_target: "PromotionTargetHost | None",
@@ -64,25 +107,36 @@ def tech_lead_action_handlers(
             )
         ),
         # Repeat pattern observation: evidence comment + durable count (#6957).
-        ActionType.APPEND_PATTERN_OBSERVATION: (
+        # Subject: the case file it comments on and counts against.
+        ActionType.APPEND_PATTERN_OBSERVATION: _guarded(
+            require_expected,
+            lambda action: action.issue_number,
             lambda action: apply_append_pattern_observation(
                 action, repository_host=repository_host, authority=authority
-            )
+            ),
         ),
-        # Finding promotion: file in the routed repo, then close the loop (#6957).
-        ActionType.PROMOTE_TECH_LEAD_FINDING: (
+        # Finding promotion: file in the routed repo, then close the loop
+        # (#6957). Subject for all three: the SOURCE repo's case file — the
+        # promoted issue lives elsewhere, outside this reconciliation model.
+        ActionType.PROMOTE_TECH_LEAD_FINDING: _guarded(
+            require_expected,
+            lambda action: action.case_file_issue_number,
             lambda action: apply_promote_tech_lead_finding(
                 action, target=promotion_target, authority=authority
-            )
+            ),
         ),
-        ActionType.REPORT_PROMOTED_FINDING_EVIDENCE: (
+        ActionType.REPORT_PROMOTED_FINDING_EVIDENCE: _guarded(
+            require_expected,
+            lambda action: action.case_file_issue_number,
             lambda action: apply_report_promoted_finding_evidence(
                 action, target=promotion_target, authority=authority
-            )
+            ),
         ),
-        ActionType.SETTLE_TECH_LEAD_PROMOTION: (
+        ActionType.SETTLE_TECH_LEAD_PROMOTION: _guarded(
+            require_expected,
+            lambda action: action.case_file_issue_number,
             lambda action: apply_settle_tech_lead_promotion(
                 action, repository_host=repository_host, authority=authority
-            )
+            ),
         ),
     }

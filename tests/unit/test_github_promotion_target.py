@@ -152,11 +152,13 @@ class TestFiling:
 
 
 class TestRecoveryOnlyLookup:
-    """#6957 round-4 review F12/A5: find WITHOUT create.
+    """#6957 round-4 F12/A5 + round-5 F13: find WITHOUT create, and PROVE absence.
 
-    The filing owner has to ask whether an interrupted filing left an issue in a
-    repo the route no longer points at. Answering that with ``file_issue`` would
-    risk creating one there.
+    The filing owner asks whether an interrupted filing left an issue in a repo
+    the route no longer points at, and RETIRES a durable creation intent on a
+    negative answer. Answering that with ``file_issue`` would risk creating one
+    there; answering it with a bounded, title-scoped search would retire the
+    intent wrongly and file a second issue for a signature that already has one.
     """
 
     def test_finds_the_marker_owned_issue_without_creating(self, target, http_client):
@@ -172,6 +174,39 @@ class TestRecoveryOnlyLookup:
         assert (found.number, found.recovered) == (77, True)
         http_client.create_issue.assert_not_called()
         http_client.create_label.assert_not_called()
+
+    def test_the_scan_is_exhaustive_and_never_title_scoped(self, target, http_client):
+        """The lookup that must PROVE absence cannot depend on a title (F13)."""
+        target.find_filed_issue(repo=REPO, title="t", idempotency_marker=MARKER)
+
+        http_client.list_issues.assert_called_once()
+        kwargs = http_client.list_issues.call_args.kwargs
+        assert kwargs["state"] == "all"
+        assert kwargs["use_cache"] is False
+        # The repository's one fail-loud completeness contract (#6779 R8/R17):
+        # a short page ends it, a cap or page failure raises.
+        assert kwargs["exhaustive"] is True
+        assert kwargs["limit"] > 100
+        http_client.search_issues_by_title.assert_not_called()
+
+    def test_an_aged_out_retitled_issue_is_still_found(self, target, http_client):
+        """The exact miss F13 describes: outside the recent window, retitled.
+
+        A bounded scan plus an ``in:title`` fallback reported this as absent,
+        which retired the intent and filed a duplicate.
+        """
+        http_client.list_issues.return_value = [
+            *({"number": n, "body": "unrelated", "html_url": "u"} for n in range(200)),
+            {"number": 999, "body": f"body kept its marker {MARKER}", "html_url": "u"},
+        ]
+        # The title no longer matches anything the caller knows.
+        http_client.search_issues_by_title.return_value = []
+
+        found = target.find_filed_issue(
+            repo=REPO, title="a title that was since edited", idempotency_marker=MARKER
+        )
+
+        assert found is not None and found.number == 999
 
     def test_proven_absent_returns_none_and_creates_nothing(
         self, target, http_client
@@ -189,6 +224,18 @@ class TestRecoveryOnlyLookup:
 
         with pytest.raises(GitHubHttpError):
             target.find_filed_issue(repo=REPO, title="t", idempotency_marker=MARKER)
+
+    def test_an_unprovable_scan_propagates_rather_than_reporting_absent(
+        self, target, http_client
+    ):
+        """Cap exhaustion is "unknown", not "absent" (F13)."""
+        http_client.list_issues.side_effect = GitHubHttpError(
+            "refusing to treat the partial repository issues as complete"
+        )
+
+        with pytest.raises(GitHubHttpError):
+            target.find_filed_issue(repo=REPO, title="t", idempotency_marker=MARKER)
+        http_client.create_issue.assert_not_called()
 
     def test_a_body_without_the_marker_is_not_this_signature(
         self, target, http_client

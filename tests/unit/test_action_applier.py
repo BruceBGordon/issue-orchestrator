@@ -3051,3 +3051,139 @@ class TestClaimGateAudit:
                 f"_verify_claim_before_write — all GitHub writes on claimed "
                 f"issues must verify claim ownership first"
             )
+
+
+class TestTechLeadMutationsCrossTheReconciliationGate:
+    """#6957 round-5 review F15/A6: the extracted tech-lead dispatch is guarded.
+
+    Every tech-lead action carries ``build_expected_for_mutation()``, but the
+    extracted owners were invoked directly, so the applier's hard
+    optimistic-concurrency gate never ran on this branch. A case file paused
+    behind ``io:needs-reconcile`` could still have a promotion filed against it,
+    receive evidence comments, or be settled.
+    """
+
+    CASE_FILE = 65
+
+    @pytest.fixture
+    def guarded(self, mock_labels, mock_sessions, mock_events, mock_repository_host):
+        """An applier with reconciliation live and the case file PAUSED."""
+        from issue_orchestrator.control.action_applier import ActionApplier
+
+        reader = MagicMock()
+        reader.read_issue_labels.return_value = [
+            "tech-lead-observation",
+            "io:needs-reconcile",
+        ]
+        authority = MagicMock()
+        target = MagicMock()
+        applier = ActionApplier(
+            labels=mock_labels,
+            sessions=mock_sessions,
+            events=mock_events,
+            repository_host=mock_repository_host,
+            fresh_issue_reader=reader,
+            reconcile=True,
+            tech_lead_ops=authority,
+            promotion_target=target,
+        )
+        return applier, authority, target, mock_repository_host
+
+    @staticmethod
+    def _actions(case_file: int):
+        from issue_orchestrator.control.actions import (
+            AppendPatternObservationAction,
+            PromoteTechLeadFindingAction,
+            ReportPromotedFindingEvidenceAction,
+            SettleTechLeadPromotionAction,
+        )
+        from issue_orchestrator.control.reconciliation import (
+            build_expected_for_mutation,
+        )
+        from issue_orchestrator.domain.tech_lead_findings import PatternObservation
+
+        expected = build_expected_for_mutation()
+        marker = "<!-- issue-orchestrator:tech-lead-promotion:v1:abc -->"
+        return [
+            AppendPatternObservationAction(
+                issue_number=case_file,
+                pattern_signature="sig",
+                observation=PatternObservation(
+                    observation_id="r1:s:A1", comment="observed again"
+                ),
+                expected=expected,
+            ),
+            PromoteTechLeadFindingAction(
+                signature="sig",
+                case_file_issue_number=case_file,
+                target_repo="owner/upstream",
+                title="[tech-lead:repo] sig",
+                body=f"body\n\n{marker}",
+                labels=("agent:backend",),
+                observation_count=2,
+                idempotency_marker=marker,
+                expected=expected,
+            ),
+            ReportPromotedFindingEvidenceAction(
+                signature="sig",
+                case_file_issue_number=case_file,
+                target_repo="owner/upstream",
+                target_issue_number=500,
+                observation_count=3,
+                comment="more evidence",
+                expected=expected,
+            ),
+            SettleTechLeadPromotionAction(
+                signature="sig",
+                case_file_issue_number=case_file,
+                target_repo="owner/upstream",
+                target_issue_number=500,
+                shipped=True,
+                merged_pr_url="https://x/pull/1",
+                expected=expected,
+            ),
+        ]
+
+    def test_each_mutating_action_raises_and_writes_nothing(self, guarded):
+        from issue_orchestrator.control.reconciliation import ReconciliationRequired
+
+        applier, authority, target, repository_host = guarded
+
+        for action in self._actions(self.CASE_FILE):
+            with pytest.raises(ReconciliationRequired):
+                applier.apply(action)
+
+        # Zero writes anywhere: no cross-repo filing/commenting, no case-file
+        # comment, and no durable ledger row.
+        assert target.method_calls == []
+        assert authority.method_calls == []
+        repository_host.add_comment.assert_not_called()
+        repository_host.create_issue.assert_not_called()
+        repository_host.update_issue_state.assert_not_called()
+
+    def test_the_gate_checks_the_managed_repos_case_file(self, guarded):
+        """The promoted issue lives in another repo; the case file is the subject."""
+        from issue_orchestrator.control.reconciliation import ReconciliationRequired
+
+        applier, _authority, _target, _repository_host = guarded
+        reader = applier.fresh_issue_reader
+
+        for action in self._actions(self.CASE_FILE):
+            reader.read_issue_labels.reset_mock()
+            with pytest.raises(ReconciliationRequired):
+                applier.apply(action)
+            assert reader.read_issue_labels.call_args[0][0] == self.CASE_FILE
+
+    def test_an_unpaused_case_file_reaches_its_owner(self, guarded):
+        """The gate blocks a PAUSED case file, not every promotion action."""
+        applier, authority, _target, _repository_host = guarded
+        applier.fresh_issue_reader.read_issue_labels.return_value = [
+            "tech-lead-observation"
+        ]
+        authority.has_pattern_observation.return_value = True  # already recorded
+
+        [append, *_rest] = self._actions(self.CASE_FILE)
+        result = applier.apply(append)
+
+        assert result.success
+        authority.has_pattern_observation.assert_called_once()

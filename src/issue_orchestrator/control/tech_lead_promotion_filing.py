@@ -31,13 +31,22 @@ a body carrying the CURRENT count while the ledger still records the intent's
 older watermark, so one evidence comment is repeated. A duplicate comment is
 cosmetic; a suppressed one is not.
 
-The owner also settles the one transition the intent's durability creates:
+Finding an intent already in the store therefore means exactly one thing: a
+previous attempt stopped somewhere inside that sequence. Which side of the
+remote create it stopped on is the only question that matters, and it is settled
+BEFORE anything is created, by the recovery-only lookup in the intent's own repo
+— the issue exists (it IS the promotion), is proven absent (that create never
+happened), or cannot be read (propagate; create nothing). Asking it with a
+bounded, title-scoped search would answer "absent" for an issue that had merely
+aged out or been retitled, and file a second issue for a signature that already
+has one, so this path requires the AUTHORITATIVE lookup (#6957 round-5 F13).
+
 ``tech_lead.findings.route`` is ordinary user-editable configuration, so an
-operator can re-point an area between ticks while a filing is in flight. A
-recovery-only lookup in the intent's own repo decides it — the old issue exists
-(it IS the promotion; the old target stays authoritative), is proven absent (the
-stale intent is retired and the current route takes over), or cannot be read
-(propagate; create nothing). See :meth:`PromotionFilingOwner._reconcile_route_change`.
+operator can also re-point an area between ticks while a filing is in flight.
+That does not change the question above — it only changes what a proven absence
+permits: with the route unchanged the intent stands and is filed under, and with
+it re-pointed the stale intent is retired so the current route can take over. A
+found issue outranks both: one signature promotes exactly once.
 """
 
 from __future__ import annotations
@@ -88,19 +97,19 @@ class PromotionFilingOwner:
         """File (or recover) the promotion issue and commit its ledger row.
 
         Order: intent, then remote create, then ledger row, then retire the
-        intent. Every step after the first is idempotent under replay — the
-        target's marker lookup returns the already-created issue, and
-        ``record_promotion`` is create-once — so the only thing a crash can cost
-        is a repeated evidence comment, never a suppressed one.
+        intent. An intent already in the store means a previous attempt was
+        interrupted inside that sequence, so it is settled against its own repo
+        FIRST — no create may precede that answer, and only the authoritative
+        lookup's "absent" is an answer at all (#6957 round-5 review F13).
         """
         pending = self._authority.load_pending_promotion(signature=action.signature)
-        if pending is not None and pending.target_repo != action.target_repo:
-            resolved = self._reconcile_route_change(
+        if pending is not None:
+            settled = self._settle_interrupted_filing(
                 action, pending, recorded_at=recorded_at
             )
-            if resolved is not None:
-                return resolved
-            pending = None
+            if settled is not None:
+                return settled
+            pending = self._intent_after_proven_absence(action, pending)
         if pending is None:
             pending = PendingPromotion(
                 signature=action.signature,
@@ -112,17 +121,6 @@ class PromotionFilingOwner:
                 body_observations=action.observation_count,
             )
             self._authority.record_pending_promotion(pending=pending)
-        else:
-            logger.warning(
-                "[tech_lead] Resuming an interrupted promotion filing for"
-                " signature %r in %s; its body documents %d observation(s), so"
-                " the ledger watermark is set from that, not from this action's"
-                " %d",
-                action.signature,
-                pending.target_repo,
-                pending.body_observations,
-                action.observation_count,
-            )
 
         filed = self._target.file_issue(
             repo=pending.target_repo,
@@ -139,34 +137,32 @@ class PromotionFilingOwner:
             recorded_at=recorded_at,
         )
 
-    def _reconcile_route_change(
+    def _settle_interrupted_filing(
         self,
         action: "PromoteTechLeadFindingAction",
         pending: "PendingPromotion",
         *,
         recorded_at: str,
     ) -> FiledPromotion | None:
-        """Settle an interrupted filing whose route has since been re-pointed.
+        """Did the interrupted attempt's remote create happen? Settle it if so.
 
-        ``tech_lead.findings.route`` is ordinary, user-editable configuration
-        and the pending intent is deliberately durable across restarts, so an
-        operator re-pointing an area between ticks reaches this — the signature's
-        area never has to change (#6957 round-4 review F12). Refusing to act
-        stranded the signature forever: every later tick rebuilt the same action
-        from the new route, hit the same mismatch, and failed again.
+        Exactly one of three things can be true, and the lookup is chosen so
+        that all three are distinguishable:
 
-        A RECOVERY-ONLY lookup in the intent's own repo decides it, and only one
-        of three things can be true:
+        * the issue EXISTS — it IS the promotion, whatever the route says now.
+          One signature promotes to exactly one issue ever, so finalize the
+          ledger from the intent and return it.
+        * it is PROVEN ABSENT — that create never happened, nothing is orphaned.
+          Return None so the caller files, under the intent the next step
+          selects.
+        * the lookup FAILS — "unknown", never "absent", so it propagates and
+          nothing is created. The next tick asks again.
 
-        * the old issue EXISTS — it is the promotion. One signature promotes to
-          exactly one issue ever, so the old target stays authoritative and the
-          new route simply does not apply to a finding already filed. Finalize
-          from the intent and return.
-        * the old issue is PROVEN ABSENT — that create never happened, so
-          nothing is orphaned. Retire the stale intent and return None, letting
-          the caller file fresh against the current route.
-        * the lookup FAILS — "unknown", never "absent". It propagates, so
-          nothing is created and the next tick tries again.
+        The third outcome is why this uses the AUTHORITATIVE lookup: a bounded,
+        title-scoped search collapses "unknown" into "absent" for an issue that
+        aged out of the recent window or was retitled, and filing on that
+        answer creates a second issue for a signature that already has one
+        (#6957 round-5 review F13).
         """
         found = self._target.find_filed_issue(
             repo=pending.target_repo,
@@ -174,6 +170,59 @@ class PromotionFilingOwner:
             idempotency_marker=pending.idempotency_marker,
         )
         if found is None:
+            return None
+        if pending.target_repo != action.target_repo:
+            logger.warning(
+                "[tech_lead] Signature %r was re-routed from %s to %s, but its"
+                " interrupted filing had already created %s#%d. That issue IS"
+                " the promotion — one signature promotes exactly once — so the"
+                " recorded target stays %s and the new route does not apply",
+                action.signature,
+                pending.target_repo,
+                action.target_repo,
+                pending.target_repo,
+                found.number,
+                pending.target_repo,
+            )
+        else:
+            logger.warning(
+                "[tech_lead] An interrupted filing for signature %r had already"
+                " created %s#%d; recovering it instead of creating a second"
+                " issue, with the ledger watermark set from the %d"
+                " observation(s) its body documents, not this action's %d",
+                action.signature,
+                pending.target_repo,
+                found.number,
+                pending.body_observations,
+                action.observation_count,
+            )
+        return self._commit(
+            pending,
+            issue_number=found.number,
+            url=found.url,
+            recovered=True,
+            recorded_at=recorded_at,
+        )
+
+    def _intent_after_proven_absence(
+        self,
+        action: "PromoteTechLeadFindingAction",
+        pending: "PendingPromotion",
+    ) -> "PendingPromotion | None":
+        """The intent to file under, once the old create is known not to exist.
+
+        The intent is deliberately durable across restarts while
+        ``tech_lead.findings.route`` is ordinary user-editable configuration, so
+        an operator can re-point an area between ticks (#6957 round-4 review
+        F12). With nothing filed, that re-point is free to take effect: retire
+        the stale intent and return None so a fresh one is recorded against the
+        current route. Refusing instead stranded the signature forever — every
+        later tick rebuilt the same action and hit the same mismatch.
+
+        With the route unchanged there is nothing stale about it, so the intent
+        stands and its older watermark keeps ruling the ledger row.
+        """
+        if pending.target_repo != action.target_repo:
             logger.warning(
                 "[tech_lead] Signature %r was re-routed from %s to %s while a"
                 " filing was in flight, and no issue carries its marker in %s —"
@@ -187,24 +236,17 @@ class PromotionFilingOwner:
             self._authority.discard_pending_promotion(signature=action.signature)
             return None
         logger.warning(
-            "[tech_lead] Signature %r was re-routed from %s to %s, but its"
-            " interrupted filing had already created %s#%d. That issue IS the"
-            " promotion — one signature promotes exactly once — so the recorded"
-            " target stays %s and the new route does not apply to it",
+            "[tech_lead] Resuming an interrupted promotion filing for signature"
+            " %r in %s; its create is proven not to have happened, so the body"
+            " filed now documents %d observation(s) while the ledger keeps the"
+            " intent's %d — at worst one evidence comment is repeated, which is"
+            " the direction this fails in deliberately",
             action.signature,
             pending.target_repo,
-            action.target_repo,
-            pending.target_repo,
-            found.number,
-            pending.target_repo,
+            action.observation_count,
+            pending.body_observations,
         )
-        return self._commit(
-            pending,
-            issue_number=found.number,
-            url=found.url,
-            recovered=True,
-            recorded_at=recorded_at,
-        )
+        return pending
 
     def _commit(
         self,

@@ -25,7 +25,7 @@ from ...ports.promotion_target import (
 )
 from .errors import GitHubHttpError
 from .http_client import GitHubHttpClient, GitHubHttpConfig
-from .marker_recovery import find_marker_issue
+from .marker_recovery import find_marker_issue, prove_marker_issue
 
 if TYPE_CHECKING:
     from .github_adapter import GitHubAdapter
@@ -120,9 +120,14 @@ class GitHubPromotionTargetHost:
         Provisioning precedes creation for the same reason the tech-lead issue
         creation boundary does it: GitHub silently DROPS unknown labels, and a
         promotion whose gate label was dropped would be an immediately
-        schedulable issue nobody approved. The fresh marker lookup closes the
-        remote-create/local-ledger crash window: a retry returns the issue the
-        previous process created rather than filing a second one.
+        schedulable issue nobody approved.
+
+        The marker lookup here is a best-effort safety net, NOT the at-most-once
+        guarantee. That guarantee belongs to ``PromotionFilingOwner``, which
+        resolves any pre-existing creation intent through the authoritative
+        :meth:`find_filed_issue` before this is ever reached — so by the time a
+        create happens, absence has been proven or no create was ever attempted
+        for this signature (#6957 round-5 review F13).
         """
         validate_promotion_issue_marker(body=body, marker=idempotency_marker)
         with self._client_for(repo) as client:
@@ -148,20 +153,29 @@ class GitHubPromotionTargetHost:
     def find_filed_issue(
         self, *, repo: str, title: str, idempotency_marker: str
     ) -> FiledIssue | None:
-        """The marker-owned issue in *repo*, or None when proven absent.
+        """The marker-owned issue in *repo*, or None when PROVEN absent.
 
         The recovery half of :meth:`file_issue`, exposed on its own so the
         filing owner can ask whether an interrupted filing left an issue behind
         in a repo the route no longer points at — without risking a create there
-        (#6957 round-4 review F12/A5). Failures propagate: an unreadable repo is
-        "unknown", never "absent".
+        (#6957 round-4 review F12/A5).
+
+        Its negative answer is load-bearing: the owner retires a durable
+        creation intent on it, and retiring one wrongly files a SECOND issue for
+        a signature that already has one. So this uses the authoritative,
+        title-independent, fail-loud scan — never the bounded best-effort one
+        (#6957 round-5 review F13). ``title`` is accepted for interface symmetry
+        and deliberately unused: an edited title must not hide the issue.
         """
         if not idempotency_marker.strip():
             raise ValueError("recovering a promotion filing needs its marker")
         with self._client_for(repo) as client:
-            return self._find_marker_issue(
-                client, title=title, marker=idempotency_marker
-            )
+            found = prove_marker_issue(client, marker=idempotency_marker)
+        return (
+            FiledIssue(number=found.number, url=found.url, recovered=True)
+            if found
+            else None
+        )
 
     @staticmethod
     def _find_marker_issue(

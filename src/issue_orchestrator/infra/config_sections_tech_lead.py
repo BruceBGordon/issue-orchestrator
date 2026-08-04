@@ -19,6 +19,33 @@ from .config_models import (
 )
 
 
+def _required_mapping(data: dict, key: str) -> dict:
+    """The ``tech_lead.<key>`` sub-dict, rejecting every non-mapping by SHAPE.
+
+    ``data.get(key, {}) or {}`` accepts any falsy value and silently replaces it
+    with the block's defaults. For ``findings`` that is not a cosmetic sloppiness:
+    the defaults are ``promote: gated`` with ``route.default: self``, so
+    ``findings: false`` — an operator plainly trying to turn the lane OFF — would
+    have quietly ENABLED issue creation (#6957 round-5 review F14). It is the
+    same truthiness bug this branch already fixed one level down, at
+    ``tech_lead.findings.route``.
+
+    Omission and an explicit ``null`` are the only accepted ways to say "use the
+    defaults"; anything else that is not a mapping is a loud configuration error.
+    """
+    value = data.get(key, None)
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError(
+            f"tech_lead.{key} must be a mapping, got {type(value).__name__}"
+            f" ({value!r}); remove the key or set it to null to accept the"
+            f" defaults — note that the tech_lead.findings defaults ENABLE the"
+            f" promotion lane, so use `promote: off` to disable it"
+        )
+    return value
+
+
 def parse_tech_lead_config(data: dict) -> TechLeadConfig:
     """Parse tech_lead section from YAML data."""
     # Parse lists (support comma-separated strings)
@@ -52,5 +79,7 @@ def parse_tech_lead_config(data: dict) -> TechLeadConfig:
             data.get("health_review", {}) or {}
         ),
         stuck_sweep=StuckSweepConfig.from_mapping(data.get("stuck_sweep", {}) or {}),
-        findings=TechLeadFindingsConfig.from_mapping(data.get("findings", {}) or {}),
+        findings=TechLeadFindingsConfig.from_mapping(
+            _required_mapping(data, "findings")
+        ),
     )

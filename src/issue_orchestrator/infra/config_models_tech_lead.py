@@ -258,6 +258,20 @@ class StuckSweepConfig:
         return errors
 
 
+def _promote_mode(raw: Any) -> str:
+    """Normalize ``tech_lead.findings.promote``, undoing YAML's boolean coercion.
+
+    YAML 1.1 parses a bare ``off`` as the boolean ``False`` — so the documented
+    disable value, written exactly as the ADR and the example config show it,
+    arrived here as ``'False'``: not a valid mode, so startup rejected the one
+    spelling operators are told to use. Map it back; ``True`` has no
+    corresponding mode and is deliberately left to fail validation loudly.
+    """
+    if raw is False:
+        return FINDING_PROMOTION_OFF
+    return str(raw).strip()
+
+
 @dataclass(frozen=True)
 class PromotionRouteTarget:
     """One ``tech_lead.findings.route`` entry: a repo AND its queue contract.
@@ -412,7 +426,7 @@ class TechLeadFindingsConfig:
             PROMOTION_ROUTE_DEFAULT_KEY, PromotionRouteTarget(repo=PROMOTION_ROUTE_SELF)
         )
         return cls(
-            promote=str(data.get("promote", FINDING_PROMOTION_GATED)).strip(),
+            promote=_promote_mode(data.get("promote", FINDING_PROMOTION_GATED)),
             min_evidence=int(data.get("min_evidence", 2)),
             max_open_promoted=int(data.get("max_open_promoted", 3)),
             route=route,

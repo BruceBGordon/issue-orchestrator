@@ -3191,6 +3191,41 @@ tech_lead:
         with pytest.raises(ValueError, match=fragment):
             Config.load(config_file)
 
+    @pytest.mark.parametrize("value", ("[]", "''", "false", "0", "3", "'gated'"))
+    def test_a_non_mapping_findings_block_is_rejected_not_defaulted(
+        self, tmp_path, value: str
+    ):
+        """#6957 round-5 review F14: the same truthiness bug, one level up.
+
+        ``tech_lead.findings`` defaults to ``promote: gated`` with
+        ``route.default: self``, so silently replacing an explicit value with
+        ``{}`` ENABLES issue creation — the opposite of what an operator writing
+        ``findings: false`` intends.
+        """
+        config_file = tmp_path / ".issue-orchestrator.yaml"
+        config_file.write_text(f"tech_lead:\n  findings: {value}\n")
+
+        with pytest.raises(ValueError, match="tech_lead.findings must be a mapping"):
+            Config.load(config_file)
+
+    @pytest.mark.parametrize("body", ("tech_lead:\n  priority: P1\n", "tech_lead:\n  findings: null\n"))
+    def test_omitted_or_null_findings_takes_the_defaults(self, tmp_path, body: str):
+        """Omission and an explicit null are the only ways to accept defaults."""
+        config_file = tmp_path / ".issue-orchestrator.yaml"
+        config_file.write_text(body)
+
+        findings = Config.load(config_file).tech_lead.findings
+
+        assert findings.promote == "gated"
+        assert findings.route == {"default": PromotionRouteTarget(repo="self")}
+
+    def test_promote_off_is_how_the_lane_is_disabled(self, tmp_path):
+        """The message points here, so it had better work."""
+        config_file = tmp_path / ".issue-orchestrator.yaml"
+        config_file.write_text("tech_lead:\n  findings:\n    promote: off\n")
+
+        assert Config.load(config_file).tech_lead.findings.enabled is False
+
     @pytest.mark.parametrize("value", ("[]", "''", "false", "0"))
     def test_falsy_non_mapping_route_is_rejected_not_defaulted(
         self, tmp_path, value: str
