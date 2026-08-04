@@ -706,12 +706,11 @@ class Planner:
                 continue
             # Terminal recovery: the issue's work has landed (PR merged/closed
             # or parent issue closed). One owner command sheds every stale
-            # transient workflow label — pr-pending, publish-failed,
-            # publish-fail-count-N, blocking — then finalizes awaiting-merge
-            # history. The applier picks the exact set from the issue's live
-            # labels and gates the history transition on the shed (and close)
-            # succeeding, so a transient failure leaves the entry reconcilable
-            # for a later pass instead of stranding the labels this P0 removes.
+            # transient workflow label (pr-pending, publish-failed,
+            # publish-fail-count-N, blocking) then finalizes awaiting-merge
+            # history; the applier picks the set from live labels and gates the
+            # history transition on the shed (and close) succeeding, so a
+            # transient failure leaves the entry reconcilable, not stranded.
             actions.append(RecoverTerminalIssueAction(
                 issue_number=reconciliation.issue_number,
                 pr_number=reconciliation.pr_number,
@@ -722,9 +721,10 @@ class Planner:
                 issue_key=issue_key,
                 reason=f"awaiting-merge terminal: {reconciliation.status}",
                 # Close-on-merge fallback (close_on_merge module, porchpin
-                # #81): merged PR + still-open issue. Never on closed status
-                # — a closed-unmerged PR's open issue is the drift path's job.
+                # #81): merged PR + still-open issue; advisory — the applier
+                # revalidates live evidence. Never on closed status (drift's job).
                 close_issue=reconciliation.status == "merged" and reconciliation.issue_open,
+                merged_at=reconciliation.merged_at or "",
                 # Carry the reconciliation pause guard the old terminal-cleanup
                 # RemoveLabelAction used to carry: an issue paused for
                 # reconciliation (io:needs-reconcile) must not have its labels

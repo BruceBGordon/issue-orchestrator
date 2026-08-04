@@ -238,7 +238,12 @@ class MockGitHubAdapter:
         self.comments: list[dict] = []
         # (issue_number, ISO-8601Z timestamp) per close, mirroring GitHub's
         # /issues/{n}/events "closed" entries for issue_closed_on_or_after.
+        # Timestamps are DETERMINISTIC (tests/AGENTS.md: never the real
+        # clock): a fixed far-future base plus a per-event counter, so any
+        # close recorded during a scenario sorts after any fixture merged_at.
+        # Tests needing precise ordering seed issue_close_events directly.
         self.issue_close_events: list[tuple[int, str]] = []
+        self._close_event_seq = 0
         self.pr_reviews: dict[int, list[dict]] = {}  # pr_number -> reviews
         self.close_pr_calls: list[int] = []
         # pr_number -> current merge queue entry (None/absent = not enqueued)
@@ -528,9 +533,11 @@ class MockGitHubAdapter:
         if issue is not None:
             issue.state = state
             if state == "closed":
+                self._close_event_seq += 1
+                seq = self._close_event_seq
                 self.issue_close_events.append((
                     issue_number,
-                    datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    f"9999-01-01T00:{seq // 60:02d}:{seq % 60:02d}Z",
                 ))
 
     def issue_closed_on_or_after(self, issue_number: int, timestamp: str) -> bool:

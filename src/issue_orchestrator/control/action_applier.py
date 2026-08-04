@@ -64,7 +64,7 @@ from .review_exchange_lifecycle import (
     cancel_issue_review_exchange,
     terminate_issue_runtime,
 )
-from .close_on_merge import close_on_merge_comment
+from .close_on_merge import run_close_on_merge_fallback
 from .actions import (
     Action,
     ActionResult,
@@ -1359,28 +1359,22 @@ Maximum rework cycles ({action.max_rework_cycles}) exceeded.
         # explicit guard that this command writes only to a still-claimed issue.
         self._verify_claim_before_write(action, action.issue_number)
 
+        close_applied = False
         if action.close_issue:
-            # Close-on-merge fallback (porchpin #81): the PR merged but no
-            # closing reference fired, so GitHub never auto-closed the issue.
-            # The close is the FIRST mutation, before the label shed: a closed
-            # issue can never re-enter the work queue, so a later shed or
-            # history failure is safe and retryable. The reverse order would
-            # open a window — queue-gating labels shed, close failed, process
-            # restarted — where the first planning pass relaunches the issue
-            # through exactly the hole this fallback closes. A close that
-            # succeeds while history finalization fails reconciles
-            # terminal-via-issue-closure on the next pass — idempotent.
-            close_result = self._apply_close_issue(CloseIssueAction(
-                issue_number=action.issue_number,
-                comment=close_on_merge_comment(action.pr_url, action.pr_number),
-                reason=action.status_reason or action.reason,
-            ))
-            if not close_result.success:
-                # No labels were touched; the entry stays reconcilable.
+            # Close-on-merge fallback (porchpin #81): revalidation ordering
+            # and rationale live in run_close_on_merge_fallback — the module
+            # owns the destructive precondition; the planner's bit is advisory.
+            close_applied, close_error = run_close_on_merge_fallback(
+                repository_host=self.repository_host,
+                action=action,
+                close=self._apply_close_issue,
+            )
+            if close_error is not None:
+                # Fail without any further mutation (no shed, no history);
+                # the entry stays reconcilable for retry.
                 return ActionResult.fail(
                     action,
-                    "close-on-merge fallback failed; awaiting-merge history "
-                    f"left reconcilable for retry: {close_result.error}",
+                    close_error,
                     issue_number=action.issue_number,
                     pr_number=action.pr_number,
                 )
@@ -1426,7 +1420,7 @@ Maximum rework cycles ({action.max_rework_cycles}) exceeded.
             pr_number=action.pr_number,
             status=action.status,
             shed_removed=list(shed_result.details.get("removed", [])),
-            closed_issue=action.close_issue,
+            closed_issue=close_applied,
         )
 
     def _apply_queue_review(self, action: Action) -> ActionResult:

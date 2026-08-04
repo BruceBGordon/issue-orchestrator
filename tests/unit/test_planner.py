@@ -1058,6 +1058,7 @@ class TestPlanAwaitingMergeReconciliations:
             source="pull_request",
             issue_key="M1-228",
             issue_open=True,
+            merged_at="2026-08-03T13:52:09Z",
         )
 
         snapshot = make_snapshot(
@@ -1071,6 +1072,9 @@ class TestPlanAwaitingMergeReconciliations:
         action = actions[0]
         assert isinstance(action, RecoverTerminalIssueAction)
         assert action.close_issue is True
+        # The merge evidence rides the owner command so the applier can
+        # revalidate the destructive precondition against live state.
+        assert action.merged_at == "2026-08-03T13:52:09Z"
 
     def test_merged_closed_issue_plans_no_close(self):
         """The common case — auto-close fired — must not order a close."""

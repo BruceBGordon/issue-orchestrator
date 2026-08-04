@@ -307,6 +307,7 @@ class AwaitingMergeReconciler:
                         reason=pr_terminal_reason(pr_state),
                         source="pull_request",
                         issue_open=issue_open,
+                        merged_at=pr.merged_at,
                     ),
                     drift=drift,
                 )

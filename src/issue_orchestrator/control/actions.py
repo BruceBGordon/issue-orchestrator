@@ -691,11 +691,11 @@ class RecoverTerminalIssueAction(Action):
     source: AwaitingMergeReconciliationSource = "pull_request"
     status_reason: str = ""
     issue_key: str = ""  # stable_id for SSE events; falls back to str(issue_number) when empty
-    # Close-on-merge fallback: PR merged but the issue is still open (no
-    # closing reference registered, so GitHub's auto-close never fired). The
-    # applier closes it between the label shed and the history finalization —
-    # rationale and ordering invariant in the close_on_merge module.
+    # Close-on-merge fallback: PR merged but no closing reference fired.
+    # Advisory — the applier revalidates the destructive precondition against
+    # live state (close_on_merge module) using ``merged_at`` as the evidence.
     close_issue: bool = False
+    merged_at: str = ""
     action_type: ActionType = field(
         default=ActionType.RECOVER_TERMINAL_ISSUE, init=False
     )
