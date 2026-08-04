@@ -1,5 +1,7 @@
 """Tests for branch-diff test skip guard."""
 
+import pytest
+
 from issue_orchestrator.control.test_skip_guard import (
     TestSkipGuardResult as SkipGuardResult,
     added_test_paths,
@@ -161,6 +163,56 @@ diff --git a/tests/unit/test_guard.py b/tests/unit/test_guard.py
         ("tests/unit/guard.test.ts", 1, "JS test skip"),
         ("tests/unit/test_guard.py", 1, "pytest.skip"),
     ]
+
+
+def test_scan_added_test_skip_guards_flags_source_resembling_diff_headers() -> None:
+    diff = """diff --git a/tests/unit/test_guard.py b/tests/unit/test_guard.py
+--- a/tests/unit/test_guard.py
++++ b/tests/unit/test_guard.py
+@@ -0,0 +1,2 @@
++++pytest.skip("real skip")
++--pytest.mark.skip
+"""
+
+    result = _scan(diff)
+
+    assert added_test_paths(diff) == ("tests/unit/test_guard.py",)
+    assert [
+        (violation.line_number, violation.pattern) for violation in result.violations
+    ] == [(1, "pytest.skip"), (2, "pytest skip marker")]
+
+
+def test_iter_added_diff_lines_still_reads_file_headers_between_hunks() -> None:
+    diff = """diff --git a/tests/first.test.ts b/tests/first.test.ts
+--- a/tests/first.test.ts
++++ b/tests/first.test.ts
+@@ -0,0 +1,1 @@
++++first;
+diff --git a/tests/second.test.ts b/tests/second.test.ts
+--- a/tests/second.test.ts
++++ b/tests/second.test.ts
+@@ -0,0 +1,1 @@
++++second;
+"""
+
+    lines = iter_added_diff_lines(diff)
+
+    assert [(line.path, line.line_number, line.text) for line in lines] == [
+        ("tests/first.test.ts", 1, "++first;"),
+        ("tests/second.test.ts", 1, "++second;"),
+    ]
+
+
+def test_iter_added_diff_lines_rejects_unparsable_hunk_header() -> None:
+    diff = """diff --git a/tests/unit/test_guard.py b/tests/unit/test_guard.py
+--- a/tests/unit/test_guard.py
++++ b/tests/unit/test_guard.py
+@@@ -1,1 -1,1 +1,1 @@@
+++pytest.skip("real skip")
+"""
+
+    with pytest.raises(ValueError, match="Unparsable diff hunk header"):
+        iter_added_diff_lines(diff)
 
 
 def test_scan_added_test_skip_guards_ignores_quoted_nested_diff_fixture_lines() -> None:
@@ -329,6 +381,36 @@ def test_scan_added_test_skip_guards_flags_division_after_string_and_template() 
     result = _scan(diff)
 
     assert [violation.line_number for violation in result.violations] == [1, 3]
+
+
+def test_scan_added_test_skip_guards_flags_division_after_postfix_operators() -> None:
+    diff = """diff --git a/tests/guard.test.ts b/tests/guard.test.ts
+--- a/tests/guard.test.ts
++++ b/tests/guard.test.ts
+@@ -0,0 +1,4 @@
++let count = 0;
++count++ / test.skip("real skip", () => {}) / 2;
++let total = 10;
++total-- / test.skip("decrement skip", () => {}) / 2;
+"""
+
+    result = _scan(diff)
+
+    assert [violation.line_number for violation in result.violations] == [2, 4]
+    assert result.violations[0].pattern == "JS test skip"
+
+
+def test_scan_added_test_skip_guards_ignores_regex_after_prefix_operators() -> None:
+    diff = """diff --git a/tests/guard.test.ts b/tests/guard.test.ts
+--- a/tests/guard.test.ts
++++ b/tests/guard.test.ts
+@@ -0,0 +1,3 @@
++const flagged = +/test.skip("fixture", () => {})/.test(source);
++const negated = !/describe.skip("fixture")/.test(source);
++const doubled = - -/it.skip("fixture")/.test(source);
+"""
+
+    assert _scan(diff).ok
 
 
 def test_scan_added_test_skip_guards_ignores_regex_literal_starting_a_line() -> None:
