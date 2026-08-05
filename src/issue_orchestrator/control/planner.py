@@ -85,8 +85,8 @@ from .tech_lead_reaction import TechLeadReactionPolicy
 from .worker_budget import (
     TechLeadSlotAvailability,
     active_tech_lead_session_count,
-    active_worker_session_count,
     tech_lead_slot_availability,
+    worker_slot_availability,
 )
 from .reconciliation import build_expected_for_mutation
 from .stuck_sweep import build_stuck_sweep_escalation_actions
@@ -342,9 +342,9 @@ class Planner:
         (``snapshot.e2e_occupies_slot``) occupies one worker slot. Tech-lead
         reserved-slot accounting lives in ``tech_lead_slot_availability``
         (worker_budget), the single slot-accounting owner (#6892 review A2)."""
-        worker_capacity = self.config.max_concurrent_sessions - active_worker_session_count(
+        worker_capacity = worker_slot_availability(
             self.config, snapshot.active_sessions
-        )
+        ).remaining
         if snapshot.e2e_occupies_slot:
             worker_capacity -= 1
         return worker_capacity
@@ -1765,9 +1765,12 @@ Flip labels from `{facts.watch_label}` to `{self.config.tech_lead_reviewed_label
         if snapshot.paused:
             return "Orchestrator is paused"
 
-        # Check capacity
-        if snapshot.active_count >= self.config.max_concurrent_sessions:
-            return f"At capacity ({snapshot.active_count}/{self.config.max_concurrent_sessions})"
+        # Check worker capacity through the canonical owner. Raw active_count
+        # includes additive reserved tech-lead sessions and can falsely report
+        # a full worker lane.
+        worker_slot = worker_slot_availability(self.config, snapshot.active_sessions)
+        if not worker_slot.is_free:
+            return f"At capacity ({worker_slot.active}/{worker_slot.maximum})"
 
         # Check max_issues_to_start
         if snapshot.max_issues_to_start is not None:
