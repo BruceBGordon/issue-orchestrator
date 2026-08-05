@@ -116,6 +116,7 @@ class DashboardDataPayload(BaseModel):
     githubOwner: str
     githubRepo: str
     paused: bool
+    providerCircuit: ProviderCircuitStatusPayload
     queueRefreshSeconds: int
     repo: str
     repoRoot: str
@@ -556,6 +557,8 @@ class IssueItemPayload(BaseModel):
     issue_number: int | str | None = None
     issue_url: str | None = None
     open_run_command: OpenE2ERunCommandPayload | None = None
+    provider_badge: ProviderBadgeViewPayload | None = None
+    provider_signal: str | None = None
     runtime_label: str | None = None
     show_stale_badge: bool
     stack_chip: StackChipViewPayload | None = None
@@ -753,6 +756,32 @@ class PhaseDialogPayload(BaseModel):
     phase: dict[str, Any] | None
     phases: list[dict[str, Any]]
     title: str
+
+class ProviderBadgeViewPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    label_text: str
+    title: str
+    tone: str
+
+class ProviderCircuitEntryPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    consecutive_outages: int
+    cooldown_remaining_label: str | None
+    is_open: bool
+    last_error_summary: str | None
+    next_retry_at: str | None
+    provider: str
+    status_label: str
+
+class ProviderCircuitStatusPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    any_open: bool
+    entries: list[ProviderCircuitEntryPayload]
+    next_retry_at: str | None
+    open_count: int
+    open_providers: list[str]
+    status_unavailable: bool
+    summary_text: str
 
 class PublishFailedCodingAttemptPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")

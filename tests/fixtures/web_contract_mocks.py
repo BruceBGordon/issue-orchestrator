@@ -5,10 +5,20 @@ from pathlib import Path
 from issue_orchestrator.domain.models import AgentConfig, OrchestratorState
 from issue_orchestrator.events import EventHub
 from issue_orchestrator.infra.config import Config
+from issue_orchestrator.ports.provider_resilience import (
+    NO_PROVIDER_CIRCUIT_STATUS,
+    ProviderCircuitStatusReader,
+)
 
 
 class MockOrchestratorForWeb:
     """Minimal orchestrator mock that satisfies the web contract protocol."""
+
+    # Explicit, and required by the real facade: the dashboard route resolves
+    # its provider circuit-status reader from this property, and a mock that
+    # silently defaulted would let missing wiring read as a healthy provider
+    # fleet (issue #5980 F2/A1). Override per test to simulate an outage.
+    provider_circuit: ProviderCircuitStatusReader = NO_PROVIDER_CIRCUIT_STATUS
 
     def __init__(self) -> None:
         self.state = OrchestratorState(

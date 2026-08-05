@@ -84,6 +84,7 @@ from ..control.issue_fetch_resilience import (
     PermanentIssueFetchError,
 )
 from ..ports import TraceEvent, RepositoryHost, SessionRunner
+from ..ports.provider_resilience import ProviderCircuitStatusReader
 from ..ports.repository_host import RepositoryHostError
 from .startup_errors import StartupError, write_startup_failure
 from ..control.health_gate import HealthDecision
@@ -142,6 +143,16 @@ class Orchestrator:
     def session_runner(self) -> SessionRunner:
         """Access the session runner for terminal operations."""
         return self.deps.runner
+
+    @property
+    def provider_circuit(self) -> ProviderCircuitStatusReader:
+        """Access the provider circuit-breaker status reader (issue #5980).
+
+        A required facade property, so read-side consumers (the dashboard
+        projection) depend on the behaviour-level port instead of traversing
+        ``deps``, and a composition error cannot degrade into "no outage".
+        """
+        return self.deps.provider_resilience
 
     @property
     def shutdown_requested(self) -> bool:
@@ -423,33 +434,13 @@ class Orchestrator:
         self.state.startup_message = f"{verdict.summary}. {verdict.suggested_fix}"
 
     def _sweep_orphan_atomic_write_tempfiles(self) -> None:
-        """Remove partial tempfiles left by a prior ``kill -9`` mid-rename.
-
-        ``_atomic_write_json`` cleans up on both success and expected failure
-        paths; only an external kill between ``mkstemp`` and ``os.replace``
-        leaves ``.summary.json.XXXX.tmp`` style dotfiles behind. Clearing
-        them at startup keeps per-run directories tidy without any hot-path
-        cost during normal operation.
-        """
+        """Remove partial tempfiles left by a prior ``kill -9`` mid-rename."""
         # Local import keeps the control->infra boundary clean: this module
         # already imports orchestrator_support from control, so one more
         # control-side helper is acceptable.
-        from ..control.review_exchange_loop import sweep_atomic_write_tempfiles
+        from ..control.review_exchange_loop import sweep_orphan_session_tempfiles
 
-        sessions_root = self.config.repo_root / ".issue-orchestrator" / "sessions"
-        try:
-            removed = sweep_atomic_write_tempfiles(sessions_root)
-        except Exception:
-            logger.exception(
-                "[STARTUP] Orphan tempfile sweep failed under %s", sessions_root
-            )
-            return
-        if removed:
-            logger.info(
-                "[STARTUP] Removed %d orphaned atomic-write tempfile(s) under %s",
-                removed,
-                sessions_root,
-            )
+        sweep_orphan_session_tempfiles(self.config.repo_root)
 
     def launch_session(self, issue: Issue, *, tech_lead_scope: "TechLeadLaunchScope | None" = None) -> Optional[Session]:
         return _launch_session(issue, self.state, self._session_launcher, self.deps.session_restorer, tech_lead_scope=tech_lead_scope)

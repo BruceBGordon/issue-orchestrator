@@ -21,8 +21,7 @@ Usage:
 """
 
 from dataclasses import dataclass, field
-from enum import Enum
-from typing import Any, Optional
+from typing import Optional
 
 from ..domain.models import (
     AwaitingMergeReconciliationSource,
@@ -30,6 +29,11 @@ from ..domain.models import (
     DiscoveredFailure,
 )
 from .action_base import Action as Action, ActionType as ActionType
+# Action result types are the Apply/report half of this boundary. They live in
+# `action_results.py` and remain re-exported here for existing importers.
+from .action_results import ActionResult as ActionResult
+from .action_results import ActionResultType as ActionResultType
+
 # Tech-lead action types live in their own module for cohesion and line budget;
 # re-exported here (including the domain value objects their fields use) so
 # every existing ``from .actions import CreateTechLeadIssueAction`` keeps
@@ -388,89 +392,3 @@ class EnqueueToMergeQueueAction(Action):
     pr_url: str = ""
     issue_key: str = ""  # stable_id for SSE events; falls back to str(issue_number) when empty
     action_type: ActionType = field(default=ActionType.ENQUEUE_TO_MERGE_QUEUE, init=False)
-
-
-# Action result types
-
-
-class ActionResultType(Enum):
-    """Result of applying an action."""
-
-    SUCCESS = "success"
-    FAILURE = "failure"
-    SKIPPED = "skipped"  # Already applied or not applicable
-
-
-@dataclass(frozen=True)
-class ActionResult:
-    """Result of applying an action.
-
-    Attributes:
-        action: The action that was applied
-        result_type: Success, failure, or skipped
-        error: Error message if failed
-        details: Additional details about the result
-    """
-
-    action: Action
-    result_type: ActionResultType
-    error: Optional[str] = None
-    details: dict[str, Any] = field(default_factory=dict)
-
-    @property
-    def success(self) -> bool:
-        """Check if the action succeeded."""
-        return self.result_type == ActionResultType.SUCCESS
-
-    @property
-    def issue_number(self) -> int | None:
-        """Canonical issue number this result carries, or ``None`` if it carries
-        none (e.g. the session_launcher-less fallback launch, which has no
-        ``Session`` and thus no canonical issue identity).
-
-        A typed accessor over the untyped ``details`` bag: it fails fast on a
-        present-but-non-``int`` value (a producer/contract bug, ``bool`` included
-        since ``bool`` is an ``int`` subclass) rather than letting a malformed
-        identity flow silently downstream. Consumers that *require* the number
-        (e.g. blocked->front launch cleanup for an issue launch) enforce presence
-        themselves; see #6873 N4.
-        """
-        value = self.details.get("issue_number")
-        if value is None:
-            return None
-        if isinstance(value, bool) or not isinstance(value, int):
-            raise TypeError(f"ActionResult.issue_number must be int, got {value!r}")
-        return value
-
-    @classmethod
-    def ok(cls, action: Action, **details: str | int | bool | list[str] | None) -> "ActionResult":
-        """Create a successful result."""
-        return cls(
-            action=action,
-            result_type=ActionResultType.SUCCESS,
-            details=details,
-        )
-
-    @classmethod
-    def fail(cls, action: Action, error: str, **details: str | int | bool | list[str] | None) -> "ActionResult":
-        """Create a failed result."""
-        return cls(
-            action=action,
-            result_type=ActionResultType.FAILURE,
-            error=error,
-            details=details,
-        )
-
-    @classmethod
-    def skip(
-        cls,
-        action: Action,
-        reason: str,
-        **details: str | int | bool | list[str] | None,
-    ) -> "ActionResult":
-        """Create a skipped result."""
-        return cls(
-            action=action,
-            result_type=ActionResultType.SKIPPED,
-            details={"skip_reason": reason, **details},
-        )

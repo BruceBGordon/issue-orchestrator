@@ -443,6 +443,18 @@
     "status": "completed",
     "step": "pr.view_changed"
   },
+  "provider.issue_blocked": {
+    "level": "phase",
+    "phase": "blocked",
+    "status": "failed",
+    "step": "provider_blocked"
+  },
+  "provider.issue_unblocked": {
+    "level": "phase",
+    "phase": "in_progress",
+    "status": "completed",
+    "step": "provider_unblocked"
+  },
   "provider.outage_entered": {
     "level": "detail",
     "phase": "system",

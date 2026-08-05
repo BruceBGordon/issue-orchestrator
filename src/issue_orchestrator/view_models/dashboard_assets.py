@@ -7,6 +7,11 @@ DASHBOARD_JS_CHUNKS: tuple[str, ...] = (
     # first so every later chunk can call formatTimestamp().
     "timestamp_formatting.js",
     "core.js",
+    # ``provider_circuit.js`` renders the provider outage banner + health
+    # panel (issue #5980) from ``window.dashboardData.providerCircuit``.
+    # Loaded after ``core.js`` so ``escapeHtml`` / ``escapeAttr`` and after
+    # ``timestamp_formatting.js`` so ``formatTimestamp`` are in scope.
+    "provider_circuit.js",
     "session_replay.js",
     # ``validation_viewer.js`` defines the canonical JUnit viewer and
     # the Phase-0 plugin registry (issue #6310 follow-up).  Loaded

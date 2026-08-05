@@ -90,6 +90,7 @@ from .actions import (
     RecoverTerminalIssueAction,
     ResetRetryIssueAction,
 )
+from .provider_impact import ApplyProviderImpactAction, apply_provider_impact
 from .session_manager import SessionManager, SessionRef, SessionType, SessionContext
 from .tech_lead_applier_handlers import tech_lead_action_handlers
 from .tech_lead_issue_creation import apply_create_tech_lead_issue
@@ -282,6 +283,7 @@ class ActionApplier:
             ActionType.ADD_LABEL: self._apply_add_label,
             ActionType.REMOVE_LABEL: self._apply_remove_label,
             ActionType.SYNC_LABELS: self._apply_sync_labels,
+            ActionType.APPLY_PROVIDER_IMPACT: self._apply_provider_impact,
             # SHED_RECOVERED_WORKFLOW_LABELS is intentionally NOT dispatchable:
             # shedding transient workflow labels is a private sub-step of the
             # RECOVER_TERMINAL_ISSUE owner command, which enforces the
@@ -459,6 +461,13 @@ class ActionApplier:
                 detail=str(e),
             )
             return ActionResult.fail(action, str(e))
+
+    def _apply_provider_impact(self, action: Action) -> ActionResult:
+        """Move an issue across the provider-availability boundary (#5980)."""
+        assert isinstance(action, ApplyProviderImpactAction)
+        return apply_provider_impact(
+            action, apply_label=self._dispatch, publish=self.events.publish
+        )
 
     def _apply_add_comment(self, action: Action) -> ActionResult:
         """Add a comment to an issue or PR."""

@@ -213,6 +213,14 @@ async function toggleExcluded() {
             'orchestrator.paused',
             'orchestrator.resumed',
             'startup_complete',
+            // Provider circuit-breaker outages (issue #5980): refresh the view
+            // model so the outage banner + health panel appear/clear live.
+            'provider.outage_entered',
+            'provider.outage_exited',
+            // Issue-scoped provider impact (#5980): a specific issue just gained
+            // or lost the provider-blocked state, so its row badge changes.
+            'provider.issue_blocked',
+            'provider.issue_unblocked',
         ];
         refreshEvents.forEach(eventType => {
             source.addEventListener(eventType, function(e) {

@@ -174,6 +174,24 @@ VIEW_REGISTRY: dict[str, list[ViewEvent]] = {
         _user("publish.failed", "Publish failed", "orchestrator"),
     ],
 
+    # -- Provider outage impact on a specific issue (issue #5980) --
+    # The fleet-scoped provider.* events carry no issue identity and so can
+    # never be stored in an issue timeline. These two are issue-scoped and
+    # deliberately user-visible: after the circuit closes and the blocked
+    # label is shed, they are the only durable record that a provider outage
+    # is why this issue stalled.
+    "provider.issue_blocked": [
+        _user("provider.issue_blocked", "Blocked by provider outage", "orchestrator"),
+    ],
+    # Neutral on purpose: a release can mean "the cooldown elapsed, retry
+    # allowed, recovery unconfirmed" OR "every circuit reads healthy". The
+    # static narrative must not claim recovery the circuit owner never observed
+    # (#5980 F4) — the event's `summary` and typed `release_kind` carry the
+    # distinction.
+    "provider.issue_unblocked": [
+        _user("provider.issue_unblocked", "Provider block cleared", "orchestrator"),
+    ],
+
     # -- Tech Lead --
     "tech_lead.launching": [
         _ops("tech_lead.launching", "Tech Lead review launching"),

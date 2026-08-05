@@ -51,3 +51,26 @@ def sweep_atomic_write_tempfiles(exchange_dirs_root: Path) -> int:
             # Next startup will retry; don't block boot on sweep failures.
             continue
     return removed
+
+
+def sweep_orphan_session_tempfiles(repo_root: Path) -> int:
+    """Startup sweep of orphaned atomic-write tempfiles under *repo_root*.
+
+    Owns the whole startup concern — where the session run directories live,
+    swallowing sweep failures so a boot is never blocked by housekeeping, and
+    reporting what was reclaimed — so the orchestrator only has to say "sweep".
+    Returns the number of tempfiles removed (0 when the sweep failed).
+    """
+    sessions_root = repo_root / ".issue-orchestrator" / "sessions"
+    try:
+        removed = sweep_atomic_write_tempfiles(sessions_root)
+    except Exception:
+        logger.exception("[STARTUP] Orphan tempfile sweep failed under %s", sessions_root)
+        return 0
+    if removed:
+        logger.info(
+            "[STARTUP] Removed %d orphaned atomic-write tempfile(s) under %s",
+            removed,
+            sessions_root,
+        )
+    return removed

@@ -44,6 +44,16 @@ def test_tech_lead_actions_depends_on_the_root_not_on_actions() -> None:
     )
 
 
+def test_action_results_depends_on_the_root_not_on_actions() -> None:
+    imports = _sibling_imports("action_results")
+
+    assert "action_base" in imports
+    assert "actions" not in imports, (
+        "action_results must type against Action from action_base; importing"
+        " from `actions` would make the re-export module its dependency root"
+    )
+
+
 def test_actions_is_the_re_export_and_action_base_is_the_root() -> None:
     assert {"action_base", "tech_lead_actions"} <= _sibling_imports("actions")
     assert not _sibling_imports("action_base") & {"actions", "tech_lead_actions"}

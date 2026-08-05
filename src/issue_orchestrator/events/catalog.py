@@ -217,11 +217,20 @@ class EventName(str, Enum):
     # =========================================================================
     # Provider resilience
     # =========================================================================
+    # Fleet-scoped: one circuit, no issue identity. Useful for fleet
+    # observability, but they can never reach an issue timeline (the timeline
+    # writer is keyed by ``issue_number``).
     PROVIDER_TRANSIENT_ERROR = "provider.transient_error"
     PROVIDER_OUTAGE_ENTERED = "provider.outage_entered"
     PROVIDER_RETRY_SCHEDULED = "provider.retry_scheduled"
     PROVIDER_RETRY_ATTEMPTED = "provider.retry_attempted"
     PROVIDER_OUTAGE_EXITED = "provider.outage_exited"
+    # Issue-scoped provider-impact transitions (issue #5980). Emitted by the
+    # provider-impact owner command *after* the blocked-label transition has
+    # been applied, so the outage stays legible in an issue's history long
+    # after the circuit closed and the label was shed.
+    PROVIDER_ISSUE_BLOCKED = "provider.issue_blocked"
+    PROVIDER_ISSUE_UNBLOCKED = "provider.issue_unblocked"
 
     # =========================================================================
     # Configuration
@@ -422,6 +431,9 @@ class PublicEventName(str, Enum):
     ISSUE_COMPLETED = "issue.completed"
     ISSUE_UNBLOCKED = "issue.unblocked"
     ISSUE_PR_CREATED = "issue.pr_created"
+
+    PROVIDER_ISSUE_BLOCKED = "provider.issue_blocked"
+    PROVIDER_ISSUE_UNBLOCKED = "provider.issue_unblocked"
 
     PUBLISH_FAILED = "publish.failed"
 

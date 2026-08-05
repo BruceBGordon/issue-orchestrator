@@ -18,6 +18,38 @@ class ContractBase(BaseModel):
     model_config = ConfigDict(extra="allow")
 
 
+class ProviderCircuitEntryContract(ContractBase):
+    """One provider's circuit row in the health panel (issue #5980)."""
+
+    provider: str
+    is_open: bool
+    status_label: str
+    cooldown_remaining_label: Optional[str] = None
+    next_retry_at: Optional[str] = None
+    consecutive_outages: int
+    last_error_summary: Optional[str] = None
+
+
+class ProviderCircuitStatusContract(ContractBase):
+    """Provider circuit-breaker status powering the outage banner + panel.
+
+    ``any_open`` is the single flag the banner gates on. ``summary_text`` is a
+    colour-independent one-liner (provider names + next retry) so the outage is
+    legible without relying on the banner's colour alone.
+    """
+
+    any_open: bool
+    open_count: int
+    open_providers: list[str] = Field(default_factory=list)
+    summary_text: str
+    next_retry_at: Optional[str] = None
+    entries: list[ProviderCircuitEntryContract] = Field(default_factory=list)
+    # True when the circuit state could not be read/projected. The banner shows
+    # a health warning instead of hiding, so a broken read never masquerades as
+    # "no outage" (issue #5980). Defaults to ``False`` (readable / healthy).
+    status_unavailable: bool = False
+
+
 class DashboardDataContract(ContractBase):
     startupComplete: bool
     paused: bool
@@ -35,6 +67,10 @@ class DashboardDataContract(ContractBase):
     # must fail the contract loudly rather than silently defaulting to ``True``
     # and suppressing the warning.
     validationConfigured: bool
+    # Provider circuit-breaker status (issue #5980). Required (no default): a
+    # dropped producer value must fail the contract loudly rather than silently
+    # reading as "no outage" and hiding a real provider outage from operators.
+    providerCircuit: ProviderCircuitStatusContract
 
 
 class DashboardViewModelContract(ContractBase):

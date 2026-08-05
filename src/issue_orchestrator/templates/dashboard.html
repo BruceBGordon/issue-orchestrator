@@ -55,6 +55,28 @@
             </span>
         </div>
         {% endif %}
+        <!-- Provider circuit-breaker outage banner + health panel (issue #5980).
+             Surgically updated by ``updateProviderCircuitBanner`` from
+             ``window.dashboardData.providerCircuit``; the whole banner is hidden
+             while all providers are healthy.
+             Accessibility: the assertive live region is the dedicated, visually
+             hidden ``#providerCircuitAnnouncer`` span -- written only when the
+             semantic outage state changes, so screen readers announce an outage
+             once rather than on every countdown tick. The interactive <details>
+             health panel lives OUTSIDE that alert region and is preserved across
+             refreshes (updates replace only its rows, so its open/focus state
+             survives live updates). -->
+        <div id="providerCircuitBanner" class="provider-circuit-banner" style="display:none;">
+            <span id="providerCircuitAnnouncer" class="pcircuit-announcer" role="alert" aria-live="assertive"></span>
+            <span class="pcircuit-icon" aria-hidden="true">&#x26A0;</span>
+            <div id="providerCircuitBody" class="pcircuit-body">
+                <span id="providerCircuitSummary" class="pcircuit-summary"></span>
+                <details id="providerCircuitDetails" class="pcircuit-details" hidden>
+                    <summary class="pcircuit-summary-toggle">Circuit details</summary>
+                    <ul id="providerCircuitList" class="pcircuit-list"></ul>
+                </details>
+            </div>
+        </div>
         <header>
             <div class="header-left">
                 <h1>Issue Orchestrator</h1>
@@ -265,6 +287,9 @@
                                 {% if not card.queue_wait_reason %}
                                 <div class="card-line card-muted">{{ card.summary }}</div>
                                 {% endif %}
+                                {% endif %}
+                                {% if card.provider_badge %}
+                                <div class="card-line card-provider"><span class="provider-badge provider-badge--{{ card.provider_badge.tone }}" title="{{ card.provider_badge.title | e }}"><span class="provider-badge-icon" aria-hidden="true">&#x26A1;</span><span class="provider-badge-text">{{ card.provider_badge.label_text }}</span></span></div>
                                 {% endif %}
                                 {% if card.stack_chip %}
                                 <div class="card-line card-stack"><span class="stack-chip stack-chip--{{ card.stack_chip.tone }}" title="{{ card.stack_chip.title | e }}"><span class="stack-chip-icon" aria-hidden="true">&#x26D3;</span><span class="stack-chip-mode">{{ card.stack_chip.mode_label }}</span><span class="stack-chip-status">{{ card.stack_chip.status_text }}</span></span></div>

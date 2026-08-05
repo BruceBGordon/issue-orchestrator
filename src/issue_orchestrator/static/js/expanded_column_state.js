@@ -41,6 +41,9 @@
                 item.status || '',
                 item.issue_url || '',
                 item.pr_url || '',
+                // The expanded row renders the provider-outage badge, so the
+                // list must rebuild when a row gains or loses it.
+                item.provider_signal || '',
                 isViewed ? '1' : '0',
             ].join('|');
         }).join('||');

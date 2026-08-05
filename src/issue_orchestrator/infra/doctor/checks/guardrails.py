@@ -10,6 +10,9 @@ from ...config import Config
 from ....ports.command_runner import CommandRunner
 
 
+_COMPLETION_COMMAND_TIMEOUT_SECONDS = 15
+
+
 def check_guardrails_in_worktree_impl(
     worktree_path: Path,
     runner: CommandRunner,
@@ -164,15 +167,27 @@ def _check_completion_commands_available(
             [cmd_name, "--help"],
             cwd=worktree_path,
             env=env,
-            timeout_seconds=5,
+            timeout_seconds=_COMPLETION_COMMAND_TIMEOUT_SECONDS,
         )
-        if result.returncode == 0:
+        command_worked = not result.timed_out and result.returncode == 0
+        command_missing = not result.timed_out and (
+            "not found" in result.stderr.lower()
+            or "no such file" in result.stderr.lower()
+        )
+        failure_detail = {
+            False: f"{cmd_name} command not working: {result.stderr[:100]}",
+            True: (
+                f"{cmd_name} --help timed out after "
+                f"{_COMPLETION_COMMAND_TIMEOUT_SECONDS} seconds"
+            ),
+        }[result.timed_out]
+        if command_worked:
             checks.append(Check(
                 name=f"{cmd_name} Available",
                 status="ok",
                 detail=f"{cmd_name} command found",
             ))
-        elif "not found" in result.stderr.lower() or "no such file" in result.stderr.lower():
+        elif command_missing:
             checks.append(Check(
                 name=f"{cmd_name} Available",
                 status="error",
@@ -182,7 +197,7 @@ def _check_completion_commands_available(
             checks.append(Check(
                 name=f"{cmd_name} Available",
                 status="error",
-                detail=f"{cmd_name} command not working: {result.stderr[:100]}",
+                detail=failure_detail,
             ))
     return checks
 

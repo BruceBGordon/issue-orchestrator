@@ -14,6 +14,7 @@ from issue_orchestrator.domain.issue_key import FakeIssueKey
 from issue_orchestrator.domain.models import AgentConfig, Issue, OrchestratorState, Session, SessionHistoryEntry
 from issue_orchestrator.domain.session_key import SessionKey, TaskKind
 from issue_orchestrator.infra.config import Config
+from issue_orchestrator.ports.provider_resilience import NO_PROVIDER_CIRCUIT_STATUS
 from issue_orchestrator.view_models.dashboard_assets import DASHBOARD_CSS_CHUNKS
 from issue_orchestrator.view_models.dashboard_assets import DASHBOARD_JS_CHUNKS
 from issue_orchestrator.view_models.dashboard import build_dashboard_view_model
@@ -99,6 +100,7 @@ def test_flow_dashboard_renders_columns_and_scope(jinja_env):
     )
     vm = build_dashboard_view_model(
         OrchestratorStub(state=state, config=config),
+        provider_circuit=NO_PROVIDER_CIRCUIT_STATUS,
         active_tab="flow",
         e2e_status_provider=e2e_disabled,
     )
@@ -145,6 +147,7 @@ def test_first_paint_renders_stack_chip_for_stacked_card(jinja_env):
     )
     vm = build_dashboard_view_model(
         OrchestratorStub(state=state, config=config),
+        provider_circuit=NO_PROVIDER_CIRCUIT_STATUS,
         active_tab="flow",
         e2e_status_provider=e2e_disabled,
     )
@@ -165,6 +168,7 @@ def test_dashboard_renders_manifest_js_chunks_in_order(jinja_env):
     state = OrchestratorState(startup_status="complete")
     vm = build_dashboard_view_model(
         OrchestratorStub(state=state, config=config),
+        provider_circuit=NO_PROVIDER_CIRCUIT_STATUS,
         active_tab="flow",
         e2e_status_provider=e2e_disabled,
     )
@@ -191,6 +195,7 @@ def test_dashboard_renders_manifest_css_chunks_before_late_styles(jinja_env):
     state = OrchestratorState(startup_status="complete")
     vm = build_dashboard_view_model(
         OrchestratorStub(state=state, config=config),
+        provider_circuit=NO_PROVIDER_CIRCUIT_STATUS,
         active_tab="flow",
         e2e_status_provider=e2e_disabled,
     )
@@ -235,6 +240,7 @@ def test_kanban_blocked_column_is_expandable(jinja_env):
     state = OrchestratorState(startup_status="complete", cached_queue_issues=[blocked])
     vm = build_dashboard_view_model(
         OrchestratorStub(state=state, config=config),
+        provider_circuit=NO_PROVIDER_CIRCUIT_STATUS,
         active_tab="kanban",
         e2e_status_provider=e2e_disabled,
     )
@@ -261,6 +267,7 @@ def test_kanban_running_column_is_expandable_and_routes_cancel_to_menu(jinja_env
     state = OrchestratorState(startup_status="complete", active_sessions=[make_session(running_issue)])
     vm = build_dashboard_view_model(
         OrchestratorStub(state=state, config=config),
+        provider_circuit=NO_PROVIDER_CIRCUIT_STATUS,
         active_tab="kanban",
         e2e_status_provider=e2e_disabled,
     )
@@ -294,6 +301,7 @@ def test_kanban_completed_column_session_scoped(jinja_env):
     )
     vm = build_dashboard_view_model(
         OrchestratorStub(state=state, config=config),
+        provider_circuit=NO_PROVIDER_CIRCUIT_STATUS,
         active_tab="kanban",
         e2e_status_provider=e2e_disabled,
     )
@@ -332,6 +340,7 @@ def test_completed_column_renders_merged_history_card(jinja_env):
     )
     vm = build_dashboard_view_model(
         OrchestratorStub(state=state, config=config),
+        provider_circuit=NO_PROVIDER_CIRCUIT_STATUS,
         active_tab="kanban",
         e2e_status_provider=e2e_disabled,
     )
@@ -377,6 +386,7 @@ def test_completed_card_phase_age_is_hydrated_by_dashboard_timestamp_localizer(j
     )
     vm = build_dashboard_view_model(
         OrchestratorStub(state=state, config=config),
+        provider_circuit=NO_PROVIDER_CIRCUIT_STATUS,
         active_tab="kanban",
         e2e_status_provider=e2e_disabled,
     )
@@ -423,6 +433,7 @@ def test_awaiting_merge_template_renders_one_pr_card_when_queue_and_history_over
     )
     vm = build_dashboard_view_model(
         OrchestratorStub(state=state, config=config),
+        provider_circuit=NO_PROVIDER_CIRCUIT_STATUS,
         active_tab="kanban",
         e2e_status_provider=e2e_disabled,
     )
@@ -444,6 +455,7 @@ def test_status_badge_shows_running(jinja_env):
     state = OrchestratorState(startup_status="complete")
     vm = build_dashboard_view_model(
         OrchestratorStub(state=state, config=config),
+        provider_circuit=NO_PROVIDER_CIRCUIT_STATUS,
         active_tab="flow",
         e2e_status_provider=e2e_disabled,
     )
@@ -460,6 +472,7 @@ def test_issue_detail_drawer_is_rendered(jinja_env):
     state = OrchestratorState(startup_status="complete")
     vm = build_dashboard_view_model(
         OrchestratorStub(state=state, config=config),
+        provider_circuit=NO_PROVIDER_CIRCUIT_STATUS,
         active_tab="flow",
         e2e_status_provider=e2e_disabled,
     )
@@ -476,6 +489,7 @@ def test_flow_refresh_preferences_modal_is_rendered(jinja_env):
     state = OrchestratorState(startup_status="complete")
     vm = build_dashboard_view_model(
         OrchestratorStub(state=state, config=config),
+        provider_circuit=NO_PROVIDER_CIRCUIT_STATUS,
         active_tab="flow",
         e2e_status_provider=e2e_disabled,
     )
@@ -494,6 +508,7 @@ def test_github_usage_pill_is_rendered(jinja_env):
     state = OrchestratorState(startup_status="complete")
     vm = build_dashboard_view_model(
         OrchestratorStub(state=state, config=config),
+        provider_circuit=NO_PROVIDER_CIRCUIT_STATUS,
         active_tab="flow",
         e2e_status_provider=e2e_disabled,
     )
@@ -518,6 +533,7 @@ def test_embedded_header_elements_in_tab_bar(jinja_env):
     state = OrchestratorState(startup_status="complete")
     vm = build_dashboard_view_model(
         OrchestratorStub(state=state, config=config),
+        provider_circuit=NO_PROVIDER_CIRCUIT_STATUS,
         active_tab="flow",
         e2e_status_provider=e2e_disabled,
     )
@@ -538,6 +554,7 @@ def test_starting_dashboard_renders_initializing_status(jinja_env):
     state = OrchestratorState(startup_status="starting")
     vm = build_dashboard_view_model(
         OrchestratorStub(state=state, config=config),
+        provider_circuit=NO_PROVIDER_CIRCUIT_STATUS,
         active_tab="flow",
         e2e_status_provider=e2e_disabled,
     )
@@ -554,6 +571,7 @@ def test_e2e_tab_and_panels_render(jinja_env):
     state = OrchestratorState(startup_status="complete")
     vm = build_dashboard_view_model(
         OrchestratorStub(state=state, config=config),
+        provider_circuit=NO_PROVIDER_CIRCUIT_STATUS,
         active_tab="e2e",
         e2e_status_provider=lambda _: {
             "enabled": True,
@@ -592,6 +610,7 @@ def test_e2e_tab_disables_results_action_when_no_run_exists(jinja_env):
     state = OrchestratorState(startup_status="complete")
     vm = build_dashboard_view_model(
         OrchestratorStub(state=state, config=config),
+        provider_circuit=NO_PROVIDER_CIRCUIT_STATUS,
         active_tab="e2e",
         e2e_status_provider=lambda _: {
             "enabled": True,
@@ -631,6 +650,7 @@ def test_server_rendered_card_carries_fingerprint_for_first_paint_no_flash(jinja
     )
     vm = build_dashboard_view_model(
         OrchestratorStub(state=state, config=config),
+        provider_circuit=NO_PROVIDER_CIRCUIT_STATUS,
         active_tab="flow",
         e2e_status_provider=e2e_disabled,
     )
@@ -670,6 +690,7 @@ def test_server_rendered_fingerprint_matches_js_helper_output(jinja_env):
     )
     vm = build_dashboard_view_model(
         OrchestratorStub(state=state, config=config),
+        provider_circuit=NO_PROVIDER_CIRCUIT_STATUS,
         active_tab="flow",
         e2e_status_provider=e2e_disabled,
     )
@@ -728,6 +749,7 @@ def test_first_paint_active_card_menu_carries_run_dir(jinja_env):
     state = OrchestratorState(startup_status="complete", active_sessions=[make_session(running_issue)])
     vm = build_dashboard_view_model(
         OrchestratorStub(state=state, config=config),
+        provider_circuit=NO_PROVIDER_CIRCUIT_STATUS,
         active_tab="kanban",
         e2e_status_provider=e2e_disabled,
     )

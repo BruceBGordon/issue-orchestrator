@@ -2966,6 +2966,10 @@ class TestClaimGateAudit:
     #   (#6779 R7/R10) - confirms each absent proposal with a targeted READ
     #   (get_issue_state) and discards only the local authority-store op row;
     #   it never writes GitHub state and never touches a claimed coding issue.
+    # - APPLY_PROVIDER_IMPACT: owner command (#5980) - its only GitHub write is
+    #   the provider-blocked label, dispatched back through this applier's
+    #   claim-verified AddLabel/RemoveLabel handlers (same delegation shape as
+    #   RESET_RETRY_ISSUE); the extra half of the command is an event emit.
     # - APPEND_PATTERN_OBSERVATION: comments on an orchestrator-owned pattern
     #   case file and increments its durable observation count (#6781/#6957);
     #   case files are observation-labeled evidence ledgers that are never
@@ -2985,6 +2989,7 @@ class TestClaimGateAudit:
     # - RECONCILE_HISTORY_ENTRY: local session history mutation + event only
     # - CREATE_PR: not implemented in action_applier
     EXEMPT_ACTIONS = {
+        ActionType.APPLY_PROVIDER_IMPACT,
         ActionType.APPEND_PATTERN_OBSERVATION,
         ActionType.PROMOTE_TECH_LEAD_FINDING,
         ActionType.REPORT_PROMOTED_FINDING_EVIDENCE,

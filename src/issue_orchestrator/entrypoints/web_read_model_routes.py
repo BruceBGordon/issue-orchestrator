@@ -16,6 +16,10 @@ from ..contracts.ui_openapi_models import (
     IssueRowsPayload,
     ViewModelSnapshotPayload,
 )
+from ..ports.provider_resilience import (
+    NO_PROVIDER_CIRCUIT_STATUS,
+    ProviderCircuitStatusReader,
+)
 from ..view_models.dashboard import build_dashboard_view_model
 from .web_session_context import WebOrchestratorDependency
 from .web_templates import get_templates
@@ -48,9 +52,25 @@ def _dashboard_query_params(request: Request) -> DashboardQueryParams:
     )
 
 
+def _provider_circuit_reader(orchestrator: Any) -> ProviderCircuitStatusReader:
+    """Resolve the dashboard's provider circuit-status reader (#5980 F2/A1).
+
+    The single place the "there is no orchestrator to read" case is decided.
+    ``GET /`` is a public browser page that must render (not 503) before the
+    orchestrator is installed, and with no orchestrator there is no provider
+    fleet to report on. A *present* orchestrator always goes through its
+    required ``provider_circuit`` facade property, so broken wiring surfaces as
+    a hard failure instead of an empty, healthy-looking payload.
+    """
+    if orchestrator is None:
+        return NO_PROVIDER_CIRCUIT_STATUS
+    return orchestrator.provider_circuit
+
+
 def _build_dashboard_vm_sync(orchestrator: Any, queue_page: int, active_tab: str, e2e_page: int):
     return build_dashboard_view_model(
         orchestrator,
+        provider_circuit=_provider_circuit_reader(orchestrator),
         queue_page=queue_page,
         active_tab=active_tab,
         e2e_page=e2e_page,

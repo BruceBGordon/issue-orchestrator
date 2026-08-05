@@ -9,7 +9,8 @@ from fastapi.responses import JSONResponse
 
 from ..infra.audit import SkipReason, audit_queue
 from ..infra.e2e_slot_policy import get_e2e_role
-from ..view_models.dashboard import blocked_summary, flow_steps_for, issue_url_for
+from ..view_models.dashboard import flow_steps_for, issue_url_for
+from ..view_models.issue_card_labels import blocked_summary
 from .web_session_context import WebOrchestratorDependency
 
 web_status_router = APIRouter()

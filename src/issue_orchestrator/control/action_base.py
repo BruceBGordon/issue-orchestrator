@@ -23,6 +23,10 @@ class ActionType(Enum):
     SYNC_LABELS = "sync_labels"
     SHED_RECOVERED_WORKFLOW_LABELS = "shed_recovered_workflow_labels"
 
+    # Provider outage impact: owns the blocked-label transition *and* the
+    # durable issue-scoped record of it (see control/provider_impact.py).
+    APPLY_PROVIDER_IMPACT = "apply_provider_impact"
+
     # Session operations
     LAUNCH_SESSION = "launch_session"
     LAUNCH_VALIDATION_RETRY = "launch_validation_retry"
