@@ -256,6 +256,14 @@
       "rule_id": "control_policy_branch_sites",
       "value": 1
     },
+    "control_policy_branch_sites:src/issue_orchestrator/control/repository_setup.py": {
+      "detail": "3 branch site(s) mention lifecycle/control terms",
+      "kind": "control_policy_branch_sites",
+      "metric_id": "src/issue_orchestrator/control/repository_setup.py",
+      "path": "src/issue_orchestrator/control/repository_setup.py",
+      "rule_id": "control_policy_branch_sites",
+      "value": 3
+    },
     "control_policy_branch_sites:src/issue_orchestrator/control/retrospective_review.py": {
       "detail": "4 branch site(s) mention lifecycle/control terms",
       "kind": "control_policy_branch_sites",
@@ -2136,10 +2144,10 @@
       "rule_id": "ruff_noqa_suppressions",
       "value": 1
     },
-    "ruff_noqa_suppressions:src/issue_orchestrator/entrypoints/mcp_server.py:25d30ad79690:line-273": {
-      "detail": "line 273: # noqa: BLE001",
+    "ruff_noqa_suppressions:src/issue_orchestrator/entrypoints/mcp_server.py:25d30ad79690:line-291": {
+      "detail": "line 291: # noqa: BLE001",
       "kind": "ruff_noqa_suppression",
-      "metric_id": "src/issue_orchestrator/entrypoints/mcp_server.py:25d30ad79690:line-273",
+      "metric_id": "src/issue_orchestrator/entrypoints/mcp_server.py:25d30ad79690:line-291",
       "path": "src/issue_orchestrator/entrypoints/mcp_server.py",
       "rule_id": "ruff_noqa_suppressions",
       "value": 1
@@ -6029,14 +6037,6 @@
       "kind": "ui_openapi_uncontracted_route",
       "metric_id": "uncontracted:GET /api/status",
       "path": "src/issue_orchestrator/entrypoints/web_status_routes.py",
-      "rule_id": "ui_openapi_routes",
-      "value": 1
-    },
-    "ui_openapi_routes:uncontracted:GET /api/timeline/{issue_number}": {
-      "detail": "GET /api/timeline/{issue_number} is a browser-facing JSON route absent from docs/api/ui-openapi.json; add it to the UI OpenAPI contract or explicitly accept the ratchet",
-      "kind": "ui_openapi_uncontracted_route",
-      "metric_id": "uncontracted:GET /api/timeline/{issue_number}",
-      "path": "src/issue_orchestrator/entrypoints/web_issue_detail_routes.py",
       "rule_id": "ui_openapi_routes",
       "value": 1
     },

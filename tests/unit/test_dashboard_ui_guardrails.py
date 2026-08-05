@@ -1711,6 +1711,24 @@ def test_theme_resolution_uses_shared_embedded_nav_helper() -> None:
     assert "storedTheme === 'system'" not in settings_apply
 
 
+def test_settings_restart_copy_names_repository_engine_lifecycle() -> None:
+    """Restart-required saves must identify which runtime needs restarting."""
+    tmpl = _read(SETTINGS_TEMPLATE)
+
+    assert (
+        "Fields marked Restart Required are saved immediately but apply only after "
+        "you stop and start the Repository Engine."
+    ) in tmpl
+    assert (
+        "Settings saved. Stop and start the Repository Engine for restart-required "
+        "changes to take effect."
+    ) in tmpl
+    assert (
+        "Settings saved. No Repository Engine restart is required."
+    ) in tmpl
+    assert "Changes to ports and worktrees require a restart" not in tmpl
+
+
 SETTINGS_FORM_CONTROLS_JS = (
     ROOT / "src" / "issue_orchestrator" / "static" / "js" / "settings_form_controls.js"
 )
@@ -2098,8 +2116,13 @@ def test_issue_detail_timeline_view_preserves_e2e_run_route() -> None:
     js = _read(DASHBOARD_JS)
     body = _function_body(js, "setTimelineView")
     assert "currentIssueDetailE2ERunId" in body
-    assert "/api/e2e-run/${e2eRunId}/issue-detail/${issueNumber}?view=${view}" in body
-    assert "/api/issue-detail/${issueNumber}?view=${view}" in body
+    # ``resolvedView`` is what ``applyTimelineView`` accepted, so the request
+    # and the active-toggle state cannot disagree (#6421).
+    assert (
+        "/api/e2e-run/${e2eRunId}/issue-detail/${issueNumber}?view=${resolvedView}"
+        in body
+    )
+    assert "/api/issue-detail/${issueNumber}?view=${resolvedView}" in body
     assert "setTimelineView('raw')" in js
 
 
@@ -2626,6 +2649,162 @@ def test_dashboard_templates_expose_direct_timeline_affordances() -> None:
     assert "openE2ERunTimeline({{ issue.e2e_run_id }})" in issue_row
     assert "openIssueTimeline({{ issue.issue_number }}, this); event.stopPropagation();" in issue_row
     assert "openTimelineModal({{ issue.issue_number }})" not in issue_row
+
+
+def test_issue_timeline_surface_uses_contracted_issue_detail_route_only() -> None:
+    """The retired ``/api/timeline/{issue_number}`` route has no UI consumer left.
+
+    Issue #6421 deleted that uncontracted route.  Its replacement is the
+    contracted ``/api/issue-detail/{issue_number}`` payload rendered by the
+    issue-detail drawer, so no dashboard chunk may fetch the old path and the
+    legacy ``#timelineModal`` teleport must be gone from the template.
+    """
+    js = _read(DASHBOARD_JS)
+    dashboard = _read(DASHBOARD_TEMPLATE)
+
+    # No chunk may call the retired route. Comment lines are excluded so the
+    # code that documents the retirement doesn't trip its own guardrail.
+    code_lines = [
+        line for line in js.splitlines() if not line.lstrip().startswith("//")
+    ]
+    offenders = [line.strip() for line in code_lines if "/api/timeline/" in line]
+    assert not offenders, (
+        "Dashboard JS must not fetch the retired /api/timeline/{issue_number} "
+        f"route; use /api/issue-detail/{{issue_number}} instead (#6421). "
+        f"Offending lines: {offenders}"
+    )
+    # The modal it fed is gone, markup and handlers alike.
+    for removed in (
+        "openTimelineModal",
+        "closeTimelineModal",
+        "timelineModalContent",
+        "timelineModalTitle",
+    ):
+        assert removed not in js, f"{removed} should have been retired with #6421"
+    for removed_markup in ('id="timelineModal"', 'id="timelineModalContent"'):
+        assert removed_markup not in dashboard, (
+            f"{removed_markup} should have been retired with #6421"
+        )
+
+    # The one caller that used to teleport into the modal now routes to the
+    # same target the typed ``open_issue_timeline`` Command dispatches to,
+    # carrying the broad lens the retired (unfiltered) route was equivalent to.
+    diagnose_body = _function_body(js, "openDiagnoseFromCycle")
+    assert (
+        "openIssueTimeline(issueNumber, null, {view: DIAGNOSTIC_TIMELINE_VIEW})"
+        in diagnose_body
+    )
+    assert "openTimelineModal" not in diagnose_body
+
+    # ``openIssueTimeline`` remains the drawer entrypoint, and the drawer is
+    # fed by the contracted issue-detail route.  (These are checked against the
+    # bundle rather than via ``_function_body`` because both functions declare
+    # an ``opts = {}`` default, which that helper's brace scan can't span.)
+    assert (
+        "function openIssueTimeline(issueNumber, triggerEl = null, opts = {}) {" in js
+    )
+    assert "return openIssueDetail(issueNumber, triggerEl, {...opts, focus: 'timeline'});" in js
+    assert "`/api/issue-detail/${issueNumber}?view=${timelineView}`" in js
+
+
+def test_timeline_view_state_has_a_single_writer() -> None:
+    """``timelineView`` is only ever written through ``applyTimelineView``.
+
+    The drawer sends the shared ``timelineView`` to the server *and* renders
+    the view toggle from it, so a second writer lets the requested lens and the
+    lens shown as active drift.  Issue #6421 made the diagnostic entrypoint
+    view-scoped (``DIAGNOSTIC_TIMELINE_VIEW``); this keeps that opt-in flowing
+    through the one owner instead of ad hoc global mutation at the call sites.
+
+    Behaviour is covered by ``tests/js/issue_timeline_diagnostic_view.test.js``;
+    this is the structural backstop.
+    """
+    js = _read(DASHBOARD_JS)
+
+    owner_body = _function_body(js, "applyTimelineView")
+    assert "timelineView = view;" in owner_body
+
+    writers = [
+        line.strip()
+        for line in js.splitlines()
+        if re.match(r"^\s*timelineView\s*=[^=]", line)
+    ]
+    assert writers == ["timelineView = view;"], (
+        "timelineView must be written only by applyTimelineView; "
+        f"found writers: {writers}"
+    )
+
+    # The broad lens is a named constant, not a literal sprinkled at call sites.
+    assert "const DIAGNOSTIC_TIMELINE_VIEW = 'debug';" in js
+    # The drawer applies an explicit ``opts.view`` through that owner.
+    assert "if (opts && opts.view) applyTimelineView(opts.view);" in js
+    # The view toggle routes through it too, and requests what it resolved to.
+    toggle_body = _function_body(js, "setTimelineView")
+    assert "const resolvedView = applyTimelineView(view);" in toggle_body
+    assert "?view=${resolvedView}`" in toggle_body
+
+
+def test_issue_detail_focus_return_target_has_a_single_writer() -> None:
+    """``lastIssueDetailTrigger`` is only ever written by its owner.
+
+    Retiring the ``#timelineModal`` teleport (#6421) made the diagnostic
+    entrypoint reload the *already-visible* drawer, so ``openIssueDetail`` is
+    re-entrant while open.  Capturing ``document.activeElement`` on every entry
+    loses the opener — the Diagnose link is detached by
+    ``closeArtifactPopover`` before its handler runs — and closing then strands
+    keyboard focus.  The owner keys the implicit capture off the closed -> open
+    transition; a second writer would reintroduce the regression.
+
+    Behaviour is covered by ``tests/js/issue_detail_focus_return.test.js``;
+    this is the structural backstop.
+    """
+    js = _read(DASHBOARD_JS)
+
+    owner_body = _function_body(js, "captureIssueDetailReturnFocus")
+    assert "lastIssueDetailTrigger = triggerEl;" in owner_body
+    assert "lastIssueDetailTrigger = document.activeElement;" in owner_body
+    assert "} else if (!isIssueDetailDrawerOpen()) {" in owner_body, (
+        "the implicit capture must be gated on the drawer being closed"
+    )
+
+    writers = [
+        line.strip()
+        for line in js.splitlines()
+        if re.match(r"^\s*lastIssueDetailTrigger\s*=[^=]", line)
+    ]
+    assert writers == [
+        "lastIssueDetailTrigger = triggerEl;",
+        "lastIssueDetailTrigger = document.activeElement;",
+    ], (
+        "lastIssueDetailTrigger must be written only by "
+        f"captureIssueDetailReturnFocus; found writers: {writers}"
+    )
+
+    # Close restores through the same owner rather than reading the state.
+    assert "restoreIssueDetailReturnFocus();" in _function_body(js, "closeIssueDetail")
+
+
+def test_dashboard_timeline_views_match_generated_wire_enum() -> None:
+    """The dashboard's accepted view set must not drift from the wire enum.
+
+    ``applyTimelineView`` rejects anything outside ``TIMELINE_VIEWS``, so a
+    view added to the generated ``TimelineView`` schema (and honoured by the
+    server's ``normalize_timeline_view``) would be silently unreachable from
+    the UI if that list were not kept in step.
+    """
+    from typing import get_args
+
+    from issue_orchestrator.contracts.ui_openapi_models import TimelineView
+
+    js = _read(DASHBOARD_JS)
+    match = re.search(r"const TIMELINE_VIEWS = \[([^\]]*)\];", js)
+    assert match, "TIMELINE_VIEWS declaration not found in the dashboard bundle"
+    declared = {value.strip().strip("'\"") for value in match.group(1).split(",")}
+
+    assert declared == set(get_args(TimelineView)), (
+        "static/js TIMELINE_VIEWS has drifted from the generated TimelineView "
+        "enum; update it (and any view-specific UI affordance) to match."
+    )
 
 
 def test_e2e_latest_results_affordance_uses_formatted_run_modal() -> None:

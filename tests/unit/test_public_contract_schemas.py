@@ -119,7 +119,7 @@ def test_role_feedback_response_type_is_a_declared_public_timeline_field():
 
 def test_generated_public_timeline_schema_documents_response_type():
     # The on-disk public schema (the durable UI/test contract) must document the
-    # field, so consumers of ``/api/timeline/{issue_number}`` can rely on it.
+    # field, so consumers of ``/api/issue-detail/{issue_number}`` can rely on it.
     schema = generate_public_schemas()["timeline.issue"]
     event_schema = schema["$defs"]["TimelineEventContract"]
     assert "response_type" in event_schema["properties"]

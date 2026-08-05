@@ -376,6 +376,15 @@ Compact `tech-lead-decision.json` example:
   report must mention every id as an exact token (`T10` does not cover `T1`).
 - Every finding MUST include `evidence`: at least one non-empty string
   reference into the inputs you were given (file names, log line ranges).
+- Keep machine fields within their hard bounds: finding and proposed-action
+  `title` values are at most **300 characters**; the decision `summary` is at
+  most 5,000 characters; each proposed-action `body` is at most 20,000
+  characters; and each finding has at most 20 evidence references. Each
+  proposed action has at most 10 labels, and each individual label is at most
+  100 characters. `pattern_signature` is at most 200 characters; `area` is at
+  most 50 characters. Put the concise diagnosis in `title` and the full
+  explanation in `evidence`, the report, or an action body. The decision may
+  contain at most 50 findings and 20 proposed actions.
 - `create_issue` labels must be plain descriptive labels. Workflow labels
   are rejected as a contract violation: anything like `in-progress`,
   `needs-*`, `*-reviewed`, `*-failed`, `publish-*`, `blocked*`, `agent:*`,
@@ -405,7 +414,19 @@ Compact `tech-lead-decision.json` example:
   root-cause/design-review `create_issue` actions may carry an `area` naming
   their component or seam. The orchestrator keeps a durable case file issue
   per signature: the first observation opens it, and later observations of
-  the SAME signature accrue there as evidence.
+  the SAME signature accrue there as evidence. Its `body` must explain the
+  causal mechanism and the suggested fix; that diagnosis is copied into any
+  routed promotion so the target issue is actionable without hidden context.
+- Classify every `flag_pattern` with `fix_class`: `"code"` when a code change
+  in some repository fixes it, `"human"` when it needs a human decision,
+  credential, or configuration change. This is the promotion gate. Once a
+  `fix:code` signature accrues enough observations, the orchestrator files it
+  as a runnable issue in the repository its `area` routes to, so pick the
+  `area` that names WHERE the fix belongs. `fix:human` findings are never made
+  runnable — a human-gated problem turned into agent work only manufactures
+  doomed rework. Omit `fix_class` when you genuinely cannot tell; an
+  unclassified signature keeps accruing evidence and is never promoted. Only
+  `flag_pattern` may carry `fix_class`.
 - Step back on recurrence: multiple case files on one area/seam, or shipped
   fixes followed by recurrence there, are a mandate to fix the design—not to
   keep applying point patches. Propose a root-cause design review issue via

@@ -48,6 +48,15 @@ path, beside worktree-prep / decoupled-scratch / provider-args.
   **tech-lead → the evidence-map paths (state dir, dbs, run-dirs, base repo,
   logs) + scratch, no egress.** The evidence-map already enumerates the
   tech-lead's read set, so it *is* the read policy.
+- **Linked-worktree Git metadata:** a worker or reviewer receives write access
+  to its exact worktree plus only the linked Git administrative paths required
+  to stage and commit that worktree. Shared configuration, hooks, packed
+  objects, other refs, and other worktree records remain read-only. Claude Code
+  and Codex consume the same provider-neutral resolved Git access policy.
+- **Default placement:** new repository Setup proposes
+  `../worktrees/<repository-directory>`, a dedicated peer collection outside
+  the source checkout. The selected relative value and its resolved absolute
+  path are shown before save and persisted explicitly.
 - **Egress is a per-role flag** (`none | model-only | model+web`). The tech-lead
   defaults **model-only (no web)**: the broadest-read agent gets no egress, and
   web hypotheses become gated "explore" issues (see below). `model+web` is
@@ -84,6 +93,9 @@ propose-don't-acquire pattern as "file an issue to instrument a missing signal."
 - The evidence-map gains a second consumer: it defines both *what the tech-lead
   reads* and *what its sandbox allows*. Composes with decoupled-scratch (scratch
   = the write-root).
+- The linked-worktree metadata resolver is another shared policy owner: provider
+  adapters translate one exact Git access result instead of independently
+  widening filesystem scope.
 - Provider asymmetry to document: claude-code can bound reads read-only; codex's
   read is coarser (workspace or full-disk), so codex uses bounded writable
   `--add-dir`. Equivalent enough for the comparison; claude-code tighter in prod.

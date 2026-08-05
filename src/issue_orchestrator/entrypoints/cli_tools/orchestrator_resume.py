@@ -1,4 +1,8 @@
-"""Control API resume helper for agent completion commands."""
+"""Control API resume helper for agent completion commands.
+
+Generic callback plumbing (endpoint resolution, auth headers) lives in
+:mod:`.agent_callback`; this module owns only the resume command.
+"""
 
 from __future__ import annotations
 
@@ -7,43 +11,11 @@ import os
 import urllib.error
 import urllib.request
 
-from collections.abc import MutableMapping
 from dataclasses import dataclass
 from pathlib import Path
 
 from ...infra.env import ENV_PREFIX, get_env
-
-
-@dataclass(frozen=True, slots=True)
-class ApiHeader:
-    """One HTTP header for an agent-scoped Control API callback."""
-
-    name: str
-    value: str
-
-
-@dataclass(frozen=True, slots=True)
-class ApiRequestHeaders:
-    """Typed HTTP headers for an agent-scoped Control API callback."""
-
-    headers: tuple[ApiHeader, ...]
-
-    @classmethod
-    def from_agent_environment(cls) -> "ApiRequestHeaders":
-        values = [ApiHeader("Content-Type", "application/json")]
-        token = os.environ.get("ISSUE_ORCHESTRATOR_AGENT_CALLBACK_TOKEN")
-        if token:
-            values.append(ApiHeader("Authorization", f"Bearer {token}"))
-        return cls(headers=tuple(values))
-
-    def to_mutable_mapping(self) -> MutableMapping[str, str]:
-        """Project to the mutable mapping required by ``urllib``."""
-        return {header.name: header.value for header in self.headers}
-
-
-def api_request_headers() -> ApiRequestHeaders:
-    """Build Control API request headers for agent-scoped callbacks."""
-    return ApiRequestHeaders.from_agent_environment()
+from .agent_callback import api_request_headers, resolve_control_api_port
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,11 +27,10 @@ class ResumeTarget:
 
     @classmethod
     def from_agent_environment(cls) -> "ResumeTarget":
-        raw_port = get_env("API_PORT") or os.environ.get("ORCHESTRATOR_API_PORT")
         raw_issue_number = get_env("ISSUE_NUMBER") or os.environ.get(
             "ORCHESTRATOR_ISSUE_NUMBER"
         )
-        port = raw_port.strip() if raw_port else ""
+        port = resolve_control_api_port() or ""
         issue_number = raw_issue_number.strip() if raw_issue_number else ""
         missing: list[str] = []
         if port == "":

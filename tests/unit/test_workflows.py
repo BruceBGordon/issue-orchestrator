@@ -391,8 +391,8 @@ class TestTechLeadWorkflow:
 
         decision = workflow.should_launch_tech_lead(
             pending_tech_lead=[make_pending_tech_lead(100)],
-            active_session_count=0,
             paused=False,
+            available_slots=1,
         )
 
         assert not decision.should_launch
@@ -401,15 +401,15 @@ class TestTechLeadWorkflow:
         """Test skips when queue is empty."""
         decision = workflow.should_launch_tech_lead(
             pending_tech_lead=[],
-            active_session_count=0,
             paused=False,
+            available_slots=1,
         )
 
         assert not decision.should_launch
         assert "No pending" in decision.skip_reason
 
-    def test_should_launch_returns_tech_lead_up_to_capacity(self, workflow):
-        """Test returns tech_lead reviews up to capacity."""
+    def test_should_launch_returns_tech_lead_up_to_available_slots(self, workflow):
+        """Launches up to the owner-supplied ``available_slots`` (no recompute)."""
         pending = [
             make_pending_tech_lead(100, "Test 1"),
             make_pending_tech_lead(101, "Test 2"),
@@ -418,55 +418,54 @@ class TestTechLeadWorkflow:
 
         decision = workflow.should_launch_tech_lead(
             pending_tech_lead=pending,
-            active_session_count=1,
             paused=False,
+            available_slots=2,
         )
 
         assert decision.should_launch
         assert len(decision.tech_lead_to_launch) == 2
 
-    def test_shared_budget_skips_when_worker_budget_full(self, workflow):
-        """None (default): a full worker budget skips tech_lead - unchanged."""
+    def test_skips_when_no_available_slots(self, workflow):
+        """available_slots == 0 (owner says no slot): skip with a capacity reason."""
         decision = workflow.should_launch_tech_lead(
             pending_tech_lead=[make_pending_tech_lead(100)],
-            active_session_count=3,  # == max_concurrent_sessions
             paused=False,
+            available_slots=0,
         )
         assert not decision.should_launch
-        assert "No capacity" in decision.skip_reason
+        assert "capacity" in decision.skip_reason.lower()
 
-    def test_reserved_capacity_launches_despite_full_worker_budget(self, workflow):
-        """reserved_capacity gates on the reserved additive budget, so a full
-        worker budget no longer blocks the tech lead."""
+    def test_launches_up_to_available_slots_bound(self, workflow):
+        """The queue is sliced by available_slots, not by max_concurrent_sessions."""
         pending = [make_pending_tech_lead(100), make_pending_tech_lead(101)]
         decision = workflow.should_launch_tech_lead(
             pending_tech_lead=pending,
-            active_session_count=3,  # worker budget full
             paused=False,
-            reserved_capacity=1,
+            available_slots=1,
         )
         assert decision.should_launch
-        # Bounded by the reserved budget, not by max_concurrent_sessions.
         assert len(decision.tech_lead_to_launch) == 1
 
-    def test_reserved_capacity_zero_skips(self, workflow):
-        """A reserved budget already fully in use skips with a reserved reason."""
-        decision = workflow.should_launch_tech_lead(
-            pending_tech_lead=[make_pending_tech_lead(100)],
-            active_session_count=0,
-            paused=False,
-            reserved_capacity=0,
+    def test_launching_event_capacity_matches_available_slots(self, workflow, collecting_sink):
+        """The TECH_LEAD_LAUNCHING event reports the owner-supplied capacity, so
+        the machine event can never disagree with the planned launches
+        (#6892 review A2 / event contract)."""
+        pending = [make_pending_tech_lead(100), make_pending_tech_lead(101)]
+        workflow.should_launch_tech_lead(
+            pending_tech_lead=pending, paused=False, available_slots=1
         )
-        assert not decision.should_launch
-        assert "reserved tech_lead capacity" in decision.skip_reason
+        launching = [
+            e for e in collecting_sink.events if e.name == "tech_lead.launching"
+        ]
+        assert launching and launching[-1].data["capacity"] == 1
+        assert launching[-1].data["count"] == 1
 
-    def test_reserved_capacity_still_honors_paused(self, workflow):
-        """Paused is the floor: a reserved budget does not override it."""
+    def test_still_honors_paused(self, workflow):
+        """Paused is the floor: available slots do not override it."""
         decision = workflow.should_launch_tech_lead(
             pending_tech_lead=[make_pending_tech_lead(100)],
-            active_session_count=0,
             paused=True,
-            reserved_capacity=1,
+            available_slots=1,
         )
         assert not decision.should_launch
         assert "paused" in decision.skip_reason.lower()

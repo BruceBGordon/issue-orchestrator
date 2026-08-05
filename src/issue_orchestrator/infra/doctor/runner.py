@@ -76,7 +76,7 @@ def run_doctor(
     result.checks.extend(_timed("template_variables", config_checks.check_template_variables, config))
     result.checks.extend(_timed("repository_config", config_checks.check_repository_config, config))
     result.checks.extend(_timed("worktree_remediation", config_checks.check_worktree_remediation, config))
-    result.checks.extend(_timed("milestone_order", milestone_checks.check_milestone_order, config))
+    result.checks.extend(_timed("milestones", milestone_checks.check_milestones, config))
 
     result.checks.extend(_timed(
         "working_directory", workspace.check_working_directory, runner, config.repo_root
@@ -90,6 +90,7 @@ def run_doctor(
     result.checks.extend(_timed("schema_checks", schema_checks.run_schema_checks, config))
     result.checks.extend(_timed("code_review", review.check_code_review, config))
     result.checks.extend(_timed("tech_lead_labels", tech_lead_checks.check_tech_lead_labels, config))
+    result.checks.extend(_timed("tech_lead_finding_routes", tech_lead_checks.check_tech_lead_finding_routes, config))
     result.checks.extend(_timed("e2e_runner", e2e.check_e2e_runner, config))
     result.checks.extend(_timed("guardrails", guardrails.check_guardrails, config, runner))
     result.checks.extend(_timed("clock_sync", clock_sync.check_clock_sync, config, runner))

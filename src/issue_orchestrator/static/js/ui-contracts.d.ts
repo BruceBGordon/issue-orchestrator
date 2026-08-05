@@ -807,6 +807,144 @@ export interface RecentE2ERunsPayload {
   runs: RecentE2ERunSummaryPayload[];
 }
 
+export interface RepositorySetupCommandPayload {
+  config_name?: string;
+  configure_reviewer: boolean;
+  configure_tech_lead: boolean;
+  create_labels?: boolean;
+  create_prompts?: boolean;
+  effort: "low" | "medium" | "high" | "xhigh" | "max";
+  github_authorization: RepositorySetupGitHubAuthorizationPayload;
+  model: "haiku" | "sonnet" | "opus";
+  replace_existing?: boolean;
+  repo_name: string;
+  repo_root: string;
+  reviewer_effort: "low" | "medium" | "high" | "xhigh" | "max";
+  reviewer_model: "haiku" | "sonnet" | "opus";
+  tech_lead_effort: "low" | "medium" | "high" | "xhigh" | "max";
+  tech_lead_model: "haiku" | "sonnet" | "opus";
+  tech_lead_review_threshold: number;
+  validation_publish_command: string;
+  validation_quick_command: string;
+  worker_agent_label: string;
+  worktree_base?: string;
+}
+
+export interface RepositorySetupConflictPayload {
+  config_path: string;
+  detail: string;
+  error: "replace_confirmation_required";
+}
+
+export interface RepositorySetupDetectionPayload {
+  agent_labels: string[];
+  config_path: string | null;
+  existing_config: Record<string, any> | null;
+  github_authorization: RepositorySetupGitHubAuthorizationDetectionPayload;
+  github_labels: string[];
+  prompt_candidates: string[];
+  repo: string | null;
+  repo_root: string;
+  validation_defaults: RepositorySetupValidationDefaultsPayload;
+  worktree_base_default: string;
+  worktree_base_resolved: string;
+}
+
+export interface RepositorySetupFailurePayload {
+  applied_files: string[];
+  created_labels: string[];
+  detail: string;
+  error: "repository_setup_failed";
+  stage: "authorization" | "planning" | "files" | "labels";
+}
+
+export interface RepositorySetupFilePayload {
+  action: "create" | "overwrite";
+  agent?: string;
+  path: string;
+  size?: number;
+  type?: "prompt";
+}
+
+export interface RepositorySetupGitHubAuthorizationDetectionPayload {
+  authorization: RepositorySetupGitHubAuthorizationPayload;
+  configuration_error?: string;
+  configured_kind: "detected" | "personal" | "github_app" | "invalid";
+  inline_token_migration_required: boolean;
+}
+
+export interface RepositorySetupGitHubAuthorizationPayload {
+  api_url: string;
+  app_client_id?: string;
+  app_id?: string;
+  app_installation_id?: string;
+  app_private_key_env?: string;
+  app_private_key_path?: string;
+  http_timeout_seconds: number;
+  keyring_service?: string;
+  keyring_username?: string;
+  kind: "detected" | "personal" | "github_app";
+  token_env?: string;
+}
+
+export interface RepositorySetupGitHubTokenPayload {
+  api_url: string;
+  http_timeout_seconds: number;
+  repo_name: string;
+  repo_root: string;
+  token: string;
+}
+
+export interface RepositorySetupGitHubVerificationPayload {
+  auth_kind: "personal" | "github_app";
+  authorization: RepositorySetupGitHubAuthorizationPayload;
+  authorship_notice: string;
+  identity: string;
+  repository: string;
+  required_permissions: string[];
+  source: string;
+  verification_note: string;
+  verified: true;
+}
+
+export interface RepositorySetupGitHubVerifyRequestPayload {
+  authorization: RepositorySetupGitHubAuthorizationPayload;
+  repo_name: string;
+  repo_root: string;
+}
+
+export interface RepositorySetupPrerequisiteCheckPayload {
+  detail: string;
+  name?: string;
+  ok: boolean;
+}
+
+export interface RepositorySetupPrerequisitesPayload {
+  agent_checks: RepositorySetupPrerequisiteCheckPayload[];
+  all_ok: boolean;
+  checks: Record<string, RepositorySetupPrerequisiteCheckPayload>;
+}
+
+export interface RepositorySetupPreviewPayload {
+  files: RepositorySetupFilePayload[];
+  github_authorization: RepositorySetupGitHubVerificationPayload;
+  worktree_base: string;
+  yaml: string;
+}
+
+export interface RepositorySetupResultPayload {
+  config_path: string;
+  created_files: string[];
+  created_labels: string[];
+  status: "saved";
+}
+
+export interface RepositorySetupValidationDefaultsPayload {
+  publish_command: string | null;
+  quick_command: string | null;
+  source: string;
+}
+
 export interface RetrospectiveReviewDecisionPayload {
   action: string;
   agent_label: string | null;

@@ -57,6 +57,8 @@ result ready to review or publish?"
 - Shows validation failures as failure rows in the timeline, with links to the
   diagnostic artifacts.
 
+Setup: [Client Test Integrations](test-integrations.md).
+
 ## Turn Review Feedback Into Bounded Rework
 
 Use this when you want an agent review loop, but still need the loop to stop
@@ -139,6 +141,9 @@ results visible in the same control surface as issue work.
 - Links E2E evidence back to related issue sessions when the run was driven by
   orchestrated work.
 
+Setup: [Client Test Integrations](test-integrations.md). Runner behavior:
+[E2E Test Runner](e2e.md).
+
 ## Work From the Control Surface That Fits You
 
 Use this when you want orchestration to be visible from your browser, editor,
@@ -149,8 +154,14 @@ automation, or AI assistant.
 - Provides a browser dashboard for monitoring and controlling issue flow.
 - Provides a VS Code integration for queues, sessions, diagnostics, worktree
   links, and dashboard access.
-- Exposes REST API endpoints for clients and automations.
-- Provides an MCP server entry point for editor and agent integrations.
+- Exposes a contracted subset of HTTP routes, described by
+  `docs/api/ui-openapi.json`, for clients and automations. The remaining
+  `/api/*` and `/control/*` routes are internal engine transport with no
+  compatibility promise — see [Stability & API Surface](stability.md).
+- Provides an MCP server entry point for editor and agent integrations. This is
+  the intended external route for automation, but it is still **experimental**
+  during `0.x` — tool names, arguments, and return shapes may change in any
+  release.
 - Supports pause, resume, stop, diagnostics, and guardrail repair controls from
   configured clients.
 

@@ -386,6 +386,35 @@ def test_view_model_queue_and_blocked_items():
     assert view_model.blocked_count == 1
 
 
+def test_tech_lead_observation_is_blocked_without_consuming_queue_position():
+    config = _make_config()
+    observation = Issue(
+        number=39,
+        title="Pattern case file",
+        labels=["agent:tech-lead", "tech-lead-observation"],
+    )
+    runnable = Issue(number=45, title="Runnable", labels=["agent:backend"])
+    state = OrchestratorState(
+        startup_status="complete",
+        cached_queue_issues=[observation, runnable],
+    )
+    orchestrator = _OrchestratorStub(state=state, config=config)
+
+    view_model = build_dashboard_view_model(
+        orchestrator,
+        queue_page=1,
+        active_tab="kanban",
+        e2e_page=1,
+        e2e_status_provider=lambda _: {"enabled": False, "running": False},
+        provider_circuit=NO_PROVIDER_CIRCUIT_STATUS,
+    )
+
+    assert [item["issue_number"] for item in view_model.queue_items] == [45]
+    assert view_model.queue_items[0]["queue_wait_reason"] == "Waiting: next scheduler tick"
+    blocked_item = next(item for item in view_model.blocked_items if item["issue_number"] == 39)
+    assert blocked_item["blocked_summary"] == "Pattern case file (tech_lead observation ledger)"
+
+
 def test_large_queue_counts_use_full_queue_not_preview_page():
     config = _make_config()
     agent_config = _make_agent_config()

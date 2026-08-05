@@ -10,7 +10,7 @@ Health Checks:
 - Paused: Is the orchestrator paused?
 
 Usage:
-    gate = HealthGate(config=config, events=event_sink)
+    gate = HealthGate(config)
     decision = gate.check(active_sessions=5, paused=False)
     if decision.can_proceed:
         # Launch new session
@@ -63,6 +63,19 @@ class RateLimitProvider(Protocol):
         ...
 
 
+class SessionCapacitySource(Protocol):
+    """Live source of the Repository Engine's worker-session limit."""
+
+    max_concurrent_sessions: int
+
+
+@dataclass(frozen=True)
+class _FixedSessionCapacity:
+    """Value owner for standalone callers that supply a fixed limit."""
+
+    max_concurrent_sessions: int
+
+
 class HealthGate:
     """Service for checking system health before launching sessions.
 
@@ -77,18 +90,23 @@ class HealthGate:
 
     def __init__(
         self,
-        max_concurrent_sessions: int,
+        max_concurrent_sessions: int | SessionCapacitySource,
         rate_limit_threshold: int = 100,
         rate_limit_provider: RateLimitProvider | None = None,
     ) -> None:
         """Initialize the health gate.
 
         Args:
-            max_concurrent_sessions: Maximum allowed concurrent sessions.
+            max_concurrent_sessions: A fixed limit, or the live configuration
+                owner whose current limit should be read on every check.
             rate_limit_threshold: Minimum remaining API calls before blocking.
             rate_limit_provider: Provider for rate limit info (e.g., gh_audit).
         """
-        self._max_concurrent = max_concurrent_sessions
+        self._capacity = (
+            _FixedSessionCapacity(max_concurrent_sessions)
+            if isinstance(max_concurrent_sessions, int)
+            else max_concurrent_sessions
+        )
         self._rate_limit_threshold = rate_limit_threshold
         self._rate_limit_provider = rate_limit_provider
 
@@ -111,12 +129,14 @@ class HealthGate:
         if paused:
             return HealthDecision.blocked("paused", paused=True)
 
-        # Check 2: Capacity
-        if active_sessions >= self._max_concurrent:
+        # Check 2: Capacity. Read once so one decision is internally
+        # consistent even if the settings owner changes between ticks.
+        max_concurrent = self._capacity.max_concurrent_sessions
+        if active_sessions >= max_concurrent:
             return HealthDecision.blocked(
                 "at_capacity",
                 active_sessions=active_sessions,
-                max_concurrent=self._max_concurrent,
+                max_concurrent=max_concurrent,
             )
 
         # Check 3: Rate limit (optional)
@@ -161,7 +181,7 @@ class HealthGate:
     @property
     def available_capacity(self) -> int:
         """Get the total capacity (for planning)."""
-        return self._max_concurrent
+        return self._capacity.max_concurrent_sessions
 
     def remaining_capacity(self, active_sessions: int) -> int:
         """Get remaining capacity given current active sessions.
@@ -172,7 +192,7 @@ class HealthGate:
         Returns:
             Number of additional sessions that can be launched.
         """
-        return max(0, self._max_concurrent - active_sessions)
+        return max(0, self._capacity.max_concurrent_sessions - active_sessions)
 
 
 def create_health_gate_from_config(config: Config) -> HealthGate:
@@ -188,7 +208,7 @@ def create_health_gate_from_config(config: Config) -> HealthGate:
 
     # gh_audit implements RateLimitProvider protocol
     return HealthGate(
-        max_concurrent_sessions=config.max_concurrent_sessions,
+        max_concurrent_sessions=config,
         rate_limit_threshold=getattr(config, "rate_limit_warn_remaining", 100),
         rate_limit_provider=gh_audit,
     )

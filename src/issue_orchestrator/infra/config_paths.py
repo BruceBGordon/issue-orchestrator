@@ -5,6 +5,13 @@ import re
 from pathlib import Path
 from typing import Any
 
+from ..domain.worktree_paths import (
+    WORKTREE_COLLECTION_DIR as WORKTREE_COLLECTION_DIR,
+    default_worktree_base as default_worktree_base,
+    default_worktree_base_config as default_worktree_base_config,
+    resolve_worktree_base as resolve_worktree_base,
+)
+
 # Config directory structure
 CONFIG_DIR = ".issue-orchestrator/config"
 DEFAULT_CONFIG_NAME = "default.yaml"

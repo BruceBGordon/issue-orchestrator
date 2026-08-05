@@ -9,6 +9,33 @@ globals().update(
     {name: value for name, value in vars(_support).items() if not name.startswith("__")}
 )
 
+
+def _complete_setup_payload(repo_root, **overrides):
+    payload = {
+        "repo_root": str(repo_root),
+        "repo_name": "owner/repo",
+        "worker_agent_label": "agent:dev",
+        "model": "sonnet",
+        "effort": "high",
+        "configure_reviewer": True,
+        "reviewer_model": "sonnet",
+        "reviewer_effort": "high",
+        "validation_quick_command": "make test-quick",
+        "validation_publish_command": "make validate",
+        "github_authorization": {
+            "kind": "detected",
+            "api_url": "https://api.github.com",
+            "http_timeout_seconds": 20,
+        },
+        "configure_tech_lead": True,
+        "tech_lead_model": "sonnet",
+        "tech_lead_effort": "high",
+        "tech_lead_review_threshold": 1,
+    }
+    payload.update(overrides)
+    return payload
+
+
 class TestControlCenterShutdownEndpoint:
     """Test /control/shutdown force-stop options."""
 
@@ -18,7 +45,9 @@ class TestControlCenterShutdownEndpoint:
         try:
             with patch("threading.Thread") as mock_thread:
                 client = TestClient(control_app)
-                response = client.post("/control/shutdown", json={"stop_orchestrators": False})
+                response = client.post(
+                    "/control/shutdown", json={"stop_orchestrators": False}
+                )
 
             assert response.status_code == 200
             data = response.json()
@@ -37,14 +66,22 @@ class TestControlCenterShutdownEndpoint:
         set_supervisor(mock_supervisor)
         repos = [SimpleNamespace(path="/tmp/repo-a")]
         try:
-            with patch.object(control_api, "_schedule_control_center_exit", return_value=None):
-                with patch("issue_orchestrator.infra.repo_registry.list_repos", return_value=repos):
+            with patch.object(
+                control_api, "_schedule_control_center_exit", return_value=None
+            ):
+                with patch(
+                    "issue_orchestrator.infra.repo_registry.list_repos",
+                    return_value=repos,
+                ):
                     with patch("pathlib.Path.exists", return_value=True):
                         with patch("threading.Thread") as mock_thread:
                             client = TestClient(control_app)
                             response = client.post(
                                 "/control/shutdown",
-                                json={"stop_orchestrators": True, "force_orchestrators": True},
+                                json={
+                                    "stop_orchestrators": True,
+                                    "force_orchestrators": True,
+                                },
                             )
                             # Worker runs in background thread; execute target inline for deterministic assertions.
                             target = mock_thread.call_args.kwargs.get("target")
@@ -74,14 +111,22 @@ class TestControlCenterShutdownEndpoint:
         set_supervisor(mock_supervisor)
         repos = [SimpleNamespace(path="/tmp/repo-a")]
         try:
-            with patch.object(control_api, "_schedule_control_center_exit", return_value=None) as schedule_exit:
-                with patch("issue_orchestrator.infra.repo_registry.list_repos", return_value=repos):
+            with patch.object(
+                control_api, "_schedule_control_center_exit", return_value=None
+            ) as schedule_exit:
+                with patch(
+                    "issue_orchestrator.infra.repo_registry.list_repos",
+                    return_value=repos,
+                ):
                     with patch("pathlib.Path.exists", return_value=True):
                         with patch("threading.Thread") as mock_thread:
                             client = TestClient(control_app)
                             response = client.post(
                                 "/control/shutdown",
-                                json={"stop_orchestrators": True, "force_orchestrators": True},
+                                json={
+                                    "stop_orchestrators": True,
+                                    "force_orchestrators": True,
+                                },
                             )
                             target = mock_thread.call_args.kwargs.get("target")
                             assert callable(target)
@@ -206,7 +251,9 @@ class TestControlCenterShutdownEndpoint:
         mock_supervisor = MagicMock()
         set_supervisor(mock_supervisor)
         try:
-            with patch("issue_orchestrator.infra.repo_registry.list_repos", return_value=[]):
+            with patch(
+                "issue_orchestrator.infra.repo_registry.list_repos", return_value=[]
+            ):
                 with patch("threading.Thread") as mock_thread:
                     control_api_shutdown_state.begin_engine_shutdown_operation(
                         Path("/tmp/repo-a"),
@@ -236,7 +283,9 @@ class TestControlCenterShutdownEndpoint:
                 force_orchestrators=False,
                 graceful_timeout_seconds=2,
             )
-            assert not isinstance(begin_result, control_api_shutdown_state.GlobalShutdownConflict)
+            assert not isinstance(
+                begin_result, control_api_shutdown_state.GlobalShutdownConflict
+            )
             operation_id, _ = begin_result
             client = TestClient(control_app)
             response = client.get("/control/shutdown/state")
@@ -253,10 +302,14 @@ class TestControlCenterShutdownEndpoint:
                 force_orchestrators=False,
                 graceful_timeout_seconds=2,
             )
-            assert not isinstance(begin_result, control_api_shutdown_state.GlobalShutdownConflict)
+            assert not isinstance(
+                begin_result, control_api_shutdown_state.GlobalShutdownConflict
+            )
 
             client = TestClient(control_app)
-            update = client.post("/control/shutdown/update", json={"graceful_timeout_seconds": 30})
+            update = client.post(
+                "/control/shutdown/update", json={"graceful_timeout_seconds": 30}
+            )
             force = client.post("/control/shutdown/force")
             abort = client.post("/control/shutdown/abort")
 
@@ -276,20 +329,155 @@ class TestControlCenterShutdownEndpoint:
 class TestControlCenterSetupRoutes:
     """Test extracted setup-wizard route behavior."""
 
-    def test_setup_preview_returns_raw_yaml_without_header(self):
-        """Preview should preserve the legacy raw-YAML response."""
+    @pytest.fixture(autouse=True)
+    def _verified_github_authorization(self):
+        from issue_orchestrator.domain.repository_setup_auth import (
+            RepositorySetupGitHubAuthorization,
+        )
+        from issue_orchestrator.ports.repository_setup import (
+            RepositorySetupGitHubVerification,
+        )
+
+        verification = RepositorySetupGitHubVerification(
+            identity="setup-user",
+            repository="owner/repo",
+            auth_kind="personal",
+            source="Environment variable ISSUE_ORCH_GITHUB_TOKEN",
+            normalized_authorization=RepositorySetupGitHubAuthorization(
+                kind="personal",
+                token_env="ISSUE_ORCH_GITHUB_TOKEN",
+            ),
+        )
+        with patch(
+            "issue_orchestrator.execution.providers."
+            "verify_repository_setup_github_authorization",
+            return_value=verification,
+        ):
+            yield
+
+    def test_setup_prereqs_matches_typed_response_contract(self, tmp_path):
+        from issue_orchestrator.contracts.ui_openapi_models import (
+            RepositorySetupPrerequisitesPayload,
+        )
+
+        response = TestClient(control_app).get(
+            "/control/setup/prereqs",
+            params={"repo_root": str(tmp_path)},
+        )
+
+        assert response.status_code == 200
+        payload = RepositorySetupPrerequisitesPayload.model_validate(response.json())
+        assert "git" in payload.checks
+        assert payload.agent_checks
+
+    def test_setup_preview_builds_complete_default_review_pipeline(self, tmp_path):
+        """Preview renders the validated reviewer and tech-lead pipeline."""
+        repo_root = tmp_path / "repo"
+        repo_root.mkdir()
         client = TestClient(control_app)
 
         response = client.post(
             "/control/setup/preview",
-            json={"config": {"repo": {"name": "owner/repo"}, "agents": {}}},
+            json=_complete_setup_payload(repo_root),
         )
 
         assert response.status_code == 200
         data = response.json()
-        assert "Issue Orchestrator Configuration" not in data["yaml"]
-        assert data["yaml"].startswith("repo:\n  name: owner/repo\n")
+        assert "Issue Orchestrator Configuration" in data["yaml"]
+        assert "repo:\n  name: owner/repo\n" in data["yaml"]
+        assert f"base: ../worktrees/{repo_root.name}" in data["yaml"]
+        assert "sandbox: true" in data["yaml"]
+        assert "agent:reviewer" in data["yaml"]
+        assert "effort: high" in data["yaml"]
+        assert "enabled: true" in data["yaml"]
+        assert "mode: via-local-loop" in data["yaml"]
+        assert data["worktree_base"] == str(
+            repo_root.parent / "worktrees" / repo_root.name
+        )
+        assert "agent:tech-lead" in data["yaml"]
+        assert "tech_lead_follow_up_agent: agent:dev" in data["yaml"]
         assert data["files"][0]["size"] == len(data["yaml"])
+        assert {
+            row["agent"] for row in data["files"] if row.get("type") == "prompt"
+        } == {"agent:dev", "agent:reviewer", "agent:tech-lead"}
+        assert not (repo_root / ".issue-orchestrator").exists()
+
+    def test_setup_preview_marks_existing_config_for_overwrite(self, tmp_path):
+        """Preview must make replacement of an existing config explicit."""
+        repo_root = tmp_path / "repo"
+        config_path = repo_root / ".issue-orchestrator" / "config" / "default.yaml"
+        config_path.parent.mkdir(parents=True)
+        config_path.write_text("repo:\n  name: old/repo\n")
+        client = TestClient(control_app)
+
+        response = client.post(
+            "/control/setup/preview",
+            json=_complete_setup_payload(repo_root),
+        )
+
+        assert response.status_code == 200
+        assert response.json()["files"][0]["action"] == "overwrite"
+
+    @pytest.mark.parametrize(
+        "config_name",
+        ["", "../escaped", "nested/default", "/tmp/escaped.yaml"],
+    )
+    @pytest.mark.parametrize(
+        "endpoint",
+        ["/control/setup/preview", "/control/setup/save"],
+    )
+    def test_setup_routes_reject_unsafe_config_names(
+        self,
+        tmp_path,
+        endpoint,
+        config_name,
+    ):
+        """Preview and save share one traversal-safe config-name contract."""
+        repo_root = tmp_path / "repo"
+        repo_root.mkdir()
+        client = TestClient(control_app)
+
+        response = client.post(
+            endpoint,
+            json=_complete_setup_payload(
+                repo_root,
+                config_name=config_name,
+                create_labels=False,
+            ),
+        )
+
+        assert response.status_code in {400, 422}
+        assert not (tmp_path / "escaped.yaml").exists()
+
+    @pytest.mark.parametrize(
+        "endpoint",
+        ["/control/setup/preview", "/control/setup/save"],
+    )
+    @pytest.mark.parametrize(
+        "worker_agent_label",
+        ["agent:", "agent:reviewer", "agent:tech-lead"],
+    )
+    def test_setup_routes_reject_non_worker_agent_labels(
+        self,
+        tmp_path,
+        endpoint,
+        worker_agent_label,
+    ):
+        """Generated request validation and command policy share the label rule."""
+        repo_root = tmp_path / "repo"
+        repo_root.mkdir()
+
+        response = TestClient(control_app).post(
+            endpoint,
+            json=_complete_setup_payload(
+                repo_root,
+                worker_agent_label=worker_agent_label,
+                create_labels=False,
+            ),
+        )
+
+        assert response.status_code == 422
+        assert not (repo_root / ".issue-orchestrator").exists()
 
     def test_setup_detect_ignores_non_default_config_files(self, tmp_path):
         """Detect should only surface the legacy default config file."""
@@ -298,6 +486,13 @@ class TestControlCenterSetupRoutes:
         config_dir = repo_root / ".issue-orchestrator" / "config"
         config_dir.mkdir(parents=True)
         (config_dir / "custom.yaml").write_text("repo:\n  name: owner/repo\n")
+        (repo_root / "Makefile").write_text(
+            (
+                "validate-fast:\n\t@true\n\n"
+                "validate-pr-raw:\n\t@true\n\n"
+                "validate-pr:\n\t@true\n"
+            )
+        )
 
         client = TestClient(control_app)
         response = client.get(
@@ -309,43 +504,308 @@ class TestControlCenterSetupRoutes:
         data = response.json()
         assert data["config_path"] is None
         assert data["existing_config"] is None
+        assert data["worktree_base_default"] == f"../worktrees/{repo_root.name}"
+        assert data["worktree_base_resolved"] == str(
+            repo_root.parent / "worktrees" / repo_root.name
+        )
+        assert data["validation_defaults"] == {
+            "quick_command": "make validate-fast",
+            "publish_command": "make validate-pr-raw",
+            "source": "Makefile targets",
+        }
 
-    def test_setup_save_preserves_legacy_labels_and_raw_yaml(self, tmp_path):
-        """Save should keep the old label set and config-file format."""
+    def test_setup_detect_never_returns_existing_inline_token(self, tmp_path):
+        """Existing legacy secrets stay server-side until the user replaces them."""
+        repo_root = tmp_path / "repo"
+        config_path = repo_root / ".issue-orchestrator/config/default.yaml"
+        config_path.parent.mkdir(parents=True)
+        config_path.write_text(
+            "repo:\n"
+            "  name: owner/repo\n"
+            "  github:\n"
+            "    token: ghp_super_secret\n"
+            "    api_url: https://github.example/api/v3\n"
+            "    http_timeout_seconds: 47\n"
+        )
+
+        response = TestClient(control_app).get(
+            "/control/setup/detect",
+            params={"repo_root": str(repo_root)},
+        )
+
+        assert response.status_code == 200
+        assert "ghp_super_secret" not in response.text
+        data = response.json()
+        assert "token" not in data["existing_config"]["repo"]["github"]
+        assert data["github_authorization"] == {
+            "authorization": {
+                "kind": "detected",
+                "api_url": "https://github.example/api/v3",
+                "http_timeout_seconds": 47,
+            },
+            "configured_kind": "personal",
+            "inline_token_migration_required": True,
+        }
+
+    def test_setup_github_verify_is_non_mutating_and_explains_scope(self, tmp_path):
+        """The guided gate verifies access before any repository artifacts exist."""
         repo_root = tmp_path / "repo"
         repo_root.mkdir()
-        host = MagicMock()
-        host.list_labels.return_value = []
 
-        with patch(
-            "issue_orchestrator.execution.providers.create_repository_host",
-            return_value=host,
+        response = TestClient(control_app).post(
+            "/control/setup/github-auth/verify",
+            json={
+                "repo_root": str(repo_root),
+                "repo_name": "owner/repo",
+                "authorization": {
+                    "kind": "detected",
+                    "api_url": "https://api.github.com",
+                    "http_timeout_seconds": 20,
+                },
+            },
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["verified"] is True
+        assert data["identity"] == "setup-user"
+        assert data["authorization"] == {
+            "kind": "personal",
+            "token_env": "ISSUE_ORCH_GITHUB_TOKEN",
+            "api_url": "https://api.github.com",
+            "http_timeout_seconds": 20,
+        }
+        assert "without making GitHub writes" in data["verification_note"]
+        assert "Pull requests: read and write" in data["required_permissions"]
+        assert not (repo_root / ".issue-orchestrator").exists()
+
+    def test_setup_github_app_verify_explains_bot_authorship(self, tmp_path):
+        """App mode leaves the operator eligible to review the bot-authored PR."""
+        from issue_orchestrator.domain.repository_setup_auth import (
+            RepositorySetupGitHubAuthorization,
+        )
+        from issue_orchestrator.ports.repository_setup import (
+            RepositorySetupGitHubVerification,
+        )
+
+        repo_root = tmp_path / "repo"
+        repo_root.mkdir()
+        authorization = RepositorySetupGitHubAuthorization(
+            kind="github_app",
+            app_client_id="Iv23example",
+            app_installation_id="145305179",
+            app_private_key_env="ISSUE_ORCH_GITHUB_APP_PRIVATE_KEY",
+        )
+        verification = RepositorySetupGitHubVerification(
+            identity="porchpin-bot[bot]",
+            repository="owner/repo",
+            auth_kind="github_app",
+            source="GitHub App installation 145305179",
+            normalized_authorization=authorization,
+        )
+        dependencies = control_app.state.control_api_setup_dependencies
+
+        with patch.object(
+            dependencies.setup_owner,
+            "verify_github_authorization",
+            return_value=verification,
         ):
-            client = TestClient(control_app)
-            response = client.post(
-                "/control/setup/save",
+            response = TestClient(control_app).post(
+                "/control/setup/github-auth/verify",
                 json={
                     "repo_root": str(repo_root),
-                    "config_name": "default",
-                    "create_prompts": False,
-                    "create_labels": True,
-                    "config": {
-                        "repo": {"name": "owner/repo"},
-                        "agents": {
-                            "agent:backend": {"prompt": ".prompts/backend.md"},
-                        },
-                        "review": {"enabled": True},
+                    "repo_name": "owner/repo",
+                    "authorization": {
+                        "kind": "github_app",
+                        "api_url": "https://api.github.com",
+                        "http_timeout_seconds": 20,
+                        "app_client_id": "Iv23example",
+                        "app_installation_id": "145305179",
+                        "app_private_key_env": ("ISSUE_ORCH_GITHUB_APP_PRIVATE_KEY"),
                     },
                 },
             )
 
         assert response.status_code == 200
         data = response.json()
-        assert "priority:high" not in data["created_labels"]
+        assert "operator remains eligible to approve" in data["authorship_notice"]
+        assert "Checks: read" in data["required_permissions"]
+        assert "Commit statuses: read" in data["required_permissions"]
+
+    def test_setup_personal_token_is_verified_then_stored_by_reference(
+        self,
+        tmp_path,
+    ):
+        """The raw PAT is never returned and YAML receives only its keyring locator."""
+        from issue_orchestrator.domain.repository_setup_auth import (
+            RepositorySetupGitHubAuthorization,
+        )
+        from issue_orchestrator.ports.repository_setup import (
+            RepositorySetupGitHubVerification,
+        )
+
+        repo_root = tmp_path / "repo"
+        repo_root.mkdir()
+        stored = RepositorySetupGitHubAuthorization(
+            kind="personal",
+            keyring_service="issue-orchestrator",
+            keyring_username="github-token:github.example:owner/repo",
+            api_url="https://github.example/api/v3",
+            http_timeout_seconds=47,
+        )
+        inline_verification = RepositorySetupGitHubVerification(
+            identity="setup-user",
+            repository="owner/repo",
+            auth_kind="personal",
+            source="Inline token from setup request",
+            normalized_authorization=RepositorySetupGitHubAuthorization(
+                kind="personal",
+                token="ghp_super_secret",
+                api_url="https://github.example/api/v3",
+                http_timeout_seconds=47,
+            ),
+        )
+        stored_verification = RepositorySetupGitHubVerification(
+            identity="setup-user",
+            repository="owner/repo",
+            auth_kind="personal",
+            source=(
+                "Keyring "
+                "(issue-orchestrator/github-token:github.example:owner/repo)"
+            ),
+            normalized_authorization=stored,
+        )
+        dependencies = control_app.state.control_api_setup_dependencies
+
+        with (
+            patch.object(
+                dependencies.setup_owner,
+                "verify_github_authorization",
+                side_effect=[inline_verification, stored_verification],
+            ) as verify,
+            patch(
+                "issue_orchestrator.execution.providers."
+                "store_repository_setup_github_token",
+                return_value=stored,
+            ) as store,
+        ):
+            response = TestClient(control_app).post(
+                "/control/setup/github-auth/store-personal-token",
+                json={
+                    "repo_root": str(repo_root),
+                    "repo_name": "owner/repo",
+                    "token": "ghp_super_secret",
+                    "api_url": "https://github.example/api/v3",
+                    "http_timeout_seconds": 47,
+                },
+            )
+
+        assert response.status_code == 200
+        assert "ghp_super_secret" not in response.text
+        assert response.json()["authorization"] == {
+            "kind": "personal",
+            "keyring_service": "issue-orchestrator",
+            "keyring_username": "github-token:github.example:owner/repo",
+            "api_url": "https://github.example/api/v3",
+            "http_timeout_seconds": 47,
+        }
+        assert verify.call_count == 2
+        store.assert_called_once_with(
+            RepositorySetupGitHubAuthorization(
+                kind="personal",
+                token="ghp_super_secret",
+                api_url="https://github.example/api/v3",
+                http_timeout_seconds=47,
+            ),
+            repo="owner/repo",
+        )
+
+    def test_setup_save_executes_complete_default_review_pipeline(self, tmp_path):
+        """Save writes runnable worker, reviewer, and tech-lead artifacts."""
+        from issue_orchestrator.infra.config import Config
+
+        repo_root = tmp_path / "repo"
+        repo_root.mkdir()
+        host = MagicMock()
+        host.list_labels.return_value = []
+
+        with patch(
+            "issue_orchestrator.execution.providers.create_repository_setup_host",
+            return_value=host,
+        ):
+            client = TestClient(control_app)
+            response = client.post(
+                "/control/setup/save",
+                json=_complete_setup_payload(
+                    repo_root,
+                    worker_agent_label="agent:backend",
+                    config_name="default",
+                    create_prompts=True,
+                    create_labels=True,
+                ),
+            )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert "priority:high" in data["created_labels"]
+        assert "agent:backend" in data["created_labels"]
+        assert "agent:reviewer" in data["created_labels"]
+        assert "agent:tech-lead" in data["created_labels"]
         assert "needs-code-review" in data["created_labels"]
         assert "code-reviewed" in data["created_labels"]
+        assert "needs-tech-lead-review" in data["created_labels"]
+        assert "tech-lead-reviewed" in data["created_labels"]
 
         config_path = repo_root / ".issue-orchestrator" / "config" / "default.yaml"
         config_text = config_path.read_text()
-        assert "Issue Orchestrator Configuration" not in config_text
-        assert config_text.startswith("repo:\n  name: owner/repo\n")
+        assert "Issue Orchestrator Configuration" in config_text
+        assert "repo:\n  name: owner/repo\n" in config_text
+        assert f"base: ../worktrees/{repo_root.name}" in config_text
+        assert config_text.count("sandbox: true") == 3
+        assert config_text.count("effort: high") == 3
+        assert "default: agent:reviewer" in config_text
+        assert "tech_lead_review_threshold: 1" in config_text
+        assert (repo_root / ".io" / "dev.md").is_file()
+        assert (repo_root / ".io" / "reviewer.md").is_file()
+        assert (repo_root / ".io" / "tech-lead.md").is_file()
+        assert Config.load(config_path).validate() == []
+
+    @pytest.mark.parametrize("stage", ["files", "labels"])
+    def test_setup_save_surfaces_required_artifact_failures(
+        self,
+        tmp_path,
+        stage,
+    ):
+        """The HTTP adapter must not convert owner failures into saved results."""
+        from issue_orchestrator.control.repository_setup import (
+            RepositorySetupExecutionError,
+        )
+
+        repo_root = tmp_path / "repo"
+        repo_root.mkdir()
+        dependencies = control_app.state.control_api_setup_dependencies
+        failure = RepositorySetupExecutionError(
+            stage=stage,
+            detail=f"{stage} failed",
+            applied_files=(repo_root / "partial",),
+            created_labels=("agent:dev",) if stage == "labels" else (),
+        )
+
+        with patch.object(
+            dependencies.setup_owner,
+            "execute",
+            side_effect=failure,
+        ):
+            response = TestClient(control_app).post(
+                "/control/setup/save",
+                json=_complete_setup_payload(repo_root),
+            )
+
+        assert response.status_code == 500
+        assert response.json() == {
+            "error": "repository_setup_failed",
+            "stage": stage,
+            "detail": f"{stage} failed",
+            "applied_files": [str(repo_root / "partial")],
+            "created_labels": ["agent:dev"] if stage == "labels" else [],
+        }

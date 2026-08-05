@@ -18,6 +18,7 @@ from issue_orchestrator.control.background_job_supervisor import (
 from issue_orchestrator.execution.thread_background_job_runner import (
     ThreadBackgroundJobRunner,
 )
+from tests.callback_endpoint_helpers import ready_callback_endpoint
 
 
 def test_successful_job_leaves_no_failure_record() -> None:
@@ -338,6 +339,7 @@ def test_review_exchange_halts_when_supervisor_records_failure() -> None:
             raise AssertionError("runner must not be invoked on halt path")
 
     review = CompletionReviewExchange(
+        agent_callback_endpoint=ready_callback_endpoint(),
         config=cfg,
         session_output=_SessionOutput(Path("/tmp")),  # type: ignore[arg-type]
         emit_review_started=lambda **_: None,

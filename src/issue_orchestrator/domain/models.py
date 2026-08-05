@@ -20,6 +20,7 @@ from .sandbox_scope import (
     compute_session_scope,
 )
 from .session_run import SessionRunAssets
+from .tech_lead_findings import PromotionUpdate, PromotableFinding, SettledPromotion
 from .tech_lead_session import (
     ApprovedTechLeadOp,
     TechLeadCaseFileSummary,
@@ -1398,6 +1399,15 @@ class DiscoveredAwaitingMergeReconciliation:
     status_reason: str
     source: AwaitingMergeReconciliationSource
     issue_key: str = ""  # stable_id; falls back to str(issue_number) when empty
+    # True when the PR merged but the GitHub issue is still open — i.e. no
+    # closing reference registered on the PR (GitHub's closing-keyword parse is
+    # word-boundary sensitive and easily defeated), so auto-close never fired.
+    # The Planner turns this into a close-on-merge fallback so the closing
+    # keyword is a redundancy, not the sole close mechanism. ``merged_at``
+    # carries the merge evidence so the apply-time owner can revalidate the
+    # destructive precondition against live state, not this discovery-time bit.
+    issue_open: bool = False
+    merged_at: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1465,6 +1475,22 @@ class TechLeadFacts:
     # scan actually ran, so durable case-file evidence survives between scans
     # instead of being wiped by a frugal tick.
     case_files_scanned: bool = False
+    # Finding-promotion lane facts (#6957), both derived by the promotion owner
+    # from the DURABLE ledgers rather than from the anchor scan, so they arm
+    # independently of the batch/health/storm triggers.
+    #   * promotable_findings — signatures that crossed min_evidence, are
+    #     classified fix:code, have no promotion row, and fit their routed
+    #     repo's in-flight cap. Computed with ZERO GitHub reads.
+    #   * promotion_updates — in-flight signatures whose durable evidence count
+    #     advanced after filing. The planner reports only the unseen suffix to
+    #     the target issue and advances a monotonic watermark after success.
+    #   * settled_promotions — in-flight promotions whose target issue was
+    #     observed CLOSED (shipped when a merged PR closed it, declined
+    #     otherwise). An unreadable target yields no fact, so a temporarily
+    #     unreachable repo leaves the promotion in flight instead of settling it.
+    promotable_findings: tuple["PromotableFinding", ...] = field(default_factory=tuple)
+    promotion_updates: tuple["PromotionUpdate", ...] = field(default_factory=tuple)
+    settled_promotions: tuple["SettledPromotion", ...] = field(default_factory=tuple)
 
 
 @dataclass(frozen=True)

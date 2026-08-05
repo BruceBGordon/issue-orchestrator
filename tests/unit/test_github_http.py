@@ -10,6 +10,7 @@ import json
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -30,11 +31,20 @@ from issue_orchestrator.adapters.github.http_client import (
 )
 from issue_orchestrator.adapters.github.tokens import (
     GitHubAppAuthConfig,
+    GitHubAuthSource,
     StaticGitHubTokenProvider,
+    TokenValidationResult,
     _normalize_keyring_secret,
     _read_gh_hosts_record,
     _read_gh_cli_token,
     _read_keyring_token,
+    resolve_github_token_with_source,
+)
+from issue_orchestrator.domain.repository_setup_auth import (
+    RepositorySetupGitHubAuthorization,
+)
+from issue_orchestrator.execution.providers import (
+    verify_repository_setup_github_authorization,
 )
 from issue_orchestrator.events import EventName
 from issue_orchestrator.infra import gh_audit
@@ -42,14 +52,19 @@ from issue_orchestrator.infra import gh_audit
 
 def _client_with_transport(transport: httpx.BaseTransport) -> GitHubHttpClient:
     client = GitHubHttpClient(
-        GitHubHttpConfig(repo="owner/repo", token="token", base_url="https://api.github.com")
+        GitHubHttpConfig(
+            repo="owner/repo", token="token", base_url="https://api.github.com"
+        )
     )
-    # noqa: SLF001 - Injecting mock transport for HTTP testing
-    client._client = httpx.Client(transport=transport, base_url="https://api.github.com")  # noqa: SLF001
+    client._client = httpx.Client(  # noqa: SLF001 - test transport injection
+        transport=transport, base_url="https://api.github.com"
+    )
     return client
 
 
-def test_resolve_github_token_repo_scoped_env_is_strict(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_resolve_github_token_repo_scoped_env_is_strict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.delenv("TIXMEUP_GITHUB_TOKEN", raising=False)
     monkeypatch.setenv("ISSUE_ORCH_GITHUB_TOKEN", "generic-token")
 
@@ -66,6 +81,110 @@ def test_resolve_github_token_allows_default_sources_without_config(
     monkeypatch.setenv("ISSUE_ORCH_GITHUB_TOKEN", "generic-token")
 
     assert resolve_github_token() == "generic-token"
+
+
+def test_resolve_github_token_reports_exact_environment_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PORCHPIN_GITHUB_TOKEN", "repo-token")
+    monkeypatch.setenv("ISSUE_ORCH_GITHUB_TOKEN", "generic-token")
+
+    resolution = resolve_github_token_with_source(
+        configured_env="PORCHPIN_GITHUB_TOKEN",
+    )
+
+    assert resolution.token == "repo-token"
+    assert resolution.source.kind == "environment"
+    assert resolution.source.environment_variable == "PORCHPIN_GITHUB_TOKEN"
+    assert resolution.source.description == (
+        "Environment variable PORCHPIN_GITHUB_TOKEN"
+    )
+
+
+def test_resolve_github_token_reports_exact_keyring_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "issue_orchestrator.adapters.github.tokens._read_keyring_token",
+        lambda *, service, username: (
+            "repo-token"
+            if (service, username) == ("issue-orchestrator", "github-token:owner/repo")
+            else None
+        ),
+    )
+
+    resolution = resolve_github_token_with_source(
+        configured_keyring_service="issue-orchestrator",
+        configured_keyring_username="github-token:owner/repo",
+    )
+
+    assert resolution.token == "repo-token"
+    assert resolution.source.kind == "keyring"
+    assert resolution.source.keyring_service == "issue-orchestrator"
+    assert resolution.source.keyring_username == "github-token:owner/repo"
+
+
+def test_setup_verifier_normalizes_detected_environment_to_durable_reference(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    auth = SimpleNamespace(
+        auth_kind="token",
+        resolved_source=GitHubAuthSource(
+            kind="environment",
+            description="Environment variable PORCHPIN_GITHUB_TOKEN",
+            environment_variable="PORCHPIN_GITHUB_TOKEN",
+        ),
+        validate=lambda **_kwargs: TokenValidationResult(
+            valid=True,
+            username="porchpin-owner",
+        ),
+    )
+    monkeypatch.setattr(
+        "issue_orchestrator.adapters.github.build_github_auth",
+        lambda **_kwargs: auth,
+    )
+
+    verification = verify_repository_setup_github_authorization(
+        "owner/repo",
+        RepositorySetupGitHubAuthorization(kind="detected"),
+    )
+
+    assert verification.identity == "porchpin-owner"
+    assert verification.normalized_authorization == (
+        RepositorySetupGitHubAuthorization(
+            kind="personal",
+            token_env="PORCHPIN_GITHUB_TOKEN",
+        )
+    )
+
+
+def test_setup_verifier_keeps_github_cli_as_explicitly_detected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    auth = SimpleNamespace(
+        auth_kind="token",
+        resolved_source=GitHubAuthSource(
+            kind="github_cli",
+            description="GitHub CLI auth (github.com)",
+        ),
+        validate=lambda **_kwargs: TokenValidationResult(
+            valid=True,
+            username="porchpin-owner",
+        ),
+    )
+    monkeypatch.setattr(
+        "issue_orchestrator.adapters.github.build_github_auth",
+        lambda **_kwargs: auth,
+    )
+    authorization = RepositorySetupGitHubAuthorization(kind="detected")
+
+    verification = verify_repository_setup_github_authorization(
+        "owner/repo",
+        authorization,
+    )
+
+    assert verification.source == "GitHub CLI auth (github.com)"
+    assert verification.normalized_authorization == authorization
 
 
 def test_resolve_github_token_uses_gh_hosts_before_default_keyring(
@@ -86,13 +205,17 @@ def test_resolve_github_token_uses_gh_hosts_before_default_keyring(
     assert resolve_github_token() == "gh-hosts-token"
 
 
-def test_resolve_github_token_repo_scoped_keyring(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_resolve_github_token_repo_scoped_keyring(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.delenv("ISSUE_ORCH_GITHUB_TOKEN", raising=False)
     monkeypatch.setattr(
         "issue_orchestrator.adapters.github.tokens._read_keyring_token",
-        lambda *, service=..., username=...: "repo-keyring-token"
-        if service == "tixmeup-github" and username == "bruce"
-        else None,
+        lambda *, service=..., username=...: (
+            "repo-keyring-token"
+            if service == "tixmeup-github" and username == "bruce"
+            else None
+        ),
     )
 
     token = resolve_github_token(
@@ -137,7 +260,9 @@ def test_read_keyring_token_logs_debug_on_exception(
     )
 
 
-def test_read_keyring_token_falls_back_to_macos_security(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_read_keyring_token_falls_back_to_macos_security(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     class _FakeKeyring:
         @staticmethod
         def get_password(service: str, username: str) -> None:
@@ -179,7 +304,9 @@ def test_normalize_keyring_secret_returns_raw_secret_for_unknown_format() -> Non
     assert _normalize_keyring_secret("plain-token") == "plain-token"
 
 
-def test_describe_github_token_sources_repo_scoped_ignores_generic_env(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_describe_github_token_sources_repo_scoped_ignores_generic_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setenv("ISSUE_ORCH_GITHUB_TOKEN", "generic-token")
     monkeypatch.delenv("TIXMEUP_GITHUB_TOKEN", raising=False)
     monkeypatch.setattr(
@@ -194,7 +321,9 @@ def test_describe_github_token_sources_repo_scoped_ignores_generic_env(monkeypat
     assert sources == []
 
 
-def test_describe_github_token_sources_includes_gh_hosts(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_describe_github_token_sources_includes_gh_hosts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.delenv("ISSUE_ORCH_GITHUB_TOKEN", raising=False)
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
     monkeypatch.delenv("GH_TOKEN", raising=False)
@@ -231,7 +360,9 @@ def test_github_app_installation_provider_mints_and_caches_token(
     tmp_path: Path,
 ) -> None:
     key_path = tmp_path / "bot.private-key.pem"
-    key_path.write_text("-----BEGIN PRIVATE KEY-----\nfake\n-----END PRIVATE KEY-----\n")
+    key_path.write_text(
+        "-----BEGIN PRIVATE KEY-----\nfake\n-----END PRIVATE KEY-----\n"
+    )
     calls: list[str] = []
 
     monkeypatch.setattr(
@@ -362,9 +493,7 @@ def test_read_gh_cli_token_from_hosts_oauth_token(
     config_dir.mkdir()
     hosts_path = config_dir / "hosts.yml"
     hosts_path.write_text(
-        "github.com:\n"
-        "  oauth_token: gh-hosts-token\n"
-        "  user: octocat\n",
+        "github.com:\n  oauth_token: gh-hosts-token\n  user: octocat\n",
         encoding="utf-8",
     )
     monkeypatch.setenv("GH_CONFIG_DIR", str(config_dir))
@@ -384,8 +513,7 @@ def test_read_gh_cli_token_from_hosts_keychain_account(
     config_dir.mkdir()
     hosts_path = config_dir / "hosts.yml"
     hosts_path.write_text(
-        "github.com:\n"
-        "  user: octocat\n",
+        "github.com:\n  user: octocat\n",
         encoding="utf-8",
     )
     monkeypatch.setenv("GH_CONFIG_DIR", str(config_dir))
@@ -393,9 +521,11 @@ def test_read_gh_cli_token_from_hosts_keychain_account(
     monkeypatch.delenv("APPDATA", raising=False)
     monkeypatch.setattr(
         "issue_orchestrator.adapters.github.tokens._read_keyring_token",
-        lambda *, service=..., username=...: "gh-keychain-token"
-        if service == "gh:github.com" and username == "octocat"
-        else None,
+        lambda *, service=..., username=...: (
+            "gh-keychain-token"
+            if service == "gh:github.com" and username == "octocat"
+            else None
+        ),
     )
 
     token = _read_gh_cli_token(host="github.com")
@@ -428,8 +558,12 @@ def test_read_gh_hosts_record_logs_malformed_yaml(
     )
 
 
-def test_validate_github_token_checks_repo_access(monkeypatch: pytest.MonkeyPatch) -> None:
-    def _mock_get(url: str, *, headers: dict[str, str], timeout: float) -> httpx.Response:
+def test_validate_github_token_checks_repo_access(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _mock_get(
+        url: str, *, headers: dict[str, str], timeout: float
+    ) -> httpx.Response:
         assert headers["Authorization"] == "Bearer repo-token"
         assert timeout == 10.0
         if url == "https://api.github.com/user":
@@ -438,7 +572,9 @@ def test_validate_github_token_checks_repo_access(monkeypatch: pytest.MonkeyPatc
             return httpx.Response(404, json={"message": "Not Found"})
         raise AssertionError(f"Unexpected URL: {url}")
 
-    monkeypatch.setattr("issue_orchestrator.adapters.github.http_client.httpx.get", _mock_get)
+    monkeypatch.setattr(
+        "issue_orchestrator.adapters.github.http_client.httpx.get", _mock_get
+    )
 
     result = validate_github_token(token="repo-token", repo="BruceBGordon/tixmeup")
 
@@ -492,7 +628,11 @@ def test_create_label_ignores_422_without_force() -> None:
 def test_list_issues_filters_pull_requests() -> None:
     payload = [
         {"number": 1, "title": "Issue"},
-        {"number": 2, "title": "PR", "pull_request": {"url": "https://api.github.com/pulls/2"}},
+        {
+            "number": 2,
+            "title": "PR",
+            "pull_request": {"url": "https://api.github.com/pulls/2"},
+        },
     ]
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -531,7 +671,9 @@ def test_list_issues_single_page_when_limit_within_one_page() -> None:
 
     def handler(request: httpx.Request) -> httpx.Response:
         requested_pages.append(int(request.url.params.get("page", "1")))
-        return httpx.Response(200, json=[{"number": n, "title": "x"} for n in range(1, 101)])
+        return httpx.Response(
+            200, json=[{"number": n, "title": "x"} for n in range(1, 101)]
+        )
 
     client = _client_with_transport(httpx.MockTransport(handler))
     issues = client.list_issues(limit=100)
@@ -620,7 +762,9 @@ def test_list_issues_non_exhaustive_later_page_stays_lenient() -> None:
         return httpx.Response(500, text="server error")
 
     client = _client_with_transport(httpx.MockTransport(handler))
-    issues = client.list_issues(labels=["tech-lead-agent"], limit=2000)  # not exhaustive
+    issues = client.list_issues(
+        labels=["tech-lead-agent"], limit=2000
+    )  # not exhaustive
 
     assert [i["number"] for i in issues] == list(range(1, 101))  # partial, no raise
 
@@ -645,14 +789,20 @@ def test_list_issues_since_paginates_and_respects_limit() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         page = int(request.url.params.get("page", "1"))
         if page == 1:
-            return httpx.Response(200, json=[
-                {"number": 100, "title": "A", "updated_at": "2026-01-02T10:00:00Z"},
-                {"number": 99, "title": "B", "updated_at": "2026-01-02T09:59:00Z"},
-                {"number": 98, "title": "C", "updated_at": "2026-01-02T09:58:00Z"},
-            ])
-        return httpx.Response(200, json=[
-            {"number": 97, "title": "D", "updated_at": "2026-01-02T09:57:00Z"},
-        ])
+            return httpx.Response(
+                200,
+                json=[
+                    {"number": 100, "title": "A", "updated_at": "2026-01-02T10:00:00Z"},
+                    {"number": 99, "title": "B", "updated_at": "2026-01-02T09:59:00Z"},
+                    {"number": 98, "title": "C", "updated_at": "2026-01-02T09:58:00Z"},
+                ],
+            )
+        return httpx.Response(
+            200,
+            json=[
+                {"number": 97, "title": "D", "updated_at": "2026-01-02T09:57:00Z"},
+            ],
+        )
 
     client = _client_with_transport(httpx.MockTransport(handler))
     issues, watermark = client.list_issues_since(
@@ -681,9 +831,7 @@ def test_issue_comment_marker_present_finds_marker_beyond_first_page() -> None:
             return httpx.Response(
                 200, json=[{"body": f"chatter {i}"} for i in range(100)]
             )
-        return httpx.Response(
-            200, json=[{"body": f"{_TEST_MARKER}\nearlier feedback"}]
-        )
+        return httpx.Response(200, json=[{"body": f"{_TEST_MARKER}\nearlier feedback"}])
 
     client = _client_with_transport(httpx.MockTransport(handler))
 
@@ -736,6 +884,7 @@ def test_issue_comment_marker_present_short_circuits_on_first_page() -> None:
 def test_issue_comment_marker_present_propagates_read_error() -> None:
     """A failed comment read must raise (fail loud) so dedupe callers do not
     silently risk a duplicate comment."""
+
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(500, text="boom")
 
@@ -757,9 +906,7 @@ def test_issue_comment_marker_present_fails_loud_at_page_cap() -> None:
         pages_requested.append(int(request.url.params.get("page", "1")))
         # Always a full page of unrelated comments: GitHub never signals a
         # final page, so the loop runs until the cap.
-        return httpx.Response(
-            200, json=[{"body": f"chatter {i}"} for i in range(100)]
-        )
+        return httpx.Response(200, json=[{"body": f"chatter {i}"} for i in range(100)])
 
     client = _client_with_transport(httpx.MockTransport(handler))
 
@@ -774,6 +921,7 @@ def test_issue_comment_marker_present_fails_loud_on_non_list_payload() -> None:
     """Regression: a malformed (non-list) 2xx body is a contract violation, not
     evidence the marker is absent. It must raise rather than return False so a
     dedupe caller never posts a duplicate from a response it could not scan."""
+
     def handler(request: httpx.Request) -> httpx.Response:
         # GitHub's comments endpoint returns a JSON array; an object here means
         # an error envelope, proxy/mock drift, or schema change.
@@ -791,7 +939,9 @@ def test_list_issues_since_default_bypasses_etag_cache() -> None:
 
     def handler(request: httpx.Request) -> httpx.Response:
         requests_seen.append(dict(request.headers))
-        return httpx.Response(200, json=payload, headers={"ETag": "W/issues-since-etag"})
+        return httpx.Response(
+            200, json=payload, headers={"ETag": "W/issues-since-etag"}
+        )
 
     client = _client_with_transport(httpx.MockTransport(handler))
 
@@ -832,6 +982,7 @@ def test_search_issues_by_title_includes_is_issue_qualifier() -> None:
 
 def test_search_issues_by_title_empty_terms_skips_http() -> None:
     """No terms → no HTTP call (don't burn search quota on a noop)."""
+
     def handler(request: httpx.Request) -> httpx.Response:
         pytest.fail(f"Unexpected HTTP request: {request.url}")
         return httpx.Response(500)
@@ -866,11 +1017,13 @@ def test_list_issues_use_cache_false_bypasses_etag() -> None:
     payload = [{"number": 1, "title": "Fresh Issue"}]
 
     def handler(request: httpx.Request) -> httpx.Response:
-        requests_seen.append({
-            "method": request.method,
-            "path": request.url.path,
-            "headers": dict(request.headers),
-        })
+        requests_seen.append(
+            {
+                "method": request.method,
+                "path": request.url.path,
+                "headers": dict(request.headers),
+            }
+        )
         # Always return 200 with fresh data
         return httpx.Response(200, json=payload, headers={"ETag": "W/fresh-etag"})
 
@@ -901,11 +1054,13 @@ def test_list_issues_use_cache_true_sends_etag() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         nonlocal call_count
         call_count += 1
-        requests_seen.append({
-            "method": request.method,
-            "path": request.url.path,
-            "headers": dict(request.headers),
-        })
+        requests_seen.append(
+            {
+                "method": request.method,
+                "path": request.url.path,
+                "headers": dict(request.headers),
+            }
+        )
         if call_count == 1:
             # First call: return data with ETag
             return httpx.Response(200, json=payload, headers={"ETag": "W/cached-etag"})
@@ -935,11 +1090,13 @@ def test_get_issue_labels_use_cache_false_bypasses_etag() -> None:
     payload = [{"name": "bug"}]
 
     def handler(request: httpx.Request) -> httpx.Response:
-        requests_seen.append({
-            "method": request.method,
-            "path": request.url.path,
-            "headers": dict(request.headers),
-        })
+        requests_seen.append(
+            {
+                "method": request.method,
+                "path": request.url.path,
+                "headers": dict(request.headers),
+            }
+        )
         return httpx.Response(200, json=payload, headers={"ETag": "W/labels-etag"})
 
     client = _client_with_transport(httpx.MockTransport(handler))
@@ -962,13 +1119,17 @@ def test_get_issue_labels_use_cache_true_sends_etag() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         nonlocal call_count
         call_count += 1
-        requests_seen.append({
-            "method": request.method,
-            "path": request.url.path,
-            "headers": dict(request.headers),
-        })
+        requests_seen.append(
+            {
+                "method": request.method,
+                "path": request.url.path,
+                "headers": dict(request.headers),
+            }
+        )
         if call_count == 1:
-            return httpx.Response(200, json=[{"name": "bug"}], headers={"ETag": "W/labels-etag"})
+            return httpx.Response(
+                200, json=[{"name": "bug"}], headers={"ETag": "W/labels-etag"}
+            )
         return httpx.Response(304, text="")
 
     client = _client_with_transport(httpx.MockTransport(handler))
@@ -993,11 +1154,13 @@ def test_invalidate_labels_etag_clears_cache() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         nonlocal call_count
         call_count += 1
-        requests_seen.append({
-            "method": request.method,
-            "path": request.url.path,
-            "headers": dict(request.headers),
-        })
+        requests_seen.append(
+            {
+                "method": request.method,
+                "path": request.url.path,
+                "headers": dict(request.headers),
+            }
+        )
         if "if-none-match" in request.headers:
             # If client sent If-None-Match, return 304
             return httpx.Response(304, text="")
@@ -1065,7 +1228,9 @@ def test_list_labels_single_page_makes_no_extra_request() -> None:
 
     def handler(request: httpx.Request) -> httpx.Response:
         requested_pages.append(int(request.url.params.get("page", "1")))
-        return httpx.Response(200, json=[{"name": "bug"}, {"name": "proposed-tech-lead"}])
+        return httpx.Response(
+            200, json=[{"name": "bug"}, {"name": "proposed-tech-lead"}]
+        )
 
     client = _client_with_transport(httpx.MockTransport(handler))
     labels = client.list_labels()
@@ -1128,11 +1293,13 @@ def test_invalidate_pr_etag_clears_pr_cache() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         nonlocal call_count
         call_count += 1
-        requests_seen.append({
-            "method": request.method,
-            "path": request.url.path,
-            "headers": dict(request.headers),
-        })
+        requests_seen.append(
+            {
+                "method": request.method,
+                "path": request.url.path,
+                "headers": dict(request.headers),
+            }
+        )
         if "if-none-match" in request.headers:
             return httpx.Response(304, text="")
         return httpx.Response(
@@ -1232,19 +1399,40 @@ def test_get_prs_with_label_state_all_skips_malformed_items() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         query = request.url.params.get("q", "")
         if "state:open" in query:
-            return httpx.Response(200, json={
-                "items": [
-                    {"number": 10, "title": "Open PR", "html_url": "https://example.com/open"},
-                    {"title": "Malformed PR", "html_url": "https://example.com/bad"},
-                ],
-            })
+            return httpx.Response(
+                200,
+                json={
+                    "items": [
+                        {
+                            "number": 10,
+                            "title": "Open PR",
+                            "html_url": "https://example.com/open",
+                        },
+                        {
+                            "title": "Malformed PR",
+                            "html_url": "https://example.com/bad",
+                        },
+                    ],
+                },
+            )
         if "state:closed" in query:
-            return httpx.Response(200, json={
-                "items": [
-                    {"number": 10, "title": "Duplicate PR", "html_url": "https://example.com/open"},
-                    {"number": 11, "title": "Closed PR", "html_url": "https://example.com/closed"},
-                ],
-            })
+            return httpx.Response(
+                200,
+                json={
+                    "items": [
+                        {
+                            "number": 10,
+                            "title": "Duplicate PR",
+                            "html_url": "https://example.com/open",
+                        },
+                        {
+                            "number": 11,
+                            "title": "Closed PR",
+                            "html_url": "https://example.com/closed",
+                        },
+                    ],
+                },
+            )
         return httpx.Response(200, json={"items": []})
 
     client = _client_with_transport(httpx.MockTransport(handler))
@@ -1269,14 +1457,16 @@ def test_graphql_successful_query() -> None:
     requests_seen: list[dict] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        requests_seen.append({
-            "method": request.method,
-            "path": request.url.path,
-            "body": json.loads(request.content),
-        })
-        return httpx.Response(200, json={
-            "data": {"repository": {"pullRequest": {"id": "PR_123"}}}
-        })
+        requests_seen.append(
+            {
+                "method": request.method,
+                "path": request.url.path,
+                "body": json.loads(request.content),
+            }
+        )
+        return httpx.Response(
+            200, json={"data": {"repository": {"pullRequest": {"id": "PR_123"}}}}
+        )
 
     client = _client_with_transport(httpx.MockTransport(handler))
     # noqa: SLF001 - Testing internal GraphQL method error handling
@@ -1295,11 +1485,11 @@ def test_graphql_successful_query() -> None:
 
 def test_graphql_raises_on_graphql_errors() -> None:
     """Verify _graphql() raises GitHubHttpError on GraphQL-level errors."""
+
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={
-            "data": None,
-            "errors": [{"message": "Field 'foo' not found"}]
-        })
+        return httpx.Response(
+            200, json={"data": None, "errors": [{"message": "Field 'foo' not found"}]}
+        )
 
     client = _client_with_transport(httpx.MockTransport(handler))
 
@@ -1311,6 +1501,7 @@ def test_graphql_raises_on_graphql_errors() -> None:
 
 def test_graphql_raises_on_http_error() -> None:
     """Verify _graphql() raises GitHubHttpError on HTTP errors."""
+
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(401, json={"message": "Bad credentials"})
 
@@ -1338,18 +1529,26 @@ def test_set_pr_draft_marks_ready_for_review() -> None:
 
         if call_count == 1:
             # First call: query for node ID
-            return httpx.Response(200, json={
-                "data": {"repository": {"pullRequest": {"id": "PR_node_123"}}}
-            })
+            return httpx.Response(
+                200,
+                json={"data": {"repository": {"pullRequest": {"id": "PR_node_123"}}}},
+            )
         else:
             # Second call: mutation
-            return httpx.Response(200, json={
-                "data": {
-                    "markPullRequestReadyForReview": {
-                        "pullRequest": {"id": "PR_node_123", "number": 42, "isDraft": False}
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "markPullRequestReadyForReview": {
+                            "pullRequest": {
+                                "id": "PR_node_123",
+                                "number": 42,
+                                "isDraft": False,
+                            }
+                        }
                     }
-                }
-            })
+                },
+            )
 
     client = _client_with_transport(httpx.MockTransport(handler))
     result = client.set_pr_draft(42, draft=False)
@@ -1379,17 +1578,25 @@ def test_set_pr_draft_converts_to_draft() -> None:
         requests_seen.append({"call": call_count, "body": body})
 
         if call_count == 1:
-            return httpx.Response(200, json={
-                "data": {"repository": {"pullRequest": {"id": "PR_node_456"}}}
-            })
+            return httpx.Response(
+                200,
+                json={"data": {"repository": {"pullRequest": {"id": "PR_node_456"}}}},
+            )
         else:
-            return httpx.Response(200, json={
-                "data": {
-                    "convertPullRequestToDraft": {
-                        "pullRequest": {"id": "PR_node_456", "number": 99, "isDraft": True}
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "convertPullRequestToDraft": {
+                            "pullRequest": {
+                                "id": "PR_node_456",
+                                "number": 99,
+                                "isDraft": True,
+                            }
+                        }
                     }
-                }
-            })
+                },
+            )
 
     client = _client_with_transport(httpx.MockTransport(handler))
     result = client.set_pr_draft(99, draft=True)
@@ -1403,10 +1610,9 @@ def test_set_pr_draft_converts_to_draft() -> None:
 
 def test_set_pr_draft_raises_on_pr_not_found() -> None:
     """Verify set_pr_draft() raises GitHubHttpError when PR doesn't exist."""
+
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={
-            "data": {"repository": {"pullRequest": None}}
-        })
+        return httpx.Response(200, json={"data": {"repository": {"pullRequest": None}}})
 
     client = _client_with_transport(httpx.MockTransport(handler))
 
@@ -1448,6 +1654,7 @@ def test_get_pr_reviews_returns_list() -> None:
 
 def test_get_pr_reviews_returns_empty_list_on_non_list_response() -> None:
     """Verify get_pr_reviews() returns empty list if response is not a list."""
+
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"error": "unexpected"})
 
@@ -1477,7 +1684,11 @@ def _commit_rollup_handler(
         if path.endswith("/check-runs"):
             return httpx.Response(check_runs_status, json=check_runs)
         if path.endswith("/status"):
-            payload = statuses if statuses is not None else {"state": "pending", "statuses": []}
+            payload = (
+                statuses
+                if statuses is not None
+                else {"state": "pending", "statuses": []}
+            )
             return httpx.Response(status_status, json=payload)
         return httpx.Response(404, json={"message": "not found"})
 
@@ -1489,7 +1700,11 @@ def test_get_commit_check_rollup_reports_failure_for_failed_check_run() -> None:
         check_runs={
             "check_runs": [
                 {"name": "validate", "status": "completed", "conclusion": "success"},
-                {"name": "system-verification", "status": "completed", "conclusion": "failure"},
+                {
+                    "name": "system-verification",
+                    "status": "completed",
+                    "conclusion": "failure",
+                },
             ]
         },
     )
@@ -1505,7 +1720,11 @@ def test_get_commit_check_rollup_reports_pending_for_incomplete_check_run() -> N
         check_runs={
             "check_runs": [
                 {"name": "validate", "status": "completed", "conclusion": "success"},
-                {"name": "system-verification", "status": "in_progress", "conclusion": None},
+                {
+                    "name": "system-verification",
+                    "status": "in_progress",
+                    "conclusion": None,
+                },
             ]
         },
     )
@@ -1556,7 +1775,9 @@ def test_get_commit_check_rollup_incomplete_when_check_runs_inaccessible() -> No
     assert rollup.complete is False
 
 
-def test_get_commit_check_rollup_legacy_status_failure_survives_check_runs_403() -> None:
+def test_get_commit_check_rollup_legacy_status_failure_survives_check_runs_403() -> (
+    None
+):
     """The core #6589 path: GraphQL inaccessible, /check-runs inaccessible, but
     /commits/{sha}/status is readable and reports failure. The readable legacy
     status failure is conclusive, so the rollup is a complete FAILURE and the PR
@@ -1652,7 +1873,9 @@ def test_get_commit_check_rollup_failure_wins_even_when_status_api_fails() -> No
     assert rollup.complete is True
 
 
-def test_get_commit_check_rollup_incomplete_when_status_api_fails_and_checks_pass() -> None:
+def test_get_commit_check_rollup_incomplete_when_status_api_fails_and_checks_pass() -> (
+    None
+):
     """A 403 on the legacy combined-status source while check-runs are all green
     is INCONCLUSIVE: a required legacy status could be failing unseen, so the
     rollup must report complete=False rather than a false SUCCESS (issue #6589)."""
@@ -1671,7 +1894,9 @@ def test_get_commit_check_rollup_incomplete_when_status_api_fails_and_checks_pas
     assert rollup.complete is False
 
 
-def test_get_commit_check_rollup_incomplete_when_status_api_fails_and_no_checks() -> None:
+def test_get_commit_check_rollup_incomplete_when_status_api_fails_and_no_checks() -> (
+    None
+):
     """A 403 on the legacy combined-status source with zero check-runs cannot
     honestly claim "no checks": the status source might hold a required status."""
     handler = _commit_rollup_handler(
@@ -1703,7 +1928,11 @@ def _paginated_check_runs_handler(
             page = int(request.url.params.get("page", "1"))
             return httpx.Response(200, json=pages.get(page, {"check_runs": []}))
         if path.endswith("/status"):
-            payload = statuses if statuses is not None else {"state": "pending", "statuses": []}
+            payload = (
+                statuses
+                if statuses is not None
+                else {"state": "pending", "statuses": []}
+            )
             return httpx.Response(status_status, json=payload)
         return httpx.Response(404, json={"message": "not found"})
 
@@ -1721,7 +1950,11 @@ def test_get_commit_check_rollup_paginates_to_failure_on_later_page() -> None:
     }
     page2 = {
         "check_runs": [
-            {"name": "system-verification", "status": "completed", "conclusion": "failure"},
+            {
+                "name": "system-verification",
+                "status": "completed",
+                "conclusion": "failure",
+            },
         ]
     }
     handler = _paginated_check_runs_handler({1: page1, 2: page2})
@@ -1747,7 +1980,11 @@ def test_get_commit_check_rollup_failure_on_later_page_beats_earlier_pending() -
     }
     page2 = {
         "check_runs": [
-            {"name": "system-verification", "status": "completed", "conclusion": "failure"},
+            {
+                "name": "system-verification",
+                "status": "completed",
+                "conclusion": "failure",
+            },
         ]
     }
     handler = _paginated_check_runs_handler({1: page1, 2: page2})
@@ -1796,7 +2033,11 @@ def test_get_commit_check_rollup_cap_hit_without_failure_is_incomplete() -> None
     # Page 21 carries a failure the cap stops us from ever reading.
     pages[21] = {
         "check_runs": [
-            {"name": "system-verification", "status": "completed", "conclusion": "failure"},
+            {
+                "name": "system-verification",
+                "status": "completed",
+                "conclusion": "failure",
+            },
         ]
     }
     handler = _paginated_check_runs_handler(pages)
@@ -1809,7 +2050,9 @@ def test_get_commit_check_rollup_cap_hit_without_failure_is_incomplete() -> None
     assert rollup.capability == "transient_error"
 
 
-def test_get_commit_check_rollup_cap_hit_stays_complete_on_readable_legacy_failure() -> None:
+def test_get_commit_check_rollup_cap_hit_stays_complete_on_readable_legacy_failure() -> (
+    None
+):
     """A cap-hit check-runs read is only inconclusive on its own: if the
     readable legacy combined-status source already reports FAILURE, the
     aggregate is a conclusive FAILURE and stays complete (an unread check-runs
@@ -1908,7 +2151,11 @@ def test_get_commit_check_rollup_cancelled_check_run_is_failure() -> None:
         check_runs={
             "check_runs": [
                 {"name": "validate", "status": "completed", "conclusion": "success"},
-                {"name": "system-verification", "status": "completed", "conclusion": "cancelled"},
+                {
+                    "name": "system-verification",
+                    "status": "completed",
+                    "conclusion": "cancelled",
+                },
             ]
         },
     )
@@ -1952,3 +2199,240 @@ def test_get_commit_check_rollup_neutral_and_skipped_runs_are_passing() -> None:
     rollup = client.get_commit_check_rollup("deadbeef")
     assert rollup.state == "SUCCESS"
     assert rollup.complete is True
+
+
+# ---------------------------------------------------------------------------
+# list_all_milestones: authoritative all-state exhaustive read
+# ---------------------------------------------------------------------------
+
+def test_list_all_milestones_requests_all_states_and_walks_pages() -> None:
+    """The doctor makes a NEGATIVE-existence decision from this list, so the
+    read must cover every state and every page. A state filter would hide a
+    closed foundation milestone; stopping at page 1 would hide a later one.
+    Either omission turns a correct configuration into a false report."""
+    seen: list[dict[str, str]] = []
+    page1 = [{"title": f"M{n}", "number": n} for n in range(100)]
+    page2 = [{"title": "M0 - Foundation", "number": 100, "state": "closed"}]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(
+            {
+                "path": request.url.path,
+                "state": request.url.params.get("state", ""),
+                "per_page": request.url.params.get("per_page", ""),
+                "page": request.url.params.get("page", "1"),
+            }
+        )
+        return httpx.Response(200, json=page1 if seen[-1]["page"] == "1" else page2)
+
+    client = _client_with_transport(httpx.MockTransport(handler))
+    milestones = client.list_all_milestones()
+
+    assert [s["page"] for s in seen] == ["1", "2"]
+    assert {s["state"] for s in seen} == {"all"}
+    assert {s["per_page"] for s in seen} == {"100"}
+    assert all(s["path"].endswith("/milestones") for s in seen)
+    # The page-2 entry survives — this is the one the doctor would otherwise
+    # report as missing.
+    assert {m["title"] for m in milestones} == {m["title"] for m in page1} | {"M0 - Foundation"}
+
+
+def test_list_all_milestones_short_first_page_stops() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=[{"title": "M0", "number": 1}])
+
+    client = _client_with_transport(httpx.MockTransport(handler))
+
+    assert [m["title"] for m in client.list_all_milestones()] == ["M0"]
+
+
+def test_list_all_milestones_empty_list_is_valid_exhaustion() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=[])
+
+    client = _client_with_transport(httpx.MockTransport(handler))
+
+    assert client.list_all_milestones() == []
+
+
+def test_list_all_milestones_non_list_body_fails_loud() -> None:
+    """A 2xx carrying a non-list body is a contract violation, not exhaustion.
+
+    Returning [] here would hand the doctor an empty snapshot, which it reads as
+    "this repo has no milestones" and reports nothing at all — recreating the
+    silent diagnostic failure the fail-loud pager exists to prevent.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"message": "unexpected shape"})
+
+    client = _client_with_transport(httpx.MockTransport(handler))
+    with pytest.raises(GitHubHttpError):
+        client.list_all_milestones()
+
+
+def test_list_all_milestones_later_page_non_200_fails_loud() -> None:
+    page1 = [{"title": f"M{n}", "number": n} for n in range(100)]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.params.get("page", "1") == "1":
+            return httpx.Response(200, json=page1)
+        return httpx.Response(502, text="bad gateway")
+
+    client = _client_with_transport(httpx.MockTransport(handler))
+    with pytest.raises(GitHubHttpError):
+        client.list_all_milestones()
+
+
+def test_issue_closed_on_or_after_true_at_exact_merge_timestamp() -> None:
+    """GitHub's auto-close event lands at (or just after) the merge moment;
+    the boundary must count as evidence the auto-close fired."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=[
+            {"event": "labeled", "created_at": "2026-08-03T13:00:00Z"},
+            {"event": "closed", "created_at": "2026-08-03T13:52:09Z"},
+        ])
+
+    client = _client_with_transport(httpx.MockTransport(handler))
+
+    assert client.issue_closed_on_or_after(45, "2026-08-03T13:52:09Z") is True
+
+
+def test_issue_closed_on_or_after_ignores_pre_merge_closures() -> None:
+    """A close that happened (and was reopened) BEFORE the merge is not
+    evidence the merge's auto-close fired."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=[
+            {"event": "closed", "created_at": "2026-08-01T10:00:00Z"},
+            {"event": "reopened", "created_at": "2026-08-01T11:00:00Z"},
+        ])
+
+    client = _client_with_transport(httpx.MockTransport(handler))
+
+    assert client.issue_closed_on_or_after(45, "2026-08-03T13:52:09Z") is False
+
+
+def test_issue_closed_on_or_after_finds_event_beyond_first_page() -> None:
+    """The close event may sit past the first 100 timeline events."""
+    pages_requested: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        page = int(request.url.params.get("page", "1"))
+        pages_requested.append(page)
+        if page == 1:
+            return httpx.Response(
+                200,
+                json=[
+                    {"event": "labeled", "created_at": "2026-08-03T12:00:00Z"}
+                    for _ in range(100)
+                ],
+            )
+        return httpx.Response(200, json=[
+            {"event": "closed", "created_at": "2026-08-03T14:00:00Z"},
+        ])
+
+    client = _client_with_transport(httpx.MockTransport(handler))
+
+    assert client.issue_closed_on_or_after(45, "2026-08-03T13:52:09Z") is True
+    assert pages_requested == [1, 2]
+
+
+def test_issue_closed_on_or_after_fails_loud_on_non_list_payload() -> None:
+    """A malformed 2xx body is a read error, not evidence of absence — the
+    caller decides a destructive close on this fact."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"message": "unexpected"})
+
+    client = _client_with_transport(httpx.MockTransport(handler))
+
+    with pytest.raises(GitHubHttpError):
+        client.issue_closed_on_or_after(45, "2026-08-03T13:52:09Z")
+
+
+# -------------------- Closing-PR linkage (#6957) --------------------
+
+
+def _closing_pr_client(nodes: list[dict]) -> tuple[GitHubHttpClient, list[dict]]:
+    """A client whose GraphQL endpoint replays *nodes* as CLOSED_EVENTs."""
+    requests_seen: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests_seen.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    "repository": {"issue": {"timelineItems": {"nodes": nodes}}}
+                }
+            },
+        )
+
+    return _client_with_transport(httpx.MockTransport(handler)), requests_seen
+
+
+def test_closing_pull_request_reports_the_merged_closer() -> None:
+    client, _ = _closing_pr_client(
+        [{"closer": {"number": 42, "url": "https://x/pull/42", "merged": True}}]
+    )
+
+    assert client.get_closing_pull_request(501) == {
+        "number": 42,
+        "url": "https://x/pull/42",
+        "merged": True,
+    }
+
+
+def test_closing_pull_request_only_asks_for_the_newest_close() -> None:
+    """The query itself is bounded to the close that left the issue closed."""
+    client, requests_seen = _closing_pr_client([])
+
+    client.get_closing_pull_request(501)
+
+    assert "last: 1" in requests_seen[0]["query"]
+    assert requests_seen[0]["variables"] == {
+        "owner": "owner",
+        "repo": "repo",
+        "number": 501,
+    }
+
+
+def test_a_newer_manual_close_supersedes_an_older_merged_pr_close() -> None:
+    """#6957 round-2 review F4: reopened-then-manually-closed is a DECLINE.
+
+    An issue closed by a merged PR, reopened, then closed by hand has two
+    ClosedEvents. Scanning backward for *any* PR-backed close returned the stale
+    merge and recorded a manual decline as shipped, permanently closing the
+    source case file. Only the newest close counts.
+    """
+    client, _ = _closing_pr_client(
+        [
+            # Older: closed by a merged PR...
+            {"closer": {"number": 42, "url": "https://x/pull/42", "merged": True}},
+            # ...reopened, then most recently closed by a human.
+            {"closer": None},
+        ]
+    )
+
+    assert client.get_closing_pull_request(501) is None
+
+
+def test_a_newer_unmerged_pr_close_supersedes_an_older_merged_one() -> None:
+    client, _ = _closing_pr_client(
+        [
+            {"closer": {"number": 42, "url": "https://x/pull/42", "merged": True}},
+            {"closer": {"number": 43, "url": "https://x/pull/43", "merged": False}},
+        ]
+    )
+
+    outcome = client.get_closing_pull_request(501)
+
+    assert outcome is not None
+    assert outcome["number"] == 43 and outcome["merged"] is False
+
+
+def test_never_closed_issue_has_no_closing_pull_request() -> None:
+    client, _ = _closing_pr_client([])
+
+    assert client.get_closing_pull_request(501) is None

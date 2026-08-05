@@ -1,0 +1,234 @@
+"""Port for filing and following a promoted finding in its ROUTED repo (#6957).
+
+Finding promotion routes a pattern case file to the repo that owns the fix,
+which is frequently NOT the managed repo the orchestrator is bound to. The
+existing ``RepositoryHost`` is single-repo by construction (its caches, label
+provisioning, and write verification are all bound to ``config.repo``), so
+promotion depends on this narrow behavior-level port instead of teaching every
+``RepositoryHost`` method a ``repo=`` parameter.
+
+It exposes exactly the four things the lane needs and nothing else, so the
+blast radius of "the orchestrator can write to another repo" stays visible:
+
+* :meth:`PromotionTargetHost.check_filing_ready` — startup/doctor validation
+  that a configured route target can run the FILING COMMAND: reachable, issues
+  enabled, issue-writable, and carrying (or able to provision) every label that
+  route's promotions require. A route the token cannot file issues in must fail
+  loudly at startup, never silently at promotion time.
+* :meth:`PromotionTargetHost.file_issue` — create the gated promotion issue,
+  or recover the same marker-owned issue after a crash, provisioning its labels
+  first so GitHub cannot silently drop the gate and leave a schedulable issue
+  behind.
+* :meth:`PromotionTargetHost.add_comment` — route a later observation onto the
+  already-promoted issue instead of filing a second one.
+* :meth:`PromotionTargetHost.read_outcome` — the loop-closure read: is the
+  promoted issue still open, and if closed, did a merged PR close it?
+
+Promotion FILES issues, full stop: there is deliberately no approve, merge,
+label-removal, or close capability on this port. Cross-repo WRITES are limited
+to these two (create issue, comment); everything the source repo does to its
+own case files goes through its own ``RepositoryHost``.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Protocol, Sequence
+
+from ..domain.tech_lead_findings import PromotionFilingContract
+
+__all__ = [
+    "FiledIssue",
+    "InMemoryPromotionTargetHost",
+    "PromotedIssueOutcome",
+    "PromotionFilingContract",
+    "PromotionTargetHost",
+    "validate_promotion_issue_marker",
+]
+
+
+@dataclass(frozen=True)
+class FiledIssue:
+    """The issue a promotion filed in its target repo.
+
+    ``recovered`` distinguishes "this call created the issue" from "this call
+    found one an earlier, interrupted attempt had already created". The filing
+    owner needs the difference to report honestly and to reason about which
+    payload the remote body actually carries; inferring it from watermark drift
+    was wrong in both directions (#6957 round-4 review A5).
+    """
+
+    number: int
+    url: str = ""
+    recovered: bool = False
+
+
+def validate_promotion_issue_marker(*, body: str, marker: str) -> None:
+    """Reject a filing that cannot be recovered after its local ledger write fails."""
+    if not marker.strip() or marker not in body:
+        raise ValueError(
+            "a promotion issue's non-empty idempotency marker must appear in its body"
+        )
+
+
+@dataclass(frozen=True)
+class PromotedIssueOutcome:
+    """Terminal-state read of a promoted issue in its target repo.
+
+    ``state`` is ``"open"`` or ``"closed"``. ``merged_pr_url`` is non-empty only
+    when a MERGED pull request references the issue — that is the evidence the
+    loop actually closed with a shipped fix, as opposed to the issue being
+    closed as declined/wontfix.
+    """
+
+    state: str
+    merged_pr_url: str = ""
+
+    @property
+    def closed(self) -> bool:
+        return self.state == "closed"
+
+
+class PromotionTargetHost(Protocol):
+    """Cross-repo filing/read seam for the finding-promotion lane."""
+
+    def check_filing_ready(self, contract: PromotionFilingContract) -> str | None:
+        """None when *contract* can be FILED as specified, else the reason.
+
+        Called by config/doctor validation at startup so a misrouted or
+        unauthorized target is a loud configuration error rather than a
+        promotion that fails on the tick a pattern finally crosses its
+        evidence threshold.
+
+        The whole contract is the argument on purpose: :meth:`file_issue`
+        provisions any missing label BEFORE it creates the issue, so a check
+        that only proved "this token can open an issue here" would approve a
+        route whose very first promotion dies provisioning a label (#6957
+        round-6 review F2/A1). Readiness must cover exactly what filing needs.
+        """
+        ...
+
+    def file_issue(
+        self,
+        *,
+        repo: str,
+        title: str,
+        body: str,
+        labels: Sequence[str],
+        idempotency_marker: str,
+    ) -> FiledIssue:
+        """Create or recover one marker-owned gated issue in *repo*.
+
+        Raises on failure — a promotion that cannot be filed must leave the
+        ledger untouched so the next tick retries, never record a phantom
+        promotion that blocks the signature forever. ``idempotency_marker`` is
+        present in ``body`` and must recover an issue created before a crash
+        that prevented the local ledger write.
+        """
+        ...
+
+    def find_filed_issue(
+        self, *, repo: str, title: str, idempotency_marker: str
+    ) -> FiledIssue | None:
+        """The marker-owned issue in *repo*, or None when PROVEN absent.
+
+        Recovery only: this never creates. ``file_issue`` conflates "find" with
+        "create", which leaves the filing owner unable to ask whether an
+        interrupted filing left an issue behind in a repo it no longer routes to
+        (#6957 round-4 review F12/A5) — the one question it must answer before
+        deciding whether a re-routed signature may take a new target.
+
+        Raises when the lookup cannot be performed. "Unknown" must never be
+        mistaken for "absent": that is what files a second issue for a signature
+        that already has one.
+        """
+        ...
+
+    def add_comment(self, *, repo: str, issue_number: int, body: str) -> None:
+        """Comment on an already-promoted issue in *repo*."""
+        ...
+
+    def read_outcome(
+        self, *, repo: str, issue_number: int
+    ) -> PromotedIssueOutcome | None:
+        """Outcome of a promoted issue, or None when it cannot be read.
+
+        None means "unknown this tick" (deleted, unreachable, or a transient
+        API failure) — the caller must leave the promotion in flight rather
+        than treat an unreadable target as declined.
+        """
+        ...
+
+
+class InMemoryPromotionTargetHost:
+    """Test double: records filings/comments, replays scripted outcomes."""
+
+    def __init__(
+        self,
+        *,
+        writable: bool = True,
+        unwritable_reason: str = "no write access",
+    ) -> None:
+        self.writable = writable
+        self.unwritable_reason = unwritable_reason
+        # Every contract readiness was asked about, so tests can assert the
+        # probe covered the labels filing will actually require.
+        self.filing_checks: list[PromotionFilingContract] = []
+        self.filed: list[tuple[str, str, str, tuple[str, ...]]] = []
+        self.comments: list[tuple[str, int, str]] = []
+        self.outcomes: dict[tuple[str, int], PromotedIssueOutcome | None] = {}
+        self.next_issue_number = 1000
+        self.file_error: Exception | None = None
+        self.find_error: Exception | None = None
+        # Markers are scoped to a repo: the same signature filed into two
+        # different routes is two different issues.
+        self._filed_by_marker: dict[tuple[str, str], FiledIssue] = {}
+
+    def check_filing_ready(self, contract: PromotionFilingContract) -> str | None:
+        self.filing_checks.append(contract)
+        if self.writable:
+            return None
+        return f"{contract.repo}: {self.unwritable_reason}"
+
+    def file_issue(
+        self,
+        *,
+        repo: str,
+        title: str,
+        body: str,
+        labels: Sequence[str],
+        idempotency_marker: str,
+    ) -> FiledIssue:
+        validate_promotion_issue_marker(body=body, marker=idempotency_marker)
+        existing = self._filed_by_marker.get((repo, idempotency_marker))
+        if existing is not None:
+            return existing
+        if self.file_error is not None:
+            raise self.file_error
+        self.filed.append((repo, title, body, tuple(labels)))
+        self.next_issue_number += 1
+        filed = FiledIssue(
+            number=self.next_issue_number,
+            url=f"https://example.invalid/{repo}/issues/{self.next_issue_number}",
+        )
+        self._filed_by_marker[(repo, idempotency_marker)] = FiledIssue(
+            number=filed.number, url=filed.url, recovered=True
+        )
+        return filed
+
+    def find_filed_issue(
+        self, *, repo: str, title: str, idempotency_marker: str
+    ) -> FiledIssue | None:
+        if self.find_error is not None:
+            raise self.find_error
+        return self._filed_by_marker.get((repo, idempotency_marker))
+
+    def add_comment(self, *, repo: str, issue_number: int, body: str) -> None:
+        self.comments.append((repo, issue_number, body))
+
+    def read_outcome(
+        self, *, repo: str, issue_number: int
+    ) -> PromotedIssueOutcome | None:
+        return self.outcomes.get(
+            (repo, issue_number), PromotedIssueOutcome(state="open")
+        )

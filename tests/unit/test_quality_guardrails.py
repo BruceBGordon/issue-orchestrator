@@ -710,6 +710,238 @@ def test_ui_openapi_routes_track_dynamic_browser_route_paths(tmp_path: Path) -> 
     assert "dynamic path 'API_DYNAMIC'" in result.stderr
 
 
+def test_ui_openapi_response_model_drift_names_an_absent_response_model(tmp_path: Path) -> None:
+    _copy_runner(tmp_path)
+    _write_ui_openapi_config(tmp_path)
+    _write_ui_openapi_schema(tmp_path, {"/api/typed": {"get": "TypedPayload"}})
+    target = tmp_path / "src" / "app" / "web_routes.py"
+    target.parent.mkdir(parents=True)
+    target.write_text(
+        "from fastapi import APIRouter\n"
+        "router = APIRouter()\n"
+        "@router.get('/api/typed')\n"
+        "def typed():\n"
+        "    return {}\n",
+        encoding="utf-8",
+    )
+
+    result = _run(tmp_path, "--format", "json")
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    drift = [
+        metric for metric in payload["metrics"] if metric["kind"] == "ui_openapi_response_model_drift"
+    ]
+    assert len(drift) == 1
+    assert drift[0]["metric_id"] == "response-model:GET /api/typed"
+    assert drift[0]["detail"] == (
+        "GET /api/typed must use response_model=TypedPayload "
+        "from docs/api/ui-openapi.json; found (no response_model)"
+    )
+
+
+def test_ui_openapi_dynamic_route_path_names_an_unknown_path_expression(tmp_path: Path) -> None:
+    _copy_runner(tmp_path)
+    _write_ui_openapi_config(tmp_path)
+    _write_ui_openapi_schema(tmp_path, {})
+    target = tmp_path / "src" / "app" / "web_routes.py"
+    target.parent.mkdir(parents=True)
+    target.write_text(
+        "from fastapi import APIRouter\n"
+        "router = APIRouter()\n"
+        "@router.get(response_model=TypedPayload)\n"
+        "def pathless():\n"
+        "    return {}\n",
+        encoding="utf-8",
+    )
+
+    result = _run(tmp_path, "--format", "json")
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    dynamic = [
+        metric for metric in payload["metrics"] if metric["kind"] == "ui_openapi_dynamic_route_path"
+    ]
+    assert len(dynamic) == 1
+    assert dynamic[0]["detail"] == (
+        "GET route at line 3 uses dynamic path (unknown route path expression); "
+        "browser-facing routes must use string literals so the UI OpenAPI guardrail "
+        "can compare them"
+    )
+    # The id keys on an explicit token, never on the None-able path expression
+    # itself and never on the diagnostic prose, so rewording the detail above
+    # cannot invalidate an accepted baseline entry.
+    assert dynamic[0]["metric_id"] == "dynamic-path:GET src/app/web_routes.py:<no-path-argument>"
+
+
+def test_pathless_dynamic_route_metric_key_survives_line_shifts(tmp_path: Path) -> None:
+    _copy_runner(tmp_path)
+    _write_ui_openapi_config(tmp_path)
+    _write_ui_openapi_schema(tmp_path, {})
+    target = tmp_path / "src" / "app" / "web_routes.py"
+    target.parent.mkdir(parents=True)
+    pathless_route = (
+        "@router.get(response_model=TypedPayload)\n"
+        "def pathless():\n"
+        "    return {}\n"
+    )
+    header = "from fastapi import APIRouter\nrouter = APIRouter()\n"
+    target.write_text(header + pathless_route, encoding="utf-8")
+    assert _run(tmp_path, "--update-baseline").returncode == 0
+    accepted_keys = _dynamic_path_keys(tmp_path)
+    assert accepted_keys == [
+        "ui_openapi_routes:dynamic-path:GET src/app/web_routes.py:<no-path-argument>"
+    ]
+
+    target.write_text(header + "\n" * 5 + pathless_route, encoding="utf-8")
+
+    result = _run(tmp_path, "--fail-on-new", "--check-stale")
+
+    assert result.returncode == 0, result.stderr + result.stdout
+    assert _dynamic_path_keys(tmp_path) == accepted_keys
+
+
+def test_ui_openapi_route_diagnostics_never_leak_placeholder_sentinels(tmp_path: Path) -> None:
+    _copy_runner(tmp_path)
+    _write_ui_openapi_config(tmp_path)
+    _write_ui_openapi_schema(tmp_path, {"/api/typed": {"get": "TypedPayload"}})
+    target = tmp_path / "src" / "app" / "web_routes.py"
+    target.parent.mkdir(parents=True)
+    target.write_text(
+        "from fastapi import APIRouter\n"
+        "router = APIRouter()\n"
+        "@router.get('/api/typed')\n"
+        "def typed():\n"
+        "    return {}\n"
+        "@router.post(**route_options)\n"
+        "def pathless():\n"
+        "    return {}\n",
+        encoding="utf-8",
+    )
+    assert _run(tmp_path, "--update-baseline").returncode == 0
+
+    result = _run(tmp_path, "--fail-on-new")
+
+    assert result.returncode == 0, result.stderr
+    baseline = json.loads((tmp_path / "quality" / "guardrails-baseline.json").read_text(encoding="utf-8"))
+    details = [entry["detail"] for entry in baseline["metrics"].values()]
+    assert details
+    assert not any("<missing>" in detail for detail in details), details
+    assert any("(no response_model)" in detail for detail in details), details
+    assert any("(unknown route path expression)" in detail for detail in details), details
+    # Absent metadata must not leak into persisted metric keys either — neither
+    # as the old sentinel nor as a stringified None from an optional field.
+    keys = list(baseline["metrics"])
+    assert not any("<missing>" in key for key in keys), keys
+    assert not any(key.endswith(":None") for key in keys), keys
+
+
+def _write_dynamic_browser_route(
+    root: Path,
+    *,
+    expression: str = "API_DYNAMIC",
+    lines_above: int = 0,
+    duplicate: bool = False,
+) -> Path:
+    target = root / "src" / "app" / "web_routes.py"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    duplicate_decorator = (
+        f"@router.get({expression})\n"
+        "def dynamic_twin():\n"
+        "    return {}\n"
+        if duplicate
+        else ""
+    )
+    target.write_text(
+        "from fastapi import APIRouter\n"
+        "router = APIRouter()\n"
+        f"{expression} = '/api/dynamic'\n"
+        + "\n" * lines_above
+        + f"@router.get({expression})\n"
+        "def dynamic():\n"
+        "    return {}\n" + duplicate_decorator,
+        encoding="utf-8",
+    )
+    return target
+
+
+def _dynamic_path_keys(root: Path) -> list[str]:
+    baseline = json.loads((root / "quality" / "guardrails-baseline.json").read_text(encoding="utf-8"))
+    return sorted(key for key in baseline["metrics"] if "dynamic-path:" in key)
+
+
+def _json_report(root: Path, *args: str) -> tuple[int, dict[str, list[dict[str, object]]]]:
+    result = _run(root, "--format", "json", *args)
+    return result.returncode, json.loads(result.stdout)
+
+
+def test_dynamic_route_metric_key_ignores_the_decorator_source_line(tmp_path: Path) -> None:
+    _copy_runner(tmp_path)
+    _write_ui_openapi_config(tmp_path)
+    _write_ui_openapi_schema(tmp_path, {})
+    _write_dynamic_browser_route(tmp_path)
+    assert _run(tmp_path, "--update-baseline").returncode == 0
+    accepted_keys = _dynamic_path_keys(tmp_path)
+    assert accepted_keys == ["ui_openapi_routes:dynamic-path:GET src/app/web_routes.py:API_DYNAMIC"]
+
+    _write_dynamic_browser_route(tmp_path, lines_above=5)
+
+    result = _run(tmp_path, "--fail-on-new", "--check-stale")
+
+    assert result.returncode == 0, result.stderr + result.stdout
+    assert _dynamic_path_keys(tmp_path) == accepted_keys
+
+
+def test_dynamic_route_metric_key_changes_when_the_path_expression_changes(tmp_path: Path) -> None:
+    _copy_runner(tmp_path)
+    _write_ui_openapi_config(tmp_path)
+    _write_ui_openapi_schema(tmp_path, {})
+    _write_dynamic_browser_route(tmp_path)
+    assert _run(tmp_path, "--update-baseline").returncode == 0
+
+    _write_dynamic_browser_route(tmp_path, expression="API_RENAMED")
+
+    returncode, report = _json_report(tmp_path, "--fail-on-new", "--check-stale")
+
+    assert returncode == 2
+    assert [violation["key"] for violation in report["violations"]] == [
+        "ui_openapi_routes:dynamic-path:GET src/app/web_routes.py:API_RENAMED"
+    ]
+    assert [entry["key"] for entry in report["stale_entries"]] == [
+        "ui_openapi_routes:dynamic-path:GET src/app/web_routes.py:API_DYNAMIC"
+    ]
+
+
+def test_duplicate_dynamic_route_decorators_get_distinct_metric_keys(tmp_path: Path) -> None:
+    _copy_runner(tmp_path)
+    _write_ui_openapi_config(tmp_path)
+    _write_ui_openapi_schema(tmp_path, {})
+    _write_dynamic_browser_route(tmp_path, duplicate=True)
+
+    assert _run(tmp_path, "--update-baseline").returncode == 0
+
+    assert _dynamic_path_keys(tmp_path) == [
+        "ui_openapi_routes:dynamic-path:GET src/app/web_routes.py:API_DYNAMIC",
+        "ui_openapi_routes:dynamic-path:GET src/app/web_routes.py:API_DYNAMIC#2",
+    ]
+
+
+def test_duplicate_dynamic_route_metric_keys_survive_line_shifts(tmp_path: Path) -> None:
+    _copy_runner(tmp_path)
+    _write_ui_openapi_config(tmp_path)
+    _write_ui_openapi_schema(tmp_path, {})
+    _write_dynamic_browser_route(tmp_path, duplicate=True)
+    assert _run(tmp_path, "--update-baseline").returncode == 0
+    accepted_keys = _dynamic_path_keys(tmp_path)
+
+    _write_dynamic_browser_route(tmp_path, duplicate=True, lines_above=3)
+
+    result = _run(tmp_path, "--fail-on-new", "--check-stale")
+
+    assert result.returncode == 0, result.stderr + result.stdout
+    assert _dynamic_path_keys(tmp_path) == accepted_keys
+
+
 def test_ui_openapi_routes_ignore_dynamic_non_browser_route_paths(tmp_path: Path) -> None:
     _copy_runner(tmp_path)
     _write_ui_openapi_config(tmp_path)

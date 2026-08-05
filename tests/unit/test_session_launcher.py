@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Optional, cast
 from unittest.mock import MagicMock, patch
 
+from issue_orchestrator.domain.tech_lead_session import TechLeadCreationOrigin
 from issue_orchestrator.control.session_completion import (
     _apply_completed_decisions,
     _record_provider_resilience_effects,
@@ -33,6 +34,7 @@ from issue_orchestrator.control.session_decision import (
     SessionDecision,
 )
 from issue_orchestrator.control.session_launch_types import LaunchResult
+from tests.callback_endpoint_helpers import ready_callback_endpoint
 from issue_orchestrator.control.session_launcher import (
     SessionLauncher,
     detect_existing_work,
@@ -114,6 +116,7 @@ from issue_orchestrator.ports import (
     NullBoardSnapshotProvider,
     NullManifestDownloader,
 )
+from issue_orchestrator.ports.command_runner import OutputNewlines
 from issue_orchestrator.ports.board_snapshot_provider import BoardSnapshotProvider
 from issue_orchestrator.control.board_snapshot_builder import (
     BoardSnapshotBuilder,
@@ -339,6 +342,7 @@ class MockCommandRunner:
         env: dict[str, str] | None = None,
         timeout_seconds: int | None = None,
         shell: bool = False,
+        newlines: OutputNewlines = OutputNewlines.TRANSLATED,
     ) -> CommandResult:
         self.run_calls.append({"command": command, "cwd": cwd, "env": env, "shell": shell})
         if self._result_index < len(self.results):
@@ -586,6 +590,7 @@ def _build_launcher_bundle(
         get_review_machine=get_review_machine,
         remove_session_machine=remove_session_machine,
         board_snapshot_provider=board_snapshot_provider,
+        agent_callback_endpoint=ready_callback_endpoint(),
     )
 
     bundle = LauncherTestBundle(
@@ -1189,6 +1194,7 @@ class TestLaunchIssueSession:
             refresh_issue_fn=refresh_issue,
             dependency_evaluator=_Evaluator(),
             board_snapshot_provider=NullBoardSnapshotProvider(),
+            agent_callback_endpoint=ready_callback_endpoint(),
         )
 
         result = launcher.launch_issue_session(sample_issue, active_sessions=[])
@@ -3849,6 +3855,7 @@ class TestLaunchTechLeadIssueSessionFlavors:
                     body="Walk the floor",
                     labels=("agent:tech-lead", HEALTH_REVIEW_MARKER_LABEL),
                     pr_count=0,
+                    origin=TechLeadCreationOrigin.authors_anchor(),
                 )
             ],
             issue_number=905,
@@ -4538,6 +4545,7 @@ class TestTechLeadProducerToLaunchBoundary:
                     body="Review these PRs",
                     labels=("agent:tech-lead",),
                     pr_count=5,
+                    origin=TechLeadCreationOrigin.authors_anchor(),
                 )
             ],
             issue_number=903,
@@ -4551,7 +4559,7 @@ class TestTechLeadProducerToLaunchBoundary:
         assert state.pending_tech_lead_reviews == []
         assert state.active_sessions == [session]
         decision = TechLeadWorkflow(config, NullEventSink()).should_launch_tech_lead(
-            state.pending_tech_lead_reviews, len(state.active_sessions), paused=False
+            state.pending_tech_lead_reviews, paused=False, available_slots=0
         )
         assert decision.should_launch is False
         assert decision.tech_lead_to_launch == ()
@@ -4815,6 +4823,7 @@ class TestTechLeadProducerToLaunchBoundary:
                 labels=("agent:tech-lead", HEALTH_REVIEW_MARKER_LABEL),
                 pr_count=0,
                 storm_problems=cohort,
+                origin=TechLeadCreationOrigin.authors_anchor(),
             ),
             905,
             pre_crash_state,
@@ -6797,6 +6806,7 @@ class TestStackRelaunchGate:
             refresh_issue_fn=refresh_issue,
             dependency_evaluator=self._CannedWorkEvaluator(report_fn),
             board_snapshot_provider=NullBoardSnapshotProvider(),
+            agent_callback_endpoint=ready_callback_endpoint(),
         )
 
     @pytest.fixture

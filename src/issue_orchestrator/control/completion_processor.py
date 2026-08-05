@@ -103,7 +103,8 @@ from .review_exchange_pr_comment import (
     GITHUB_COMMENT_BODY_LIMIT,
     build_review_exchange_pr_comment_body,
 )
-from .test_skip_guard import scan_added_test_skip_guards
+from .test_skip_guard import added_test_paths, scan_added_test_skip_guards
+from .tech_lead_approval_gate import build_tech_lead_decision_approval_gate
 from .tech_lead_completion import tech_lead_decision_processing_error
 from .tech_lead_session_policy import is_benign_tech_lead_no_commits, is_tech_lead_session, shape_requested_actions_for_tech_lead
 from .worktree_head import current_worktree_head_sha
@@ -114,6 +115,8 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from ..infra.config import Config
+    from ..ports.agent_callback_endpoint import AgentCallbackEndpoint
+    from ..ports.review_exchange_approval_gate import ReviewExchangeApprovalGate
     from ..ports.tech_lead_authority import TechLeadAuthorityStore
     from .stack_base import StackBaseDecision
     from .stack_publish_gate import StackBaseGate
@@ -186,6 +189,10 @@ class CompletionProcessor:
         config: "Config | None" = None,
         background_job_supervisor: "BackgroundJobSupervisor | None" = None,
         review_exchange_canceller: ReviewExchangeCanceller | None = None,
+        *,
+        # Required: an agent with no callback endpoint cannot report
+        # anything back, so there is no sensible default to fall back to.
+        agent_callback_endpoint: "AgentCallbackEndpoint",
         review_artifact_reader: ReviewArtifactReader | None = None,
         runtime_identity: RuntimeIdentity | None = None,
         tech_lead_authority: "TechLeadAuthorityStore | None" = None,
@@ -250,6 +257,7 @@ class CompletionProcessor:
             review_exchange_runner=review_exchange_runner or NullReviewExchangeRunner(),
             job_supervisor=background_job_supervisor,
             review_exchange_canceller=review_exchange_canceller,
+            agent_callback_endpoint=agent_callback_endpoint,
         )
         # Per-(session, head_sha) consecutive validation-failed reroute count.
         # The reroute path can re-enter every tick when downstream rework
@@ -935,6 +943,25 @@ class CompletionProcessor:
             errors=[tech_lead_error],
         )
 
+    def _review_exchange_approval_gate(
+        self,
+        *,
+        agent_label: str | None,
+        run_assets: SessionRunAssets,
+    ) -> "ReviewExchangeApprovalGate | None":
+        """Build the artifact gate used at the terminal reviewer boundary."""
+        return build_tech_lead_decision_approval_gate(
+            self._config,
+            tech_lead_agent=(
+                self._config.tech_lead_review_agent if self._config else None
+            ),
+            agent_label=agent_label,
+            tech_lead_authority=self._tech_lead_authority,
+            run_dir=run_assets.run_dir,
+            run_id=run_assets.run_id,
+            session_name=run_assets.session_name,
+        )
+
     def _check_pre_action_policies(
         self,
         worktree: Path,
@@ -1098,7 +1125,50 @@ class CompletionProcessor:
                 run_assets=run_assets,
             )
 
-        scan = scan_added_test_skip_guards(diff_result.diff_text)
+        try:
+            test_paths = added_test_paths(diff_result.diff_text)
+        except ValueError as exc:
+            return self._handle_gate_failure(
+                worktree,
+                record,
+                session_name,
+                issue_number,
+                f"Could not parse branch diff for banned test skips: {exc}",
+                gate_record=None,
+                run_assets=run_assets,
+            )
+        if not test_paths:
+            return None
+        branch_files_result = self.git_adapter.read_branch_text_files(
+            worktree, test_paths
+        )
+        if not branch_files_result.success:
+            return self._handle_gate_failure(
+                worktree,
+                record,
+                session_name,
+                issue_number,
+                (
+                    "Could not read branch-tip test files for banned test-skip "
+                    f"scan: {branch_files_result.error or 'unknown git error'}"
+                ),
+                gate_record=None,
+                run_assets=run_assets,
+            )
+        try:
+            scan = scan_added_test_skip_guards(
+                diff_result.diff_text, branch_files_result.files
+            )
+        except ValueError as exc:
+            return self._handle_gate_failure(
+                worktree,
+                record,
+                session_name,
+                issue_number,
+                f"Could not scan branch-tip test files for banned test skips: {exc}",
+                gate_record=None,
+                run_assets=run_assets,
+            )
         if scan.ok:
             return None
         return self._handle_gate_failure(
@@ -1572,6 +1642,10 @@ class CompletionProcessor:
             errors=errors,
             actions_taken=actions_taken,
             run_review_exchange_loop=self._run_review_exchange_loop,
+            approval_gate=self._review_exchange_approval_gate(
+                agent_label=agent_label,
+                run_assets=run_assets,
+            ),
         )
         if deferred:
             return branch, pr_url, review_exchange_completed, True, None
@@ -2418,6 +2492,7 @@ class CompletionProcessor:
         session_name: str | None,
         agent_label: str | None,
         initial_validation_record_path: Path | None = None,
+        approval_gate: "ReviewExchangeApprovalGate | None" = None,
     ) -> Any:
         return self._review_exchange.run_review_exchange_loop(
             exchange_run=exchange_run,
@@ -2427,6 +2502,7 @@ class CompletionProcessor:
             session_name=session_name,
             agent_label=agent_label,
             initial_validation_record_path=initial_validation_record_path,
+            approval_gate=approval_gate,
             events=self._trace_events,
             event_context=self._event_context,
         )

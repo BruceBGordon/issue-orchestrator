@@ -366,10 +366,14 @@
             display: flex;
             justify-content: space-between;
             align-items: center;
+            gap: 16px;
+            flex-wrap: wrap;
         }
         .footer-hint {
             font-size: 12px;
             color: var(--text-muted);
+            line-height: 1.45;
+            max-width: 560px;
         }
 
         /* Press feedback — unified for all interactive elements */
@@ -523,7 +527,7 @@
 
         <footer>
             <div class="footer-hint">
-                Changes to ports and worktrees require a restart to take effect.
+                Fields marked Restart Required are saved immediately but apply only after you stop and start the Repository Engine.
             </div>
             <div class="header-actions">
                 <button class="btn btn-secondary" id="cancelSettingsBtn" onclick="cancelSettings()">Cancel</button>
@@ -680,9 +684,9 @@
 
                 if (response.ok) {
                     if (result.restart_required) {
-                        showStatus('Settings saved. Restart required for some changes to take effect.', 'warning');
+                        showStatus('Settings saved. Stop and start the Repository Engine for restart-required changes to take effect.', 'warning');
                     } else {
-                        showStatus('Settings saved successfully.', 'success');
+                        showStatus('Settings saved. No Repository Engine restart is required.', 'success');
                     }
                     originalSettings = getFormValues();
                     checkForChanges();

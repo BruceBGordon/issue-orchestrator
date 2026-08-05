@@ -313,19 +313,15 @@ class Orchestrator:
 
     @cached_property
     def _session_launcher(self) -> SessionLauncher:
-        return SessionLauncher(
-            self.config, self.deps.events, self.deps.repository_host, self.deps.action_applier, self.deps.session_manager,
-            self.deps.worktree_manager, self.deps.working_copy, self.deps.command_runner, self.deps.session_output,
-            self.deps.manifest_downloader, self.deps.tech_lead_authority,
-            lambda name: _session_exists(name, self.deps.session_manager, self.deps.events),
-            self._create_session, self._get_issue_machine, self._get_session_machine,
-            self._get_review_machine, self._refresh_issue, self.scheduler.dependency_evaluator,
-            claim_manager=self.deps.claim_manager,
-            provider_resilience=self.deps.provider_resilience,
-            remove_session_machine=self.deps.state_machine_manager.remove_session_machine,
-            label_manager=self.deps.label_manager,
-            send_to_session_fn=lambda name, text: self.deps.session_manager.runner.send_to_session_by_name(name, text),
+        return self.deps.session_launcher_factory(
             board_snapshot_provider=StateBoardSnapshotProvider(self.deps.board_snapshot_builder, lambda: self.state),
+            session_exists_fn=lambda name: _session_exists(name, self.deps.session_manager, self.deps.events),
+            create_session_fn=self._create_session,
+            get_issue_machine=self._get_issue_machine,
+            get_session_machine=self._get_session_machine,
+            get_review_machine=self._get_review_machine,
+            refresh_issue_fn=self._refresh_issue,
+            dependency_evaluator=self.scheduler.dependency_evaluator,
         )
 
     @cached_property
@@ -632,7 +628,10 @@ class Orchestrator:
         """Clean up E2E runner on orchestrator shutdown.
 
         Behavior depends on survive_restart config:
-        - True (default): Let worker continue, mark run as 'interrupted' (resumable)
+        - True (default): Leave the worker and its 'running' row untouched so the
+          detached worker can finish the run. Nothing is marked 'interrupted'
+          here; that only happens later, in E2EDB.start_run(), if the worker
+          turns out to have died (stale 'running' row with a dead PID).
         - False: Stop worker and mark run as canceled
         """
         if not self.config.e2e.enabled:
@@ -647,8 +646,9 @@ class Orchestrator:
             return
 
         if self.config.e2e.survive_restart:
-            # Let worker continue - on next startup, orchestrator will detect
-            # the running worker OR (if worker dies) mark as interrupted and resume
+            # Let the worker continue and leave its run row alone. If the worker
+            # later dies, the next start_run() sees the dead PID and marks that
+            # orphaned row interrupted (resumable for the pytest runner).
             logger.info(
                 "E2E worker pid=%s continuing (survive_restart=True)",
                 status["pid"],

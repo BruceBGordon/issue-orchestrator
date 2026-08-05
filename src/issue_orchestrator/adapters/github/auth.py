@@ -18,13 +18,14 @@ from ... import __version__
 from .errors import GitHubAuthError
 from .tokens import (
     GitHubAppAuthConfig,
+    GitHubAuthSource,
     GitHubTokenProvider,
     StaticGitHubTokenProvider,
     TokenValidationResult,
     _mask_token,
     describe_github_token_sources,
     has_github_app_auth_config,
-    resolve_github_token,
+    resolve_github_token_with_source,
 )
 
 _APP_JWT_LIFETIME_SECONDS = 540
@@ -92,8 +93,7 @@ class GitHubAppInstallationTokenProvider:
             )
         except (httpx.TimeoutException, httpx.HTTPError, OSError) as exc:
             raise GitHubAuthError(
-                "Failed to request GitHub App installation token: "
-                f"{exc}"
+                f"Failed to request GitHub App installation token: {exc}"
             ) from exc
 
         if response.status_code >= 400:
@@ -129,6 +129,7 @@ class GitHubAuth:
     api_url: str = "https://api.github.com"
     repo: str | None = None
     enable_git_push_auth: bool = False
+    resolved_source: GitHubAuthSource | None = None
 
     @property
     def auth_kind(self) -> str:
@@ -312,9 +313,13 @@ def build_github_auth(
             api_url=api_url,
             repo=repo,
             enable_git_push_auth=True,
+            resolved_source=GitHubAuthSource(
+                kind="github_app",
+                description=app_config.describe_source(),
+            ),
         )
 
-    token = resolve_github_token(
+    resolution = resolve_github_token_with_source(
         configured_token=configured_token,
         configured_env=configured_env,
         configured_keyring_service=configured_keyring_service,
@@ -334,11 +339,12 @@ def build_github_auth(
             )
         )
     return GitHubAuth(
-        token_provider=StaticGitHubTokenProvider(token=token),
+        token_provider=StaticGitHubTokenProvider(token=resolution.token),
         source_descriptions=tuple(source_descriptions),
         api_url=api_url,
         repo=repo,
         enable_git_push_auth=False,
+        resolved_source=resolution.source,
     )
 
 

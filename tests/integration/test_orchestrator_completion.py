@@ -33,6 +33,7 @@ from issue_orchestrator.observation.observation import SessionObservation, Sessi
 from issue_orchestrator.domain.issue_key import FakeIssueKey
 from issue_orchestrator.domain.session_key import SessionKey, TaskKind
 from tests.unit.session_run_helpers import make_session_run_assets
+from tests.callback_endpoint_helpers import ready_callback_endpoint
 
 
 def make_completion_record(
@@ -128,6 +129,7 @@ def mock_event_sink():
 def completion_processor(mock_label_adapter, mock_pr_adapter, mock_git_adapter):
     """Create a CompletionProcessor with mocked adapters."""
     return CompletionProcessor(
+        agent_callback_endpoint=ready_callback_endpoint(),
         label_adapter=mock_label_adapter,
         pr_adapter=mock_pr_adapter,
         git_adapter=mock_git_adapter,

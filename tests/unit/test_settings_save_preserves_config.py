@@ -10,7 +10,7 @@ The fix builds a field-granular patch plan and writes only the settings-owned
 that boundary:
 
 * the persistence-policy owner (``build_save_plan`` -> ``SettingsSavePlan``,
-  composed with ``save_config_document_patch`` via ``plan.apply``), and
+  composed with ``save_config_document_patch`` via ``plan.entries``), and
 * the settings HTTP handler (``update_settings``) that wires them together.
 
 They pin the two invariants the field-granular plan protects: an unedited
@@ -43,8 +43,9 @@ _OPERATIONAL_CONFIG = """# Issue Orchestrator Configuration
 # Hand-authored operational config -- must survive settings saves.
 
 repo:
-  name: owner/repo
+  name: owner/repo  # inline comments are part of the operator-owned document
   github:
+    # Keep the repo-scoped credential locator documented here.
     token_env: MY_GH_TOKEN
     keyring_service: io-gh
     app:
@@ -93,6 +94,13 @@ execution:
 agents:
   agent:test:
     prompt: prompt.txt
+    provider: "codex"
+    provider_args:
+      reasoning_effort: 'xhigh'
+    initial_prompt: >-
+      Keep this hand-wrapped scalar exactly as the operator wrote it when an
+      unrelated setting changes.
+...
 """
 
 
@@ -110,7 +118,7 @@ def _save_one_tab_change(config: Config, cfg_path, mutate) -> dict:
 
     ``mutate`` receives the ``from_config`` tab dict and edits one field, the
     same way the settings POST handler does before persisting. Persistence goes
-    through the real field-granular owner (``build_save_plan`` -> ``plan.apply``)
+    through the real field-granular owner (``build_save_plan`` -> ``plan.entries``)
     so these tests exercise the same seam the route does, and the write is
     skipped for an empty (no-op) plan.
     """
@@ -120,7 +128,7 @@ def _save_one_tab_change(config: Config, cfg_path, mutate) -> dict:
     apply_to(tabs, config)
     plan = build_save_plan(snapshot, tabs)
     if not plan.is_empty:
-        save_config_document_patch(config, plan.apply)
+        save_config_document_patch(config, plan.entries)
     return yaml.safe_load(cfg_path.read_text())
 
 
@@ -197,6 +205,53 @@ def test_partial_save_preserves_leading_comment_header(loaded_config):
     assert "# Hand-authored operational config" in text
 
 
+def test_single_field_save_preserves_entire_yaml_presentation(tmp_path):
+    """A one-field edit produces a one-line diff in a hand-authored config."""
+    (tmp_path / "prompt.txt").write_text("p")
+    cfg_path = tmp_path / "main.yaml"
+    original = """# Porchpin configuration
+repo:
+  name: porchpin/porchpin
+  github:
+    # Keep the repo-scoped credential locator documented here.
+    keyring_username: "${USER}"
+
+agents:
+  agent:backend:
+    prompt: prompt.txt
+    provider: "claude-code"
+    initial_prompt: "Keep this deliberately long quoted string on one line when an unrelated setting changes."
+    provider_args: &shared_args
+      effort: "xhigh"
+  agent:reviewer:
+    prompt: prompt.txt
+    provider_args: *shared_args
+
+execution:
+  concurrency:
+    # Tune the worker cap without rewriting this hand-authored document.
+    max_concurrent_sessions: 2
+    session_timeout_minutes: 120
+
+filtering:
+  exclude_labels: [ "proposed-tech-lead",  "deferred" ] # keep custom flow spacing
+""".rstrip("\n")
+    cfg_path.write_text(original)
+    config = Config.load(cfg_path)
+
+    _save_one_tab_change(
+        config,
+        cfg_path,
+        lambda tabs: setattr(tabs["concurrency"], "max_concurrent_sessions", 3),
+    )
+
+    assert cfg_path.read_text() == original.replace(
+        "    max_concurrent_sessions: 2\n",
+        "    max_concurrent_sessions: 3\n",
+    )
+    assert not cfg_path.read_bytes().endswith(b"\n")
+
+
 def test_partial_save_does_not_expand_env_var_references(tmp_path, monkeypatch):
     """``${VAR}`` references are preserved verbatim; no secret is leaked.
 
@@ -234,40 +289,33 @@ def test_partial_save_does_not_expand_env_var_references(tmp_path, monkeypatch):
     assert yaml.safe_load(text)["repo"]["github"]["token"] == "${SECRET_GH_TOKEN}"
 
 
-def test_save_plan_apply_only_touches_owned_changed_paths():
-    """The save plan writes only changed owned yaml_paths and nothing else."""
-    document = {
-        "repo": {"name": "owner/repo", "github": {"token_env": "T"}},
-        "custom_operator_section": {"keep": "me"},
-        "execution": {"concurrency": {"max_concurrent_sessions": 2}},
-    }
-
+def test_save_plan_emits_only_owned_changed_paths():
+    """The save plan contains only changed settings-owned paths."""
     # Build tabs from a minimal config, then flip one owned field.
     config = Config()
     snapshot = from_config(config)
     submitted = from_config(config)
     submitted["concurrency"].max_concurrent_sessions = 5
 
-    build_save_plan(snapshot, submitted).apply(document)
+    plan = build_save_plan(snapshot, submitted)
 
-    # Owned path that changed is updated.
-    assert document["execution"]["concurrency"]["max_concurrent_sessions"] == 5
-    # Unowned keys untouched.
-    assert document["repo"]["github"]["token_env"] == "T"
-    assert document["custom_operator_section"] == {"keep": "me"}
+    assert [(entry.yaml_path, entry.value) for entry in plan.entries] == [
+        ("execution.concurrency.max_concurrent_sessions", 5)
+    ]
 
 
-def test_save_plan_apply_reverses_list_ui_transform():
-    """comma-separated display values are written back as YAML lists."""
-    document: dict = {}
+def test_save_plan_entry_reverses_list_ui_transform():
+    """Comma-separated display values become list-valued persistence entries."""
     config = Config()
     snapshot = from_config(config)
     submitted = from_config(config)
     submitted["filtering"].exclude_labels = "test-data, skip"
 
-    build_save_plan(snapshot, submitted).apply(document)
+    plan = build_save_plan(snapshot, submitted)
 
-    assert document["filtering"]["exclude_labels"] == ["test-data", "skip"]
+    assert [(entry.yaml_path, entry.value) for entry in plan.entries] == [
+        ("filtering.exclude_labels", ["test-data", "skip"])
+    ]
 
 
 def test_save_config_document_patch_starts_from_empty_when_file_missing(tmp_path):
@@ -277,13 +325,21 @@ def test_save_config_document_patch_starts_from_empty_when_file_missing(tmp_path
 
     save_config_document_patch(
         config,
-        lambda doc: doc.__setitem__("execution", {"concurrency": {"max_concurrent_sessions": 3}}),
+        (
+            types.SimpleNamespace(
+                yaml_path="execution.concurrency.max_concurrent_sessions",
+                value=3,
+            ),
+        ),
         path=target,
     )
 
-    assert yaml.safe_load(target.read_text())["execution"]["concurrency"][
-        "max_concurrent_sessions"
-    ] == 3
+    assert (
+        yaml.safe_load(target.read_text())["execution"]["concurrency"][
+            "max_concurrent_sessions"
+        ]
+        == 3
+    )
 
 
 def test_save_config_document_patch_rejects_non_mapping_document(tmp_path):
@@ -293,14 +349,516 @@ def test_save_config_document_patch_rejects_non_mapping_document(tmp_path):
     target.write_text("- a\n- b\n")
 
     with pytest.raises(ValueError, match="not a mapping"):
-        save_config_document_patch(config, lambda doc: None, path=target)
+        save_config_document_patch(
+            config,
+            (types.SimpleNamespace(yaml_path="execution.concurrency.max", value=3),),
+            path=target,
+        )
 
 
 def test_save_config_document_patch_requires_a_path():
     """No path and no config_path is a hard error."""
     config = Config()
     with pytest.raises(ValueError, match="No path specified"):
-        save_config_document_patch(config, lambda doc: None)
+        save_config_document_patch(
+            config,
+            (types.SimpleNamespace(yaml_path="execution.concurrency.max", value=3),),
+        )
+
+
+def test_save_config_document_patch_inserts_missing_block_path_locally(tmp_path):
+    """Adding a field retains unrelated block indentation and document markers."""
+    config = Config()
+    target = tmp_path / "main.yaml"
+    original = """# operator header
+repo:
+  scopes:
+      - repo
+      - read:org
+execution:
+  concurrency:
+    max_concurrent_sessions: 2
+review: { enabled: true, default: "agent:reviewer" }
+...
+"""
+    target.write_text(original)
+
+    save_config_document_patch(
+        config,
+        (
+            types.SimpleNamespace(
+                yaml_path="execution.concurrency.session_timeout_minutes",
+                value=45,
+            ),
+        ),
+        path=target,
+    )
+
+    assert target.read_text() == original.replace(
+        "    max_concurrent_sessions: 2\n",
+        "    max_concurrent_sessions: 2\n    session_timeout_minutes: 45\n",
+    )
+
+
+def test_save_config_document_patch_inserts_missing_flow_path_locally(tmp_path):
+    """A missing field can be added without normalizing custom flow spacing."""
+    config = Config()
+    target = tmp_path / "main.yaml"
+    original = "execution: { concurrency: { max_concurrent_sessions: 2 } }"
+    target.write_text(original)
+
+    save_config_document_patch(
+        config,
+        (
+            types.SimpleNamespace(
+                yaml_path="execution.concurrency.session_timeout_minutes",
+                value=45,
+            ),
+        ),
+        path=target,
+    )
+
+    assert target.read_text() == (
+        "execution: { concurrency: { max_concurrent_sessions: 2 , "
+        '"session_timeout_minutes": 45} }'
+    )
+
+
+@pytest.mark.parametrize(
+    ("properties", "custom"),
+    [
+        ("&cfg", "custom: *cfg\n"),
+        ("!!map", ""),
+        ("!!map &cfg", "custom: *cfg\n"),
+        ("&cfg !!map", "custom: *cfg\n"),
+    ],
+    ids=("anchor", "tag", "tag-before-anchor", "anchor-before-tag"),
+)
+def test_save_config_document_patch_inserts_into_property_prefixed_flow_mapping(
+    tmp_path, properties, custom
+):
+    """A flow parent's tag/anchor prefix does not hide its collection boundary."""
+    config = Config()
+    target = tmp_path / "main.yaml"
+    original = (
+        "execution:\n"
+        f"  concurrency: {properties} {{max_concurrent_sessions: 2}}\n"
+        f"{custom}"
+    )
+    target.write_text(original)
+
+    save_config_document_patch(
+        config,
+        (
+            types.SimpleNamespace(
+                yaml_path="execution.concurrency.session_timeout_minutes",
+                value=45,
+            ),
+        ),
+        path=target,
+    )
+
+    expected = original.replace(
+        "{max_concurrent_sessions: 2}",
+        '{max_concurrent_sessions: 2, "session_timeout_minutes": 45}',
+    )
+    assert target.read_text() == expected
+    loaded = yaml.safe_load(target.read_text())
+    concurrency = loaded["execution"]["concurrency"]
+    assert concurrency == {
+        "max_concurrent_sessions": 2,
+        "session_timeout_minutes": 45,
+    }
+    if custom:
+        assert loaded["custom"] == concurrency
+
+
+@pytest.mark.parametrize(
+    ("original", "expected"),
+    [
+        (
+            "execution: { concurrency: { max_concurrent_sessions: 2 "
+            "# operator note\n  } }\n",
+            "execution: { concurrency: { max_concurrent_sessions: 2 "
+            '# operator note\n  , "session_timeout_minutes": 45} }\n',
+        ),
+        (
+            "execution: { concurrency: { max_concurrent_sessions: 2, } }\n",
+            "execution: { concurrency: { max_concurrent_sessions: 2, "
+            '"session_timeout_minutes": 45} }\n',
+        ),
+    ],
+    ids=("trailing-comment", "trailing-comma"),
+)
+def test_save_config_document_patch_inserts_after_flow_trivia(
+    tmp_path, original, expected
+):
+    """Flow insertion respects comments/commas and persists the requested value."""
+    config = Config()
+    target = tmp_path / "main.yaml"
+    target.write_text(original)
+
+    save_config_document_patch(
+        config,
+        (
+            types.SimpleNamespace(
+                yaml_path="execution.concurrency.session_timeout_minutes",
+                value=45,
+            ),
+        ),
+        path=target,
+    )
+
+    assert target.read_text() == expected
+    assert (
+        yaml.safe_load(target.read_text())["execution"]["concurrency"][
+            "session_timeout_minutes"
+        ]
+        == 45
+    )
+
+
+@pytest.mark.parametrize(
+    ("original", "expected"),
+    [
+        (
+            "---\n...\n",
+            "---\nexecution:\n  concurrency:\n    max_concurrent_sessions: 3\n...\n",
+        ),
+        (
+            "%YAML 1.2\n# operator header\n---\n...\n",
+            "%YAML 1.2\n# operator header\n---\nexecution:\n  concurrency:\n"
+            "    max_concurrent_sessions: 3\n...\n",
+        ),
+        (
+            "---",
+            "---\nexecution:\n  concurrency:\n    max_concurrent_sessions: 3",
+        ),
+        (
+            "# operator header\n---",
+            "# operator header\n---\nexecution:\n  concurrency:\n"
+            "    max_concurrent_sessions: 3",
+        ),
+    ],
+    ids=(
+        "document-markers",
+        "directive-comment-preamble",
+        "bare-start-marker-no-final-newline",
+        "comment-start-marker-no-final-newline",
+    ),
+)
+def test_save_config_document_patch_populates_explicit_empty_document(
+    tmp_path, original, expected
+):
+    """A marker-framed null document gains its first path inside the markers."""
+    config = Config()
+    target = tmp_path / "main.yaml"
+    target.write_text(original)
+
+    save_config_document_patch(
+        config,
+        (
+            types.SimpleNamespace(
+                yaml_path="execution.concurrency.max_concurrent_sessions",
+                value=3,
+            ),
+        ),
+        path=target,
+    )
+
+    assert target.read_text() == expected
+    assert yaml.safe_load(target.read_text()) == {
+        "execution": {"concurrency": {"max_concurrent_sessions": 3}}
+    }
+    assert target.read_bytes().endswith(b"\n") == original.endswith("\n")
+
+
+def test_save_config_document_patch_preserves_changed_scalar_anchor(tmp_path):
+    """Changing an anchored scalar keeps aliases elsewhere in the document valid."""
+    config = Config()
+    target = tmp_path / "main.yaml"
+    original = """execution:
+  concurrency:
+    max_concurrent_sessions: &worker_limit 2
+custom:
+  mirrored_limit: *worker_limit
+"""
+    target.write_text(original)
+
+    save_config_document_patch(
+        config,
+        (
+            types.SimpleNamespace(
+                yaml_path="execution.concurrency.max_concurrent_sessions",
+                value=3,
+            ),
+        ),
+        path=target,
+    )
+
+    assert target.read_text() == original.replace(
+        "max_concurrent_sessions: &worker_limit 2",
+        "max_concurrent_sessions: &worker_limit 3",
+    )
+    assert yaml.safe_load(target.read_text())["custom"]["mirrored_limit"] == 3
+
+
+@pytest.mark.parametrize(
+    "properties",
+    ("!!int &worker_limit", "&worker_limit !!int"),
+    ids=("tag-before-anchor", "anchor-before-tag"),
+)
+def test_save_config_document_patch_preserves_tagged_scalar_anchor_order(
+    tmp_path, properties
+):
+    """A changed scalar retains its tag and anchor in either legal order."""
+    config = Config()
+    target = tmp_path / "main.yaml"
+    original = f"""execution:
+  concurrency:
+    max_concurrent_sessions: {properties} 2
+custom:
+  mirrored_limit: *worker_limit
+"""
+    target.write_text(original)
+
+    save_config_document_patch(
+        config,
+        (
+            types.SimpleNamespace(
+                yaml_path="execution.concurrency.max_concurrent_sessions",
+                value=3,
+            ),
+        ),
+        path=target,
+    )
+
+    assert target.read_text() == original.replace(f"{properties} 2", f"{properties} 3")
+    assert yaml.safe_load(target.read_text())["custom"]["mirrored_limit"] == 3
+
+
+@pytest.mark.parametrize(
+    ("original", "expected"),
+    [
+        (
+            "worktrees:\n  base_branch_override: # auto-detect\n",
+            'worktrees:\n  base_branch_override: "main" # auto-detect\n',
+        ),
+        (
+            "worktrees:\n  base_branch_override:\n",
+            'worktrees:\n  base_branch_override: "main"\n',
+        ),
+        (
+            "worktrees:\n  base_branch_override: &base\ncustom: *base\n",
+            'worktrees:\n  base_branch_override: &base "main"\ncustom: *base\n',
+        ),
+        (
+            "worktrees:\n  base_branch_override: !!str\n",
+            'worktrees:\n  base_branch_override: !!str "main"\n',
+        ),
+    ],
+    ids=("inline-comment", "plain", "anchor-only", "tag-only"),
+)
+def test_save_config_document_patch_replaces_implicit_empty_scalar(
+    tmp_path, original, expected
+):
+    """Implicit and property-only empty scalars accept a settings value."""
+    config = Config()
+    target = tmp_path / "main.yaml"
+    target.write_text(original)
+
+    save_config_document_patch(
+        config,
+        (
+            types.SimpleNamespace(
+                yaml_path="worktrees.base_branch_override",
+                value="main",
+            ),
+        ),
+        path=target,
+    )
+
+    assert target.read_text() == expected
+    loaded = yaml.safe_load(target.read_text())
+    assert loaded["worktrees"]["base_branch_override"] == "main"
+    if "custom" in loaded:
+        assert loaded["custom"] == "main"
+
+
+@pytest.mark.parametrize(
+    ("original", "value", "expected", "expected_alias"),
+    [
+        (
+            "worktrees:\n  base_branch_override: !!null\n",
+            "main",
+            'worktrees:\n  base_branch_override: "main"\n',
+            None,
+        ),
+        (
+            'worktrees:\n  base_branch_override: !!str "main"\n',
+            None,
+            "worktrees:\n  base_branch_override: null\n",
+            None,
+        ),
+        (
+            "worktrees:\n  base_branch_override: !!int 3\n",
+            None,
+            "worktrees:\n  base_branch_override: null\n",
+            None,
+        ),
+        (
+            "worktrees:\n  base_branch_override: !!null &base\ncustom: *base\n",
+            "main",
+            'worktrees:\n  base_branch_override: &base "main"\ncustom: *base\n',
+            "main",
+        ),
+        (
+            'worktrees:\n  base_branch_override: &base !!str "main"\ncustom: *base\n',
+            None,
+            "worktrees:\n  base_branch_override: &base null\ncustom: *base\n",
+            None,
+        ),
+        (
+            "worktrees:\n  base_branch_override: !!str # old type\n"
+            '    &base "main"\ncustom: *base\n',
+            None,
+            "worktrees:\n  base_branch_override: # old type\n"
+            "    &base null\ncustom: *base\n",
+            None,
+        ),
+        (
+            "worktrees:\n  base_branch_override: &base # keep anchor\n"
+            '    !!str "main"\ncustom: *base\n',
+            None,
+            "worktrees:\n  base_branch_override: &base # keep anchor\n"
+            "    null\ncustom: *base\n",
+            None,
+        ),
+    ],
+    ids=(
+        "tag-only-null-to-string",
+        "tagged-string-to-null",
+        "tagged-integer-to-null",
+        "tag-before-anchor-null-to-string",
+        "anchor-before-tag-string-to-null",
+        "tag-comment-before-anchor",
+        "anchor-comment-before-tag",
+    ),
+)
+def test_save_config_document_patch_drops_incompatible_explicit_scalar_tag(
+    tmp_path, original, value, expected, expected_alias
+):
+    """An explicit tag cannot force the submitted setting back to its old type."""
+    config = Config()
+    target = tmp_path / "main.yaml"
+    target.write_text(original)
+
+    save_config_document_patch(
+        config,
+        (
+            types.SimpleNamespace(
+                yaml_path="worktrees.base_branch_override",
+                value=value,
+            ),
+        ),
+        path=target,
+    )
+
+    assert target.read_text() == expected
+    loaded = yaml.safe_load(target.read_text())
+    persisted = loaded["worktrees"]["base_branch_override"]
+    assert type(persisted) is type(value)
+    assert persisted == value
+    if "custom" in loaded:
+        assert type(loaded["custom"]) is type(expected_alias)
+        assert loaded["custom"] == expected_alias
+
+
+@pytest.mark.parametrize(
+    ("yaml_path", "value", "original", "expected"),
+    [
+        (
+            "filtering.exclude_labels",
+            ["new", "skip"],
+            'filtering:\n  exclude_labels: !!seq &labels ["old"]\ncustom: *labels\n',
+            'filtering:\n  exclude_labels: !!seq &labels ["new", "skip"]\n'
+            "custom: *labels\n",
+        ),
+        (
+            "filtering.exclude_labels",
+            ["new", "skip"],
+            "filtering:\n  exclude_labels: &labels\n    - old\n    - stale\n"
+            "custom: *labels\n",
+            'filtering:\n  exclude_labels: &labels\n    ["new", "skip"]\n'
+            "custom: *labels\n",
+        ),
+        (
+            "review.nits.by_agent",
+            {"codex": "address", "claude": "ignore"},
+            "review:\n  nits:\n    by_agent: !!map &policies {codex: surface}\n"
+            "custom: *policies\n",
+            'review:\n  nits:\n    by_agent: !!map &policies {"codex": "address", '
+            '"claude": "ignore"}\ncustom: *policies\n',
+        ),
+        (
+            "review.nits.by_agent",
+            {"codex": "address", "claude": "ignore"},
+            "review:\n  nits:\n    by_agent: &policies\n      codex: surface\n"
+            "custom: *policies\n",
+            'review:\n  nits:\n    by_agent: &policies\n      {"codex": "address", '
+            '"claude": "ignore"}\ncustom: *policies\n',
+        ),
+    ],
+    ids=("flow-list", "block-list", "flow-dict", "block-dict"),
+)
+def test_save_config_document_patch_preserves_collection_anchor(
+    tmp_path, yaml_path, value, original, expected
+):
+    """Flow and block collection replacements keep aliases valid."""
+    config = Config()
+    target = tmp_path / "main.yaml"
+    target.write_text(original)
+
+    save_config_document_patch(
+        config,
+        (types.SimpleNamespace(yaml_path=yaml_path, value=value),),
+        path=target,
+    )
+
+    assert target.read_text() == expected
+    loaded = yaml.safe_load(target.read_text())
+    cursor = loaded
+    for part in yaml_path.split("."):
+        cursor = cursor[part]
+    assert cursor == value
+    assert loaded["custom"] == value
+
+
+def test_save_config_document_patch_rejects_changed_alias_without_writing(tmp_path):
+    """An alias-owned field fails closed instead of mutating its remote anchor."""
+    config = Config()
+    target = tmp_path / "main.yaml"
+    original = """defaults:
+  worker_limit: &worker_limit 2
+execution:
+  concurrency:
+    max_concurrent_sessions: *worker_limit
+"""
+    target.write_text(original)
+
+    with pytest.raises(ValueError, match="Cannot patch YAML alias"):
+        save_config_document_patch(
+            config,
+            (
+                types.SimpleNamespace(
+                    yaml_path="execution.concurrency.max_concurrent_sessions",
+                    value=3,
+                ),
+            ),
+            path=target,
+        )
+
+    assert target.read_text() == original
 
 
 def test_save_plan_selects_only_changed_fields(loaded_config):
@@ -326,7 +884,9 @@ def test_save_plan_selects_only_changed_fields(loaded_config):
     assert plan.changed_yaml_paths == ("execution.concurrency.max_concurrent_sessions",)
 
 
-def test_save_plan_preserves_unedited_env_var_field_in_changed_tab(tmp_path, monkeypatch):
+def test_save_plan_preserves_unedited_env_var_field_in_changed_tab(
+    tmp_path, monkeypatch
+):
     """A ``${VAR}`` sibling of an edit, in the SAME tab, keeps its literal form.
 
     This is F1: ``Config.load`` expands ``${VAR}``, so ``from_config`` holds the
@@ -400,7 +960,9 @@ async def test_update_settings_route_preserves_operational_config(
 
     # Build the full whole-form payload the browser posts (every tab), then
     # change exactly one Concurrency field -- exactly like the settings UI save.
-    full_payload = {key: model.model_dump() for key, model in from_config(config).items()}
+    full_payload = {
+        key: model.model_dump() for key, model in from_config(config).items()
+    }
     full_payload["concurrency"]["max_concurrent_sessions"] = 8
 
     class _FakeRequest:
@@ -410,6 +972,14 @@ async def test_update_settings_route_preserves_operational_config(
     response = await web_settings_routes.update_settings(_FakeRequest(), orchestrator)
 
     assert response.status_code == 200
+
+    # This is the regression boundary the original #6686 tests missed: a real
+    # changed save must preserve the whole hand-authored YAML presentation, not
+    # merely parse back to the same data. Only the requested scalar may differ.
+    assert cfg_path.read_text() == _OPERATIONAL_CONFIG.replace(
+        "    max_concurrent_sessions: 2\n",
+        "    max_concurrent_sessions: 8\n",
+    )
 
     saved = yaml.safe_load(cfg_path.read_text())
     assert saved["execution"]["concurrency"]["max_concurrent_sessions"] == 8
@@ -434,10 +1004,9 @@ async def test_update_settings_route_preserves_operational_config(
 async def test_noop_settings_save_leaves_file_bytes_untouched(tmp_path, monkeypatch):
     """A Save with no changed fields must not rewrite ``main.yaml`` (F2).
 
-    Re-dumping the parsed YAML would strip non-leading comments, anchors, and
-    hand-authored quoting even when nothing changed. The empty-plan path skips
-    the file write entirely, so the bytes -- including a non-leading inline
-    comment a YAML round-trip would drop -- are preserved exactly.
+    Even though changed saves now use a presentation-preserving codec, a no-op
+    should not touch the file at all. The empty-plan path therefore keeps the
+    bytes -- including a non-leading inline comment -- exactly identical.
     """
     from issue_orchestrator.entrypoints import web_settings_routes
 
@@ -464,7 +1033,9 @@ async def test_noop_settings_save_leaves_file_bytes_untouched(tmp_path, monkeypa
 
     original_bytes = cfg_path.read_bytes()
     # The real whole-form payload the browser posts, with NO edits.
-    full_payload = {key: model.model_dump() for key, model in from_config(config).items()}
+    full_payload = {
+        key: model.model_dump() for key, model in from_config(config).items()
+    }
 
     class _FakeRequest:
         async def json(self):

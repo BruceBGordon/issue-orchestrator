@@ -29,12 +29,13 @@ from ..infra.config import Config
 from ..infra.logging_config import issue_log
 from ..ports.issue import Issue
 from ..domain.models import (
+    PendingTechLeadReview,
     TechLeadFacts,
     active_retrospective_review_issue_numbers,
 )
 from ..domain.post_publish_escalation import build_post_publish_escalation_comment
 from ..domain.tech_lead_naming import TECH_LEAD_DISPLAY_NAME
-from ..domain.tech_lead_session import TechLeadSessionFlavor
+from ..domain.tech_lead_session import TechLeadCreationOrigin, TechLeadSessionFlavor
 
 if TYPE_CHECKING:
     from .provider_resilience import ProviderResilienceManager
@@ -54,6 +55,7 @@ from .workflows import (
 )
 from .actions import (
     Action,
+    ActionType,
     AddCommentAction,
     AddLabelAction,
     RemoveLabelAction,
@@ -63,7 +65,6 @@ from .actions import (
     QueueRetrospectiveReviewAction,
     QueueReworkAction,
     CreateTechLeadIssueAction,
-    DiscardTerminalTechLeadProposalOpsAction,
     EnqueueToMergeQueueAction,
     EscalateToHumanAction,
     CleanupSessionAction,
@@ -76,12 +77,16 @@ from .awaiting_merge_post_publish_policy import (
     build_post_publish_validation_comment,
     POST_PUBLISH_VALIDATION_SOURCE,
 )
+from .queue_decision_log import QueueDecisionLog
 from .reactive_tech_lead_planning import plan_reactive_tech_lead
-from .tech_lead_proposals import plan_approved_tech_lead_op_executions
+from .tech_lead_launch_log import TechLeadLaunchLog
+from .tech_lead_ledger_planning import plan_tech_lead_ledger_actions
 from .tech_lead_reaction import TechLeadReactionPolicy
 from .worker_budget import (
+    TechLeadSlotAvailability,
     active_tech_lead_session_count,
     active_worker_session_count,
+    tech_lead_slot_availability,
 )
 from .reconciliation import build_expected_for_mutation
 from .stuck_sweep import build_stuck_sweep_escalation_actions
@@ -93,6 +98,14 @@ from .tech_lead_issue_policy import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Launch action kinds that occupy a worker slot when planned — the single source
+# of truth the capacity counter uses so a new launch kind can't silently escape
+# the worker budget (#6892 review F1/F2). A provider-skip label action is
+# deliberately absent (it launches nothing).
+_CAPACITY_CONSUMING_LAUNCH_TYPES: frozenset[ActionType] = frozenset(
+    {ActionType.LAUNCH_SESSION, ActionType.LAUNCH_VALIDATION_RETRY}
+)
 
 
 class Planner:
@@ -154,9 +167,13 @@ class Planner:
             dependency_evaluator=self.dependency_evaluator,
             clock=clock,
         )
-        self._last_queue_decisions: dict[int, str] = {}
-        self._last_queue_summary_logged_at: float = 0.0
-        self._queue_summary_interval_seconds = 60.0
+        # On-change human logs for the two coarse control decisions the planner
+        # makes each tick — the per-issue queue decision, and the tech_lead
+        # launch decision. Both write INFO lines keyed ``issue=<n>`` so a
+        # deferred issue/session explains WHY in its per-issue trace instead of
+        # going silent, and log only on change to avoid per-tick spam.
+        self._queue_decision_log = QueueDecisionLog(logger)
+        self._tech_lead_launch_log = TechLeadLaunchLog(logger)
 
     def _align_dependency_evaluator(
         self,
@@ -205,6 +222,13 @@ class Planner:
             # cannot act on are instead RETAINED by clear_discovered_facts, so
             # a storm cohort survives the pause (#6780). The health-review
             # gate already ran above for its TECH_LEAD_SKIPPED emission (#6763).
+            # A queued tech_lead session (e.g. a health review) is deferred by the
+            # pause and never reaches the launch path, so log WHY here on-change —
+            # else it sits queued with no explanation in its per-issue trace.
+            self._tech_lead_launch_log.defer_all(
+                snapshot.pending_tech_lead, "orchestrator_paused"
+            )
+            self._tech_lead_launch_log.retain(snapshot.pending_tech_lead)
             return Plan.empty()
 
         plan_context = PlanContext(issue_labels_by_number={
@@ -272,34 +296,14 @@ class Planner:
         if tech_lead_create_action:
             actions.append(tech_lead_create_action)
 
-        # 1f3. Execute APPROVED gated tech_lead proposals (#6778): the operator
-        # removed the proposed-tech-lead label, so the fact scan classified the
-        # stored op as approved. Policy lives in tech_lead_proposals; the
-        # appliers re-validate preconditions and finalize the proposal issue.
-        if snapshot.tech_lead_facts and snapshot.tech_lead_facts.approved_tech_lead_ops:
-            actions.extend(
-                plan_approved_tech_lead_op_executions(
-                    snapshot.tech_lead_facts.approved_tech_lead_ops
-                )
-            )
-
-        # 1f4. Confirm-and-discard terminal gated-proposal ledger rows (#6779
-        # R7/R10): fact gathering only CLASSIFIED ledger rows absent from the
-        # exhaustive scan as cleanup candidates (it stays read-only). Emit the
-        # cleanup action so the applier re-reads each proposal issue before
-        # discarding — absence from a possibly-truncated scan must never delete
-        # a live op.
-        candidates = (
-            snapshot.tech_lead_facts.absent_proposal_op_candidates
-            if snapshot.tech_lead_facts
-            else ()
+        # 1f3. Everything the tech-lead DURABLE LEDGERS drive this tick:
+        # approved gated proposals, terminal-op cleanup candidates, and finding
+        # promotion/settlement. All three read facts the gatherer classified
+        # read-only; the single owner turns them into actions (see
+        # tech_lead_ledger_planning).
+        actions.extend(
+            plan_tech_lead_ledger_actions(self.config, snapshot.tech_lead_facts)
         )
-        if candidates:
-            actions.append(
-                DiscardTerminalTechLeadProposalOpsAction(
-                    candidate_issue_numbers=candidates
-                )
-            )
 
         # 1g. Process cleanups for reviewed PRs
         cleanup_actions = self._plan_cleanups(snapshot)
@@ -331,36 +335,40 @@ class Planner:
         """
         return active_tech_lead_session_count(self.config, snapshot.active_sessions)
 
-    def _launch_budgets(
-        self, snapshot: OrchestratorSnapshot
-    ) -> tuple[int, Optional[int]]:
-        """Compute ``(worker_capacity, reserved_tech_lead_capacity)`` for this tick.
-
-        ``reserved_tech_lead_capacity`` is ``None`` when ``tech_lead.max_concurrent``
-        is unset: tech_lead then SHARES the worker budget and worker capacity
-        counts every active session, exactly as before (byte-for-byte). When
-        set, active tech_lead sessions are ADDITIVE — they neither consume worker
-        capacity nor count against ``max_concurrent_sessions`` — and tech_lead
-        draws from its own ``max_concurrent - active_tech_lead`` budget so the
-        tech lead can launch even at worker saturation.
-
-        A running first-class E2E workload (``snapshot.e2e_occupies_slot``, only
-        ever set when ``e2e.occupies_session_slot`` is on) occupies one WORKER
-        slot for as long as it runs, so worker capacity drops by 1 — one fewer
-        agent launches. It is charged to the worker budget ONLY: the reserved
-        tech_lead capacity is untouched, so the tech lead still runs in its own
-        slot while E2E holds a worker slot.
-        """
-        reserved = self.config.tech_lead.max_concurrent
-        worker_capacity = self.config.max_concurrent_sessions - (
-            active_worker_session_count(self.config, snapshot.active_sessions)
+    def _worker_capacity(self, snapshot: OrchestratorSnapshot) -> int:
+        """Remaining worker-budget capacity this tick — charged for reviews,
+        reworks, validation retries and new issues (and for tech_lead only in
+        the shared-budget default). A running first-class E2E workload
+        (``snapshot.e2e_occupies_slot``) occupies one worker slot. Tech-lead
+        reserved-slot accounting lives in ``tech_lead_slot_availability``
+        (worker_budget), the single slot-accounting owner (#6892 review A2)."""
+        worker_capacity = self.config.max_concurrent_sessions - active_worker_session_count(
+            self.config, snapshot.active_sessions
         )
         if snapshot.e2e_occupies_slot:
             worker_capacity -= 1
-        if reserved is None:
-            return worker_capacity, None
-        active_tech_lead = self._active_tech_lead_count(snapshot)
-        return worker_capacity, reserved - active_tech_lead
+        return worker_capacity
+
+    @staticmethod
+    def _launch_count(actions: list[Action]) -> int:
+        """Count capacity-consuming launches only — a provider-skip label action
+        is not a launch. Every launch KIND is registered in
+        ``_CAPACITY_CONSUMING_LAUNCH_TYPES`` (not a per-call concrete-class
+        check), so a new launch kind can't silently escape the budget the way
+        validation retries did (#6892 review F1/F2)."""
+        return sum(
+            1 for a in actions if a.action_type in _CAPACITY_CONSUMING_LAUNCH_TYPES
+        )
+
+    def _defer_pending_tech_lead(
+        self, snapshot: OrchestratorSnapshot, slot: TechLeadSlotAvailability
+    ) -> None:
+        """Log (on-change) the owner-computed reason every queued tech_lead
+        session was deferred this tick. ``slot.reason`` is set because the owner
+        returns it iff ``available == 0``. Pruning departed items is the
+        caller's job (``retain``)."""
+        assert slot.reason is not None  # invariant of TechLeadSlotAvailability
+        self._tech_lead_launch_log.defer_all(snapshot.pending_tech_lead, slot.reason)
 
     def _plan_session_launches(
         self,
@@ -372,24 +380,35 @@ class Planner:
         """Plan capacity-consuming session launches in priority order."""
         actions: list[Action] = []
         skipped: list[SkippedItem] = []
-        capacity, reserved_tech_lead_capacity = self._launch_budgets(snapshot)
-        # Worker-only active count for the issue scheduler's own slot gate.
-        # Derived from the (pre-decrement) worker capacity so it excludes active
-        # tech_lead sessions exactly when they are additive; in the shared-budget
-        # default this equals snapshot.active_count (unchanged behavior).
+        capacity = self._worker_capacity(snapshot)
+        # Worker-only active count for the review/rework worker gate (includes the
+        # E2E charge, exactly as before). Tech-lead slot accounting does NOT reuse
+        # this — its owner derives active-worker independently so E2E is never
+        # misattributed as worker saturation (#6892 review F1/A2).
         worker_active_count = self.config.max_concurrent_sessions - capacity
-        # Short-circuit only when NEITHER budget can launch anything. When
-        # tech_lead shares the worker budget (reserved_tech_lead_capacity is None)
-        # this reduces to exactly the original ``capacity <= 0`` guard; a
-        # reserved tech_lead budget lets the tech lead run past worker saturation.
-        if capacity <= 0 and (
-            reserved_tech_lead_capacity is None or reserved_tech_lead_capacity <= 0
-        ):
+        workflow_configured = bool(
+            self.tech_lead_workflow and self.tech_lead_workflow.is_configured()
+        )
+        # The tech-lead slot budget + (when 0) its true reason, from the single
+        # slot-accounting owner. Recomputed after higher-priority launches below.
+        tech_lead_slot = tech_lead_slot_availability(
+            self.config,
+            snapshot.active_sessions,
+            e2e_occupies_slot=snapshot.e2e_occupies_slot,
+            launched_this_tick=0,
+            workflow_configured=workflow_configured,
+        )
+        # Short-circuit only when NEITHER budget can launch anything.
+        if capacity <= 0 and tech_lead_slot.available <= 0:
             logger.debug(
                 "Planner: no capacity available (active=%d, max=%d)",
                 snapshot.active_count,
                 self.config.max_concurrent_sessions,
             )
+            # A queued tech_lead session must not go silent: log the owner's
+            # reason (nothing has launched yet this tick).
+            self._defer_pending_tech_lead(snapshot, tech_lead_slot)
+            self._tech_lead_launch_log.retain(snapshot.pending_tech_lead)
             return actions, skipped
 
         # PRIORITY ORDER: Reviews > Retrospective Reviews > Reworks >
@@ -404,15 +423,16 @@ class Planner:
         # 2. Plan review launches (highest priority). The worker workflows gate
         # on the WORKER-only count (``worker_active_count``, owner: worker_budget),
         # NOT raw ``snapshot.active_count`` — else a reserved-tech-lead session steals
-        # worker review/rework capacity (#6824 F5).
+        # worker review/rework capacity (#6824 F5). Only actual launches consume
+        # capacity — a provider-skip label action does not (#6892 review F2).
         if capacity > 0 and self.review_workflow:
             review_actions, review_skipped = self._plan_reviews(
                 snapshot, capacity, worker_active_count, plan_context
             )
             actions.extend(review_actions)
             skipped.extend(review_skipped)
-            capacity -= len(review_actions)
-            review_launch_count = len(review_actions)
+            review_launch_count = self._launch_count(review_actions)
+            capacity -= review_launch_count
 
         # 2b. Plan retrospective review launches
         if capacity > 0 and self.retrospective_review_workflow:
@@ -424,8 +444,8 @@ class Planner:
             )
             actions.extend(retrospective_actions)
             skipped.extend(retrospective_skipped)
-            capacity -= len(retrospective_actions)
-            retrospective_review_launch_count = len(retrospective_actions)
+            retrospective_review_launch_count = self._launch_count(retrospective_actions)
+            capacity -= retrospective_review_launch_count
 
         # 3. Plan rework launches
         if capacity > 0 and self.rework_workflow:
@@ -434,8 +454,8 @@ class Planner:
             )
             actions.extend(rework_actions)
             skipped.extend(rework_skipped)
-            capacity -= len(rework_actions)
-            rework_launch_count = len(rework_actions)
+            rework_launch_count = self._launch_count(rework_actions)
+            capacity -= rework_launch_count
 
         # 4. Plan validation retry launches. These are continuations of
         # existing coding work and are not subject to max_issues_to_start.
@@ -447,30 +467,44 @@ class Planner:
             )
             actions.extend(validation_retry_actions)
             skipped.extend(validation_retry_skipped)
-            capacity -= len(validation_retry_actions)
-            validation_retry_launch_count = len(validation_retry_actions)
+            validation_retry_launch_count = self._launch_count(validation_retry_actions)
+            capacity -= validation_retry_launch_count
 
-        # 5. Plan tech_lead launches. By default tech_lead draws from the shared
-        # worker ``capacity`` (decremented above). When tech_lead.max_concurrent
-        # is set, it draws from its own reserved additive budget instead, so
-        # the tech lead runs even when the worker budget is exhausted, and its
-        # launches do NOT decrement the shared worker capacity.
-        tech_lead_capacity = (
-            capacity if reserved_tech_lead_capacity is None else reserved_tech_lead_capacity
+        # 5. Plan tech_lead launches. Recompute the slot now that higher-priority
+        # launches this tick are known — the owner returns available>0 to launch,
+        # or available==0 with the true deferral reason. By default tech_lead
+        # draws from the shared worker budget; with tech_lead.max_concurrent set
+        # it uses its own reserved additive slot and does NOT decrement worker
+        # capacity.
+        launched_this_tick = (
+            review_launch_count
+            + retrospective_review_launch_count
+            + rework_launch_count
+            + validation_retry_launch_count
         )
-        if tech_lead_capacity > 0 and self.tech_lead_workflow:
+        tech_lead_slot = tech_lead_slot_availability(
+            self.config,
+            snapshot.active_sessions,
+            e2e_occupies_slot=snapshot.e2e_occupies_slot,
+            launched_this_tick=launched_this_tick,
+            workflow_configured=workflow_configured,
+        )
+        if tech_lead_slot.available > 0:
             tech_lead_actions, tech_lead_skipped = self._plan_tech_lead(
                 snapshot,
-                tech_lead_capacity,
+                tech_lead_slot.available,
                 plan_context,
-                reserved=reserved_tech_lead_capacity is not None,
+                reserved=self.config.tech_lead.max_concurrent is not None,
                 suppressed_issue_numbers=suppressed_tech_lead_issue_numbers,
             )
             actions.extend(tech_lead_actions)
             skipped.extend(tech_lead_skipped)
-            if reserved_tech_lead_capacity is None:
-                capacity -= len(tech_lead_actions)
-            tech_lead_launch_count = len(tech_lead_actions)
+            tech_lead_launch_count = self._launch_count(tech_lead_actions)
+            if self.config.tech_lead.max_concurrent is None:
+                capacity -= tech_lead_launch_count
+        else:
+            self._defer_pending_tech_lead(snapshot, tech_lead_slot)
+        self._tech_lead_launch_log.retain(snapshot.pending_tech_lead)
 
         # 5b. Reserve one worker slot for a due first-class E2E run — after all
         # completion work above, before new issues below (see method docstring).
@@ -650,16 +684,12 @@ class Planner:
                 ))
                 continue
             # Terminal recovery: the issue's work has landed (PR merged/closed
-            # or parent issue closed). Shed every transient workflow label that
-            # no longer applies — pr-pending, publish-failed, publish-fail-count-N,
-            # and any blocking label — and only then finalize the awaiting-merge
-            # history, as one owner command (RecoverTerminalIssueAction). The
-            # applier reads the issue's live labels to decide the exact set (the
-            # planner rarely has labels for an already closed/merged issue) and
-            # gates the history transition on the shed succeeding, so a transient
-            # label-removal failure leaves the entry reconcilable for a later
-            # discovery pass instead of terminalizing it and stranding the labels
-            # this P0 removes.
+            # or parent issue closed). One owner command sheds every stale
+            # transient workflow label (pr-pending, publish-failed,
+            # publish-fail-count-N, blocking) then finalizes awaiting-merge
+            # history; the applier picks the set from live labels and gates the
+            # history transition on the shed (and close) succeeding, so a
+            # transient failure leaves the entry reconcilable, not stranded.
             actions.append(RecoverTerminalIssueAction(
                 issue_number=reconciliation.issue_number,
                 pr_number=reconciliation.pr_number,
@@ -669,6 +699,11 @@ class Planner:
                 status_reason=reconciliation.status_reason,
                 issue_key=issue_key,
                 reason=f"awaiting-merge terminal: {reconciliation.status}",
+                # Close-on-merge fallback (close_on_merge module, porchpin
+                # #81): merged PR + still-open issue; advisory — the applier
+                # revalidates live evidence. Never on closed status (drift's job).
+                close_issue=reconciliation.status == "merged" and reconciliation.issue_open,
+                merged_at=reconciliation.merged_at or "",
                 # Carry the reconciliation pause guard the old terminal-cleanup
                 # RemoveLabelAction used to carry: an issue paused for
                 # reconciliation (io:needs-reconcile) must not have its labels
@@ -747,6 +782,8 @@ class Planner:
         return CreateTechLeadIssueAction(
             title=title, body=body, labels=labels, pr_count=facts.pr_count,
             milestone=milestone, reason=f"threshold met: {facts.pr_count} >= {facts.threshold}",
+            # This IS the anchor: no prior issue to reconcile against (#6957 F6).
+            origin=TechLeadCreationOrigin.authors_anchor(),
         )
 
     def _should_create_tech_lead_issue(self, facts: "TechLeadFacts") -> bool:
@@ -1289,92 +1326,9 @@ Flip labels from `{facts.watch_label}` to `{self.config.tech_lead_reviewed_label
                 continue
             scheduler_reason = decision_reason_by_issue.get(issue.number, "unknown")
             decision_by_issue[issue.number] = f"skip:{scheduler_reason}"
-        self._log_queue_decision_changes(decision_by_issue, detail_by_issue)
+        self._queue_decision_log.record(decision_by_issue, detail_by_issue)
 
         return actions, skipped, len(actions)
-
-    def _log_queue_decision_changes(
-        self,
-        decision_by_issue: dict[int, str],
-        detail_by_issue: dict[int, str],
-    ) -> None:
-        """Emit queue decision traces only when they change, plus periodic summary."""
-        for issue_number, decision in decision_by_issue.items():
-            self._log_queue_decision_if_changed(
-                issue_number,
-                decision,
-                detail_by_issue.get(issue_number),
-            )
-
-        # Prune stale issues no longer in this snapshot.
-        current_numbers = set(decision_by_issue.keys())
-        for issue_number in list(self._last_queue_decisions.keys()):
-            if issue_number not in current_numbers:
-                del self._last_queue_decisions[issue_number]
-
-        now = time.monotonic()
-        if (now - self._last_queue_summary_logged_at) < self._queue_summary_interval_seconds:
-            return
-        self._last_queue_summary_logged_at = now
-
-        launch_count = 0
-        reason_counts: dict[str, int] = {}
-        for decision in decision_by_issue.values():
-            kind, reason = decision.split(":", 1)
-            if kind == "launch":
-                launch_count += 1
-                continue
-            reason_counts[reason] = reason_counts.get(reason, 0) + 1
-        reason_summary = ", ".join(f"{reason}:{count}" for reason, count in sorted(reason_counts.items()))
-        logger.info(
-            "trace-queue-summary total=%d launch=%d skip=%d reasons=%s",
-            len(decision_by_issue),
-            launch_count,
-            len(decision_by_issue) - launch_count,
-            reason_summary or "none",
-        )
-
-    def _log_queue_decision_if_changed(
-        self,
-        issue_number: int,
-        decision: str,
-        detail: str | None,
-    ) -> None:
-        fingerprint = f"{decision}|{detail}" if detail else decision
-        previous = self._last_queue_decisions.get(issue_number)
-        if previous == fingerprint:
-            return
-        self._last_queue_decisions[issue_number] = fingerprint
-        if decision.startswith("launch:"):
-            reason = decision.split(":", 1)[1]
-            logger.info(
-                "trace-queue-decision issue=%d decision=launch reason=%s",
-                issue_number,
-                reason,
-            )
-            return
-
-        reason = decision.split(":", 1)[1]
-        if reason == "dependency_blocked":
-            logger.info(
-                "trace-queue-decision issue=%d decision=skip reason=dependency_blocked detail=%s",
-                issue_number,
-                detail or "dependency blocked",
-            )
-            return
-        if detail:
-            logger.info(
-                "trace-queue-decision issue=%d decision=skip reason=%s detail=%s",
-                issue_number,
-                reason,
-                detail,
-            )
-            return
-        logger.info(
-            "trace-queue-decision issue=%d decision=skip reason=%s",
-            issue_number,
-            reason,
-        )
 
     def _plan_reviews(
         self,
@@ -1674,19 +1628,47 @@ Flip labels from `{facts.watch_label}` to `{self.config.tech_lead_reviewed_label
         if not self.tech_lead_workflow or not self.tech_lead_workflow.is_configured():
             return actions, skipped
 
-        pending_tech_lead = [
-            item
-            for item in snapshot.pending_tech_lead
-            if not (
+        # A failure-investigation whose storm cohort was escalated this tick is
+        # dropped from the launch set (#6780). Log the drop instead of removing
+        # it silently, so a suppressed item explains WHY in its per-issue trace.
+        pending_tech_lead = []
+        for item in snapshot.pending_tech_lead:
+            if (
                 item.flavor is TechLeadSessionFlavor.FAILURE_INVESTIGATION
                 and item.issue_number in suppressed_issue_numbers
+            ):
+                self._tech_lead_launch_log.note_suppressed(item, len(snapshot.pending_tech_lead))
+            else:
+                pending_tech_lead.append(item)
+        # Provider eligibility precedes the workflow decision so the launching
+        # event can never claim a launch the provider gate then suppresses
+        # (#6892). One shared agent/provider => one gate for the whole queue.
+        provider = self.provider_policy.provider_for_agent_label(self.config.tech_lead_review_agent) if self.provider_policy else None
+        if provider and self.provider_policy and self.provider_policy.is_open(provider):
+            for tech_lead in pending_tech_lead:
+                self._record_provider_skip(
+                    issue_number=tech_lead.issue_number,
+                    item_type="tech_lead",
+                    item_number=tech_lead.issue_number,
+                    provider=provider,
+                    actions=actions,
+                    skipped=skipped,
+                    plan_context=plan_context,
+                )
+            # Nothing is asked of the workflow => no launching event; log all as provider-skipped.
+            self._tech_lead_launch_log.launch_outcomes(
+                pending_tech_lead,
+                [],
+                list(pending_tech_lead),
+                reserved=reserved,
+                provider=provider,
             )
-        ]
+            return actions, skipped
+
         decision: TechLeadDecision = self.tech_lead_workflow.should_launch_tech_lead(
             pending_tech_lead=pending_tech_lead,
-            active_session_count=snapshot.active_count,
             paused=snapshot.paused,
-            reserved_capacity=capacity if reserved else None,
+            available_slots=capacity,  # owner-computed availability (worker_budget)
         )
 
         if decision.skip_reason:
@@ -1696,22 +1678,13 @@ Flip labels from `{facts.watch_label}` to `{self.config.tech_lead_reviewed_label
                     number=tech_lead.issue_number,
                     reason=decision.skip_reason,
                 ))
+            self._tech_lead_launch_log.gate_skip(pending_tech_lead, decision.skip_reason)
             return actions, skipped
 
+        launched: list[PendingTechLeadReview] = []
         if decision.should_launch:
-            provider = self.provider_policy.provider_for_agent_label(self.config.tech_lead_review_agent) if self.provider_policy else None
+            # Provider cleared above => every asked item launches; TECH_LEAD_LAUNCHING count == these actions.
             for tech_lead in decision.tech_lead_to_launch[:capacity]:
-                if provider and self.provider_policy and self.provider_policy.is_open(provider):
-                    self._record_provider_skip(
-                        issue_number=tech_lead.issue_number,
-                        item_type="tech_lead",
-                        item_number=tech_lead.issue_number,
-                        provider=provider,
-                        actions=actions,
-                        skipped=skipped,
-                        plan_context=plan_context,
-                    )
-                    continue
                 actions.append(LaunchSessionAction(
                     session_type=SessionType.TECH_LEAD,
                     number=tech_lead.issue_number,
@@ -1720,6 +1693,15 @@ Flip labels from `{facts.watch_label}` to `{self.config.tech_lead_reviewed_label
                     title=tech_lead.title,
                     reason=f"tech_lead review for #{tech_lead.issue_number}",
                 ))
+                launched.append(tech_lead)
+            # Per-item outcome (launch / capacity-deferred), on-change so a queued session is never silent.
+            self._tech_lead_launch_log.launch_outcomes(
+                pending_tech_lead,
+                launched,
+                [],
+                reserved=reserved,
+                provider=provider,
+            )
 
         return actions, skipped
 

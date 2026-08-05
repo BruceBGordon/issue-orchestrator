@@ -10,10 +10,16 @@
 .setup-step.active {
     background: var(--primary-color);
     color: white;
+    font-weight: 600;
+    box-shadow: inset 0 0 0 2px currentColor;
 }
 .setup-step.done {
     background: var(--success-color);
     color: white;
+}
+.setup-step.done::after {
+    content: " ✓";
+    font-weight: 700;
 }
 .prereq-item {
     display: flex;
@@ -29,3 +35,102 @@
 .prereq-icon { font-size: 18px; }
 .prereq-name { font-weight: 500; }
 .prereq-detail { font-size: 12px; color: var(--text-muted); }
+
+.setup-replacement-warning {
+    margin-top: 16px;
+    padding: 12px;
+    border: 1px solid var(--accent-yellow);
+    border-radius: 8px;
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
+}
+
+#setupContent {
+    min-width: 0;
+    overflow-wrap: anywhere;
+}
+
+#setupContent input,
+#setupContent select {
+    max-width: 100%;
+}
+
+.setup-role-grid {
+    display: grid;
+    gap: 12px;
+    margin-top: 16px;
+}
+
+.setup-role-card.setup-validation-card {
+    margin-top: 16px;
+}
+
+.setup-role-card {
+    min-width: 0;
+    margin: 0;
+    padding: 14px;
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+}
+
+.setup-role-card legend {
+    padding: 0 6px;
+    font-weight: 600;
+}
+
+.setup-role-fields {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 12px;
+    margin-top: 12px;
+}
+
+.setup-role-fields input,
+.setup-role-fields select {
+    width: 100%;
+}
+
+.setup-role-toggle {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 10px;
+    cursor: pointer;
+}
+
+.setup-field-help {
+    margin: 4px 0 0;
+    color: var(--text-muted);
+    font-size: 12px;
+}
+
+.setup-next-options {
+    margin-top: 20px;
+    padding: 14px;
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    background: var(--bg-tertiary);
+}
+
+.setup-next-options h4 {
+    margin: 0 0 8px;
+}
+
+.setup-next-options ul {
+    margin: 8px 0 0;
+    padding-left: 20px;
+}
+
+@media (max-width: 600px) {
+    #setupSteps {
+        flex-wrap: wrap;
+    }
+
+    .setup-step {
+        flex-basis: calc(50% - 4px);
+    }
+
+    .setup-role-fields {
+        grid-template-columns: minmax(0, 1fr);
+    }
+}

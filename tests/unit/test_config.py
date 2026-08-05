@@ -4,6 +4,7 @@ import pytest
 import yaml
 from pathlib import Path
 from issue_orchestrator.infra.config import Config
+from issue_orchestrator.infra.config_models import PromotionRouteTarget
 
 
 class TestConfig:
@@ -34,7 +35,9 @@ class TestConfig:
                 tmp_path / ".issue-orchestrator" / "config" / "default.yaml"
             )
             installed_path.parent.mkdir(parents=True, exist_ok=True)
-            installed_path.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+            installed_path.write_text(
+                path.read_text(encoding="utf-8"), encoding="utf-8"
+            )
             path = installed_path
 
         config = Config.load(path)
@@ -118,8 +121,7 @@ class TestConfig:
         path = tmp_path / ".issue-orchestrator" / "config" / "default.yaml"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(
-            "repo:\n  name: owner/repo\n"
-            "merge_queue:\n  failure_action: explode\n",
+            "repo:\n  name: owner/repo\nmerge_queue:\n  failure_action: explode\n",
             encoding="utf-8",
         )
         with pytest.raises(ValueError, match="merge_queue.failure_action"):
@@ -222,7 +224,9 @@ worktrees:
         for path in config_paths:
             Config.load(path)
 
-    def test_config_load_codex_agent_without_model_uses_provider_default(self, tmp_path):
+    def test_config_load_codex_agent_without_model_uses_provider_default(
+        self, tmp_path
+    ):
         """Codex agents without a model should not inherit Claude's sonnet fallback."""
         prompt = tmp_path / "prompt.md"
         prompt.write_text("Prompt")
@@ -244,7 +248,9 @@ worktrees:
         assert config.agents["agent:dev"].provider == "codex"
         assert config.agents["agent:dev"].model == ""
 
-    def test_config_load_default_agent_codex_without_model_uses_provider_default(self, tmp_path):
+    def test_config_load_default_agent_codex_without_model_uses_provider_default(
+        self, tmp_path
+    ):
         """Default-agent Codex configs should also preserve the provider CLI default model."""
         prompt = tmp_path / "prompt.md"
         prompt.write_text("Prompt")
@@ -441,9 +447,10 @@ worktrees:
 
         e2e = data["e2e"]
         assert e2e["runner_kind"] == "pytest"
-        assert "--junitxml=.issue-orchestrator/e2e-results/pytest-junit.xml" in e2e[
-            "pytest_args"
-        ]
+        assert (
+            "--junitxml=.issue-orchestrator/e2e-results/pytest-junit.xml"
+            in e2e["pytest_args"]
+        )
         assert e2e["junit_xml_paths"] == [
             ".issue-orchestrator/e2e-results/pytest-junit.xml"
         ]
@@ -460,9 +467,10 @@ worktrees:
 
         e2e = data["e2e"]
         assert e2e["runner_kind"] == "pytest"
-        assert "--junitxml=.issue-orchestrator/e2e-results/issue-orchestrator-e2e.xml" in e2e[
-            "pytest_args"
-        ]
+        assert (
+            "--junitxml=.issue-orchestrator/e2e-results/issue-orchestrator-e2e.xml"
+            in e2e["pytest_args"]
+        )
         assert e2e["junit_xml_paths"] == [
             ".issue-orchestrator/e2e-results/issue-orchestrator-e2e.xml"
         ]
@@ -1203,7 +1211,7 @@ review:
                 "labels.in_progress=claimed",
                 "review.default=agent:code-review",
                 "ui.queue_refresh_seconds=120",
-                "filtering.milestones=[\"M1\", \"M2\"]",
+                'filtering.milestones=["M1", "M2"]',
             ],
         )
 
@@ -1493,13 +1501,19 @@ agents:
         assert config.review_exchange_require_validation is True
         assert config.review_nits_default_policy == "surface"
         assert config.review_nits_by_agent == {}
-        assert config.review_keep_current_approach_label == "reviewer-keep-current-approach"
+        assert (
+            config.review_keep_current_approach_label
+            == "reviewer-keep-current-approach"
+        )
         assert config.review_run_audit_min_runtime_minutes == 20
         assert config.review_run_audit_on_timeout is True
         assert config.retrospective_review_enabled is False
         assert config.retrospective_review_trigger_label == "retrospective-review"
         assert config.retrospective_reviewed_label == "retrospective-reviewed"
-        assert config.retrospective_changes_requested_label == "retrospective-changes-requested"
+        assert (
+            config.retrospective_changes_requested_label
+            == "retrospective-changes-requested"
+        )
         # tech_lead review defaults
         assert config.tech_lead_review_agent is None
         assert config.tech_lead_review_label is None
@@ -1652,8 +1666,13 @@ review:
         assert config.retrospective_review_enabled is True
         assert config.retrospective_review_trigger_label == "lack-of-review-redo"
         assert config.retrospective_reviewed_label == "lack-of-review-reviewed"
-        assert config.retrospective_changes_requested_label == "lack-of-review-needs-work"
-        assert config.review_keep_current_approach_label == "reviewer-keep-current-approach"
+        assert (
+            config.retrospective_changes_requested_label == "lack-of-review-needs-work"
+        )
+        assert (
+            config.review_keep_current_approach_label
+            == "reviewer-keep-current-approach"
+        )
         assert config.tech_lead_review_agent == "agent:tech-lead"
         assert config.tech_lead_reviewed_label == "tech-lead-reviewed"
         assert config.tech_lead_review_threshold == 5
@@ -1678,7 +1697,9 @@ review:
         config = Config.load(config_file)
 
         errors = config.validate()
-        assert any("review.retrospective.enabled requires review.default" in e for e in errors)
+        assert any(
+            "review.retrospective.enabled requires review.default" in e for e in errors
+        )
 
     def test_retrospective_review_validates_non_empty_labels(self, tmp_path):
         """Retrospective labels are source-of-truth state and must be explicit."""
@@ -1924,7 +1945,9 @@ agents:
         config = Config.load(config_file)
 
         errors = config.validate()
-        assert any("reviewer 'agent:nonexistent-reviewer' not found" in e for e in errors)
+        assert any(
+            "reviewer 'agent:nonexistent-reviewer' not found" in e for e in errors
+        )
 
     def test_validate_default_reviewer_required_when_enabled(self, tmp_path):
         """Test that default reviewer is required when review.enabled is true."""
@@ -2224,9 +2247,9 @@ review:
         config = Config.load(config_file)
         errors = config.validate()
 
-        assert any(
-            "review.nits.by_agent must be a mapping" in e for e in errors
-        ), errors
+        assert any("review.nits.by_agent must be a mapping" in e for e in errors), (
+            errors
+        )
 
     def test_review_nits_by_agent_non_string_key_fails_validation(self, tmp_path):
         """Non-string agent labels never match real labels; fail loudly."""
@@ -2297,7 +2320,10 @@ class TestProviderResilienceConfig:
         assert config.provider_resilience.short_retry.jitter is True
         assert config.provider_resilience.circuit_breaker.cooldown_seconds == 1800
         assert config.provider_resilience.circuit_breaker.max_cooldowns == 6
-        assert config.provider_resilience.circuit_breaker.label == "blocked:provider-unavailable"
+        assert (
+            config.provider_resilience.circuit_breaker.label
+            == "blocked:provider-unavailable"
+        )
 
     def test_parsing(self, tmp_path):
         prompt = tmp_path / "prompt.md"
@@ -2336,8 +2362,14 @@ class TestInterruptedSessionRetryConfig:
         assert config.retry.interrupted_sessions.enabled is True
         assert config.retry.interrupted_sessions.retry_coding is True
         assert config.retry.interrupted_sessions.retry_review is True
-        assert config.retry.interrupted_sessions.coding_guard_label == "io:auto-retried-interrupted-coding"
-        assert config.retry.interrupted_sessions.review_guard_label == "io:auto-retried-interrupted-review"
+        assert (
+            config.retry.interrupted_sessions.coding_guard_label
+            == "io:auto-retried-interrupted-coding"
+        )
+        assert (
+            config.retry.interrupted_sessions.review_guard_label
+            == "io:auto-retried-interrupted-review"
+        )
 
     def test_parsing(self, tmp_path):
         prompt = tmp_path / "prompt.md"
@@ -2359,8 +2391,14 @@ retry:
         assert config.retry.interrupted_sessions.enabled is True
         assert config.retry.interrupted_sessions.retry_coding is False
         assert config.retry.interrupted_sessions.retry_review is True
-        assert config.retry.interrupted_sessions.coding_guard_label == "io:custom-coding-guard"
-        assert config.retry.interrupted_sessions.review_guard_label == "io:custom-review-guard"
+        assert (
+            config.retry.interrupted_sessions.coding_guard_label
+            == "io:custom-coding-guard"
+        )
+        assert (
+            config.retry.interrupted_sessions.review_guard_label
+            == "io:custom-review-guard"
+        )
 
 
 class TestCleanupConfig:
@@ -2550,7 +2588,10 @@ claims:
 
         config = Config.load(config_file)
 
-        assert "Unknown config field: 'claims.convergence_required_wins'" in config.validate()
+        assert (
+            "Unknown config field: 'claims.convergence_required_wins'"
+            in config.validate()
+        )
 
     def test_validate_missing_prompt_file(self, tmp_path):
         """Test validation catches missing prompt files."""
@@ -2597,6 +2638,32 @@ agents:
         # Relative path should be resolved to absolute (worktrees.base)
         assert config.worktree_base.is_absolute()
         assert str(config.worktree_base).startswith(str(tmp_path))
+
+    def test_missing_worktree_base_uses_dedicated_sibling_collection(
+        self,
+        tmp_path,
+    ):
+        """A config omission must not place generated worktrees beside every repo."""
+        repo_root = tmp_path / "repo"
+        prompt_file = repo_root / "prompt.md"
+        config_dir = repo_root / ".issue-orchestrator" / "config"
+        config_dir.mkdir(parents=True)
+        prompt_file.write_text("# Test prompt")
+        config_file = config_dir / "default.yaml"
+        config_file.write_text(
+            f"""
+agents:
+  agent:test:
+    prompt: {prompt_file}
+"""
+        )
+
+        config = Config.load(config_file)
+
+        expected = tmp_path / "worktrees" / "repo"
+        assert config.worktree_base == expected
+        assert expected.is_dir()
+        assert config.to_dict()["worktrees"]["base"] == "../worktrees/repo"
 
     def test_validate_worktree_base_created_if_missing(self, tmp_path):
         """Test that worktree_base directory is created during load."""
@@ -2701,6 +2768,7 @@ agents:
         config = Config.load(config_file)
 
         import pytest
+
         with pytest.raises(ValueError) as exc_info:
             config.validate_or_raise()
 
@@ -2904,6 +2972,7 @@ e2e:
         assert config.e2e.auto_create_issues is False
         assert config.e2e.issue_agent_label == "agent:backend"
 
+
 class TestE2EFlakeConfig:
     """Tests for e2e flake detection configuration."""
 
@@ -2969,17 +3038,269 @@ tech_lead:
         assert config.tech_lead.dedup.similarity_threshold == 0.88
 
     @pytest.mark.parametrize("threshold", (0.0, -0.1, 1.01))
-    def test_tech_lead_dedup_invalid_threshold_fails_validation(
-        self, threshold: float
-    ):
+    def test_tech_lead_dedup_invalid_threshold_fails_validation(self, threshold: float):
         config = Config()
         config.tech_lead.dedup.similarity_threshold = threshold
 
         errors = config.validate()
 
-        assert any(
-            "tech_lead.dedup.similarity_threshold" in error for error in errors
+        assert any("tech_lead.dedup.similarity_threshold" in error for error in errors)
+
+    def test_finding_promotion_defaults(self):
+        """#6957: the lane ships ON but gated, so promotion needs one approval."""
+        findings = Config().tech_lead.findings
+
+        assert findings.promote == "gated"
+        assert findings.min_evidence == 2
+        assert findings.max_open_promoted == 3
+        assert findings.route == {"default": PromotionRouteTarget(repo="self")}
+        assert findings.enabled is True
+        assert findings.gated is True
+
+    def test_finding_promotion_from_yaml(self, tmp_path):
+        config_file = tmp_path / ".issue-orchestrator.yaml"
+        config_file.write_text(
+            """
+tech_lead:
+  findings:
+    promote: auto
+    min_evidence: 4
+    max_open_promoted: 1
+    route:
+      completion-pipeline: issue-orchestrator/issue-orchestrator
+      default: self
+"""
         )
+
+        findings = Config.load(config_file).tech_lead.findings
+
+        assert findings.promote == "auto"
+        assert findings.gated is False
+        assert findings.min_evidence == 4
+        assert findings.max_open_promoted == 1
+        assert findings.route_for("completion-pipeline").repo == (
+            "issue-orchestrator/issue-orchestrator"
+        )
+        assert findings.route_for("ui").repo == "self"
+        assert findings.target_repos() == ("issue-orchestrator/issue-orchestrator",)
+
+    def test_finding_promotion_route_defaults_to_self_when_omitted(self, tmp_path):
+        config_file = tmp_path / ".issue-orchestrator.yaml"
+        config_file.write_text(
+            """
+tech_lead:
+  findings:
+    route:
+      completion-pipeline: owner/repo
+"""
+        )
+
+        findings = Config.load(config_file).tech_lead.findings
+
+        assert findings.route_for("anything-else").repo == "self"
+
+    def test_finding_promotion_default_route_is_case_insensitive(self, tmp_path):
+        config_file = tmp_path / ".issue-orchestrator.yaml"
+        config_file.write_text(
+            """
+tech_lead:
+  findings:
+    route:
+      Default: owner/repo
+"""
+        )
+
+        findings = Config.load(config_file).tech_lead.findings
+
+        assert findings.route == {"default": PromotionRouteTarget(repo="owner/repo")}
+        assert findings.route_for("anything-else").repo == "owner/repo"
+
+    def test_finding_promotion_target_repos_fold_repository_case(self):
+        findings = Config().tech_lead.findings
+        findings.route = {
+            "one": PromotionRouteTarget(repo="Owner/Repo"),
+            "two": PromotionRouteTarget(repo="owner/repo"),
+        }
+
+        assert findings.target_repos() == ("Owner/Repo",)
+
+    def test_promote_off_disables_the_lane(self):
+        config = Config()
+        config.tech_lead.findings.promote = "off"
+
+        assert config.tech_lead.findings.enabled is False
+        assert config.validate() == [] or not any(
+            "tech_lead.findings" in error for error in config.validate()
+        )
+
+    @pytest.mark.parametrize(
+        "attr,value,fragment",
+        (
+            ("promote", "sometimes", "tech_lead.findings.promote"),
+            ("min_evidence", 0, "tech_lead.findings.min_evidence"),
+            ("max_open_promoted", 0, "tech_lead.findings.max_open_promoted"),
+        ),
+    )
+    def test_invalid_finding_promotion_settings_fail_startup(
+        self, attr: str, value, fragment: str
+    ):
+        """Fail-loud: a misconfigured lane must never silently never-promote."""
+        config = Config()
+        setattr(config.tech_lead.findings, attr, value)
+
+        assert any(fragment in error for error in config.validate())
+
+    def test_malformed_route_target_fails_startup(self):
+        config = Config()
+        config.tech_lead.findings.route = {
+            "default": PromotionRouteTarget(repo="not-a-repo")
+        }
+
+        errors = config.validate()
+
+        assert any("tech_lead.findings.route" in error for error in errors)
+
+    @pytest.mark.parametrize(
+        "route_yaml,fragment",
+        (
+            ("'': owner/repo", "keys must be non-empty"),
+            ("completion-pipeline: ''", "must not be empty"),
+            (
+                "Queue: owner/one\n      queue: owner/two",
+                "duplicate case-insensitive area",
+            ),
+            ("completion-pipeline: []", "must be 'self', 'owner/repo'"),
+            ("completion-pipeline: 3", "must be 'self', 'owner/repo'"),
+            ("completion-pipeline:\n        nope: x", "unknown key"),
+            ("completion-pipeline:\n        scope_label: x", "requires a non-empty"),
+            (
+                "completion-pipeline:\n        repo: owner/repo\n"
+                "        scope_label: [1]",
+                "must be a label string",
+            ),
+        ),
+    )
+    def test_blank_or_ambiguous_finding_routes_fail_load(
+        self, tmp_path, route_yaml: str, fragment: str
+    ):
+        config_file = tmp_path / ".issue-orchestrator.yaml"
+        config_file.write_text(
+            f"tech_lead:\n  findings:\n    route:\n      {route_yaml}\n"
+        )
+
+        with pytest.raises(ValueError, match=fragment):
+            Config.load(config_file)
+
+    @pytest.mark.parametrize("value", ("[]", "''", "false", "0", "3", "'gated'"))
+    def test_a_non_mapping_findings_block_is_rejected_not_defaulted(
+        self, tmp_path, value: str
+    ):
+        """#6957 round-5 review F14: the same truthiness bug, one level up.
+
+        ``tech_lead.findings`` defaults to ``promote: gated`` with
+        ``route.default: self``, so silently replacing an explicit value with
+        ``{}`` ENABLES issue creation — the opposite of what an operator writing
+        ``findings: false`` intends.
+        """
+        config_file = tmp_path / ".issue-orchestrator.yaml"
+        config_file.write_text(f"tech_lead:\n  findings: {value}\n")
+
+        with pytest.raises(ValueError, match="tech_lead.findings must be a mapping"):
+            Config.load(config_file)
+
+    @pytest.mark.parametrize("body", ("tech_lead:\n  priority: P1\n", "tech_lead:\n  findings: null\n"))
+    def test_omitted_or_null_findings_takes_the_defaults(self, tmp_path, body: str):
+        """Omission and an explicit null are the only ways to accept defaults."""
+        config_file = tmp_path / ".issue-orchestrator.yaml"
+        config_file.write_text(body)
+
+        findings = Config.load(config_file).tech_lead.findings
+
+        assert findings.promote == "gated"
+        assert findings.route == {"default": PromotionRouteTarget(repo="self")}
+
+    def test_promote_off_is_how_the_lane_is_disabled(self, tmp_path):
+        """The message points here, so it had better work."""
+        config_file = tmp_path / ".issue-orchestrator.yaml"
+        config_file.write_text("tech_lead:\n  findings:\n    promote: off\n")
+
+        assert Config.load(config_file).tech_lead.findings.enabled is False
+
+    @pytest.mark.parametrize("value", ("[]", "''", "false", "0"))
+    def test_falsy_non_mapping_route_is_rejected_not_defaulted(
+        self, tmp_path, value: str
+    ):
+        """#6957 review F6: an explicitly supplied non-mapping must fail loudly.
+
+        ``data.get("route") or {}`` accepted every falsy value and silently
+        replaced it with ``default: self`` — quietly redirecting a cross-repo
+        routing feature into the managed repo.
+        """
+        config_file = tmp_path / ".issue-orchestrator.yaml"
+        config_file.write_text(
+            f"tech_lead:\n  findings:\n    route: {value}\n"
+        )
+
+        with pytest.raises(ValueError, match="route must be a mapping"):
+            Config.load(config_file)
+
+    @pytest.mark.parametrize("value", ("", "null"))
+    def test_omitted_or_null_route_takes_the_default(self, tmp_path, value: str):
+        """Omission and an explicit null are the only accepted 'no route table'."""
+        config_file = tmp_path / ".issue-orchestrator.yaml"
+        config_file.write_text(
+            "tech_lead:\n  findings:\n    min_evidence: 3\n"
+            + (f"    route: {value}\n" if value else "")
+        )
+
+        findings = Config.load(config_file).tech_lead.findings
+
+        assert findings.route == {"default": PromotionRouteTarget(repo="self")}
+
+    def test_foreign_route_declares_the_targets_scheduling_labels(self, tmp_path):
+        """#6957 review F2: a route owns the target's whole queue contract."""
+        config_file = tmp_path / ".issue-orchestrator.yaml"
+        config_file.write_text(
+            """
+tech_lead:
+  findings:
+    route:
+      completion-pipeline:
+        repo: owner/repo
+        scope_label: upstream-scope
+        agent_label: agent:platform
+      default: self
+"""
+        )
+
+        findings = Config.load(config_file).tech_lead.findings
+
+        target = findings.route_for("completion-pipeline")
+        assert target.repo == "owner/repo"
+        assert target.scope_label == "upstream-scope"
+        assert target.agent_label == "agent:platform"
+        assert findings.target_repos() == ("owner/repo",)
+
+    def test_self_route_may_not_redeclare_the_managed_repos_contract(self):
+        """The managed repo's scheduling labels come from its own config."""
+        config = Config()
+        config.tech_lead.findings.route = {
+            "default": PromotionRouteTarget(repo="self", scope_label="something")
+        }
+
+        errors = config.validate()
+
+        assert any("routes to 'self'" in error for error in errors)
+
+    def test_foreign_route_with_a_blank_agent_label_fails_startup(self):
+        config = Config()
+        config.tech_lead.findings.route = {
+            "default": PromotionRouteTarget(repo="owner/repo", agent_label="")
+        }
+
+        errors = config.validate()
+
+        assert any("agent_label" in error for error in errors)
 
     def test_tech_lead_config_from_yaml(self, tmp_path):
         """Test loading tech_lead config from YAML."""
@@ -3129,7 +3450,9 @@ tech_lead:
         config_file = tmp_path / ".issue-orchestrator.yaml"
         config_file.write_text(config_content)
         errors = Config.load(config_file).validate()
-        assert any("max_expedited must be between 0 and 20" in e for e in errors), errors
+        assert any("max_expedited must be between 0 and 20" in e for e in errors), (
+            errors
+        )
 
     def test_tech_lead_startup_errors_unit(self):
         cls = Config().tech_lead.__class__
@@ -3154,7 +3477,10 @@ tech_lead:
         from issue_orchestrator.infra.settings_schema import ReviewSettings
         from pydantic import ValidationError
 
-        assert ReviewSettings(tech_lead_max_expedited=limit).tech_lead_max_expedited == limit
+        assert (
+            ReviewSettings(tech_lead_max_expedited=limit).tech_lead_max_expedited
+            == limit
+        )
         with pytest.raises(ValidationError):
             ReviewSettings(tech_lead_max_expedited=limit + 1)
 
@@ -3179,7 +3505,9 @@ tech_lead:
         config_file = tmp_path / ".issue-orchestrator.yaml"
         config_file.write_text(config_content)
         errors = Config.load(config_file).validate()
-        assert any("max_expedited must be between 0 and 20" in e for e in errors), errors
+        assert any("max_expedited must be between 0 and 20" in e for e in errors), (
+            errors
+        )
 
     def test_tech_lead_config_included_in_to_event_dict(self):
         """tech_lead config should be included in to_event_dict output."""
@@ -3198,7 +3526,21 @@ tech_lead:
             "enabled": True,
             "similarity_threshold": 0.72,
         }
-        assert result["tech_lead"]["milestone_strategy"]["inherit_from_issues"] == "latest"
+        assert result["tech_lead"]["findings"] == {
+            "promote": "gated",
+            "min_evidence": 2,
+            "max_open_promoted": 3,
+            "route": {
+                "default": {
+                    "repo": "self",
+                    "scope_label": None,
+                    "agent_label": None,
+                }
+            },
+        }
+        assert (
+            result["tech_lead"]["milestone_strategy"]["inherit_from_issues"] == "latest"
+        )
         # All five graduated-authority modes are operator-visible (#6761 F7).
         assert result["tech_lead"]["authority"] == {
             "post_comment": "propose",
@@ -3440,7 +3782,6 @@ scheduling:
         assert result["scheduling"]["default_priority_tier"] == 3
 
 
-
 class TestPriorityValidation:
     """Tests for priority-related validation."""
 
@@ -3486,9 +3827,7 @@ class TestValidationConfig:
         "unsupported_key",
         ["cmd", "timeout_seconds", "pre_push_dirty_check", "bogus"],
     )
-    def test_unsupported_validation_keys_fail_fast(
-        self, tmp_path, unsupported_key
-    ):
+    def test_unsupported_validation_keys_fail_fast(self, tmp_path, unsupported_key):
         unsupported_values = {
             "cmd": '"make validate"',
             "timeout_seconds": "400",
@@ -3561,7 +3900,10 @@ validation:
         config.validation.publish.dirty_check = "invalid-mode"
 
         errors = config.validate()
-        assert "validation.publish.dirty_check must be one of: tracked, unstaged, all, off" in errors
+        assert (
+            "validation.publish.dirty_check must be one of: tracked, unstaged, all, off"
+            in errors
+        )
 
     def test_junit_xml_paths_load_from_yaml(self, tmp_path):
         """validation.junit_xml_paths must round-trip through YAML — without
@@ -4281,7 +4623,10 @@ e2e:
         assert config2.max_concurrent_sessions == config.max_concurrent_sessions
         assert config2.session_timeout_minutes == config.session_timeout_minutes
         assert config2.e2e.enabled == config.e2e.enabled
-        assert config2.e2e.auto_run_interval_minutes == config.e2e.auto_run_interval_minutes
+        assert (
+            config2.e2e.auto_run_interval_minutes
+            == config.e2e.auto_run_interval_minutes
+        )
 
 
 class TestHooksConfig:

@@ -685,8 +685,7 @@ def _build_queue_items(  # noqa: C901, PLR0912 — aggregates queue from multipl
         )
         # Separate dependency-blocked (stays in queue) from agent-blocked (goes to blocked column)
         is_dependency_blocked = dep_problem is not None
-        is_agent_blocked = issue.is_blocked
-        is_blocked = is_agent_blocked  # Only label-based blocks go to the blocked column
+        is_blocked = lm.is_blocking_any(issue.labels)  # Only label-based blocks go to the blocked column
         agent_label = (issue.agent_type or "unknown").replace("agent:", "")
         if is_blocked:
             status = "blocked"
@@ -807,7 +806,8 @@ def _build_scope_blocked_items(
     dependency_info = get_issue_dependencies(scope_issues, config)
 
     for issue in scope_issues:
-        if issue.number in seen_issues or not issue.is_blocked:
+        is_blocked = lm.is_blocking_any(issue.labels)
+        if issue.number in seen_issues or not is_blocked:
             continue
         seen_issues.add(issue.number)
         dep_info = dependency_info.get(issue.number)

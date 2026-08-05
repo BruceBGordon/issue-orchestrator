@@ -17,6 +17,11 @@ from .cli_dry_run import run_dry_run as _run_dry_run
 from .cli_hook_commands import cmd_setup_guardrails, cmd_setup_hooks, cmd_verify
 from .cli_parser import CLICommandHandlers, build_parser
 from .cli_queue_commands import cmd_audit
+from .cli_run_modes import (
+    run_no_dashboard,
+    run_tui_dashboard,
+    run_web_dashboard_mode,
+)
 from .cli_support import (
     client_dashboard_link as _client_dashboard_link,
     get_repository_host as _get_repository_host,
@@ -115,90 +120,6 @@ def _apply_cli_overrides(args: argparse.Namespace, config: "Config") -> None:  #
             console.print(
                 f"[dim]Review threshold: {config.tech_lead_review_threshold} PRs[/dim]"
             )
-
-
-async def _run_no_dashboard(orchestrator, api_port: int | None) -> None:
-    """Run orchestrator without dashboard UI."""
-    from .control_api import ControlAPIServer
-
-    control_api = None
-    if api_port is not None:
-        control_api = ControlAPIServer(orchestrator, port=api_port)
-        try:
-            await control_api.start()
-        except OSError as exc:
-            logging.warning("Control API failed to start on port %s: %s", api_port, exc)
-            control_api = None
-
-    try:
-        await orchestrator.startup()
-        await orchestrator.run_loop()
-    finally:
-        if control_api:
-            await control_api.stop()
-
-
-async def _run_web_dashboard(
-    orchestrator, config: "Config", args: argparse.Namespace, api_port: int | None
-) -> None:
-    """Run orchestrator with web dashboard."""
-    import signal
-    from .web import run_with_web_dashboard, trigger_server_shutdown
-    from .control_api import ControlAPIServer
-
-    def handle_signal():
-        if orchestrator.shutdown_requested:
-            orchestrator.request_shutdown(force=True)
-            trigger_server_shutdown()
-        else:
-            orchestrator.request_shutdown()
-            trigger_server_shutdown()
-
-    loop = asyncio.get_running_loop()
-    loop.add_signal_handler(signal.SIGINT, handle_signal)
-    loop.add_signal_handler(signal.SIGTERM, handle_signal)
-
-    control_api = None
-    if api_port is not None:
-        if api_port != 0:
-            console.print(f"[dim]Control API on http://127.0.0.1:{api_port}[/dim]")
-        control_api = ControlAPIServer(orchestrator, port=api_port)
-        try:
-            await control_api.start()
-            if api_port == 0:
-                console.print(
-                    f"[dim]Control API on http://127.0.0.1:{control_api.port}[/dim]"
-                )
-        except OSError as exc:
-            logging.warning("Control API failed to start on port %s: %s", api_port, exc)
-            control_api = None
-
-    try:
-        port = args.port if args.port != 8080 else config.web_port
-        await run_with_web_dashboard(orchestrator, port=port)
-    finally:
-        if control_api:
-            await control_api.stop()
-
-
-async def _run_tui_dashboard(
-    orchestrator, config: "Config", api_port: int | None
-) -> bool:
-    """Run orchestrator with TUI dashboard."""
-    from .control_api import ControlAPIServer
-    from .dashboard import run_with_dashboard
-
-    control_api = None
-    if api_port is not None:
-        control_api = ControlAPIServer(orchestrator, port=api_port)
-        await control_api.start()
-
-    try:
-        await orchestrator.startup()
-        return await run_with_dashboard(orchestrator, config.ui_mode)
-    finally:
-        if control_api:
-            await control_api.stop()
 
 
 def cmd_start(args: argparse.Namespace) -> int:  # noqa: C901, PLR0912 - CLI entry point with config/logging/validation/startup phases
@@ -379,7 +300,7 @@ def cmd_start(args: argparse.Namespace) -> int:  # noqa: C901, PLR0912 - CLI ent
             console.print("[dim]Running without dashboard UI[/dim]")
             if api_port and api_port != 0:
                 console.print(f"[dim]Control API on http://127.0.0.1:{api_port}[/dim]")
-            asyncio.run(_run_no_dashboard(orchestrator, api_port))
+            asyncio.run(run_no_dashboard(orchestrator, api_port))
         elif config.ui_mode == "web":
             # Run with web dashboard in browser
             port = args.port if args.port != 8080 else config.web_port
@@ -388,12 +309,12 @@ def cmd_start(args: argparse.Namespace) -> int:  # noqa: C901, PLR0912 - CLI ent
                 console.print(
                     f"[green]Dashboard will open at {_client_dashboard_link(port)}[/green]"
                 )
-            asyncio.run(_run_web_dashboard(orchestrator, config, args, api_port))
+            asyncio.run(run_web_dashboard_mode(orchestrator, config, args, api_port))
         else:
             # Run with interactive TUI dashboard (tmux mode)
             if api_port and api_port != 0:
                 console.print(f"[dim]Control API on http://127.0.0.1:{api_port}[/dim]")
-            asyncio.run(_run_tui_dashboard(orchestrator, config, api_port))
+            asyncio.run(run_tui_dashboard(orchestrator, config, api_port))
     except KeyboardInterrupt:
         console.print("\n[yellow]Shutting down...[/yellow]")
 
@@ -428,36 +349,50 @@ def cmd_status(args: argparse.Namespace) -> int:
         return 0
 
 
-def cmd_attach(args: argparse.Namespace) -> int:
-    """Attach to session (deprecated - use web dashboard)."""
-    console.print("[yellow]The 'attach' command is no longer available.[/yellow]")
-    console.print("Use the web dashboard to view sessions: issue-orchestrator start")
+def retired_command(name: str, guidance: str) -> int:
+    """Report a retired command uniformly and fail.
+
+    Single owner for the retired-stub behavior. These commands are kept only so
+    an old script gets a pointer to the replacement instead of an argparse
+    "invalid choice" error — the capability itself is gone, so they always exit
+    non-zero. ``CLIStability.RETIRED`` in
+    :mod:`issue_orchestrator.entrypoints.cli_parser` is the published tier, and
+    ``tests/unit/test_cli.py::TestRetiredCommandStubs`` pins that tier to which
+    handlers delegate here, so a tier and its behavior cannot drift apart.
+    """
+    console.print(f"[yellow]The '{name}' command is no longer available.[/yellow]")
+    console.print(guidance)
     return 1
+
+
+def cmd_attach(args: argparse.Namespace) -> int:
+    """Attach to session (retired - use the web dashboard)."""
+    return retired_command(
+        "attach", "Use the web dashboard to view sessions: issue-orchestrator start"
+    )
 
 
 def cmd_switch(args: argparse.Namespace) -> int:
-    """Switch to session (deprecated - use web dashboard)."""
-    console.print("[yellow]The 'switch' command is no longer available.[/yellow]")
-    console.print("Use the web dashboard to view sessions: issue-orchestrator start")
-    return 1
+    """Switch to session (retired - use the web dashboard)."""
+    return retired_command(
+        "switch", "Use the web dashboard to view sessions: issue-orchestrator start"
+    )
 
 
 def cmd_dashboard(args: argparse.Namespace) -> int:
-    """Switch to dashboard (deprecated - use web dashboard)."""
-    console.print("[yellow]The 'dashboard' command is no longer available.[/yellow]")
-    console.print(
-        "Start the orchestrator to access the web dashboard: issue-orchestrator start"
+    """Switch to dashboard (retired - use the web dashboard)."""
+    return retired_command(
+        "dashboard",
+        "Start the orchestrator to access the web dashboard: issue-orchestrator start",
     )
-    return 1
 
 
 def cmd_output(args: argparse.Namespace) -> int:
-    """Show recent output from an issue's session."""
-    console.print("[yellow]The 'output' command is no longer available.[/yellow]")
-    console.print(
-        "View session recordings in .issue-orchestrator/sessions/<run>/terminal-recording.jsonl"
+    """Show recent session output (retired - read the terminal recording)."""
+    return retired_command(
+        "output",
+        "View session recordings in .issue-orchestrator/sessions/<run>/terminal-recording.jsonl",
     )
-    return 1
 
 
 def cmd_pause(args: argparse.Namespace) -> int:

@@ -31,6 +31,7 @@ from .http_client import (
     build_github_auth,
     classify_github_http_failure,
 )
+from .marker_recovery import find_marker_issue, prove_marker_issue
 from .repo import get_repo_from_git, GitRepoError
 from .cache import GitHubCache
 from .adapter_cache import GitHubAdapterCacheSupport
@@ -163,6 +164,8 @@ class GitHubAdapter:
         http_client: "GitHubHttpClient | None" = None,
         auth: GitHubAuth | None = None,
         verify_writes: bool = True,
+        api_url: str | None = None,
+        http_timeout_seconds: float | None = None,
     ):
         """Initialize the GitHub adapter.
 
@@ -176,6 +179,8 @@ class GitHubAdapter:
                          Inject for testing to avoid real API calls.
             auth: GitHub auth object. Inject to share cached App installation tokens.
             verify_writes: Whether to verify writes. Defaults to True.
+            api_url: Explicit API base URL when no full Config object is available.
+            http_timeout_seconds: Explicit HTTP timeout when no Config is available.
         """
         if repo:
             self.repo = repo
@@ -187,40 +192,66 @@ class GitHubAdapter:
         if http_client is not None:
             self._client = http_client
         else:
+            resolved_api_url = api_url or (
+                getattr(config, "github_api_url", "https://api.github.com")
+                if config
+                else "https://api.github.com"
+            )
+            resolved_timeout = http_timeout_seconds or (
+                float(getattr(config, "github_http_timeout_seconds", 20.0))
+                if config
+                else 20.0
+            )
             auth_kwargs = config.github_auth_kwargs() if config else {}
             auth = auth or build_github_auth(
                 **auth_kwargs,
                 repo=self.repo,
-                api_url=getattr(config, "github_api_url", "https://api.github.com") if config else "https://api.github.com",
-                timeout_seconds=float(getattr(config, "github_http_timeout_seconds", 20.0)) if config else 20.0,
+                api_url=resolved_api_url,
+                timeout_seconds=resolved_timeout,
             )
             self._client = GitHubHttpClient(
                 GitHubHttpConfig(
                     repo=self.repo,
-                    base_url=getattr(config, "github_api_url", "https://api.github.com") if config else "https://api.github.com",
-                    timeout_seconds=float(getattr(config, "github_http_timeout_seconds", 20.0)) if config else 20.0,
+                    base_url=resolved_api_url,
+                    timeout_seconds=resolved_timeout,
                     auth=auth,
                 )
             )
         self._verify_writes = verify_writes
-        self._verify_timeout_seconds = config.gh_write_verify_timeout_seconds if config else 20
+        self._verify_timeout_seconds = (
+            config.gh_write_verify_timeout_seconds if config else 20
+        )
         self._default_branch_cache: str | None = None
-        self._verify_initial_delay_ms = config.gh_write_verify_initial_delay_ms if config else 250
-        self._verify_max_delay_ms = config.gh_write_verify_max_delay_ms if config else 2000
+        self._verify_initial_delay_ms = (
+            config.gh_write_verify_initial_delay_ms if config else 250
+        )
+        self._verify_max_delay_ms = (
+            config.gh_write_verify_max_delay_ms if config else 2000
+        )
         self._verify_backoff = config.gh_write_verify_backoff if config else 1.5
         self._verify_jitter_ms = config.gh_write_verify_jitter_ms if config else 0
 
         # Use injected cache or create one with config-based TTL
-        cache_ttl = float(max(0, int(getattr(config, "github_cache_ttl_seconds", 0)))) if config else 0.0
+        cache_ttl = (
+            float(max(0, int(getattr(config, "github_cache_ttl_seconds", 0))))
+            if config
+            else 0.0
+        )
         self._cache = cache if cache is not None else GitHubCache(default_ttl=cache_ttl)
-        self._adapter_cache = GitHubAdapterCacheSupport(self._cache, label_cache_enabled=cache_ttl > 0)
+        self._adapter_cache = GitHubAdapterCacheSupport(
+            self._cache, label_cache_enabled=cache_ttl > 0
+        )
 
         # Use injected verification service or create one with default budget
         # IMPORTANT: Inject the service to preserve circuit breaker state across calls
         if verification_service is not None:
             self._verification_service = verification_service
         else:
-            from ...execution.verification_service import DefaultVerificationService, VerificationBudget
+            from ...execution.verification_service import (
+                DefaultVerificationService,
+                VerificationBudget,
+            )
+
             default_budget = VerificationBudget(
                 timeout_seconds=self._verify_timeout_seconds,
                 max_attempts=20,
@@ -229,7 +260,9 @@ class GitHubAdapter:
                 backoff_factor=self._verify_backoff,
                 jitter_ms=self._verify_jitter_ms,
             )
-            self._verification_service = DefaultVerificationService(default_budget=default_budget)
+            self._verification_service = DefaultVerificationService(
+                default_budget=default_budget
+            )
 
         logger.info(f"GitHubAdapter initialized for repo: {self.repo}")
 
@@ -255,16 +288,26 @@ class GitHubAdapter:
         )
         self._client.invalidate_pr_etag(issue_number)
 
-    def invalidate_pr_cache(self, issue_number: int | None = None, branch: str | None = None) -> None:
+    def invalidate_pr_cache(
+        self, issue_number: int | None = None, branch: str | None = None
+    ) -> None:
         """Invalidate cached PR info.
 
         Args:
             issue_number: Invalidate PR cache for this issue.
             branch: Invalidate PR cache for this branch.
         """
-        self._adapter_cache.invalidate_pr_cache(issue_number=issue_number, branch=branch)
+        self._adapter_cache.invalidate_pr_cache(
+            issue_number=issue_number, branch=branch
+        )
 
-    def _verify_write(self, description: str, predicate, detail_fn=None, issue_number: int | None = None) -> None:
+    def _verify_write(
+        self,
+        description: str,
+        predicate,
+        detail_fn=None,
+        issue_number: int | None = None,
+    ) -> None:
         """Verify a write operation completed successfully.
 
         Uses the injected VerificationService which maintains circuit breaker
@@ -338,14 +381,18 @@ class GitHubAdapter:
 
         if result == VerificationResult.TIMED_OUT or api_error_occurred:
             # SYSTEMIC: Timeout or API error indicates infrastructure problem
-            logger.warning("Write verification timed out (SYSTEMIC) for %s%s", description, detail)
+            logger.warning(
+                "Write verification timed out (SYSTEMIC) for %s%s", description, detail
+            )
             raise GitHubHttpError(
                 f"Timed out verifying write: {description}",
                 failure_type=FailureType.SYSTEMIC,
             )
         else:
             # ISSUE_LOCAL: Predicate returned false - write didn't take effect for this issue
-            logger.warning("Write verification failed (ISSUE_LOCAL) for %s%s", description, detail)
+            logger.warning(
+                "Write verification failed (ISSUE_LOCAL) for %s%s", description, detail
+            )
             raise GitHubHttpError(
                 f"Failed to verify write: {description}",
                 failure_type=FailureType.ISSUE_LOCAL,
@@ -392,7 +439,8 @@ class GitHubAdapter:
         if still_missing:
             logger.warning(
                 "[INFLIGHT] Still missing %d required IDs after non-cached fetch: %s",
-                len(still_missing), sorted(still_missing)
+                len(still_missing),
+                sorted(still_missing),
             )
         return issues
 
@@ -427,6 +475,7 @@ class GitHubAdapter:
             GitHubHttpError: If GitHub rejects the query.
             GitHubTransportError: If the request fails before a response.
         """
+
         def _fetch(use_cache: bool) -> list[dict]:
             return self._client.list_issues(
                 labels=labels,
@@ -448,14 +497,17 @@ class GitHubAdapter:
             if missing:
                 logger.info(
                     "[INFLIGHT] Missing %d required IDs after cached fetch, retrying without cache: %s",
-                    len(missing), sorted(missing)
+                    len(missing),
+                    sorted(missing),
                 )
                 # Retry without cache to bypass potential stale 304
                 raw_issues = _fetch(use_cache=False)
                 issues = self._raw_issues_to_issues(raw_issues)
 
                 # Retry with backoff for eventual consistency if still missing
-                issues = self._retry_for_missing_ids(_fetch, required_stable_ids, issues)
+                issues = self._retry_for_missing_ids(
+                    _fetch, required_stable_ids, issues
+                )
 
                 # Final check
                 found_ids = {i.key.stable_id() for i in issues}
@@ -494,6 +546,24 @@ class GitHubAdapter:
         """
         raw = self._client.search_issues_by_title(query_terms, limit=limit)
         return self._raw_issues_to_issues(raw)
+
+    def find_issue_by_marker(
+        self, *, title: str, marker: str, authoritative: bool = False
+    ) -> int | None:
+        """Recover an issue this orchestrator created, by its body marker.
+
+        The ``RepositoryHost`` half of the shared crash-window recovery the
+        promotion target adapter uses (``marker_recovery``). ``authoritative``
+        picks which lookup runs: the bounded best-effort scan, or the complete,
+        title-independent, fail-loud one whose miss is proof of absence (#6957
+        round-5 review F13).
+        """
+        found = (
+            prove_marker_issue(self._client, marker=marker)
+            if authoritative
+            else find_marker_issue(self._client, title=title, marker=marker)
+        )
+        return found.number if found is not None else None
 
     def get_default_branch(self) -> str:
         """The repository's real default branch (cached; GitHub is authoritative)."""
@@ -616,7 +686,9 @@ class GitHubAdapter:
         self.update_label_cache(issue_number, list(labels))
         return labels
 
-    def _get_issue_labels_with_retry(self, issue_number: int, use_cache: bool) -> list[str]:
+    def _get_issue_labels_with_retry(
+        self, issue_number: int, use_cache: bool
+    ) -> list[str]:
         import time
 
         for attempt in range(1, 4):
@@ -646,7 +718,9 @@ class GitHubAdapter:
 
         for attempt in range(1, 4):
             try:
-                output = self._client.create_pr(title=title, body=body, head=head, base=base, draft=draft)
+                output = self._client.create_pr(
+                    title=title, body=body, head=head, base=base, draft=draft
+                )
                 if output is None:
                     raise GitHubHttpError("Failed to parse PR create response")
                 return output
@@ -831,11 +905,18 @@ class GitHubAdapter:
         """
         try:
             output = self._client.get_prs_with_label_graphql(label, state=state)
-            return [pr for item in output if (pr := self._pr_info_from_api(item)) is not None]
+            return [
+                pr
+                for item in output
+                if (pr := self._pr_info_from_api(item)) is not None
+            ]
         except (GitHubHttpError, GitHubTransportError):
             raise
         except Exception:
-            logger.debug("GraphQL get_prs_with_label failed, falling back to search API", exc_info=True)
+            logger.debug(
+                "GraphQL get_prs_with_label failed, falling back to search API",
+                exc_info=True,
+            )
         # Fallback: search API + individual get_pr() calls
         output = self._client.get_prs_with_label(label, state=state)
         prs: list[PRInfo] = []
@@ -968,7 +1049,8 @@ class GitHubAdapter:
             # so the reconciler waits a tick rather than aborting the scan.
             logger.warning(
                 "status_check_rollup read failed for PR %s (transient_error): %s",
-                pr_number, e,
+                pr_number,
+                e,
             )
             return StatusCheckRollupRead(state=None, capability="transient_error")
         except GitHubHttpError as e:
@@ -981,7 +1063,9 @@ class GitHubAdapter:
                     return fallback
             logger.warning(
                 "status_check_rollup read failed for PR %s (%s): %s",
-                pr_number, capability, e,
+                pr_number,
+                capability,
+                e,
             )
             return StatusCheckRollupRead(
                 state=None,
@@ -991,7 +1075,9 @@ class GitHubAdapter:
                 # error is not a denial and leaves the backoff untouched.
                 primary_source_denied=capability == "permission_denied",
             )
-        return StatusCheckRollupRead(state=_coerce_rollup_state(rollup), capability="ok")
+        return StatusCheckRollupRead(
+            state=_coerce_rollup_state(rollup), capability="ok"
+        )
 
     def enqueue_to_merge_queue(self, pr_number: int) -> None:
         """Add a PR to GitHub's native merge queue (GraphQL mutation)."""
@@ -1151,6 +1237,7 @@ class GitHubAdapter:
         logger.debug("create_pr: E2E_DRY_RUN_PUSH=%r", dry_run)
         if dry_run == "1":
             import random
+
             fake_pr_number = random.randint(90000, 99999)
             logger.info(
                 "[E2E_DRY_RUN] PR creation skipped (would create PR for head=%s base=%s)",
@@ -1181,8 +1268,15 @@ class GitHubAdapter:
             return existing_pr
 
         try:
-            logger.info("Creating PR via GitHub API: repo=%s head=%s base=%s", self.repo, head, base)
-            output = self._create_pr_with_retry(title=title, body=body, head=head, base=base, draft=draft)
+            logger.info(
+                "Creating PR via GitHub API: repo=%s head=%s base=%s",
+                self.repo,
+                head,
+                base,
+            )
+            output = self._create_pr_with_retry(
+                title=title, body=body, head=head, base=base, draft=draft
+            )
             if isinstance(output, dict):
                 pr_info = self._pr_info_from_api(output)
                 logger.info("Created PR #%s: %s", pr_info.number, pr_info.title)
@@ -1205,7 +1299,13 @@ class GitHubAdapter:
                 return pr_info
             raise GitHubHttpError("Failed to parse PR create response")
         except GitHubHttpError as e:
-            logger.error("Failed to create PR: title=%s head=%s base=%s error=%s", title, head, base, e)
+            logger.error(
+                "Failed to create PR: title=%s head=%s base=%s error=%s",
+                title,
+                head,
+                base,
+                e,
+            )
             raise
 
     def set_pr_draft(self, pr_number: int, draft: bool) -> None:
@@ -1275,7 +1375,9 @@ class GitHubAdapter:
             logger.error(f"Failed to add comment to issue/PR {issue_or_pr_number}")
             raise
 
-    def _get_issue_for_repo(self, issue_number: int, target_repo: str) -> dict[str, Any] | None:
+    def _get_issue_for_repo(
+        self, issue_number: int, target_repo: str
+    ) -> dict[str, Any] | None:
         """Get issue data for a specific repository.
 
         Creates a temporary client if needed for cross-repo lookups.
@@ -1332,18 +1434,30 @@ class GitHubAdapter:
                 if not isinstance(state, str):
                     return None
                 milestone = output.get("milestone")
-                raw_milestone_title = milestone.get("title") if isinstance(milestone, dict) else None
-                milestone_title = raw_milestone_title if isinstance(raw_milestone_title, str) else None
+                raw_milestone_title = (
+                    milestone.get("title") if isinstance(milestone, dict) else None
+                )
+                milestone_title = (
+                    raw_milestone_title
+                    if isinstance(raw_milestone_title, str)
+                    else None
+                )
                 return DependencyIssueSnapshot(state=state, milestone=milestone_title)
             return None
         except GitHubHttpError as e:
             if _is_not_found_error(e):
-                logger.debug("Issue %s in %s not found: %s", issue_number, target_repo, e)
+                logger.debug(
+                    "Issue %s in %s not found: %s", issue_number, target_repo, e
+                )
                 return None
-            logger.debug("Error checking issue %s in %s: %s", issue_number, target_repo, e)
+            logger.debug(
+                "Error checking issue %s in %s: %s", issue_number, target_repo, e
+            )
             raise
         except Exception as e:
-            logger.debug("Error checking issue %s in %s: %s", issue_number, target_repo, e)
+            logger.debug(
+                "Error checking issue %s in %s: %s", issue_number, target_repo, e
+            )
             raise
 
     def get_issue_state(self, issue_number: int, repo: str | None = None) -> str | None:
@@ -1354,7 +1468,9 @@ class GitHubAdapter:
         snapshot = self.get_dependency_issue_snapshot(issue_number, repo)
         return snapshot.state if snapshot is not None else None
 
-    def get_issue_milestone(self, issue_number: int, repo: str | None = None) -> str | None:
+    def get_issue_milestone(
+        self, issue_number: int, repo: str | None = None
+    ) -> str | None:
         """Get the milestone name of an issue (or None if no milestone).
 
         This method implements the IssueStateChecker compatibility method.
@@ -1495,7 +1611,10 @@ class GitHubAdapter:
                 if pr.get("mergeable_state") is not None
                 else None
             ),
-            base_branch=(pr.get("base") or {}).get("ref") or pr.get("baseRefName") or None,
+            base_branch=(pr.get("base") or {}).get("ref")
+            or pr.get("baseRefName")
+            or None,
+            merged_at=pr.get("merged_at") or None,
         )
 
     def _fetch_pr_info_from_search(self, pr: dict[str, Any]) -> PRInfo | None:
@@ -1532,7 +1651,9 @@ class GitHubAdapter:
             description: Optional label description.
             force: If True, update existing label if it already exists.
         """
-        self._client.create_label(name, color=color, description=description, force=force)
+        self._client.create_label(
+            name, color=color, description=description, force=force
+        )
         # Invalidate ETag cache so verification fetches fresh data
         self._client.invalidate_labels_etag()
         last_labels: list[str] = []
@@ -1622,7 +1743,10 @@ class GitHubAdapter:
         self._verify_write(
             f"branch delete {branch}",
             _check,
-            detail_fn=lambda: {"branch": branch, "exists": self._client.branch_exists(branch)},
+            detail_fn=lambda: {
+                "branch": branch,
+                "exists": self._client.branch_exists(branch),
+            },
         )
 
     def branch_exists(self, branch: str) -> bool:
@@ -1676,6 +1800,16 @@ class GitHubAdapter:
         """
         return self._client.issue_comment_marker_present(issue_number, marker)
 
+    def issue_closed_on_or_after(self, issue_number: int, timestamp: str) -> bool:
+        """Return True if the issue has a ``closed`` event at/after ``timestamp``.
+
+        Typed transition evidence for the close-on-merge fallback: proves
+        whether an auto-close already fired for a given merge, so a deliberate
+        human reopen is never re-closed. Scans all event pages, fail-loud on
+        truncated or malformed reads.
+        """
+        return self._client.issue_closed_on_or_after(issue_number, timestamp)
+
     def get_pr_reviews(self, pr_number: int) -> list[dict[str, Any]]:
         """Get all reviews on a pull request.
 
@@ -1716,7 +1850,9 @@ class GitHubAdapter:
 
     def update_issue_milestone(self, issue_number: int, milestone: int | None) -> None:
         """Assign or clear a milestone on an issue."""
-        result = self._client.update_issue_milestone(issue_number=issue_number, milestone=milestone)
+        result = self._client.update_issue_milestone(
+            issue_number=issue_number, milestone=milestone
+        )
         if result is None:
             return
 

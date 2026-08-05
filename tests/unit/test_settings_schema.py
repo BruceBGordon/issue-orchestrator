@@ -6,6 +6,9 @@ import pytest
 from pydantic import BaseModel, ValidationError
 
 from issue_orchestrator.infra.config import Config, E2EConfig, FilteringConfig
+from issue_orchestrator.domain.tech_lead_findings import (
+    VALID_FINDING_PROMOTION_MODES,
+)
 from issue_orchestrator.infra.config_models import MERGE_QUEUE_PROVIDERS
 from issue_orchestrator.infra.settings_schema import (
     CONFIG_VALUE_TYPE_PATH,
@@ -249,6 +252,53 @@ class TestValidation:
     def test_review_max_rework_max(self):
         with pytest.raises(ValidationError):
             ReviewSettings(max_rework_cycles=11)
+
+    def test_finding_promotion_mode_rejects_unsupported(self):
+        """#6957 R3 F9: `enum` in json_schema_extra shapes the select, it does
+        NOT validate. Without a validator a tampered POST body reached live
+        config and was only rejected later by the doctor pass — after the write,
+        and as a whole-config error the form cannot attach to a field."""
+        with pytest.raises(ValidationError) as excinfo:
+            ReviewSettings(tech_lead_findings_promote="sometimes")
+
+        # Field-scoped, so the settings form can point at the offending input.
+        assert excinfo.value.errors()[0]["loc"] == ("tech_lead_findings_promote",)
+
+    @pytest.mark.parametrize("mode", VALID_FINDING_PROMOTION_MODES)
+    def test_finding_promotion_mode_accepts_every_supported_value(self, mode):
+        assert (
+            ReviewSettings(tech_lead_findings_promote=mode).tech_lead_findings_promote
+            == mode
+        )
+
+    def test_every_enum_declaring_field_actually_rejects_outsiders(self):
+        """The CLASS behind F9, pinned so it cannot reopen on the next field.
+
+        A field that advertises a closed set in ``json_schema_extra["enum"]``
+        must also enforce it; Pydantic does not do that for a plain ``str``.
+        This walks every tab model and proves each such field rejects a value
+        outside its own declared set.
+        """
+        unenforced: list[str] = []
+        for tab in TAB_DEFINITIONS:
+            model = tab["model"]
+            for name, field in model.model_fields.items():
+                extra = field.json_schema_extra
+                allowed = extra.get("enum") if isinstance(extra, dict) else None
+                if not allowed:
+                    continue
+                outsider = "__not_a_supported_value__"
+                assert outsider not in allowed
+                try:
+                    model.model_validate({name: outsider})
+                except ValidationError:
+                    continue
+                unenforced.append(f"{model.__name__}.{name}")
+
+        assert not unenforced, (
+            "these settings fields advertise a closed enum but accept anything: "
+            f"{unenforced}"
+        )
 
     def test_health_review_interval_rejects_negative(self):
         """ge=0: the dashboard and YAML must reject -5, not treat it as disabled
@@ -755,6 +805,37 @@ class TestApplyTo:
         assert restart is True
         assert cfg.web_port == 9090
 
+    def test_concurrency_change_applies_without_repository_engine_restart(self):
+        """Concurrency is read live by the Repository Engine's health gate."""
+        cfg = Config()
+        cfg.max_concurrent_sessions = 2
+
+        tabs = from_config(cfg)
+        tabs["concurrency"] = tabs["concurrency"].model_copy(
+            update={"max_concurrent_sessions": 3}
+        )
+
+        restart = apply_to(tabs, cfg)
+
+        assert restart is False
+        assert cfg.max_concurrent_sessions == 3
+
+    def test_deprecated_browser_session_max_is_not_restart_required(self):
+        """The ignored compatibility field must not promise a restart effect."""
+        cfg = Config()
+        tabs = from_config(cfg)
+        tabs["advanced"] = tabs["advanced"].model_copy(
+            update={"browser_session_max": 2048}
+        )
+
+        restart = apply_to(tabs, cfg)
+
+        field = AdvancedSettings.model_fields["browser_session_max"]
+        assert isinstance(field.json_schema_extra, dict)
+        assert field.json_schema_extra.get("restart_required") is not True
+        assert restart is False
+        assert cfg.browser_session_max == 2048
+
     def test_no_restart_when_unchanged(self):
         """apply_to should return False when no restart-required fields change."""
         cfg = Config()
@@ -895,6 +976,7 @@ class TestRestartFields:
     def test_non_restart_fields_absent(self):
         fields = get_restart_fields()
         assert "max_concurrent_sessions" not in fields
+        assert "session_timeout_minutes" not in fields
         assert "enabled" not in fields
 
 

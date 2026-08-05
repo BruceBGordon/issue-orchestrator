@@ -258,7 +258,7 @@ def test_access_log_redaction_scrubs_sse_token(
     """
     import logging as _logging
 
-    from issue_orchestrator.entrypoints.control_api import (
+    from issue_orchestrator.entrypoints._auth_middleware import (
         install_access_log_redaction,
     )
 

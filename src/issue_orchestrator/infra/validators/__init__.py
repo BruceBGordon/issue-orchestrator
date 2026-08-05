@@ -18,6 +18,7 @@ from .base import ConfigValidator
 from .worktree import WorktreeValidator
 from .agent import AgentValidator
 from .goal_pilot import GoalPilotValidator
+from .milestones import MilestonesValidator
 from .review import ReviewWorkflowValidator
 from .isolation import IsolationValidator
 from .template import TemplateValidator
@@ -28,6 +29,7 @@ __all__ = [
     "WorktreeValidator",
     "AgentValidator",
     "GoalPilotValidator",
+    "MilestonesValidator",
     "ReviewWorkflowValidator",
     "IsolationValidator",
     "TemplateValidator",

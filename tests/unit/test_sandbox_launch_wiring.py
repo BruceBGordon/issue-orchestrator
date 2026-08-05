@@ -15,6 +15,25 @@ from pathlib import Path
 import pytest
 
 from issue_orchestrator.domain.models import AgentConfig
+from issue_orchestrator.execution.agent_runner_providers import (
+    sandbox as sandbox_module,
+)
+from issue_orchestrator.execution.agent_runner_providers.sandbox import (
+    GitWorktreeAccess,
+)
+
+
+@pytest.fixture(autouse=True)
+def _linked_worktree_git_access(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _resolve(worktree: Path) -> GitWorktreeAccess:
+        common_dir = Path("/repo/.git")
+        return GitWorktreeAccess(
+            git_dir=common_dir / "worktrees" / worktree.name,
+            common_dir=common_dir,
+            head_ref=common_dir / "refs" / "heads" / f"{worktree.name}-branch",
+        )
+
+    monkeypatch.setattr(sandbox_module, "resolve_git_worktree_access", _resolve)
 
 
 def _agent(*, sandbox: bool) -> AgentConfig:
@@ -53,7 +72,11 @@ def test_opted_out_command_keeps_bypass_and_no_sandbox() -> None:
 
 def test_opted_out_command_is_stable_across_calls() -> None:
     agent = _agent(sandbox=False)
-    kwargs = dict(worktree=Path("/wt/issue-42"), task_kind="code", prompt_file=".prompts/backend.md")
+    kwargs = dict(
+        worktree=Path("/wt/issue-42"),
+        task_kind="code",
+        prompt_file=".prompts/backend.md",
+    )
     first = agent.get_command_for_prompt("do the work", **kwargs)
     second = agent.get_command_for_prompt("do the work", **kwargs)
     assert first == second
@@ -91,9 +114,11 @@ def test_opted_in_coder_command_applies_sandbox() -> None:
     assert "bypassPermissions" not in cmd
 
     settings = _settings_from_command(cmd)
-    assert settings["sandbox"]["filesystem"]["allowWrite"] == [str(worktree)]
+    assert str(worktree) in settings["sandbox"]["filesystem"]["allowWrite"]
     assert settings["sandbox"]["enabled"] is True
-    assert {"name": "GITHUB_TOKEN", "mode": "deny"} in settings["sandbox"]["credentials"]["envVars"]
+    assert {"name": "GITHUB_TOKEN", "mode": "deny"} in settings["sandbox"][
+        "credentials"
+    ]["envVars"]
     assert "WebSearch" in settings["permissions"]["deny"]
 
 
@@ -108,7 +133,8 @@ def test_opted_in_reviewer_command_applies_sandbox() -> None:
     )
     assert "--permission-mode dontAsk" in cmd
     settings = _settings_from_command(cmd)
-    assert settings["sandbox"]["filesystem"]["allowRead"] == [str(worktree)]
+    assert str(worktree) in settings["sandbox"]["filesystem"]["allowRead"]
+    assert "/repo/.git" not in settings["sandbox"]["filesystem"]["allowWrite"]
 
 
 def test_opted_in_worktree_path_flows_into_settings() -> None:

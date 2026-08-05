@@ -56,8 +56,9 @@ from ...domain.artifact_contracts import ValidationFailed, ValidationPassed
 from ...domain.session_run import ValidationArtifactPaths
 from ...execution.run_evidence import RunEvidenceRecorder
 from ...execution.session_output_adapter import FileSystemSessionOutput
-from .orchestrator_resume import (
+from .agent_callback import (
     api_request_headers as _api_request_headers,
+    resolve_control_api_port as _resolve_control_api_port,
 )
 
 
@@ -643,9 +644,9 @@ def run_preflight_push_check(worktree: Path, verbose: bool = False) -> tuple[boo
     import urllib.request
     import urllib.error
 
-    # Get orchestrator port from environment
-    # Support prefixed orchestrator env var first, with legacy fallback.
-    port = get_env("API_PORT") or os.environ.get("ORCHESTRATOR_API_PORT")
+    # Resolved by the shared agent-callback owner, which treats the
+    # ``0`` auto-assign sentinel as unset (#6913).
+    port = _resolve_control_api_port()
     if not port:
         # No port configured - skip preflight check
         # This happens when running coding-done/reviewer-done outside orchestrator context

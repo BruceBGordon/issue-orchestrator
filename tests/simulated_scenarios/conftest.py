@@ -17,6 +17,7 @@ from issue_orchestrator.execution.agent_runner import AgentRunner, AgentSpec
 from issue_orchestrator.ports.working_copy import (
     BranchPathsResult,
     BranchStatus,
+    BranchTextFilesResult,
     CommitInfo,
     DiffResult,
     PreflightResult,
@@ -185,6 +186,7 @@ def _stub_persistent_review_exchange_setup(monkeypatch, request):
         max_no_progress,
         require_validation,
         initial_validation_record_path=None,
+        approval_gate=None,
         web_port=None,  # noqa: ARG001
         nit_policy="surface",
         events=None,
@@ -268,6 +270,13 @@ def _stub_persistent_review_exchange_setup(monkeypatch, request):
                 response_type = "changes_requested"
                 response_text = "Validation record missing or failed"
                 getting_closer = False
+
+            if response_type == "ok" and approval_gate is not None:
+                rejection_reason = approval_gate.rejection_reason()
+                if rejection_reason is not None:
+                    response_type = "changes_requested"
+                    response_text = f"{rejection_reason} Address it and continue."
+                    getting_closer = False
 
             reviewer = ReviewExchangeResponse(
                 response_type=response_type,
@@ -626,6 +635,11 @@ class StubWorkingCopy:
 
     def diff_against_base(self, worktree: Path, base_ref: str) -> DiffResult:
         return DiffResult(success=True, diff_text="")
+
+    def read_branch_text_files(
+        self, worktree: Path, paths: tuple[str, ...]
+    ) -> BranchTextFilesResult:
+        return BranchTextFilesResult(success=True)
 
     def branch_post_image_paths_against_base(
         self, worktree: Path, base_ref: str

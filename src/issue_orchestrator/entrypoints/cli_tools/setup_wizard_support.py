@@ -8,7 +8,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
 
-from ...ports import RepositoryHost
 from ..setup_wizard_common import (
     FileCollector,
     detect_repo as detect_repo,
@@ -94,9 +93,6 @@ class DetectedState:
 RunGit = Callable[[list[str]], tuple[bool, str]]
 ProviderLister = Callable[[], list[str]]
 ProviderGetter = Callable[[str], "SetupProvider"]
-RepositoryHostFactory = Callable[[str], RepositoryHost]
-
-
 class SetupProvider(Protocol):
     def is_available(self) -> bool:
         """Return whether this provider can run on the current machine."""
@@ -194,52 +190,13 @@ def print_changes_summary(
         prompter.print("\nFiles: (none)")
 
     if collector.labels:
-        prompter.print("\nGitHub labels to create:")
+        prompter.print("\nGitHub labels to ensure:")
         for name, _color, desc in collector.labels:
             prompter.print(f"  • {name} - {desc}")
     else:
-        prompter.print("\nGitHub labels: (none - all exist)")
+        prompter.print("\nGitHub labels: (none planned)")
 
     prompter.print("")
-
-
-def apply_changes(
-    collector: FileCollector,
-    repo: str | None,
-    prompter: Prompter,
-    repository_host_factory: RepositoryHostFactory,
-) -> None:
-    """Apply all collected changes."""
-    # Write files.
-    for write in collector.writes:
-        write.path.parent.mkdir(parents=True, exist_ok=True)
-        if write.action == "append":
-            with open(write.path, "a") as f:
-                f.write(write.content)
-        else:
-            write.path.write_text(write.content)
-        prompter.print(f"  ✓ {write.action.title()}d {write.path}")
-
-    # Create labels.
-    if collector.labels and repo:
-        try:
-            client = repository_host_factory(repo)
-            for name, color, desc in collector.labels:
-                client.create_label(name, color=color, description=desc, force=True)
-        except Exception as exc:
-            prompter.print("\n✗ Failed to create GitHub labels.")
-            prompter.print(f"  Repo: {repo}")
-            prompter.print(f"  Detail: {exc}")
-            prompter.print(
-                "  Verify your token can access this repo, then rerun "
-                "`issue-orchestrator doctor`."
-            )
-            prompter.print(
-                "  If you need to store a token locally, run "
-                "`issue-orchestrator auth store`."
-            )
-            raise SystemExit(1) from exc
-        prompter.print(f"  ✓ Created {len(collector.labels)} GitHub labels")
 
 
 def setup_ai_providers(prompter: Prompter) -> None:

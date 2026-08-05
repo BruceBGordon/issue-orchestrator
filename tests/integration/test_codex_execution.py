@@ -20,6 +20,7 @@ pytestmark = [
     pytest.mark.integration,
     pytest.mark.live,
     pytest.mark.xdist_group("codex"),
+    pytest.mark.usefixtures("isolated_codex_home"),
 ]
 
 from issue_orchestrator.infra.env import ENV_PREFIX

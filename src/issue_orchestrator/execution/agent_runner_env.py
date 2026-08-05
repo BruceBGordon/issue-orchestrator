@@ -93,8 +93,10 @@ ALWAYS_PASSTHROUGH_ENV_VARS: list[str] = [
     "ISSUE_ORCHESTRATOR_PYTHON",
     # Scoped bearer token for the loopback Control API (security
     # #5987 F3). Agent subprocesses call back into the orchestrator
-    # for preflight-push and session-resume; this token authorizes
-    # ONLY those routes in ``control_api._AGENT_CALLBACK_ROUTES``.
+    # for preflight-push, exchange-respond and session-resume; this
+    # token authorizes ONLY the routes allowed by
+    # ``_auth_middleware.is_agent_callback_route``, which every serving
+    # surface shares.
     #
     # Scope note: the admin token is scrubbed from agent env, but a
     # deliberately malicious agent running as the same user can still

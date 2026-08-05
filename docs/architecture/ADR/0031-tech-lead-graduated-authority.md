@@ -254,6 +254,123 @@ from the recorded authority; context failures exceeding the grant are expected
 and are not tampering. Execution-time precondition checks still apply
 independently to each cohort action.
 
+### 4a. Finding promotion: the actuation lane for case files (#6957 amendment)
+
+Pattern case files (#6781) accrue evidence but had no way to become work: a
+correctly diagnosed orchestrator bug sat in a case file until a human noticed
+the symptoms and hand-carried the finding into a fix, and
+`tech_lead_shipped_fixes` never had a row. §2's gated op proposals already
+solve per-instance consent for consequential tech-lead *acts*; this is the
+equivalent lane for *findings*.
+
+Configuration lives under `tech_lead.findings`:
+
+```yaml
+tech_lead:
+  findings:
+    promote: gated            # off | gated | auto   (default: gated)
+    min_evidence: 2           # observations before promotion eligibility
+    max_open_promoted: 3      # per target repo, cap on in-flight promotions
+    route:                    # area label -> target that owns the fix
+      completion-pipeline: issue-orchestrator/issue-orchestrator
+      review-exchange:        # a target whose queue filters on its own labels
+        repo: issue-orchestrator/issue-orchestrator
+        scope_label: io-scope
+        agent_label: agent:backend
+      default: self
+```
+
+A route names more than a repository: an issue is only RUNNABLE in its target
+when it carries that target's scheduling labels. A `self` route inherits the
+managed repo's own contract (`filtering.label` plus
+`review.tech_lead_follow_up_agent`) and may not redeclare it; a foreign target
+declares its own, because the source repo's scope label means nothing there.
+
+Lifecycle: **flag** (unchanged) → **promote** → **gate** → **run** (the target
+repo's own pipeline, unchanged) → **close the loop**.
+
+On the tick a signature crosses `min_evidence`, has no promotion row, fits its
+routed target's cap, and is classified `fix:code`, the orchestrator files ONE
+issue in the routed repo carrying `proposed-tech-lead` plus the route's full
+scheduling contract (worker agent + scope label) and the area label. Removing
+the gate label is the operator's whole approval — the issue is then discoverable
+by the target's unchanged pipeline with nothing else missing. Closing the issue
+is a decline, recorded permanently so it is never re-filed. When a promoted
+issue closes and the pull request GitHub records as its CLOSER is merged, the
+source orchestrator writes the `tech_lead_shipped_fixes` row, comments the fix
+reference on the case file, and closes it. Merely being mentioned by a merged
+PR is not closing linkage and never counts as a shipped fix — and only the
+NEWEST close counts, so an issue closed by a merge, reopened, then closed by
+hand is a decline.
+
+`min_evidence` counts DISTINCT observations. Each `flag_pattern` observation
+carries a stable identity — its source run, session, and decision action — and
+the durable ledger records it create-once, so replaying a partially applied
+decision after a crash can repeat an evidence comment but can never advance the
+count twice.
+
+Both cross-system creations — a case file, and a promotion filing — record a
+durable **creation intent before the remote create** and finalize from THAT.
+The GitHub issue exists before its ledger row does, and a marker lookup can find
+the orphan again but cannot say which command wrote it; the retry is not
+guaranteed to be the same command, because an ordinary finalization failure is
+just a failed action and the next observation of that signature can be the one
+that recovers it. So the intent carries what only the original command knew: for
+a case file, the body's observation identity, classification, area, and
+diagnosis; for a promotion, the evidence watermark its body documents. The
+recovering action is then handled separately, as an ordinary append. An orphan
+with no intent is durable-state loss rather than a crash window, and the lane
+stops rather than guessing its metadata.
+
+Because the intent is durable and `route` is ordinary editable configuration, an
+operator can re-point an area while a filing is in flight — without the
+signature's area changing at all. A recovery-only lookup in the intent's own
+repo settles that: if the old route's issue exists it IS the promotion (one
+signature promotes exactly once, so the recorded target stays authoritative and
+the new route does not apply to it); if it is proven absent the stale intent is
+retired and the current route takes over; if the lookup fails, nothing is
+created and the next tick tries again. A re-routed signature is never stranded.
+
+A signature's `fix_class` and `area` are immutable once recorded: an
+unclassified row may be upgraded once, identical values are idempotent, and a
+conflicting classification is rejected — before any action is produced, so no
+evidence comment or sibling effect from that decision is ever applied. Planning
+receives the full durable row precisely so the conflict is caught there rather
+than mid-write.
+
+Constraints that make this safe to leave on:
+
+- **`fix:code` only.** The tech lead classifies each `flag_pattern` at flag
+  time. A `fix:human` or unclassified finding is never promoted — a
+  human-gated problem made runnable manufactures doomed rework.
+- **At most one issue per signature, ever**, in either direction: a durable
+  ledger keyed by signature carries promoted/declined/shipped, and later
+  observations comment on the promoted issue rather than re-filing.
+- **`max_open_promoted` is per-target work-in-progress backpressure**, and it
+  bounds the lane's API cost too — loop closure polls at most that many issues
+  per target PER TICK, enforced by a read budget rather than implied by the
+  cap. The durable ledger outlives the setting, so lowering the cap (or
+  restarting after a larger cohort was filed) slows coverage — the budget
+  rotates so no in-flight promotion starves — instead of exceeding the budget.
+- **Only reads cross repositories.** Every write the source orchestrator makes
+  (case-file comment/close, shipped-fix memory, ledger state) lands in its own
+  repo; the cross-repo writes are exactly two — create the issue, comment on
+  it — behind a narrow port with no approve/merge/close capability.
+- **Route targets are validated at startup**, not at promotion time: a target
+  the token cannot file issues in is a loud doctor error rather than a lost
+  actuation on the tick a pattern finally firms up.
+- **One activation/readiness decision**, consumed by configuration validation,
+  doctor, fact gathering, and route resolution alike. The lane is active only
+  with a promotion mode other than `off`, a configured repository, AND a
+  configured tech-lead agent — removing the tech lead turns the lane off
+  completely, including its cross-repo reads, and the durable rows are kept so
+  re-enabling resumes where it stopped. An active lane's remaining dependencies
+  (a follow-up worker agent for any route that carries this repo's label) are
+  startup errors, never tick-time exceptions.
+- **`self`-routed promotions face the managed repo's own gates.** They carry
+  its scope label so they are discoverable, and every other gate (dependencies,
+  claims, review) applies unchanged. Promotion files issues, full stop.
+
 ### 5. Sequencing and scope boundaries
 
 Hygiene precedes construction: the dead batch-trigger engine and its

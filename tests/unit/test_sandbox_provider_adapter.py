@@ -25,14 +25,14 @@ from issue_orchestrator.execution.agent_runner_providers.codex import CodexProvi
 from issue_orchestrator.execution.agent_runner_providers.sandbox import (
     MODEL_API_DOMAINS,
     CODEX_PERMISSION_PROFILE,
-    CodexGitWorktreeAccess,
+    GitWorktreeAccess,
     ClaudeSandboxAdapter,
     CodexSandboxAdapter,
     ProviderSandboxAdapter,
     build_claude_sandbox_argv,
     build_claude_sandbox_settings,
     build_codex_sandbox_argv,
-    resolve_codex_git_worktree_access,
+    resolve_git_worktree_access,
     validate_codex_permission_profile_compatibility,
 )
 from issue_orchestrator.execution.agent_runner_providers import (
@@ -194,12 +194,14 @@ def test_native_file_tools_deny_each_secret_path() -> None:
     # ``sandbox-exec -p`` argument and risks E2BIG, which breaks all sandboxed Bash.
     deny = build_claude_sandbox_settings(_scope())["permissions"]["deny"]
     assert not any(e.startswith(("Write(", "Grep(", "Glob(", "Edit(~")) for e in deny)
-    assert not any(e.endswith("/**)") and not e.startswith("Edit(//wt/") for e in deny), (
-        f"no secret deny should carry a /** glob variant: {deny}"
-    )
+    assert not any(
+        e.endswith("/**)") and not e.startswith("Edit(//wt/") for e in deny
+    ), f"no secret deny should carry a /** glob variant: {deny}"
     for path in ("~/.ssh", "~/.issue-orchestrator"):
         assert f"Read({path})" in deny, f"missing Read({path})"
-        assert f"Edit({path})" not in deny, f"redundant Edit({path}) (writes are worktree-confined)"
+        assert f"Edit({path})" not in deny, (
+            f"redundant Edit({path}) (writes are worktree-confined)"
+        )
 
 
 def test_anti_self_modification_denies_policy_files() -> None:
@@ -257,7 +259,9 @@ def test_generated_deny_rule_count_is_bounded() -> None:
     settings = build_claude_sandbox_settings(big)
     deny = settings["permissions"]["deny"]
     # One Read() per secret + a couple of self-config Edit denies + egress denies.
-    assert len(deny) <= len(big.deny_read_files) + 8, f"deny rule count unbounded: {len(deny)}"
+    assert len(deny) <= len(big.deny_read_files) + 8, (
+        f"deny rule count unbounded: {len(deny)}"
+    )
     # No rule may fan out into globbed subpaths (what triggers Claude's filesystem
     # expansion and the E2BIG blowup).
     assert not any(r.endswith("/**)") and not r.startswith("Edit(//wt/") for r in deny)
@@ -284,10 +288,18 @@ def test_claude_argv_carries_inline_settings_json() -> None:
     assert payload["sandbox"]["filesystem"]["allowWrite"] == ["/wt/issue-42"]
 
 
-def test_claude_adapter_implements_port() -> None:
+def test_claude_adapter_implements_port(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        sandbox_module,
+        "resolve_git_worktree_access",
+        lambda _worktree: _git_access(),
+    )
     adapter = ClaudeSandboxAdapter()
     assert isinstance(adapter, ProviderSandboxAdapter)
-    assert adapter.apply_scope(_scope()) == build_claude_sandbox_argv(_scope())
+    assert adapter.apply_scope(_scope()) == build_claude_sandbox_argv(
+        _scope(),
+        git_access=_git_access(),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -295,13 +307,47 @@ def test_claude_adapter_implements_port() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _git_access() -> CodexGitWorktreeAccess:
+def _git_access() -> GitWorktreeAccess:
     common_dir = Path("/repo/.git")
-    return CodexGitWorktreeAccess(
+    return GitWorktreeAccess(
         git_dir=common_dir / "worktrees" / "issue-42",
         common_dir=common_dir,
         head_ref=common_dir / "refs" / "heads" / "42-fix",
     )
+
+
+def test_claude_settings_grant_only_current_linked_worktree_git_writes() -> None:
+    settings = build_claude_sandbox_settings(
+        _scope(),
+        git_access=_git_access(),
+    )
+    filesystem = settings["sandbox"]["filesystem"]
+
+    assert "/repo/.git" in filesystem["allowRead"]
+    assert "/repo/.git" not in filesystem["allowWrite"]
+    for path in (
+        "/repo/.git/worktrees/issue-42",
+        "/repo/.git/objects",
+        "/repo/.git/refs/heads/42-fix",
+        "/repo/.git/refs/heads/42-fix.lock",
+        "/repo/.git/logs/refs/heads/42-fix",
+        "/repo/.git/logs/refs/heads/42-fix.lock",
+    ):
+        assert path in filesystem["allowWrite"]
+
+    for path in (
+        "/repo/.git/worktrees/issue-42/HEAD",
+        "/repo/.git/worktrees/issue-42/commondir",
+        "/repo/.git/worktrees/issue-42/gitdir",
+        "/repo/.git/worktrees/issue-42/config",
+        "/repo/.git/worktrees/issue-42/config.worktree",
+        "/repo/.git/objects/info",
+        "/repo/.git/objects/pack",
+    ):
+        assert path in filesystem["denyWrite"]
+
+    assert "/repo/.git/config" not in filesystem["allowWrite"]
+    assert "/repo/.git/refs/heads/main" not in filesystem["allowWrite"]
 
 
 def _codex_argv(scope: SandboxScope | None = None) -> list[str]:
@@ -321,7 +367,7 @@ def _codex_config_overrides(argv: list[str]) -> dict[str, object]:
 def test_codex_adapter_implements_port(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         sandbox_module,
-        "resolve_codex_git_worktree_access",
+        "resolve_git_worktree_access",
         lambda _worktree: _git_access(),
     )
     adapter = CodexSandboxAdapter()
@@ -395,7 +441,7 @@ def test_codex_profile_grants_only_current_linked_worktree_git_writes() -> None:
 
 def test_codex_profile_supports_detached_reviewer_worktree() -> None:
     linked = _git_access()
-    detached = CodexGitWorktreeAccess(
+    detached = GitWorktreeAccess(
         git_dir=linked.git_dir,
         common_dir=linked.common_dir,
         head_ref=None,
@@ -412,7 +458,7 @@ def test_codex_profile_supports_detached_reviewer_worktree() -> None:
 
 def test_codex_profile_grants_only_specific_non_linked_git_writes() -> None:
     common_dir = Path("/repo/.git")
-    access = CodexGitWorktreeAccess(
+    access = GitWorktreeAccess(
         git_dir=common_dir,
         common_dir=common_dir,
         head_ref=common_dir / "refs" / "heads" / "main",
@@ -467,7 +513,7 @@ def test_codex_resolves_linked_worktree_git_paths(tmp_path: Path) -> None:
         check=True,
     )
 
-    access = resolve_codex_git_worktree_access(worktree)
+    access = resolve_git_worktree_access(worktree)
 
     assert access.common_dir == (repo / ".git").resolve()
     assert access.git_dir.parent == (repo / ".git" / "worktrees").resolve()
@@ -612,7 +658,7 @@ def test_codex_build_command_places_scope_before_exec_and_ignores_yolo(
 ) -> None:
     monkeypatch.setattr(
         sandbox_module,
-        "resolve_codex_git_worktree_access",
+        "resolve_git_worktree_access",
         lambda _worktree: _git_access(),
     )
     cmd = CodexProvider().build_command(

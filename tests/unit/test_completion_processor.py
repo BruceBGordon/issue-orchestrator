@@ -32,6 +32,7 @@ from issue_orchestrator.domain.review_exchange_run import (
 )
 from issue_orchestrator.domain.review_exchange_summary import ReviewExchangeSummaryV1
 from issue_orchestrator.domain.runtime_config import RuntimeConfigReference
+from tests.callback_endpoint_helpers import ready_callback_endpoint
 from issue_orchestrator.control.completion_processor import (
     CompletionProcessor,
     ProcessingResult,
@@ -59,6 +60,8 @@ from issue_orchestrator.ports.review_artifact_reader import (
 )
 from issue_orchestrator.ports.working_copy import (
     BranchPathsResult,
+    BranchTextFile,
+    BranchTextFilesResult,
     DiffResult,
     PushResult,
 )
@@ -172,6 +175,25 @@ class _RunningReviewExchangeJobRunner:
         return []
 
 
+class _CapturingReviewExchangeRunner:
+    """Review-exchange port fake that records public ``run`` calls."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def run(self, **kwargs) -> ReviewExchangeOutcome:
+        self.calls.append(dict(kwargs))
+        return _review_exchange_outcome(
+            kwargs["exchange_run"],
+            status="ok",
+            rounds=1,
+            reason="reviewer_ok",
+        )
+
+    def job_timeout_seconds(self, **_kwargs) -> float:
+        return 60.0
+
+
 @pytest.fixture
 def mock_label_adapter():
     """Mock adapter for label operations."""
@@ -227,6 +249,9 @@ def mock_git_adapter():
     adapter.diff_against_base = Mock(
         return_value=DiffResult(success=True, diff_text="")
     )
+    adapter.read_branch_text_files = Mock(
+        return_value=BranchTextFilesResult(success=True)
+    )
     adapter.branch_post_image_paths_against_base = Mock(
         return_value=BranchPathsResult(success=True, paths=())
     )
@@ -240,9 +265,20 @@ def event_bus():
 
 
 @pytest.fixture
+def tech_lead_authority_store(tmp_path):
+    """Retained launch-authority collaborator for Tech Lead completion tests."""
+    from issue_orchestrator.infra.tech_lead_authority_store import (
+        SqliteTechLeadAuthorityStore,
+    )
+
+    return SqliteTechLeadAuthorityStore.for_repo(tmp_path)
+
+
+@pytest.fixture
 def processor(mock_label_adapter, mock_pr_adapter, mock_git_adapter, event_bus):
     """Create a CompletionProcessor with mocked adapters."""
     return CompletionProcessor(
+        agent_callback_endpoint=ready_callback_endpoint(),
         label_adapter=mock_label_adapter,
         pr_adapter=mock_pr_adapter,
         git_adapter=mock_git_adapter,
@@ -721,6 +757,7 @@ class TestReviewExchangeModeResolution:
 
     def _make_processor(self, config: Config) -> CompletionProcessor:
         return CompletionProcessor(
+            agent_callback_endpoint=ready_callback_endpoint(),
             label_adapter=Mock(spec=LabelAdapter),
             pr_adapter=Mock(spec=PRAdapter),
             git_adapter=Mock(spec=GitAdapter),
@@ -783,6 +820,7 @@ class TestReviewExchangeExecution:
 
         session_output = FileSystemSessionOutput()
         return CompletionProcessor(
+            agent_callback_endpoint=ready_callback_endpoint(),
             label_adapter=Mock(spec=LabelAdapter),
             pr_adapter=Mock(spec=PRAdapter),
             git_adapter=Mock(spec=GitAdapter),
@@ -808,6 +846,7 @@ class TestReviewExchangeExecution:
     ) -> None:
         config = self._make_config(tmp_path)
         processor = CompletionProcessor(
+            agent_callback_endpoint=ready_callback_endpoint(),
             label_adapter=mock_label_adapter,
             pr_adapter=mock_pr_adapter,
             git_adapter=mock_git_adapter,
@@ -864,6 +903,7 @@ class TestReviewExchangeExecution:
         config.review_exchange_mode = "via-local-loop"
         config.worktree_remediation_pr_collision = "reuse_open"
         processor = CompletionProcessor(
+            agent_callback_endpoint=ready_callback_endpoint(),
             label_adapter=mock_label_adapter,
             pr_adapter=mock_pr_adapter,
             git_adapter=mock_git_adapter,
@@ -936,6 +976,7 @@ class TestReviewExchangeExecution:
         config = self._make_config(tmp_path)
         config.review_exchange_mode = "via-local-loop"
         processor = CompletionProcessor(
+            agent_callback_endpoint=ready_callback_endpoint(),
             label_adapter=mock_label_adapter,
             pr_adapter=mock_pr_adapter,
             git_adapter=mock_git_adapter,
@@ -1007,6 +1048,7 @@ class TestReviewExchangeExecution:
         config = self._make_config(tmp_path)
         config.review_exchange_mode = "via-local-loop"
         processor = CompletionProcessor(
+            agent_callback_endpoint=ready_callback_endpoint(),
             label_adapter=mock_label_adapter,
             pr_adapter=mock_pr_adapter,
             git_adapter=mock_git_adapter,
@@ -1071,6 +1113,7 @@ class TestReviewExchangeExecution:
         config.review_exchange_mode = "via-local-loop"
         config.worktree_remediation_pr_collision = "reuse_open"
         processor = CompletionProcessor(
+            agent_callback_endpoint=ready_callback_endpoint(),
             label_adapter=mock_label_adapter,
             pr_adapter=mock_pr_adapter,
             git_adapter=mock_git_adapter,
@@ -1140,6 +1183,7 @@ class TestReviewExchangeExecution:
         config.review_exchange_mode = "via-local-loop"
         config.worktree_remediation_pr_collision = "reuse_open"
         processor = CompletionProcessor(
+            agent_callback_endpoint=ready_callback_endpoint(),
             label_adapter=mock_label_adapter,
             pr_adapter=mock_pr_adapter,
             git_adapter=mock_git_adapter,
@@ -1221,6 +1265,7 @@ class TestReviewExchangeExecution:
             "# Review Report\n\nNo issues.\n"
         )
         processor = CompletionProcessor(
+            agent_callback_endpoint=ready_callback_endpoint(),
             label_adapter=mock_label_adapter,
             pr_adapter=mock_pr_adapter,
             git_adapter=mock_git_adapter,
@@ -1333,6 +1378,7 @@ class TestReviewExchangeExecution:
         config = self._make_config(tmp_path)
         config.review_exchange_mode = "via-local-loop"
         processor = CompletionProcessor(
+            agent_callback_endpoint=ready_callback_endpoint(),
             label_adapter=mock_label_adapter,
             pr_adapter=mock_pr_adapter,
             git_adapter=mock_git_adapter,
@@ -1407,6 +1453,7 @@ class TestReviewExchangeExecution:
         config = self._make_config(tmp_path)
         config.review_exchange_mode = "via-local-loop"
         processor = CompletionProcessor(
+            agent_callback_endpoint=ready_callback_endpoint(),
             label_adapter=mock_label_adapter,
             pr_adapter=mock_pr_adapter,
             git_adapter=mock_git_adapter,
@@ -1508,6 +1555,7 @@ class TestReviewExchangeExecution:
         config = self._make_config(tmp_path)
         config.review_exchange_mode = "via-local-loop"
         processor = CompletionProcessor(
+            agent_callback_endpoint=ready_callback_endpoint(),
             label_adapter=mock_label_adapter,
             pr_adapter=mock_pr_adapter,
             git_adapter=mock_git_adapter,
@@ -1584,6 +1632,7 @@ class TestReviewExchangeExecution:
         config = self._make_config(tmp_path)
         config.review_exchange_mode = "via-local-loop"
         processor = CompletionProcessor(
+            agent_callback_endpoint=ready_callback_endpoint(),
             label_adapter=mock_label_adapter,
             pr_adapter=mock_pr_adapter,
             git_adapter=mock_git_adapter,
@@ -1648,6 +1697,7 @@ class TestReviewExchangeExecution:
     ) -> None:
         config = self._make_config(tmp_path)
         processor = CompletionProcessor(
+            agent_callback_endpoint=ready_callback_endpoint(),
             label_adapter=mock_label_adapter,
             pr_adapter=mock_pr_adapter,
             git_adapter=mock_git_adapter,
@@ -1754,6 +1804,7 @@ class TestReviewExchangeExecution:
         # narrates it as a replay rather than a fresh reviewer verdict.
         config = self._make_config(tmp_path)
         processor = CompletionProcessor(
+            agent_callback_endpoint=ready_callback_endpoint(),
             label_adapter=mock_label_adapter,
             pr_adapter=mock_pr_adapter,
             git_adapter=mock_git_adapter,
@@ -1880,6 +1931,7 @@ class TestReviewExchangeExecution:
         # ``"cached_summary"`` overwrite breaks both tests, not one.
         config = self._make_config(tmp_path)
         processor = CompletionProcessor(
+            agent_callback_endpoint=ready_callback_endpoint(),
             label_adapter=mock_label_adapter,
             pr_adapter=mock_pr_adapter,
             git_adapter=mock_git_adapter,
@@ -1972,6 +2024,7 @@ class TestReviewExchangeExecution:
     ) -> None:
         config = self._make_config(tmp_path)
         processor = CompletionProcessor(
+            agent_callback_endpoint=ready_callback_endpoint(),
             label_adapter=mock_label_adapter,
             pr_adapter=mock_pr_adapter,
             git_adapter=mock_git_adapter,
@@ -2054,6 +2107,7 @@ class TestReviewExchangeExecution:
         config = self._make_config(tmp_path)
         session_output = FileSystemSessionOutput()
         processor = CompletionProcessor(
+            agent_callback_endpoint=ready_callback_endpoint(),
             label_adapter=mock_label_adapter,
             pr_adapter=mock_pr_adapter,
             git_adapter=mock_git_adapter,
@@ -2201,6 +2255,9 @@ class TestReviewExchangeExecution:
             event_bus=EventBus(),
             label_config={},
             config=config,
+            # This test drives a real exchange, so it reaches the
+            # callback endpoint and must inject one.
+            agent_callback_endpoint=ready_callback_endpoint(),
         )
 
         exchange_run = ReviewExchangeRun(
@@ -2590,6 +2647,9 @@ class TestTechLeadCompletionEffects:
         mock_pr_adapter,
         mock_git_adapter,
         event_bus,
+        *,
+        review_exchange_runner=None,
+        tech_lead_authority=None,
     ) -> CompletionProcessor:
         prompt = tmp_path / "tech-lead.md"
         prompt.write_text("Tech Lead prompt")
@@ -2600,20 +2660,31 @@ class TestTechLeadCompletionEffects:
             "agent:tech-lead": AgentConfig(prompt_path=prompt),
             "agent:coder": AgentConfig(prompt_path=prompt),
         }
+        if review_exchange_runner is not None:
+            config.review_enabled = True
+            config.review_exchange_mode = "via-local-loop"
+            config.review_exchange_require_validation = False
+            config.code_review_agent = "agent:reviewer"
+            config.config_path = _write_test_config(tmp_path)
+            config.agents["agent:reviewer"] = AgentConfig(prompt_path=prompt)
         mock_git_adapter.default_branch.return_value = "main"
         from issue_orchestrator.infra.tech_lead_authority_store import (
             SqliteTechLeadAuthorityStore,
         )
 
+        if tech_lead_authority is None:
+            tech_lead_authority = SqliteTechLeadAuthorityStore.for_repo(tmp_path)
         return CompletionProcessor(
+            agent_callback_endpoint=ready_callback_endpoint(),
             label_adapter=mock_label_adapter,
             pr_adapter=mock_pr_adapter,
             git_adapter=mock_git_adapter,
             session_output=FileSystemSessionOutput(),
+            review_exchange_runner=review_exchange_runner,
             event_bus=event_bus,
             label_config={},
             config=config,
-            tech_lead_authority=SqliteTechLeadAuthorityStore.for_repo(tmp_path),
+            tech_lead_authority=tech_lead_authority,
         )
 
     @staticmethod
@@ -2639,10 +2710,10 @@ class TestTechLeadCompletionEffects:
             agent_label=agent_label,
         )
 
-    def _armed_run_assets(self, processor, worktree):
+    def _armed_run_assets(self, authority_store, worktree):
         """Run assets with launch authority + valid empty-audit pair."""
         run_assets = make_session_run_assets(worktree)
-        self._arm_authority(processor, run_assets)
+        self._record_launch_authority(authority_store, run_assets)
         self._plant_valid_pair(run_assets.run_dir)
         return run_assets
 
@@ -2653,16 +2724,22 @@ class TestTechLeadCompletionEffects:
         mock_pr_adapter,
         mock_git_adapter,
         event_bus,
+        tech_lead_authority_store,
         worktree_with_completion,
     ):
         """No-change audit: NoCommitsBetweenError is success, no labels/comment."""
         processor = self._make_processor(
-            tmp_path, mock_label_adapter, mock_pr_adapter, mock_git_adapter, event_bus
+            tmp_path,
+            mock_label_adapter,
+            mock_pr_adapter,
+            mock_git_adapter,
+            event_bus,
+            tech_lead_authority=tech_lead_authority_store,
         )
         processor._emit_publish_failed = MagicMock()  # noqa: SLF001
         mock_pr_adapter.create_pr.side_effect = self.NO_COMMITS_ERROR
         worktree = worktree_with_completion(self._completed_record())
-        run_assets = self._armed_run_assets(processor, worktree)
+        run_assets = self._armed_run_assets(tech_lead_authority_store, worktree)
 
         result = self._process(
             processor, worktree, agent_label="agent:tech-lead", run_assets=run_assets
@@ -2681,14 +2758,20 @@ class TestTechLeadCompletionEffects:
         mock_pr_adapter,
         mock_git_adapter,
         event_bus,
+        tech_lead_authority_store,
         worktree_with_completion,
     ):
         """Changed audit: PR is created, but the completion comment is dropped."""
         processor = self._make_processor(
-            tmp_path, mock_label_adapter, mock_pr_adapter, mock_git_adapter, event_bus
+            tmp_path,
+            mock_label_adapter,
+            mock_pr_adapter,
+            mock_git_adapter,
+            event_bus,
+            tech_lead_authority=tech_lead_authority_store,
         )
         worktree = worktree_with_completion(self._completed_record())
-        run_assets = self._armed_run_assets(processor, worktree)
+        run_assets = self._armed_run_assets(tech_lead_authority_store, worktree)
 
         result = self._process(
             processor, worktree, agent_label="agent:tech-lead", run_assets=run_assets
@@ -2747,7 +2830,7 @@ class TestTechLeadCompletionEffects:
     # --- #6761 finding 3 + re-review finding 1: processing-path validation --
 
     @staticmethod
-    def _arm_authority(processor, run_assets):
+    def _record_launch_authority(authority_store, run_assets):
         """Record launch authority + matching worktree assignment (empty batch)."""
         import json as _json
 
@@ -2768,7 +2851,7 @@ class TestTechLeadCompletionEffects:
             run_dir / "tech-lead-data" / TECH_LEAD_ASSIGNMENT_FILENAME
         )
         manifest_path.write_text(_json.dumps(manifest))
-        processor._tech_lead_authority.record(  # noqa: SLF001
+        authority_store.record(
             run_id=run_assets.run_id,
             session_name=run_assets.session_name,
             authority=TechLeadLaunchAuthority(
@@ -2795,6 +2878,75 @@ class TestTechLeadCompletionEffects:
         )
         (data_dir / "tech-lead-report.md").write_text("# Report\n\nNothing found.\n")
 
+    def test_tech_lead_completion_supplies_approval_gate_to_review_pipeline(
+        self,
+        tmp_path,
+        mock_label_adapter,
+        mock_pr_adapter,
+        mock_git_adapter,
+        event_bus,
+        tech_lead_authority_store,
+        worktree_with_completion,
+    ):
+        """The completion producer classifies Tech Lead sessions and wires a gate."""
+        from issue_orchestrator.control.tech_lead_approval_gate import (
+            TechLeadDecisionApprovalGate,
+        )
+        review_runner = _CapturingReviewExchangeRunner()
+        processor = self._make_processor(
+            tmp_path,
+            mock_label_adapter,
+            mock_pr_adapter,
+            mock_git_adapter,
+            event_bus,
+            review_exchange_runner=review_runner,
+            tech_lead_authority=tech_lead_authority_store,
+        )
+        worktree = worktree_with_completion(self._completed_record())
+        run_assets = make_session_run_assets(worktree)
+        self._record_launch_authority(tech_lead_authority_store, run_assets)
+        self._plant_valid_pair(run_assets.run_dir)
+
+        result = self._process(
+            processor,
+            worktree,
+            agent_label="agent:tech-lead",
+            run_assets=run_assets,
+        )
+
+        assert result.success is True
+        assert len(review_runner.calls) == 1
+        gate = review_runner.calls[0]["approval_gate"]
+        assert isinstance(gate, TechLeadDecisionApprovalGate)
+        assert gate.rejection_reason() is None
+
+    def test_ordinary_completion_supplies_no_approval_gate(
+        self,
+        tmp_path,
+        mock_label_adapter,
+        mock_pr_adapter,
+        mock_git_adapter,
+        event_bus,
+        worktree_with_completion,
+    ):
+        """The completion producer must not attach Tech Lead policy to other agents."""
+        review_runner = _CapturingReviewExchangeRunner()
+        processor = self._make_processor(
+            tmp_path,
+            mock_label_adapter,
+            mock_pr_adapter,
+            mock_git_adapter,
+            event_bus,
+            review_exchange_runner=review_runner,
+        )
+        worktree = worktree_with_completion(self._completed_record())
+
+        result = self._process(processor, worktree, agent_label="agent:coder")
+
+        assert result.success is True
+        assert len(review_runner.calls) == 1
+        assert review_runner.calls[0]["approval_gate"] is None
+
     def test_completed_tech_lead_session_without_pair_records_critical_error(
         self,
         tmp_path,
@@ -2802,6 +2954,7 @@ class TestTechLeadCompletionEffects:
         mock_pr_adapter,
         mock_git_adapter,
         event_bus,
+        tech_lead_authority_store,
         worktree_with_completion,
     ):
         """Missing/invalid pair rejects the completion in the PRE-ACTION
@@ -2811,13 +2964,17 @@ class TestTechLeadCompletionEffects:
         from issue_orchestrator.control.completion_types import (
             ERROR_PREFIX_TECH_LEAD_DECISION,
         )
-
         processor = self._make_processor(
-            tmp_path, mock_label_adapter, mock_pr_adapter, mock_git_adapter, event_bus
+            tmp_path,
+            mock_label_adapter,
+            mock_pr_adapter,
+            mock_git_adapter,
+            event_bus,
+            tech_lead_authority=tech_lead_authority_store,
         )
         worktree = worktree_with_completion(self._completed_record())
         run_assets = make_session_run_assets(worktree)
-        self._arm_authority(processor, run_assets)
+        self._record_launch_authority(tech_lead_authority_store, run_assets)
 
         result = processor.process(
             worktree,
@@ -2884,6 +3041,7 @@ class TestTechLeadCompletionEffects:
         mock_pr_adapter,
         mock_git_adapter,
         event_bus,
+        tech_lead_authority_store,
         worktree_with_completion,
     ):
         """A worktree assignment copy that no longer mirrors the recorded
@@ -2897,12 +3055,16 @@ class TestTechLeadCompletionEffects:
             TechLeadAssignment,
             TechLeadSessionFlavor,
         )
-
         processor = self._make_processor(
-            tmp_path, mock_label_adapter, mock_pr_adapter, mock_git_adapter, event_bus
+            tmp_path,
+            mock_label_adapter,
+            mock_pr_adapter,
+            mock_git_adapter,
+            event_bus,
+            tech_lead_authority=tech_lead_authority_store,
         )
         worktree = worktree_with_completion(self._completed_record())
-        run_assets = self._armed_run_assets(processor, worktree)
+        run_assets = self._armed_run_assets(tech_lead_authority_store, worktree)
         # Agent flips its copy from batch review to a focused investigation.
         TechLeadAssignment(
             flavor=TechLeadSessionFlavor.FAILURE_INVESTIGATION,
@@ -2933,18 +3095,23 @@ class TestTechLeadCompletionEffects:
         mock_pr_adapter,
         mock_git_adapter,
         event_bus,
+        tech_lead_authority_store,
         worktree_with_completion,
     ):
         from issue_orchestrator.control.completion_types import (
             ERROR_PREFIX_TECH_LEAD_DECISION,
         )
-
         processor = self._make_processor(
-            tmp_path, mock_label_adapter, mock_pr_adapter, mock_git_adapter, event_bus
+            tmp_path,
+            mock_label_adapter,
+            mock_pr_adapter,
+            mock_git_adapter,
+            event_bus,
+            tech_lead_authority=tech_lead_authority_store,
         )
         worktree = worktree_with_completion(self._completed_record())
         run_assets = make_session_run_assets(worktree)
-        self._arm_authority(processor, run_assets)
+        self._record_launch_authority(tech_lead_authority_store, run_assets)
         self._plant_valid_pair(run_assets.run_dir)
 
         result = processor.process(
@@ -3266,6 +3433,7 @@ class TestCompletionProcessorDirtyPolicy:
         config = Config()
         config.validation.publish.dirty_check = "tracked"
         processor = CompletionProcessor(
+            agent_callback_endpoint=ready_callback_endpoint(),
             label_adapter=mock_label_adapter,
             pr_adapter=mock_pr_adapter,
             git_adapter=mock_git_adapter,
@@ -3314,6 +3482,7 @@ class TestCompletionProcessorDirtyPolicy:
         config = Config()
         config.validation.publish.dirty_check = "all"
         processor = CompletionProcessor(
+            agent_callback_endpoint=ready_callback_endpoint(),
             label_adapter=mock_label_adapter,
             pr_adapter=mock_pr_adapter,
             git_adapter=mock_git_adapter,
@@ -3359,6 +3528,7 @@ class TestCompletionProcessorDirtyPolicy:
         config = Config()
         config.validation.publish.dirty_check = "all"
         processor = CompletionProcessor(
+            agent_callback_endpoint=ready_callback_endpoint(),
             label_adapter=mock_label_adapter,
             pr_adapter=mock_pr_adapter,
             git_adapter=mock_git_adapter,
@@ -3397,6 +3567,7 @@ class TestCompletionProcessorDirtyPolicy:
         config = Config()
         config.validation.publish.dirty_check = "tracked"
         processor = CompletionProcessor(
+            agent_callback_endpoint=ready_callback_endpoint(),
             label_adapter=mock_label_adapter,
             pr_adapter=mock_pr_adapter,
             git_adapter=mock_git_adapter,
@@ -3444,6 +3615,7 @@ class TestCompletionProcessorDirtyPolicy:
         config = Config()
         config.validation.publish.dirty_check = "all"
         processor = CompletionProcessor(
+            agent_callback_endpoint=ready_callback_endpoint(),
             label_adapter=mock_label_adapter,
             pr_adapter=mock_pr_adapter,
             git_adapter=mock_git_adapter,
@@ -3484,6 +3656,7 @@ class TestCompletionProcessorDirtyPolicy:
         config = Config()
         config.validation.publish.dirty_check = "off"
         processor = CompletionProcessor(
+            agent_callback_endpoint=ready_callback_endpoint(),
             label_adapter=mock_label_adapter,
             pr_adapter=mock_pr_adapter,
             git_adapter=mock_git_adapter,
@@ -3627,6 +3800,7 @@ class TestCompletionProcessorPublishGate:
     ):
         """Processor with publish gate configured."""
         return CompletionProcessor(
+            agent_callback_endpoint=ready_callback_endpoint(),
             label_adapter=mock_label_adapter,
             pr_adapter=mock_pr_adapter,
             git_adapter=mock_git_adapter,
@@ -3900,6 +4074,7 @@ class TestCompletionProcessorPublishGate:
         worktree_with_completion,
     ):
         processor = CompletionProcessor(
+            agent_callback_endpoint=ready_callback_endpoint(),
             label_adapter=mock_label_adapter,
             pr_adapter=mock_pr_adapter,
             git_adapter=mock_git_adapter,
@@ -3948,6 +4123,7 @@ class TestCompletionProcessorPublishGate:
             ran=True,
         )
         processor = CompletionProcessor(
+            agent_callback_endpoint=ready_callback_endpoint(),
             label_adapter=mock_label_adapter,
             pr_adapter=mock_pr_adapter,
             git_adapter=mock_git_adapter,
@@ -3996,6 +4172,7 @@ class TestCompletionProcessorPublishGate:
             )
         )
         processor = CompletionProcessor(
+            agent_callback_endpoint=ready_callback_endpoint(),
             label_adapter=mock_label_adapter,
             pr_adapter=mock_pr_adapter,
             git_adapter=mock_git_adapter,
@@ -4044,7 +4221,20 @@ class TestCompletionProcessorPublishGate:
                 "+        assumeTrue(PostgresTestSupport.isAvailable())\n"
             ),
         )
+        mock_git_adapter.read_branch_text_files.return_value = BranchTextFilesResult(
+            success=True,
+            files=(
+                BranchTextFile(
+                    path="src/test/kotlin/FooTest.kt",
+                    content=(
+                        "\n" * 20
+                        + "        assumeTrue(PostgresTestSupport.isAvailable())\n"
+                    ),
+                ),
+            ),
+        )
         processor = CompletionProcessor(
+            agent_callback_endpoint=ready_callback_endpoint(),
             label_adapter=mock_label_adapter,
             pr_adapter=mock_pr_adapter,
             git_adapter=mock_git_adapter,
@@ -4068,10 +4258,201 @@ class TestCompletionProcessorPublishGate:
         assert not result.success
         assert result.failure_kind == "validation_failed"
         assert "Newly added test-skip guard" in result.message
+        mock_git_adapter.read_branch_text_files.assert_called_once_with(
+            worktree, ("src/test/kotlin/FooTest.kt",)
+        )
         mock_publish_gate.check.assert_not_called()
         mock_git_adapter.push.assert_not_called()
         mock_pr_adapter.create_pr.assert_not_called()
         mock_label_adapter.add_label.assert_called_once_with(123, "validation-failed")
+
+    def test_test_skip_guard_uses_branch_tip_multiline_context(
+        self,
+        processor,
+        mock_git_adapter,
+        worktree_with_completion,
+    ):
+        mock_git_adapter.diff_against_base.return_value = DiffResult(
+            success=True,
+            diff_text=(
+                "diff --git a/tests/test_guard.py b/tests/test_guard.py\n"
+                "--- a/tests/test_guard.py\n"
+                "+++ b/tests/test_guard.py\n"
+                "@@ -10,0 +11,1 @@\n"
+                '+pytest.skip("fixture text")\n'
+            ),
+        )
+        mock_git_adapter.read_branch_text_files.return_value = BranchTextFilesResult(
+            success=True,
+            files=(
+                BranchTextFile(
+                    path="tests/test_guard.py",
+                    content=(
+                        "\n" * 9
+                        + 'fixture = """documentation\n'
+                        + 'pytest.skip("fixture text")\n'
+                        + '"""\n'
+                    ),
+                ),
+            ),
+        )
+        record = make_record(
+            outcome=CompletionOutcome.COMPLETED,
+            requested_actions=[RequestedAction.PUSH_BRANCH],
+        )
+        worktree = worktree_with_completion(record)
+
+        result = processor.process(
+            worktree,
+            run_assets=make_session_run_assets(worktree),
+            issue_number=123,
+            issue_title="Test",
+        )
+
+        assert result.success
+        mock_git_adapter.read_branch_text_files.assert_called_once_with(
+            worktree, ("tests/test_guard.py",)
+        )
+        mock_git_adapter.push.assert_called_once()
+
+    @pytest.mark.parametrize(
+        ("branch_files_result", "expected_message"),
+        [
+            (
+                BranchTextFilesResult(
+                    success=False,
+                    error="fatal: path missing from HEAD",
+                ),
+                "Could not read branch-tip test files",
+            ),
+            (
+                BranchTextFilesResult(
+                    success=True,
+                    files=(
+                        BranchTextFile(
+                            path="tests/test_guard.py",
+                            content='\npytest.skip("different text")\n',
+                        ),
+                    ),
+                ),
+                "Branch-tip content does not match diff",
+            ),
+        ],
+    )
+    def test_test_skip_guard_branch_tip_failure_fails_closed(
+        self,
+        processor,
+        mock_git_adapter,
+        worktree_with_completion,
+        branch_files_result,
+        expected_message,
+    ):
+        mock_git_adapter.diff_against_base.return_value = DiffResult(
+            success=True,
+            diff_text=(
+                "diff --git a/tests/test_guard.py b/tests/test_guard.py\n"
+                "--- a/tests/test_guard.py\n"
+                "+++ b/tests/test_guard.py\n"
+                "@@ -1,0 +2,1 @@\n"
+                '+pytest.skip("real skip")\n'
+            ),
+        )
+        mock_git_adapter.read_branch_text_files.return_value = branch_files_result
+        record = make_record(
+            outcome=CompletionOutcome.COMPLETED,
+            requested_actions=[RequestedAction.PUSH_BRANCH],
+        )
+        worktree = worktree_with_completion(record)
+
+        result = processor.process(
+            worktree,
+            run_assets=make_session_run_assets(worktree),
+            issue_number=123,
+            issue_title="Test",
+        )
+
+        assert not result.success
+        assert expected_message in result.message
+        mock_git_adapter.push.assert_not_called()
+
+    def test_test_skip_guard_unparsable_diff_fails_closed(
+        self,
+        processor,
+        mock_git_adapter,
+        worktree_with_completion,
+    ):
+        mock_git_adapter.diff_against_base.return_value = DiffResult(
+            success=True,
+            diff_text=(
+                "diff --git a/tests/test_guard.py b/tests/test_guard.py\n"
+                "--- a/tests/test_guard.py\n"
+                "+++ b/tests/test_guard.py\n"
+                "@@@ -1,1 -1,1 +1,1 @@@\n"
+                '+pytest.skip("real skip")\n'
+            ),
+        )
+        record = make_record(
+            outcome=CompletionOutcome.COMPLETED,
+            requested_actions=[RequestedAction.PUSH_BRANCH],
+        )
+        worktree = worktree_with_completion(record)
+
+        result = processor.process(
+            worktree,
+            run_assets=make_session_run_assets(worktree),
+            issue_number=123,
+            issue_title="Test",
+        )
+
+        assert not result.success
+        assert "Could not parse branch diff for banned test skips" in result.message
+        mock_git_adapter.read_branch_text_files.assert_not_called()
+        mock_git_adapter.push.assert_not_called()
+
+    def test_test_skip_guard_scans_source_resembling_diff_headers(
+        self,
+        processor,
+        mock_git_adapter,
+        worktree_with_completion,
+    ):
+        mock_git_adapter.diff_against_base.return_value = DiffResult(
+            success=True,
+            diff_text=(
+                "diff --git a/tests/test_guard.py b/tests/test_guard.py\n"
+                "--- a/tests/test_guard.py\n"
+                "+++ b/tests/test_guard.py\n"
+                "@@ -0,0 +1,1 @@\n"
+                '+++pytest.skip("real skip")\n'
+            ),
+        )
+        mock_git_adapter.read_branch_text_files.return_value = BranchTextFilesResult(
+            success=True,
+            files=(
+                BranchTextFile(
+                    path="tests/test_guard.py",
+                    content='++pytest.skip("real skip")\n',
+                ),
+            ),
+        )
+        record = make_record(
+            outcome=CompletionOutcome.COMPLETED,
+            requested_actions=[RequestedAction.PUSH_BRANCH],
+        )
+        worktree = worktree_with_completion(record)
+
+        result = processor.process(
+            worktree,
+            run_assets=make_session_run_assets(worktree),
+            issue_number=123,
+            issue_title="Test",
+        )
+
+        assert not result.success
+        assert "Newly added test-skip guard" in result.message
+        mock_git_adapter.read_branch_text_files.assert_called_once_with(
+            worktree, ("tests/test_guard.py",)
+        )
+        mock_git_adapter.push.assert_not_called()
 
     def test_pre_publish_gate_failure_reroutes_back_into_review_exchange(
         self,
@@ -4113,6 +4494,7 @@ class TestCompletionProcessorPublishGate:
             ran=True,
         )
         processor = CompletionProcessor(
+            agent_callback_endpoint=ready_callback_endpoint(),
             label_adapter=mock_label_adapter,
             pr_adapter=mock_pr_adapter,
             git_adapter=mock_git_adapter,
@@ -4228,6 +4610,7 @@ class TestCompletionProcessorPublishGate:
             ran=True,
         )
         processor = CompletionProcessor(
+            agent_callback_endpoint=ready_callback_endpoint(),
             label_adapter=mock_label_adapter,
             pr_adapter=mock_pr_adapter,
             git_adapter=mock_git_adapter,
@@ -4307,6 +4690,7 @@ class TestCompletionProcessorPublishGate:
         mock_publish_gate,
     ):
         processor = CompletionProcessor(
+            agent_callback_endpoint=ready_callback_endpoint(),
             label_adapter=mock_label_adapter,
             pr_adapter=mock_pr_adapter,
             git_adapter=mock_git_adapter,
@@ -4349,6 +4733,7 @@ class TestCompletionProcessorPublishGate:
         config = Config()
         config.review_exchange_max_rounds = 3  # tighten for the test
         processor = CompletionProcessor(
+            agent_callback_endpoint=ready_callback_endpoint(),
             label_adapter=mock_label_adapter,
             pr_adapter=mock_pr_adapter,
             git_adapter=mock_git_adapter,
@@ -4441,6 +4826,7 @@ class TestCompletionProcessorPublishGate:
         supervisor = BackgroundJobSupervisor(fake_runner)
 
         processor = CompletionProcessor(
+            agent_callback_endpoint=ready_callback_endpoint(),
             label_adapter=mock_label_adapter,
             pr_adapter=mock_pr_adapter,
             git_adapter=mock_git_adapter,
@@ -4493,6 +4879,7 @@ class TestCompletionProcessorPublishGate:
         config = Config()
         config.review_exchange_max_rounds = 2
         processor = CompletionProcessor(
+            agent_callback_endpoint=ready_callback_endpoint(),
             label_adapter=mock_label_adapter,
             pr_adapter=mock_pr_adapter,
             git_adapter=mock_git_adapter,
@@ -4625,6 +5012,7 @@ class TestRunScopedArtifacts:
         completion_path.write_text(json.dumps(record.to_dict()))
 
         processor = CompletionProcessor(
+            agent_callback_endpoint=ready_callback_endpoint(),
             label_adapter=mock_label_adapter,
             pr_adapter=mock_pr_adapter,
             git_adapter=mock_git_adapter,
@@ -4710,6 +5098,7 @@ class TestRunScopedArtifacts:
         )
 
         processor = CompletionProcessor(
+            agent_callback_endpoint=ready_callback_endpoint(),
             label_adapter=mock_label_adapter,
             pr_adapter=mock_pr_adapter,
             git_adapter=mock_git_adapter,
@@ -4803,6 +5192,7 @@ class TestRunScopedArtifacts:
         completion_path.write_text(json.dumps(record.to_dict()))
 
         processor = CompletionProcessor(
+            agent_callback_endpoint=ready_callback_endpoint(),
             label_adapter=mock_label_adapter,
             pr_adapter=mock_pr_adapter,
             git_adapter=mock_git_adapter,

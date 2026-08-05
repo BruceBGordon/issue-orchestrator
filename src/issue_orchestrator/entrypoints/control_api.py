@@ -48,30 +48,31 @@ import logging
 import os
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Mapping, Optional
+from typing import TYPE_CHECKING, Any, Mapping
 
 from fastapi import FastAPI, Request, Query
 from fastapi.responses import JSONResponse, HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 from sse_starlette.sse import EventSourceResponse
 
-from ..infra import browser_session, gh_audit
-from ..infra.api_token import (
-    resolve_agent_callback_token,
-    resolve_api_token,
-)
+from ..infra import gh_audit
 from ..infra.supervisor import DefaultSupervisorOps, SupervisorOps
+from ..ports import RepositoryHost
 from ..control.goal_pilot import GoalPilot
 from ..execution.control_center_actions import ControlCenterActions
+from ..execution.repository_setup_validation import (
+    RepositorySetupValidationDetectorAdapter,
+)
 from ._auth_middleware import (
     AuthSurfaceConfig,
     evaluate_request,
     handle_login_post,
-    install_access_log_redaction,
+    is_agent_callback_route,
     issue_sse_token_response,
     resolve_browser_page_auth,
 )
 from .brand_assets import read_logo_svg
+from .bootstrap_repository_setup import build_repository_setup_owner
 from .control_api_goal_pilot_routes import control_goal_pilot_router
 from .control_api_goal_pilot_support import (
     ControlApiGoalPilotDependencies,
@@ -132,8 +133,10 @@ from .timeline_presentation import (
 _TEMPLATES_DIR = Path(__file__).parent.parent / "templates"
 
 if TYPE_CHECKING:
+    from ..domain.repository_setup_auth import RepositorySetupGitHubAuthorization
     from ..infra.orchestrator import Orchestrator
     from ..infra.config import Config
+    from ..ports.repository_setup import RepositorySetupGitHubVerification
 
 logger = logging.getLogger(__name__)
 _PREFERRED_REPO_ROOT_ENV = "ISSUE_ORCHESTRATOR_CC_REPO_ROOT"
@@ -145,6 +148,37 @@ def _load_config_by_name(repo_root: Path, config_name: str) -> "Config":
     """
     from ..infra.config import Config
     return Config.find_and_load(repo_root, config_name=config_name)
+
+
+def _create_repository_setup_host(
+    repo_name: str,
+    authorization: "RepositorySetupGitHubAuthorization",
+) -> RepositoryHost:
+    """Composition-root adapter for setup label mutations."""
+    from ..execution.providers import create_repository_setup_host
+
+    return create_repository_setup_host(repo_name, authorization)
+
+
+def _verify_repository_setup_github_authorization(
+    repo_name: str,
+    authorization: "RepositorySetupGitHubAuthorization",
+) -> "RepositorySetupGitHubVerification":
+    """Composition-root adapter for setup GitHub verification."""
+    from ..execution.providers import verify_repository_setup_github_authorization
+
+    return verify_repository_setup_github_authorization(repo_name, authorization)
+
+
+def _store_repository_setup_github_token(
+    authorization: "RepositorySetupGitHubAuthorization",
+    *,
+    repo: str,
+) -> "RepositorySetupGitHubAuthorization":
+    """Composition-root adapter for repo-scoped keychain storage."""
+    from ..execution.providers import store_repository_setup_github_token
+
+    return store_repository_setup_github_token(authorization, repo=repo)
 
 
 # Create minimal control API app
@@ -162,14 +196,17 @@ if STATIC_DIR.exists():
 #   the operator CLI, the Control Center, and MCP clients driven by the
 #   operator.
 # - ``_agent_callback_token`` authorizes an allowlist of routes only
-#   (``_AGENT_CALLBACK_ROUTES``). Issued to agent subprocesses so they
-#   can call preflight-push / issue-resume without holding the admin
-#   credential (#6017 P2 review).
+#   (see ``_auth_middleware.is_agent_callback_route``). Issued to agent
+#   subprocesses so they can call preflight-push / exchange-respond /
+#   issue-resume without holding the admin credential (#6017 P2 review).
 #
 # Both are ``None`` by default so unit tests using ``TestClient`` keep
-# working. Production startup in ``ControlAPIServer.start`` and
-# ``control_center.main`` calls ``configure_api_token`` to turn
-# enforcement on.
+# working. Every production entrypoint that serves these routes must
+# call ``configure_api_token`` to turn enforcement on:
+# ``ControlAPIServer.start``, ``control_center.main``, and
+# ``EngineStartup.configure_auth`` — the last of these serves
+# ``control_app`` mounted under the dashboard app, and omitting it
+# left the engine with no callback token at all (#6924).
 _admin_token: str | None = None
 _agent_callback_token: str | None = None
 
@@ -188,38 +225,15 @@ _UNAUTHENTICATED_PATHS: frozenset[str] = frozenset({
 })
 _UNAUTHENTICATED_PREFIXES: tuple[str, ...] = ("/static/",)
 
-# Routes the agent-callback token is allowed to reach. Anything NOT in
-# this set requires the admin token.
-#
-# Honest scope: this allowlist limits what the agent-callback token
-# can do IF an agent holds only that token. It does NOT stop an
-# agent that reads ``~/.issue-orchestrator/api-token`` off the same
-# filesystem (agents run with the real HOME under the same user;
-# see issue #6024) from mutating any route. The callback token is
-# defense in depth — it narrows the default blast radius and is
-# the right shape for a future isolated-agent model — not a
-# privilege boundary against same-user agents today.
-_AGENT_CALLBACK_ROUTES: frozenset[str] = frozenset(
-    {"/api/preflight-push", "/api/review-exchange/respond"}
-)
-
-
-def _is_agent_callback_route(path: str) -> bool:
-    if path in _AGENT_CALLBACK_ROUTES:
-        return True
-    # ``/api/issues/{issue_number}/resume`` has a variable path segment;
-    # match by prefix + suffix rather than hardcoding every number.
-    if path.startswith("/api/issues/") and path.endswith("/resume"):
-        return True
-    return False
-
-
+# The agent-callback route allowlist lives in ``_auth_middleware`` so
+# every surface serving these routes answers identically — see that
+# module's docstring for why a per-surface copy was a defect (#6913).
 _CONTROL_API_SURFACE = AuthSurfaceConfig(
     sse_path="/api/events",
     public_paths=_UNAUTHENTICATED_PATHS,
     name="control_api",
     public_prefixes=_UNAUTHENTICATED_PREFIXES,
-    agent_callback_matcher=_is_agent_callback_route,
+    agent_callback_matcher=is_agent_callback_route,
 )
 
 
@@ -1087,6 +1101,12 @@ install_control_api_setup_dependencies(
     control_app,
     ControlApiSetupDependencies(
         validate_repo_root=_validate_repo_root,
+        setup_owner=build_repository_setup_owner(
+            _create_repository_setup_host,
+            _verify_repository_setup_github_authorization,
+        ),
+        github_token_store=_store_repository_setup_github_token,
+        validation_detector=RepositorySetupValidationDetectorAdapter(),
     ),
 )
 control_app.include_router(control_orchestrator_router)
@@ -1184,106 +1204,3 @@ async def control_issue_detail(
         raw_events=raw_events,
     )
     return JSONResponse(payload)
-
-class ControlAPIServer:
-    """Manages the control API server lifecycle."""
-
-    def __init__(self, orchestrator: "Orchestrator", port: int = 19080):
-        """Initialize the control API server.
-
-        Args:
-            orchestrator: The orchestrator instance to control
-            port: Port to listen on (default: 19080 to avoid conflict with web dashboard)
-        """
-        self.orchestrator = orchestrator
-        self.port = port
-        self._server: Optional[Any] = None  # uvicorn.Server (imported inside start())
-        self._task: Optional[asyncio.Task] = None
-
-    async def start(self) -> None:
-        """Start the control API server.
-
-        When self.port is 0, uvicorn binds to an OS-assigned free port.
-        After startup, self.port is updated to the actual bound port.
-        """
-        import uvicorn
-
-        set_orchestrator(self.orchestrator)
-
-        # Resolve + activate both tokens before binding. Kept inside
-        # ``start`` so test harnesses that import ``control_app``
-        # without spinning up a server do not inadvertently create
-        # the token files on a developer machine. The admin token
-        # authorizes every route; the agent-callback token narrows
-        # the default path for agent subprocesses to
-        # ``_AGENT_CALLBACK_ROUTES`` — defense in depth, not an
-        # isolation boundary against a same-user malicious agent
-        # that can read the admin token file directly (issue #6024).
-        # See security #5987 (F3) and #6017 review (P2).
-        admin_token = resolve_api_token()
-        agent_callback_token = resolve_agent_callback_token()
-        configure_api_token(admin_token, agent_callback=agent_callback_token)
-        # Initialize the browser-session HMAC secret + tunables so the
-        # Control Center UI can establish an ``io_session`` cookie on
-        # first visit (#6017 re-review P3). YAML config supplies the
-        # defaults; env vars override at resolution time.
-        cfg = getattr(self.orchestrator, "config", None)
-        # Derive the HMAC secret from the admin token so the dashboard
-        # process (which loads the same token) ends up with the same
-        # secret without any IPC. A cookie minted on port 19080 then
-        # validates on port 8080 — single-login UX across processes.
-        browser_session.initialize(
-            admin_token=admin_token,
-            session_ttl_seconds=getattr(cfg, "browser_session_ttl_seconds", None),
-            sse_token_ttl_seconds=getattr(cfg, "sse_token_ttl_seconds", None),
-            max_sessions=getattr(cfg, "browser_session_max", None),
-        )
-        # Strip SSE tokens from uvicorn access-log lines so a query
-        # param that's still valid for a few seconds doesn't persist
-        # in log storage (#6017 re-review-3 P2).
-        install_access_log_redaction()
-        # Export into the process environment so in-process clients
-        # (MCP server, CLI tools launched by this orchestrator) pick
-        # up the admin token. The agent-callback token is surfaced
-        # only into agent subprocesses — see agent_runner_env.py.
-        os.environ.setdefault("ISSUE_ORCHESTRATOR_API_TOKEN", admin_token)
-        os.environ["ISSUE_ORCHESTRATOR_AGENT_CALLBACK_TOKEN"] = agent_callback_token
-        config = uvicorn.Config(
-            control_app,
-            host="127.0.0.1",
-            port=self.port,
-            log_level="warning",  # Quiet logging
-            access_log=False,
-        )
-        self._server = uvicorn.Server(config)
-
-        # Run server in background task
-        self._task = asyncio.create_task(self._server.serve())
-
-        # Wait for server to be ready (up to 5 seconds)
-        for _ in range(50):
-            if self._server.started:
-                break
-            await asyncio.sleep(0.1)
-
-        # Read back the actual bound port (important when port=0)
-        if self.port == 0 and self._server.started:
-            for s in self._server.servers:
-                for sock in s.sockets:
-                    addr = sock.getsockname()
-                    if isinstance(addr, tuple) and len(addr) >= 2:
-                        self.port = addr[1]
-                        break
-
-        logger.info(f"Control API started on http://127.0.0.1:{self.port}")
-
-    async def stop(self) -> None:
-        """Stop the control API server."""
-        if self._server:
-            self._server.should_exit = True
-        if self._task:
-            try:
-                await asyncio.wait_for(self._task, timeout=5.0)
-            except (asyncio.CancelledError, asyncio.TimeoutError):
-                pass
-            logger.info("Control API stopped")

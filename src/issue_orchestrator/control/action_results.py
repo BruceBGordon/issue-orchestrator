@@ -13,7 +13,7 @@ from enum import Enum
 from typing import TYPE_CHECKING, Any, Optional
 
 if TYPE_CHECKING:
-    from .actions import Action
+    from .action_base import Action
 
 
 class ActionResultType(Enum):

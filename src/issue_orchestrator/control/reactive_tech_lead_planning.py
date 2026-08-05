@@ -127,12 +127,24 @@ def plan_health_review_creation(
     """
     if not workflow:
         return None
+    # Owner-computed tech-lead slot budget (worker_budget) — the workflow no
+    # longer derives its own capacity (#6892 review A2). Creation runs before
+    # this tick's launches, so launched_this_tick is 0.
+    from .worker_budget import tech_lead_slot_availability
+
+    available_slots = tech_lead_slot_availability(
+        config,
+        snapshot.active_sessions,
+        e2e_occupies_slot=snapshot.e2e_occupies_slot,
+        launched_this_tick=0,
+        workflow_configured=workflow.is_configured(),
+    ).available
     return plan_health_review_issue_creation(
         snapshot.tech_lead_facts,
         snapshot.pending_tech_lead,
         config,
         workflow=workflow,
-        active_session_count=snapshot.active_count,
+        available_slots=available_slots,
         paused=snapshot.paused,
         storm_problems=storm_problems,
     )

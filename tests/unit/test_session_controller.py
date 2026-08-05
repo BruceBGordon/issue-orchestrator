@@ -52,6 +52,7 @@ from issue_orchestrator.ports import NullEventSink
 from issue_orchestrator.ports.event_sink import TraceEvent
 from issue_orchestrator.ports.provider_resilience import ProviderErrorType
 from issue_orchestrator.execution.session_output_adapter import FileSystemSessionOutput
+from tests.callback_endpoint_helpers import ready_callback_endpoint
 
 
 class StubWorkingCopy:
@@ -2089,6 +2090,7 @@ class TestSessionControllerValidationCaching:
         git_adapter.list_dirty_files.return_value = ["scripts/dev.sh"]
 
         processor = CompletionProcessor(
+            agent_callback_endpoint=ready_callback_endpoint(),
             label_adapter=label_adapter,
             pr_adapter=pr_adapter,
             git_adapter=git_adapter,

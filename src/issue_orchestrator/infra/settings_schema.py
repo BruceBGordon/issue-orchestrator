@@ -16,6 +16,10 @@ from typing import Any, Literal, Optional, TYPE_CHECKING
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from ..domain.tech_lead_findings import (
+    FINDING_PROMOTION_GATED,
+    VALID_FINDING_PROMOTION_MODES,
+)
 from ..domain.tech_lead_naming import TECH_LEAD_DISPLAY_NAME
 from .config_models import (
     MERGE_QUEUE_PROVIDERS,
@@ -62,6 +66,7 @@ if TYPE_CHECKING:
 # ---------------------------------------------------------------------------
 # Sub-models for each settings tab
 # ---------------------------------------------------------------------------
+
 
 class ConcurrencySettings(BaseModel):
     """Settings for the Concurrency tab."""
@@ -351,7 +356,10 @@ class E2ESettings(BaseModel):
         title="Command",
         description="Space-separated command used when Runner Kind is command",
         json_schema_extra={
-            "doc_examples": ["./scripts/run-e2e-suite.sh", "npm run test:e2e -- --reporter=junit"],
+            "doc_examples": [
+                "./scripts/run-e2e-suite.sh",
+                "npm run test:e2e -- --reporter=junit",
+            ],
             "doc_notes": "Used when runner_kind=command. The command runs inside the E2E worktree.",
             "config_attr": "e2e.command",
             "yaml_path": "e2e.command",
@@ -367,7 +375,7 @@ class E2ESettings(BaseModel):
                 ".issue-orchestrator/e2e-results/pytest-junit.xml",
                 "test-results/junit.xml",
             ],
-            "doc_notes": "Leave empty for log-only runs. Missing configured reports fail the run loudly. Use the same path you passed to pytest --junitxml or your external test runner.",
+            "doc_notes": "Leave empty for log-only runs. The run fails loudly when this list as a whole resolves to no fresh files; a single non-matching entry is tolerated when another entry here matched. Use the same path you passed to pytest --junitxml or your external test runner.",
             "config_attr": "e2e.junit_xml_paths",
             "yaml_path": "e2e.junit_xml_paths",
             "ui_transform": "newline_separated_list",
@@ -423,7 +431,10 @@ class E2ESettings(BaseModel):
         title="Quarantine File",
         description="Path to quarantine file for skipping known-flaky tests",
         json_schema_extra={
-            "doc_examples": ["tests/e2e/quarantine.txt", "tests/e2e/quarantine-local.txt"],
+            "doc_examples": [
+                "tests/e2e/quarantine.txt",
+                "tests/e2e/quarantine-local.txt",
+            ],
             "doc_notes": "Doctor verifies the file exists when E2E is enabled.",
             "config_attr": "e2e.quarantine_file",
             "yaml_path": "e2e.quarantine_file",
@@ -518,7 +529,10 @@ class ValidationSettings(BaseModel):
         title="Publish Validation Command",
         description="Authoritative command run before push/publish",
         json_schema_extra={
-            "doc_examples": ["./scripts/validate-pr.sh", "./scripts/validate-pr-suite.sh"],
+            "doc_examples": [
+                "./scripts/validate-pr.sh",
+                "./scripts/validate-pr-suite.sh",
+            ],
             "doc_notes": "This should match the repo's authoritative local PR/pre-push gate. If make validate-pr wraps the cache-aware verify hook, configure a private non-recursive suite command instead.",
             "section": "Publish Gate",
             "config_attr": "validation.publish.cmd",
@@ -557,7 +571,7 @@ class ValidationSettings(BaseModel):
         description="Relative JUnit XML files or globs emitted by validation commands",
         json_schema_extra={
             "doc_examples": ["test-results.xml", "build/test-results/test/*.xml"],
-            "doc_notes": "When set, failed validations render a structured test-results view in the dashboard.",
+            "doc_notes": "When set, failed validations render a structured test-results view in the dashboard. Evidence only: reports that do not resolve or cannot be parsed leave the view empty without changing the validation command's own outcome.",
             "section": "Evidence",
             "config_attr": "validation.junit_xml_paths",
             "yaml_path": "validation.junit_xml_paths",
@@ -585,7 +599,7 @@ class FilteringSettings(BaseModel):
         title="Milestones",
         description="Milestones to process (comma-separated string or YAML list)",
         json_schema_extra={
-            "doc_examples": ["M1, M2", "[\"M1\", \"M2\"]", ""],
+            "doc_examples": ["M1, M2", '["M1", "M2"]', ""],
             "doc_notes": "Accepts a comma-separated string or a YAML list. Leave empty to allow all milestones.",
             "config_attr": "filtering.milestones",
             "config_read_method": "filtering.get_milestones",
@@ -598,7 +612,7 @@ class FilteringSettings(BaseModel):
         title="Exclude Labels",
         description="Labels to exclude (comma-separated string or YAML list)",
         json_schema_extra={
-            "doc_examples": ["test-data, skip", "[\"test-data\", \"skip\"]", ""],
+            "doc_examples": ["test-data, skip", '["test-data", "skip"]', ""],
             "doc_notes": "Accepts a comma-separated string or a YAML list.",
             "config_attr": "filtering.exclude_labels",
             "yaml_path": "filtering.exclude_labels",
@@ -610,7 +624,7 @@ class FilteringSettings(BaseModel):
         title="Exclude Label Prefixes",
         description="Label prefixes to exclude (comma-separated string or YAML list)",
         json_schema_extra={
-            "doc_examples": ["io:e2e:", "[\"io:e2e:\", \"tmp:\"]", ""],
+            "doc_examples": ["io:e2e:", '["io:e2e:", "tmp:"]', ""],
             "doc_notes": "Exclude issues that have any label starting with one of these prefixes.",
             "config_attr": "filtering.exclude_label_prefixes",
             "yaml_path": "filtering.exclude_label_prefixes",
@@ -1235,6 +1249,82 @@ class ReviewSettings(BaseModel):
             "yaml_path": "tech_lead.authority.kill_hung_session",
         },
     )
+    tech_lead_findings_promote: str = Field(
+        FINDING_PROMOTION_GATED,
+        title=f"{TECH_LEAD_DISPLAY_NAME} Finding Promotion",
+        description="Promote accrued pattern case files to runnable issues",
+        json_schema_extra={
+            "enum": list(VALID_FINDING_PROMOTION_MODES),
+            "doc_examples": ["gated", "off", "auto"],
+            "doc_notes": (
+                "The finding-promotion lane (#6957) turns a pattern case file "
+                "that crossed its evidence threshold into a runnable issue in "
+                "the repo that owns the fix. gated (default) files it carrying "
+                "the proposed-tech-lead label, so operator approval is exactly "
+                "one action — removing the label; auto files it ungated, "
+                "immediately runnable in the target repo's own pipeline; off "
+                "disables the lane entirely (no promotion issues and no "
+                "loop-closure reads); the lane is also inert without "
+                "review.tech_lead_review_agent, since it actuates tech-lead "
+                "findings. Only findings the tech lead classified "
+                "fix:code are ever promoted. Routing is YAML-only: "
+                "tech_lead.findings.route maps an area label to 'self' or an "
+                "owner/repo target, with route.default as the catch-all. A "
+                "route entry may also be a mapping "
+                "({repo, scope_label, agent_label}) declaring the target's "
+                "scheduling labels; a 'self' route inherits filtering.label and "
+                "review.tech_lead_follow_up_agent and must not redeclare them. "
+                "Every foreign target is proven FILEABLE at startup, not at "
+                "promotion time: reachable, issues enabled, and able to apply "
+                "that route's labels plus create any it lacks (filing "
+                "provisions labels before it opens the issue, and GitHub's "
+                "triage role cannot create them). "
+                "Allowed values: off, gated, auto."
+            ),
+            "section": _TECH_LEAD_SECTION,
+            "config_attr": "tech_lead.findings.promote",
+            "yaml_path": "tech_lead.findings.promote",
+        },
+    )
+    tech_lead_findings_min_evidence: int = Field(
+        2,
+        title="Finding Promotion: Minimum Evidence",
+        description="Observations a pattern must accrue before it can be promoted",
+        ge=1,
+        json_schema_extra={
+            "doc_examples": ["2", "3"],
+            "doc_notes": (
+                "Counted from the orchestrator-owned pattern ledger, not from "
+                "case-file comments, so human comments on a case file can never "
+                "inflate it. A signature becomes promotable on the tick its "
+                "observation count reaches this value."
+            ),
+            "section": _TECH_LEAD_SECTION,
+            "config_attr": "tech_lead.findings.min_evidence",
+            "yaml_path": "tech_lead.findings.min_evidence",
+        },
+    )
+    tech_lead_findings_max_open_promoted: int = Field(
+        3,
+        title="Finding Promotion: Max Open Per Target",
+        description="Cap on in-flight promoted issues per target repository",
+        ge=1,
+        json_schema_extra={
+            "doc_examples": ["3", "1"],
+            "doc_notes": (
+                "Storm backpressure: excess eligible signatures wait behind "
+                "merges rather than flooding a repo. It also bounds the lane's "
+                "GitHub reads — loop closure polls at most this many issues per "
+                "target per tick, rotating across the durable ledger so lowering "
+                "the cap after a larger cohort was filed slows coverage instead "
+                "of exceeding the budget. Set tech_lead.findings.promote: off to "
+                "disable the lane instead of setting this to 0."
+            ),
+            "section": _TECH_LEAD_SECTION,
+            "config_attr": "tech_lead.findings.max_open_promoted",
+            "yaml_path": "tech_lead.findings.max_open_promoted",
+        },
+    )
     tech_lead_health_review_interval_minutes: int = Field(
         0,
         title="Health Review Interval (minutes)",
@@ -1422,6 +1512,24 @@ class ReviewSettings(BaseModel):
             )
         return value
 
+    @field_validator("tech_lead_findings_promote")
+    @classmethod
+    def _validate_finding_promotion_mode(cls, value: str) -> str:
+        """Close the promotion mode at the SCHEMA boundary (#6957 R3 F9).
+
+        ``json_schema_extra={"enum": ...}`` only shapes the generated select; it
+        does not make Pydantic reject anything. Without this, a tampered POST
+        body was applied to live config and only rejected later by the doctor
+        pass — after the write, and as a whole-config error rather than a
+        field-scoped one the form can attach to the offending input.
+        """
+        if value not in VALID_FINDING_PROMOTION_MODES:
+            raise ValueError(
+                "tech_lead.findings.promote must be one of"
+                f" {list(VALID_FINDING_PROMOTION_MODES)}, got {value!r}"
+            )
+        return value
+
     @model_validator(mode="after")
     def _health_review_interval_requires_tech_lead_agent(self) -> "ReviewSettings":
         # Cross-field invariant (#6763/#6776): a positive health-review
@@ -1429,7 +1537,10 @@ class ReviewSettings(BaseModel):
         # disabled at runtime. Reject the pair so the misconfiguration is
         # loud instead of degrading (0 disables; a positive interval needs
         # an agent to walk the board).
-        if self.tech_lead_health_review_interval_minutes > 0 and not self.tech_lead_agent:
+        if (
+            self.tech_lead_health_review_interval_minutes > 0
+            and not self.tech_lead_agent
+        ):
             raise ValueError(
                 "tech_lead.health_review.interval_minutes is "
                 f"{self.tech_lead_health_review_interval_minutes} but no tech lead "
@@ -1955,7 +2066,6 @@ class AdvancedSettings(BaseModel):
                 "Safe to remove from your config."
             ),
             "section": "Browser Session",
-            "restart_required": True,
             "config_attr": "browser_session_max",
             "yaml_path": "ui.browser_session.max",
         },
@@ -1998,13 +2108,20 @@ class AdvancedSettings(BaseModel):
         },
     )
     worktree_base: str = Field(
-        "../",
+        "../worktrees",
         title="Worktree Base Directory",
-        description="Directory where git worktrees are created",
+        description="Outside-repository directory where git worktrees are created",
         min_length=1,
         json_schema_extra={
-            "doc_examples": ["../", "../worktrees", "/tmp/worktrees"],
-            "doc_notes": "Relative paths are resolved from the repo root.",
+            "doc_examples": [
+                "../worktrees/my-repo",
+                "../worktrees",
+                "/tmp/worktrees/my-repo",
+            ],
+            "doc_notes": (
+                "Relative paths are resolved from the repo root. New repository "
+                "Setup defaults to ../worktrees/<repository-directory>."
+            ),
             "section": "Worktrees",
             "restart_required": True,
             "config_value_type": CONFIG_VALUE_TYPE_PATH,
@@ -2014,6 +2131,7 @@ class AdvancedSettings(BaseModel):
                 "enabled": True,
                 "section": "worktrees",
                 "order": 10,
+                "prompt": "Worktree Base Directory",
             },
         },
     )
@@ -2145,6 +2263,7 @@ TAB_DEFINITIONS: list[dict[str, Any]] = [
 # Config <-> Schema bridge
 # ---------------------------------------------------------------------------
 
+
 def from_config(config: Config) -> dict[str, BaseModel]:
     """Build all tab models from a Config object.
 
@@ -2175,13 +2294,12 @@ def build_save_plan(
 
     Compose it with
     :func:`~.config_document_patch.save_config_document_patch` via
-    ``plan.apply`` so a save patches only edited fields into the parsed on-disk
-    YAML -- preserving unrelated operational config (``repo.github`` auth,
-    merge queue, hooks, ...) AND unedited settings-owned raw values (a sibling
-    ``${SECRET}`` reference is not expanded) -- and skips the file write
-    entirely for a no-op. See
-    :func:`~.settings_schema_support.build_settings_save_plan` for the full
-    rationale.
+    ``plan.entries`` so a save patches only edited fields in the on-disk YAML --
+    preserving unrelated operational config (``repo.github`` auth, merge queue,
+    hooks, ...) AND unedited settings-owned raw bytes (a sibling ``${SECRET}``
+    reference is not expanded) -- and skips the file write entirely for a
+    no-op. See :func:`~.settings_schema_support.build_settings_save_plan` for
+    the full rationale.
     """
     return build_settings_save_plan(TAB_DEFINITIONS, snapshot, submitted)
 
@@ -2194,6 +2312,7 @@ def get_restart_fields() -> set[str]:
 # ---------------------------------------------------------------------------
 # JSON Schema generation (cached for template rendering)
 # ---------------------------------------------------------------------------
+
 
 @functools.lru_cache(maxsize=1)
 def get_settings_json_schema() -> dict[str, Any]:
@@ -2209,6 +2328,7 @@ def get_settings_json_schema() -> dict[str, Any]:
 # Metadata accessor for wizard / docs
 # ---------------------------------------------------------------------------
 
+
 def get_field_meta(tab_key: str, field_name: str) -> dict[str, Any]:
     """Get schema metadata for a specific field.
 
@@ -2220,6 +2340,7 @@ def get_field_meta(tab_key: str, field_name: str) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # Setup wizard field extraction (data-driven)
 # ---------------------------------------------------------------------------
+
 
 def get_setup_fields(section: str) -> list[dict[str, Any]]:
     """Get schema fields for a wizard section, sorted by order.
@@ -2233,6 +2354,7 @@ def get_setup_fields(section: str) -> list[dict[str, Any]]:
 # ---------------------------------------------------------------------------
 # Doctor check field extraction (data-driven)
 # ---------------------------------------------------------------------------
+
 
 def get_doctor_check_fields() -> list[dict[str, Any]]:
     """Get all schema fields that have doctor_check annotations.
@@ -2255,6 +2377,7 @@ def get_summary_fields(section: str) -> list[dict[str, Any]]:
 # ---------------------------------------------------------------------------
 # Documentation generation
 # ---------------------------------------------------------------------------
+
 
 def generate_config_reference() -> str:
     """Generate markdown configuration reference from schema.

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 from pathlib import Path
 from typing import Generator
 
@@ -23,6 +24,28 @@ def xdist_timeout(base_seconds: float) -> float:
     if os.environ.get("PYTEST_XDIST_WORKER"):
         return base_seconds * 3
     return base_seconds
+
+
+@pytest.fixture
+def isolated_codex_home(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Path:
+    """Run live Codex tests without inheriting personal config or MCP servers."""
+    configured_home = os.environ.get("CODEX_HOME")
+    source_home = (
+        Path(configured_home).expanduser()
+        if configured_home
+        else Path.home() / ".codex"
+    )
+    isolated_home = tmp_path / "codex-home"
+    isolated_home.mkdir()
+    auth_file = source_home / "auth.json"
+    if auth_file.is_file():
+        shutil.copy2(auth_file, isolated_home / "auth.json")
+    monkeypatch.setenv("CODEX_HOME", str(isolated_home))
+    return isolated_home
+
 
 def _resolve_base_repo_root() -> Path:
     """Resolve the actual base repo root, following worktree references.

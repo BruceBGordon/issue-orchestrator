@@ -23,6 +23,38 @@ from fastapi.testclient import TestClient
 
 from issue_orchestrator.entrypoints.control_api import control_app
 from issue_orchestrator.infra.repo_lock import acquire_lock, release_lock, AlreadyRunning
+from issue_orchestrator.ports.repository_setup import (
+    RepositorySetupGitHubVerification,
+)
+
+
+def _complete_setup_payload(
+    repo_root: Path,
+    **overrides: object,
+) -> dict[str, object]:
+    payload = {
+        "repo_root": str(repo_root),
+        "repo_name": "test/repo",
+        "worker_agent_label": "agent:dev",
+        "model": "sonnet",
+        "effort": "high",
+        "configure_reviewer": True,
+        "reviewer_model": "sonnet",
+        "reviewer_effort": "high",
+        "validation_quick_command": "make test-quick",
+        "validation_publish_command": "make validate",
+        "github_authorization": {
+            "kind": "detected",
+            "api_url": "https://api.github.com",
+            "http_timeout_seconds": 20,
+        },
+        "configure_tech_lead": True,
+        "tech_lead_model": "sonnet",
+        "tech_lead_effort": "high",
+        "tech_lead_review_threshold": 1,
+    }
+    payload.update(overrides)
+    return payload
 
 
 class TestPhase1LockInvariant:
@@ -290,6 +322,25 @@ class TestPhase7MultiRepoFromControlCenter:
 class TestSetupWizardEndpoints:
     """Setup wizard API endpoints for GUI configuration."""
 
+    @pytest.fixture(autouse=True)
+    def _verified_github_authorization(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Exercise endpoint composition without reaching external GitHub."""
+        owner = control_app.state.control_api_setup_dependencies.setup_owner
+
+        def _verify(repo_name, authorization):
+            return RepositorySetupGitHubVerification(
+                identity="phase-invariant-user",
+                repository=repo_name,
+                auth_kind="personal",
+                source="integration test credential",
+                normalized_authorization=authorization,
+            )
+
+        monkeypatch.setattr(owner, "_github_verifier", _verify)
+
     def test_prereqs_endpoint_exists(self) -> None:
         """GET /control/setup/prereqs endpoint exists."""
         client = TestClient(control_app)
@@ -301,8 +352,19 @@ class TestSetupWizardEndpoints:
         assert "all_ok" in data
         assert "checks" in data
         assert "git" in data["checks"]
-        assert "github_auth" in data["checks"]
+        # GitHub authorization is a resumable wizard stage, not a prerequisite:
+        # users may open Setup before creating or selecting a credential.
+        assert "github_auth" not in data["checks"]
         assert "ai_provider_clis" in data["checks"]
+
+    def test_github_verification_endpoint_exists(self) -> None:
+        """The dedicated GitHub stage is registered separately from prereqs."""
+        response = TestClient(control_app).post(
+            "/control/setup/github-auth/verify",
+            json={},
+        )
+
+        assert response.status_code == 422
 
     def test_validate_endpoint_exists(self, tmp_path: Path) -> None:
         """POST /control/repos/validate endpoint exists."""
@@ -339,19 +401,13 @@ class TestSetupWizardEndpoints:
         assert "repo_root" in data
         assert "existing_config" in data
 
-    def test_preview_endpoint_exists(self) -> None:
-        """POST /control/setup/preview endpoint exists."""
+    def test_preview_endpoint_executes_setup_command(self, tmp_path: Path) -> None:
+        """POST /control/setup/preview executes the typed setup command."""
         client = TestClient(control_app)
 
         response = client.post(
             "/control/setup/preview",
-            json={
-                "repo_root": "/tmp/test",
-                "config": {
-                    "repo": {"name": "test/repo"},
-                    "agents": {"agent:dev": {"prompt": "dev.md", "model": "sonnet"}},
-                },
-            },
+            json=_complete_setup_payload(tmp_path),
         )
 
         assert response.status_code == 200
@@ -366,15 +422,11 @@ class TestSetupWizardEndpoints:
 
         response = client.post(
             "/control/setup/save",
-            json={
-                "repo_root": str(tmp_path),
-                "config": {
-                    "repo": {"name": "test/repo"},
-                    "agents": {"agent:dev": {"prompt": ".io/dev.md", "model": "sonnet"}},
-                },
-                "create_prompts": True,
-                "create_labels": False,  # Skip GitHub API calls
-            },
+            json=_complete_setup_payload(
+                tmp_path,
+                create_prompts=True,
+                create_labels=False,  # Skip GitHub API calls
+            ),
         )
 
         assert response.status_code == 200
@@ -415,8 +467,11 @@ agents:
         assert data["existing_config"]["repo"]["name"] == "existing/repo"
         assert "agent:backend" in data["existing_config"]["agents"]
 
-    def test_save_endpoint_updates_existing_config(self, tmp_path: Path) -> None:
-        """POST /control/setup/save can update an existing config file."""
+    def test_save_endpoint_requires_confirmation_to_replace_existing_config(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Existing configs remain unchanged until replacement is confirmed."""
         client = TestClient(control_app)
 
         # Create initial config at new location
@@ -425,18 +480,27 @@ agents:
         initial_config = "repo:\n  name: old/repo\nagents:\n  agent:old: {}\n"
         (config_dir / "default.yaml").write_text(initial_config)
 
-        # Update with new config
+        replacement = _complete_setup_payload(
+            tmp_path,
+            repo_name="new/repo",
+            worker_agent_label="agent:new",
+            configure_reviewer=False,
+            configure_tech_lead=False,
+            create_prompts=False,
+            create_labels=False,
+        )
+        unconfirmed = client.post(
+            "/control/setup/save",
+            json=replacement,
+        )
+
+        assert unconfirmed.status_code == 409
+        assert unconfirmed.json()["error"] == "replace_confirmation_required"
+        assert (config_dir / "default.yaml").read_text() == initial_config
+
         response = client.post(
             "/control/setup/save",
-            json={
-                "repo_root": str(tmp_path),
-                "config": {
-                    "repo": {"name": "new/repo"},
-                    "agents": {"agent:new": {"prompt": "new.md", "model": "sonnet"}},
-                },
-                "create_prompts": False,
-                "create_labels": False,
-            },
+            json={**replacement, "replace_existing": True},
         )
 
         assert response.status_code == 200

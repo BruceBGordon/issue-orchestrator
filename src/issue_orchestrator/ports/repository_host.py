@@ -207,6 +207,42 @@ class RepositoryHost(IssueTracker, LabelSet, PullRequestTracker, Protocol):
         """
         ...
 
+    def find_issue_by_marker(
+        self, *, title: str, marker: str, authoritative: bool = False
+    ) -> int | None:
+        """Recover an orchestrator-created issue by its body marker (#6957).
+
+        Every "create the remote issue, then record the local ledger row"
+        boundary can die in between, leaving a real issue no ledger knows
+        about. This is how the retry finds that issue instead of filing a
+        second one, so a create-once invariant survives the crash window.
+
+        Ownership is decided by *marker* appearing in the issue BODY — never by
+        the mutable title or labels.
+
+        ``authoritative`` selects which of two contracts a NEGATIVE answer
+        carries, mirroring ``list_issues(exhaustive=...)``:
+
+        * ``False`` (default) — best-effort. A hit is real; a MISS IS NOT PROOF.
+          The scan is bounded and its fallback is title-scoped, so an aged-out,
+          retitled issue is invisible. Use only where a miss costs at most a
+          duplicate some other invariant already prevents.
+        * ``True`` — a miss means PROVEN ABSENT. Title-independent and complete
+          or loud: incompleteness raises rather than answering "no". Required
+          wherever a negative answer is load-bearing, such as retiring a durable
+          creation intent (#6957 round-5 review F13).
+
+        Returns:
+            The existing issue's number, or None per the contract selected above.
+
+        Raises:
+            RepositoryHostError: If the lookup cannot be performed, or (when
+                ``authoritative``) if completeness cannot be established.
+                Callers must treat that as "unknown", never as "no issue exists"
+                — creating a duplicate is the failure this exists to prevent.
+        """
+        ...
+
     def create_milestone(
         self,
         title: str,

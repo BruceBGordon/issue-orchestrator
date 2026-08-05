@@ -25,6 +25,7 @@ from ..domain.review_exchange_run import ReviewExchangeRun
 from ..domain.runtime_config import RuntimeConfigReference
 from ..events import EventContext
 from ..ports.event_sink import EventSink
+from ..ports.review_exchange_approval_gate import ReviewExchangeApprovalGate
 from .persistent_exchange_pair_registry_inmemory import (
     InMemoryPersistentExchangePairRegistry,
 )
@@ -136,6 +137,7 @@ class PersistentReviewExchangeRunner:
         require_validation: bool,
         nit_policy: str = "surface",
         initial_validation_record_path: Path | None = None,
+        approval_gate: ReviewExchangeApprovalGate | None = None,
         web_port: int | None = None,
         events: EventSink | None = None,
         event_context: EventContext | None = None,
@@ -182,6 +184,7 @@ class PersistentReviewExchangeRunner:
             require_validation=require_validation,
             nit_policy=nit_policy,
             initial_validation_record_path=initial_validation_record_path,
+            approval_gate=approval_gate,
             web_port=web_port,
             events=events,
             event_context=event_context,

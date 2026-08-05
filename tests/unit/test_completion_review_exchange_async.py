@@ -38,6 +38,7 @@ from issue_orchestrator.infra.config import Config
 from issue_orchestrator.domain.models import AgentConfig
 from issue_orchestrator.ports.background_job import CompletedJob
 from issue_orchestrator.ports.session_output import ReviewExchangeSummary, SessionOutput
+from tests.callback_endpoint_helpers import ready_callback_endpoint
 
 
 class _FakeReviewExchangeRunner:
@@ -350,6 +351,7 @@ def _build(
     # these tests because the fake runner doesn't raise; when failure paths
     # need testing, tests call `supervisor.tick()` themselves.
     review = CompletionReviewExchange(
+        agent_callback_endpoint=ready_callback_endpoint(),
         config=_make_config(tmp_path, require_validation=require_validation),
         session_output=cast(SessionOutput, session_output),
         emit_review_started=_record_review_started,
@@ -404,6 +406,54 @@ def test_first_pass_submits_background_job_and_returns_deferred(tmp_path: Path) 
     assert job_runner.submitted[0][0] == "review-exchange:230:coding-1:coding-run-1"
 
 
+def test_background_job_forwards_approval_gate_to_loop(tmp_path: Path) -> None:
+    """The async closure must carry the producer's gate to the runner unchanged."""
+    job_runner = _FakeJobRunner()
+    review, _ = _build(tmp_path, job_runner, [], [])
+    calls: list[dict[str, Any]] = []
+
+    class _ApprovalGate:
+        def rejection_reason(self) -> str | None:
+            return None
+
+    approval_gate = _ApprovalGate()
+
+    def fake_loop(**kwargs: Any) -> ReviewExchangeOutcome:
+        calls.append(kwargs)
+        exchange_run = kwargs["exchange_run"]
+        return ReviewExchangeOutcome(
+            status="ok",
+            rounds=1,
+            reason="reviewer_ok",
+            run_assets=exchange_run.assets,
+            summary=_summary(status="ok", reason="reviewer_ok", rounds=1),
+        )
+
+    (_, _, _, _, _, deferred) = review.prepare_review_exchange(
+        requested_actions=(RequestedAction.CREATE_PR,),
+        worktree=tmp_path,
+        issue_number=230,
+        issue_title="Example",
+        session_name="coding-1",
+        run_id="coding-run-1",
+        agent_label="agent:backend",
+        record=_make_record(),
+        errors=[],
+        actions_taken=[],
+        run_review_exchange_loop=fake_loop,
+        approval_gate=approval_gate,
+    )
+
+    assert deferred is True
+    assert calls == []
+
+    _job_id, submitted_fn = job_runner.submitted[0]
+    submitted_fn()
+
+    assert len(calls) == 1
+    assert calls[0]["approval_gate"] is approval_gate
+
+
 def test_background_deadline_is_derived_from_runner_port(tmp_path: Path) -> None:
     class _TimeoutRunner(_FakeReviewExchangeRunner):
         def __init__(self) -> None:
@@ -417,6 +467,7 @@ def test_background_deadline_is_derived_from_runner_port(tmp_path: Path) -> None
     supervisor = _CapturingSupervisor()
     cfg = _make_config(tmp_path)
     review = CompletionReviewExchange(
+        agent_callback_endpoint=ready_callback_endpoint(),
         config=cfg,
         session_output=cast(SessionOutput, _FakeSessionOutput(tmp_path)),
         emit_review_started=lambda **_: None,
@@ -515,6 +566,7 @@ def test_running_background_job_without_deadline_halts(tmp_path: Path) -> None:
 
     errors: list[str] = []
     review = CompletionReviewExchange(
+        agent_callback_endpoint=ready_callback_endpoint(),
         config=_make_config(tmp_path),
         session_output=cast(SessionOutput, _FakeSessionOutput(tmp_path)),
         emit_review_started=lambda **_: None,
@@ -602,6 +654,7 @@ def test_within_deadline_for_completion_returns_false_for_unbounded_job(
     job_runner = _FakeJobRunner()
     supervisor = BackgroundJobSupervisor(job_runner)
     review = CompletionReviewExchange(
+        agent_callback_endpoint=ready_callback_endpoint(),
         config=_make_config(tmp_path),
         session_output=cast(SessionOutput, _FakeSessionOutput(tmp_path)),
         emit_review_started=lambda **_: None,
@@ -660,6 +713,7 @@ def test_within_deadline_for_completion_returns_true_for_bounded_running_job(
     # The default _FakeReviewExchangeRunner reports a 60s deadline, so
     # the BG job is bounded and still inside it.
     review = CompletionReviewExchange(
+        agent_callback_endpoint=ready_callback_endpoint(),
         config=_make_config(tmp_path),
         session_output=cast(SessionOutput, _FakeSessionOutput(tmp_path)),
         emit_review_started=lambda **_: None,
@@ -725,6 +779,7 @@ def test_background_deadline_failure_cancels_runtime(tmp_path: Path) -> None:
 
     errors: list[str] = []
     review = CompletionReviewExchange(
+        agent_callback_endpoint=ready_callback_endpoint(),
         config=_make_config(tmp_path),
         session_output=cast(SessionOutput, _FakeSessionOutput(tmp_path)),
         emit_review_started=lambda **_: None,
@@ -1411,6 +1466,7 @@ def test_no_job_runner_falls_back_to_inline_execution(
     )
 
     review = CompletionReviewExchange(
+        agent_callback_endpoint=ready_callback_endpoint(),
         config=_make_config(tmp_path),
         session_output=cast(SessionOutput, session_output),
         emit_review_started=lambda **kw: started.append(kw),
@@ -1477,6 +1533,7 @@ def test_inline_review_exchange_halt_is_logged(
     )
 
     review = CompletionReviewExchange(
+        agent_callback_endpoint=ready_callback_endpoint(),
         config=_make_config(tmp_path),
         session_output=cast(SessionOutput, session_output),
         emit_review_started=lambda **kw: started.append(kw),
@@ -1575,6 +1632,7 @@ def test_retry_does_not_reconsume_prior_run_timeout_cancellation(
         return _Cancellation(cancelled_job_ids=cancelled)
 
     review = CompletionReviewExchange(
+        agent_callback_endpoint=ready_callback_endpoint(),
         config=_make_config(tmp_path),
         session_output=cast(SessionOutput, _FakeSessionOutput(tmp_path)),
         emit_review_started=lambda **_: None,

@@ -6,6 +6,11 @@ from pathlib import Path
 import pytest
 
 from issue_orchestrator.domain.models import DiscoveredFailure
+from issue_orchestrator.domain.tech_lead_findings import (
+    PatternClassificationConflictError,
+    PendingCaseFile,
+    PendingPromotion,
+)
 from issue_orchestrator.domain.tech_lead_session import (
     StoredTechLeadOp,
     TechLeadLaunchAuthority,
@@ -17,6 +22,7 @@ from issue_orchestrator.ports.tech_lead_authority import (
     TechLeadAuthorityConflictError,
     TechLeadOpConflictError,
     TechLeadPatternConflictError,
+    TechLeadPendingIntentConflictError,
     TechLeadShippedFixConflictError,
     TechLeadStormCohortConflictError,
 )
@@ -45,10 +51,13 @@ def test_round_trip_keyed_by_run_identity(tmp_path: Path) -> None:
     assert store.load(run_id="r1", session_name="issue-8") is None
 
 
-@pytest.mark.parametrize("make_store", [
-    lambda tmp_path: SqliteTechLeadAuthorityStore.for_repo(tmp_path),
-    lambda _tmp_path: InMemoryTechLeadAuthorityStore(),
-])
+@pytest.mark.parametrize(
+    "make_store",
+    [
+        lambda tmp_path: SqliteTechLeadAuthorityStore.for_repo(tmp_path),
+        lambda _tmp_path: InMemoryTechLeadAuthorityStore(),
+    ],
+)
 def test_record_identical_payload_is_noop(tmp_path: Path, make_store) -> None:
     """Create-once: re-recording the same payload is silently accepted."""
     store = make_store(tmp_path)
@@ -61,10 +70,13 @@ def test_record_identical_payload_is_noop(tmp_path: Path, make_store) -> None:
     assert loaded.manifest_pr_numbers == (1,)
 
 
-@pytest.mark.parametrize("make_store", [
-    lambda tmp_path: SqliteTechLeadAuthorityStore.for_repo(tmp_path),
-    lambda _tmp_path: InMemoryTechLeadAuthorityStore(),
-])
+@pytest.mark.parametrize(
+    "make_store",
+    [
+        lambda tmp_path: SqliteTechLeadAuthorityStore.for_repo(tmp_path),
+        lambda _tmp_path: InMemoryTechLeadAuthorityStore(),
+    ],
+)
 def test_record_conflicting_payload_fails_loudly(tmp_path: Path, make_store) -> None:
     """The authority constrains mutation scope: it must never silently
     change or expand for an existing (run_id, session_name) (#6769 r4)."""
@@ -219,7 +231,9 @@ def test_health_review_authority_targets_only_its_anchor() -> None:
 # --- Gated proposal ops (#6778) ------------------------------------------
 
 
-def _op(target: int = 13, *, op_type: str = "reset_retry", rationale: str = "r") -> "StoredTechLeadOp":
+def _op(
+    target: int = 13, *, op_type: str = "reset_retry", rationale: str = "r"
+) -> "StoredTechLeadOp":
     return StoredTechLeadOp(
         op_type=op_type,
         target_issue_number=target,
@@ -325,11 +339,20 @@ def test_stored_op_dict_round_trip() -> None:
 @pytest.mark.parametrize("make_store", OP_STORES)
 def test_pattern_round_trip(tmp_path: Path, make_store) -> None:
     store = make_store(tmp_path)
-    store.record_pattern(signature="db-timeout", issue_number=600)
+    store.record_pattern(
+        signature="db-timeout",
+        issue_number=600,
+        observation_id="run-1:sess:A1",
+        diagnosis="Mechanism: leaked DB connection. Suggested fix: close it.",
+    )
 
     assert store.lookup_pattern(signature="db-timeout") == 600
     assert store.lookup_pattern(signature="absent") is None
     assert store.list_patterns() == (("db-timeout", 600),)
+    [evidence] = store.list_pattern_evidence()
+    assert evidence.diagnosis == (
+        "Mechanism: leaked DB connection. Suggested fix: close it."
+    )
 
 
 @pytest.mark.parametrize("make_store", OP_STORES)
@@ -337,8 +360,16 @@ def test_record_pattern_identical_issue_is_noop(tmp_path: Path, make_store) -> N
     """Create-once: re-recording the SAME case-file issue for a signature is
     silently accepted — the case file IS the accumulating artifact (#6781)."""
     store = make_store(tmp_path)
-    store.record_pattern(signature="db-timeout", issue_number=600)
-    store.record_pattern(signature="db-timeout", issue_number=600)
+    store.record_pattern(
+        signature="db-timeout",
+        issue_number=600,
+        observation_id="run-1:sess:db-timeout",
+    )
+    store.record_pattern(
+        signature="db-timeout",
+        issue_number=600,
+        observation_id="run-1:sess:db-timeout",
+    )
 
     assert store.lookup_pattern(signature="db-timeout") == 600
     assert store.list_patterns() == (("db-timeout", 600),)
@@ -351,10 +382,18 @@ def test_record_pattern_conflicting_issue_fails_loudly(
     """A signature keys exactly one evidence trail; it must never silently
     move to a different case-file issue (#6781)."""
     store = make_store(tmp_path)
-    store.record_pattern(signature="db-timeout", issue_number=600)
+    store.record_pattern(
+        signature="db-timeout",
+        issue_number=600,
+        observation_id="run-1:sess:db-timeout",
+    )
 
     with pytest.raises(TechLeadPatternConflictError):
-        store.record_pattern(signature="db-timeout", issue_number=601)
+        store.record_pattern(
+        signature="db-timeout",
+        issue_number=601,
+        observation_id="run-1:sess:db-timeout",
+    )
 
     assert store.lookup_pattern(signature="db-timeout") == 600
 
@@ -362,9 +401,21 @@ def test_record_pattern_conflicting_issue_fails_loudly(
 @pytest.mark.parametrize("make_store", OP_STORES)
 def test_list_patterns_is_signature_sorted(tmp_path: Path, make_store) -> None:
     store = make_store(tmp_path)
-    store.record_pattern(signature="zeta", issue_number=3)
-    store.record_pattern(signature="alpha", issue_number=1)
-    store.record_pattern(signature="mu", issue_number=2)
+    store.record_pattern(
+        signature="zeta",
+        issue_number=3,
+        observation_id="run-1:sess:zeta",
+    )
+    store.record_pattern(
+        signature="alpha",
+        issue_number=1,
+        observation_id="run-1:sess:alpha",
+    )
+    store.record_pattern(
+        signature="mu",
+        issue_number=2,
+        observation_id="run-1:sess:mu",
+    )
 
     assert store.list_patterns() == (("alpha", 1), ("mu", 2), ("zeta", 3))
 
@@ -372,7 +423,7 @@ def test_list_patterns_is_signature_sorted(tmp_path: Path, make_store) -> None:
 def test_pattern_survives_reopen(tmp_path: Path) -> None:
     """The evidence-trail ledger outlives the recording process (#6781)."""
     SqliteTechLeadAuthorityStore.for_repo(tmp_path).record_pattern(
-        signature="db-timeout", issue_number=600
+        signature="db-timeout", issue_number=600, observation_id="run-1:sess:A1"
     )
 
     reopened = SqliteTechLeadAuthorityStore.for_repo(tmp_path)
@@ -380,12 +431,386 @@ def test_pattern_survives_reopen(tmp_path: Path) -> None:
     assert reopened.lookup_pattern(signature="db-timeout") == 600
 
 
+# --- Observation identity: create-once counting (#6957 review F1) ---------
+
+
+@pytest.mark.parametrize("make_store", OP_STORES)
+def test_distinct_observations_each_advance_the_count(
+    tmp_path: Path, make_store
+) -> None:
+    store = make_store(tmp_path)
+    store.record_pattern(
+        signature="db-timeout", issue_number=600, observation_id="r1:s:A1"
+    )
+
+    assert store.note_pattern_observation(
+        signature="db-timeout", observation_id="r2:s:A1"
+    )
+    assert store.note_pattern_observation(
+        signature="db-timeout", observation_id="r2:s:A2"
+    )
+
+    [evidence] = store.list_pattern_evidence()
+    assert evidence.observation_count == 3
+
+
+@pytest.mark.parametrize("make_store", OP_STORES)
+def test_replaying_one_observation_never_counts_it_twice(
+    tmp_path: Path, make_store
+) -> None:
+    """The #6957 review F1 defect: a blind increment inflated min_evidence.
+
+    Replaying a completed decision action after a crash reproduces the same
+    observation identity, so the count must not move — otherwise a two-
+    observation action could reach count 4 after one retry and promote a
+    signature that never had distinct evidence.
+    """
+    store = make_store(tmp_path)
+    store.record_pattern(
+        signature="db-timeout", issue_number=600, observation_id="r1:s:A1"
+    )
+
+    assert store.note_pattern_observation(
+        signature="db-timeout", observation_id="r2:s:A1"
+    )
+    assert not store.note_pattern_observation(
+        signature="db-timeout", observation_id="r2:s:A1"
+    )
+    # ...including the observation the case-file BODY already recorded.
+    assert not store.note_pattern_observation(
+        signature="db-timeout", observation_id="r1:s:A1"
+    )
+
+    [evidence] = store.list_pattern_evidence()
+    assert evidence.observation_count == 2
+
+
+@pytest.mark.parametrize("make_store", OP_STORES)
+def test_has_pattern_observation_reports_what_is_recorded(
+    tmp_path: Path, make_store
+) -> None:
+    store = make_store(tmp_path)
+    store.record_pattern(
+        signature="db-timeout", issue_number=600, observation_id="r1:s:A1"
+    )
+
+    assert store.has_pattern_observation(
+        signature="db-timeout", observation_id="r1:s:A1"
+    )
+    assert not store.has_pattern_observation(
+        signature="db-timeout", observation_id="r2:s:A1"
+    )
+    assert not store.has_pattern_observation(
+        signature="absent", observation_id="r1:s:A1"
+    )
+
+
+@pytest.mark.parametrize("make_store", OP_STORES)
+def test_observation_identity_is_required(tmp_path: Path, make_store) -> None:
+    store = make_store(tmp_path)
+    with pytest.raises(ValueError):
+        store.record_pattern(signature="s", issue_number=1, observation_id="  ")
+    store.record_pattern(signature="s", issue_number=1, observation_id="r1:s:A1")
+    with pytest.raises(ValueError):
+        store.note_pattern_observation(signature="s", observation_id="")
+
+
+def test_observation_identities_survive_reopen(tmp_path: Path) -> None:
+    """Replay safety must outlive the process, or a restart re-counts (#6957 F1)."""
+    store = SqliteTechLeadAuthorityStore.for_repo(tmp_path)
+    store.record_pattern(signature="s", issue_number=1, observation_id="r1:s:A1")
+    store.note_pattern_observation(signature="s", observation_id="r2:s:A1")
+
+    reopened = SqliteTechLeadAuthorityStore.for_repo(tmp_path)
+
+    assert not reopened.note_pattern_observation(signature="s", observation_id="r2:s:A1")
+    [evidence] = reopened.list_pattern_evidence()
+    assert evidence.observation_count == 2
+
+
+def test_legacy_pattern_rows_keep_their_count_and_accept_new_observations(
+    tmp_path: Path,
+) -> None:
+    """Migration: a pre-#6957 row has a count but no observation identities."""
+    db = state_dir(tmp_path) / "tech_lead_authority.sqlite"
+    db.parent.mkdir(parents=True, exist_ok=True)
+    legacy = sqlite3.connect(db)
+    legacy.execute(
+        "CREATE TABLE tech_lead_patterns (signature TEXT PRIMARY KEY,"
+        " issue_number INTEGER NOT NULL, recorded_at TEXT NOT NULL)"
+    )
+    legacy.execute(
+        "INSERT INTO tech_lead_patterns VALUES ('legacy', 42, '2026-01-01T00:00:00Z')"
+    )
+    legacy.commit()
+    legacy.close()
+
+    store = SqliteTechLeadAuthorityStore.for_repo(tmp_path)
+    [before] = store.list_pattern_evidence()
+    assert before.observation_count == 1
+
+    assert store.note_pattern_observation(signature="legacy", observation_id="r1:s:A1")
+
+    [after] = store.list_pattern_evidence()
+    assert after.observation_count == 2
+
+
+# --- Classification immutability (#6957 review F3) -------------------------
+
+
+@pytest.mark.parametrize("make_store", OP_STORES)
+def test_unclassified_row_is_upgraded_by_a_later_observation(
+    tmp_path: Path, make_store
+) -> None:
+    store = make_store(tmp_path)
+    store.record_pattern(signature="s", issue_number=1, observation_id="r1:s:A1")
+
+    store.note_pattern_observation(
+        signature="s", observation_id="r2:s:A1", fix_class="code", area="db"
+    )
+
+    [evidence] = store.list_pattern_evidence()
+    assert (evidence.fix_class, evidence.area) == ("code", "db")
+
+
+@pytest.mark.parametrize("make_store", OP_STORES)
+def test_empty_incoming_classification_preserves_what_is_recorded(
+    tmp_path: Path, make_store
+) -> None:
+    store = make_store(tmp_path)
+    store.record_pattern(
+        signature="s",
+        issue_number=1,
+        observation_id="r1:s:A1",
+        fix_class="code",
+        area="db",
+    )
+
+    store.note_pattern_observation(signature="s", observation_id="r2:s:A1")
+
+    [evidence] = store.list_pattern_evidence()
+    assert (evidence.fix_class, evidence.area) == ("code", "db")
+
+
+@pytest.mark.parametrize("make_store", OP_STORES)
+@pytest.mark.parametrize(
+    "recorded,incoming",
+    (
+        ("human", "code"),
+        ("code", "human"),
+    ),
+)
+def test_conflicting_fix_class_fails_loudly(
+    tmp_path: Path, make_store, recorded: str, incoming: str
+) -> None:
+    """#6957 review F3: observation order must not decide promotability.
+
+    ``human -> code`` would make a human-gated finding runnable; ``code ->
+    human`` would silently retire established promotable work. Both are a
+    reviewed reclassification, not a side effect of the next observation.
+    """
+    store = make_store(tmp_path)
+    store.record_pattern(
+        signature="s", issue_number=1, observation_id="r1:s:A1", fix_class=recorded
+    )
+
+    with pytest.raises(PatternClassificationConflictError):
+        store.note_pattern_observation(
+            signature="s", observation_id="r2:s:A1", fix_class=incoming
+        )
+
+    [evidence] = store.list_pattern_evidence()
+    assert evidence.fix_class == recorded
+    # The rejected observation was not counted either.
+    assert evidence.observation_count == 1
+
+
+@pytest.mark.parametrize("make_store", OP_STORES)
+def test_conflicting_area_fails_loudly(tmp_path: Path, make_store) -> None:
+    """Area decides which repository a promotion routes to (#6957 review F3)."""
+    store = make_store(tmp_path)
+    store.record_pattern(
+        signature="s", issue_number=1, observation_id="r1:s:A1", area="db"
+    )
+
+    with pytest.raises(PatternClassificationConflictError):
+        store.note_pattern_observation(
+            signature="s", observation_id="r2:s:A1", area="ui"
+        )
+
+    [evidence] = store.list_pattern_evidence()
+    assert evidence.area == "db"
+
+
+@pytest.mark.parametrize("make_store", OP_STORES)
+def test_identical_classification_is_idempotent(tmp_path: Path, make_store) -> None:
+    store = make_store(tmp_path)
+    store.record_pattern(
+        signature="s",
+        issue_number=1,
+        observation_id="r1:s:A1",
+        fix_class="code",
+        area="DB",
+    )
+
+    store.note_pattern_observation(
+        signature="s", observation_id="r2:s:A1", fix_class="code", area="db"
+    )
+
+    [evidence] = store.list_pattern_evidence()
+    # GitHub folds label case, so an area respelled in another case is the same.
+    assert (evidence.fix_class, evidence.area, evidence.observation_count) == (
+        "code",
+        "DB",
+        2,
+    )
+
+
+# --- In-flight creation intents (#6957 round-3 review F10/F11) -------------
+
+
+def _pending_case_file(**overrides) -> PendingCaseFile:
+    fields = dict(
+        signature="db-timeout",
+        title="Pattern case file: db-timeout",
+        idempotency_marker="<!-- marker -->",
+        body_observation_id="r1:s:A1",
+        fix_class="human",
+        area="database",
+        diagnosis="Mechanism: leaked DB connection.",
+    )
+    fields.update(overrides)
+    return PendingCaseFile(**fields)
+
+
+def _pending_promotion(**overrides) -> PendingPromotion:
+    fields = dict(
+        signature="db-timeout",
+        case_file_issue_number=600,
+        target_repo="owner/upstream",
+        title="[tech-lead:repo] db-timeout",
+        idempotency_marker="<!-- marker -->",
+        area="database",
+        body_observations=2,
+    )
+    fields.update(overrides)
+    return PendingPromotion(**fields)
+
+
+@pytest.mark.parametrize("make_store", OP_STORES)
+def test_pending_case_file_round_trip(tmp_path: Path, make_store) -> None:
+    store = make_store(tmp_path)
+    store.record_pending_case_file(pending=_pending_case_file())
+
+    assert store.load_pending_case_file(signature="db-timeout") == _pending_case_file()
+    assert store.load_pending_case_file(signature="absent") is None
+
+    store.discard_pending_case_file(signature="db-timeout")
+    assert store.load_pending_case_file(signature="db-timeout") is None
+    store.discard_pending_case_file(signature="db-timeout")  # idempotent
+
+
+@pytest.mark.parametrize("make_store", OP_STORES)
+def test_pending_case_file_is_create_once(tmp_path: Path, make_store) -> None:
+    """A later command must never silently replace an earlier one's authority."""
+    store = make_store(tmp_path)
+    store.record_pending_case_file(pending=_pending_case_file())
+    store.record_pending_case_file(pending=_pending_case_file())  # identical: no-op
+
+    with pytest.raises(TechLeadPendingIntentConflictError):
+        store.record_pending_case_file(
+            pending=_pending_case_file(body_observation_id="r2:s:B1", fix_class="code")
+        )
+
+    assert store.load_pending_case_file(signature="db-timeout") == _pending_case_file()
+
+
+@pytest.mark.parametrize("make_store", OP_STORES)
+def test_pending_promotion_round_trip_and_create_once(
+    tmp_path: Path, make_store
+) -> None:
+    store = make_store(tmp_path)
+    store.record_pending_promotion(pending=_pending_promotion())
+    store.record_pending_promotion(pending=_pending_promotion())
+
+    assert store.load_pending_promotion(signature="db-timeout") == _pending_promotion()
+
+    with pytest.raises(TechLeadPendingIntentConflictError):
+        store.record_pending_promotion(pending=_pending_promotion(body_observations=3))
+
+    store.discard_pending_promotion(signature="db-timeout")
+    assert store.load_pending_promotion(signature="db-timeout") is None
+
+
+def test_pending_intents_survive_reopen(tmp_path: Path) -> None:
+    """They only help if they outlive the process that crashed."""
+    store = SqliteTechLeadAuthorityStore.for_repo(tmp_path)
+    store.record_pending_case_file(pending=_pending_case_file())
+    store.record_pending_promotion(pending=_pending_promotion())
+
+    reopened = SqliteTechLeadAuthorityStore.for_repo(tmp_path)
+
+    assert reopened.load_pending_case_file(signature="db-timeout") == (
+        _pending_case_file()
+    )
+    assert reopened.load_pending_promotion(signature="db-timeout") == (
+        _pending_promotion()
+    )
+
+
+@pytest.mark.parametrize("make_store", OP_STORES)
+def test_load_pattern_evidence_reads_one_signature(tmp_path: Path, make_store) -> None:
+    store = make_store(tmp_path)
+    store.record_pattern(
+        signature="db-timeout",
+        issue_number=600,
+        observation_id="r1:s:A1",
+        fix_class="code",
+        area="database",
+    )
+
+    row = store.load_pattern_evidence(signature="db-timeout")
+
+    assert row is not None
+    assert (row.case_file_issue_number, row.fix_class, row.area) == (
+        600,
+        "code",
+        "database",
+    )
+    assert store.load_pattern_evidence(signature="absent") is None
+
+
+def test_pending_intent_methods_satisfy_the_port() -> None:
+    from issue_orchestrator.ports.tech_lead_authority import (
+        TechLeadAuthorityStore as TechLeadAuthorityStorePort,
+    )
+
+    for method in (
+        "record_pending_case_file",
+        "load_pending_case_file",
+        "discard_pending_case_file",
+        "record_pending_promotion",
+        "load_pending_promotion",
+        "discard_pending_promotion",
+        "load_pattern_evidence",
+    ):
+        assert callable(getattr(SqliteTechLeadAuthorityStore, method))
+        assert callable(getattr(InMemoryTechLeadAuthorityStore, method))
+        assert callable(getattr(TechLeadAuthorityStorePort, method))
+
+
 def test_pattern_methods_satisfy_the_port() -> None:
     from issue_orchestrator.ports.tech_lead_authority import (
         TechLeadAuthorityStore as TechLeadAuthorityStorePort,
     )
 
-    for method in ("record_pattern", "lookup_pattern", "list_patterns"):
+    for method in (
+        "record_pattern",
+        "lookup_pattern",
+        "list_patterns",
+        "note_pattern_observation",
+        "has_pattern_observation",
+    ):
         assert callable(getattr(SqliteTechLeadAuthorityStore, method))
         assert callable(getattr(InMemoryTechLeadAuthorityStore, method))
         assert callable(getattr(TechLeadAuthorityStorePort, method))
@@ -446,9 +871,7 @@ def test_record_conflicting_storm_cohort_fails_loudly(
     store.record_storm_cohort(anchor_issue_number=999, cohort=_cohort())
 
     with pytest.raises(TechLeadStormCohortConflictError):
-        store.record_storm_cohort(
-            anchor_issue_number=999, cohort=_cohort((41, 42, 43))
-        )
+        store.record_storm_cohort(anchor_issue_number=999, cohort=_cohort((41, 42, 43)))
 
     assert store.load_storm_cohort(anchor_issue_number=999) == _cohort()
 
@@ -622,6 +1045,53 @@ def test_existing_authority_database_adds_shipped_fix_ledger(tmp_path: Path) -> 
     )
 
     assert store.list_recent_shipped_fixes(limit=10)[0].issue_number == 600
+    assert store.list_pattern_evidence() == ()
+
+
+def test_existing_pattern_ledger_adds_empty_diagnosis_column(tmp_path: Path) -> None:
+    db_path = state_dir(tmp_path) / "tech_lead_authority.sqlite"
+    db_path.parent.mkdir(parents=True)
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "CREATE TABLE tech_lead_patterns ("
+            "signature TEXT PRIMARY KEY, issue_number INTEGER NOT NULL, "
+            "recorded_at TEXT NOT NULL, observation_count INTEGER NOT NULL, "
+            "fix_class TEXT NOT NULL, area TEXT NOT NULL)"
+        )
+        connection.execute(
+            "INSERT INTO tech_lead_patterns VALUES "
+            "('legacy', 65, 'now', 2, 'code', 'queue')"
+        )
+
+    [evidence] = SqliteTechLeadAuthorityStore.for_repo(tmp_path).list_pattern_evidence()
+
+    assert evidence.signature == "legacy"
+    assert evidence.diagnosis == ""
+
+
+def test_existing_promotion_ledger_adds_reported_observation_watermark(
+    tmp_path: Path,
+) -> None:
+    """Opening an earlier #6957 database applies the additive column migration."""
+    db_path = state_dir(tmp_path) / "tech_lead_authority.sqlite"
+    db_path.parent.mkdir(parents=True)
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "CREATE TABLE tech_lead_promoted_findings ("
+            "signature TEXT PRIMARY KEY, case_file_issue_number INTEGER NOT NULL, "
+            "target_repo TEXT NOT NULL, target_issue_number INTEGER NOT NULL, "
+            "state TEXT NOT NULL, area TEXT NOT NULL DEFAULT '', "
+            "title TEXT NOT NULL DEFAULT '', shipped_pr_url TEXT NOT NULL DEFAULT '', "
+            "recorded_at TEXT NOT NULL)"
+        )
+        connection.execute(
+            "INSERT INTO tech_lead_promoted_findings VALUES "
+            "('sig', 65, 'o/r', 99, 'promoted', '', '', '', 'now')"
+        )
+
+    store = SqliteTechLeadAuthorityStore.for_repo(tmp_path)
+
+    assert store.load_promotion(signature="sig").reported_observations == 0
 
 
 def test_shipped_fix_methods_satisfy_the_port() -> None:

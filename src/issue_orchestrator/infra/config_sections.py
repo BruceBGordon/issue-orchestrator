@@ -40,7 +40,7 @@ from .config_models import (
 # tech_lead section parsing lives in its own cohesion module; re-exported here so
 # the section dispatch table and existing importers keep working.
 from .config_sections_tech_lead import parse_tech_lead_config
-from .config_paths import get_section, resolve_relative_path
+from .config_paths import get_section, resolve_relative_path, resolve_worktree_base
 from .config_value_rules import normalize_optional_mapping
 from . import github_config as _github_config
 
@@ -484,10 +484,7 @@ def load_worktrees_section(
 ) -> None:
     """Load worktree configuration."""
     worktree_base_raw = worktrees_section.get("base")
-    if worktree_base_raw is None:
-        config.worktree_base = repo_root.parent
-    else:
-        config.worktree_base = resolve_relative_path(worktree_base_raw, repo_root)
+    config.worktree_base = resolve_worktree_base(worktree_base_raw, repo_root)
 
     base_branch_override_raw = worktrees_section.get("base_branch_override")
     if base_branch_override_raw is None:

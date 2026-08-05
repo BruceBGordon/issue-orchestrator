@@ -1,4 +1,4 @@
-.PHONY: help venv venv-fast semgrep-venv worktree-setup install upgrade-deps deps-batch release release-pr prepare-release preview-readme typecheck lint-arch lint-complexity quality-guardrails quality-guardrails-stale sync-deps test test-unit test-unit-cov test-unit-cov-html test-integration test-integration-core test-integration-core-local test-integration-core-live-codex test-integration-agent test-simulated test-simulated-core test-simulated-agent test-e2e test-e2e-heavy test-e2e-onboarding-live test-e2e-one test-e2e-live test-real-claude-dev test-real-claude-review test-real-gh-labels test-real-gh test-real-gh-plus-e2e test-real-gh-plus-e2e-subprocess test-web test-web-headed playwright-install validate validate-raw validate-pr validate-pr-raw validate-quick validate-full verify-hooks-all _validate-impl _validate-static-impl _validate-core-tests-impl _validate-pr-impl _validate-agent-impl _validate-full-impl clean demo issues-validate issues-fix issues-fix-dry-run issues-create
+.PHONY: help venv venv-fast semgrep-venv worktree-create worktree-setup install upgrade-deps deps-batch release release-pr prepare-release preview-readme typecheck lint-arch lint-complexity quality-guardrails quality-guardrails-stale sync-deps test test-unit test-unit-cov test-unit-cov-html test-integration test-integration-core test-integration-core-local test-integration-core-live-codex test-integration-agent test-simulated test-simulated-core test-simulated-agent test-e2e test-e2e-heavy test-e2e-onboarding-live test-e2e-one test-e2e-live test-real-claude-dev test-real-claude-review test-real-gh-labels test-real-gh test-real-gh-plus-e2e test-real-gh-plus-e2e-subprocess test-web test-web-headed playwright-install validate validate-raw validate-pr validate-pr-raw validate-quick validate-full verify-hooks-all _validate-impl _validate-static-impl _validate-core-tests-impl _validate-pr-impl _validate-agent-impl _validate-full-impl clean demo issues-validate issues-fix issues-fix-dry-run issues-create
 
 # GNU make detection - required for parallel validation with grouped output
 # On macOS: brew install make (provides gmake)
@@ -12,6 +12,7 @@ help:
 	@echo "  venv                Create/recreate .venv with Python 3.14+ and install all deps"
 	@echo "  venv-fast           Reuse .venv when possible; install/sync deps (reliable + fast)"
 	@echo "  semgrep-venv        Sync locked Semgrep tool environment"
+	@echo "  worktree-create     Create and fully set up a worktree (use BRANCH=my-branch)"
 	@echo "  worktree-setup      Full worktree setup: venv + vscode extensions + playwright"
 	@echo "  install             Install dev dependencies (assumes venv exists)"
 	@echo "  upgrade-deps        Update uv.lock after changing pyproject.toml"
@@ -162,7 +163,18 @@ venv-pip:
 	@echo ""
 	@echo "Done! Activate with: source .venv/bin/activate"
 
+# Keep user-provided values out of Make's exported-variable expansion path.
+unexport BRANCH BASE_REF WORKTREE_PATH
+worktree-create: export IO_WORKTREE_CREATE_BRANCH := $(value BRANCH)
+worktree-create: export IO_WORKTREE_CREATE_BASE_REF := $(value BASE_REF)
+worktree-create: export IO_WORKTREE_CREATE_PATH := $(value WORKTREE_PATH)
+
 # Full worktree setup - use this when setting up a new git worktree
+worktree-create:
+	@$(SYSTEM_PYTHON) scripts/create_dev_worktree.py \
+		--repo-root . \
+		--make "$(GMAKE)"
+
 worktree-setup: venv-fast
 	@echo ""
 	@t0=$$(date +%s); \

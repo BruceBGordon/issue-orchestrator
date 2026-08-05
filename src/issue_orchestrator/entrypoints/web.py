@@ -19,12 +19,14 @@ from fastapi.staticfiles import StaticFiles
 from sse_starlette.sse import EventSourceResponse
 
 from ..control.shutdown_manager import shutdown_manager
+from ..events.sse_envelope import apply_sse_envelope
 from ..execution.client_host import ClientHost, detect_client_host
 from ..execution.review_artifact_reader import ManifestReviewArtifactReader
 from ._auth_middleware import (
     AuthSurfaceConfig,
     evaluate_request,
     handle_login_post,
+    is_agent_callback_route,
     issue_sse_token_response,
 )
 from .brand_assets import read_logo_svg
@@ -56,6 +58,10 @@ if TYPE_CHECKING:
     from ..infra.orchestrator import Orchestrator
 
 logger = logging.getLogger(__name__)
+
+# How long orchestration waits for the server to publish its bound port
+# before starting anyway (and reporting the problem).
+_SERVER_PUBLISH_TIMEOUT_SECONDS = 30.0
 _COMPAT_EXPORTS = (
     _decorate_timeline_events,
     _is_agent_scoped_event,
@@ -110,11 +116,16 @@ _DASHBOARD_UNAUTHENTICATED_PATHS: frozenset[str] = frozenset({
 })
 _DASHBOARD_UNAUTHENTICATED_PREFIXES: tuple[str, ...] = ("/static/",)
 
+# This app mounts ``control_app`` at ``""`` (see the bottom of this
+# module), so the agent-callback routes are served on the dashboard
+# port and *this* gate is the first one they hit. It must therefore
+# honour the same allowlist the Control API does — see #6913.
 _DASHBOARD_SURFACE = AuthSurfaceConfig(
     sse_path="/api/events",
     public_paths=_DASHBOARD_UNAUTHENTICATED_PATHS,
     name="web_dashboard",
     public_prefixes=_DASHBOARD_UNAUTHENTICATED_PREFIXES,
+    agent_callback_matcher=is_agent_callback_route,
 )
 
 
@@ -140,12 +151,21 @@ async def _dashboard_auth_middleware(  # pyright: ignore[reportUnusedFunction]
 ) -> Response:
     """Enforce dashboard auth via the shared three-path gate.
 
-    The mounted ``control_app`` has its own middleware — requests to
-    ``/control/*`` flow through both gates, which is intentional
-    defense in depth.
+    ``control_app`` is mounted at ``""`` (bottom of this module), so its
+    routes are served here and flow through both gates — intentional
+    defense in depth. That also means agent-callback requests reach
+    *this* gate first, so it must know the agent-callback token; passing
+    ``None`` here rejected every valid agent callback before the inner
+    gate ever ran (#6913). The token is read from the Control API rather
+    than mirrored, so the two surfaces cannot drift apart.
     """
+    from .control_api import get_configured_agent_callback_token
+
     gate_response = evaluate_request(
-        request, _dashboard_admin_token, None, _DASHBOARD_SURFACE
+        request,
+        _dashboard_admin_token,
+        get_configured_agent_callback_token(),
+        _DASHBOARD_SURFACE,
     )
     if gate_response is not None:
         return gate_response
@@ -200,11 +220,20 @@ _main_loop: asyncio.AbstractEventLoop | None = None
 async def broadcast_event(event_type: str, data: dict | None = None) -> None:
     """Broadcast an event to all SSE subscribers.
 
+    This is the single serialization boundary for the SSE stream, so it is where
+    the public envelope is applied: ``apply_sse_envelope`` stamps the ``schema``
+    version onto every event regardless of which producer emitted it. Callers
+    must not add the field themselves — see
+    :mod:`issue_orchestrator.events.sse_envelope`.
+
     Args:
         event_type: Type of event (e.g., "session_started", "session_completed", "state_changed")
         data: Optional data to include with the event
     """
-    event = {"type": event_type, "data": data or {}}
+    enveloped = apply_sse_envelope(event_type, data)
+    # ``data`` is a read-only mapping; copy it into a plain dict so the
+    # transport can JSON-serialize it.
+    event = {"type": enveloped.type, "data": dict(enveloped.data)}
     dead_subscribers = []
 
     for queue in _event_subscribers:
@@ -536,6 +565,7 @@ async def run_web_dashboard(
     port: int = 8080,
     open_browser: bool = True,
     on_server_started: Callable[[int], Awaitable[None] | None] | None = None,
+    server_published: asyncio.Event | None = None,
 ) -> None:
     """Run the web dashboard server.
 
@@ -575,6 +605,10 @@ async def run_web_dashboard(
             result = on_server_started(actual_port)
             if asyncio.iscoroutine(result):
                 await result
+        # Set only after the hook has run, so anything awaiting this
+        # sees a published callback endpoint, not merely a bound socket.
+        if server_published is not None:
+            server_published.set()
         if open_browser:
             url = f"http://127.0.0.1:{actual_port}"
             logger.info("[web] Starting uvicorn server on %s", url)
@@ -622,12 +656,33 @@ async def run_with_web_dashboard(
         """
         asyncio.run(orchestrator.startup())
 
+    server_published = asyncio.Event()
+
     async def run_startup_and_loop():
         """Run startup then the orchestrator loop."""
         global _main_loop
 
-        # Wait for server to start and serve initial request before running startup
-        await asyncio.sleep(0.5)
+        # Wait for the server to publish its bound port before starting
+        # orchestration. A fixed sleep raced session launch against
+        # endpoint publication, so an agent could be spawned before it
+        # could be told where to call back (#6924 F7).
+        #
+        # Bounded: if the server never comes up, the loop must still
+        # start so the dashboard reports the problem instead of hanging
+        # silently. Agent launch stays blocked by the readiness gate in
+        # SessionLauncher, so proceeding here cannot spawn an agent that
+        # has nowhere to call back.
+        try:
+            await asyncio.wait_for(
+                server_published.wait(), timeout=_SERVER_PUBLISH_TIMEOUT_SECONDS
+            )
+        except asyncio.TimeoutError:
+            logger.error(
+                "[web] Server did not publish a bound port within %.0fs; "
+                "starting orchestration anyway. Agent sessions stay "
+                "blocked until the callback endpoint is available.",
+                _SERVER_PUBLISH_TIMEOUT_SECONDS,
+            )
         try:
             # Run startup in a thread pool to avoid blocking the event loop
             # startup() makes synchronous GitHub API calls that would block serving requests
@@ -670,6 +725,7 @@ async def run_with_web_dashboard(
             port,
             open_browser=open_browser,
             on_server_started=on_server_started,
+            server_published=server_published,
         )
     finally:
         # When web server stops, stop orchestrator

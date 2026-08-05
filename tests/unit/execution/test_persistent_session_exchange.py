@@ -35,6 +35,7 @@ from issue_orchestrator.execution.persistent_role_prompt_policy import (
 )
 from issue_orchestrator.execution.session_output_adapter import FileSystemSessionOutput
 from issue_orchestrator.ports import TraceEvent
+from tests.callback_endpoint_helpers import ready_callback_endpoint
 
 
 # ---------------------------------------------------------------------------
@@ -899,6 +900,97 @@ class TestPersistentSessionExchangeHappyPath:
         assert "Reviewer report:" in coder_prompt
         assert "Fix the typo in the persisted report path." in coder_prompt
         assert "Reviewer feedback:" not in coder_prompt
+
+    def test_approval_gate_routes_contract_error_through_coder_rework(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        prompt_path = tmp_path / "p.md"
+        prompt_path.write_text("Prompt", encoding="utf-8")
+        coder_wt, reviewer_wt = _setup_worktrees(tmp_path)
+        session_output = FileSystemSessionOutput()
+
+        class _RejectOnce:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def rejection_reason(self) -> str | None:
+                self.calls += 1
+                if self.calls == 1:
+                    return (
+                        "Tech Lead decision artifact rejected "
+                        "(contract_violation): finding T2 title exceeds "
+                        "300 characters (459)."
+                    )
+                return None
+
+        gate = _RejectOnce()
+        state = _patch_persistent_runner(
+            monkeypatch,
+            response_script={
+                "reviewer": [
+                    {
+                        "response_type": "ok",
+                        "response_text": "Looks good",
+                        "getting_closer": True,
+                    },
+                    {
+                        "response_type": "ok",
+                        "response_text": "Contract repair verified",
+                        "getting_closer": True,
+                    },
+                ],
+                "coder": [
+                    {
+                        "response_type": "ok",
+                        "response_text": "Shortened T2 and moved detail to evidence",
+                        "getting_closer": True,
+                    }
+                ],
+            },
+        )
+
+        outcome = pse.run_persistent_session_exchange(
+            exchange_run=_start_exchange_run(
+                session_output=session_output,
+                coder_worktree_path=coder_wt,
+                issue_number=34,
+                coder_label="agent:tech-lead",
+            ),
+            session_output=session_output,
+            pair_registry=state["registry"],
+            persistent_pair_root=tmp_path / "persistent-pairs",
+            coder_worktree_path=coder_wt,
+            reviewer_worktree_factory=lambda: reviewer_wt,
+            issue_number=34,
+            issue_title="Health Review — walk the floor",
+            coder_label="agent:tech-lead",
+            reviewer_label="agent:reviewer",
+            coder_agent=_make_agent(prompt_path),
+            reviewer_agent=_make_agent(prompt_path),
+            runtime_config=_runtime_config(tmp_path),
+            max_rounds=3,
+            max_no_progress=2,
+            require_validation=False,
+            approval_gate=gate,
+        )
+
+        assert outcome.status == "ok"
+        assert outcome.rounds == 2
+        assert gate.calls == 2
+        assert [role for role, _ in state["rounds_seen"]] == [
+            "reviewer",
+            "coder",
+            "reviewer",
+        ]
+        coder_prompt = next(
+            prompt
+            for role, prompt, _notice in state["prompt_inboxes_seen"]
+            if role == "coder"
+        )
+        assert "Orchestrator acceptance gate" in coder_prompt
+        assert "finding T2 title exceeds 300 characters (459)" in coder_prompt
 
     def test_codex_reviewer_respawns_before_followup_prompt(
         self,
@@ -6758,6 +6850,7 @@ class TestProductionLayoutCacheResolution:
             ),
         }
         return CompletionReviewExchange(
+            agent_callback_endpoint=ready_callback_endpoint(),
             config=cfg,
             session_output=session_output,
             emit_review_started=lambda **_: None,

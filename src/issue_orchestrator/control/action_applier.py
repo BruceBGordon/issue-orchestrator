@@ -49,26 +49,24 @@ if TYPE_CHECKING:
     from ..ports.persistent_exchange_pair_registry import (
         PersistentExchangePairRegistry,
     )
+    from ..ports.promotion_target import PromotionTargetHost
     from ..ports.tech_lead_authority import TechLeadAuthorityStore
     from .retry_history_state import ExpediteLane
     from .session_history import SessionHistoryOwner
     from .tech_lead_kill_session import TechLeadKillSessionExecutor
     from .tech_lead_reset_retry import TechLeadResetRetryExecutor
-from .reconciliation import (
-    ExternalSnapshot,
-    ReconciliationRequired,
-    require_reconciliation,
-)
+from .mutation_gate import ReconciliationGate
+from .reconciliation import ReconciliationRequired
 from .claim_gate import ClaimGate, ClaimLostError
 from .review_exchange_lifecycle import (
     cancel_issue_review_exchange,
     terminate_issue_runtime,
 )
+from .close_on_merge import run_close_on_merge_fallback
 from .actions import (
     Action,
     ActionResult,
     ActionType,
-    TECH_LEAD_ISSUE_CREATION_ACTION_TYPES,
     AddLabelAction,
     RemoveLabelAction,
     SyncLabelsAction,
@@ -94,9 +92,10 @@ from .actions import (
 )
 from .provider_impact import ApplyProviderImpactAction, apply_provider_impact
 from .session_manager import SessionManager, SessionRef, SessionType, SessionContext
+from .tech_lead_applier_handlers import tech_lead_action_handlers
 from .tech_lead_issue_creation import apply_create_tech_lead_issue
 from .history_reconciliation import apply_history_reconciliation
-from .tech_lead_proposals import apply_discard_terminal_tech_lead_proposal_ops, execute_approved_tech_lead_op
+from .tech_lead_proposals import execute_approved_tech_lead_op
 from .tech_lead_reset_retry import apply_surface_tech_lead_proposal
 
 logger = logging.getLogger(__name__)
@@ -221,6 +220,10 @@ class ActionApplier:
     tech_lead_reset_retry: Optional["TechLeadResetRetryExecutor"] = None
     tech_lead_kill_session: Optional["TechLeadKillSessionExecutor"] = None
     tech_lead_ops: Optional["TechLeadAuthorityStore"] = None
+    # Cross-repo filing seam for the finding-promotion lane (#6957). Unwired
+    # means promotion actions fail loudly instead of silently no-oping — the
+    # lane is only ever planned when tech_lead.findings is enabled.
+    promotion_target: Optional["PromotionTargetHost"] = None
     # Expedite-lane owner seam (#6870), wired post-construction; unwired = no-op.
     expedite_lane: Optional["ExpediteLane"] = None
     _active_label_mutation_stats: _LabelMutationStats | None = field(
@@ -297,15 +300,19 @@ class ActionApplier:
             ActionType.QUEUE_TECH_LEAD: self._apply_queue_operation,
             ActionType.ESCALATE_TO_HUMAN: self._apply_escalate,
             ActionType.ENQUEUE_TO_MERGE_QUEUE: self._apply_enqueue_to_merge_queue,
-            # All tech-lead-authored issues share one apply-time creation owner.
-            **dict.fromkeys(TECH_LEAD_ISSUE_CREATION_ACTION_TYPES, self._apply_create_tech_lead_issue),
-            # Tech Lead decision proposals - event-only, no GitHub calls (ADR-0031)
-            ActionType.SURFACE_TECH_LEAD_PROPOSAL: self._apply_surface_tech_lead_proposal,
-            # Act-level tech_lead execution via the reset owner (#6764)
-            ActionType.RESET_RETRY_ISSUE: self._apply_reset_retry_issue,
-            # Approved kill_hung_session ops via the termination owner (#6778)
-            ActionType.KILL_HUNG_SESSION: self._apply_kill_hung_session,
-            ActionType.DISCARD_TERMINAL_TECH_LEAD_PROPOSAL_OPS: lambda action: apply_discard_terminal_tech_lead_proposal_ops(action, tracker=self.repository_host, authority=self.tech_lead_ops),
+            # Every tech-lead action type -> its extracted apply-time owner.
+            **tech_lead_action_handlers(
+                create_tech_lead_issue=self._apply_create_tech_lead_issue,
+                surface_proposal=self._apply_surface_tech_lead_proposal,
+                reset_retry=self._apply_reset_retry_issue,
+                kill_hung_session=self._apply_kill_hung_session,
+                # Mutation policy stays HERE: the extracted owners get the
+                # applier's own expected-state gate, not a copy of it (#6957 F15).
+                require_expected=self._require_expected,
+                repository_host=self.repository_host,
+                authority=self.tech_lead_ops,
+                promotion_target=self.promotion_target,
+            ),
             # Cleanup operations
             ActionType.CLEANUP_SESSION: self._apply_cleanup_session,
             ActionType.REMOVE_WORKTREE: self._apply_remove_worktree,
@@ -592,6 +599,23 @@ class ActionApplier:
         try:
             self.repository_host.update_issue_state(action.issue_number, "closed")
             logger.info(issue_log(action.issue_number, "Issue closed"))
+            if action.comment:
+                # Only after a successful close — a comment claiming "the
+                # orchestrator closed it" before the close would leave a false
+                # audit trail on failure and repeat on every retry. Best-effort:
+                # a failed comment must never fail an already-applied close.
+                try:
+                    self.repository_host.add_comment(
+                        action.issue_number, action.comment,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        issue_log(
+                            action.issue_number,
+                            "Failed to post close comment: %s",
+                        ),
+                        e,
+                    )
             return ActionResult.ok(
                 action,
                 issue_number=action.issue_number,
@@ -631,65 +655,30 @@ class ActionApplier:
             )
             return ActionResult.fail(action, str(e), issue_number=action.issue_number)
 
-    def _fetch_current_labels(self, issue_number: int) -> set[str] | None:
-        """Fetch current labels for an issue if fresh_issue_reader is available.
+    @property
+    def _gate(self) -> ReconciliationGate:
+        """The owner that decides whether a mutation may happen at all.
 
-        Returns:
-            Set of label names, or None if fresh_issue_reader not configured
+        Extracted so "unknown is not empty, and unknown fails closed" lives in
+        one named place instead of two methods inside this dispatcher (#6957
+        round-2 review F4/A5). Built per access from the applier's own
+        collaborators, which tests reassign after construction.
         """
-        if self.fresh_issue_reader is None:
-            return None
-        try:
-            labels = self.fresh_issue_reader.read_issue_labels(issue_number)
-            return set(labels)
-        except Exception as e:
-            logger.warning(
-                issue_log(issue_number, "Failed to fetch labels for reconciliation: %s"),
-                e,
-            )
-            return None
+        return ReconciliationGate(
+            fresh_issue_reader=self.fresh_issue_reader, reconcile=self.reconcile
+        )
+
+    def _fetch_current_labels(self, issue_number: int) -> set[str] | None:
+        """Current labels, or None when they could not be OBSERVED."""
+        return self._gate.current_labels(issue_number)
 
     def _require_expected(self, action: Action, issue_number: int) -> None:
-        """Enforce reconciliation before a mutation if action has expected state.
-
-        This is the hard gate for optimistic concurrency control. If the action
-        has an ExpectedState attached, we fetch current state and verify it
-        satisfies the constraints. If not, we raise ReconciliationRequired.
-
-        Args:
-            action: The action being applied (checks action.expected)
-            issue_number: The issue/PR number to check
+        """Refuse the mutation unless the board still satisfies its expectations.
 
         Raises:
-            ReconciliationRequired: If current state doesn't satisfy expected
+            ReconciliationRequired: the expectation is violated, or unverifiable.
         """
-        if action.expected is None:
-            # No expected state attached - allow (for backwards compatibility)
-            return
-
-        if not self.reconcile:
-            # Reconciliation disabled - skip enforcement
-            return
-
-        # Fetch current state
-        current_labels = self._fetch_current_labels(issue_number)
-        if current_labels is None:
-            # Can't verify - fail closed (require fresh_issue_reader for reconciliation)
-            logger.warning(
-                issue_log(issue_number, "Reconciliation required but cannot fetch labels - failing closed"),
-            )
-            raise ReconciliationRequired(
-                entity_type="issue",
-                entity_id=issue_number,
-                expected=ExternalSnapshot.for_issue(issue_number, set(action.expected.required_labels)),
-                actual=ExternalSnapshot.for_issue(issue_number, set()),
-                reason="Cannot fetch current labels to verify expected state",
-            )
-
-        actual = ExternalSnapshot.for_issue(issue_number, current_labels)
-
-        # This raises ReconciliationRequired if constraints not satisfied
-        require_reconciliation(action.expected, actual, entity_type="issue")
+        self._gate.require_expected(action, issue_number)
 
     def _verify_claim_before_write(self, action: Action, issue_number: int) -> None:
         """Verify claim ownership before a write operation.
@@ -1350,6 +1339,26 @@ Maximum rework cycles ({action.max_rework_cycles}) exceeded.
         # explicit guard that this command writes only to a still-claimed issue.
         self._verify_claim_before_write(action, action.issue_number)
 
+        close_applied = False
+        if action.close_issue:
+            # Close-on-merge fallback (porchpin #81): revalidation ordering
+            # and rationale live in run_close_on_merge_fallback — the module
+            # owns the destructive precondition; the planner's bit is advisory.
+            close_applied, close_error = run_close_on_merge_fallback(
+                repository_host=self.repository_host,
+                action=action,
+                close=self._apply_close_issue,
+            )
+            if close_error is not None:
+                # Fail without any further mutation (no shed, no history);
+                # the entry stays reconcilable for retry.
+                return ActionResult.fail(
+                    action,
+                    close_error,
+                    issue_number=action.issue_number,
+                    pr_number=action.pr_number,
+                )
+
         shed_result = self._apply_shed_recovered_workflow_labels(
             ShedRecoveredWorkflowLabelsAction(
                 issue_number=action.issue_number,
@@ -1391,6 +1400,7 @@ Maximum rework cycles ({action.max_rework_cycles}) exceeded.
             pr_number=action.pr_number,
             status=action.status,
             shed_removed=list(shed_result.details.get("removed", [])),
+            closed_issue=close_applied,
         )
 
     def _apply_queue_review(self, action: Action) -> ActionResult:
@@ -1492,9 +1502,14 @@ Maximum rework cycles ({action.max_rework_cycles}) exceeded.
         apply_fn: "Callable[[_TechLeadOpAction], ActionResult] | None",
         op_type: str,
     ) -> ActionResult:
-        # Reconciliation pause gate first (raises ReconciliationRequired) — a
-        # paused issue must never be mutated from an agent proposal.
-        self._require_expected(action, action.issue_number)
+        # NO reconciliation gate here. Every mutating tech-lead command now
+        # crosses it in exactly one place — the typed dispatch wrapper in
+        # ``tech_lead_applier_handlers`` — which reads this same subject
+        # (``ResetRetryIssueAction``/``KillHungSessionAction`` name
+        # ``issue_number``). Keeping the old call as well made an allowed
+        # reset/kill perform TWO cache-bypassing GitHub reads per dispatch and
+        # left mutation policy owned in two places (#6957 round-2 review F5/A5).
+        # This executor owns operation-specific preconditions and execution only.
         if apply_fn is None:
             return ActionResult.fail(
                 action,

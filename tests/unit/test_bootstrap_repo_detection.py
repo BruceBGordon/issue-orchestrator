@@ -316,6 +316,29 @@ class TestCheckGithubTokenScopes:
 class TestBuildOrchestratorForTesting:
     """Tests for build_orchestrator_for_testing function."""
 
+    def test_callback_endpoint_is_ready(
+        self, minimal_config: Config, mock_github: MagicMock
+    ) -> None:
+        """A composition that binds no Control API must say so.
+
+        The launcher refuses to start a session while the callback
+        endpoint is unresolved, so a composition that neither publishes
+        nor declares silently stops launching anything — which is how
+        this surfaced: one tech-lead launch test failed with a bare
+        ``session is None`` and nothing pointing at the cause (#6924 F7).
+        """
+        with patch("issue_orchestrator.entrypoints.bootstrap.install_gh_guard"):
+            orchestrator = build_orchestrator_for_testing(
+                config=minimal_config,
+                github=mock_github,
+            )
+        endpoint = orchestrator.deps.agent_callback_endpoint
+        assert endpoint.is_ready(), (
+            "testing composition must resolve the endpoint question, or "
+            "every session launch is silently gated"
+        )
+        assert endpoint.resolve_port(0) is None, "no Control API is bound here"
+
     @pytest.fixture
     def minimal_config(self, tmp_path) -> Config:
         """Minimal valid config for testing."""

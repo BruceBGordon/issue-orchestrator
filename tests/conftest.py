@@ -1,6 +1,7 @@
 """Shared fixtures and configuration for tests."""
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import os
 import pytest
 from pathlib import Path
@@ -235,6 +236,14 @@ class MockGitHubAdapter:
         self.labels: dict[int, set[str]] = {}  # issue_number -> labels
         self.prs: dict[str, list[PRInfo]] = {}  # branch -> PRs
         self.comments: list[dict] = []
+        # (issue_number, ISO-8601Z timestamp) per close, mirroring GitHub's
+        # /issues/{n}/events "closed" entries for issue_closed_on_or_after.
+        # Timestamps are DETERMINISTIC (tests/AGENTS.md: never the real
+        # clock): a fixed far-future base plus a per-event counter, so any
+        # close recorded during a scenario sorts after any fixture merged_at.
+        # Tests needing precise ordering seed issue_close_events directly.
+        self.issue_close_events: list[tuple[int, str]] = []
+        self._close_event_seq = 0
         self.pr_reviews: dict[int, list[dict]] = {}  # pr_number -> reviews
         self.close_pr_calls: list[int] = []
         # pr_number -> current merge queue entry (None/absent = not enqueued)
@@ -523,6 +532,27 @@ class MockGitHubAdapter:
         issue = self.get_issue(issue_number)
         if issue is not None:
             issue.state = state
+            if state == "closed":
+                self._close_event_seq += 1
+                seq = self._close_event_seq
+                self.issue_close_events.append((
+                    issue_number,
+                    f"9999-01-01T00:{seq // 60:02d}:{seq % 60:02d}Z",
+                ))
+
+    def issue_closed_on_or_after(self, issue_number: int, timestamp: str) -> bool:
+        """Whether a recorded close event exists at/after ``timestamp`` (mock).
+
+        Mirrors the GitHub adapter's typed close-event evidence read. The mock
+        does not simulate GitHub's closing-keyword auto-close, so scenarios
+        that merge a PR without closing its issue genuinely have no close
+        event — the close-on-merge fallback then behaves exactly as it would
+        against real GitHub.
+        """
+        return any(
+            number == issue_number and closed_at >= timestamp
+            for number, closed_at in self.issue_close_events
+        )
 
 
 @pytest.fixture
@@ -832,6 +862,10 @@ def build_test_orchestrator_deps(
     from issue_orchestrator.control.label_sync import LabelSync
     from issue_orchestrator.control.board_snapshot_builder import BoardSnapshotBuilder
     from issue_orchestrator.control.orchestrator_deps import OrchestratorDeps
+    from issue_orchestrator.entrypoints.bootstrap_session_launcher import (
+        build_session_launcher_factory,
+    )
+    from tests.callback_endpoint_helpers import ready_callback_endpoint
     from issue_orchestrator.events import EventHub
     from issue_orchestrator.execution.git_working_copy import GitWorkingCopy
     from issue_orchestrator.execution.command_runner import LocalCommandRunner
@@ -856,7 +890,10 @@ def build_test_orchestrator_deps(
     from issue_orchestrator.execution.persistent_review_exchange_runner import (
         PersistentReviewExchangeRunner,
     )
+    agent_callback_endpoint = ready_callback_endpoint()
+
     completion_processor = CompletionProcessor(
+        agent_callback_endpoint=agent_callback_endpoint,
         label_adapter=repo_host,
         pr_adapter=repo_host,
         git_adapter=working_copy,
@@ -1031,6 +1068,30 @@ def build_test_orchestrator_deps(
     return OrchestratorDeps(
         events=events,
         runner=runner,
+        # The same endpoint the completion processor got, mirroring how
+        # bootstrap shares one instance. Nothing binds a port in tests, so
+        # it honestly resolves to "no endpoint yet".
+        agent_callback_endpoint=agent_callback_endpoint,
+        # Same shape as bootstrap: assembly at the composition boundary,
+        # closing over these collaborators (#6924 A3-R2).
+        session_launcher_factory=build_session_launcher_factory(
+            config=config,
+            events=events,
+            repository_host=repo_host,
+            action_applier=_action_applier,
+            session_manager=_session_manager,
+            worktree_manager=worktree_manager,
+            working_copy=working_copy,
+            command_runner=command_runner,
+            session_output=session_output,
+            manifest_downloader=manifest_downloader,
+            tech_lead_authority=tech_lead_authority,
+            claim_manager=claim_manager,
+            provider_resilience=provider_resilience,
+            state_machine_manager=state_machine_manager,
+            label_manager=label_manager,
+            agent_callback_endpoint=agent_callback_endpoint,
+        ),
         repository_host=repo_host,
         e2e_issue_tracker=e2e_issue_tracker,
         fresh_issue_reader=fresh_reader,

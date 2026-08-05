@@ -150,8 +150,7 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass
-from pathlib import Path, PurePosixPath, PureWindowsPath
+from pathlib import Path, PureWindowsPath
 from typing import Any, Protocol, runtime_checkable
 
 from issue_orchestrator.domain.sandbox_scope import (
@@ -164,12 +163,21 @@ from .codex_config import (
     resolve_codex_home,
     validate_codex_permission_profile_compatibility,
 )
+from .git_worktree_access import (
+    GitWorktreeAccess,
+    git_worktree_filesystem_rules as _git_worktree_filesystem_rules,
+    resolve_git_worktree_access,
+)
+
+CodexGitWorktreeAccess = GitWorktreeAccess
+resolve_codex_git_worktree_access = resolve_git_worktree_access
 
 __all__ = [
     "MODEL_API_DOMAINS",
     "MODEL_ONLY_DENY_TOOLS",
     "CODEX_PERMISSION_PROFILE",
     "CodexGitWorktreeAccess",
+    "GitWorktreeAccess",
     "ClaudeSandboxAdapter",
     "CodexSandboxAdapter",
     "ProviderSandboxAdapter",
@@ -177,6 +185,7 @@ __all__ = [
     "build_claude_sandbox_settings",
     "build_codex_sandbox_argv",
     "resolve_codex_git_worktree_access",
+    "resolve_git_worktree_access",
     "validate_codex_permission_profile_compatibility",
 ]
 
@@ -323,13 +332,42 @@ def _deny_tools_for_egress(egress: SandboxEgress) -> tuple[str, ...]:
     return MODEL_ONLY_DENY_TOOLS  # "model-only" and "none"
 
 
-def build_claude_sandbox_settings(scope: SandboxScope) -> dict[str, Any]:
+def build_claude_sandbox_settings(
+    scope: SandboxScope,
+    *,
+    git_access: "GitWorktreeAccess | None" = None,
+) -> dict[str, Any]:
     """Pure translation of a :class:`SandboxScope` into a Claude Code settings dict.
 
     Extracted as a pure function so the mapping is unit-testable without
     building a full command.
     """
     self_config_paths = _self_config_paths(scope.write_roots)
+    git_rules = (
+        _git_worktree_filesystem_rules(git_access) if git_access is not None else []
+    )
+    git_read_paths = [path for path, permission in git_rules if permission == "read"]
+    git_write_paths = [path for path, permission in git_rules if permission == "write"]
+    git_write_roots = tuple(Path(path) for path in git_write_paths)
+    git_write_carveouts = [
+        path
+        for path in git_read_paths
+        if any(Path(path).is_relative_to(root) for root in git_write_roots)
+    ]
+
+    allow_read = list(
+        dict.fromkeys(
+            [
+                *(str(path) for path in scope.read_roots),
+                *git_read_paths,
+                *git_write_paths,
+            ]
+        )
+    )
+    allow_write = list(
+        dict.fromkeys([*(str(path) for path in scope.write_roots), *git_write_paths])
+    )
+    deny_write = list(dict.fromkeys([*self_config_paths, *git_write_carveouts]))
     sandbox: dict[str, Any] = {
         "enabled": True,
         # Hard-fail rather than silently run unsandboxed if the sandbox can't
@@ -347,13 +385,13 @@ def build_claude_sandbox_settings(scope: SandboxScope) -> dict[str, Any]:
             # layer is the ``permissions.deny Read(...)`` rules below, which merge
             # into this OS profile and also cover Bash.
             "denyRead": ["~/"],
-            "allowRead": [str(p) for p in scope.read_roots],
-            "allowWrite": [str(p) for p in scope.write_roots],
+            "allowRead": allow_read,
+            "allowWrite": allow_write,
             # Anti-self-modification (Bash layer): the agent may write its worktree
             # but NOT its own policy files. ``denyWrite`` wins over ``allowWrite``,
             # so a sandboxed command cannot rewrite settings to hot-reload a wider
             # policy after launch.
-            "denyWrite": self_config_paths,
+            "denyWrite": deny_write,
         },
         "credentials": {
             # Unset credential env vars for sandboxed commands. Secret FILE reads
@@ -399,7 +437,11 @@ def build_claude_sandbox_settings(scope: SandboxScope) -> dict[str, Any]:
     return settings
 
 
-def build_claude_sandbox_argv(scope: SandboxScope) -> list[str]:
+def build_claude_sandbox_argv(
+    scope: SandboxScope,
+    *,
+    git_access: "GitWorktreeAccess | None" = None,
+) -> list[str]:
     """Return the claude-code argv fragment that enforces *scope*.
 
     Emits ``--permission-mode dontAsk`` (non-yolo, unattended, deny-by-default)
@@ -409,7 +451,7 @@ def build_claude_sandbox_argv(scope: SandboxScope) -> list[str]:
     repository contract); the policy this adds constrains the agent, not the repo.
     """
     settings_json = json.dumps(
-        build_claude_sandbox_settings(scope),
+        build_claude_sandbox_settings(scope, git_access=git_access),
         sort_keys=True,
         separators=(",", ":"),
     )
@@ -425,7 +467,8 @@ class ClaudeSandboxAdapter:
     """Claude Code implementation of :class:`ProviderSandboxAdapter`."""
 
     def apply_scope(self, scope: SandboxScope) -> list[str]:
-        return build_claude_sandbox_argv(scope)
+        git_access = resolve_git_worktree_access(scope.working_directory)
+        return build_claude_sandbox_argv(scope, git_access=git_access)
 
 
 def _toml_string(value: str) -> str:
@@ -446,59 +489,6 @@ def _is_absolute_or_home_path(raw: str) -> bool:
     )
 
 
-@dataclass(frozen=True)
-class CodexGitWorktreeAccess:
-    """Resolved Git paths a sandboxed Codex session needs to make commits.
-
-    A linked worktree's ``.git`` entry is a file pointing into the base
-    repository's shared Git directory. Granting only the visible worktree is
-    therefore insufficient: ``git add`` must update the worktree-specific
-    index, while ``git commit`` must add objects and advance the current branch.
-
-    The paths are resolved before Codex starts and translated into exact
-    permission-profile entries. Shared config, hooks, other refs, and other
-    worktrees remain read-only.
-    """
-
-    git_dir: Path
-    common_dir: Path
-    head_ref: Path | None
-
-    def __post_init__(self) -> None:
-        for name, path in (
-            ("git_dir", self.git_dir),
-            ("common_dir", self.common_dir),
-        ):
-            if not path.is_absolute():
-                raise SandboxUnsupportedError(
-                    f"Codex sandbox {name} must be absolute (got {path})"
-                )
-        if not self.git_dir.is_relative_to(self.common_dir):
-            raise SandboxUnsupportedError(
-                "Codex sandbox worktree Git directory must stay inside the "
-                f"common Git directory (got {self.git_dir})"
-            )
-        if self.head_ref is not None:
-            if not self.head_ref.is_absolute():
-                raise SandboxUnsupportedError(
-                    f"Codex sandbox head_ref must be absolute (got {self.head_ref})"
-                )
-            if not self.head_ref.is_relative_to(self.common_dir):
-                raise SandboxUnsupportedError(
-                    "Codex sandbox current branch ref must stay inside the "
-                    f"common Git directory (got {self.head_ref})"
-                )
-
-
-def _read_git_path_file(path: Path, *, label: str) -> str:
-    try:
-        return path.read_text(encoding="utf-8").strip()
-    except OSError as exc:
-        raise SandboxUnsupportedError(
-            f"Codex sandbox could not read {label} at {path}: {exc}"
-        ) from exc
-
-
 def _codex_credential_files() -> tuple[str, ...]:
     """Credential stores to deny, including an operator-set Codex home."""
     paths = list(_CODEX_CREDENTIAL_FILES)
@@ -507,155 +497,9 @@ def _codex_credential_files() -> tuple[str, ...]:
     return tuple(dict.fromkeys(paths))
 
 
-def _resolve_git_directory(worktree: Path) -> Path:
-    marker = worktree / ".git"
-    if marker.is_dir():
-        return marker.resolve()
-    if not marker.is_file():
-        raise SandboxUnsupportedError(
-            f"Codex sandbox working directory is not a Git worktree: {worktree}"
-        )
-
-    raw = _read_git_path_file(marker, label="linked-worktree .git pointer")
-    prefix = "gitdir:"
-    if not raw.lower().startswith(prefix):
-        raise SandboxUnsupportedError(
-            f"Codex sandbox found a malformed .git pointer at {marker}"
-        )
-    target = raw[len(prefix) :].strip()
-    if not target:
-        raise SandboxUnsupportedError(
-            f"Codex sandbox found an empty .git pointer at {marker}"
-        )
-    git_dir = Path(target)
-    if not git_dir.is_absolute():
-        git_dir = marker.parent / git_dir
-    git_dir = git_dir.resolve()
-    if not git_dir.is_dir():
-        raise SandboxUnsupportedError(
-            f"Codex sandbox linked-worktree Git directory does not exist: {git_dir}"
-        )
-    return git_dir
-
-
-def resolve_codex_git_worktree_access(worktree: Path) -> CodexGitWorktreeAccess:
-    """Resolve the minimal Git metadata paths required by the current worktree.
-
-    This filesystem discovery belongs in the provider adapter rather than the
-    domain scope computation: :class:`SandboxScope` stays provider-agnostic and
-    pure, while Codex receives the concrete paths its OS profile must expose.
-    """
-    git_dir = _resolve_git_directory(worktree)
-    common_marker = git_dir / "commondir"
-    if common_marker.exists():
-        raw_common = _read_git_path_file(
-            common_marker, label="linked-worktree commondir pointer"
-        )
-        if not raw_common:
-            raise SandboxUnsupportedError(
-                f"Codex sandbox found an empty commondir pointer at {common_marker}"
-            )
-        common_dir = Path(raw_common)
-        if not common_dir.is_absolute():
-            common_dir = git_dir / common_dir
-        common_dir = common_dir.resolve()
-    else:
-        common_dir = git_dir
-    if not common_dir.is_dir():
-        raise SandboxUnsupportedError(
-            f"Codex sandbox common Git directory does not exist: {common_dir}"
-        )
-
-    raw_head = _read_git_path_file(git_dir / "HEAD", label="worktree HEAD")
-    head_ref: Path | None = None
-    if raw_head.startswith("ref:"):
-        raw_ref = raw_head.removeprefix("ref:").strip()
-        ref = PurePosixPath(raw_ref)
-        if (
-            not raw_ref
-            or ref.is_absolute()
-            or ".." in ref.parts
-            or ref.parts[:2] != ("refs", "heads")
-        ):
-            raise SandboxUnsupportedError(
-                "Codex sandbox only supports symbolic HEAD refs under refs/heads "
-                f"(got {raw_ref!r})"
-            )
-        head_ref = common_dir.joinpath(*ref.parts)
-
-    return CodexGitWorktreeAccess(
-        git_dir=git_dir,
-        common_dir=common_dir,
-        head_ref=head_ref,
-    )
-
-
-def _with_lock_path(path: Path) -> Path:
-    return path.with_name(path.name + ".lock")
-
-
-def _codex_git_filesystem_entries(
-    access: CodexGitWorktreeAccess,
-) -> list[tuple[str, str]]:
-    """Return least-privilege Git entries for status, staging, and commits."""
-    read = _toml_string("read")
-    write = _toml_string("write")
-    entries: list[tuple[str, str]] = [(str(access.common_dir), read)]
-
-    if access.git_dir != access.common_dir:
-        # A linked worktree's admin directory contains its index, HEAD reflog,
-        # merge/rebase state, and COMMIT_EDITMSG. It is private to this
-        # worktree, so it can be writable as a unit. Pointer/config files are
-        # carved back to read-only so the agent cannot redirect or reconfigure
-        # later Git operations.
-        entries.append((str(access.git_dir), write))
-        protected_names = ["commondir", "gitdir", "config", "config.worktree"]
-        if access.head_ref is not None:
-            # A symbolic HEAD pins the orchestrator-owned issue branch. Detached
-            # reviewer worktrees instead need their private HEAD writable.
-            protected_names.insert(0, "HEAD")
-        for name in protected_names:
-            entries.append((str(access.git_dir / name), read))
-    else:
-        # A non-linked checkout has no private admin directory. Keep the shared
-        # directory read-only and open only the files used by a normal add +
-        # commit sequence.
-        for path in (
-            access.git_dir / "index",
-            access.git_dir / "COMMIT_EDITMSG",
-            access.git_dir / "logs" / "HEAD",
-        ):
-            entries.extend(((str(path), write), (str(_with_lock_path(path)), write)))
-
-    # New commit/tree/blob objects necessarily enter the shared object store.
-    # Existing packs and the alternates/configuration area remain read-only,
-    # preventing a session from replacing packs or redirecting object lookup.
-    objects = access.common_dir / "objects"
-    entries.extend(
-        (
-            (str(objects), write),
-            (str(objects / "info"), read),
-            (str(objects / "pack"), read),
-        )
-    )
-
-    if access.head_ref is None:
-        # Detached linked worktrees advance their private HEAD directly.
-        head = access.git_dir / "HEAD"
-        entries.extend(((str(head), write), (str(_with_lock_path(head)), write)))
-        return entries
-
-    branch_log = (
-        access.common_dir / "logs" / access.head_ref.relative_to(access.common_dir)
-    )
-    for path in (access.head_ref, branch_log):
-        entries.extend(((str(path), write), (str(_with_lock_path(path)), write)))
-    return entries
-
-
 def _codex_permission_profile(
     scope: SandboxScope,
-    git_access: CodexGitWorktreeAccess,
+    git_access: GitWorktreeAccess,
 ) -> str:
     """Serialize the invocation-scoped Codex permission profile for *scope*."""
     workspace_rules = _toml_inline_table(
@@ -676,7 +520,10 @@ def _codex_permission_profile(
         (":slash_tmp", _toml_string("read")),
         (":workspace_roots", workspace_rules),
     ]
-    filesystem_entries.extend(_codex_git_filesystem_entries(git_access))
+    filesystem_entries.extend(
+        (path, _toml_string(permission))
+        for path, permission in _git_worktree_filesystem_rules(git_access)
+    )
     # Read-only god-view roots (read_roots that are NOT write roots): a tech-lead
     # failure investigation READS these but must not WRITE them. Codex's
     # --add-dir workspace roots are writable, so these are emitted as explicit
@@ -732,7 +579,7 @@ def _codex_read_only_roots(scope: SandboxScope) -> list[Path]:
 def build_codex_sandbox_argv(
     scope: SandboxScope,
     *,
-    git_access: CodexGitWorktreeAccess | None = None,
+    git_access: GitWorktreeAccess | None = None,
 ) -> list[str]:
     """Return Codex global argv enforcing *scope* with a native profile.
 
@@ -743,7 +590,7 @@ def build_codex_sandbox_argv(
     """
     if git_access is None:
         validate_codex_permission_profile_compatibility(scope.working_directory)
-        resolved_git_access = resolve_codex_git_worktree_access(scope.working_directory)
+        resolved_git_access = resolve_git_worktree_access(scope.working_directory)
     else:
         resolved_git_access = git_access
     argv = [

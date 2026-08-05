@@ -22,6 +22,13 @@ import time
 from typing import TYPE_CHECKING
 from uuid import uuid4
 
+from ..control.background_job_supervisor import BackgroundJobSupervisor
+from ..infra.agent_callback_endpoint import RuntimeAgentCallbackEndpoint
+from .bootstrap_session_launcher import build_session_launcher_factory
+from .bootstrap_completion import (
+    _validation_attempt_key_factory,
+    create_completion_components,
+)
 from ..infra.config import Config
 from ..infra.env import ENV_PREFIX
 from ..adapters.github.repo import get_repo_from_git, GitRepoError
@@ -104,17 +111,9 @@ if TYPE_CHECKING:
     from ..control.session_controller import SessionController
     from ..adapters.github.fresh_issue_reader import GitHubFreshIssueReader
     from ..ports.fresh_issue_reader import FreshIssueReader
-    from ..domain.attempt import AttemptKey
-    from ..domain.issue_key import IssueKey
     from ..ports.e2e_issue_tracker import E2EIssueTracker
     from ..ports.attempt_store import AttemptStore
-    from ..ports.validation_attempt_key_factory import ValidationAttemptKeyFactory
-    from ..execution.persistent_exchange_pair_registry_inmemory import (
-        InMemoryPersistentExchangePairRegistry,
-    )
-    from ..ports.turn_mailbox import TurnMailbox
     from ..ports.tech_lead_authority import TechLeadAuthorityStore
-    from ..control.background_job_supervisor import BackgroundJobSupervisor
 
 logger = logging.getLogger(__name__)
 
@@ -402,123 +401,6 @@ def create_attempt_store(config: Config) -> "AttemptStore":
     from ..adapters.sidecar_attempt_store import SidecarAttemptStore
 
     return SidecarAttemptStore(config.repo_root)
-
-
-def _validation_junit_xml_paths(config: Config) -> tuple[str, ...]:
-    from ..infra.validation_junit_paths import configured_validation_junit_xml_paths
-
-    return configured_validation_junit_xml_paths(config)
-
-
-class _IssueKeyValidationAttemptKeyFactory:
-    """Derives validation attempt identity from a stable issue key."""
-
-    def for_validation_attempt(
-        self,
-        *,
-        issue_key: "IssueKey",
-        head_sha: str,
-    ) -> "AttemptKey":
-        from ..domain.attempt import AttemptKey
-
-        return AttemptKey(issue_key, head_sha)
-
-
-def _validation_attempt_key_factory(
-    config: Config,
-) -> "ValidationAttemptKeyFactory":
-    _ = config
-    return _IssueKeyValidationAttemptKeyFactory()
-
-
-def _create_completion_components(
-    config: Config,
-    github: GitHubAdapter | None,
-    events: EventSink,
-    working_copy: GitWorkingCopy,
-    session_output: FileSystemSessionOutput,
-    command_runner: LocalCommandRunner,
-    provider_resilience: ProviderResilienceManager | None = None,
-    label_manager: "LabelManager | None" = None,
-    background_job_supervisor: "BackgroundJobSupervisor | None" = None,
-    pair_registry: "InMemoryPersistentExchangePairRegistry | None" = None,
-    attempt_store: "AttemptStore | None" = None,
-    turn_mailbox: "TurnMailbox | None" = None,
-    tech_lead_authority: "TechLeadAuthorityStore | None" = None,
-) -> tuple["CompletionProcessor | None", "SessionController | None"]:
-    """Create completion processor and session controller."""
-    from ..control.completion_processor import CompletionProcessor
-    from ..control.pre_publish_gate import PrePublishGate
-    from ..control.session_controller import SessionController
-    from ..control.label_manager import LabelManager as _LM
-    from ..execution.run_evidence import RunEvidenceRecorder
-    from ..execution.persistent_exchange_pair_registry_inmemory import (
-        InMemoryPersistentExchangePairRegistry,
-    )
-    from ..execution.persistent_review_exchange_runner import (
-        PersistentReviewExchangeRunner,
-    )
-    from ..control.review_exchange_lifecycle import (
-        ReviewExchangeCancellation,
-        cancel_issue_review_exchange,
-    )
-
-    if label_manager is None:
-        label_manager = _LM(config)
-    if pair_registry is None:
-        pair_registry = InMemoryPersistentExchangePairRegistry()
-
-    def _cancel_review_exchange(
-        issue_number: int,
-        reason: str,
-    ) -> ReviewExchangeCancellation:
-        return cancel_issue_review_exchange(
-            issue_number=issue_number,
-            reason=reason,
-            pair_registry=pair_registry,
-            job_supervisor=background_job_supervisor,
-        )
-
-    completion_processor = CompletionProcessor(
-        label_adapter=github,
-        pr_adapter=github,
-        git_adapter=working_copy,
-        session_output=session_output,
-        # The review exchange delivers verdicts through the orchestrator-owned
-        # mailbox: agents run `exchange-respond`, the Control API delivers into
-        # the open turn slot, and send_round polls the mailbox (#6549).
-        review_exchange_runner=PersistentReviewExchangeRunner(
-            session_output, pair_registry, turn_mailbox=turn_mailbox,
-        ),
-        event_bus=None,
-        label_config=label_manager.to_label_config_dict(),
-        pre_publish_gate=PrePublishGate(command_runner) if config.enforce_hooks else None,
-        config=config,
-        background_job_supervisor=background_job_supervisor,
-        review_exchange_canceller=_cancel_review_exchange,
-        review_artifact_reader=ManifestReviewArtifactReader(),
-        runtime_identity=runtime_identity.resolve_runtime_identity(),
-        tech_lead_authority=tech_lead_authority,
-    ) if github else None
-
-    session_controller_instance = SessionController(
-        completion_processor=completion_processor,
-        events=events,
-        session_output=session_output,
-        working_copy=working_copy,
-        command_runner=command_runner if config.validation.quick.cmd else None,
-        validation_cmd=config.validation.quick.cmd,
-        validation_timeout_seconds=config.validation.quick.timeout_seconds,
-        validation_junit_xml_paths=_validation_junit_xml_paths(config),
-        validation_evidence_recorder=RunEvidenceRecorder(session_output),
-        attempt_store=attempt_store,
-        validation_attempt_key_factory=_validation_attempt_key_factory(config),
-        max_validation_retries=config.retry.max_validation_retries,
-        provider_blocked_label=label_manager.provider_unavailable,
-        review_exchange_canceller=_cancel_review_exchange,
-    ) if completion_processor else None
-
-    return completion_processor, session_controller_instance
 
 
 def _wire_stack_publish_gate(
@@ -825,7 +707,6 @@ def build_orchestrator(
     # N concurrent subprocesses. Add a bounded executor if this becomes a real
     # load issue.
     background_job_runner = ThreadBackgroundJobRunner()
-    from ..control.background_job_supervisor import BackgroundJobSupervisor
     background_job_supervisor = BackgroundJobSupervisor(background_job_runner)
 
     # The persistent exchange pair registry is process-scoped: one
@@ -842,11 +723,19 @@ def build_orchestrator(
     from ..execution.review_exchange_turn_mailbox import InMemoryTurnMailbox
     turn_mailbox = InMemoryTurnMailbox()
 
+    # One instance per orchestrator, shared by everything that needs to
+    # know where agents can call back: the review exchange, the session
+    # launcher, and the server-started hook that publishes the bound
+    # port into it (#6924).
+    agent_callback_endpoint = RuntimeAgentCallbackEndpoint()
+
+
     # Create completion components
-    completion_processor, session_controller_instance = _create_completion_components(
+    completion_processor, session_controller_instance = create_completion_components(
         config, github, events, working_copy, session_output, command_runner, provider_resilience,
         label_manager=label_manager,
         background_job_supervisor=background_job_supervisor,
+        agent_callback_endpoint=agent_callback_endpoint,
         pair_registry=pair_registry,
         attempt_store=attempt_store,
         turn_mailbox=turn_mailbox,
@@ -858,7 +747,7 @@ def build_orchestrator(
 
     # Create health gate
     health_gate = HealthGate(
-        max_concurrent_sessions=config.max_concurrent_sessions,
+        max_concurrent_sessions=config,
         rate_limit_threshold=getattr(config, "rate_limit_warn_remaining", 100),
     )
 
@@ -924,6 +813,7 @@ def build_orchestrator(
         goal_pilot_store=goal_pilot_store,
         attempt_store=attempt_store,
         tech_lead_authority=tech_lead_authority,
+        promotion_target=tech_lead.promotion_target,
         open_issue_corpus=tech_lead.open_issue_corpus,
         pair_registry=pair_registry,
         turn_mailbox=turn_mailbox,
@@ -933,6 +823,26 @@ def build_orchestrator(
     )
 
     # Bundle all dependencies into OrchestratorDeps (no nulls, no optionals)
+    # Assembly of the session launcher lives here, at the composition
+    # root, rather than in the facade or the control layer (#6924 A3-R2).
+    session_launcher_factory = build_session_launcher_factory(
+        config=config,
+        events=events,
+        repository_host=github,
+        action_applier=action_applier,
+        session_manager=session_manager,
+        worktree_manager=worktree_manager,
+        working_copy=working_copy,
+        command_runner=command_runner,
+        session_output=session_output,
+        manifest_downloader=manifest_downloader,
+        tech_lead_authority=tech_lead_authority,
+        claim_manager=claim_manager,
+        provider_resilience=provider_resilience,
+        state_machine_manager=state_machine_manager,
+        label_manager=label_manager,
+        agent_callback_endpoint=agent_callback_endpoint,
+    )
     deps = OrchestratorDeps(
         events=events,
         runner=runner,
@@ -959,6 +869,8 @@ def build_orchestrator(
         # on a dedicated runner so a slow publish never blocks the heartbeat.
         completion_dispatcher=BackgroundCompletionDispatcher(ThreadBackgroundJobRunner()),
         health_gate=health_gate,
+        agent_callback_endpoint=agent_callback_endpoint,
+        session_launcher_factory=session_launcher_factory,
         board_snapshot_builder=create_board_snapshot_builder(
             config, timeline_store, tech_lead_board_publisher, working_copy
         ),
@@ -1032,7 +944,6 @@ def build_orchestrator_for_testing(
         Orchestrator configured with test dependencies
     """
     from ..infra.orchestrator import Orchestrator
-    from ..control.background_job_supervisor import BackgroundJobSupervisor
     from ..ports.background_job import NullBackgroundJobRunner
 
     install_gh_guard()
@@ -1121,7 +1032,7 @@ def build_orchestrator_for_testing(
 
     # Create HealthGate for testing
     health_gate = HealthGate(
-        max_concurrent_sessions=config.max_concurrent_sessions,
+        max_concurrent_sessions=config,
         rate_limit_threshold=100,
     )
 
@@ -1159,10 +1070,23 @@ def build_orchestrator_for_testing(
     pair_registry_for_testing = _build_pair_registry_with_worktree_hook()
     from ..execution.review_exchange_turn_mailbox import InMemoryTurnMailbox
     turn_mailbox = InMemoryTurnMailbox()
+
+    # One instance per orchestrator, shared by everything that needs to
+    # know where agents can call back: the review exchange, the session
+    # launcher, and the server-started hook that publishes the bound
+    # port into it (#6924).
+    agent_callback_endpoint = RuntimeAgentCallbackEndpoint()
+    # This composition never binds a Control API, so it answers the
+    # endpoint question here. Production answers it from the CLI run
+    # mode (declare) or the server-started hook (publish); without an
+    # answer the launcher correctly refuses to start sessions (#6924 F7).
+    agent_callback_endpoint.declare_unavailable()
+
     if action_applier is not None:
         action_applier.pair_registry = pair_registry_for_testing
         action_applier.background_job_supervisor = background_job_supervisor
         action_applier.tech_lead_ops = tech_lead_authority_for_testing
+        action_applier.promotion_target = tech_lead.promotion_target
 
     def _cancel_review_exchange_for_testing(
         issue_number: int,
@@ -1188,6 +1112,7 @@ def build_orchestrator_for_testing(
         pre_publish_gate=PrePublishGate(command_runner) if config.enforce_hooks else None,
         config=config,
         background_job_supervisor=background_job_supervisor,
+        agent_callback_endpoint=agent_callback_endpoint,
         review_exchange_canceller=_cancel_review_exchange_for_testing,
         review_artifact_reader=ManifestReviewArtifactReader(),
         runtime_identity=runtime_identity.resolve_runtime_identity(),
@@ -1270,6 +1195,7 @@ def build_orchestrator_for_testing(
         goal_pilot_store=goal_pilot_store,
         attempt_store=attempt_store,
         tech_lead_authority=tech_lead_authority_for_testing,
+        promotion_target=tech_lead.promotion_target,
         open_issue_corpus=tech_lead.open_issue_corpus,
         pair_registry=pair_registry_for_testing,
         turn_mailbox=turn_mailbox,
@@ -1277,6 +1203,26 @@ def build_orchestrator_for_testing(
     )
 
     # Bundle all dependencies into OrchestratorDeps (no nulls, no optionals)
+    # Assembly of the session launcher lives here, at the composition
+    # root, rather than in the facade or the control layer (#6924 A3-R2).
+    session_launcher_factory = build_session_launcher_factory(
+        config=config,
+        events=events,
+        repository_host=github,
+        action_applier=action_applier,
+        session_manager=session_manager,
+        worktree_manager=worktree_manager,
+        working_copy=working_copy,
+        command_runner=command_runner,
+        session_output=session_output,
+        manifest_downloader=manifest_downloader,
+        tech_lead_authority=tech_lead_authority_for_testing,
+        claim_manager=claim_manager,
+        provider_resilience=provider_resilience,
+        state_machine_manager=state_machine_manager,
+        label_manager=label_manager,
+        agent_callback_endpoint=agent_callback_endpoint,
+    )
     deps = OrchestratorDeps(
         events=events,
         runner=runner,
@@ -1302,6 +1248,8 @@ def build_orchestrator_for_testing(
         # Tests default to synchronous; async dispatch is exercised explicitly.
         completion_dispatcher=SynchronousCompletionDispatcher(),
         health_gate=health_gate,
+        agent_callback_endpoint=agent_callback_endpoint,
+        session_launcher_factory=session_launcher_factory,
         board_snapshot_builder=create_board_snapshot_builder(
             config, timeline_store, tech_lead_board_publisher_for_testing, working_copy
         ),

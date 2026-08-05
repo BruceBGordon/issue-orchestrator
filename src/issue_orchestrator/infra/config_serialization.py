@@ -43,7 +43,9 @@ def filtering_section(config: "Config") -> dict:
     if config.filtering.exclude_labels:
         section["exclude_labels"] = list(config.filtering.exclude_labels)
     if config.filtering.exclude_label_prefixes:
-        section["exclude_label_prefixes"] = list(config.filtering.exclude_label_prefixes)
+        section["exclude_label_prefixes"] = list(
+            config.filtering.exclude_label_prefixes
+        )
     if config.filtering.fetch_limit != 100:
         section["fetch_limit"] = config.filtering.fetch_limit
     if config.filtering.max_to_start != 0:
@@ -62,7 +64,9 @@ def goal_pilot_section(config: "Config") -> dict:
     if config.goal_pilot.approval_batch_size != 10:
         section["approval_batch_size"] = config.goal_pilot.approval_batch_size
     if config.goal_pilot.approval_batch_window_minutes != 60:
-        section["approval_batch_window_minutes"] = config.goal_pilot.approval_batch_window_minutes
+        section["approval_batch_window_minutes"] = (
+            config.goal_pilot.approval_batch_window_minutes
+        )
     return section
 
 
@@ -80,10 +84,15 @@ def merge_queue_section(config: "Config") -> dict:
 
 
 def worktrees_section(config: "Config") -> dict:
-    section: dict = {}
-    # Only include base if it was explicitly set (not the default).
-    if config.worktree_base != config.repo_root.parent:
-        section["base"] = str(config.worktree_base)
+    from .config_paths import default_worktree_base, default_worktree_base_config
+
+    section: dict = {
+        "base": (
+            default_worktree_base_config(config.repo_root)
+            if config.worktree_base == default_worktree_base(config.repo_root)
+            else str(config.worktree_base)
+        )
+    }
     if config.worktree_base_branch_override:
         section["base_branch_override"] = config.worktree_base_branch_override
     if config.worktree_seed_ref:

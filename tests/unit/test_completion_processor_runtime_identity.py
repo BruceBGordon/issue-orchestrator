@@ -20,9 +20,11 @@ from issue_orchestrator.execution.session_output_adapter import FileSystemSessio
 from issue_orchestrator.ports.pull_request_tracker import PRInfo
 from issue_orchestrator.ports.working_copy import (
     BranchPathsResult,
+    BranchTextFilesResult,
     DiffResult,
     PushResult,
 )
+from tests.callback_endpoint_helpers import ready_callback_endpoint
 
 
 def _make_git_adapter() -> Mock:
@@ -43,6 +45,9 @@ def _make_git_adapter() -> Mock:
     adapter.has_tracked_changes = Mock(return_value=False)
     adapter.list_dirty_files = Mock(return_value=[])
     adapter.diff_against_base = Mock(return_value=DiffResult(success=True, diff_text=""))
+    adapter.read_branch_text_files = Mock(
+        return_value=BranchTextFilesResult(success=True)
+    )
     adapter.branch_post_image_paths_against_base = Mock(
         return_value=BranchPathsResult(success=True, paths=())
     )
@@ -85,6 +90,7 @@ def test_completion_processor_stamps_runtime_identity_on_created_pr(
     git_adapter = _make_git_adapter()
     session_output = FileSystemSessionOutput()
     processor = CompletionProcessor(
+        agent_callback_endpoint=ready_callback_endpoint(),
         label_adapter=label_adapter,
         pr_adapter=pr_adapter,
         git_adapter=git_adapter,

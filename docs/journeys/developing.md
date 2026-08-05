@@ -15,10 +15,23 @@ pytest tests/unit/ -x -q    # Verify the unit suite passes
 If you're working on a feature branch, use a git worktree to keep the base repo clean:
 
 ```bash
-git worktree add ../issue-orchestrator-wt-my-feature -b my-feature
-cd ../issue-orchestrator-wt-my-feature
-make worktree-setup
+make worktree-create BRANCH=my-feature
 ```
+
+This one-shot command creates `../issue-orchestrator-wt-my-feature` from
+`HEAD` and runs the complete worktree setup there. It does not depend on a
+shell `cd` carrying over between commands. To choose a different starting ref
+or destination, use:
+
+```bash
+make worktree-create \
+  BRANCH=my-feature \
+  BASE_REF=origin/main \
+  WORKTREE_PATH=/absolute/path/to/my-feature-worktree
+```
+
+If Git creates the worktree but setup fails, the worktree is kept and the
+command prints an explicit `make -C <path> worktree-setup` retry command.
 
 ## Understand the architecture
 

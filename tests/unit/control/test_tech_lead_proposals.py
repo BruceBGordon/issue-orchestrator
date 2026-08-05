@@ -44,8 +44,13 @@ from issue_orchestrator.domain.tech_lead_session import (
     TECH_LEAD_OBSERVATION_LABEL,
     ApprovedTechLeadOp,
     StoredTechLeadOp,
+    TechLeadCreationOrigin,
 )
 from issue_orchestrator.infra.config import Config
+from issue_orchestrator.domain.tech_lead_findings import (
+    PatternObservation,
+    case_file_issue_marker,
+)
 from issue_orchestrator.ports.tech_lead_authority import InMemoryTechLeadAuthorityStore
 
 EXPECTED = build_expected_for_mutation()
@@ -108,6 +113,8 @@ def _issue(number: int, labels: list[str], title: str = "t") -> Issue:
 def _host(created_number: int = 500) -> MagicMock:
     host = MagicMock()
     host.create_issue.return_value = {"number": created_number}
+    # No orphaned remote case file unless a test says otherwise (#6957 F10).
+    host.find_issue_by_marker.return_value = None
     host.list_milestones.return_value = []
     # The gate must be provisioned or the applier refuses to create (#6779 R3).
     host.list_labels.return_value = [
@@ -135,7 +142,12 @@ def test_proposal_action_carries_gate_label_and_scan_labels() -> None:
 def test_proposal_action_requires_gate_label() -> None:
     with pytest.raises(ValueError, match="gate label"):
         CreateTechLeadProposalIssueAction(
-            title="t", body="b", labels=("x",), op=_op(), anchor_issue_number=99
+            title="t",
+            body="b",
+            labels=("x",),
+            op=_op(),
+            origin=TechLeadCreationOrigin.derived_from_anchor(99),
+            expected=build_expected_for_mutation(),
         )
 
 
@@ -436,18 +448,45 @@ def _case_file_action(
     *,
     area: str | None = None,
     additional_comments: tuple[str, ...] = (),
+    fix_class: str = "",
+    observation_suffix: str = "",
 ) -> CreateTechLeadCaseFileIssueAction:
+    """A case-file creation action.
+
+    ``observation_suffix`` makes a DIFFERENT decision's action for the same
+    signature: same title and marker (both derived from the signature), but
+    distinct observation identities — which is exactly the shape a later
+    observation recovering an interrupted creation takes.
+    """
     labels = ["tech-lead-agent", TECH_LEAD_OBSERVATION_LABEL]
     if area is not None:
         labels.append(f"area:{area}")
+    prefix = f"{signature}:{observation_suffix}" if observation_suffix else signature
+    observations = (
+        PatternObservation(
+            observation_id=f"{prefix}:obs-1", comment="first observation"
+        ),
+        *(
+            PatternObservation(
+                observation_id=f"{prefix}:obs-{index}", comment=comment
+            )
+            for index, comment in enumerate(additional_comments, start=2)
+        ),
+    )
+    marker = case_file_issue_marker(signature)
     return CreateTechLeadCaseFileIssueAction(
         title=f"Pattern case file: {signature}",
-        body="documentation only",
+        body=f"documentation only\n\n{marker}",
         labels=tuple(labels),
         pr_count=0,
         pattern_signature=signature,
-        dedup_comment="first observation",
-        additional_observation_comments=additional_comments,
+        origin=TechLeadCreationOrigin.derived_from_anchor(42),
+        expected=build_expected_for_mutation(),
+        area=area,
+        fix_class=fix_class,
+        diagnosis="Pool exhaustion comes from a leaked connection.",
+        idempotency_marker=marker,
+        observations=observations,
     )
 
 
@@ -469,6 +508,9 @@ def test_apply_case_file_creation_records_pattern_ledger() -> None:
     assert result.success
     host.create_issue.assert_called_once()
     assert ops.lookup_pattern(signature="db-timeout") == 600
+    assert ops.list_pattern_evidence()[0].diagnosis == (
+        "Pool exhaustion comes from a leaked connection."
+    )
     # Case files do not record ops and post no anchor-link comment.
     assert ops.list_ops() == ()
     host.add_comment.assert_not_called()
@@ -535,6 +577,16 @@ def test_apply_case_file_provisions_labels_before_blocking_area_tagged_issue() -
 
     assert result.success
     assert host.method_calls == [
+        # Recovery first: "has a previous attempt already created this case
+        # file?" must be answered before anything is provisioned or created,
+        # or a crash-retry files a second one (#6957 R2 F10).
+        # Best-effort here: with no creation intent, a miss just means "carry
+        # on and create", so this does NOT pay for the exhaustive scan (F13).
+        call.find_issue_by_marker(
+            title=action.title,
+            marker=action.idempotency_marker,
+            authoritative=False,
+        ),
         call.list_labels(),
         call.create_label(
             TECH_LEAD_OBSERVATION_LABEL,
@@ -589,7 +641,9 @@ def test_apply_case_file_creation_posts_same_decision_observations() -> None:
 def test_apply_case_file_rechecks_ledger_and_comments_inflight_duplicate() -> None:
     host = _host(601)
     ops = InMemoryTechLeadAuthorityStore()
-    ops.record_pattern(signature="db-timeout", issue_number=600)
+    ops.record_pattern(
+        signature="db-timeout", issue_number=600, observation_id="prior:obs"
+    )
     result = apply_create_tech_lead_issue(
         _case_file_action("db-timeout", additional_comments=("follow-up",)),
         repository_host=host,
@@ -604,6 +658,367 @@ def test_apply_case_file_rechecks_ledger_and_comments_inflight_duplicate() -> No
     assert host.add_comment.call_args_list == [
         call(600, "first observation"), call(600, "follow-up")
     ]
+    # Two distinct observations landed on the pre-existing case file.
+    [evidence] = ops.list_pattern_evidence()
+    assert evidence.observation_count == 3
+
+
+# --- Replay after each partial write (#6957 review F1) ---------------------
+#
+# The lane's evidence count gates promotion, so every crash window between a
+# GitHub write and the durable count has to be replay-safe: a retry may repeat
+# a comment, but it must never count one observation twice.
+
+
+def _apply_case_file(action, *, ops, host):
+    return apply_create_tech_lead_issue(
+        action,
+        repository_host=host,
+        events=MagicMock(),
+        ops=ops,
+        add_comment=host.add_comment,
+        emit_labels_changed=lambda *_: None,
+    )
+
+
+def test_replay_after_ledger_creation_does_not_recount_its_observations() -> None:
+    """Crash right after ``record_pattern``: the retry reconciles onto the row.
+
+    Before the fix this counted the body observation AND every additional
+    comment all over again — a two-observation action reached count 4 after one
+    retry and could cross ``min_evidence`` without distinct evidence.
+    """
+    action = _case_file_action("db-timeout", additional_comments=("second",))
+    ops = InMemoryTechLeadAuthorityStore()
+
+    first = _apply_case_file(action, ops=ops, host=_host(600))
+    assert first.success
+    [after_first] = ops.list_pattern_evidence()
+    assert after_first.observation_count == 2
+
+    # The process dies before the action is marked applied; the next tick
+    # replays the SAME action.
+    replay_host = _host(600)
+    replay = _apply_case_file(action, ops=ops, host=replay_host)
+
+    assert replay.success
+    assert replay.details["deduplicated"] is True
+    [after_replay] = ops.list_pattern_evidence()
+    assert after_replay.observation_count == 2
+    # Nothing is re-posted either: both identities are already recorded.
+    replay_host.add_comment.assert_not_called()
+
+
+def test_replay_after_one_additional_comment_counts_only_what_is_missing() -> None:
+    """Crash between two additional comments: only the unposted one is added."""
+    action = _case_file_action(
+        "db-timeout", additional_comments=("second", "third")
+    )
+    ops = InMemoryTechLeadAuthorityStore()
+    host = _host(600)
+    # Fail while posting the SECOND additional comment (the third observation
+    # of the decision), after the first one and its count already landed.
+    host.add_comment.side_effect = [None, RuntimeError("network died")]
+
+    failed = _apply_case_file(action, ops=ops, host=host)
+
+    assert not failed.success
+    [partial] = ops.list_pattern_evidence()
+    assert partial.observation_count == 2  # body + the one comment that landed
+
+    replay_host = _host(600)
+    replay = _apply_case_file(action, ops=ops, host=replay_host)
+
+    assert replay.success
+    [final] = ops.list_pattern_evidence()
+    assert final.observation_count == 3
+    # Exactly the observation that never landed is re-posted.
+    assert replay_host.add_comment.call_args_list == [call(600, "third")]
+
+
+def test_replay_after_a_lost_comment_repeats_it_rather_than_losing_evidence()  -> None:
+    """The comment is posted BEFORE its count, so a crash between them repeats
+    the comment (cosmetic) instead of counting evidence nobody can read."""
+    action = _case_file_action("db-timeout", additional_comments=("second",))
+    ops = InMemoryTechLeadAuthorityStore()
+    host = _host(600)
+    host.add_comment.side_effect = RuntimeError("network died")
+
+    assert not _apply_case_file(action, ops=ops, host=host).success
+    [partial] = ops.list_pattern_evidence()
+    assert partial.observation_count == 1
+
+    replay_host = _host(600)
+    assert _apply_case_file(action, ops=ops, host=replay_host).success
+
+    [final] = ops.list_pattern_evidence()
+    assert final.observation_count == 2
+    assert replay_host.add_comment.call_args_list == [call(600, "second")]
+
+
+def test_replaying_a_repeat_observation_append_never_double_counts() -> None:
+    from issue_orchestrator.control.actions import AppendPatternObservationAction
+    from issue_orchestrator.control.tech_lead_case_files import (
+        apply_append_pattern_observation,
+    )
+
+    ops = InMemoryTechLeadAuthorityStore()
+    ops.record_pattern(
+        signature="db-timeout", issue_number=600, observation_id="r1:s:A1"
+    )
+    action = AppendPatternObservationAction(
+        issue_number=600,
+        pattern_signature="db-timeout",
+        observation=PatternObservation(
+            observation_id="r2:s:A1", comment="observed again"
+        ),
+    )
+    host = MagicMock()
+
+    assert apply_append_pattern_observation(
+        action, repository_host=host, authority=ops
+    ).success
+    replay = apply_append_pattern_observation(
+        action, repository_host=host, authority=ops
+    )
+
+    assert replay.success
+    assert replay.details["deduplicated"] is True
+    [evidence] = ops.list_pattern_evidence()
+    assert evidence.observation_count == 2
+    host.add_comment.assert_called_once_with(600, "observed again")
+
+
+# --- Case-file creation crash window (#6957 review F10) --------------------
+#
+# The GitHub issue is created before its ledger row lands. A crash in between
+# leaves an issue nothing knows about, and the retry is NOT guaranteed to be the
+# same command: a case-file finalization failure is an ordinary ActionResult
+# failure, so the next observation of that signature can be the one that
+# recovers it. Everything below turns on that distinction.
+
+
+def _crash_the_ledger_write(ops: InMemoryTechLeadAuthorityStore):
+    """Make the next record_pattern die, as a process kill would."""
+    original = ops.record_pattern
+
+    def explode(**kwargs):
+        ops.record_pattern = original  # type: ignore[method-assign]
+        raise RuntimeError("sqlite went away")
+
+    ops.record_pattern = explode  # type: ignore[method-assign]
+
+
+def test_crash_after_remote_create_recovers_instead_of_filing_a_second() -> None:
+    action = _case_file_action("db-timeout", additional_comments=("second",))
+    ops = InMemoryTechLeadAuthorityStore()
+
+    first_host = _host(600)
+    _crash_the_ledger_write(ops)
+    failed = _apply_case_file(action, ops=ops, host=first_host)
+
+    assert not failed.success
+    first_host.create_issue.assert_called_once()
+    assert ops.lookup_pattern(signature="db-timeout") is None
+    # The durable creation intent survives the crash - that is what makes the
+    # recovery attributable rather than guessed.
+    pending = ops.load_pending_case_file(signature="db-timeout")
+    assert pending is not None
+    assert pending.body_observation_id == "db-timeout:obs-1"
+
+    retry_host = _host(999)  # a NEW number, to prove nothing was created
+    retry_host.find_issue_by_marker.return_value = 600
+
+    retry = _apply_case_file(action, ops=ops, host=retry_host)
+
+    assert retry.success
+    assert retry.details["deduplicated"] is True
+    assert retry.details["recovered"] is True
+    retry_host.create_issue.assert_not_called()
+    assert ops.lookup_pattern(signature="db-timeout") == 600
+    # The intent is retired once the ledger row lands.
+    assert ops.load_pending_case_file(signature="db-timeout") is None
+
+
+def test_recovered_case_file_records_the_right_count_and_classification() -> None:
+    action = _case_file_action("db-timeout", additional_comments=("second",))
+    ops = InMemoryTechLeadAuthorityStore()
+    host = _host(600)
+    _crash_the_ledger_write(ops)
+    assert not _apply_case_file(action, ops=ops, host=host).success
+
+    retry_host = _host(999)
+    retry_host.find_issue_by_marker.return_value = 600
+    assert _apply_case_file(action, ops=ops, host=retry_host).success
+
+    [evidence] = ops.list_pattern_evidence()
+    assert evidence.case_file_issue_number == 600
+    # Body observation + the one additional observation, counted once each.
+    assert evidence.observation_count == 2
+    assert evidence.diagnosis == "Pool exhaustion comes from a leaked connection."
+    # The body already carries observation 1 (the dead process wrote it), so
+    # only the additional observation is posted as a comment.
+    assert retry_host.add_comment.call_args_list == [call(600, "second")]
+
+
+def test_a_later_action_recovering_keeps_the_original_body_authoritative() -> None:
+    """#6957 round-3 review F10: the recovering action is NOT the creator.
+
+    Action A (fix:human, observation A) creates #600 and its ledger write dies.
+    A later action B (fix:code, observation B) is the one that recovers it.
+    Attributing B's metadata to the body would silently reclassify a human-gated
+    finding as promotable code work, lose observation A's identity, and claim
+    evidence is visible when it is not.
+    """
+    first = _case_file_action("db-timeout", fix_class="human", area="database")
+    ops = InMemoryTechLeadAuthorityStore()
+    _crash_the_ledger_write(ops)
+    assert not _apply_case_file(first, ops=ops, host=_host(600)).success
+
+    # A DIFFERENT, later observation of the same signature, agreeing on
+    # classification so it is a legitimate append rather than a conflict.
+    later = _case_file_action(
+        "db-timeout",
+        fix_class="human",
+        area="database",
+        observation_suffix="later",
+        additional_comments=(),
+    )
+    retry_host = _host(999)
+    retry_host.find_issue_by_marker.return_value = 600
+
+    recovered = _apply_case_file(later, ops=ops, host=retry_host)
+
+    assert recovered.success and recovered.details["recovered"] is True
+    retry_host.create_issue.assert_not_called()
+    [evidence] = ops.list_pattern_evidence()
+    assert evidence.case_file_issue_number == 600
+    # The ORIGINAL action's observation is what the body records...
+    assert ops.has_pattern_observation(
+        signature="db-timeout", observation_id="db-timeout:obs-1"
+    )
+    # ...and the later observation is visibly appended AND counted, not
+    # swallowed as "already recorded".
+    assert ops.has_pattern_observation(
+        signature="db-timeout", observation_id="db-timeout:later:obs-1"
+    )
+    assert evidence.observation_count == 2
+    assert retry_host.add_comment.call_args_list == [call(600, "first observation")]
+
+
+def test_a_recovering_action_cannot_reclassify_the_recovered_body() -> None:
+    """The same scenario, with the conflict the immutability rule exists for.
+
+    Nothing may be published before the classification is reconciled, so the
+    later fix:code observation is rejected with no comment and no count.
+    """
+    first = _case_file_action("db-timeout", fix_class="human")
+    ops = InMemoryTechLeadAuthorityStore()
+    _crash_the_ledger_write(ops)
+    assert not _apply_case_file(first, ops=ops, host=_host(600)).success
+
+    later = _case_file_action(
+        "db-timeout", fix_class="code", observation_suffix="later"
+    )
+    retry_host = _host(999)
+    retry_host.find_issue_by_marker.return_value = 600
+
+    result = _apply_case_file(later, ops=ops, host=retry_host)
+
+    assert not result.success
+    retry_host.create_issue.assert_not_called()
+    retry_host.add_comment.assert_not_called()
+    # The recovered row keeps the ORIGINAL classification, so the signature
+    # stays excluded from promotion.
+    [evidence] = ops.list_pattern_evidence()
+    assert evidence.fix_class == "human"
+    assert evidence.observation_count == 1
+    assert not ops.has_pattern_observation(
+        signature="db-timeout", observation_id="db-timeout:later:obs-1"
+    )
+
+
+def test_a_stale_intent_with_no_remote_issue_creates_fresh() -> None:
+    """The create never happened, so the intent is discarded, not recovered."""
+    action = _case_file_action("db-timeout")
+    ops = InMemoryTechLeadAuthorityStore()
+    failing_host = _host(600)
+    failing_host.create_issue.side_effect = RuntimeError("GitHub rejected it")
+    assert not _apply_case_file(action, ops=ops, host=failing_host).success
+    assert ops.load_pending_case_file(signature="db-timeout") is not None
+
+    retry_host = _host(700)  # no issue carries the marker
+    retry = _apply_case_file(action, ops=ops, host=retry_host)
+
+    assert retry.success
+    retry_host.create_issue.assert_called_once()
+    assert ops.lookup_pattern(signature="db-timeout") == 700
+    assert ops.load_pending_case_file(signature="db-timeout") is None
+
+
+def test_retiring_an_intent_demands_a_lookup_whose_no_is_proof() -> None:
+    """#6957 round-5 review F13, case-file lane.
+
+    The negative answer above is load-bearing: it RETIRES a durable creation
+    intent and files a fresh case file. A bounded, title-scoped search reports
+    "absent" for an issue that merely aged out of the recent window or was
+    retitled, so answering this question with one creates a second case file for
+    a signature that already has one. Only the authoritative lookup may be asked.
+    """
+    action = _case_file_action("db-timeout")
+    ops = InMemoryTechLeadAuthorityStore()
+    failing_host = _host(600)
+    failing_host.create_issue.side_effect = RuntimeError("GitHub rejected it")
+    assert not _apply_case_file(action, ops=ops, host=failing_host).success
+
+    retry_host = _host(700)
+    _apply_case_file(action, ops=ops, host=retry_host)
+
+    assert retry_host.find_issue_by_marker.call_args.kwargs["authoritative"] is True
+
+
+def test_an_orphan_with_no_creation_intent_stops_instead_of_guessing() -> None:
+    """Durable-state loss, not a crash window: neither answer is safe."""
+    host = _host(999)
+    host.find_issue_by_marker.return_value = 600
+
+    result = _apply_case_file(
+        _case_file_action("db-timeout"),
+        ops=InMemoryTechLeadAuthorityStore(),
+        host=host,
+    )
+
+    assert not result.success
+    assert "neither a ledger row nor a record of creating it" in (result.error or "")
+    host.create_issue.assert_not_called()
+
+
+def test_recovery_is_attempted_only_when_the_ledger_has_no_row() -> None:
+    """A committed signature costs no GitHub call (API discipline)."""
+    ops = InMemoryTechLeadAuthorityStore()
+    ops.record_pattern(
+        signature="db-timeout", issue_number=600, observation_id="prior:obs"
+    )
+    host = _host(601)
+
+    assert _apply_case_file(_case_file_action("db-timeout"), ops=ops, host=host).success
+
+    host.find_issue_by_marker.assert_not_called()
+
+
+def test_a_failed_recovery_lookup_never_files_a_duplicate() -> None:
+    """"Unknown" must not be mistaken for "no case file exists"."""
+    host = _host(601)
+    host.find_issue_by_marker.side_effect = RuntimeError("GitHub unreachable")
+
+    result = _apply_case_file(
+        _case_file_action("db-timeout"),
+        ops=InMemoryTechLeadAuthorityStore(),
+        host=host,
+    )
+
+    assert not result.success
+    host.create_issue.assert_not_called()
 
 
 def test_apply_plain_tech_lead_issue_records_no_op() -> None:
@@ -613,7 +1028,13 @@ def test_apply_plain_tech_lead_issue_records_no_op() -> None:
     ops = InMemoryTechLeadAuthorityStore()
 
     result = apply_create_tech_lead_issue(
-        CreateTechLeadIssueAction(title="t", body="b", labels=("x",), pr_count=2),
+        CreateTechLeadIssueAction(
+            title="t",
+            body="b",
+            labels=("x",),
+            pr_count=2,
+            origin=TechLeadCreationOrigin.authors_anchor(),
+        ),
         repository_host=host,
         events=MagicMock(),
         ops=ops,

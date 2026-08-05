@@ -32,6 +32,47 @@ Use `validation.quick` for fast coding/review feedback and
 `validation.publish` for the authoritative pre-push/pre-publish gate. The
 publish dirty-tree policy lives at `validation.publish.dirty_check`.
 
+### Control Center Repository Setup
+
+For a discovered repository that needs configuration, select **Setup** in the
+Control Center. The wizard previews the generated YAML and files before saving
+them. Before preview, its GitHub stage explains the personal-identity and
+GitHub App tradeoffs, waits while you complete any GitHub-side steps, and
+requires **Verify**. Verification reads the selected identity and repository
+without making GitHub writes; confirm the listed write permissions in GitHub.
+Setup verifies again immediately before saving.
+
+The default worktree base is the dedicated peer directory
+`../worktrees/<repository-directory>`. Setup shows the resolved absolute path
+and writes the selected value explicitly to YAML.
+
+Setup defaults to a complete Claude Code pipeline:
+
+1. The worker implements an issue in an isolated, sandboxed worktree.
+2. The reviewer runs a bounded local review/rework loop after quick validation.
+3. The tech lead reviews every approved PR by default and investigates
+   unexplained failures.
+
+Worker, reviewer, and tech-lead model and effort are editable independently.
+The tech-lead cadence accepts `1` for every approved PR, a larger number for
+batch review, or `0` for manual and failure-triggered review only. Reviewer and
+tech-lead roles can be explicitly disabled.
+
+Setup also requires quick and publish validation gates that exercise repository
+behavior. It detects established Make, package-manager, and test-runner commands
+when possible. If it cannot find both gates, the Configuration step waits for
+you to enter the target repository's fast feedback and authoritative
+pre-publish commands.
+
+After saving, Setup names optional capabilities that were not enabled:
+specialized agent routing, other AI providers, E2E, merge queue, Goal Pilot,
+and tech-lead health automation. Those remain available through repository
+Settings.
+
+If the selected config already exists, the preview labels it as **Replace** and
+requires an explicit acknowledgement before saving; settings not shown in the
+generated preview are not preserved.
+
 ### Use Claude Opus With XHigh Effort
 
 Set this on `default_agent` to apply it to every agent that does not override
@@ -196,15 +237,21 @@ or anything the agent is expected to commit.
 
 ## Advanced Options (Teaser)
 
-You can configure much more than the minimal setup, including:
-- Automated code review and tech lead workflows
+The guided Control Center baseline already includes worker, reviewer, and
+tech-lead roles. Independent capabilities you may add later include:
+
+- Specialized workers and role-specific reviewers
+- Codex or custom agent providers
 - E2E test runner with flake tracking
-- Multi-orchestrator coordination (claims)
-- Provider resilience (retry + circuit breaker)
-- Observability thresholds and escalation
-- Hook enforcement and safety guardrails
+- GitHub merge queue integration
+- Goal Pilot multi-issue coordination
+- Tech-lead periodic health review, storm detection, and stuck-session recovery
 
 The web Settings dialog (when `ui.mode: web`) is always available, and you can always edit the raw YAML config file directly.
+Saving a field marked **Restart Required** updates the YAML immediately, but a
+running Repository Engine keeps its startup-time value. Stop and start that
+Repository Engine to apply the change; restarting the Control Center is not a
+substitute.
 If you want to revisit setup, you can rerun the setup wizard on an existing config at any time.
 
 ---

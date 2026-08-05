@@ -78,7 +78,7 @@ from .config_sections import (
     parse_filtering_config,
     parse_milestone_order,
 )
-from .config_value_rules import resolve_tech_lead_watch_label, validate_review_nit_policy
+from .config_value_rules import resolve_tech_lead_watch_label
 from .validation_config_loader import (
     load_validation_config as load_validation_config,
     load_validation_config_from_file as load_validation_config_from_file,
@@ -1297,6 +1297,7 @@ class Config:
         from .validators import (
             AgentValidator,
             GoalPilotValidator,
+            MilestonesValidator,
             IsolationValidator,
             ReviewWorkflowValidator,
             TemplateValidator,
@@ -1311,6 +1312,7 @@ class Config:
         errors.extend(AgentValidator().validate(self))
         errors.extend(ReviewWorkflowValidator().validate(self))
         errors.extend(GoalPilotValidator().validate(self))
+        errors.extend(MilestonesValidator().validate(self))
         errors.extend(IsolationValidator().validate(self))
         errors.extend(TemplateValidator().validate(self))
         errors.extend(UnknownFieldsValidator().validate(self))
@@ -1330,8 +1332,6 @@ class Config:
             errors.append(
                 "validation.publish.dirty_check must be one of: tracked, unstaged, all, off"
             )
-        errors.extend(self._validate_review_nit_policy_config())
-        errors.extend(self._validate_retrospective_review_config())
         if (
             self.review_enabled
             and self.review_exchange_require_validation
@@ -1341,39 +1341,6 @@ class Config:
                 "validation.quick.cmd must be configured when review.exchange.loop.require_validation is true"
             )
 
-        return errors
-
-    def _validate_review_nit_policy_config(self) -> list[str]:
-        """Validate review nit policy settings."""
-
-        return validate_review_nit_policy(
-            self.review_nits_default_policy, self.review_nits_by_agent
-        )
-
-    def _validate_retrospective_review_config(self) -> list[str]:
-        """Validate review-first existing-implementation rerun settings."""
-
-        if not self.retrospective_review_enabled:
-            return []
-
-        errors: list[str] = []
-        if not self.code_review_agent:
-            errors.append("review.retrospective.enabled requires review.default to be configured")
-        elif self.code_review_agent not in self.agents:
-            errors.append(
-                f"review.default '{self.code_review_agent}' not found in agents for retrospective review. "
-                f"Available: {list(self.agents.keys())}"
-            )
-        for attr, yaml_path in (
-            (self.retrospective_review_trigger_label, "review.retrospective.trigger_label"),
-            (self.retrospective_reviewed_label, "review.retrospective.reviewed_label"),
-            (
-                self.retrospective_changes_requested_label,
-                "review.retrospective.changes_requested_label",
-            ),
-        ):
-            if not str(attr or "").strip():
-                errors.append(f"{yaml_path} must be non-empty when retrospective review is enabled")
         return errors
 
     def validate_unknown_fields(self) -> list[tuple[str, str]]:

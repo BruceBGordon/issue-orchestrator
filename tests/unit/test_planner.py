@@ -9,6 +9,7 @@ import logging
 from pathlib import Path
 from unittest.mock import Mock, MagicMock
 
+from issue_orchestrator.domain.tech_lead_session import TechLeadCreationOrigin
 from issue_orchestrator.infra.config import Config
 from issue_orchestrator.control.planner import (
     Planner,
@@ -1060,6 +1061,98 @@ class TestPlanAwaitingMergeReconciliations:
         assert action.status == "merged"
         assert "merged" in action.reason
 
+    def test_merged_open_issue_plans_close_on_merge_fallback(self):
+        """A merged PR whose issue is still open (issue_open=True) means
+        GitHub's closing-keyword auto-close did not fire; the owner command
+        must carry close_issue=True so the applier closes the issue before
+        finalizing history (porchpin case file #81)."""
+        config = make_config()
+        scheduler = Scheduler(config)
+        planner = Planner(config=config, scheduler=scheduler)
+        discovered = DiscoveredAwaitingMergeReconciliation(
+            issue_number=228,
+            pr_number=318,
+            pr_url="https://github.com/test/repo/pull/318",
+            status="merged",
+            status_reason="PR merged; awaiting merge reconciled",
+            source="pull_request",
+            issue_key="M1-228",
+            issue_open=True,
+            merged_at="2026-08-03T13:52:09Z",
+        )
+
+        snapshot = make_snapshot(
+            discovered_awaiting_merge_reconciliations=(discovered,),
+        )
+
+        plan = planner.plan(snapshot)
+
+        actions = plan.actions_of_type(ActionType.RECOVER_TERMINAL_ISSUE)
+        assert len(actions) == 1
+        action = actions[0]
+        assert isinstance(action, RecoverTerminalIssueAction)
+        assert action.close_issue is True
+        # The merge evidence rides the owner command so the applier can
+        # revalidate the destructive precondition against live state.
+        assert action.merged_at == "2026-08-03T13:52:09Z"
+
+    def test_merged_closed_issue_plans_no_close(self):
+        """The common case — auto-close fired — must not order a close."""
+        config = make_config()
+        scheduler = Scheduler(config)
+        planner = Planner(config=config, scheduler=scheduler)
+        discovered = DiscoveredAwaitingMergeReconciliation(
+            issue_number=228,
+            pr_number=318,
+            pr_url="https://github.com/test/repo/pull/318",
+            status="merged",
+            status_reason="PR merged; awaiting merge reconciled",
+            source="pull_request",
+            issue_key="M1-228",
+        )
+
+        snapshot = make_snapshot(
+            discovered_awaiting_merge_reconciliations=(discovered,),
+        )
+
+        plan = planner.plan(snapshot)
+
+        actions = plan.actions_of_type(ActionType.RECOVER_TERMINAL_ISSUE)
+        assert len(actions) == 1
+        action = actions[0]
+        assert isinstance(action, RecoverTerminalIssueAction)
+        assert action.close_issue is False
+
+    def test_closed_status_never_plans_close_even_if_issue_open(self):
+        """Only a MERGED PR earns the close fallback: a closed-unmerged PR
+        with an open issue is the drift path's territory (blocked:pr-closed),
+        and the issue legitimately stays open for rework."""
+        config = make_config()
+        scheduler = Scheduler(config)
+        planner = Planner(config=config, scheduler=scheduler)
+        discovered = DiscoveredAwaitingMergeReconciliation(
+            issue_number=228,
+            pr_number=318,
+            pr_url="https://github.com/test/repo/pull/318",
+            status="closed",
+            status_reason="Issue closed; awaiting merge reconciled",
+            source="issue",
+            issue_key="M1-228",
+            issue_open=True,
+        )
+
+        snapshot = make_snapshot(
+            discovered_awaiting_merge_reconciliations=(discovered,),
+        )
+
+        plan = planner.plan(snapshot)
+
+        actions = plan.actions_of_type(ActionType.RECOVER_TERMINAL_ISSUE)
+        assert len(actions) == 1
+        action = actions[0]
+        assert isinstance(action, RecoverTerminalIssueAction)
+        assert action.close_issue is False
+
     def test_terminal_issue_closed_reconciliation_recovers_terminal_issue(self):
         """When the parent issue is closed (regardless of PR state), the same
         owner command applies: shed every transient workflow label, then
@@ -1858,8 +1951,8 @@ class TestPlanHealthReviewIssueCreation:
         skipped = self._tech_lead_skipped(events)
         assert len(skipped) == 1
         assert skipped[0].data["reason"] == "no_capacity"
-        assert skipped[0].data["active"] == 2
-        assert skipped[0].data["max"] == 2
+        # Owner-computed availability (worker budget 2 - 2 active = 0) (#6892 A2).
+        assert skipped[0].data["available"] == 0
 
     def test_open_gate_still_creates_and_emits_no_skip(self):
         """Belt and braces: with the gate open the anchor is filed and NO
@@ -3171,6 +3264,7 @@ class TestStormCohortCleanupLifecycle:
                 labels=("agent:tech-lead", HEALTH_REVIEW_MARKER_LABEL),
                 pr_count=0,
                 storm_problems=tuple(cohort),
+                origin=TechLeadCreationOrigin.authors_anchor(),
             ),
             999,
             state,

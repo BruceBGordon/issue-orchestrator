@@ -12,7 +12,10 @@ A: You need at least one agent definition and a validation command. See the mini
 A: The orchestrator auto-detects the repository from the git checkout. Override it only if detection isn't correct, using `repo.root` for the path and `repo.name` for the GitHub repo slug.
 
 **Q4: Where do worktrees go by default, and can I move them?**
-A: Worktrees default to `../` via `worktrees.base`. Set `worktrees.base` to point somewhere else if you want to keep them in a dedicated directory.
+A: New repository Setup defaults to `../worktrees/<repo-name>` via
+`worktrees.base`, keeping every repository's issue worktrees in a dedicated
+peer collection outside the source checkout. The absolute path is shown before
+Setup saves the YAML. You can edit it there or set `worktrees.base` manually.
 
 If you use Claude Code, enable `execution.session_interactions.enabled: true` or let the setup wizard do it for you. That lets Issue Orchestrator auto-accept Claude's initial trust prompt in orchestrator-created worktrees. A dedicated worktree directory can still make the paths easier to find, but trust is stored per worktree path, not inherited from the parent directory.
 
@@ -106,7 +109,13 @@ A: No. The `[M?-nnn]` prefix (e.g., `[M1-010]`) gives an issue a stable, human-r
 A: Use `execution.concurrency.max_concurrent_sessions` and `execution.concurrency.session_timeout_minutes`.
 
 **Q11: How do I enable code review and set a default reviewer?**
-A: Set `review.enabled: true`, then `review.default` to the reviewer agent label (for example, `agent:reviewer`). Make sure that agent is defined under `agents`.
+A: Guided Control Center Setup enables `agent:reviewer` and the bounded local
+review/rework loop by default. For a hand-written config, set
+`review.enabled: true`, then set `review.default` to a reviewer agent label
+(for example, `agent:reviewer`) defined under `agents`. Guided Setup also
+defaults the tech-lead threshold to `1`, which reviews every approved PR;
+change it to a larger batch size or `0` for manual and failure-triggered
+tech-lead reviews only.
 
 **Q12: Can I reference environment variables in config?**
 A: Yes. Any string can use `${VAR}` substitution. If the variable is missing, config loading fails with a clear error pointing to the field.

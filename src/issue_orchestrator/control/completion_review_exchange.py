@@ -33,6 +33,8 @@ from .review_publish_pipeline import resolve_review_publish_pipeline
 if TYPE_CHECKING:
     from ..infra.config import Config
     from ..domain.review_exchange import ReviewExchangeOutcome
+    from ..ports.agent_callback_endpoint import AgentCallbackEndpoint
+    from ..ports.review_exchange_approval_gate import ReviewExchangeApprovalGate
 
 logger = logging.getLogger(__name__)
 
@@ -199,6 +201,7 @@ class CompletionReviewExchange:
         review_exchange_runner: ReviewExchangeRunner,
         job_supervisor: BackgroundJobSupervisor | None = None,
         review_exchange_canceller: ReviewExchangeCanceller | None = None,
+        agent_callback_endpoint: "AgentCallbackEndpoint",
     ) -> None:
         self._config = config
         self._session_output = session_output
@@ -206,6 +209,7 @@ class CompletionReviewExchange:
         self._emit_review_started = emit_review_started
         self._emit_review_outcome = emit_review_outcome
         self._review_exchange_canceller = review_exchange_canceller
+        self._agent_callback_endpoint = agent_callback_endpoint
         # Supervisor injection is REQUIRED for the async failure path to work:
         # ``take_failure`` only returns values that ``tick()`` has populated,
         # and ``tick()`` must be called from the orchestrator's main loop.
@@ -232,6 +236,7 @@ class CompletionReviewExchange:
         errors: list[str],
         actions_taken: list[str],
         run_review_exchange_loop: RunReviewExchangeLoop,
+        approval_gate: "ReviewExchangeApprovalGate | None" = None,
         review_cache_boundary_started_at: str | None = None,
         current_head_sha: str | None = None,
     ) -> tuple[Any, str | None, ReviewExchangeOutcome | None, bool, bool, bool]:
@@ -288,6 +293,7 @@ class CompletionReviewExchange:
             errors=errors,
             actions_taken=actions_taken,
             run_review_exchange_loop=run_review_exchange_loop,
+            approval_gate=approval_gate,
         )
         if exchange_mode in {"via-mcp", "via-local-loop"} and exchange_result:
             review_exchange_completed = True
@@ -406,6 +412,7 @@ class CompletionReviewExchange:
         errors: list[str],
         actions_taken: list[str],
         run_review_exchange_loop: RunReviewExchangeLoop,
+        approval_gate: "ReviewExchangeApprovalGate | None" = None,
         review_cache_boundary_started_at: str | None = None,
         current_head_sha: str | None = None,
     ) -> tuple[str | None, ReviewExchangeOutcome | None, bool, bool]:
@@ -517,6 +524,7 @@ class CompletionReviewExchange:
             review_run=review_run,
             current_head_sha=current_head_sha,
             run_review_exchange_loop=run_review_exchange_loop,
+            approval_gate=approval_gate,
         )
         if submitted:
             # Deferred: the exchange is now running off the main tick. A
@@ -541,6 +549,7 @@ class CompletionReviewExchange:
             errors=errors,
             actions_taken=actions_taken,
             run_review_exchange_loop=run_review_exchange_loop,
+            approval_gate=approval_gate,
         )
         return mode, outcome, halt, False
 
@@ -715,6 +724,7 @@ class CompletionReviewExchange:
         review_run: ReviewExchangeRun,
         current_head_sha: str | None,
         run_review_exchange_loop: RunReviewExchangeLoop,
+        approval_gate: "ReviewExchangeApprovalGate | None",
     ) -> bool:
         """Start the review exchange in a background job; return True if accepted.
 
@@ -734,6 +744,7 @@ class CompletionReviewExchange:
                     session_name=session_name,
                     agent_label=agent_label,
                     initial_validation_record_path=initial_validation_record_path,
+                    approval_gate=approval_gate,
                 )
             except Exception:
                 logger.exception(
@@ -947,6 +958,7 @@ class CompletionReviewExchange:
         errors: list[str],
         actions_taken: list[str],
         run_review_exchange_loop: RunReviewExchangeLoop,
+        approval_gate: "ReviewExchangeApprovalGate | None",
     ) -> tuple[str, ReviewExchangeOutcome, bool]:
         exchange_result = run_review_exchange_loop(
             exchange_run=review_run,
@@ -956,6 +968,7 @@ class CompletionReviewExchange:
             session_name=session_name,
             agent_label=agent_label,
             initial_validation_record_path=initial_validation_record_path,
+            approval_gate=approval_gate,
         )
         self._require_matching_review_run(exchange_result, review_run)
         run_assets = review_run.assets
@@ -1272,6 +1285,7 @@ class CompletionReviewExchange:
         session_name: str | None,
         agent_label: str | None,
         initial_validation_record_path: Path | None = None,
+        approval_gate: "ReviewExchangeApprovalGate | None" = None,
         events: Any | None = None,
         event_context: Any | None = None,
     ) -> Any:
@@ -1307,7 +1321,14 @@ class CompletionReviewExchange:
             require_validation=self._config.review_exchange_require_validation,
             nit_policy=nit_policy,
             initial_validation_record_path=initial_validation_record_path,
-            web_port=self._config.control_api_port,
+            approval_gate=approval_gate,
+            # Through the bound-endpoint owner, not the configured
+            # value: the engine binds an auto-assigned port and never
+            # writes it back into Config, so the raw value is 0 and the
+            # exchange exported an undialable port (#6924).
+            web_port=self._agent_callback_endpoint.resolve_port(
+                self._config.control_api_port
+            ),
             events=events,
             event_context=event_context,
         )

@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
+from .command_runner import OutputNewlines
+
 
 @dataclass(frozen=True)
 class GitResult:
@@ -33,8 +35,15 @@ class Git(Protocol):
         timeout_s: int | None = None,
         env: dict[str, str] | None = None,
         check: bool = True,
+        newlines: OutputNewlines = OutputNewlines.TRANSLATED,
     ) -> GitResult:
-        """Run a git command in repo context."""
+        r"""Run a git command in repo context.
+
+        ``newlines`` selects the transport's newline fidelity. Reads whose
+        output is interpreted with Git's own LF-delimited physical-line rule --
+        patch text and blob content, where a bare ``\r`` is in-line data rather
+        than a terminator -- must pass ``OutputNewlines.PRESERVED``.
+        """
         ...
 
     def status_porcelain(self, repo: Path) -> str: ...
