@@ -941,10 +941,7 @@ def build_test_orchestrator_deps(
         reconcile=False,
     )
 
-    health_gate = HealthGate(
-        max_concurrent_sessions=config.max_concurrent_sessions,
-        rate_limit_threshold=100,
-    )
+    health_gate = HealthGate(rate_limit_threshold=100)
 
     session_restorer = SessionRestorer(
         config=config,

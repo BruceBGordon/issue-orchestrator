@@ -192,10 +192,7 @@ class OrchestratorSupport:
 
     def _check_health(self, health_gate: "HealthGate") -> object:
         """Check system health using HealthGate service."""
-        return health_gate.check(
-            active_sessions=len(self.state.active_sessions),
-            paused=self.state.paused,
-        )
+        return health_gate.check(paused=self.state.paused)
 
     def clear_discovered_facts(self, tick: "OrchestratorSnapshot") -> None:
         clear_discovered_facts(
@@ -551,14 +548,10 @@ def emit_heartbeat_if_needed(
 
 def check_health(
     health_gate: "HealthGate",
-    active_sessions_count: int,
     paused: bool,
 ) -> "HealthDecision":
     """Check system health - moved per method table."""
-    return health_gate.check(
-        active_sessions=active_sessions_count,
-        paused=paused,
-    )
+    return health_gate.check(paused=paused)
 
 
 def handle_signal(
@@ -1432,10 +1425,14 @@ def run_tick(
             len(state.active_sessions),
         )
 
-    # Use HealthGate to check if we can proceed with planning. A paused
-    # orchestrator may still need to refresh its read-only queue projection
-    # after labels change in GitHub; planning remains safe because the paused
-    # snapshot produces no launch actions.
+    # Use HealthGate for system-wide blockers only. The planner's worker_budget
+    # owner enforces worker, reserved tech-lead, and E2E capacity. Planning must
+    # still run at worker saturation so it can apply non-launch actions or use
+    # an independent reserved budget.
+    #
+    # A paused orchestrator may still need to refresh its read-only queue
+    # projection after labels change in GitHub; planning remains safe because
+    # the paused snapshot produces no launch actions.
     health_decision = check_health_fn()
     refresh_while_paused = (
         not health_decision.can_proceed

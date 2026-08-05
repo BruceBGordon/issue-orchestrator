@@ -59,6 +59,7 @@ from .queue_cache import QueueCache, QueueMutationStatus, record_issue_refreshes
 from .review_validity import evaluate_review_validity
 from .review_scope import ReviewScopeChecker, extract_issue_number_from_pr
 from .retrospective_review import discover_retrospective_review_issues
+from .worker_budget import worker_slot_free
 from ..events import EventName
 from ..ports import EventSink, SessionRunner, make_trace_event, RepositoryHost
 from ..ports.session_runner import DiscoveredSession
@@ -971,8 +972,7 @@ class StartupManager:
         print(f"\n🔄 Resuming {len(issues_to_resume)} in-progress issue(s) with partial work...")
 
         for issue, _agent_label in issues_to_resume:
-            # Check capacity
-            if len(state.active_sessions) >= self.config.max_concurrent_sessions:
+            if not worker_slot_free(self.config, state.active_sessions):
                 print(f"  #{issue.number}: At max capacity, will resume when slot available")
                 self._queue_partial_work_resume(state, issue)
                 continue

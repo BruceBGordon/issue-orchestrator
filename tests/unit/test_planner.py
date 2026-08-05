@@ -808,6 +808,25 @@ class TestExplainSkip:
 
         assert "capacity" in reason.lower()
 
+    def test_explain_skip_ignores_reserved_tech_lead_for_worker_capacity(self):
+        """A reserved tech-lead session does not make the worker lane full."""
+        config = make_config(
+            max_concurrent_sessions=1,
+            tech_lead_review_agent="agent:tech-lead",
+        )
+        config.tech_lead.max_concurrent = 1
+        planner = Planner(config=config, scheduler=Scheduler(config))
+        tech_lead_session = make_session(make_issue(9))
+        tech_lead_session.agent_label = "agent:tech-lead"
+        snapshot = make_snapshot(
+            issues=[make_issue(2)],
+            active_sessions=[tech_lead_session],
+        )
+
+        reason = planner.explain_skip(2, snapshot)
+
+        assert reason == "Unknown reason"
+
 
 class TestPlanDiscoveredReviews:
     """Tests for Planner's _plan_discovered_reviews method.
