@@ -6,7 +6,7 @@ from pathlib import Path
 
 from ..types import Check
 from ...config import Config
-from ...hooks.hooks import get_adapter
+from ...hooks.hooks import get_adapter, summarize_ai_gate_message
 from ...ai_gate_state import load_ai_gate_state, save_ai_gate_state
 from ...repo_guardrails import (
     MANAGED_PRE_PUSH_MARKER,
@@ -167,12 +167,12 @@ def _run_ai_gate_tests(
             expandable["results"][agent_name] = {"success": success, "message": message}
 
             if not success:
-                failures.append(f"{agent_name}: {message[:50]}")
+                failures.append(f"{agent_name}: {summarize_ai_gate_message(message)}")
         except Exception as e:
             error_msg = f"Error: {e}"
             results[agent_name] = (False, error_msg)
             expandable["results"][agent_name] = {"success": False, "message": error_msg}
-            failures.append(f"{agent_name}: {error_msg[:50]}")
+            failures.append(f"{agent_name}: {summarize_ai_gate_message(error_msg)}")
             logger.warning("AI gate test failed for %s: %s", agent_name, e)
 
     return results, failures

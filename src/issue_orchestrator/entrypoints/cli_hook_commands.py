@@ -243,6 +243,7 @@ def cmd_setup_hooks(args: argparse.Namespace) -> int:  # noqa: C901, PLR0912 - m
         UnsupportedAiAgentError,
         detect_agents_from_config,
         get_adapter,
+        summarize_ai_gate_message,
     )
 
     console.print("[bold cyan]Installing AI Agent Hooks[/bold cyan]\n")
@@ -343,15 +344,14 @@ def cmd_setup_hooks(args: argparse.Namespace) -> int:  # noqa: C901, PLR0912 - m
                     continue
                 success, message = adapter.test_ai_gate(target_root)
                 gate_results[agent_name] = (success, message)
+                detail = summarize_ai_gate_message(message)
 
                 if success:
-                    # Extract the blocked command from the message if available
-                    detail = message.split("\n")[0] if message else "blocked"
                     console.print(
                         f"[green]✓[/green] {agent_name}: correctly {detail[:60]}"
                     )
                 else:
-                    console.print(f"[red]✗[/red] {agent_name}: {message[:60]}")
+                    console.print(f"[red]✗[/red] {agent_name}: {detail}")
                     gate_failures.append(agent_name)
             except Exception as exc:
                 error_msg = str(exc)
