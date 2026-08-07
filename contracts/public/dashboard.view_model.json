@@ -264,6 +264,11 @@
           "title": "Queuedissuenumbers",
           "type": "array"
         },
+        "running": {
+          "default": true,
+          "title": "Running",
+          "type": "boolean"
+        },
         "runningIssueNumbers": {
           "items": {
             "type": "integer"

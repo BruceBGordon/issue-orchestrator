@@ -34,6 +34,8 @@ from issue_orchestrator.domain.tech_lead_run import (
     REASON_NO_LONGER_BLOCKED,
     REASON_NO_TECH_LEAD_AGENT,
     REASON_ORCHESTRATOR_PAUSED,
+    REASON_RUN_CLAIM_UNAVAILABLE,
+    GlobalBatchReviewScope,
     GlobalHealthReviewScope,
     IssueInvestigationScope,
     TechLeadRunOutcome,
@@ -41,7 +43,8 @@ from issue_orchestrator.domain.tech_lead_run import (
     TechLeadRunScopeKind,
     TechLeadRunTrigger,
 )
-from issue_orchestrator.domain.claim import Claim, ClaimFetchError
+from issue_orchestrator.control.tech_lead_run_ownership import TechLeadRunOwnership
+from issue_orchestrator.domain.claim import RunClaim, RunClaimAcquisition
 from issue_orchestrator.domain.models import (
     DiscoveredFailure,
     OrchestratorState,
@@ -136,15 +139,75 @@ class RecordingEvents:
         return [dict(getattr(e, "data", {}) or {}) for e in self.published]
 
 
-class FakeClaimManager:
-    def __init__(self, claim: Optional[Claim] = None, raises: bool = False) -> None:
-        self._claim = claim
-        self._raises = raises
+class SharedRunClaimStore:
+    """One in-memory compare-and-swap cell per run key, shared by N engines.
 
-    def get_current_claim(self, issue_number: int) -> Optional[Claim]:
-        if self._raises:
-            raise ClaimFetchError("backing store unreachable")
-        return self._claim
+    Stands in for the GitHub ref the real store uses. Deterministic and
+    ordering-explicit: a test drives two "engines" by interleaving their calls,
+    so the race is reproduced exactly rather than raced for.
+    """
+
+    def __init__(self, *, unreachable: bool = False) -> None:
+        self.holders: dict[str, RunClaim] = {}
+        self.unreachable = unreachable
+        self.acquired: list[str] = []
+        self.released: list[str] = []
+
+    def acquire(self, run_key: str) -> RunClaimAcquisition:
+        if self.unreachable:
+            return RunClaimAcquisition.unavailable("backing store unreachable")
+        holder = self.holders.get(run_key)
+        if holder is not None and not holder.is_expired():
+            return RunClaimAcquisition.held_by(holder)
+        lease_id = f"lease-{run_key}-{len(self.acquired)}"
+        self.holders[run_key] = RunClaim(
+            lease_id=lease_id,
+            claimant=f"engine-{len(self.acquired)}",
+            run_key=run_key,
+            started_at=datetime(2026, 8, 7, 12, 0, 0),
+            # Far-future expiry: lease EXPIRY is exercised explicitly by
+            # ``hold(expired=True)``, so it must never depend on the wall clock
+            # the suite happens to run at.
+            expires_at=datetime(2999, 1, 1),
+            priority=1,
+        )
+        self.acquired.append(run_key)
+        return RunClaimAcquisition.acquired(lease_id)
+
+    def renew(self, run_key: str, lease_id: str) -> bool:
+        holder = self.holders.get(run_key)
+        return holder is not None and holder.lease_id == lease_id
+
+    def release(self, run_key: str, lease_id: str) -> None:
+        holder = self.holders.get(run_key)
+        if holder is not None and holder.lease_id == lease_id:
+            del self.holders[run_key]
+            self.released.append(run_key)
+
+    def current(self, run_key: str) -> Optional[RunClaim]:
+        return self.holders.get(run_key)
+
+    def hold(self, run_key: str, *, claimant: str, expired: bool = False) -> None:
+        """Seed a peer engine's live (or dead) ownership of a run."""
+        started = datetime(2026, 8, 7, 12, 0, 0)
+        self.holders[run_key] = RunClaim(
+            lease_id=f"peer-{run_key}",
+            claimant=claimant,
+            run_key=run_key,
+            started_at=started,
+            expires_at=(
+                datetime(1999, 1, 1) if expired else datetime(2999, 1, 1)
+            ),
+            priority=1,
+        )
+
+
+def _ownership(store: SharedRunClaimStore) -> TechLeadRunOwnership:
+    return TechLeadRunOwnership(
+        store,  # type: ignore[arg-type]
+        lease_seconds=900,
+        renew_before_expiry_seconds=300,
+    )
 
 
 def _config(agent: Optional[str] = TECH_LEAD_AGENT) -> Any:
@@ -168,10 +231,8 @@ def _coordinator(
     config: Any = None,
     repository_host: Optional[FakeRepositoryHost] = None,
     anchor_host: Optional[FakeAnchorHost] = None,
-    open_anchor: Optional[int] = None,
-    claim_manager: Any = None,
+    ownership: Optional[TechLeadRunOwnership] = None,
     events: Optional[RecordingEvents] = None,
-    now: Optional[datetime] = None,
 ) -> TechLeadRunCoordinator:
     config = config or _config()
     return TechLeadRunCoordinator(
@@ -179,13 +240,11 @@ def _coordinator(
         config=config,
         repository_host=repository_host or FakeRepositoryHost(),
         anchor_host=anchor_host or FakeAnchorHost(state),
-        discover_open_anchor=lambda _host, _config: open_anchor,
+        ownership=ownership or _ownership(SharedRunClaimStore()),
         is_blocking_any=lambda labels: any(
             str(label).startswith("blocked") for label in labels
         ),
         events=events or RecordingEvents(),  # type: ignore[arg-type]
-        claim_manager=claim_manager,
-        now=now,
     )
 
 
@@ -325,23 +384,39 @@ def test_repeated_global_requests_coalesce_onto_one_run():
 
 
 def test_global_request_deduplicates_against_a_running_health_review():
-    """Shared GitHub truth, not the in-process queue, is what proves this.
+    """The launched run's stamped scope IS its identity.
 
-    Once the anchor launches, the pending item is gone — the only thing left
-    that a peer (or this process after a restart) can see is the still-open
-    marker-labelled anchor issue.
+    Once the anchor launches, the pending item is gone; what remains is the
+    session's ``tech_lead_scope``, which a restart now rebuilds from the
+    anchor's marker label (#6994 round 1 F3) rather than losing.
     """
     state = _state(
-        active_sessions=[FakeSession(900, flavor=None)]  # restored: no stamped scope
+        active_sessions=[
+            FakeSession(900, flavor=TechLeadSessionFlavor.HEALTH_REVIEW)
+        ]
     )
     anchor_host = FakeAnchorHost(state)
-    admission = _coordinator(state, anchor_host=anchor_host, open_anchor=900).admit(
-        _global_request()
-    )
+    admission = _coordinator(state, anchor_host=anchor_host).admit(_global_request())
 
     assert admission.outcome is TechLeadRunOutcome.ALREADY_RUNNING
     assert admission.issue_number == 900
     assert anchor_host.calls == 0
+
+
+def test_a_restored_global_run_without_a_stamp_is_still_treated_as_global():
+    """Fail toward the barrier, never away from it (#6994 round 1 F3).
+
+    A tech-lead session whose flavor could not be established must not be read
+    as issue-scoped: the cost of being wrong that way is targeted work running
+    concurrently with an exclusive whole-repository review.
+    """
+    state = _state(active_sessions=[FakeSession(900, flavor=None)])
+    admission = _coordinator(
+        state, repository_host=FakeRepositoryHost({42: FakeIssue(42)})
+    ).admit(_issue_request(42))
+
+    assert admission.outcome is TechLeadRunOutcome.QUEUED
+    assert admission.behind_global_barrier is True
 
 
 def test_global_request_is_admitted_while_a_targeted_run_is_active():
@@ -445,77 +520,220 @@ def test_failed_anchor_preparation_is_reported_as_failed():
 # ---------------------------------------------------------------------------
 
 
-def _claim(lease_id: str, claimant: str, *, expired: bool = False) -> Claim:
-    base = datetime(2026, 8, 7, 12, 0, 0)
-    return Claim(
-        lease_id=lease_id,
-        claimant=claimant,
-        issue_number=42,
-        started_at=base,
-        expires_at=base - timedelta(minutes=5) if expired else base + timedelta(hours=1),
-        priority=1,
-    )
+def _two_engines(store: SharedRunClaimStore, issues: dict[int, FakeIssue]):
+    """Two independent engines over ONE shared coordination store.
+
+    Each has its own state and its own ownership bookkeeping — exactly the
+    production shape — so an interleaved admission is arbitrated only by the
+    shared compare-and-swap, never by anything in-process.
+    """
+    engines = []
+    for _ in range(2):
+        state = _state()
+        engines.append(
+            (
+                state,
+                _coordinator(
+                    state,
+                    repository_host=FakeRepositoryHost(dict(issues)),
+                    anchor_host=FakeAnchorHost(state),
+                    ownership=_ownership(store),
+                ),
+            )
+        )
+    return engines
 
 
-def test_a_peer_orchestrators_live_claim_is_a_typed_conflict():
-    repo = FakeRepositoryHost({42: FakeIssue(42)})
+def test_two_engines_interleaving_one_issue_produce_exactly_one_queued_run():
+    """The check-then-act gap, reproduced deterministically (#6994 R1 F1).
+
+    Both engines observe "not running, not queued" BEFORE either writes — the
+    interleaving that used to make both answer ``queued``. Only the engine that
+    wins the shared claim may enqueue; the loser gets a typed conflict.
+    """
+    store = SharedRunClaimStore()
+    (state_a, engine_a), (state_b, engine_b) = _two_engines(store, {42: FakeIssue(42)})
+
+    first = engine_a.admit(_issue_request(42))
+    second = engine_b.admit(_issue_request(42))
+
+    assert first.outcome is TechLeadRunOutcome.QUEUED
+    assert second.outcome is TechLeadRunOutcome.CLAIM_CONFLICT
+    assert second.reason == REASON_CLAIMED_BY_PEER
+    assert [item.issue_number for item in state_a.pending_tech_lead_reviews] == [42]
+    assert state_b.pending_tech_lead_reviews == []
+
+
+def test_two_engines_interleaving_a_global_request_create_one_anchor():
+    """The scan-then-create gap: ownership is taken BEFORE the anchor exists.
+
+    Previously both engines scanned, both found no open anchor, and both created
+    one. The loser must not reach the anchor lifecycle at all.
+    """
+    store = SharedRunClaimStore()
+    (state_a, engine_a), (state_b, engine_b) = _two_engines(store, {})
+    anchor_a = FakeAnchorHost(state_a)
+    anchor_b = FakeAnchorHost(state_b)
+    engine_a = _coordinator(state_a, anchor_host=anchor_a, ownership=_ownership(store))
+    engine_b = _coordinator(state_b, anchor_host=anchor_b, ownership=_ownership(store))
+
+    first = engine_a.admit(_global_request())
+    second = engine_b.admit(_global_request())
+
+    assert first.outcome is TechLeadRunOutcome.QUEUED
+    assert second.outcome is TechLeadRunOutcome.CLAIM_CONFLICT
+    assert anchor_a.calls == 1
+    assert anchor_b.calls == 0, "the losing engine must not create a second anchor"
+
+
+def test_a_peer_claim_on_a_different_run_does_not_block_this_one():
+    store = SharedRunClaimStore()
+    store.hold(IssueInvestigationScope(73).run_key, claimant="other-host")
     state = _state()
     admission = _coordinator(
         state,
-        repository_host=repo,
-        claim_manager=FakeClaimManager(_claim("peer-lease", "other-host")),
-        now=datetime(2026, 8, 7, 12, 30, 0),
+        repository_host=FakeRepositoryHost({42: FakeIssue(42)}),
+        ownership=_ownership(store),
     ).admit(_issue_request(42))
 
-    assert admission.outcome is TechLeadRunOutcome.CLAIM_CONFLICT
-    assert admission.reason == REASON_CLAIMED_BY_PEER
+    assert admission.outcome is TechLeadRunOutcome.QUEUED
+
+
+def test_a_dead_peers_expired_run_claim_is_recovered_not_respected():
+    """Stale-claim recovery: an expired lease means the owner died.
+
+    Leaving the run un-takeable would strand it forever, so an expired holder is
+    no holder at all.
+    """
+    store = SharedRunClaimStore()
+    store.hold(IssueInvestigationScope(42).run_key, claimant="dead-host", expired=True)
+    state = _state()
+    admission = _coordinator(
+        state,
+        repository_host=FakeRepositoryHost({42: FakeIssue(42)}),
+        ownership=_ownership(store),
+    ).admit(_issue_request(42))
+
+    assert admission.outcome is TechLeadRunOutcome.QUEUED
+    assert [item.issue_number for item in state.pending_tech_lead_reviews] == [42]
+
+
+def test_an_unreadable_claim_store_fails_closed_rather_than_admitting():
+    """Ignorance is not permission (#6994 round 1 F1).
+
+    Admitting when ownership cannot be established is exactly what produces the
+    duplicate run this step exists to prevent, and "queued" is an answer the
+    operator cannot discover to be false. A typed failure is retryable.
+    """
+    state = _state()
+    admission = _coordinator(
+        state,
+        repository_host=FakeRepositoryHost({42: FakeIssue(42)}),
+        ownership=_ownership(SharedRunClaimStore(unreachable=True)),
+    ).admit(_issue_request(42))
+
+    assert admission.outcome is TechLeadRunOutcome.FAILED
+    assert admission.reason == REASON_RUN_CLAIM_UNAVAILABLE
     assert state.pending_tech_lead_reviews == []
 
 
-def test_our_own_sessions_claim_is_not_a_conflict():
-    repo = FakeRepositoryHost({42: FakeIssue(42)})
-    state = _state(
-        active_sessions=[
-            FakeSession(7, agent_label="agent:backend", lease_id="our-lease")
-        ]
-    )
-    admission = _coordinator(
+def test_repeated_requests_reuse_one_claim_instead_of_churning_the_store():
+    store = SharedRunClaimStore()
+    state = _state()
+    coordinator = _coordinator(
         state,
-        repository_host=repo,
-        claim_manager=FakeClaimManager(_claim("our-lease", "this-host")),
-        now=datetime(2026, 8, 7, 12, 30, 0),
-    ).admit(_issue_request(42))
+        repository_host=FakeRepositoryHost({42: FakeIssue(42)}),
+        ownership=_ownership(store),
+    )
 
-    assert admission.outcome is TechLeadRunOutcome.QUEUED
+    coordinator.admit(_issue_request(42))
+    coordinator.admit(_issue_request(42))
+    coordinator.admit(_issue_request(42))
 
-
-def test_an_expired_peer_claim_does_not_block_admission():
-    repo = FakeRepositoryHost({42: FakeIssue(42)})
-    admission = _coordinator(
-        _state(),
-        repository_host=repo,
-        claim_manager=FakeClaimManager(_claim("stale", "dead-host", expired=True)),
-        now=datetime(2026, 8, 7, 12, 30, 0),
-    ).admit(_issue_request(42))
-
-    assert admission.outcome is TechLeadRunOutcome.QUEUED
+    assert store.acquired == [IssueInvestigationScope(42).run_key]
 
 
-def test_an_unreadable_claim_store_defers_to_the_launch_time_claim_gate():
-    """Fail-open HERE, fail-closed at the write boundary.
+def test_ownership_is_handed_back_when_the_run_leaves_the_queue():
+    """Per-tick reconcile releases a run that no longer exists.
 
-    Refusing on a transient GitHub blip would make an operator's request fail
-    for a reason that is not about their request; the launch path's ``ClaimGate``
-    still verifies ownership (fail-closed) before any mutation.
+    Without it, a peer would have to wait out the whole lease before it could
+    investigate the same subject.
     """
-    repo = FakeRepositoryHost({42: FakeIssue(42)})
-    admission = _coordinator(
-        _state(),
-        repository_host=repo,
-        claim_manager=FakeClaimManager(raises=True),
-    ).admit(_issue_request(42))
+    store = SharedRunClaimStore()
+    state = _state()
+    coordinator = _coordinator(
+        state,
+        repository_host=FakeRepositoryHost({42: FakeIssue(42)}),
+        ownership=_ownership(store),
+    )
+    coordinator.admit(_issue_request(42))
+
+    state.pending_tech_lead_reviews.clear()
+    coordinator.reconcile_ownership()
+
+    assert store.released == [IssueInvestigationScope(42).run_key]
+    assert store.current(IssueInvestigationScope(42).run_key) is None
+
+
+def test_a_run_whose_claim_a_peer_took_is_reported_so_the_tick_withdraws_it():
+    """A restarted engine must not launch work a peer now owns.
+
+    The queue survives the restart (it is rebuilt from the recovered run), but
+    the lease bookkeeping does not — so reconcile has to re-establish ownership,
+    and when a peer holds it the run comes back as LOST.
+    """
+    store = SharedRunClaimStore()
+    state = _state(pending_tech_lead_reviews=[_investigation(42)])
+    store.hold(IssueInvestigationScope(42).run_key, claimant="other-host")
+
+    # A fresh coordinator + fresh ownership IS the restarted process.
+    restarted = _coordinator(state, ownership=_ownership(store))
+
+    assert restarted.reconcile_ownership() == (IssueInvestigationScope(42).run_key,)
+
+
+def test_a_run_recovered_after_restart_reclaims_its_shared_ownership():
+    """Restart recovery: the queue survives, so ownership must be re-established.
+
+    A restarted engine holds no lease bookkeeping, but it still has the run. If
+    the shared claim is free (its own lease expired with the old process), it
+    takes it back rather than launching unowned work.
+    """
+    store = SharedRunClaimStore()
+    state = _state(pending_tech_lead_reviews=[_investigation(42)])
+    coordinator = _coordinator(state, ownership=_ownership(store))
+
+    assert coordinator.reconcile_ownership() == ()
+    assert store.acquired == [IssueInvestigationScope(42).run_key]
+
+
+def test_a_batch_review_does_not_deduplicate_against_a_queued_health_review():
+    """Two global flavors are two identities that serialize (#6994 R1 F2).
+
+    Collapsing them made one operator's request silently disappear into the
+    other's run.
+    """
+    state = _state(pending_tech_lead_reviews=[_health_review()])
+    admission = _coordinator(state).admit(
+        TechLeadRunRequest(
+            scope=GlobalBatchReviewScope(), trigger=TechLeadRunTrigger.DASHBOARD
+        )
+    )
+
+    assert admission.outcome is not TechLeadRunOutcome.ALREADY_QUEUED
+    assert admission.scope_kind is TechLeadRunScopeKind.GLOBAL_BATCH_REVIEW
+    assert admission.run_key == "global:batch_review"
+
+
+def test_a_second_global_flavor_is_reported_as_waiting_behind_the_first():
+    batch = PendingTechLeadReview(
+        800, "Tech Lead Batch Review", flavor=TechLeadSessionFlavor.BATCH_REVIEW
+    )
+    state = _state(pending_tech_lead_reviews=[batch])
+    admission = _coordinator(state).admit(_global_request())
 
     assert admission.outcome is TechLeadRunOutcome.QUEUED
+    assert admission.behind_global_barrier is True
 
 
 # ---------------------------------------------------------------------------

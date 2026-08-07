@@ -1185,10 +1185,10 @@ export interface TechLeadRunAdmissionPayload {
   behind_global_barrier: boolean;
   detail: string;
   issue_number: number | null;
-  outcome: "queued" | "already_queued" | "already_running" | "paused" | "not_configured" | "not_eligible" | "claim_conflict" | "failed";
+  outcome: "queued" | "already_queued" | "already_running" | "paused" | "not_running" | "not_configured" | "not_eligible" | "claim_conflict" | "failed";
   reason: string;
   run_key: string;
-  scope_kind: "global_health_review" | "issue";
+  scope_kind: "global_health_review" | "global_batch_review" | "issue";
 }
 
 export interface TechLeadRunRequestPayload {

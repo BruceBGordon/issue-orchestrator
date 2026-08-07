@@ -55,6 +55,12 @@ class TechLeadRunActionsView(BaseModel):
     # False when no tech lead agent is configured. The feature stays visible
     # (discoverable) but disabled, with the UI pointing at Settings.
     configured: bool
+    # False when there is no Repository Engine at all (the dashboard is being
+    # served without a live engine). Projected SEPARATELY from ``configured``
+    # because the two need different operator remedies — "start the engine" vs
+    # "add a tech lead agent in Settings" — and reporting a stopped engine as
+    # unconfigured sent operators to the wrong place (#6994 round 1 F5).
+    running: bool
     # True when the Repository Engine is paused. A paused engine must not claim
     # the action will run, so both actions disable.
     paused: bool
@@ -85,9 +91,17 @@ class TechLeadRunActionsView(BaseModel):
 
     @classmethod
     def empty(cls) -> "TechLeadRunActionsView":
-        """The projection when no engine state is available."""
+        """The projection when no engine is running.
+
+        ``configured`` is deliberately left True: with no engine we cannot know
+        whether a tech lead agent is configured, and claiming it is missing
+        would point the operator at Settings for a problem they do not have.
+        ``running=False`` is the fact we DO have, and it is the one that
+        disables the actions.
+        """
         return cls(
-            configured=False,
+            configured=True,
+            running=False,
             paused=False,
             global_status=STATUS_IDLE,
             global_status_label="",
@@ -124,6 +138,7 @@ def read_tech_lead_run_actions(
     global_run_numbers = _global_run_issue_numbers(config, state)
     return TechLeadRunActionsView(
         configured=bool(config.tech_lead_review_agent),
+        running=True,
         paused=bool(state.paused),
         global_status=global_status,
         global_status_label=_STATUS_LABELS[global_status],

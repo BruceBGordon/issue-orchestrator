@@ -103,6 +103,11 @@
 .issue-action-status:empty {
     display: none;
 }
+.issue-detail-actions .tech-lead-settings-link {
+    align-self: center;
+    width: auto;
+    font-size: 12px;
+}
 /* Issue story: status explanation */
 .issue-detail-status {
     padding: 2px 0 0;

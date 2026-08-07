@@ -93,6 +93,11 @@ class OrchestratorSnapshot:
     # planner emits the idempotent label via the Applier (#6824 R1, label-only).
     stuck_sweep_escalations: tuple[int, ...] = field(default_factory=tuple)
     tech_lead_facts: Optional[TechLeadFacts] = None
+    # Authoritative lifecycle reads of queued investigation subjects the
+    # filtered board did not carry (#6994 F4). Launch-time revalidation
+    # consults these so a subject CLOSED while queued is observed as closed
+    # rather than merely absent.
+    tech_lead_subjects: tuple["Issue", ...] = ()
     cleanup_facts: Optional[CleanupFacts] = None
     # Issues with stale in-progress labels (label present but no active session)
     stale_in_progress_issues: tuple[Issue, ...] = field(default_factory=tuple)
@@ -147,6 +152,7 @@ class OrchestratorSnapshot:
         ] = (),
         discovered_failures: Sequence[DiscoveredFailure] = (),
         tech_lead_facts: Optional[TechLeadFacts] = None,
+        tech_lead_subjects: tuple["Issue", ...] = (),
         cleanup_facts: Optional[CleanupFacts] = None,
         stale_in_progress_issues: Sequence[Issue] = (),
         stale_claim_issues: Sequence[Issue] = (),
@@ -200,6 +206,7 @@ class OrchestratorSnapshot:
             ),
             discovered_failures=tuple(discovered_failures),
             tech_lead_facts=tech_lead_facts,
+            tech_lead_subjects=tech_lead_subjects,
             cleanup_facts=cleanup_facts,
             stale_in_progress_issues=tuple(stale_in_progress_issues),
             stale_claim_issues=tuple(stale_claim_issues),

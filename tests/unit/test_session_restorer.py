@@ -660,3 +660,192 @@ class TestReviewSessionSpecifics:
 
         assert len(restored) == 1
         assert restored[0].key.task == TaskKind.REVIEW
+
+
+class TestRestoredTechLeadScope:
+    """A restored tech-lead run keeps its scope, so the global barrier holds.
+
+    Before #6994 round 1 F3 a restart rebuilt tech-lead sessions with no
+    ``tech_lead_scope``. A running whole-board review therefore stopped counting
+    as global: targeted work launched alongside an exclusive review, and the
+    dashboard reported the anchor as an ordinary running issue. Everything
+    needed to rebuild the grant is durable — the anchor's marker label and the
+    cohort ledger — so these pin that it IS rebuilt.
+    """
+
+    @staticmethod
+    def _restorer(tmp_path, issue, *, authority=None):
+        from issue_orchestrator.control.health_review_trigger import (
+            HEALTH_REVIEW_MARKER_LABEL,
+        )
+
+        _ = HEALTH_REVIEW_MARKER_LABEL
+        config = make_config(agents={"agent:tech-lead": make_agent_config(tmp_path)})
+        config.tech_lead_review_agent = "agent:tech-lead"
+        repo_host = MockRepositoryHost()
+        repo_host.issues[issue.number] = issue
+        working_copy = MockWorkingCopy()
+        return (
+            SessionRestorer(config, repo_host, working_copy, authority),
+            config,
+        )
+
+    def _restore(self, tmp_path, issue, *, authority=None):
+        worktree = tmp_path / f"repo-{issue.number}"
+        worktree.mkdir()
+        restorer, config = self._restorer(tmp_path, issue, authority=authority)
+        working_copy = restorer.working_copy
+        working_copy.branches[worktree] = "main"
+        discovered = [
+            make_discovered_session(issue.number, is_review=False, worktree=worktree)
+        ]
+        restored = restorer.restore_sessions(discovered, already_tracked=[])
+        return restored, config
+
+    def test_a_restored_health_review_is_still_a_global_run(self, tmp_path):
+        from issue_orchestrator.control.health_review_trigger import (
+            HEALTH_REVIEW_MARKER_LABEL,
+        )
+        from issue_orchestrator.control.tech_lead_run_admission import (
+            has_active_global_run,
+        )
+        from issue_orchestrator.domain.tech_lead_session import TechLeadSessionFlavor
+
+        issue = Issue(
+            number=900,
+            title="Health Review — walk the floor",
+            labels=["agent:tech-lead", HEALTH_REVIEW_MARKER_LABEL],
+        )
+        restored, config = self._restore(tmp_path, issue)
+
+        assert len(restored) == 1
+        scope = restored[0].tech_lead_scope
+        assert scope is not None
+        assert scope.flavor is TechLeadSessionFlavor.HEALTH_REVIEW
+        assert has_active_global_run(config, restored) is True
+
+    def test_a_restored_batch_review_is_still_a_global_run(self, tmp_path):
+        from issue_orchestrator.control.tech_lead_run_admission import (
+            has_active_global_run,
+        )
+        from issue_orchestrator.domain.tech_lead_session import TechLeadSessionFlavor
+
+        issue = Issue(
+            number=800,
+            title="Tech Lead Batch Review (3 PRs)",
+            labels=["agent:tech-lead"],
+        )
+        restored, config = self._restore(tmp_path, issue)
+
+        scope = restored[0].tech_lead_scope
+        assert scope is not None
+        assert scope.flavor is TechLeadSessionFlavor.BATCH_REVIEW
+        assert has_active_global_run(config, restored) is True
+
+    def test_a_restored_investigation_is_not_a_global_barrier(self, tmp_path):
+        """The conservative default must not swallow targeted runs.
+
+        A restored FAILURE_INVESTIGATION has to come back issue-scoped, or every
+        restart would silently block all other tech-lead work.
+        """
+        from issue_orchestrator.control.tech_lead_run_admission import (
+            has_active_global_run,
+        )
+        from issue_orchestrator.domain.tech_lead_session import TechLeadSessionFlavor
+
+        issue = Issue(number=42, title="Broken thing", labels=["agent:tech-lead"])
+        restored, config = self._restore(tmp_path, issue)
+
+        scope = restored[0].tech_lead_scope
+        assert scope is not None
+        assert scope.flavor is TechLeadSessionFlavor.FAILURE_INVESTIGATION
+        assert has_active_global_run(config, restored) is False
+
+    def test_a_restored_storm_review_recovers_its_owned_cohort(self, tmp_path):
+        from issue_orchestrator.control.health_review_trigger import (
+            HEALTH_REVIEW_MARKER_LABEL,
+        )
+        from issue_orchestrator.domain.models import DiscoveredFailure
+
+        class _Authority:
+            def load_storm_cohort(self, *, anchor_issue_number):
+                assert anchor_issue_number == 900
+                return (
+                    DiscoveredFailure(
+                        issue_number=7, issue_title="a", failure_reason="timed_out"
+                    ),
+                    DiscoveredFailure(
+                        issue_number=5, issue_title="b", failure_reason="timed_out"
+                    ),
+                )
+
+        issue = Issue(
+            number=900,
+            title="Health Review",
+            labels=["agent:tech-lead", HEALTH_REVIEW_MARKER_LABEL],
+        )
+        restored, _ = self._restore(tmp_path, issue, authority=_Authority())
+
+        assert restored[0].tech_lead_scope.problem_issue_numbers == (5, 7)
+
+    def test_a_restored_global_run_still_blocks_targeted_launches(self, tmp_path):
+        """The end the barrier exists for (#6994 round 1 F3)."""
+        from issue_orchestrator.control.health_review_trigger import (
+            HEALTH_REVIEW_MARKER_LABEL,
+        )
+        from issue_orchestrator.control.tech_lead_run_admission import (
+            plan_tech_lead_launch_gate,
+        )
+        from issue_orchestrator.domain.models import (
+            DiscoveredFailure,
+            PendingTechLeadReview,
+        )
+        from issue_orchestrator.domain.tech_lead_session import TechLeadSessionFlavor
+
+        issue = Issue(
+            number=900,
+            title="Health Review",
+            labels=["agent:tech-lead", HEALTH_REVIEW_MARKER_LABEL],
+        )
+        restored, config = self._restore(tmp_path, issue)
+        queued = PendingTechLeadReview(
+            42,
+            "Investigate #42",
+            flavor=TechLeadSessionFlavor.FAILURE_INVESTIGATION,
+            failure=DiscoveredFailure(
+                issue_number=42, issue_title="Investigate", failure_reason="timed_out"
+            ),
+        )
+
+        gate = plan_tech_lead_launch_gate(config, [queued], restored)
+
+        assert gate.launchable == ()
+        assert list(gate.held) == [queued]
+
+    def test_the_dashboard_reports_a_restored_global_run_as_global(self, tmp_path):
+        """The projection reads the same recovered stamp the gate does."""
+        from issue_orchestrator.control.health_review_trigger import (
+            HEALTH_REVIEW_MARKER_LABEL,
+        )
+        from issue_orchestrator.domain.models import OrchestratorState
+        from issue_orchestrator.view_models.tech_lead_run_actions import (
+            STATUS_RUNNING,
+            read_tech_lead_run_actions,
+        )
+
+        issue = Issue(
+            number=900,
+            title="Health Review",
+            labels=["agent:tech-lead", HEALTH_REVIEW_MARKER_LABEL],
+        )
+        restored, config = self._restore(tmp_path, issue)
+        state = OrchestratorState()
+        state.active_sessions = list(restored)
+
+        view = read_tech_lead_run_actions(config, state)
+
+        assert view.global_status == STATUS_RUNNING
+        assert view.global_barrier_active is True
+        # The anchor is NOT a board card an operator can aim the targeted
+        # action at, so it must not appear as a running investigation.
+        assert view.running_issue_numbers == ()

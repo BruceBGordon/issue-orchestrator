@@ -21,6 +21,8 @@ from issue_orchestrator.control.planner import Planner
 from issue_orchestrator.control.scheduler import Scheduler
 from issue_orchestrator.control.session_manager import SessionType
 from issue_orchestrator.control.workflows.tech_lead_workflow import TechLeadWorkflow
+from issue_orchestrator.control.tech_lead_run_ownership import TechLeadRunOwnership
+from issue_orchestrator.ports.run_claim_store import NullRunClaimStore
 from issue_orchestrator.domain.models import (
     AgentConfig,
     DiscoveredFailure,
@@ -277,6 +279,11 @@ def _apply_withdrawal(state: OrchestratorState, action: DropTechLeadAction) -> l
     tick = _Tick()
     tick.state = state  # type: ignore[attr-defined]
     tick.events = events  # type: ignore[attr-defined]
+    # The apply seam hands the run's shared claim back; a real ownership owner
+    # over the single-instance store keeps that observable without a fake.
+    tick.run_ownership = TechLeadRunOwnership(  # type: ignore[attr-defined]
+        NullRunClaimStore(), lease_seconds=900, renew_before_expiry_seconds=300
+    )
     withdraw_revalidated_tech_lead_run(action, tick)  # type: ignore[arg-type]
     return events.published
 
@@ -313,3 +320,153 @@ def test_a_withdrawal_is_published_with_its_machine_readable_reason():
     assert payload["issue_number"] == 42
     assert payload["reason"] == REASON_ISSUE_CLOSED
     assert payload["run_key"] == "issue:42"
+
+
+# ---------------------------------------------------------------------------
+# The PRODUCTION evidence path (#6994 round 1 F4)
+#
+# The tests above hand the planner a synthetic snapshot that already contains a
+# closed issue. Production cannot produce that snapshot: the board fetch asks
+# GitHub only for OPEN issues and filters by agent label / milestone /
+# exclude_labels, so a subject closed while queued comes back ABSENT — and
+# absence is the one signal revalidation must never act on. These tests cover
+# the whole fact-gatherer -> snapshot -> plan path instead.
+# ---------------------------------------------------------------------------
+
+
+class _RecordingRepositoryHost:
+    """A repository host with the production ``list_issues`` semantics.
+
+    ``list_issues`` honours ``state`` (defaulting to open, exactly as the real
+    adapter does), so a closed subject is genuinely invisible to the board fetch
+    and the test cannot accidentally prove the fix through a lenient fake.
+    """
+
+    def __init__(self, issues):
+        self._issues = {issue.number: issue for issue in issues}
+        self.get_issue_calls: list[int] = []
+
+    def list_issues(self, labels=None, milestone=None, limit=None, state="open", **_):
+        _ = labels, milestone, limit
+        return [
+            issue
+            for issue in self._issues.values()
+            if state == "all" or (issue.state or "open") == state
+        ]
+
+    def get_issue(self, number: int):
+        self.get_issue_calls.append(number)
+        return self._issues.get(number)
+
+
+def _fact_gatherer(repository_host):
+    from issue_orchestrator.control.fact_gatherer import FactGatherer
+
+    config = Config()
+    config.tech_lead_review_agent = TECH_LEAD_AGENT
+    config.agents[TECH_LEAD_AGENT] = AgentConfig(
+        command="claude", prompt_path=Path("/tmp/tech-lead.md")
+    )
+    return FactGatherer(config=config, repository_host=repository_host)
+
+
+def test_a_subject_closed_while_queued_is_read_authoritatively_and_withdrawn():
+    closed = _issue(42, ["agent:backend", "blocked-failed"], state="closed")
+    repository_host = _RecordingRepositoryHost([closed])
+    state = OrchestratorState()
+    state.pending_tech_lead_reviews.append(_investigation(42))
+
+    # The board fetch cannot see it: GitHub was asked for OPEN issues only.
+    board = repository_host.list_issues()
+    assert board == []
+
+    subjects = _fact_gatherer(repository_host).gather_tech_lead_subject_facts(
+        state, board
+    )
+    assert [issue.number for issue in subjects] == [42]
+
+    plan = _planner().plan(
+        make_snapshot(
+            issues=board,
+            pending_tech_lead=list(state.pending_tech_lead_reviews),
+            tech_lead_subjects=subjects,
+        )
+    )
+
+    assert _tech_lead_launches(plan) == []
+    assert [(w.issue_number, w.reason) for w in _withdrawals(plan)] == [
+        (42, REASON_ISSUE_CLOSED)
+    ]
+
+
+def test_a_subject_still_on_the_board_costs_no_extra_github_read():
+    """GitHub API discipline: only the subjects the board could not answer for."""
+    open_subject = _blocked(42)
+    repository_host = _RecordingRepositoryHost([open_subject])
+    state = OrchestratorState()
+    state.pending_tech_lead_reviews.append(_investigation(42))
+
+    subjects = _fact_gatherer(repository_host).gather_tech_lead_subject_facts(
+        state, [open_subject]
+    )
+
+    assert subjects == ()
+    assert repository_host.get_issue_calls == []
+
+
+def test_a_tick_with_no_queued_investigations_makes_no_extra_reads():
+    repository_host = _RecordingRepositoryHost([])
+
+    subjects = _fact_gatherer(repository_host).gather_tech_lead_subject_facts(
+        OrchestratorState(), []
+    )
+
+    assert subjects == ()
+    assert repository_host.get_issue_calls == []
+
+
+def test_a_globally_scoped_queued_run_is_never_re_read_as_a_subject():
+    """A health-review anchor is not a blocked work item."""
+    repository_host = _RecordingRepositoryHost([])
+    state = OrchestratorState()
+    state.pending_tech_lead_reviews.append(
+        PendingTechLeadReview(
+            900, "Health Review", flavor=TechLeadSessionFlavor.HEALTH_REVIEW
+        )
+    )
+
+    subjects = _fact_gatherer(repository_host).gather_tech_lead_subject_facts(
+        state, []
+    )
+
+    assert subjects == ()
+    assert repository_host.get_issue_calls == []
+
+
+def test_an_unreadable_subject_keeps_its_run_rather_than_cancelling_it():
+    """Absence still proves nothing — including the absence of a read."""
+
+    class _Unreadable(_RecordingRepositoryHost):
+        def get_issue(self, number: int):
+            self.get_issue_calls.append(number)
+            raise RuntimeError("GitHub is unreachable")
+
+    repository_host = _Unreadable([])
+    state = OrchestratorState()
+    state.pending_tech_lead_reviews.append(_investigation(42))
+
+    subjects = _fact_gatherer(repository_host).gather_tech_lead_subject_facts(
+        state, []
+    )
+    assert subjects == ()
+
+    plan = _planner().plan(
+        make_snapshot(
+            issues=[],
+            pending_tech_lead=list(state.pending_tech_lead_reviews),
+            tech_lead_subjects=subjects,
+        )
+    )
+
+    assert _tech_lead_launches(plan) == [42]
+    assert _withdrawals(plan) == []

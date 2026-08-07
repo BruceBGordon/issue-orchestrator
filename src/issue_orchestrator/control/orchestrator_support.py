@@ -41,6 +41,7 @@ from .queue_cache import (
 from .blocked_front_queue import front_queue_newly_unblocked, release_blocked_front_on_launch
 from .dependency_gate_snapshot import build_refresh_snapshot
 from .tech_lead_artifact_retention import clear_discovered_facts
+from .tech_lead_run_ownership import TechLeadRunOwnership
 from .tech_lead_run_wiring import tech_lead_state_handlers
 from .issue_fetch_resilience import IssueFetchResilience, TransientIssueFetchError
 from .reconciliation import ReconciliationRequired, get_pause_label
@@ -115,9 +116,32 @@ def init_orchestrator_components(orch: "Orchestrator") -> None:
         )
 
 
+def _single_instance_run_ownership() -> TechLeadRunOwnership:
+    """Run ownership for a deployment with no peer engines.
+
+    Backed by :class:`NullRunClaimStore`, which always wins — correct precisely
+    because with claims disabled there IS no other claimant. Production
+    bootstrap injects the GitHub-ref-backed store instead.
+    """
+    from ..domain.lease_config import LeaseConfig
+    from ..ports.run_claim_store import NullRunClaimStore
+
+    lease = LeaseConfig()
+    return TechLeadRunOwnership(
+        NullRunClaimStore(),
+        lease_seconds=lease.lease_seconds,
+        renew_before_expiry_seconds=lease.renew_interval_seconds,
+    )
+
+
 @dataclass
 class OrchestratorSupport:
-    """Support class holding methods extracted from Orchestrator."""
+    """Support class holding methods extracted from Orchestrator.
+
+    ``run_ownership`` defaults to a single-instance store (see
+    :func:`_single_instance_run_ownership`); production always injects the
+    bootstrap-wired one.
+    """
 
     config: "Config"
     events: EventSink
@@ -140,6 +164,13 @@ class OrchestratorSupport:
     # storm anchor cannot prove its cohort, so intake declines to collapse the
     # individual investigations rather than losing the problems.
     tech_lead_authority: "TechLeadAuthorityStore | None" = None
+    # Cross-instance ownership of logical tech-lead runs (#6994). Defaults to
+    # the single-orchestrator store rather than to None so the apply seam never
+    # has to branch on "is coordination wired?" — the same "No Nulls" shape
+    # NullClaimManager gives issue claims.
+    run_ownership: "TechLeadRunOwnership" = field(
+        default_factory=_single_instance_run_ownership
+    )
 
     _last_ui_update: float = field(default=0.0, init=False)
     _ui_update_interval: int = field(default=30, init=False)
@@ -390,10 +421,13 @@ class OrchestratorSupport:
 
     def _handle_create_tech_lead_issue(self, action: "Action", result: "ActionResult") -> None:
         from .actions import CreateTechLeadIssueAction
-        from .health_review_trigger import intake_created_tech_lead_anchor
+        from .tech_lead_run_wiring import intake_owned_tech_lead_anchor
         num = result.details.get("issue_number")
         if num:
-            intake_created_tech_lead_anchor(cast(CreateTechLeadIssueAction, action), num, self.state, self.queue_cache_store, self.tech_lead_authority)
+            # Through the run-ownership owner, not straight into the queue: the
+            # periodic/storm anchor is the same logical global run the dashboard
+            # and CLI request, so it obeys the same cross-instance exclusivity.
+            intake_owned_tech_lead_anchor(cast(CreateTechLeadIssueAction, action), num, self)
             logger.info("Created tech_lead #%d", num)
 
     def _handle_cleanup_session(self, action: "Action", result: "ActionResult") -> None:

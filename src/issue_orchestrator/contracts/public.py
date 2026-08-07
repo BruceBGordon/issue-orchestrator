@@ -61,6 +61,10 @@ class TechLeadRunActionsContract(ContractBase):
     # False when no tech lead agent is configured: the actions stay visible
     # (discoverable) but disabled, pointing at Settings.
     configured: bool
+    # False when no Repository Engine is running. Separate from ``configured``
+    # so the UI names the right remedy: "start the engine" is not "add a tech
+    # lead agent in Settings" (#6994 round 1 F5).
+    running: bool = True
     # True when the Repository Engine is paused; both actions disable rather
     # than promise a run that nothing would start.
     paused: bool

@@ -18,7 +18,6 @@ re-implements either rule.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
 from typing import TYPE_CHECKING, Callable, Optional, Protocol, cast
 
 from ..domain.models import PendingTechLeadReview
@@ -39,9 +38,16 @@ if TYPE_CHECKING:
     from ..domain.models import OrchestratorState
     from ..infra.config import Config
     from ..ports import EventSink, RepositoryHost
-    from ..ports.claim_manager import ClaimManager
+    from ..ports.queue_cache_store import QueueCacheStore
+    from ..ports.tech_lead_authority import TechLeadAuthorityStore
     from .action_applier import ActionResult
-    from .actions import Action, DropTechLeadAction, QueueTechLeadAction
+    from .tech_lead_run_ownership import TechLeadRunOwnership
+    from .actions import (
+        Action,
+        CreateTechLeadIssueAction,
+        DropTechLeadAction,
+        QueueTechLeadAction,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,19 +91,19 @@ def build_tech_lead_run_coordinator(
     config: "Config",
     repository_host: "RepositoryHost",
     anchor_host: SupportsHealthReviewAnchor,
+    ownership: "TechLeadRunOwnership",
     events: "EventSink",
-    claim_manager: "Optional[ClaimManager]" = None,
-    now: Optional[datetime] = None,
 ) -> "TechLeadRunCoordinator":
     """Compose the coordinator from the real policy owners.
 
-    One factory so every trigger path — dashboard route, one-shot CLI, and the
-    in-tick applier — gets an identically-wired coordinator. Anchor discovery
-    comes from the health-review trigger owner (the marker-label scan that is
-    shared truth) and blocking classification from :class:`LabelManager`, so
-    neither rule is re-implemented per call site.
+    One factory so every trigger path — dashboard route, one-shot CLI, reactive
+    failure handling, and the periodic/storm health trigger — gets an
+    identically-wired coordinator. Blocking classification comes from
+    :class:`LabelManager` so the rule is not re-implemented per call site, and
+    ``ownership`` is the LONG-LIVED cross-instance run-claim owner: it is
+    injected rather than constructed here because a coordinator is built per
+    request and must not be able to forget which runs this engine already holds.
     """
-    from .health_review_trigger import discover_open_health_review_anchor
     from .label_manager import LabelManager
 
     label_manager = LabelManager(config)
@@ -106,11 +112,9 @@ def build_tech_lead_run_coordinator(
         config=config,
         repository_host=repository_host,
         anchor_host=anchor_host,
-        discover_open_anchor=discover_open_health_review_anchor,
+        ownership=ownership,
         is_blocking_any=label_manager.is_blocking_any,
         events=events,
-        claim_manager=claim_manager,
-        now=now,
     )
 
 
@@ -145,6 +149,9 @@ class TechLeadTickDependencies(Protocol):
     @property
     def tech_lead_authority(self) -> object: ...
 
+    @property
+    def run_ownership(self) -> "TechLeadRunOwnership": ...
+
 
 def admit_planned_tech_lead_investigation(
     action: "QueueTechLeadAction", tick: TechLeadTickDependencies
@@ -169,6 +176,7 @@ def admit_planned_tech_lead_investigation(
             queue_cache_store=tick.queue_cache_store,
             tech_lead_authority=tick.tech_lead_authority,
         ),
+        ownership=tick.run_ownership,
         events=tick.events,
     ).admit(
         TechLeadRunRequest(
@@ -188,6 +196,48 @@ def admit_planned_tech_lead_investigation(
     return admission
 
 
+def intake_owned_tech_lead_anchor(
+    action: "CreateTechLeadIssueAction",
+    issue_number: int,
+    tick: TechLeadTickDependencies,
+) -> bool:
+    """Take shared ownership of a freshly created anchor, then queue it (#6994).
+
+    The periodic/storm health-review path creates its anchor through the
+    planner's action pipeline rather than through :meth:`admit`, so this is
+    where it meets the SAME run-ownership owner every other trigger uses. Losing
+    the claim means a peer engine already owns this whole-repository run: the
+    anchor issue stays open (the next discovery reuses it) but it is NOT queued
+    here, so the two engines cannot both run the review.
+
+    Returns whether the anchor was queued for this engine.
+    """
+    from ..domain.tech_lead_run import global_scope_for_flavor
+    from .health_review_trigger import intake_created_tech_lead_anchor
+
+    # The creating owner already DECLARED which variant it authored, so the
+    # run identity is read from the action rather than re-derived from marker
+    # labels at this boundary (#6780's rule, reused here).
+    run_key = global_scope_for_flavor(action.flavor).run_key
+    if not tick.run_ownership.claim(run_key).owned:
+        logger.warning(
+            "[TECH_LEAD] Not queueing anchor #%d (%s): another orchestrator owns"
+            " run %s",
+            issue_number,
+            action.flavor.value,
+            run_key,
+        )
+        return False
+    intake_created_tech_lead_anchor(
+        action,
+        issue_number,
+        tick.state,
+        cast("QueueCacheStore | None", tick.queue_cache_store),
+        cast("TechLeadAuthorityStore | None", tick.tech_lead_authority),
+    )
+    return True
+
+
 def withdraw_revalidated_tech_lead_run(
     action: "DropTechLeadAction", tick: TechLeadTickDependencies
 ) -> None:
@@ -204,7 +254,12 @@ def withdraw_revalidated_tech_lead_run(
     from ..ports import make_trace_event
     from .session_routing import PendingSessionQueues
 
+    scope = IssueInvestigationScope(action.issue_number)
     PendingSessionQueues(tick.state).remove_tech_lead(action.issue_number)
+    # The run no longer exists, so its shared claim must go back immediately:
+    # leaving it held would make a peer wait out the whole lease before it could
+    # investigate the same subject.
+    tick.run_ownership.release(scope.run_key)
     logger.info(
         "[TECH_LEAD] Withdrew queued investigation for #%d before launch: %s",
         action.issue_number,
@@ -214,7 +269,7 @@ def withdraw_revalidated_tech_lead_run(
         make_trace_event(
             EventName.TECH_LEAD_RUN_WITHDRAWN,
             {
-                "run_key": IssueInvestigationScope(action.issue_number).run_key,
+                "run_key": scope.run_key,
                 "issue_number": action.issue_number,
                 "reason": action.reason,
                 "detail": action.detail,
@@ -285,15 +340,28 @@ def orchestrator_tech_lead_run(
     The facade passes ITSELF as the anchor host, so a global admission drives
     the same ``ensure_health_review_anchor`` lifecycle the periodic trigger uses.
     """
+    return tech_lead_run_coordinator(orchestrator).admit(request)
+
+
+def tech_lead_run_coordinator(
+    orchestrator: TechLeadFacadeHost,
+) -> "TechLeadRunCoordinator":
+    """The facade's identically-wired run coordinator.
+
+    Exposed (rather than inlined into one admit call) because the facade needs
+    the SAME owner for two operations: admitting a request, and reconciling run
+    ownership each tick. Building it twice from different inputs is how a second
+    view of "which runs do we own" would appear.
+    """
     deps = orchestrator.deps
     return build_tech_lead_run_coordinator(
         state=orchestrator.state,
         config=orchestrator.config,
         repository_host=deps.repository_host,  # type: ignore[attr-defined]
         anchor_host=orchestrator,
+        ownership=deps.run_ownership,  # type: ignore[attr-defined]
         events=deps.events,  # type: ignore[attr-defined]
-        claim_manager=deps.claim_manager,  # type: ignore[attr-defined]
-    ).admit(request)
+    )
 
 
 def _facade_anchor_lifecycle(

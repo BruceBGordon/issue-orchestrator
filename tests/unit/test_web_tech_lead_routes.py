@@ -255,13 +255,24 @@ def test_every_outcome_has_an_http_mapping():
     assert set(_OUTCOME_STATUS) == set(TechLeadRunOutcome)
 
 
-def test_a_stopped_engine_rejects_the_request_instead_of_promising_a_run(client):
+def test_a_stopped_engine_answers_with_the_declared_admission_contract(client):
+    """503 is the SAME typed body every other outcome uses (#6994 round 1 F5).
+
+    An ad hoc ``{"error": ...}`` shape is one the OpenAPI contract cannot
+    describe and the dashboard cannot branch on — an untyped escape hatch in a
+    typed command surface.
+    """
     set_orchestrator(None)
 
     response = client.post(ENDPOINT, json={"scope": {"kind": "global_health_review"}})
 
     assert response.status_code == 503
-    assert "not running" in response.json()["error"]
+    body = TechLeadRunAdmissionPayload.model_validate(response.json())
+    assert body.outcome == "not_running"
+    assert body.reason == "engine_not_running"
+    assert body.admitted is False
+    assert body.run_key == "global:health_review"
+    assert "not running" in body.detail
 
 
 # ---------------------------------------------------------------------------

@@ -39,16 +39,19 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Protocol
 
-from ..domain.models import DiscoveredFailure, PendingTechLeadReview
-from ..domain.tech_lead_session import TechLeadSessionFlavor
-from .tech_lead_run_admission import (
-    MANUAL_TECH_LEAD_LABEL,
-    manual_focus_failure,
+from ..domain.models import PendingTechLeadReview
+from ..domain.tech_lead_run import (
+    GlobalHealthReviewScope,
+    IssueInvestigationScope,
+    TechLeadRunAdmission,
+    TechLeadRunRequest,
+    TechLeadRunTrigger,
 )
+from .tech_lead_run_admission import run_key_of_pending
 
 if TYPE_CHECKING:
     from ..domain.models import OrchestratorState, Session
-    from ..ports import Issue, RepositoryHost
+    from ..ports import RepositoryHost
 
 logger = logging.getLogger(__name__)
 
@@ -82,7 +85,9 @@ class TechLeadDispatchHost(Protocol):
         self, tech_lead: "PendingTechLeadReview"
     ) -> "Session | None": ...
 
-    def ensure_health_review_anchor(self) -> "PendingTechLeadReview | None": ...
+    def request_tech_lead_run(
+        self, request: "TechLeadRunRequest"
+    ) -> "TechLeadRunAdmission": ...
 
     def pause(self) -> None: ...
 
@@ -233,14 +238,29 @@ def run_targeted_investigations(
 ) -> list[InvestigationResult]:
     """Dispatch the tech lead at each issue and drive it to completion.
 
-    Pauses the planner ONCE up front so no other board work launches while the
-    targeted investigations run, then processes each issue in order: look it up,
-    build the same failure-investigation :class:`PendingTechLeadReview` a
-    discovered failure would, launch it through the real facade path, and tick
-    until the session leaves ``active_sessions`` or ``timeout_s`` elapses.
+    Admission runs BEFORE the pause, then the planner is paused ONCE so no other
+    board work launches while the targeted investigations run. That order is
+    deliberate: every run — dashboard, reactive, or CLI — is admitted by the one
+    :class:`~.tech_lead_run_admission.TechLeadRunCoordinator`, and its matrix
+    rightly refuses a paused engine, so the CLI must ask while the engine is
+    still live and only then halt the planner it is standing in for (#6994
+    round 1 F2). Each admitted run is launched through the real facade path and
+    ticked until its session leaves ``active_sessions`` or ``timeout_s`` elapses.
 
     Returns one :class:`InvestigationResult` per requested issue, in order.
     """
+    admissions = [
+        (
+            issue_number,
+            orchestrator.request_tech_lead_run(
+                TechLeadRunRequest(
+                    scope=IssueInvestigationScope(issue_number),
+                    trigger=TechLeadRunTrigger.CLI,
+                )
+            ),
+        )
+        for issue_number in issue_numbers
+    ]
     orchestrator.pause()
     logger.info(
         "[TECH_LEAD_TRIGGER] planner paused for %d on-demand investigation(s) (#6823)",
@@ -250,12 +270,13 @@ def run_targeted_investigations(
         _investigate_one(
             orchestrator,
             issue_number,
+            admission,
             now=now,
             sleep=sleep,
             poll_interval=poll_interval,
             timeout_s=timeout_s,
         )
-        for issue_number in issue_numbers
+        for issue_number, admission in admissions
     ]
 
 
@@ -298,20 +319,25 @@ def run_health_review(
     anchor is launched through the real tech-lead-launch path and ticked to
     completion, exactly as a targeted investigation is.
     """
-    orchestrator.pause()
-    logger.info("[TECH_LEAD_TRIGGER] planner paused for an on-demand health review")
+    # Admit BEFORE pausing: the shared admission matrix refuses a paused engine,
+    # so a CLI that halted the planner first would be refused by the very owner
+    # it is meant to share with the dashboard (#6994 round 1 F2).
     # The anchor decision (board fingerprint + interval) is sourced on the
     # WALL clock by the facade, matching the timer path (fact_gatherer uses
     # ``time.time()``); the injected ``now`` here is the monotonic drive-loop
     # clock, used only to bound the wait below.
-    tech_lead = orchestrator.ensure_health_review_anchor()
+    admission = orchestrator.request_tech_lead_run(
+        TechLeadRunRequest(
+            scope=GlobalHealthReviewScope(), trigger=TechLeadRunTrigger.CLI
+        )
+    )
+    orchestrator.pause()
+    logger.info("[TECH_LEAD_TRIGGER] planner paused for an on-demand health review")
+    tech_lead = _admitted_queue_item(orchestrator, admission)
     if tech_lead is None:
         return HealthReviewResult(
-            None, status=TechLeadOutcomeStatus.NOT_LAUNCHED,
-            detail=(
-                "no health-review anchor could be prepared (no tech lead agent"
-                " configured, or anchor creation failed)"
-            ),
+            admission.issue_number, status=TechLeadOutcomeStatus.NOT_LAUNCHED,
+            detail=f"health review not admitted: {admission.reason} ({admission.detail})",
         )
     session = orchestrator.launch_tech_lead_session(tech_lead)
     if session is None:
@@ -356,30 +382,28 @@ def run_health_review(
 def _investigate_one(
     orchestrator: TechLeadDispatchHost,
     issue_number: int,
+    admission: TechLeadRunAdmission,
     *,
     now: Callable[[], float],
     sleep: Callable[[float], None],
     poll_interval: float,
     timeout_s: float,
 ) -> InvestigationResult:
-    """Look up, launch, and drive a single on-demand investigation."""
-    issue = orchestrator.repository_host.get_issue(issue_number)
-    if issue is None:
+    """Launch and drive a single already-admitted on-demand investigation."""
+    tech_lead = _admitted_queue_item(orchestrator, admission)
+    if tech_lead is None:
         logger.warning(
-            "[TECH_LEAD_TRIGGER] issue #%d not found; skipping investigation",
+            "[TECH_LEAD_TRIGGER] investigation of #%d not admitted: %s",
             issue_number,
+            admission.reason,
         )
         return InvestigationResult(
             issue_number, status=TechLeadOutcomeStatus.NOT_LAUNCHED,
-            detail=f"issue #{issue_number} not found",
+            detail=(
+                f"investigation of issue #{issue_number} not admitted:"
+                f" {admission.reason} ({admission.detail})"
+            ),
         )
-
-    tech_lead = PendingTechLeadReview(
-        issue_number=issue_number,
-        title=issue.title,
-        flavor=TechLeadSessionFlavor.FAILURE_INVESTIGATION,
-        failure=_focus_failure(issue, _blocking_label(issue), now()),
-    )
     session = orchestrator.launch_tech_lead_session(tech_lead)
     if session is None:
         logger.warning(
@@ -528,21 +552,27 @@ def _session_identity(session: "Session") -> str:
     return session.key.stable_id()
 
 
-def _blocking_label(issue: "Issue") -> str:
-    """The issue's first ``blocked*`` label, else the manual-tech-lead fallback."""
-    for name in issue.labels:
-        if name.casefold().startswith(_BLOCKED_LABEL_PREFIX):
-            return name
-    return MANUAL_TECH_LEAD_LABEL
+def _admitted_queue_item(
+    orchestrator: TechLeadDispatchHost, admission: TechLeadRunAdmission
+) -> "PendingTechLeadReview | None":
+    """The queued run this admission refers to, or None when there is no run.
 
+    The one-shot CLI launches a run it did not construct: admission owns
+    identity, eligibility, cross-instance ownership, and the typed failure
+    context, and leaves the queue entry behind. Reading it back — rather than
+    building a second :class:`PendingTechLeadReview` here — is what stops the
+    CLI from being a path where those rules do not apply (#6994 round 1 F2).
 
-def _focus_failure(
-    issue: "Issue", blocking_label: str, observed_at: float
-) -> DiscoveredFailure:
-    """Build the focus failure fact fed to the tech_lead launch.
-
-    Delegates to the run-admission owner (#6994) so a hand-aimed investigation
-    carries byte-for-byte the same typed context whether it was aimed from this
-    one-shot CLI or from the dashboard command surface.
+    ``ALREADY_QUEUED``/``ALREADY_RUNNING`` are as launchable as ``QUEUED``: the
+    caller asked for the run to happen, and it exists.
     """
-    return manual_focus_failure(issue, blocking_label, observed_at)
+    if not admission.outcome.has_run:
+        return None
+    return next(
+        (
+            item
+            for item in orchestrator.state.pending_tech_lead_reviews
+            if run_key_of_pending(item) == admission.run_key
+        ),
+        None,
+    )

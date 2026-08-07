@@ -4,6 +4,11 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import os
 import pytest
+
+from issue_orchestrator.control.tech_lead_run_ownership import (
+    TechLeadRunOwnership,
+)
+from issue_orchestrator.ports.run_claim_store import NullRunClaimStore
 from pathlib import Path
 from typing import Optional
 from unittest.mock import MagicMock, PropertyMock, patch
@@ -1123,6 +1128,11 @@ def build_test_orchestrator_deps(
         claim_manager=claim_manager,
         claim_gate=claim_gate,
         lease_renewer=lease_renewer,
+        # Single-instance run ownership: the same "No Nulls" shape
+        # NullClaimManager gives issue claims (#6994).
+        run_ownership=TechLeadRunOwnership(
+            NullRunClaimStore(), lease_seconds=900, renew_before_expiry_seconds=300
+        ),
         publish_recovery=publish_recovery,
         services=infra_services,
     )

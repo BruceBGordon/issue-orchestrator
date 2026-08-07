@@ -12,8 +12,14 @@ from issue_orchestrator.control.tech_lead_trigger import (
     run_health_review,
     run_targeted_investigations,
 )
+from issue_orchestrator.control.tech_lead_run_admission import (
+    TechLeadRunCoordinator,
+)
+from issue_orchestrator.control.tech_lead_run_ownership import TechLeadRunOwnership
 from issue_orchestrator.domain.models import PendingTechLeadReview
 from issue_orchestrator.domain.tech_lead_session import TechLeadSessionFlavor
+from issue_orchestrator.infra.config import Config
+from issue_orchestrator.ports.run_claim_store import NullRunClaimStore
 
 
 def _clock(values):
@@ -48,16 +54,64 @@ class _Session:
 class _State:
     def __init__(self) -> None:
         self.active_sessions: list[_Session] = []
+        self.pending_tech_lead_reviews: list = []
+        self.paused = False
+
+
+class _FakeAnchorHost:
+    """The shared anchor lifecycle, as the real facade exposes it."""
+
+    def __init__(self, state, anchor_number=900) -> None:
+        self._state = state
+        self._anchor_number = anchor_number
+        self.calls = 0
+
+    def ensure_health_review_anchor(self):
+        self.calls += 1
+        if self._anchor_number is None:
+            return None
+        item = PendingTechLeadReview(
+            self._anchor_number,
+            "Health Review",
+            flavor=TechLeadSessionFlavor.HEALTH_REVIEW,
+        )
+        self._state.pending_tech_lead_reviews.append(item)
+        return item
 
 
 class _FakeHost:
-    """Minimal TechLeadDispatchHost fake: launch adds a session, tick drains it."""
+    """Minimal TechLeadDispatchHost fake: launch adds a session, tick drains it.
+
+    ``request_tech_lead_run`` delegates to a REAL
+    :class:`TechLeadRunCoordinator`, exactly as the production facade does: the
+    point of #6994 round 1 F2 is that the one-shot CLI is admitted by the same
+    owner as the dashboard, and a hand-written stub here would let that
+    regress silently.
+    """
 
     def __init__(
         self, *, issue, launch=True, ticks_to_complete=2, termination=None
     ) -> None:
         self.repository_host = SimpleNamespace(get_issue=lambda n: issue)
         self.state = _State()
+        self.anchor_host = _FakeAnchorHost(self.state)
+        config = Config()
+        config.tech_lead_review_agent = "agent:tech-lead"
+        self._coordinator = TechLeadRunCoordinator(
+            state=self.state,
+            config=config,
+            repository_host=self.repository_host,
+            anchor_host=self.anchor_host,
+            ownership=TechLeadRunOwnership(
+                NullRunClaimStore(),
+                lease_seconds=900,
+                renew_before_expiry_seconds=300,
+            ),
+            is_blocking_any=lambda labels: any(
+                str(label).startswith("blocked") for label in labels
+            ),
+            events=SimpleNamespace(publish=lambda _event: None),
+        )
         self._launch = launch
         self._ticks_to_complete = ticks_to_complete
         # The typed outcome the facade returns on terminate — defaults to clean,
@@ -72,8 +126,16 @@ class _FakeHost:
     def pause(self) -> None:
         self.pause_calls += 1
 
+    def request_tech_lead_run(self, request):
+        return self._coordinator.admit(request)
+
     def launch_tech_lead_session(self, tech_lead):
         self.launched.append(tech_lead)
+        self.state.pending_tech_lead_reviews = [
+            item
+            for item in self.state.pending_tech_lead_reviews
+            if item.issue_number != tech_lead.issue_number
+        ]
         if not self._launch:
             return None
         self._session = _Session(f"tech-lead:{tech_lead.issue_number}")
@@ -134,7 +196,7 @@ def test_issue_not_found_is_not_launched() -> None:
     assert host.launched == []  # never attempted a launch
     assert results[0].launched is False
     assert results[0].completed is False
-    assert "not found" in results[0].detail
+    assert "issue_not_found" in results[0].detail
 
 
 def test_launch_declined_reports_not_launched() -> None:
@@ -167,12 +229,22 @@ def test_timeout_when_session_never_completes() -> None:
     assert host.state.active_sessions == []
 
 
-def test_blocking_label_falls_back_to_manual_when_no_blocked_label() -> None:
+def test_an_unblocked_subject_is_refused_by_the_shared_eligibility_rule() -> None:
+    """One rule for every trigger, not a manual/automatic split (#6994 R1 F2).
+
+    The CLI used to build its own queue item and launch an investigation of any
+    issue an operator named. It now asks the same admission owner the dashboard
+    does, so the "open AND still blocked" rule applies here too — a trigger-
+    conditional exemption is exactly the cross-path drift that owner exists to
+    remove.
+    """
     host = _FakeHost(issue=_issue(5980, labels=("agent:backend",)), ticks_to_complete=1)
-    run_targeted_investigations(
+    results = run_targeted_investigations(
         host, [5980], now=_clock([0, 1, 2]), sleep=_noop_sleep
     )
-    assert host.launched[0].failure.blocking_label == "manual-tech-lead"
+    assert host.launched == []
+    assert results[0].launched is False
+    assert "no_longer_blocked" in results[0].detail
 
 
 def test_blocking_label_prefers_real_blocked_label() -> None:
@@ -206,6 +278,23 @@ class _FakeHealthHost:
     ) -> None:
         self.state = _State()
         self._anchor = anchor
+        config = Config()
+        config.tech_lead_review_agent = "agent:tech-lead"
+        self._coordinator = TechLeadRunCoordinator(
+            state=self.state,
+            config=config,
+            repository_host=SimpleNamespace(get_issue=lambda _n: None),
+            anchor_host=self,
+            ownership=TechLeadRunOwnership(
+                NullRunClaimStore(),
+                lease_seconds=900,
+                renew_before_expiry_seconds=300,
+            ),
+            is_blocking_any=lambda labels: any(
+                str(label).startswith("blocked") for label in labels
+            ),
+            events=SimpleNamespace(publish=lambda _event: None),
+        )
         self._launch = launch
         self._ticks_to_complete = ticks_to_complete
         self._termination = termination or TechLeadTerminationOutcome()
@@ -219,8 +308,13 @@ class _FakeHealthHost:
     def pause(self) -> None:
         self.pause_calls += 1
 
+    def request_tech_lead_run(self, request):
+        return self._coordinator.admit(request)
+
     def ensure_health_review_anchor(self):
         self.ensure_calls += 1
+        if self._anchor is not None:
+            self.state.pending_tech_lead_reviews.append(self._anchor)
         return self._anchor
 
     def launch_tech_lead_session(self, tech_lead):
@@ -278,7 +372,7 @@ def test_health_review_not_launched_when_no_anchor() -> None:
     assert result.anchor_issue_number is None
     assert result.launched is False
     assert result.completed is False
-    assert "no health-review anchor" in result.detail
+    assert "anchor_unavailable" in result.detail
 
 
 def test_health_review_launch_declined_reports_not_launched() -> None:

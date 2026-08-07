@@ -170,8 +170,18 @@ def test_non_tech_lead_sessions_are_not_reported_as_tech_lead_runs():
     assert view.global_status == STATUS_IDLE
 
 
-def test_a_missing_engine_projects_the_disabled_empty_state():
-    assert read_tech_lead_run_actions(None, None) == TechLeadRunActionsView.empty()
+def test_a_missing_engine_projects_not_running_rather_than_unconfigured():
+    """"Start the engine" and "add a tech lead agent" are different remedies.
+
+    With no engine we cannot know whether an agent is configured, so claiming it
+    is missing would send the operator to Settings for a problem they may not
+    have (#6994 round 1 F5).
+    """
+    view = read_tech_lead_run_actions(None, None)
+
+    assert view == TechLeadRunActionsView.empty()
+    assert view.running is False
+    assert view.configured is True
 
 
 def test_the_payload_is_the_camel_case_shape_the_dashboard_reads():
@@ -181,6 +191,7 @@ def test_the_payload_is_the_camel_case_shape_the_dashboard_reads():
 
     assert _payload(view) == {
         "configured": True,
+        "running": True,
         "paused": False,
         "globalStatus": STATUS_IDLE,
         "globalStatusLabel": "",

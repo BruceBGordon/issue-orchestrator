@@ -21,15 +21,35 @@ function loadModule(overrides = {}) {
     const listeners = {};
     const elements = new Map();
 
-    function fakeElement(id) {
+    // A container whose children we can inspect: the Settings path is rendered
+    // as a real sibling control, so the test has to see insertions.
+    function fakeParent() {
         return {
+            children: [],
+            insertBefore(node, _ref) {
+                if (!this.children.includes(node)) this.children.push(node);
+                node.parentNode = this;
+            },
+            removeChild(node) {
+                this.children = this.children.filter((c) => c !== node);
+                node.parentNode = null;
+            },
+        };
+    }
+
+    function fakeElement(id, parent) {
+        const el = {
             id,
             dataset: {},
             style: {},
             disabled: false,
+            hidden: false,
             title: '',
             textContent: '',
+            type: '',
+            className: '',
             attributes: {},
+            parentNode: parent || null,
             classList: {
                 _set: new Set(),
                 add(name) { this._set.add(name); },
@@ -39,17 +59,31 @@ function loadModule(overrides = {}) {
             },
             setAttribute(name, value) { this.attributes[name] = value; },
             removeAttribute(name) { delete this.attributes[name]; },
-            addEventListener(event, handler) { listeners[`${id}:${event}`] = handler; },
+            addEventListener(event, handler) {
+                listeners[`${this.id || 'anon'}:${event}`] = handler;
+                // Also on the node itself: dynamically created controls are
+                // given their id AFTER construction, so an id-keyed map alone
+                // cannot find their handler.
+                if (event === 'click') this.__clickHandler = handler;
+            },
         };
+        if (parent) parent.children.push(el);
+        return el;
     }
 
-    for (const id of [
-        'techLeadHealthReviewItem',
-        'techLeadHealthReviewStatus',
-        'settingsMenu',
-        'contextMenu',
-        'menuInvestigateTechLead',
-    ]) {
+    const globalHost = fakeParent();
+    const drawerHost = fakeParent();
+    elements.set('techLeadHealthReviewItem', fakeElement('techLeadHealthReviewItem', globalHost));
+    elements.set('techLeadHealthReviewStatus', fakeElement('techLeadHealthReviewStatus', globalHost));
+    elements.set(
+        'issueDetailInvestigateTechLeadBtn',
+        fakeElement('issueDetailInvestigateTechLeadBtn', drawerHost),
+    );
+    elements.set(
+        'issueDetailTechLeadStatus',
+        fakeElement('issueDetailTechLeadStatus', drawerHost),
+    );
+    for (const id of ['settingsMenu', 'contextMenu', 'menuInvestigateTechLead']) {
         elements.set(id, fakeElement(id));
     }
 
@@ -57,9 +91,17 @@ function loadModule(overrides = {}) {
         console,
         document: {
             getElementById: (id) => elements.get(id) || null,
+            createElement: (_tag) => {
+                const el = fakeElement('');
+                el.id = '';
+                return el;
+            },
             addEventListener: (event, handler) => { listeners[`document:${event}`] = handler; },
         },
         window: { dashboardData: { techLeadRuns: null } },
+        // The open drawer's subject, as ``issue_detail_drawer.js`` publishes it.
+        issueDetailData: null,
+        showConfigDialog: () => calls.push(['showConfigDialog']),
         // Cross-chunk owner: ``issue_menus.js`` owns the actions menu's
         // open/closed state (class + aria-expanded together).
         closeSettingsMenu: () => calls.push(['closeSettingsMenu']),
@@ -74,6 +116,18 @@ function loadModule(overrides = {}) {
             };
         },
         ...overrides,
+    };
+    // Elements created during the run (the Settings link) must be findable by
+    // id, exactly as they are in the real document.
+    const originalGetById = context.document.getElementById;
+    context.document.getElementById = (id) => {
+        const found = originalGetById(id);
+        if (found) return found;
+        for (const host of [globalHost, drawerHost]) {
+            const hit = host.children.find((child) => child.id === id);
+            if (hit) return hit;
+        }
+        return null;
     };
     vm.createContext(context);
     vm.runInContext(
@@ -90,6 +144,7 @@ function loadModule(overrides = {}) {
 function ready(overrides = {}) {
     return {
         configured: true,
+        running: true,
         paused: false,
         globalStatus: 'idle',
         globalStatusLabel: '',
@@ -235,16 +290,66 @@ test('a successful admission refreshes the view model', async () => {
 // Affordance state — disabled reasons and non-colour status text
 // ---------------------------------------------------------------------------
 
-test('the global menu item is disabled with a Settings pointer when unconfigured', () => {
+test('an unconfigured engine explains itself in VISIBLE, associated text', () => {
+    // A natively disabled button is not keyboard focusable, so a `title`
+    // tooltip is an explanation no keyboard or screen-reader user can reach.
+    // The reason has to be on screen and programmatically associated (F7).
     const { context, elements } = loadModule();
     context.window.dashboardData.techLeadRuns = ready({ configured: false });
 
-    context.refreshTechLeadMenuState();
+    context.refreshTechLeadRunControls();
 
     const item = elements.get('techLeadHealthReviewItem');
+    const status = elements.get('techLeadHealthReviewStatus');
     assert.equal(item.disabled, true);
     assert.equal(item.attributes['aria-disabled'], 'true');
-    assert.match(item.title, /Settings/);
+    assert.match(status.textContent, /No tech lead agent is configured/);
+    assert.equal(item.attributes['aria-describedby'], status.id);
+});
+
+test('an unconfigured engine offers a keyboard-reachable Settings control', () => {
+    const { context, elements, calls } = loadModule();
+    context.window.dashboardData.techLeadRuns = ready({ configured: false });
+
+    context.refreshTechLeadRunControls();
+
+    const link = context.document.getElementById('techLeadHealthReviewItemSettingsLink');
+    assert.ok(link, 'a Settings path must exist when configuration is missing');
+    assert.equal(link.disabled, false, 'the remedy must stay operable');
+    assert.equal(link.textContent, 'Open Settings');
+
+    // It is a real control, not prose: activating it opens Settings.
+    const handler = link.__clickHandler;
+    assert.ok(handler, 'the Settings control must handle activation');
+    handler({ preventDefault() {}, stopPropagation() {} });
+    assert.deepEqual(calls.at(-1), ['showConfigDialog']);
+
+    // ...and it disappears once configuration is no longer the problem.
+    context.window.dashboardData.techLeadRuns = ready();
+    context.refreshTechLeadRunControls();
+    assert.equal(
+        context.document.getElementById('techLeadHealthReviewItemSettingsLink'),
+        null,
+    );
+    void elements;
+});
+
+test('a stopped engine says so instead of blaming configuration', () => {
+    // "Start the engine" and "add a tech lead agent" are different remedies;
+    // reporting a stopped engine as unconfigured sent operators to the wrong
+    // place (#6994 round 1 F5).
+    const { context, elements } = loadModule();
+    context.window.dashboardData.techLeadRuns = ready({ running: false });
+
+    context.refreshTechLeadRunControls();
+
+    const status = elements.get('techLeadHealthReviewStatus');
+    assert.match(status.textContent, /Repository Engine is not running/);
+    assert.equal(
+        context.document.getElementById('techLeadHealthReviewItemSettingsLink'),
+        null,
+        'a stopped engine is not a Settings problem',
+    );
 });
 
 test('a paused engine disables the global action instead of promising a run', () => {
@@ -327,4 +432,97 @@ test('the compact menu and the drawer read the same per-issue status source', ()
     assert.equal(context.techLeadIssueStatus(42), 'queued');
     assert.equal(context.techLeadIssueStatus(73), 'running');
     assert.equal(context.techLeadIssueStatus(7), 'idle');
+});
+
+
+// ---------------------------------------------------------------------------
+// The refresh owner (#6994 round 1 F6)
+//
+// Every surface that can change run state ends in one refresh, so no visible
+// control can be left claiming "idle" for a run the server already queued.
+// These assert on RENDERED state after a payload change, not on the fact that
+// a refresh function was called.
+// ---------------------------------------------------------------------------
+
+test('an open drawer re-renders from idle to queued when the payload changes', () => {
+    const { context, elements } = loadModule();
+    context.window.dashboardData.techLeadRuns = ready();
+    context.issueDetailData = { issue_number: 42 };
+    const button = elements.get('issueDetailInvestigateTechLeadBtn');
+    const status = elements.get('issueDetailTechLeadStatus');
+    context.updateTechLeadIssueAction({ button, statusEl: status }, 42, true);
+    assert.equal(button.disabled, false);
+    assert.equal(status.textContent, '');
+
+    context.window.dashboardData.techLeadRuns = ready({ queuedIssueNumbers: [42] });
+    context.refreshTechLeadRunControls();
+
+    assert.equal(button.disabled, true, 'the open drawer must not stay enabled');
+    assert.equal(status.textContent, 'Tech lead queued');
+});
+
+test('the compact card action re-renders and relabels itself on refresh', () => {
+    const { context, elements } = loadModule();
+    context.window.dashboardData.techLeadRuns = ready();
+    const button = elements.get('menuInvestigateTechLead');
+    button.dataset.issue = '42';
+    button.style.display = '';
+
+    context.window.dashboardData.techLeadRuns = ready({ runningIssueNumbers: [42] });
+    context.refreshTechLeadRunControls();
+
+    assert.equal(button.disabled, true);
+    assert.equal(button.textContent, 'Investigate with tech lead — Tech lead running');
+});
+
+test('a hidden targeted action is left alone by the refresh owner', () => {
+    // Refreshing must not resurrect an action the surface deliberately hid.
+    const { context, elements } = loadModule();
+    context.window.dashboardData.techLeadRuns = ready({ queuedIssueNumbers: [42] });
+    const button = elements.get('issueDetailInvestigateTechLeadBtn');
+    button.style.display = 'none';
+    context.issueDetailData = { issue_number: 42 };
+
+    context.refreshTechLeadRunControls();
+
+    assert.equal(button.style.display, 'none');
+});
+
+test('the targeted action stays VISIBLE but disabled when the engine cannot run it', () => {
+    // Hiding the control when no tech lead is configured makes the capability
+    // undiscoverable; it must stay on screen with its reason (#6994 R1 F7).
+    const { context, elements } = loadModule();
+    context.window.dashboardData.techLeadRuns = ready({ configured: false });
+    const button = elements.get('issueDetailInvestigateTechLeadBtn');
+    const status = elements.get('issueDetailTechLeadStatus');
+
+    const visible = context.updateTechLeadIssueAction(
+        { button, statusEl: status }, 42, true,
+    );
+
+    assert.equal(visible, true);
+    assert.equal(button.style.display, '');
+    assert.equal(button.disabled, true);
+    assert.match(status.textContent, /No tech lead agent is configured/);
+});
+
+test('an admission response refreshes every visible surface, not just the one clicked', async () => {
+    const { context, elements, calls } = loadModule();
+    context.window.dashboardData.techLeadRuns = ready();
+    context.issueDetailData = { issue_number: 42 };
+    const drawerButton = elements.get('issueDetailInvestigateTechLeadBtn');
+    const drawerStatus = elements.get('issueDetailTechLeadStatus');
+    context.updateTechLeadIssueAction(
+        { button: drawerButton, statusEl: drawerStatus }, 42, true,
+    );
+    // The server accepted the request; the next view model says so.
+    context.refreshViewModel = async () => {
+        calls.push(['refreshViewModel']);
+        context.window.dashboardData.techLeadRuns = ready({ queuedIssueNumbers: [42] });
+    };
+
+    await context.investigateWithTechLead(42);
+
+    assert.equal(drawerButton.disabled, true);
+    assert.equal(drawerStatus.textContent, 'Tech lead queued');
 });

@@ -26,11 +26,14 @@ Deliberate boundaries:
 * **Capacity is not re-decided here.** ``tech_lead_slot_availability`` remains
   the single owner of the numeric budget; this owner decides only SEMANTIC
   conflicts, so the two cannot drift.
-* **Shared truth, not process-local truth.** A global run deduplicates against
-  the marker-labeled anchor issue on GitHub (ADR-0013 labels-as-truth, the same
-  discovery the automatic trigger uses), and both scopes consult the issue
-  claim before admitting, so a peer orchestrator's in-flight run is visible.
-  The in-process pending queue alone would let two engines both admit.
+* **Shared truth, not process-local truth.** Before a request is answered
+  ``queued``, this owner ATOMICALLY takes the logical run through
+  :class:`.tech_lead_run_ownership.TechLeadRunOwnership` (ADR-0033 compare-and-
+  swap, keyed by ``run_key``). Reading shared state and then appending locally
+  is a check-then-act gap two engines can both pass, which is how the same run
+  used to be admitted twice and both callers told "queued" (#6994 round 1 F1).
+  Ownership is taken BEFORE the health-review anchor is created, so the
+  scan-then-create gap closes with it.
 * **No launching.** Admission ENQUEUES; the planner still launches, so a manual
   request rides the identical evidence/authority path an automatic one does.
 """
@@ -39,11 +42,9 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, replace
-from datetime import datetime
 from typing import TYPE_CHECKING, Callable, Optional, Protocol, Sequence
 
 from ..domain.models import DiscoveredFailure, PendingTechLeadReview, SessionStatus
-from ..domain.claim import ClaimFetchError
 from ..domain.tech_lead_run import (
     BARRIER_GLOBAL_AWAITING_DRAIN,
     BARRIER_GLOBAL_RUN_ACTIVE,
@@ -55,27 +56,29 @@ from ..domain.tech_lead_run import (
     REASON_ISSUE_CLOSED,
     REASON_ISSUE_NOT_FOUND,
     REASON_NO_LONGER_BLOCKED,
+    REASON_NO_ON_DEMAND_ANCHOR,
     REASON_NO_TECH_LEAD_AGENT,
     REASON_ORCHESTRATOR_PAUSED,
     REASON_RUN_ACTIVE,
-    GlobalHealthReviewScope,
+    REASON_RUN_CLAIM_UNAVAILABLE,
     IssueInvestigationScope,
     TechLeadRunAdmission,
     TechLeadRunOutcome,
     TechLeadRunRequest,
     TechLeadRunScope,
     TechLeadRunScopeKind,
+    global_scope_for_flavor,
 )
 from ..domain.tech_lead_session import TechLeadSessionFlavor
 from ..events import EventName
 from ..ports import make_trace_event
+from .tech_lead_run_ownership import RunOwnershipVerdict, TechLeadRunOwnership
 from .tech_lead_session_policy import is_tech_lead_session
 
 if TYPE_CHECKING:
     from ..domain.models import OrchestratorState, Session
     from ..infra.config import Config
     from ..ports import EventSink, Issue, RepositoryHost
-    from ..ports.claim_manager import ClaimManager
 
 logger = logging.getLogger(__name__)
 
@@ -105,17 +108,57 @@ def scope_of_pending(item: PendingTechLeadReview) -> TechLeadRunScope:
     """The scope a queued item runs at, derived from its declared flavor.
 
     Health reviews AND batch reviews audit the whole repository (one walks the
-    board, the other the accumulated PR manifest), so both are global; only a
-    failure investigation is scoped to a single subject issue.
+    board, the other the accumulated PR manifest), so both are global — but they
+    are DIFFERENT global identities, not one bucket (#6994 round 1 F2). Both are
+    exclusive of every other run; neither deduplicates against the other.
     """
     if item.flavor is TechLeadSessionFlavor.FAILURE_INVESTIGATION:
         return IssueInvestigationScope(item.issue_number)
-    return GlobalHealthReviewScope()
+    return global_scope_for_flavor(item.flavor)
 
 
 def is_global_pending(item: PendingTechLeadReview) -> bool:
-    """True when a queued item holds the exclusive whole-repository scope."""
-    return scope_of_pending(item).kind is TechLeadRunScopeKind.GLOBAL_HEALTH_REVIEW
+    """True when a queued item holds an exclusive whole-repository scope."""
+    return scope_of_pending(item).kind.is_global
+
+
+def run_key_of_pending(item: PendingTechLeadReview) -> str:
+    """The logical run identity of a queued item."""
+    return scope_of_pending(item).run_key
+
+
+def scope_of_session(session: "Session") -> Optional[TechLeadRunScope]:
+    """The scope an ACTIVE tech-lead session is running at, or None.
+
+    ``None`` only when the session carries no launch stamp at all, which after
+    #6994 round 1 F3 means a session whose flavor could not be recovered — not
+    the routine restart case, which now restores the stamp from marker truth.
+    """
+    scope = session.tech_lead_scope
+    if scope is None:
+        return None
+    if scope.flavor is TechLeadSessionFlavor.FAILURE_INVESTIGATION:
+        return IssueInvestigationScope(session.issue.number)
+    return global_scope_for_flavor(scope.flavor)
+
+
+def live_run_keys(
+    config: "Config",
+    pending: "Sequence[PendingTechLeadReview]",
+    active_sessions: "Sequence[Session]",
+) -> tuple[str, ...]:
+    """Every logical run this engine currently has queued or running.
+
+    The input to :meth:`TechLeadRunOwnership.reconcile`: ownership must cover a
+    run for its WHOLE life, and a run's life spans the queue and the session, so
+    neither collection alone is the answer.
+    """
+    keys = {run_key_of_pending(item) for item in pending}
+    for session in active_tech_lead_sessions(config, active_sessions):
+        scope = scope_of_session(session)
+        if scope is not None:
+            keys.add(scope.run_key)
+    return tuple(sorted(keys))
 
 
 def active_tech_lead_sessions(
@@ -134,20 +177,47 @@ def has_active_global_run(
 ) -> bool:
     """True when a whole-repository tech-lead run is executing right now.
 
-    Read from the launch scope the producer stamped onto the session, so the
-    answer does not depend on re-reading GitHub. A session restored across a
-    restart carries no stamp; it is treated as issue-scoped, which fails toward
-    letting targeted work proceed rather than toward a barrier nobody can
-    explain — and a GLOBAL request still deduplicates correctly in that window,
-    because :meth:`TechLeadRunCoordinator.admit` additionally consults the open
-    anchor issue, which is shared truth that survives the restart.
+    Read from the launch scope stamped onto the session. That stamp is present
+    on a RESTORED session too (``SessionRestorer`` rebuilds it from the anchor's
+    marker label and the durable authority ledger — #6994 round 1 F3), so a
+    global run survives a restart as a barrier instead of silently becoming
+    issue-scoped and letting targeted work run alongside it.
+
+    A tech-lead session with no stamp at all is a session whose flavor could not
+    be established. It is treated as GLOBAL — the conservative direction: the
+    cost of being wrong is a targeted run waiting a while, whereas failing the
+    other way runs work concurrently with an exclusive review.
     """
     return any(
-        session.tech_lead_scope is not None
-        and session.tech_lead_scope.flavor
+        session.tech_lead_scope is None
+        or session.tech_lead_scope.flavor
         is not TechLeadSessionFlavor.FAILURE_INVESTIGATION
         for session in active_tech_lead_sessions(config, active_sessions)
     )
+
+
+# Operator-facing name of each whole-repository run. One map so the admission
+# detail text, the launch log, and the dashboard all call the same run the same
+# thing rather than each inventing a phrase.
+_GLOBAL_RUN_LABELS: dict[TechLeadRunScopeKind, str] = {
+    TechLeadRunScopeKind.GLOBAL_HEALTH_REVIEW: "board health review",
+    TechLeadRunScopeKind.GLOBAL_BATCH_REVIEW: "batch review",
+}
+
+
+def _scope_phrase(scope: TechLeadRunScope) -> str:
+    """How a scope is named in operator-facing detail text."""
+    if scope.kind.is_global:
+        return f"A {_GLOBAL_RUN_LABELS[scope.kind]}"
+    return f"A tech-lead investigation of issue #{scope.subject_issue_number}"
+
+
+def _already_running_detail(scope: TechLeadRunScope) -> str:
+    return f"{_scope_phrase(scope)} is already running."
+
+
+def _already_queued_detail(scope: TechLeadRunScope) -> str:
+    return f"{_scope_phrase(scope)} is already queued."
 
 
 class SupportsHealthReviewAnchor(Protocol):
@@ -262,24 +332,36 @@ def plan_tech_lead_launch_revalidation(
     pending: "Sequence[PendingTechLeadReview]",
     board: "Sequence[Issue]",
     is_blocking_any: "Callable[[Sequence[str]], bool]",
+    subjects: "Sequence[Issue]" = (),
 ) -> TechLeadRevalidation:
-    """Re-check every queued INVESTIGATION against this tick's live board.
+    """Re-check every queued INVESTIGATION against this tick's live evidence.
 
-    Evidence comes from the board the tick already fetched, so revalidating
-    costs no extra GitHub call no matter how long a run waits behind a barrier.
+    Two evidence sources, in order:
+
+    * ``board`` — the issues the tick already fetched, so a subject still on the
+      board costs no extra GitHub call no matter how long its run waits behind
+      the global barrier;
+    * ``subjects`` — the AUTHORITATIVE lifecycle reads the fact gatherer makes
+      for queued subjects the board did not carry
+      (:meth:`FactGatherer.gather_tech_lead_subject_facts`). Without them the
+      closed-while-queued rule was unreachable in production: the board fetch
+      asks GitHub only for OPEN issues, so a subject closed while queued came
+      back ABSENT rather than ``state="closed"`` (#6994 round 1 F4).
 
     Only POSITIVE evidence withdraws a run. The board is filtered — by agent
     label, milestone, and ``filtering.exclude_labels``, which ``tech_lead
     .inherit_labels`` deliberately re-admits for tech-lead work — so a subject
-    that is simply ABSENT proves nothing and its run is kept. Withdrawing on
-    absence would silently cancel legitimate investigations of every issue the
-    board filter happens not to carry.
+    that is absent from BOTH sources proves nothing and its run is kept.
+    Withdrawing on absence would silently cancel legitimate investigations of
+    every issue the board filter happens not to carry, and would turn a
+    transient GitHub read failure into a cancelled run.
 
     Global runs are never subject to this: a health-review anchor is not a
     blocked work item, and blocked-label eligibility says nothing about whether
     the board is still worth auditing.
     """
-    by_number = {issue.number: issue for issue in board}
+    by_number: dict[int, "Issue"] = {issue.number: issue for issue in subjects}
+    by_number.update({issue.number: issue for issue in board})
     eligible: list[PendingTechLeadReview] = []
     withdrawn: list[TechLeadRunWithdrawal] = []
     for item in pending:
@@ -314,21 +396,17 @@ class TechLeadRunCoordinator:
         config: "Config",
         repository_host: "RepositoryHost",
         anchor_host: SupportsHealthReviewAnchor,
-        discover_open_anchor: "Callable[[RepositoryHost, Config], Optional[int]]",
+        ownership: "TechLeadRunOwnership",
         is_blocking_any: "Callable[[Sequence[str]], bool]",
         events: "EventSink",
-        claim_manager: "Optional[ClaimManager]" = None,
-        now: Optional[datetime] = None,
     ) -> None:
         self._state = state
         self._config = config
         self._repository_host = repository_host
         self._anchor_host = anchor_host
-        self._discover_open_anchor = discover_open_anchor
+        self._ownership = ownership
         self._is_blocking_any = is_blocking_any
         self._events = events
-        self._claim_manager = claim_manager
-        self._now = now
 
     # ------------------------------------------------------------------
     # Admission
@@ -378,27 +456,16 @@ class TechLeadRunCoordinator:
             )
         if isinstance(request.scope, IssueInvestigationScope):
             return self._admit_issue(request, request.scope)
-        return self._admit_global(request)
+        return self._admit_global(request, request.scope)
 
     def _admit_issue(
         self, request: TechLeadRunRequest, scope: IssueInvestigationScope
     ) -> TechLeadRunAdmission:
         """Admit (or refuse) a focused investigation of one issue."""
         number = scope.issue_number
-        running = self._active_run_for_issue(number)
-        if running is not None:
-            return self._reject(
-                request,
-                TechLeadRunOutcome.ALREADY_RUNNING,
-                REASON_RUN_ACTIVE,
-                f"A tech-lead session is already investigating issue #{number}.",
-            )
-        if any(item.issue_number == number for item in self._pending()):
-            return self._existing(
-                request,
-                TechLeadRunOutcome.ALREADY_QUEUED,
-                f"Issue #{number} is already queued for tech-lead investigation.",
-            )
+        existing = self._existing_run_for_scope(request, scope)
+        if existing is not None:
+            return existing
 
         failure = request.failure
         title = request.title
@@ -425,11 +492,9 @@ class TechLeadRunCoordinator:
             failure = manual_focus_failure(issue, blocking)
             title = title or issue.title
 
-        conflict = self._peer_claim_detail(number)
+        conflict = self._own_run_or_conflict(request, scope)
         if conflict is not None:
-            return self._reject(
-                request, TechLeadRunOutcome.CLAIM_CONFLICT, REASON_CLAIMED_BY_PEER, conflict
-            )
+            return conflict
 
         outcome = self._queues().queue_failure_investigation(
             number, title, failure=failure
@@ -447,59 +512,143 @@ class TechLeadRunCoordinator:
             f"Queued a tech-lead investigation of issue #{number}.",
         )
 
-    def _admit_global(self, request: TechLeadRunRequest) -> TechLeadRunAdmission:
-        """Admit (or coalesce) the exclusive whole-board health review."""
-        pending_global = next(
-            (item for item in self._pending() if is_global_pending(item)), None
-        )
-        if pending_global is not None:
-            return self._existing(
+    def _admit_global(
+        self, request: TechLeadRunRequest, scope: TechLeadRunScope
+    ) -> TechLeadRunAdmission:
+        """Admit (or coalesce) one exclusive whole-repository review.
+
+        Deduplication is per FLAVOR, never "any global run": a queued health
+        review must not swallow a batch-review request, and vice versa. Two
+        different global flavors are two runs that SERIALIZE — the launch gate
+        makes the second wait — which is what the operator asked for, rather
+        than one of the two silently disappearing (#6994 round 1 F2).
+        """
+        label = _GLOBAL_RUN_LABELS[scope.kind]
+        existing = self._existing_run_for_scope(request, scope)
+        if existing is not None:
+            return existing
+        if scope.kind is not TechLeadRunScopeKind.GLOBAL_HEALTH_REVIEW:
+            # A batch review's anchor is authored by the PR-manifest threshold
+            # path, which owns when a batch is worth auditing. Admission models
+            # it as a distinct global identity (so it dedups and serializes
+            # correctly) but does not manufacture one on request.
+            return self._reject(
                 request,
-                TechLeadRunOutcome.ALREADY_QUEUED,
-                "A board health review is already queued.",
-                issue_number=pending_global.issue_number,
+                TechLeadRunOutcome.NOT_ELIGIBLE,
+                REASON_NO_ON_DEMAND_ANCHOR,
+                f"A {label} is created from the PR-manifest threshold, not on"
+                " demand; there is no batch anchor to run.",
             )
 
-        anchor = self._open_anchor_number()
-        if anchor is not None and self._active_run_for_issue(anchor) is not None:
-            return self._reject(
-                request,
-                TechLeadRunOutcome.ALREADY_RUNNING,
-                REASON_RUN_ACTIVE,
-                "A board health review is already running.",
-                issue_number=anchor,
-            )
-        if has_active_global_run(self._config, self._state.active_sessions):
-            return self._reject(
-                request,
-                TechLeadRunOutcome.ALREADY_RUNNING,
-                REASON_RUN_ACTIVE,
-                "A board health review is already running.",
-            )
-        if anchor is not None:
-            conflict = self._peer_claim_detail(anchor)
-            if conflict is not None:
-                return self._reject(
-                    request,
-                    TechLeadRunOutcome.CLAIM_CONFLICT,
-                    REASON_CLAIMED_BY_PEER,
-                    conflict,
-                    issue_number=anchor,
-                )
+        # Ownership FIRST, then create. The old order — scan for an open anchor,
+        # then create one if absent — is a check-then-act gap two engines can
+        # both pass before either writes, which is precisely how a repository
+        # ends up with two anchors and two "queued" answers (round 1 F1).
+        conflict = self._own_run_or_conflict(request, scope)
+        if conflict is not None:
+            return conflict
 
         queued = self._anchor_host.ensure_health_review_anchor()
         if queued is None:
+            self._ownership.release(scope.run_key)
             return self._reject(
                 request,
                 TechLeadRunOutcome.FAILED,
                 REASON_ANCHOR_UNAVAILABLE,
-                "The health-review anchor issue could not be prepared.",
+                f"The {label} anchor issue could not be prepared.",
             )
         return self._queued(
             request,
-            f"Queued a board health review (anchor #{queued.issue_number}).",
+            f"Queued a {label} (anchor #{queued.issue_number}).",
             issue_number=queued.issue_number,
         )
+
+    # ------------------------------------------------------------------
+    # Identity: does this logical run already exist, and may we own it?
+    # ------------------------------------------------------------------
+
+    def _existing_run_for_scope(
+        self, request: TechLeadRunRequest, scope: TechLeadRunScope
+    ) -> Optional[TechLeadRunAdmission]:
+        """The coalescing answer when THIS engine already has the run, else None.
+
+        Checked before any shared write so repeated clicks cost nothing: the
+        run already exists here, so there is no race left to arbitrate.
+        """
+        running = self._active_session_for_run(scope.run_key)
+        if running is not None:
+            return self._reject(
+                request,
+                TechLeadRunOutcome.ALREADY_RUNNING,
+                REASON_RUN_ACTIVE,
+                _already_running_detail(scope),
+                issue_number=running.issue.number,
+            )
+        queued = next(
+            (
+                item
+                for item in self._pending()
+                if run_key_of_pending(item) == scope.run_key
+            ),
+            None,
+        )
+        if queued is not None:
+            return self._existing(
+                request,
+                TechLeadRunOutcome.ALREADY_QUEUED,
+                _already_queued_detail(scope),
+                issue_number=queued.issue_number,
+            )
+        return None
+
+    def _own_run_or_conflict(
+        self, request: TechLeadRunRequest, scope: TechLeadRunScope
+    ) -> Optional[TechLeadRunAdmission]:
+        """Atomically take the logical run, or return the typed refusal.
+
+        Fails CLOSED when the coordination store cannot be reached. Admitting on
+        ignorance is exactly what produces the duplicate run this step exists to
+        prevent, and an operator who is told "could not establish ownership" can
+        retry, whereas one told "queued" cannot discover it was not.
+        """
+        ownership = self._ownership.claim(scope.run_key)
+        if ownership.owned:
+            return None
+        if ownership.verdict is RunOwnershipVerdict.HELD_BY_PEER:
+            return self._reject(
+                request,
+                TechLeadRunOutcome.CLAIM_CONFLICT,
+                REASON_CLAIMED_BY_PEER,
+                ownership.detail,
+            )
+        return self._reject(
+            request,
+            TechLeadRunOutcome.FAILED,
+            REASON_RUN_CLAIM_UNAVAILABLE,
+            ownership.detail,
+        )
+
+    # ------------------------------------------------------------------
+    # Ownership lifecycle
+    # ------------------------------------------------------------------
+
+    def reconcile_ownership(self) -> tuple[str, ...]:
+        """Renew/settle claims for every run this engine has live (one per tick).
+
+        Returns the run keys ownership was lost for, so the caller withdraws
+        them instead of launching work a peer now owns.
+        """
+        return self._ownership.reconcile(
+            live_run_keys(
+                self._config,
+                self._state.pending_tech_lead_reviews,
+                self._state.active_sessions,
+            )
+        )
+
+    def release_run(self, run_key: str) -> None:
+        """Hand a finished or withdrawn run back to the shared store."""
+        self._ownership.release(run_key)
 
     # ------------------------------------------------------------------
     # Launch gating (the global barrier)
@@ -513,9 +662,19 @@ class TechLeadRunCoordinator:
         """Which queued runs the scope matrix lets launch this tick."""
         return plan_tech_lead_launch_gate(self._config, pending, active_sessions)
 
-    def barrier_reason_for_new_request(self) -> Optional[str]:
-        """Why a newly admitted targeted run would not start immediately."""
-        if any(is_global_pending(item) for item in self._pending()):
+    def barrier_reason_for_new_request(
+        self, scope: Optional[TechLeadRunScope] = None
+    ) -> Optional[str]:
+        """Why a newly admitted run would not start immediately.
+
+        ``scope`` is excluded from its own barrier: a queued global run is not
+        waiting behind itself, but a SECOND global flavor genuinely is.
+        """
+        run_key = scope.run_key if scope is not None else None
+        if any(
+            is_global_pending(item) and run_key_of_pending(item) != run_key
+            for item in self._pending()
+        ):
             return BARRIER_GLOBAL_RUN_QUEUED
         if has_active_global_run(self._config, self._state.active_sessions):
             return BARRIER_GLOBAL_RUN_ACTIVE
@@ -533,29 +692,15 @@ class TechLeadRunCoordinator:
 
         return PendingSessionQueues(self._state)
 
-    def _active_run_for_issue(self, issue_number: int) -> "Optional[Session]":
+    def _active_session_for_run(self, run_key: str) -> "Optional[Session]":
+        """The active tech-lead session executing this logical run, if any."""
         for session in active_tech_lead_sessions(
             self._config, self._state.active_sessions
         ):
-            if session.issue.number == issue_number:
+            scope = scope_of_session(session)
+            if scope is not None and scope.run_key == run_key:
                 return session
         return None
-
-    def _open_anchor_number(self) -> Optional[int]:
-        """The open marker-labeled anchor issue, or None.
-
-        Shared GitHub truth (ADR-0013): it is what makes a global run's identity
-        visible to a PEER orchestrator and what survives a restart, neither of
-        which the in-process queue can do.
-        """
-        try:
-            return self._discover_open_anchor(self._repository_host, self._config)
-        except Exception as exc:  # pragma: no cover - transport-specific
-            logger.warning(
-                "[TECH_LEAD_ADMISSION] open health-review anchor lookup failed: %s",
-                exc,
-            )
-            return None
 
     def _issue_eligibility(
         self, issue: "Issue", blocking: str
@@ -567,40 +712,6 @@ class TechLeadRunCoordinator:
         """The issue's first blocking label, or "" when it carries none."""
         return next(
             (name for name in issue.labels if self._is_blocking_any([name])), ""
-        )
-
-    def _peer_claim_detail(self, issue_number: int) -> Optional[str]:
-        """Detail text when a DIFFERENT orchestrator holds a live claim.
-
-        A claim whose lease belongs to one of our own active sessions is ours,
-        not a conflict. A fetch failure is not treated as a conflict: refusing
-        on an unreadable claim store would make an operator's request fail for a
-        transient GitHub blip, and the launch path re-verifies ownership through
-        ``ClaimGate`` (which does fail closed) before any mutation.
-        """
-        if self._claim_manager is None:
-            return None
-        try:
-            claim = self._claim_manager.get_current_claim(issue_number)
-        except ClaimFetchError:
-            logger.warning(
-                "[TECH_LEAD_ADMISSION] claim lookup failed for #%d; admitting and"
-                " deferring to the launch-time claim gate",
-                issue_number,
-            )
-            return None
-        if claim is None or claim.is_expired(self._now):
-            return None
-        own_leases = {
-            session.lease_id
-            for session in self._state.active_sessions
-            if session.lease_id
-        }
-        if claim.lease_id in own_leases:
-            return None
-        return (
-            f"Another orchestrator instance ({claim.claimant}) holds the claim on"
-            f" #{issue_number}."
         )
 
     def _reject(
@@ -638,7 +749,9 @@ class TechLeadRunCoordinator:
                 detail,
                 issue_number=issue_number,
             ),
-            behind_global_barrier=self.barrier_reason_for_new_request() is not None,
+            behind_global_barrier=(
+                self.barrier_reason_for_new_request(request.scope) is not None
+            ),
         )
 
     def _queued(
@@ -648,7 +761,6 @@ class TechLeadRunCoordinator:
         *,
         issue_number: Optional[int] = None,
     ) -> TechLeadRunAdmission:
-        barrier = self.barrier_reason_for_new_request()
         return TechLeadRunAdmission(
             outcome=TechLeadRunOutcome.QUEUED,
             scope_kind=request.scope.kind,
@@ -657,9 +769,11 @@ class TechLeadRunCoordinator:
             detail=detail,
             trigger=request.trigger,
             issue_number=issue_number or request.scope.subject_issue_number,
+            # A second GLOBAL flavor waits behind the first exactly as targeted
+            # work does, so the barrier flag is asked about every scope rather
+            # than assumed false for global runs.
             behind_global_barrier=(
-                barrier is not None
-                and request.scope.kind is TechLeadRunScopeKind.ISSUE
+                self.barrier_reason_for_new_request(request.scope) is not None
             ),
         )
 

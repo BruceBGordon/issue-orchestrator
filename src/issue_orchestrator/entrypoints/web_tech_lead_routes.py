@@ -54,6 +54,8 @@ _OUTCOME_STATUS: dict[TechLeadRunOutcome, int] = {
     TechLeadRunOutcome.NOT_CONFIGURED: 409,
     TechLeadRunOutcome.NOT_ELIGIBLE: 409,
     TechLeadRunOutcome.CLAIM_CONFLICT: 409,
+    # Nothing is running to admit the request.
+    TechLeadRunOutcome.NOT_RUNNING: 503,
     # The request was admissible but the run could not be prepared.
     TechLeadRunOutcome.FAILED: 502,
 }
@@ -91,21 +93,20 @@ async def request_tech_lead_run(
 ) -> JSONResponse:
     """Request a scoped tech-lead run from the repository dashboard.
 
-    A stale request that arrives while the engine is not running is rejected
-    with 503 rather than optimistically queued: the dashboard must never claim
-    that an action will run when nothing is there to run it.
+    Every answer — including "the engine is not running" — leaves here as the
+    SAME typed :class:`TechLeadRunAdmissionPayload`. An ad hoc ``{"error": ...}``
+    body for the 503 would be a shape the declared contract cannot describe and
+    the dashboard cannot branch on, which is exactly how an untyped escape hatch
+    reappears in a typed command surface (#6994 round 1 F5).
     """
-    if orchestrator is None:
-        return JSONResponse(
-            {"error": "The Repository Engine is not running; start it and retry."},
-            status_code=503,
-        )
-
-    admission = orchestrator.request_tech_lead_run(
-        TechLeadRunRequest(
-            scope=_domain_scope(payload),
-            trigger=TechLeadRunTrigger.DASHBOARD,
-        )
+    request = TechLeadRunRequest(
+        scope=_domain_scope(payload),
+        trigger=TechLeadRunTrigger.DASHBOARD,
+    )
+    admission = (
+        TechLeadRunAdmission.engine_not_running(request.scope, request.trigger)
+        if orchestrator is None
+        else orchestrator.request_tech_lead_run(request)
     )
     logger.info(
         "[tech-lead] Dashboard run request: scope=%s run_key=%s outcome=%s reason=%s",

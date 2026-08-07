@@ -334,6 +334,7 @@ class Orchestrator:
             kill_session=lambda name: _kill_session(name, self.deps.session_manager, self.deps.events),
             queue_cache_store=self.deps.queue_cache_store,
             tech_lead_authority=self.deps.tech_lead_authority,
+            run_ownership=self.deps.run_ownership,
         )
 
     def _get_session_name(self, number: int, session_type: str = "issue") -> str: return get_session_name(number, session_type)
@@ -677,6 +678,9 @@ class Orchestrator:
             )
             # Check lease renewals for active sessions
             self._check_lease_renewals()
+            # Keep cross-instance ownership of queued/running tech-lead runs
+            # alive, and withdraw any run this engine no longer owns.
+            self._reconcile_tech_lead_run_ownership()
         finally:
             self._last_orphan_reconcile_active_count = len(self.state.active_sessions)
 
@@ -777,6 +781,32 @@ class Orchestrator:
             return True, "interval"
         return False, "throttled"
 
+
+    def _reconcile_tech_lead_run_ownership(self) -> None:
+        """Renew claims for live tech-lead runs; withdraw the ones we lost.
+
+        The whole per-tick ownership decision is ONE call into the run
+        coordinator: this facade owns only the consequence — a run whose shared
+        claim went to a peer must leave our queue, or we would launch work a
+        different engine is already doing.
+        """
+        from ..control.session_routing import PendingSessionQueues
+        from ..control.tech_lead_run_admission import run_key_of_pending
+        from ..control.tech_lead_run_wiring import tech_lead_run_coordinator
+
+        lost = set(tech_lead_run_coordinator(self).reconcile_ownership())
+        if not lost:
+            return
+        queues = PendingSessionQueues(self.state)
+        for item in list(self.state.pending_tech_lead_reviews):
+            if run_key_of_pending(item) in lost:
+                logger.warning(
+                    "[TECH_LEAD] Withdrawing queued %s for #%d: another"
+                    " orchestrator now owns this run",
+                    item.flavor.value,
+                    item.issue_number,
+                )
+                queues.remove_tech_lead(item.issue_number)
 
     def _check_lease_renewals(self) -> None:
         """Check and renew leases for active sessions.

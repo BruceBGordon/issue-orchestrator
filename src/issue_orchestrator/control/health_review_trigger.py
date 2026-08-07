@@ -283,11 +283,18 @@ def classify_tech_lead_anchor_issues(
         if has_health_review_marker(issue.labels):
             health = issue.number if health is None else health
             continue
-        if batch is None and (
-            "Batch Review" in issue.title or "Tech Lead Review" in issue.title
-        ):
+        if batch is None and is_batch_anchor_title(issue.title):
             batch = issue.number
     return batch, health
+
+
+def is_batch_anchor_title(title: str) -> bool:
+    """True when a title carries the batch tracking issue's signature.
+
+    The one owner of that historical match, so anchor classification and restart
+    recovery of a running batch review agree on what a batch anchor looks like.
+    """
+    return "Batch Review" in title or "Tech Lead Review" in title
 
 
 def plan_health_review_issue_creation(

@@ -1210,10 +1210,10 @@ class TechLeadRunAdmissionPayload(BaseModel):
     behind_global_barrier: bool
     detail: str
     issue_number: int | None = Field(..., ge=1)
-    outcome: Literal['queued', 'already_queued', 'already_running', 'paused', 'not_configured', 'not_eligible', 'claim_conflict', 'failed']
+    outcome: Literal['queued', 'already_queued', 'already_running', 'paused', 'not_running', 'not_configured', 'not_eligible', 'claim_conflict', 'failed']
     reason: str
     run_key: str
-    scope_kind: Literal['global_health_review', 'issue']
+    scope_kind: Literal['global_health_review', 'global_batch_review', 'issue']
 
 class TechLeadRunRequestPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")

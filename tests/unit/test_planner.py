@@ -51,7 +51,10 @@ from issue_orchestrator.domain.models import (
 
 from issue_orchestrator.domain.issue_key import FakeIssueKey
 from issue_orchestrator.domain.session_key import SessionKey, TaskKind
-from issue_orchestrator.domain.tech_lead_session import TechLeadSessionFlavor
+from issue_orchestrator.domain.tech_lead_session import (
+    TechLeadLaunchScope,
+    TechLeadSessionFlavor,
+)
 from issue_orchestrator.control.provider_impact import ProviderImpactTransition
 from issue_orchestrator.control.provider_resilience import ProviderResilienceManager
 from issue_orchestrator.control.workflows import (
@@ -4680,6 +4683,13 @@ class TestReservedTechLeadDoesNotStealWorkerReviewCapacity:
     def _tech_lead_session(self, number: int, agent_label: str) -> Session:
         session = make_session(make_issue(number, labels=[agent_label]))
         session.agent_label = agent_label
+        # Faithful to the launch path, which always stamps the producer's grant.
+        # An UNSTAMPED tech-lead session is now read as global (the conservative
+        # direction — see ``has_active_global_run``), so a fake that omits it
+        # would be exercising a state production cannot produce (#6994 R1 F3).
+        session.tech_lead_scope = TechLeadLaunchScope(
+            flavor=TechLeadSessionFlavor.FAILURE_INVESTIGATION
+        )
         return session
 
     def _config(self, *, reserved: bool):
@@ -4830,6 +4840,13 @@ class TestE2EFirstClassWorkload:
     def _tech_lead_session(self, number: int, agent_label: str) -> Session:
         session = make_session(make_issue(number, labels=[agent_label]))
         session.agent_label = agent_label
+        # Faithful to the launch path, which always stamps the producer's grant.
+        # An UNSTAMPED tech-lead session is now read as global (the conservative
+        # direction — see ``has_active_global_run``), so a fake that omits it
+        # would be exercising a state production cannot produce (#6994 R1 F3).
+        session.tech_lead_scope = TechLeadLaunchScope(
+            flavor=TechLeadSessionFlavor.FAILURE_INVESTIGATION
+        )
         return session
 
     def _review_workflow(self):

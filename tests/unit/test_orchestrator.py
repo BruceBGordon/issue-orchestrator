@@ -309,6 +309,10 @@ def test_composed_one_shot_timeout_terminates_via_real_driver_and_facade(
     that separate unit tests with a fake host could not catch. No live GitHub."""
     from issue_orchestrator.control.tech_lead_trigger import run_targeted_investigations
 
+    # A tech lead agent must be configured: the one-shot CLI now shares the
+    # dashboard's admission owner, which refuses a repository without one
+    # (#6994 round 1 F2).
+    sample_config.tech_lead_review_agent = "agent:tech-lead"
     orchestrator = create_test_orchestrator(sample_config)
     session_manager = MagicMock()
     claim_manager = MagicMock()
@@ -343,7 +347,9 @@ def test_composed_one_shot_timeout_terminates_via_real_driver_and_facade(
     orchestrator.tick = lambda: True  # never drains the session -> forces timeout
     orchestrator.pause = lambda: None
 
-    clock = iter([0, 0, 0, 9_999])  # observed_at, deadline, check#1, check#2 (past)
+    # deadline, then the poll checks; the tail stays past the deadline so the
+    # drive loop terminates deterministically however often it samples.
+    clock = iter([0, 0] + [9_999] * 8)
     results = run_targeted_investigations(
         orchestrator, [77], now=lambda: next(clock), sleep=lambda _s: None, timeout_s=1
     )

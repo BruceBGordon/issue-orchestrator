@@ -175,6 +175,30 @@
                 "schema": {"$ref": "#/components/schemas/TechLeadRunAdmissionPayload"}
               }
             }
+          },
+          "409": {
+            "description": "The run was refused (paused, not configured, not eligible, or claimed by a peer). Same typed admission body.",
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "#/components/schemas/TechLeadRunAdmissionPayload"}
+              }
+            }
+          },
+          "502": {
+            "description": "The run was admissible but could not be prepared. Same typed admission body.",
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "#/components/schemas/TechLeadRunAdmissionPayload"}
+              }
+            }
+          },
+          "503": {
+            "description": "The Repository Engine is not running, so nothing can admit the request. Same typed admission body with outcome not_running.",
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "#/components/schemas/TechLeadRunAdmissionPayload"}
+              }
+            }
           }
         }
       }
@@ -3207,8 +3231,8 @@
         "additionalProperties": false,
         "required": ["outcome", "scope_kind", "run_key", "reason", "detail", "issue_number", "behind_global_barrier", "admitted"],
         "properties": {
-          "outcome": {"enum": ["queued", "already_queued", "already_running", "paused", "not_configured", "not_eligible", "claim_conflict", "failed"]},
-          "scope_kind": {"enum": ["global_health_review", "issue"]},
+          "outcome": {"enum": ["queued", "already_queued", "already_running", "paused", "not_running", "not_configured", "not_eligible", "claim_conflict", "failed"]},
+          "scope_kind": {"enum": ["global_health_review", "global_batch_review", "issue"]},
           "run_key": {"type": "string"},
           "reason": {"type": "string"},
           "detail": {"type": "string"},
