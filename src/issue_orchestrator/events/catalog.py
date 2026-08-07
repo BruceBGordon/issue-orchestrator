@@ -208,6 +208,11 @@ class EventName(str, Enum):
     # outcome/deferral reason. Internal trace event: the UI synchronizes on the
     # command response and the dashboard view model, never on this.
     TECH_LEAD_RUN_REQUESTED = "tech_lead.run_requested"
+    # A queued tech-lead investigation was withdrawn by launch-time
+    # revalidation (#6994): between admission and launch its subject was closed
+    # or unblocked, so the run is removed instead of spending an agent session
+    # on work that no longer exists. Internal trace event.
+    TECH_LEAD_RUN_WITHDRAWN = "tech_lead.run_withdrawn"
 
     # =========================================================================
     # Cleanup operations

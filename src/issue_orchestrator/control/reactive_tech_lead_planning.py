@@ -27,12 +27,23 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
-from .actions import Action, CreateTechLeadIssueAction, QueueTechLeadAction
+from .actions import (
+    Action,
+    CreateTechLeadIssueAction,
+    DropTechLeadAction,
+    QueueTechLeadAction,
+)
 from .health_review_trigger import plan_health_review_issue_creation
-from .tech_lead_run_admission import plan_tech_lead_launch_gate
+from .tech_lead_run_admission import (
+    plan_tech_lead_launch_gate,
+    plan_tech_lead_launch_revalidation,
+)
 from ..domain.tech_lead_session import TechLeadSessionFlavor
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+    from typing import Callable
+
     from ..domain.models import DiscoveredFailure, PendingTechLeadReview
     from ..infra.config import Config
     from .planner_types import OrchestratorSnapshot, SkippedItem
@@ -181,34 +192,65 @@ def plan_failure_investigations(
     return actions
 
 
-def eligible_tech_lead_launch_queue(
+@dataclass(frozen=True, slots=True)
+class TechLeadLaunchPlan:
+    """What this tick may do with the queued tech-lead runs (#6994).
+
+    ``withdrawals`` is separate from ``launchable`` because the two have
+    different fates: a held run stays queued and retries next tick, whereas a
+    withdrawn one must be REMOVED — the queue is an investigation's only durable
+    record, so leaving a run that can never launch would strand it (and its
+    dashboard "Tech lead queued" affordance) forever.
+    """
+
+    launchable: tuple["PendingTechLeadReview", ...]
+    withdrawals: tuple[Action, ...]
+
+
+def plan_tech_lead_launch_queue(
     config: "Config",
     snapshot: "OrchestratorSnapshot",
     *,
     suppressed_issue_numbers: frozenset[int],
     launch_log: "TechLeadLaunchLog",
     skipped: "list[SkippedItem]",
-) -> "list[PendingTechLeadReview]":
+    is_blocking_any: "Callable[[Sequence[str]], bool]",
+    workflow_configured: bool,
+) -> TechLeadLaunchPlan:
     """The queued tech-lead runs still eligible to launch this tick (#6994).
 
-    Two independent filters, in order, both applied BEFORE capacity and the
-    provider gate so neither is ever reported as a capacity skip — a distinction
+    Answers the whole eligibility question, so the planner asks once — before
+    it knows whether a slot is free. That ordering is deliberate: withdrawal is
+    not a capacity decision, and with ``tech_lead.max_concurrent: 1`` a single
+    active run leaves zero slots, so gating revalidation behind a free slot
+    would strand a run whose subject is already gone for exactly as long as the
+    other run takes — the very window the rule exists for.
+
+    Three independent filters, in order, all applied BEFORE capacity and the
+    provider gate so none is ever reported as a capacity skip — a distinction
     that matters to an operator, because "no capacity" invites raising
     ``tech_lead.max_concurrent``, which would not release a single held run:
 
     1. **Storm suppression** (#6780) — a failure investigation whose cohort was
        escalated to an anchor this tick. Logged rather than silently dropped, so
        its per-issue trace explains why it did not launch.
-    2. **Scope exclusivity** (#6994) — a global run is exclusive of every other
-       tech-lead run, and a queued one is a barrier. The rule belongs to the
-       run-admission owner (:func:`plan_tech_lead_launch_gate`); this only
-       records the barrier reason that owner supplies.
+    2. **Launch-time revalidation** (#6994) — an investigation whose subject has
+       since been closed or unblocked. Admission is not a standing licence to
+       launch: a run can wait many ticks behind the global barrier, and the
+       board moves underneath it. Refused runs are withdrawn, not held.
+    3. **Scope exclusivity** (#6994) — a global run is exclusive of every other
+       tech-lead run, and a queued one is a barrier.
 
-    It lives here for the same reason the reaction model does: the planner's job
-    is to order and assemble a tick's actions, not to host the rules that decide
-    which tech-lead work is eligible in the first place.
+    Both #6994 rules belong to the run-admission owner
+    (:mod:`.tech_lead_run_admission`); this assembles their verdicts into a
+    tick's plan. It lives here for the same reason the reaction model does: the
+    planner's job is to order and assemble a tick's actions, not to host the
+    rules that decide which tech-lead work is eligible in the first place.
     """
     from .planner_types import SkippedItem as _SkippedItem
+
+    if not workflow_configured:
+        return TechLeadLaunchPlan((), ())
 
     pending: list["PendingTechLeadReview"] = []
     for item in snapshot.pending_tech_lead:
@@ -220,7 +262,38 @@ def eligible_tech_lead_launch_queue(
         else:
             pending.append(item)
 
-    gate = plan_tech_lead_launch_gate(config, pending, snapshot.active_sessions)
+    revalidated = plan_tech_lead_launch_revalidation(
+        pending, snapshot.issues, is_blocking_any
+    )
+    withdrawals: list[Action] = []
+    for withdrawal in revalidated.withdrawn:
+        logger.info(
+            "Planner: withdrawing queued tech_lead investigation of #%d (%s)",
+            withdrawal.item.issue_number,
+            withdrawal.reason,
+        )
+        skipped.append(
+            _SkippedItem(
+                item_type="tech_lead",
+                number=withdrawal.item.issue_number,
+                reason=withdrawal.reason,
+            )
+        )
+        withdrawals.append(
+            DropTechLeadAction(
+                issue_number=withdrawal.item.issue_number,
+                reason=withdrawal.reason,
+                detail=withdrawal.detail,
+            )
+        )
+    if revalidated.withdrawn:
+        launch_log.gate_skip(
+            [w.item for w in revalidated.withdrawn], "subject_no_longer_eligible"
+        )
+
+    gate = plan_tech_lead_launch_gate(
+        config, revalidated.still_eligible, snapshot.active_sessions
+    )
     if gate.held:
         reason = gate.barrier_reason or "tech_lead_scope_barrier"
         skipped.extend(
@@ -230,4 +303,4 @@ def eligible_tech_lead_launch_queue(
             for item in gate.held
         )
         launch_log.gate_skip(gate.held, reason)
-    return list(gate.launchable)
+    return TechLeadLaunchPlan(gate.launchable, tuple(withdrawals))

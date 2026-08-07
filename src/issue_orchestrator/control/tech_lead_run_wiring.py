@@ -19,9 +19,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import TYPE_CHECKING, Optional, Protocol
+from typing import TYPE_CHECKING, Callable, Optional, Protocol, cast
 
 from ..domain.models import PendingTechLeadReview
+from .action_base import ActionType
 from ..domain.tech_lead_run import (
     IssueInvestigationScope,
     TechLeadRunAdmission,
@@ -39,7 +40,8 @@ if TYPE_CHECKING:
     from ..infra.config import Config
     from ..ports import EventSink, RepositoryHost
     from ..ports.claim_manager import ClaimManager
-    from .actions import QueueTechLeadAction
+    from .action_applier import ActionResult
+    from .actions import Action, DropTechLeadAction, QueueTechLeadAction
 
 
 @dataclass(frozen=True, slots=True)
@@ -184,6 +186,66 @@ def admit_planned_tech_lead_investigation(
             admission.reason,
         )
     return admission
+
+
+def withdraw_revalidated_tech_lead_run(
+    action: "DropTechLeadAction", tick: TechLeadTickDependencies
+) -> None:
+    """Remove one queued investigation that launch-time revalidation refused.
+
+    The apply seam owns the mutation, but not the RULE: the planner already
+    asked :func:`..control.tech_lead_run_admission.issue_run_eligibility`, and
+    the typed refusal it produced rides on the action. Removal goes through
+    :class:`PendingSessionQueues`, the single writer for this queue, and the
+    withdrawal is published so a run that vanished between queueing and launch
+    is machine-readable rather than only a log line.
+    """
+    from ..events import EventName
+    from ..ports import make_trace_event
+    from .session_routing import PendingSessionQueues
+
+    PendingSessionQueues(tick.state).remove_tech_lead(action.issue_number)
+    logger.info(
+        "[TECH_LEAD] Withdrew queued investigation for #%d before launch: %s",
+        action.issue_number,
+        action.reason,
+    )
+    tick.events.publish(
+        make_trace_event(
+            EventName.TECH_LEAD_RUN_WITHDRAWN,
+            {
+                "run_key": IssueInvestigationScope(action.issue_number).run_key,
+                "issue_number": action.issue_number,
+                "reason": action.reason,
+                "detail": action.detail,
+            },
+        )
+    )
+
+
+def tech_lead_state_handlers(
+    tick: TechLeadTickDependencies,
+) -> dict[ActionType, "Callable[[Action, ActionResult], None]"]:
+    """Every tech-lead queue transition's apply-seam handler, in one map.
+
+    Mirrors ``tech_lead_action_handlers`` on the applier side: the tick owns
+    WHEN a handler runs, this module owns WHAT it does. Handing back a map
+    rather than growing one thin delegating method per action on
+    ``OrchestratorSupport`` keeps the queue-transition policy beside the owner
+    that implements it, so adding a transition does not widen the apply-time
+    class that already sits over its line budget.
+    """
+
+    def queue(action: "Action", _result: "ActionResult") -> None:
+        admit_planned_tech_lead_investigation(cast("QueueTechLeadAction", action), tick)
+
+    def drop(action: "Action", _result: "ActionResult") -> None:
+        withdraw_revalidated_tech_lead_run(cast("DropTechLeadAction", action), tick)
+
+    return {
+        ActionType.QUEUE_TECH_LEAD: queue,
+        ActionType.DROP_TECH_LEAD: drop,
+    }
 
 
 class TechLeadFacadeHost(Protocol):

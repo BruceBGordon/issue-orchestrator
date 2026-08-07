@@ -19,7 +19,7 @@ if TYPE_CHECKING:
     from .planner import Planner
     from .planner_types import OrchestratorSnapshot, Plan
     from .action_applier import ActionApplier, ActionResult
-    from .actions import Action, QueueTechLeadAction
+    from .actions import Action
     from .cleanup_manager import CleanupManager
     from .session_manager import SessionManager
     from .fact_gatherer import FactGatherer
@@ -41,7 +41,7 @@ from .queue_cache import (
 from .blocked_front_queue import front_queue_newly_unblocked, release_blocked_front_on_launch
 from .dependency_gate_snapshot import build_refresh_snapshot
 from .tech_lead_artifact_retention import clear_discovered_facts
-from .tech_lead_run_wiring import admit_planned_tech_lead_investigation
+from .tech_lead_run_wiring import tech_lead_state_handlers
 from .issue_fetch_resilience import IssueFetchResilience, TransientIssueFetchError
 from .reconciliation import ReconciliationRequired, get_pause_label
 from .tick_telemetry import report_slow_tick
@@ -360,7 +360,8 @@ class OrchestratorSupport:
             ActionType.QUEUE_REVIEW: self._handle_queue_review,
             ActionType.QUEUE_RETROSPECTIVE_REVIEW: self._handle_queue_retrospective_review,
             ActionType.QUEUE_REWORK: self._handle_queue_rework,
-            ActionType.QUEUE_TECH_LEAD: self._handle_queue_tech_lead,
+            # Every tech-lead queue transition -> its owner in the run wiring.
+            **tech_lead_state_handlers(self),
         }
 
         handler = handlers.get(action.action_type)
@@ -465,10 +466,6 @@ class OrchestratorSupport:
             )
         )
         log_transition("rework", a.issue_number, "CREATED", "QUEUED", f"cycle {a.rework_cycle}")
-
-    def _handle_queue_tech_lead(self, action: "Action", result: "ActionResult") -> None:
-        """Admit a planned investigation through the shared run owner (#6994)."""
-        admit_planned_tech_lead_investigation(cast("QueueTechLeadAction", action), self)
 
     def update_queue_cache(self) -> None:
         from .queue_projection import QueueProjection

@@ -203,6 +203,101 @@ def plan_tech_lead_launch_gate(
     return TechLeadLaunchGate(items, ())
 
 
+# ----------------------------------------------------------------------
+# Subject eligibility — one rule, applied at request time AND before launch
+# ----------------------------------------------------------------------
+
+
+def issue_run_eligibility(
+    issue: "Issue", blocking_label: str
+) -> Optional[tuple[str, str]]:
+    """Is this issue still worth a tech-lead investigation? None when yes.
+
+    The rule: the issue must be OPEN and must still carry a blocking label.
+    Returned as a ``(reason_code, detail)`` pair so both callers report the same
+    machine-readable refusal.
+
+    It is deliberately module-level, because it is asked TWICE about the same
+    logical run: once by :meth:`TechLeadRunCoordinator.admit` when the request
+    arrives, and again by :func:`plan_tech_lead_launch_revalidation` immediately
+    before the queued run would launch. A run can sit queued for many ticks
+    behind the global barrier, and in that window its subject can be closed or
+    unblocked by a human — so admitting a run is never a standing licence to
+    launch it. ``blocking_label`` is the label the caller already resolved:
+    classification happens ONCE, so the verdict and the evidence-map context can
+    never disagree about which label blocked it.
+    """
+    lifecycle = (getattr(issue, "state", "") or "").casefold()
+    if lifecycle and lifecycle != "open":
+        return (
+            REASON_ISSUE_CLOSED,
+            f"Issue #{issue.number} is closed; nothing to investigate.",
+        )
+    if not blocking_label:
+        return (
+            REASON_NO_LONGER_BLOCKED,
+            f"Issue #{issue.number} is no longer blocked; nothing to investigate.",
+        )
+    return None
+
+
+@dataclass(frozen=True, slots=True)
+class TechLeadRunWithdrawal:
+    """A queued run whose subject stopped being worth investigating."""
+
+    item: PendingTechLeadReview
+    reason: str
+    detail: str
+
+
+@dataclass(frozen=True, slots=True)
+class TechLeadRevalidation:
+    """Which queued runs survived launch-time revalidation, and which did not."""
+
+    still_eligible: tuple[PendingTechLeadReview, ...]
+    withdrawn: tuple[TechLeadRunWithdrawal, ...]
+
+
+def plan_tech_lead_launch_revalidation(
+    pending: "Sequence[PendingTechLeadReview]",
+    board: "Sequence[Issue]",
+    is_blocking_any: "Callable[[Sequence[str]], bool]",
+) -> TechLeadRevalidation:
+    """Re-check every queued INVESTIGATION against this tick's live board.
+
+    Evidence comes from the board the tick already fetched, so revalidating
+    costs no extra GitHub call no matter how long a run waits behind a barrier.
+
+    Only POSITIVE evidence withdraws a run. The board is filtered — by agent
+    label, milestone, and ``filtering.exclude_labels``, which ``tech_lead
+    .inherit_labels`` deliberately re-admits for tech-lead work — so a subject
+    that is simply ABSENT proves nothing and its run is kept. Withdrawing on
+    absence would silently cancel legitimate investigations of every issue the
+    board filter happens not to carry.
+
+    Global runs are never subject to this: a health-review anchor is not a
+    blocked work item, and blocked-label eligibility says nothing about whether
+    the board is still worth auditing.
+    """
+    by_number = {issue.number: issue for issue in board}
+    eligible: list[PendingTechLeadReview] = []
+    withdrawn: list[TechLeadRunWithdrawal] = []
+    for item in pending:
+        issue = (
+            None if is_global_pending(item) else by_number.get(item.issue_number)
+        )
+        if issue is None:
+            eligible.append(item)
+            continue
+        blocking = next(
+            (name for name in issue.labels if is_blocking_any([name])), ""
+        )
+        verdict = issue_run_eligibility(issue, blocking)
+        if verdict is None:
+            eligible.append(item)
+        else:
+            withdrawn.append(TechLeadRunWithdrawal(item, verdict[0], verdict[1]))
+    return TechLeadRevalidation(tuple(eligible), tuple(withdrawn))
 
 
 class TechLeadRunCoordinator:
@@ -465,26 +560,8 @@ class TechLeadRunCoordinator:
     def _issue_eligibility(
         self, issue: "Issue", blocking: str
     ) -> Optional[tuple[str, str]]:
-        """Revalidate a hand-aimed subject. None when it is still worth a run.
-
-        The rule: the issue must be OPEN and must still carry a blocking label.
-        It is re-run by every fresh request, so a queued run whose subject
-        recovered is refused rather than launched. ``blocking`` is the label the
-        caller already resolved — classification happens ONCE, so the verdict and
-        the evidence-map context can never disagree about which label blocked it.
-        """
-        lifecycle = (getattr(issue, "state", "") or "").casefold()
-        if lifecycle and lifecycle != "open":
-            return (
-                REASON_ISSUE_CLOSED,
-                f"Issue #{issue.number} is closed; nothing to investigate.",
-            )
-        if not blocking:
-            return (
-                REASON_NO_LONGER_BLOCKED,
-                f"Issue #{issue.number} is no longer blocked; nothing to investigate.",
-            )
-        return None
+        """Revalidate a hand-aimed subject. None when it is still worth a run."""
+        return issue_run_eligibility(issue, blocking)
 
     def _blocking_label(self, issue: "Issue") -> str:
         """The issue's first blocking label, or "" when it carries none."""

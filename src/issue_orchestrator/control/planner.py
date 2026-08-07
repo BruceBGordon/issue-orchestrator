@@ -88,7 +88,7 @@ from .worker_budget import (
     tech_lead_slot_availability,
     worker_slot_availability,
 )
-from .reactive_tech_lead_planning import eligible_tech_lead_launch_queue
+from .reactive_tech_lead_planning import plan_tech_lead_launch_queue
 from .reconciliation import build_expected_for_mutation
 from .stuck_sweep import build_stuck_sweep_escalation_actions
 from .planner_types import OrchestratorSnapshot, Plan, PlanContext, SkippedItem
@@ -490,13 +490,26 @@ class Planner:
             launched_this_tick=launched_this_tick,
             workflow_configured=workflow_configured,
         )
+        # Eligibility is decided OUTSIDE the capacity branch: withdrawal is not
+        # a capacity decision, and an ineligible run must leave the queue even
+        # on a tick that could not have launched anything.
+        tech_lead_plan = plan_tech_lead_launch_queue(
+            self.config,
+            snapshot,
+            suppressed_issue_numbers=suppressed_tech_lead_issue_numbers,
+            launch_log=self._tech_lead_launch_log,
+            skipped=skipped,
+            is_blocking_any=self._lm.is_blocking_any,
+            workflow_configured=workflow_configured,
+        )
+        actions.extend(tech_lead_plan.withdrawals)
         if tech_lead_slot.available > 0:
             tech_lead_actions, tech_lead_skipped = self._plan_tech_lead(
                 snapshot,
                 tech_lead_slot.available,
                 plan_context,
                 reserved=self.config.tech_lead.max_concurrent is not None,
-                suppressed_issue_numbers=suppressed_tech_lead_issue_numbers,
+                pending_tech_lead=list(tech_lead_plan.launchable),
             )
             actions.extend(tech_lead_actions)
             skipped.extend(tech_lead_skipped)
@@ -1614,9 +1627,14 @@ Flip labels from `{facts.watch_label}` to `{self.config.tech_lead_reviewed_label
         plan_context: PlanContext,
         *,
         reserved: bool = False,
-        suppressed_issue_numbers: frozenset[int] = frozenset(),
+        pending_tech_lead: list[PendingTechLeadReview],
     ) -> tuple[list[Action], list[SkippedItem]]:
-        """Plan which tech_lead reviews to launch.
+        """Plan which of the already-eligible tech_lead reviews to launch.
+
+        ``pending_tech_lead`` is the eligible set from
+        :meth:`_plan_tech_lead_launch_queue` — storm suppression, launch-time
+        revalidation, and the scope barrier have all been applied, so what
+        remains here is only the provider gate and the numeric budget.
 
         ``reserved`` selects the budget the launch gate uses: when False
         (default) tech_lead draws from the shared worker budget and the workflow
@@ -1626,17 +1644,9 @@ Flip labels from `{facts.watch_label}` to `{self.config.tech_lead_reviewed_label
         """
         actions: list[Action] = []
         skipped: list[SkippedItem] = []
-        if not self.tech_lead_workflow or not self.tech_lead_workflow.is_configured():
-            return actions, skipped
-
-        pending_tech_lead = eligible_tech_lead_launch_queue(
-            self.config,
-            snapshot,
-            suppressed_issue_numbers=suppressed_issue_numbers,
-            launch_log=self._tech_lead_launch_log,
-            skipped=skipped,
-        )
-        if not pending_tech_lead:
+        # An unconfigured workflow yields no eligible items, so this is the same
+        # early exit as before — restated so the workflow is non-None below.
+        if not pending_tech_lead or not self.tech_lead_workflow:
             return actions, skipped
         # Provider eligibility precedes the workflow decision so the launching
         # event can never claim a launch the provider gate then suppresses

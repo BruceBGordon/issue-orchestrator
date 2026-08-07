@@ -22,6 +22,7 @@ from issue_orchestrator.control.tech_lead_run_admission import (
     TechLeadLaunchGate,
     TechLeadRunCoordinator,
     plan_tech_lead_launch_gate,
+    plan_tech_lead_launch_revalidation,
 )
 from issue_orchestrator.domain.tech_lead_run import (
     BARRIER_GLOBAL_AWAITING_DRAIN,
@@ -581,6 +582,108 @@ def test_the_launch_gate_never_holds_work_without_naming_the_rule():
         TechLeadLaunchGate((), (_investigation(42),), None)
     with pytest.raises(ValueError):
         TechLeadLaunchGate((_investigation(42),), (), BARRIER_GLOBAL_RUN_QUEUED)
+
+
+# ---------------------------------------------------------------------------
+# Launch-time revalidation: admission is not a standing licence to launch
+# ---------------------------------------------------------------------------
+
+
+def _blocking_any(labels) -> bool:
+    return any(str(label).startswith("blocked") for label in labels)
+
+
+def _revalidate(pending, board):
+    return plan_tech_lead_launch_revalidation(pending, board, _blocking_any)
+
+
+def test_a_still_blocked_subject_keeps_its_queued_run():
+    queued = _investigation(42)
+
+    result = _revalidate([queued], [FakeIssue(42)])
+
+    assert list(result.still_eligible) == [queued]
+    assert result.withdrawn == ()
+
+
+def test_a_subject_unblocked_while_queued_is_withdrawn_before_launch():
+    queued = _investigation(42)
+
+    result = _revalidate([queued], [FakeIssue(42, labels=("agent:backend",))])
+
+    assert result.still_eligible == ()
+    assert [w.item for w in result.withdrawn] == [queued]
+    assert result.withdrawn[0].reason == REASON_NO_LONGER_BLOCKED
+
+
+def test_a_subject_closed_while_queued_is_withdrawn_before_launch():
+    queued = _investigation(42)
+
+    result = _revalidate([queued], [FakeIssue(42, state="closed")])
+
+    assert result.still_eligible == ()
+    assert [w.reason for w in result.withdrawn] == [REASON_ISSUE_CLOSED]
+
+
+def test_a_subject_absent_from_the_filtered_board_is_not_withdrawn():
+    """Absence is not evidence.
+
+    The board is filtered by agent label, milestone, and
+    ``filtering.exclude_labels`` — which ``tech_lead.inherit_labels``
+    deliberately re-admits for tech-lead work. Withdrawing on absence would
+    silently cancel legitimate investigations of every issue the board filter
+    happens not to carry.
+    """
+    queued = _investigation(42)
+
+    result = _revalidate([queued], [FakeIssue(73)])
+
+    assert list(result.still_eligible) == [queued]
+    assert result.withdrawn == ()
+
+
+def test_a_global_run_is_never_withdrawn_by_subject_eligibility():
+    """A health-review anchor is not a blocked work item.
+
+    Its anchor issue carries no blocking label, so applying the per-issue rule
+    to it would cancel every board health review the moment it was revalidated.
+    """
+    health = _health_review()
+
+    result = _revalidate([health], [FakeIssue(900, labels=())])
+
+    assert list(result.still_eligible) == [health]
+    assert result.withdrawn == ()
+
+
+def test_revalidation_withdraws_only_the_ineligible_run():
+    keep = _investigation(42)
+    drop = _investigation(73)
+
+    result = _revalidate(
+        [keep, drop], [FakeIssue(42), FakeIssue(73, labels=("agent:backend",))]
+    )
+
+    assert list(result.still_eligible) == [keep]
+    assert [w.item for w in result.withdrawn] == [drop]
+
+
+def test_admission_and_revalidation_share_one_eligibility_rule():
+    """The same subject must get the same verdict from both entry points.
+
+    They are asked at different times about the same logical run; if they could
+    disagree, a run refused at request time could still launch (or the reverse).
+    """
+    recovered = FakeIssue(42, labels=("agent:backend",))
+    admission = _coordinator(
+        _state(), repository_host=FakeRepositoryHost({42: recovered})
+    ).admit(_issue_request(42))
+
+    revalidated = _revalidate([_investigation(42)], [recovered])
+
+    assert admission.outcome is TechLeadRunOutcome.NOT_ELIGIBLE
+    assert admission.reason == REASON_NO_LONGER_BLOCKED
+    assert [w.reason for w in revalidated.withdrawn] == [admission.reason]
 
 
 # ---------------------------------------------------------------------------

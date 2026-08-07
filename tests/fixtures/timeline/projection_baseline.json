@@ -941,6 +941,12 @@
     "status": "completed",
     "step": "tech_lead.run_requested"
   },
+  "tech_lead.run_withdrawn": {
+    "level": "detail",
+    "phase": "system",
+    "status": "completed",
+    "step": "tech_lead.run_withdrawn"
+  },
   "tech_lead.skipped": {
     "level": "detail",
     "phase": "system",

@@ -3002,6 +3002,9 @@ class TestClaimGateAudit:
         ActionType.QUEUE_RETROSPECTIVE_REVIEW,
         ActionType.QUEUE_REWORK,
         ActionType.QUEUE_TECH_LEAD,
+        # Withdraws a queued investigation from in-process state only (#6994
+        # launch-time revalidation). No GitHub write, so no claim to verify.
+        ActionType.DROP_TECH_LEAD,
         ActionType.CREATE_TECH_LEAD_ISSUE,
         ActionType.CREATE_TECH_LEAD_PROPOSAL_ISSUE,
         ActionType.CREATE_TECH_LEAD_CASE_FILE_ISSUE,

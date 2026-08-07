@@ -298,6 +298,7 @@ class ActionApplier:
             ActionType.QUEUE_RETROSPECTIVE_REVIEW: self._apply_queue_operation,
             ActionType.QUEUE_REWORK: self._apply_queue_operation,
             ActionType.QUEUE_TECH_LEAD: self._apply_queue_operation,
+            ActionType.DROP_TECH_LEAD: self._apply_queue_operation,
             ActionType.ESCALATE_TO_HUMAN: self._apply_escalate,
             ActionType.ENQUEUE_TO_MERGE_QUEUE: self._apply_enqueue_to_merge_queue,
             # Every tech-lead action type -> its extracted apply-time owner.
