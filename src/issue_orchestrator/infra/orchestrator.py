@@ -347,7 +347,7 @@ class Orchestrator:
         retry = next((r for r in self.state.pending_validation_retries if r.issue_number == n), None)
         if retry is None:
             return None
-        return _launch_validation_retry_session(retry, self.state, self._session_launcher, self.deps.session_restorer)
+        return _launch_validation_retry_session(retry, self.state, self._session_launcher, self.deps.session_restorer, self.deps.session_output)
     def _launch_tech_lead_by_number(self, n: int) -> Optional[Session]: return _ch_launch_tech_lead_by_number(n, self.state.pending_tech_lead_reviews, self.launch_tech_lead_session)
 
     def _get_issue_machine(self, issue: Issue) -> Optional[IssueStateMachine]: return _gw_get_issue_machine(issue, self.deps.state_machine_manager)
@@ -1112,16 +1112,16 @@ class Orchestrator:
     def _update_dependency_problems(self, dep_blocked: list[tuple["Issue", str]]) -> None: self._github_workflow.update_dependency_problems(self.state, dep_blocked)
     @property
     def _github_workflow(self) -> GitHubWorkflow: return GitHubWorkflow(self.config, self.deps.events, self.deps.repository_host, self.deps.fact_gatherer, self.deps.pr_scanner, self.deps.label_sync, self._event_context, self.deps.label_manager, self.scheduler.dependency_evaluator)
-    def launch_review_session(self, review: PendingReview) -> Optional[Session]: return _launch_review_session(review, self.state, self._session_launcher, self.deps.session_restorer)
-    def launch_retrospective_review_session(self, review: PendingRetrospectiveReview) -> Optional[Session]: return _launch_retrospective_review_session(review, self.state, self._session_launcher, self.deps.session_restorer)
-    def launch_tech_lead_session(self, tech_lead: PendingTechLeadReview) -> Optional[Session]: return _launch_tech_lead_session(tech_lead, self.state, self.config, self._session_launcher, self.deps.session_restorer)
+    def launch_review_session(self, review: PendingReview) -> Optional[Session]: return _launch_review_session(review, self.state, self._session_launcher, self.deps.session_restorer, self.deps.session_output)
+    def launch_retrospective_review_session(self, review: PendingRetrospectiveReview) -> Optional[Session]: return _launch_retrospective_review_session(review, self.state, self._session_launcher, self.deps.session_restorer, self.deps.session_output)
+    def launch_tech_lead_session(self, tech_lead: PendingTechLeadReview) -> Optional[Session]: return _launch_tech_lead_session(tech_lead, self.state, self.config, self._session_launcher, self.deps.session_restorer, self.deps.session_output)
     def ensure_health_review_anchor(self) -> Optional[PendingTechLeadReview]: return _ensure_on_demand_health_review_anchor(state=self.state, config=self.config, repository_host=self.deps.repository_host, action_applier=self.deps.action_applier, queue_cache_store=self.deps.queue_cache_store, tech_lead_authority=self.deps.tech_lead_authority, now=time.time())
     def process_deferred_cleanups(self) -> None: self.state.pending_cleanups = self._github_workflow.process_deferred_cleanups(self.state.pending_cleanups, self._cleanup_manager)
     def _recover_orphaned_cleanups(self) -> None: self._plan_applier.recover_orphaned_cleanups()
     def scan_needs_code_review_prs(self) -> None: self._github_workflow.scan_needs_code_review_prs(self.state)
     def scan_needs_rework_prs(self) -> None: self._github_workflow.scan_needs_rework_prs(self.state)
     def reconcile_orphaned_pr_labels(self) -> int: return self._github_workflow.reconcile_orphaned_pr_labels(ORCHESTRATOR_PR_MARKER)
-    def launch_rework_session(self, rework: PendingRework) -> Optional[Session]: return _launch_rework_session(rework, self.state, self._session_launcher, self.deps.session_restorer)
+    def launch_rework_session(self, rework: PendingRework) -> Optional[Session]: return _launch_rework_session(rework, self.state, self._session_launcher, self.deps.session_restorer, self.deps.session_output)
 
 async def run_orchestrator(config_path: Optional[Path] = None) -> None:
     from ..entrypoints.bootstrap import build_orchestrator

@@ -2668,19 +2668,23 @@ def _route(queue: str, state, harness, restorer=None):
     restorer.restore_session.return_value = None
     if queue == "review":
         return session_routing.orchestrator_launch_review_session(
-            state.pending_reviews[0], state, harness.launcher, restorer
+            state.pending_reviews[0], state, harness.launcher, restorer,
+            FileSystemSessionOutput(),
         )
     if queue == "retrospective_review":
         return session_routing.orchestrator_launch_retrospective_review_session(
-            state.pending_retrospective_reviews[0], state, harness.launcher, restorer
+            state.pending_retrospective_reviews[0], state, harness.launcher, restorer,
+            FileSystemSessionOutput(),
         )
     if queue == "rework":
         return session_routing.orchestrator_launch_rework_session(
-            state.pending_reworks[0], state, harness.launcher, restorer
+            state.pending_reworks[0], state, harness.launcher, restorer,
+            FileSystemSessionOutput(),
         )
     if queue == "validation_retry":
         return session_routing.orchestrator_launch_validation_retry_session(
-            state.pending_validation_retries[0], state, harness.launcher, restorer
+            state.pending_validation_retries[0], state, harness.launcher, restorer,
+            FileSystemSessionOutput(),
         )
     if queue == "tech_lead":
         return session_routing.orchestrator_launch_tech_lead_session(
@@ -2689,6 +2693,7 @@ def _route(queue: str, state, harness, restorer=None):
             harness.launcher.config,
             harness.launcher,
             restorer,
+            FileSystemSessionOutput(),
         )
     raise AssertionError(f"unknown queue {queue!r}")
 
@@ -3448,3 +3453,411 @@ class TestAnAuthBannerPastTheHeadOfTheLog:
         result = observer.observe_session(session)
 
         assert result.observation is SessionObservation.RUNNING
+
+
+# ---------------------------------------------------------------------------
+# The claim survives a restart (#6999 F4)
+# ---------------------------------------------------------------------------
+
+
+def _restart(state, session, harness):
+    """Rebuild orchestrator state the way startup does, and rehydrate claims.
+
+    Returns a FRESH OrchestratorState: the pending queues and the in-flight
+    ledger are in-memory, so after a restart the launched request exists only
+    beside the session's run assets. Restoration goes through the real
+    SessionRestorer and the real run-artifact adapter, so nothing here can
+    accidentally hand the claim over in memory.
+    """
+    from issue_orchestrator.control.session_restorer import SessionRestorer
+    from issue_orchestrator.control.session_routing import restore_running_sessions
+    from issue_orchestrator.domain.models import OrchestratorState
+    from issue_orchestrator.ports.session_runner import DiscoveredSession
+    from tests.unit.test_session_restorer import MockRepositoryHost, MockWorkingCopy
+
+    del state  # the old process's state is gone; that is the whole point
+    restarted = OrchestratorState()
+    repo_host = MockRepositoryHost()
+    repo_host.issues[session.issue.number] = session.issue
+    working_copy = MockWorkingCopy()
+    working_copy.branches[session.worktree_path] = session.branch_name or "branch"
+    restorer = SessionRestorer(
+        harness.launcher.config, repo_host, working_copy
+    )
+    discovered = [
+        DiscoveredSession(
+            issue_number=session.issue.number,
+            tab_name="",
+            is_review=session.terminal_id.startswith(
+                ("review-", "retrospective-review-")
+            ),
+            session_name=session.terminal_id,
+            run_dir=str(session.run_assets.run_dir),
+        )
+    ]
+    restored = restore_running_sessions(
+        discovered, restarted, restorer, FileSystemSessionOutput()
+    )
+    assert restored, "the terminal itself must restore, or the test proves nothing"
+    return restarted, restored[0]
+
+
+@pytest.mark.parametrize("queue", _PENDING_QUEUES)
+def test_a_restart_still_returns_the_work_on_a_provider_failure(
+    queue, tmp_path: Path
+) -> None:
+    """The gap F4 named: the claim was process-local.
+
+    Launch removes the item from its queue, so between launch and settlement
+    the claim is the only record. If the orchestrator restarted while the
+    terminal was live and THEN saw the credential die, completion found no
+    claim and the work was gone - permanently, for a failure investigation,
+    which auth outcomes deliberately never re-mint.
+    """
+    harness = _ready_harness(tmp_path)
+    state = _pending_state(queue)
+    session = _route(queue, state, harness)
+    assert session is not None
+
+    restarted, restored = _restart(state, session, harness)
+    assert _pending_count(restarted, queue) == 0  # nothing recovered it in memory
+
+    _terminate_on_provider(restarted, restored, ProviderErrorType.AUTH)
+
+    assert _pending_count(restarted, queue) == 1
+
+
+def test_a_restarted_failure_investigation_keeps_its_typed_trigger(
+    tmp_path: Path,
+) -> None:
+    """The DiscoveredFailure has to survive the disk round trip, not just exist."""
+    from issue_orchestrator.domain.tech_lead_session import TechLeadSessionFlavor
+
+    harness = _ready_harness(tmp_path)
+    state = _pending_state("tech_lead")
+    session = _route("tech_lead", state, harness)
+    assert session is not None
+    restarted, restored = _restart(state, session, harness)
+
+    _terminate_on_provider(restarted, restored, ProviderErrorType.AUTH)
+
+    returned = restarted.pending_tech_lead_reviews[0]
+    assert returned.flavor is TechLeadSessionFlavor.FAILURE_INVESTIGATION
+    assert returned.failure is not None
+    assert returned.failure.issue_number == 7
+    assert returned.failure.issue_title == "Test Issue"
+    assert returned.failure.failure_reason == "failed"
+    assert returned.failure.blocking_label == "blocked-failed"
+    assert returned.retryable_launch_failures == 0
+
+
+def test_a_restarted_validation_retry_keeps_its_prompt_and_budget(
+    tmp_path: Path,
+) -> None:
+    """Prompt, error and attempt count cannot be rebuilt from a terminal alone."""
+    from issue_orchestrator.domain.session_key import TaskKind
+
+    harness = _ready_harness(tmp_path)
+    state = _pending_state("validation_retry")
+    state.pending_validation_retries[0].original_prompt = "the original prompt"
+    session = _route("validation_retry", state, harness)
+    assert session is not None
+    restarted, restored = _restart(state, session, harness)
+
+    _terminate_on_provider(restarted, restored, ProviderErrorType.AUTH)
+
+    returned = restarted.pending_validation_retries[0]
+    assert returned.original_prompt == "the original prompt"
+    assert returned.validation_error == "boom"
+    assert returned.retry_count == 1
+    assert returned.source_task is TaskKind.CODE
+
+
+def test_a_restarted_rework_can_still_restore_its_durable_label(
+    tmp_path: Path,
+) -> None:
+    """The second half of the rework case F4 named.
+
+    A restored ``rework-*`` terminal comes back as generic CODE work with no PR
+    number, and the provider-blocked planner keys the ``needs-rework`` restore
+    on the PR. Without the claim the label is unrecoverable too, so BOTH the
+    queue item and its crash-safe trigger were lost.
+    """
+    from issue_orchestrator.domain.session_key import TaskKind
+
+    harness = _ready_harness(tmp_path)
+    state = _pending_state("rework")
+    state.pending_reworks[0].pr_number = 70
+    state.pending_reworks[0].rework_cycle = 3
+    session = _route("rework", state, harness)
+    assert session is not None
+
+    _restarted, restored = _restart(state, session, harness)
+
+    # Identity the terminal name could not supply, taken from the claim.
+    assert restored.pr_number == 70
+    assert restored.key.task is TaskKind.REWORK
+    assert restored.rework_cycle == 3
+
+
+def test_a_restart_leaves_a_claimless_terminal_alone(tmp_path: Path) -> None:
+    """Issue sessions hold no claim; rehydration must not invent one."""
+    from issue_orchestrator.control.in_flight_work import InFlightWorkLedger
+    from issue_orchestrator.domain.models import Issue, OrchestratorState
+
+    harness = _ready_harness(tmp_path)
+    result = harness.launcher.launch_issue_session(
+        Issue(number=123, title="Test Issue", labels=["agent:backend"], repo="test/repo"),
+        [],
+    )
+    assert result.session is not None
+    restarted, restored = _restart(OrchestratorState(), result.session, harness)
+
+    assert InFlightWorkLedger(restarted, FileSystemSessionOutput()).holds(
+        restored.terminal_id
+    ) is None
+    assert restarted.in_flight_work == []
+
+
+def test_a_settled_claim_does_not_come_back_after_a_restart(
+    tmp_path: Path,
+) -> None:
+    """Consuming the work must clear the durable record too.
+
+    A stale artifact would be re-taken at the next restart and re-queue work
+    that had already been done.
+    """
+    harness = _ready_harness(tmp_path)
+    state = _pending_state("tech_lead")
+    session = _route("tech_lead", state, harness)
+    assert session is not None
+    _terminate_on_provider(state, session, None)  # a real terminal work outcome
+
+    restarted, restored = _restart(state, session, harness)
+    _terminate_on_provider(restarted, restored, ProviderErrorType.AUTH)
+
+    assert restarted.pending_tech_lead_reviews == []
+
+
+# ---------------------------------------------------------------------------
+# Ledger invariants: atomic settlement, unique ownership (#6999 F5)
+# ---------------------------------------------------------------------------
+
+
+def test_a_failing_restoration_leaves_the_claim_held(tmp_path: Path) -> None:
+    """Releasing before the queue accepts destroys the only record of the work.
+
+    Settlement runs when something has ALREADY gone wrong, so it is exactly
+    where a destructive-first ordering is least affordable: the tick raises,
+    the claim is gone, and no later attempt can find it.
+    """
+    from issue_orchestrator.control.in_flight_work import (
+        InFlightWorkLedger,
+        SettlementOutcome,
+    )
+
+    harness = _ready_harness(tmp_path)
+    state = _pending_state("tech_lead")
+    session = _route("tech_lead", state, harness)
+    assert session is not None
+    ledger = InFlightWorkLedger(state, FileSystemSessionOutput())
+    held = ledger.holds(session.terminal_id)
+    assert held is not None
+    # A queue kind with no entry in the admission table - the failure mode the
+    # restoration decision table raises on by design.
+    object.__setattr__(held, "kind", "not-a-kind")
+
+    with pytest.raises(ValueError, match="unhandled pending work kind"):
+        ledger.settle(session, SettlementOutcome.PROVIDER_DEFERRED)
+
+    assert ledger.holds(session.terminal_id) is held  # still held in memory
+    # ...and still on disk, so the next process can still find it.
+    assert (session.run_assets.run_dir / "pending-work-claim.json").is_file()
+
+
+def test_a_conflicting_second_claim_is_refused(tmp_path: Path) -> None:
+    """Two claims for one terminal is registry drift, not a launch.
+
+    Replacing the first would convert a caller bug into silent work loss -
+    precisely what this boundary exists to prevent - so it fails fast.
+    """
+    from issue_orchestrator.control.in_flight_work import (
+        DuplicateClaimError,
+        InFlightWorkLedger,
+    )
+
+    harness = _ready_harness(tmp_path)
+    state = _pending_state("tech_lead")
+    session = _route("tech_lead", state, harness)
+    assert session is not None
+    ledger = InFlightWorkLedger(state, FileSystemSessionOutput())
+    original = ledger.holds(session.terminal_id)
+    other = _claim("review", _pending_state("review"))
+
+    with pytest.raises(DuplicateClaimError, match="already holds"):
+        ledger.take(session, other)
+
+    assert ledger.holds(session.terminal_id) is original
+    assert len(state.in_flight_work) == 1
+
+
+def test_re_taking_the_same_claim_is_idempotent(tmp_path: Path) -> None:
+    """A repeated adoption of the terminal it already recorded changed nothing."""
+    from issue_orchestrator.control.in_flight_work import InFlightWorkLedger
+
+    harness = _ready_harness(tmp_path)
+    state = _pending_state("tech_lead")
+    session = _route("tech_lead", state, harness)
+    assert session is not None
+    ledger = InFlightWorkLedger(state, FileSystemSessionOutput())
+    held = ledger.holds(session.terminal_id)
+    assert held is not None
+
+    ledger.take(session, held)
+
+    assert len(state.in_flight_work) == 1
+    assert ledger.holds(session.terminal_id) is held
+
+
+def test_a_refused_claim_leaves_the_queue_item_alone(tmp_path: Path) -> None:
+    """Ordering inside the launch settlement, asserted at the settlement.
+
+    The ledger is the collaborator that can refuse, so it is asked first. If
+    removal came first, a refused claim would leave the work dequeued and
+    unheld - lost by the very check meant to protect it.
+    """
+    from issue_orchestrator.control.in_flight_work import (
+        DuplicateClaimError,
+        InFlightWorkLedger,
+        LaunchSettlement,
+    )
+    from issue_orchestrator.control.session_launch_types import LaunchResult
+
+    harness = _ready_harness(tmp_path)
+    state = _pending_state("tech_lead")
+    session = _route("tech_lead", state, harness)
+    assert session is not None
+    review_state = _pending_state("review")
+    removed: list[str] = []
+
+    settlement = LaunchSettlement(
+        claims=FileSystemSessionOutput(),
+        claim=_claim("review", review_state),
+        remove=lambda: removed.append("removed"),
+    )
+
+    with pytest.raises(DuplicateClaimError):
+        settlement.settle(LaunchResult(session, True), state)
+
+    assert removed == []  # the review item is still queued
+    ledger = InFlightWorkLedger(state, FileSystemSessionOutput())
+    assert ledger.holds(session.terminal_id) is not None
+
+
+# ---------------------------------------------------------------------------
+# The durable encoding round-trips every kind (#6999 F4)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("queue", _PENDING_QUEUES)
+def test_every_claim_kind_round_trips_through_the_durable_artifact(
+    queue, tmp_path: Path
+) -> None:
+    """Encoding is explicit per kind, so every kind needs proving.
+
+    Asserted through the real adapter rather than the codec functions, so the
+    file name, the write and the read are all covered.
+    """
+    from issue_orchestrator.domain.pending_work import PendingWorkKind
+
+    state = _pending_state(queue)
+    claim = _claim(queue, state)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    store = FileSystemSessionOutput()
+
+    store.write_pending_work_claim(run_dir, claim)
+    restored = store.read_pending_work_claim(run_dir)
+
+    assert restored is not None
+    assert restored.kind is PendingWorkKind(queue)
+    original_key = getattr(claim.request, "issue_key", None)
+    restored_key = getattr(restored.request, "issue_key", None)
+    if original_key is not None:
+        # An IssueKey returns as a GitHubIssueKey, which is the protocol's own
+        # definition of the same work item: identity is structural over scope
+        # and stable id. (Production only ever stores GitHubIssueKey, so this
+        # is exact there; these fixtures use FakeIssueKey.)
+        assert restored_key is not None
+        assert restored_key.scope() == original_key.scope()
+        assert restored_key.stable_id() == original_key.stable_id()
+        assert replace(restored.request, issue_key=original_key) == claim.request
+    else:
+        assert restored.request == claim.request  # every field, structurally
+
+
+def test_reading_a_run_that_holds_no_claim_returns_none(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+
+    assert FileSystemSessionOutput().read_pending_work_claim(run_dir) is None
+
+
+def test_clearing_a_claim_is_idempotent(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    store = FileSystemSessionOutput()
+
+    store.clear_pending_work_claim(run_dir)  # nothing to clear
+    store.write_pending_work_claim(run_dir, _claim("review", _pending_state("review")))
+    store.clear_pending_work_claim(run_dir)
+    store.clear_pending_work_claim(run_dir)
+
+    assert store.read_pending_work_claim(run_dir) is None
+
+
+def test_an_undecodable_claim_is_never_read_as_absent(tmp_path: Path) -> None:
+    """"No claim" and "a claim I cannot rebuild" are different facts.
+
+    Returning None for the second would drop the only record of the work while
+    looking like a clean restart.
+    """
+    from issue_orchestrator.execution.pending_work_codec import (
+        PendingWorkClaimDecodeError,
+    )
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "pending-work-claim.json").write_text(
+        json.dumps({"schema_version": 99, "kind": "review", "request": {}}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(PendingWorkClaimDecodeError, match="schema version"):
+        FileSystemSessionOutput().read_pending_work_claim(run_dir)
+
+
+def test_an_undecodable_claim_does_not_stop_other_sessions_restoring(
+    tmp_path: Path,
+) -> None:
+    """One corrupt artifact must not take startup down with it."""
+    from issue_orchestrator.control.in_flight_work import InFlightWorkLedger
+    from issue_orchestrator.domain.models import OrchestratorState
+
+    harness = _ready_harness(tmp_path)
+    state = _pending_state("tech_lead")
+    session = _route("tech_lead", state, harness)
+    assert session is not None
+    (session.run_assets.run_dir / "pending-work-claim.json").write_text(
+        "{not json", encoding="utf-8"
+    )
+    restarted = OrchestratorState()
+
+    rehydrated = InFlightWorkLedger(
+        restarted, FileSystemSessionOutput()
+    ).rehydrate([session])
+
+    assert rehydrated == []
+    assert restarted.in_flight_work == []
+    # Left on disk for inspection rather than quietly deleted.
+    assert (session.run_assets.run_dir / "pending-work-claim.json").is_file()

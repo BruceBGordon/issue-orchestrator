@@ -4,6 +4,8 @@ import json
 from pathlib import Path
 
 import pytest
+
+from issue_orchestrator.execution.session_output_adapter import FileSystemSessionOutput
 from unittest.mock import MagicMock, call, patch
 
 from issue_orchestrator.control.session_launch_types import LaunchResult
@@ -1039,7 +1041,8 @@ class TestStartupManagerTechLeadRecovery:
         launcher.session_manager.runner.discover_running_sessions.return_value = []
 
         orchestrator_launch_tech_lead_session(
-            recovered, sample_state, mock_config, launcher, MagicMock()
+            recovered, sample_state, mock_config, launcher, MagicMock(),
+            FileSystemSessionOutput(),
         )
 
         launch_call = launcher.launch_issue_session.call_args

@@ -11,7 +11,6 @@ from __future__ import annotations
 import json
 import logging
 import threading
-import uuid
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -40,13 +39,7 @@ from ..domain.exchange_chapter import (
     ExchangeChapter,
     ExchangeChapterSidecar,
 )
-from ..domain.pending_work import PendingWorkClaim
-from .pending_work_codec import (
-    CLAIM_ARTIFACT_NAME,
-    PendingWorkClaimDecodeError,
-    decode_claim,
-    encode_claim,
-)
+from .run_directory_artifacts import RunDirectoryArtifacts
 from ..ports.session_output import (
     ReviewExchangeSummary,
     SessionRunAssets,
@@ -98,7 +91,7 @@ EXCHANGE_CHAPTERS_NAME = "chapters.json"
 REVIEW_FEEDBACK_DIR_NAME = "review-feedback"
 
 
-class FileSystemSessionOutput:
+class FileSystemSessionOutput(RunDirectoryArtifacts):
     """Filesystem-backed implementation of SessionOutput port.
 
     All artifacts for a session are stored in a single run directory:
@@ -1030,36 +1023,6 @@ Timestamp: {self._now_iso()}
         self._write_json(identity_path, payload)
         return identity_path
 
-    def write_pending_work_claim(
-        self,
-        run_dir: Path,
-        claim: PendingWorkClaim,
-    ) -> None:
-        """Record the queued request this run's session took at launch."""
-        self._write_json(run_dir / CLAIM_ARTIFACT_NAME, encode_claim(claim))
-
-    def read_pending_work_claim(self, run_dir: Path) -> PendingWorkClaim | None:
-        """Rebuild this run's claim, or None when it holds none.
-
-        A claim that exists but cannot be rebuilt is NOT silently treated as
-        absent: that would drop the only record of the work while looking like
-        a clean restart. It raises, and the restoration seam reports it.
-        """
-        claim_path = run_dir / CLAIM_ARTIFACT_NAME
-        if not claim_path.is_file():
-            return None
-        try:
-            payload = json.loads(claim_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            raise PendingWorkClaimDecodeError(
-                f"pending work claim at {claim_path} is unreadable: {exc}"
-            ) from exc
-        return decode_claim(payload)
-
-    def clear_pending_work_claim(self, run_dir: Path) -> None:
-        """Drop this run's claim once it has been settled."""
-        (run_dir / CLAIM_ARTIFACT_NAME).unlink(missing_ok=True)
-
     def append_cleaned_session_log(
         self,
         run_dir: Path,
@@ -1278,44 +1241,6 @@ Timestamp: {self._now_iso()}
             symlink_path.symlink_to(target, target_is_directory=True)
         except OSError:
             return
-
-    @staticmethod
-    def _read_json(path: Path) -> dict[str, Any] | None:
-        try:
-            if not path.exists():
-                return None
-            return json.loads(path.read_text())
-        except Exception:
-            return None
-
-    @staticmethod
-    def _write_json(path: Path, payload: dict[str, Any]) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-        temp_path.write_text(json.dumps(payload, indent=2, sort_keys=True))
-        temp_path.replace(path)
-
-    @staticmethod
-    def _write_text(path: Path, content: str) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-        temp_path.write_text(content)
-        temp_path.replace(path)
-
-    @staticmethod
-    def _append_run_log_line(run_dir: Path, line: str) -> None:
-        log_path = run_dir / TERMINAL_RECORDING_NAME
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        append_output_event(log_path, f"{line}\n")
-
-    @staticmethod
-    def _delete_tree(path: Path) -> None:
-        for child in path.iterdir():
-            if child.is_dir():
-                FileSystemSessionOutput._delete_tree(child)
-            else:
-                child.unlink()
-        path.rmdir()
 
     def _update_latest(self, worktree_path: Path, manifest: dict[str, Any]) -> None:
         payload = {

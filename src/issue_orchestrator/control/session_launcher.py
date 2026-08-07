@@ -282,17 +282,6 @@ class SessionLauncher:
             ),
         )
 
-
-    @property
-    def session_output(self) -> SessionOutput:
-        """The run-artifact port this launcher writes through.
-
-        Exposed so launch routing can persist the pending-work claim beside the
-        run assets of the session it just started (#6999 F4), without either
-        side reaching into the other's internals.
-        """
-        return self._session_output
-
     def _worktree_reuse_options(
         self,
         *,

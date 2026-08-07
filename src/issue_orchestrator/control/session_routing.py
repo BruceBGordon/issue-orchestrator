@@ -338,12 +338,13 @@ def orchestrator_launch_review_session(
     state: "OrchestratorState",
     session_launcher: SessionLauncher,
     session_restorer: "SessionRestorer",
+    claims: PendingWorkClaimStore,
 ) -> Optional[Session]:
     """Launch a review session and update orchestrator queues."""
     pending_queues = PendingSessionQueues(state)
     result = session_launcher.launch_review_session(review, state.active_sessions)
     return LaunchSettlement(
-        claims=session_launcher.session_output,
+        claims=claims,
         claim=PendingWorkClaim(PendingWorkKind.REVIEW, review),
         remove=lambda: pending_queues.remove_review(review.pr_number),
         restore_existing=lambda: _restore_existing_terminal(
@@ -365,6 +366,7 @@ def orchestrator_launch_retrospective_review_session(
     state: "OrchestratorState",
     session_launcher: SessionLauncher,
     session_restorer: "SessionRestorer",
+    claims: PendingWorkClaimStore,
 ) -> Optional[Session]:
     """Launch a retrospective review session and update orchestrator queues."""
     pending_queues = PendingSessionQueues(state)
@@ -373,7 +375,7 @@ def orchestrator_launch_retrospective_review_session(
         state.active_sessions,
     )
     return LaunchSettlement(
-        claims=session_launcher.session_output,
+        claims=claims,
         claim=PendingWorkClaim(PendingWorkKind.RETROSPECTIVE_REVIEW, review),
         remove=lambda: pending_queues.remove_retrospective_review(review.issue_number),
         restore_existing=lambda: _restore_existing_terminal(
@@ -396,6 +398,7 @@ def orchestrator_launch_rework_session(
     state: "OrchestratorState",
     session_launcher: SessionLauncher,
     session_restorer: "SessionRestorer",
+    claims: PendingWorkClaimStore,
 ) -> Optional[Session]:
     """Launch a rework session and update orchestrator queues."""
     pending_queues = PendingSessionQueues(state)
@@ -417,7 +420,7 @@ def orchestrator_launch_rework_session(
         )
 
     return LaunchSettlement(
-        claims=session_launcher.session_output,
+        claims=claims,
         claim=PendingWorkClaim(PendingWorkKind.REWORK, rework),
         remove=lambda: pending_queues.remove_rework(rework),
         restore_existing=_restore_rework,
@@ -429,6 +432,7 @@ def orchestrator_launch_validation_retry_session(
     state: "OrchestratorState",
     session_launcher: SessionLauncher,
     session_restorer: "SessionRestorer",
+    claims: PendingWorkClaimStore,
 ) -> Optional[Session]:
     """Launch a validation retry session and update retry queue tracking."""
     pending_queues = PendingSessionQueues(state)
@@ -436,7 +440,7 @@ def orchestrator_launch_validation_retry_session(
         retry, state.active_sessions
     )
     return LaunchSettlement(
-        claims=session_launcher.session_output,
+        claims=claims,
         claim=PendingWorkClaim(PendingWorkKind.VALIDATION_RETRY, retry),
         remove=lambda: pending_queues.remove_validation_retry(retry.issue_number),
         restore_existing=lambda: _restore_existing_terminal(
@@ -459,6 +463,7 @@ def orchestrator_launch_tech_lead_session(
     config: Config,
     session_launcher: SessionLauncher,
     session_restorer: "SessionRestorer",
+    claims: PendingWorkClaimStore,
 ) -> Optional[Session]:
     """Launch a queued tech_lead session and update orchestrator queues.
 
@@ -510,7 +515,7 @@ def orchestrator_launch_tech_lead_session(
             )
 
     return LaunchSettlement(
-        claims=session_launcher.session_output,
+        claims=claims,
         claim=PendingWorkClaim(PendingWorkKind.TECH_LEAD, tech_lead),
         remove=lambda: pending_queues.remove_tech_lead(tech_lead.issue_number),
         restore_existing=lambda: _restore_existing_terminal(
