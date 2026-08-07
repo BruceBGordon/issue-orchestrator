@@ -22,7 +22,11 @@ from ..domain.models import (
     PendingValidationRetry,
     Session,
 )
-from ..domain.pending_work import PendingWorkClaim, PendingWorkKind
+from ..domain.pending_work import (
+    PendingWorkClaim,
+    PendingWorkKind,
+    PendingWorkRequest,
+)
 from ..domain.tech_lead_session import TechLeadLaunchScope, TechLeadSessionFlavor
 from ..events import EventName
 from ..infra.config import Config
@@ -230,59 +234,38 @@ class PendingSessionQueues:
 
         The admission half of this owner (#6999 A1): every queue already
         declares here how an item is removed, so it declares here how one comes
-        back. Each branch re-appends the ORIGINAL request object, preserving the
-        context that exists nowhere else - a failure investigation's typed
+        back. Admission is a decision TABLE rather than a branch chain, and each
+        entry delegates to the collection's own owner method, so the duplicate
+        rule for a queue lives in exactly one place whether the item is arriving
+        from discovery or coming back from a dead session.
+
+        The re-admitted object is the ORIGINAL request, preserving the context
+        that exists nowhere else - a failure investigation's typed
         ``DiscoveredFailure``, a validation retry's prompt/error/count, a
-        rework's cycle number - and applies that queue's own duplicate rule so a
-        restore can never double-queue work that was re-discovered meanwhile.
+        rework's cycle number.
 
         Returns True when the item was admitted, False when the queue already
         held an equivalent request. Restoring costs no retry budget: nothing
         about the request failed.
         """
-        request = claim.request
-        if claim.kind is PendingWorkKind.REVIEW:
-            assert isinstance(request, PendingReview)
-            if any(
-                r.pr_number == request.pr_number for r in self.state.pending_reviews
-            ):
-                return False
-            self.state.pending_reviews.append(request)
-            return True
-        if claim.kind is PendingWorkKind.RETROSPECTIVE_REVIEW:
-            assert isinstance(request, PendingRetrospectiveReview)
-            # Deliberately the QUEUE only, not the wider
-            # ``has_pending_or_active_retrospective_review``: the session being
-            # settled is this request's own, and whether it has already been
-            # dropped from ``active_sessions`` is an ordering detail of the
-            # completion path. Reading it here would silently discard the work
-            # if that order ever changed.
-            if any(
-                r.issue_number == request.issue_number
-                for r in self.state.pending_retrospective_reviews
-            ):
-                return False
-            self.state.pending_retrospective_reviews.append(request)
-            return True
-        if claim.kind is PendingWorkKind.REWORK:
-            assert isinstance(request, PendingRework)
-            return self.state.queue_pending_rework(request)
-        if claim.kind is PendingWorkKind.VALIDATION_RETRY:
-            assert isinstance(request, PendingValidationRetry)
-            if any(
-                queued.issue_number == request.issue_number
-                for queued in self.state.pending_validation_retries
-            ):
-                return False
-            self.state.pending_validation_retries.append(request)
-            return True
-        if claim.kind is PendingWorkKind.TECH_LEAD:
-            assert isinstance(request, PendingTechLeadReview)
-            return self._queue_tech_lead(request) is TechLeadQueueOutcome.QUEUED
-        # Named explicitly, like the launch-disposition switch: a new queue kind
-        # added without a decision here must fail loudly rather than silently
-        # drop the only record of its work.
-        raise ValueError(f"unhandled pending work kind: {claim.kind}")
+        admit = _QUEUE_ADMISSION.get(claim.kind)
+        if admit is None:
+            # Named explicitly, like the launch-disposition switch: a queue kind
+            # added without an entry here must fail loudly rather than silently
+            # drop the only record of its work.
+            raise ValueError(f"unhandled pending work kind: {claim.kind}")
+        return admit(self, claim.request)
+
+    def queue_existing_tech_lead(
+        self, item: PendingTechLeadReview
+    ) -> TechLeadQueueOutcome:
+        """Re-admit an already-built tech_lead item under the same dedup rule.
+
+        Distinct from the ``queue_*`` producers above, which BUILD the item from
+        its parts. Restoring must not rebuild: the original carries its typed
+        failure context and its spent retry count (#6999 A1).
+        """
+        return self._queue_tech_lead(item)
 
     def _queue_tech_lead(self, item: PendingTechLeadReview) -> TechLeadQueueOutcome:
         """Apply the one dedup rule (issue number vs pending queue) and enqueue."""
@@ -303,6 +286,50 @@ class PendingSessionQueues:
         )
         return TechLeadQueueOutcome.QUEUED
 
+
+
+def _admit_review(queues: PendingSessionQueues, request: PendingWorkRequest) -> bool:
+    assert isinstance(request, PendingReview)
+    return queues.state.queue_pending_review(request)
+
+
+def _admit_retrospective_review(
+    queues: PendingSessionQueues, request: PendingWorkRequest
+) -> bool:
+    assert isinstance(request, PendingRetrospectiveReview)
+    return queues.state.queue_pending_retrospective_review(request)
+
+
+def _admit_rework(queues: PendingSessionQueues, request: PendingWorkRequest) -> bool:
+    assert isinstance(request, PendingRework)
+    return queues.state.queue_pending_rework(request)
+
+
+def _admit_validation_retry(
+    queues: PendingSessionQueues, request: PendingWorkRequest
+) -> bool:
+    assert isinstance(request, PendingValidationRetry)
+    return queues.state.queue_pending_validation_retry(request)
+
+
+def _admit_tech_lead(queues: PendingSessionQueues, request: PendingWorkRequest) -> bool:
+    assert isinstance(request, PendingTechLeadReview)
+    # Through the tech-lead intake owner, not the state list: this queue's
+    # duplicate rule carries logging and a typed outcome that the others do not.
+    return queues.queue_existing_tech_lead(request) is TechLeadQueueOutcome.QUEUED
+
+
+# One entry per pending queue. A decision table rather than a branch chain so
+# "which queue admits this" has a single, enumerable answer (#6999 A1).
+_QUEUE_ADMISSION: dict[
+    PendingWorkKind, Callable[[PendingSessionQueues, PendingWorkRequest], bool]
+] = {
+    PendingWorkKind.REVIEW: _admit_review,
+    PendingWorkKind.RETROSPECTIVE_REVIEW: _admit_retrospective_review,
+    PendingWorkKind.REWORK: _admit_rework,
+    PendingWorkKind.VALIDATION_RETRY: _admit_validation_retry,
+    PendingWorkKind.TECH_LEAD: _admit_tech_lead,
+}
 
 
 def orchestrator_launch_review_session(

@@ -32,6 +32,7 @@ from .invalid_record_actions import (
 )
 from .label_manager import LabelManager
 from .provider_availability import ProviderAvailabilityPolicy
+from .provider_blocked_completion import provider_blocked_actions
 from .reconciliation import ExpectedState, build_expected_for_mutation
 from .tech_lead_session_policy import is_tech_lead_session
 from ..ports.provider_resilience import ProviderErrorType
@@ -656,70 +657,6 @@ class CompletionActionPlanner:
             ),
         ]
 
-    def _generate_provider_blocked_actions(
-        self,
-        session: Session,
-        expected: ExpectedState,
-    ) -> list[Action]:
-        """Actions for a session blocked by its provider, not by its work.
-
-        The provider-blocked label and the durable issue-scoped record are two
-        halves of one transition, and ``ApplyProviderImpactAction`` is the only
-        thing that keeps them together (#5980 F1). Generic blocked handling
-        would apply a bare ``AddLabelAction``, after which the impact planner
-        sees the label already present and has no transition left to record —
-        the outage would vanish from the issue's history (#6999 F5).
-
-        Unlike the generic path this rule does NOT differ by session kind: a
-        review or rework session stalled by a dead credential impacts its issue
-        exactly as a coding session does, so every kind gets the transition. The
-        claim release stays kind-scoped, because holding the issue is a property
-        of the coding session, not of the outage.
-
-        No comment is posted. The impact command emits an issue-scoped
-        ``provider.issue_blocked`` event that survives the label being shed,
-        which is precisely the durable signal #5980 added to replace commenting
-        on every affected issue during a fleet-wide outage.
-
-        A rework session additionally gets its ``needs-rework`` trigger back.
-        The in-memory queue restore is owned by ``InFlightWorkLedger`` (#6999
-        F2), but the label is the crash-safe half of the same fact: the launcher
-        strips it when the session starts, so leaving it off would mean an
-        orchestrator restarted during the outage sees a PR that asked for rework
-        and no longer says so.
-        """
-        provider = session.agent_config.provider
-        actions: list[Action] = []
-        if provider:
-            assessment = self._provider_availability.assess((provider,))
-            if assessment.blocked:
-                actions.append(
-                    self._provider_availability.blocked_transition(
-                        session.issue.number,
-                        assessment,
-                        issue_key=session.issue.key.stable_id(),
-                    )
-                )
-        if session.terminal_id.startswith("issue-"):
-            actions.append(
-                RemoveLabelAction(
-                    issue_number=session.issue.number,
-                    label=self._lm.in_progress,
-                    reason="Session blocked by provider - releasing claim",
-                    expected=expected,
-                )
-            )
-        if session.terminal_id.startswith("rework-") and session.pr_number:
-            actions.append(
-                AddLabelAction(
-                    issue_number=session.pr_number,
-                    label=self._lm.needs_rework,
-                    reason="Rework blocked by provider - restoring rework trigger",
-                    expected=expected,
-                )
-            )
-        return actions
-
     def _generate_blocked_actions(
         self,
         session: Session,
@@ -735,7 +672,12 @@ class CompletionActionPlanner:
         the issue, and anything else is the agent reporting it cannot proceed.
         """
         if provider_error_type is not None:
-            return self._generate_provider_blocked_actions(session, expected)
+            return provider_blocked_actions(
+                session,
+                expected,
+                label_manager=self._lm,
+                provider_availability=self._provider_availability,
+            )
         is_issue_session = session.terminal_id.startswith("issue-")
         label = blocked_label or self._lm.blocked
 

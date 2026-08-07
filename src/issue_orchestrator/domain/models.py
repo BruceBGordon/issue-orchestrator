@@ -2032,6 +2032,51 @@ class OrchestratorState:
         self.pending_reworks.extend([rework])
         return True
 
+    def queue_pending_review(self, review: PendingReview) -> bool:
+        """Queue a PR for code review if it is not already waiting for one.
+
+        Sibling of :meth:`queue_pending_rework` (#6999 A1): the collection owns
+        its own admission rule, so callers returning work to this queue never
+        reach into the list to append and never re-derive the duplicate check.
+        """
+
+        if any(
+            existing.pr_number == review.pr_number for existing in self.pending_reviews
+        ):
+            return False
+        self.pending_reviews.extend([review])
+        return True
+
+    def queue_pending_retrospective_review(
+        self, review: PendingRetrospectiveReview
+    ) -> bool:
+        """Queue an existing implementation for review if not already queued.
+
+        Checks the QUEUE only, deliberately narrower than
+        :meth:`has_pending_or_active_retrospective_review`: a caller returning
+        work whose own session is terminating must not be answered "already
+        active" by that very session.
+        """
+
+        if any(
+            existing.issue_number == review.issue_number
+            for existing in self.pending_retrospective_reviews
+        ):
+            return False
+        self.pending_retrospective_reviews.extend([review])
+        return True
+
+    def queue_pending_validation_retry(self, retry: "PendingValidationRetry") -> bool:
+        """Queue a validation retry if the issue is not already waiting for one."""
+
+        if any(
+            existing.issue_number == retry.issue_number
+            for existing in self.pending_validation_retries
+        ):
+            return False
+        self.pending_validation_retries.extend([retry])
+        return True
+
     def record_discovered_failure(self, failure: DiscoveredFailure) -> None:
         """Record a session-failure fact for the Planner (owner boundary).
 
