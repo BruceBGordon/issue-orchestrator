@@ -330,7 +330,7 @@ class TestCreateWorktree:
         # Git should not have been called
         mock_run.assert_not_called()
 
-    @patch("issue_orchestrator.adapters.worktree._worktree.install_hooks")
+    @patch("issue_orchestrator.adapters.worktree._worktree_runtime_setup.install_hooks")
     @patch("issue_orchestrator.adapters.git.git_cli.subprocess.run")
     def test_create_worktree_already_exists(self, mock_run, mock_install_hooks, tmp_path):
         """Test that existing worktree is reused when it passes validation."""
@@ -469,8 +469,8 @@ class TestCreateWorktree:
         assert branch_name == "123-test"
         assert state["worktree_add_calls"] == 2
 
-    @patch("issue_orchestrator.adapters.worktree._worktree.install_claude_settings")
-    @patch("issue_orchestrator.adapters.worktree._worktree.install_hooks")
+    @patch("issue_orchestrator.adapters.worktree._worktree_runtime_setup.install_claude_settings")
+    @patch("issue_orchestrator.adapters.worktree._worktree_runtime_setup.install_hooks")
     @patch("issue_orchestrator.adapters.git.git_cli.subprocess.run")
     def test_create_worktree_detaches_when_branch_in_use(
         self,
@@ -526,8 +526,8 @@ class TestCreateWorktree:
         mock_install_hooks.assert_called_once()
         mock_install_claude_settings.assert_called_once()
 
-    @patch("issue_orchestrator.adapters.worktree._worktree.install_claude_settings")
-    @patch("issue_orchestrator.adapters.worktree._worktree.install_hooks")
+    @patch("issue_orchestrator.adapters.worktree._worktree_runtime_setup.install_claude_settings")
+    @patch("issue_orchestrator.adapters.worktree._worktree_runtime_setup.install_hooks")
     @patch("issue_orchestrator.adapters.git.git_cli.subprocess.run")
     def test_create_worktree_removes_existing_path_when_reuse_disabled(
         self,
@@ -593,9 +593,9 @@ class TestCreateWorktree:
         mock_install_hooks.assert_called_once()
         mock_install_claude_settings.assert_called_once()
 
-    @patch("issue_orchestrator.adapters.worktree._worktree.sync_cli_tools")
-    @patch("issue_orchestrator.adapters.worktree._worktree.install_claude_settings")
-    @patch("issue_orchestrator.adapters.worktree._worktree.install_hooks")
+    @patch("issue_orchestrator.adapters.worktree._worktree_runtime_setup.sync_cli_tools")
+    @patch("issue_orchestrator.adapters.worktree._worktree_runtime_setup.install_claude_settings")
+    @patch("issue_orchestrator.adapters.worktree._worktree_runtime_setup.install_hooks")
     @patch("issue_orchestrator.adapters.git.git_cli.subprocess.run")
     def test_create_worktree_does_not_create_setup_commit(
         self,
@@ -696,9 +696,9 @@ class TestCreateWorktree:
         assert ".issue-orchestrator/worktree-id" in exclude_text
         assert "src/issue_orchestrator/entrypoints/cli_tools/coding_done.py" in exclude_text
 
-    @patch("issue_orchestrator.adapters.worktree._worktree.sync_cli_tools")
-    @patch("issue_orchestrator.adapters.worktree._worktree.install_claude_settings")
-    @patch("issue_orchestrator.adapters.worktree._worktree.install_hooks")
+    @patch("issue_orchestrator.adapters.worktree._worktree_runtime_setup.sync_cli_tools")
+    @patch("issue_orchestrator.adapters.worktree._worktree_runtime_setup.install_claude_settings")
+    @patch("issue_orchestrator.adapters.worktree._worktree_runtime_setup.install_hooks")
     @patch("issue_orchestrator.adapters.git.git_cli.subprocess.run")
     def test_create_worktree_writes_excludes_to_common_git_dir_for_linked_worktree(
         self,
@@ -776,9 +776,9 @@ class TestCreateWorktree:
         assert synced_models.exists()
         assert "class ProposedFollowUpIssue" in synced_models.read_text()
 
-    @patch("issue_orchestrator.adapters.worktree._worktree.sync_cli_tools")
-    @patch("issue_orchestrator.adapters.worktree._worktree.install_claude_settings")
-    @patch("issue_orchestrator.adapters.worktree._worktree.install_hooks")
+    @patch("issue_orchestrator.adapters.worktree._worktree_runtime_setup.sync_cli_tools")
+    @patch("issue_orchestrator.adapters.worktree._worktree_runtime_setup.install_claude_settings")
+    @patch("issue_orchestrator.adapters.worktree._worktree_runtime_setup.install_hooks")
     @patch("issue_orchestrator.adapters.git.git_cli.subprocess.run")
     def test_create_worktree_links_repo_venv_into_issue_worktree(
         self,
@@ -1986,10 +1986,10 @@ class TestCreateWorktreeReuse:
 
         with (
             patch("issue_orchestrator.adapters.git.git_cli.subprocess.run") as mock_run,
-            patch("issue_orchestrator.adapters.worktree._worktree.install_hooks"),
-            patch("issue_orchestrator.adapters.worktree._worktree.install_claude_settings"),
+            patch("issue_orchestrator.adapters.worktree._worktree_runtime_setup.install_hooks"),
+            patch("issue_orchestrator.adapters.worktree._worktree_runtime_setup.install_claude_settings"),
 
-            patch("issue_orchestrator.adapters.worktree._worktree.sync_cli_tools"),
+            patch("issue_orchestrator.adapters.worktree._worktree_runtime_setup.sync_cli_tools"),
         ):
             def run_side_effect(cmd, *args, **kwargs):
                 argv = cmd[3:]
@@ -2055,10 +2055,10 @@ class TestCreateWorktreeReuse:
 
         with (
             patch("issue_orchestrator.adapters.git.git_cli.subprocess.run") as mock_run,
-            patch("issue_orchestrator.adapters.worktree._worktree.install_hooks"),
-            patch("issue_orchestrator.adapters.worktree._worktree.install_claude_settings"),
+            patch("issue_orchestrator.adapters.worktree._worktree_runtime_setup.install_hooks"),
+            patch("issue_orchestrator.adapters.worktree._worktree_runtime_setup.install_claude_settings"),
 
-            patch("issue_orchestrator.adapters.worktree._worktree.sync_cli_tools"),
+            patch("issue_orchestrator.adapters.worktree._worktree_runtime_setup.sync_cli_tools"),
         ):
             def run_side_effect(cmd, *args, **kwargs):
                 argv = cmd[3:]
@@ -2120,10 +2120,10 @@ class TestCreateWorktreeReuse:
 
         with (
             patch("issue_orchestrator.adapters.git.git_cli.subprocess.run") as mock_run,
-            patch("issue_orchestrator.adapters.worktree._worktree.install_hooks"),
-            patch("issue_orchestrator.adapters.worktree._worktree.install_claude_settings"),
+            patch("issue_orchestrator.adapters.worktree._worktree_runtime_setup.install_hooks"),
+            patch("issue_orchestrator.adapters.worktree._worktree_runtime_setup.install_claude_settings"),
 
-            patch("issue_orchestrator.adapters.worktree._worktree.sync_cli_tools"),
+            patch("issue_orchestrator.adapters.worktree._worktree_runtime_setup.sync_cli_tools"),
         ):
             def run_side_effect(cmd, *args, **kwargs):
                 argv = cmd[3:]
@@ -2184,9 +2184,9 @@ class TestCreateWorktreeReuse:
 
         with (
             patch("issue_orchestrator.adapters.git.git_cli.subprocess.run") as mock_run,
-            patch("issue_orchestrator.adapters.worktree._worktree.install_hooks"),
-            patch("issue_orchestrator.adapters.worktree._worktree.install_claude_settings"),
-            patch("issue_orchestrator.adapters.worktree._worktree.sync_cli_tools"),
+            patch("issue_orchestrator.adapters.worktree._worktree_runtime_setup.install_hooks"),
+            patch("issue_orchestrator.adapters.worktree._worktree_runtime_setup.install_claude_settings"),
+            patch("issue_orchestrator.adapters.worktree._worktree_runtime_setup.sync_cli_tools"),
         ):
             def run_side_effect(cmd, *args, **kwargs):
                 argv = cmd[3:]
@@ -2262,9 +2262,9 @@ class TestCreateWorktreeReuse:
 
         with (
             patch("issue_orchestrator.adapters.git.git_cli.subprocess.run") as mock_run,
-            patch("issue_orchestrator.adapters.worktree._worktree.install_hooks"),
-            patch("issue_orchestrator.adapters.worktree._worktree.install_claude_settings"),
-            patch("issue_orchestrator.adapters.worktree._worktree.sync_cli_tools"),
+            patch("issue_orchestrator.adapters.worktree._worktree_runtime_setup.install_hooks"),
+            patch("issue_orchestrator.adapters.worktree._worktree_runtime_setup.install_claude_settings"),
+            patch("issue_orchestrator.adapters.worktree._worktree_runtime_setup.sync_cli_tools"),
         ):
             def run_side_effect(cmd, *args, **kwargs):
                 argv = cmd[3:]
