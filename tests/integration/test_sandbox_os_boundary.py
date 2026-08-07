@@ -276,7 +276,15 @@ def _tool_events(stdout: str) -> list[_ToolEvent]:
             evt = json.loads(line)
         except ValueError:
             continue
-        content = (evt.get("message") or {}).get("content")
+        # The CLI's stream carries non-assistant events too, and some of them
+        # (errors, system notices) put a plain string in ``message``. Skip them
+        # the way _codex_command_events skips non-dict ``item`` payloads —
+        # a missing tool event still fails the assertions below, but with the
+        # assertion's message instead of an AttributeError in the parser.
+        message = evt.get("message")
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
         if not isinstance(content, list):
             continue
         for block in content:
