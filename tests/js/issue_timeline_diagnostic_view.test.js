@@ -42,6 +42,10 @@ function loadDrawer() {
     const fetchCalls = [];
     const manifestCalls = [];
     const context = {
+        // Cross-chunk owner: ``tech_lead_runs.js`` owns the targeted tech-lead
+        // action's visibility/state; the drawer only names its elements (#6994).
+        resetTechLeadIssueAction: () => {},
+        updateTechLeadIssueAction: () => false,
         console,
         document: {
             activeElement: _element(),

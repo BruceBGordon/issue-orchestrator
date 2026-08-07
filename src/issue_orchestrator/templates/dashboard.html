@@ -204,13 +204,14 @@
             </button>
             <div class="tab-spacer"></div>
             <div class="tab-menu-wrap">
-                <button class="tab-menu-btn" onclick="toggleSettingsMenu(event)" aria-label="Dashboard actions" aria-haspopup="true">&#x2630;</button>
+                <button class="tab-menu-btn" id="settingsMenuBtn" onclick="toggleSettingsMenu(event)" aria-label="Dashboard actions" aria-haspopup="true" aria-expanded="false">&#x2630;</button>
                 <div class="settings-menu" id="settingsMenu" role="menu" aria-label="Dashboard actions">
                     <button class="settings-menu-item" id="pauseResumeItem" onclick="togglePause()" role="menuitem">
                         {% if paused %}<span aria-hidden="true">&#x25B6;</span> Resume{% else %}<span aria-hidden="true">&#x23F8;</span> Pause{% endif %}
                     </button>
                     <button class="settings-menu-item" onclick="refreshFromGitHub()" role="menuitem"><span aria-hidden="true">&#x1F504;</span> Refresh from GitHub</button>
                     <button class="settings-menu-item" onclick="openRetrospectiveReviewDialog()" role="menuitem"><span aria-hidden="true">&#x21BB;</span> Review Existing Implementation</button>
+                    <button class="settings-menu-item" id="techLeadHealthReviewItem" onclick="runBoardHealthReview()" role="menuitem"><span aria-hidden="true">&#x1F9ED;</span> Run board health review<span class="settings-menu-status" id="techLeadHealthReviewStatus"></span></button>
                     <button class="settings-menu-item" onclick="openFlowRefreshPrefs()" role="menuitem"><span aria-hidden="true">&#x26A1;</span> Flow refresh preferences</button>
                     <button class="settings-menu-item" onclick="showGitHubUsage()" role="menuitem"><span aria-hidden="true">&#x1F4CA;</span> Show GitHub usage</button>
                     <button class="settings-menu-item" onclick="goToSettings()" role="menuitem"><span aria-hidden="true">&#x2699;</span> Settings</button>
@@ -423,6 +424,8 @@
         <div class="issue-detail-actions" id="issueDetailActions" style="display:none;">
             <button class="issue-action-btn" id="issueDetailUnblockBtn" style="display:none;" onclick="unblockFromDrawer()">Unblock</button>
             <button class="issue-action-btn" id="issueDetailRetryPublishBtn" style="display:none;">Retry Publish</button>
+            <button class="issue-action-btn" id="issueDetailInvestigateTechLeadBtn" style="display:none;" onclick="investigateWithTechLeadFromDrawer()">Investigate with tech lead</button>
+            <span class="issue-action-status" id="issueDetailTechLeadStatus" role="status" aria-live="polite"></span>
         </div>
         <details class="issue-detail-section issue-detail-stack" id="issueDetailStack" style="display:none;">
             <summary id="issueDetailStackSummary">Stack dependencies &amp; gates</summary>
@@ -607,6 +610,7 @@
         <button id="menuCloseIssue" class="context-menu-item" role="menuitem" style="display:none;">Close Issue</button>
         <button id="menuResetRetry" class="context-menu-item" role="menuitem" style="display:none;">Reset &amp; Retry</button>
         <button id="menuResetRetryScratch" class="context-menu-item" role="menuitem" style="display:none;">Reset and Retry From Scratch</button>
+        <button id="menuInvestigateTechLead" class="context-menu-item" role="menuitem" style="display:none;">Investigate with tech lead</button>
     </div>
     <div id="toast" role="status" aria-live="polite"></div>
 

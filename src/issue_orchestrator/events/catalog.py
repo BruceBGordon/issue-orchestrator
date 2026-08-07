@@ -202,6 +202,12 @@ class EventName(str, Enum):
     # Tech-lead attention sweep re-injected stuck issues / flagged exhausted
     # ones (#6823); internal trace event only (not a public UI event).
     TECH_LEAD_STUCK_SWEEP = "tech_lead.stuck_sweep"
+    # One scoped tech-lead run request reached the admission owner (#6994) —
+    # from the dashboard, the CLI, or an automatic trigger — carrying the run
+    # identity, scope kind, subject issue, trigger source, and the typed
+    # outcome/deferral reason. Internal trace event: the UI synchronizes on the
+    # command response and the dashboard view model, never on this.
+    TECH_LEAD_RUN_REQUESTED = "tech_lead.run_requested"
 
     # =========================================================================
     # Cleanup operations

@@ -20,6 +20,7 @@
         REVIEW_ARTIFACT: (issueNumber) => `/api/session/review-artifact/${issueNumber}`,
         SESSION_PROMPT: (issueNumber) => `/api/session/prompt/${issueNumber}`,
         TERMINAL_RECORDING: (issueNumber) => `/api/session/terminal-recording/${issueNumber}`,
+        TECH_LEAD_RUNS: '/api/tech-lead/runs',
         RETRY_PUBLISH: (issueNumber) => `/api/issues/${issueNumber}/retry-publish`,
         CLOSE_ISSUE: (issueNumber) => `/api/issues/${issueNumber}/close`,
         ISSUE_RESUME: (issueNumber) => `/api/issues/${issueNumber}/resume`,
@@ -152,6 +153,30 @@
         };
     }
 
+    // Tech-lead run requests (#6994). One command surface, one discriminated
+    // scope: the endpoint never learns "which button" was clicked, only which
+    // scope was requested, so the server-side admission owner stays the single
+    // place that decides whether the run may start.
+    function buildGlobalHealthReviewRunRequest() {
+        return {
+            endpoint: ENDPOINTS.TECH_LEAD_RUNS,
+            method: 'POST',
+            body: { scope: { kind: 'global_health_review' } },
+        };
+    }
+
+    function buildIssueInvestigationRunRequest(issueNumber) {
+        const normalized = normalizeIssueNumbers([issueNumber]);
+        if (normalized.length !== 1) {
+            throw new Error(`Invalid issue number for tech-lead investigation: ${issueNumber}`);
+        }
+        return {
+            endpoint: ENDPOINTS.TECH_LEAD_RUNS,
+            method: 'POST',
+            body: { scope: { kind: 'issue', issue_number: normalized[0] } },
+        };
+    }
+
     function buildRevealWorktreeRequest(issueNumber) {
         const normalized = normalizeIssueNumbers([issueNumber]);
         if (normalized.length !== 1) {
@@ -254,6 +279,8 @@
         buildIssueResumeRequest,
         buildRetryPublishRequest,
         buildCloseIssueRequest,
+        buildGlobalHealthReviewRunRequest,
+        buildIssueInvestigationRunRequest,
         buildHostOpenPathRequest,
         buildRevealWorktreeRequest,
         buildTerminalRecordingRequest,

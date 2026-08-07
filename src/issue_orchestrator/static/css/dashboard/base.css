@@ -418,6 +418,20 @@ h1 {
 }
 .settings-menu-item:hover { background: var(--bg-panel-soft); }
 .settings-menu-item:active { background: var(--bg-hover); }
+/* A disabled dashboard action stays readable (not colour-only): the adjacent
+   status text says WHY, and the reduced opacity is a secondary cue (#6994). */
+.settings-menu-item[disabled],
+.settings-menu-item[aria-disabled="true"] {
+    opacity: 0.6;
+    cursor: not-allowed;
+}
+.settings-menu-status {
+    display: block;
+    font-size: 11px;
+    color: var(--text-muted, var(--text));
+    margin-top: 2px;
+}
+.settings-menu-status:empty { display: none; }
 
 .gh-usage-wrap {
     position: relative;

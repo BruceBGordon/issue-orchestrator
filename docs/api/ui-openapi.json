@@ -156,6 +156,29 @@
         }
       }
     },
+    "/api/tech-lead/runs": {
+      "post": {
+        "summary": "Request a tech-lead run with an explicit scope",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {"$ref": "#/components/schemas/TechLeadRunRequestPayload"}
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Typed admission outcome for the requested tech-lead run",
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "#/components/schemas/TechLeadRunAdmissionPayload"}
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/dialog/info": {
       "get": {
         "summary": "Get about dialog",
@@ -3145,6 +3168,53 @@
           "issue_number": {"type": "integer"},
           "phase": {"type": ["object", "null"], "additionalProperties": true},
           "phases": {"type": "array", "items": {"type": "object", "additionalProperties": true}}
+        }
+      },
+      "TechLeadGlobalHealthReviewScopePayload": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind"],
+        "properties": {
+          "kind": {"const": "global_health_review"}
+        }
+      },
+      "TechLeadIssueScopePayload": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "issue_number"],
+        "properties": {
+          "kind": {"const": "issue"},
+          "issue_number": {"type": "integer", "minimum": 1}
+        }
+      },
+      "TechLeadRunScopePayload": {
+        "oneOf": [
+          {"$ref": "#/components/schemas/TechLeadGlobalHealthReviewScopePayload"},
+          {"$ref": "#/components/schemas/TechLeadIssueScopePayload"}
+        ],
+        "discriminator": {"propertyName": "kind"}
+      },
+      "TechLeadRunRequestPayload": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["scope"],
+        "properties": {
+          "scope": {"$ref": "#/components/schemas/TechLeadRunScopePayload"}
+        }
+      },
+      "TechLeadRunAdmissionPayload": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["outcome", "scope_kind", "run_key", "reason", "detail", "issue_number", "behind_global_barrier", "admitted"],
+        "properties": {
+          "outcome": {"enum": ["queued", "already_queued", "already_running", "paused", "not_configured", "not_eligible", "claim_conflict", "failed"]},
+          "scope_kind": {"enum": ["global_health_review", "issue"]},
+          "run_key": {"type": "string"},
+          "reason": {"type": "string"},
+          "detail": {"type": "string"},
+          "issue_number": {"type": ["integer", "null"], "minimum": 1},
+          "behind_global_barrier": {"type": "boolean"},
+          "admitted": {"type": "boolean"}
         }
       }
     }

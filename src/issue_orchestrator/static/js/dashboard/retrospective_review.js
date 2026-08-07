@@ -7,8 +7,7 @@ function parseRetrospectiveReviewIssueInput(value) {
 }
 
 function openRetrospectiveReviewDialog() {
-    const menu = document.getElementById('settingsMenu');
-    if (menu) menu.classList.remove('visible');
+    closeSettingsMenu();
     retrospectiveReviewPreviewedIssueIds = [];
     retrospectiveReviewEligibleIssueIds = [];
     openModal('Review Existing Implementation', `

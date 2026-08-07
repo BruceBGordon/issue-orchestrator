@@ -44,9 +44,7 @@ from ..control.session_completion import (
 )
 from ..control.session_launcher import SessionLauncher
 from ..control.board_snapshot_builder import StateBoardSnapshotProvider
-from ..control.health_review_trigger import (
-    ensure_on_demand_health_review_anchor as _ensure_on_demand_health_review_anchor,
-)
+from ..control.tech_lead_run_wiring import TechLeadRunAdmission, TechLeadRunRequest, orchestrator_health_review_anchor as _ensure_health_review_anchor, orchestrator_tech_lead_run as _admit_tech_lead_run
 from ..control.session_routing import (
     orchestrator_launch_review_session as _launch_review_session,
     orchestrator_launch_retrospective_review_session as _launch_retrospective_review_session,
@@ -1118,7 +1116,8 @@ class Orchestrator:
     def launch_review_session(self, review: PendingReview) -> Optional[Session]: return _launch_review_session(review, self.state, self._session_launcher, self.deps.session_restorer)
     def launch_retrospective_review_session(self, review: PendingRetrospectiveReview) -> Optional[Session]: return _launch_retrospective_review_session(review, self.state, self._session_launcher, self.deps.session_restorer)
     def launch_tech_lead_session(self, tech_lead: PendingTechLeadReview) -> Optional[Session]: return _launch_tech_lead_session(tech_lead, self.state, self.config, self._session_launcher, self.deps.session_restorer)
-    def ensure_health_review_anchor(self) -> Optional[PendingTechLeadReview]: return _ensure_on_demand_health_review_anchor(state=self.state, config=self.config, repository_host=self.deps.repository_host, action_applier=self.deps.action_applier, queue_cache_store=self.deps.queue_cache_store, tech_lead_authority=self.deps.tech_lead_authority, now=time.time())
+    def ensure_health_review_anchor(self) -> Optional[PendingTechLeadReview]: return _ensure_health_review_anchor(self)
+    def request_tech_lead_run(self, request: TechLeadRunRequest) -> TechLeadRunAdmission: return _admit_tech_lead_run(self, request)
     def process_deferred_cleanups(self) -> None: self.state.pending_cleanups = self._github_workflow.process_deferred_cleanups(self.state.pending_cleanups, self._cleanup_manager)
     def _recover_orphaned_cleanups(self) -> None: self._plan_applier.recover_orphaned_cleanups()
     def scan_needs_code_review_prs(self) -> None: self._github_workflow.scan_needs_code_review_prs(self.state)

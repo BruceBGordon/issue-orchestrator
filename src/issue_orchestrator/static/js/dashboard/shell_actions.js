@@ -1,5 +1,5 @@
 async function showInfo() {
-    settingsMenu.classList.remove('visible');
+    closeSettingsMenu();
     const res = await fetch('/api/dialog/info');
     const data = await res.json();
     const html = (data.rows || []).map(row => `
@@ -9,14 +9,14 @@ async function showInfo() {
 }
 
 async function showConfig() {
-    settingsMenu.classList.remove('visible');
+    closeSettingsMenu();
     const res = await fetch('/api/dialog/config');
     const data = await res.json();
     openModal(data.title || 'Configuration', `<pre>${escapeHtml(data.config_text || '')}</pre>`);
 }
 
 async function showDebug() {
-    settingsMenu.classList.remove('visible');
+    closeSettingsMenu();
     const res = await fetch('/api/dialog/debug');
     const data = await res.json();
     let html = '';
@@ -31,7 +31,7 @@ async function showDebug() {
 }
 
 async function showDoctor() {
-    settingsMenu.classList.remove('visible');
+    closeSettingsMenu();
     const res = await fetch('/api/dialog/doctor');
     const data = await res.json();
 
@@ -57,7 +57,7 @@ async function showDoctor() {
 }
 
 function openRepo() {
-    settingsMenu.classList.remove('visible');
+    closeSettingsMenu();
     window.open(`https://github.com/${window.dashboardData.repo}`, '_blank');
 }
 
@@ -88,7 +88,7 @@ function formatNextRun(nextInfo) {
 }
 
 async function clearHistory() {
-    settingsMenu.classList.remove('visible');
+    closeSettingsMenu();
     if (!confirm('Clear all session history (completed, failed, etc.)?')) return;
     const res = await fetch('/api/history/clear', { method: 'POST' });
     const data = await res.json();

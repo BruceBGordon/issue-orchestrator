@@ -93,6 +93,16 @@
 .issue-detail-actions:empty {
     display: none;
 }
+/* Non-colour status text beside a drawer action (#6994): the queued/running
+   state must be legible without relying on the button's tint. */
+.issue-action-status {
+    align-self: center;
+    font-size: 12px;
+    color: var(--text-muted, var(--text));
+}
+.issue-action-status:empty {
+    display: none;
+}
 /* Issue story: status explanation */
 .issue-detail-status {
     padding: 2px 0 0;

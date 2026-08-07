@@ -50,6 +50,31 @@ class ProviderCircuitStatusContract(ContractBase):
     status_unavailable: bool = False
 
 
+class TechLeadRunActionsContract(ContractBase):
+    """State powering the two scoped tech-lead dashboard actions (#6994).
+
+    Advisory affordance data only. ``POST /api/tech-lead/runs`` re-decides
+    admission server-side on every click, so these flags shape what the operator
+    SEES, never what the engine allows.
+    """
+
+    # False when no tech lead agent is configured: the actions stay visible
+    # (discoverable) but disabled, pointing at Settings.
+    configured: bool
+    # True when the Repository Engine is paused; both actions disable rather
+    # than promise a run that nothing would start.
+    paused: bool
+    # "idle" | "queued" | "running" for the whole-board health review.
+    globalStatus: str
+    # Colour-independent status text ("" when idle) — never colour alone.
+    globalStatusLabel: str
+    queuedIssueNumbers: list[int] = Field(default_factory=list)
+    runningIssueNumbers: list[int] = Field(default_factory=list)
+    # True when a global run is queued or running, so newly requested targeted
+    # work waits behind it.
+    globalBarrierActive: bool
+
+
 class DashboardDataContract(ContractBase):
     startupComplete: bool
     paused: bool
@@ -71,6 +96,11 @@ class DashboardDataContract(ContractBase):
     # dropped producer value must fail the contract loudly rather than silently
     # reading as "no outage" and hiding a real provider outage from operators.
     providerCircuit: ProviderCircuitStatusContract
+    # Scoped tech-lead run affordances (#6994). Required (no default): the
+    # producer always emits it, and a dropped value must fail the contract
+    # loudly rather than silently reading as "no tech lead configured" and
+    # hiding both dashboard actions.
+    techLeadRuns: TechLeadRunActionsContract
 
 
 class DashboardViewModelContract(ContractBase):

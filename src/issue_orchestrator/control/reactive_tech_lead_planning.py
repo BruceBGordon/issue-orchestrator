@@ -29,11 +29,14 @@ from typing import TYPE_CHECKING, Optional
 
 from .actions import Action, CreateTechLeadIssueAction, QueueTechLeadAction
 from .health_review_trigger import plan_health_review_issue_creation
+from .tech_lead_run_admission import plan_tech_lead_launch_gate
+from ..domain.tech_lead_session import TechLeadSessionFlavor
 
 if TYPE_CHECKING:
-    from ..domain.models import DiscoveredFailure
+    from ..domain.models import DiscoveredFailure, PendingTechLeadReview
     from ..infra.config import Config
-    from .planner_types import OrchestratorSnapshot
+    from .planner_types import OrchestratorSnapshot, SkippedItem
+    from .tech_lead_launch_log import TechLeadLaunchLog
     from .tech_lead_reaction import TechLeadReaction
     from .workflows import TechLeadWorkflow
 
@@ -176,3 +179,55 @@ def plan_failure_investigations(
         logger.info("Planner: queuing tech_lead for failed issue #%d (%s)",
                    failure.issue_number, failure.failure_reason)
     return actions
+
+
+def eligible_tech_lead_launch_queue(
+    config: "Config",
+    snapshot: "OrchestratorSnapshot",
+    *,
+    suppressed_issue_numbers: frozenset[int],
+    launch_log: "TechLeadLaunchLog",
+    skipped: "list[SkippedItem]",
+) -> "list[PendingTechLeadReview]":
+    """The queued tech-lead runs still eligible to launch this tick (#6994).
+
+    Two independent filters, in order, both applied BEFORE capacity and the
+    provider gate so neither is ever reported as a capacity skip — a distinction
+    that matters to an operator, because "no capacity" invites raising
+    ``tech_lead.max_concurrent``, which would not release a single held run:
+
+    1. **Storm suppression** (#6780) — a failure investigation whose cohort was
+       escalated to an anchor this tick. Logged rather than silently dropped, so
+       its per-issue trace explains why it did not launch.
+    2. **Scope exclusivity** (#6994) — a global run is exclusive of every other
+       tech-lead run, and a queued one is a barrier. The rule belongs to the
+       run-admission owner (:func:`plan_tech_lead_launch_gate`); this only
+       records the barrier reason that owner supplies.
+
+    It lives here for the same reason the reaction model does: the planner's job
+    is to order and assemble a tick's actions, not to host the rules that decide
+    which tech-lead work is eligible in the first place.
+    """
+    from .planner_types import SkippedItem as _SkippedItem
+
+    pending: list["PendingTechLeadReview"] = []
+    for item in snapshot.pending_tech_lead:
+        if (
+            item.flavor is TechLeadSessionFlavor.FAILURE_INVESTIGATION
+            and item.issue_number in suppressed_issue_numbers
+        ):
+            launch_log.note_suppressed(item, len(snapshot.pending_tech_lead))
+        else:
+            pending.append(item)
+
+    gate = plan_tech_lead_launch_gate(config, pending, snapshot.active_sessions)
+    if gate.held:
+        reason = gate.barrier_reason or "tech_lead_scope_barrier"
+        skipped.extend(
+            _SkippedItem(
+                item_type="tech_lead", number=item.issue_number, reason=reason
+            )
+            for item in gate.held
+        )
+        launch_log.gate_skip(gate.held, reason)
+    return list(gate.launchable)

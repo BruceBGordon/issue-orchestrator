@@ -39,8 +39,12 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Protocol
 
-from ..domain.models import DiscoveredFailure, PendingTechLeadReview, SessionStatus
+from ..domain.models import DiscoveredFailure, PendingTechLeadReview
 from ..domain.tech_lead_session import TechLeadSessionFlavor
+from .tech_lead_run_admission import (
+    MANUAL_TECH_LEAD_LABEL,
+    manual_focus_failure,
+)
 
 if TYPE_CHECKING:
     from ..domain.models import OrchestratorState, Session
@@ -52,8 +56,8 @@ logger = logging.getLogger(__name__)
 # ``blocked*`` label (e.g. a plain open issue they want the tech lead to look
 # at). It rides along in ``DiscoveredFailure.blocking_label`` for evidence-map
 # context only; ``failure_reason`` is always ``timed_out`` so the reaction model
-# investigates regardless of the label.
-MANUAL_TECH_LEAD_LABEL = "manual-tech-lead"
+# investigates regardless of the label. Re-exported from the run-admission owner
+# (#6994) so both hand-aimed surfaces label their context identically.
 _BLOCKED_LABEL_PREFIX = "blocked"
 
 
@@ -537,18 +541,8 @@ def _focus_failure(
 ) -> DiscoveredFailure:
     """Build the focus failure fact fed to the tech_lead launch.
 
-    Modelled on :func:`.stuck_sweep._recovered_failure`: ``failure_reason`` is
-    ``timed_out`` (never ``blocked``) so the reaction model always INVESTIGATES
-    rather than treating a leaf issue as healthy waiting. The issue's real
-    terminal label rides along in ``blocking_label`` for evidence-map context.
+    Delegates to the run-admission owner (#6994) so a hand-aimed investigation
+    carries byte-for-byte the same typed context whether it was aimed from this
+    one-shot CLI or from the dashboard command surface.
     """
-    return DiscoveredFailure(
-        issue_number=issue.number,
-        issue_title=issue.title,
-        failure_reason=SessionStatus.TIMED_OUT.value,
-        blocking_label=blocking_label,
-        issue_body=issue.body or "",
-        issue_milestone=issue.milestone,
-        observed_at=observed_at,
-        artifact_hints=(),
-    )
+    return manual_focus_failure(issue, blocking_label, observed_at)

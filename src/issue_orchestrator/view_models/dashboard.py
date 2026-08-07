@@ -26,6 +26,7 @@ from .dependency_gate import (
 from .issue_card_labels import blocked_summary, display_labels as _display_labels
 from .issue_card_labels import provider_badge, provider_badge_payload, provider_signal
 from .provider_circuit import ProviderCircuitStatusView, read_provider_circuit_status
+from .tech_lead_run_actions import TechLeadRunActionsView, read_tech_lead_run_actions
 from .dashboard_e2e import E2E_PAGE_SIZE
 from .dashboard_e2e import build_e2e_items
 from .dashboard_e2e import build_e2e_view_model
@@ -38,7 +39,7 @@ from .dashboard_flow import apply_lane_precedence
 from .dashboard_flow import build_awaiting_merge_items
 from .dashboard_flow import build_flow_columns
 from .dashboard_flow import exclude_flow_overlaps
-from .dashboard_flow import select_issues_for_tab
+from .dashboard_flow import normalize_dashboard_tab, select_issues_for_tab
 from .dashboard_flow import stamp_issue_item_stale_badge_visibility
 from .rework_status import queued_rework_issue_numbers, resolve_queued_rework
 from .timestamp_values import dashboard_timestamp_source
@@ -100,6 +101,7 @@ class DashboardViewModel:
     agent_names: list[str]
 
     provider_circuit: ProviderCircuitStatusView
+    tech_lead_runs: TechLeadRunActionsView
 
     def template_context(self) -> dict[str, Any]:
         return {
@@ -166,6 +168,7 @@ class DashboardViewModel:
             "refresh": self.scope_summary.get("refresh", {}),
             "githubUsage": github_usage,
             "providerCircuit": self.provider_circuit.model_dump(mode="json"),
+            "techLeadRuns": self.tech_lead_runs.model_dump(mode="json", by_alias=True),
             "fetchLayerVisibilityAwareEnabled": self.scope_summary.get("refresh", {}).get("visibilityAwareEnabled", False),
             "fetchLayerSelectiveSyncPlannerEnabled": self.scope_summary.get("refresh", {}).get("selectiveSyncPlannerEnabled", False),
         }
@@ -1169,19 +1172,6 @@ def _history_time_fields(entry) -> tuple[str, bool]:
     return (f"{runtime} min", False) if runtime else ("", False)
 
 
-def _normalize_tab(active_tab: str) -> str:
-    # Map legacy tab names to new kanban-based tabs
-    if active_tab in {"work", "active", "queue", "flow"}:
-        return "kanban"
-    if active_tab == "attention":
-        return "kanban"
-    if active_tab in {"history", "merged"}:
-        return "kanban"
-    if active_tab in {"kanban", "blocked", "awaiting-merge", "completed", "e2e"}:
-        return active_tab
-    return "kanban"
-
-
 def build_dashboard_view_model(
     orchestrator,
     *,
@@ -1197,7 +1187,7 @@ def build_dashboard_view_model(
     projection never traverses the orchestrator's dependency container, and
     omitting the wiring is a hard error rather than a silently healthy fleet.
     """
-    active_tab = _normalize_tab(active_tab)
+    active_tab = normalize_dashboard_tab(active_tab)
     queue_page = max(queue_page, 1)
     e2e_page = max(e2e_page, 1)
 
@@ -1457,4 +1447,5 @@ def build_dashboard_view_model(
         agents=agents,
         agent_names=list(agents.keys()) if agents else [],
         provider_circuit=read_provider_circuit_status(provider_circuit),
+        tech_lead_runs=read_tech_lead_run_actions(config, state),
     )

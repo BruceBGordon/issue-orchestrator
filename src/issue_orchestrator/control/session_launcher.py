@@ -1194,6 +1194,11 @@ class SessionLauncher:
                 # A scratch investigation worktree is disposable: completion must
                 # always remove it, regardless of the cleanup config (#6823).
                 scratch_worktree=is_scratch_investigation,
+                # The producer's typed grant, carried onto the active session so
+                # the run coordinator can read a running tech-lead run's SCOPE
+                # (exclusive whole-board vs focused investigation) without a
+                # GitHub read (#6994).
+                tech_lead_scope=tech_lead_scope,
             )
 
             total_time = time.time() - launch_start

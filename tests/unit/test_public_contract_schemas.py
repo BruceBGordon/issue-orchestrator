@@ -54,6 +54,15 @@ def _dashboard_data_payload(**overrides: object) -> dict[str, object]:
             "next_retry_at": None,
             "entries": [],
         },
+        "techLeadRuns": {
+            "configured": True,
+            "paused": False,
+            "globalStatus": "idle",
+            "globalStatusLabel": "",
+            "queuedIssueNumbers": [],
+            "runningIssueNumbers": [],
+            "globalBarrierActive": False,
+        },
     }
     payload.update(overrides)
     return payload

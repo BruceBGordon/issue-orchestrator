@@ -1,7 +1,6 @@
 // Helper to hide settings menu (used by multiple functions)
 function hideSettingsMenu() {
-    const menu = document.getElementById('settingsMenu');
-    if (menu) menu.classList.remove('visible');
+    closeSettingsMenu();
 }
 
 function escapeHtml(text) {

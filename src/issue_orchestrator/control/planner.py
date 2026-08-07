@@ -35,7 +35,7 @@ from ..domain.models import (
 )
 from ..domain.post_publish_escalation import build_post_publish_escalation_comment
 from ..domain.tech_lead_naming import TECH_LEAD_DISPLAY_NAME
-from ..domain.tech_lead_session import TechLeadCreationOrigin, TechLeadSessionFlavor
+from ..domain.tech_lead_session import TechLeadCreationOrigin
 
 if TYPE_CHECKING:
     from .provider_resilience import ProviderResilienceManager
@@ -88,6 +88,7 @@ from .worker_budget import (
     tech_lead_slot_availability,
     worker_slot_availability,
 )
+from .reactive_tech_lead_planning import eligible_tech_lead_launch_queue
 from .reconciliation import build_expected_for_mutation
 from .stuck_sweep import build_stuck_sweep_escalation_actions
 from .planner_types import OrchestratorSnapshot, Plan, PlanContext, SkippedItem
@@ -1628,18 +1629,15 @@ Flip labels from `{facts.watch_label}` to `{self.config.tech_lead_reviewed_label
         if not self.tech_lead_workflow or not self.tech_lead_workflow.is_configured():
             return actions, skipped
 
-        # A failure-investigation whose storm cohort was escalated this tick is
-        # dropped from the launch set (#6780). Log the drop instead of removing
-        # it silently, so a suppressed item explains WHY in its per-issue trace.
-        pending_tech_lead = []
-        for item in snapshot.pending_tech_lead:
-            if (
-                item.flavor is TechLeadSessionFlavor.FAILURE_INVESTIGATION
-                and item.issue_number in suppressed_issue_numbers
-            ):
-                self._tech_lead_launch_log.note_suppressed(item, len(snapshot.pending_tech_lead))
-            else:
-                pending_tech_lead.append(item)
+        pending_tech_lead = eligible_tech_lead_launch_queue(
+            self.config,
+            snapshot,
+            suppressed_issue_numbers=suppressed_issue_numbers,
+            launch_log=self._tech_lead_launch_log,
+            skipped=skipped,
+        )
+        if not pending_tech_lead:
+            return actions, skipped
         # Provider eligibility precedes the workflow decision so the launching
         # event can never claim a launch the provider gate then suppresses
         # (#6892). One shared agent/provider => one gate for the whole queue.

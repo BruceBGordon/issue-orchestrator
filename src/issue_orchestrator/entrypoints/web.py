@@ -40,6 +40,7 @@ from .timeline_presentation import (
 )
 from .web_diagnostics_routes import install_web_diagnostics_dependencies, web_diagnostics_router
 from .web_retrospective_review_routes import web_retrospective_review_router
+from .web_tech_lead_routes import web_tech_lead_router
 from .web_issue_detail_routes import web_issue_detail_router
 from .web_log_routes import web_log_router
 from .web_operator_routes import install_web_operator_dependencies, web_operator_router
@@ -347,6 +348,7 @@ app.include_router(web_operator_router)
 app.include_router(web_diagnostics_router)
 app.include_router(web_retry_history_router)
 app.include_router(web_retrospective_review_router)
+app.include_router(web_tech_lead_router)
 app.include_router(web_session_router)
 app.include_router(web_issue_detail_router)
 

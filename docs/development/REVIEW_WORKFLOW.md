@@ -94,6 +94,44 @@ flowchart TD
   TFAIL -->|no| SKIP["No investigation"]
 ```
 
+## Requesting a Tech-Lead Run from the Dashboard
+
+Every tech-lead run — whether a timer, a failure, a problem storm, the one-shot
+CLI, or an operator's click started it — is admitted by one control-layer owner,
+`TechLeadRunCoordinator`. It models each run's **scope** explicitly:
+
+| Scope | Requested from | Concurrency |
+|---|---|---|
+| Global health review (whole board) | Dashboard actions menu → **Run board health review** | Exclusive: no other tech-lead run executes alongside it |
+| Issue investigation (one focus issue) | A blocked card's actions menu and the issue detail drawer → **Investigate with tech lead** | Up to `tech_lead.max_concurrent`, one run per issue |
+
+A queued global run acts as a **barrier**: targeted work queued behind it waits
+until it completes, and the global run itself waits for active tech-lead
+sessions to drain. `worker_budget.tech_lead_slot_availability` still owns the
+numeric capacity; the coordinator owns only the semantic conflicts, so the two
+cannot drift.
+
+Both dashboard actions POST one discriminated command to `/api/tech-lead/runs`:
+
+```json
+{"scope": {"kind": "issue", "issue_number": 42}}
+{"scope": {"kind": "global_health_review"}}
+```
+
+The response is a typed admission outcome — `queued`, `already_queued`,
+`already_running`, `paused`, `not_configured`, `not_eligible`, `claim_conflict`,
+or `failed` — with a machine-readable `reason` and human `detail` the dashboard
+surfaces as a durable toast. Repeated clicks coalesce onto one logical run
+(`run_key`), and an issue-scoped request is revalidated against GitHub right
+before it is queued, so a closed or no-longer-blocked target is refused rather
+than launched.
+
+Admission only ENQUEUES. The planner still launches, so a hand-aimed run gets
+byte-for-byte the same evidence map, launch authority, and sandboxing an
+automatic one does — and the dashboard never invokes the one-shot
+`orchestrator health-review` CLI, which would take the repository lock and pause
+planning under the running engine.
+
 ## Label State Transitions
 
 Labels are the source of truth for issue state. The orchestrator recovers from crashes by reading labels — no database required.

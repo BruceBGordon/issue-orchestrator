@@ -384,3 +384,21 @@ def select_issues_for_tab(
     if active_tab == "e2e":
         return e2e_items
     return active_items
+
+
+def normalize_dashboard_tab(active_tab: str) -> str:
+    """Map a requested (possibly legacy) tab name onto a tab that exists.
+
+    Beside :func:`select_issues_for_tab`: which tab is being shown and what
+    belongs on it are one policy, and an unknown name must resolve to a real
+    tab here rather than reaching a projection that has no rows for it.
+    """
+    if active_tab in {"work", "active", "queue", "flow"}:
+        return "kanban"
+    if active_tab == "attention":
+        return "kanban"
+    if active_tab in {"history", "merged"}:
+        return "kanban"
+    if active_tab in {"kanban", "blocked", "awaiting-merge", "completed", "e2e"}:
+        return active_tab
+    return "kanban"

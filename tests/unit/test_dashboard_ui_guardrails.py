@@ -404,6 +404,131 @@ def test_issue_detail_template_includes_retry_publish_button() -> None:
     assert 'id="issueDetailRetryPublishBtn"' in html
 
 
+# ---------------------------------------------------------------------------
+# Scoped tech-lead run actions (#6994)
+# ---------------------------------------------------------------------------
+
+
+def test_board_health_review_uses_the_explicit_label_in_the_actions_menu() -> None:
+    """The label must say what it does — "Run tech lead" is ambiguous between
+    the whole-board review and a focused investigation."""
+    html = _read(DASHBOARD_TEMPLATE)
+    attrs, text = _html_element(html, "button", "techLeadHealthReviewItem")
+
+    assert "Run board health review" in text
+    assert "Run tech lead" not in html
+    # Advanced, repository-wide operation: it lives in the dashboard actions
+    # menu, not on a card.
+    assert attrs["class"] == "settings-menu-item"
+    assert attrs["role"] == "menuitem"
+    assert attrs["onclick"] == "runBoardHealthReview()"
+
+
+def test_dashboard_actions_menu_stays_a_keyboard_reachable_native_menu() -> None:
+    html = _read(DASHBOARD_TEMPLATE)
+    menu_attrs, _ = _html_element(html, "div", "settingsMenu")
+    trigger_attrs, _ = _html_element(html, "button", "settingsMenuBtn")
+
+    assert menu_attrs["role"] == "menu"
+    assert menu_attrs["aria-label"] == "Dashboard actions"
+    # The trigger keeps its accessible name and popup semantics, and starts
+    # collapsed so `aria-expanded` is a real state rather than an absent one.
+    assert trigger_attrs["aria-label"] == "Dashboard actions"
+    assert trigger_attrs["aria-haspopup"] == "true"
+    assert trigger_attrs["aria-expanded"] == "false"
+
+
+def test_actions_menu_visibility_has_one_owner_that_mirrors_aria_expanded() -> None:
+    """A menu that looks closed but still reads as expanded is broken only for
+    assistive-tech users, so the class and the ARIA state get one writer."""
+    js = _read(DASHBOARD_JS)
+    body = _function_body(js, "setSettingsMenuVisible")
+
+    assert "classList.toggle('visible'" in body
+    assert "aria-expanded" in body
+    # No surface dismisses the menu behind the owner's back.
+    assert "settingsMenu.classList.remove('visible')" not in js
+
+
+def test_targeted_investigation_is_a_native_menu_item_and_a_native_drawer_button() -> None:
+    """Compact/expanded parity: the same action, the same exact label, on both
+    surfaces — a card's actions menu and the issue detail drawer."""
+    html = _read(DASHBOARD_TEMPLATE)
+    menu_attrs, menu_text = _html_element(html, "button", "menuInvestigateTechLead")
+    drawer_attrs, drawer_text = _html_element(
+        html, "button", "issueDetailInvestigateTechLeadBtn"
+    )
+
+    assert menu_text == "Investigate with tech lead"
+    assert drawer_text == "Investigate with tech lead"
+    assert menu_attrs["role"] == "menuitem"
+    assert menu_attrs["class"] == "context-menu-item"
+    assert drawer_attrs["class"] == "issue-action-btn"
+    assert drawer_attrs["onclick"] == "investigateWithTechLeadFromDrawer()"
+
+
+def test_targeted_investigation_status_is_a_live_region_not_colour_only() -> None:
+    html = _read(DASHBOARD_TEMPLATE)
+    attrs, _ = _html_element(html, "span", "issueDetailTechLeadStatus")
+
+    assert attrs["role"] == "status"
+    assert attrs["aria-live"] == "polite"
+
+
+def test_tech_lead_context_menu_item_is_keyboard_reachable() -> None:
+    js = _read(DASHBOARD_JS)
+
+    # It joins the same addKeyboardSupport list every other context-menu item
+    # is registered through, rather than relying on click alone.
+    assert "menuInvestigateTechLead]" in js
+    assert "addKeyboardSupport" in js
+
+
+def test_tech_lead_actions_go_through_the_ui_action_contract_builders() -> None:
+    contract = _read(UI_ACTION_CONTRACT_JS)
+    js = _read(DASHBOARD_JS)
+
+    assert "TECH_LEAD_RUNS: '/api/tech-lead/runs'" in contract
+    assert "buildGlobalHealthReviewRunRequest" in contract
+    assert "buildIssueInvestigationRunRequest" in contract
+    # The dashboard never hand-rolls the endpoint or the payload.
+    assert "uiActionContract.buildGlobalHealthReviewRunRequest()" in js
+    assert "uiActionContract.buildIssueInvestigationRunRequest(number)" in js
+    assert "'/api/tech-lead/runs'" not in js
+
+
+def test_tech_lead_requests_check_response_ok_and_surface_the_typed_detail() -> None:
+    js = _read(DASHBOARD_JS)
+    body = _function_body(js, "submitTechLeadRunRequest")
+
+    assert "res.ok" in body
+    assert "showToast" in body
+    # Errors and warnings are the sticky severities in showToast, so a typed
+    # rejection stays on screen until the operator dismisses it.
+    assert "'error'" in body and "'warning'" in body
+
+
+def test_disabled_tech_lead_actions_carry_a_reason_and_aria_state() -> None:
+    js = _read(DASHBOARD_JS)
+    body = _function_body(js, "applyTechLeadDisabledState")
+
+    assert "aria-disabled" in body
+    assert "button.title" in body
+    assert "statusEl.textContent" in body
+
+
+def test_tech_lead_disabled_and_status_styling_exists_in_the_css_bundle() -> None:
+    css = _read_dashboard_css_bundle()
+
+    assert '.settings-menu-item[aria-disabled="true"]' in css
+    assert ".settings-menu-status" in css
+    assert ".issue-action-status" in css
+
+
+def test_tech_lead_runs_chunk_is_registered_in_the_dashboard_bundle() -> None:
+    assert "tech_lead_runs.js" in DASHBOARD_JS_CHUNKS
+
+
 def test_issue_detail_timeline_filters_are_grouped_button_controls() -> None:
     js = _read(DASHBOARD_JS)
     css = _read_dashboard_css_bundle()
