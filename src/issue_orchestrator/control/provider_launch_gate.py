@@ -2,8 +2,15 @@
 
 Two questions, always in this order:
 
-1. Is the provider's circuit already open? (cheap — no subprocess)
-2. If not, does the provider's own credential probe say it is authenticated?
+1. Does the provider's own credential probe say it is authenticated?
+2. If so, is its circuit open for some other (transient) reason?
+
+The probe comes first even though it is the more expensive question, because it
+is also the only way *out* of an auth outage: while the circuit is open no
+session runs, so a gate that short-circuited on the open circuit could never
+observe the human re-authenticating and would stall the fleet for the full auth
+cooldown. The probe's own short-lived result cache keeps the real cost to about
+one local, non-interactive CLI call per provider per minute.
 
 Both answers arrive as typed values. Nothing here reads a banner, an exit code,
 or circuit arithmetic: :class:`ProviderAvailabilityPolicy` owns the provider
@@ -42,13 +49,12 @@ class ProviderLaunchGate:
         """Return a parking :class:`LaunchResult`, or ``None`` to proceed."""
         if not provider:
             return None
-        if result := self._park_for_open_circuit(provider, issue_number):
-            return result
         readiness = self.policy.probe_launch_readiness(provider)
         if readiness.launchable:
-            return None
+            # Healthy credentials still do not override a transient outage.
+            return self._park_for_open_circuit(provider, issue_number)
         # Probing may have just tripped the circuit (the policy feeds typed AUTH
-        # outcomes to the circuit owner), so re-ask for the blocked transition —
+        # outcomes to the circuit owner), so ask for the blocked transition —
         # that is what parks the issue with its durable record.
         parked = self._park_for_open_circuit(provider, issue_number)
         self.events.publish(make_trace_event(

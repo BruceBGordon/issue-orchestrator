@@ -224,6 +224,52 @@ class ProviderResilienceManager:
 
         return new_state
 
+    def clear_auth_failures(
+        self, provider: str | None, now: datetime | None = None
+    ) -> ProviderCircuitState | None:
+        """Retire an auth outage after the credential probe confirms recovery.
+
+        Recovery must NOT wait out :attr:`auth_cooldown_seconds`. That window is
+        long precisely because only a human can end a credential outage — and
+        the moment they do, the probe says so. Leaving the fleet parked for the
+        remaining hours would trade one stall for a longer one.
+
+        Closing the circuit here can also release a genuine *transient* outage a
+        little early, since one ``open_until`` records both. That is the right
+        way to be wrong: the next transient failure re-opens the circuit on its
+        own escalating ladder immediately, so the cost is at most one wasted
+        launch attempt, against hours of a wrongly-parked fleet.
+
+        Returns the updated state, or ``None`` when there was no auth outage.
+        """
+        if not provider:
+            return None
+        state = self.store.get(provider)
+        if state is None or state.consecutive_auth_failures == 0:
+            return None
+
+        now = now or _now()
+        was_open = state.open_until is not None and state.open_until > now
+        updated = ProviderCircuitState(
+            provider=provider,
+            open_until=None,
+            consecutive_outages=state.consecutive_outages,
+            last_error_summary=state.last_error_summary,
+            updated_at=now,
+            consecutive_auth_failures=0,
+        )
+        self.store.save(updated)
+
+        if was_open:
+            self.events.publish(make_trace_event(
+                EventName.PROVIDER_OUTAGE_EXITED,
+                {
+                    "provider": provider,
+                    "at": now.isoformat(),
+                },
+            ))
+        return updated
+
     def record_success(self, provider: str | None, now: datetime | None = None) -> None:
         if not provider:
             return

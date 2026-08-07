@@ -125,11 +125,17 @@ class ProviderAvailabilityPolicy:
     ) -> ProviderReadiness:
         """Return the typed readiness of ``provider``, feeding the circuit owner.
 
-        A confirmed auth failure is reported to
+        Both directions are reported to
         :class:`~.provider_resilience.ProviderResilienceManager` here rather
         than at the call sites, so the circuit is the only thing that decides
-        how many failures are tolerated and how long launches stay paused.
-        Control receives only the typed outcome — never a banner or exit code.
+        how many failures are tolerated, how long launches stay paused, and when
+        an outage is over. Control receives only the typed outcome — never a
+        banner or exit code.
+
+        Recovery goes through the *probe*, not through a successful session:
+        while the circuit is open no session runs, so waiting for one would be
+        the deadlock that makes the long auth cooldown a hard stall. A confirmed
+        ``READY`` probe is the human's re-authentication becoming visible.
         """
         if not provider:
             return ProviderReadiness.unknown("", "no provider configured")
@@ -140,6 +146,8 @@ class ProviderAvailabilityPolicy:
                 error_summary=readiness.detail or "provider is not authenticated",
                 now=now,
             )
+        elif readiness.authenticated:
+            self.provider_resilience.clear_auth_failures(provider, now=now)
         return readiness
 
     def should_add_blocked_label(self, issue_labels: Iterable[str], planned_labels: set[str]) -> bool:

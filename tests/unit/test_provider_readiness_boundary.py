@@ -239,7 +239,7 @@ class TestClaudeExpiredLoginPreflight:
         assert manager.is_open("claude-code")
         assert EventName.PROVIDER_AUTH_FAILED.value in events.names()
 
-    def test_ready_provider_leaves_the_circuit_untouched(self) -> None:
+    def test_ready_provider_leaves_a_healthy_circuit_untouched(self) -> None:
         events = RecordingEvents()
         manager = _manager(events)
         policy = ProviderAvailabilityPolicy(
@@ -251,6 +251,62 @@ class TestClaudeExpiredLoginPreflight:
         assert policy.probe_launch_readiness("claude-code").launchable
         assert not manager.is_open("claude-code")
         assert events.names() == []
+
+    def test_a_re_authenticated_provider_is_released_by_the_probe(self) -> None:
+        """The deadlock guard: no session can run to report the good news.
+
+        While the auth circuit is open nothing launches, so recovery has to be
+        observable from the probe alone — otherwise the fleet stays parked for
+        the whole (deliberately long) auth cooldown.
+        """
+        events = RecordingEvents()
+        manager = _manager(events)
+        outage = ProviderAvailabilityPolicy(
+            config=_config(),
+            provider_resilience=manager,
+            readiness_probe=StubReadinessProbe(
+                ProviderReadiness.auth_expired("claude-code", "not logged in")
+            ),
+        )
+        outage.probe_launch_readiness("claude-code")
+        assert manager.is_open("claude-code")
+
+        recovered = ProviderAvailabilityPolicy(
+            config=_config(),
+            provider_resilience=manager,
+            readiness_probe=StubReadinessProbe(ProviderReadiness.ready("claude-code")),
+        )
+        recovered.probe_launch_readiness("claude-code")
+
+        assert not manager.is_open("claude-code")
+
+    def test_the_gate_reopens_launches_after_re_authentication(self) -> None:
+        """End to end through the launcher: parked, then flowing again."""
+        from issue_orchestrator.control.provider_launch_gate import ProviderLaunchGate
+
+        events = RecordingEvents()
+        manager = _manager(events)
+
+        def gate_for(readiness: ProviderReadiness) -> ProviderLaunchGate:
+            return ProviderLaunchGate(
+                policy=ProviderAvailabilityPolicy(
+                    config=_config(),
+                    provider_resilience=manager,
+                    readiness_probe=StubReadinessProbe(readiness),
+                ),
+                events=events,
+                apply_actions=lambda actions, context: True,
+            )
+
+        parked = gate_for(
+            ProviderReadiness.auth_expired("claude-code", "not logged in")
+        ).check("claude-code", 123)
+        assert parked is not None and not parked.success
+
+        proceeded = gate_for(ProviderReadiness.ready("claude-code")).check(
+            "claude-code", 123
+        )
+        assert proceeded is None
 
     def test_launcher_parks_the_launch_without_spawning_a_session(
         self, tmp_path: Path
@@ -426,9 +482,15 @@ class TestSingleClassificationTable:
 
         assert classified is ProviderErrorType.AUTH
 
-    def test_timeout_without_an_auth_signature_is_still_transient(self) -> None:
+    @pytest.mark.parametrize(
+        "output", ["working...", "rate limit exceeded", "503 service unavailable"]
+    )
+    def test_timeout_without_an_auth_signature_is_still_transient(
+        self, output: str
+    ) -> None:
+        """Only AUTH overrides the timeout; other retry behaviour is untouched."""
         classified = classify_provider_error(
-            stdout="working...", stderr="", exit_code=None, timed_out=True
+            stdout=output, stderr="", exit_code=None, timed_out=True
         )
 
         assert classified is ProviderErrorType.TRANSIENT
@@ -651,15 +713,40 @@ class TestCircuitOwnership:
         assert state is not None
         assert state.open_until == now + timedelta(seconds=7200)
 
-    def test_a_successful_launch_clears_the_auth_circuit(self) -> None:
+    def test_a_confirmed_probe_clears_the_auth_circuit(self) -> None:
         """Recovery does not wait out the long cooldown."""
+        events = RecordingEvents()
+        manager = _manager(events)
+        manager.record_auth_failure("claude-code", error_summary="not logged in")
+        assert manager.is_open("claude-code")
+
+        cleared = manager.clear_auth_failures("claude-code")
+
+        assert cleared is not None
+        assert cleared.consecutive_auth_failures == 0
+        assert not manager.is_open("claude-code")
+        assert EventName.PROVIDER_OUTAGE_EXITED.value in events.names()
+
+    def test_clearing_a_healthy_provider_is_a_no_op(self) -> None:
+        """Nothing to retire means no write and no event."""
+        events = RecordingEvents()
+        manager = _manager(events)
+
+        assert manager.clear_auth_failures("claude-code") is None
+        assert events.names() == []
+
+    def test_clearing_auth_leaves_a_transient_outage_count_intact(self) -> None:
+        """Only the auth half is retired; the transient ladder keeps its place."""
         manager = _manager(RecordingEvents())
+        manager.record_transient_failure("claude-code", error_summary="503")
         manager.record_auth_failure("claude-code", error_summary="not logged in")
 
-        manager.record_success("claude-code")
+        manager.clear_auth_failures("claude-code")
 
-        assert not manager.is_open("claude-code")
-        assert manager.get_state("claude-code") is None
+        state = manager.get_state("claude-code")
+        assert state is not None
+        assert state.consecutive_auth_failures == 0
+        assert state.consecutive_outages == 1
 
     def test_transient_failures_do_not_disturb_the_auth_count(self) -> None:
         manager = _manager(RecordingEvents(), threshold=2)

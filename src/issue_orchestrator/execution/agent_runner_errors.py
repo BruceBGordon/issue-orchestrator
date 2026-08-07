@@ -119,17 +119,17 @@ def classify_provider_error(
     stdout/stderr in real-time so PTY output is preserved. The captured text
     is used here for transient error classification (retry logic).
 
-    A wall-clock timeout does **not** mask what the output says. An auth-dead
+    A wall-clock timeout does **not** mask an auth failure. An auth-dead
     provider sits at its login banner until the timeout fires, so classifying
     ``timed_out`` as TRANSIENT before reading the text is exactly how a
-    credential outage got retried as a blip (#6999). AUTH and RATE_LIMIT — the
-    two categories a retry cannot fix — win over the timeout; anything else
-    still degrades to TRANSIENT so retry behaviour is unchanged.
+    credential outage got retried as a blip (#6999). AUTH is the one category a
+    retry can never fix, so it wins over the timeout; every other timeout still
+    degrades to TRANSIENT, leaving existing retry behaviour untouched.
     """
     classified = classify_provider_output(f"{stdout}\n{stderr}")
 
     if timed_out:
-        if classified in (ProviderErrorType.AUTH, ProviderErrorType.RATE_LIMIT):
+        if classified is ProviderErrorType.AUTH:
             return classified
         return ProviderErrorType.TRANSIENT
 

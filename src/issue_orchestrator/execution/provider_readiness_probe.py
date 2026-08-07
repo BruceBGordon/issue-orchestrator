@@ -88,18 +88,6 @@ class CLIProviderReadinessProbe:
             "auth-failure signature not confirmed by the provider credential probe",
         )
 
-    def invalidate(self, provider: str | None = None) -> None:
-        """Drop cached readiness so the next check re-probes.
-
-        Used when something has plausibly changed the credential state (a human
-        re-authenticating, a circuit closing) and waiting out the TTL would
-        stall recovery.
-        """
-        if provider is None:
-            self._cache.clear()
-        else:
-            self._cache.pop(provider, None)
-
     def _cached(self, provider: str) -> ProviderReadiness | None:
         entry = self._cache.get(provider)
         if entry is None:
