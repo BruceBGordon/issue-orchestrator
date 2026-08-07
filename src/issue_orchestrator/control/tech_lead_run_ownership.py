@@ -191,8 +191,28 @@ class TechLeadRunOwnership:
         return remaining <= self._renew_before_expiry_seconds
 
 
+def single_instance_run_ownership() -> TechLeadRunOwnership:
+    """Run ownership for a deployment with no peer engines.
+
+    Backed by :class:`NullRunClaimStore`, which always wins — correct precisely
+    because with claims disabled there IS no other claimant. It lives here, with
+    the owner it constructs, so a caller that needs a default never has to know
+    which store and lease numbers make one.
+    """
+    from ..domain.lease_config import LeaseConfig
+    from ..ports.run_claim_store import NullRunClaimStore
+
+    lease = LeaseConfig()
+    return TechLeadRunOwnership(
+        NullRunClaimStore(),
+        lease_seconds=lease.lease_seconds,
+        renew_before_expiry_seconds=lease.renew_interval_seconds,
+    )
+
+
 __all__ = [
     "RunOwnership",
     "RunOwnershipVerdict",
     "TechLeadRunOwnership",
+    "single_instance_run_ownership",
 ]

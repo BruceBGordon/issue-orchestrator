@@ -793,7 +793,7 @@ class TestRestoredTechLeadScope:
         from issue_orchestrator.control.health_review_trigger import (
             HEALTH_REVIEW_MARKER_LABEL,
         )
-        from issue_orchestrator.control.tech_lead_run_admission import (
+        from issue_orchestrator.control.tech_lead_launch_planning import (
             plan_tech_lead_launch_gate,
         )
         from issue_orchestrator.domain.models import (

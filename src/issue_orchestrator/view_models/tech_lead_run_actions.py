@@ -43,6 +43,19 @@ _STATUS_LABELS = {
     STATUS_RUNNING: "Tech lead running",
 }
 
+# Why the engine as a whole cannot run tech-lead work right now. Resolved HERE,
+# in the order the admission owner applies it, so the dashboard renders a
+# sentence instead of re-deciding the policy in JavaScript — the UI is an
+# adapter, and a second copy of this order in the browser is exactly the drift
+# that lets a disabled button contradict the server's rejection.
+REASON_ENGINE_STOPPED = (
+    "The Repository Engine is not running. Start it to run tech-lead work."
+)
+REASON_NO_AGENT = "No tech lead agent is configured for this repository."
+REASON_ENGINE_PAUSED = (
+    "The Repository Engine is paused. Resume it to run tech-lead work."
+)
+
 
 class TechLeadRunActionsView(BaseModel):
     """What the dashboard needs to render the two tech-lead actions."""
@@ -80,6 +93,14 @@ class TechLeadRunActionsView(BaseModel):
     # work will wait behind it. Surfaced so the UI can say WHY, rather than
     # showing an action that appears to do nothing.
     global_barrier_active: bool = Field(serialization_alias="globalBarrierActive")
+    # "" when the engine can run tech-lead work; otherwise the one sentence the
+    # dashboard renders for BOTH actions. The engine-level availability policy
+    # therefore has exactly one implementation, on this side of the boundary.
+    unavailable_reason: str = Field(serialization_alias="unavailableReason")
+    # True only when the missing piece is configuration, i.e. when the operator's
+    # remedy is Settings. Published rather than inferred from ``configured`` so
+    # the UI never has to decide which remedy a state deserves.
+    needs_settings: bool = Field(serialization_alias="needsSettings")
 
     def issue_status(self, issue_number: int) -> str:
         """Status of the targeted action for one issue."""
@@ -108,6 +129,8 @@ class TechLeadRunActionsView(BaseModel):
             queued_issue_numbers=(),
             running_issue_numbers=(),
             global_barrier_active=False,
+            unavailable_reason=REASON_ENGINE_STOPPED,
+            needs_settings=False,
         )
 
 
@@ -136,10 +159,12 @@ def read_tech_lead_run_actions(
         global_status = STATUS_IDLE
 
     global_run_numbers = _global_run_issue_numbers(config, state)
+    configured = bool(config.tech_lead_review_agent)
+    paused = bool(state.paused)
     return TechLeadRunActionsView(
-        configured=bool(config.tech_lead_review_agent),
+        configured=configured,
         running=True,
-        paused=bool(state.paused),
+        paused=paused,
         global_status=global_status,
         global_status_label=_STATUS_LABELS[global_status],
         queued_issue_numbers=tuple(
@@ -155,7 +180,18 @@ def read_tech_lead_run_actions(
             )
         ),
         global_barrier_active=global_running or global_queued,
+        unavailable_reason=_unavailable_reason(configured, paused),
+        needs_settings=not configured,
     )
+
+
+def _unavailable_reason(configured: bool, paused: bool) -> str:
+    """Why neither action can run, in the admission owner's own order."""
+    if not configured:
+        return REASON_NO_AGENT
+    if paused:
+        return REASON_ENGINE_PAUSED
+    return ""
 
 
 def _global_run_issue_numbers(
@@ -184,6 +220,9 @@ def _is_focus_scope(scope: "TechLeadLaunchScope") -> bool:
 
 
 __all__ = [
+    "REASON_ENGINE_PAUSED",
+    "REASON_ENGINE_STOPPED",
+    "REASON_NO_AGENT",
     "STATUS_IDLE",
     "STATUS_QUEUED",
     "STATUS_RUNNING",

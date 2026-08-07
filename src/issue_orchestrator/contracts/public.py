@@ -77,6 +77,12 @@ class TechLeadRunActionsContract(ContractBase):
     # True when a global run is queued or running, so newly requested targeted
     # work waits behind it.
     globalBarrierActive: bool
+    # "" when the engine can run tech-lead work; otherwise the single sentence
+    # the dashboard renders for both actions. Published so engine-availability
+    # policy has one implementation, on the server side of the boundary.
+    unavailableReason: str = ""
+    # True only when the missing piece is configuration (remedy: Settings).
+    needsSettings: bool = False
 
 
 class DashboardDataContract(ContractBase):

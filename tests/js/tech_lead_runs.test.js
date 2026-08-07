@@ -141,19 +141,33 @@ function loadModule(overrides = {}) {
     return { context, calls, fetches, elements, listeners };
 }
 
+// One projection payload, exactly as the server publishes it. `unavailableReason`
+// and `needsSettings` are SERVER decisions (see `read_tech_lead_run_actions`), so
+// these tests state them explicitly rather than re-deriving the availability
+// policy here — re-deriving it is the drift the projection exists to prevent.
 function ready(overrides = {}) {
     return {
-        configured: true,
-        running: true,
-        paused: false,
         globalStatus: 'idle',
         globalStatusLabel: '',
         queuedIssueNumbers: [],
         runningIssueNumbers: [],
         globalBarrierActive: false,
+        unavailableReason: '',
+        needsSettings: false,
         ...overrides,
     };
 }
+
+const UNCONFIGURED = {
+    unavailableReason: 'No tech lead agent is configured for this repository.',
+    needsSettings: true,
+};
+const PAUSED = {
+    unavailableReason: 'The Repository Engine is paused. Resume it to run tech-lead work.',
+};
+const STOPPED = {
+    unavailableReason: 'The Repository Engine is not running. Start it to run tech-lead work.',
+};
 
 // ---------------------------------------------------------------------------
 // Request builders (the contract both actions go through)
@@ -295,7 +309,7 @@ test('an unconfigured engine explains itself in VISIBLE, associated text', () =>
     // tooltip is an explanation no keyboard or screen-reader user can reach.
     // The reason has to be on screen and programmatically associated (F7).
     const { context, elements } = loadModule();
-    context.window.dashboardData.techLeadRuns = ready({ configured: false });
+    context.window.dashboardData.techLeadRuns = ready(UNCONFIGURED);
 
     context.refreshTechLeadRunControls();
 
@@ -309,7 +323,7 @@ test('an unconfigured engine explains itself in VISIBLE, associated text', () =>
 
 test('an unconfigured engine offers a keyboard-reachable Settings control', () => {
     const { context, elements, calls } = loadModule();
-    context.window.dashboardData.techLeadRuns = ready({ configured: false });
+    context.window.dashboardData.techLeadRuns = ready(UNCONFIGURED);
 
     context.refreshTechLeadRunControls();
 
@@ -339,7 +353,7 @@ test('a stopped engine says so instead of blaming configuration', () => {
     // reporting a stopped engine as unconfigured sent operators to the wrong
     // place (#6994 round 1 F5).
     const { context, elements } = loadModule();
-    context.window.dashboardData.techLeadRuns = ready({ running: false });
+    context.window.dashboardData.techLeadRuns = ready(STOPPED);
 
     context.refreshTechLeadRunControls();
 
@@ -354,7 +368,7 @@ test('a stopped engine says so instead of blaming configuration', () => {
 
 test('a paused engine disables the global action instead of promising a run', () => {
     const { context, elements } = loadModule();
-    context.window.dashboardData.techLeadRuns = ready({ paused: true });
+    context.window.dashboardData.techLeadRuns = ready(PAUSED);
 
     context.refreshTechLeadMenuState();
 
@@ -378,7 +392,7 @@ test('a running global review shows non-colour status text on the menu item', ()
 
 test('a blocked-state action click while disabled warns and sends nothing', async () => {
     const { context, fetches, calls } = loadModule();
-    context.window.dashboardData.techLeadRuns = ready({ paused: true });
+    context.window.dashboardData.techLeadRuns = ready(PAUSED);
 
     await context.runBoardHealthReview();
 
@@ -492,7 +506,7 @@ test('the targeted action stays VISIBLE but disabled when the engine cannot run 
     // Hiding the control when no tech lead is configured makes the capability
     // undiscoverable; it must stay on screen with its reason (#6994 R1 F7).
     const { context, elements } = loadModule();
-    context.window.dashboardData.techLeadRuns = ready({ configured: false });
+    context.window.dashboardData.techLeadRuns = ready(UNCONFIGURED);
     const button = elements.get('issueDetailInvestigateTechLeadBtn');
     const status = elements.get('issueDetailTechLeadStatus');
 

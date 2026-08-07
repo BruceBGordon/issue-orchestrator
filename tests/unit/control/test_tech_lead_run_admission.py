@@ -18,11 +18,13 @@ from typing import Any, Optional
 
 import pytest
 
-from issue_orchestrator.control.tech_lead_run_admission import (
+from issue_orchestrator.control.tech_lead_launch_planning import (
     TechLeadLaunchGate,
-    TechLeadRunCoordinator,
     plan_tech_lead_launch_gate,
     plan_tech_lead_launch_revalidation,
+)
+from issue_orchestrator.control.tech_lead_run_admission import (
+    TechLeadRunCoordinator,
 )
 from issue_orchestrator.domain.tech_lead_run import (
     BARRIER_GLOBAL_AWAITING_DRAIN,

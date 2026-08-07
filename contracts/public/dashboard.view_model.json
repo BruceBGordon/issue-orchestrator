@@ -253,6 +253,11 @@
           "title": "Globalstatuslabel",
           "type": "string"
         },
+        "needsSettings": {
+          "default": false,
+          "title": "Needssettings",
+          "type": "boolean"
+        },
         "paused": {
           "title": "Paused",
           "type": "boolean"
@@ -275,6 +280,11 @@
           },
           "title": "Runningissuenumbers",
           "type": "array"
+        },
+        "unavailableReason": {
+          "default": "",
+          "title": "Unavailablereason",
+          "type": "string"
         }
       },
       "required": [

@@ -237,11 +237,11 @@ def test_a_batch_anchor_claims_its_OWN_global_identity_not_the_health_one():
 
 def test_the_tick_seam_defaults_to_single_instance_ownership_not_to_none():
     """No branch on "is coordination wired?" anywhere in the apply seam."""
-    from issue_orchestrator.control.orchestrator_support import (
-        _single_instance_run_ownership,
+    from issue_orchestrator.control.tech_lead_run_ownership import (
+        single_instance_run_ownership,
     )
 
-    ownership = _single_instance_run_ownership()
+    ownership = single_instance_run_ownership()
 
     assert ownership.claim("issue:42").owned is True
     assert ownership.owns("issue:42") is True

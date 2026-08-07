@@ -514,7 +514,10 @@ def test_disabled_tech_lead_actions_carry_a_reason_and_aria_state() -> None:
 
     assert "aria-disabled" in body
     assert "button.title" in body
-    assert "statusEl.textContent" in body
+    # The reason is VISIBLE text, programmatically associated — a disabled
+    # button is not focusable, so a tooltip alone is unreachable (#6994 F7).
+    assert "sink.textContent" in body
+    assert "aria-describedby" in body
 
 
 def test_tech_lead_disabled_and_status_styling_exists_in_the_css_bundle() -> None:

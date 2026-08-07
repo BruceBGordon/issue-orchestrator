@@ -18,24 +18,19 @@ const TECH_LEAD_STATUS_LABELS = {
     running: 'Tech lead running',
 };
 
-const TECH_LEAD_NOT_RUNNING_REASON = 'The Repository Engine is not running. Start it to run tech-lead work.';
-const TECH_LEAD_PAUSED_REASON = 'The Repository Engine is paused. Resume it to run tech-lead work.';
-const TECH_LEAD_UNCONFIGURED_REASON = 'No tech lead agent is configured for this repository.';
-
 // The projection the server publishes on every view-model refresh. Before the
 // first payload arrives the actions read as "engine not running", which
 // disables them rather than promising a run nothing would start — and, unlike
 // claiming the agent is unconfigured, does not send the operator to Settings
 // for a problem they may not have.
 const TECH_LEAD_RUNS_UNKNOWN = {
-    configured: true,
-    running: false,
-    paused: false,
     globalStatus: 'idle',
     globalStatusLabel: '',
     queuedIssueNumbers: [],
     runningIssueNumbers: [],
     globalBarrierActive: false,
+    unavailableReason: 'The Repository Engine is not running. Start it to run tech-lead work.',
+    needsSettings: false,
 };
 
 function techLeadRunState() {
@@ -50,33 +45,50 @@ function techLeadIssueStatus(issueNumber) {
     return 'idle';
 }
 
-// Why the action cannot run right now, or '' when it can. The same reasons the
-// server enforces, so the visible explanation never contradicts the rejection an
-// operator would get by clicking anyway. An in-flight run is its own reason,
-// read straight from the status vocabulary rather than re-branched here.
+// Why the action cannot run right now, or '' when it can.
 //
-// Order matters: engine liveness, then configuration, then pause, then run
-// state — the same order `TechLeadRunCoordinator` applies, so the reason shown
-// is the reason the server would give.
+// Both halves come from the server: the ENGINE-level sentence is published as
+// `unavailableReason` (resolved by `read_tech_lead_run_actions` in the same
+// order `TechLeadRunCoordinator` applies), and an in-flight run supplies its own
+// reason from the shared status vocabulary. Nothing about availability is
+// decided here — a second copy of that order in the browser is exactly how a
+// disabled button ends up contradicting the server's rejection.
 function techLeadActionBlockedReason(runStatus) {
-    const state = techLeadRunState();
-    if (state.running === false) return TECH_LEAD_NOT_RUNNING_REASON;
-    if (!state.configured) return TECH_LEAD_UNCONFIGURED_REASON;
-    if (state.paused) return TECH_LEAD_PAUSED_REASON;
-    return TECH_LEAD_STATUS_LABELS[runStatus] || '';
+    return techLeadRunState().unavailableReason
+        || TECH_LEAD_STATUS_LABELS[runStatus]
+        || '';
 }
 
-// True when the only thing missing is a configured tech lead agent, which is
-// the one blocked state the operator fixes in Settings.
+// Whether the operator's remedy is Settings. Published by the projection, not
+// inferred here, so the UI never decides which remedy a state deserves.
 function techLeadNeedsSettings() {
-    const state = techLeadRunState();
-    return state.running !== false && !state.configured;
+    return Boolean(techLeadRunState().needsSettings);
 }
 
-// A no-op status sink for surfaces that carry their state in the action's own
-// label (the compact card menu). No nulls: the owner always has somewhere to
-// write, so no caller needs a presence check.
-const NO_STATUS_TEXT = { textContent: '' };
+// Where an action writes its state text. Surfaces that carry their state in the
+// action's own label (the compact card menu) get this null object rather than
+// `null`, so the renderer below has NO presence checks to make: it always has
+// somewhere to write and something to associate. Each caller gets its own, so a
+// shared sink can never lend one control's id to another.
+function nullStatusSink() {
+    return {
+        id: '',
+        textContent: '',
+        parentNode: null,
+        setAttribute() {},
+        removeAttribute() {},
+    };
+}
+
+// Set an attribute, or remove it when the value is empty. One helper so the
+// present/absent rule is written once instead of at every aria call site.
+function setOrRemoveAttribute(element, name, value) {
+    if (value) {
+        element.setAttribute(name, value);
+        return;
+    }
+    element.removeAttribute(name);
+}
 
 // Render one action's availability.
 //
@@ -85,36 +97,29 @@ const NO_STATUS_TEXT = { textContent: '' };
 // A natively disabled button is not keyboard focusable, so a tooltip is an
 // explanation no keyboard or screen-reader user can reach (#6994 round 1 F7).
 // `title` is kept as well, purely as a pointer-user convenience.
-function applyTechLeadDisabledState(button, blockedReason, statusEl, statusText) {
+function applyTechLeadDisabledState(button, blockedReason, sink, runLabel) {
     if (!button) return;
     button.disabled = Boolean(blockedReason);
     // aria mirrors the real disabled state by construction, so the two cannot
-    // drift; the reason itself becomes the visible status text.
+    // drift; the reason itself becomes the visible text below.
     button.setAttribute('aria-disabled', String(button.disabled));
     button.title = blockedReason;
     // Text, never colour alone: the queued/running/blocked state stays readable
     // with no styling applied.
-    const visible = blockedReason || statusText;
-    if (statusEl && typeof statusEl.setAttribute === 'function') {
-        if (!statusEl.id) statusEl.id = `${button.id || 'techLeadAction'}Status`;
-        if (visible) {
-            button.setAttribute('aria-describedby', statusEl.id);
-        } else {
-            button.removeAttribute('aria-describedby');
-        }
-    }
-    if (statusEl) statusEl.textContent = visible;
-    applyTechLeadSettingsLink(button, statusEl);
+    const visible = blockedReason || runLabel;
+    sink.id = sink.id || `${button.id || 'techLeadAction'}Status`;
+    setOrRemoveAttribute(button, 'aria-describedby', visible ? sink.id : '');
+    sink.textContent = visible;
+    applyTechLeadSettingsLink(button, sink);
 }
 
 // A keyboard-reachable path to Settings, rendered beside the explanation when
 // (and only when) configuration is what is missing. A disabled button cannot
 // carry the operator anywhere, so the remedy has to be its own operable
 // control (#6994 round 1 F7).
-function applyTechLeadSettingsLink(button, statusEl) {
-    if (!statusEl || typeof document === 'undefined' || !document.createElement) return;
-    const host = statusEl.parentNode;
-    if (!host || typeof host.insertBefore !== 'function') return;
+function applyTechLeadSettingsLink(button, sink) {
+    const host = sink.parentNode;
+    if (!host || typeof document === 'undefined' || !document.createElement) return;
     const linkId = `${button.id || 'techLeadAction'}SettingsLink`;
     let link = document.getElementById(linkId);
     const wanted = techLeadNeedsSettings() && !button.hidden && button.style.display !== 'none';
@@ -135,7 +140,7 @@ function applyTechLeadSettingsLink(button, statusEl) {
         });
         if (typeof addKeyboardSupport === 'function') addKeyboardSupport(link);
     }
-    if (link.parentNode !== host) host.insertBefore(link, statusEl.nextSibling);
+    if (link.parentNode !== host) host.insertBefore(link, sink.nextSibling);
 }
 
 function refreshTechLeadMenuState() {
@@ -181,7 +186,7 @@ function refreshTechLeadCardMenuAction() {
     applyTechLeadDisabledState(
         button,
         techLeadActionBlockedReason(techLeadIssueStatus(number)),
-        NO_STATUS_TEXT,
+        nullStatusSink(),
         TECH_LEAD_STATUS_LABELS[techLeadIssueStatus(number)],
     );
     button.textContent = techLeadIssueActionLabel(number);
@@ -288,7 +293,8 @@ function resetTechLeadIssueAction(elements) {
 // Returns whether the action ended up visible.
 function updateTechLeadIssueAction(elements, issueNumber, isBlocked) {
     const eligible = Boolean(isBlocked);
-    const { button, statusEl = NO_STATUS_TEXT } = elements;
+    const { button, statusEl } = elements;
+    const sink = statusEl || nullStatusSink();
     if (!button) return false;
     button.style.display = eligible ? '' : 'none';
     const runStatus = eligible ? techLeadIssueStatus(issueNumber) : 'idle';
@@ -297,7 +303,7 @@ function updateTechLeadIssueAction(elements, issueNumber, isBlocked) {
     applyTechLeadDisabledState(
         button,
         blockedReason,
-        statusEl,
+        sink,
         eligible ? TECH_LEAD_STATUS_LABELS[runStatus] : '',
     );
     return eligible;

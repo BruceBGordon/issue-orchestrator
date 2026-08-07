@@ -364,6 +364,34 @@ def tech_lead_run_coordinator(
     )
 
 
+def reconcile_orchestrator_tech_lead_ownership(
+    orchestrator: TechLeadFacadeHost,
+) -> None:
+    """Renew claims for live tech-lead runs; withdraw the ones we lost (#6994).
+
+    One call per tick. The coordinator decides which runs this engine may still
+    act on; the CONSEQUENCE — a run whose shared claim went to a peer must leave
+    our queue, or we would launch work another engine is already doing — is
+    applied here, next to that policy, rather than in the facade.
+    """
+    from .session_routing import PendingSessionQueues
+    from .tech_lead_run_admission import run_key_of_pending
+
+    lost = set(tech_lead_run_coordinator(orchestrator).reconcile_ownership())
+    if not lost:
+        return
+    queues = PendingSessionQueues(orchestrator.state)
+    for item in list(orchestrator.state.pending_tech_lead_reviews):
+        if run_key_of_pending(item) in lost:
+            logger.warning(
+                "[TECH_LEAD] Withdrawing queued %s for #%d: another orchestrator"
+                " now owns this run",
+                item.flavor.value,
+                item.issue_number,
+            )
+            queues.remove_tech_lead(item.issue_number)
+
+
 def _facade_anchor_lifecycle(
     orchestrator: TechLeadFacadeHost,
 ) -> HealthReviewAnchorLifecycle:

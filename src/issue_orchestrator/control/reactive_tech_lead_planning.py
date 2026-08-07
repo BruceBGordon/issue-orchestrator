@@ -34,7 +34,7 @@ from .actions import (
     QueueTechLeadAction,
 )
 from .health_review_trigger import plan_health_review_issue_creation
-from .tech_lead_run_admission import (
+from .tech_lead_launch_planning import (
     plan_tech_lead_launch_gate,
     plan_tech_lead_launch_revalidation,
 )

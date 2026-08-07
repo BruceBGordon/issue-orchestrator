@@ -198,6 +198,8 @@ def test_the_payload_is_the_camel_case_shape_the_dashboard_reads():
         "queuedIssueNumbers": [42],
         "runningIssueNumbers": [],
         "globalBarrierActive": False,
+        "unavailableReason": "",
+        "needsSettings": False,
     }
 
 
@@ -220,3 +222,47 @@ def test_the_dashboard_data_payload_carries_the_projection():
     payload = _payload(view)
     assert payload["globalStatus"] == STATUS_RUNNING
     assert payload["globalBarrierActive"] is True
+
+
+# ---------------------------------------------------------------------------
+# Engine availability is decided HERE, not in the browser (#6994 round 1 F5/F7)
+#
+# The dashboard renders `unavailableReason` verbatim. Keeping the order that
+# produces it on this side of the boundary is what stops a disabled button from
+# contradicting the rejection the operator would get by clicking anyway.
+# ---------------------------------------------------------------------------
+
+
+def test_a_ready_engine_publishes_no_unavailable_reason():
+    view = read_tech_lead_run_actions(_config(), _state())
+
+    assert view.unavailable_reason == ""
+    assert view.needs_settings is False
+
+
+def test_a_missing_tech_lead_agent_names_settings_as_the_remedy():
+    view = read_tech_lead_run_actions(_config(agent=None), _state())
+
+    assert "No tech lead agent is configured" in view.unavailable_reason
+    assert view.needs_settings is True
+
+
+def test_a_paused_engine_says_resume_not_configure():
+    view = read_tech_lead_run_actions(_config(), _state(paused=True))
+
+    assert "paused" in view.unavailable_reason
+    assert view.needs_settings is False
+
+
+def test_a_stopped_engine_says_start_and_is_not_a_settings_problem():
+    view = TechLeadRunActionsView.empty()
+
+    assert "not running" in view.unavailable_reason
+    assert view.needs_settings is False
+
+
+def test_configuration_outranks_pause_the_way_admission_does():
+    """Same order the coordinator applies, so the two cannot disagree."""
+    view = read_tech_lead_run_actions(_config(agent=None), _state(paused=True))
+
+    assert "No tech lead agent is configured" in view.unavailable_reason

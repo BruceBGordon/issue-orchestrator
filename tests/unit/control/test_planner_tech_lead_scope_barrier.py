@@ -14,9 +14,7 @@ from pathlib import Path
 from issue_orchestrator.control.actions import ActionType
 from issue_orchestrator.control.planner import Planner
 from issue_orchestrator.control.scheduler import Scheduler
-from issue_orchestrator.control.tech_lead_run_admission import (
-    BARRIER_GLOBAL_RUN_QUEUED,
-)
+from issue_orchestrator.domain.tech_lead_run import BARRIER_GLOBAL_RUN_QUEUED
 from issue_orchestrator.control.workflows.tech_lead_workflow import TechLeadWorkflow
 from issue_orchestrator.domain.models import (
     AgentConfig,
