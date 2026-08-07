@@ -96,13 +96,14 @@ class EventName(str, Enum):
     SESSION_INVALID_COMPLETION_RECORD = "session.invalid_completion_record"
     SESSION_TIMEOUT_RECOVERED = "session.timeout_recovered"
     SESSION_PROCESSING_COMPLETED = "session.processing_completed"
-    # Two distinct, deliberately non-timeout provider-credential outcomes.
-    # Keeping both out of SESSION_TIMEOUT is the point: a timeout mints a
-    # substance failure-investigation, and a credential problem has none.
+    # Two distinct, deliberately non-timeout provider outcomes. Keeping both
+    # out of SESSION_TIMEOUT is the point: a timeout mints a substance
+    # failure-investigation, and a provider problem has none.
     #
-    # A launch that never happened: the gate probed before spawning and parked
-    # the work instead. Nothing ran, so there is nothing to explain about it.
-    SESSION_LAUNCH_FAILED_AUTH = "session.launch_failed_auth"
+    # A launch that never happened: the gate asked the provider before spawning
+    # and it refused — an expired login, or a CLI that is not installed. Nothing
+    # ran, so there is nothing to explain about the work itself.
+    SESSION_LAUNCH_BLOCKED_PROVIDER = "session.launch_blocked_provider"
     # A session that *did* launch and is being terminated because its provider
     # is not authenticated. A separate name because the reader's question is
     # different — "what happened to my running session" versus "why did nothing
@@ -235,7 +236,13 @@ class EventName(str, Enum):
     PROVIDER_TRANSIENT_ERROR = "provider.transient_error"
     # A typed AUTH outcome reached the circuit owner: the provider's own
     # credential probe says it is not logged in. Fleet-scoped like its
-    # neighbours; the issue-scoped consequence is SESSION_LAUNCH_FAILED_AUTH.
+    # neighbours — it names a circuit, not an issue. Which issue-scoped event
+    # follows depends on where the work was when it hit the outage:
+    #   * circuit still closed (sub-threshold): the launch gate refuses the
+    #     launch => SESSION_LAUNCH_BLOCKED_PROVIDER
+    #   * circuit open: planning parks the work up front => PROVIDER_ISSUE_BLOCKED
+    #   * a session already running: it is terminated
+    #     => SESSION_PROVIDER_AUTH_TERMINATED
     PROVIDER_AUTH_FAILED = "provider.auth_failed"
     PROVIDER_OUTAGE_ENTERED = "provider.outage_entered"
     PROVIDER_RETRY_SCHEDULED = "provider.retry_scheduled"
@@ -404,7 +411,7 @@ class PublicEventName(str, Enum):
     SESSION_FAILED = "session.failed"
     SESSION_TIMEOUT = "session.timeout"
     SESSION_BLOCKED = "session.blocked"
-    SESSION_LAUNCH_FAILED_AUTH = "session.launch_failed_auth"
+    SESSION_LAUNCH_BLOCKED_PROVIDER = "session.launch_blocked_provider"
     SESSION_PROVIDER_AUTH_TERMINATED = "session.provider_auth_terminated"
     SESSION_NO_COMPLETION_RECORD = "session.no_completion_record"
     SESSION_INVALID_COMPLETION_RECORD = "session.invalid_completion_record"

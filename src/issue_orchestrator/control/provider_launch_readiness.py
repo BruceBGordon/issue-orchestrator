@@ -53,14 +53,23 @@ class ProviderLaunchReadiness:
         return self.outcomes.get(provider)
 
     def blocks(self, provider: str | None) -> bool:
-        """Whether ``provider`` must not be launched against this tick."""
-        outcome = self.outcome_for(provider)
-        return outcome is not None and not outcome.may_launch
+        """Whether planning must not queue work for ``provider`` this tick.
 
-    def blocked_by_credentials(self, provider: str | None) -> bool:
-        """Whether the provider itself refused — only a human can clear it."""
+        The *circuit* decides, not the raw readiness. That is deliberate: a
+        readiness refusal that has not opened the circuit — a sub-threshold auth
+        sample, or a provider that is simply not installed — has no issue-scoped
+        consequence available at planning time, because the provider-impact
+        command only records a transition when a circuit is actually open.
+        Suppressing planning on it would drop the work with nothing to show for
+        it on any issue (#6999 F6).
+
+        So planning defers those to the launch gate, which refuses the launch
+        per issue and says why. Once the circuit opens, planning parks the work
+        up front and the impact command records it. Every non-launchable state
+        therefore has exactly one owner and one issue-scoped outcome.
+        """
         outcome = self.outcome_for(provider)
-        return outcome is not None and outcome.blocked_by_credentials
+        return outcome is not None and outcome.circuit_open
 
 
 @dataclass(frozen=True)
@@ -92,10 +101,11 @@ class ProviderLaunchReadinessSampler:
             if not outcome.may_launch:
                 logger.info(
                     "[PROVIDER] %s is not launchable this tick: readiness=%s "
-                    "circuit_open=%s",
+                    "circuit_open=%s (planning %s)",
                     provider,
                     outcome.readiness.state.value,
                     outcome.circuit_open,
+                    "parks the work" if outcome.circuit_open else "defers to the launch gate",
                 )
         return ProviderLaunchReadiness(outcomes=outcomes)
 

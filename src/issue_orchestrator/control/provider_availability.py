@@ -65,8 +65,14 @@ class ProviderLaunchOutcome:
         return self.readiness.launchable and not self.circuit_open
 
     @property
-    def blocked_by_credentials(self) -> bool:
-        """Whether the provider itself refused — only a human can clear this."""
+    def blocked_by_readiness(self) -> bool:
+        """Whether the provider's own probe refused, whatever the reason.
+
+        Covers an expired login and a provider that is not installed. Both are
+        human-fixable in the sense that agent retries are pure waste, but only
+        the former is an *auth* failure — the circuit owner is told about that
+        one alone (#6999 F6).
+        """
         return not self.readiness.launchable
 
     @classmethod

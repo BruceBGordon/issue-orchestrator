@@ -63,7 +63,8 @@ class ProviderAuthOutcome:
     ) -> "ProviderAuthOutcome":
         """Build from the observation's typed readiness, or fail loudly.
 
-        A missing or unnamed readiness cannot produce a usable outcome: the
+        A missing, unnamed or non-auth readiness cannot produce a usable
+        outcome: the
         circuit owner would get no provider to record against and the
         provider-impact command would have nothing to assess, so the session
         would end BLOCKED with the outage invisible. Manufacturing an empty
@@ -71,10 +72,10 @@ class ProviderAuthOutcome:
         forbids — the malformed observation is the bug, and it should surface
         as one (#6999 F9).
         """
-        if readiness is None or not readiness.provider:
+        if readiness is None or not readiness.provider or not readiness.human_fixable:
             raise ValueError(
-                "a PROVIDER_AUTH_FAILED observation must carry a named "
-                f"ProviderReadiness; got {readiness!r}"
+                "a PROVIDER_AUTH_FAILED observation must carry a named, "
+                f"auth-expired ProviderReadiness; got {readiness!r}"
             )
         return cls(
             provider=readiness.provider,

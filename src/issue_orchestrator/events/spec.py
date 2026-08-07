@@ -61,7 +61,7 @@ EVENT_SPEC: dict[PublicEventName, EventSpec] = {
     PublicEventName.SESSION_FAILED: EventSpec(phase='in_progress', step='failed', status='failed', level='detail'),
     PublicEventName.SESSION_TIMEOUT: EventSpec(phase='in_progress', step='timeout', status='failed', level='detail'),
     PublicEventName.SESSION_BLOCKED: EventSpec(phase='in_progress', step='blocked', status='failed', level='detail'),
-    PublicEventName.SESSION_LAUNCH_FAILED_AUTH: EventSpec(phase='in_progress', step='launch_failed_auth', status='failed', level='detail'),
+    PublicEventName.SESSION_LAUNCH_BLOCKED_PROVIDER: EventSpec(phase='in_progress', step='launch_blocked_provider', status='failed', level='detail'),
     PublicEventName.SESSION_PROVIDER_AUTH_TERMINATED: EventSpec(phase='in_progress', step='provider_auth_terminated', status='failed', level='detail'),
     PublicEventName.SESSION_NO_COMPLETION_RECORD: EventSpec(phase='in_progress', step='no_completion_record', status='completed', level='detail'),
     PublicEventName.SESSION_INVALID_COMPLETION_RECORD: EventSpec(phase='in_progress', step='invalid_completion_record', status='failed', level='detail'),

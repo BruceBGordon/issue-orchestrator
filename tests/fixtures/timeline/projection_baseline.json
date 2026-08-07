@@ -791,11 +791,11 @@
     "status": "failed",
     "step": "invalid_completion_record"
   },
-  "session.launch_failed_auth": {
+  "session.launch_blocked_provider": {
     "level": "detail",
     "phase": "in_progress",
     "status": "failed",
-    "step": "launch_failed_auth"
+    "step": "launch_blocked_provider"
   },
   "session.launched": {
     "level": "detail",

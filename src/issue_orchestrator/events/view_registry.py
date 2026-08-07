@@ -191,13 +191,14 @@ VIEW_REGISTRY: dict[str, list[ViewEvent]] = {
     "provider.issue_unblocked": [
         _user("provider.issue_unblocked", "Provider block cleared", "orchestrator"),
     ],
-    # User-visible on purpose: this is the story replacing "timed out" for an
-    # unauthenticated provider. A reader must be able to tell at a glance that
-    # the issue's substance was never the problem — the credential was (#6999).
-    "session.launch_failed_auth": [
+    # User-visible on purpose: this is the story replacing "timed out" when a
+    # provider refuses. A reader must be able to tell at a glance that the
+    # issue's substance was never the problem — the provider was (#6999). Worded
+    # for every refusal the gate can report, not only an expired login.
+    "session.launch_blocked_provider": [
         _user(
-            "session.launch_failed_auth",
-            "Provider not authenticated — launch parked",
+            "session.launch_blocked_provider",
+            "Provider not ready — launch blocked",
             "orchestrator",
         ),
     ],

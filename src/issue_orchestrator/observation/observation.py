@@ -70,6 +70,25 @@ class SessionObservationResult:
     # so control never re-reads a banner: the provider adapter already decided.
     provider_readiness: Optional[ProviderReadiness] = None
 
+    def __post_init__(self) -> None:
+        """Enforce the cross-field invariant on the type, not on one factory.
+
+        A ``PROVIDER_AUTH_FAILED`` observation is only meaningful with a named,
+        auth-expired readiness: control hands that provider to the circuit owner
+        and the provider-impact command, so a missing or ``READY`` value would
+        terminate the session while recording the outage nowhere. Checking it
+        here means no construction path can bypass it — a convenience
+        classmethod is not a boundary (#6999 F9).
+        """
+        if self.observation is not SessionObservation.PROVIDER_AUTH_FAILED:
+            return
+        readiness = self.provider_readiness
+        if readiness is None or not readiness.human_fixable or not readiness.provider:
+            raise ValueError(
+                "a PROVIDER_AUTH_FAILED observation requires a named, "
+                f"auth-expired ProviderReadiness; got {readiness!r}"
+            )
+
     @property
     def is_terminal(self) -> bool:
         """Check if this observation represents a terminal state.
@@ -126,17 +145,9 @@ class SessionObservationResult:
     ) -> "SessionObservationResult":
         """Create observation for a session whose provider is not authenticated.
 
-        A ``PROVIDER_AUTH_FAILED`` observation without a concrete auth-expired
-        readiness is malformed: control would have no provider to hand the
-        circuit owner and no impact to record, so the session would be
-        terminated with the outage silently unrecorded. Rejected here, at
-        construction, rather than tolerated downstream (#6999 F9).
+        The auth-expired invariant is enforced by ``__post_init__``, so it holds
+        for this constructor and for direct dataclass construction alike.
         """
-        if readiness is None or not readiness.human_fixable or not readiness.provider:
-            raise ValueError(
-                "provider_auth_failed requires a named, auth-expired "
-                f"ProviderReadiness; got {readiness!r}"
-            )
         return cls(
             observation=SessionObservation.PROVIDER_AUTH_FAILED,
             session_exists=session_exists,

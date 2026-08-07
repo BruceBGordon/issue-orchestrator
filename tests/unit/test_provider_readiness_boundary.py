@@ -14,7 +14,7 @@ importantly — pin that the boundary has exactly ONE owner per concern:
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -239,7 +239,7 @@ class TestClaudeExpiredLoginPreflight:
         outcome = policy.assess_launch("claude-code")
 
         assert not outcome.may_launch
-        assert outcome.blocked_by_credentials
+        assert outcome.blocked_by_readiness
         assert probe.launch_calls == ["claude-code"]
         # The circuit — not the caller — decided to pause the fleet.
         assert outcome.circuit_open
@@ -331,7 +331,7 @@ class TestClaudeExpiredLoginPreflight:
         assert not result.success
         assert "not ready" in result.reason
         assert harness.created == []
-        assert EventName.SESSION_LAUNCH_FAILED_AUTH.value in harness.event_names()
+        assert EventName.SESSION_LAUNCH_BLOCKED_PROVIDER.value in harness.event_names()
 
     def test_launcher_proceeds_past_the_gate_when_the_provider_is_ready(
         self, tmp_path: Path
@@ -345,7 +345,7 @@ class TestClaudeExpiredLoginPreflight:
         # The gate really ran (not skipped by an earlier precondition) and let
         # the launch through.
         assert probe.launch_calls == ["claude-code"]
-        assert EventName.SESSION_LAUNCH_FAILED_AUTH.value not in harness.event_names()
+        assert EventName.SESSION_LAUNCH_BLOCKED_PROVIDER.value not in harness.event_names()
 
     def test_default_policy_never_claims_a_provider_is_authenticated(self) -> None:
         """With no probe wired, readiness is UNKNOWN — not READY, not blocked."""
@@ -373,7 +373,9 @@ class _LauncherHarness:
     the gate spawns a session, not about worktree mechanics.
     """
 
-    def __init__(self, tmp_path: Path, probe) -> None:
+    def __init__(
+        self, tmp_path: Path, probe, *, manager=None, events=None, config=None
+    ) -> None:
         from unittest.mock import MagicMock
 
         from issue_orchestrator.control.session_launcher import SessionLauncher
@@ -403,17 +405,18 @@ class _LauncherHarness:
             MockWorktreeManager,
         )
 
-        prompt_path = tmp_path / "prompt.md"
-        prompt_path.write_text("Test prompt")
-        config = Config(repo="test/repo", repo_root=tmp_path)
-        config.agents = {
-            "agent:backend": AgentConfig(
-                prompt_path=prompt_path, provider="claude-code", model="sonnet"
-            )
-        }
+        if config is None:
+            prompt_path = tmp_path / "prompt.md"
+            prompt_path.write_text("Test prompt")
+            config = Config(repo="test/repo", repo_root=tmp_path)
+            config.agents = {
+                "agent:backend": AgentConfig(
+                    prompt_path=prompt_path, provider="claude-code", model="sonnet"
+                )
+            }
 
         self.created: list[str] = []
-        self.events = MockEventSink()
+        self.events = events if events is not None else MockEventSink()
         self.launcher = SessionLauncher(
             config=config,
             events=self.events,
@@ -435,7 +438,7 @@ class _LauncherHarness:
                 name, n, timeout_minutes=timeout
             ),
             get_review_machine=lambda pr, issue: ReviewStateMachine(pr, issue),
-            provider_resilience=_manager(self.events),
+            provider_resilience=manager if manager is not None else _manager(self.events),
             board_snapshot_provider=NullBoardSnapshotProvider(),
             agent_callback_endpoint=ready_callback_endpoint(),
             provider_readiness_probe=probe,
@@ -450,6 +453,9 @@ class _LauncherHarness:
             labels=["agent:backend"],
             repo="test/repo",
         )
+        return self.launch_issue(issue)
+
+    def launch_issue(self, issue):
         return self.launcher.launch_issue_session(issue, [])
 
     def event_names(self) -> list[str]:
@@ -638,7 +644,7 @@ class TestDistinctAuthOutcome:
         assert decision.blocked_label is None
         names = events.names()
         assert names.count(EventName.SESSION_PROVIDER_AUTH_TERMINATED.value) == 1
-        assert EventName.SESSION_LAUNCH_FAILED_AUTH.value not in names
+        assert EventName.SESSION_LAUNCH_BLOCKED_PROVIDER.value not in names
 
     def test_auth_observation_is_terminal(self) -> None:
         observation = SessionObservationResult.provider_auth_failed(
@@ -950,18 +956,27 @@ PROVIDER = "claude-code"
 
 @dataclass
 class _RecordingProbe:
-    """A probe handing out one fixed sample, recording every launch question."""
+    """A probe handing out one fixed sample, recording every launch question.
+
+    The sample carries a stable id, exactly as the real probe's short-lived
+    cache does within its TTL: the tick sampler and the launch-gate recheck see
+    ONE physical observation, so the circuit counts it once.
+    """
 
     readiness: ProviderReadiness
+    sample_id: str = "sample-1"
     launch_calls: list[str] = field(default_factory=list)
+
+    def _sample(self) -> ProviderReadiness:
+        return replace(self.readiness, sample_id=self.sample_id)
 
     def check_launch_readiness(self, provider: str) -> ProviderReadiness:
         self.launch_calls.append(provider)
-        return self.readiness
+        return self._sample()
 
     def diagnose_session_output(self, provider: str, output: str) -> ProviderReadiness:
         del output
-        return self.readiness
+        return self._sample()
 
 
 def _recovery_config(tmp_path: Path):
@@ -1557,7 +1572,7 @@ class TestIndependentOutageCauses:
 
         outcome = policy.assess_launch("claude-code")
 
-        assert not outcome.blocked_by_credentials  # credentials are fine...
+        assert not outcome.blocked_by_readiness  # credentials are fine...
         assert outcome.circuit_open  # ...but the service outage still holds
         assert not outcome.may_launch
 
@@ -1958,7 +1973,7 @@ class TestLiveAuthEventIsToldOnce:
         observer.observe_session(session)
 
         assert EventName.SESSION_PROVIDER_AUTH_TERMINATED.value not in events.names()
-        assert EventName.SESSION_LAUNCH_FAILED_AUTH.value not in events.names()
+        assert EventName.SESSION_LAUNCH_BLOCKED_PROVIDER.value not in events.names()
 
     def test_the_controller_announces_a_termination_not_a_parked_launch(
         self, tmp_path: Path
@@ -1985,7 +2000,7 @@ class TestLiveAuthEventIsToldOnce:
 
         names = events.names()
         assert names.count(EventName.SESSION_PROVIDER_AUTH_TERMINATED.value) == 1
-        assert EventName.SESSION_LAUNCH_FAILED_AUTH.value not in names
+        assert EventName.SESSION_LAUNCH_BLOCKED_PROVIDER.value not in names
 
     def test_the_launch_gate_still_owns_the_parked_launch_story(self) -> None:
         """The two concepts stay distinct: nothing ran, versus something was stopped."""
@@ -2007,7 +2022,7 @@ class TestLiveAuthEventIsToldOnce:
         gate.check("claude-code", 123)
 
         names = events.names()
-        assert names.count(EventName.SESSION_LAUNCH_FAILED_AUTH.value) == 1
+        assert names.count(EventName.SESSION_LAUNCH_BLOCKED_PROVIDER.value) == 1
         assert EventName.SESSION_PROVIDER_AUTH_TERMINATED.value not in names
 
 
@@ -2177,3 +2192,252 @@ class TestMalformedAuthObservationFailsLoudly:
         assert decision.provider_auth_failure is not None
         assert decision.provider_auth_failure.provider == "claude-code"
         assert decision.provider_auth_failure.sample_id == "sample-1"
+
+
+# ---------------------------------------------------------------------------
+# The production tick boundary (#6999 F6)
+#
+# Everything above tests a seam. This exercises the real chain a running
+# orchestrator uses — run_planning_cycle -> sampler -> FactGatherer -> Planner
+# -> ActionApplier -> SessionLauncher/ProviderLaunchGate — so a regression that
+# forgets to carry the sample into the snapshot, or plans an action nothing
+# applies, cannot pass.
+# ---------------------------------------------------------------------------
+
+
+class _ProductionTick:
+    """One real planning cycle over a real applier and a real launcher."""
+
+    def __init__(
+        self,
+        tmp_path: Path,
+        readiness: ProviderReadiness,
+        *,
+        threshold: int = 1,
+        auth_cooldown: int = 21600,
+    ) -> None:
+        from unittest.mock import MagicMock
+
+        from issue_orchestrator.control.action_applier import ActionApplier
+        from issue_orchestrator.control.fact_gatherer import FactGatherer
+        from issue_orchestrator.control.label_manager import LabelManager
+        from issue_orchestrator.control.planner import Planner
+        from issue_orchestrator.control.provider_availability import (
+            ProviderAvailabilityPolicy,
+        )
+        from issue_orchestrator.control.provider_launch_readiness import (
+            ProviderLaunchReadinessSampler,
+        )
+        from issue_orchestrator.control.scheduler import Scheduler
+        from issue_orchestrator.control.session_manager import SessionType
+        from issue_orchestrator.domain.models import OrchestratorState
+        from tests.conftest import MockGitHubAdapter
+        from tests.unit.test_planner import make_issue
+
+        self.config = _recovery_config(tmp_path)
+        # No fetch this tick: the seeded queue IS the queue, so label mutations
+        # applied by the real applier are what the next tick sees.
+        self.config.fetch_layer_network_sync_seconds = 3600
+        self.events = RecordingEvents()
+        self.manager = ProviderResilienceManager(
+            config=_resilience_config(threshold=threshold, auth_cooldown=auth_cooldown),
+            store=InMemoryProviderCircuitStore(),
+            events=self.events,
+        )
+        self.probe = _RecordingProbe(readiness)
+        self.labels = LabelManager(self.config)
+
+        self.github = MockGitHubAdapter()
+        self.github.issues = [make_issue(7, labels=["agent:backend"])]
+
+        self.launched: list[int] = []
+        self.launcher = _LauncherHarness(
+            tmp_path,
+            self.probe,
+            manager=self.manager,
+            events=self.events,
+            config=self.config,
+        )
+
+        def _launch(session_type, number):
+            if session_type is not SessionType.ISSUE:
+                return None
+            issue = self.github.get_issue(number)
+            result = self.launcher.launch_issue(issue)
+            if result.success:
+                self.launched.append(number)
+            return result.session
+
+        self.applier = ActionApplier(
+            labels=self.github,
+            sessions=MagicMock(),
+            events=self.events,
+            repository_host=self.github,
+            label_manager=self.labels,
+            session_launcher=_launch,
+        )
+        self.sampler = ProviderLaunchReadinessSampler(
+            config=self.config,
+            policy=ProviderAvailabilityPolicy(
+                self.config, self.manager, self.labels, readiness_probe=self.probe
+            ),
+        )
+        self.fact_gatherer = FactGatherer(
+            config=self.config, repository_host=self.github, events=self.events
+        )
+        self.planner = Planner(
+            config=self.config,
+            scheduler=Scheduler(self.config),
+            provider_resilience=self.manager,
+            label_manager=self.labels,
+        )
+        self.state = OrchestratorState()
+        self.state.cached_queue_issues = self.github.issues
+        self.state.cached_scope_issues = self.github.issues
+
+    def tick(self) -> None:
+        import time
+        from unittest.mock import Mock
+
+        from issue_orchestrator.control.orchestrator_support import (
+            IssueFetchResilience,
+            run_planning_cycle,
+        )
+
+        run_planning_cycle(
+            config=self.config,
+            events=self.events,
+            event_context=Mock(enrich=lambda payload: payload),
+            state=self.state,
+            fact_gatherer=self.fact_gatherer,
+            planner=self.planner,
+            repository_host=self.github,
+            scheduler=Mock(),
+            github_workflow=Mock(),
+            apply_plan_fn=self._apply,
+            clear_discovered_facts_fn=Mock(),
+            last_network_sync=time.time(),
+            refresh_requested=False,
+            inflight_stable_ids={},
+            issue_fetch_resilience=IssueFetchResilience("owner/repo"),
+            provider_launch_sampler=self.sampler,
+        )
+
+    def _apply(self, plan) -> None:
+        for action in plan.actions:
+            self.applier.apply(action)
+
+    def issue_labels(self) -> set[str]:
+        return set(self.github.get_issue_labels(7))
+
+    def event_names(self) -> list[str]:
+        return self.events.names()
+
+
+class TestTheProductionTickExplainsEveryProviderRefusal:
+    """Every non-launchable sample must leave one issue-scoped consequence."""
+
+    def test_a_sub_threshold_auth_sample_is_refused_at_the_launch_gate(
+        self, tmp_path: Path
+    ) -> None:
+        """Threshold 2: the first sample does not open the circuit.
+
+        Planning must NOT silently suppress the work here — the provider-impact
+        command has no open circuit to record, so the issue would be dropped
+        with nothing on it to explain why. The launch gate owns this case and
+        says so per issue (#6999 F6).
+        """
+        tick = _ProductionTick(
+            tmp_path,
+            ProviderReadiness.auth_expired(PROVIDER, "not logged in"),
+            threshold=2,
+        )
+
+        tick.tick()
+
+        assert not tick.manager.is_open(PROVIDER)  # sub-threshold
+        assert tick.launched == []  # ...but nothing was spawned
+        names = tick.event_names()
+        assert names.count(EventName.SESSION_LAUNCH_BLOCKED_PROVIDER.value) == 1
+        assert tick.labels.provider_unavailable not in tick.issue_labels()
+
+    def test_a_not_installed_provider_is_refused_without_an_auth_failure(
+        self, tmp_path: Path
+    ) -> None:
+        """A missing CLI is not a credential problem and must not be counted as one."""
+        tick = _ProductionTick(
+            tmp_path, ProviderReadiness.not_installed(PROVIDER, "claude not on PATH")
+        )
+
+        tick.tick()
+
+        assert tick.launched == []
+        assert tick.manager.get_state(PROVIDER) is None  # no auth failure recorded
+        assert EventName.PROVIDER_AUTH_FAILED.value not in tick.event_names()
+        assert (
+            tick.event_names().count(EventName.SESSION_LAUNCH_BLOCKED_PROVIDER.value)
+            == 1
+        )
+
+    def test_an_open_circuit_parks_the_issue_once_across_repeated_ticks(
+        self, tmp_path: Path
+    ) -> None:
+        """Two parked ticks, one issue-scoped event and one label.
+
+        The second tick re-plans against the label the first tick applied, so
+        the impact command's mutation is a no-op and records nothing further.
+        Anything else would re-announce the same outage every tick forever.
+        """
+        tick = _ProductionTick(
+            tmp_path, ProviderReadiness.auth_expired(PROVIDER, "not logged in")
+        )
+
+        tick.tick()
+        tick.tick()
+
+        assert tick.manager.is_open(PROVIDER)
+        assert tick.launched == []
+        assert tick.labels.provider_unavailable in tick.issue_labels()
+        names = tick.event_names()
+        # Both ticks really ran a full cycle — otherwise "exactly once" would be
+        # satisfied by the second tick doing nothing at all.
+        assert names.count(EventName.PLAN_COMPUTED.value) == 2
+        assert names.count(EventName.PROVIDER_ISSUE_BLOCKED.value) == 1
+        # Planning parked the work, so the launch gate was never reached.
+        assert EventName.SESSION_LAUNCH_BLOCKED_PROVIDER.value not in names
+
+    def test_a_ready_probe_reaches_the_launcher_before_the_cooldown(
+        self, tmp_path: Path
+    ) -> None:
+        """Recovery, end to end: the session actually starts.
+
+        The circuit is open on a six-hour auth cooldown with nothing expired.
+        The tick's sample sees READY, the circuit closes, planning queues the
+        launch, the applier calls the launcher, and the gate lets it through.
+        """
+        tick = _ProductionTick(
+            tmp_path, ProviderReadiness.ready(PROVIDER), auth_cooldown=21600
+        )
+        tick.manager.record_auth_failure(
+            PROVIDER, error_summary="not logged in", sample_id="earlier-outage"
+        )
+        assert tick.manager.is_open(PROVIDER)
+
+        tick.tick()
+
+        assert not tick.manager.is_open(PROVIDER)
+        assert tick.launched == [7]
+        assert EventName.SESSION_LAUNCH_BLOCKED_PROVIDER.value not in tick.event_names()
+
+    def test_a_healthy_provider_launches_without_any_provider_event(
+        self, tmp_path: Path
+    ) -> None:
+        """The gate is scoped to refusals; it blocks and announces nothing else."""
+        tick = _ProductionTick(tmp_path, ProviderReadiness.ready(PROVIDER))
+
+        tick.tick()
+
+        assert tick.launched == [7]
+        names = tick.event_names()
+        assert EventName.SESSION_LAUNCH_BLOCKED_PROVIDER.value not in names
+        assert EventName.PROVIDER_ISSUE_BLOCKED.value not in names

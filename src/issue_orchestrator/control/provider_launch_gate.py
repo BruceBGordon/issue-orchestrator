@@ -50,7 +50,7 @@ class ProviderLaunchGate:
         if not provider:
             return None
         outcome = self.policy.assess_launch(provider)
-        if not outcome.blocked_by_credentials:
+        if not outcome.blocked_by_readiness:
             # Healthy credentials still do not override a transient outage.
             return self._park_for_open_circuit(provider, issue_number)
         readiness = outcome.readiness
@@ -59,7 +59,7 @@ class ProviderLaunchGate:
         # that is what parks the issue with its durable record.
         parked = self._park_for_open_circuit(provider, issue_number)
         self.events.publish(make_trace_event(
-            EventName.SESSION_LAUNCH_FAILED_AUTH,
+            EventName.SESSION_LAUNCH_BLOCKED_PROVIDER,
             {
                 "issue_number": issue_number,
                 "provider": provider,
