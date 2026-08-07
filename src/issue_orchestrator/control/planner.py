@@ -28,7 +28,6 @@ from typing import TYPE_CHECKING, Callable, Optional
 from ..infra.config import Config
 from ..infra.logging_config import issue_log
 from ..ports.issue import Issue
-from ..ports.provider_readiness import NO_PROVIDER_READINESS_PROBE, ProviderReadinessProbe
 from ..domain.models import (
     PendingTechLeadReview,
     TechLeadFacts,
@@ -137,7 +136,6 @@ class Planner:
         provider_resilience: Optional["ProviderResilienceManager"] = None,
         label_manager: Optional["LabelManager"] = None,
         clock: Callable[[], float] = time.time,
-        provider_readiness_probe: ProviderReadinessProbe = NO_PROVIDER_READINESS_PROBE,
     ):
         """Initialize planner with its dependencies.
 
@@ -149,7 +147,6 @@ class Planner:
             rework_workflow: Optional rework decision logic
             tech_lead_workflow: Optional tech_lead decision logic
             label_manager: Label registry for prefix-aware queries.
-            provider_readiness_probe: Typed provider-readiness boundary (#6999).
         """
         self.config = config
         self.scheduler = scheduler
@@ -160,7 +157,7 @@ class Planner:
         self.tech_lead_workflow = tech_lead_workflow
         self.provider_resilience = provider_resilience
         self.provider_policy = ProviderAvailabilityPolicy(
-            config, provider_resilience, readiness_probe=provider_readiness_probe
+            config, provider_resilience
         ) if provider_resilience else None
         if label_manager is None:
             from .label_manager import LabelManager
@@ -539,7 +536,7 @@ class Planner:
                     tech_lead_launch_count, capacity,
                 )
             issue_actions, issue_skipped, _ = self._plan_issues(
-                snapshot, capacity, worker_active_count
+                snapshot, capacity, worker_active_count, plan_context
             )
             actions.extend(issue_actions)
             skipped.extend(issue_skipped)
@@ -732,19 +729,20 @@ class Planner:
 
         return actions
 
-    def _provider_blocking_launch(self, agent_label: str | None) -> str | None:
+    def _provider_blocking_launch(
+        self, snapshot: OrchestratorSnapshot, agent_label: str | None
+    ) -> str | None:
         """The provider this queue item must not launch against, if any.
 
-        Every queue asks this one question in one place, through the bounded
-        launch assessment — which samples readiness before consulting the
-        circuit, so an open auth outage cannot suppress its own recovery
-        (#6999 F1/A1). ``None`` includes the no-policy case.
+        A pure read of the tick's sampled fact: the probe ran, and the circuit
+        was consulted and updated, before planning began (#6999 A3). Every
+        queue asks it the same way, so eligibility cannot drift between them.
         """
         policy = self.provider_policy
         if policy is None:
             return None
         provider = policy.provider_for_agent_label(agent_label)
-        if provider and policy.blocks_launch(provider):
+        if provider and snapshot.provider_launch.blocks(provider):
             return provider
         return None
 
@@ -1162,6 +1160,7 @@ Flip labels from `{facts.watch_label}` to `{self.config.tech_lead_reviewed_label
         snapshot: OrchestratorSnapshot,
         capacity: int,
         worker_active_count: int,
+        plan_context: PlanContext,
     ) -> tuple[list[Action], list[SkippedItem], int]:
         """Plan which issues to launch.
 
@@ -1225,20 +1224,25 @@ Flip labels from `{facts.watch_label}` to `{self.config.tech_lead_reviewed_label
                     issue_key=issue.key.stable_id(),
                 ))
 
-        # Filter out providers with open circuit
-        if self.provider_policy:
-            filtered: list[Issue] = []
-            for issue in available:
-                if provider := self._provider_blocking_launch(issue.agent_type):
-                    skipped.append(SkippedItem(
-                        item_type="issue",
-                        number=issue.number,
-                        reason=f"provider unavailable: {provider}",
-                    ))
-                    logger.info(issue_log(issue.number, "Skipped: reason=provider_unavailable provider=%s"), provider)
-                    continue
-                filtered.append(issue)
-            available = filtered
+        # Filter out issues whose provider cannot be launched against. Routed
+        # through the shared skip owner like every other queue, so the issue
+        # gets the provider-impact transition (blocked label + durable record)
+        # rather than vanishing from the plan unexplained (#6999 F6).
+        filtered: list[Issue] = []
+        for issue in available:
+            if provider := self._provider_blocking_launch(snapshot, issue.agent_type):
+                self._record_provider_skip(
+                    issue_number=issue.number,
+                    item_type="issue",
+                    item_number=issue.number,
+                    provider=provider,
+                    actions=actions,
+                    skipped=skipped,
+                    plan_context=plan_context,
+                )
+                continue
+            filtered.append(issue)
+        available = filtered
 
         # Filter out issues already being worked on, just completed, or failed this cycle.
         # Include both discovered (new this tick) and pending (queued for launch) reviews/reworks
@@ -1385,7 +1389,7 @@ Flip labels from `{facts.watch_label}` to `{self.config.tech_lead_reviewed_label
         if decision.should_launch:
             for review in decision.reviews_to_launch[:capacity]:
                 reviewer_label = self.config.get_reviewer_for_agent(review.agent_label) if review.agent_label else self.config.code_review_agent
-                if provider := self._provider_blocking_launch(reviewer_label):
+                if provider := self._provider_blocking_launch(snapshot, reviewer_label):
                     self._record_provider_skip(
                         issue_number=review.issue_number,
                         item_type="review",
@@ -1441,7 +1445,7 @@ Flip labels from `{facts.watch_label}` to `{self.config.tech_lead_reviewed_label
         if decision.should_launch:
             for review in decision.reviews_to_launch[:capacity]:
                 reviewer_label = self.config.get_reviewer_for_agent(review.agent_label)
-                if provider := self._provider_blocking_launch(reviewer_label):
+                if provider := self._provider_blocking_launch(snapshot, reviewer_label):
                     self._record_provider_skip(
                         issue_number=review.issue_number,
                         item_type="retrospective_review",
@@ -1511,7 +1515,7 @@ Flip labels from `{facts.watch_label}` to `{self.config.tech_lead_reviewed_label
                 if issue_num is None:
                     logger.warning("Planner: skipping rework with unresolved issue number: %s", rework.issue_key)
                     continue
-                if provider := self._provider_blocking_launch(rework.agent_type):
+                if provider := self._provider_blocking_launch(snapshot, rework.agent_type):
                     self._record_provider_skip(
                         issue_number=issue_num,
                         item_type="rework",
@@ -1589,7 +1593,7 @@ Flip labels from `{facts.watch_label}` to `{self.config.tech_lead_reviewed_label
                 logger.info(issue_log(issue_number, "Skipped validation retry: reason=active_session"))
                 continue
 
-            blocking_provider = self._provider_blocking_launch(retry.agent_label)
+            blocking_provider = self._provider_blocking_launch(snapshot, retry.agent_label)
             if blocking_provider:
                 self._record_provider_skip(
                     issue_number=issue_number,
@@ -1652,7 +1656,7 @@ Flip labels from `{facts.watch_label}` to `{self.config.tech_lead_reviewed_label
         # Provider eligibility precedes the workflow decision so the launching
         # event can never claim a launch the provider gate then suppresses
         # (#6892). One shared agent/provider => one gate for the whole queue.
-        if provider := self._provider_blocking_launch(self.config.tech_lead_review_agent):
+        if provider := self._provider_blocking_launch(snapshot, self.config.tech_lead_review_agent):
             for tech_lead in pending_tech_lead:
                 self._record_provider_skip(
                     issue_number=tech_lead.issue_number,

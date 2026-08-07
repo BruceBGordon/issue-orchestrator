@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from ..events import EventHub
     from ..ports.agent_callback_endpoint import AgentCallbackEndpoint
+    from ..ports.completion_handler_factory import CompletionHandlerFactory
     from ..ports.session_launcher_factory import SessionLauncherFactory
     from ..ports.label_store import LabelStore
     from ..ports.queue_cache_store import QueueCacheStore
@@ -115,6 +116,9 @@ class OrchestratorDeps:
     # Builds the session launcher. Assembly lives at the composition
     # root; the facade supplies only its own callbacks (#6924 A3-R2).
     session_launcher_factory: "SessionLauncherFactory"
+    # Same split for the completion handler: the facade supplies only its own
+    # runtime state, never the dependency-container layout (#6999 A4).
+    completion_handler_factory: "CompletionHandlerFactory"
 
     # IO adapters
     worktree_manager: "WorktreeManager"

@@ -867,6 +867,9 @@ def build_test_orchestrator_deps(
     from issue_orchestrator.control.label_sync import LabelSync
     from issue_orchestrator.control.board_snapshot_builder import BoardSnapshotBuilder
     from issue_orchestrator.control.orchestrator_deps import OrchestratorDeps
+    from issue_orchestrator.entrypoints.bootstrap_completion import (
+        build_completion_handler_factory,
+    )
     from issue_orchestrator.entrypoints.bootstrap_session_launcher import (
         build_session_launcher_factory,
     )
@@ -1101,6 +1104,17 @@ def build_test_orchestrator_deps(
             label_manager=label_manager,
             agent_callback_endpoint=agent_callback_endpoint,
             provider_readiness_probe=readiness_probe,
+        ),
+        # Same shape again for the completion handler (#6999 A4).
+        completion_handler_factory=build_completion_handler_factory(
+            config,
+            events=events,
+            repository_host=repo_host,
+            session_output=session_output,
+            tech_lead_authority=tech_lead_authority,
+            open_issue_corpus=open_issue_corpus,
+            label_manager=label_manager,
+            provider_resilience=provider_resilience,
         ),
         repository_host=repo_host,
         e2e_issue_tracker=e2e_issue_tracker,

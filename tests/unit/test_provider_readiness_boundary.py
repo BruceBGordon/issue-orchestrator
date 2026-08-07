@@ -126,20 +126,25 @@ class RecordingEvents:
         ]
 
 
-def _manager(events, *, threshold: int = 1, auth_cooldown: int = 21600):
+def _resilience_config(*, threshold: int = 1, auth_cooldown: int = 21600):
     from issue_orchestrator.infra.config_models import (
         ProviderCircuitBreakerConfig,
         ProviderResilienceConfig,
     )
 
-    config = ProviderResilienceConfig(
+    return ProviderResilienceConfig(
         circuit_breaker=ProviderCircuitBreakerConfig(
             auth_failure_threshold=threshold,
             auth_cooldown_seconds=auth_cooldown,
         )
     )
+
+
+def _manager(events, *, threshold: int = 1, auth_cooldown: int = 21600):
     return ProviderResilienceManager(
-        config=config, store=InMemoryProviderCircuitStore(), events=events
+        config=_resilience_config(threshold=threshold, auth_cooldown=auth_cooldown),
+        store=InMemoryProviderCircuitStore(),
+        events=events,
     )
 
 
@@ -1086,48 +1091,109 @@ def _planned_launch_kinds(actions) -> set[str]:
     return kinds
 
 
-def _recovery_planner(config, manager, probe, workflows):
+def _sample_and_plan(config, manager, probe, workflows, snapshot):
+    """Run the real tick order: sample readiness, then plan against the fact.
+
+    Deliberately mirrors ``run_planning_cycle``: the sampler probes and feeds
+    the circuit BEFORE planning, and the planner only reads the resulting fact.
+    A planner that probed for itself would not be a pure function of its
+    snapshot (#6999 F6/A3).
+    """
+    from dataclasses import replace
+
     from issue_orchestrator.control.planner import Planner
+    from issue_orchestrator.control.provider_availability import (
+        ProviderAvailabilityPolicy,
+    )
+    from issue_orchestrator.control.provider_launch_readiness import (
+        ProviderLaunchReadinessSampler,
+    )
     from issue_orchestrator.control.scheduler import Scheduler
     from issue_orchestrator.control.workflows import TechLeadWorkflow
 
-    return Planner(
+    sampler = ProviderLaunchReadinessSampler(
+        config=config,
+        policy=ProviderAvailabilityPolicy(
+            config, manager, readiness_probe=probe
+        ),
+    )
+    planner = Planner(
         config=config,
         scheduler=Scheduler(config),
         tech_lead_workflow=TechLeadWorkflow(config, RecordingEvents()),
         provider_resilience=manager,
-        provider_readiness_probe=probe,
         **workflows,
     )
+    return planner.plan(replace(snapshot, provider_launch=sampler.sample()))
+
+
+def _apply_impact_actions(actions, events) -> list[int]:
+    """Apply every provider-impact command the plan produced.
+
+    The plan is only half the story: the blocked label and the durable
+    issue-scoped record are applied by the command, and that is where the
+    user-visible event comes from.
+    """
+    from issue_orchestrator.control.actions import ActionResult
+    from issue_orchestrator.control.provider_impact import (
+        ApplyProviderImpactAction,
+        apply_provider_impact,
+    )
+
+    labelled: list[int] = []
+
+    def _apply_label(action):
+        labelled.append(action.issue_number)
+        return ActionResult.ok(action)
+
+    for action in actions:
+        if isinstance(action, ApplyProviderImpactAction):
+            apply_provider_impact(
+                action, apply_label=_apply_label, publish=events.publish
+            )
+    return labelled
 
 
 @pytest.mark.parametrize("queue", sorted(_LAUNCH_FOR_QUEUE))
 class TestPlanningReleasesTheAuthOutage:
     """Every planner queue must be able to observe re-authentication."""
 
-    def test_open_auth_circuit_suppresses_the_queue(self, queue, tmp_path) -> None:
-        """Baseline: while the provider really is dead, nothing is planned."""
+    def test_open_auth_circuit_parks_the_queue_with_a_durable_record(
+        self, queue, tmp_path
+    ) -> None:
+        """While the provider really is dead: no launch, and the issue is parked.
+
+        Parking is not just an absent launch action. The issue gets the
+        provider-impact transition — blocked label plus the issue-scoped
+        record that survives the label being shed — so an operator can see why
+        nothing happened (#6999 F6).
+        """
         config = _recovery_config(tmp_path)
         manager = _manager(RecordingEvents())
         probe = _RecordingProbe(
-            ProviderReadiness.auth_expired(PROVIDER, "not logged in", )
+            ProviderReadiness.auth_expired(PROVIDER, "not logged in")
         )
         snapshot, workflows = _queue_snapshot(queue)
 
-        plan = _recovery_planner(config, manager, probe, workflows).plan(snapshot)
+        plan = _sample_and_plan(config, manager, probe, workflows, snapshot)
 
         assert _LAUNCH_FOR_QUEUE[queue] not in _planned_launch_kinds(plan.actions)
         assert manager.is_open(PROVIDER)
+        applied_events = RecordingEvents()
+        assert _apply_impact_actions(plan.actions, applied_events) == [7]
+        assert (
+            applied_events.names().count(EventName.PROVIDER_ISSUE_BLOCKED.value) == 1
+        )
 
     def test_a_ready_probe_reopens_the_queue_before_the_cooldown(
         self, queue, tmp_path
     ) -> None:
         """The deadlock guard, on the real production path.
 
-        The circuit is open on a six-hour auth cooldown and nothing has expired.
-        Planning still asks the provider, sees READY, and the launch flows —
-        which is only possible because planning takes a readiness sample rather
-        than peeking at the circuit (#6999 F1).
+        The circuit is open on a six-hour auth cooldown and nothing has
+        expired. The pre-planning sample still asks the provider, sees READY,
+        and the launch flows — which is only possible because the sample is
+        taken before the circuit is consulted (#6999 F1).
         """
         config = _recovery_config(tmp_path)
         manager = _manager(RecordingEvents(), auth_cooldown=21600)
@@ -1138,11 +1204,68 @@ class TestPlanningReleasesTheAuthOutage:
         probe = _RecordingProbe(ProviderReadiness.ready(PROVIDER))
         snapshot, workflows = _queue_snapshot(queue)
 
-        plan = _recovery_planner(config, manager, probe, workflows).plan(snapshot)
+        plan = _sample_and_plan(config, manager, probe, workflows, snapshot)
 
-        assert probe.launch_calls, "the queue never asked the provider"
+        assert probe.launch_calls, "the tick never asked the provider"
         assert not manager.is_open(PROVIDER)
         assert _LAUNCH_FOR_QUEUE[queue] in _planned_launch_kinds(plan.actions)
+        assert _apply_impact_actions(plan.actions, RecordingEvents()) == []
+
+
+def test_planning_never_probes_or_writes_the_circuit(tmp_path: Path) -> None:
+    """Planner purity: it is a pure function of its snapshot (#6999 F6/A3).
+
+    Given a snapshot whose sampled fact already says the provider is fine, a
+    plan must not touch the probe or the circuit — even with an unauthenticated
+    provider sitting behind that probe.
+    """
+    from issue_orchestrator.control.planner import Planner
+    from issue_orchestrator.control.scheduler import Scheduler
+
+    config = _recovery_config(tmp_path)
+    events = RecordingEvents()
+    manager = _manager(events)
+    probe = _RecordingProbe(
+        ProviderReadiness.auth_expired(PROVIDER, "not logged in")
+    )
+    snapshot, workflows = _queue_snapshot("coding")
+    planner = Planner(
+        config=config,
+        scheduler=Scheduler(config),
+        provider_resilience=manager,
+        **workflows,
+    )
+    # Hand planning a policy that CAN probe, so a regression that reintroduces
+    # sampling inside the planner is observable rather than silently inert.
+    planner.provider_policy = ProviderAvailabilityPolicy(
+        config, manager, readiness_probe=probe
+    )
+
+    plan = planner.plan(snapshot)
+
+    assert probe.launch_calls == []
+    assert manager.snapshot() == []
+    assert events.names() == []
+    assert "issue" in _planned_launch_kinds(plan.actions)
+
+
+def test_a_test_composition_never_shells_out_to_a_provider_cli(tmp_path: Path) -> None:
+    """The default test orchestrator must not depend on an installed CLI."""
+    from unittest.mock import MagicMock
+
+    from issue_orchestrator.entrypoints.bootstrap import build_orchestrator_for_testing
+    from issue_orchestrator.infra.config import Config
+    from issue_orchestrator.ports.provider_readiness import (
+        StaticProviderReadinessProbe,
+    )
+
+    orchestrator = build_orchestrator_for_testing(
+        Config(repo="test/repo", repo_root=tmp_path), github=MagicMock()
+    )
+
+    assert isinstance(
+        orchestrator.deps.provider_readiness_probe, StaticProviderReadinessProbe
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1222,6 +1345,49 @@ class TestOneSampleCountsOnce:
         assert state.consecutive_auth_failures == 3
         assert manager.is_open("claude-code")
         assert events.names().count(EventName.PROVIDER_AUTH_FAILED.value) == 3
+
+    def test_a_fresh_process_does_not_collide_with_the_persisted_sample(
+        self, tmp_path: Path
+    ) -> None:
+        """Restart: the first real observation after a reboot must still count.
+
+        The circuit persists the last sample it counted, so sample identity has
+        to be unique across process lifetimes. A per-process counter restarts at
+        the same value every boot, collides with the stored id, and gets dropped
+        as a replay — which with a threshold above 1 could stop the circuit ever
+        tripping (#6999 F2).
+        """
+        from issue_orchestrator.execution.provider_circuit_store import (
+            SQLiteProviderCircuitStore,
+        )
+
+        store = SQLiteProviderCircuitStore(tmp_path / "circuit.sqlite")
+
+        def policy_over(store) -> ProviderAvailabilityPolicy:
+            manager = ProviderResilienceManager(
+                config=_resilience_config(threshold=3),
+                store=store,
+                events=RecordingEvents(),
+            )
+            probe, _runner = _logged_out_probe(_StepClock())
+            return ProviderAvailabilityPolicy(
+                config=_config(), provider_resilience=manager, readiness_probe=probe
+            )
+
+        # First process: one physical sample, deduplicated within itself.
+        first = policy_over(store)
+        first.assess_launch("claude-code")
+        first.assess_launch("claude-code")
+        assert store.get("claude-code").consecutive_auth_failures == 1
+
+        # Second process, same database: a genuinely new sample.
+        second = policy_over(SQLiteProviderCircuitStore(tmp_path / "circuit.sqlite"))
+        second.assess_launch("claude-code")
+        second.assess_launch("claude-code")
+
+        state = store.get("claude-code")
+        assert state is not None
+        assert state.consecutive_auth_failures == 2
 
     def test_a_live_session_death_reuses_its_confirming_sample(self) -> None:
         """The session's verdict came from the same probe result, so it counts once."""
@@ -1886,3 +2052,128 @@ class TestAuthVerdictNeverDiscardsFinishedWork:
         assert decision.status is SessionStatus.COMPLETED
         assert decision.completion_processed
         assert decision.provider_auth_failure is None
+
+
+class TestAuthCircuitSettingsAreValidatedAtStartup:
+    """Raw YAML bypasses the settings schema, so startup must re-check."""
+
+    def _config_with(self, **circuit):
+        from issue_orchestrator.infra.config import Config
+        from issue_orchestrator.infra.config_models import (
+            ProviderCircuitBreakerConfig,
+            ProviderResilienceConfig,
+        )
+
+        config = Config(repo="test/repo", repo_root=Path("/tmp/does-not-matter"))
+        config.provider_resilience = ProviderResilienceConfig(
+            circuit_breaker=ProviderCircuitBreakerConfig(**circuit)
+        )
+        return config
+
+    @pytest.mark.parametrize("threshold", [0, -1, 11])
+    def test_out_of_range_threshold_is_rejected(self, threshold: int) -> None:
+        errors = self._config_with(auth_failure_threshold=threshold).validate()
+
+        assert any("auth_failure_threshold" in error for error in errors)
+
+    @pytest.mark.parametrize("cooldown", [0, -1, 59, 604801])
+    def test_out_of_range_cooldown_is_rejected(self, cooldown: int) -> None:
+        """A zero/negative cooldown yields an already-expired auth deadline.
+
+        The circuit would then stop protecting the fleet the instant it opened,
+        which is the long-burn behaviour this issue exists to remove (#6999 F7).
+        """
+        errors = self._config_with(auth_cooldown_seconds=cooldown).validate()
+
+        assert any("auth_cooldown_seconds" in error for error in errors)
+
+    @pytest.mark.parametrize("threshold,cooldown", [(1, 60), (10, 604800), (3, 21600)])
+    def test_in_range_values_are_accepted(self, threshold: int, cooldown: int) -> None:
+        errors = self._config_with(
+            auth_failure_threshold=threshold, auth_cooldown_seconds=cooldown
+        ).validate()
+
+        assert not [e for e in errors if "auth_" in e]
+
+    def test_yaml_out_of_range_fails_the_normal_load_path(self, tmp_path: Path) -> None:
+        """The values arrive as raw YAML, so the check must be on that path."""
+        from issue_orchestrator.infra.config import Config
+
+        config_path = tmp_path / ".issue-orchestrator" / "config" / "default.yaml"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(
+            "repo:\n  name: owner/repo\n"
+            "provider_resilience:\n"
+            "  circuit_breaker:\n"
+            "    auth_failure_threshold: 0\n"
+            "    auth_cooldown_seconds: 0\n",
+            encoding="utf-8",
+        )
+
+        config = Config.load(config_path)
+
+        assert config.provider_resilience.circuit_breaker.auth_failure_threshold == 0
+        errors = config.validate()
+        assert any("auth_failure_threshold" in e for e in errors)
+        assert any("auth_cooldown_seconds" in e for e in errors)
+
+    def test_the_circuit_owner_no_longer_clamps_a_bad_threshold(self) -> None:
+        """Fail-fast: the config gate owns the range, not a silent max(1, ...)."""
+        manager = ProviderResilienceManager(
+            config=_resilience_config(threshold=2),
+            store=InMemoryProviderCircuitStore(),
+            events=RecordingEvents(),
+        )
+
+        manager.record_auth_failure(
+            "claude-code", error_summary="not logged in", sample_id="s1"
+        )
+
+        assert not manager.is_open("claude-code")  # honours the configured 2
+
+
+class TestMalformedAuthObservationFailsLoudly:
+    """A partial auth outcome would end a session with the outage unrecorded."""
+
+    def test_an_observation_without_readiness_is_rejected_at_construction(
+        self,
+    ) -> None:
+        with pytest.raises(ValueError, match="auth-expired"):
+            SessionObservationResult.provider_auth_failed(None)  # type: ignore[arg-type]
+
+    def test_an_unnamed_provider_is_rejected_at_construction(self) -> None:
+        with pytest.raises(ValueError, match="auth-expired"):
+            SessionObservationResult.provider_auth_failed(
+                ProviderReadiness.auth_expired("", "not logged in")
+            )
+
+    def test_a_non_auth_readiness_is_rejected_at_construction(self) -> None:
+        """READY is not an auth failure; carrying it here would be a lie."""
+        with pytest.raises(ValueError, match="auth-expired"):
+            SessionObservationResult.provider_auth_failed(
+                ProviderReadiness.ready("claude-code")
+            )
+
+    def test_the_outcome_refuses_to_manufacture_a_missing_provider(self) -> None:
+        """The consumer fails loudly too, for an observation built by other means."""
+        from issue_orchestrator.control.session_decision import ProviderAuthOutcome
+
+        with pytest.raises(ValueError, match="named"):
+            ProviderAuthOutcome.from_readiness(None)
+
+    def test_a_well_formed_observation_still_reaches_the_circuit_owner(self) -> None:
+        """The happy path is unchanged: provider, detail and sample all carried."""
+        from issue_orchestrator.control.session_decision import ProviderAuthOutcome
+
+        readiness = ProviderReadiness(
+            provider="claude-code",
+            state=ProviderReadinessState.AUTH_EXPIRED,
+            detail="not logged in",
+            sample_id="sample-1",
+        )
+
+        decision = ProviderAuthOutcome.from_readiness(readiness).as_decision()
+
+        assert decision.provider_auth_failure is not None
+        assert decision.provider_auth_failure.provider == "claude-code"
+        assert decision.provider_auth_failure.sample_id == "sample-1"

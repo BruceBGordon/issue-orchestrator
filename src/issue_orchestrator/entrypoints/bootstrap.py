@@ -24,9 +24,16 @@ from uuid import uuid4
 
 from ..control.background_job_supervisor import BackgroundJobSupervisor
 from ..infra.agent_callback_endpoint import RuntimeAgentCallbackEndpoint
+from .bootstrap_provider import (
+    build_provider_circuit_store,
+    build_provider_launch_sampler,
+    build_provider_readiness_probe,
+    build_provider_resilience,
+)
 from .bootstrap_session_launcher import build_session_launcher_factory
 from .bootstrap_completion import (
     _validation_attempt_key_factory,
+    build_completion_handler_factory,
     create_completion_components,
 )
 from ..infra.config import Config
@@ -34,7 +41,6 @@ from ..infra.env import ENV_PREFIX
 from ..adapters.github.repo import get_repo_from_git, GitRepoError
 from ..ports.event_sink import EventSink, NullEventSink
 from ..ports.issue_tracker import IssueTracker
-from ..ports.provider_resilience import InMemoryProviderCircuitStore
 from ..ports.session_runner import SessionRunner, NullSessionRunner
 from ..ports.timeline_reader import NullTimelineReader
 from ..ports.timeline_store import NullTimelineStore, TimelineStore
@@ -49,7 +55,6 @@ from ..execution import (
     GitHubAdapter,
     CompositeEventSink,
     SqliteGoalPilotStore,
-    SQLiteProviderCircuitStore,
     QueueCacheStore,
     TimelineEventSink,
     DefaultTimelineReader,
@@ -75,7 +80,6 @@ from ..ports.verification import VerificationBudget
 from ..execution.worktree_adapter import GitWorktreeManager
 from ..execution.git_working_copy import GitWorkingCopy
 from ..execution.command_runner import LocalCommandRunner
-from ..execution.provider_readiness_probe import CLIProviderReadinessProbe
 from ..ports.provider_readiness import (
     NO_PROVIDER_READINESS_PROBE,
     ProviderReadinessProbe,
@@ -335,7 +339,6 @@ def _create_planner(
     events: EventSink,
     provider_resilience: ProviderResilienceManager | None = None,
     label_manager: "LabelManager | None" = None,
-    provider_readiness_probe: "ProviderReadinessProbe" = NO_PROVIDER_READINESS_PROBE,
 ) -> tuple[Planner, Scheduler, DependencyEvaluator | None, LabelSync | None]:
     """Create planner and supporting control plane components."""
     issue_resolver = None
@@ -383,7 +386,6 @@ def _create_planner(
         tech_lead_workflow=tech_lead_workflow,
         provider_resilience=provider_resilience,
         label_manager=label_manager,
-        provider_readiness_probe=provider_readiness_probe,
     )
     return planner, scheduler, dependency_evaluator, label_sync
 
@@ -637,34 +639,23 @@ def build_orchestrator(
         config, github, events, io_claimed_label=label_manager.io_claimed,
     )
 
-    provider_circuit_store = SQLiteProviderCircuitStore(
-        state_dir(config.repo_root) / "provider_circuit.sqlite"
-    )
     queue_cache_store = QueueCacheStore(
         state_dir(config.repo_root) / "queue_cache.sqlite"
     )
-    provider_resilience = ProviderResilienceManager(
-        config.provider_resilience,
-        store=provider_circuit_store,
-        events=events,
+    provider_resilience = build_provider_resilience(
+        config, events, build_provider_circuit_store(state_dir(config.repo_root))
     )
 
-    # Create IO adapters. These come before the planner because the planner's
-    # provider-eligibility check needs the one shared readiness probe, which
-    # needs a command runner (#6999 A1).
+    # Create IO adapters
     worktree_manager, working_copy, command_runner, session_output = _create_io_adapters(github_auth)
 
-    # One typed provider-readiness boundary per orchestrator, shared by
-    # planning, the launch gate and the live-session observer so all three read
-    # one probe (and one short-lived result cache) rather than each spawning
-    # their own (#6999).
-    provider_readiness_probe = CLIProviderReadinessProbe(command_runner)
+    provider_readiness_probe = build_provider_readiness_probe(command_runner)
+    provider_launch_sampler = build_provider_launch_sampler(
+        config, provider_resilience, provider_readiness_probe, label_manager
+    )
 
     # Create planner and control plane components
-    planner, _scheduler, _dependency_evaluator, label_sync = _create_planner(
-        config, github, events, provider_resilience, label_manager=label_manager,
-        provider_readiness_probe=provider_readiness_probe,
-    )
+    planner, _scheduler, _dependency_evaluator, label_sync = _create_planner(config, github, events, provider_resilience, label_manager=label_manager)
     session_manager = SessionManager(runner=runner, events=events, config=config)
 
     goal_pilot_store = SqliteGoalPilotStore(repo_root=config.repo_root)
@@ -750,7 +741,7 @@ def build_orchestrator(
 
 
     # Create completion components
-    completion_processor, session_controller_instance = create_completion_components(
+    completion_processor, session_controller_instance, completion_handler_factory = create_completion_components(
         config, github, events, working_copy, session_output, command_runner, provider_resilience,
         label_manager=label_manager,
         background_job_supervisor=background_job_supervisor,
@@ -759,6 +750,8 @@ def build_orchestrator(
         attempt_store=attempt_store,
         turn_mailbox=turn_mailbox,
         tech_lead_authority=tech_lead_authority,
+        open_issue_corpus=tech_lead.open_issue_corpus,
+        repository_host=github,
     )
     _wire_stack_publish_gate(
         completion_processor, _dependency_evaluator, github, command_runner, config,
@@ -789,6 +782,7 @@ def build_orchestrator(
     assert session_restorer is not None
     assert completion_processor is not None
     assert session_controller_instance is not None
+    assert completion_handler_factory is not None
     assert fresh_issue_reader is not None
     assert manifest_downloader is not None
     assert e2e_issue_tracker is not None
@@ -826,6 +820,7 @@ def build_orchestrator(
         queue_cache_store=queue_cache_store,
         provider_resilience=provider_resilience,
         provider_readiness_probe=provider_readiness_probe,
+        provider_launch_sampler=provider_launch_sampler,
         timeline_reader=timeline_reader,
         timeline_store=timeline_store,
         timeline_writer=timeline_writer,
@@ -891,6 +886,7 @@ def build_orchestrator(
         health_gate=health_gate,
         agent_callback_endpoint=agent_callback_endpoint,
         session_launcher_factory=session_launcher_factory,
+        completion_handler_factory=completion_handler_factory,
         board_snapshot_builder=create_board_snapshot_builder(
             config, timeline_store, tech_lead_board_publisher, working_copy
         ),
@@ -943,6 +939,7 @@ def build_orchestrator_for_testing(
     action_applier: ActionApplier | None = None,
     fact_gatherer: FactGatherer | None = None,
     claim_manager: ClaimManager | None = None,
+    provider_readiness_probe: "ProviderReadinessProbe | None" = None,
 ) -> "Orchestrator":
     """Build an orchestrator for testing with mock dependencies.
 
@@ -959,6 +956,9 @@ def build_orchestrator_for_testing(
         session_manager: Mock SessionManager (defaults to creating one)
         action_applier: Mock ActionApplier (defaults to creating one from github)
         fact_gatherer: Mock FactGatherer (defaults to creating one from github)
+        provider_readiness_probe: Fake provider-readiness port. Defaults to the
+            explicit "no probe wired" reader — a test composition must never
+            shell out to a real provider CLI (#6999 F6).
 
     Returns:
         Orchestrator configured with test dependencies
@@ -975,11 +975,7 @@ def build_orchestrator_for_testing(
     events = SequencedEventSink(events)
     background_job_supervisor = BackgroundJobSupervisor(NullBackgroundJobRunner())
 
-    provider_resilience = ProviderResilienceManager(
-        config.provider_resilience,
-        store=InMemoryProviderCircuitStore(),
-        events=events,
-    )
+    provider_resilience = build_provider_resilience(config, events)
 
     # Create label manager (shared instance for all control-layer components)
     from ..control.label_manager import LabelManager as _LabelManager
@@ -990,19 +986,19 @@ def build_orchestrator_for_testing(
     # carries its own evaluator, so the stack publish-gate stays unwired there.
     _dependency_evaluator: DependencyEvaluator | None = None
 
-    # Create adapters for IO operations. These come before the planner because
-    # the planner's provider-eligibility check needs the one shared readiness
-    # probe, which needs a command runner (#6999 A1).
+    # Create adapters for IO operations
     worktree_manager = GitWorktreeManager()
     working_copy = GitWorkingCopy()
     command_runner = LocalCommandRunner()
     session_output = FileSystemSessionOutput()
 
-    # One typed provider-readiness boundary per orchestrator, shared by
-    # planning, the launch gate and the live-session observer so all three read
-    # one probe (and one short-lived result cache) rather than each spawning
-    # their own (#6999).
-    provider_readiness_probe = CLIProviderReadinessProbe(command_runner)
+    # A test composition must never shell out to a real provider CLI: readiness
+    # defaults to the explicit "no probe wired" reader (UNKNOWN => launchable,
+    # no circuit writes) and tests inject a fake when they mean to exercise it.
+    provider_readiness_probe = provider_readiness_probe or NO_PROVIDER_READINESS_PROBE
+    provider_launch_sampler = build_provider_launch_sampler(
+        config, provider_resilience, provider_readiness_probe, label_manager
+    )
 
     # Create default planner if not provided
     if planner is None:
@@ -1012,7 +1008,6 @@ def build_orchestrator_for_testing(
             events=events,
             provider_resilience=provider_resilience,
             label_manager=label_manager,
-            provider_readiness_probe=provider_readiness_probe,
         )
 
     # Create default session manager if not provided
@@ -1217,6 +1212,7 @@ def build_orchestrator_for_testing(
         queue_cache_store=queue_cache_store,
         provider_resilience=provider_resilience,
         provider_readiness_probe=provider_readiness_probe,
+        provider_launch_sampler=provider_launch_sampler,
         timeline_reader=timeline_reader,
         timeline_store=timeline_store,
         timeline_writer=timeline_writer,
@@ -1252,6 +1248,16 @@ def build_orchestrator_for_testing(
         agent_callback_endpoint=agent_callback_endpoint,
         provider_readiness_probe=provider_readiness_probe,
     )
+    completion_handler_factory = build_completion_handler_factory(
+        config,
+        events=events,
+        repository_host=github,
+        session_output=session_output,
+        tech_lead_authority=tech_lead_authority_for_testing,
+        open_issue_corpus=tech_lead.open_issue_corpus,
+        label_manager=label_manager,
+        provider_resilience=provider_resilience,
+    )
     deps = OrchestratorDeps(
         events=events,
         runner=runner,
@@ -1279,6 +1285,7 @@ def build_orchestrator_for_testing(
         health_gate=health_gate,
         agent_callback_endpoint=agent_callback_endpoint,
         session_launcher_factory=session_launcher_factory,
+        completion_handler_factory=completion_handler_factory,
         board_snapshot_builder=create_board_snapshot_builder(
             config, timeline_store, tech_lead_board_publisher_for_testing, working_copy
         ),

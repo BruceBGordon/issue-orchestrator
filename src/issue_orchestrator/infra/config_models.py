@@ -176,8 +176,10 @@ class ProviderCircuitBreakerConfig:
     auth_failure_threshold: int = 1
     # An expired login is human-fixable, so the auth cooldown is long: retrying
     # on the transient cooldown would just re-burn the fleet until a human
-    # notices. Recovery does not wait it out — a successful launch clears the
-    # circuit as soon as credentials work again.
+    # notices. Recovery does not wait it out, and does not need a session to
+    # succeed either — while the circuit is open nothing launches, so the
+    # credential probe itself is what observes the human re-authenticating and
+    # clears the circuit before the next launch.
     auth_cooldown_seconds: int = 21600
 
 

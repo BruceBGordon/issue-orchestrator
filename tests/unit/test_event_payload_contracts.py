@@ -8,10 +8,10 @@ from issue_orchestrator.control.github_workflow import GitHubWorkflow
 from issue_orchestrator.control.action_applier import ActionApplier
 from issue_orchestrator.control.actions import ReconcileHistoryEntryAction
 from issue_orchestrator.control.orchestrator_support import (
-    detect_stale_in_progress,
     emit_queue_changes,
     track_stale_ticks,
 )
+from issue_orchestrator.control.stale_detection import detect_stale_in_progress
 from issue_orchestrator.control.session_history import SessionHistoryOwner
 from issue_orchestrator.contracts.public import (
     DependencyBlockedPayload,

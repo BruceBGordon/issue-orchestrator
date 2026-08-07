@@ -291,8 +291,10 @@ provider_resilience:
     # every launch. One confirmed failure opens the circuit by default because
     # the probe reads local CLI state and is deterministic.
     auth_failure_threshold: 1
-    # Long on purpose: only a human can re-authenticate. The circuit still
-    # clears immediately once a launch succeeds again.
+    # Long on purpose: only a human can re-authenticate. The fleet does not
+    # wait it out: while the circuit is open nothing launches, so the
+    # credential probe is what notices the re-authentication and clears the
+    # circuit before the next launch.
     auth_cooldown_seconds: 21600
 
 ui:

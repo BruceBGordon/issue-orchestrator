@@ -200,7 +200,7 @@ class ProviderResilienceManager:
             return state
 
         consecutive_auth = (state.consecutive_auth_failures + 1) if state else 1
-        threshold = max(1, self.config.circuit_breaker.auth_failure_threshold)
+        threshold = self.config.circuit_breaker.auth_failure_threshold
         trips = consecutive_auth >= threshold
 
         was_open = self._is_open_state(state, now)

@@ -139,7 +139,7 @@ class ProviderAvailabilityPolicy:
         Deliberately NOT a launch gate: it takes no readiness sample, so on its
         own it can never observe a human re-authenticating and would keep the
         fleet parked for the whole auth cooldown (#6999 F1). Launch paths call
-        :meth:`assess_launch` / :meth:`blocks_launch` instead. This remains for
+        :meth:`assess_launch` instead (via the per-tick sampler). This remains for
         the readers that genuinely ask about circuit *ownership* rather than
         eligibility, such as the tech-lead stuck sweep.
 
@@ -155,13 +155,13 @@ class ProviderAvailabilityPolicy:
     # ------------------------------------------------------------------
     # Bounded provider launch assessment (#6999 A1)
     #
-    # ONE answer to "may I launch against this provider right now?", shared by
-    # planning (which queue items are eligible) and launch control (which one
-    # actually spawns). Both halves of the question — the credential sample and
-    # the circuit — are resolved here, in that order, and the sample's circuit
-    # consequence is recorded exactly once. No call site reads the raw circuit
-    # to make a launch decision, so an open auth circuit can never suppress the
-    # very probe that would retire it.
+    # ONE answer to "may I launch against this provider right now?". Both
+    # halves of the question — the credential sample and the circuit — are
+    # resolved here, in that order, and the sample's circuit consequence is
+    # recorded exactly once. Callers are the per-tick sampler (whose result
+    # planning reads as a fact) and the launch-time gate. No call site reads
+    # the raw circuit to make a launch decision, so an open auth circuit can
+    # never suppress the very probe that would retire it.
     # ------------------------------------------------------------------
 
     def assess_launch(
@@ -200,14 +200,6 @@ class ProviderAvailabilityPolicy:
             readiness=readiness,
             circuit_open=self.provider_resilience.is_open(provider, now),
         )
-
-    def blocks_launch(self, provider: str | None, *, now: datetime | None = None) -> bool:
-        """Whether ``provider`` must not be launched against right now.
-
-        The single predicate every planner queue uses. It is a full assessment,
-        not a circuit peek, so planning cannot starve the recovery path.
-        """
-        return not self.assess_launch(provider, now=now).may_launch
 
     def should_add_blocked_label(self, issue_labels: Iterable[str], planned_labels: set[str]) -> bool:
         label = self.blocked_label()

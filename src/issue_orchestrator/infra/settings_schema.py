@@ -1948,8 +1948,10 @@ class AdvancedSettings(BaseModel):
             "doc_examples": ["3600", "21600", "86400"],
             "doc_notes": (
                 "An expired login only a human can fix, so this is much longer "
-                "than the transient cooldown. Recovery does not wait it out: the "
-                "circuit clears as soon as a launch succeeds again."
+                "than the transient cooldown. Recovery does not wait it out, and "
+                "does not need a successful session: while the circuit is open "
+                "nothing launches, so the credential probe is what notices the "
+                "re-authentication and clears the circuit before the next launch."
             ),
             "section": "Provider Resilience",
             "config_attr": "provider_resilience.circuit_breaker.auth_cooldown_seconds",

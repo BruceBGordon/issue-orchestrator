@@ -8,9 +8,9 @@ cheap non-interactive credential probe, and hands control one typed
 
 from __future__ import annotations
 
-import itertools
 import logging
 import time
+import uuid
 from collections.abc import Callable
 from dataclasses import replace
 
@@ -48,7 +48,6 @@ class CLIProviderReadinessProbe:
         self._clock = clock
         self._resolve_provider = resolve_provider
         self._cache: dict[str, tuple[float, ProviderReadiness]] = {}
-        self._sample_ids = itertools.count(1)
 
     def check_launch_readiness(self, provider: str) -> ProviderReadiness:
         """Typed answer to "may I launch ``provider`` right now?".
@@ -58,15 +57,20 @@ class CLIProviderReadinessProbe:
         same id back. The circuit owner keys on it, so a tick that gates ten
         launches on one cached ``AUTH_EXPIRED`` result records one auth failure
         rather than ten (#6999 F2).
+
+        The id is a UUID rather than a counter because the circuit owner
+        *persists* the last one it counted. A per-process counter would restart
+        at the same value every boot and collide with the stored id, so the
+        first real observation after a restart would be discarded as a replay —
+        and with a threshold above 1, repeated restarts could keep the circuit
+        from ever tripping.
         """
         if not provider:
             return ProviderReadiness.unknown("", "no provider configured")
         cached = self._cached(provider)
         if cached is not None:
             return cached
-        readiness = replace(
-            self._probe(provider), sample_id=f"{provider}#{next(self._sample_ids)}"
-        )
+        readiness = replace(self._probe(provider), sample_id=uuid.uuid4().hex)
         self._cache[provider] = (self._clock(), readiness)
         return readiness
 

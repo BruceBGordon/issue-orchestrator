@@ -61,20 +61,25 @@ class ProviderAuthOutcome:
     def from_readiness(
         cls, readiness: ProviderReadiness | None
     ) -> "ProviderAuthOutcome":
-        """Build from a :class:`ProviderReadiness`, tolerating an absent one.
+        """Build from the observation's typed readiness, or fail loudly.
 
-        The observation that carries this always sets ``provider_readiness``;
-        the ``None`` branch keeps a malformed observation reportable rather than
-        turning a diagnosable problem into an AttributeError.
+        A missing or unnamed readiness cannot produce a usable outcome: the
+        circuit owner would get no provider to record against and the
+        provider-impact command would have nothing to assess, so the session
+        would end BLOCKED with the outage invisible. Manufacturing an empty
+        provider to keep going is exactly the silent degradation this codebase
+        forbids — the malformed observation is the bug, and it should surface
+        as one (#6999 F9).
         """
+        if readiness is None or not readiness.provider:
+            raise ValueError(
+                "a PROVIDER_AUTH_FAILED observation must carry a named "
+                f"ProviderReadiness; got {readiness!r}"
+            )
         return cls(
-            provider=readiness.provider if readiness else "",
-            detail=(
-                readiness.detail
-                if readiness and readiness.detail
-                else "provider is not authenticated"
-            ),
-            sample_id=readiness.sample_id if readiness else "",
+            provider=readiness.provider,
+            detail=readiness.detail or "provider is not authenticated",
+            sample_id=readiness.sample_id,
         )
 
     def event_payload(self, issue_number: int, session_name: str) -> dict[str, Any]:
@@ -106,14 +111,10 @@ class ProviderAuthOutcome:
             reason=f"Provider not authenticated: {self.detail}",
             blocked_reason=self.detail,
             provider_error_type=ProviderErrorType.AUTH,
-            provider_auth_failure=(
-                ProviderAuthFailureDecision(
-                    provider=self.provider,
-                    error_summary=self.detail,
-                    sample_id=self.sample_id,
-                )
-                if self.provider
-                else None
+            provider_auth_failure=ProviderAuthFailureDecision(
+                provider=self.provider,
+                error_summary=self.detail,
+                sample_id=self.sample_id,
             ),
         )
 

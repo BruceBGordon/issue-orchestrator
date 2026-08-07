@@ -26,12 +26,14 @@ if TYPE_CHECKING:
     from .state_machine_manager import StateMachineManager
     from .health_gate import HealthGate, HealthDecision
     from .open_issue_corpus import OpenIssueCorpusManager
+    from .provider_launch_readiness import ProviderLaunchReadinessSampler
     from ..ports.worktree_manager import WorktreeManager
     from ..ports.issue import Issue
 
 from ..events import EventName, EventContext
 from ..ports import EventSink, make_trace_event, RepositoryHost
 from .actions import AddLabelAction
+from .stale_detection import _detect_stale_claims, _detect_stale_in_progress
 from .queue_cache import (
     QueueCache,
     queue_shrink_confirmation_due,
@@ -576,78 +578,6 @@ def handle_signal(
 PlanApplier = OrchestratorSupport
 
 
-def _detect_stale_claims(
-    issues: list["Issue"],
-    active_sessions: list["Session"],
-    claim_manager: object | None,
-    events: EventSink,
-    event_context: EventContext,
-    io_claimed_label: str = "io:claimed",
-) -> list["Issue"]:
-    """Detect issues with stale claims (io:claimed label but no valid claim).
-
-    A claim is considered stale if:
-    1. The issue has the io:claimed label
-    2. There's no active session for this issue
-    3. The claim has expired or doesn't exist
-
-    Args:
-        issues: List of issues to check
-        active_sessions: Currently active sessions
-        claim_manager: ClaimManager for checking claim validity
-        events: Event sink for emitting events
-        event_context: Event context for enriching events
-        io_claimed_label: Resolved io:claimed label string
-
-    Returns:
-        List of issues with stale claims
-    """
-    if not claim_manager:
-        return []
-
-    # Build set of issues with active sessions
-    active_issue_numbers = {s.issue.number for s in active_sessions}
-
-    stale_claim_issues: list["Issue"] = []
-
-    for issue in issues:
-        # Only check issues with io:claimed label
-        if io_claimed_label not in issue.labels:
-            continue
-
-        # Skip issues with active sessions (claim is valid, session is running)
-        if issue.number in active_issue_numbers:
-            continue
-
-        # Check if claim is valid via ClaimManager
-        if hasattr(claim_manager, 'get_current_claim'):
-            from ..domain.claim import ClaimFetchError
-            try:
-                claim = claim_manager.get_current_claim(issue.number)
-            except ClaimFetchError:
-                logger.warning(
-                    "[STALE-CLAIM] Cannot check claim for issue #%d due to API error - skipping",
-                    issue.number,
-                )
-                continue
-            if claim is None or (hasattr(claim, 'is_expired') and claim.is_expired()):
-                # Claim is stale
-                stale_claim_issues.append(issue)
-                logger.info(
-                    "[STALE-CLAIM] Issue #%d has io:claimed label but no valid claim",
-                    issue.number,
-                )
-                events.publish(make_trace_event(
-                    EventName.CLAIM_STALE_DETECTED,
-                    event_context.enrich({
-                        "issue_number": issue.number,
-                        "labels": list(issue.labels),
-                    }),
-                ))
-
-    return stale_claim_issues
-
-
 def run_planning_cycle(
     config: "Config",
     events: EventSink,
@@ -669,6 +599,7 @@ def run_planning_cycle(
     queue_cache_store: "QueueCacheStore | None" = None,
     io_claimed_label: str = "io:claimed",
     open_issue_corpus: "OpenIssueCorpusManager | None" = None,
+    provider_launch_sampler: "ProviderLaunchReadinessSampler | None" = None,
 ) -> tuple[float, bool]:
     """Run the planning cycle - extracted from Orchestrator per move map Step 2."""
     now = time.time()
@@ -708,8 +639,13 @@ def run_planning_cycle(
     stale_issues = _detect_stale_in_progress(observer, state, events, event_context)
     stale_claim_issues = _detect_stale_claims(state.cached_queue_issues, state.active_sessions, claim_manager, events, event_context, io_claimed_label=io_claimed_label)
 
+    # Sample provider launch eligibility BEFORE planning: it probes a CLI and
+    # writes circuit state, so it is the tick's job, not the pure planner's
+    # (#6999 A3). Planning then reads the result as a snapshot fact.
+    provider_launch = provider_launch_sampler.sample() if provider_launch_sampler else None
+
     # Create snapshot and plan
-    snapshot = fact_gatherer.create_snapshot(state, state.cached_queue_issues, stale_in_progress_issues=stale_issues, stale_claim_issues=stale_claim_issues)
+    snapshot = fact_gatherer.create_snapshot(state, state.cached_queue_issues, stale_in_progress_issues=stale_issues, stale_claim_issues=stale_claim_issues, provider_launch=provider_launch)
     _emit_facts_gathered(events, event_context, state, stale_issues)
 
     plan = planner.plan(snapshot)
@@ -1257,26 +1193,6 @@ def _emit_queue_changes(events: EventSink, state: "OrchestratorState", new_queue
         ]
         events.publish(make_trace_event(EventName.QUEUE_CHANGED, {"added": added, "removed": removed, "total": len(new_queue)}))
         logger.info("Queue changed: %d added, %d removed, %d total", len(added), len(removed), len(new_queue))
-
-
-def detect_stale_in_progress(
-    observer: object | None,
-    state: "OrchestratorState",
-    events: EventSink,
-    event_context: EventContext,
-) -> list["Issue"]:
-    """Detect stale in-progress issues."""
-    return _detect_stale_in_progress(observer, state, events, event_context)
-
-
-def _detect_stale_in_progress(observer: object | None, state: "OrchestratorState", events: EventSink, event_context: EventContext) -> list["Issue"]:
-    """Detect stale in-progress issues."""
-    if not (observer and hasattr(observer, 'detect_stale_in_progress')):
-        return []
-    stale_issues = observer.detect_stale_in_progress(state.cached_queue_issues, state.active_sessions)
-    for issue in stale_issues:
-        events.publish(make_trace_event(EventName.STALE_IN_PROGRESS_DETECTED, event_context.enrich({"issue_number": issue.number, "labels": list(issue.labels)})))
-    return stale_issues
 
 
 def _emit_facts_gathered(events: EventSink, event_context: EventContext, state: "OrchestratorState", stale_issues: list["Issue"]) -> None:

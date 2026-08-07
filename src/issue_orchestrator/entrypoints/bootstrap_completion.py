@@ -20,6 +20,10 @@ from ..infra.config import Config
 from ..ports import EventSink
 
 if TYPE_CHECKING:
+    from ..control.open_issue_corpus import OpenIssueCorpusManager
+    from ..ports.completion_handler_factory import CompletionHandlerFactory
+    from ..ports.repository_host import RepositoryHost
+    from ..ports.session_output import SessionOutput
     from ..domain.attempt import AttemptKey
     from ..domain.issue_key import IssueKey
     from ..ports.validation_attempt_key_factory import ValidationAttemptKeyFactory
@@ -88,11 +92,25 @@ def create_completion_components(
     attempt_store: "AttemptStore | None" = None,
     turn_mailbox: "TurnMailbox | None" = None,
     tech_lead_authority: "TechLeadAuthorityStore | None" = None,
+    open_issue_corpus: "OpenIssueCorpusManager | None" = None,
+    # The completion handler needs a full repository host; ``github`` above is
+    # only guaranteed to satisfy the narrower label/PR completion port, so the
+    # handler factory is built only when the caller supplies the real thing.
+    repository_host: "RepositoryHost | None" = None,
     *,
     # Required: the composition root owns the single shared endpoint.
     agent_callback_endpoint: "AgentCallbackEndpoint",
-) -> tuple["CompletionProcessor | None", "SessionController | None"]:
-    """Create completion processor and session controller."""
+) -> tuple[
+    "CompletionProcessor | None",
+    "SessionController | None",
+    "CompletionHandlerFactory | None",
+]:
+    """Create the completion processor, controller and handler factory.
+
+    One call because they are one subsystem: all three consume the same
+    repository host, session output and label registry, and the facade should
+    receive them assembled rather than assemble them itself (#6999 A4).
+    """
     from ..control.completion_processor import CompletionProcessor
     from ..control.pre_publish_gate import PrePublishGate
     from ..control.session_controller import SessionController
@@ -111,7 +129,7 @@ def create_completion_components(
 
     if github is None:
         # No repository host: there is no completion pipeline to build.
-        return None, None
+        return None, None, None
     if label_manager is None:
         label_manager = _LM(config)
     if pair_registry is None:
@@ -167,4 +185,73 @@ def create_completion_components(
         review_exchange_canceller=_cancel_review_exchange,
     )
 
-    return completion_processor, session_controller_instance
+    completion_handler_factory = (
+        build_completion_handler_factory(
+            config,
+            events=events,
+            repository_host=repository_host,
+            session_output=session_output,
+            tech_lead_authority=tech_lead_authority,
+            open_issue_corpus=open_issue_corpus,
+            label_manager=label_manager,
+            provider_resilience=provider_resilience,
+        )
+        if repository_host is not None
+        and tech_lead_authority is not None
+        and open_issue_corpus is not None
+        and provider_resilience is not None
+        else None
+    )
+    return (
+        completion_processor,
+        session_controller_instance,
+        completion_handler_factory,
+    )
+
+
+def build_completion_handler_factory(
+    config: Config,
+    *,
+    events: EventSink,
+    repository_host: "RepositoryHost",
+    session_output: "SessionOutput",
+    tech_lead_authority: "TechLeadAuthorityStore",
+    open_issue_corpus: "OpenIssueCorpusManager",
+    label_manager: "LabelManager",
+    provider_resilience: ProviderResilienceManager,
+) -> "CompletionHandlerFactory":
+    """Implement ``ports.completion_handler_factory.CompletionHandlerFactory``.
+
+    Closes over the application dependencies; the facade passes only its own
+    runtime state (#6999 A4).
+    """
+    from ..control.completion_handler import CompletionHandler
+    from ..control.provider_availability import ProviderAvailabilityPolicy
+
+    # Completion never applies the provider-blocked label itself; it asks this
+    # owner for the transition that carries the durable issue-scoped record
+    # with it (#6999 F5/A2).
+    provider_availability = ProviderAvailabilityPolicy(
+        config, provider_resilience, label_manager
+    )
+
+    def factory(*, state_machines, active_sessions):
+        from ..control.active_sessions import active_session_run_id
+
+        return CompletionHandler(
+            config,
+            events,
+            repository_host,
+            lambda issue: state_machines.issue_machines.get(issue.number),
+            lambda name: state_machines.session_machines.get(name),
+            lambda pr_number: state_machines.review_machines.get(pr_number),
+            session_output,
+            tech_lead_authority,
+            open_issue_corpus,
+            lambda n: active_session_run_id(active_sessions(), n),
+            provider_availability,
+            remove_session_machine_fn=state_machines.remove_session_machine,
+            label_manager=label_manager,
+        )
+
+    return factory

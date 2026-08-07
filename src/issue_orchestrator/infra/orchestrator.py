@@ -302,9 +302,10 @@ class Orchestrator:
 
     @cached_property
     def _completion_handler(self) -> CompletionHandler:
-        from ..control.completion_handler_wiring import build_completion_handler
-
-        return build_completion_handler(self)
+        return self.deps.completion_handler_factory(
+            state_machines=self.deps.state_machine_manager,
+            active_sessions=lambda: self.state.active_sessions,
+        )
 
     @cached_property
     def _session_launcher(self) -> SessionLauncher:
@@ -848,7 +849,7 @@ class Orchestrator:
         # operator has removed onto the worker lane before this tick plans (#6870).
         if (applier := self.deps.action_applier) and applier.expedite_lane:
             applier.expedite_lane.promote_ungated()
-        self._last_network_sync, _ = _run_planning_cycle_impl(self.config, self.deps.events, self._event_context, self.state, self.deps.fact_gatherer, self.deps.planner, self.deps.repository_host, self.scheduler, self._github_workflow, self._apply_plan, self._clear_discovered_facts, self._last_network_sync, refresh_to_process, self._inflight_stable_ids, self._issue_fetch_resilience, self.observer, self.deps.claim_manager, queue_cache_store=self.deps.queue_cache_store, io_claimed_label=self.deps.label_manager.io_claimed, open_issue_corpus=self.deps.open_issue_corpus)
+        self._last_network_sync, _ = _run_planning_cycle_impl(self.config, self.deps.events, self._event_context, self.state, self.deps.fact_gatherer, self.deps.planner, self.deps.repository_host, self.scheduler, self._github_workflow, self._apply_plan, self._clear_discovered_facts, self._last_network_sync, refresh_to_process, self._inflight_stable_ids, self._issue_fetch_resilience, self.observer, self.deps.claim_manager, queue_cache_store=self.deps.queue_cache_store, io_claimed_label=self.deps.label_manager.io_claimed, open_issue_corpus=self.deps.open_issue_corpus, provider_launch_sampler=self.deps.services.provider_launch_sampler)
 
     def _clear_discovered_facts(self, tick: "OrchestratorSnapshot") -> None: self._plan_applier.clear_discovered_facts(tick)
     def _emit_heartbeat_if_needed(self) -> None: self._plan_applier.emit_heartbeat_if_needed()
