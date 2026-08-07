@@ -99,8 +99,12 @@ class TestCodexExecution:
 
         result = subprocess.run(
             [
-                "codex", "exec",
-                "--full-auto",
+                "codex",
+                "--ask-for-approval",
+                "on-request",
+                "exec",
+                "--sandbox",
+                "workspace-write",
                 "--skip-git-repo-check",
                 "What is 2 + 2? Reply with just the number, no explanation.",
             ],

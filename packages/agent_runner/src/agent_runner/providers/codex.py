@@ -6,7 +6,7 @@ Codex CLI invocations.
 Codex CLI flags (for `codex exec` subcommand):
 - exec: Run non-interactively
 - --model, -m: Model to use (e.g., gpt-5-codex)
-- --full-auto: Low-friction mode (workspace-write sandbox, on-request approvals)
+- --ask-for-approval on-request + --sandbox workspace-write: Low-friction mode
 - --dangerously-bypass-approvals-and-sandbox, --yolo: No approvals, no sandbox
 - --json: Output newline-delimited JSON events
 - --sandbox, -s: Sandbox policy (read-only, workspace-write, danger-full-access)
@@ -27,7 +27,8 @@ class CodexProvider(CLIProvider):
             prompt="Fix the bug in auth.py",
             model="gpt-5-codex",
         )
-        # Returns: ["codex", "exec", "--full-auto", "--model", "gpt-5-codex",
+        # Returns: ["codex", "--ask-for-approval", "on-request", "exec",
+        #           "--model", "gpt-5-codex", "--sandbox", "workspace-write",
         #           "--json", "Fix the bug in auth.py"]
     """
 
@@ -62,16 +63,18 @@ class CodexProvider(CLIProvider):
         Returns:
             Command as argv list
         """
-        # Use exec subcommand for non-interactive execution
-        cmd = [self.executable, "exec"]
+        cmd = [self.executable]
 
-        # Approval mode
+        # Approval policy is a global option and must precede the exec subcommand.
         approval_mode = kwargs.get("approval_mode", "full-auto")
         if approval_mode == "yolo":
             cmd.append("--dangerously-bypass-approvals-and-sandbox")
         elif approval_mode == "full-auto":
-            cmd.append("--full-auto")
+            cmd.extend(["--ask-for-approval", "on-request"])
         # else: default mode, no flag needed
+
+        # Use exec subcommand for non-interactive execution
+        cmd.append("exec")
 
         # Model (optional - Codex will use default if not specified)
         if model:
@@ -79,6 +82,8 @@ class CodexProvider(CLIProvider):
 
         # Sandbox policy (only if not using yolo which disables sandbox)
         sandbox = kwargs.get("sandbox")
+        if sandbox is None and approval_mode == "full-auto":
+            sandbox = "workspace-write"
         if sandbox and approval_mode != "yolo":
             cmd.extend(["--sandbox", sandbox])
 
