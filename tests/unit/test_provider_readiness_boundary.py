@@ -14,6 +14,7 @@ importantly — pin that the boundary has exactly ONE owner per concern:
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -33,6 +34,7 @@ from issue_orchestrator.execution.agent_runner_errors import (
     classify_provider_output,
 )
 from issue_orchestrator.execution.agent_runner_providers import (
+    CLIProvider,
     ClaudeCodeProvider,
     CodexProvider,
 )
@@ -65,6 +67,29 @@ SRC_ROOT = Path(__file__).resolve().parents[2] / "src" / "issue_orchestrator"
 # The banner an expired Claude Code login renders, verbatim from the terminal
 # recordings in the incident (offset 2740 ms for #6463, 522 ms for #5336).
 EXPIRED_LOGIN_BANNER = "Login expired · Please run /login"
+
+
+# The provider adapter intentionally checks PATH before asking CommandRunner to
+# execute its credential probe.  Developer machines normally have both CLIs,
+# but validate-fast intentionally does not.  Keep these adapter tests hermetic:
+# PATH owns the installation fact and FakeCommandRunner below owns probe output.
+@pytest.fixture(scope="module")
+def provider_cli_bin(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    fake_bin = tmp_path_factory.mktemp("provider-bin")
+    for executable in ("claude", "codex"):
+        path = fake_bin / executable
+        path.touch()
+        path.chmod(0o755)
+    return fake_bin
+
+
+@pytest.fixture(autouse=True)
+def provider_clis_on_path(
+    provider_cli_bin: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(
+        "PATH", f"{provider_cli_bin}{os.pathsep}{os.environ.get('PATH', '')}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -155,6 +180,27 @@ def _manager(events, *, threshold: int = 1, auth_cooldown: int = 21600):
 
 class TestClaudeExpiredLoginPreflight:
     """The provider adapter answers "am I logged in" without spawning a TUI."""
+
+    @pytest.mark.parametrize(
+        "provider",
+        [ClaudeCodeProvider(), CodexProvider()],
+        ids=["claude-code", "codex"],
+    )
+    def test_missing_cli_reports_not_installed_without_probing(
+        self,
+        provider: CLIProvider,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("PATH", str(tmp_path))
+        runner = FakeCommandRunner(
+            CommandResult(returncode=0, stdout='{"loggedIn": true}', stderr="")
+        )
+
+        readiness = provider.check_readiness(runner)
+
+        assert readiness.state is ProviderReadinessState.NOT_INSTALLED
+        assert runner.commands == []
 
     def test_logged_out_probe_reports_auth_expired(self) -> None:
         runner = FakeCommandRunner(
