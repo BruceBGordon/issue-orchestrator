@@ -84,6 +84,7 @@ from ..ports.provider_readiness import (
     NO_PROVIDER_READINESS_PROBE,
     ProviderReadinessProbe,
 )
+from ..control.claim_quarantine import build_claim_quarantine_owner
 from ..execution.pending_work_claim_store import SqlitePendingWorkClaimStore
 from ..execution.session_output_adapter import FileSystemSessionOutput
 from ..execution.review_artifact_reader import ManifestReviewArtifactReader
@@ -860,6 +861,10 @@ def build_orchestrator(
         provider_readiness_probe=provider_readiness_probe,
     )
     pending_work_claims = SqlitePendingWorkClaimStore.for_repo(config.repo_root)
+    claim_quarantine = build_claim_quarantine_owner(
+        store=pending_work_claims, action_applier=action_applier,
+        label_manager=label_manager, events=events,
+    )
     deps = OrchestratorDeps(
         events=events,
         runner=runner,
@@ -880,6 +885,7 @@ def build_orchestrator(
         session_output=session_output,
         manifest_downloader=manifest_downloader,
         pending_work_claims=pending_work_claims,
+        claim_quarantine=claim_quarantine,
         state_machine_manager=state_machine_manager,
         completion_processor=completion_processor,
         session_controller=session_controller_instance,
@@ -1262,6 +1268,10 @@ def build_orchestrator_for_testing(
         provider_resilience=provider_resilience,
     )
     pending_work_claims = SqlitePendingWorkClaimStore.for_repo(config.repo_root)
+    claim_quarantine = build_claim_quarantine_owner(
+        store=pending_work_claims, action_applier=action_applier,
+        label_manager=label_manager, events=events,
+    )
     deps = OrchestratorDeps(
         events=events,
         runner=runner,
@@ -1282,6 +1292,7 @@ def build_orchestrator_for_testing(
         session_output=session_output,
         manifest_downloader=manifest_downloader,
         pending_work_claims=pending_work_claims,
+        claim_quarantine=claim_quarantine,
         state_machine_manager=state_machine_manager,
         completion_processor=completion_processor,
         session_controller=session_controller,

@@ -20,6 +20,7 @@ if TYPE_CHECKING:
     from ..ports.session_launcher_factory import SessionLauncherFactory
     from ..ports.label_store import LabelStore
     from ..ports.pending_work_claim_store import PendingWorkClaimStore
+    from .claim_quarantine import ClaimQuarantineOwner
     from ..ports.queue_cache_store import QueueCacheStore
     from ..ports import (
         EventSink,
@@ -131,6 +132,9 @@ class OrchestratorDeps:
     # records which queued request each running session is carrying, and
     # restoration accepts it as authority.
     pending_work_claims: "PendingWorkClaimStore"
+    # Owns what an unreadable claim means: its own durable per-run marker, its
+    # own labels/comment, and the event only after those commit (#6999 F12/A5).
+    claim_quarantine: "ClaimQuarantineOwner"
 
     # Claim/lease management (multi-orchestrator coordination)
     claim_manager: "ClaimManager"

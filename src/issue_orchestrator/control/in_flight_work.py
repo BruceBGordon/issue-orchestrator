@@ -42,6 +42,7 @@ from .session_launch_types import LaunchDisposition, LaunchResult
 
 if TYPE_CHECKING:
     from ..domain.models import OrchestratorState
+    from .claim_quarantine import ClaimQuarantineOwner
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +94,10 @@ class QuarantinedSession:
 
     session: Session
     error: str
+    # The store's own key for the run, so the quarantine marker is per-RUN.
+    # Two runs of one issue quarantine independently, and a rediscovered
+    # terminal maps back to the same marker rather than a new one (#6999 F12).
+    run_key: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -152,7 +157,7 @@ class InFlightWorkLedger:
         # Written every time, including the idempotent path: the durable record
         # is what a restart reads, and an in-memory hit is no evidence that the
         # on-disk one was ever produced.
-        self.claims.write_pending_work_claim(session.run_assets, claim)
+        self.claims.hold_pending_work_claim(session.run_assets, claim)
         logger.debug("[WORK] %s holds %s", terminal_id, claim.kind.value)
 
     def settle(
@@ -164,20 +169,30 @@ class InFlightWorkLedger:
         none - the ordinary case for an issue session, which claims its work
         with a label rather than by dequeuing it.
 
-        Settlement is atomic from the ledger's point of view: the claim is
-        released only after the queue has accepted it back. If re-admission
-        raises - an unregistered queue kind, a queue owner fault - the claim
-        stays held, in memory and on disk, so the next attempt can still find
-        it (#6999 F5). Releasing first would destroy the only record of the
-        work at exactly the moment something already went wrong.
+        Settlement never destroys the only record of the work. A consumed
+        claim is deleted because the work was really attempted. A deferred one
+        is moved to a durable "deferred" row FIRST and re-admitted to its queue
+        second, so a crash on either side of the in-memory re-queue leaves a row
+        startup can enumerate (#6999 F8). If re-admission raises - an
+        unregistered queue kind, a queue owner fault - the in-memory claim stays
+        held too, so the next attempt can still find it (#6999 F5).
         """
         terminal_id = session.terminal_id
         held = self.holds(terminal_id)
         if held is None:
             return None
-        if outcome is not SettlementOutcome.CONSUMED:
-            self._restore(terminal_id, held)
-        self._release(session)
+        if outcome is SettlementOutcome.CONSUMED:
+            # The work really was attempted; only now may the durable record go.
+            self.claims.consume_pending_work_claim(session.run_assets)
+            self._forget_in_memory(session)
+            return held
+        # Durable first, in-memory second. The row moves to "deferred" and
+        # SURVIVES, so a crash on either side of the in-memory re-queue leaves
+        # something a fresh process can enumerate and re-admit (#6999 F8). It is
+        # deleted only when a relaunch takes the same work again.
+        self.claims.defer_pending_work_claim(session.run_assets)
+        self._restore(terminal_id, held)
+        self._forget_in_memory(session)
         return held
 
     def rehydrate(self, sessions: Sequence[Session]) -> "ClaimRestoration":
@@ -214,7 +229,13 @@ class InFlightWorkLedger:
                     session.terminal_id,
                     exc,
                 )
-                quarantined.append(QuarantinedSession(session, str(exc)))
+                quarantined.append(
+                    QuarantinedSession(
+                        session,
+                        str(exc),
+                        self.claims.run_key_for(session.run_assets),
+                    )
+                )
                 continue
             if claim is not None:
                 if self.holds(session.terminal_id) is None:
@@ -229,6 +250,40 @@ class InFlightWorkLedger:
                 )
             admitted.append(session)
         return ClaimRestoration(tuple(admitted), tuple(quarantined))
+
+    def recover_unresolved(self, quarantine: "ClaimQuarantineOwner") -> int:
+        """Re-admit ledger work that no live terminal is holding (#6999 F8).
+
+        The enumerable half of recovery. ``rehydrate`` can only reach terminals
+        discovery still finds; a run that ended while its settlement was
+        interrupted - a crash mid-defer, a kill between the durable transition
+        and the in-memory re-queue - leaves a row no discovery will ever
+        surface. Without this sweep that work sits in the ledger forever, and
+        for a failure investigation the ledger is the only record there is.
+
+        Deferred rows are re-admitted for the same reason: their in-memory
+        re-queue did not survive the restart, only the row did.
+
+        Runs that ARE live keep their claims untouched. A row is dropped only
+        after its work has been admitted to a queue, so an admission that
+        raises leaves it for the next sweep.
+        """
+        live = {
+            self.claims.run_key_for(session.run_assets)
+            for session in self.state.active_sessions
+        }
+        readmitted = 0
+        for unresolved in self.claims.list_unresolved_claims():
+            if unresolved.run_key in live and not unresolved.deferred:
+                continue
+            self._restore(unresolved.session_name, unresolved.claim)
+            self.claims.resolve_by_run_key(unresolved.run_key)
+            readmitted += 1
+        for unreadable in self.claims.list_unreadable_claims():
+            # No work can be recovered from it, and it is not attached to any
+            # live terminal, so the only honest move is to tell a human.
+            quarantine.quarantine_unresolved(unreadable)
+        return readmitted
 
     def holds(self, terminal_id: str) -> PendingWorkClaim | None:
         """The claim ``terminal_id`` is currently carrying, if any."""
@@ -255,14 +310,7 @@ class InFlightWorkLedger:
             "returned to its queue" if requeued else "already queued",
         )
 
-    def _release(self, session: Session) -> None:
-        """Drop both records of a settled claim, durable one first.
-
-        Order matters for a crash between the two writes: a stale on-disk claim
-        with no in-memory twin would be re-taken at the next restart and
-        re-queue work that was already settled.
-        """
-        self.claims.clear_pending_work_claim(session.run_assets)
+    def _forget_in_memory(self, session: Session) -> None:
         self.state.in_flight_work[:] = [
             w
             for w in self.state.in_flight_work

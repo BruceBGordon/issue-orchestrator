@@ -5130,28 +5130,46 @@ def _claims_store(base=None):
 
 
 def _no_claims_store():
-    """A claim store for terminals that never held one (#6999 F4)."""
+    """A claim ledger holding nothing, for terminals that took no work.
+
+    Restoration must read and enumerate, and must not write (#6999 F4/F8).
+    """
 
     class _Empty:
-        def write_pending_work_claim(self, run, claim) -> None:
-            raise AssertionError("restoration must not write claims")
+        def hold_pending_work_claim(self, run, claim) -> None:
+            raise AssertionError("restoration must not hold claims")
+
+        def defer_pending_work_claim(self, run) -> None:
+            raise AssertionError("restoration must not defer claims")
+
+        def consume_pending_work_claim(self, run) -> None:
+            raise AssertionError("restoration must not consume claims")
 
         def read_pending_work_claim(self, run):
             return None
 
-        def clear_pending_work_claim(self, run) -> None:
-            raise AssertionError("restoration must not clear claims")
+        def list_unresolved_claims(self):
+            return ()
+
+        def list_unreadable_claims(self):
+            return ()
+
+        def resolve_by_run_key(self, run_key) -> None:
+            raise AssertionError("nothing to resolve")
+
+        def run_key_for(self, run) -> str:
+            return str(run.run_dir)
 
     return _Empty()
 
 
-def _quarantine_free_launcher():
+def _no_quarantine():
     """These terminals hold no claim, so none may be quarantined (#6999 F6)."""
-    launcher = MagicMock()
-    launcher.escalate_issue_needs_human.side_effect = AssertionError(
+    owner = MagicMock()
+    owner.quarantine_session.side_effect = AssertionError(
         "no terminal here holds a claim, so none may be quarantined"
     )
-    return launcher
+    return owner
 
 
 class TestRestoreRunningSessions:
@@ -5169,8 +5187,7 @@ class TestRestoreRunningSessions:
         running = [{"tab_name": "issue-123", "issue_number": 123}]
 
         added = restore_running_sessions(
-            running, state, mock_restorer, _no_claims_store(),
-            _quarantine_free_launcher(), MockEventSink(),
+            running, state, mock_restorer, _no_claims_store(), _no_quarantine()
         )
 
         assert added == [mock_session]
@@ -5228,8 +5245,7 @@ class TestRestoreRunningSessions:
             state,
             mock_restorer,
             _no_claims_store(),
-            _quarantine_free_launcher(),
-            MockEventSink(),
+            _no_quarantine(),
         )
 
         assert added == [new_session]
@@ -5344,6 +5360,7 @@ class TestProcessActiveSessions:
             worktree_manager=None,
             kill_session_fn=lambda x: None,
             config=config,
+            pending_work_claims=_test_claim_store(),
         )
 
         # Session should still be in active list
@@ -5391,6 +5408,7 @@ class TestProcessActiveSessions:
             worktree_manager=None,
             kill_session_fn=MagicMock(),
             config=MagicMock(),
+            pending_work_claims=_test_claim_store(),
         )
 
         assert state.active_sessions == [session]
@@ -5444,6 +5462,7 @@ class TestProcessActiveSessions:
             worktree_manager=None,
             kill_session_fn=MagicMock(),
             config=MagicMock(),
+            pending_work_claims=_test_claim_store(),
         )
 
         assert captured_phase["value"] == "active_sessions:#392"
@@ -5524,6 +5543,7 @@ class TestProcessActiveSessions:
                 worktree_manager=None,
                 kill_session_fn=MagicMock(),
                 config=MagicMock(),
+                pending_work_claims=_test_claim_store(),
             )
 
         # Session stayed active because the controller deferred…
@@ -5613,6 +5633,7 @@ class TestProcessActiveSessions:
             worktree_manager=None,
             kill_session_fn=kill_session_fn,
             config=MagicMock(),
+            pending_work_claims=_test_claim_store(),
         )
 
         assert state.active_sessions == []
@@ -5738,6 +5759,7 @@ class TestProcessActiveSessions:
                 kill_session_fn=kill_session_fn,
                 config=MagicMock(),
                 completion_dispatcher=dispatcher,
+                pending_work_claims=_test_claim_store(),
             )
 
         # Tick 1: the decision is offloaded to the runner, NOT run inline — the
@@ -5884,6 +5906,7 @@ class TestProcessActiveSessions:
                 kill_session_fn=kill_session_fn,
                 config=MagicMock(),
                 completion_dispatcher=dispatcher,
+                pending_work_claims=_test_claim_store(),
             )
 
         # Tick 1: dispatch the decision (submit #1); nothing is decided yet.
@@ -6035,6 +6058,7 @@ class TestHandleSessionCompletion:
             kill_session_fn=lambda x: None,
             config=config,
             session_output=MagicMock(spec=SessionOutput),
+            pending_work_claims=_test_claim_store(),
         )
 
         assert len(state.active_sessions) == 0
@@ -6103,6 +6127,7 @@ class TestHandleSessionCompletion:
             config=config,
             session_output=session_output,
             diagnostic_path=diagnostic_path,
+            pending_work_claims=_test_claim_store(),
         )
 
         assert len(state.discovered_failures) == 1
@@ -6234,6 +6259,7 @@ class TestHandleSessionCompletion:
             kill_session_fn=lambda _name: calls.append("kill"),
             config=MagicMock(),
             session_output=session_output,
+            pending_work_claims=_test_claim_store(),
         )
 
         assert calls == ["process_completion", "kill", "actions"]
@@ -6298,6 +6324,7 @@ class TestHandleSessionCompletion:
             kill_session_fn=lambda _name: None,
             config=MagicMock(),
             session_output=session_output,
+            pending_work_claims=_test_claim_store(),
         )
 
         session_output.find_run_dir.assert_not_called()
@@ -6363,6 +6390,7 @@ class TestHandleSessionCompletion:
             kill_session_fn=lambda _name: calls.append("kill"),
             config=MagicMock(),
             session_output=session_output,
+            pending_work_claims=_test_claim_store(),
         )
 
         assert calls == ["process_completion", "kill", "actions"]
@@ -6433,6 +6461,7 @@ class TestHandleSessionCompletion:
             config=MagicMock(),
             session_output=session_output,
             completion_detail=completion_detail,
+            pending_work_claims=_test_claim_store(),
         )
 
         assert len(state.pending_reworks) == 1
@@ -6517,6 +6546,7 @@ class TestHandleSessionCompletion:
                 kill_session_fn=kill_session,
                 config=MagicMock(),
                 session_output=MagicMock(spec=SessionOutput),
+                pending_work_claims=_test_claim_store(),
             )
 
         assert state.active_sessions == []
@@ -6579,6 +6609,7 @@ class TestHandleSessionCompletion:
             kill_session_fn=lambda x: None,
             config=config,
             session_output=MagicMock(spec=SessionOutput),
+            pending_work_claims=_test_claim_store(),
         )
 
         assert len(state.discovered_reviews) == 1
@@ -6639,6 +6670,7 @@ class TestHandleSessionCompletion:
             session_output=MagicMock(spec=SessionOutput),
             blocked_label="blocked-upstream",
             blocked_reason="Waiting for external API",
+            pending_work_claims=_test_claim_store(),
         )
 
         mock_completion_handler.process_completion.assert_called_once()
@@ -7057,3 +7089,17 @@ class TestStackRelaunchGate:
         assert result.success is False
         assert mock_worktree_manager.create_calls == []
         assert any(str(e.name) == "issue.dependency_blocked" for e in mock_events.events)
+
+
+def _test_claim_store(tmp_path=None):
+    """The orchestrator-owned claim store completion now requires (#6999 F9)."""
+    import tempfile
+    from pathlib import Path as _Path
+
+    from issue_orchestrator.execution.pending_work_claim_store import (
+        SqlitePendingWorkClaimStore,
+    )
+
+    return SqlitePendingWorkClaimStore.for_repo(
+        _Path(tmp_path) if tmp_path is not None else _Path(tempfile.mkdtemp())
+    )

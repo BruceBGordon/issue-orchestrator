@@ -3934,3 +3934,75 @@ def test_full_deps_publish_recovery_reconciles_through_shared_action_applier(sam
         and action.label == deps.label_manager.pr_pending
         for action in applied
     ), "publish recovery must apply labels through deps.action_applier"
+
+
+class TestPublicCompletionFacadeSettlesClaims:
+    """Both completion paths must settle the pending-work claim (#6999 F9).
+
+    The periodic processing path injected the claim store; the public facade
+    did not. A queued session completing through the facade therefore removed
+    itself from active_sessions and then failed while settling, leaving state
+    half-mutated and the two paths behaving differently. These tests drive the
+    facade itself, because the boundary tests pass the store explicitly to the
+    control function and cannot see the wiring.
+    """
+
+    def _claimed_session(self, orchestrator, tmp_path: Path):
+        from issue_orchestrator.control.in_flight_work import InFlightWorkLedger
+        from issue_orchestrator.domain.issue_key import FakeIssueKey
+        from issue_orchestrator.domain.models import PendingReview
+        from issue_orchestrator.domain.pending_work import (
+            PendingWorkClaim,
+            PendingWorkKind,
+        )
+
+        issue = create_issue(1)
+        session = create_session(issue)
+        from tests.unit.session_run_helpers import make_session_run_assets
+
+        session.run_assets = make_session_run_assets(
+            tmp_path / "wt", session_name=session.terminal_id
+        )
+        claim = PendingWorkClaim(
+            PendingWorkKind.REVIEW,
+            PendingReview(
+                issue_key=FakeIssueKey(name="1"),
+                pr_number=70,
+                pr_url="url",
+                branch_name="branch",
+                _issue_number=1,
+                agent_label="agent:backend",
+            ),
+        )
+        orchestrator.state.active_sessions.append(session)
+        InFlightWorkLedger(
+            orchestrator.state, orchestrator.deps.pending_work_claims
+        ).take(session, claim)
+        return session
+
+    def test_facade_returns_provider_deferred_work_to_its_queue(
+        self, sample_config, tmp_path: Path
+    ):
+        from issue_orchestrator.ports.provider_resilience import ProviderErrorType
+
+        orchestrator = create_test_orchestrator(sample_config)
+        session = self._claimed_session(orchestrator, tmp_path)
+
+        orchestrator.handle_session_completion(
+            session,
+            SessionStatus.BLOCKED,
+            provider_error_type=ProviderErrorType.AUTH,
+        )
+
+        assert [r.pr_number for r in orchestrator.state.pending_reviews] == [70]
+
+    def test_facade_consumes_the_claim_on_a_real_work_outcome(
+        self, sample_config, tmp_path: Path
+    ):
+        orchestrator = create_test_orchestrator(sample_config)
+        session = self._claimed_session(orchestrator, tmp_path)
+
+        orchestrator.handle_session_completion(session, SessionStatus.COMPLETED)
+
+        assert orchestrator.state.pending_reviews == []
+        assert orchestrator.deps.pending_work_claims.list_unresolved_claims() == ()

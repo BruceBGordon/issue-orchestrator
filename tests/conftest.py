@@ -1057,9 +1057,14 @@ def build_test_orchestrator_deps(
     from issue_orchestrator.execution.thread_background_job_runner import (
         ThreadBackgroundJobRunner,
     )
+    from issue_orchestrator.control.claim_quarantine import (
+        build_claim_quarantine_owner,
+    )
     from issue_orchestrator.execution.pending_work_claim_store import (
         SqlitePendingWorkClaimStore,
     )
+
+    pending_work_claims = SqlitePendingWorkClaimStore.for_repo(config.repo_root)
 
     publish_recovery = PublishRecoveryService(
         repository_host=repo_host,
@@ -1085,7 +1090,13 @@ def build_test_orchestrator_deps(
         runner=runner,
         # Orchestrator-owned, outside every worktree, exactly as bootstrap
         # wires it (#6999 F7).
-        pending_work_claims=SqlitePendingWorkClaimStore.for_repo(config.repo_root),
+        pending_work_claims=pending_work_claims,
+        claim_quarantine=build_claim_quarantine_owner(
+            store=pending_work_claims,
+            action_applier=_action_applier,
+            label_manager=label_manager,
+            events=events,
+        ),
         # The same endpoint the completion processor got, mirroring how
         # bootstrap shares one instance. Nothing binds a port in tests, so
         # it honestly resolves to "no endpoint yet".

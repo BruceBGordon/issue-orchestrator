@@ -1,37 +1,38 @@
-"""Authoritative storage for the queued request a running session is carrying.
+"""The durable ledger of queued work that has left its queue (#6999 F4/F7/F8).
 
-The narrowest contract :class:`~issue_orchestrator.control.in_flight_work.InFlightWorkLedger`
-needs (#6999 F4). Why durable at all: the claim is removed from its pending
-queue at launch, so between then and terminal settlement it is the ONLY record
-of that work. An in-memory ledger loses it on restart, and the affected work
-types cannot be reconstructed from a restored terminal — a tech-lead failure
-investigation has no label anchor at all, a rework has had its ``needs-rework``
-trigger stripped, and a validation retry's prompt, error and attempt count exist
-nowhere else.
+A request removed from a pending queue at launch exists nowhere else until the
+session that took it reaches a terminal outcome. The pending queues themselves
+are in-memory, so this store — not those lists — is the authoritative record.
+Three durable states cover that whole span:
 
-Why implementations must not store it in the run directory (#6999 F7): that
-directory lives inside the session worktree, which is handed to the launched
-agent and is writable by it. A claim stored there would let an agent rewrite
-what work the orchestrator believes it is doing — which queue, on which PR, with
-which evidence hints — and restoration would accept it as truth. That inverts
-"Agent Intent, Orchestrator Authority". The authoritative record belongs in
-orchestrator-owned storage outside every worktree.
+* **held** — a live run is doing this work.
+* **deferred** — the run stopped for a provider reason; the work is untouched
+  and waiting to be relaunched.
+* **gone** — the row is deleted, and only a true terminal work outcome does that.
 
-The whole :class:`SessionRunAssets` is passed rather than a bare identity so an
-implementation can key on the orchestrator-allocated run root AND validate the
-identity recorded against it. Run ids are timestamps and are NOT unique on their
-own — two sessions launched in the same second share one — so identity alone is
-neither a safe key nor a sufficient check.
+Why deferral is a state rather than a delete (#6999 F8): re-admitting the
+request to an in-memory queue is not durable, so deleting the row at that moment
+opens a window where a crash loses the only record. The row survives the
+transition and startup re-admits from it; the relaunch that takes the work again
+supersedes it by :meth:`PendingWorkClaim.work_key`.
 
-Writes are create-once: re-writing the SAME claim for a run is idempotent, and a
-DIFFERENT claim for a run raises :class:`ConflictingPendingWorkClaimError`
-rather than overwriting. One run does one piece of work; a second, different
-claim is drift, and silently taking the newer one is how the only record of the
-first gets lost.
+Why implementations must not store any of this in the run directory (#6999 F7):
+that directory lives inside the session worktree, which is handed to the
+launched agent and is writable by it. A claim stored there would let an agent
+rewrite what work the orchestrator believes it is doing — which queue, on which
+PR, with which evidence hints — and restoration would accept it as truth. That
+inverts "Agent Intent, Orchestrator Authority".
+
+Rows are addressed by the ORCHESTRATOR-allocated run root and validated against
+every field of the run identity recorded with them. Run ids are timestamps and
+are not unique on their own; identities come from the worktree manifest and are
+agent-writable. So neither is a safe address by itself, and a mismatch on any
+recorded field fails closed rather than reading as "no claim".
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Protocol
 
 from ..domain.pending_work import PendingWorkClaim
@@ -39,26 +40,65 @@ from ..domain.session_run import SessionRunAssets
 
 
 class ConflictingPendingWorkClaimError(RuntimeError):
-    """A different claim already exists for this run identity."""
+    """A different claim already exists for this run."""
+
+
+@dataclass(frozen=True, slots=True)
+class UnresolvedClaim:
+    """A claim the ledger still holds, as seen by startup recovery.
+
+    ``run_key`` is opaque to control: it identifies the run whose settlement
+    never completed, and is only ever compared against other run keys the store
+    produced.
+    """
+
+    run_key: str
+    session_name: str
+    deferred: bool
+    claim: PendingWorkClaim
+
+
+@dataclass(frozen=True, slots=True)
+class UnreadableClaim:
+    """A stored row whose payload or identity could not be rebuilt."""
+
+    run_key: str
+    session_name: str
+    error: str
 
 
 class PendingWorkClaimStore(Protocol):
-    """Read/write the claim held by one session run."""
+    """The durable side of the launch-to-settlement lifecycle."""
 
-    def write_pending_work_claim(
+    def hold_pending_work_claim(
         self, run: SessionRunAssets, claim: PendingWorkClaim
     ) -> None:
-        """Record that ``run`` holds ``claim``.
+        """Record that ``run`` has taken ``claim`` off its queue.
 
-        Idempotent for an identical claim; raises
-        :class:`ConflictingPendingWorkClaimError` for a different one.
+        Supersedes any deferred row for the same work: relaunching it is what
+        resolves the earlier deferral. Re-holding the identical claim for the
+        same run is idempotent; a DIFFERENT claim for one run raises
+        :class:`ConflictingPendingWorkClaimError` rather than overwriting,
+        because overwriting destroys the only record of the first.
         """
+        ...
+
+    def defer_pending_work_claim(self, run: SessionRunAssets) -> None:
+        """Mark ``run``'s claim as waiting to be relaunched.
+
+        One durable transition. The row must survive it, so a crash on either
+        side of the in-memory re-queue is recoverable at startup.
+        """
+        ...
+
+    def consume_pending_work_claim(self, run: SessionRunAssets) -> None:
+        """Delete ``run``'s claim. Only a true terminal work outcome may."""
         ...
 
     def read_pending_work_claim(
         self, run: SessionRunAssets
     ) -> PendingWorkClaim | None:
-        """The claim ``run`` holds, or None when it holds none.
+        """The claim ``run`` currently HOLDS, or None when it holds none.
 
         Raises rather than returning None when a record exists but cannot be
         trusted or rebuilt: "no claim" and "a claim I cannot read" are different
@@ -66,51 +106,63 @@ class PendingWorkClaimStore(Protocol):
         """
         ...
 
-    def clear_pending_work_claim(self, run: SessionRunAssets) -> None:
-        """Drop this run's claim. A no-op when there is none."""
+    def list_unresolved_claims(self) -> tuple[UnresolvedClaim, ...]:
+        """Every claim still held or deferred, for startup recovery.
+
+        Deliberately enumerable (#6999 F8): a run whose terminal is long gone
+        cannot be found by discovery, so without this its work would sit in the
+        ledger forever. Rows whose payload cannot be rebuilt are reported by
+        :meth:`list_unreadable_claims` instead of being skipped in silence.
+        """
+        ...
+
+    def list_unreadable_claims(self) -> tuple[UnreadableClaim, ...]:
+        """Stored rows that cannot be rebuilt, for the same recovery sweep."""
+        ...
+
+    def resolve_by_run_key(self, run_key: str) -> None:
+        """Delete an enumerated row once its work has been re-admitted."""
+        ...
+
+    def run_key_for(self, run: SessionRunAssets) -> str:
+        """The opaque key this store addresses ``run`` by."""
         ...
 
 
-class UnwiredPendingWorkClaimStore:
-    """The explicit "no claim store was injected here" value.
+class ClaimQuarantineStore(Protocol):
+    """Durable record of runs whose claim could not be read (#6999 F12).
 
-    Deliberately NOT a silent no-op. Every method raises, because the only way
-    to reach one is to hold a claim while nothing durable is recording it - and
-    quietly dropping it is the failure this whole boundary exists to prevent.
-    Paths that legitimately hold no claim never touch the store at all, so this
-    can only fire on a genuine wiring bug.
+    Separate from the claim lifecycle on purpose: a quarantine outlives the
+    claim it could not read, is keyed on the run rather than the work (the work
+    is precisely what is unknown), and is cleared by a human rather than by any
+    session outcome.
     """
 
-    def write_pending_work_claim(
-        self, run: SessionRunAssets, claim: PendingWorkClaim
+    def record_quarantine(
+        self, run_key: str, *, session_name: str, issue_number: int, error: str
     ) -> None:
-        raise self._unwired(run)
+        """Record (or refresh) that this run is quarantined."""
+        ...
 
-    def read_pending_work_claim(
-        self, run: SessionRunAssets
-    ) -> PendingWorkClaim | None:
-        raise self._unwired(run)
+    def mark_quarantine_escalated(self, run_key: str) -> None:
+        """Record that the durable operator surface committed for this run."""
+        ...
 
-    def clear_pending_work_claim(self, run: SessionRunAssets) -> None:
-        raise self._unwired(run)
+    def is_quarantine_escalated(self, run_key: str) -> bool:
+        """Whether the durable operator surface already committed.
 
-    @staticmethod
-    def _unwired(run: SessionRunAssets) -> RuntimeError:
-        return RuntimeError(
-            f"no pending-work claim store is wired, but run {run.run_id} "
-            f"(session {run.session_name}) holds a claim; the composition root "
-            "must inject PendingWorkClaimStore"
-        )
-
-
-UNWIRED_PENDING_WORK_CLAIMS: UnwiredPendingWorkClaimStore = (
-    UnwiredPendingWorkClaimStore()
-)
+        Idempotency is the point: the orphan scan re-discovers an untracked
+        terminal every 30 seconds, and each rediscovery must not re-comment.
+        A quarantine recorded but NOT escalated is retried, so a failed label
+        or comment does not silently become the final state.
+        """
+        ...
 
 
 __all__ = [
+    "ClaimQuarantineStore",
     "ConflictingPendingWorkClaimError",
     "PendingWorkClaimStore",
-    "UNWIRED_PENDING_WORK_CLAIMS",
-    "UnwiredPendingWorkClaimStore",
+    "UnreadableClaim",
+    "UnresolvedClaim",
 ]

@@ -25,10 +25,7 @@ from ..infra.config import Config
 from ..ports import EventSink
 from ..ports.event_sink import make_trace_event
 from ..ports.provider_resilience import ProviderErrorType
-from ..ports.pending_work_claim_store import (
-    UNWIRED_PENDING_WORK_CLAIMS,
-    PendingWorkClaimStore,
-)
+from ..ports.pending_work_claim_store import PendingWorkClaimStore
 from ..ports.session_output import SessionOutput
 from ..ports.worktree_manager import WorktreeManager
 from .active_sessions import has_active_terminal
@@ -243,6 +240,10 @@ def handle_session_completion(  # noqa: C901, PLR0912 - handles validation, acti
     kill_session_fn: Callable[[str], None],
     config: Config,
     session_output: SessionOutput,
+    # Required, not defaulted: settling the pending-work claim is part of what
+    # completing a session MEANS, and a default let one completion path drift
+    # from the other (#6999 F9/A4).
+    pending_work_claims: PendingWorkClaimStore,
     pr_url_hint: Optional[str] = None,
     processing_errors: Optional[list[str]] = None,
     diagnostic_path: Optional[str] = None,
@@ -256,7 +257,6 @@ def handle_session_completion(  # noqa: C901, PLR0912 - handles validation, acti
     claim_manager: Optional["ClaimManager"] = None,
     events: Optional[EventSink] = None,
     publish_recovery: Optional["PublishRecoveryService"] = None,
-    pending_work_claims: PendingWorkClaimStore = UNWIRED_PENDING_WORK_CLAIMS,
     # The typed provider verdict this session ended on (#6999). Carried rather
     # than re-derived so the reaction owner can decline to mint a substance
     # investigation for a credential outage.
@@ -549,10 +549,10 @@ def process_active_sessions(
     worktree_manager: Optional[WorktreeManager],
     kill_session_fn: Callable[[str], None],
     config: Config,
+    pending_work_claims: PendingWorkClaimStore,
     completion_dispatcher: "CompletionDispatcher | None" = None,
     provider_resilience: "ProviderResilienceManager | None" = None,
     publish_recovery: "PublishRecoveryService | None" = None,
-    pending_work_claims: PendingWorkClaimStore = UNWIRED_PENDING_WORK_CLAIMS,
 ) -> None:
     """Process active sessions - moved from Orchestrator per method table.
 
@@ -703,9 +703,9 @@ def _apply_completed_decision(
     kill_session_fn: Callable[[str], None],
     config: Config,
     session_output: SessionOutput,
+    pending_work_claims: PendingWorkClaimStore,
     provider_resilience: "ProviderResilienceManager | None" = None,
     publish_recovery: "PublishRecoveryService | None" = None,
-    pending_work_claims: PendingWorkClaimStore = UNWIRED_PENDING_WORK_CLAIMS,
 ) -> None:
     """Apply a finished completion decision on the tick thread."""
     if completed.error is not None:

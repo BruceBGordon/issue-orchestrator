@@ -394,6 +394,7 @@ class TestCompletionPipelineEligibility:
                 kill_session_fn=lambda _x: None,
                 config=config,
                 session_output=session_output,
+                pending_work_claims=_test_claim_store(),
             )
 
         return state, run
@@ -667,6 +668,7 @@ class TestEffectiveTerminalOutcomeEvents:
             session_output=session_output,
             claim_manager=claim_manager if claim_manager is not None else MagicMock(),
             events=events,
+            pending_work_claims=_test_claim_store(),
         )
         return state
 
@@ -865,3 +867,17 @@ class TestEffectiveTerminalOutcomeEvents:
         manager = StateMachineManager(Config())
         manager.session_machines["issue-17"] = machine
         assert manager.get_session_machine("issue-17", 17) is not machine
+
+
+def _test_claim_store(tmp_path=None):
+    """The orchestrator-owned claim store completion now requires (#6999 F9)."""
+    import tempfile
+    from pathlib import Path as _Path
+
+    from issue_orchestrator.execution.pending_work_claim_store import (
+        SqlitePendingWorkClaimStore,
+    )
+
+    return SqlitePendingWorkClaimStore.for_repo(
+        _Path(tmp_path) if tmp_path is not None else _Path(tempfile.mkdtemp())
+    )

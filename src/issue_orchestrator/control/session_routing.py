@@ -38,7 +38,6 @@ from .existing_terminal_restoration import (
     _ExistingTerminalRestorationRequest,
     _restore_existing_terminal,
 )
-from .claim_quarantine import escalate_unreadable_claim
 from .in_flight_work import InFlightWorkLedger, LaunchSettlement
 from .session_launch_types import LaunchDisposition
 from .session_launcher import SessionLauncher
@@ -46,6 +45,7 @@ from .session_manager import SessionManager, SessionRef
 
 if TYPE_CHECKING:
     from ..domain.models import OrchestratorState
+    from .claim_quarantine import ClaimQuarantineOwner
     from ..domain.state_machines.session_machine import SessionStateMachine
     from .session_manager import SessionType
     from .session_restorer import SessionRestorer
@@ -620,8 +620,7 @@ def restore_running_sessions(
     state: "OrchestratorState",
     session_restorer: "SessionRestorer",
     claims: PendingWorkClaimStore,
-    session_launcher: SessionLauncher,
-    events: EventSink,
+    quarantine: "ClaimQuarantineOwner",
 ) -> list[Session]:
     """Restore running terminal sessions into active-session tracking.
 
@@ -638,16 +637,24 @@ def restore_running_sessions(
     would end with its completion settling as claimless and destroying that
     work. It is quarantined and escalated instead, where a human can see it.
     Healthy neighbours restore regardless.
+
+    Finally the ledger is swept for work no live terminal is holding at all
+    (#6999 F8) - a run killed mid-settlement leaves a row discovery will never
+    surface, and for a failure investigation that row is the only record there
+    is.
     """
+    ledger = InFlightWorkLedger(state, claims)
     restored = session_restorer.restore_sessions(running, state.active_sessions)
-    restoration = InFlightWorkLedger(state, claims).rehydrate(restored)
+    restoration = ledger.rehydrate(restored)
     for quarantined in restoration.quarantined:
-        escalate_unreadable_claim(
-            quarantined, session_launcher=session_launcher, events=events
-        )
+        quarantine.quarantine_session(quarantined)
     added = append_unique_active_sessions(
         state.active_sessions, list(restoration.admitted)
     )
+    # Then the half discovery cannot reach: ledger rows whose run ended while
+    # its settlement was interrupted, and deferred rows whose in-memory
+    # re-queue did not survive the restart (#6999 F8).
+    ledger.recover_unresolved(quarantine)
     if added:
         logger.info(
             "[ORPHAN] Restored %d running terminal session(s): %s",
