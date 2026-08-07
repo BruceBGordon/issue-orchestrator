@@ -23,6 +23,9 @@ from ._ai_gate import (
     _init_test_ai_gate_repo,
     _synthesize_gate_settings,
     _test_ai_gate_env,
+    evaluate_claude_ai_gate_result,
+    format_ai_gate_console_details,
+    summarize_ai_gate_message,
 )
 from ._hook_test_runner import (
     HookBlockMode,
@@ -333,26 +336,12 @@ class ClaudeCodeAdapter(AiAgentAdapter):
                     timeout=timeout,
                 )
 
-                output = result.stdout + result.stderr
-
-                # Check if the output indicates the command was blocked
-                was_blocked = _detect_blocked_from_output(output)
-
-                if was_blocked:
-                    return (
-                        True,
-                        f"AI gate test passed: Claude was blocked from running --no-verify\nOutput: {output[:500]}",
-                    )
-                else:
-                    diag = (
-                        f"AI gate test FAILED: Claude was NOT blocked\n"
-                        f"Exit code: {result.returncode}\n"
-                        f"Work repo: {work_repo}\n"
-                        f"Hooks dir exists: {(work_repo / '.claude' / 'hooks').exists()}\n"
-                        f"Stdout ({len(result.stdout)} chars): {result.stdout[:500]}\n"
-                        f"Stderr ({len(result.stderr)} chars): {result.stderr[:500]}"
-                    )
-                    return False, diag
+                return evaluate_claude_ai_gate_result(
+                    returncode=result.returncode,
+                    stdout=result.stdout,
+                    stderr=result.stderr,
+                    work_repo=work_repo,
+                )
 
             except subprocess.TimeoutExpired:
                 return (
@@ -1265,6 +1254,9 @@ __all__ = [
     "_init_test_ai_gate_repo",
     "_synthesize_gate_settings",
     "_test_ai_gate_env",
+    "evaluate_claude_ai_gate_result",
+    "format_ai_gate_console_details",
+    "summarize_ai_gate_message",
     "detect_agents_from_config",
     "detect_ai_agent",
     "get_adapter",

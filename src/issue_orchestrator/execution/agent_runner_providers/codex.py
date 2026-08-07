@@ -92,9 +92,6 @@ class CodexProvider(CLIProvider):
         scope_argv = self.apply_scope(sandbox_scope) if sandbox_scope is not None else []
 
         cmd = [self.executable, *scope_argv]
-        if execution_mode == "exec":
-            cmd.append("exec")
-
         approval_mode = kwargs.get("approval_mode", "full-auto")
         if sandbox_scope is None:
             self._append_approval_flags(
@@ -102,6 +99,9 @@ class CodexProvider(CLIProvider):
                 approval_mode=approval_mode,
                 execution_mode=execution_mode,
             )
+
+        if execution_mode == "exec":
+            cmd.append("exec")
 
         # Model (optional - Codex will use default if not specified)
         if model:
@@ -114,7 +114,6 @@ class CodexProvider(CLIProvider):
                 cmd,
                 kwargs,
                 approval_mode=approval_mode,
-                execution_mode=execution_mode,
             )
 
         if json_output:
@@ -142,7 +141,7 @@ class CodexProvider(CLIProvider):
             cmd.append("--dangerously-bypass-approvals-and-sandbox")
         elif approval_mode == "full-auto":
             if execution_mode == "exec":
-                cmd.append("--full-auto")
+                cmd.extend(["--ask-for-approval", "on-request"])
             else:
                 cmd.extend(["--ask-for-approval", "never"])
 
@@ -163,10 +162,9 @@ class CodexProvider(CLIProvider):
         kwargs: Mapping[str, object],
         *,
         approval_mode: str,
-        execution_mode: str,
     ) -> None:
         sandbox = kwargs.get("sandbox")
-        if sandbox is None and approval_mode == "full-auto" and execution_mode == "interactive":
+        if sandbox is None and approval_mode == "full-auto":
             sandbox = "workspace-write"
         if sandbox and approval_mode != "yolo":
             cmd.extend(["--sandbox", str(sandbox)])

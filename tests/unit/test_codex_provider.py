@@ -95,7 +95,8 @@ class TestCodexBaseCommand:
 
     def test_exec_mode_uses_codex_exec(self) -> None:
         cmd = _cmd(execution_mode="exec")
-        assert cmd[:2] == ["codex", "exec"]
+        assert cmd[0] == "codex"
+        assert "exec" in cmd
 
     def test_full_auto_default(self) -> None:
         cmd = _cmd()
@@ -105,14 +106,23 @@ class TestCodexBaseCommand:
         assert "workspace-write" in cmd
         assert "--full-auto" not in cmd
 
-    def test_exec_mode_preserves_full_auto_flag(self) -> None:
-        # Non-interactive exec keeps the old compatibility flag.
-        assert "--full-auto" in _cmd(execution_mode="exec")
+    def test_exec_mode_uses_supported_full_auto_equivalent(self) -> None:
+        cmd = _cmd(execution_mode="exec")
+        assert "--full-auto" not in cmd
+        assert cmd[cmd.index("--ask-for-approval") + 1] == "on-request"
+        assert cmd.index("--ask-for-approval") < cmd.index("exec")
+        assert cmd[cmd.index("--sandbox") + 1] == "workspace-write"
 
     def test_yolo_swaps_to_dangerously_bypass(self) -> None:
         cmd = _cmd(approval_mode="yolo")
         assert "--dangerously-bypass-approvals-and-sandbox" in cmd
         assert "--full-auto" not in cmd
+
+    def test_exec_yolo_flag_precedes_subcommand(self) -> None:
+        cmd = _cmd(execution_mode="exec", approval_mode="yolo")
+        assert cmd.index("--dangerously-bypass-approvals-and-sandbox") < cmd.index(
+            "exec"
+        )
 
     def test_prompt_is_last_arg(self) -> None:
         cmd = CodexProvider().build_command(prompt="hello world")
