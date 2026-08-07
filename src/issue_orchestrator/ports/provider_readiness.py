@@ -54,6 +54,13 @@ class ProviderReadiness:
     provider: str
     state: ProviderReadinessState
     detail: str = ""
+    # Identity of the physical probe execution this value came from. Every
+    # caller served from the probe's short-lived result cache carries the SAME
+    # id, which is what lets the circuit owner count one credential observation
+    # exactly once no matter how many launches it gated (#6999 F2). Empty means
+    # "not produced by a probe" — a hand-built or adapter-level value that no
+    # one can replay.
+    sample_id: str = ""
 
     @property
     def launchable(self) -> bool:
@@ -141,18 +148,26 @@ class StaticProviderReadinessProbe:
 
     state: ProviderReadinessState = ProviderReadinessState.UNKNOWN
     detail: str = "no provider readiness probe configured"
+    # A static probe never takes a new sample: its answer is fixed for its
+    # whole lifetime, so every result it hands out is literally the same
+    # observation and the circuit owner must count it once.
+    sample_id: str = "static-provider-readiness"
 
     def check_launch_readiness(self, provider: str) -> ProviderReadiness:
-        return ProviderReadiness(
-            provider=provider, state=self.state, detail=self.detail
-        )
+        return self._readiness(provider)
 
     def diagnose_session_output(
         self, provider: str, output: str
     ) -> ProviderReadiness:
         del output  # a static probe interprets no output
+        return self._readiness(provider)
+
+    def _readiness(self, provider: str) -> ProviderReadiness:
         return ProviderReadiness(
-            provider=provider, state=self.state, detail=self.detail
+            provider=provider,
+            state=self.state,
+            detail=self.detail,
+            sample_id=self.sample_id,
         )
 
 

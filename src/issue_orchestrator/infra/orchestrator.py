@@ -303,11 +303,18 @@ class Orchestrator:
     @cached_property
     def _completion_handler(self) -> CompletionHandler:
         from ..control.active_sessions import active_session_run_id
+        from ..control.provider_availability import ProviderAvailabilityPolicy
         smm = self.deps.state_machine_manager
         return CompletionHandler(
             self.config, self.deps.events, self.deps.repository_host,
             lambda issue: smm.issue_machines.get(issue.number), lambda s: smm.session_machines.get(s), lambda n: smm.review_machines.get(n),
             self.deps.session_output, self.deps.tech_lead_authority, self.deps.open_issue_corpus, lambda n: active_session_run_id(self.state.active_sessions, n),
+            # Completion never applies the provider-blocked label itself; it
+            # asks this owner for the transition that carries the durable
+            # issue-scoped record with it (#6999 F5/A2).
+            ProviderAvailabilityPolicy(
+                self.config, self.deps.provider_resilience, self.deps.label_manager
+            ),
             remove_session_machine_fn=smm.remove_session_machine, label_manager=self.deps.label_manager,
         )
 

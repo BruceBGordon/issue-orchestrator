@@ -17,15 +17,49 @@ class ProviderErrorType(str, Enum):
 
 @dataclass(frozen=True)
 class ProviderCircuitState:
+    """Persisted circuit state, with one deadline per independent cause.
+
+    A credential outage and a service outage are unrelated facts about a
+    provider, and each has its own validity window. Collapsing them into a
+    single ``open_until`` meant retiring one silently released the other: a
+    ``READY`` credential probe says nothing about a 429/5xx outage, but would
+    have re-opened launches into it (#6999 F3). Both dimensions are stored, and
+    "is the circuit open" is *derived* from them.
+    """
+
     provider: str
-    open_until: datetime | None
     consecutive_outages: int
     last_error_summary: str | None
     updated_at: datetime
+    # Deadline for the escalating transient ladder (429/5xx/transport).
+    transient_open_until: datetime | None = None
+    # Deadline for the human-fixable credential outage. Its own (long) window,
+    # cleared the moment the probe confirms re-authentication.
+    auth_open_until: datetime | None = None
     # Auth failures are counted separately from transient outages: a credential
     # outage is human-fixable and must trip the circuit on its own threshold,
     # not be diluted by unrelated network blips (#6999).
     consecutive_auth_failures: int = 0
+    # Identity of the last provider-readiness *sample* counted against this
+    # circuit. One physical credential probe gates many launches in a tick, and
+    # every one of them reports the same result; the circuit counts that sample
+    # exactly once so a configured threshold > 1 still means "more than one
+    # observation" (#6999 F2).
+    last_auth_sample_id: str = ""
+
+    @property
+    def open_until(self) -> datetime | None:
+        """The latest deadline across both causes, or ``None`` if neither is set.
+
+        The aggregate the circuit is judged on: a provider is unavailable while
+        *any* cause is still within its own window.
+        """
+        deadlines = [
+            deadline
+            for deadline in (self.transient_open_until, self.auth_open_until)
+            if deadline is not None
+        ]
+        return max(deadlines) if deadlines else None
 
 
 @dataclass(frozen=True)

@@ -76,6 +76,10 @@ from ..execution.worktree_adapter import GitWorktreeManager
 from ..execution.git_working_copy import GitWorkingCopy
 from ..execution.command_runner import LocalCommandRunner
 from ..execution.provider_readiness_probe import CLIProviderReadinessProbe
+from ..ports.provider_readiness import (
+    NO_PROVIDER_READINESS_PROBE,
+    ProviderReadinessProbe,
+)
 from ..execution.session_output_adapter import FileSystemSessionOutput
 from ..execution.review_artifact_reader import ManifestReviewArtifactReader
 from ..execution.thread_background_job_runner import ThreadBackgroundJobRunner
@@ -331,6 +335,7 @@ def _create_planner(
     events: EventSink,
     provider_resilience: ProviderResilienceManager | None = None,
     label_manager: "LabelManager | None" = None,
+    provider_readiness_probe: "ProviderReadinessProbe" = NO_PROVIDER_READINESS_PROBE,
 ) -> tuple[Planner, Scheduler, DependencyEvaluator | None, LabelSync | None]:
     """Create planner and supporting control plane components."""
     issue_resolver = None
@@ -378,6 +383,7 @@ def _create_planner(
         tech_lead_workflow=tech_lead_workflow,
         provider_resilience=provider_resilience,
         label_manager=label_manager,
+        provider_readiness_probe=provider_readiness_probe,
     )
     return planner, scheduler, dependency_evaluator, label_sync
 
@@ -643,12 +649,24 @@ def build_orchestrator(
         events=events,
     )
 
+    # Create IO adapters. These come before the planner because the planner's
+    # provider-eligibility check needs the one shared readiness probe, which
+    # needs a command runner (#6999 A1).
+    worktree_manager, working_copy, command_runner, session_output = _create_io_adapters(github_auth)
+
+    # One typed provider-readiness boundary per orchestrator, shared by
+    # planning, the launch gate and the live-session observer so all three read
+    # one probe (and one short-lived result cache) rather than each spawning
+    # their own (#6999).
+    provider_readiness_probe = CLIProviderReadinessProbe(command_runner)
+
     # Create planner and control plane components
-    planner, _scheduler, _dependency_evaluator, label_sync = _create_planner(config, github, events, provider_resilience, label_manager=label_manager)
+    planner, _scheduler, _dependency_evaluator, label_sync = _create_planner(
+        config, github, events, provider_resilience, label_manager=label_manager,
+        provider_readiness_probe=provider_readiness_probe,
+    )
     session_manager = SessionManager(runner=runner, events=events, config=config)
 
-    # Create IO adapters
-    worktree_manager, working_copy, command_runner, session_output = _create_io_adapters(github_auth)
     goal_pilot_store = SqliteGoalPilotStore(repo_root=config.repo_root)
     attempt_store = create_attempt_store(config)
 
@@ -802,10 +820,6 @@ def build_orchestrator(
         action_applier.label_store = label_store
         action_applier.publish_recovery = publish_recovery
 
-    # One typed provider-readiness boundary per orchestrator, shared by the
-    # launch gate and the live-session observer so both read one probe (and one
-    # short-lived result cache) rather than each spawning their own (#6999).
-    provider_readiness_probe = CLIProviderReadinessProbe(command_runner)
     infra_services = InfraServices(
         label_manager=label_manager,
         label_store=label_store,
@@ -976,6 +990,20 @@ def build_orchestrator_for_testing(
     # carries its own evaluator, so the stack publish-gate stays unwired there.
     _dependency_evaluator: DependencyEvaluator | None = None
 
+    # Create adapters for IO operations. These come before the planner because
+    # the planner's provider-eligibility check needs the one shared readiness
+    # probe, which needs a command runner (#6999 A1).
+    worktree_manager = GitWorktreeManager()
+    working_copy = GitWorkingCopy()
+    command_runner = LocalCommandRunner()
+    session_output = FileSystemSessionOutput()
+
+    # One typed provider-readiness boundary per orchestrator, shared by
+    # planning, the launch gate and the live-session observer so all three read
+    # one probe (and one short-lived result cache) rather than each spawning
+    # their own (#6999).
+    provider_readiness_probe = CLIProviderReadinessProbe(command_runner)
+
     # Create default planner if not provided
     if planner is None:
         planner, _scheduler, _dependency_evaluator, default_label_sync = _create_planner(
@@ -984,17 +1012,12 @@ def build_orchestrator_for_testing(
             events=events,
             provider_resilience=provider_resilience,
             label_manager=label_manager,
+            provider_readiness_probe=provider_readiness_probe,
         )
 
     # Create default session manager if not provided
     if session_manager is None:
         session_manager = SessionManager(runner=runner, events=events, config=config)
-
-    # Create adapters for IO operations
-    worktree_manager = GitWorktreeManager()
-    working_copy = GitWorkingCopy()
-    command_runner = LocalCommandRunner()
-    session_output = FileSystemSessionOutput()
     goal_pilot_store = SqliteGoalPilotStore(repo_root=config.repo_root)
     attempt_store = create_attempt_store(config)
 
@@ -1139,7 +1162,6 @@ def build_orchestrator_for_testing(
         validation_timeout_seconds=config.validation.quick.timeout_seconds,
         attempt_store=attempt_store,
         validation_attempt_key_factory=_validation_attempt_key_factory(config),
-        provider_blocked_label=label_manager.provider_unavailable,
         review_exchange_canceller=_cancel_review_exchange_for_testing,
     )
 
@@ -1189,10 +1211,6 @@ def build_orchestrator_for_testing(
         action_applier.label_store = label_store
         action_applier.publish_recovery = publish_recovery
 
-    # One typed provider-readiness boundary per orchestrator, shared by the
-    # launch gate and the live-session observer so both read one probe (and one
-    # short-lived result cache) rather than each spawning their own (#6999).
-    provider_readiness_probe = CLIProviderReadinessProbe(command_runner)
     infra_services = InfraServices(
         label_manager=label_manager,
         label_store=label_store,

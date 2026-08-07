@@ -31,10 +31,16 @@ class ProviderAuthFailureDecision:
     A separate type from the transient one on purpose: the circuit owner treats
     the two differently (its own threshold, its own long cooldown), and a caller
     must not be able to smuggle a credential outage into the transient ladder.
+
+    ``sample_id`` is the identity of the credential probe result this verdict
+    was confirmed against, carried so the circuit owner counts one physical
+    observation once even when a launch check already saw the same sample
+    (#6999 F2).
     """
 
     provider: str
     error_summary: str
+    sample_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -49,6 +55,7 @@ class ProviderAuthOutcome:
 
     provider: str
     detail: str
+    sample_id: str = ""
 
     @classmethod
     def from_readiness(
@@ -67,6 +74,7 @@ class ProviderAuthOutcome:
                 if readiness and readiness.detail
                 else "provider is not authenticated"
             ),
+            sample_id=readiness.sample_id if readiness else "",
         )
 
     def event_payload(self, issue_number: int, session_name: str) -> dict[str, Any]:
@@ -77,23 +85,32 @@ class ProviderAuthOutcome:
             "detail": self.detail,
         }
 
-    def as_decision(self, *, blocked_label: str | None) -> "SessionDecision":
+    def as_decision(self) -> "SessionDecision":
         """Blocked, never failed or timed out.
 
         The work is untouched and becomes launchable again the moment a human
         re-authenticates. The typed AUTH verdict rides along so the circuit
         owner can act on it and the reaction model can decline to mint a
         substance investigation for a credential problem.
+
+        No ``blocked_label`` is set. The provider-blocked label and its durable
+        issue-scoped record are two halves of one transition owned by
+        :class:`~.provider_impact.ApplyProviderImpactAction`; naming a label
+        here would route it through generic blocked handling as a bare
+        ``AddLabelAction`` and leave the history behind (#6999 F5). The typed
+        ``provider_error_type`` is what tells completion planning to ask the
+        provider-impact owner instead.
         """
         return SessionDecision(
             status=SessionStatus.BLOCKED,
             reason=f"Provider not authenticated: {self.detail}",
-            blocked_label=blocked_label,
             blocked_reason=self.detail,
             provider_error_type=ProviderErrorType.AUTH,
             provider_auth_failure=(
                 ProviderAuthFailureDecision(
-                    provider=self.provider, error_summary=self.detail
+                    provider=self.provider,
+                    error_summary=self.detail,
+                    sample_id=self.sample_id,
                 )
                 if self.provider
                 else None

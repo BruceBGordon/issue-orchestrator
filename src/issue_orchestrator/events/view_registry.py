@@ -201,6 +201,16 @@ VIEW_REGISTRY: dict[str, list[ViewEvent]] = {
             "orchestrator",
         ),
     ],
+    # The live-session counterpart. Worded for what actually happened: work was
+    # already running and was stopped, which is a different story from a launch
+    # that never started (#6999 F5).
+    "session.provider_auth_terminated": [
+        _user(
+            "session.provider_auth_terminated",
+            "Provider not authenticated — session stopped",
+            "orchestrator",
+        ),
+    ],
 
     # -- Tech Lead --
     "tech_lead.launching": [

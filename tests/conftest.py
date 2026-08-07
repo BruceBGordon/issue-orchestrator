@@ -1446,3 +1446,37 @@ repo:
     config_file = tmp_path / ".issue-orchestrator.yaml"
     config_file.write_text(config_content)
     return config_file
+
+
+# =============================================================================
+# Provider availability (#6999)
+# =============================================================================
+
+
+def make_provider_availability(config, provider_resilience=None):
+    """A real :class:`ProviderAvailabilityPolicy` over an in-memory circuit.
+
+    Completion planning asks this owner for the provider-blocked transition
+    instead of building a raw label mutation, so tests that construct a
+    completion planner/handler must supply a real one (#6999 F5/A2). Passing an
+    existing ``provider_resilience`` shares the circuit under test.
+    """
+    from issue_orchestrator.control.label_manager import LabelManager
+    from issue_orchestrator.control.provider_availability import (
+        ProviderAvailabilityPolicy,
+    )
+    from issue_orchestrator.control.provider_resilience import (
+        ProviderResilienceManager,
+    )
+    from issue_orchestrator.ports import InMemoryProviderCircuitStore
+    from issue_orchestrator.ports.event_sink import NullEventSink
+
+    if provider_resilience is None:
+        provider_resilience = ProviderResilienceManager(
+            config=config.provider_resilience,
+            store=InMemoryProviderCircuitStore(),
+            events=NullEventSink(),
+        )
+    return ProviderAvailabilityPolicy(
+        config, provider_resilience, LabelManager(config)
+    )

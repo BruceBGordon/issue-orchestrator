@@ -46,6 +46,40 @@ def _now() -> datetime:
 
 
 @dataclass(frozen=True)
+class ProviderLaunchOutcome:
+    """The one typed answer to "may I launch against this provider?" (#6999 A1).
+
+    Carries both halves of the question so no consumer has to re-ask either:
+    what the provider's own credential probe said, and whether the circuit
+    owner is holding launches back. Planning and launch control consume the
+    same value, which is why they cannot drift apart on eligibility.
+    """
+
+    provider: str
+    readiness: ProviderReadiness
+    circuit_open: bool
+
+    @property
+    def may_launch(self) -> bool:
+        """Whether a session may be spawned for this provider right now."""
+        return self.readiness.launchable and not self.circuit_open
+
+    @property
+    def blocked_by_credentials(self) -> bool:
+        """Whether the provider itself refused — only a human can clear this."""
+        return not self.readiness.launchable
+
+    @classmethod
+    def no_provider(cls) -> "ProviderLaunchOutcome":
+        """The outcome for work that names no provider: nothing to gate on."""
+        return cls(
+            provider="",
+            readiness=ProviderReadiness.unknown("", "no provider configured"),
+            circuit_open=False,
+        )
+
+
+@dataclass(frozen=True)
 class ProviderAvailabilityPolicy:
     config: Config
     provider_resilience: ProviderResilienceManager
@@ -99,10 +133,17 @@ class ProviderAvailabilityPolicy:
 
         return providers_by_issue
 
-    def is_open(self, provider: str | None) -> bool:
-        """Single-provider launch gate ("should I start work right now?").
+    def circuit_is_open(self, provider: str | None) -> bool:
+        """Raw circuit read — "does the resilience owner still hold this?".
 
-        Deliberately NOT used to decide what a provider-impact record says:
+        Deliberately NOT a launch gate: it takes no readiness sample, so on its
+        own it can never observe a human re-authenticating and would keep the
+        fleet parked for the whole auth cooldown (#6999 F1). Launch paths call
+        :meth:`assess_launch` / :meth:`blocks_launch` instead. This remains for
+        the readers that genuinely ask about circuit *ownership* rather than
+        eligibility, such as the tech-lead stuck sweep.
+
+        Also deliberately NOT used to decide what a provider-impact record says:
         anything that ends up in an issue's history goes through :meth:`assess`,
         so the record cannot describe a different instant or a wider set of
         providers than the decision that produced it (#5980 F4/A2).
@@ -112,18 +153,28 @@ class ProviderAvailabilityPolicy:
         return self.provider_resilience.is_open(provider)
 
     # ------------------------------------------------------------------
-    # Provider readiness (#6999)
+    # Bounded provider launch assessment (#6999 A1)
     #
-    # The launch-side counterpart to :meth:`is_open`. Every launch path asks
-    # this one method, so "credentials are dead, do not spawn" is decided in a
-    # single place and the circuit consequence cannot be forgotten at a call
-    # site.
+    # ONE answer to "may I launch against this provider right now?", shared by
+    # planning (which queue items are eligible) and launch control (which one
+    # actually spawns). Both halves of the question — the credential sample and
+    # the circuit — are resolved here, in that order, and the sample's circuit
+    # consequence is recorded exactly once. No call site reads the raw circuit
+    # to make a launch decision, so an open auth circuit can never suppress the
+    # very probe that would retire it.
     # ------------------------------------------------------------------
 
-    def probe_launch_readiness(
+    def assess_launch(
         self, provider: str | None, *, now: datetime | None = None
-    ) -> ProviderReadiness:
-        """Return the typed readiness of ``provider``, feeding the circuit owner.
+    ) -> ProviderLaunchOutcome:
+        """Take one readiness sample, feed the circuit, and read the result.
+
+        Order matters and is the whole fix: the probe runs *before* the circuit
+        is consulted. While an auth circuit is open no session runs, so a gate
+        that short-circuited on the open circuit could never observe the human
+        re-authenticating (#6999 F1). The circuit is then read *after* the
+        sample is recorded, so this one outcome reflects the sample it was
+        derived from.
 
         Both directions are reported to
         :class:`~.provider_resilience.ProviderResilienceManager` here rather
@@ -131,24 +182,32 @@ class ProviderAvailabilityPolicy:
         how many failures are tolerated, how long launches stay paused, and when
         an outage is over. Control receives only the typed outcome — never a
         banner or exit code.
-
-        Recovery goes through the *probe*, not through a successful session:
-        while the circuit is open no session runs, so waiting for one would be
-        the deadlock that makes the long auth cooldown a hard stall. A confirmed
-        ``READY`` probe is the human's re-authentication becoming visible.
         """
         if not provider:
-            return ProviderReadiness.unknown("", "no provider configured")
+            return ProviderLaunchOutcome.no_provider()
         readiness = self.readiness_probe.check_launch_readiness(provider)
         if readiness.human_fixable:
             self.provider_resilience.record_auth_failure(
                 provider,
                 error_summary=readiness.detail or "provider is not authenticated",
+                sample_id=readiness.sample_id,
                 now=now,
             )
         elif readiness.authenticated:
             self.provider_resilience.clear_auth_failures(provider, now=now)
-        return readiness
+        return ProviderLaunchOutcome(
+            provider=provider,
+            readiness=readiness,
+            circuit_open=self.provider_resilience.is_open(provider, now),
+        )
+
+    def blocks_launch(self, provider: str | None, *, now: datetime | None = None) -> bool:
+        """Whether ``provider`` must not be launched against right now.
+
+        The single predicate every planner queue uses. It is a full assessment,
+        not a circuit peek, so planning cannot starve the recovery path.
+        """
+        return not self.assess_launch(provider, now=now).may_launch
 
     def should_add_blocked_label(self, issue_labels: Iterable[str], planned_labels: set[str]) -> bool:
         label = self.blocked_label()

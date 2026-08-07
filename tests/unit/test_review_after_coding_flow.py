@@ -45,6 +45,7 @@ from issue_orchestrator.control.scheduler import Scheduler
 from issue_orchestrator.ports.session_output import SessionOutput
 from issue_orchestrator.control.workflows.review_workflow import ReviewDecision
 from issue_orchestrator.ports import NullEventSink
+from tests.conftest import make_provider_availability
 from tests.unit.session_run_helpers import make_session_run_assets
 
 
@@ -92,6 +93,7 @@ def make_completion_handler(config: Config, repository_host) -> CompletionHandle
             is_enabled=lambda: config.tech_lead.dedup.enabled,
         ),
         active_session_run_id=lambda _n: None,
+        provider_availability=make_provider_availability(config),
     )
 
 

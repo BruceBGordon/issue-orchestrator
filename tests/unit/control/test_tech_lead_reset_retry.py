@@ -50,6 +50,7 @@ from issue_orchestrator.ports.open_issue_corpus_store import (
     InMemoryOpenIssueCorpusStore,
 )
 from issue_orchestrator.ports.tech_lead_authority import InMemoryTechLeadAuthorityStore
+from tests.conftest import make_provider_availability
 from tests.unit.session_run_helpers import make_session_run_assets
 
 BLOCKED_FAILED = "blocked-failed"
@@ -619,6 +620,7 @@ class TestEffectiveTerminalOutcomeEvents:
                 is_enabled=lambda: config.tech_lead.dedup.enabled,
             ),
             active_session_run_id=lambda _issue_number: None,
+            provider_availability=make_provider_availability(config),
             mandated_action=mandated_action,
         )
 

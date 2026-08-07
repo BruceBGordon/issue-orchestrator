@@ -51,7 +51,7 @@ def _provider_policy(
 ) -> ProviderAvailabilityPolicy:
     """Build the real policy owner around a deterministic circuit collaborator."""
     resilience = Mock(spec=ProviderResilienceManager)
-    resilience.is_open.side_effect = lambda provider: provider in open_providers
+    resilience.is_open.side_effect = lambda provider, now=None: provider in open_providers
 
     def status(provider: str, _now: datetime) -> ProviderCircuitStatus | None:
         if provider not in open_providers:

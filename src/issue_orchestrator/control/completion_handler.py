@@ -19,7 +19,9 @@ if TYPE_CHECKING:
     from ..domain.state_machines.review_machine import ReviewStateMachine
     from ..domain.models import PendingReview, PendingRework, PendingTechLeadReview
     from ..ports.tech_lead_authority import TechLeadAuthorityStore
+    from ..ports.provider_resilience import ProviderErrorType
     from .open_issue_corpus import OpenIssueCorpusManager
+    from .provider_availability import ProviderAvailabilityPolicy
     from .state_machine_manager import StateMachineManager
     from .label_manager import LabelManager
 
@@ -139,6 +141,7 @@ class CompletionHandler:
         tech_lead_authority: "TechLeadAuthorityStore",
         open_issue_corpus: "OpenIssueCorpusManager",
         active_session_run_id: Callable[[int], str | None],
+        provider_availability: "ProviderAvailabilityPolicy",
         remove_session_machine_fn: Callable[[str], None] | None = None,
         label_manager: "LabelManager | None" = None,
     ):
@@ -157,7 +160,7 @@ class CompletionHandler:
         self._lm = label_manager
         self._action_planner = CompletionActionPlanner(
             config, repository_host, label_manager, tech_lead_authority,
-            open_issue_corpus, active_session_run_id,
+            open_issue_corpus, active_session_run_id, provider_availability,
         )
 
     def mark_session_retry(self, session: Session, reason: str) -> None:
@@ -192,6 +195,7 @@ class CompletionHandler:
         blocked_reason: Optional[str] = None,
         completion_detail: Optional[dict[str, Any]] = None,
         finalize_terminal: bool = True,
+        provider_error_type: "ProviderErrorType | None" = None,
     ) -> CompletionResult:
         """Process a session completion and update all state machines.
 
@@ -299,6 +303,7 @@ class CompletionHandler:
                 blocked_reason=blocked_reason,
                 pr_url=pr_url,
                 completion_detail=completion_detail,
+                provider_error_type=provider_error_type,
             )
         )
         completion_actions.extend(

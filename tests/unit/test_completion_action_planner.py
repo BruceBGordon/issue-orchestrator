@@ -29,6 +29,7 @@ from issue_orchestrator.control.tech_lead_completion import (
     tech_lead_decision_processing_error,
 )
 from issue_orchestrator.control.label_manager import LabelManager
+from tests.conftest import make_provider_availability
 from issue_orchestrator.domain.board_snapshot import BoardFailure, BoardSnapshot
 from issue_orchestrator.domain.issue_key import FakeIssueKey
 from issue_orchestrator.domain.models import AgentConfig, Issue, Session, SessionStatus
@@ -136,6 +137,7 @@ def make_planner(
         config, repository_host, LabelManager(config), tech_lead_authority,
         open_issue_corpus,
         lambda _n: None,  # no live target session in these unit fixtures (#6779 R1)
+        make_provider_availability(config),
     )
 
 

@@ -31,8 +31,10 @@ from .invalid_record_actions import (
     invalid_record_allows_interrupted_retry,
 )
 from .label_manager import LabelManager
+from .provider_availability import ProviderAvailabilityPolicy
 from .reconciliation import ExpectedState, build_expected_for_mutation
 from .tech_lead_session_policy import is_tech_lead_session
+from ..ports.provider_resilience import ProviderErrorType
 
 logger = logging.getLogger(__name__)
 
@@ -104,12 +106,17 @@ class CompletionActionPlanner:
         tech_lead_authority: TechLeadAuthorityStore,
         open_issue_corpus: OpenIssueCorpusManager,
         active_session_run_id: Callable[[int], str | None],
+        provider_availability: "ProviderAvailabilityPolicy",
     ) -> None:
         self.config = config
         self.repository_host = repository_host
         self._lm = label_manager
         self._tech_lead_authority = tech_lead_authority
         self._open_issue_corpus = open_issue_corpus
+        # The only way this planner is allowed to move the provider-blocked
+        # label: through the owner command that carries the durable
+        # issue-scoped record with it (#5980 F1 / #6999 F5/A2).
+        self._provider_availability = provider_availability
         # Resolves the target issue's live session run id so a gated
         # kill_hung_session proposal binds approval to that generation (#6779 R1).
         self._active_session_run_id = active_session_run_id
@@ -294,11 +301,16 @@ class CompletionActionPlanner:
         blocked_reason: Optional[str] = None,
         pr_url: Optional[str] = None,
         completion_detail: Optional[dict[str, Any]] = None,
+        provider_error_type: ProviderErrorType | None = None,
     ) -> tuple[Action, ...]:
         """Generate label/comment actions for session completion.
 
         This encapsulates the POLICY logic for what labels to add/remove
         when a session completes with various statuses.
+
+        ``provider_error_type`` carries the typed verdict a provider-caused
+        block ended on. It is what routes the block to the provider-impact
+        owner instead of generic blocked handling, for every session kind.
         """
         expected = build_expected_for_mutation()
 
@@ -355,6 +367,10 @@ class CompletionActionPlanner:
             return tuple(failure_actions)
 
         if status == SessionStatus.BLOCKED:
+            if provider_error_type is not None:
+                return tuple(
+                    self._generate_provider_blocked_actions(session, expected)
+                )
             return tuple(
                 self._generate_blocked_actions(
                     session,
@@ -642,6 +658,54 @@ class CompletionActionPlanner:
                 expected=expected,
             ),
         ]
+
+    def _generate_provider_blocked_actions(
+        self,
+        session: Session,
+        expected: ExpectedState,
+    ) -> list[Action]:
+        """Actions for a session blocked by its provider, not by its work.
+
+        The provider-blocked label and the durable issue-scoped record are two
+        halves of one transition, and ``ApplyProviderImpactAction`` is the only
+        thing that keeps them together (#5980 F1). Generic blocked handling
+        would apply a bare ``AddLabelAction``, after which the impact planner
+        sees the label already present and has no transition left to record —
+        the outage would vanish from the issue's history (#6999 F5).
+
+        Unlike the generic path this rule does NOT differ by session kind: a
+        review or rework session stalled by a dead credential impacts its issue
+        exactly as a coding session does, so every kind gets the transition. The
+        claim release stays kind-scoped, because holding the issue is a property
+        of the coding session, not of the outage.
+
+        No comment is posted. The impact command emits an issue-scoped
+        ``provider.issue_blocked`` event that survives the label being shed,
+        which is precisely the durable signal #5980 added to replace commenting
+        on every affected issue during a fleet-wide outage.
+        """
+        provider = session.agent_config.provider
+        actions: list[Action] = []
+        if provider:
+            assessment = self._provider_availability.assess((provider,))
+            if assessment.blocked:
+                actions.append(
+                    self._provider_availability.blocked_transition(
+                        session.issue.number,
+                        assessment,
+                        issue_key=session.issue.key.stable_id(),
+                    )
+                )
+        if session.terminal_id.startswith("issue-"):
+            actions.append(
+                RemoveLabelAction(
+                    issue_number=session.issue.number,
+                    label=self._lm.in_progress,
+                    reason="Session blocked by provider - releasing claim",
+                    expected=expected,
+                )
+            )
+        return actions
 
     def _generate_blocked_actions(
         self,

@@ -833,6 +833,12 @@
     "status": "completed",
     "step": "processing_completed"
   },
+  "session.provider_auth_terminated": {
+    "level": "detail",
+    "phase": "in_progress",
+    "status": "failed",
+    "step": "provider_auth_terminated"
+  },
   "session.restored": {
     "level": "detail",
     "phase": "in_progress",

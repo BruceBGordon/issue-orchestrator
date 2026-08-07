@@ -49,11 +49,12 @@ class ProviderLaunchGate:
         """Return a parking :class:`LaunchResult`, or ``None`` to proceed."""
         if not provider:
             return None
-        readiness = self.policy.probe_launch_readiness(provider)
-        if readiness.launchable:
+        outcome = self.policy.assess_launch(provider)
+        if not outcome.blocked_by_credentials:
             # Healthy credentials still do not override a transient outage.
             return self._park_for_open_circuit(provider, issue_number)
-        # Probing may have just tripped the circuit (the policy feeds typed AUTH
+        readiness = outcome.readiness
+        # The assessment may have just tripped the circuit (it feeds typed AUTH
         # outcomes to the circuit owner), so ask for the blocked transition —
         # that is what parks the issue with its durable record.
         parked = self._park_for_open_circuit(provider, issue_number)

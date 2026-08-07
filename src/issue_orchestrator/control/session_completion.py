@@ -329,6 +329,9 @@ def handle_session_completion(  # noqa: C901, PLR0912 - handles validation, acti
             blocked_reason=blocked_reason,
             completion_detail=completion_detail,
             finalize_terminal=False,
+            # Routes a provider-caused block to the provider-impact owner
+            # rather than generic blocked handling (#6999 F5).
+            provider_error_type=provider_error_type,
         )
     finally:
         # Completion state is orchestrator-authoritative. Runtime session
@@ -766,4 +769,8 @@ def _record_provider_resilience_effects(
         provider_resilience.record_auth_failure(
             auth_failure.provider,
             error_summary=auth_failure.error_summary,
+            # The credential sample this verdict was confirmed against. Sharing
+            # it with the launch-side check means one physical observation is
+            # counted once, not once per consumer (#6999 F2).
+            sample_id=auth_failure.sample_id,
         )

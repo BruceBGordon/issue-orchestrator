@@ -164,7 +164,6 @@ def create_completion_components(
         attempt_store=attempt_store,
         validation_attempt_key_factory=_validation_attempt_key_factory(config),
         max_validation_retries=config.retry.max_validation_retries,
-        provider_blocked_label=label_manager.provider_unavailable,
         review_exchange_canceller=_cancel_review_exchange,
     )
 

@@ -28,6 +28,10 @@ from typing import TYPE_CHECKING, Callable, Optional
 from ..infra.config import Config
 from ..infra.logging_config import issue_log
 from ..ports.issue import Issue
+from ..ports.provider_readiness import (
+    NO_PROVIDER_READINESS_PROBE,
+    ProviderReadinessProbe,
+)
 from ..domain.models import (
     PendingTechLeadReview,
     TechLeadFacts,
@@ -136,6 +140,7 @@ class Planner:
         provider_resilience: Optional["ProviderResilienceManager"] = None,
         label_manager: Optional["LabelManager"] = None,
         clock: Callable[[], float] = time.time,
+        provider_readiness_probe: ProviderReadinessProbe = NO_PROVIDER_READINESS_PROBE,
     ):
         """Initialize planner with its dependencies.
 
@@ -147,6 +152,11 @@ class Planner:
             rework_workflow: Optional rework decision logic
             tech_lead_workflow: Optional tech_lead decision logic
             label_manager: Label registry for prefix-aware queries.
+            provider_readiness_probe: The typed provider-readiness boundary
+                (#6999). Planning consults it through
+                :meth:`ProviderAvailabilityPolicy.blocks_launch` rather than
+                reading the circuit directly, so an open auth circuit cannot
+                suppress the one probe that would retire it.
         """
         self.config = config
         self.scheduler = scheduler
@@ -156,7 +166,15 @@ class Planner:
         self.rework_workflow = rework_workflow
         self.tech_lead_workflow = tech_lead_workflow
         self.provider_resilience = provider_resilience
-        self.provider_policy = ProviderAvailabilityPolicy(config, provider_resilience) if provider_resilience else None
+        self.provider_policy = (
+            ProviderAvailabilityPolicy(
+                config,
+                provider_resilience,
+                readiness_probe=provider_readiness_probe,
+            )
+            if provider_resilience
+            else None
+        )
         if label_manager is None:
             from .label_manager import LabelManager
             label_manager = LabelManager(config)
@@ -1209,7 +1227,7 @@ Flip labels from `{facts.watch_label}` to `{self.config.tech_lead_reviewed_label
             filtered: list[Issue] = []
             for issue in available:
                 provider = self.provider_policy.provider_for_issue(issue)
-                if provider and self.provider_policy.is_open(provider):
+                if provider and self.provider_policy.blocks_launch(provider):
                     skipped.append(SkippedItem(
                         item_type="issue",
                         number=issue.number,
@@ -1366,7 +1384,7 @@ Flip labels from `{facts.watch_label}` to `{self.config.tech_lead_reviewed_label
             for review in decision.reviews_to_launch[:capacity]:
                 reviewer_label = self.config.get_reviewer_for_agent(review.agent_label) if review.agent_label else self.config.code_review_agent
                 provider = self.provider_policy.provider_for_agent_label(reviewer_label) if self.provider_policy else None
-                if provider and self.provider_policy and self.provider_policy.is_open(provider):
+                if provider and self.provider_policy and self.provider_policy.blocks_launch(provider):
                     self._record_provider_skip(
                         issue_number=review.issue_number,
                         item_type="review",
@@ -1427,7 +1445,7 @@ Flip labels from `{facts.watch_label}` to `{self.config.tech_lead_reviewed_label
                     if self.provider_policy
                     else None
                 )
-                if provider and self.provider_policy and self.provider_policy.is_open(provider):
+                if provider and self.provider_policy and self.provider_policy.blocks_launch(provider):
                     self._record_provider_skip(
                         issue_number=review.issue_number,
                         item_type="retrospective_review",
@@ -1498,7 +1516,7 @@ Flip labels from `{facts.watch_label}` to `{self.config.tech_lead_reviewed_label
                     logger.warning("Planner: skipping rework with unresolved issue number: %s", rework.issue_key)
                     continue
                 provider = self.provider_policy.provider_for_agent_label(rework.agent_type) if self.provider_policy else None
-                if provider and self.provider_policy and self.provider_policy.is_open(provider):
+                if provider and self.provider_policy and self.provider_policy.blocks_launch(provider):
                     self._record_provider_skip(
                         issue_number=issue_num,
                         item_type="rework",
@@ -1581,7 +1599,7 @@ Flip labels from `{facts.watch_label}` to `{self.config.tech_lead_reviewed_label
                 if self.provider_policy and retry.agent_label
                 else None
             )
-            if provider and self.provider_policy and self.provider_policy.is_open(provider):
+            if provider and self.provider_policy and self.provider_policy.blocks_launch(provider):
                 self._record_provider_skip(
                     issue_number=issue_number,
                     item_type="validation_retry",
@@ -1644,7 +1662,7 @@ Flip labels from `{facts.watch_label}` to `{self.config.tech_lead_reviewed_label
         # event can never claim a launch the provider gate then suppresses
         # (#6892). One shared agent/provider => one gate for the whole queue.
         provider = self.provider_policy.provider_for_agent_label(self.config.tech_lead_review_agent) if self.provider_policy else None
-        if provider and self.provider_policy and self.provider_policy.is_open(provider):
+        if provider and self.provider_policy and self.provider_policy.blocks_launch(provider):
             for tech_lead in pending_tech_lead:
                 self._record_provider_skip(
                     issue_number=tech_lead.issue_number,

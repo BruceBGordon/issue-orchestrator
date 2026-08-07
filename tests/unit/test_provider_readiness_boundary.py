@@ -231,11 +231,13 @@ class TestClaudeExpiredLoginPreflight:
             config=_config(), provider_resilience=manager, readiness_probe=probe
         )
 
-        readiness = policy.probe_launch_readiness("claude-code")
+        outcome = policy.assess_launch("claude-code")
 
-        assert not readiness.launchable
+        assert not outcome.may_launch
+        assert outcome.blocked_by_credentials
         assert probe.launch_calls == ["claude-code"]
         # The circuit — not the caller — decided to pause the fleet.
+        assert outcome.circuit_open
         assert manager.is_open("claude-code")
         assert EventName.PROVIDER_AUTH_FAILED.value in events.names()
 
@@ -248,7 +250,7 @@ class TestClaudeExpiredLoginPreflight:
             readiness_probe=StubReadinessProbe(ProviderReadiness.ready("claude-code")),
         )
 
-        assert policy.probe_launch_readiness("claude-code").launchable
+        assert policy.assess_launch("claude-code").may_launch
         assert not manager.is_open("claude-code")
         assert events.names() == []
 
@@ -268,7 +270,7 @@ class TestClaudeExpiredLoginPreflight:
                 ProviderReadiness.auth_expired("claude-code", "not logged in")
             ),
         )
-        outage.probe_launch_readiness("claude-code")
+        outage.assess_launch("claude-code")
         assert manager.is_open("claude-code")
 
         recovered = ProviderAvailabilityPolicy(
@@ -276,7 +278,7 @@ class TestClaudeExpiredLoginPreflight:
             provider_resilience=manager,
             readiness_probe=StubReadinessProbe(ProviderReadiness.ready("claude-code")),
         )
-        recovered.probe_launch_readiness("claude-code")
+        assert recovered.assess_launch("claude-code").may_launch
 
         assert not manager.is_open("claude-code")
 
@@ -346,11 +348,11 @@ class TestClaudeExpiredLoginPreflight:
             config=_config(), provider_resilience=_manager(RecordingEvents())
         )
 
-        readiness = policy.probe_launch_readiness("claude-code")
+        outcome = policy.assess_launch("claude-code")
 
-        assert readiness.state is ProviderReadinessState.UNKNOWN
-        assert not readiness.authenticated
-        assert readiness.launchable
+        assert outcome.readiness.state is ProviderReadinessState.UNKNOWN
+        assert not outcome.readiness.authenticated
+        assert outcome.may_launch
 
 
 def _config():
@@ -626,7 +628,12 @@ class TestDistinctAuthOutcome:
         assert decision.provider_error_type is ProviderErrorType.AUTH
         assert decision.provider_auth_failure is not None
         assert decision.provider_auth_failure.provider == "claude-code"
-        assert EventName.SESSION_LAUNCH_FAILED_AUTH.value in events.names()
+        # The live-session story, not the launch-gate one — and no raw
+        # provider-blocked label rides along (#6999 F5).
+        assert decision.blocked_label is None
+        assert events.names() == [
+            EventName.SESSION_PROVIDER_AUTH_TERMINATED.value
+        ]
 
     def test_auth_observation_is_terminal(self) -> None:
         observation = SessionObservationResult.provider_auth_failed(
@@ -678,20 +685,22 @@ class TestCircuitOwnership:
         events = RecordingEvents()
         manager = _manager(events, threshold=2)
 
-        first = manager.record_auth_failure("claude-code", error_summary="not logged in")
+        first = manager.record_auth_failure(
+            "claude-code", error_summary="not logged in", sample_id="s1"
+        )
         assert first is not None
         assert first.consecutive_auth_failures == 1
         assert not manager.is_open("claude-code")
 
         second = manager.record_auth_failure(
-            "claude-code", error_summary="still not logged in"
+            "claude-code", error_summary="still not logged in", sample_id="s2"
         )
         assert second is not None
         assert second.consecutive_auth_failures == 2
         assert manager.is_open("claude-code")
 
         third = manager.record_auth_failure(
-            "claude-code", error_summary="still not logged in"
+            "claude-code", error_summary="still not logged in", sample_id="s3"
         )
         assert third is not None
         assert third.consecutive_auth_failures == 3
@@ -707,7 +716,7 @@ class TestCircuitOwnership:
         now = datetime(2026, 8, 4, 22, 0, tzinfo=timezone.utc)
 
         state = manager.record_auth_failure(
-            "claude-code", error_summary="not logged in", now=now
+            "claude-code", error_summary="not logged in", sample_id="s1", now=now
         )
 
         assert state is not None
@@ -717,7 +726,9 @@ class TestCircuitOwnership:
         """Recovery does not wait out the long cooldown."""
         events = RecordingEvents()
         manager = _manager(events)
-        manager.record_auth_failure("claude-code", error_summary="not logged in")
+        manager.record_auth_failure(
+            "claude-code", error_summary="not logged in", sample_id="s1"
+        )
         assert manager.is_open("claude-code")
 
         cleared = manager.clear_auth_failures("claude-code")
@@ -739,7 +750,9 @@ class TestCircuitOwnership:
         """Only the auth half is retired; the transient ladder keeps its place."""
         manager = _manager(RecordingEvents())
         manager.record_transient_failure("claude-code", error_summary="503")
-        manager.record_auth_failure("claude-code", error_summary="not logged in")
+        manager.record_auth_failure(
+            "claude-code", error_summary="not logged in", sample_id="s1"
+        )
 
         manager.clear_auth_failures("claude-code")
 
@@ -750,7 +763,9 @@ class TestCircuitOwnership:
 
     def test_transient_failures_do_not_disturb_the_auth_count(self) -> None:
         manager = _manager(RecordingEvents(), threshold=2)
-        manager.record_auth_failure("claude-code", error_summary="not logged in")
+        manager.record_auth_failure(
+            "claude-code", error_summary="not logged in", sample_id="s1"
+        )
 
         manager.record_transient_failure("claude-code", error_summary="502")
 
@@ -762,7 +777,12 @@ class TestCircuitOwnership:
     def test_no_provider_means_no_circuit_write(self) -> None:
         manager = _manager(RecordingEvents())
 
-        assert manager.record_auth_failure("", error_summary="not logged in") is None
+        assert (
+            manager.record_auth_failure(
+                "", error_summary="not logged in", sample_id="s1"
+            )
+            is None
+        )
         assert manager.snapshot() == []
 
 
@@ -842,28 +862,6 @@ class TestLiveSessionObservation:
 
         assert result.observation is SessionObservation.RUNNING
 
-    def test_an_old_session_is_not_auth_checked(
-        self, sample_config, make_session
-    ) -> None:
-        """Beyond the launch window the banner cannot be about this launch."""
-        from issue_orchestrator.observation.observer import (
-            PROVIDER_AUTH_CHECK_WINDOW_SECONDS,
-        )
-
-        probe = StubReadinessProbe(
-            ProviderReadiness.auth_expired("claude-code", "not logged in")
-        )
-        observer = self._observer(sample_config, probe)
-        session = self._session_with_log(make_session, EXPIRED_LOGIN_BANNER)
-        session.started_at = datetime.now() - timedelta(
-            seconds=PROVIDER_AUTH_CHECK_WINDOW_SECONDS + 60
-        )
-
-        result = observer.observe_session(session)
-
-        assert result.observation is SessionObservation.RUNNING
-        assert probe.diagnose_calls == []
-
     def test_default_observer_never_reports_an_auth_failure(
         self, sample_config, make_session
     ) -> None:
@@ -929,3 +927,962 @@ def test_launchability_is_decided_by_the_typed_state(
     readiness = ProviderReadiness(provider="claude-code", state=state)
 
     assert readiness.launchable is launchable
+
+
+# ---------------------------------------------------------------------------
+# The production planning path (#6999 F1 / A1)
+#
+# The launch gate alone cannot end an auth outage: every queue is filtered by
+# the planner first, so if planning consults the raw circuit the gate is never
+# reached, no probe runs, and the fleet waits out the whole auth cooldown. These
+# tests start from an OPEN auth circuit and a provider that is now READY, and
+# prove a launch is planned — through the real Planner, for every queue.
+# ---------------------------------------------------------------------------
+
+
+PROVIDER = "claude-code"
+
+
+@dataclass
+class _RecordingProbe:
+    """A probe handing out one fixed sample, recording every launch question."""
+
+    readiness: ProviderReadiness
+    launch_calls: list[str] = field(default_factory=list)
+
+    def check_launch_readiness(self, provider: str) -> ProviderReadiness:
+        self.launch_calls.append(provider)
+        return self.readiness
+
+    def diagnose_session_output(self, provider: str, output: str) -> ProviderReadiness:
+        del output
+        return self.readiness
+
+
+def _recovery_config(tmp_path: Path):
+    from issue_orchestrator.infra.config import AgentConfig, Config
+
+    prompt = tmp_path / "prompt.md"
+    prompt.write_text("Test prompt")
+    config = Config(repo="test/repo", repo_root=tmp_path, max_concurrent_sessions=4)
+    config.agents = {
+        label: AgentConfig(prompt_path=prompt, provider=PROVIDER)
+        for label in ("agent:backend", "agent:reviewer", "agent:tech-lead")
+    }
+    config.code_review_agent = "agent:reviewer"
+    config.tech_lead_review_agent = "agent:tech-lead"
+    config.tech_lead.max_concurrent = 1
+    return config
+
+
+def _queue_snapshot(queue: str):
+    """One pending item on ``queue``, with everything else empty."""
+    from unittest.mock import Mock
+
+    from issue_orchestrator.domain.issue_key import FakeIssueKey
+    from issue_orchestrator.domain.models import (
+        PendingRetrospectiveReview,
+        PendingReview,
+        PendingRework,
+        PendingTechLeadReview,
+        PendingValidationRetry,
+    )
+    from issue_orchestrator.domain.session_key import TaskKind
+    from issue_orchestrator.domain.tech_lead_session import TechLeadSessionFlavor
+    from tests.unit.test_planner import make_issue, make_snapshot
+
+    issue_key = FakeIssueKey(name="7")
+    if queue == "coding":
+        return make_snapshot(issues=[make_issue(7, labels=["agent:backend"])]), {}
+    if queue == "review":
+        review = PendingReview(
+            issue_key=issue_key,
+            pr_number=70,
+            pr_url="url",
+            branch_name="branch",
+            _issue_number=7,
+            agent_label="agent:backend",
+        )
+        workflow = Mock()
+        workflow.is_configured.return_value = True
+        workflow.should_launch_reviews.return_value = Mock(
+            should_launch=True, skip_reason=None, reviews_to_launch=[review]
+        )
+        return make_snapshot(pending_reviews=[review]), {"review_workflow": workflow}
+    if queue == "retrospective_review":
+        review = PendingRetrospectiveReview(
+            issue_key=issue_key,
+            issue_number=7,
+            issue_title="Retro",
+            agent_label="agent:backend",
+            trigger_label="review-first",
+        )
+        workflow = Mock()
+        workflow.is_configured.return_value = True
+        workflow.should_launch_reviews.return_value = Mock(
+            should_launch=True, skip_reason=None, reviews_to_launch=[review]
+        )
+        return (
+            make_snapshot(pending_retrospective_reviews=[review]),
+            {"retrospective_review_workflow": workflow},
+        )
+    if queue == "rework":
+        rework = PendingRework(
+            issue_key=issue_key, agent_type="agent:backend", issue_number=7
+        )
+        workflow = Mock()
+        workflow.should_launch_reworks.return_value = Mock(
+            should_launch=True, skip_reason=None, reworks_to_launch=[rework]
+        )
+        workflow.should_escalate.return_value = Mock(should_escalate=False)
+        return make_snapshot(pending_reworks=[rework]), {"rework_workflow": workflow}
+    if queue == "validation_retry":
+        retry = PendingValidationRetry(
+            issue_number=7,
+            issue_title="Retry",
+            agent_label="agent:backend",
+            worktree_path="/tmp/wt",
+            branch_name="branch",
+            original_prompt=None,
+            validation_error="boom",
+            validation_error_file=None,
+            retry_count=1,
+            source_task=TaskKind.CODE,
+        )
+        return make_snapshot(pending_validation_retries=[retry]), {}
+    if queue == "tech_lead":
+        item = PendingTechLeadReview(
+            issue_number=7,
+            title="Health Review",
+            flavor=TechLeadSessionFlavor.HEALTH_REVIEW,
+        )
+        return make_snapshot(pending_tech_lead=[item]), {}
+    raise AssertionError(f"unknown queue {queue!r}")
+
+
+_LAUNCH_FOR_QUEUE = {
+    "coding": "issue",
+    "review": "review",
+    "retrospective_review": "retrospective-review",
+    "rework": "rework",
+    "validation_retry": "validation_retry",
+    "tech_lead": "tech-lead",
+}
+
+
+def _planned_launch_kinds(actions) -> set[str]:
+    from issue_orchestrator.control.actions import (
+        LaunchSessionAction,
+        LaunchValidationRetryAction,
+    )
+
+    kinds = {
+        action.session_type.value
+        for action in actions
+        if isinstance(action, LaunchSessionAction)
+    }
+    if any(isinstance(action, LaunchValidationRetryAction) for action in actions):
+        kinds.add("validation_retry")
+    return kinds
+
+
+def _recovery_planner(config, manager, probe, workflows):
+    from issue_orchestrator.control.planner import Planner
+    from issue_orchestrator.control.scheduler import Scheduler
+    from issue_orchestrator.control.workflows import TechLeadWorkflow
+
+    return Planner(
+        config=config,
+        scheduler=Scheduler(config),
+        tech_lead_workflow=TechLeadWorkflow(config, RecordingEvents()),
+        provider_resilience=manager,
+        provider_readiness_probe=probe,
+        **workflows,
+    )
+
+
+@pytest.mark.parametrize("queue", sorted(_LAUNCH_FOR_QUEUE))
+class TestPlanningReleasesTheAuthOutage:
+    """Every planner queue must be able to observe re-authentication."""
+
+    def test_open_auth_circuit_suppresses_the_queue(self, queue, tmp_path) -> None:
+        """Baseline: while the provider really is dead, nothing is planned."""
+        config = _recovery_config(tmp_path)
+        manager = _manager(RecordingEvents())
+        probe = _RecordingProbe(
+            ProviderReadiness.auth_expired(PROVIDER, "not logged in", )
+        )
+        snapshot, workflows = _queue_snapshot(queue)
+
+        plan = _recovery_planner(config, manager, probe, workflows).plan(snapshot)
+
+        assert _LAUNCH_FOR_QUEUE[queue] not in _planned_launch_kinds(plan.actions)
+        assert manager.is_open(PROVIDER)
+
+    def test_a_ready_probe_reopens_the_queue_before_the_cooldown(
+        self, queue, tmp_path
+    ) -> None:
+        """The deadlock guard, on the real production path.
+
+        The circuit is open on a six-hour auth cooldown and nothing has expired.
+        Planning still asks the provider, sees READY, and the launch flows —
+        which is only possible because planning takes a readiness sample rather
+        than peeking at the circuit (#6999 F1).
+        """
+        config = _recovery_config(tmp_path)
+        manager = _manager(RecordingEvents(), auth_cooldown=21600)
+        manager.record_auth_failure(
+            PROVIDER, error_summary="not logged in", sample_id="outage"
+        )
+        assert manager.is_open(PROVIDER)
+        probe = _RecordingProbe(ProviderReadiness.ready(PROVIDER))
+        snapshot, workflows = _queue_snapshot(queue)
+
+        plan = _recovery_planner(config, manager, probe, workflows).plan(snapshot)
+
+        assert probe.launch_calls, "the queue never asked the provider"
+        assert not manager.is_open(PROVIDER)
+        assert _LAUNCH_FOR_QUEUE[queue] in _planned_launch_kinds(plan.actions)
+
+
+# ---------------------------------------------------------------------------
+# One physical probe sample = one circuit input (#6999 F2)
+# ---------------------------------------------------------------------------
+
+
+class _StepClock:
+    """A monotonic clock that only moves when a test says so."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+def _logged_out_probe(clock: _StepClock) -> tuple[CLIProviderReadinessProbe, FakeCommandRunner]:
+    runner = FakeCommandRunner(
+        CommandResult(returncode=0, stdout='{"loggedIn": false}', stderr="")
+    )
+    return (
+        CLIProviderReadinessProbe(runner, ttl_seconds=60.0, clock=clock),
+        runner,
+    )
+
+
+class TestOneSampleCountsOnce:
+    """A configurable threshold must mean observations, not call sites."""
+
+    def test_many_launch_checks_on_one_sample_count_once(self) -> None:
+        """A tick gating five launches on one cached probe is ONE failure.
+
+        Counting per call turned a single physical observation into N failures
+        and blew through any ``auth_failure_threshold > 1`` immediately, which
+        is exactly what the knob exists to prevent (#6999 F2).
+        """
+        events = RecordingEvents()
+        manager = _manager(events, threshold=3)
+        clock = _StepClock()
+        probe, runner = _logged_out_probe(clock)
+        policy = ProviderAvailabilityPolicy(
+            config=_config(), provider_resilience=manager, readiness_probe=probe
+        )
+
+        for _ in range(5):
+            policy.assess_launch("claude-code")
+
+        assert len(runner.commands) == 1  # one physical probe...
+        state = manager.get_state("claude-code")
+        assert state is not None
+        assert state.consecutive_auth_failures == 1  # ...counted once
+        assert not manager.is_open("claude-code")  # threshold 3 not reached
+        assert events.names().count(EventName.PROVIDER_AUTH_FAILED.value) == 1
+
+    def test_distinct_samples_advance_the_threshold(self) -> None:
+        """Genuinely new observations still march the circuit toward tripping."""
+        events = RecordingEvents()
+        manager = _manager(events, threshold=3)
+        clock = _StepClock()
+        probe, runner = _logged_out_probe(clock)
+        policy = ProviderAvailabilityPolicy(
+            config=_config(), provider_resilience=manager, readiness_probe=probe
+        )
+
+        for _ in range(3):
+            policy.assess_launch("claude-code")
+            policy.assess_launch("claude-code")  # same sample, must not count
+            clock.advance(61.0)  # the cached sample expires => a NEW observation
+
+        assert len(runner.commands) == 3
+        state = manager.get_state("claude-code")
+        assert state is not None
+        assert state.consecutive_auth_failures == 3
+        assert manager.is_open("claude-code")
+        assert events.names().count(EventName.PROVIDER_AUTH_FAILED.value) == 3
+
+    def test_a_live_session_death_reuses_its_confirming_sample(self) -> None:
+        """The session's verdict came from the same probe result, so it counts once."""
+        from issue_orchestrator.control.session_decision import ProviderAuthOutcome
+
+        events = RecordingEvents()
+        manager = _manager(events, threshold=3)
+        clock = _StepClock()
+        probe, _runner = _logged_out_probe(clock)
+        policy = ProviderAvailabilityPolicy(
+            config=_config(), provider_resilience=manager, readiness_probe=probe
+        )
+        policy.assess_launch("claude-code")
+
+        diagnosis = probe.diagnose_session_output("claude-code", EXPIRED_LOGIN_BANNER)
+        auth_failure = ProviderAuthOutcome.from_readiness(diagnosis)
+        manager.record_auth_failure(
+            auth_failure.provider,
+            error_summary=auth_failure.detail,
+            sample_id=auth_failure.sample_id,
+        )
+
+        state = manager.get_state("claude-code")
+        assert state is not None
+        assert state.consecutive_auth_failures == 1
+
+
+class TestAuthCircuitSettingsRoundTrip:
+    """The two new knobs must survive YAML in both directions."""
+
+    def test_yaml_values_reach_the_circuit_config(self) -> None:
+        from issue_orchestrator.infra.config_sections import (
+            parse_provider_resilience_config,
+        )
+
+        parsed = parse_provider_resilience_config(
+            {
+                "circuit_breaker": {
+                    "auth_failure_threshold": 4,
+                    "auth_cooldown_seconds": 900,
+                }
+            }
+        )
+
+        assert parsed.circuit_breaker.auth_failure_threshold == 4
+        assert parsed.circuit_breaker.auth_cooldown_seconds == 900
+
+    def test_defaults_are_one_confirmed_failure_and_six_hours(self) -> None:
+        from issue_orchestrator.infra.config_sections import (
+            parse_provider_resilience_config,
+        )
+
+        parsed = parse_provider_resilience_config({})
+
+        assert parsed.circuit_breaker.auth_failure_threshold == 1
+        assert parsed.circuit_breaker.auth_cooldown_seconds == 21600
+
+    def test_non_default_values_serialize_back_out(self) -> None:
+        from issue_orchestrator.infra.config import Config
+        from issue_orchestrator.infra.config_models import (
+            ProviderCircuitBreakerConfig,
+            ProviderResilienceConfig,
+        )
+
+        config = Config(repo="test/repo", repo_root=Path("/tmp/does-not-matter"))
+        config.provider_resilience = ProviderResilienceConfig(
+            circuit_breaker=ProviderCircuitBreakerConfig(
+                auth_failure_threshold=4, auth_cooldown_seconds=900
+            )
+        )
+
+        circuit = config.to_dict()["provider_resilience"]["circuit_breaker"]
+
+        assert circuit["auth_failure_threshold"] == 4
+        assert circuit["auth_cooldown_seconds"] == 900
+
+    def test_default_values_stay_out_of_serialized_yaml(self) -> None:
+        from issue_orchestrator.infra.config import Config
+
+        config = Config(repo="test/repo", repo_root=Path("/tmp/does-not-matter"))
+
+        assert "provider_resilience" not in config.to_dict()
+
+
+# ---------------------------------------------------------------------------
+# Auth and transient outages are independent causes (#6999 F3)
+# ---------------------------------------------------------------------------
+
+
+class TestIndependentOutageCauses:
+    """A credential probe is evidence about credentials and nothing else."""
+
+    def test_auth_recovery_does_not_release_a_live_transient_outage(self) -> None:
+        """The provider is still 503ing; re-authenticating must not unpark it."""
+        events = RecordingEvents()
+        manager = _manager(events)
+        start = datetime(2026, 8, 4, 22, 0, tzinfo=timezone.utc)
+        manager.record_transient_failure(
+            "claude-code", error_summary="503", now=start
+        )
+        transient_state = manager.get_state("claude-code")
+        assert transient_state is not None
+        transient_deadline = transient_state.transient_open_until
+        assert transient_deadline is not None
+        manager.record_auth_failure(
+            "claude-code",
+            error_summary="not logged in",
+            sample_id="s1",
+            now=start + timedelta(seconds=1),
+        )
+
+        manager.clear_auth_failures("claude-code", now=start + timedelta(seconds=2))
+
+        just_before = transient_deadline - timedelta(seconds=1)
+        assert manager.is_open("claude-code", just_before)
+        assert not manager.is_open(
+            "claude-code", transient_deadline + timedelta(seconds=1)
+        )
+        state = manager.get_state("claude-code")
+        assert state is not None
+        assert state.consecutive_auth_failures == 0
+        assert state.auth_open_until is None
+        assert state.transient_open_until == transient_deadline
+
+    def test_no_recovery_is_announced_while_the_provider_is_still_down(self) -> None:
+        """``provider.outage_exited`` describes the aggregate, not one half."""
+        events = RecordingEvents()
+        manager = _manager(events)
+        start = datetime(2026, 8, 4, 22, 0, tzinfo=timezone.utc)
+        manager.record_transient_failure("claude-code", error_summary="503", now=start)
+        manager.record_auth_failure(
+            "claude-code",
+            error_summary="not logged in",
+            sample_id="s1",
+            now=start + timedelta(seconds=1),
+        )
+
+        manager.clear_auth_failures("claude-code", now=start + timedelta(seconds=2))
+
+        assert EventName.PROVIDER_OUTAGE_EXITED.value not in events.names()
+
+    def test_recovery_is_announced_once_the_last_cause_is_gone(self) -> None:
+        """With no transient outage in play, auth recovery IS the recovery."""
+        events = RecordingEvents()
+        manager = _manager(events)
+        start = datetime(2026, 8, 4, 22, 0, tzinfo=timezone.utc)
+        manager.record_auth_failure(
+            "claude-code", error_summary="not logged in", sample_id="s1", now=start
+        )
+
+        manager.clear_auth_failures("claude-code", now=start + timedelta(seconds=1))
+
+        assert events.names().count(EventName.PROVIDER_OUTAGE_EXITED.value) == 1
+
+    def test_a_ready_probe_cannot_launch_work_into_a_transient_outage(self) -> None:
+        """End to end through the assessment: healthy credentials are not enough."""
+        manager = _manager(RecordingEvents())
+        manager.record_transient_failure("claude-code", error_summary="503")
+        manager.record_auth_failure(
+            "claude-code", error_summary="not logged in", sample_id="s1"
+        )
+        policy = ProviderAvailabilityPolicy(
+            config=_config(),
+            provider_resilience=manager,
+            readiness_probe=StubReadinessProbe(ProviderReadiness.ready("claude-code")),
+        )
+
+        outcome = policy.assess_launch("claude-code")
+
+        assert not outcome.blocked_by_credentials  # credentials are fine...
+        assert outcome.circuit_open  # ...but the service outage still holds
+        assert not outcome.may_launch
+
+    def test_a_transient_failure_leaves_the_auth_deadline_alone(self) -> None:
+        manager = _manager(RecordingEvents(), auth_cooldown=21600)
+        start = datetime(2026, 8, 4, 22, 0, tzinfo=timezone.utc)
+        manager.record_auth_failure(
+            "claude-code", error_summary="not logged in", sample_id="s1", now=start
+        )
+
+        manager.record_transient_failure(
+            "claude-code", error_summary="503", now=start + timedelta(seconds=1)
+        )
+
+        state = manager.get_state("claude-code")
+        assert state is not None
+        assert state.auth_open_until == start + timedelta(seconds=21600)
+        assert state.open_until == start + timedelta(seconds=21600)
+
+
+def test_split_deadlines_survive_a_single_open_until_database(tmp_path: Path) -> None:
+    """A store written against the one-deadline schema opens and reads as transient."""
+    import sqlite3
+
+    from issue_orchestrator.execution.provider_circuit_store import (
+        SQLiteProviderCircuitStore,
+    )
+
+    db_path = tmp_path / "circuit.sqlite"
+    legacy = sqlite3.connect(db_path)
+    legacy.executescript(
+        """
+        CREATE TABLE provider_circuit (
+            provider TEXT PRIMARY KEY,
+            open_until TEXT,
+            consecutive_outages INTEGER NOT NULL,
+            last_error_summary TEXT,
+            updated_at TEXT NOT NULL
+        );
+        INSERT INTO provider_circuit VALUES
+            ('claude-code', '2026-08-04T23:00:00+00:00', 2, 'boom',
+             '2026-08-04T22:00:00+00:00');
+        """
+    )
+    legacy.commit()
+    legacy.close()
+
+    store = SQLiteProviderCircuitStore(db_path)
+    state = store.get("claude-code")
+
+    assert state is not None
+    assert state.transient_open_until == datetime(
+        2026, 8, 4, 23, 0, tzinfo=timezone.utc
+    )
+    assert state.auth_open_until is None
+    assert state.open_until == state.transient_open_until
+
+
+# ---------------------------------------------------------------------------
+# Diagnosis is not gated on when we happened to look (#6999 F4)
+# ---------------------------------------------------------------------------
+
+
+class TestAuthDiagnosisOutranksTimeAndTimeout:
+    """A session-age or timeout ordering rule re-opens the 90-minute burn."""
+
+    def _observer(self, config, probe):
+        from issue_orchestrator.observation.observer import SessionObserver
+
+        class _AlwaysRunning:
+            def session_exists_by_name(self, name: str) -> bool:
+                return True
+
+            def send_to_session_by_name(self, name: str, text: str) -> bool:
+                return True
+
+            def get_session_output(self, issue_number, lines=100, session_name=None):
+                return ""
+
+        return SessionObserver(
+            config=config,
+            session_output=FileSystemSessionOutput(),
+            events=RecordingEvents(),
+            session_runner=_AlwaysRunning(),
+            provider_readiness_probe=probe,
+        )
+
+    def _auth_dead_session(self, make_session, *, age_seconds: float):
+        from issue_orchestrator.infra.config import AgentConfig
+        from issue_orchestrator.infra.terminal_recording import (
+            TERMINAL_RECORDING_FILENAME,
+        )
+
+        session = make_session()
+        session.agent_config = AgentConfig(
+            prompt_path=session.agent_config.prompt_path, provider="claude-code"
+        )
+        recording = session.run_assets.run_dir / TERMINAL_RECORDING_FILENAME
+        recording.parent.mkdir(parents=True, exist_ok=True)
+        recording.write_text(
+            json.dumps({"kind": "output", "data": EXPIRED_LOGIN_BANNER}) + "\n",
+            encoding="utf-8",
+        )
+        session.started_at = datetime.now() - timedelta(seconds=age_seconds)
+        return session
+
+    @pytest.mark.parametrize(
+        "age_seconds",
+        [
+            10,  # observed immediately, as in the happy path
+            6 * 60,  # first observation delayed past the old five-minute window
+            3 * 60 * 60,  # orchestrator restarted hours into the session
+        ],
+    )
+    def test_a_late_first_observation_still_diagnoses_the_auth_failure(
+        self, sample_config, make_session, age_seconds
+    ) -> None:
+        """The head of the log belongs to THIS launch however late we read it.
+
+        A restart or a delayed first tick used to skip the check entirely and
+        let the session burn to its full timeout (#6999 F4).
+        """
+        probe = StubReadinessProbe(
+            ProviderReadiness.auth_expired("claude-code", "not logged in")
+        )
+        observer = self._observer(sample_config, probe)
+        session = self._auth_dead_session(make_session, age_seconds=age_seconds)
+
+        result = observer.observe_session(session)
+
+        assert result.observation is SessionObservation.PROVIDER_AUTH_FAILED
+        assert probe.diagnose_calls == ["claude-code"]
+
+    def test_an_auth_dead_session_past_its_timeout_is_not_timed_out(
+        self, sample_config, make_session
+    ) -> None:
+        """The credential outage is the cause; TIMED_OUT would mint an investigation."""
+        sample_config.session_timeout_minutes = 1
+        probe = StubReadinessProbe(
+            ProviderReadiness.auth_expired("claude-code", "not logged in")
+        )
+        observer = self._observer(sample_config, probe)
+        session = self._auth_dead_session(make_session, age_seconds=90 * 60)
+
+        result = observer.observe_session(session)
+
+        assert result.observation is SessionObservation.PROVIDER_AUTH_FAILED
+        assert result.observation is not SessionObservation.TIMED_OUT
+
+    def test_a_timed_out_session_without_an_auth_failure_still_times_out(
+        self, sample_config, make_session
+    ) -> None:
+        """The reordering is scoped to confirmed auth failures, nothing wider."""
+        sample_config.session_timeout_minutes = 1
+        probe = StubReadinessProbe(
+            ProviderReadiness.unknown("claude-code", "not confirmed")
+        )
+        observer = self._observer(sample_config, probe)
+        session = self._auth_dead_session(make_session, age_seconds=90 * 60)
+
+        result = observer.observe_session(session)
+
+        assert result.observation is SessionObservation.TIMED_OUT
+
+
+# ---------------------------------------------------------------------------
+# The issue-impact owner is not bypassed, and the story is told once (#6999 F5)
+# ---------------------------------------------------------------------------
+
+
+class TestLiveAuthFailureRoutesThroughTheImpactOwner:
+    """The provider-blocked label and its durable record are one transition."""
+
+    def _planner(self, config, manager):
+        from issue_orchestrator.control.completion_action_planner import (
+            CompletionActionPlanner,
+        )
+        from issue_orchestrator.control.label_manager import LabelManager
+        from issue_orchestrator.control.open_issue_corpus import OpenIssueCorpusManager
+        from issue_orchestrator.control.provider_availability import (
+            ProviderAvailabilityPolicy,
+        )
+        from issue_orchestrator.ports.open_issue_corpus_store import (
+            InMemoryOpenIssueCorpusStore,
+        )
+        from issue_orchestrator.ports.tech_lead_authority import (
+            InMemoryTechLeadAuthorityStore,
+        )
+
+        class _NoRepositoryReads:
+            def get_prs_for_branch(self, branch):
+                return []
+
+            def get_issue(self, issue_number):
+                return None
+
+        host = _NoRepositoryReads()
+        return CompletionActionPlanner(
+            config,
+            host,
+            LabelManager(config),
+            InMemoryTechLeadAuthorityStore(),
+            OpenIssueCorpusManager(
+                host, InMemoryOpenIssueCorpusStore(), is_enabled=lambda: False
+            ),
+            lambda _n: None,
+            ProviderAvailabilityPolicy(config, manager, LabelManager(config)),
+        )
+
+    def _session(self, make_session, terminal_id: str):
+        from issue_orchestrator.infra.config import AgentConfig
+
+        session = make_session()
+        session.agent_config = AgentConfig(
+            prompt_path=session.agent_config.prompt_path, provider="claude-code"
+        )
+        session.terminal_id = terminal_id
+        return session
+
+    @pytest.mark.parametrize(
+        "terminal_id", ["issue-123", "review-123", "rework-123"]
+    )
+    def test_every_session_kind_records_the_provider_impact(
+        self, sample_config, make_session, terminal_id
+    ) -> None:
+        """A dead credential impacts the issue whichever session hit it."""
+        from issue_orchestrator.control.actions import AddLabelAction
+        from issue_orchestrator.control.provider_impact import (
+            ApplyProviderImpactAction,
+        )
+
+        manager = _manager(RecordingEvents())
+        manager.record_auth_failure(
+            "claude-code", error_summary="not logged in", sample_id="s1"
+        )
+        planner = self._planner(sample_config, manager)
+
+        actions = planner.generate_completion_actions(
+            self._session(make_session, terminal_id),
+            SessionStatus.BLOCKED,
+            blocked_reason="not logged in",
+            provider_error_type=ProviderErrorType.AUTH,
+        )
+
+        impacts = [a for a in actions if isinstance(a, ApplyProviderImpactAction)]
+        assert len(impacts) == 1
+        assert impacts[0].assessment.open_providers == ("claude-code",)
+        # ...and never as a bare label mutation that would strand the history.
+        assert not [a for a in actions if isinstance(a, AddLabelAction)]
+
+    def test_an_issue_session_still_releases_its_claim(
+        self, sample_config, make_session
+    ) -> None:
+        from issue_orchestrator.control.actions import RemoveLabelAction
+        from issue_orchestrator.control.label_manager import LabelManager
+
+        manager = _manager(RecordingEvents())
+        manager.record_auth_failure(
+            "claude-code", error_summary="not logged in", sample_id="s1"
+        )
+
+        actions = self._planner(sample_config, manager).generate_completion_actions(
+            self._session(make_session, "issue-123"),
+            SessionStatus.BLOCKED,
+            provider_error_type=ProviderErrorType.AUTH,
+        )
+
+        removed = {
+            a.label for a in actions if isinstance(a, RemoveLabelAction)
+        }
+        assert LabelManager(sample_config).in_progress in removed
+
+    def test_a_transient_provider_block_takes_the_same_route(
+        self, sample_config, make_session
+    ) -> None:
+        """The rule is about provider causes, not about which one (#5980 F1)."""
+        from issue_orchestrator.control.actions import AddLabelAction
+        from issue_orchestrator.control.provider_impact import (
+            ApplyProviderImpactAction,
+        )
+
+        manager = _manager(RecordingEvents())
+        manager.record_transient_failure("claude-code", error_summary="503")
+
+        actions = self._planner(sample_config, manager).generate_completion_actions(
+            self._session(make_session, "issue-123"),
+            SessionStatus.BLOCKED,
+            provider_error_type=ProviderErrorType.TRANSIENT,
+        )
+
+        assert any(isinstance(a, ApplyProviderImpactAction) for a in actions)
+        assert not [a for a in actions if isinstance(a, AddLabelAction)]
+
+    def test_an_ordinary_agent_block_keeps_the_generic_route(
+        self, sample_config, make_session
+    ) -> None:
+        """Only a typed provider verdict diverts; agent-reported blocks are untouched."""
+        from issue_orchestrator.control.actions import AddLabelAction
+        from issue_orchestrator.control.provider_impact import (
+            ApplyProviderImpactAction,
+        )
+
+        actions = self._planner(
+            sample_config, _manager(RecordingEvents())
+        ).generate_completion_actions(
+            self._session(make_session, "issue-123"),
+            SessionStatus.BLOCKED,
+            blocked_label="blocked:needs-human",
+            blocked_reason="I cannot find the spec",
+        )
+
+        assert any(isinstance(a, AddLabelAction) for a in actions)
+        assert not [a for a in actions if isinstance(a, ApplyProviderImpactAction)]
+
+    def test_the_impact_command_applies_the_label_and_records_the_outage(
+        self, sample_config, make_session
+    ) -> None:
+        """Command to label/event: one apply moves both halves together."""
+        from issue_orchestrator.control.provider_impact import (
+            ApplyProviderImpactAction,
+        )
+
+        manager = _manager(RecordingEvents())
+        manager.record_auth_failure(
+            "claude-code", error_summary="not logged in", sample_id="s1"
+        )
+        actions = self._planner(sample_config, manager).generate_completion_actions(
+            self._session(make_session, "issue-123"),
+            SessionStatus.BLOCKED,
+            provider_error_type=ProviderErrorType.AUTH,
+        )
+        [impact] = [a for a in actions if isinstance(a, ApplyProviderImpactAction)]
+        from issue_orchestrator.control.actions import ActionResult
+        from issue_orchestrator.control.label_manager import LabelManager
+        from issue_orchestrator.control.provider_impact import apply_provider_impact
+
+        events = RecordingEvents()
+        applied: list[tuple[int, str]] = []
+
+        def _apply_label(action):
+            applied.append((action.issue_number, action.label))
+            return ActionResult.ok(action)
+
+        result = apply_provider_impact(
+            impact, apply_label=_apply_label, publish=events.publish
+        )
+
+        assert result.success
+        assert applied == [
+            (123, LabelManager(sample_config).provider_unavailable)
+        ]
+        assert EventName.PROVIDER_ISSUE_BLOCKED.value in events.names()
+
+
+class TestLiveAuthEventIsToldOnce:
+    """Two publishers meant the same failure appeared twice, worded wrongly."""
+
+    def test_the_observer_publishes_nothing(
+        self, sample_config, make_session
+    ) -> None:
+        from issue_orchestrator.infra.config import AgentConfig
+        from issue_orchestrator.infra.terminal_recording import (
+            TERMINAL_RECORDING_FILENAME,
+        )
+        from issue_orchestrator.observation.observer import SessionObserver
+
+        class _AlwaysRunning:
+            def session_exists_by_name(self, name: str) -> bool:
+                return True
+
+            def send_to_session_by_name(self, name: str, text: str) -> bool:
+                return True
+
+            def get_session_output(self, issue_number, lines=100, session_name=None):
+                return ""
+
+        events = RecordingEvents()
+        session = make_session()
+        session.agent_config = AgentConfig(
+            prompt_path=session.agent_config.prompt_path, provider="claude-code"
+        )
+        recording = session.run_assets.run_dir / TERMINAL_RECORDING_FILENAME
+        recording.parent.mkdir(parents=True, exist_ok=True)
+        recording.write_text(
+            json.dumps({"kind": "output", "data": EXPIRED_LOGIN_BANNER}) + "\n",
+            encoding="utf-8",
+        )
+        observer = SessionObserver(
+            config=sample_config,
+            session_output=FileSystemSessionOutput(),
+            events=events,
+            session_runner=_AlwaysRunning(),
+            provider_readiness_probe=StubReadinessProbe(
+                ProviderReadiness.auth_expired("claude-code", "not logged in")
+            ),
+        )
+
+        observer.observe_session(session)
+
+        assert EventName.SESSION_PROVIDER_AUTH_TERMINATED.value not in events.names()
+        assert EventName.SESSION_LAUNCH_FAILED_AUTH.value not in events.names()
+
+    def test_the_controller_announces_a_termination_not_a_parked_launch(
+        self, tmp_path: Path
+    ) -> None:
+        """A session that DID launch must not be reported as a parked launch."""
+        events = RecordingEvents()
+        controller = SessionController(
+            completion_processor=MockCompletionProcessor(),
+            events=events,
+            session_output=FileSystemSessionOutput(),
+            working_copy=StubWorkingCopy(),
+        )
+
+        decide_with_run_assets(
+            controller,
+            observation=SessionObservationResult.provider_auth_failed(
+                ProviderReadiness.auth_expired("claude-code", "not logged in")
+            ),
+            worktree_path=tmp_path / "worktree",
+            issue_number=123,
+            issue_title="Test Issue",
+            session_name="issue-123",
+        )
+
+        names = events.names()
+        assert names.count(EventName.SESSION_PROVIDER_AUTH_TERMINATED.value) == 1
+        assert EventName.SESSION_LAUNCH_FAILED_AUTH.value not in names
+
+    def test_the_launch_gate_still_owns_the_parked_launch_story(self) -> None:
+        """The two concepts stay distinct: nothing ran, versus something was stopped."""
+        from issue_orchestrator.control.provider_launch_gate import ProviderLaunchGate
+
+        events = RecordingEvents()
+        gate = ProviderLaunchGate(
+            policy=ProviderAvailabilityPolicy(
+                config=_config(),
+                provider_resilience=_manager(RecordingEvents()),
+                readiness_probe=StubReadinessProbe(
+                    ProviderReadiness.auth_expired("claude-code", "not logged in")
+                ),
+            ),
+            events=events,
+            apply_actions=lambda actions, context: True,
+        )
+
+        gate.check("claude-code", 123)
+
+        names = events.names()
+        assert names.count(EventName.SESSION_LAUNCH_FAILED_AUTH.value) == 1
+        assert EventName.SESSION_PROVIDER_AUTH_TERMINATED.value not in names
+
+
+class TestAuthVerdictNeverDiscardsFinishedWork:
+    """Removing the age cutoff must not let a late verdict strand a record."""
+
+    def test_a_completion_record_outranks_the_auth_verdict(
+        self, tmp_path: Path
+    ) -> None:
+        """completion.json is the agent's reported intent and it finished.
+
+        An auth outage that becomes visible *after* the work was written says
+        nothing about that work. Discarding it would be the stranded-work
+        failure mode, traded for the burn this issue removes.
+        """
+        from issue_orchestrator.domain.models import CompletionOutcome
+
+        from tests.unit.test_session_controller import make_record
+
+        processor = MockCompletionProcessor()
+        processor.completion_record = make_record(
+            CompletionOutcome.COMPLETED, implementation="did the work"
+        )
+        controller = SessionController(
+            completion_processor=processor,
+            events=RecordingEvents(),
+            session_output=FileSystemSessionOutput(),
+            working_copy=StubWorkingCopy(),
+        )
+
+        decision = decide_with_run_assets(
+            controller,
+            observation=SessionObservationResult.provider_auth_failed(
+                ProviderReadiness.auth_expired("claude-code", "not logged in")
+            ),
+            worktree_path=tmp_path / "worktree",
+            issue_number=123,
+            issue_title="Test Issue",
+            session_name="issue-123",
+        )
+
+        assert decision.status is SessionStatus.COMPLETED
+        assert decision.completion_processed
+        assert decision.provider_auth_failure is None

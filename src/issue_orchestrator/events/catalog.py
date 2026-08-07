@@ -96,12 +96,18 @@ class EventName(str, Enum):
     SESSION_INVALID_COMPLETION_RECORD = "session.invalid_completion_record"
     SESSION_TIMEOUT_RECOVERED = "session.timeout_recovered"
     SESSION_PROCESSING_COMPLETED = "session.processing_completed"
-    # The distinct, deliberately non-timeout outcome for a session that could
-    # never work because the provider is not authenticated — either parked
-    # before launch or failed within minutes of showing its login banner.
-    # Keeping it out of SESSION_TIMEOUT is the point: a timeout mints a
+    # Two distinct, deliberately non-timeout provider-credential outcomes.
+    # Keeping both out of SESSION_TIMEOUT is the point: a timeout mints a
     # substance failure-investigation, and a credential problem has none.
+    #
+    # A launch that never happened: the gate probed before spawning and parked
+    # the work instead. Nothing ran, so there is nothing to explain about it.
     SESSION_LAUNCH_FAILED_AUTH = "session.launch_failed_auth"
+    # A session that *did* launch and is being terminated because its provider
+    # is not authenticated. A separate name because the reader's question is
+    # different — "what happened to my running session" versus "why did nothing
+    # start" — and because exactly one owner announces each (#6999 F5).
+    SESSION_PROVIDER_AUTH_TERMINATED = "session.provider_auth_terminated"
     SESSION_START_FAILED = "session.start_failed"
     SESSION_STOPPED = "session.stopped"
     SESSION_CLEANUP = "session.cleanup"
@@ -399,6 +405,7 @@ class PublicEventName(str, Enum):
     SESSION_TIMEOUT = "session.timeout"
     SESSION_BLOCKED = "session.blocked"
     SESSION_LAUNCH_FAILED_AUTH = "session.launch_failed_auth"
+    SESSION_PROVIDER_AUTH_TERMINATED = "session.provider_auth_terminated"
     SESSION_NO_COMPLETION_RECORD = "session.no_completion_record"
     SESSION_INVALID_COMPLETION_RECORD = "session.invalid_completion_record"
     SESSION_PROCESSING_COMPLETED = "session.processing_completed"

@@ -33,10 +33,13 @@ class ProviderResilienceManager:
     def is_open(self, provider: str, now: datetime | None = None) -> bool:
         if not provider:
             return False
-        state = self.store.get(provider)
+        return self._is_open_state(self.store.get(provider), now or _now())
+
+    @staticmethod
+    def _is_open_state(state: ProviderCircuitState | None, now: datetime) -> bool:
+        """Whether *any* cause still holds this circuit open at ``now``."""
         if state is None or state.open_until is None:
             return False
-        now = now or _now()
         return state.open_until > now
 
     def snapshot(self, now: datetime | None = None) -> list[ProviderCircuitStatus]:
@@ -106,15 +109,19 @@ class ProviderResilienceManager:
         cooldown_seconds = self.config.circuit_breaker.cooldown_seconds * multiplier
         open_until = now + timedelta(seconds=cooldown_seconds)
 
-        was_open = state is not None and state.open_until is not None and state.open_until > now
+        was_open = self._is_open_state(state, now)
 
         new_state = ProviderCircuitState(
             provider=provider,
-            open_until=open_until,
+            transient_open_until=open_until,
+            # The auth dimension is untouched: a service outage neither proves
+            # nor disproves anything about the credentials (#6999 F3).
+            auth_open_until=state.auth_open_until if state else None,
             consecutive_outages=consecutive,
             last_error_summary=error_summary,
             updated_at=now,
             consecutive_auth_failures=state.consecutive_auth_failures if state else 0,
+            last_auth_sample_id=state.last_auth_sample_id if state else "",
         )
         self.store.save(new_state)
 
@@ -155,9 +162,10 @@ class ProviderResilienceManager:
         provider: str | None,
         *,
         error_summary: str,
+        sample_id: str,
         now: datetime | None = None,
     ) -> ProviderCircuitState | None:
-        """Record one typed AUTH outcome for ``provider``.
+        """Record one typed AUTH *observation* for ``provider``.
 
         The only way an auth failure reaches circuit state. Callers hand over a
         typed outcome (from the provider-readiness boundary) and this owner
@@ -165,11 +173,20 @@ class ProviderResilienceManager:
         how long the circuit stays open, and which events describe it. No
         launcher or watcher computes circuit state (#6999).
 
+        ``sample_id`` identifies the *physical* probe result the outcome came
+        from. One credential probe gates every launch in a tick and every caller
+        is served the same cached answer, so counting per call would turn one
+        observation into N failures and blow straight through any threshold > 1
+        (#6999 F2). Re-recording a sample already counted here is a no-op: same
+        state, no counter movement, no event. An empty ``sample_id`` means "not
+        from a probe" (e.g. a live session's own death) and is always counted.
+
         An expired credential is human-fixable, so the auth cooldown is its own
         (long) window rather than the transient escalation ladder: retrying on
         the transient schedule is exactly how one expired login burned four
         90-minute sessions. Recovery is not gated on that window elapsing —
-        :meth:`record_success` clears the circuit the moment a launch works.
+        :meth:`clear_auth_failures` retires it the moment the probe confirms
+        re-authentication.
 
         Returns the stored state, or ``None`` when there is no provider to
         record against.
@@ -179,24 +196,29 @@ class ProviderResilienceManager:
 
         now = now or _now()
         state = self.store.get(provider)
+        if state is not None and sample_id and state.last_auth_sample_id == sample_id:
+            return state
+
         consecutive_auth = (state.consecutive_auth_failures + 1) if state else 1
         threshold = max(1, self.config.circuit_breaker.auth_failure_threshold)
         trips = consecutive_auth >= threshold
 
-        was_open = state is not None and state.open_until is not None and state.open_until > now
-        open_until = (
+        was_open = self._is_open_state(state, now)
+        auth_open_until = (
             now + timedelta(seconds=self.config.circuit_breaker.auth_cooldown_seconds)
             if trips
-            else (state.open_until if state else None)
+            else (state.auth_open_until if state else None)
         )
 
         new_state = ProviderCircuitState(
             provider=provider,
-            open_until=open_until,
+            transient_open_until=state.transient_open_until if state else None,
+            auth_open_until=auth_open_until,
             consecutive_outages=state.consecutive_outages if state else 0,
             last_error_summary=error_summary,
             updated_at=now,
             consecutive_auth_failures=consecutive_auth,
+            last_auth_sample_id=sample_id,
         )
         self.store.save(new_state)
 
@@ -211,12 +233,12 @@ class ProviderResilienceManager:
             },
         ))
 
-        if trips and not was_open and open_until is not None:
+        if trips and not was_open and auth_open_until is not None:
             self.events.publish(make_trace_event(
                 EventName.PROVIDER_OUTAGE_ENTERED,
                 {
                     "provider": provider,
-                    "open_until": open_until.isoformat(),
+                    "open_until": auth_open_until.isoformat(),
                     "consecutive_outages": new_state.consecutive_outages,
                     "error_summary": error_summary,
                 },
@@ -227,40 +249,46 @@ class ProviderResilienceManager:
     def clear_auth_failures(
         self, provider: str | None, now: datetime | None = None
     ) -> ProviderCircuitState | None:
-        """Retire an auth outage after the credential probe confirms recovery.
+        """Retire the *auth* outage after the credential probe confirms recovery.
 
         Recovery must NOT wait out :attr:`auth_cooldown_seconds`. That window is
         long precisely because only a human can end a credential outage — and
         the moment they do, the probe says so. Leaving the fleet parked for the
         remaining hours would trade one stall for a longer one.
 
-        Closing the circuit here can also release a genuine *transient* outage a
-        little early, since one ``open_until`` records both. That is the right
-        way to be wrong: the next transient failure re-opens the circuit on its
-        own escalating ladder immediately, so the cost is at most one wasted
-        launch attempt, against hours of a wrongly-parked fleet.
+        Only the auth dimension is retired. A ``READY`` credential probe is
+        evidence about credentials and nothing else, so a concurrently valid
+        transient outage keeps its own deadline and the provider stays open
+        until that deadline passes (#6999 F3). ``provider.outage_exited`` is
+        therefore emitted on the *aggregate* transition, never on the auth half
+        alone — the fleet must not be told a provider recovered while it is
+        still refusing calls.
 
         Returns the updated state, or ``None`` when there was no auth outage.
         """
         if not provider:
             return None
         state = self.store.get(provider)
-        if state is None or state.consecutive_auth_failures == 0:
+        if state is None or (
+            state.consecutive_auth_failures == 0 and state.auth_open_until is None
+        ):
             return None
 
         now = now or _now()
-        was_open = state.open_until is not None and state.open_until > now
+        was_open = self._is_open_state(state, now)
         updated = ProviderCircuitState(
             provider=provider,
-            open_until=None,
+            transient_open_until=state.transient_open_until,
+            auth_open_until=None,
             consecutive_outages=state.consecutive_outages,
             last_error_summary=state.last_error_summary,
             updated_at=now,
             consecutive_auth_failures=0,
+            last_auth_sample_id="",
         )
         self.store.save(updated)
 
-        if was_open:
+        if was_open and not self._is_open_state(updated, now):
             self.events.publish(make_trace_event(
                 EventName.PROVIDER_OUTAGE_EXITED,
                 {
@@ -287,6 +315,13 @@ class ProviderResilienceManager:
         ))
 
     def close_expired(self, now: datetime | None = None) -> list[ProviderCircuitState]:
+        """Retire circuits whose causes have *all* elapsed.
+
+        The aggregate deadline is the latest of the per-cause ones, so a
+        provider whose transient cooldown ran out while a much longer auth
+        window is still running is skipped here entirely: no half-retirement,
+        and no ``outage_exited`` claimed while the provider still refuses calls.
+        """
         now = now or _now()
         closed: list[ProviderCircuitState] = []
         for state in self.store.list_all():
@@ -294,11 +329,13 @@ class ProviderResilienceManager:
                 continue
             updated = ProviderCircuitState(
                 provider=state.provider,
-                open_until=None,
+                transient_open_until=None,
+                auth_open_until=None,
                 consecutive_outages=state.consecutive_outages,
                 last_error_summary=state.last_error_summary,
                 updated_at=now,
                 consecutive_auth_failures=state.consecutive_auth_failures,
+                last_auth_sample_id=state.last_auth_sample_id,
             )
             self.store.save(updated)
             closed.append(updated)

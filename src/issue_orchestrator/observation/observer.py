@@ -38,16 +38,17 @@ from .observation import SessionObservation, SessionObservationResult
 
 logger = logging.getLogger(__name__)
 
-# A provider login banner renders within seconds of launch (2740 ms and 522 ms
-# in the two recordings that motivated #6999), so an auth check outside the
-# first few minutes cannot be about *this* launch's credentials. The window is
-# a cost guard rather than a correctness guard — the diagnosis is confirmed by
-# the provider's own probe either way — so it lives here as a constant rather
-# than becoming another knob nobody tunes.
-PROVIDER_AUTH_CHECK_WINDOW_SECONDS = 300
-
 # Only the head of the log can hold a launch-time banner; reading more would
 # just feed the agent's own working output into the signature match.
+#
+# There is deliberately NO session-age cutoff on the auth check. An age window
+# reads as a cost guard but behaves as a correctness one: an orchestrator
+# restart, a delayed first observation, or any auth failure that only becomes
+# visible later would fall outside it and let the session burn to its full
+# timeout — the exact failure #6999 exists to remove (F4). The head of the log
+# is immutable once written, so re-reading it is cheap, and the expensive part
+# (the credential probe) only runs when the signature matches and is itself
+# cached by the probe.
 PROVIDER_AUTH_CHECK_MAX_BYTES = 8192
 
 
@@ -461,6 +462,15 @@ class SessionObserver:
         exists: bool,
     ) -> SessionObservationResult:
         """Build the observation result based on gathered facts."""
+        # A confirmed credential failure outranks the generic timeout. It is the
+        # true cause, and reporting TIMED_OUT instead sends an auth-dead session
+        # into the failure-investigation path looking for a substance problem
+        # that does not exist (#6999 F4). Deciding it first is what makes the
+        # ordering independent of *when* the session was first observed.
+        auth_result = self._check_provider_auth(session, runtime, session_exists=exists)
+        if auth_result is not None:
+            return auth_result
+
         if timeout_exceeded:
             return SessionObservationResult.timed_out(
                 runtime_minutes=runtime,
@@ -469,9 +479,6 @@ class SessionObserver:
             )
 
         if process_alive:
-            auth_result = self._check_provider_auth(session, runtime)
-            if auth_result is not None:
-                return auth_result
             self._emit_no_output_if_stale(session)
             return SessionObservationResult.running(runtime_minutes=runtime)
 
@@ -488,9 +495,13 @@ class SessionObserver:
         return SessionObservationResult.terminated(runtime_minutes=runtime)
 
     def _check_provider_auth(
-        self, session: Session, runtime: Optional[float]
+        self,
+        session: Session,
+        runtime: Optional[float],
+        *,
+        session_exists: bool,
     ) -> SessionObservationResult | None:
-        """Observe whether this live session's provider is authenticated.
+        """Observe whether this session's provider is authenticated.
 
         Fact-gathering only: the observer hands the session's early output to
         the typed provider-readiness boundary and reports back whatever verdict
@@ -499,12 +510,16 @@ class SessionObserver:
         probe — so an agent that merely echoes a provider's auth banner (this
         orchestrator working on its own auth tooling does exactly that) cannot
         kill its own session (#6999).
+
+        Deliberately unconditioned on session age or liveness. Only the head of
+        the log is read and the head belongs to *this* launch, so a banner found
+        there is about this launch's credentials however late the observation
+        happens — and a restart, a delayed first tick, or a session already past
+        its timeout must still get the typed auth verdict rather than a
+        misdirected TIMED_OUT (#6999 F4).
         """
         provider = session.agent_config.provider
         if not provider:
-            return None
-        session_age = (datetime.now() - session.started_at).total_seconds()
-        if session_age > PROVIDER_AUTH_CHECK_WINDOW_SECONDS:
             return None
         log_path = (
             self._session_output.get_log_path(session.worktree_path, session.terminal_id)
@@ -523,6 +538,7 @@ class SessionObserver:
         if not readiness.human_fixable:
             return None
 
+        session_age = (datetime.now() - session.started_at).total_seconds()
         logger.error(
             issue_log(
                 session.issue.number,
@@ -534,20 +550,12 @@ class SessionObserver:
             readiness.detail,
             session_age,
         )
-        self.events.publish(TraceEvent(
-            EventName.SESSION_LAUNCH_FAILED_AUTH,
-            {
-                "issue_number": session.issue.number,
-                "session_name": session.terminal_id,
-                "provider": provider,
-                "readiness": readiness.state.value,
-                "detail": readiness.detail,
-                "human_fixable": readiness.human_fixable,
-                "session_age_seconds": int(session_age),
-            },
-        ))
+        # No event is published here. The observer gathers facts; the single
+        # user-visible announcement of a live auth-dead session belongs to the
+        # controller that terminates it, so the story is told exactly once
+        # (#6999 F5).
         return SessionObservationResult.provider_auth_failed(
-            readiness, runtime_minutes=runtime, session_exists=True
+            readiness, runtime_minutes=runtime, session_exists=session_exists
         )
 
     @staticmethod

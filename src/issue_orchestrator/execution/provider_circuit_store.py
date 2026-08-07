@@ -15,25 +15,24 @@ from ..ports.provider_resilience import ProviderCircuitState
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS provider_circuit (
     provider TEXT PRIMARY KEY,
-    open_until TEXT,
+    transient_open_until TEXT,
     consecutive_outages INTEGER NOT NULL,
     last_error_summary TEXT,
     updated_at TEXT NOT NULL,
-    consecutive_auth_failures INTEGER NOT NULL DEFAULT 0
+    consecutive_auth_failures INTEGER NOT NULL DEFAULT 0,
+    auth_open_until TEXT,
+    last_auth_sample_id TEXT NOT NULL DEFAULT ''
 );
 """
 
-_SELECT_ONE = """
-SELECT provider, open_until, consecutive_outages, last_error_summary, updated_at,
-       consecutive_auth_failures
-FROM provider_circuit WHERE provider = ?
+_COLUMNS = """
+provider, transient_open_until, consecutive_outages, last_error_summary,
+updated_at, consecutive_auth_failures, auth_open_until, last_auth_sample_id
 """
 
-_SELECT_ALL = """
-SELECT provider, open_until, consecutive_outages, last_error_summary, updated_at,
-       consecutive_auth_failures
-FROM provider_circuit
-"""
+_SELECT_ONE = f"SELECT {_COLUMNS} FROM provider_circuit WHERE provider = ?"
+
+_SELECT_ALL = f"SELECT {_COLUMNS} FROM provider_circuit"
 
 
 def _parse_dt(value: str | None) -> datetime | None:
@@ -62,21 +61,42 @@ class SQLiteProviderCircuitStore:
 
     @staticmethod
     def _migrate(conn: sqlite3.Connection) -> None:
-        """Add columns introduced after the table's first release.
+        """Reshape a table written before the per-cause deadlines existed.
 
         ``CREATE TABLE IF NOT EXISTS`` leaves an existing table untouched, so a
-        database written before ``consecutive_auth_failures`` existed needs the
-        column added explicitly.
+        database written against the single-``open_until`` schema needs both the
+        rename and the added columns. The old column becomes the *transient*
+        deadline: that is the only cause it could ever have recorded, since the
+        auth dimension did not exist while it was being written.
         """
         columns = {
             row["name"] for row in conn.execute("PRAGMA table_info(provider_circuit)")
         }
+        migrations = []
+        if "transient_open_until" not in columns and "open_until" in columns:
+            migrations.append(
+                "ALTER TABLE provider_circuit "
+                "RENAME COLUMN open_until TO transient_open_until"
+            )
         if "consecutive_auth_failures" not in columns:
-            conn.execute(
+            migrations.append(
                 "ALTER TABLE provider_circuit "
                 "ADD COLUMN consecutive_auth_failures INTEGER NOT NULL DEFAULT 0"
             )
-            conn.commit()
+        if "auth_open_until" not in columns:
+            migrations.append(
+                "ALTER TABLE provider_circuit ADD COLUMN auth_open_until TEXT"
+            )
+        if "last_auth_sample_id" not in columns:
+            migrations.append(
+                "ALTER TABLE provider_circuit "
+                "ADD COLUMN last_auth_sample_id TEXT NOT NULL DEFAULT ''"
+            )
+        if not migrations:
+            return
+        for statement in migrations:
+            conn.execute(statement)
+        conn.commit()
 
     def _get_connection(self) -> sqlite3.Connection:
         conn = getattr(self._local, "conn", None)
@@ -100,11 +120,13 @@ class SQLiteProviderCircuitStore:
     def _to_state(row: sqlite3.Row) -> ProviderCircuitState:
         return ProviderCircuitState(
             provider=row["provider"],
-            open_until=_parse_dt(row["open_until"]),
+            transient_open_until=_parse_dt(row["transient_open_until"]),
+            auth_open_until=_parse_dt(row["auth_open_until"]),
             consecutive_outages=int(row["consecutive_outages"]),
             last_error_summary=row["last_error_summary"],
             updated_at=_parse_dt(row["updated_at"]) or datetime.now(timezone.utc),
             consecutive_auth_failures=int(row["consecutive_auth_failures"] or 0),
+            last_auth_sample_id=row["last_auth_sample_id"] or "",
         )
 
     def get(self, provider: str) -> ProviderCircuitState | None:
@@ -122,25 +144,31 @@ class SQLiteProviderCircuitStore:
     def save(self, state: ProviderCircuitState) -> None:
         with self._transaction() as tx:
             tx.execute(
-                """
-                INSERT INTO provider_circuit (
-                    provider, open_until, consecutive_outages, last_error_summary,
-                    updated_at, consecutive_auth_failures
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                f"""
+                INSERT INTO provider_circuit ({_COLUMNS})
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(provider) DO UPDATE SET
-                    open_until=excluded.open_until,
+                    transient_open_until=excluded.transient_open_until,
                     consecutive_outages=excluded.consecutive_outages,
                     last_error_summary=excluded.last_error_summary,
                     updated_at=excluded.updated_at,
-                    consecutive_auth_failures=excluded.consecutive_auth_failures
+                    consecutive_auth_failures=excluded.consecutive_auth_failures,
+                    auth_open_until=excluded.auth_open_until,
+                    last_auth_sample_id=excluded.last_auth_sample_id
                 """,
                 (
                     state.provider,
-                    state.open_until.isoformat() if state.open_until else None,
+                    state.transient_open_until.isoformat()
+                    if state.transient_open_until
+                    else None,
                     int(state.consecutive_outages),
                     state.last_error_summary,
                     state.updated_at.isoformat(),
                     int(state.consecutive_auth_failures),
+                    state.auth_open_until.isoformat()
+                    if state.auth_open_until
+                    else None,
+                    state.last_auth_sample_id,
                 ),
             )
 

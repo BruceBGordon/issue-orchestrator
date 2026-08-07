@@ -159,7 +159,6 @@ class SessionController:
         attempt_store: "AttemptStore | None" = None,
         validation_attempt_key_factory: "ValidationAttemptKeyFactory | None" = None,
         max_validation_retries: int = 0,
-        provider_blocked_label: Optional[str] = None,
         review_exchange_canceller: ReviewExchangeCanceller | None = None,
     ):
         """Initialize the controller.
@@ -194,7 +193,6 @@ class SessionController:
         )
         self._attempt_store = attempt_store
         self._validation_attempt_key_factory = validation_attempt_key_factory
-        self._provider_blocked_label = provider_blocked_label
         self._review_exchange_canceller = review_exchange_canceller
 
     def decide_outcome(
@@ -233,12 +231,6 @@ class SessionController:
                 status=SessionStatus.RUNNING, reason="Session still running"
             )
 
-        # An unauthenticated provider is decided before anything else: there is
-        # no completion record to look for, no validation to run, and nothing
-        # about the issue to investigate (#6999).
-        if observation.observation == SessionObservation.PROVIDER_AUTH_FAILED:
-            return self._provider_auth_failed_decision(observation, issue_number, session_name)
-
         completion_session_name = self.session_output.session_name_from_path(
             completion_path
         )
@@ -261,6 +253,16 @@ class SessionController:
         record = load_result.record
 
         if record is None:
+            # An unauthenticated provider outranks every absent-record outcome —
+            # notably TIMED_OUT, which would mint a substance investigation for
+            # a credential problem (#6999 F4). It does NOT outrank a record that
+            # exists: completion.json is the agent's reported intent, and a
+            # session that finished its work must never have that work discarded
+            # because the credential expired afterwards.
+            if observation.observation == SessionObservation.PROVIDER_AUTH_FAILED:
+                return self._provider_auth_failed_decision(
+                    observation, issue_number, session_name
+                )
             decision = self._handle_absent_completion_record(
                 observation=observation,
                 worktree_path=worktree_path,
@@ -390,7 +392,14 @@ class SessionController:
         issue_number: int,
         session_name: str,
     ) -> SessionDecision:
-        """Terminate an auth-dead session on its own, non-timeout outcome."""
+        """Terminate an auth-dead session on its own, non-timeout outcome.
+
+        The single announcement point for a live session killed by a credential
+        outage. The observer that spotted it publishes nothing — it gathers
+        facts — so this event fires exactly once per terminated session, and it
+        is the *terminated* event rather than the launch-gate's parking one:
+        this session did launch (#6999 F5).
+        """
         outcome = ProviderAuthOutcome.from_readiness(observation.provider_readiness)
         logger.error(
             issue_log(
@@ -403,10 +412,10 @@ class SessionController:
             outcome.detail,
         )
         self._emit_event(
-            EventName.SESSION_LAUNCH_FAILED_AUTH,
+            EventName.SESSION_PROVIDER_AUTH_TERMINATED,
             outcome.event_payload(issue_number, session_name),
         )
-        return outcome.as_decision(blocked_label=self._provider_blocked_label)
+        return outcome.as_decision()
 
     def _handle_absent_completion_record(
         self,
@@ -863,9 +872,13 @@ class SessionController:
             return SessionDecision(
                 status=SessionStatus.BLOCKED,
                 reason="Provider unavailable",
-                blocked_label=self._provider_blocked_label,
+                # Same rule as the auth path: the provider-blocked label is only
+                # ever moved by the provider-impact owner, so it and the durable
+                # record stay one transition. The typed verdict is what routes
+                # it there (#5980 F1 / #6999 F5).
                 blocked_reason=provider_status.last_error_summary
                 or "Provider unavailable",
+                provider_error_type=ProviderErrorType.TRANSIENT,
                 provider_transient_failure=provider_failure_from_status(provider_status),
             )
 
