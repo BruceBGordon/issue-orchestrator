@@ -64,7 +64,7 @@ def _install_orchestrator_pre_push(src: Path, dst: Path) -> None:
     dst.chmod(0o755)
 
 
-def install_hooks(worktree_path: Path, pre_push_hook: Path | None = None) -> None:
+def install_hooks(worktree_path: Path, pre_push_hook: Path | None = None) -> bool:
     """
     Install git hooks into a worktree.
 
@@ -74,6 +74,16 @@ def install_hooks(worktree_path: Path, pre_push_hook: Path | None = None) -> Non
     Args:
         worktree_path: Path to the worktree
         pre_push_hook: Custom pre-push hook path (uses bundled if None)
+
+    Returns:
+        True when the orchestrator's pre-push guardrail ended up installed in
+        the worktree hooks directory — either standalone as ``pre-push`` or as
+        ``pre-push.orchestrator`` behind the chained wrapper. False when it did
+        not: the worktree has no linked git dir, or the caller supplied a
+        ``pre_push_hook`` path that does not exist. Callers that asked for
+        enforced guardrails must treat False as a failure; the guardrail is the
+        only thing stopping an agent from pushing past validation, so "asked
+        for it" and "got it" are not the same fact.
 
     Note:
         Worktrees have a .git file (not directory) that points to the main repo.
@@ -86,11 +96,11 @@ def install_hooks(worktree_path: Path, pre_push_hook: Path | None = None) -> Non
 
     git_file = worktree_path / ".git"
     if not git_file.exists():
-        return
+        return False
 
     content = git_file.read_text().strip()
     if not content.startswith("gitdir:"):
-        return
+        return False
 
     gitdir = Path(content.split(":", 1)[1].strip())
     hooks_dir = gitdir / "hooks"
@@ -159,10 +169,19 @@ def install_hooks(worktree_path: Path, pre_push_hook: Path | None = None) -> Non
     quarantine_managed_hook_file(hooks_dir / "pre-push.project")
 
     if project_hook is not None and project_hook.is_file():
-        _install_chained_hook(hooks_dir, dst_hook, project_hook, orchestrator_hook)
-    elif orchestrator_hook.exists():
+        return _install_chained_hook(
+            hooks_dir, dst_hook, project_hook, orchestrator_hook
+        )
+    if orchestrator_hook.exists():
         _install_orchestrator_pre_push(orchestrator_hook, dst_hook)
         logger.info("Installed orchestrator pre-push hook")
+        return True
+
+    logger.warning(
+        "No orchestrator pre-push hook to install (missing source %s)",
+        orchestrator_hook,
+    )
+    return False
 
 
 def _project_hooks_base(gitdir: Path, custom_hooks_path: str | None) -> Path:
@@ -252,7 +271,14 @@ def _install_chained_hook(
     dst_hook: Path,
     project_hook: Path,
     orchestrator_hook: Path,
-) -> None:
+) -> bool:
+    """Install the project+orchestrator chain; report whether the guardrail landed.
+
+    Returns False when the wrapper and the project hook are installed but the
+    orchestrator hook source does not exist. The wrapper then runs only the
+    project's own gate, which is exactly the silent guardrail loss the caller
+    must be able to see.
+    """
     # Fail fast: reaching here with a managed source hook means
     # _resolve_project_pre_push_hook's filter was bypassed (e.g. a caller
     # supplied an explicit project_hook). Silently skipping the copy would
@@ -274,11 +300,19 @@ def _install_chained_hook(
     dst_hook.write_text(wrapper_content)
     dst_hook.chmod(0o755)
 
-    if orchestrator_hook.exists():
-        orch_hook_copy = hooks_dir / "pre-push.orchestrator"
-        _install_orchestrator_pre_push(orchestrator_hook, orch_hook_copy)
+    if not orchestrator_hook.exists():
+        logger.warning(
+            "Installed chained pre-push wrapper without the orchestrator hook "
+            "(missing source %s)",
+            orchestrator_hook,
+        )
+        return False
+
+    orch_hook_copy = hooks_dir / "pre-push.orchestrator"
+    _install_orchestrator_pre_push(orchestrator_hook, orch_hook_copy)
 
     logger.info("Installed chained pre-push hooks (project + orchestrator)")
+    return True
 
 
 def _chained_hook_script() -> str:

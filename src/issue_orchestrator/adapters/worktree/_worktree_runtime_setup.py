@@ -14,6 +14,7 @@ import logging
 from dataclasses import dataclass
 from pathlib import Path
 
+from ._worktree_errors import WorktreeError
 from ._worktree_hooks import install_hooks
 from ._worktree_runtime import (
     _configure_no_verify_dry_run,
@@ -34,7 +35,20 @@ class WorktreeRuntimeState:
     """What runtime setup actually put in place for one worktree.
 
     Returned so callers can observe the outcome (and tests can assert on it)
-    without re-deriving it from the filesystem or from the setup inputs.
+    without re-deriving it from the filesystem or from the setup inputs. Every
+    field is an observed result: a state object that echoed the request back
+    would be a more convincing lie than no state object at all.
+
+    Args:
+        worktree_path: The worktree the setup was applied to.
+        worktree_id: Identity persisted in the worktree, existing or new.
+        hooks_installed: Whether the orchestrator pre-push guardrail is now
+            installed. False only when hooks were not requested — a requested
+            hook that did not install fails ``apply`` instead of being reported.
+        no_verify_dry_run_allowed: State the ``--no-verify`` dry-run flag file
+            was left in.
+        synced_cli_tool_paths: Worktree-relative paths of the CLI tools copied
+            in, in the form the git exclude entries use.
     """
 
     worktree_path: Path
@@ -68,17 +82,47 @@ class WorktreeRuntimeSetup:
         """Bring ``worktree_path`` to a runnable state for an agent session.
 
         Idempotent: a reused worktree runs the same sequence as a fresh one.
-        Artifact hiding runs last because it needs the CLI tool paths the sync
-        step planted.
+
+        ``WorktreeError`` is the whole failure surface of this owner. The steps
+        it composes fail in their own vocabularies (``OSError`` from a write,
+        ``RuntimeError`` from a corrupt hook chain); callers hold the owner, not
+        the steps, so anything that escapes a step is translated here rather
+        than leaking an adapter's internals through a public API.
 
         Raises:
-            WorktreeError: If a step the session depends on cannot complete —
-                hook install, Claude settings, the no-verify flag, or worktree
-                identity. A half-set-up worktree is a worse outcome than a
-                failed create the lifecycle can retry or recreate from.
+            WorktreeError: If any step the session depends on cannot complete —
+                hook install, Claude settings, the no-verify flag, worktree
+                identity, or artifact hiding. A half-set-up worktree is a worse
+                outcome than a failed create the lifecycle can retry or
+                recreate from.
         """
+        try:
+            return self._apply(worktree_path)
+        except WorktreeError:
+            raise
+        except Exception as exc:
+            raise WorktreeError(
+                f"Worktree runtime setup failed for {worktree_path}: {exc}"
+            ) from exc
+
+    def _apply(self, worktree_path: Path) -> WorktreeRuntimeState:
+        """Run the setup sequence.
+
+        Artifact hiding runs last because it needs the CLI tool paths the sync
+        step planted.
+        """
+        hooks_installed = False
         if self.enforce_hooks:
-            install_hooks(worktree_path, self.pre_push_hook)
+            hooks_installed = install_hooks(worktree_path, self.pre_push_hook)
+            if not hooks_installed:
+                # Enforced hooks are the guardrail that stops an agent pushing
+                # past validation. Continuing here would hand back a worktree
+                # that looks configured and silently is not.
+                raise WorktreeError(
+                    "Enforced guardrail hooks were requested but no "
+                    f"orchestrator pre-push hook was installed in {worktree_path} "
+                    f"(pre_push_hook={self.pre_push_hook or 'bundled'})"
+                )
         install_claude_settings(worktree_path)
         _configure_no_verify_dry_run(
             worktree_path, self.allow_no_verify_dry_run_preflight
@@ -92,12 +136,12 @@ class WorktreeRuntimeSetup:
             "Worktree runtime setup applied: path=%s id=%s hooks=%s",
             worktree_path,
             worktree_id,
-            self.enforce_hooks,
+            hooks_installed,
         )
         return WorktreeRuntimeState(
             worktree_path=worktree_path,
             worktree_id=worktree_id,
-            hooks_installed=self.enforce_hooks,
+            hooks_installed=hooks_installed,
             no_verify_dry_run_allowed=self.allow_no_verify_dry_run_preflight,
             synced_cli_tool_paths=tuple(synced_cli_tool_paths),
         )

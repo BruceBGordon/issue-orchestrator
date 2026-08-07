@@ -12,6 +12,7 @@ These pin two things the lifecycle module used to own inline:
 
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -25,6 +26,27 @@ from issue_orchestrator.adapters.worktree._worktree_runtime import (
     CLAUDE_SETTINGS_FOR_AGENTS,
     WORKTREE_ID_MARKER,
 )
+
+
+def _break_read_of(
+    monkeypatch: pytest.MonkeyPatch, target: Path, error: OSError
+) -> None:
+    """Make exactly one path fail to read while its bytes stay intact on disk.
+
+    This is the case the owner has to tell apart from "the content is broken",
+    and it cannot be staged with ``chmod`` alone — a root test runner reads a
+    ``0o000`` file happily, so the test would pass for the wrong reason there
+    and fail for the wrong reason here. Only ``target`` is affected; every other
+    read in the setup sequence runs for real.
+    """
+    original_read_text = Path.read_text
+
+    def guarded(self: Path, *args: Any, **kwargs: Any) -> str:
+        if self == target:
+            raise error
+        return original_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", guarded)
 
 
 @pytest.fixture
@@ -118,6 +140,57 @@ class TestApplyProducesRunnableWorktree:
         ).exists()
 
 
+class TestEnforcedHooksAreAnInvariantNotARequest:
+    """``hooks_installed`` must be an observed outcome, never the input echoed.
+
+    A worktree that reports enforced guardrails while having none is worse than
+    one that fails to be created: the session runs and can push past validation.
+    """
+
+    def test_enforced_hooks_that_cannot_be_installed_fail_setup(
+        self, repo_root, worktree_path, tmp_path
+    ):
+        missing_hook = tmp_path / "nonexistent-pre-push"
+
+        with pytest.raises(WorktreeError, match="pre-push hook was installed"):
+            WorktreeRuntimeSetup(
+                repo_root=repo_root,
+                enforce_hooks=True,
+                pre_push_hook=missing_hook,
+            ).apply(worktree_path)
+
+        assert not (
+            repo_root / ".git" / "worktrees" / "repo-123" / "hooks" / "pre-push"
+        ).exists()
+
+    def test_enforced_hooks_fail_when_the_worktree_has_no_git_link(
+        self, repo_root, tmp_path
+    ):
+        # No ``.git`` link means hook installation has nowhere to write; the
+        # old owner reported success anyway.
+        detached = tmp_path / "detached"
+        detached.mkdir()
+
+        with pytest.raises(WorktreeError, match="pre-push hook was installed"):
+            WorktreeRuntimeSetup(repo_root=repo_root, enforce_hooks=True).apply(detached)
+
+
+class TestOwnerErrorBoundary:
+    """``WorktreeError`` is the owner's whole failure surface."""
+
+    def test_step_failures_are_translated_to_worktree_error(
+        self, repo_root, worktree_path
+    ):
+        # A file where git's ``info/`` directory belongs makes the exclude
+        # write raise a bare OSError from inside a composed step.
+        (repo_root / ".git" / "worktrees" / "repo-123" / "info").write_text(
+            "not a directory"
+        )
+
+        with pytest.raises(WorktreeError, match="Worktree runtime setup failed"):
+            _setup(repo_root).apply(worktree_path)
+
+
 class TestNoVerifyDryRunFlag:
     """The flag gates a hook bypass, so both directions must actually land."""
 
@@ -173,6 +246,33 @@ class TestWorktreeIdentityFailureSemantics:
         assert state.worktree_id.startswith("wt-")
         assert marker.read_text() == state.worktree_id
 
+    def test_non_utf8_identity_marker_is_regenerated(self, repo_root, worktree_path):
+        # Undecodable bytes carry no identity, so replacing them loses nothing.
+        marker = worktree_path / WORKTREE_ID_MARKER
+        marker.parent.mkdir(parents=True)
+        marker.write_bytes(b"\xff\xfe not an id")
+
+        state = _setup(repo_root).apply(worktree_path)
+
+        assert state.worktree_id.startswith("wt-")
+        assert marker.read_text() == state.worktree_id
+
+    def test_unreadable_identity_marker_fails_without_reissuing_the_identity(
+        self, repo_root, worktree_path, monkeypatch
+    ):
+        # A read that fails is not evidence the identity is gone. Regenerating
+        # would tell every job holding "wt-original" that its worktree was
+        # replaced underneath it.
+        marker = worktree_path / WORKTREE_ID_MARKER
+        marker.parent.mkdir(parents=True)
+        marker.write_text("wt-original")
+        _break_read_of(monkeypatch, marker, PermissionError("simulated read failure"))
+
+        with pytest.raises(WorktreeError, match="read worktree identity marker"):
+            _setup(repo_root).apply(worktree_path)
+
+        assert marker.read_bytes() == b"wt-original"
+
 
 class TestInstallClaudeSettingsFailureSemantics:
     """The Stop hook is a completion guardrail; installing it cannot half-fail."""
@@ -206,6 +306,67 @@ class TestInstallClaudeSettingsFailureSemantics:
 
         assert json.loads(settings_file.read_text()) == CLAUDE_SETTINGS_FOR_AGENTS
         assert "non-object 'hooks'" in caplog.text
+
+    def test_null_hooks_are_replaced_rather_than_crashing(self, tmp_path, caplog):
+        # Regression: an explicit JSON ``null`` used to be indistinguishable
+        # from a missing key, so the merge tried to ``setdefault`` into None
+        # and raised AttributeError out of worktree setup.
+        settings_file = tmp_path / ".claude" / "settings.json"
+        settings_file.parent.mkdir(parents=True)
+        settings_file.write_text(json.dumps({"model": "opus", "hooks": None}))
+
+        with caplog.at_level("WARNING"):
+            install_claude_settings(tmp_path)
+
+        assert json.loads(settings_file.read_text()) == CLAUDE_SETTINGS_FOR_AGENTS
+        assert "non-object 'hooks'" in caplog.text
+
+    def test_missing_hooks_key_preserves_operator_settings(self, tmp_path):
+        # The counterpart to the null case: absent really is absent, and an
+        # operator's unrelated settings must survive the merge.
+        settings_file = tmp_path / ".claude" / "settings.json"
+        settings_file.parent.mkdir(parents=True)
+        settings_file.write_text(
+            json.dumps({"model": "opus", "permissions": {"allow": ["Bash(ls:*)"]}})
+        )
+
+        install_claude_settings(tmp_path)
+
+        settings = json.loads(settings_file.read_text())
+        assert settings["model"] == "opus"
+        assert settings["permissions"] == {"allow": ["Bash(ls:*)"]}
+        assert self._stop_hook_commands(settings_file) == [
+            CLAUDE_SETTINGS_FOR_AGENTS["hooks"]["Stop"][0]["hooks"][0]["command"]
+        ]
+
+    def test_non_utf8_settings_are_replaced(self, tmp_path, caplog):
+        settings_file = tmp_path / ".claude" / "settings.json"
+        settings_file.parent.mkdir(parents=True)
+        settings_file.write_bytes(b"\xff\xfe{")
+
+        with caplog.at_level("WARNING"):
+            install_claude_settings(tmp_path)
+
+        assert json.loads(settings_file.read_text()) == CLAUDE_SETTINGS_FOR_AGENTS
+        assert "non-UTF-8 Claude settings" in caplog.text
+
+    def test_unreadable_settings_fail_without_discarding_operator_content(
+        self, tmp_path, monkeypatch
+    ):
+        # Failing to read a file says nothing about what is in it. Overwriting
+        # on a read error silently deletes operator settings that were fine.
+        settings_file = tmp_path / ".claude" / "settings.json"
+        settings_file.parent.mkdir(parents=True)
+        original = json.dumps({"model": "opus"})
+        settings_file.write_text(original)
+        _break_read_of(
+            monkeypatch, settings_file, PermissionError("simulated read failure")
+        )
+
+        with pytest.raises(WorktreeError, match="read existing Claude settings"):
+            install_claude_settings(tmp_path)
+
+        assert settings_file.read_bytes() == original.encode()
 
     def test_non_list_stop_hooks_are_replaced(self, tmp_path, caplog):
         settings_file = tmp_path / ".claude" / "settings.json"

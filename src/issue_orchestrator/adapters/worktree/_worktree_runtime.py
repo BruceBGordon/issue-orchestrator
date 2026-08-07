@@ -177,21 +177,36 @@ def sync_cli_tools(worktree_path: Path) -> list[Path]:
 def _read_worktree_identity(marker_path: Path) -> str | None:
     """Return the persisted worktree identity, or None if it must be created.
 
-    An unreadable or empty marker is treated as absent: for path-reuse
-    detection it carries exactly as much information as a missing file. It is
-    logged rather than swallowed so a filesystem problem is visible.
+    Content policy and I/O policy are deliberately different here.
+
+    Content that cannot carry an identity — an empty marker, or bytes that are
+    not UTF-8 — is regenerated: there is nothing to preserve, so a fresh id
+    loses no information.
+
+    An I/O failure says nothing about the content. The marker may hold a
+    perfectly good identity this process simply could not read, and the caller's
+    next move is to write a new one. That would silently rebrand the worktree
+    and make every job holding the old id believe its worktree was replaced, so
+    a read error aborts setup instead and leaves the file alone.
+
+    Raises:
+        WorktreeError: If an existing marker cannot be read.
     """
     if not marker_path.exists():
         return None
     try:
         existing_id = marker_path.read_text().strip()
-    except OSError as exc:
+    except UnicodeDecodeError as exc:
         logger.warning(
-            "Unreadable worktree identity marker, regenerating: path=%s error=%s",
+            "Non-UTF-8 worktree identity marker, regenerating: path=%s error=%s",
             marker_path,
             exc,
         )
         return None
+    except OSError as exc:
+        raise WorktreeError(
+            f"Failed to read worktree identity marker at {marker_path}: {exc}"
+        ) from exc
     if not existing_id:
         logger.warning("Empty worktree identity marker, regenerating: %s", marker_path)
         return None
@@ -215,9 +230,11 @@ def _install_worktree_identity(worktree_path: Path) -> str:
         The worktree identity (existing or newly created)
 
     Raises:
-        WorktreeError: If a new identity cannot be persisted. Returning an
-            unpersisted id would hand jobs a value no later run can match,
-            silently disabling path-reuse detection.
+        WorktreeError: If an existing identity cannot be read, or a new one
+            cannot be persisted. Returning an unpersisted id would hand jobs a
+            value no later run can match, silently disabling path-reuse
+            detection; overwriting an unreadable one would change the identity
+            of a worktree that already had a valid id.
     """
     marker_path = worktree_path / WORKTREE_ID_MARKER
 
@@ -347,17 +364,41 @@ def _hide_runtime_artifacts_from_git_status(
 def _read_mergeable_claude_settings(settings_file: Path) -> dict[str, Any] | None:
     """Return existing settings safe to merge into, or None to write a fresh file.
 
-    Missing, unreadable, non-JSON, or wrong-shaped settings all resolve to
-    "replace": the Stop hook is a completion guardrail, so a broken file must
-    never leave a worktree without it. Replacement discards operator content,
-    so it is logged at WARNING rather than swallowed.
+    Content the merge cannot use — non-UTF-8 bytes, non-JSON text, a non-object
+    document, or a wrong-shaped ``hooks`` entry — resolves to "replace": the
+    Stop hook is a completion guardrail, so a broken file must never leave a
+    worktree without it. Replacement discards operator content, so it is logged
+    at WARNING rather than swallowed.
+
+    A read failure is *not* a content verdict. Replacing a file we merely failed
+    to open would throw away operator settings that are perfectly intact, so it
+    fails setup and leaves the file untouched.
+
+    A ``hooks`` key that is present but not an object (``null`` included) is
+    wrong-shaped, not absent — the merge would try to ``setdefault`` into a
+    non-mapping. Only a genuinely missing key is safe to merge into.
+
+    Raises:
+        WorktreeError: If an existing settings file cannot be read.
     """
     if not settings_file.exists():
         return None
 
     try:
-        existing = json.loads(settings_file.read_text())
-    except (OSError, json.JSONDecodeError) as exc:
+        raw_settings = settings_file.read_text()
+    except UnicodeDecodeError as exc:
+        logger.warning(
+            "Replacing non-UTF-8 Claude settings: path=%s error=%s", settings_file, exc
+        )
+        return None
+    except OSError as exc:
+        raise WorktreeError(
+            f"Failed to read existing Claude settings at {settings_file}: {exc}"
+        ) from exc
+
+    try:
+        existing = json.loads(raw_settings)
+    except json.JSONDecodeError as exc:
         logger.warning(
             "Replacing unreadable Claude settings: path=%s error=%s", settings_file, exc
         )
@@ -367,17 +408,18 @@ def _read_mergeable_claude_settings(settings_file: Path) -> dict[str, Any] | Non
         logger.warning("Replacing non-object Claude settings: %s", settings_file)
         return None
 
-    hooks = existing.get("hooks")
-    if hooks is not None and not isinstance(hooks, dict):
-        logger.warning(
-            "Replacing Claude settings with non-object 'hooks': %s", settings_file
-        )
-        return None
-    if hooks is not None and not isinstance(hooks.get("Stop", []), list):
-        logger.warning(
-            "Replacing Claude settings with non-list 'hooks.Stop': %s", settings_file
-        )
-        return None
+    if "hooks" in existing:
+        hooks = existing["hooks"]
+        if not isinstance(hooks, dict):
+            logger.warning(
+                "Replacing Claude settings with non-object 'hooks': %s", settings_file
+            )
+            return None
+        if not isinstance(hooks.get("Stop", []), list):
+            logger.warning(
+                "Replacing Claude settings with non-list 'hooks.Stop': %s", settings_file
+            )
+            return None
 
     return existing
 
@@ -407,9 +449,11 @@ def install_claude_settings(worktree_path: Path) -> None:
         worktree_path: Path to the worktree
 
     Raises:
-        WorktreeError: If the settings file cannot be written. The Stop hook is
-            the only reminder an agent gets to run a completion command, so a
-            worktree without it is not a runnable session.
+        WorktreeError: If an existing settings file cannot be read, or the
+            settings file cannot be written. The Stop hook is the only reminder
+            an agent gets to run a completion command, so a worktree without it
+            is not a runnable session — and an unreadable file is not a licence
+            to overwrite whatever the operator put there.
     """
     worktree_path = Path(worktree_path)
     claude_dir = worktree_path / ".claude"
