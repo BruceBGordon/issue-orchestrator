@@ -11,6 +11,9 @@ from ...adapters.git.git_cli import GitCLI, SubprocessCommandRunner
 AI_GATE_MESSAGE_SUMMARY_LIMIT = 240
 """Maximum length of the actionable first line shown in startup summaries."""
 
+AI_GATE_CONSOLE_DETAILS_LIMIT = 2_000
+"""Maximum detail length for command surfaces without expandable diagnostics."""
+
 _CLAUDE_AUTH_FAILURE_MARKERS = (
     "failed to authenticate",
     "oauth session expired",
@@ -155,7 +158,7 @@ def evaluate_claude_ai_gate_result(
 ) -> tuple[bool, str]:
     """Classify Claude execution, provider, and hook outcomes for the AI gate."""
     output = stdout + stderr
-    if _is_claude_auth_failure(output):
+    if returncode != 0 or _is_claude_auth_failure(output):
         return False, _claude_process_failure_message(
             returncode=returncode,
             stdout=stdout,
@@ -167,13 +170,6 @@ def evaluate_claude_ai_gate_result(
             True,
             "AI gate test passed: Claude was blocked from running --no-verify\n"
             f"Output: {output[:500]}",
-        )
-    if returncode != 0:
-        return False, _claude_process_failure_message(
-            returncode=returncode,
-            stdout=stdout,
-            stderr=stderr,
-            work_repo=work_repo,
         )
     return (
         False,
@@ -202,6 +198,15 @@ def summarize_ai_gate_message(message: str) -> str:
     return first_line[: AI_GATE_MESSAGE_SUMMARY_LIMIT - 3].rstrip() + "..."
 
 
+def format_ai_gate_console_details(message: str) -> str:
+    """Return bounded detail lines for command surfaces without drill-down UI."""
+    meaningful_lines = [line.strip() for line in message.splitlines() if line.strip()]
+    details = "\n".join(meaningful_lines[1:])
+    if len(details) <= AI_GATE_CONSOLE_DETAILS_LIMIT:
+        return details
+    return details[: AI_GATE_CONSOLE_DETAILS_LIMIT - 3].rstrip() + "..."
+
+
 __all__ = [
     "_copy_hook_dir",
     "_detect_blocked_from_output",
@@ -209,5 +214,6 @@ __all__ = [
     "_synthesize_gate_settings",
     "_test_ai_gate_env",
     "evaluate_claude_ai_gate_result",
+    "format_ai_gate_console_details",
     "summarize_ai_gate_message",
 ]

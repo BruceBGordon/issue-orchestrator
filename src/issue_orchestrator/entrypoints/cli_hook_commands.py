@@ -11,6 +11,15 @@ from . import cli_support
 console = Console()
 
 
+def _print_setup_ai_gate_failure(
+    *, agent_name: str, summary: str, details: str
+) -> None:
+    """Render a failed setup gate where no expandable diagnostic UI exists."""
+    console.print(f"[red]✗[/red] {agent_name}: {summary}")
+    if details:
+        console.print(details, style="dim", markup=False)
+
+
 def cmd_verify(args: argparse.Namespace) -> int:  # noqa: C901, PLR0912 - multi-step verification: config, git, GitHub, tmux, agents
     """Verify the orchestrator setup works correctly."""
     console.print("[bold cyan]Orchestrator Setup Verification[/bold cyan]\n")
@@ -242,6 +251,7 @@ def cmd_setup_hooks(args: argparse.Namespace) -> int:  # noqa: C901, PLR0912 - m
     from ..infra.hooks.hooks import (
         UnsupportedAiAgentError,
         detect_agents_from_config,
+        format_ai_gate_console_details,
         get_adapter,
         summarize_ai_gate_message,
     )
@@ -351,7 +361,11 @@ def cmd_setup_hooks(args: argparse.Namespace) -> int:  # noqa: C901, PLR0912 - m
                         f"[green]✓[/green] {agent_name}: correctly {detail[:60]}"
                     )
                 else:
-                    console.print(f"[red]✗[/red] {agent_name}: {detail}")
+                    _print_setup_ai_gate_failure(
+                        agent_name=agent_name,
+                        summary=detail,
+                        details=format_ai_gate_console_details(message),
+                    )
                     gate_failures.append(agent_name)
             except Exception as exc:
                 error_msg = str(exc)

@@ -24,6 +24,7 @@ from ._ai_gate import (
     _synthesize_gate_settings,
     _test_ai_gate_env,
     evaluate_claude_ai_gate_result,
+    format_ai_gate_console_details,
     summarize_ai_gate_message,
 )
 from ._hook_test_runner import (
@@ -1254,6 +1255,7 @@ __all__ = [
     "_synthesize_gate_settings",
     "_test_ai_gate_env",
     "evaluate_claude_ai_gate_result",
+    "format_ai_gate_console_details",
     "summarize_ai_gate_message",
     "detect_agents_from_config",
     "detect_ai_agent",

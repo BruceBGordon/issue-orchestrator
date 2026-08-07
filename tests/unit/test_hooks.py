@@ -520,8 +520,16 @@ class TestClaudeCodeAdapter:
         assert auth_error.strip() in message
         assert "Claude was NOT blocked" not in message
 
-    def test_ai_gate_reports_claude_process_failure_before_hook_result(
-        self, adapter, temp_project, monkeypatch
+    @pytest.mark.parametrize(
+        "provider_error",
+        [
+            "Permission denied while reading Claude credentials",
+            "Cannot connect to the Anthropic API",
+            "Request blocked by provider network policy",
+        ],
+    )
+    def test_ai_gate_reports_nonzero_provider_failure_before_blocked_text(
+        self, adapter, temp_project, monkeypatch, provider_error
     ):
         from issue_orchestrator.infra.hooks import hooks as hooks_module
 
@@ -532,7 +540,7 @@ class TestClaudeCodeAdapter:
             lambda *args, **kwargs: subprocess.CompletedProcess(
                 args=args[0],
                 returncode=1,
-                stdout="Provider unavailable\n",
+                stdout=f"{provider_error}\n",
                 stderr="",
             ),
         )
@@ -542,6 +550,7 @@ class TestClaudeCodeAdapter:
         assert success is False
         assert message.startswith("Claude AI gate could not run (exit 1)")
         assert "Resolve the Claude CLI error below" in message
+        assert provider_error in message
         assert "Claude was NOT blocked" not in message
 
     def test_hook_blocks_no_verify(self, adapter, temp_project):
