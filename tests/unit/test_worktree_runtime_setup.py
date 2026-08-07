@@ -26,6 +26,11 @@ from issue_orchestrator.adapters.worktree._worktree_runtime import (
     CLAUDE_SETTINGS_FOR_AGENTS,
     WORKTREE_ID_MARKER,
 )
+from tests.unit.worktree_git_helpers import (
+    block_worktree_config_writes,
+    effective_hooks_path,
+    make_git_worktree,
+)
 
 
 def _break_read_of(
@@ -120,14 +125,18 @@ class TestApplyProducesRunnableWorktree:
 
         assert second.worktree_id == first.worktree_id
 
-    def test_hooks_are_installed_when_enforced(self, repo_root, worktree_path):
-        state = WorktreeRuntimeSetup(repo_root=repo_root, enforce_hooks=True).apply(
-            worktree_path
-        )
+    def test_hooks_are_installed_when_enforced(self, tmp_path):
+        # Real repo: "installed" means git will run it, which only a real repo
+        # can be asked.
+        wt = make_git_worktree(tmp_path)
+
+        state = WorktreeRuntimeSetup(
+            repo_root=wt.main_repo, enforce_hooks=True
+        ).apply(wt.worktree_path)
 
         assert state.hooks_installed is True
-        installed = repo_root / ".git" / "worktrees" / "repo-123" / "hooks" / "pre-push"
-        assert installed.exists()
+        assert (wt.hooks_dir / "pre-push").exists()
+        assert effective_hooks_path(wt.worktree_path) == str(wt.hooks_dir)
 
     def test_hooks_are_skipped_when_not_enforced(self, repo_root, worktree_path):
         state = WorktreeRuntimeSetup(repo_root=repo_root, enforce_hooks=False).apply(
@@ -147,21 +156,35 @@ class TestEnforcedHooksAreAnInvariantNotARequest:
     one that fails to be created: the session runs and can push past validation.
     """
 
-    def test_enforced_hooks_that_cannot_be_installed_fail_setup(
-        self, repo_root, worktree_path, tmp_path
-    ):
+    def test_enforced_hooks_that_cannot_be_installed_fail_setup(self, tmp_path):
+        wt = make_git_worktree(tmp_path)
         missing_hook = tmp_path / "nonexistent-pre-push"
 
         with pytest.raises(WorktreeError, match="pre-push hook was installed"):
             WorktreeRuntimeSetup(
-                repo_root=repo_root,
+                repo_root=wt.main_repo,
                 enforce_hooks=True,
                 pre_push_hook=missing_hook,
-            ).apply(worktree_path)
+            ).apply(wt.worktree_path)
 
-        assert not (
-            repo_root / ".git" / "worktrees" / "repo-123" / "hooks" / "pre-push"
-        ).exists()
+        assert not (wt.hooks_dir / "pre-push").exists()
+
+    def test_enforced_hooks_fail_when_git_config_will_not_take(self, tmp_path):
+        """The hook file can land in a directory git never consults.
+
+        Nothing about the filesystem looks wrong in this case — the hooks
+        directory is writable, the copy succeeds — so an owner that only checks
+        for the file reports a guardrail that will never run.
+        """
+        wt = make_git_worktree(tmp_path)
+        block_worktree_config_writes(wt.gitdir)
+
+        with pytest.raises(WorktreeError, match="pre-push hook was installed"):
+            WorktreeRuntimeSetup(
+                repo_root=wt.main_repo, enforce_hooks=True
+            ).apply(wt.worktree_path)
+
+        assert effective_hooks_path(wt.worktree_path) != str(wt.hooks_dir)
 
     def test_enforced_hooks_fail_when_the_worktree_has_no_git_link(
         self, repo_root, tmp_path

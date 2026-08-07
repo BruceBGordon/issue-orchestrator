@@ -26,6 +26,11 @@ from issue_orchestrator.adapters.worktree.api import (
     WorktreeError,
 )
 from issue_orchestrator.ports.worktree_manager import WorktreeReuseOptions
+from tests.unit.worktree_git_helpers import (
+    block_worktree_config_writes,
+    effective_hooks_path,
+    make_git_worktree,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -1698,31 +1703,20 @@ class TestInstallHooks:
         # sys.executable (not whatever the caller's shell has configured).
         monkeypatch.delenv("ISSUE_ORCHESTRATOR_PYTHON", raising=False)
 
-        # Setup fake git structure
-        main_repo = tmp_path / "main_repo"
-        main_repo.mkdir()
-        main_git = main_repo / ".git"
-        main_git.mkdir()
-        main_hooks = main_git / "hooks"
-        main_hooks.mkdir()
-        # No pre-push hook in main repo
+        # A real repo, because "installed" means git will run it — which only a
+        # real repo can be asked.
+        wt = make_git_worktree(tmp_path)
 
-        worktrees_dir = main_git / "worktrees" / "test-worktree"
-        worktrees_dir.mkdir(parents=True)
-        hooks_dir = worktrees_dir / "hooks"
-
-        worktree_path = tmp_path / "worktree"
-        worktree_path.mkdir()
-        (worktree_path / ".git").write_text(f"gitdir: {worktrees_dir}")
-
-        assert install_hooks(worktree_path) is True
+        assert install_hooks(wt.worktree_path) is True
 
         # Should have installed orchestrator's hook directly (no chaining)
-        pre_push = hooks_dir / "pre-push"
+        pre_push = wt.hooks_dir / "pre-push"
         assert pre_push.exists()
         # Should NOT have project or orchestrator suffixed hooks
-        assert not (hooks_dir / "pre-push.project").exists()
-        assert not (hooks_dir / "pre-push.orchestrator").exists()
+        assert not (wt.hooks_dir / "pre-push.project").exists()
+        assert not (wt.hooks_dir / "pre-push.orchestrator").exists()
+        # ...and git must actually be pointed at the directory holding it.
+        assert effective_hooks_path(wt.worktree_path) == str(wt.hooks_dir)
 
         # Regression: the bundled hook ships with an ``@@ORCHESTRATOR_PYTHON@@``
         # placeholder; install must substitute it with the orchestrator's
@@ -1740,44 +1734,31 @@ class TestInstallHooks:
     def test_install_hooks_chains_with_project_hook(self, tmp_path, monkeypatch):
         """Test that hooks are chained when project has a pre-push hook."""
         monkeypatch.delenv("ISSUE_ORCHESTRATOR_PYTHON", raising=False)
-        # Setup fake git structure
-        main_repo = tmp_path / "main_repo"
-        main_repo.mkdir()
-        main_git = main_repo / ".git"
-        main_git.mkdir()
-        main_hooks = main_git / "hooks"
-        main_hooks.mkdir()
-        
+        wt = make_git_worktree(tmp_path)
+
         # Create a project pre-push hook
-        project_hook = main_hooks / "pre-push"
+        project_hook = wt.main_repo / ".git" / "hooks" / "pre-push"
         project_hook.write_text("#!/bin/bash\necho 'Project hook'\nexit 0\n")
         project_hook.chmod(0o755)
-        
-        worktrees_dir = main_git / "worktrees" / "test-worktree"
-        worktrees_dir.mkdir(parents=True)
-        hooks_dir = worktrees_dir / "hooks"
-        
-        worktree_path = tmp_path / "worktree"
-        worktree_path.mkdir()
-        (worktree_path / ".git").write_text(f"gitdir: {worktrees_dir}")
-        
-        assert install_hooks(worktree_path) is True
+
+        assert install_hooks(wt.worktree_path) is True
 
         # Verify chained hooks were created
-        pre_push = hooks_dir / "pre-push"
-        pre_push_project = hooks_dir / "pre-push.project"
-        pre_push_orchestrator = hooks_dir / "pre-push.orchestrator"
-        
+        pre_push = wt.hooks_dir / "pre-push"
+        pre_push_project = wt.hooks_dir / "pre-push.project"
+        pre_push_orchestrator = wt.hooks_dir / "pre-push.orchestrator"
+
         assert pre_push.exists(), "Wrapper hook should exist"
         assert pre_push_project.exists(), "Project hook copy should exist"
         assert pre_push_orchestrator.exists(), "Orchestrator hook copy should exist"
-        
+        assert effective_hooks_path(wt.worktree_path) == str(wt.hooks_dir)
+
         # Verify wrapper content chains both hooks
         wrapper_content = pre_push.read_text()
         assert "pre-push.project" in wrapper_content, "Wrapper should call project hook"
         assert "pre-push.orchestrator" in wrapper_content, "Wrapper should call orchestrator hook"
         assert "set -e" in wrapper_content, "Wrapper should fail on error"
-        
+
         # Verify project hook was copied correctly
         assert "Project hook" in pre_push_project.read_text()
 
@@ -1800,23 +1781,48 @@ class TestInstallHooks:
         wrong — which is exactly why the return value has to say it didn't.
         """
         monkeypatch.delenv("ISSUE_ORCHESTRATOR_PYTHON", raising=False)
-        main_repo = tmp_path / "main_repo"
-        main_hooks = main_repo / ".git" / "hooks"
-        main_hooks.mkdir(parents=True)
-        project_hook = main_hooks / "pre-push"
+        wt = make_git_worktree(tmp_path)
+        project_hook = wt.main_repo / ".git" / "hooks" / "pre-push"
         project_hook.write_text("#!/bin/bash\nexit 0\n")
         project_hook.chmod(0o755)
 
-        worktrees_dir = main_repo / ".git" / "worktrees" / "test-worktree"
-        worktrees_dir.mkdir(parents=True)
-        worktree_path = tmp_path / "worktree"
-        worktree_path.mkdir()
-        (worktree_path / ".git").write_text(f"gitdir: {worktrees_dir}")
-
-        installed = install_hooks(worktree_path, tmp_path / "nonexistent-pre-push")
+        installed = install_hooks(wt.worktree_path, tmp_path / "nonexistent-pre-push")
 
         assert installed is False
-        assert not (worktrees_dir / "hooks" / "pre-push.orchestrator").exists()
+        assert not (wt.hooks_dir / "pre-push.orchestrator").exists()
+
+    def test_install_hooks_reports_failure_when_worktree_config_cannot_be_written(
+        self, tmp_path
+    ):
+        """A copied hook in a directory git never consults is not a guardrail.
+
+        This is the bypass the return value exists to close: the hooks directory
+        stays perfectly writable, so the file lands and everything *looks*
+        installed, while git keeps using its previous hooks path and the
+        orchestrator's pre-push check never runs.
+        """
+        wt = make_git_worktree(tmp_path)
+        block_worktree_config_writes(wt.gitdir)
+
+        installed = install_hooks(wt.worktree_path)
+
+        assert installed is False
+        assert not (wt.hooks_dir / "pre-push").exists()
+        assert effective_hooks_path(wt.worktree_path) != str(wt.hooks_dir)
+
+    def test_install_hooks_reports_failure_when_repo_hooks_path_is_unreadable(
+        self, tmp_path
+    ):
+        """A config-read error must not be read as "this repo has no hooksPath".
+
+        Treating the two the same would resolve project hooks against the wrong
+        directory and silently drop the repo's own pre-push gate from the chain.
+        """
+        wt = make_git_worktree(tmp_path)
+        (wt.main_repo / ".git" / "config").write_text("[core\nthis is not valid\n")
+
+        assert install_hooks(wt.worktree_path) is False
+        assert not (wt.hooks_dir / "pre-push").exists()
 
     @patch("issue_orchestrator.adapters.git.git_cli.subprocess.run")
     def test_install_hooks_with_custom_hooks_path(self, mock_run, tmp_path):
@@ -1845,20 +1851,22 @@ class TestInstallHooks:
         project_hook.write_text("#!/bin/bash\necho 'Custom hooks path hook'\nexit 0\n")
         project_hook.chmod(0o755)
 
-        # Mock git config to return custom hooksPath
+        # Mock a coherent git: the main repo reports .githooks, the worktree
+        # config writes succeed, and reading core.hooksPath back afterwards
+        # returns the worktree hooks dir those writes just set.
         def mock_git_command(*args, **kwargs):
-            cmd = args[0]
-            if "config" in cmd and "--get" in cmd and "core.hooksPath" in cmd:
+            argv = args[0][3:]  # strip ["git", "-C", <repo>]
+            if argv[:4] == ["config", "--local", "--get", "core.hooksPath"]:
                 return MagicMock(returncode=0, stdout=".githooks\n", stderr="")
-            elif "config" in cmd and "extensions.worktreeConfig" in cmd:
-                return MagicMock(returncode=0, stdout="", stderr="")
-            elif "config" in cmd and "--worktree" in cmd and "core.hooksPath" in cmd:
+            if argv[:3] == ["config", "--get", "core.hooksPath"]:
+                return MagicMock(returncode=0, stdout=f"{hooks_dir}\n", stderr="")
+            if argv[:1] == ["config"]:
                 return MagicMock(returncode=0, stdout="", stderr="")
             return MagicMock(returncode=1, stdout="", stderr="")
 
         mock_run.side_effect = mock_git_command
 
-        install_hooks(worktree_path)
+        assert install_hooks(worktree_path) is True
 
         # Verify chained hooks were created in gitdir/hooks (not .githooks)
         pre_push = hooks_dir / "pre-push"
