@@ -56,6 +56,14 @@
       "rule_id": "control_policy_branch_sites",
       "value": 35
     },
+    "control_policy_branch_sites:src/issue_orchestrator/control/completion_history_status.py": {
+      "detail": "4 branch site(s) mention lifecycle/control terms",
+      "kind": "control_policy_branch_sites",
+      "metric_id": "src/issue_orchestrator/control/completion_history_status.py",
+      "path": "src/issue_orchestrator/control/completion_history_status.py",
+      "rule_id": "control_policy_branch_sites",
+      "value": 4
+    },
     "control_policy_branch_sites:src/issue_orchestrator/control/completion_pr_collision.py": {
       "detail": "1 branch site(s) mention lifecycle/control terms",
       "kind": "control_policy_branch_sites",

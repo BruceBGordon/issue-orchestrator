@@ -367,16 +367,13 @@ class CompletionActionPlanner:
             return tuple(failure_actions)
 
         if status == SessionStatus.BLOCKED:
-            if provider_error_type is not None:
-                return tuple(
-                    self._generate_provider_blocked_actions(session, expected)
-                )
             return tuple(
                 self._generate_blocked_actions(
                     session,
                     expected,
                     blocked_label=blocked_label,
                     blocked_reason=blocked_reason,
+                    provider_error_type=provider_error_type,
                 )
             )
 
@@ -713,8 +710,16 @@ class CompletionActionPlanner:
         expected: ExpectedState,
         blocked_label: Optional[str] = None,
         blocked_reason: Optional[str] = None,
+        provider_error_type: ProviderErrorType | None = None,
     ) -> list[Action]:
-        """Generate actions when agent explicitly reported blocked."""
+        """Generate actions for a BLOCKED completion.
+
+        Two routes, decided here rather than by the caller so "what a block
+        means" has one owner: a typed provider verdict is an outage impacting
+        the issue, and anything else is the agent reporting it cannot proceed.
+        """
+        if provider_error_type is not None:
+            return self._generate_provider_blocked_actions(session, expected)
         is_issue_session = session.terminal_id.startswith("issue-")
         label = blocked_label or self._lm.blocked
 

@@ -25,14 +25,17 @@ CREATE TABLE IF NOT EXISTS provider_circuit (
 );
 """
 
-_COLUMNS = """
-provider, transient_open_until, consecutive_outages, last_error_summary,
-updated_at, consecutive_auth_failures, auth_open_until, last_auth_sample_id
+_SELECT_ONE = """
+SELECT provider, transient_open_until, consecutive_outages, last_error_summary,
+       updated_at, consecutive_auth_failures, auth_open_until, last_auth_sample_id
+FROM provider_circuit WHERE provider = ?
 """
 
-_SELECT_ONE = f"SELECT {_COLUMNS} FROM provider_circuit WHERE provider = ?"
-
-_SELECT_ALL = f"SELECT {_COLUMNS} FROM provider_circuit"
+_SELECT_ALL = """
+SELECT provider, transient_open_until, consecutive_outages, last_error_summary,
+       updated_at, consecutive_auth_failures, auth_open_until, last_auth_sample_id
+FROM provider_circuit
+"""
 
 
 def _parse_dt(value: str | None) -> datetime | None:
@@ -144,9 +147,12 @@ class SQLiteProviderCircuitStore:
     def save(self, state: ProviderCircuitState) -> None:
         with self._transaction() as tx:
             tx.execute(
-                f"""
-                INSERT INTO provider_circuit ({_COLUMNS})
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """
+                INSERT INTO provider_circuit (
+                    provider, transient_open_until, consecutive_outages,
+                    last_error_summary, updated_at, consecutive_auth_failures,
+                    auth_open_until, last_auth_sample_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(provider) DO UPDATE SET
                     transient_open_until=excluded.transient_open_until,
                     consecutive_outages=excluded.consecutive_outages,

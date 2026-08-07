@@ -28,10 +28,7 @@ from typing import TYPE_CHECKING, Callable, Optional
 from ..infra.config import Config
 from ..infra.logging_config import issue_log
 from ..ports.issue import Issue
-from ..ports.provider_readiness import (
-    NO_PROVIDER_READINESS_PROBE,
-    ProviderReadinessProbe,
-)
+from ..ports.provider_readiness import NO_PROVIDER_READINESS_PROBE, ProviderReadinessProbe
 from ..domain.models import (
     PendingTechLeadReview,
     TechLeadFacts,
@@ -152,11 +149,7 @@ class Planner:
             rework_workflow: Optional rework decision logic
             tech_lead_workflow: Optional tech_lead decision logic
             label_manager: Label registry for prefix-aware queries.
-            provider_readiness_probe: The typed provider-readiness boundary
-                (#6999). Planning consults it through
-                :meth:`ProviderAvailabilityPolicy.blocks_launch` rather than
-                reading the circuit directly, so an open auth circuit cannot
-                suppress the one probe that would retire it.
+            provider_readiness_probe: Typed provider-readiness boundary (#6999).
         """
         self.config = config
         self.scheduler = scheduler
@@ -166,15 +159,9 @@ class Planner:
         self.rework_workflow = rework_workflow
         self.tech_lead_workflow = tech_lead_workflow
         self.provider_resilience = provider_resilience
-        self.provider_policy = (
-            ProviderAvailabilityPolicy(
-                config,
-                provider_resilience,
-                readiness_probe=provider_readiness_probe,
-            )
-            if provider_resilience
-            else None
-        )
+        self.provider_policy = ProviderAvailabilityPolicy(
+            config, provider_resilience, readiness_probe=provider_readiness_probe
+        ) if provider_resilience else None
         if label_manager is None:
             from .label_manager import LabelManager
             label_manager = LabelManager(config)
@@ -745,6 +732,22 @@ class Planner:
 
         return actions
 
+    def _provider_blocking_launch(self, agent_label: str | None) -> str | None:
+        """The provider this queue item must not launch against, if any.
+
+        Every queue asks this one question in one place, through the bounded
+        launch assessment — which samples readiness before consulting the
+        circuit, so an open auth outage cannot suppress its own recovery
+        (#6999 F1/A1). ``None`` includes the no-policy case.
+        """
+        policy = self.provider_policy
+        if policy is None:
+            return None
+        provider = policy.provider_for_agent_label(agent_label)
+        if provider and policy.blocks_launch(provider):
+            return provider
+        return None
+
     def _record_provider_skip(
         self,
         issue_number: int,
@@ -1226,8 +1229,7 @@ Flip labels from `{facts.watch_label}` to `{self.config.tech_lead_reviewed_label
         if self.provider_policy:
             filtered: list[Issue] = []
             for issue in available:
-                provider = self.provider_policy.provider_for_issue(issue)
-                if provider and self.provider_policy.blocks_launch(provider):
+                if provider := self._provider_blocking_launch(issue.agent_type):
                     skipped.append(SkippedItem(
                         item_type="issue",
                         number=issue.number,
@@ -1383,8 +1385,7 @@ Flip labels from `{facts.watch_label}` to `{self.config.tech_lead_reviewed_label
         if decision.should_launch:
             for review in decision.reviews_to_launch[:capacity]:
                 reviewer_label = self.config.get_reviewer_for_agent(review.agent_label) if review.agent_label else self.config.code_review_agent
-                provider = self.provider_policy.provider_for_agent_label(reviewer_label) if self.provider_policy else None
-                if provider and self.provider_policy and self.provider_policy.blocks_launch(provider):
+                if provider := self._provider_blocking_launch(reviewer_label):
                     self._record_provider_skip(
                         issue_number=review.issue_number,
                         item_type="review",
@@ -1440,12 +1441,7 @@ Flip labels from `{facts.watch_label}` to `{self.config.tech_lead_reviewed_label
         if decision.should_launch:
             for review in decision.reviews_to_launch[:capacity]:
                 reviewer_label = self.config.get_reviewer_for_agent(review.agent_label)
-                provider = (
-                    self.provider_policy.provider_for_agent_label(reviewer_label)
-                    if self.provider_policy
-                    else None
-                )
-                if provider and self.provider_policy and self.provider_policy.blocks_launch(provider):
+                if provider := self._provider_blocking_launch(reviewer_label):
                     self._record_provider_skip(
                         issue_number=review.issue_number,
                         item_type="retrospective_review",
@@ -1515,8 +1511,7 @@ Flip labels from `{facts.watch_label}` to `{self.config.tech_lead_reviewed_label
                 if issue_num is None:
                     logger.warning("Planner: skipping rework with unresolved issue number: %s", rework.issue_key)
                     continue
-                provider = self.provider_policy.provider_for_agent_label(rework.agent_type) if self.provider_policy else None
-                if provider and self.provider_policy and self.provider_policy.blocks_launch(provider):
+                if provider := self._provider_blocking_launch(rework.agent_type):
                     self._record_provider_skip(
                         issue_number=issue_num,
                         item_type="rework",
@@ -1594,17 +1589,13 @@ Flip labels from `{facts.watch_label}` to `{self.config.tech_lead_reviewed_label
                 logger.info(issue_log(issue_number, "Skipped validation retry: reason=active_session"))
                 continue
 
-            provider = (
-                self.provider_policy.provider_for_agent_label(retry.agent_label)
-                if self.provider_policy and retry.agent_label
-                else None
-            )
-            if provider and self.provider_policy and self.provider_policy.blocks_launch(provider):
+            blocking_provider = self._provider_blocking_launch(retry.agent_label)
+            if blocking_provider:
                 self._record_provider_skip(
                     issue_number=issue_number,
                     item_type="validation_retry",
                     item_number=issue_number,
-                    provider=provider,
+                    provider=blocking_provider,
                     actions=actions,
                     skipped=skipped,
                     plan_context=plan_context,
@@ -1661,8 +1652,7 @@ Flip labels from `{facts.watch_label}` to `{self.config.tech_lead_reviewed_label
         # Provider eligibility precedes the workflow decision so the launching
         # event can never claim a launch the provider gate then suppresses
         # (#6892). One shared agent/provider => one gate for the whole queue.
-        provider = self.provider_policy.provider_for_agent_label(self.config.tech_lead_review_agent) if self.provider_policy else None
-        if provider and self.provider_policy and self.provider_policy.blocks_launch(provider):
+        if provider := self._provider_blocking_launch(self.config.tech_lead_review_agent):
             for tech_lead in pending_tech_lead:
                 self._record_provider_skip(
                     issue_number=tech_lead.issue_number,

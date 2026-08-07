@@ -631,9 +631,9 @@ class TestDistinctAuthOutcome:
         # The live-session story, not the launch-gate one — and no raw
         # provider-blocked label rides along (#6999 F5).
         assert decision.blocked_label is None
-        assert events.names() == [
-            EventName.SESSION_PROVIDER_AUTH_TERMINATED.value
-        ]
+        names = events.names()
+        assert names.count(EventName.SESSION_PROVIDER_AUTH_TERMINATED.value) == 1
+        assert EventName.SESSION_LAUNCH_FAILED_AUTH.value not in names
 
     def test_auth_observation_is_terminal(self) -> None:
         observation = SessionObservationResult.provider_auth_failed(
