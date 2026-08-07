@@ -25,7 +25,7 @@ from pathlib import Path
 
 import pytest
 
-from issue_orchestrator.adapters.worktree._worktree import sync_cli_tools
+from issue_orchestrator.adapters.worktree.api import sync_cli_tools
 from issue_orchestrator.domain.models import Issue
 from issue_orchestrator.events import EventName
 from issue_orchestrator.execution.terminal_subprocess import SubprocessPlugin
