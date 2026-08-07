@@ -25,7 +25,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
-from ..domain.pending_work import PendingWorkClaim
 
 if TYPE_CHECKING:
     from ..domain.artifact_contracts import ValidationOutcome
@@ -598,27 +597,6 @@ class SessionOutput(Protocol):
         Returns:
             Path to the written identity file
         """
-        ...
-
-    def write_pending_work_claim(
-        self,
-        run_dir: Path,
-        claim: "PendingWorkClaim",
-    ) -> None:
-        """Record the queued request this run's session took at launch (#6999 F4).
-
-        Lives with the run assets because it shares their lifetime and their
-        restoration seam: whatever rebuilds the session after a restart can
-        rebuild what that session is carrying.
-        """
-        ...
-
-    def read_pending_work_claim(self, run_dir: Path) -> "PendingWorkClaim | None":
-        """The claim this run holds, or None when it holds none."""
-        ...
-
-    def clear_pending_work_claim(self, run_dir: Path) -> None:
-        """Drop this run's claim. A no-op when there is none."""
         ...
 
     def append_cleaned_session_log(

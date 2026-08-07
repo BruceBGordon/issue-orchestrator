@@ -80,6 +80,29 @@ class SettlementOutcome(Enum):
         return cls.CONSUMED
 
 
+@dataclass(frozen=True, slots=True)
+class QuarantinedSession:
+    """A restored terminal whose claim record could not be read (#6999 F6).
+
+    The dangerous state this type exists to make un-ignorable: the terminal is
+    alive and doing queued work, and the orchestrator no longer knows which.
+    Admitting it to ordinary processing would let its completion settle as
+    claimless and destroy that work; the caller must instead keep it out and
+    raise the problem where an operator will see it.
+    """
+
+    session: Session
+    error: str
+
+
+@dataclass(frozen=True, slots=True)
+class ClaimRestoration:
+    """Per-session verdicts from rehydrating a restart's live terminals."""
+
+    admitted: tuple[Session, ...]
+    quarantined: tuple[QuarantinedSession, ...]
+
+
 class DuplicateClaimError(RuntimeError):
     """Two different claims were taken against one terminal (#6999 F5).
 
@@ -129,7 +152,7 @@ class InFlightWorkLedger:
         # Written every time, including the idempotent path: the durable record
         # is what a restart reads, and an in-memory hit is no evidence that the
         # on-disk one was ever produced.
-        self.claims.write_pending_work_claim(session.run_assets.run_dir, claim)
+        self.claims.write_pending_work_claim(session.run_assets, claim)
         logger.debug("[WORK] %s holds %s", terminal_id, claim.kind.value)
 
     def settle(
@@ -157,51 +180,55 @@ class InFlightWorkLedger:
         self._release(session)
         return held
 
-    def rehydrate(self, sessions: Sequence[Session]) -> list[PendingWorkClaim]:
+    def rehydrate(self, sessions: Sequence[Session]) -> "ClaimRestoration":
         """Re-take the claims of terminals that survived a restart (#6999 F4).
 
         The pending queues are in-memory, so after a restart a live terminal's
-        request is on disk and nowhere else. Reading it back is what lets a
-        provider failure observed AFTER the restart still return the work.
+        request is in the orchestrator's claim store and nowhere else. Reading
+        it back is what lets a provider failure observed AFTER the restart still
+        return the work.
 
-        The claim is also the authority on what the terminal is doing, which
-        the restored session cannot always tell: terminal-name parsing gives a
+        The claim is also the authority on what the terminal is doing, which the
+        restored session cannot always tell: terminal-name parsing gives a
         rework session generic CODE identity and no PR number, and without the
-        PR number the provider-blocked planner cannot put ``needs-rework``
-        back. Reconciling identity from the claim fixes that at its source.
+        PR number the provider-blocked planner cannot put ``needs-rework`` back.
+        Reconciling identity from the claim fixes that at its source.
 
-        A claim that exists but cannot be decoded is reported and skipped
-        rather than crashing startup: one unreadable artifact must not stop
-        every other session from being restored. It stays on disk for
-        inspection.
+        Returns a typed per-session verdict rather than a bare list (#6999 F6).
+        A session whose claim is RECORDED BUT UNREADABLE is quarantined, not
+        admitted: letting it run on would end with ``settle`` finding no claim
+        and treating it exactly like a claimless issue session, silently
+        destroying the queued request the unreadable record described. Its
+        neighbours are unaffected — one bad record must not stop an
+        orchestrator restarting.
         """
-        rehydrated: list[PendingWorkClaim] = []
+        admitted: list[Session] = []
+        quarantined: list[QuarantinedSession] = []
         for session in sessions:
             try:
-                claim = self.claims.read_pending_work_claim(
-                    session.run_assets.run_dir
-                )
-            except Exception as exc:  # adapter-defined decode/IO failure
+                claim = self.claims.read_pending_work_claim(session.run_assets)
+            except Exception as exc:  # adapter-defined decode/identity failure
                 logger.error(
-                    "[WORK] Could not rebuild the claim held by %s: %s",
+                    "[WORK] Quarantining %s: its claim record exists but could "
+                    "not be read, so what work it holds is unknown: %s",
                     session.terminal_id,
                     exc,
                 )
+                quarantined.append(QuarantinedSession(session, str(exc)))
                 continue
-            if claim is None:
-                continue
-            if self.holds(session.terminal_id) is None:
-                self.state.in_flight_work.append(
-                    InFlightWork(session.terminal_id, claim)
+            if claim is not None:
+                if self.holds(session.terminal_id) is None:
+                    self.state.in_flight_work.append(
+                        InFlightWork(session.terminal_id, claim)
+                    )
+                _reconcile_restored_identity(session, claim)
+                logger.info(
+                    "[WORK] Restored terminal %s is still holding %s",
+                    session.terminal_id,
+                    claim.kind.value,
                 )
-            _reconcile_restored_identity(session, claim)
-            rehydrated.append(claim)
-            logger.info(
-                "[WORK] Restored terminal %s is still holding %s",
-                session.terminal_id,
-                claim.kind.value,
-            )
-        return rehydrated
+            admitted.append(session)
+        return ClaimRestoration(tuple(admitted), tuple(quarantined))
 
     def holds(self, terminal_id: str) -> PendingWorkClaim | None:
         """The claim ``terminal_id`` is currently carrying, if any."""
@@ -235,7 +262,7 @@ class InFlightWorkLedger:
         with no in-memory twin would be re-taken at the next restart and
         re-queue work that was already settled.
         """
-        self.claims.clear_pending_work_claim(session.run_assets.run_dir)
+        self.claims.clear_pending_work_claim(session.run_assets)
         self.state.in_flight_work[:] = [
             w
             for w in self.state.in_flight_work
@@ -337,8 +364,10 @@ class LaunchSettlement:
 
 
 __all__ = [
+    "ClaimRestoration",
     "DuplicateClaimError",
     "InFlightWorkLedger",
     "LaunchSettlement",
+    "QuarantinedSession",
     "SettlementOutcome",
 ]

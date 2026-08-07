@@ -21,6 +21,7 @@ from pathlib import Path
 
 import pytest
 
+from issue_orchestrator.control.in_flight_work import InFlightWorkLedger
 from issue_orchestrator.control.provider_availability import ProviderAvailabilityPolicy
 from issue_orchestrator.control.provider_resilience import ProviderResilienceManager
 from issue_orchestrator.control.session_controller import SessionController
@@ -52,6 +53,9 @@ from issue_orchestrator.ports.provider_readiness import (
     NO_PROVIDER_READINESS_PROBE,
     ProviderReadiness,
     ProviderReadinessState,
+)
+from issue_orchestrator.ports.pending_work_claim_store import (
+    UNWIRED_PENDING_WORK_CLAIMS,
 )
 from issue_orchestrator.ports.provider_resilience import ProviderErrorType
 
@@ -2561,6 +2565,7 @@ class _RefusingLauncherHarness(_LauncherHarness):
             config=_routing_config(tmp_path),
         )
         self.manager = manager
+        self.claims = _claims(tmp_path)
 
 
 def _pending_state(queue: str):
@@ -2658,6 +2663,9 @@ def _route(queue: str, state, harness, restorer=None):
     can assert what the settlement did NOT do. A provider deferral must not
     attempt terminal adoption, and that is only observable from outside if the
     mock belongs to the caller (#6999 F12).
+
+    The claim store comes from the harness so launch and settlement share the
+    one orchestrator-owned store, exactly as the composition root wires it.
     """
     from unittest.mock import MagicMock
 
@@ -2666,25 +2674,24 @@ def _route(queue: str, state, harness, restorer=None):
     if restorer is None:
         restorer = MagicMock()
     restorer.restore_session.return_value = None
+    claims = harness.claims
     if queue == "review":
         return session_routing.orchestrator_launch_review_session(
-            state.pending_reviews[0], state, harness.launcher, restorer,
-            FileSystemSessionOutput(),
+            state.pending_reviews[0], state, harness.launcher, restorer, claims
         )
     if queue == "retrospective_review":
         return session_routing.orchestrator_launch_retrospective_review_session(
-            state.pending_retrospective_reviews[0], state, harness.launcher, restorer,
-            FileSystemSessionOutput(),
+            state.pending_retrospective_reviews[0], state, harness.launcher,
+            restorer, claims,
         )
     if queue == "rework":
         return session_routing.orchestrator_launch_rework_session(
-            state.pending_reworks[0], state, harness.launcher, restorer,
-            FileSystemSessionOutput(),
+            state.pending_reworks[0], state, harness.launcher, restorer, claims
         )
     if queue == "validation_retry":
         return session_routing.orchestrator_launch_validation_retry_session(
-            state.pending_validation_retries[0], state, harness.launcher, restorer,
-            FileSystemSessionOutput(),
+            state.pending_validation_retries[0], state, harness.launcher,
+            restorer, claims,
         )
     if queue == "tech_lead":
         return session_routing.orchestrator_launch_tech_lead_session(
@@ -2693,7 +2700,7 @@ def _route(queue: str, state, harness, restorer=None):
             harness.launcher.config,
             harness.launcher,
             restorer,
-            FileSystemSessionOutput(),
+            claims,
         )
     raise AssertionError(f"unknown queue {queue!r}")
 
@@ -2863,7 +2870,7 @@ def test_a_provider_deferral_touches_neither_restoration_nor_the_retry_budget() 
         return None
 
     owner = LaunchSettlement(
-        claims=FileSystemSessionOutput(),
+        claims=UNWIRED_PENDING_WORK_CLAIMS,
         claim=_claim("tech_lead", _pending_state("tech_lead")),
         remove=lambda: calls.append("remove"),
         restore_existing=_spy_restore_existing,
@@ -2926,7 +2933,7 @@ def test_an_unhandled_launch_disposition_never_silently_drops_the_work() -> None
 
     removed: list[str] = []
     owner = LaunchSettlement(
-        claims=FileSystemSessionOutput(),
+        claims=UNWIRED_PENDING_WORK_CLAIMS,
         claim=_claim("review", _pending_state("review")),
         remove=lambda: removed.append("removed"),
     )
@@ -2968,18 +2975,26 @@ def _ready_harness(tmp_path: Path):
     )
 
 
-def _claims():
-    """The real run-artifact adapter, so the durable claim path is exercised."""
-    return FileSystemSessionOutput()
+def _claims(tmp_path: Path):
+    """The real orchestrator-owned store, so the durable claim path is exercised.
+
+    Rooted at the test's repo root rather than any worktree: the whole point of
+    #6999 F7 is that this record lives where the agent cannot reach it.
+    """
+    from issue_orchestrator.execution.pending_work_claim_store import (
+        SqlitePendingWorkClaimStore,
+    )
+
+    return SqlitePendingWorkClaimStore.for_repo(tmp_path)
 
 
-def _ledger(state):
+def _ledger(state, harness):
     from issue_orchestrator.control.in_flight_work import InFlightWorkLedger
 
-    return InFlightWorkLedger(state, _claims())
+    return InFlightWorkLedger(state, harness.claims)
 
 
-def _terminate_on_provider(state, session, error_type, *, drop_active=True):
+def _terminate_on_provider(state, session, error_type, harness, *, drop_active=True):
     """Settle a running session the way terminal completion does.
 
     ``drop_active`` mirrors ``handle_session_completion``, which drops the
@@ -2992,7 +3007,7 @@ def _terminate_on_provider(state, session, error_type, *, drop_active=True):
         state.active_sessions = [
             s for s in state.active_sessions if s.terminal_id != session.terminal_id
         ]
-    return _ledger(state).settle(
+    return _ledger(state, harness).settle(
         session, SettlementOutcome.for_provider_error(error_type)
     )
 
@@ -3021,7 +3036,7 @@ class TestALiveAuthTerminationReturnsTheWorkItConsumed:
 
         assert session is not None
         assert _pending_count(state, queue) == 0  # off the queue...
-        held = _ledger(state).holds(session.terminal_id)
+        held = _ledger(state, harness).holds(session.terminal_id)
         assert held is not None  # ...but not gone
         assert held.request is original
 
@@ -3043,7 +3058,7 @@ class TestALiveAuthTerminationReturnsTheWorkItConsumed:
         # session yet is an ordering detail, and the work must come back either
         # way.
         _terminate_on_provider(
-            state, session, ProviderErrorType.AUTH, drop_active=False
+            state, session, ProviderErrorType.AUTH, harness, drop_active=False
         )
 
         assert _pending_count(state, queue) == 1
@@ -3060,7 +3075,7 @@ class TestALiveAuthTerminationReturnsTheWorkItConsumed:
         harness.probe.readiness = ProviderReadiness.auth_expired(
             PROVIDER, "not logged in"
         )
-        _terminate_on_provider(state, first, ProviderErrorType.AUTH)
+        _terminate_on_provider(state, first, ProviderErrorType.AUTH, harness)
 
         harness.probe.readiness = ProviderReadiness.ready(PROVIDER)
         second = _route(queue, state, harness)
@@ -3083,7 +3098,7 @@ class TestALiveAuthTerminationReturnsTheWorkItConsumed:
         session = _route(queue, state, harness)
         assert session is not None
 
-        _terminate_on_provider(state, session, None)
+        _terminate_on_provider(state, session, None, harness)
 
         assert _pending_count(state, queue) == 0
 
@@ -3102,7 +3117,7 @@ class TestALiveAuthTerminationReturnsTheWorkItConsumed:
         assert session is not None
         _pending_items(state, queue).append(original)  # rediscovered meanwhile
 
-        _terminate_on_provider(state, session, ProviderErrorType.AUTH)
+        _terminate_on_provider(state, session, ProviderErrorType.AUTH, harness)
 
         assert _pending_count(state, queue) == 1
 
@@ -3124,7 +3139,7 @@ def test_a_returned_failure_investigation_keeps_its_typed_trigger(
     session = _route("tech_lead", state, harness)
     assert session is not None
 
-    _terminate_on_provider(state, session, ProviderErrorType.AUTH)
+    _terminate_on_provider(state, session, ProviderErrorType.AUTH, harness)
 
     returned = state.pending_tech_lead_reviews[0]
     assert returned.flavor is TechLeadSessionFlavor.FAILURE_INVESTIGATION
@@ -3144,7 +3159,7 @@ def test_a_returned_validation_retry_keeps_its_attempt_budget(
     session = _route("validation_retry", state, harness)
     assert session is not None
 
-    _terminate_on_provider(state, session, ProviderErrorType.AUTH)
+    _terminate_on_provider(state, session, ProviderErrorType.AUTH, harness)
 
     returned = state.pending_validation_retries[0]
     assert returned.retry_count == 1  # unchanged by the outage
@@ -3159,19 +3174,29 @@ def test_a_transient_provider_outage_also_returns_the_work(tmp_path: Path) -> No
     session = _route("tech_lead", state, harness)
     assert session is not None
 
-    _terminate_on_provider(state, session, ProviderErrorType.TRANSIENT)
+    _terminate_on_provider(state, session, ProviderErrorType.TRANSIENT, harness)
 
     assert len(state.pending_tech_lead_reviews) == 1
 
 
-def test_an_issue_session_holds_no_claim_to_return(make_session) -> None:
-    """Issue work is claimed by label, not by dequeuing; settling is a no-op."""
-    from issue_orchestrator.control.in_flight_work import SettlementOutcome
+def test_an_issue_session_holds_no_claim_to_return(
+    make_session, tmp_path: Path
+) -> None:
+    """Issue work is claimed by label, not by dequeuing; settling is a no-op.
+
+    The store is the raising ``UNWIRED`` value on purpose: a claimless path must
+    never touch it, so any read or clear here would fail the test rather than
+    quietly succeed.
+    """
+    from issue_orchestrator.control.in_flight_work import (
+        InFlightWorkLedger,
+        SettlementOutcome,
+    )
     from issue_orchestrator.domain.models import OrchestratorState
 
     state = OrchestratorState()
 
-    settled = _ledger(state).settle(
+    settled = InFlightWorkLedger(state, UNWIRED_PENDING_WORK_CLAIMS).settle(
         make_session(), SettlementOutcome.PROVIDER_DEFERRED
     )
 
@@ -3205,7 +3230,7 @@ def test_an_unhandled_pending_work_kind_never_silently_drops_the_work() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _complete_session(session, state, *, provider_error_type):
+def _complete_session(session, state, claims, *, provider_error_type):
     """Drive the production completion entrypoint for one session."""
     from unittest.mock import MagicMock
 
@@ -3239,6 +3264,7 @@ def _complete_session(session, state, *, provider_error_type):
         config=config,
         session_output=MagicMock(spec=SessionOutput),
         provider_error_type=provider_error_type,
+        pending_work_claims=claims,
     )
 
 
@@ -3257,7 +3283,7 @@ def test_completion_control_returns_the_work_on_a_provider_block(
     assert session is not None
     assert state.pending_tech_lead_reviews == []
 
-    _complete_session(session, state, provider_error_type=ProviderErrorType.AUTH)
+    _complete_session(session, state, harness.claims, provider_error_type=ProviderErrorType.AUTH)
 
     assert len(state.pending_tech_lead_reviews) == 1
     assert state.pending_tech_lead_reviews[0].failure is not None
@@ -3272,7 +3298,7 @@ def test_completion_control_consumes_the_work_on_an_ordinary_block(
     session = _route("tech_lead", state, harness)
     assert session is not None
 
-    _complete_session(session, state, provider_error_type=None)
+    _complete_session(session, state, harness.claims, provider_error_type=None)
 
     assert state.pending_tech_lead_reviews == []
 
@@ -3496,7 +3522,8 @@ def _restart(state, session, harness):
         )
     ]
     restored = restore_running_sessions(
-        discovered, restarted, restorer, FileSystemSessionOutput()
+        discovered, restarted, restorer, harness.claims,
+        harness.launcher, harness.events,
     )
     assert restored, "the terminal itself must restore, or the test proves nothing"
     return restarted, restored[0]
@@ -3522,7 +3549,7 @@ def test_a_restart_still_returns_the_work_on_a_provider_failure(
     restarted, restored = _restart(state, session, harness)
     assert _pending_count(restarted, queue) == 0  # nothing recovered it in memory
 
-    _terminate_on_provider(restarted, restored, ProviderErrorType.AUTH)
+    _terminate_on_provider(restarted, restored, ProviderErrorType.AUTH, harness)
 
     assert _pending_count(restarted, queue) == 1
 
@@ -3539,7 +3566,7 @@ def test_a_restarted_failure_investigation_keeps_its_typed_trigger(
     assert session is not None
     restarted, restored = _restart(state, session, harness)
 
-    _terminate_on_provider(restarted, restored, ProviderErrorType.AUTH)
+    _terminate_on_provider(restarted, restored, ProviderErrorType.AUTH, harness)
 
     returned = restarted.pending_tech_lead_reviews[0]
     assert returned.flavor is TechLeadSessionFlavor.FAILURE_INVESTIGATION
@@ -3564,7 +3591,7 @@ def test_a_restarted_validation_retry_keeps_its_prompt_and_budget(
     assert session is not None
     restarted, restored = _restart(state, session, harness)
 
-    _terminate_on_provider(restarted, restored, ProviderErrorType.AUTH)
+    _terminate_on_provider(restarted, restored, ProviderErrorType.AUTH, harness)
 
     returned = restarted.pending_validation_retries[0]
     assert returned.original_prompt == "the original prompt"
@@ -3613,7 +3640,7 @@ def test_a_restart_leaves_a_claimless_terminal_alone(tmp_path: Path) -> None:
     assert result.session is not None
     restarted, restored = _restart(OrchestratorState(), result.session, harness)
 
-    assert InFlightWorkLedger(restarted, FileSystemSessionOutput()).holds(
+    assert InFlightWorkLedger(restarted, harness.claims).holds(
         restored.terminal_id
     ) is None
     assert restarted.in_flight_work == []
@@ -3631,10 +3658,10 @@ def test_a_settled_claim_does_not_come_back_after_a_restart(
     state = _pending_state("tech_lead")
     session = _route("tech_lead", state, harness)
     assert session is not None
-    _terminate_on_provider(state, session, None)  # a real terminal work outcome
+    _terminate_on_provider(state, session, None, harness)  # a real terminal work outcome
 
     restarted, restored = _restart(state, session, harness)
-    _terminate_on_provider(restarted, restored, ProviderErrorType.AUTH)
+    _terminate_on_provider(restarted, restored, ProviderErrorType.AUTH, harness)
 
     assert restarted.pending_tech_lead_reviews == []
 
@@ -3660,7 +3687,7 @@ def test_a_failing_restoration_leaves_the_claim_held(tmp_path: Path) -> None:
     state = _pending_state("tech_lead")
     session = _route("tech_lead", state, harness)
     assert session is not None
-    ledger = InFlightWorkLedger(state, FileSystemSessionOutput())
+    ledger = InFlightWorkLedger(state, harness.claims)
     held = ledger.holds(session.terminal_id)
     assert held is not None
     # A queue kind with no entry in the admission table - the failure mode the
@@ -3672,7 +3699,7 @@ def test_a_failing_restoration_leaves_the_claim_held(tmp_path: Path) -> None:
 
     assert ledger.holds(session.terminal_id) is held  # still held in memory
     # ...and still on disk, so the next process can still find it.
-    assert (session.run_assets.run_dir / "pending-work-claim.json").is_file()
+    assert harness.claims.read_pending_work_claim(session.run_assets) is not None
 
 
 def test_a_conflicting_second_claim_is_refused(tmp_path: Path) -> None:
@@ -3690,7 +3717,7 @@ def test_a_conflicting_second_claim_is_refused(tmp_path: Path) -> None:
     state = _pending_state("tech_lead")
     session = _route("tech_lead", state, harness)
     assert session is not None
-    ledger = InFlightWorkLedger(state, FileSystemSessionOutput())
+    ledger = InFlightWorkLedger(state, harness.claims)
     original = ledger.holds(session.terminal_id)
     other = _claim("review", _pending_state("review"))
 
@@ -3709,7 +3736,7 @@ def test_re_taking_the_same_claim_is_idempotent(tmp_path: Path) -> None:
     state = _pending_state("tech_lead")
     session = _route("tech_lead", state, harness)
     assert session is not None
-    ledger = InFlightWorkLedger(state, FileSystemSessionOutput())
+    ledger = InFlightWorkLedger(state, harness.claims)
     held = ledger.holds(session.terminal_id)
     assert held is not None
 
@@ -3741,7 +3768,7 @@ def test_a_refused_claim_leaves_the_queue_item_alone(tmp_path: Path) -> None:
     removed: list[str] = []
 
     settlement = LaunchSettlement(
-        claims=FileSystemSessionOutput(),
+        claims=harness.claims,
         claim=_claim("review", review_state),
         remove=lambda: removed.append("removed"),
     )
@@ -3750,34 +3777,38 @@ def test_a_refused_claim_leaves_the_queue_item_alone(tmp_path: Path) -> None:
         settlement.settle(LaunchResult(session, True), state)
 
     assert removed == []  # the review item is still queued
-    ledger = InFlightWorkLedger(state, FileSystemSessionOutput())
+    ledger = InFlightWorkLedger(state, harness.claims)
     assert ledger.holds(session.terminal_id) is not None
 
 
 # ---------------------------------------------------------------------------
-# The durable encoding round-trips every kind (#6999 F4)
+# The authoritative claim store (#6999 F4/F7)
 # ---------------------------------------------------------------------------
 
 
+def _run(tmp_path: Path, name: str = "issue-7", run_id: str = "run-1"):
+    """A minimal owned run root, the way the launcher would allocate one."""
+    from tests.unit.session_run_helpers import make_session_run_assets
+
+    worktree = tmp_path / f"wt-{name}-{run_id}"
+    worktree.mkdir(parents=True, exist_ok=True)
+    return make_session_run_assets(worktree, session_name=name, run_id=run_id)
+
+
 @pytest.mark.parametrize("queue", _PENDING_QUEUES)
-def test_every_claim_kind_round_trips_through_the_durable_artifact(
+def test_every_claim_kind_round_trips_through_the_authoritative_store(
     queue, tmp_path: Path
 ) -> None:
-    """Encoding is explicit per kind, so every kind needs proving.
-
-    Asserted through the real adapter rather than the codec functions, so the
-    file name, the write and the read are all covered.
-    """
+    """Encoding is explicit per kind, so every kind needs proving."""
     from issue_orchestrator.domain.pending_work import PendingWorkKind
 
     state = _pending_state(queue)
     claim = _claim(queue, state)
-    run_dir = tmp_path / "run"
-    run_dir.mkdir()
-    store = FileSystemSessionOutput()
+    store = _claims(tmp_path)
+    run = _run(tmp_path)
 
-    store.write_pending_work_claim(run_dir, claim)
-    restored = store.read_pending_work_claim(run_dir)
+    store.write_pending_work_claim(run, claim)
+    restored = store.read_pending_work_claim(run)
 
     assert restored is not None
     assert restored.kind is PendingWorkKind(queue)
@@ -3797,23 +3828,82 @@ def test_every_claim_kind_round_trips_through_the_durable_artifact(
 
 
 def test_reading_a_run_that_holds_no_claim_returns_none(tmp_path: Path) -> None:
-    run_dir = tmp_path / "run"
-    run_dir.mkdir()
-
-    assert FileSystemSessionOutput().read_pending_work_claim(run_dir) is None
+    assert _claims(tmp_path).read_pending_work_claim(_run(tmp_path)) is None
 
 
 def test_clearing_a_claim_is_idempotent(tmp_path: Path) -> None:
-    run_dir = tmp_path / "run"
-    run_dir.mkdir()
-    store = FileSystemSessionOutput()
+    store = _claims(tmp_path)
+    run = _run(tmp_path)
 
-    store.clear_pending_work_claim(run_dir)  # nothing to clear
-    store.write_pending_work_claim(run_dir, _claim("review", _pending_state("review")))
-    store.clear_pending_work_claim(run_dir)
-    store.clear_pending_work_claim(run_dir)
+    store.clear_pending_work_claim(run)  # nothing to clear
+    store.write_pending_work_claim(run, _claim("review", _pending_state("review")))
+    store.clear_pending_work_claim(run)
+    store.clear_pending_work_claim(run)
 
-    assert store.read_pending_work_claim(run_dir) is None
+    assert store.read_pending_work_claim(run) is None
+
+
+def test_rewriting_the_same_claim_is_idempotent(tmp_path: Path) -> None:
+    """A retried adoption of a run that already recorded this claim is a no-op."""
+    store = _claims(tmp_path)
+    run = _run(tmp_path)
+    claim = _claim("tech_lead", _pending_state("tech_lead"))
+
+    store.write_pending_work_claim(run, claim)
+    store.write_pending_work_claim(run, claim)
+
+    assert store.read_pending_work_claim(run) is not None
+
+
+def test_a_conflicting_authoritative_write_fails_loudly(tmp_path: Path) -> None:
+    """Create-once: one run does one piece of work.
+
+    Overwriting would destroy the only record of the first claim, which is the
+    failure this whole boundary exists to prevent (#6999 F7).
+    """
+    from issue_orchestrator.ports.pending_work_claim_store import (
+        ConflictingPendingWorkClaimError,
+    )
+
+    store = _claims(tmp_path)
+    run = _run(tmp_path)
+    first = _claim("tech_lead", _pending_state("tech_lead"))
+    store.write_pending_work_claim(run, first)
+
+    with pytest.raises(ConflictingPendingWorkClaimError, match="already holds"):
+        store.write_pending_work_claim(run, _claim("review", _pending_state("review")))
+
+    restored = store.read_pending_work_claim(run)
+    assert restored is not None
+    assert restored.kind is first.kind
+
+
+def test_a_rewritten_run_identity_is_refused_rather_than_read_as_absent(
+    tmp_path: Path,
+) -> None:
+    """Rows are validated against the identity they were asked for.
+
+    The identity comes from the worktree manifest, which the agent can write.
+    Refusing here is what turns a rewritten manifest into a quarantined
+    terminal rather than a silently claimless one.
+    """
+    from dataclasses import replace as dc_replace
+
+    from issue_orchestrator.execution.pending_work_codec import (
+        PendingWorkClaimDecodeError,
+    )
+
+    store = _claims(tmp_path)
+    run = _run(tmp_path)
+    store.write_pending_work_claim(
+        run, _claim("tech_lead", _pending_state("tech_lead"))
+    )
+    renamed = dc_replace(
+        run, identity=dc_replace(run.identity, session_name="rework-9")
+    )
+
+    with pytest.raises(PendingWorkClaimDecodeError, match="rework-9"):
+        store.read_pending_work_claim(renamed)
 
 
 def test_an_undecodable_claim_is_never_read_as_absent(tmp_path: Path) -> None:
@@ -3822,42 +3912,188 @@ def test_an_undecodable_claim_is_never_read_as_absent(tmp_path: Path) -> None:
     Returning None for the second would drop the only record of the work while
     looking like a clean restart.
     """
+    import sqlite3
+
+    from issue_orchestrator.execution.pending_work_claim_store import STORE_FILENAME
     from issue_orchestrator.execution.pending_work_codec import (
         PendingWorkClaimDecodeError,
     )
+    from issue_orchestrator.infra.repo_identity import state_dir
 
-    run_dir = tmp_path / "run"
-    run_dir.mkdir()
-    (run_dir / "pending-work-claim.json").write_text(
-        json.dumps({"schema_version": 99, "kind": "review", "request": {}}),
-        encoding="utf-8",
+    store = _claims(tmp_path)
+    run = _run(tmp_path)
+    store.write_pending_work_claim(run, _claim("review", _pending_state("review")))
+    corrupt = sqlite3.connect(state_dir(tmp_path) / STORE_FILENAME)
+    corrupt.execute(
+        "UPDATE pending_work_claim SET payload = ? WHERE run_dir = ?",
+        ("{not json", str(run.run_dir.resolve())),
     )
+    corrupt.commit()
+    corrupt.close()
 
-    with pytest.raises(PendingWorkClaimDecodeError, match="schema version"):
-        FileSystemSessionOutput().read_pending_work_claim(run_dir)
+    with pytest.raises(PendingWorkClaimDecodeError):
+        _claims(tmp_path).read_pending_work_claim(run)
 
 
-def test_an_undecodable_claim_does_not_stop_other_sessions_restoring(
+# ---------------------------------------------------------------------------
+# The claim ledger is not on the agent's side of the boundary (#6999 F7)
+# ---------------------------------------------------------------------------
+
+
+def test_the_authoritative_claim_is_not_written_into_the_agent_worktree(
     tmp_path: Path,
 ) -> None:
-    """One corrupt artifact must not take startup down with it."""
-    from issue_orchestrator.control.in_flight_work import InFlightWorkLedger
-    from issue_orchestrator.domain.models import OrchestratorState
+    """The run directory is handed to the agent and is writable by it.
+
+    A claim stored there would let the launched agent rewrite which queue its
+    own session is holding, which PR a restored rework targets, and which paths
+    a tech-lead investigation admits as evidence roots - all of which
+    restoration accepts as orchestrator truth.
+    """
+    harness = _ready_harness(tmp_path)
+    state = _pending_state("tech_lead")
+    session = _route("tech_lead", state, harness)
+    assert session is not None
+
+    run_dir = session.run_assets.run_dir
+    assert run_dir.is_relative_to(session.worktree_path)  # agent-reachable
+    planted = [p.name for p in run_dir.rglob("*") if "claim" in p.name.lower()]
+    assert planted == []
+    # And it really was recorded - just somewhere the agent cannot reach.
+    assert harness.claims.read_pending_work_claim(session.run_assets) is not None
+
+
+def test_a_worktree_side_claim_file_cannot_change_what_is_restored(
+    tmp_path: Path,
+) -> None:
+    """An agent-planted shadow is inert: restoration never reads the worktree."""
+    from issue_orchestrator.domain.pending_work import PendingWorkKind
 
     harness = _ready_harness(tmp_path)
     state = _pending_state("tech_lead")
     session = _route("tech_lead", state, harness)
     assert session is not None
+    # The agent writes a claim of its own choosing into its own run directory.
+    forged = _claim("rework", _pending_state("rework"))
     (session.run_assets.run_dir / "pending-work-claim.json").write_text(
-        "{not json", encoding="utf-8"
+        json.dumps(
+            {"schema_version": 1, "kind": "rework", "request": {"pr_number": 999}}
+        ),
+        encoding="utf-8",
     )
+    assert forged.kind is PendingWorkKind.REWORK
+
+    restarted, restored = _restart(state, session, harness)
+
+    # Still the tech-lead investigation the orchestrator recorded, untouched.
+    held = InFlightWorkLedger(restarted, harness.claims).holds(restored.terminal_id)
+    assert held is not None
+    assert held.kind is PendingWorkKind.TECH_LEAD
+    assert restored.pr_number is None  # the forged PR identity never applied
+
+
+# ---------------------------------------------------------------------------
+# An unreadable claim quarantines its terminal, not its neighbours (#6999 F6)
+# ---------------------------------------------------------------------------
+
+
+def _corrupt_stored_claim(tmp_path: Path, run) -> None:
+    import sqlite3
+
+    from issue_orchestrator.execution.pending_work_claim_store import STORE_FILENAME
+    from issue_orchestrator.infra.repo_identity import state_dir
+
+    conn = sqlite3.connect(state_dir(tmp_path) / STORE_FILENAME)
+    conn.execute(
+        "UPDATE pending_work_claim SET payload = ? WHERE run_dir = ?",
+        ("{not json", str(run.run_dir.resolve())),
+    )
+    conn.commit()
+    conn.close()
+
+
+def _restore_pair(state, sessions, harness):
+    """Run the REAL restoration seam over several live terminals at once."""
+    from issue_orchestrator.control.session_restorer import SessionRestorer
+    from issue_orchestrator.control.session_routing import restore_running_sessions
+    from issue_orchestrator.domain.models import OrchestratorState
+    from issue_orchestrator.ports.session_runner import DiscoveredSession
+    from tests.unit.test_session_restorer import MockRepositoryHost, MockWorkingCopy
+
+    del state
     restarted = OrchestratorState()
+    repo_host = MockRepositoryHost()
+    working_copy = MockWorkingCopy()
+    discovered = []
+    for session in sessions:
+        repo_host.issues[session.issue.number] = session.issue
+        working_copy.branches[session.worktree_path] = session.branch_name or "b"
+        discovered.append(
+            DiscoveredSession(
+                issue_number=session.issue.number,
+                tab_name="",
+                is_review=False,
+                session_name=session.terminal_id,
+                run_dir=str(session.run_assets.run_dir),
+            )
+        )
+    added = restore_running_sessions(
+        discovered,
+        restarted,
+        SessionRestorer(harness.launcher.config, repo_host, working_copy),
+        harness.claims,
+        harness.launcher,
+        harness.events,
+    )
+    quarantined = [
+        e for e in harness.event_names() if e == EventName.SESSION_CLAIM_UNREADABLE.value
+    ]
+    return restarted, added, quarantined
 
-    rehydrated = InFlightWorkLedger(
-        restarted, FileSystemSessionOutput()
-    ).rehydrate([session])
 
-    assert rehydrated == []
+def test_an_unreadable_claim_quarantines_only_its_own_terminal(
+    tmp_path: Path,
+) -> None:
+    """One bad record must not stop an orchestrator restarting.
+
+    The healthy neighbour restores with its claim intact; the corrupt one is
+    reported for a human instead.
+    """
+    harness = _ready_harness(tmp_path)
+    healthy_state = _pending_state("review")
+    healthy = _route("review", healthy_state, harness)
+    corrupt_state = _pending_state("tech_lead")
+    corrupt = _route("tech_lead", corrupt_state, harness)
+    assert healthy is not None and corrupt is not None
+    _corrupt_stored_claim(tmp_path, corrupt.run_assets)
+
+    restarted, added, quarantined = _restore_pair(
+        None, [healthy, corrupt], harness
+    )
+
+    assert [s.terminal_id for s in added] == [healthy.terminal_id]
+    assert len(quarantined) == 1  # announced exactly once, for the corrupt one
+    ledger = InFlightWorkLedger(restarted, harness.claims)
+    assert ledger.holds(healthy.terminal_id) is not None
+
+
+def test_a_quarantined_terminal_never_settles_as_claimless(tmp_path: Path) -> None:
+    """The loss F6 named: an active terminal with no ledger entry.
+
+    Its completion would take the ordinary claimless path and discard the
+    queued request the unreadable record described. Keeping it out of
+    active_sessions is what makes that unreachable.
+    """
+    harness = _ready_harness(tmp_path)
+    corrupt_state = _pending_state("tech_lead")
+    corrupt = _route("tech_lead", corrupt_state, harness)
+    assert corrupt is not None
+    _corrupt_stored_claim(tmp_path, corrupt.run_assets)
+
+    restarted, added, quarantined = _restore_pair(None, [corrupt], harness)
+
+    assert added == []
+    assert len(quarantined) == 1  # a human was told
+    # Never entered ordinary processing, so nothing can settle it away.
+    assert restarted.active_sessions == []
     assert restarted.in_flight_work == []
-    # Left on disk for inspection rather than quietly deleted.
-    assert (session.run_assets.run_dir / "pending-work-claim.json").is_file()

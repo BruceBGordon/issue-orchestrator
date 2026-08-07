@@ -84,6 +84,7 @@ from ..ports.provider_readiness import (
     NO_PROVIDER_READINESS_PROBE,
     ProviderReadinessProbe,
 )
+from ..execution.pending_work_claim_store import SqlitePendingWorkClaimStore
 from ..execution.session_output_adapter import FileSystemSessionOutput
 from ..execution.review_artifact_reader import ManifestReviewArtifactReader
 from ..execution.thread_background_job_runner import ThreadBackgroundJobRunner
@@ -858,6 +859,7 @@ def build_orchestrator(
         agent_callback_endpoint=agent_callback_endpoint,
         provider_readiness_probe=provider_readiness_probe,
     )
+    pending_work_claims = SqlitePendingWorkClaimStore.for_repo(config.repo_root)
     deps = OrchestratorDeps(
         events=events,
         runner=runner,
@@ -877,6 +879,7 @@ def build_orchestrator(
         command_runner=command_runner,
         session_output=session_output,
         manifest_downloader=manifest_downloader,
+        pending_work_claims=pending_work_claims,
         state_machine_manager=state_machine_manager,
         completion_processor=completion_processor,
         session_controller=session_controller_instance,
@@ -1258,6 +1261,7 @@ def build_orchestrator_for_testing(
         label_manager=label_manager,
         provider_resilience=provider_resilience,
     )
+    pending_work_claims = SqlitePendingWorkClaimStore.for_repo(config.repo_root)
     deps = OrchestratorDeps(
         events=events,
         runner=runner,
@@ -1277,6 +1281,7 @@ def build_orchestrator_for_testing(
         command_runner=command_runner,
         session_output=session_output,
         manifest_downloader=manifest_downloader,
+        pending_work_claims=pending_work_claims,
         state_machine_manager=state_machine_manager,
         completion_processor=completion_processor,
         session_controller=session_controller,

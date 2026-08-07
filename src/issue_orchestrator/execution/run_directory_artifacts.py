@@ -6,9 +6,10 @@ Separated from :class:`~.session_output_adapter.FileSystemSessionOutput` so
 bytes, and the write-to-temp-then-replace discipline that keeps a reader from
 ever seeing a half-written artifact.
 
-The pending-work claim (#6999 F4) is its first typed client and lives here
-because it is exactly that — one small artifact belonging to one run, written
-at launch and cleared at settlement.
+Note what is deliberately NOT here: the pending-work claim. A run directory
+lives inside the session worktree and the launched agent can write to it, so
+nothing the orchestrator later trusts as authority may be stored through this
+class (#6999 F7).
 """
 
 from __future__ import annotations
@@ -18,49 +19,13 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from ..domain.pending_work import PendingWorkClaim
 from ..infra.terminal_recording import (
     TERMINAL_RECORDING_FILENAME as TERMINAL_RECORDING_NAME,
     append_output_event,
 )
-from .pending_work_codec import (
-    CLAIM_ARTIFACT_NAME,
-    PendingWorkClaimDecodeError,
-    decode_claim,
-    encode_claim,
-)
-
 
 class RunDirectoryArtifacts:
-    """Typed and generic artifact access for one run directory."""
-
-    def write_pending_work_claim(
-        self, run_dir: Path, claim: PendingWorkClaim
-    ) -> None:
-        """Record the queued request this run's session took at launch."""
-        self._write_json(run_dir / CLAIM_ARTIFACT_NAME, encode_claim(claim))
-
-    def read_pending_work_claim(self, run_dir: Path) -> PendingWorkClaim | None:
-        """Rebuild this run's claim, or None when it holds none.
-
-        A claim that exists but cannot be rebuilt is NOT reported as absent:
-        that would drop the only record of the work while looking like a clean
-        restart. It raises, and the restoration seam reports it.
-        """
-        claim_path = run_dir / CLAIM_ARTIFACT_NAME
-        if not claim_path.is_file():
-            return None
-        try:
-            payload = json.loads(claim_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            raise PendingWorkClaimDecodeError(
-                f"pending work claim at {claim_path} is unreadable: {exc}"
-            ) from exc
-        return decode_claim(payload)
-
-    def clear_pending_work_claim(self, run_dir: Path) -> None:
-        """Drop this run's claim once it has been settled."""
-        (run_dir / CLAIM_ARTIFACT_NAME).unlink(missing_ok=True)
+    """Atomic file access for one run directory."""
 
     @staticmethod
     def _read_json(path: Path) -> dict[str, Any] | None:

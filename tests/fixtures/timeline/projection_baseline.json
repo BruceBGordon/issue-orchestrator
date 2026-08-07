@@ -767,6 +767,12 @@
     "status": "failed",
     "step": "blocked"
   },
+  "session.claim_unreadable": {
+    "level": "detail",
+    "phase": "in_progress",
+    "status": "failed",
+    "step": "claim_unreadable"
+  },
   "session.cleanup": {
     "level": "detail",
     "phase": "in_progress",

@@ -109,6 +109,12 @@ class EventName(str, Enum):
     # different — "what happened to my running session" versus "why did nothing
     # start" — and because exactly one owner announces each (#6999 F5).
     SESSION_PROVIDER_AUTH_TERMINATED = "session.provider_auth_terminated"
+    # A restored terminal whose durable pending-work claim could not be read, so
+    # the orchestrator does not know which queued request it is holding and
+    # refuses to track it (#6999 F6). Paired with a durable needs-human label:
+    # this event is what the dashboard reacts to, the label is what survives a
+    # restart.
+    SESSION_CLAIM_UNREADABLE = "session.claim_unreadable"
     SESSION_START_FAILED = "session.start_failed"
     SESSION_STOPPED = "session.stopped"
     SESSION_CLEANUP = "session.cleanup"
@@ -413,6 +419,7 @@ class PublicEventName(str, Enum):
     SESSION_BLOCKED = "session.blocked"
     SESSION_LAUNCH_BLOCKED_PROVIDER = "session.launch_blocked_provider"
     SESSION_PROVIDER_AUTH_TERMINATED = "session.provider_auth_terminated"
+    SESSION_CLAIM_UNREADABLE = "session.claim_unreadable"
     SESSION_NO_COMPLETION_RECORD = "session.no_completion_record"
     SESSION_INVALID_COMPLETION_RECORD = "session.invalid_completion_record"
     SESSION_PROCESSING_COMPLETED = "session.processing_completed"

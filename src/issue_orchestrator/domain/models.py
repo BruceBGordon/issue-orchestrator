@@ -1893,9 +1893,13 @@ class OrchestratorState:
     # right now. A launched request is not spent until its session reaches a
     # true terminal work outcome; a provider-caused termination returns it.
     # Owned exclusively by InFlightWorkLedger - never appended to directly.
-    # In-memory like priority_queue and the pending queues themselves: GitHub
-    # labels stay the crash-safe truth, so a restart re-derives what it can and
-    # simply forgets the rest rather than resurrecting a stale claim.
+    #
+    # This list is the in-process view only. The AUTHORITATIVE record is the
+    # ledger's PendingWorkClaimStore, which lives in orchestrator-owned storage
+    # outside every agent-writable worktree (#6999 F4/F7); restoration rebuilds
+    # this list from it, so a restart does not forget what a live terminal is
+    # carrying. A terminal whose stored claim cannot be read is quarantined
+    # rather than restored, so it can never appear here as claimless (F6).
     in_flight_work: list["InFlightWork"] = field(default_factory=list)
     startup_status: str = "pending"  # "pending", "running", "complete"
     startup_message: str = ""  # Current startup task description

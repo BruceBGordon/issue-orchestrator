@@ -2751,7 +2751,7 @@ class TestOrchestratorLaunchValidationRetrySession:
             state,
             launcher_bundle.launcher,
             MagicMock(),
-            FileSystemSessionOutput(),
+            _claims_store(),
         )
 
         assert result is not None
@@ -2809,7 +2809,7 @@ class TestOrchestratorLaunchValidationRetrySession:
             state,
             launcher_bundle.launcher,
             mock_restorer,
-            FileSystemSessionOutput(),
+            _claims_store(),
         )
 
         assert result is restored
@@ -2834,7 +2834,7 @@ class TestOrchestratorLaunchReviewSession:
 
         mock_restorer = MagicMock()
 
-        result = orchestrator_launch_review_session(review, state, session_launcher, mock_restorer, FileSystemSessionOutput())
+        result = orchestrator_launch_review_session(review, state, session_launcher, mock_restorer, _claims_store())
 
         assert result is not None
         assert len(state.pending_reviews) == 0
@@ -2865,7 +2865,7 @@ class TestOrchestratorLaunchReviewSession:
         mock_restorer = MagicMock()
         mock_restorer.restore_known_terminal.return_value = []
 
-        result = orchestrator_launch_review_session(review, state, launcher_bundle.launcher, mock_restorer, FileSystemSessionOutput())
+        result = orchestrator_launch_review_session(review, state, launcher_bundle.launcher, mock_restorer, _claims_store())
 
         assert result is None
         mock_restorer.restore_known_terminal.assert_not_called()
@@ -2917,7 +2917,7 @@ class TestOrchestratorLaunchReviewSession:
             state,
             launcher_bundle.launcher,
             mock_restorer,
-            FileSystemSessionOutput(),
+            _claims_store(),
         )
 
         assert result is restored
@@ -2955,7 +2955,7 @@ class TestOrchestratorLaunchReworkSession:
 
         mock_restorer = MagicMock()
 
-        result = orchestrator_launch_rework_session(rework, state, session_launcher, mock_restorer, FileSystemSessionOutput())
+        result = orchestrator_launch_rework_session(rework, state, session_launcher, mock_restorer, _claims_store())
 
         assert result is not None
         assert len(state.pending_reworks) == 0
@@ -3156,7 +3156,7 @@ class TestOrchestratorLaunchTechLeadSession:
                 sample_config,
                 MagicMock(),
                 MagicMock(),
-                FileSystemSessionOutput(),
+                _claims_store(),
             )
 
     def test_raises_when_tech_lead_agent_not_in_config(self, sample_config):
@@ -3170,7 +3170,7 @@ class TestOrchestratorLaunchTechLeadSession:
                 sample_config,
                 MagicMock(),
                 MagicMock(),
-                FileSystemSessionOutput(),
+                _claims_store(),
             )
 
     @pytest.mark.parametrize(
@@ -3193,7 +3193,7 @@ class TestOrchestratorLaunchTechLeadSession:
             sample_config,
             launcher,
             MagicMock(),
-            FileSystemSessionOutput(),
+            _claims_store(),
         )
 
         call = launcher.launch_issue_session.call_args
@@ -3220,7 +3220,7 @@ class TestOrchestratorLaunchTechLeadSession:
 
         result = orchestrator_launch_tech_lead_session(
             state.pending_tech_lead_reviews[0], state, sample_config, launcher, MagicMock(),
-            FileSystemSessionOutput(),
+            _claims_store(),
         )
 
         assert result is session
@@ -3246,7 +3246,7 @@ class TestOrchestratorLaunchTechLeadSession:
 
         result = orchestrator_launch_tech_lead_session(
             state.pending_tech_lead_reviews[0], state, sample_config, launcher, MagicMock(),
-            FileSystemSessionOutput(),
+            _claims_store(),
         )
 
         assert result is None
@@ -3271,7 +3271,7 @@ class TestOrchestratorLaunchTechLeadSession:
 
         result = orchestrator_launch_tech_lead_session(
             state.pending_tech_lead_reviews[0], state, sample_config, launcher, MagicMock(),
-            FileSystemSessionOutput(),
+            _claims_store(),
         )
 
         assert result is None
@@ -3565,7 +3565,7 @@ class TestLaunchTechLeadIssueSessionFlavors:
             launcher_bundle.launcher.config,
             launcher_bundle.launcher,
             MagicMock(),
-            FileSystemSessionOutput(),
+            _claims_store(),
         )
         assert session is not None
         return session
@@ -3942,7 +3942,7 @@ class TestLaunchTechLeadIssueSessionFlavors:
                 config,
                 launcher_bundle.launcher,
                 MagicMock(),
-                FileSystemSessionOutput(),
+                _claims_store(),
             )
             assert session is None
             assert len(state.pending_tech_lead_reviews) == 1, (
@@ -3969,7 +3969,7 @@ class TestLaunchTechLeadIssueSessionFlavors:
             config,
             launcher_bundle.launcher,
             MagicMock(),
-            FileSystemSessionOutput(),
+            _claims_store(),
         )
         assert session is None
         assert state.pending_tech_lead_reviews == []
@@ -4022,7 +4022,7 @@ class TestLaunchTechLeadIssueSessionFlavors:
                 config,
                 launcher_bundle.launcher,
                 MagicMock(),
-                FileSystemSessionOutput(),
+                _claims_store(),
             )
 
     @staticmethod
@@ -4145,7 +4145,7 @@ class TestLaunchTechLeadIssueSessionFlavors:
             config,
             launcher_bundle.launcher,
             MagicMock(),
-            FileSystemSessionOutput(),
+            _claims_store(),
         )
         assert state.pending_tech_lead_reviews == [], (
             "the drop must commit only after the durable transition succeeds"
@@ -4239,7 +4239,7 @@ class TestLaunchTechLeadIssueSessionFlavors:
             config,
             launcher_bundle.launcher,
             MagicMock(),
-            FileSystemSessionOutput(),
+            _claims_store(),
         )
 
         assert session is not None
@@ -4544,7 +4544,7 @@ class TestTechLeadProducerToLaunchBoundary:
             launcher_bundle.launcher.config,
             launcher_bundle.launcher,
             MagicMock(),
-            FileSystemSessionOutput(),
+            _claims_store(),
         )
         assert session is not None
         return session
@@ -5111,20 +5111,47 @@ class TestParseSessionRef:
 # =============================================================================
 
 
+def _claims_store(base=None):
+    """The orchestrator-owned claim store, rooted outside any worktree.
+
+    Defaults to a throwaway root for the launch tests that only assert queue
+    state; pass a real base when a test needs launch and settlement to share
+    one store (#6999 F7).
+    """
+    import tempfile
+
+    from issue_orchestrator.execution.pending_work_claim_store import (
+        SqlitePendingWorkClaimStore,
+    )
+
+    return SqlitePendingWorkClaimStore.for_repo(
+        Path(base) if base is not None else Path(tempfile.mkdtemp())
+    )
+
+
 def _no_claims_store():
     """A claim store for terminals that never held one (#6999 F4)."""
 
     class _Empty:
-        def write_pending_work_claim(self, run_dir, claim) -> None:
+        def write_pending_work_claim(self, run, claim) -> None:
             raise AssertionError("restoration must not write claims")
 
-        def read_pending_work_claim(self, run_dir):
+        def read_pending_work_claim(self, run):
             return None
 
-        def clear_pending_work_claim(self, run_dir) -> None:
+        def clear_pending_work_claim(self, run) -> None:
             raise AssertionError("restoration must not clear claims")
 
     return _Empty()
+
+
+def _quarantine_free_launcher():
+    """These terminals hold no claim, so none may be quarantined (#6999 F6)."""
+    launcher = MagicMock()
+    launcher.escalate_issue_needs_human.side_effect = AssertionError(
+        "no terminal here holds a claim, so none may be quarantined"
+    )
+    return launcher
 
 
 class TestRestoreRunningSessions:
@@ -5142,7 +5169,8 @@ class TestRestoreRunningSessions:
         running = [{"tab_name": "issue-123", "issue_number": 123}]
 
         added = restore_running_sessions(
-            running, state, mock_restorer, _no_claims_store()
+            running, state, mock_restorer, _no_claims_store(),
+            _quarantine_free_launcher(), MockEventSink(),
         )
 
         assert added == [mock_session]
@@ -5200,6 +5228,8 @@ class TestRestoreRunningSessions:
             state,
             mock_restorer,
             _no_claims_store(),
+            _quarantine_free_launcher(),
+            MockEventSink(),
         )
 
         assert added == [new_session]
@@ -5470,7 +5500,7 @@ class TestProcessActiveSessions:
         mock_session_runner.session_exists_by_name.return_value = True
         observer = SessionObserver(
             MagicMock(),
-            FileSystemSessionOutput(),
+            _claims_store(),
             events=events,
             session_runner=mock_session_runner,
             repository_host=MagicMock(),

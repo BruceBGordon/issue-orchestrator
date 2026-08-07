@@ -38,6 +38,7 @@ from .existing_terminal_restoration import (
     _ExistingTerminalRestorationRequest,
     _restore_existing_terminal,
 )
+from .claim_quarantine import escalate_unreadable_claim
 from .in_flight_work import InFlightWorkLedger, LaunchSettlement
 from .session_launch_types import LaunchDisposition
 from .session_launcher import SessionLauncher
@@ -619,27 +620,41 @@ def restore_running_sessions(
     state: "OrchestratorState",
     session_restorer: "SessionRestorer",
     claims: PendingWorkClaimStore,
+    session_launcher: SessionLauncher,
+    events: EventSink,
 ) -> list[Session]:
     """Restore running terminal sessions into active-session tracking.
 
     Restoring the terminal is only half of it. A session launched off a pending
     queue is still carrying that queue's request, and after a restart the
-    request lives only beside the session's run assets - so the claim is
-    rehydrated here too, in the same step that makes the session active
-    (#6999 F4). Without it a provider failure observed after a restart would
-    find no claim and the work would be gone for good.
+    request lives only in the orchestrator's claim store - so the claim is
+    rehydrated here, before the session is admitted (#6999 F4). Without it a
+    provider failure observed after a restart would find no claim and the work
+    would be gone for good.
+
+    Admission is deliberately gated on that rehydration (#6999 F6). A terminal
+    whose claim RECORD EXISTS but cannot be read is not admitted at all: it is
+    alive and doing queued work nobody can now name, so processing it normally
+    would end with its completion settling as claimless and destroying that
+    work. It is quarantined and escalated instead, where a human can see it.
+    Healthy neighbours restore regardless.
     """
-    active_sessions = state.active_sessions
-    restored = session_restorer.restore_sessions(running, active_sessions)
-    added = append_unique_active_sessions(active_sessions, restored)
-    InFlightWorkLedger(state, claims).rehydrate(added)
+    restored = session_restorer.restore_sessions(running, state.active_sessions)
+    restoration = InFlightWorkLedger(state, claims).rehydrate(restored)
+    for quarantined in restoration.quarantined:
+        escalate_unreadable_claim(
+            quarantined, session_launcher=session_launcher, events=events
+        )
+    added = append_unique_active_sessions(
+        state.active_sessions, list(restoration.admitted)
+    )
     if added:
         logger.info(
             "[ORPHAN] Restored %d running terminal session(s): %s",
             len(added),
             ", ".join(str(session.terminal_id) for session in added),
         )
-    elif running:
+    elif running and not restoration.quarantined:
         logger.warning(
             "[ORPHAN] Found %d running terminal session(s), but none could be restored",
             len(running),

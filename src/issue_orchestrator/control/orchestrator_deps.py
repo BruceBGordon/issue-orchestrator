@@ -19,6 +19,7 @@ if TYPE_CHECKING:
     from ..ports.completion_handler_factory import CompletionHandlerFactory
     from ..ports.session_launcher_factory import SessionLauncherFactory
     from ..ports.label_store import LabelStore
+    from ..ports.pending_work_claim_store import PendingWorkClaimStore
     from ..ports.queue_cache_store import QueueCacheStore
     from ..ports import (
         EventSink,
@@ -126,6 +127,10 @@ class OrchestratorDeps:
     command_runner: "CommandRunner"
     session_output: "SessionOutput"
     manifest_downloader: "ManifestDownloader"
+    # Orchestrator-owned, OUTSIDE every agent-writable worktree (#6999 F7): it
+    # records which queued request each running session is carrying, and
+    # restoration accepts it as authority.
+    pending_work_claims: "PendingWorkClaimStore"
 
     # Claim/lease management (multi-orchestrator coordination)
     claim_manager: "ClaimManager"

@@ -25,6 +25,10 @@ from ..infra.config import Config
 from ..ports import EventSink
 from ..ports.event_sink import make_trace_event
 from ..ports.provider_resilience import ProviderErrorType
+from ..ports.pending_work_claim_store import (
+    UNWIRED_PENDING_WORK_CLAIMS,
+    PendingWorkClaimStore,
+)
 from ..ports.session_output import SessionOutput
 from ..ports.worktree_manager import WorktreeManager
 from .active_sessions import has_active_terminal
@@ -252,6 +256,7 @@ def handle_session_completion(  # noqa: C901, PLR0912 - handles validation, acti
     claim_manager: Optional["ClaimManager"] = None,
     events: Optional[EventSink] = None,
     publish_recovery: Optional["PublishRecoveryService"] = None,
+    pending_work_claims: PendingWorkClaimStore = UNWIRED_PENDING_WORK_CLAIMS,
     # The typed provider verdict this session ended on (#6999). Carried rather
     # than re-derived so the reaction owner can decline to mint a substance
     # investigation for a credential outage.
@@ -291,7 +296,7 @@ def handle_session_completion(  # noqa: C901, PLR0912 - handles validation, acti
     # claimed by label) and settle to a no-op.
     from .in_flight_work import InFlightWorkLedger, SettlementOutcome
 
-    InFlightWorkLedger(state, session_output).settle(
+    InFlightWorkLedger(state, pending_work_claims).settle(
         session,
         SettlementOutcome.for_provider_error(provider_error_type),
     )
@@ -547,6 +552,7 @@ def process_active_sessions(
     completion_dispatcher: "CompletionDispatcher | None" = None,
     provider_resilience: "ProviderResilienceManager | None" = None,
     publish_recovery: "PublishRecoveryService | None" = None,
+    pending_work_claims: PendingWorkClaimStore = UNWIRED_PENDING_WORK_CLAIMS,
 ) -> None:
     """Process active sessions - moved from Orchestrator per method table.
 
@@ -585,6 +591,7 @@ def process_active_sessions(
             session_output=session_controller.session_output,
             provider_resilience=provider_resilience,
             publish_recovery=publish_recovery,
+            pending_work_claims=pending_work_claims,
         )
 
     # Apply decisions that finished on a prior tick (background dispatcher)
@@ -698,6 +705,7 @@ def _apply_completed_decision(
     session_output: SessionOutput,
     provider_resilience: "ProviderResilienceManager | None" = None,
     publish_recovery: "PublishRecoveryService | None" = None,
+    pending_work_claims: PendingWorkClaimStore = UNWIRED_PENDING_WORK_CLAIMS,
 ) -> None:
     """Apply a finished completion decision on the tick thread."""
     if completed.error is not None:
@@ -751,6 +759,7 @@ def _apply_completed_decision(
         completion_detail=decision.completion_detail,
         publish_recovery=publish_recovery,
         provider_error_type=decision.provider_error_type,
+        pending_work_claims=pending_work_claims,
     )
     elapsed = time.monotonic() - started
     if elapsed > 5:

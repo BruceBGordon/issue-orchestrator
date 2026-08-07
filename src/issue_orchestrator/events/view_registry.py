@@ -212,6 +212,15 @@ VIEW_REGISTRY: dict[str, list[ViewEvent]] = {
             "orchestrator",
         ),
     ],
+    # A live terminal the orchestrator will not track because it cannot tell
+    # what queued work it holds. User-visible: it needs a human (#6999 F6).
+    "session.claim_unreadable": [
+        _user(
+            "session.claim_unreadable",
+            "Session quarantined — its queued work could not be identified",
+            "orchestrator",
+        ),
+    ],
 
     # -- Tech Lead --
     "tech_lead.launching": [
