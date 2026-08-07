@@ -28,6 +28,11 @@ from ..infra.config import Config
 from ..ports import EventSink, Issue as IssueProtocol, make_trace_event
 from ..ports.session_runner import DiscoveredSession
 from .active_sessions import append_unique_active_sessions
+from .existing_terminal_restoration import (
+    _ExistingTerminalRestorationRequest,
+    _restore_existing_terminal,
+)
+from .session_launch_types import LaunchDisposition, LaunchResult
 from .session_launcher import SessionLauncher
 from .session_manager import SessionManager, SessionRef
 
@@ -39,16 +44,6 @@ if TYPE_CHECKING:
     from .state_machine_manager import StateMachineManager
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass(frozen=True, slots=True)
-class _ExistingTerminalRestorationRequest:
-    """Typed request to restore one known terminal from runner discovery."""
-
-    issue_number: int
-    session_name: str
-    is_review: bool
-    tab_name: str = ""
 
 
 class TechLeadQueueOutcome(Enum):
@@ -248,6 +243,56 @@ class PendingSessionQueues:
         return TechLeadQueueOutcome.QUEUED
 
 
+
+@dataclass(frozen=True)
+class _PendingQueueOwner:
+    """How one pending queue settles its item for each launch disposition.
+
+    The single place "does this launch outcome consume the work?" is answered.
+    Each queue supplies its own removal and, where it has one, its restoration
+    and bounded-retry behaviour; the mapping from disposition to action is
+    shared, so a new disposition cannot mean different things per queue and an
+    unhandled one cannot silently fall through to dropping the item (#6999 A1).
+    """
+
+    remove: Callable[[], None]
+    # Adopting an already-running terminal, and spending one unit of the
+    # bounded required-input retry budget. Both default to doing nothing, for
+    # the queues that have no such behaviour — an explicit no-op rather than an
+    # optional every caller of `settle` would have to re-check.
+    restore_existing: Callable[[], Optional[Session]] = lambda: None
+    retain_for_input_retry: Callable[[], None] = lambda: None
+    # Validation retries own their own durable queue and are re-derived from
+    # it, so a plain failure leaves the item alone. Every other queue drops.
+    drop_on_permanent_failure: bool = True
+
+    def settle(
+        self, result: LaunchResult, state: "OrchestratorState"
+    ) -> Optional[Session]:
+        if result.success and result.session:
+            self.remove()
+            append_unique_active_sessions(state.active_sessions, [result.session])
+            return result.session
+        if result.disposition is LaunchDisposition.EXISTING_TERMINAL:
+            restored = self.restore_existing()
+            if restored:
+                self.remove()
+            return restored
+        if result.disposition is LaunchDisposition.PROVIDER_DEFERRED:
+            # The provider refused before the work was touched. Keep the item
+            # exactly as it is: no restoration attempt (there is no terminal to
+            # restore) and no budget spent (nothing about this request failed).
+            # For a failure investigation the queue is the only record that
+            # exists, so dropping it here would lose it permanently.
+            logger.info("[PROVIDER] Launch deferred, work retained: %s", result.reason)
+            return None
+        if result.disposition is LaunchDisposition.INPUT_RETRY:
+            self.retain_for_input_retry()
+            return None
+        if self.drop_on_permanent_failure:
+            self.remove()
+        return None
+
 def orchestrator_launch_review_session(
     review: PendingReview,
     state: "OrchestratorState",
@@ -257,11 +302,9 @@ def orchestrator_launch_review_session(
     """Launch a review session and update orchestrator queues."""
     pending_queues = PendingSessionQueues(state)
     result = session_launcher.launch_review_session(review, state.active_sessions)
-    if result.success and result.session:
-        pending_queues.remove_review(review.pr_number)
-        append_unique_active_sessions(state.active_sessions, [result.session])
-    elif result.keep_queued:
-        restored = _restore_existing_terminal(
+    return _PendingQueueOwner(
+        remove=lambda: pending_queues.remove_review(review.pr_number),
+        restore_existing=lambda: _restore_existing_terminal(
             request=_ExistingTerminalRestorationRequest(
                 issue_number=review.issue_number,
                 session_name=f"review-{review.pr_number}",
@@ -271,13 +314,8 @@ def orchestrator_launch_review_session(
             state=state,
             session_launcher=session_launcher,
             session_restorer=session_restorer,
-        )
-        if restored:
-            pending_queues.remove_review(review.pr_number)
-            return restored
-    else:
-        pending_queues.remove_review(review.pr_number)
-    return result.session if result.success else None
+        ),
+    ).settle(result, state)
 
 
 def orchestrator_launch_retrospective_review_session(
@@ -292,11 +330,9 @@ def orchestrator_launch_retrospective_review_session(
         review,
         state.active_sessions,
     )
-    if result.success and result.session:
-        pending_queues.remove_retrospective_review(review.issue_number)
-        append_unique_active_sessions(state.active_sessions, [result.session])
-    elif result.keep_queued:
-        restored = _restore_existing_terminal(
+    return _PendingQueueOwner(
+        remove=lambda: pending_queues.remove_retrospective_review(review.issue_number),
+        restore_existing=lambda: _restore_existing_terminal(
             request=_ExistingTerminalRestorationRequest(
                 issue_number=review.issue_number,
                 session_name=SessionRef.for_retrospective_review(
@@ -307,13 +343,8 @@ def orchestrator_launch_retrospective_review_session(
             state=state,
             session_launcher=session_launcher,
             session_restorer=session_restorer,
-        )
-        if restored:
-            pending_queues.remove_retrospective_review(review.issue_number)
-            return restored
-    else:
-        pending_queues.remove_retrospective_review(review.issue_number)
-    return result.session if result.success else None
+        ),
+    ).settle(result, state)
 
 
 def orchestrator_launch_rework_session(
@@ -325,15 +356,12 @@ def orchestrator_launch_rework_session(
     """Launch a rework session and update orchestrator queues."""
     pending_queues = PendingSessionQueues(state)
     result = session_launcher.launch_rework_session(rework, state.active_sessions)
-    if result.success and result.session:
-        pending_queues.remove_rework(rework)
-        append_unique_active_sessions(state.active_sessions, [result.session])
-    elif result.keep_queued:
+    def _restore_rework() -> Optional[Session]:
         issue_number = rework.resolve_issue_number()
         if issue_number is None:
             logger.warning("[ORPHAN] Rework missing issue number: %s", rework.issue_key)
             return None
-        restored = _restore_existing_terminal(
+        return _restore_existing_terminal(
             request=_ExistingTerminalRestorationRequest(
                 issue_number=issue_number,
                 session_name=f"rework-{issue_number}",
@@ -343,12 +371,11 @@ def orchestrator_launch_rework_session(
             session_launcher=session_launcher,
             session_restorer=session_restorer,
         )
-        if restored:
-            pending_queues.remove_rework(rework)
-            return restored
-    else:
-        pending_queues.remove_rework(rework)
-    return result.session if result.success else None
+
+    return _PendingQueueOwner(
+        remove=lambda: pending_queues.remove_rework(rework),
+        restore_existing=_restore_rework,
+    ).settle(result, state)
 
 
 def orchestrator_launch_validation_retry_session(
@@ -362,11 +389,9 @@ def orchestrator_launch_validation_retry_session(
     result = session_launcher.launch_validation_retry_session(
         retry, state.active_sessions
     )
-    if result.success and result.session:
-        pending_queues.remove_validation_retry(retry.issue_number)
-        append_unique_active_sessions(state.active_sessions, [result.session])
-    elif result.keep_queued:
-        restored = _restore_existing_terminal(
+    return _PendingQueueOwner(
+        remove=lambda: pending_queues.remove_validation_retry(retry.issue_number),
+        restore_existing=lambda: _restore_existing_terminal(
             request=_ExistingTerminalRestorationRequest(
                 issue_number=retry.issue_number,
                 session_name=f"issue-{retry.issue_number}",
@@ -375,11 +400,9 @@ def orchestrator_launch_validation_retry_session(
             state=state,
             session_launcher=session_launcher,
             session_restorer=session_restorer,
-        )
-        if restored:
-            pending_queues.remove_validation_retry(retry.issue_number)
-            return restored
-    return result.session if result.success else None
+        ),
+        drop_on_permanent_failure=False,
+    ).settle(result, state)
 
 
 def orchestrator_launch_tech_lead_session(
@@ -404,10 +427,14 @@ def orchestrator_launch_tech_lead_session(
     :class:`PendingSessionQueues` on success, on restore of an existing
     terminal, and on permanent launch failure (labels-as-truth recovers a
     dropped batch at startup; a dropped investigation is a best-effort audit).
-    It is retained in exactly two cases:
+    It is retained in exactly three cases:
 
-    - ``keep_queued`` — an existing terminal that could not be restored yet;
-    - ``retry_queued`` — required-input prep failed transiently BEFORE the
+    - ``EXISTING_TERMINAL`` — a terminal that could not be restored yet;
+    - ``PROVIDER_DEFERRED`` — the provider refused before anything was
+      attempted. Nothing about the investigation failed, so it keeps its full
+      retry budget and simply waits for a tick when the provider is ready
+      (#6999 F10);
+    - ``INPUT_RETRY`` — required-input prep failed transiently BEFORE the
       session started. For failure investigations the queued item is the only
       record of the investigation (no labels-as-truth recovery), so one
       transient SQLite/log/filesystem error must not delete it. Retention is
@@ -427,11 +454,16 @@ def orchestrator_launch_tech_lead_session(
         state.active_sessions,
         tech_lead_scope=tech_lead.launch_scope(),
     )
-    if result.success and result.session:
-        append_unique_active_sessions(state.active_sessions, [result.session])
-        pending_queues.remove_tech_lead(tech_lead.issue_number)
-    elif result.keep_queued:
-        restored = _restore_existing_terminal(
+    def _retain_for_input_retry() -> None:
+        outcome = pending_queues.retain_tech_lead_for_retry(tech_lead.issue_number)
+        if outcome is TechLeadRetentionOutcome.EXHAUSTED:
+            _commit_or_retain_dropped_tech_lead(
+                tech_lead, result.reason, session_launcher, pending_queues
+            )
+
+    return _PendingQueueOwner(
+        remove=lambda: pending_queues.remove_tech_lead(tech_lead.issue_number),
+        restore_existing=lambda: _restore_existing_terminal(
             request=_ExistingTerminalRestorationRequest(
                 issue_number=tech_lead.issue_number,
                 session_name=f"issue-{tech_lead.issue_number}",
@@ -440,19 +472,9 @@ def orchestrator_launch_tech_lead_session(
             state=state,
             session_launcher=session_launcher,
             session_restorer=session_restorer,
-        )
-        if restored:
-            pending_queues.remove_tech_lead(tech_lead.issue_number)
-            return restored
-    elif result.retry_queued:
-        outcome = pending_queues.retain_tech_lead_for_retry(tech_lead.issue_number)
-        if outcome is TechLeadRetentionOutcome.EXHAUSTED:
-            _commit_or_retain_dropped_tech_lead(
-                tech_lead, result.reason, session_launcher, pending_queues
-            )
-    else:
-        pending_queues.remove_tech_lead(tech_lead.issue_number)
-    return result.session if result.success else None
+        ),
+        retain_for_input_retry=_retain_for_input_retry,
+    ).settle(result, state)
 
 
 def _commit_or_retain_dropped_tech_lead(
@@ -632,7 +654,7 @@ def orchestrator_launch_session(
     )
     if result.success and result.session:
         append_unique_active_sessions(state.active_sessions, [result.session])
-    elif result.keep_queued and session_restorer is not None:
+    elif result.disposition is LaunchDisposition.EXISTING_TERMINAL and session_restorer is not None:
         restored = _restore_existing_terminal(
             request=_ExistingTerminalRestorationRequest(
                 issue_number=issue.number,
@@ -646,153 +668,3 @@ def orchestrator_launch_session(
         if restored:
             return restored
     return result.session if result.success else None
-
-
-def _restore_existing_terminal(
-    *,
-    request: _ExistingTerminalRestorationRequest,
-    state: "OrchestratorState",
-    session_launcher: SessionLauncher,
-    session_restorer: "SessionRestorer",
-) -> Optional[Session]:
-    discovered = _discover_existing_terminal(
-        request=request,
-        session_launcher=session_launcher,
-        session_restorer=session_restorer,
-    )
-    if discovered is None:
-        _log_unrestorable_existing_terminal(request.session_name)
-        return None
-
-    run_dir = _recorded_run_dir_from_discovered(discovered, request.session_name)
-    if run_dir is None:
-        return None
-
-    restored = session_restorer.restore_known_terminal(
-        issue_number=request.issue_number,
-        session_name=request.session_name,
-        run_dir=run_dir,
-        is_review=request.is_review,
-        already_tracked=list(state.active_sessions),
-        tab_name=request.tab_name,
-    )
-    added = append_unique_active_sessions(state.active_sessions, restored)
-    if not added:
-        _log_unrestorable_existing_terminal(request.session_name)
-        return None
-    logger.info(
-        "[ORPHAN] Restored existing terminal %s from discovered run assets: %s",
-        request.session_name,
-        run_dir,
-    )
-    return added[0]
-
-
-def _discover_existing_terminal(
-    *,
-    request: _ExistingTerminalRestorationRequest,
-    session_launcher: SessionLauncher,
-    session_restorer: "SessionRestorer",
-) -> "DiscoveredSession | None":
-    try:
-        running = session_launcher.session_manager.runner.discover_running_sessions()
-    except Exception:
-        logger.exception(
-            "[ORPHAN] Failed to discover running terminal sessions for %s",
-            request.session_name,
-        )
-        return None
-
-    for raw_session_info in running:
-        session_info = _discovered_session_from_raw(raw_session_info)
-        if session_info is None:
-            continue
-        if _matches_existing_terminal(
-            session_info=session_info,
-            request=request,
-            session_restorer=session_restorer,
-        ):
-            return session_info
-    return None
-
-
-def _discovered_session_from_raw(raw: object) -> DiscoveredSession | None:
-    if not isinstance(raw, dict):
-        return None
-
-    raw_issue_number = raw.get("issue_number")
-    raw_tab_name = raw.get("tab_name")
-    raw_is_review = raw.get("is_review")
-    raw_run_dir = raw.get("run_dir")
-    if isinstance(raw_issue_number, bool) or not isinstance(raw_issue_number, int):
-        return None
-    if not isinstance(raw_tab_name, str):
-        return None
-    if not isinstance(raw_is_review, bool):
-        return None
-    run_dir = raw_run_dir if isinstance(raw_run_dir, str) else ""
-    raw_session_name = raw.get("session_name")
-    if isinstance(raw_session_name, str):
-        return DiscoveredSession(
-            issue_number=raw_issue_number,
-            tab_name=raw_tab_name,
-            is_review=raw_is_review,
-            run_dir=run_dir,
-            session_name=raw_session_name,
-        )
-    return DiscoveredSession(
-        issue_number=raw_issue_number,
-        tab_name=raw_tab_name,
-        is_review=raw_is_review,
-        run_dir=run_dir,
-    )
-
-
-def _matches_existing_terminal(
-    *,
-    session_info: "DiscoveredSession",
-    request: _ExistingTerminalRestorationRequest,
-    session_restorer: "SessionRestorer",
-) -> bool:
-    discovered_names = {
-        str(session_info.get("session_name") or ""),
-        str(session_info.get("tab_name") or ""),
-    }
-    try:
-        discovered_names.add(session_restorer.canonical_terminal_id(session_info))
-    except Exception:
-        logger.debug(
-            "[ORPHAN] Could not derive canonical terminal id from discovered session",
-            exc_info=True,
-        )
-    return request.session_name in discovered_names
-
-
-def _recorded_run_dir_from_discovered(
-    session_info: "DiscoveredSession",
-    session_name: str,
-) -> Path | None:
-    raw: object = session_info.get("run_dir")
-    if type(raw) is not str or not raw.strip():
-        logger.warning(
-            "[ORPHAN] Existing terminal %s has no recorded run_dir from runner discovery",
-            session_name,
-        )
-        return None
-    run_dir = Path(raw)
-    if not run_dir.is_absolute():
-        logger.warning(
-            "[ORPHAN] Existing terminal %s reported non-absolute run_dir: %s",
-            session_name,
-            run_dir,
-        )
-        return None
-    return run_dir
-
-
-def _log_unrestorable_existing_terminal(session_name: str) -> None:
-    logger.warning(
-        "[ORPHAN] Existing terminal %s cannot be restored from launch routing; "
-        "active restoration requires discovered run assets",
-        session_name,
-    )

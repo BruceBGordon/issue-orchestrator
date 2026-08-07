@@ -18,6 +18,10 @@ questions and :class:`~.provider_resilience.ProviderResilienceManager` owns the
 circuit. This module owns only the launch consequence — park or proceed — so
 the five launch paths (issue, validation retry, review, retrospective review,
 rework) cannot drift apart on it.
+
+A refusal here is a ``PROVIDER_DEFERRED`` disposition, never a plain failure:
+nothing about the work went wrong, so the queue that asked for the launch must
+keep its item intact for a tick when the provider is ready (#6999 F10).
 """
 
 from __future__ import annotations
@@ -32,7 +36,7 @@ from ..ports import EventSink
 from ..ports.event_sink import make_trace_event
 from .actions import Action
 from .provider_availability import ProviderAvailabilityPolicy
-from .session_launch_types import LaunchResult
+from .session_launch_types import LaunchDisposition, LaunchResult
 
 logger = logging.getLogger(__name__)
 
@@ -78,7 +82,10 @@ class ProviderLaunchGate:
             readiness.detail,
         )
         return LaunchResult(
-            None, False, f"Provider not ready: {provider} ({readiness.state.value})"
+            None,
+            False,
+            f"Provider not ready: {provider} ({readiness.state.value})",
+            disposition=LaunchDisposition.PROVIDER_DEFERRED,
         )
 
     def _park_for_open_circuit(
@@ -94,7 +101,12 @@ class ProviderLaunchGate:
             [self.policy.blocked_transition(issue_number, assessment)],
             "provider_unavailable",
         )
-        return LaunchResult(None, False, f"Provider unavailable: {provider}")
+        return LaunchResult(
+            None,
+            False,
+            f"Provider unavailable: {provider}",
+            disposition=LaunchDisposition.PROVIDER_DEFERRED,
+        )
 
 
 __all__ = ["ProviderLaunchGate"]

@@ -459,6 +459,8 @@ class _LauncherHarness:
         return self.launcher.launch_issue_session(issue, [])
 
     def event_names(self) -> list[str]:
+        if hasattr(self.events, "names"):
+            return self.events.names()
         return [
             e.event_type.value if hasattr(e.event_type, "value") else str(e.event_type)
             for e in self.events.events
@@ -2147,34 +2149,74 @@ class TestAuthCircuitSettingsAreValidatedAtStartup:
         assert not manager.is_open("claude-code")  # honours the configured 2
 
 
+# Every way a PROVIDER_AUTH_FAILED observation can be malformed. Built by
+# DIRECT dataclass construction, not through the convenience factory: the
+# invariant belongs to the type, and a regression that moved it back into the
+# factory would reopen the bypass while leaving factory-only tests green.
+_MALFORMED_READINESS = {
+    "missing": None,
+    "ready": ProviderReadiness.ready("claude-code"),
+    "unknown": ProviderReadiness.unknown("claude-code", "probe could not run"),
+    "unnamed": ProviderReadiness.auth_expired("", "not logged in"),
+}
+
+
 class TestMalformedAuthObservationFailsLoudly:
     """A partial auth outcome would end a session with the outage unrecorded."""
 
-    def test_an_observation_without_readiness_is_rejected_at_construction(
-        self,
+    @pytest.mark.parametrize("variant", sorted(_MALFORMED_READINESS))
+    def test_direct_construction_rejects_a_malformed_readiness(
+        self, variant: str
     ) -> None:
         with pytest.raises(ValueError, match="auth-expired"):
-            SessionObservationResult.provider_auth_failed(None)  # type: ignore[arg-type]
-
-    def test_an_unnamed_provider_is_rejected_at_construction(self) -> None:
-        with pytest.raises(ValueError, match="auth-expired"):
-            SessionObservationResult.provider_auth_failed(
-                ProviderReadiness.auth_expired("", "not logged in")
+            SessionObservationResult(
+                observation=SessionObservation.PROVIDER_AUTH_FAILED,
+                session_exists=True,
+                provider_readiness=_MALFORMED_READINESS[variant],
             )
 
-    def test_a_non_auth_readiness_is_rejected_at_construction(self) -> None:
-        """READY is not an auth failure; carrying it here would be a lie."""
+    def test_direct_construction_accepts_a_named_auth_expired_readiness(self) -> None:
+        """The invariant is a guard, not a ban: the well-formed case still builds."""
+        observation = SessionObservationResult(
+            observation=SessionObservation.PROVIDER_AUTH_FAILED,
+            session_exists=True,
+            provider_readiness=ProviderReadiness.auth_expired(
+                "claude-code", "not logged in"
+            ),
+        )
+
+        assert observation.provider_readiness is not None
+        assert observation.provider_readiness.provider == "claude-code"
+        assert observation.is_terminal
+
+    def test_other_observations_are_unaffected_by_the_invariant(self) -> None:
+        """Only PROVIDER_AUTH_FAILED carries the requirement."""
+        assert (
+            SessionObservationResult(
+                observation=SessionObservation.RUNNING, session_exists=True
+            ).provider_readiness
+            is None
+        )
+
+    def test_the_convenience_factory_inherits_the_same_guard(self) -> None:
         with pytest.raises(ValueError, match="auth-expired"):
             SessionObservationResult.provider_auth_failed(
                 ProviderReadiness.ready("claude-code")
             )
 
-    def test_the_outcome_refuses_to_manufacture_a_missing_provider(self) -> None:
-        """The consumer fails loudly too, for an observation built by other means."""
+    @pytest.mark.parametrize("variant", sorted(_MALFORMED_READINESS))
+    def test_the_consumer_boundary_also_refuses_a_malformed_readiness(
+        self, variant: str
+    ) -> None:
+        """Separate coverage: an observation built by any other means still fails.
+
+        The controller converts this into a circuit write and a provider-impact
+        route, so it must not accept a value the observation type would reject.
+        """
         from issue_orchestrator.control.session_decision import ProviderAuthOutcome
 
-        with pytest.raises(ValueError, match="named"):
-            ProviderAuthOutcome.from_readiness(None)
+        with pytest.raises(ValueError, match="auth-expired"):
+            ProviderAuthOutcome.from_readiness(_MALFORMED_READINESS[variant])
 
     def test_a_well_formed_observation_still_reaches_the_circuit_owner(self) -> None:
         """The happy path is unchanged: provider, detail and sample all carried."""
@@ -2441,3 +2483,292 @@ class TestTheProductionTickExplainsEveryProviderRefusal:
         names = tick.event_names()
         assert EventName.SESSION_LAUNCH_BLOCKED_PROVIDER.value not in names
         assert EventName.PROVIDER_ISSUE_BLOCKED.value not in names
+
+
+# ---------------------------------------------------------------------------
+# A provider refusal must not consume the pending work (#6999 F10 / A1)
+# ---------------------------------------------------------------------------
+
+
+def _routing_config(tmp_path: Path):
+    config = _recovery_config(tmp_path)
+    config.tech_lead_review_agent = "agent:tech-lead"
+    return config
+
+
+class _RefusingLauncherHarness(_LauncherHarness):
+    """A real SessionLauncher whose provider gate refuses every launch."""
+
+    def __init__(self, tmp_path: Path, readiness: ProviderReadiness, *, threshold: int):
+        events = RecordingEvents()
+        manager = ProviderResilienceManager(
+            config=_resilience_config(threshold=threshold),
+            store=InMemoryProviderCircuitStore(),
+            events=events,
+        )
+        self.probe = _RecordingProbe(readiness)
+        super().__init__(
+            tmp_path,
+            self.probe,
+            manager=manager,
+            events=events,
+            config=_routing_config(tmp_path),
+        )
+        self.manager = manager
+
+
+def _pending_state(queue: str):
+    """Orchestrator state holding exactly one pending item on ``queue``."""
+    from issue_orchestrator.domain.issue_key import FakeIssueKey
+    from issue_orchestrator.domain.models import (
+        OrchestratorState,
+        PendingRetrospectiveReview,
+        PendingReview,
+        PendingRework,
+        PendingTechLeadReview,
+        PendingValidationRetry,
+    )
+    from issue_orchestrator.domain.session_key import TaskKind
+    from issue_orchestrator.domain.tech_lead_session import TechLeadSessionFlavor
+
+    state = OrchestratorState()
+    issue_key = FakeIssueKey(name="7")
+    if queue == "review":
+        state.pending_reviews.append(
+            PendingReview(
+                issue_key=issue_key,
+                pr_number=70,
+                pr_url="url",
+                branch_name="branch",
+                _issue_number=7,
+                agent_label="agent:backend",
+            )
+        )
+    elif queue == "retrospective_review":
+        state.pending_retrospective_reviews.append(
+            PendingRetrospectiveReview(
+                issue_key=issue_key,
+                issue_number=7,
+                issue_title="Retro",
+                agent_label="agent:backend",
+                trigger_label="review-first",
+            )
+        )
+    elif queue == "rework":
+        state.pending_reworks.append(
+            PendingRework(
+                issue_key=issue_key, agent_type="agent:backend", issue_number=7
+            )
+        )
+    elif queue == "validation_retry":
+        state.pending_validation_retries.append(
+            PendingValidationRetry(
+                issue_number=7,
+                issue_title="Retry",
+                agent_label="agent:backend",
+                worktree_path="/tmp/wt",
+                branch_name="branch",
+                original_prompt=None,
+                validation_error="boom",
+                validation_error_file=None,
+                retry_count=1,
+                source_task=TaskKind.CODE,
+            )
+        )
+    elif queue == "tech_lead":
+        from issue_orchestrator.domain.models import DiscoveredFailure
+
+        state.pending_tech_lead_reviews.append(
+            PendingTechLeadReview(
+                issue_number=7,
+                title="Investigate: session failed",
+                flavor=TechLeadSessionFlavor.FAILURE_INVESTIGATION,
+                failure=DiscoveredFailure(
+                    7, "Test Issue", "failed", blocking_label="blocked-failed"
+                ),
+            )
+        )
+    else:
+        raise AssertionError(f"unknown queue {queue!r}")
+    return state
+
+
+def _pending_count(state, queue: str) -> int:
+    return len(
+        {
+            "review": state.pending_reviews,
+            "retrospective_review": state.pending_retrospective_reviews,
+            "rework": state.pending_reworks,
+            "validation_retry": state.pending_validation_retries,
+            "tech_lead": state.pending_tech_lead_reviews,
+        }[queue]
+    )
+
+
+def _route(queue: str, state, harness):
+    """Drive the production routing function that owns ``queue``."""
+    from unittest.mock import MagicMock
+
+    from issue_orchestrator.control import session_routing
+
+    restorer = MagicMock()
+    restorer.restore_session.return_value = None
+    if queue == "review":
+        return session_routing.orchestrator_launch_review_session(
+            state.pending_reviews[0], state, harness.launcher, restorer
+        )
+    if queue == "retrospective_review":
+        return session_routing.orchestrator_launch_retrospective_review_session(
+            state.pending_retrospective_reviews[0], state, harness.launcher, restorer
+        )
+    if queue == "rework":
+        return session_routing.orchestrator_launch_rework_session(
+            state.pending_reworks[0], state, harness.launcher, restorer
+        )
+    if queue == "validation_retry":
+        return session_routing.orchestrator_launch_validation_retry_session(
+            state.pending_validation_retries[0], state, harness.launcher, restorer
+        )
+    if queue == "tech_lead":
+        return session_routing.orchestrator_launch_tech_lead_session(
+            state.pending_tech_lead_reviews[0],
+            state,
+            harness.launcher.config,
+            harness.launcher,
+            restorer,
+        )
+    raise AssertionError(f"unknown queue {queue!r}")
+
+
+_PENDING_QUEUES = [
+    "review",
+    "retrospective_review",
+    "rework",
+    "validation_retry",
+    "tech_lead",
+]
+
+_REFUSALS = {
+    # Sub-threshold: the sample counts, but the circuit is not open yet.
+    "sub_threshold_auth": (
+        ProviderReadiness.auth_expired(PROVIDER, "not logged in"),
+        2,
+    ),
+    # Never opens a circuit at all.
+    "not_installed": (
+        ProviderReadiness.not_installed(PROVIDER, "claude not on PATH"),
+        1,
+    ),
+}
+
+
+@pytest.mark.parametrize("queue", _PENDING_QUEUES)
+@pytest.mark.parametrize("refusal", sorted(_REFUSALS))
+class TestAProviderRefusalNeverConsumesPendingWork:
+    """A refused launch is not a failed one; the work must survive it.
+
+    The routing layer drops a pending item on any launch result that is not
+    explicitly retained, so a provider refusal used to delete the request. For a
+    failure-investigation tech-lead item the queue is the only record that
+    exists, so that lost the investigation outright (#6999 F10).
+    """
+
+    def test_the_pending_item_survives_the_refusal(
+        self, queue, refusal, tmp_path: Path
+    ) -> None:
+        readiness, threshold = _REFUSALS[refusal]
+        harness = _RefusingLauncherHarness(tmp_path, readiness, threshold=threshold)
+        state = _pending_state(queue)
+
+        session = _route(queue, state, harness)
+
+        assert session is None
+        assert harness.created == []  # nothing spawned
+        assert _pending_count(state, queue) == 1  # still queued for a healthy tick
+        assert state.active_sessions == []
+
+    def test_the_refusal_is_announced_for_the_issue(
+        self, queue, refusal, tmp_path: Path
+    ) -> None:
+        """Retained is not the same as silent: the issue still gets the story."""
+        readiness, threshold = _REFUSALS[refusal]
+        harness = _RefusingLauncherHarness(tmp_path, readiness, threshold=threshold)
+        state = _pending_state(queue)
+
+        _route(queue, state, harness)
+
+        assert (
+            harness.event_names().count(
+                EventName.SESSION_LAUNCH_BLOCKED_PROVIDER.value
+            )
+            == 1
+        )
+
+    def test_a_later_healthy_tick_launches_the_retained_item(
+        self, queue, refusal, tmp_path: Path
+    ) -> None:
+        """The whole point of retaining it: the work still runs afterwards."""
+        readiness, threshold = _REFUSALS[refusal]
+        harness = _RefusingLauncherHarness(tmp_path, readiness, threshold=threshold)
+        state = _pending_state(queue)
+        _route(queue, state, harness)
+
+        harness.probe.readiness = ProviderReadiness.ready(PROVIDER)
+        harness.probe.sample_id = "recovered"
+        session = _route(queue, state, harness)
+
+        assert session is not None
+        assert harness.created  # a session really started this time
+        assert _pending_count(state, queue) == 0  # and the item was consumed
+
+
+def test_a_refused_tech_lead_launch_keeps_its_full_retry_budget(
+    tmp_path: Path,
+) -> None:
+    """A provider refusal must not spend the bounded required-input budget.
+
+    That budget exists for transient failures of the request itself (an
+    unreadable log or database). Nothing about the investigation failed here,
+    so burning a retry against it would eventually drop the item for a reason
+    that was never its fault (#6999 F10).
+    """
+    from issue_orchestrator.control.session_routing import PendingSessionQueues
+
+    harness = _RefusingLauncherHarness(
+        tmp_path, ProviderReadiness.not_installed(PROVIDER, "not on PATH"), threshold=1
+    )
+    state = _pending_state("tech_lead")
+
+    for _ in range(5):
+        _route("tech_lead", state, harness)
+
+    assert len(state.pending_tech_lead_reviews) == 1
+    # The retry budget is untouched, so a genuine input failure later still has
+    # its full allowance.
+    queues = PendingSessionQueues(state)
+    assert queues.retain_tech_lead_for_retry(7) is not None
+
+
+def test_the_launch_gate_reports_a_provider_deferral(tmp_path: Path) -> None:
+    """The typed disposition, at the seam that produces it."""
+    from issue_orchestrator.control.provider_launch_gate import ProviderLaunchGate
+    from issue_orchestrator.control.session_launch_types import LaunchDisposition
+
+    gate = ProviderLaunchGate(
+        policy=ProviderAvailabilityPolicy(
+            config=_config(),
+            provider_resilience=_manager(RecordingEvents()),
+            readiness_probe=StubReadinessProbe(
+                ProviderReadiness.auth_expired("claude-code", "not logged in")
+            ),
+        ),
+        events=RecordingEvents(),
+        apply_actions=lambda actions, context: True,
+    )
+
+    result = gate.check("claude-code", 123)
+
+    assert result is not None
+    assert not result.success
+    assert result.disposition is LaunchDisposition.PROVIDER_DEFERRED
+    assert result.defers_to_provider

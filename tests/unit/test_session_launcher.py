@@ -33,7 +33,10 @@ from issue_orchestrator.control.session_decision import (
     ProviderTransientFailureDecision,
     SessionDecision,
 )
-from issue_orchestrator.control.session_launch_types import LaunchResult
+from issue_orchestrator.control.session_launch_types import (
+    LaunchDisposition,
+    LaunchResult,
+)
 from tests.callback_endpoint_helpers import ready_callback_endpoint
 from issue_orchestrator.control.session_launcher import (
     SessionLauncher,
@@ -1074,7 +1077,7 @@ class TestLaunchIssueSession:
 
         assert result.success is False
         assert "Terminal session already running" in result.reason
-        assert result.keep_queued is True
+        assert result.disposition is LaunchDisposition.EXISTING_TERMINAL
 
     def test_adds_in_progress_label(self, launcher_bundle, sample_issue, mock_repo_host):
         """Verify in-progress label is added."""
@@ -1740,7 +1743,7 @@ class TestLaunchReviewSession:
         assert "No repo configured" in result.reason
 
     def test_skips_when_terminal_already_running(self, launcher_bundle):
-        """Verify keeps queued when terminal exists (keep_queued=True)."""
+        """Verify keeps queued when terminal exists (EXISTING_TERMINAL)."""
         launcher_bundle.session_exists_override[0] = lambda name: name == "review-456"
         review = PendingReview(
             issue_key=GitHubIssueKey(repo="test/repo", external_id="123"),
@@ -1753,7 +1756,7 @@ class TestLaunchReviewSession:
         result = launcher_bundle.launcher.launch_review_session(review, active_sessions=[])
 
         assert result.success is False
-        assert result.keep_queued is True
+        assert result.disposition is LaunchDisposition.EXISTING_TERMINAL
 
     def test_triggers_review_state_machine(self, launcher_bundle):
         """Verify review state machine is triggered."""
@@ -2093,7 +2096,7 @@ class TestLaunchRetrospectiveReviewSession:
         )
 
         assert result.success is False
-        assert result.keep_queued is True
+        assert result.disposition is LaunchDisposition.EXISTING_TERMINAL
 
 
 # =============================================================================
@@ -2227,7 +2230,7 @@ class TestLaunchReworkSession:
         result = launcher_bundle.launcher.launch_rework_session(rework, active_sessions=[])
 
         assert result.success is False
-        assert result.keep_queued is True
+        assert result.disposition is LaunchDisposition.EXISTING_TERMINAL
 
     def test_updates_rework_cycle_label(self, launcher_bundle, mock_repo_host):
         """Verify rework cycle label is updated (lines 820-839)."""
@@ -3218,16 +3221,20 @@ class TestOrchestratorLaunchTechLeadSession:
         assert state.active_sessions == [session]
 
     def test_keep_queued_launch_retains_item_for_retry(self, sample_config):
-        """keep_queued (existing terminal, not yet restorable) retains the item.
+        """EXISTING_TERMINAL (not yet restorable) retains the item.
 
-        (The other retention case is ``retry_queued`` — a transient
+        (The other retention cases are ``INPUT_RETRY`` — a transient
         required-input prep failure — covered by the bounded-retention tests.)
         """
         sample_config.tech_lead_review_agent = "agent:web"
         state = OrchestratorState()
         PendingSessionQueues(state).queue_batch_review(789, "Tech Lead batch")
         launcher = _stub_tech_lead_launcher(
-            LaunchResult(session=None, success=False, keep_queued=True)
+            LaunchResult(
+                session=None,
+                success=False,
+                disposition=LaunchDisposition.EXISTING_TERMINAL,
+            )
         )
 
         result = orchestrator_launch_tech_lead_session(

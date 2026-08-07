@@ -81,7 +81,11 @@ from .action_applier import ActionApplier
 from .actions import Action, AddLabelAction, RemoveLabelAction
 from .tech_lead_needs_human_reconcile import TechLeadNeedsHumanLifecycle, discover_tech_lead_needs_human_issue_numbers
 from .session_manager import SessionManager, SessionRef
-from .session_launch_types import ClaimAcquisitionResult, LaunchResult
+from .session_launch_types import (
+    ClaimAcquisitionResult,
+    LaunchDisposition,
+    LaunchResult,
+)
 from .session_rework_launcher import (
     ReworkLaunchDependencies,
     launch_rework_session as launch_rework_flow,
@@ -503,7 +507,7 @@ class SessionLauncher:
 
         if self._session_exists(session_name):
             log_transition("issue", issue.number, "AVAILABLE", "SKIP", "terminal session already running")
-            return LaunchResult(None, False, "Terminal session already running", keep_queued=True)
+            return LaunchResult(None, False, "Terminal session already running", disposition=LaunchDisposition.EXISTING_TERMINAL)
 
         return None
 
@@ -814,7 +818,7 @@ class SessionLauncher:
             )
         self._discard_tech_lead_authority_after_failed_launch(issue, ctx)
         self._release_claim_if_held(issue.number, claim)
-        return LaunchResult(None, False, f"Tech Lead session data preparation failed: {error}", retry_queued=True)
+        return LaunchResult(None, False, f"Tech Lead session data preparation failed: {error}", disposition=LaunchDisposition.INPUT_RETRY)
 
     def launch_issue_session(  # noqa: C901, PLR0912 - coordinator with claim acquisition, worktree setup, and error handling phases
         self,
@@ -1640,7 +1644,7 @@ class SessionLauncher:
 
         if self._session_exists(session_name):
             log_transition("review", review.pr_number, "QUEUED", "SKIP", "terminal session already running")
-            return LaunchResult(None, False, "Terminal session already running", keep_queued=True)
+            return LaunchResult(None, False, "Terminal session already running", disposition=LaunchDisposition.EXISTING_TERMINAL)
 
         if not self.config.repo:
             return LaunchResult(None, False, "No repo configured")

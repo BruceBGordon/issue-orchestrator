@@ -27,7 +27,7 @@ from ..ports.event_sink import make_run_scoped_event, make_trace_event
 from ..ports.session_output import SessionOutput
 from ..ports.worktree_manager import WorktreeManager, WorktreeReuseOptions
 from .actions import Action, AddCommentAction, AddLabelAction, RemoveLabelAction
-from .session_launch_types import LaunchResult
+from .session_launch_types import LaunchDisposition, LaunchResult
 from .stack_base import StackBaseDecision
 from .session_review_support import copy_review_feedback_to_rework, format_reviewer_feedback
 from .session_worktree_diagnostics import (
@@ -511,7 +511,7 @@ def check_rework_conflicts(
         return LaunchResult(None, False, "Already in active sessions")
     if session_exists(session_name):
         log_transition("rework", issue_number, "QUEUED", "SKIP", "terminal session already running")
-        return LaunchResult(None, False, "Terminal session already running", keep_queued=True)
+        return LaunchResult(None, False, "Terminal session already running", disposition=LaunchDisposition.EXISTING_TERMINAL)
     return None
 
 
