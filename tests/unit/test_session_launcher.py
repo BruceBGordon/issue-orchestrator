@@ -5095,6 +5095,22 @@ class TestParseSessionRef:
 # =============================================================================
 
 
+def _no_claims_store():
+    """A claim store for terminals that never held one (#6999 F4)."""
+
+    class _Empty:
+        def write_pending_work_claim(self, run_dir, claim) -> None:
+            raise AssertionError("restoration must not write claims")
+
+        def read_pending_work_claim(self, run_dir):
+            return None
+
+        def clear_pending_work_claim(self, run_dir) -> None:
+            raise AssertionError("restoration must not clear claims")
+
+    return _Empty()
+
+
 class TestRestoreRunningSessions:
     """Tests for restore_running_sessions function (line 1085)."""
 
@@ -5105,10 +5121,13 @@ class TestRestoreRunningSessions:
         mock_session.terminal_id = "issue-123"
         mock_restorer.restore_sessions.return_value = [mock_session]
 
-        active_sessions = []
+        state = OrchestratorState()
+        active_sessions = state.active_sessions
         running = [{"tab_name": "issue-123", "issue_number": 123}]
 
-        added = restore_running_sessions(running, active_sessions, mock_restorer)
+        added = restore_running_sessions(
+            running, state, mock_restorer, _no_claims_store()
+        )
 
         assert added == [mock_session]
         assert len(active_sessions) == 1
@@ -5156,12 +5175,15 @@ class TestRestoreRunningSessions:
         )
         mock_restorer = MagicMock()
         mock_restorer.restore_sessions.return_value = [duplicate, new_session]
-        active_sessions = [existing]
+        state = OrchestratorState()
+        state.active_sessions.append(existing)
+        active_sessions = state.active_sessions
 
         added = restore_running_sessions(
             [{"tab_name": "issue-123"}, {"tab_name": "issue-456"}],
-            active_sessions,
+            state,
             mock_restorer,
+            _no_claims_store(),
         )
 
         assert added == [new_session]

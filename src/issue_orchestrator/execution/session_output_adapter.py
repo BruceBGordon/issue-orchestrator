@@ -40,6 +40,13 @@ from ..domain.exchange_chapter import (
     ExchangeChapter,
     ExchangeChapterSidecar,
 )
+from ..domain.pending_work import PendingWorkClaim
+from .pending_work_codec import (
+    CLAIM_ARTIFACT_NAME,
+    PendingWorkClaimDecodeError,
+    decode_claim,
+    encode_claim,
+)
 from ..ports.session_output import (
     ReviewExchangeSummary,
     SessionRunAssets,
@@ -1022,6 +1029,36 @@ Timestamp: {self._now_iso()}
         identity_path = run_dir / SESSION_IDENTITY_NAME
         self._write_json(identity_path, payload)
         return identity_path
+
+    def write_pending_work_claim(
+        self,
+        run_dir: Path,
+        claim: PendingWorkClaim,
+    ) -> None:
+        """Record the queued request this run's session took at launch."""
+        self._write_json(run_dir / CLAIM_ARTIFACT_NAME, encode_claim(claim))
+
+    def read_pending_work_claim(self, run_dir: Path) -> PendingWorkClaim | None:
+        """Rebuild this run's claim, or None when it holds none.
+
+        A claim that exists but cannot be rebuilt is NOT silently treated as
+        absent: that would drop the only record of the work while looking like
+        a clean restart. It raises, and the restoration seam reports it.
+        """
+        claim_path = run_dir / CLAIM_ARTIFACT_NAME
+        if not claim_path.is_file():
+            return None
+        try:
+            payload = json.loads(claim_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise PendingWorkClaimDecodeError(
+                f"pending work claim at {claim_path} is unreadable: {exc}"
+            ) from exc
+        return decode_claim(payload)
+
+    def clear_pending_work_claim(self, run_dir: Path) -> None:
+        """Drop this run's claim once it has been settled."""
+        (run_dir / CLAIM_ARTIFACT_NAME).unlink(missing_ok=True)
 
     def append_cleaned_session_log(
         self,

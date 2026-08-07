@@ -291,8 +291,8 @@ def handle_session_completion(  # noqa: C901, PLR0912 - handles validation, acti
     # claimed by label) and settle to a no-op.
     from .in_flight_work import InFlightWorkLedger, SettlementOutcome
 
-    InFlightWorkLedger(state).settle(
-        session.terminal_id,
+    InFlightWorkLedger(state, session_output).settle(
+        session,
         SettlementOutcome.for_provider_error(provider_error_type),
     )
 

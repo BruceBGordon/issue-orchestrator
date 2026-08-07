@@ -31,13 +31,14 @@ from ..domain.tech_lead_session import TechLeadLaunchScope, TechLeadSessionFlavo
 from ..events import EventName
 from ..infra.config import Config
 from ..ports import EventSink, Issue as IssueProtocol, make_trace_event
+from ..ports.pending_work_claim_store import PendingWorkClaimStore
 from ..ports.session_runner import DiscoveredSession
 from .active_sessions import append_unique_active_sessions
 from .existing_terminal_restoration import (
     _ExistingTerminalRestorationRequest,
     _restore_existing_terminal,
 )
-from .in_flight_work import LaunchSettlement
+from .in_flight_work import InFlightWorkLedger, LaunchSettlement
 from .session_launch_types import LaunchDisposition
 from .session_launcher import SessionLauncher
 from .session_manager import SessionManager, SessionRef
@@ -342,6 +343,7 @@ def orchestrator_launch_review_session(
     pending_queues = PendingSessionQueues(state)
     result = session_launcher.launch_review_session(review, state.active_sessions)
     return LaunchSettlement(
+        claims=session_launcher.session_output,
         claim=PendingWorkClaim(PendingWorkKind.REVIEW, review),
         remove=lambda: pending_queues.remove_review(review.pr_number),
         restore_existing=lambda: _restore_existing_terminal(
@@ -371,6 +373,7 @@ def orchestrator_launch_retrospective_review_session(
         state.active_sessions,
     )
     return LaunchSettlement(
+        claims=session_launcher.session_output,
         claim=PendingWorkClaim(PendingWorkKind.RETROSPECTIVE_REVIEW, review),
         remove=lambda: pending_queues.remove_retrospective_review(review.issue_number),
         restore_existing=lambda: _restore_existing_terminal(
@@ -414,6 +417,7 @@ def orchestrator_launch_rework_session(
         )
 
     return LaunchSettlement(
+        claims=session_launcher.session_output,
         claim=PendingWorkClaim(PendingWorkKind.REWORK, rework),
         remove=lambda: pending_queues.remove_rework(rework),
         restore_existing=_restore_rework,
@@ -432,6 +436,7 @@ def orchestrator_launch_validation_retry_session(
         retry, state.active_sessions
     )
     return LaunchSettlement(
+        claims=session_launcher.session_output,
         claim=PendingWorkClaim(PendingWorkKind.VALIDATION_RETRY, retry),
         remove=lambda: pending_queues.remove_validation_retry(retry.issue_number),
         restore_existing=lambda: _restore_existing_terminal(
@@ -505,6 +510,7 @@ def orchestrator_launch_tech_lead_session(
             )
 
     return LaunchSettlement(
+        claims=session_launcher.session_output,
         claim=PendingWorkClaim(PendingWorkKind.TECH_LEAD, tech_lead),
         remove=lambda: pending_queues.remove_tech_lead(tech_lead.issue_number),
         restore_existing=lambda: _restore_existing_terminal(
@@ -605,12 +611,23 @@ def session_launcher_callback(
 
 def restore_running_sessions(
     running: list["DiscoveredSession"],
-    active_sessions: list[Session],
+    state: "OrchestratorState",
     session_restorer: "SessionRestorer",
+    claims: PendingWorkClaimStore,
 ) -> list[Session]:
-    """Restore running terminal sessions into active-session tracking."""
+    """Restore running terminal sessions into active-session tracking.
+
+    Restoring the terminal is only half of it. A session launched off a pending
+    queue is still carrying that queue's request, and after a restart the
+    request lives only beside the session's run assets - so the claim is
+    rehydrated here too, in the same step that makes the session active
+    (#6999 F4). Without it a provider failure observed after a restart would
+    find no claim and the work would be gone for good.
+    """
+    active_sessions = state.active_sessions
     restored = session_restorer.restore_sessions(running, active_sessions)
     added = append_unique_active_sessions(active_sessions, restored)
+    InFlightWorkLedger(state, claims).rehydrate(added)
     if added:
         logger.info(
             "[ORPHAN] Restored %d running terminal session(s): %s",

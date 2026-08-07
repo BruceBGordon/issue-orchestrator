@@ -354,7 +354,7 @@ class Orchestrator:
     def _get_session_machine(self, name: str, n: int, timeout: int) -> Optional[SessionStateMachine]: return _sl_get_session_machine(name, n, timeout, self.deps.state_machine_manager)
     def _get_review_machine(self, pr: int, issue: int) -> Optional[ReviewStateMachine]: return _ch_get_review_machine(pr, issue, self.deps.state_machine_manager)
 
-    def _restore_running_sessions(self, running: list["DiscoveredSession"]) -> None: _restore_running_sessions(running, self.state.active_sessions, self.deps.session_restorer)
+    def _restore_running_sessions(self, running: list["DiscoveredSession"]) -> None: _restore_running_sessions(running, self.state, self.deps.session_restorer, self.deps.session_output)
     def _parse_session_ref(self, session_name: str, operation: str) -> "SessionRef": return _parse_session_ref(session_name, operation, self.deps.events)
     def _create_session(self, name: str, cmd: str, wd: Path, title: str | None = None) -> bool: return _create_session(name, cmd, wd, title, self.deps.session_manager, self.deps.events)
     def _session_exists(self, name: str) -> bool: return _session_exists(name, self.deps.session_manager, self.deps.events)
@@ -735,8 +735,9 @@ class Orchestrator:
         )
         restored = _restore_running_sessions(
             [info for info, _ in untracked],
-            self.state.active_sessions,
+            self.state,
             self.deps.session_restorer,
+            self.deps.session_output,
         )
         self._last_orphan_reconcile_active_count = len(self.state.active_sessions)
         restored_names = {s.terminal_id for s in restored}

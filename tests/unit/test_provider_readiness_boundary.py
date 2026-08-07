@@ -2858,6 +2858,7 @@ def test_a_provider_deferral_touches_neither_restoration_nor_the_retry_budget() 
         return None
 
     owner = LaunchSettlement(
+        claims=FileSystemSessionOutput(),
         claim=_claim("tech_lead", _pending_state("tech_lead")),
         remove=lambda: calls.append("remove"),
         restore_existing=_spy_restore_existing,
@@ -2920,6 +2921,7 @@ def test_an_unhandled_launch_disposition_never_silently_drops_the_work() -> None
 
     removed: list[str] = []
     owner = LaunchSettlement(
+        claims=FileSystemSessionOutput(),
         claim=_claim("review", _pending_state("review")),
         remove=lambda: removed.append("removed"),
     )
@@ -2961,24 +2963,32 @@ def _ready_harness(tmp_path: Path):
     )
 
 
-def _terminate_on_provider(state, terminal_id: str, error_type, *, drop_active=True):
+def _claims():
+    """The real run-artifact adapter, so the durable claim path is exercised."""
+    return FileSystemSessionOutput()
+
+
+def _ledger(state):
+    from issue_orchestrator.control.in_flight_work import InFlightWorkLedger
+
+    return InFlightWorkLedger(state, _claims())
+
+
+def _terminate_on_provider(state, session, error_type, *, drop_active=True):
     """Settle a running session the way terminal completion does.
 
     ``drop_active`` mirrors ``handle_session_completion``, which drops the
     session from ``active_sessions`` before settling. One test flips it off to
     prove the restore does not silently depend on that order.
     """
-    from issue_orchestrator.control.in_flight_work import (
-        InFlightWorkLedger,
-        SettlementOutcome,
-    )
+    from issue_orchestrator.control.in_flight_work import SettlementOutcome
 
     if drop_active:
         state.active_sessions = [
-            s for s in state.active_sessions if s.terminal_id != terminal_id
+            s for s in state.active_sessions if s.terminal_id != session.terminal_id
         ]
-    return InFlightWorkLedger(state).settle(
-        terminal_id, SettlementOutcome.for_provider_error(error_type)
+    return _ledger(state).settle(
+        session, SettlementOutcome.for_provider_error(error_type)
     )
 
 
@@ -2998,8 +3008,6 @@ class TestALiveAuthTerminationReturnsTheWorkItConsumed:
         self, queue, tmp_path: Path
     ) -> None:
         """Dequeued is not the same as spent: someone still holds it."""
-        from issue_orchestrator.control.in_flight_work import InFlightWorkLedger
-
         harness = _ready_harness(tmp_path)
         state = _pending_state(queue)
         original = _pending_items(state, queue)[0]
@@ -3008,7 +3016,7 @@ class TestALiveAuthTerminationReturnsTheWorkItConsumed:
 
         assert session is not None
         assert _pending_count(state, queue) == 0  # off the queue...
-        held = InFlightWorkLedger(state).holds(session.terminal_id)
+        held = _ledger(state).holds(session.terminal_id)
         assert held is not None  # ...but not gone
         assert held.request is original
 
@@ -3030,7 +3038,7 @@ class TestALiveAuthTerminationReturnsTheWorkItConsumed:
         # session yet is an ordering detail, and the work must come back either
         # way.
         _terminate_on_provider(
-            state, session.terminal_id, ProviderErrorType.AUTH, drop_active=False
+            state, session, ProviderErrorType.AUTH, drop_active=False
         )
 
         assert _pending_count(state, queue) == 1
@@ -3047,7 +3055,7 @@ class TestALiveAuthTerminationReturnsTheWorkItConsumed:
         harness.probe.readiness = ProviderReadiness.auth_expired(
             PROVIDER, "not logged in"
         )
-        _terminate_on_provider(state, first.terminal_id, ProviderErrorType.AUTH)
+        _terminate_on_provider(state, first, ProviderErrorType.AUTH)
 
         harness.probe.readiness = ProviderReadiness.ready(PROVIDER)
         second = _route(queue, state, harness)
@@ -3070,7 +3078,7 @@ class TestALiveAuthTerminationReturnsTheWorkItConsumed:
         session = _route(queue, state, harness)
         assert session is not None
 
-        _terminate_on_provider(state, session.terminal_id, None)
+        _terminate_on_provider(state, session, None)
 
         assert _pending_count(state, queue) == 0
 
@@ -3089,7 +3097,7 @@ class TestALiveAuthTerminationReturnsTheWorkItConsumed:
         assert session is not None
         _pending_items(state, queue).append(original)  # rediscovered meanwhile
 
-        _terminate_on_provider(state, session.terminal_id, ProviderErrorType.AUTH)
+        _terminate_on_provider(state, session, ProviderErrorType.AUTH)
 
         assert _pending_count(state, queue) == 1
 
@@ -3111,7 +3119,7 @@ def test_a_returned_failure_investigation_keeps_its_typed_trigger(
     session = _route("tech_lead", state, harness)
     assert session is not None
 
-    _terminate_on_provider(state, session.terminal_id, ProviderErrorType.AUTH)
+    _terminate_on_provider(state, session, ProviderErrorType.AUTH)
 
     returned = state.pending_tech_lead_reviews[0]
     assert returned.flavor is TechLeadSessionFlavor.FAILURE_INVESTIGATION
@@ -3131,7 +3139,7 @@ def test_a_returned_validation_retry_keeps_its_attempt_budget(
     session = _route("validation_retry", state, harness)
     assert session is not None
 
-    _terminate_on_provider(state, session.terminal_id, ProviderErrorType.AUTH)
+    _terminate_on_provider(state, session, ProviderErrorType.AUTH)
 
     returned = state.pending_validation_retries[0]
     assert returned.retry_count == 1  # unchanged by the outage
@@ -3146,23 +3154,20 @@ def test_a_transient_provider_outage_also_returns_the_work(tmp_path: Path) -> No
     session = _route("tech_lead", state, harness)
     assert session is not None
 
-    _terminate_on_provider(state, session.terminal_id, ProviderErrorType.TRANSIENT)
+    _terminate_on_provider(state, session, ProviderErrorType.TRANSIENT)
 
     assert len(state.pending_tech_lead_reviews) == 1
 
 
-def test_an_issue_session_holds_no_claim_to_return() -> None:
+def test_an_issue_session_holds_no_claim_to_return(make_session) -> None:
     """Issue work is claimed by label, not by dequeuing; settling is a no-op."""
-    from issue_orchestrator.control.in_flight_work import (
-        InFlightWorkLedger,
-        SettlementOutcome,
-    )
+    from issue_orchestrator.control.in_flight_work import SettlementOutcome
     from issue_orchestrator.domain.models import OrchestratorState
 
     state = OrchestratorState()
 
-    settled = InFlightWorkLedger(state).settle(
-        "issue-123", SettlementOutcome.PROVIDER_DEFERRED
+    settled = _ledger(state).settle(
+        make_session(), SettlementOutcome.PROVIDER_DEFERRED
     )
 
     assert settled is None

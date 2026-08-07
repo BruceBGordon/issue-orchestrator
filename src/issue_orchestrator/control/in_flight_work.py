@@ -30,10 +30,12 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Callable, Optional
+from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
-from ..domain.models import Session
-from ..domain.pending_work import InFlightWork, PendingWorkClaim
+from ..domain.models import PendingRework, Session
+from ..domain.pending_work import InFlightWork, PendingWorkClaim, PendingWorkKind
+from ..domain.session_key import SessionKey, TaskKind
+from ..ports.pending_work_claim_store import PendingWorkClaimStore
 from ..ports.provider_resilience import ProviderErrorType
 from .active_sessions import append_unique_active_sessions
 from .session_launch_types import LaunchDisposition, LaunchResult
@@ -78,6 +80,18 @@ class SettlementOutcome(Enum):
         return cls.CONSUMED
 
 
+class DuplicateClaimError(RuntimeError):
+    """Two different claims were taken against one terminal (#6999 F5).
+
+    A terminal id identifies one live session, so this means registry drift or
+    a repeated adoption - a bug in the caller. Replacing the first claim would
+    convert that bug into silent work loss, which is exactly what this whole
+    boundary exists to prevent, so it is raised instead. Re-taking the SAME
+    claim is idempotent and does not raise: a retried adoption of the terminal
+    it already recorded has changed nothing.
+    """
+
+
 @dataclass(frozen=True, slots=True)
 class InFlightWorkLedger:
     """The one owner of claims held by running sessions.
@@ -86,42 +100,108 @@ class InFlightWorkLedger:
     admits a returned request is the pending-queue owner's job, and deciding
     what a termination *means* is the caller's typed
     :class:`SettlementOutcome`.
+
+    Holds each claim in two places on purpose. ``state.in_flight_work`` is the
+    fast in-process record; ``claims`` is the durable one, written beside the
+    run assets of the session that took it, so a restart can rebuild what a
+    live terminal is carrying (#6999 F4). The two are kept in step here and
+    nowhere else.
     """
 
     state: "OrchestratorState"
+    claims: PendingWorkClaimStore
 
-    def take(self, terminal_id: str, claim: PendingWorkClaim) -> None:
-        """Record that ``terminal_id`` launched holding ``claim``.
+    def take(self, session: Session, claim: PendingWorkClaim) -> None:
+        """Record that ``session``'s terminal launched holding ``claim``.
 
-        Re-taking the same terminal replaces the previous claim rather than
-        stacking a second one: a terminal id identifies one live session, so two
-        simultaneous claims against it would be a bug, and keeping the newer one
-        matches the item that was actually dequeued.
+        Raises :class:`DuplicateClaimError` if the terminal already holds a
+        DIFFERENT claim. Taking the same claim twice is idempotent.
         """
-        self._forget(terminal_id)
-        self.state.in_flight_work.append(InFlightWork(terminal_id, claim))
+        terminal_id = session.terminal_id
+        existing = self.holds(terminal_id)
+        if existing is not None and existing != claim:
+            raise DuplicateClaimError(
+                f"terminal {terminal_id} already holds a {existing.kind.value} "
+                f"claim; refusing to replace it with a {claim.kind.value} one"
+            )
+        if existing is None:
+            self.state.in_flight_work.append(InFlightWork(terminal_id, claim))
+        # Written every time, including the idempotent path: the durable record
+        # is what a restart reads, and an in-memory hit is no evidence that the
+        # on-disk one was ever produced.
+        self.claims.write_pending_work_claim(session.run_assets.run_dir, claim)
         logger.debug("[WORK] %s holds %s", terminal_id, claim.kind.value)
 
     def settle(
-        self, terminal_id: str, outcome: SettlementOutcome
+        self, session: Session, outcome: SettlementOutcome
     ) -> PendingWorkClaim | None:
-        """Release ``terminal_id``'s claim, returning the work if deferred.
+        """Release the claim ``session``'s terminal holds, returning it if deferred.
 
         Returns the claim that was settled, or ``None`` when the terminal held
-        none — the ordinary case for an issue session, which claims its work
+        none - the ordinary case for an issue session, which claims its work
         with a label rather than by dequeuing it.
+
+        Settlement is atomic from the ledger's point of view: the claim is
+        released only after the queue has accepted it back. If re-admission
+        raises - an unregistered queue kind, a queue owner fault - the claim
+        stays held, in memory and on disk, so the next attempt can still find
+        it (#6999 F5). Releasing first would destroy the only record of the
+        work at exactly the moment something already went wrong.
         """
-        held = next(
-            (w for w in self.state.in_flight_work if w.terminal_id == terminal_id),
-            None,
-        )
+        terminal_id = session.terminal_id
+        held = self.holds(terminal_id)
         if held is None:
             return None
-        self._forget(terminal_id)
-        if outcome is SettlementOutcome.CONSUMED:
-            return held.claim
-        self._restore(terminal_id, held.claim)
-        return held.claim
+        if outcome is not SettlementOutcome.CONSUMED:
+            self._restore(terminal_id, held)
+        self._release(session)
+        return held
+
+    def rehydrate(self, sessions: Sequence[Session]) -> list[PendingWorkClaim]:
+        """Re-take the claims of terminals that survived a restart (#6999 F4).
+
+        The pending queues are in-memory, so after a restart a live terminal's
+        request is on disk and nowhere else. Reading it back is what lets a
+        provider failure observed AFTER the restart still return the work.
+
+        The claim is also the authority on what the terminal is doing, which
+        the restored session cannot always tell: terminal-name parsing gives a
+        rework session generic CODE identity and no PR number, and without the
+        PR number the provider-blocked planner cannot put ``needs-rework``
+        back. Reconciling identity from the claim fixes that at its source.
+
+        A claim that exists but cannot be decoded is reported and skipped
+        rather than crashing startup: one unreadable artifact must not stop
+        every other session from being restored. It stays on disk for
+        inspection.
+        """
+        rehydrated: list[PendingWorkClaim] = []
+        for session in sessions:
+            try:
+                claim = self.claims.read_pending_work_claim(
+                    session.run_assets.run_dir
+                )
+            except Exception as exc:  # adapter-defined decode/IO failure
+                logger.error(
+                    "[WORK] Could not rebuild the claim held by %s: %s",
+                    session.terminal_id,
+                    exc,
+                )
+                continue
+            if claim is None:
+                continue
+            if self.holds(session.terminal_id) is None:
+                self.state.in_flight_work.append(
+                    InFlightWork(session.terminal_id, claim)
+                )
+            _reconcile_restored_identity(session, claim)
+            rehydrated.append(claim)
+            logger.info(
+                "[WORK] Restored terminal %s is still holding %s",
+                session.terminal_id,
+                claim.kind.value,
+            )
+        return rehydrated
 
     def holds(self, terminal_id: str) -> PendingWorkClaim | None:
         """The claim ``terminal_id`` is currently carrying, if any."""
@@ -148,10 +228,40 @@ class InFlightWorkLedger:
             "returned to its queue" if requeued else "already queued",
         )
 
-    def _forget(self, terminal_id: str) -> None:
+    def _release(self, session: Session) -> None:
+        """Drop both records of a settled claim, durable one first.
+
+        Order matters for a crash between the two writes: a stale on-disk claim
+        with no in-memory twin would be re-taken at the next restart and
+        re-queue work that was already settled.
+        """
+        self.claims.clear_pending_work_claim(session.run_assets.run_dir)
         self.state.in_flight_work[:] = [
-            w for w in self.state.in_flight_work if w.terminal_id != terminal_id
+            w
+            for w in self.state.in_flight_work
+            if w.terminal_id != session.terminal_id
         ]
+
+
+def _reconcile_restored_identity(
+    session: Session, claim: PendingWorkClaim
+) -> None:
+    """Give a restored session back the identity its claim proves it has.
+
+    Restoration rebuilds a session from its terminal name and its run assets,
+    which cannot express every task kind: a ``rework-*`` terminal comes back as
+    generic CODE work with no PR number. The claim knows better, and downstream
+    policy depends on it - notably restoring the ``needs-rework`` label, which
+    is keyed on the PR (#6999 F4).
+    """
+    if claim.kind is not PendingWorkKind.REWORK:
+        return
+    request = claim.request
+    assert isinstance(request, PendingRework)
+    session.key = SessionKey(issue=session.key.issue, task=TaskKind.REWORK)
+    if request.pr_number is not None:
+        session.pr_number = request.pr_number
+    session.rework_cycle = request.rework_cycle
 
 
 @dataclass(frozen=True)
@@ -170,6 +280,7 @@ class LaunchSettlement:
     """
 
     claim: PendingWorkClaim
+    claims: PendingWorkClaimStore
     remove: Callable[[], None]
     # Adopting an already-running terminal, and spending one unit of the
     # bounded required-input retry budget. Both default to doing nothing, for
@@ -218,11 +329,15 @@ class LaunchSettlement:
     def _consume_into_flight(
         self, session: Session, state: "OrchestratorState"
     ) -> None:
+        # The ledger first: it is the thing that can refuse (a terminal already
+        # holding a different claim is a bug, not a launch). Removing the queue
+        # item only after it accepts means a refusal leaves the work queued.
+        InFlightWorkLedger(state, self.claims).take(session, self.claim)
         self.remove()
-        InFlightWorkLedger(state).take(session.terminal_id, self.claim)
 
 
 __all__ = [
+    "DuplicateClaimError",
     "InFlightWorkLedger",
     "LaunchSettlement",
     "SettlementOutcome",
