@@ -282,6 +282,20 @@ def handle_session_completion(  # noqa: C901, PLR0912 - handles validation, acti
     # Remove by session name, NOT issue number - multiple sessions can share an issue number
     state.active_sessions = [s for s in state.active_sessions if s.terminal_id != session.terminal_id]
 
+    # Settle the claim this session took off a pending queue at launch (#6999
+    # F2/A1). One typed outcome for every terminal path: a session stopped by
+    # its provider never got to attempt the work, so its request goes back to
+    # its own queue with its full context and its full retry budget instead of
+    # being spent. Every other status - including an agent-reported BLOCKED -
+    # consumes it exactly as before. Issue sessions hold no claim (they are
+    # claimed by label) and settle to a no-op.
+    from .in_flight_work import InFlightWorkLedger, SettlementOutcome
+
+    InFlightWorkLedger(state).settle(
+        session.terminal_id,
+        SettlementOutcome.for_provider_error(provider_error_type),
+    )
+
     # Handle validation retry - queue for re-launch instead of normal completion
     if status == SessionStatus.NEEDS_VALIDATION_RETRY:
         next_retry_count = session.validation_retry_count + 1

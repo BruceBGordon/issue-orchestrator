@@ -680,6 +680,13 @@ class CompletionActionPlanner:
         ``provider.issue_blocked`` event that survives the label being shed,
         which is precisely the durable signal #5980 added to replace commenting
         on every affected issue during a fleet-wide outage.
+
+        A rework session additionally gets its ``needs-rework`` trigger back.
+        The in-memory queue restore is owned by ``InFlightWorkLedger`` (#6999
+        F2), but the label is the crash-safe half of the same fact: the launcher
+        strips it when the session starts, so leaving it off would mean an
+        orchestrator restarted during the outage sees a PR that asked for rework
+        and no longer says so.
         """
         provider = session.agent_config.provider
         actions: list[Action] = []
@@ -699,6 +706,15 @@ class CompletionActionPlanner:
                     issue_number=session.issue.number,
                     label=self._lm.in_progress,
                     reason="Session blocked by provider - releasing claim",
+                    expected=expected,
+                )
+            )
+        if session.terminal_id.startswith("rework-") and session.pr_number:
+            actions.append(
+                AddLabelAction(
+                    issue_number=session.pr_number,
+                    label=self._lm.needs_rework,
+                    reason="Rework blocked by provider - restoring rework trigger",
                     expected=expected,
                 )
             )

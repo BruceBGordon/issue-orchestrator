@@ -38,17 +38,31 @@ from .observation import SessionObservation, SessionObservationResult
 
 logger = logging.getLogger(__name__)
 
-# Only the head of the log can hold a launch-time banner; reading more would
-# just feed the agent's own working output into the signature match.
+# A credential can die at two moments, and the log records them in two places.
+#
+# The HEAD holds a launch-time banner: the CLI refused before it did anything.
+# The TAIL holds a mid-session one: the session was working fine and the token
+# expired underneath it, or a delayed first observation only reached the log
+# after the agent had already written past the head. Reading the head alone made
+# the second case undiagnosable — once ordinary output passed this many bytes,
+# an auth banner appended later could never reach the probe, and the session
+# fell through to the generic timeout path. That is the exact 90-minute burn
+# #6999 exists to remove (F3).
+#
+# Both windows are bounded, so the read stays O(1) in session length no matter
+# how much the agent prints: at most this many bytes from each end, and they
+# collapse to a single read for a log smaller than both. The signature match is
+# only a trigger — the provider adapter confirms it against the credential probe
+# — so pulling in the agent's own working output cannot by itself kill a session
+# (this orchestrator echoes provider auth banners while working on its own auth
+# tooling).
 #
 # There is deliberately NO session-age cutoff on the auth check. An age window
 # reads as a cost guard but behaves as a correctness one: an orchestrator
 # restart, a delayed first observation, or any auth failure that only becomes
 # visible later would fall outside it and let the session burn to its full
-# timeout — the exact failure #6999 exists to remove (F4). The head of the log
-# is immutable once written, so re-reading it is cheap, and the expensive part
-# (the credential probe) only runs when the signature matches and is itself
-# cached by the probe.
+# timeout (F4). The expensive part (the credential probe) only runs when the
+# signature matches and is itself cached by the probe.
 PROVIDER_AUTH_CHECK_MAX_BYTES = 8192
 
 
@@ -511,12 +525,16 @@ class SessionObserver:
         orchestrator working on its own auth tooling does exactly that) cannot
         kill its own session (#6999).
 
-        Deliberately unconditioned on session age or liveness. Only the head of
-        the log is read and the head belongs to *this* launch, so a banner found
-        there is about this launch's credentials however late the observation
-        happens — and a restart, a delayed first tick, or a session already past
-        its timeout must still get the typed auth verdict rather than a
-        misdirected TIMED_OUT (#6999 F4).
+        Deliberately unconditioned on session age or liveness. The log belongs
+        to *this* launch, so a banner found in it is about this launch's
+        credentials however late the observation happens — and a restart, a
+        delayed first tick, or a session already past its timeout must still get
+        the typed auth verdict rather than a misdirected TIMED_OUT (#6999 F4).
+
+        The scanned window is bounded at both ends rather than at the head
+        alone, so a credential that dies mid-session — after the agent has
+        already written megabytes of ordinary output — is still diagnosable
+        (#6999 F3).
         """
         provider = session.agent_config.provider
         if not provider:
@@ -528,12 +546,14 @@ class SessionObserver:
         )
         if not log_path or not log_path.exists():
             return None
-        head = self._read_log_head(log_path, PROVIDER_AUTH_CHECK_MAX_BYTES)
-        if not head:
+        window = self._read_auth_scan_window(
+            log_path, PROVIDER_AUTH_CHECK_MAX_BYTES
+        )
+        if not window:
             return None
 
         readiness = self._provider_readiness_probe.diagnose_session_output(
-            provider, head
+            provider, window
         )
         if not readiness.human_fixable:
             return None
@@ -559,14 +579,37 @@ class SessionObserver:
         )
 
     @staticmethod
-    def _read_log_head(log_path, max_bytes: int) -> str:
-        """Read the first ``max_bytes`` of a session log, tolerating decode noise."""
+    def _read_auth_scan_window(log_path, edge_bytes: int) -> str:
+        """Read the first and last ``edge_bytes`` of a session log.
+
+        Two bounded reads rather than one: the head carries a launch-time
+        refusal, the tail carries a credential that expired while the session
+        was already working (#6999 F3). A log shorter than both windows is read
+        once and returned whole, so the common case costs exactly what the
+        head-only read used to.
+
+        Decode noise is tolerated (a tail slice can start mid-codepoint) because
+        the result feeds a signature match, not a parser.
+        """
         try:
             with open(log_path, "rb") as handle:
-                raw = handle.read(max_bytes)
+                head = handle.read(edge_bytes)
+                # `tell()` after a short read is the true size for the part we
+                # care about; seek from the end for the rest.
+                handle.seek(0, 2)
+                size = handle.tell()
+                if size <= edge_bytes:
+                    tail = b""
+                else:
+                    handle.seek(max(edge_bytes, size - edge_bytes))
+                    tail = handle.read(edge_bytes)
         except OSError:
             return ""
-        return raw.decode("utf-8", errors="replace")
+        if not tail:
+            return head.decode("utf-8", errors="replace")
+        # A separator keeps a signature from being manufactured across the gap
+        # by two unrelated fragments happening to abut.
+        return b"\n".join((head, tail)).decode("utf-8", errors="replace")
 
     def _emit_no_output_if_stale(self, session: Session) -> None:
         """Emit a session_no_output event if the session log is idle too long."""

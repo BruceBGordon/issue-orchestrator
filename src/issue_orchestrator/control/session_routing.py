@@ -22,6 +22,7 @@ from ..domain.models import (
     PendingValidationRetry,
     Session,
 )
+from ..domain.pending_work import PendingWorkClaim, PendingWorkKind
 from ..domain.tech_lead_session import TechLeadLaunchScope, TechLeadSessionFlavor
 from ..events import EventName
 from ..infra.config import Config
@@ -32,7 +33,8 @@ from .existing_terminal_restoration import (
     _ExistingTerminalRestorationRequest,
     _restore_existing_terminal,
 )
-from .session_launch_types import LaunchDisposition, LaunchResult
+from .in_flight_work import LaunchSettlement
+from .session_launch_types import LaunchDisposition
 from .session_launcher import SessionLauncher
 from .session_manager import SessionManager, SessionRef
 
@@ -223,6 +225,58 @@ class PendingSessionQueues:
         )
         return TechLeadRetentionOutcome.RETAINED
 
+    def restore_deferred(self, claim: PendingWorkClaim) -> bool:
+        """Return a launched-but-provider-deferred request to its own queue.
+
+        The admission half of this owner (#6999 A1): every queue already
+        declares here how an item is removed, so it declares here how one comes
+        back. Each branch re-appends the ORIGINAL request object, preserving the
+        context that exists nowhere else - a failure investigation's typed
+        ``DiscoveredFailure``, a validation retry's prompt/error/count, a
+        rework's cycle number - and applies that queue's own duplicate rule so a
+        restore can never double-queue work that was re-discovered meanwhile.
+
+        Returns True when the item was admitted, False when the queue already
+        held an equivalent request. Restoring costs no retry budget: nothing
+        about the request failed.
+        """
+        request = claim.request
+        if claim.kind is PendingWorkKind.REVIEW:
+            assert isinstance(request, PendingReview)
+            if any(
+                r.pr_number == request.pr_number for r in self.state.pending_reviews
+            ):
+                return False
+            self.state.pending_reviews.append(request)
+            return True
+        if claim.kind is PendingWorkKind.RETROSPECTIVE_REVIEW:
+            assert isinstance(request, PendingRetrospectiveReview)
+            if self.state.has_pending_or_active_retrospective_review(
+                request.issue_number
+            ):
+                return False
+            self.state.pending_retrospective_reviews.append(request)
+            return True
+        if claim.kind is PendingWorkKind.REWORK:
+            assert isinstance(request, PendingRework)
+            return self.state.queue_pending_rework(request)
+        if claim.kind is PendingWorkKind.VALIDATION_RETRY:
+            assert isinstance(request, PendingValidationRetry)
+            if any(
+                queued.issue_number == request.issue_number
+                for queued in self.state.pending_validation_retries
+            ):
+                return False
+            self.state.pending_validation_retries.append(request)
+            return True
+        if claim.kind is PendingWorkKind.TECH_LEAD:
+            assert isinstance(request, PendingTechLeadReview)
+            return self._queue_tech_lead(request) is TechLeadQueueOutcome.QUEUED
+        # Named explicitly, like the launch-disposition switch: a new queue kind
+        # added without a decision here must fail loudly rather than silently
+        # drop the only record of its work.
+        raise ValueError(f"unhandled pending work kind: {claim.kind}")
+
     def _queue_tech_lead(self, item: PendingTechLeadReview) -> TechLeadQueueOutcome:
         """Apply the one dedup rule (issue number vs pending queue) and enqueue."""
         queue = self.state.pending_tech_lead_reviews
@@ -244,60 +298,6 @@ class PendingSessionQueues:
 
 
 
-@dataclass(frozen=True)
-class _PendingQueueOwner:
-    """How one pending queue settles its item for each launch disposition.
-
-    The single place "does this launch outcome consume the work?" is answered.
-    Each queue supplies its own removal and, where it has one, its restoration
-    and bounded-retry behaviour; the mapping from disposition to action is
-    shared, so a new disposition cannot mean different things per queue and an
-    unhandled one cannot silently fall through to dropping the item (#6999 A1).
-    """
-
-    remove: Callable[[], None]
-    # Adopting an already-running terminal, and spending one unit of the
-    # bounded required-input retry budget. Both default to doing nothing, for
-    # the queues that have no such behaviour — an explicit no-op rather than an
-    # optional every caller of `settle` would have to re-check.
-    restore_existing: Callable[[], Optional[Session]] = lambda: None
-    retain_for_input_retry: Callable[[], None] = lambda: None
-    # Validation retries own their own durable queue and are re-derived from
-    # it, so a plain failure leaves the item alone. Every other queue drops.
-    drop_on_permanent_failure: bool = True
-
-    def settle(
-        self, result: LaunchResult, state: "OrchestratorState"
-    ) -> Optional[Session]:
-        if result.success and result.session:
-            self.remove()
-            append_unique_active_sessions(state.active_sessions, [result.session])
-            return result.session
-        if result.disposition is LaunchDisposition.EXISTING_TERMINAL:
-            restored = self.restore_existing()
-            if restored:
-                self.remove()
-            return restored
-        if result.disposition is LaunchDisposition.PROVIDER_DEFERRED:
-            # The provider refused before the work was touched. Keep the item
-            # exactly as it is: no restoration attempt (there is no terminal to
-            # restore) and no budget spent (nothing about this request failed).
-            # For a failure investigation the queue is the only record that
-            # exists, so dropping it here would lose it permanently.
-            logger.info("[PROVIDER] Launch deferred, work retained: %s", result.reason)
-            return None
-        if result.disposition is LaunchDisposition.INPUT_RETRY:
-            self.retain_for_input_retry()
-            return None
-        if result.disposition is LaunchDisposition.PERMANENT_FAILURE:
-            if self.drop_on_permanent_failure:
-                self.remove()
-            return None
-        # Named explicitly rather than left as a fall-through: dropping the
-        # work is the destructive branch, and a disposition added later without
-        # a decision here must not silently land in it (#6999 A1).
-        raise ValueError(f"unhandled launch disposition: {result.disposition}")
-
 def orchestrator_launch_review_session(
     review: PendingReview,
     state: "OrchestratorState",
@@ -307,7 +307,8 @@ def orchestrator_launch_review_session(
     """Launch a review session and update orchestrator queues."""
     pending_queues = PendingSessionQueues(state)
     result = session_launcher.launch_review_session(review, state.active_sessions)
-    return _PendingQueueOwner(
+    return LaunchSettlement(
+        claim=PendingWorkClaim(PendingWorkKind.REVIEW, review),
         remove=lambda: pending_queues.remove_review(review.pr_number),
         restore_existing=lambda: _restore_existing_terminal(
             request=_ExistingTerminalRestorationRequest(
@@ -335,7 +336,8 @@ def orchestrator_launch_retrospective_review_session(
         review,
         state.active_sessions,
     )
-    return _PendingQueueOwner(
+    return LaunchSettlement(
+        claim=PendingWorkClaim(PendingWorkKind.RETROSPECTIVE_REVIEW, review),
         remove=lambda: pending_queues.remove_retrospective_review(review.issue_number),
         restore_existing=lambda: _restore_existing_terminal(
             request=_ExistingTerminalRestorationRequest(
@@ -377,7 +379,8 @@ def orchestrator_launch_rework_session(
             session_restorer=session_restorer,
         )
 
-    return _PendingQueueOwner(
+    return LaunchSettlement(
+        claim=PendingWorkClaim(PendingWorkKind.REWORK, rework),
         remove=lambda: pending_queues.remove_rework(rework),
         restore_existing=_restore_rework,
     ).settle(result, state)
@@ -394,7 +397,8 @@ def orchestrator_launch_validation_retry_session(
     result = session_launcher.launch_validation_retry_session(
         retry, state.active_sessions
     )
-    return _PendingQueueOwner(
+    return LaunchSettlement(
+        claim=PendingWorkClaim(PendingWorkKind.VALIDATION_RETRY, retry),
         remove=lambda: pending_queues.remove_validation_retry(retry.issue_number),
         restore_existing=lambda: _restore_existing_terminal(
             request=_ExistingTerminalRestorationRequest(
@@ -466,7 +470,8 @@ def orchestrator_launch_tech_lead_session(
                 tech_lead, result.reason, session_launcher, pending_queues
             )
 
-    return _PendingQueueOwner(
+    return LaunchSettlement(
+        claim=PendingWorkClaim(PendingWorkKind.TECH_LEAD, tech_lead),
         remove=lambda: pending_queues.remove_tech_lead(tech_lead.issue_number),
         restore_existing=lambda: _restore_existing_terminal(
             request=_ExistingTerminalRestorationRequest(
