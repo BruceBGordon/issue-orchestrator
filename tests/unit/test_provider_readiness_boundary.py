@@ -2844,7 +2844,7 @@ def test_a_provider_deferral_touches_neither_restoration_nor_the_retry_budget() 
     future edit that reorders the branch cannot spend the only queued
     failure-investigation record's budget (#6999 F12).
     """
-    from issue_orchestrator.control import session_routing
+    from issue_orchestrator.control.in_flight_work import LaunchSettlement
     from issue_orchestrator.control.session_launch_types import (
         LaunchDisposition,
         LaunchResult,
@@ -2857,7 +2857,8 @@ def test_a_provider_deferral_touches_neither_restoration_nor_the_retry_budget() 
         calls.append("restore_existing")
         return None
 
-    owner = session_routing._PendingQueueOwner(  # noqa: SLF001 - owner contract
+    owner = LaunchSettlement(
+        claim=_claim("tech_lead", _pending_state("tech_lead")),
         remove=lambda: calls.append("remove"),
         restore_existing=_spy_restore_existing,
         retain_for_input_retry=lambda: calls.append("retain_for_input_retry"),
@@ -2910,7 +2911,7 @@ def test_an_unhandled_launch_disposition_never_silently_drops_the_work() -> None
     land in it silently — which is how the provider refusal deleted work in the
     first place (#6999 A1).
     """
-    from issue_orchestrator.control import session_routing
+    from issue_orchestrator.control.in_flight_work import LaunchSettlement
     from issue_orchestrator.control.session_launch_types import (
         LaunchDisposition,
         LaunchResult,
@@ -2918,8 +2919,9 @@ def test_an_unhandled_launch_disposition_never_silently_drops_the_work() -> None
     from issue_orchestrator.domain.models import OrchestratorState
 
     removed: list[str] = []
-    owner = session_routing._PendingQueueOwner(  # noqa: SLF001 - owner contract
-        remove=lambda: removed.append("removed")
+    owner = LaunchSettlement(
+        claim=_claim("review", _pending_state("review")),
+        remove=lambda: removed.append("removed"),
     )
     result = LaunchResult(session=None, success=False, reason="new kind of failure")
     object.__setattr__(result, "disposition", "not-a-disposition")
@@ -2928,3 +2930,516 @@ def test_an_unhandled_launch_disposition_never_silently_drops_the_work() -> None
         owner.settle(result, OrchestratorState())
 
     assert removed == []
+
+
+# ---------------------------------------------------------------------------
+# A live auth termination returns the work it consumed at launch (#6999 F2/A1)
+# ---------------------------------------------------------------------------
+
+
+def _pending_items(state, queue: str) -> list:
+    return {
+        "review": state.pending_reviews,
+        "retrospective_review": state.pending_retrospective_reviews,
+        "rework": state.pending_reworks,
+        "validation_retry": state.pending_validation_retries,
+        "tech_lead": state.pending_tech_lead_reviews,
+    }[queue]
+
+
+def _claim(queue: str, state):
+    """The typed claim a launch off ``queue`` would take from ``state``."""
+    from issue_orchestrator.domain.pending_work import PendingWorkClaim, PendingWorkKind
+
+    return PendingWorkClaim(PendingWorkKind(queue), _pending_items(state, queue)[0])
+
+
+def _ready_harness(tmp_path: Path):
+    """The same production launcher, with a provider that is authenticated."""
+    return _RefusingLauncherHarness(
+        tmp_path, ProviderReadiness.ready(PROVIDER), threshold=1
+    )
+
+
+def _terminate_on_provider(state, terminal_id: str, error_type, *, drop_active=True):
+    """Settle a running session the way terminal completion does.
+
+    ``drop_active`` mirrors ``handle_session_completion``, which drops the
+    session from ``active_sessions`` before settling. One test flips it off to
+    prove the restore does not silently depend on that order.
+    """
+    from issue_orchestrator.control.in_flight_work import (
+        InFlightWorkLedger,
+        SettlementOutcome,
+    )
+
+    if drop_active:
+        state.active_sessions = [
+            s for s in state.active_sessions if s.terminal_id != terminal_id
+        ]
+    return InFlightWorkLedger(state).settle(
+        terminal_id, SettlementOutcome.for_provider_error(error_type)
+    )
+
+
+@pytest.mark.parametrize("queue", _PENDING_QUEUES)
+class TestALiveAuthTerminationReturnsTheWorkItConsumed:
+    """Launching spends the request; only finishing the WORK should.
+
+    The provider refusal path (above) never removed the queue item because the
+    session never started. This is the other half: the session DID start, ran
+    on a credential that then expired, and ended BLOCKED. Nothing in that path
+    held the request, so queue-only work — a failure investigation's typed
+    DiscoveredFailure, a validation retry's prompt/error/count, a rework whose
+    needs-rework trigger was stripped at launch — was lost outright (#6999 F2).
+    """
+
+    def test_the_launch_hands_the_claim_to_the_in_flight_owner(
+        self, queue, tmp_path: Path
+    ) -> None:
+        """Dequeued is not the same as spent: someone still holds it."""
+        from issue_orchestrator.control.in_flight_work import InFlightWorkLedger
+
+        harness = _ready_harness(tmp_path)
+        state = _pending_state(queue)
+        original = _pending_items(state, queue)[0]
+
+        session = _route(queue, state, harness)
+
+        assert session is not None
+        assert _pending_count(state, queue) == 0  # off the queue...
+        held = InFlightWorkLedger(state).holds(session.terminal_id)
+        assert held is not None  # ...but not gone
+        assert held.request is original
+
+    def test_a_confirmed_auth_failure_returns_the_original_request(
+        self, queue, tmp_path: Path
+    ) -> None:
+        """The SAME object, not a reconstruction.
+
+        Identity is the assertion that matters: a rebuilt stand-in would lose
+        the typed context that exists nowhere else once the item left its queue.
+        """
+        harness = _ready_harness(tmp_path)
+        state = _pending_state(queue)
+        original = _pending_items(state, queue)[0]
+        session = _route(queue, state, harness)
+        assert session is not None
+
+        # Still listed as active on purpose: whether completion has dropped the
+        # session yet is an ordering detail, and the work must come back either
+        # way.
+        _terminate_on_provider(
+            state, session.terminal_id, ProviderErrorType.AUTH, drop_active=False
+        )
+
+        assert _pending_count(state, queue) == 1
+        assert _pending_items(state, queue)[0] is original
+
+    def test_the_recovered_provider_relaunches_the_same_work(
+        self, queue, tmp_path: Path
+    ) -> None:
+        """The whole point: after a human re-authenticates, the work still runs."""
+        harness = _ready_harness(tmp_path)
+        state = _pending_state(queue)
+        first = _route(queue, state, harness)
+        assert first is not None
+        harness.probe.readiness = ProviderReadiness.auth_expired(
+            PROVIDER, "not logged in"
+        )
+        _terminate_on_provider(state, first.terminal_id, ProviderErrorType.AUTH)
+
+        harness.probe.readiness = ProviderReadiness.ready(PROVIDER)
+        second = _route(queue, state, harness)
+
+        assert second is not None
+        assert len(harness.created) == 2  # a real second spawn
+        assert _pending_count(state, queue) == 0
+
+    def test_a_terminal_work_outcome_still_consumes_the_request(
+        self, queue, tmp_path: Path
+    ) -> None:
+        """The retention rule is scoped to provider verdicts, nothing wider.
+
+        An agent that reported BLOCKED on the substance of the work has spent
+        its request exactly as it always did; re-queueing that would relaunch
+        the same doomed session forever.
+        """
+        harness = _ready_harness(tmp_path)
+        state = _pending_state(queue)
+        session = _route(queue, state, harness)
+        assert session is not None
+
+        _terminate_on_provider(state, session.terminal_id, None)
+
+        assert _pending_count(state, queue) == 0
+
+    def test_a_returned_request_is_not_double_queued(
+        self, queue, tmp_path: Path
+    ) -> None:
+        """Discovery may have re-queued the work while the session was dying.
+
+        Each queue applies its own duplicate rule on the way back in, so a
+        restore can add at most one item.
+        """
+        harness = _ready_harness(tmp_path)
+        state = _pending_state(queue)
+        original = _pending_items(state, queue)[0]
+        session = _route(queue, state, harness)
+        assert session is not None
+        _pending_items(state, queue).append(original)  # rediscovered meanwhile
+
+        _terminate_on_provider(state, session.terminal_id, ProviderErrorType.AUTH)
+
+        assert _pending_count(state, queue) == 1
+
+
+def test_a_returned_failure_investigation_keeps_its_typed_trigger(
+    tmp_path: Path,
+) -> None:
+    """The context F2 said was lost, asserted as context rather than as a count.
+
+    The queued item is the only carrier of the typed DiscoveredFailure once the
+    per-tick buffer is cleared, so a restore that produced a bare
+    PendingTechLeadReview would leave the investigation with nothing to
+    investigate.
+    """
+    from issue_orchestrator.domain.tech_lead_session import TechLeadSessionFlavor
+
+    harness = _ready_harness(tmp_path)
+    state = _pending_state("tech_lead")
+    session = _route("tech_lead", state, harness)
+    assert session is not None
+
+    _terminate_on_provider(state, session.terminal_id, ProviderErrorType.AUTH)
+
+    returned = state.pending_tech_lead_reviews[0]
+    assert returned.flavor is TechLeadSessionFlavor.FAILURE_INVESTIGATION
+    assert returned.failure is not None
+    assert returned.failure.issue_number == 7
+    assert returned.failure.blocking_label == "blocked-failed"
+    # And the launch that died on the provider cost it nothing.
+    assert returned.retryable_launch_failures == 0
+
+
+def test_a_returned_validation_retry_keeps_its_attempt_budget(
+    tmp_path: Path,
+) -> None:
+    """A credential outage must not count as a validation attempt."""
+    harness = _ready_harness(tmp_path)
+    state = _pending_state("validation_retry")
+    session = _route("validation_retry", state, harness)
+    assert session is not None
+
+    _terminate_on_provider(state, session.terminal_id, ProviderErrorType.AUTH)
+
+    returned = state.pending_validation_retries[0]
+    assert returned.retry_count == 1  # unchanged by the outage
+    assert returned.validation_error == "boom"
+    assert returned.original_prompt is None
+
+
+def test_a_transient_provider_outage_also_returns_the_work(tmp_path: Path) -> None:
+    """AUTH is not the only verdict that means "the work was never attempted"."""
+    harness = _ready_harness(tmp_path)
+    state = _pending_state("tech_lead")
+    session = _route("tech_lead", state, harness)
+    assert session is not None
+
+    _terminate_on_provider(state, session.terminal_id, ProviderErrorType.TRANSIENT)
+
+    assert len(state.pending_tech_lead_reviews) == 1
+
+
+def test_an_issue_session_holds_no_claim_to_return() -> None:
+    """Issue work is claimed by label, not by dequeuing; settling is a no-op."""
+    from issue_orchestrator.control.in_flight_work import (
+        InFlightWorkLedger,
+        SettlementOutcome,
+    )
+    from issue_orchestrator.domain.models import OrchestratorState
+
+    state = OrchestratorState()
+
+    settled = InFlightWorkLedger(state).settle(
+        "issue-123", SettlementOutcome.PROVIDER_DEFERRED
+    )
+
+    assert settled is None
+    assert state.pending_reviews == []
+    assert state.pending_tech_lead_reviews == []
+
+
+def test_an_unhandled_pending_work_kind_never_silently_drops_the_work() -> None:
+    """The mirror of the launch-disposition guard, on the admission side.
+
+    A queue kind added without a decision in ``restore_deferred`` would
+    otherwise return None-ish and silently discard the only record of its work.
+    """
+    from issue_orchestrator.control.session_routing import PendingSessionQueues
+    from issue_orchestrator.domain.models import OrchestratorState
+    from issue_orchestrator.domain.pending_work import PendingWorkClaim
+
+    state = _pending_state("review")
+    claim = _claim("review", state)
+    object.__setattr__(claim, "kind", "not-a-kind")
+
+    with pytest.raises(ValueError, match="unhandled pending work kind"):
+        PendingSessionQueues(OrchestratorState()).restore_deferred(claim)
+
+    assert isinstance(claim, PendingWorkClaim)
+
+
+# ---------------------------------------------------------------------------
+# Terminal completion is the seam that invokes the owner
+# ---------------------------------------------------------------------------
+
+
+def _complete_session(session, state, *, provider_error_type):
+    """Drive the production completion entrypoint for one session."""
+    from unittest.mock import MagicMock
+
+    from issue_orchestrator.control.session_completion import handle_session_completion
+    from issue_orchestrator.domain.models import SessionStatus
+    from issue_orchestrator.ports.session_output import SessionOutput
+
+    config = MagicMock()
+    config.code_review_agent = "agent:reviewer"
+    config.cleanup.without_tech_lead.close_ai_session_tabs = False
+    completion_handler = MagicMock()
+    completion_handler.process_completion.return_value = MagicMock(
+        actions=[],
+        history_entry=None,
+        should_defer_cleanup=False,
+        pending_cleanup=None,
+        should_queue_review=False,
+        pr_url=None,
+        pr_number=None,
+    )
+
+    handle_session_completion(
+        session=session,
+        status=SessionStatus.BLOCKED,
+        state=state,
+        completion_handler=completion_handler,
+        action_applier=MagicMock(),
+        observer=MagicMock(),
+        worktree_manager=None,
+        kill_session_fn=lambda name: None,
+        config=config,
+        session_output=MagicMock(spec=SessionOutput),
+        provider_error_type=provider_error_type,
+    )
+
+
+def test_completion_control_returns_the_work_on_a_provider_block(
+    tmp_path: Path,
+) -> None:
+    """The other half of F2: the ledger is useless if nothing settles it.
+
+    Asserted through ``handle_session_completion`` rather than the ledger, so a
+    completion path that stopped calling the owner would fail here even while
+    every owner-level test above stayed green.
+    """
+    harness = _ready_harness(tmp_path)
+    state = _pending_state("tech_lead")
+    session = _route("tech_lead", state, harness)
+    assert session is not None
+    assert state.pending_tech_lead_reviews == []
+
+    _complete_session(session, state, provider_error_type=ProviderErrorType.AUTH)
+
+    assert len(state.pending_tech_lead_reviews) == 1
+    assert state.pending_tech_lead_reviews[0].failure is not None
+
+
+def test_completion_control_consumes_the_work_on_an_ordinary_block(
+    tmp_path: Path,
+) -> None:
+    """An agent-reported block is still a spent request."""
+    harness = _ready_harness(tmp_path)
+    state = _pending_state("tech_lead")
+    session = _route("tech_lead", state, harness)
+    assert session is not None
+
+    _complete_session(session, state, provider_error_type=None)
+
+    assert state.pending_tech_lead_reviews == []
+
+
+# ---------------------------------------------------------------------------
+# An auth banner written after the head of the log (#6999 F3)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _BannerConfirmingProbe:
+    """A probe shaped like the real one: signature first, then confirmation.
+
+    ``StubReadinessProbe`` answers the same way whatever it is handed, which
+    cannot show whether the banner actually REACHED the probe. This one runs the
+    real classification table over the output it was given, so a scan window
+    that never included the banner — or that mangled it — fails the test.
+    """
+
+    confirms: bool = True
+    seen: list[str] = field(default_factory=list)
+
+    def check_launch_readiness(self, provider: str) -> ProviderReadiness:
+        return ProviderReadiness.ready(provider)
+
+    def diagnose_session_output(self, provider: str, output: str) -> ProviderReadiness:
+        self.seen.append(output)
+        matched = classify_provider_output(output) is ProviderErrorType.AUTH
+        if not matched or not self.confirms:
+            return ProviderReadiness.unknown(provider, "no confirmed auth failure")
+        return ProviderReadiness.auth_expired(provider, "not logged in")
+
+
+class TestAnAuthBannerPastTheHeadOfTheLog:
+    """A credential can expire long after the session started working.
+
+    The observer used to read only the first 8 KiB of the terminal log. Once
+    ordinary output passed that mark, a banner appended later could never reach
+    the probe, and the session fell through to the generic timeout path — the
+    90-minute burn this issue exists to remove (#6999 F3).
+    """
+
+    def _observer(self, config, probe):
+        from issue_orchestrator.observation.observer import SessionObserver
+
+        class _AlwaysRunning:
+            def session_exists_by_name(self, name: str) -> bool:
+                return True
+
+            def send_to_session_by_name(self, name: str, text: str) -> bool:
+                return True
+
+            def get_session_output(self, issue_number, lines=100, session_name=None):
+                return ""
+
+        return SessionObserver(
+            config=config,
+            session_output=FileSystemSessionOutput(),
+            events=RecordingEvents(),
+            session_runner=_AlwaysRunning(),
+            provider_readiness_probe=probe,
+        )
+
+    def _session_with_lines(self, make_session, lines: list[str]):
+        from issue_orchestrator.infra.config import AgentConfig
+        from issue_orchestrator.infra.terminal_recording import (
+            TERMINAL_RECORDING_FILENAME,
+        )
+
+        session = make_session()
+        session.agent_config = AgentConfig(
+            prompt_path=session.agent_config.prompt_path, provider="claude-code"
+        )
+        recording = session.run_assets.run_dir / TERMINAL_RECORDING_FILENAME
+        recording.parent.mkdir(parents=True, exist_ok=True)
+        recording.write_text(
+            "".join(
+                json.dumps({"kind": "output", "data": line}) + "\n" for line in lines
+            ),
+            encoding="utf-8",
+        )
+        return session
+
+    @staticmethod
+    def _ordinary_output(total_bytes: int) -> list[str]:
+        """Believable agent chatter, comfortably past the head window."""
+        chunk = "reading src/issue_orchestrator/control/planner.py ... ok"
+        return [chunk] * (total_bytes // len(chunk) + 1)
+
+    def test_a_banner_after_8kib_of_output_still_fails_the_session(
+        self, sample_config, make_session
+    ) -> None:
+        probe = _BannerConfirmingProbe()
+        observer = self._observer(sample_config, probe)
+        session = self._session_with_lines(
+            make_session,
+            self._ordinary_output(64 * 1024) + [EXPIRED_LOGIN_BANNER],
+        )
+
+        result = observer.observe_session(session)
+
+        assert result.observation is SessionObservation.PROVIDER_AUTH_FAILED
+        assert result.provider_readiness is not None
+        assert result.provider_readiness.human_fixable
+
+    def test_a_banner_after_8kib_of_output_outranks_timeout(
+        self, sample_config, make_session
+    ) -> None:
+        """The exact misdirection F3 described: TIMED_OUT mints an investigation."""
+        probe = _BannerConfirmingProbe()
+        observer = self._observer(sample_config, probe)
+        session = self._session_with_lines(
+            make_session,
+            self._ordinary_output(64 * 1024) + [EXPIRED_LOGIN_BANNER],
+        )
+        session.started_at = datetime.now() - timedelta(
+            minutes=sample_config.session_timeout_minutes + 30
+        )
+
+        result = observer.observe_session(session)
+
+        assert result.observation is SessionObservation.PROVIDER_AUTH_FAILED
+
+    def test_the_launch_time_banner_is_still_read_from_the_head(
+        self, sample_config, make_session
+    ) -> None:
+        """Widening the window must not cost the case that already worked."""
+        probe = _BannerConfirmingProbe()
+        observer = self._observer(sample_config, probe)
+        session = self._session_with_lines(
+            make_session,
+            [EXPIRED_LOGIN_BANNER] + self._ordinary_output(64 * 1024),
+        )
+
+        result = observer.observe_session(session)
+
+        assert result.observation is SessionObservation.PROVIDER_AUTH_FAILED
+
+    def test_the_scan_window_stays_bounded(
+        self, sample_config, make_session
+    ) -> None:
+        """Bounded at both ends, not "read the whole log".
+
+        An unbounded read is O(session length) on every observation of every
+        session, every tick. Two 8 KiB edges plus a separator is the ceiling.
+        """
+        from issue_orchestrator.observation.observer import (
+            PROVIDER_AUTH_CHECK_MAX_BYTES,
+        )
+
+        probe = _BannerConfirmingProbe()
+        observer = self._observer(sample_config, probe)
+        session = self._session_with_lines(
+            make_session,
+            self._ordinary_output(512 * 1024) + [EXPIRED_LOGIN_BANNER],
+        )
+
+        observer.observe_session(session)
+
+        assert probe.seen
+        assert len(probe.seen[0].encode("utf-8")) <= 2 * PROVIDER_AUTH_CHECK_MAX_BYTES + 1
+
+    def test_an_unconfirmed_late_banner_leaves_the_session_running(
+        self, sample_config, make_session
+    ) -> None:
+        """The false-positive guard is unchanged by the wider window.
+
+        The tail is where an agent echoing a provider's auth banner while
+        working shows up, so probe confirmation matters more here, not less.
+        """
+        probe = _BannerConfirmingProbe(confirms=False)
+        observer = self._observer(sample_config, probe)
+        session = self._session_with_lines(
+            make_session,
+            self._ordinary_output(64 * 1024) + [EXPIRED_LOGIN_BANNER],
+        )
+
+        result = observer.observe_session(session)
+
+        assert result.observation is SessionObservation.RUNNING

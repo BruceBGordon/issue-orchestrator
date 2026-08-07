@@ -251,8 +251,15 @@ class PendingSessionQueues:
             return True
         if claim.kind is PendingWorkKind.RETROSPECTIVE_REVIEW:
             assert isinstance(request, PendingRetrospectiveReview)
-            if self.state.has_pending_or_active_retrospective_review(
-                request.issue_number
+            # Deliberately the QUEUE only, not the wider
+            # ``has_pending_or_active_retrospective_review``: the session being
+            # settled is this request's own, and whether it has already been
+            # dropped from ``active_sessions`` is an ordering detail of the
+            # completion path. Reading it here would silently discard the work
+            # if that order ever changed.
+            if any(
+                r.issue_number == request.issue_number
+                for r in self.state.pending_retrospective_reviews
             ):
                 return False
             self.state.pending_retrospective_reviews.append(request)
