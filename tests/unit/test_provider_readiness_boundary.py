@@ -2772,3 +2772,31 @@ def test_the_launch_gate_reports_a_provider_deferral(tmp_path: Path) -> None:
     assert not result.success
     assert result.disposition is LaunchDisposition.PROVIDER_DEFERRED
     assert result.defers_to_provider
+
+
+def test_an_unhandled_launch_disposition_never_silently_drops_the_work() -> None:
+    """The destructive branch must be reached deliberately, never by default.
+
+    Dropping the pending item is the one irreversible thing the queue owner
+    does. A disposition added later without a decision here would otherwise
+    land in it silently — which is how the provider refusal deleted work in the
+    first place (#6999 A1).
+    """
+    from issue_orchestrator.control import session_routing
+    from issue_orchestrator.control.session_launch_types import (
+        LaunchDisposition,
+        LaunchResult,
+    )
+    from issue_orchestrator.domain.models import OrchestratorState
+
+    removed: list[str] = []
+    owner = session_routing._PendingQueueOwner(  # noqa: SLF001 - owner contract
+        remove=lambda: removed.append("removed")
+    )
+    result = LaunchResult(session=None, success=False, reason="new kind of failure")
+    object.__setattr__(result, "disposition", "not-a-disposition")
+
+    with pytest.raises(ValueError, match="unhandled launch disposition"):
+        owner.settle(result, OrchestratorState())
+
+    assert removed == []

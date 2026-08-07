@@ -289,9 +289,14 @@ class _PendingQueueOwner:
         if result.disposition is LaunchDisposition.INPUT_RETRY:
             self.retain_for_input_retry()
             return None
-        if self.drop_on_permanent_failure:
-            self.remove()
-        return None
+        if result.disposition is LaunchDisposition.PERMANENT_FAILURE:
+            if self.drop_on_permanent_failure:
+                self.remove()
+            return None
+        # Named explicitly rather than left as a fall-through: dropping the
+        # work is the destructive branch, and a disposition added later without
+        # a decision here must not silently land in it (#6999 A1).
+        raise ValueError(f"unhandled launch disposition: {result.disposition}")
 
 def orchestrator_launch_review_session(
     review: PendingReview,
