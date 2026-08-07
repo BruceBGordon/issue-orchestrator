@@ -888,6 +888,10 @@ class Config:
             circuit_dict["max_cooldowns"] = circuit.max_cooldowns
         if circuit.label != "blocked:provider-unavailable":
             circuit_dict["label"] = circuit.label
+        if circuit.auth_failure_threshold != 1:
+            circuit_dict["auth_failure_threshold"] = circuit.auth_failure_threshold
+        if circuit.auth_cooldown_seconds != 21600:
+            circuit_dict["auth_cooldown_seconds"] = circuit.auth_cooldown_seconds
         if circuit_dict:
             provider_dict["circuit_breaker"] = circuit_dict
 

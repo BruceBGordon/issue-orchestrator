@@ -11,6 +11,11 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+from ..ports.provider_readiness import (
+    NO_PROVIDER_READINESS_PROBE,
+    ProviderReadinessProbe,
+)
+
 if TYPE_CHECKING:
     from ..ports.label_store import LabelStore
     from ..ports.queue_cache_store import QueueCacheStore
@@ -57,6 +62,10 @@ class InfraServices:
     tech_lead_authority: "TechLeadAuthorityStore"
     # Rebuildable GitHub open-issue corpus owner (#6881).
     open_issue_corpus: "OpenIssueCorpusManager"
+    # The typed provider-readiness/auth-failure boundary (#6999). Shared by the
+    # launch gate and the live-session observer so both consume one probe (and
+    # one short-lived result cache) rather than each spawning their own.
+    provider_readiness_probe: ProviderReadinessProbe = NO_PROVIDER_READINESS_PROBE
     # Cross-repo filing seam for the finding-promotion lane (#6957). None when
     # the repository host is not a real GitHub adapter (offline/testing).
     promotion_target: "PromotionTargetHost | None" = None

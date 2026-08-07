@@ -75,6 +75,7 @@ from ..ports.verification import VerificationBudget
 from ..execution.worktree_adapter import GitWorktreeManager
 from ..execution.git_working_copy import GitWorkingCopy
 from ..execution.command_runner import LocalCommandRunner
+from ..execution.provider_readiness_probe import CLIProviderReadinessProbe
 from ..execution.session_output_adapter import FileSystemSessionOutput
 from ..execution.review_artifact_reader import ManifestReviewArtifactReader
 from ..execution.thread_background_job_runner import ThreadBackgroundJobRunner
@@ -801,11 +802,16 @@ def build_orchestrator(
         action_applier.label_store = label_store
         action_applier.publish_recovery = publish_recovery
 
+    # One typed provider-readiness boundary per orchestrator, shared by the
+    # launch gate and the live-session observer so both read one probe (and one
+    # short-lived result cache) rather than each spawning their own (#6999).
+    provider_readiness_probe = CLIProviderReadinessProbe(command_runner)
     infra_services = InfraServices(
         label_manager=label_manager,
         label_store=label_store,
         queue_cache_store=queue_cache_store,
         provider_resilience=provider_resilience,
+        provider_readiness_probe=provider_readiness_probe,
         timeline_reader=timeline_reader,
         timeline_store=timeline_store,
         timeline_writer=timeline_writer,
@@ -841,6 +847,7 @@ def build_orchestrator(
         state_machine_manager=state_machine_manager,
         label_manager=label_manager,
         agent_callback_endpoint=agent_callback_endpoint,
+        provider_readiness_probe=provider_readiness_probe,
     )
     deps = OrchestratorDeps(
         events=events,
@@ -1182,11 +1189,16 @@ def build_orchestrator_for_testing(
         action_applier.label_store = label_store
         action_applier.publish_recovery = publish_recovery
 
+    # One typed provider-readiness boundary per orchestrator, shared by the
+    # launch gate and the live-session observer so both read one probe (and one
+    # short-lived result cache) rather than each spawning their own (#6999).
+    provider_readiness_probe = CLIProviderReadinessProbe(command_runner)
     infra_services = InfraServices(
         label_manager=label_manager,
         label_store=label_store,
         queue_cache_store=queue_cache_store,
         provider_resilience=provider_resilience,
+        provider_readiness_probe=provider_readiness_probe,
         timeline_reader=timeline_reader,
         timeline_store=timeline_store,
         timeline_writer=timeline_writer,
@@ -1220,6 +1232,7 @@ def build_orchestrator_for_testing(
         state_machine_manager=state_machine_manager,
         label_manager=label_manager,
         agent_callback_endpoint=agent_callback_endpoint,
+        provider_readiness_probe=provider_readiness_probe,
     )
     deps = OrchestratorDeps(
         events=events,

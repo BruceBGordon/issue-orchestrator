@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING, Callable, Iterable, Mapping
 
 from ..domain.dependency_gates import Gate, GateBlockReason
 from ..domain.models import DiscoveredFailure, Session, SessionStatus
+from ..ports.provider_resilience import ProviderErrorType
 from .dependency_gate_snapshot import build_successor_index
 from .tech_lead_session_policy import is_tech_lead_session
 
@@ -163,6 +164,7 @@ def record_completed_session_problem(
     artifact_hints: Callable[[], tuple[str, ...]],
     record: Callable[[DiscoveredFailure], None],
     clock: Callable[[], float] = time.time,
+    provider_error_type: ProviderErrorType | None = None,
 ) -> None:
     """Record one reactive worker-session fact at the state owner boundary.
 
@@ -175,7 +177,15 @@ def record_completed_session_problem(
     agents reporting ``coding-done blocked`` are a reaction trigger this model
     exists to serve. Tech Lead's own sessions are excluded below — that check, not
     task kind, is what prevents tech_lead self-recursion.
+
+    A typed AUTH verdict is excluded: an unauthenticated provider says nothing
+    about the issue, and on 2026-08-04 one expired login minted four failure
+    investigations that each spent their budget reading the wrong code. Only a
+    human re-authenticating clears it, and the circuit owner has already paused
+    the fleet — an investigation adds load, not information (#6999).
     """
+    if provider_error_type is ProviderErrorType.AUTH:
+        return
     if status not in _REACTIVE_SESSION_STATUSES:
         return
     if is_tech_lead_session(tech_lead_agent, session.issue.agent_type):

@@ -114,6 +114,7 @@ class ProviderResilienceManager:
             consecutive_outages=consecutive,
             last_error_summary=error_summary,
             updated_at=now,
+            consecutive_auth_failures=state.consecutive_auth_failures if state else 0,
         )
         self.store.save(new_state)
 
@@ -149,6 +150,80 @@ class ProviderResilienceManager:
 
         return new_state
 
+    def record_auth_failure(
+        self,
+        provider: str | None,
+        *,
+        error_summary: str,
+        now: datetime | None = None,
+    ) -> ProviderCircuitState | None:
+        """Record one typed AUTH outcome for ``provider``.
+
+        The only way an auth failure reaches circuit state. Callers hand over a
+        typed outcome (from the provider-readiness boundary) and this owner
+        decides everything else: how many consecutive failures are tolerated,
+        how long the circuit stays open, and which events describe it. No
+        launcher or watcher computes circuit state (#6999).
+
+        An expired credential is human-fixable, so the auth cooldown is its own
+        (long) window rather than the transient escalation ladder: retrying on
+        the transient schedule is exactly how one expired login burned four
+        90-minute sessions. Recovery is not gated on that window elapsing —
+        :meth:`record_success` clears the circuit the moment a launch works.
+
+        Returns the stored state, or ``None`` when there is no provider to
+        record against.
+        """
+        if not provider:
+            return None
+
+        now = now or _now()
+        state = self.store.get(provider)
+        consecutive_auth = (state.consecutive_auth_failures + 1) if state else 1
+        threshold = max(1, self.config.circuit_breaker.auth_failure_threshold)
+        trips = consecutive_auth >= threshold
+
+        was_open = state is not None and state.open_until is not None and state.open_until > now
+        open_until = (
+            now + timedelta(seconds=self.config.circuit_breaker.auth_cooldown_seconds)
+            if trips
+            else (state.open_until if state else None)
+        )
+
+        new_state = ProviderCircuitState(
+            provider=provider,
+            open_until=open_until,
+            consecutive_outages=state.consecutive_outages if state else 0,
+            last_error_summary=error_summary,
+            updated_at=now,
+            consecutive_auth_failures=consecutive_auth,
+        )
+        self.store.save(new_state)
+
+        self.events.publish(make_trace_event(
+            EventName.PROVIDER_AUTH_FAILED,
+            {
+                "provider": provider,
+                "consecutive_auth_failures": consecutive_auth,
+                "threshold": threshold,
+                "circuit_open": trips,
+                "error_summary": error_summary,
+            },
+        ))
+
+        if trips and not was_open and open_until is not None:
+            self.events.publish(make_trace_event(
+                EventName.PROVIDER_OUTAGE_ENTERED,
+                {
+                    "provider": provider,
+                    "open_until": open_until.isoformat(),
+                    "consecutive_outages": new_state.consecutive_outages,
+                    "error_summary": error_summary,
+                },
+            ))
+
+        return new_state
+
     def record_success(self, provider: str | None, now: datetime | None = None) -> None:
         if not provider:
             return
@@ -177,6 +252,7 @@ class ProviderResilienceManager:
                 consecutive_outages=state.consecutive_outages,
                 last_error_summary=state.last_error_summary,
                 updated_at=now,
+                consecutive_auth_failures=state.consecutive_auth_failures,
             )
             self.store.save(updated)
             closed.append(updated)

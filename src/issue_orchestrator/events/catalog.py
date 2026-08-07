@@ -96,6 +96,12 @@ class EventName(str, Enum):
     SESSION_INVALID_COMPLETION_RECORD = "session.invalid_completion_record"
     SESSION_TIMEOUT_RECOVERED = "session.timeout_recovered"
     SESSION_PROCESSING_COMPLETED = "session.processing_completed"
+    # The distinct, deliberately non-timeout outcome for a session that could
+    # never work because the provider is not authenticated — either parked
+    # before launch or failed within minutes of showing its login banner.
+    # Keeping it out of SESSION_TIMEOUT is the point: a timeout mints a
+    # substance failure-investigation, and a credential problem has none.
+    SESSION_LAUNCH_FAILED_AUTH = "session.launch_failed_auth"
     SESSION_START_FAILED = "session.start_failed"
     SESSION_STOPPED = "session.stopped"
     SESSION_CLEANUP = "session.cleanup"
@@ -221,6 +227,10 @@ class EventName(str, Enum):
     # observability, but they can never reach an issue timeline (the timeline
     # writer is keyed by ``issue_number``).
     PROVIDER_TRANSIENT_ERROR = "provider.transient_error"
+    # A typed AUTH outcome reached the circuit owner: the provider's own
+    # credential probe says it is not logged in. Fleet-scoped like its
+    # neighbours; the issue-scoped consequence is SESSION_LAUNCH_FAILED_AUTH.
+    PROVIDER_AUTH_FAILED = "provider.auth_failed"
     PROVIDER_OUTAGE_ENTERED = "provider.outage_entered"
     PROVIDER_RETRY_SCHEDULED = "provider.retry_scheduled"
     PROVIDER_RETRY_ATTEMPTED = "provider.retry_attempted"
@@ -388,6 +398,7 @@ class PublicEventName(str, Enum):
     SESSION_FAILED = "session.failed"
     SESSION_TIMEOUT = "session.timeout"
     SESSION_BLOCKED = "session.blocked"
+    SESSION_LAUNCH_FAILED_AUTH = "session.launch_failed_auth"
     SESSION_NO_COMPLETION_RECORD = "session.no_completion_record"
     SESSION_INVALID_COMPLETION_RECORD = "session.invalid_completion_record"
     SESSION_PROCESSING_COMPLETED = "session.processing_completed"

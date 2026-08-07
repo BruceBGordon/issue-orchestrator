@@ -1456,6 +1456,7 @@ class TestLaunchSessionDependencyCAS:
                 state_machine_manager=orch.deps.state_machine_manager,
                 label_manager=orch.deps.label_manager,
                 agent_callback_endpoint=ready_callback_endpoint(),
+                provider_readiness_probe=orch.deps.provider_readiness_probe,
             )
 
         # Original issue had no dependencies
@@ -1547,6 +1548,7 @@ class TestLaunchSessionDependencyCAS:
                 state_machine_manager=orch.deps.state_machine_manager,
                 label_manager=orch.deps.label_manager,
                 agent_callback_endpoint=ready_callback_endpoint(),
+                provider_readiness_probe=orch.deps.provider_readiness_probe,
             )
 
         issue = Issue(

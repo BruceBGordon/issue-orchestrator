@@ -22,6 +22,10 @@ class ProviderCircuitState:
     consecutive_outages: int
     last_error_summary: str | None
     updated_at: datetime
+    # Auth failures are counted separately from transient outages: a credential
+    # outage is human-fixable and must trip the circuit on its own threshold,
+    # not be diluted by unrelated network blips (#6999).
+    consecutive_auth_failures: int = 0
 
 
 @dataclass(frozen=True)

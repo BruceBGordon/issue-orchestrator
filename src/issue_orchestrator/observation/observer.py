@@ -29,10 +29,26 @@ from ..infra.logging_config import issue_log
 from ..events import EventName
 from ..domain.models import Session, SessionStatus
 from ..ports import EventSink, TraceEvent, NullEventSink
+from ..ports.provider_readiness import (
+    NO_PROVIDER_READINESS_PROBE,
+    ProviderReadinessProbe,
+)
 from ..ports.session_output import SessionOutput
 from .observation import SessionObservation, SessionObservationResult
 
 logger = logging.getLogger(__name__)
+
+# A provider login banner renders within seconds of launch (2740 ms and 522 ms
+# in the two recordings that motivated #6999), so an auth check outside the
+# first few minutes cannot be about *this* launch's credentials. The window is
+# a cost guard rather than a correctness guard — the diagnosis is confirmed by
+# the provider's own probe either way — so it lives here as a constant rather
+# than becoming another knob nobody tunes.
+PROVIDER_AUTH_CHECK_WINDOW_SECONDS = 300
+
+# Only the head of the log can hold a launch-time banner; reading more would
+# just feed the agent's own working output into the signature match.
+PROVIDER_AUTH_CHECK_MAX_BYTES = 8192
 
 
 class SessionObserver:
@@ -57,6 +73,7 @@ class SessionObserver:
         fresh_issue_reader: Optional["FreshIssueReader"] = None,
         terminal_observer: Optional["TerminalObserver"] = None,
         label_manager: "LabelManager | None" = None,
+        provider_readiness_probe: ProviderReadinessProbe = NO_PROVIDER_READINESS_PROBE,
     ) -> None:
         """Initialize the observer with configuration.
 
@@ -69,8 +86,12 @@ class SessionObserver:
             repository_host: RepositoryHost port for GitHub operations
             fresh_issue_reader: FreshIssueReader port for correctness-critical reads
             terminal_observer: Optional TerminalObserver for process state detection
+            provider_readiness_probe: Typed provider-readiness boundary (#6999).
+                Defaults to the explicit "nothing to probe" reader, which never
+                reports an auth failure.
         """
         self.config = config
+        self._provider_readiness_probe = provider_readiness_probe
         self.session_machines = session_machines or {}
         self.events = events or NullEventSink()
         self._session_runner = session_runner
@@ -448,6 +469,9 @@ class SessionObserver:
             )
 
         if process_alive:
+            auth_result = self._check_provider_auth(session, runtime)
+            if auth_result is not None:
+                return auth_result
             self._emit_no_output_if_stale(session)
             return SessionObservationResult.running(runtime_minutes=runtime)
 
@@ -462,6 +486,79 @@ class SessionObserver:
             self._capture_terminal_output_on_termination(session)
 
         return SessionObservationResult.terminated(runtime_minutes=runtime)
+
+    def _check_provider_auth(
+        self, session: Session, runtime: Optional[float]
+    ) -> SessionObservationResult | None:
+        """Observe whether this live session's provider is authenticated.
+
+        Fact-gathering only: the observer hands the session's early output to
+        the typed provider-readiness boundary and reports back whatever verdict
+        the *provider adapter* reached. It keeps no banner list of its own, and
+        the adapter confirms any signature against the provider's credential
+        probe — so an agent that merely echoes a provider's auth banner (this
+        orchestrator working on its own auth tooling does exactly that) cannot
+        kill its own session (#6999).
+        """
+        provider = session.agent_config.provider
+        if not provider:
+            return None
+        session_age = (datetime.now() - session.started_at).total_seconds()
+        if session_age > PROVIDER_AUTH_CHECK_WINDOW_SECONDS:
+            return None
+        log_path = (
+            self._session_output.get_log_path(session.worktree_path, session.terminal_id)
+            if self._session_output
+            else None
+        )
+        if not log_path or not log_path.exists():
+            return None
+        head = self._read_log_head(log_path, PROVIDER_AUTH_CHECK_MAX_BYTES)
+        if not head:
+            return None
+
+        readiness = self._provider_readiness_probe.diagnose_session_output(
+            provider, head
+        )
+        if not readiness.human_fixable:
+            return None
+
+        logger.error(
+            issue_log(
+                session.issue.number,
+                "PROVIDER_AUTH_FAILED: session=%s provider=%s detail=%s "
+                "age=%.0fs - failing instead of burning the timeout",
+            ),
+            session.terminal_id,
+            provider,
+            readiness.detail,
+            session_age,
+        )
+        self.events.publish(TraceEvent(
+            EventName.SESSION_LAUNCH_FAILED_AUTH,
+            {
+                "issue_number": session.issue.number,
+                "session_name": session.terminal_id,
+                "provider": provider,
+                "readiness": readiness.state.value,
+                "detail": readiness.detail,
+                "human_fixable": readiness.human_fixable,
+                "session_age_seconds": int(session_age),
+            },
+        ))
+        return SessionObservationResult.provider_auth_failed(
+            readiness, runtime_minutes=runtime, session_exists=True
+        )
+
+    @staticmethod
+    def _read_log_head(log_path, max_bytes: int) -> str:
+        """Read the first ``max_bytes`` of a session log, tolerating decode noise."""
+        try:
+            with open(log_path, "rb") as handle:
+                raw = handle.read(max_bytes)
+        except OSError:
+            return ""
+        return raw.decode("utf-8", errors="replace")
 
     def _emit_no_output_if_stale(self, session: Session) -> None:
         """Emit a session_no_output event if the session log is idle too long."""

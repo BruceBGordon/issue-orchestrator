@@ -287,6 +287,13 @@ provider_resilience:
     cooldown_seconds: 1800
     max_cooldowns: 6
     label: "blocked:provider-unavailable"
+    # Provider credentials (e.g. an expired `claude` login) are probed before
+    # every launch. One confirmed failure opens the circuit by default because
+    # the probe reads local CLI state and is deterministic.
+    auth_failure_threshold: 1
+    # Long on purpose: only a human can re-authenticate. The circuit still
+    # clears immediately once a launch succeeds again.
+    auth_cooldown_seconds: 21600
 
 ui:
   mode: "web"                   # web or cli

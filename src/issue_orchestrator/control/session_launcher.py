@@ -67,11 +67,16 @@ from ..ports import (
     WorkingCopy,
     CommandRunner,
 )
+from ..ports.provider_readiness import (
+    NO_PROVIDER_READINESS_PROBE,
+    ProviderReadinessProbe,
+)
 from ..ports.session_output import SessionOutput
 from ..ports.event_sink import SessionStartedEventPayload, make_session_started_event
 from ..ports.worktree_manager import WorktreeManager, WorktreeReuseOptions
 from ..ports.event_sink import make_run_scoped_event, make_trace_event
 from .provider_availability import ProviderAvailabilityPolicy
+from .provider_launch_gate import ProviderLaunchGate
 from .action_applier import ActionApplier
 from .actions import Action, AddLabelAction, RemoveLabelAction
 from .tech_lead_needs_human_reconcile import TechLeadNeedsHumanLifecycle, discover_tech_lead_needs_human_issue_numbers
@@ -213,6 +218,11 @@ class SessionLauncher:
         # produce one. Tests inject a null-object/fake provider, never None.
         board_snapshot_provider: "BoardSnapshotProvider",
         agent_callback_endpoint: "AgentCallbackEndpoint",
+        # The typed provider-readiness boundary (#6999). Defaults to the
+        # explicit "nothing to probe" reader so a composition path that has no
+        # provider adapter names that fact instead of silently claiming the
+        # provider is authenticated.
+        provider_readiness_probe: ProviderReadinessProbe = NO_PROVIDER_READINESS_PROBE,
     ):
         self.config = config
         self.events = events
@@ -236,7 +246,21 @@ class SessionLauncher:
         self._dependency_evaluator = dependency_evaluator
         self._claim_manager = claim_manager
         self._provider_resilience = provider_resilience
-        self._provider_policy = ProviderAvailabilityPolicy(config, provider_resilience) if provider_resilience else None
+        self._provider_gate = (
+            ProviderLaunchGate(
+                policy=ProviderAvailabilityPolicy(
+                    config,
+                    provider_resilience,
+                    readiness_probe=provider_readiness_probe,
+                ),
+                events=events,
+                apply_actions=lambda actions, context: self._apply_actions(
+                    actions, context=context
+                ),
+            )
+            if provider_resilience
+            else None
+        )
         self._provider_command_wrapper: ProviderCommandWrapper | None = None
         self._remove_session_machine = remove_session_machine
         self._send_to_session = send_to_session_fn
@@ -853,7 +877,7 @@ class SessionLauncher:
             return freshness.failure
 
         # Provider circuit breaker check
-        if result := self._check_provider_circuit(agent_config.provider, issue.number):
+        if result := self._check_provider_ready(agent_config.provider, issue.number):
             return result
 
         log_transition("issue", issue.number, "AVAILABLE", "LAUNCHING", "no conflicts")
@@ -1247,7 +1271,7 @@ class SessionLauncher:
         session_name = f"issue-{issue.number}"
         if result := self._check_launch_preconditions(issue, active_sessions, session_name):
             return result
-        if result := self._check_provider_circuit(agent_config.provider, issue.number):
+        if result := self._check_provider_ready(agent_config.provider, issue.number):
             return result
 
         retry_count = max(1, retry.retry_count)
@@ -1571,7 +1595,7 @@ class SessionLauncher:
         if not agent_config:
             return LaunchResult(None, False, f"No agent config for {agent_label}")
 
-        if result := self._check_provider_circuit(agent_config.provider, review.issue_number):
+        if result := self._check_provider_ready(agent_config.provider, review.issue_number):
             return result
 
         # Check for conflicts
@@ -1865,7 +1889,7 @@ class SessionLauncher:
         if not agent_config:
             return LaunchResult(None, False, f"No agent config for {agent_label}")
 
-        if result := self._check_provider_circuit(agent_config.provider, review.issue_number):
+        if result := self._check_provider_ready(agent_config.provider, review.issue_number):
             return result
 
         session_name = SessionRef.for_retrospective_review(review.issue_number).name
@@ -2126,7 +2150,7 @@ class SessionLauncher:
             persist_session_prompt=self._persist_session_prompt,
             wrap_provider_command=self._wrap_provider_command,
             build_session_env=self._build_session_env,
-            check_provider_circuit=self._check_provider_circuit,
+            check_provider_ready=self._check_provider_ready,
             resolve_stack_decision=self._stack_decision_for_issue_number,
         )
         return launch_rework_flow(rework, active_sessions, deps)
@@ -2219,20 +2243,11 @@ class SessionLauncher:
             )
         return self._provider_command_wrapper
 
-    def _check_provider_circuit(self, provider: str | None, issue_number: int) -> Optional["LaunchResult"]:
-        if not provider or not self._provider_policy:
+    def _check_provider_ready(self, provider: str | None, issue_number: int) -> Optional["LaunchResult"]:
+        """Ask the provider launch gate whether this provider can do work now."""
+        if self._provider_gate is None:
             return None
-        # One point-in-time assessment drives both the launch gate and the
-        # provider-impact command (blocked label + durable record), so the two
-        # can never describe different instants (#5980 F4/A2).
-        assessment = self._provider_policy.assess((provider,))
-        if not assessment.blocked:
-            return None
-        self._apply_actions(
-            [self._provider_policy.blocked_transition(issue_number, assessment)],
-            context="provider_unavailable",
-        )
-        return LaunchResult(None, False, f"Provider unavailable: {provider}")
+        return self._provider_gate.check(provider, issue_number)
 
     def _trigger_issue_session_state_transitions(
         self,

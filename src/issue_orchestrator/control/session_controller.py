@@ -19,7 +19,6 @@ Example flows:
 
 import json
 import logging
-import os
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from enum import Enum
@@ -66,9 +65,15 @@ from ..ports.run_evidence import (
 from ..ports.session_output import SessionOutput, ValidationRecord, ValidationState
 from .completion_types import REVIEW_EXCHANGE_ERROR_PREFIX
 from .completion_record_validation import CompletionRecordLoadResult
+from .absent_completion_record import (
+    collect_completion_debug_context,
+    log_completion_debug_context,
+    write_no_completion_diagnostic,
+)
 from .invalid_completion_record import report_invalid_completion_record
 from .review_exchange_contracts import ReviewExchangeCanceller
 from .session_decision import (
+    ProviderAuthOutcome,
     SessionDecision,
     provider_failure_from_status,
     provider_success_from_status,
@@ -77,7 +82,6 @@ from .session_run_resolution import resolve_run_assets
 from .validation import PublishGate
 
 logger = logging.getLogger(__name__)
-_AGENT_DONE_MARKER = ".agent-done-marker"
 
 
 class ValidationFailureKind(str, Enum):
@@ -229,6 +233,12 @@ class SessionController:
                 status=SessionStatus.RUNNING, reason="Session still running"
             )
 
+        # An unauthenticated provider is decided before anything else: there is
+        # no completion record to look for, no validation to run, and nothing
+        # about the issue to investigate (#6999).
+        if observation.observation == SessionObservation.PROVIDER_AUTH_FAILED:
+            return self._provider_auth_failed_decision(observation, issue_number, session_name)
+
         completion_session_name = self.session_output.session_name_from_path(
             completion_path
         )
@@ -373,6 +383,30 @@ class SessionController:
             completion_detail=completion_detail,
             provider_success=provider_success,
         )
+
+    def _provider_auth_failed_decision(
+        self,
+        observation: SessionObservationResult,
+        issue_number: int,
+        session_name: str,
+    ) -> SessionDecision:
+        """Terminate an auth-dead session on its own, non-timeout outcome."""
+        outcome = ProviderAuthOutcome.from_readiness(observation.provider_readiness)
+        logger.error(
+            issue_log(
+                issue_number,
+                "SESSION COMPLETE: status=BLOCKED outcome=none "
+                "reason=provider_auth_failed session=%s provider=%s detail=%s",
+            ),
+            session_name,
+            outcome.provider,
+            outcome.detail,
+        )
+        self._emit_event(
+            EventName.SESSION_LAUNCH_FAILED_AUTH,
+            outcome.event_payload(issue_number, session_name),
+        )
+        return outcome.as_decision(blocked_label=self._provider_blocked_label)
 
     def _handle_absent_completion_record(
         self,
@@ -794,18 +828,19 @@ class SessionController:
         provider_status: ProviderStatus | None,
     ) -> SessionDecision:
         """Handle case where no completion record exists."""
-        debug_context = self._collect_completion_debug_context(
+        debug_context = collect_completion_debug_context(
             worktree_path=worktree_path,
             run_dir=run_dir,
             completion_path=completion_path,
         )
-        self._write_no_completion_diagnostic(
+        write_no_completion_diagnostic(
             observation=observation,
             worktree_path=worktree_path,
             issue_number=issue_number,
             session_name=session_name,
             run_dir=run_dir,
             completion_path=completion_path,
+            session_output=self.session_output,
             debug_context=debug_context,
         )
         session_log = self._get_session_log_tail(run_dir, session_name)
@@ -847,7 +882,7 @@ class SessionController:
                 debug_context["agent_done_marker_exists"],
                 len(debug_context["nearby_completion_candidates"]),
             )
-            self._log_completion_debug_context(
+            log_completion_debug_context(
                 issue_number, session_name, debug_context
             )
             if session_log:
@@ -869,7 +904,7 @@ class SessionController:
             debug_context["agent_done_marker_exists"],
             len(debug_context["nearby_completion_candidates"]),
         )
-        self._log_completion_debug_context(issue_number, session_name, debug_context)
+        log_completion_debug_context(issue_number, session_name, debug_context)
         if session_log:
             logger.error(issue_log(issue_number, "LAST OUTPUT:\n%s"), session_log)
         return SessionDecision(
@@ -888,7 +923,7 @@ class SessionController:
         load_result: CompletionRecordLoadResult,
     ) -> SessionDecision:
         """Handle a present completion record that failed strict validation."""
-        debug_context = self._collect_completion_debug_context(
+        debug_context = collect_completion_debug_context(
             worktree_path=worktree_path,
             run_dir=run_dir,
             completion_path=completion_path,
@@ -911,199 +946,6 @@ class SessionController:
             completion_detail=report.completion_detail,
             diagnostic_path=report.diagnostic_path,
         )
-
-    def _write_no_completion_diagnostic(
-        self,
-        observation: SessionObservationResult,
-        worktree_path: Path,
-        issue_number: int,
-        session_name: str,
-        run_dir: Path,
-        completion_path: str | None,
-        debug_context: dict[str, Any] | None = None,
-    ) -> None:
-        """Persist a durable diagnostic snapshot when completion is missing."""
-        try:
-            requested_rel_path = (
-                completion_path or ".issue-orchestrator/completion.json"
-            )
-            requested_path = (worktree_path / requested_rel_path).resolve()
-
-            run_dir_completion_path: str | None = None
-            run_dir_completion_exists: bool | None = None
-            run_dir_completion_size: int | None = None
-            if completion_path:
-                completion_name = Path(completion_path).name
-                run_dir_candidate = run_dir / completion_name
-                run_dir_completion_path = str(run_dir_candidate)
-                run_dir_completion_exists = run_dir_candidate.exists()
-                if run_dir_completion_exists:
-                    run_dir_completion_size = run_dir_candidate.stat().st_size
-
-            requested_exists = requested_path.exists()
-            requested_size = requested_path.stat().st_size if requested_exists else None
-
-            diagnostic = {
-                "kind": "no-completion-record",
-                "schema_version": 1,
-                "observed_at": datetime.now(timezone.utc).isoformat(),
-                "issue_number": issue_number,
-                "session_name": session_name,
-                "observation": observation.observation.value,
-                "runtime_minutes": observation.runtime_minutes,
-                "requested_completion_path": requested_rel_path,
-                "requested_completion_abs_path": str(requested_path),
-                "requested_completion_exists": requested_exists,
-                "requested_completion_size": requested_size,
-                "run_dir": str(run_dir),
-                "run_dir_completion_abs_path": run_dir_completion_path,
-                "run_dir_completion_exists": run_dir_completion_exists,
-                "run_dir_completion_size": run_dir_completion_size,
-                "pid": os.getpid(),
-            }
-            if debug_context:
-                diagnostic.update(debug_context)
-            diagnostic_path = self.session_output.write_diagnostic(
-                run_dir,
-                diagnostic,
-                prefix="no-completion",
-            )
-            logger.info(
-                issue_log(
-                    issue_number,
-                    "Saved no-completion diagnostic: session=%s path=%s",
-                ),
-                session_name,
-                diagnostic_path,
-            )
-        except Exception as exc:
-            logger.warning(
-                issue_log(
-                    issue_number,
-                    "Failed to write no-completion diagnostic for session=%s: %s",
-                ),
-                session_name,
-                exc,
-            )
-
-    def _collect_completion_debug_context(
-        self,
-        *,
-        worktree_path: Path,
-        run_dir: Path,
-        completion_path: str | None,
-    ) -> dict[str, Any]:
-        requested_rel_path = completion_path or ".issue-orchestrator/completion.json"
-        requested_path = (worktree_path / requested_rel_path).resolve()
-        marker_path = worktree_path / _AGENT_DONE_MARKER
-        marker_exists = marker_path.exists()
-        marker_preview: str | None = None
-        if marker_exists:
-            try:
-                marker_preview = _truncate_with_tail(
-                    marker_path.read_text(encoding="utf-8"), 200
-                )
-            except OSError:
-                marker_preview = "<unreadable>"
-        return {
-            "requested_completion_path": requested_rel_path,
-            "requested_completion_abs_path": str(requested_path),
-            "agent_done_marker_path": str(marker_path.resolve()),
-            "agent_done_marker_exists": marker_exists,
-            "agent_done_marker_preview": marker_preview,
-            "nearby_completion_candidates": self._find_nearby_completion_candidates(
-                worktree_path=worktree_path,
-                run_dir=run_dir,
-                requested_path=requested_path,
-            ),
-        }
-
-    def _find_nearby_completion_candidates(
-        self,
-        *,
-        worktree_path: Path,
-        run_dir: Path,
-        requested_path: Path,
-    ) -> list[dict[str, Any]]:
-        candidates: list[Path] = []
-        root_candidates = worktree_path / ".issue-orchestrator"
-        if root_candidates.exists():
-            candidates.extend(root_candidates.glob("completion*.json"))
-            sessions_dir = root_candidates / "sessions"
-            if sessions_dir.exists():
-                candidates.extend(sessions_dir.glob("**/completion*.json"))
-
-        unique_paths: dict[Path, None] = {}
-        for candidate in candidates:
-            try:
-                resolved = candidate.resolve()
-            except OSError:
-                continue
-            if resolved == requested_path:
-                continue
-            unique_paths[resolved] = None
-
-        sorted_candidates = sorted(
-            unique_paths.keys(),
-            key=lambda path: path.stat().st_mtime if path.exists() else 0.0,
-            reverse=True,
-        )[:10]
-        records: list[dict[str, Any]] = []
-        for candidate in sorted_candidates:
-            try:
-                stat = candidate.stat()
-                relative_to_run_dir = None
-                try:
-                    relative_to_run_dir = str(candidate.relative_to(run_dir))
-                except ValueError:
-                    relative_to_run_dir = None
-                records.append(
-                    {
-                        "path": str(candidate),
-                        "size": stat.st_size,
-                        "mtime": datetime.fromtimestamp(
-                            stat.st_mtime, timezone.utc
-                        ).isoformat(),
-                        "under_run_dir": relative_to_run_dir is not None,
-                        "run_dir_relative_path": relative_to_run_dir,
-                    }
-                )
-            except OSError:
-                continue
-        return records
-
-    def _log_completion_debug_context(
-        self,
-        issue_number: int,
-        session_name: str,
-        debug_context: dict[str, Any],
-    ) -> None:
-        logger.warning(
-            issue_log(
-                issue_number,
-                "Completion debug: session=%s marker_path=%s marker_exists=%s marker_preview=%s",
-            ),
-            session_name,
-            debug_context["agent_done_marker_path"],
-            debug_context["agent_done_marker_exists"],
-            debug_context["agent_done_marker_preview"] or "",
-        )
-        nearby_candidates = debug_context["nearby_completion_candidates"]
-        if nearby_candidates:
-            logger.warning(
-                issue_log(
-                    issue_number, "Completion debug: session=%s nearby_candidates=%s"
-                ),
-                session_name,
-                nearby_candidates,
-            )
-        else:
-            logger.warning(
-                issue_log(
-                    issue_number, "Completion debug: session=%s nearby_candidates=[]"
-                ),
-                session_name,
-            )
 
     def _read_provider_status(self, run_dir: Path) -> ProviderStatus | None:
         return read_provider_status(run_dir)

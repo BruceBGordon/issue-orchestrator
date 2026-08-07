@@ -821,6 +821,7 @@ def build_test_orchestrator_deps(
     lease_renewer=None,
     timeline_reader=None,
     timeline_writer=None,
+    provider_readiness_probe=None,
 ):
     """Factory function to create OrchestratorDeps for testing.
 
@@ -841,6 +842,10 @@ def build_test_orchestrator_deps(
         planner: Optional override for Planner (for testing)
         session_manager: Optional override for SessionManager (for testing)
         action_applier: Optional override for ActionApplier (for testing)
+        provider_readiness_probe: Optional ProviderReadinessProbe. Defaults to
+            the explicit "nothing to probe" reader, so a test that does not
+            care about provider credentials never spawns a CLI probe and never
+            silently claims a provider is authenticated (#6999).
 
     Returns:
         OrchestratorDeps with all components wired
@@ -1022,11 +1027,18 @@ def build_test_orchestrator_deps(
     # for tests that consume deps directly instead of relying on runtime wiring.
     _action_applier.lease_id_lookup = lambda _issue_number: None
 
+    from issue_orchestrator.ports.provider_readiness import (
+        NO_PROVIDER_READINESS_PROBE,
+    )
+
+    readiness_probe = provider_readiness_probe or NO_PROVIDER_READINESS_PROBE
+
     infra_services = InfraServices(
         label_manager=label_manager,
         label_store=label_store,
         queue_cache_store=_build_null_queue_cache_store(),
         provider_resilience=provider_resilience,
+        provider_readiness_probe=readiness_probe,
         timeline_reader=timeline_reader,
         timeline_store=NullTimelineStore(),
         timeline_writer=timeline_writer,
@@ -1088,6 +1100,7 @@ def build_test_orchestrator_deps(
             state_machine_manager=state_machine_manager,
             label_manager=label_manager,
             agent_callback_endpoint=agent_callback_endpoint,
+            provider_readiness_probe=readiness_probe,
         ),
         repository_host=repo_host,
         e2e_issue_tracker=e2e_issue_tracker,

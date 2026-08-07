@@ -58,6 +58,7 @@ if TYPE_CHECKING:
     from .lease_renewer import LeaseRenewer
     from .provider_resilience import ProviderResilienceManager
     from .board_snapshot_builder import BoardSnapshotBuilder
+    from ..ports.provider_readiness import ProviderReadinessProbe
 
 
 @dataclass(frozen=True)
@@ -164,6 +165,10 @@ class OrchestratorDeps:
     @property
     def provider_resilience(self) -> "ProviderResilienceManager":
         return self.services.provider_resilience
+
+    @property
+    def provider_readiness_probe(self) -> "ProviderReadinessProbe":
+        return self.services.provider_readiness_probe
 
     @property
     def queue_cache_store(self) -> "QueueCacheStore":

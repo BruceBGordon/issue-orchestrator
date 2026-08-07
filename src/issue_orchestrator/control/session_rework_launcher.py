@@ -109,7 +109,7 @@ class SessionEnvBuilder(Protocol):
     ) -> str: ...
 
 
-class ProviderCircuitChecker(Protocol):
+class ProviderReadinessChecker(Protocol):
     def __call__(self, provider: str | None, issue_number: int) -> LaunchResult | None: ...
 
 
@@ -138,7 +138,7 @@ class ReworkLaunchDependencies:
     persist_session_prompt: PromptPersister
     wrap_provider_command: ProviderCommandWrapper
     build_session_env: SessionEnvBuilder
-    check_provider_circuit: ProviderCircuitChecker
+    check_provider_ready: ProviderReadinessChecker
     resolve_stack_decision: StackDecisionResolverFn
 
 
@@ -203,7 +203,7 @@ def launch_rework_session(
     if issue_number is None:
         return LaunchResult(None, False, f"Unresolved issue number for rework {issue_key}")
 
-    if result := deps.check_provider_circuit(agent_config.provider, issue_number):
+    if result := deps.check_provider_ready(agent_config.provider, issue_number):
         return result
 
     pr_number, branch_name = resolve_rework_pr(deps.repository_host, rework, issue_number)

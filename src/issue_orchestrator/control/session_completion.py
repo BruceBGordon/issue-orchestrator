@@ -24,6 +24,7 @@ from ..events import EventName
 from ..infra.config import Config
 from ..ports import EventSink
 from ..ports.event_sink import make_trace_event
+from ..ports.provider_resilience import ProviderErrorType
 from ..ports.session_output import SessionOutput
 from ..ports.worktree_manager import WorktreeManager
 from .active_sessions import has_active_terminal
@@ -251,6 +252,10 @@ def handle_session_completion(  # noqa: C901, PLR0912 - handles validation, acti
     claim_manager: Optional["ClaimManager"] = None,
     events: Optional[EventSink] = None,
     publish_recovery: Optional["PublishRecoveryService"] = None,
+    # The typed provider verdict this session ended on (#6999). Carried rather
+    # than re-derived so the reaction owner can decline to mint a substance
+    # investigation for a credential outage.
+    provider_error_type: ProviderErrorType | None = None,
 ) -> None:
     """Handle session completion - moved from Orchestrator per method table.
 
@@ -465,6 +470,7 @@ def handle_session_completion(  # noqa: C901, PLR0912 - handles validation, acti
             session.worktree_path, run_dir, diagnostic_path, claude_log_path
         ),
         record=state.record_discovered_failure,
+        provider_error_type=provider_error_type,
     )
     if effective_status in (SessionStatus.FAILED, SessionStatus.TIMED_OUT):
         # Track failed issues to prevent immediate retry (cleared on cache refresh)
@@ -727,6 +733,7 @@ def _apply_completed_decision(
         blocked_reason=decision.blocked_reason,
         completion_detail=decision.completion_detail,
         publish_recovery=publish_recovery,
+        provider_error_type=decision.provider_error_type,
     )
     elapsed = time.monotonic() - started
     if elapsed > 5:
@@ -753,4 +760,10 @@ def _record_provider_resilience_effects(
             failure.provider,
             error_summary=failure.error_summary,
             attempts=failure.attempts,
+        )
+    if decision.provider_auth_failure:
+        auth_failure = decision.provider_auth_failure
+        provider_resilience.record_auth_failure(
+            auth_failure.provider,
+            error_summary=auth_failure.error_summary,
         )

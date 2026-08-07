@@ -15,6 +15,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
 
+from ..ports.provider_readiness import ProviderReadiness
+
 
 class SessionObservation(Enum):
     """What we observed about a session.
@@ -31,6 +33,13 @@ class SessionObservation(Enum):
 
     # Session exceeded its timeout limit (may still be running)
     TIMED_OUT = "timed_out"
+
+    # The provider this session runs on is not authenticated, confirmed by the
+    # provider's own credential probe. Deliberately NOT TIMED_OUT: an auth-dead
+    # session sits at its login banner for the full timeout, and reporting that
+    # as a timeout is what misdirected four failure investigations toward issue
+    # substance on 2026-08-04 (#6999).
+    PROVIDER_AUTH_FAILED = "provider_auth_failed"
 
 
 @dataclass(frozen=True)
@@ -57,16 +66,21 @@ class SessionObservationResult:
     # Additional context
     context: dict = field(default_factory=dict)
 
+    # Why the provider could not do work, when that is the observation. Typed
+    # so control never re-reads a banner: the provider adapter already decided.
+    provider_readiness: Optional[ProviderReadiness] = None
+
     @property
     def is_terminal(self) -> bool:
         """Check if this observation represents a terminal state.
 
         Terminal means the session is no longer running and won't resume.
-        This is true for TERMINATED and TIMED_OUT.
+        This is true for TERMINATED, TIMED_OUT, and PROVIDER_AUTH_FAILED.
         """
         return self.observation in (
             SessionObservation.TERMINATED,
             SessionObservation.TIMED_OUT,
+            SessionObservation.PROVIDER_AUTH_FAILED,
         )
 
     @classmethod
@@ -101,4 +115,19 @@ class SessionObservationResult:
             runtime_minutes=runtime_minutes,
             timeout_minutes=timeout_minutes,
             timeout_exceeded=True,
+        )
+
+    @classmethod
+    def provider_auth_failed(
+        cls,
+        readiness: ProviderReadiness,
+        runtime_minutes: Optional[float] = None,
+        session_exists: bool = True,
+    ) -> "SessionObservationResult":
+        """Create observation for a session whose provider is not authenticated."""
+        return cls(
+            observation=SessionObservation.PROVIDER_AUTH_FAILED,
+            session_exists=session_exists,
+            runtime_minutes=runtime_minutes,
+            provider_readiness=readiness,
         )

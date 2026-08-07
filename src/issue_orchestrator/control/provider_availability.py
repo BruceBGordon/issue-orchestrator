@@ -19,6 +19,11 @@ from typing import Iterable
 from typing import TYPE_CHECKING
 
 from ..ports.issue import Issue
+from ..ports.provider_readiness import (
+    NO_PROVIDER_READINESS_PROBE,
+    ProviderReadiness,
+    ProviderReadinessProbe,
+)
 from ..infra.config import Config
 from .actions import Action
 from .provider_impact import (
@@ -45,6 +50,7 @@ class ProviderAvailabilityPolicy:
     config: Config
     provider_resilience: ProviderResilienceManager
     label_manager: "LabelManager | None" = None
+    readiness_probe: ProviderReadinessProbe = NO_PROVIDER_READINESS_PROBE
 
     def blocked_label(self) -> str:
         if self.label_manager is not None:
@@ -104,6 +110,37 @@ class ProviderAvailabilityPolicy:
         if not provider:
             return False
         return self.provider_resilience.is_open(provider)
+
+    # ------------------------------------------------------------------
+    # Provider readiness (#6999)
+    #
+    # The launch-side counterpart to :meth:`is_open`. Every launch path asks
+    # this one method, so "credentials are dead, do not spawn" is decided in a
+    # single place and the circuit consequence cannot be forgotten at a call
+    # site.
+    # ------------------------------------------------------------------
+
+    def probe_launch_readiness(
+        self, provider: str | None, *, now: datetime | None = None
+    ) -> ProviderReadiness:
+        """Return the typed readiness of ``provider``, feeding the circuit owner.
+
+        A confirmed auth failure is reported to
+        :class:`~.provider_resilience.ProviderResilienceManager` here rather
+        than at the call sites, so the circuit is the only thing that decides
+        how many failures are tolerated and how long launches stay paused.
+        Control receives only the typed outcome — never a banner or exit code.
+        """
+        if not provider:
+            return ProviderReadiness.unknown("", "no provider configured")
+        readiness = self.readiness_probe.check_launch_readiness(provider)
+        if readiness.human_fixable:
+            self.provider_resilience.record_auth_failure(
+                provider,
+                error_summary=readiness.detail or "provider is not authenticated",
+                now=now,
+            )
+        return readiness
 
     def should_add_blocked_label(self, issue_labels: Iterable[str], planned_labels: set[str]) -> bool:
         label = self.blocked_label()

@@ -104,6 +104,7 @@ def init_orchestrator_components(orch: "Orchestrator") -> None:
         repository_host=orch.deps.repository_host,
         fresh_issue_reader=orch.deps.fresh_issue_reader,
         session_output=orch.deps.session_output,
+        provider_readiness_probe=orch.deps.provider_readiness_probe,
     )
     orch.observer.session_machines = orch.deps.state_machine_manager.session_machines
 
