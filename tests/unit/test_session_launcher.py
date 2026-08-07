@@ -2757,7 +2757,7 @@ class TestOrchestratorLaunchValidationRetrySession:
         assert [r.issue_number for r in state.pending_validation_retries] == [456]
         assert [s.terminal_id for s in state.active_sessions] == ["issue-123"]
 
-    def test_restores_keep_queued_retry_and_removes_pending(
+    def test_restores_existing_terminal_and_removes_pending(
         self,
         launcher_bundle,
         sample_issue,
@@ -3220,7 +3220,7 @@ class TestOrchestratorLaunchTechLeadSession:
         assert state.pending_tech_lead_reviews == []
         assert state.active_sessions == [session]
 
-    def test_keep_queued_launch_retains_item_for_retry(self, sample_config):
+    def test_existing_terminal_launch_retains_item_for_retry(self, sample_config):
         """EXISTING_TERMINAL (not yet restorable) retains the item.
 
         (The other retention cases are ``INPUT_RETRY`` — a transient
