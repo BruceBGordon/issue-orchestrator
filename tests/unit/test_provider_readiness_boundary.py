@@ -2605,13 +2605,20 @@ def _pending_count(state, queue: str) -> int:
     )
 
 
-def _route(queue: str, state, harness):
-    """Drive the production routing function that owns ``queue``."""
+def _route(queue: str, state, harness, restorer=None):
+    """Drive the production routing function that owns ``queue``.
+
+    ``restorer`` is a caller-supplied spy rather than a hidden local so a test
+    can assert what the settlement did NOT do. A provider deferral must not
+    attempt terminal adoption, and that is only observable from outside if the
+    mock belongs to the caller (#6999 F12).
+    """
     from unittest.mock import MagicMock
 
     from issue_orchestrator.control import session_routing
 
-    restorer = MagicMock()
+    if restorer is None:
+        restorer = MagicMock()
     restorer.restore_session.return_value = None
     if queue == "review":
         return session_routing.orchestrator_launch_review_session(
@@ -2704,6 +2711,30 @@ class TestAProviderRefusalNeverConsumesPendingWork:
             == 1
         )
 
+    def test_the_refusal_attempts_no_terminal_restoration(
+        self, queue, refusal, tmp_path: Path
+    ) -> None:
+        """PROVIDER_DEFERRED is not EXISTING_TERMINAL — there is nothing to adopt.
+
+        Adoption starts by asking the runner what is running, so a single
+        discovery call is enough to prove the settlement wandered into the
+        restoration path. Both collaborators are asserted silent (#6999 F12).
+        """
+        from unittest.mock import MagicMock
+
+        readiness, threshold = _REFUSALS[refusal]
+        harness = _RefusingLauncherHarness(tmp_path, readiness, threshold=threshold)
+        state = _pending_state(queue)
+        restorer = MagicMock()
+
+        _route(queue, state, harness, restorer)
+
+        runner = harness.launcher.session_manager.runner
+        runner.discover_running_sessions.assert_not_called()
+        # Nothing at all was asked of the restorer — not discovery matching, not
+        # canonical-id derivation, not restore_known_terminal.
+        assert restorer.mock_calls == []
+
     def test_a_later_healthy_tick_launches_the_retained_item(
         self, queue, refusal, tmp_path: Path
     ) -> None:
@@ -2732,7 +2763,10 @@ def test_a_refused_tech_lead_launch_keeps_its_full_retry_budget(
     so burning a retry against it would eventually drop the item for a reason
     that was never its fault (#6999 F10).
     """
-    from issue_orchestrator.control.session_routing import PendingSessionQueues
+    from issue_orchestrator.control.session_routing import (
+        PendingSessionQueues,
+        TechLeadRetentionOutcome,
+    )
 
     harness = _RefusingLauncherHarness(
         tmp_path, ProviderReadiness.not_installed(PROVIDER, "not on PATH"), threshold=1
@@ -2743,10 +2777,58 @@ def test_a_refused_tech_lead_launch_keeps_its_full_retry_budget(
         _route("tech_lead", state, harness)
 
     assert len(state.pending_tech_lead_reviews) == 1
-    # The retry budget is untouched, so a genuine input failure later still has
-    # its full allowance.
+    # Not "an outcome was returned" — five refusals must count as zero. Asserting
+    # the counter itself is what makes this a regression test: any deferral that
+    # started spending the budget would show up here immediately (#6999 F12).
+    assert state.pending_tech_lead_reviews[0].retryable_launch_failures == 0
+
+    # And the allowance is genuinely intact rather than merely unread: the first
+    # REAL input failure is the first one counted, and it is retained.
     queues = PendingSessionQueues(state)
-    assert queues.retain_tech_lead_for_retry(7) is not None
+    assert queues.retain_tech_lead_for_retry(7) is TechLeadRetentionOutcome.RETAINED
+    assert state.pending_tech_lead_reviews[0].retryable_launch_failures == 1
+
+
+def test_a_provider_deferral_touches_neither_restoration_nor_the_retry_budget() -> None:
+    """The two side effects F10 required the new disposition to exclude.
+
+    Asserted at the owner itself, where both collaborators are directly
+    observable. The production matrix can only show that restoration was never
+    *reached*; this pins the contract of the settlement branch itself, so a
+    future edit that reorders the branch cannot spend the only queued
+    failure-investigation record's budget (#6999 F12).
+    """
+    from issue_orchestrator.control import session_routing
+    from issue_orchestrator.control.session_launch_types import (
+        LaunchDisposition,
+        LaunchResult,
+    )
+    from issue_orchestrator.domain.models import OrchestratorState
+
+    calls: list[str] = []
+
+    def _spy_restore_existing():
+        calls.append("restore_existing")
+        return None
+
+    owner = session_routing._PendingQueueOwner(  # noqa: SLF001 - owner contract
+        remove=lambda: calls.append("remove"),
+        restore_existing=_spy_restore_existing,
+        retain_for_input_retry=lambda: calls.append("retain_for_input_retry"),
+    )
+
+    settled = owner.settle(
+        LaunchResult(
+            session=None,
+            success=False,
+            reason="claude not on PATH",
+            disposition=LaunchDisposition.PROVIDER_DEFERRED,
+        ),
+        OrchestratorState(),
+    )
+
+    assert settled is None
+    assert calls == []  # not removed, not restored, no budget spent
 
 
 def test_the_launch_gate_reports_a_provider_deferral(tmp_path: Path) -> None:
