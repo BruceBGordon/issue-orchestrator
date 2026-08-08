@@ -55,6 +55,8 @@ if TYPE_CHECKING:
     from .session_history import SessionHistoryOwner
     from .tech_lead_kill_session import TechLeadKillSessionExecutor
     from .tech_lead_reset_retry import TechLeadResetRetryExecutor
+    from .tech_lead_run_ownership import TechLeadRunOwnership
+
 from .label_mutation_stats import LabelMutationStatField, LabelMutationStats
 from .escalation_notice import escalation_comment, publish_escalation_events
 from .mutation_gate import ReconciliationGate
@@ -193,6 +195,9 @@ class ActionApplier:
     promotion_target: Optional["PromotionTargetHost"] = None
     # Expedite-lane owner seam (#6870), wired post-construction; unwired = no-op.
     expedite_lane: Optional["ExpediteLane"] = None
+    # Cross-engine tech-lead run ownership (#6994 R2 F3). Unwired means anchor
+    # creation fails loudly rather than racing a peer.
+    run_ownership: Optional["TechLeadRunOwnership"] = None
     _active_label_mutation_stats: LabelMutationStats | None = field(
         default=None, init=False, repr=False
     )
@@ -265,6 +270,7 @@ class ActionApplier:
             ActionType.QUEUE_RETROSPECTIVE_REVIEW: self._apply_queue_operation,
             ActionType.QUEUE_REWORK: self._apply_queue_operation,
             ActionType.QUEUE_TECH_LEAD: self._apply_queue_operation,
+            ActionType.DROP_TECH_LEAD: self._apply_queue_operation,
             ActionType.ESCALATE_TO_HUMAN: self._apply_escalate,
             ActionType.ENQUEUE_TO_MERGE_QUEUE: self._apply_enqueue_to_merge_queue,
             # Every tech-lead action type -> its extracted apply-time owner.
@@ -1478,12 +1484,28 @@ class ActionApplier:
         )
 
     def _apply_create_tech_lead_issue(self, action: Action) -> ActionResult:
-        """Delegate tech-lead-authored issue creation to its apply-time owner."""
+        """Create a tech-lead-authored issue under whole-run coordination.
+
+        The ORDER — reserve the global run, then create its anchor, then
+        compensate on failure — is policy, and it lives with the run owner
+        (#6994 round 2 F3/A3). This seam supplies only the GitHub create.
+        """
         assert isinstance(action, CreateTechLeadIssueAction)
+        from .tech_lead_run_wiring import create_owned_tech_lead_issue
+
         if not self.repository_host:
             return ActionResult.fail(
                 action, "No repository_host configured for issue creation"
             )
+        return create_owned_tech_lead_issue(
+            action, ownership=self.run_ownership, create=self._create_tech_lead_issue
+        )
+
+    def _create_tech_lead_issue(
+        self, action: CreateTechLeadIssueAction
+    ) -> ActionResult:
+        """The GitHub create itself, with no run-coordination policy of its own."""
+        assert self.repository_host is not None
         return apply_create_tech_lead_issue(
             action,
             repository_host=self.repository_host,

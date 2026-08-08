@@ -48,6 +48,11 @@ class ActionType(Enum):
     QUEUE_RETROSPECTIVE_REVIEW = "queue_retrospective_review"
     QUEUE_REWORK = "queue_rework"
     QUEUE_TECH_LEAD = "queue_tech_lead"
+    # Withdraw a queued tech-lead investigation whose subject stopped being
+    # worth investigating (#6994 launch-time revalidation). The queue is the
+    # only durable record of an investigation, so a run that can no longer
+    # launch must be removed rather than left queued forever.
+    DROP_TECH_LEAD = "drop_tech_lead"
 
     # Issue creation
     CREATE_TECH_LEAD_ISSUE = "create_tech_lead_issue"

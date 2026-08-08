@@ -12,6 +12,12 @@ const menuResetRetry = document.getElementById('menuResetRetry');
 const menuResetRetryScratch = document.getElementById('menuResetRetryScratch');
 const menuRetry = document.getElementById('menuRetry');
 const menuCloseIssue = document.getElementById('menuCloseIssue');
+const menuInvestigateTechLead = document.getElementById('menuInvestigateTechLead');
+// The compact menu's action carries REAL sibling elements — a status span and
+// the row that hides them together — so its blocked reason and Settings remedy
+// have somewhere valid to render (#6994 round 2 F6).
+const menuInvestigateTechLeadStatus = document.getElementById('menuInvestigateTechLeadStatus');
+const menuInvestigateTechLeadRow = document.getElementById('menuInvestigateTechLeadRow');
 const menuHistoryDivider = document.getElementById('menuHistoryDivider');
 const menuDepsDivider = document.getElementById('menuDepsDivider');
 const menuDepsLabel = document.getElementById('menuDepsLabel');
@@ -22,7 +28,7 @@ const contextMenuEnabled = Boolean(contextMenu);
 
 // Add keyboard support to all context menu items
 if (contextMenuEnabled) {
-    [menuFocus, menuRevealWorktree, menuLog, menuAgentLog, menuPrompt, menuKill, menuPR, menuIssue, menuUnblock, menuResetRetry, menuResetRetryScratch, menuRetry, menuCloseIssue]
+    [menuFocus, menuRevealWorktree, menuLog, menuAgentLog, menuPrompt, menuKill, menuPR, menuIssue, menuUnblock, menuResetRetry, menuResetRetryScratch, menuRetry, menuCloseIssue, menuInvestigateTechLead]
         .filter(Boolean)
         .forEach(addKeyboardSupport);
 }
@@ -161,6 +167,26 @@ function showContextMenu(e, row) {
             menuRetry.style.display = 'none';
             if (menuCloseIssue) menuCloseIssue.style.display = 'none';
         }
+    }
+
+    // Targeted tech-lead action (#6994): eligible on blocked items only, and
+    // labelled with its live queued/running state. The owner in
+    // ``tech_lead_runs.js`` decides visibility/disabled state so the compact
+    // card menu and the issue detail drawer cannot drift apart.
+    if (menuInvestigateTechLead) {
+        menuInvestigateTechLead.dataset.issue = String(issueNumber || '');
+        // The label goes on FIRST, so the run owner's status/aria work is the
+        // last write and cannot be clobbered by a later label update (F6).
+        menuInvestigateTechLead.textContent = techLeadIssueActionLabel(Number(issueNumber));
+        updateTechLeadIssueAction(
+            {
+                button: menuInvestigateTechLead,
+                statusEl: menuInvestigateTechLeadStatus,
+                container: menuInvestigateTechLeadRow,
+            },
+            Number(issueNumber),
+            isBlockedHistory,
+        );
     }
 
     // Position menu (clamped to viewport so right-edge triggers still show)
@@ -422,13 +448,29 @@ if (contextMenuEnabled) {
 // Settings menu
 const settingsMenu = document.getElementById('settingsMenu');
 
+// Single owner for the dashboard actions menu's open/closed state. Every
+// surface that opens or dismisses the menu goes through here, so the `visible`
+// class and the trigger's `aria-expanded` can never disagree — a menu that
+// looks closed to the eye while still announcing itself as expanded is broken
+// for screen-reader users only, which is exactly the kind of drift a second
+// writer introduces silently.
+function setSettingsMenuVisible(visible) {
+    settingsMenu.classList.toggle('visible', visible);
+    const trigger = document.getElementById('settingsMenuBtn');
+    if (trigger) trigger.setAttribute('aria-expanded', String(visible));
+}
+
+function closeSettingsMenu() {
+    setSettingsMenuVisible(false);
+}
+
 function toggleSettingsMenu(e) {
     e.stopPropagation();
-    settingsMenu.classList.toggle('visible');
+    setSettingsMenuVisible(!settingsMenu.classList.contains('visible'));
 }
 
 document.addEventListener('click', () => {
-    settingsMenu.classList.remove('visible');
+    closeSettingsMenu();
 });
 
 // Modal

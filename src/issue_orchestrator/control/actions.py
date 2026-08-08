@@ -251,6 +251,22 @@ class QueueTechLeadAction(Action):
 
 
 @dataclass(frozen=True)
+class DropTechLeadAction(Action):
+    """Withdraw a queued tech_lead investigation before it launches (#6994).
+
+    Emitted when launch-time revalidation finds the subject closed or no longer
+    blocked. ``reason``/``detail`` carry the typed refusal produced by
+    :func:`.tech_lead_run_admission.issue_run_eligibility`, so the withdrawal
+    event names the same machine-readable cause a rejected REQUEST would have.
+    """
+
+    issue_number: int = 0
+    reason: str = ""
+    detail: str = ""
+    action_type: ActionType = field(default=ActionType.DROP_TECH_LEAD, init=False)
+
+
+@dataclass(frozen=True)
 class EscalateToHumanAction(Action):
     """Escalate an issue to human intervention.
 

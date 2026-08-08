@@ -56,6 +56,58 @@ def is_tech_lead_session(
     return bool(tech_lead_review_agent and agent_type == tech_lead_review_agent)
 
 
+def recover_tech_lead_launch_scope(
+    config: "Config",
+    issue: "Issue",
+    tech_lead_authority: "TechLeadAuthorityStore | None",
+) -> "TechLeadLaunchScope | None":
+    """Rebuild a RESTORED tech-lead session's launch grant from durable truth.
+
+    A session that survives an orchestrator restart has no in-memory producer to
+    hand it a :class:`TechLeadLaunchScope`, and before #6994 round 1 F3 it was
+    restored without one — which quietly downgraded a running whole-board review
+    to "issue-scoped", so the global barrier lifted and targeted work launched
+    alongside an exclusive review, and the dashboard reported the anchor as a
+    targeted running issue.
+
+    Everything needed to rebuild the grant is already durable, and this reads it
+    in the SAME order the launch path resolves flavor
+    (:func:`prepare_tech_lead_session_data`), so a restored run and a fresh one
+    can never be classified differently:
+
+    1. the ADR-0031 §4 marker label on the anchor -> ``HEALTH_REVIEW``, whose
+       owned cohort comes back from the durable authority ledger;
+    2. the batch anchor's title signature -> ``BATCH_REVIEW``;
+    3. anything else is an ordinary board issue the tech lead was aimed at, so
+       it is a ``FAILURE_INVESTIGATION``.
+
+    Returns ``None`` for a session that is not a tech-lead run at all.
+    """
+    from .health_review_trigger import (
+        HEALTH_REVIEW_MARKER_LABEL,
+        is_batch_anchor_title,
+    )
+
+    if not is_tech_lead_session(config.tech_lead_review_agent, issue.agent_type):
+        return None
+    labels = [str(name).casefold() for name in issue.labels]
+    if HEALTH_REVIEW_MARKER_LABEL.casefold() in labels:
+        cohort = (
+            tech_lead_authority.load_storm_cohort(anchor_issue_number=issue.number)
+            if tech_lead_authority is not None
+            else None
+        )
+        return TechLeadLaunchScope(
+            flavor=TechLeadSessionFlavor.HEALTH_REVIEW,
+            problem_issue_numbers=tuple(
+                sorted({problem.issue_number for problem in cohort or ()})
+            ),
+        )
+    if is_batch_anchor_title(issue.title):
+        return TechLeadLaunchScope(flavor=TechLeadSessionFlavor.BATCH_REVIEW)
+    return TechLeadLaunchScope(flavor=TechLeadSessionFlavor.FAILURE_INVESTIGATION)
+
+
 def failure_investigation_scratch_identity(
     config: "Config",
     issue: "Issue",

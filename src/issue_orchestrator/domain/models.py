@@ -1235,6 +1235,12 @@ class Session:
     # config (a "keep worktrees for inspection" preference is for PR-producing
     # coding worktrees, not for scratch investigation workspaces).
     scratch_worktree: bool = False
+    # The producer-declared tech-lead launch scope this session runs under
+    # (#6994), or None for ordinary worker/review sessions and for tech-lead
+    # sessions restored across a restart. It is what makes an ACTIVE tech-lead
+    # run's scope readable without re-reading GitHub, so the run coordinator can
+    # tell an exclusive whole-board run from a focused investigation.
+    tech_lead_scope: "TechLeadLaunchScope | None" = None
 
     def __post_init__(self) -> None:
         _require_session_run_assets(self.run_assets)

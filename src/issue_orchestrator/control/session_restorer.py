@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
     from ..infra.config import Config
+    from ..ports.tech_lead_authority import TechLeadAuthorityStore
 
 from ..domain.issue_key import GitHubIssueKey
 from ..domain.session_key import SessionKey, TaskKind
@@ -25,6 +26,7 @@ from ..domain.models import Issue, RETROSPECTIVE_REVIEW_TERMINAL_PREFIX, Session
 from ..domain.session_run import SessionRunAssets
 from ..ports import RepositoryHost, WorkingCopy
 from ..ports.session_runner import DiscoveredSession
+from .tech_lead_session_policy import recover_tech_lead_launch_scope
 
 logger = logging.getLogger(__name__)
 
@@ -52,10 +54,16 @@ class SessionRestorer:
         config: "Config",
         repository_host: RepositoryHost,
         working_copy: WorkingCopy,
+        tech_lead_authority: "TechLeadAuthorityStore | None" = None,
     ):
         self.config = config
         self.repository_host = repository_host
         self.working_copy = working_copy
+        # Durable cohort ledger, read when rebuilding a restored health
+        # review's owned scope (#6994 round 1 F3). Optional so unrelated tests
+        # need not wire it; without it a restored storm review still recovers
+        # its GLOBAL flavor (the barrier that matters) with an empty cohort.
+        self.tech_lead_authority = tech_lead_authority
 
     def restore_sessions(
         self,
@@ -221,6 +229,12 @@ class SessionRestorer:
             run_assets=run_assets,
             agent_label=agent_label_val,
             pr_number=restored_pr_number,
+            # Rebuild the tech-lead launch grant from durable truth. Without it
+            # a restored whole-board review stops acting as the exclusive
+            # barrier it is, and the dashboard misreports it (#6994 F3).
+            tech_lead_scope=recover_tech_lead_launch_scope(
+                self.config, issue_obj, self.tech_lead_authority
+            ),
         )
 
     @staticmethod

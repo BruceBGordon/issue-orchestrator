@@ -1,7 +1,6 @@
 // Helper to hide settings menu (used by multiple functions)
 function hideSettingsMenu() {
-    const menu = document.getElementById('settingsMenu');
-    if (menu) menu.classList.remove('visible');
+    closeSettingsMenu();
 }
 
 function escapeHtml(text) {
@@ -537,6 +536,11 @@ async function _refreshViewModelImpl({ reloadOnListChange = true } = {}) {
             viewModel = payload;
         }
         window.dashboardData = viewModel.dashboard_data || window.dashboardData;
+        // The tech-lead run projection just changed, so every tech-lead
+        // affordance on screen has to be re-rendered from it — the global menu
+        // item AND any open drawer/card action. One owner does all of them, so
+        // no surface can be left claiming "idle" for a queued run (#6994 F6).
+        if (typeof refreshTechLeadRunControls === 'function') refreshTechLeadRunControls();
         isPaused = !!viewModel.paused;
         updateStatusBadgeFromViewModel(viewModel);
         updatePauseMenuFromViewModel(viewModel);

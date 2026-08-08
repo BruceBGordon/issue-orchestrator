@@ -404,6 +404,154 @@ def test_issue_detail_template_includes_retry_publish_button() -> None:
     assert 'id="issueDetailRetryPublishBtn"' in html
 
 
+# ---------------------------------------------------------------------------
+# Scoped tech-lead run actions (#6994)
+# ---------------------------------------------------------------------------
+
+
+def test_board_health_review_uses_the_explicit_label_in_the_actions_menu() -> None:
+    """The label must say what it does — "Run tech lead" is ambiguous between
+    the whole-board review and a focused investigation."""
+    html = _read(DASHBOARD_TEMPLATE)
+    attrs, text = _html_element(html, "button", "techLeadHealthReviewItem")
+
+    assert "Run board health review" in text
+    assert "Run tech lead" not in html
+    # Advanced, repository-wide operation: it lives in the dashboard actions
+    # menu, not on a card.
+    assert attrs["class"] == "settings-menu-item"
+    assert attrs["role"] == "menuitem"
+    assert attrs["onclick"] == "runBoardHealthReview()"
+
+
+def test_dashboard_actions_menu_stays_a_keyboard_reachable_native_menu() -> None:
+    html = _read(DASHBOARD_TEMPLATE)
+    menu_attrs, _ = _html_element(html, "div", "settingsMenu")
+    trigger_attrs, _ = _html_element(html, "button", "settingsMenuBtn")
+
+    assert menu_attrs["role"] == "menu"
+    assert menu_attrs["aria-label"] == "Dashboard actions"
+    # The trigger keeps its accessible name and popup semantics, and starts
+    # collapsed so `aria-expanded` is a real state rather than an absent one.
+    assert trigger_attrs["aria-label"] == "Dashboard actions"
+    assert trigger_attrs["aria-haspopup"] == "true"
+    assert trigger_attrs["aria-expanded"] == "false"
+
+
+def test_actions_menu_visibility_has_one_owner_that_mirrors_aria_expanded() -> None:
+    """A menu that looks closed but still reads as expanded is broken only for
+    assistive-tech users, so the class and the ARIA state get one writer."""
+    js = _read(DASHBOARD_JS)
+    body = _function_body(js, "setSettingsMenuVisible")
+
+    assert "classList.toggle('visible'" in body
+    assert "aria-expanded" in body
+    # No surface dismisses the menu behind the owner's back.
+    assert "settingsMenu.classList.remove('visible')" not in js
+
+
+def test_targeted_investigation_is_a_native_menu_item_and_a_native_drawer_button() -> None:
+    """Compact/expanded parity: the same action, the same exact label, on both
+    surfaces — a card's actions menu and the issue detail drawer."""
+    html = _read(DASHBOARD_TEMPLATE)
+    menu_attrs, menu_text = _html_element(html, "button", "menuInvestigateTechLead")
+    drawer_attrs, drawer_text = _html_element(
+        html, "button", "issueDetailInvestigateTechLeadBtn"
+    )
+
+    assert menu_text == "Investigate with tech lead"
+    assert drawer_text == "Investigate with tech lead"
+    assert menu_attrs["role"] == "menuitem"
+    assert menu_attrs["class"] == "context-menu-item"
+    assert drawer_attrs["class"] == "issue-action-btn"
+    assert drawer_attrs["onclick"] == "investigateWithTechLeadFromDrawer()"
+
+
+def test_targeted_investigation_status_is_a_live_region_not_colour_only() -> None:
+    html = _read(DASHBOARD_TEMPLATE)
+    attrs, _ = _html_element(html, "span", "issueDetailTechLeadStatus")
+
+    assert attrs["role"] == "status"
+    assert attrs["aria-live"] == "polite"
+
+
+def test_tech_lead_context_menu_item_is_keyboard_reachable() -> None:
+    js = _read(DASHBOARD_JS)
+
+    # It joins the same addKeyboardSupport list every other context-menu item
+    # is registered through, rather than relying on click alone.
+    assert "menuInvestigateTechLead]" in js
+    assert "addKeyboardSupport" in js
+
+
+def test_keyboard_activation_is_wired_at_most_once_per_element() -> None:
+    """One keypress must not become two activations (#6994 round 4 F15).
+
+    ``addKeyboardSupport`` synthesises a click, so an element registered by two
+    independently loaded chunks turns one Enter/Space into two POSTs while a
+    pointer user gets one. Structural backstop for the behavioural proof in
+    ``tests/js/tech_lead_menu_keyboard.test.js``; "exactly once" is enforced by
+    the helper rather than by convention across chunks.
+    """
+    helper = _read(DASHBOARD_JS_DIR / "issue_metadata.js")
+    tech_lead = _read(DASHBOARD_JS_DIR / "tech_lead_runs.js")
+
+    assert "keyboardActivationWired" in helper
+    assert "keyboardActivationWired.has(element)" in helper
+    # The context menu owns its own items' keyboard wiring; the tech-lead chunk
+    # only wires the Settings remedy it creates itself.
+    assert "addKeyboardSupport(menuItem)" not in tech_lead
+    assert "addKeyboardSupport(link)" in tech_lead
+
+
+def test_tech_lead_actions_go_through_the_ui_action_contract_builders() -> None:
+    contract = _read(UI_ACTION_CONTRACT_JS)
+    js = _read(DASHBOARD_JS)
+
+    assert "TECH_LEAD_RUNS: '/api/tech-lead/runs'" in contract
+    assert "buildGlobalHealthReviewRunRequest" in contract
+    assert "buildIssueInvestigationRunRequest" in contract
+    # The dashboard never hand-rolls the endpoint or the payload.
+    assert "uiActionContract.buildGlobalHealthReviewRunRequest()" in js
+    assert "uiActionContract.buildIssueInvestigationRunRequest(number)" in js
+    assert "'/api/tech-lead/runs'" not in js
+
+
+def test_tech_lead_requests_check_response_ok_and_surface_the_typed_detail() -> None:
+    js = _read(DASHBOARD_JS)
+    body = _function_body(js, "submitTechLeadRunRequest")
+
+    assert "res.ok" in body
+    assert "showToast" in body
+    # Errors and warnings are the sticky severities in showToast, so a typed
+    # rejection stays on screen until the operator dismisses it.
+    assert "'error'" in body and "'warning'" in body
+
+
+def test_disabled_tech_lead_actions_carry_a_reason_and_aria_state() -> None:
+    js = _read(DASHBOARD_JS)
+    body = _function_body(js, "applyTechLeadDisabledState")
+
+    assert "aria-disabled" in body
+    assert "button.title" in body
+    # The reason is VISIBLE text, programmatically associated — a disabled
+    # button is not focusable, so a tooltip alone is unreachable (#6994 F7).
+    assert "sink.textContent" in body
+    assert "aria-describedby" in body
+
+
+def test_tech_lead_disabled_and_status_styling_exists_in_the_css_bundle() -> None:
+    css = _read_dashboard_css_bundle()
+
+    assert '.settings-menu-item[aria-disabled="true"]' in css
+    assert ".settings-menu-status" in css
+    assert ".issue-action-status" in css
+
+
+def test_tech_lead_runs_chunk_is_registered_in_the_dashboard_bundle() -> None:
+    assert "tech_lead_runs.js" in DASHBOARD_JS_CHUNKS
+
+
 def test_issue_detail_timeline_filters_are_grouped_button_controls() -> None:
     js = _read(DASHBOARD_JS)
     css = _read_dashboard_css_bundle()
@@ -3917,3 +4065,107 @@ def test_provider_impact_events_trigger_live_row_refresh() -> None:
     source = _read(DASHBOARD_JS_DIR / "issue_metadata.js")
     assert "'provider.issue_blocked'" in source
     assert "'provider.issue_unblocked'" in source
+
+
+# ---------------------------------------------------------------------------
+# Tech-lead action DOM validity + reachable remedies (#6994 round 2 F6)
+#
+# The JS harness in ``tests/js/tech_lead_runs.test.js`` models the real
+# topology, but only the template can prove the real topology IS that. These
+# assertions are about structure the browser tests take as given.
+# ---------------------------------------------------------------------------
+
+
+def test_the_health_review_status_is_a_SIBLING_of_its_button_not_a_child() -> None:
+    """A status inside the button makes the Settings remedy a nested button.
+
+    ``applyTechLeadSettingsLink`` inserts the remedy into the status element's
+    PARENT. When the status lived inside the button, that parent WAS the button
+    — invalid interactive markup, and a remedy no keyboard user could reach.
+    """
+    html = _read(DASHBOARD_TEMPLATE)
+    button_attrs, button_text = _html_element(html, "button", "techLeadHealthReviewItem")
+    status_attrs, _ = _html_element(html, "span", "techLeadHealthReviewStatus")
+
+    assert 'id="techLeadHealthReviewStatus"' not in button_text, (
+        "the status must not be nested inside the action button"
+    )
+    assert 'class="settings-menu-row"' in html, (
+        "the action and its status need a shared container to be siblings in"
+    )
+    assert button_attrs["role"] == "menuitem"
+    assert status_attrs["role"] == "status"
+    assert status_attrs["aria-live"] == "polite"
+
+
+def test_the_compact_card_action_carries_a_REAL_status_sibling() -> None:
+    """The compact menu used to pass a detached null sink.
+
+    That left ``aria-describedby`` pointing at an id no element had, gave the
+    blocked reason nowhere to render, and left the Settings remedy impossible to
+    insert at all.
+    """
+    html = _read(DASHBOARD_TEMPLATE)
+    button_attrs, button_text = _html_element(html, "button", "menuInvestigateTechLead")
+    status_attrs, _ = _html_element(html, "span", "menuInvestigateTechLeadStatus")
+    row_attrs, _ = _html_element(html, "div", "menuInvestigateTechLeadRow")
+
+    assert 'id="menuInvestigateTechLeadStatus"' not in button_text
+    assert button_attrs["role"] == "menuitem"
+    assert status_attrs["role"] == "status"
+    assert status_attrs["aria-live"] == "polite"
+    # The row (not the button) carries the hidden default, so hiding the action
+    # takes its status text and its remedy with it.
+    assert "display:none" in row_attrs.get("style", "")
+    assert "display:none" not in button_attrs.get("style", "")
+
+
+def test_tech_lead_actions_are_aria_disabled_rather_than_natively_disabled() -> None:
+    """A natively disabled control is not focusable, so its reason is unreachable."""
+    js = _read(DASHBOARD_JS_DIR / "tech_lead_runs.js")
+
+    assert "button.disabled = false;" in js
+    assert "aria-disabled" in js
+    assert "button.disabled = Boolean(" not in js
+    assert "nullStatusSink" not in js, (
+        "every surface must own a real status element"
+    )
+
+
+def _rule_body_containing(css: str, selector: str) -> str:
+    """The declaration block of the rule whose selector list names ``selector``."""
+    # Comments carry commas, which would corrupt the selector-list split.
+    css = re.sub(r"/\*.*?\*/", "", css, flags=re.DOTALL)
+    for match in re.finditer(r"(?P<selectors>[^{}]+)\{(?P<body>[^{}]*)\}", css):
+        names = [part.strip() for part in match.group("selectors").split(",")]
+        if selector in names:
+            return match.group("body")
+    raise AssertionError(f"no CSS rule declares {selector!r}")
+
+
+def test_unavailable_tech_lead_actions_keep_a_visible_focus_style() -> None:
+    """aria-disabled keeps the control focusable, so it must LOOK focused."""
+    css = _read_dashboard_css_bundle()
+
+    for selector in (
+        ".settings-menu-item:focus-visible",
+        ".context-menu-item:focus-visible",
+    ):
+        assert "outline" in _rule_body_containing(css, selector)
+    for selector in (
+        '.settings-menu-item[aria-disabled="true"]',
+        '.context-menu-item[aria-disabled="true"]',
+    ):
+        # Not colour alone: the adjacent status text carries the reason, and
+        # this is the secondary cue.
+        assert "opacity" in _rule_body_containing(css, selector)
+
+
+def test_tech_lead_status_text_wraps_rather_than_clipping_the_reason() -> None:
+    """The blocked reason is a full sentence; clipping it hides the remedy."""
+    css = _read_dashboard_css_bundle()
+
+    for selector in (".settings-menu-status", ".context-menu-status"):
+        body = _last_css_rule_body(css, selector)
+        assert "overflow-wrap" in body
+        assert "white-space: normal" in body

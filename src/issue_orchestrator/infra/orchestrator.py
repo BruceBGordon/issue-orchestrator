@@ -45,9 +45,7 @@ from ..control.session_completion import (
 )
 from ..control.session_launcher import SessionLauncher
 from ..control.board_snapshot_builder import StateBoardSnapshotProvider
-from ..control.health_review_trigger import (
-    ensure_on_demand_health_review_anchor as _ensure_on_demand_health_review_anchor,
-)
+from ..control.tech_lead_run_wiring import TechLeadRunAdmission, TechLeadRunRequest, orchestrator_health_review_anchor as _ensure_health_review_anchor, orchestrator_launch_tech_lead_run as _launch_tech_lead_run, orchestrator_tech_lead_run as _admit_tech_lead_run, reconcile_orchestrator_tech_lead_ownership as _reconcile_tech_lead_ownership
 from ..control.session_routing import (
     orchestrator_launch_review_session as _launch_review_session,
     orchestrator_launch_retrospective_review_session as _launch_retrospective_review_session,
@@ -120,7 +118,14 @@ class Orchestrator:
     _loop_error_count: int = field(default=0, init=False)
     _loop_error_limit: int = field(default=3, init=False)
     _last_tick_time: float = field(default=0.0, init=False)
-    _state_lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
+    # The serialization boundary for every state-mutating transition: the tick,
+    # the control API, and the dashboard's tech-lead command surface all take it,
+    # so read-then-mutate sequences on `state` cannot interleave across threads
+    # (#6994 round 2 F8). Reentrant, so a transition nested inside a tick is
+    # free. A public, injectable collaborator rather than a hidden attribute:
+    # a test that needs to observe the boundary substitutes an instrumented
+    # lock instead of reaching into internals.
+    state_lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
     _external_close_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
     _external_resources_closed: bool = field(default=False, init=False, repr=False)
     _last_backup_check: float = field(default=0.0, init=False)
@@ -177,10 +182,6 @@ class Orchestrator:
         """Get the timestamp of the last tick."""
         return self._last_tick_time
 
-    @property
-    def state_lock(self) -> threading.RLock:
-        return self._state_lock
-
     @cached_property
     def operator_issue_commands(self) -> "OperatorIssueCommands":
         """Operator "retry"/"dismiss", bound to this facade's state and lock.
@@ -196,85 +197,20 @@ class Orchestrator:
         )
 
     def _run_locked(self, fn):
-        with self._state_lock:
+        with self.state_lock:
             return fn()
-
     def kill_session(self, name: str) -> None:
         """Kill a session by terminal ID (public wrapper)."""
         self._kill_session(name)
 
-    def terminate_tech_lead_session(
-        self, session: "Session"
-    ) -> "TechLeadTerminationOutcome":
-        """Behavior-complete termination of a tech_lead session on timeout (#6824 R7).
+    def terminate_tech_lead_session(self, session: "Session") -> "TechLeadTerminationOutcome":
+        """Behaviour-complete termination of a tech_lead session (#6824 R7).
 
-        ``kill_session`` only stops the terminal, and a one-shot command runs NO
-        further tick after this — so a recorded cleanup fact would never be
-        applied. The termination is therefore self-contained, mirroring the
-        outcomes normal completion produces: remove the session state machine,
-        stop the terminal, reconcile the session out of ``active_sessions`` (via
-        the state owner), release its claim, and FORCE-remove the disposable
-        scratch worktree.
-
-        EVERY effect is attempted independently — a failure of one (e.g. the
-        terminal stop) never aborts the others — and the result is a typed
-        :class:`TechLeadTerminationOutcome`, the SOLE owner of a failed one-shot
-        cleanup: on a scratch-worktree removal failure the outcome carries the
-        exact ``leaked_worktree`` path so the command can require explicit
-        operator removal. (No engine tick ever runs after this — the only caller
-        is the on-demand driver, which pauses and ``close()``s — so there is no
-        second, tick-based retry mechanism; #6824 R7.)
+        The facade coordinates; the effects and their independence are owned by
+        :mod:`..control.tech_lead_termination`.
         """
-        from ..control.tech_lead_trigger import TechLeadTerminationOutcome
-
-        n = session.issue.number
-
-        def _effect(fn, what: str) -> bool:  # attempt one effect independently
-            try:
-                fn()
-                return True
-            except Exception:
-                logger.warning(
-                    "[TECH_LEAD] Failed to %s for issue #%d on timeout terminate",
-                    what, n, exc_info=True,
-                )
-                return False
-
-        smm = getattr(self.deps, "state_machine_manager", None)
-        machine_removed = _effect(
-            lambda: smm.remove_session_machine(session.terminal_id) if smm else None,
-            "remove state machine",
-        )
-        terminal_stopped = _effect(
-            lambda: self._kill_session(session.terminal_id), "stop terminal"
-        )
-        self.state.drop_active_session(session.terminal_id)  # pure in-memory owner op
-        cm = getattr(self.deps, "claim_manager", None)
-        lease_id = getattr(session, "lease_id", None)
-        claim_released = _effect(
-            lambda: cm.release_claim(n, lease_id) if (cm and lease_id) else None,
-            "release claim",
-        )
-        wtm = getattr(self.deps, "worktree_manager", None)
-        disposable = getattr(session, "scratch_worktree", False) and session.worktree_path
-        worktree_removed = _effect(
-            lambda: wtm.remove(session.worktree_path, force=True)
-            if (disposable and wtm) else None,
-            "remove scratch worktree",
-        )
-        # A failed removal surfaces the EXACT leaked path in the outcome for
-        # explicit operator action before exit — the single cleanup-failure owner
-        # (no dead engine-tick retry, #6824 R7).
-        leaked_worktree = (
-            str(session.worktree_path) if (disposable and not worktree_removed) else None
-        )
-        return TechLeadTerminationOutcome(
-            terminal_stopped=terminal_stopped,
-            machine_removed=machine_removed,
-            claim_released=claim_released,
-            worktree_removed=worktree_removed,
-            leaked_worktree=leaked_worktree,
-        )
+        from ..control.tech_lead_termination import terminate_tech_lead_session
+        return terminate_tech_lead_session(self, session)
 
     def cancel_review_exchange_for_issue(
         self,
@@ -352,7 +288,7 @@ class Orchestrator:
             get_review_machine=self._get_review_machine,
             kill_session=lambda name: _kill_session(name, self.deps.session_manager, self.deps.events),
             queue_cache_store=self.deps.queue_cache_store,
-            tech_lead_authority=self.deps.tech_lead_authority,
+            tech_lead_authority=self.deps.tech_lead_authority, run_ownership=self.deps.run_ownership,
         )
 
     def _get_session_name(self, number: int, session_type: str = "issue") -> str: return get_session_name(number, session_type)
@@ -464,7 +400,7 @@ class Orchestrator:
     def handle_session_completion(self, session: Session, status: SessionStatus, *, provider_error_type: "ProviderErrorType | None" = None) -> None: _handle_session_completion(session, status, self.state, self._completion_handler, self.deps.action_applier, self.observer, self.deps.worktree_manager, self._kill_session, self.config, self.deps.session_output, publish_recovery=self.deps.publish_recovery, pending_work_claims=self.deps.pending_work_claims, provider_error_type=provider_error_type)
 
     def tick(self) -> bool:
-        with self._state_lock:
+        with self.state_lock:
             self._last_tick_time = time.time()
             self.deps.provider_resilience.close_expired()
             self.deps.services.state_health_check()
@@ -648,6 +584,7 @@ class Orchestrator:
             )
             # Check lease renewals for active sessions
             self._check_lease_renewals()
+            _reconcile_tech_lead_ownership(self)  # renew/withdraw run claims
         finally:
             self._last_orphan_reconcile_active_count = len(self.state.active_sessions)
 
@@ -815,7 +752,7 @@ class Orchestrator:
         # Capture and clear the state-owned refresh flag before the cycle.
         # If request_refresh() is called during the cycle, it sets the state
         # flag again and the next tick will process that new request.
-        with self._state_lock:
+        with self.state_lock:
             refresh_to_process = self.state.queue_refresh_requested
             self.state.queue_refresh_requested = False
         # Promote any gated expedite follow-ups whose proposed-tech-lead gate an
@@ -882,7 +819,7 @@ class Orchestrator:
                 "mode": "web" if hasattr(self, "_web_mode") else "headless",
             }),
         ))
-        with self._state_lock:
+        with self.state_lock:
             if self.state.paused:
                 self.deps.events.publish(TraceEvent(
                     EventName.ORCHESTRATOR_PAUSED,
@@ -990,7 +927,7 @@ class Orchestrator:
     def request_shutdown(self, force: bool = False) -> None:
         """Request graceful or forced shutdown."""
         self._shutdown_requested = True
-        with self._state_lock:
+        with self.state_lock:
             active = self.state.active_sessions
         self.deps.events.publish(TraceEvent(
             EventName.ORCHESTRATOR_SHUTDOWN_REQUESTED,
@@ -1010,7 +947,7 @@ class Orchestrator:
                     self._kill_session(s.terminal_id)
                 except Exception as e:
                     logger.warning("Failed to kill session %s: %s", s.terminal_id, e)
-            with self._state_lock:
+            with self.state_lock:
                 self.state.active_sessions = []
         else:
             logger.info("Shutdown requested - waiting for %d session(s)", len(active))
@@ -1020,7 +957,7 @@ class Orchestrator:
         self._close_external_resources()
 
     def request_refresh(self, inflight_stable_ids: set[str] | None = None) -> None:
-        with self._state_lock:
+        with self.state_lock:
             self.state.queue_refresh_requested = True
             self._plan_applier.request_refresh(
                 inflight_stable_ids,
@@ -1029,7 +966,7 @@ class Orchestrator:
             )
 
     def pause(self) -> None:
-        with self._state_lock:
+        with self.state_lock:
             self.state.paused = True
         logger.info("Orchestrator paused")
         self.deps.events.publish(TraceEvent(
@@ -1044,13 +981,13 @@ class Orchestrator:
         needs one read-only refresh because warm cache state may be stale before
         the dashboard first renders.
         """
-        with self._state_lock:
+        with self.state_lock:
             self.state.paused = True
             self.state.queue_refresh_requested = True
         logger.info("Orchestrator marked paused for startup")
 
     def resume(self) -> None:
-        with self._state_lock:
+        with self.state_lock:
             self.state.paused = False
         logger.info("Orchestrator resumed")
         self.deps.events.publish(TraceEvent(
@@ -1086,8 +1023,19 @@ class Orchestrator:
     def _github_workflow(self) -> GitHubWorkflow: return GitHubWorkflow(self.config, self.deps.events, self.deps.repository_host, self.deps.fact_gatherer, self.deps.pr_scanner, self.deps.label_sync, self._event_context, self.deps.label_manager, self.scheduler.dependency_evaluator)
     def launch_review_session(self, review: PendingReview) -> Optional[Session]: return _launch_review_session(review, self.state, self._session_launcher, self.deps.session_restorer, self.deps.pending_work_claims)
     def launch_retrospective_review_session(self, review: PendingRetrospectiveReview) -> Optional[Session]: return _launch_retrospective_review_session(review, self.state, self._session_launcher, self.deps.session_restorer, self.deps.pending_work_claims)
-    def launch_tech_lead_session(self, tech_lead: PendingTechLeadReview) -> Optional[Session]: return _launch_tech_lead_session(tech_lead, self.state, self.config, self._session_launcher, self.deps.session_restorer, self.deps.pending_work_claims)
-    def ensure_health_review_anchor(self) -> Optional[PendingTechLeadReview]: return _ensure_on_demand_health_review_anchor(state=self.state, config=self.config, repository_host=self.deps.repository_host, action_applier=self.deps.action_applier, queue_cache_store=self.deps.queue_cache_store, tech_lead_authority=self.deps.tech_lead_authority, now=time.time())
+    # #6994 R2 F2/F8: `launch_tech_lead_session` is the ONE entry point — it re-decides
+    # subject eligibility, scope exclusivity and cross-engine ownership immediately
+    # before starting. `launch_queued_*` is the raw step that authority delegates to.
+    # Both tech-lead transitions run under `state_lock` (reentrant, so the tick's
+    # own launch nests safely) because admission and launch each read the pending
+    # queue and then mutate it, and the dashboard command surface runs on a
+    # different thread from the tick.
+    def launch_queued_tech_lead_session(self, tech_lead: PendingTechLeadReview) -> Optional[Session]: return _launch_tech_lead_session(tech_lead, self.state, self.config, self._session_launcher, self.deps.session_restorer, self.deps.pending_work_claims)
+    def launch_tech_lead_session(self, tech_lead: PendingTechLeadReview) -> Optional[Session]:
+        with self.state_lock: return _launch_tech_lead_run(self, tech_lead)
+    def ensure_health_review_anchor(self) -> Optional[PendingTechLeadReview]: return _ensure_health_review_anchor(self)
+    def request_tech_lead_run(self, request: TechLeadRunRequest) -> TechLeadRunAdmission:
+        with self.state_lock: return _admit_tech_lead_run(self, request)
     def process_deferred_cleanups(self) -> None: self.state.pending_cleanups = self._github_workflow.process_deferred_cleanups(self.state.pending_cleanups, self._cleanup_manager)
     def _recover_orphaned_cleanups(self) -> None: self._plan_applier.recover_orphaned_cleanups()
     def scan_needs_code_review_prs(self) -> None: self._github_workflow.scan_needs_code_review_prs(self.state)

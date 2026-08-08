@@ -1195,6 +1195,30 @@ class SwitchE2ETimelineViewCommandPayload(BaseModel):
     run_id: int = Field(..., ge=1, strict=True)
     view: TimelineView
 
+class TechLeadGlobalHealthReviewScopePayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    kind: Literal['global_health_review']
+
+class TechLeadIssueScopePayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    issue_number: int = Field(..., ge=1, strict=True)
+    kind: Literal['issue']
+
+class TechLeadRunAdmissionPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    admitted: bool
+    behind_global_barrier: bool
+    detail: str
+    issue_number: int | None = Field(..., ge=1)
+    outcome: Literal['queued', 'already_queued', 'already_running', 'paused', 'not_running', 'not_configured', 'not_eligible', 'claim_conflict', 'failed']
+    reason: str
+    run_key: str
+    scope_kind: Literal['global_health_review', 'global_batch_review', 'issue']
+
+class TechLeadRunRequestPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    scope: TechLeadRunScopePayload
+
 class TestCaseHistoryPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
     outcome: str
@@ -1324,6 +1348,8 @@ ReviewStagePayload: TypeAlias = ReviewNotReachedPayload | ReviewSkippedPayload |
 ReviewTranscriptEvidencePayload: TypeAlias = ReviewTranscriptAvailablePayload | ReviewTranscriptUnavailablePayload
 
 SessionRecordingEvidencePayload: TypeAlias = SessionRecordingAvailablePayload | SessionRecordingUnavailablePayload
+
+TechLeadRunScopePayload: TypeAlias = TechLeadGlobalHealthReviewScopePayload | TechLeadIssueScopePayload
 
 TimelineCommandPayload: TypeAlias = ShowEventDetailsCommandPayload | OpenCompletionRecordCommandPayload | OpenValidationDetailsCommandPayload | OpenSessionRecordingCommandPayload | OpenReviewFeedbackCommandPayload | OpenReviewArtifactCommandPayload | OpenIssueTimelineCommandPayload | OpenE2ERunCommandPayload | ExpandE2ERunCommandPayload | SwitchE2ETimelineViewCommandPayload | CreateE2EUntriagedIssuesCommandPayload | OpenInlineAgentAttemptsCommandPayload
 

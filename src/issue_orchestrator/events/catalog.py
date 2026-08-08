@@ -237,6 +237,29 @@ class EventName(str, Enum):
     # Tech-lead attention sweep re-injected stuck issues / flagged exhausted
     # ones (#6823); internal trace event only (not a public UI event).
     TECH_LEAD_STUCK_SWEEP = "tech_lead.stuck_sweep"
+    # One scoped tech-lead run request reached the admission owner (#6994) —
+    # from the dashboard, the CLI, or an automatic trigger — carrying the run
+    # identity, scope kind, subject issue, trigger source, and the typed
+    # outcome/deferral reason. Internal trace event: the UI synchronizes on the
+    # command response and the dashboard view model, never on this.
+    TECH_LEAD_RUN_REQUESTED = "tech_lead.run_requested"
+    # A queued tech-lead investigation was withdrawn by launch-time
+    # revalidation (#6994): between admission and launch its subject was closed
+    # or unblocked, so the run is removed instead of spending an agent session
+    # on work that no longer exists. Internal trace event.
+    TECH_LEAD_RUN_WITHDRAWN = "tech_lead.run_withdrawn"
+    # The single launch authority refused to start a queued tech-lead run
+    # (#6994 round 2 F2): scope exclusivity, the shared run ledger, or
+    # launch-time subject revalidation said no at the very last moment. Carries
+    # the typed refusal so a queued-but-idle run is machine-readable rather than
+    # only a log line. Internal trace event.
+    TECH_LEAD_RUN_HELD = "tech_lead.run_held"
+    # A tech-lead run's cross-engine ownership changed under us (#6994 round 2
+    # F4). ``status`` distinguishes definitive loss (queued work withdrawn,
+    # active session stopped) from contention and from an unreadable
+    # coordination store, both of which are RETRIED rather than acted on.
+    # Internal trace event.
+    TECH_LEAD_RUN_OWNERSHIP_CHANGED = "tech_lead.run_ownership_changed"
 
     # =========================================================================
     # Cleanup operations

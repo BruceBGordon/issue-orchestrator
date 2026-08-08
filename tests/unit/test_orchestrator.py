@@ -20,6 +20,11 @@ from issue_orchestrator.domain.models import (
     ORCHESTRATOR_PR_MARKER,
 )
 from issue_orchestrator.domain.issue_key import FakeIssueKey
+from issue_orchestrator.domain.tech_lead_run import IssueInvestigationScope
+from issue_orchestrator.domain.tech_lead_session import (
+    TechLeadLaunchScope,
+    TechLeadSessionFlavor,
+)
 from issue_orchestrator.domain.session_key import SessionKey, TaskKind
 from issue_orchestrator.infra.config import Config
 from issue_orchestrator.control.scheduler import Scheduler
@@ -220,16 +225,24 @@ def test_terminate_tech_lead_session_is_behavior_complete(sample_config, tmp_pat
     tech_lead = SimpleNamespace(
         terminal_id="tech-lead-77", issue=SimpleNamespace(number=77), lease_id="lease-1",
         scratch_worktree=True, worktree_path=scratch,
+        tech_lead_scope=TechLeadLaunchScope(
+            flavor=TechLeadSessionFlavor.FAILURE_INVESTIGATION
+        ),
     )
     other = SimpleNamespace(
         terminal_id="issue-88", issue=SimpleNamespace(number=88), lease_id=None,
-        scratch_worktree=False, worktree_path=None,
+        scratch_worktree=False, worktree_path=None, tech_lead_scope=None,
     )
     orchestrator.state.active_sessions = [tech_lead, other]
+    # The run this session holds across engines — termination owns BOTH
+    # coordination layers, so it must go back too (#6994 round 2 F10).
+    assert orchestrator.deps.run_ownership.claim(IssueInvestigationScope(77)).owned
 
     outcome = orchestrator.terminate_tech_lead_session(tech_lead)
 
     assert outcome.clean is True  # every effect succeeded
+    assert outcome.run_released is True
+    assert orchestrator.deps.run_ownership.owns("issue:77") is False
     # State machine terminalized (removed)...
     smm.remove_session_machine.assert_called_once_with("tech-lead-77")
     # ...terminal stopped through the real session-routing boundary...
@@ -309,6 +322,10 @@ def test_composed_one_shot_timeout_terminates_via_real_driver_and_facade(
     that separate unit tests with a fake host could not catch. No live GitHub."""
     from issue_orchestrator.control.tech_lead_trigger import run_targeted_investigations
 
+    # A tech lead agent must be configured: the one-shot CLI now shares the
+    # dashboard's admission owner, which refuses a repository without one
+    # (#6994 round 1 F2).
+    sample_config.tech_lead_review_agent = "agent:tech-lead"
     orchestrator = create_test_orchestrator(sample_config)
     session_manager = MagicMock()
     claim_manager = MagicMock()
@@ -343,7 +360,9 @@ def test_composed_one_shot_timeout_terminates_via_real_driver_and_facade(
     orchestrator.tick = lambda: True  # never drains the session -> forces timeout
     orchestrator.pause = lambda: None
 
-    clock = iter([0, 0, 0, 9_999])  # observed_at, deadline, check#1, check#2 (past)
+    # deadline, then the poll checks; the tail stays past the deadline so the
+    # drive loop terminates deterministically however often it samples.
+    clock = iter([0, 0] + [9_999] * 8)
     results = run_targeted_investigations(
         orchestrator, [77], now=lambda: next(clock), sleep=lambda _s: None, timeout_s=1
     )
