@@ -75,13 +75,15 @@ Four concrete mechanisms in today's code destroy or strand the work:
    choice *between* units is the lineage decision, made durably after all of them
    are admitted.
 
-   Each member carries one of **seven** states, partitioned into two sets that the
-   contract keeps distinct because conflating them is how work gets destroyed:
+   Each member names its durable record and carries one of **six** states,
+   partitioned into two sets that the contract keeps distinct because conflating
+   them is how work gets destroyed. "No work here" is the empty batch, not a
+   seventh state — a disposition of nothing has no record to name:
 
    | Set | States | Meaning |
    |---|---|---|
    | Unresolved | `QUEUED` (automatic recovery), `PARKED` (awaiting approval), `PUBLISHING` (submission in flight), `FAILED` (fail-closed) | work exists and must not be lost; blocks teardown-with-destruction and scratch reset |
-   | Resolved | `NONE` (no work here), `RECOVERED` (published + routed), `ABANDONED` (operator explicitly accepted the loss) | nothing is at risk |
+   | Resolved | `RECOVERED` (published + routed), `ABANDONED` (operator explicitly accepted the loss) | nothing is at risk |
 
    An unverifiable or failed disposition preserves artifacts and must never
    collapse into generic `timed_out`, cleanup success, or scratch-reset
@@ -201,9 +203,18 @@ Four concrete mechanisms in today's code destroy or strand the work:
 
    | Layer | Owner | Needs orchestrator state |
    |---|---|---|
-   | Remote execution | `ValidatedHeadPublisher` — exact-object/exact-lease branch write, then ensure exactly one PR | no |
+   | Remote execution | `ValidatedHeadExecutor` — exact-object/exact-lease branch write, then ensure exactly one PR, as two separately callable steps | no |
+   | Fenced publication | `FencedValidatedHeadPublisher` — the disposition owner's claim re-checked before and between those steps | no |
    | Finalization | `PublishedWorkFinalizer` — staged review routing, then recovery-block clearing, composing the existing `RetryReviewRouting` policy | yes, on the request |
    | Admission | `PublishRecoveryService` (manual) and `ValidatedWorkDispositionService` (validated work), as **siblings** | yes |
+
+   The executor is shared, so it must carry **no admission-specific authorization
+   type**. Requiring the validated-work claim on its command while forbidding the
+   manual owner to acquire one would have made the shared port unusable by one of
+   its two allowed callers. Authority lives one layer up instead: the disposition
+   owner wraps the executor in a fenced publisher that holds its claim, and the
+   manual owner calls the executor under its existing locator/background-job
+   authority. Neither forges the other's.
 
    **Publication is fenced, synchronous, and its durability lives in numbered
    attempt rows.** A lease expiring proves only that time passed, never that the
@@ -216,7 +227,12 @@ Four concrete mechanisms in today's code destroy or strand the work:
    write is discarded, not merged), the fence is re-checked immediately before each
    external mutation, and the two remote writes are each independently fenced by the
    remote itself — the exact ref lease for the push, and GitHub's one-open-PR-per
-   (head, base) rule for the create. Process-liveness evidence gates *reclamation*
+   (head, base) rule for the create. Ownership is **record-scoped and spans
+   finalization**, not attempt-scoped: routing, history and the staged label
+   sequence happen after the push outcome is durable and are exactly as
+   single-owner as the push. Acquiring the claim is what bumps the fence, so a
+   rival cannot obtain one by reading the column — and a takeover invalidates the
+   previous owner in the same act that authorizes the new one. Process-liveness evidence gates *reclamation*
    so a healthy slow publisher is not displaced needlessly, but it is never the
    safety argument; the fence holds even when the liveness probe is wrong. The port makes one call and returns what happened; there is no
    "submitted, poll later" state, because nothing in this design owns a job runner

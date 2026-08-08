@@ -82,7 +82,6 @@ existing owner, and it becomes a fifth probe in the activity predicate.
 
 ```python
 class ValidatedWorkState(StrEnum):
-    NONE       = "none"       # resolved: no completed+validated work at this edge
     QUEUED     = "queued"     # recovery admitted automatically; drain will execute
     PARKED     = "parked"     # durable, awaiting approval (gated op or operator)
     PUBLISHING = "publishing" # admitted to the publisher; submission in flight
@@ -101,18 +100,17 @@ UNRESOLVED_STATES = frozenset({          # work still exists and is not safe to 
 })
 
 RESOLVED_STATES = frozenset({            # nothing is at risk; reset/teardown may proceed
-    ValidatedWorkState.NONE,
     ValidatedWorkState.RECOVERED,
     ValidatedWorkState.ABANDONED,
 })
 
-# NONE is a DISPOSITION state, never a ROW state. "No completed+validated work at
-# this edge" means no evidence was admitted, so no row exists to hold it; a stored
-# NONE would be a row asserting its own absence. Only the six remaining states are
-# ever persisted, and §2.1.3's `row.state in RESOLVED_STATES` branch therefore
-# reaches only RECOVERED and ABANDONED. The store rejects an attempt to write NONE.
-PERSISTED_STATES = frozenset(ValidatedWorkState) - {ValidatedWorkState.NONE}
-
+# There is deliberately NO "none" state. "No completed+validated work at this edge"
+# is not a property of a record — it is the ABSENCE of records, which an empty
+# ValidatedWorkDispositionBatch says directly (§2.2). A `NONE` member would be a
+# disposition of nothing, carrying no record_id and no key, and every consumer
+# would have to special-case it out of a collection whose whole purpose is that
+# each member names a unit of work. Every state here is persisted; every
+# disposition names a row.
 assert UNRESOLVED_STATES | RESOLVED_STATES == set(ValidatedWorkState)
 assert not (UNRESOLVED_STATES & RESOLVED_STATES)
 
@@ -545,9 +543,46 @@ issue+branch carries a `LineageRole` (§2.1). The lineage key is canonical over
 `(repo_slug, issue_number, branch_name)` — deliberately *not* the head sha, which is
 what makes it the thing several records share.
 
-**Admission classifies the new head against every unresolved row on the key**, using
-`merge-base --is-ancestor` against the **pinned refs** (§6) so a pruned object can
-never make the comparison unanswerable:
+**The lineage's published head is a durable fact, not a derived one.** A separate
+row per lineage key records what this owner has actually published:
+
+```sql
+CREATE TABLE IF NOT EXISTS validated_work_lineage (
+    lineage_key                 TEXT PRIMARY KEY,
+    published_head_sha          TEXT NOT NULL DEFAULT '',
+    published_by_record_id      TEXT NOT NULL DEFAULT '',
+    published_pre_push_expected TEXT NOT NULL DEFAULT '',  -- the baseline it pushed from
+    published_at                TEXT NOT NULL DEFAULT ''
+);
+```
+
+It is written **only** in the transaction that marks a record `RECOVERED` with
+`resolution_kind = PUBLISHED`, and only when the new head is a descendant of (or
+equal to) the recorded one, so the fact moves forward and never backward. It is
+never inferred from a label, and never from a remote read.
+
+**Admission classifies the new head against the published fact AND every unresolved
+row on the key**, using `merge-base --is-ancestor` against the **pinned refs** (§6)
+so a pruned object can never make the comparison unanswerable. Consulting only
+unresolved peers was a stranding path in its own right: once a descendant `H` is
+`RECOVERED`, it is resolved and therefore invisible to that comparison, so a later
+admission of ancestor `V` — an ordinary backfill (§11 slice 8) or an orphan repair
+that surfaced late — saw no peer at all, became the drainable `HEAD`, captured a
+fresh expectation of `H`, and then failed check 8 for not descending from `H`.
+Work demonstrably contained in the published head became durable
+`FAILED(REMOTE_DIVERGED)` and blocked reset until a human abandoned it.
+
+So classification is a **total** function of (new head, published fact, unresolved
+peers). When a published head `H` exists for the lineage key:
+
+| New head vs. published `H` | Result |
+|---|---|
+| ancestor of `H`, or equal to it | escrow re-verified ⇒ `RECOVERED(CONTAINED_IN_PUBLISHED_HEAD)` with `published_head_sha = H`, immediately and without ever being `QUEUED`; escrow fails to verify ⇒ `FAILED(ARTIFACT_HASH_MISMATCH)`, unresolved |
+| descendant of `H` | `HEAD`, drainable, **sequenced from the proven baseline**: `expected_remote_head := H`, permitted only when the new row's captured expectation is `H` itself or the lineage's `published_pre_push_expected` — the same two-durable-records proof the in-flight waiter rule uses. Anything else ⇒ `PARKED(REMOTE_BASELINE_UNPROVEN)` |
+| divergent from `H` | `PARKED(DIVERGENT_VALIDATED_HEADS)`. A published divergent head is never published over automatically |
+| ancestry unanswerable | `FAILED(VALIDATION_SHA_MISMATCH)` |
+
+Only after that gate does the comparison against unresolved peers run:
 
 | New head vs. existing unresolved rows | Result |
 |---|---|
@@ -580,7 +615,8 @@ never observable in a state its predecessor has already left:
 | `FAILED` or `ABANDONED` | any | classified by §2.1.4's ordinary admission rules against the predecessor's **unpublished** head. No baseline moves — nothing was published, so the waiter's captured expectation still stands. |
 | still `PUBLISHING` (an attempt merely expired and reconciled) | any | stays `PENDING`. Reconciliation is not resolution. |
 
-**The baseline advance is proven, not observed.** A descendant waiter captured its
+**The baseline advance is proven, not observed**, and it reads the same
+`validated_work_lineage` fact the post-resolution rules do. A descendant waiter captured its
 `expected_remote_head_sha` before the predecessor pushed — typically `R` — and the
 remote is now at the predecessor's `H`. Under the §4.3 allowed-state table `H` is a
 third sha, so without this rule the waiter would fail against the very publication
@@ -594,13 +630,19 @@ expectations differ, something else moved the branch: the waiter goes to
 `PARKED(REMOTE_BASELINE_UNPROVEN)` for an explicit decision rather than inheriting a
 baseline nobody proved.
 
-**Publication resolves the ancestors it contains.** In the same transaction that
-marks the `HEAD` row `RECOVERED` at published head `H`, every unresolved row on the
+**Publication resolves the ancestors it contains, and records why it may.** In the
+same transaction that marks the `HEAD` row `RECOVERED` at published head `H`, the
+`validated_work_lineage` fact is advanced to `H` — and every unresolved row on the
 lineage key whose `validated_head_sha` is an ancestor of `H` **and whose escrowed
 artifacts still verify** is marked `RECOVERED` with
 `resolution_kind = CONTAINED_IN_PUBLISHED_HEAD`, `published_head_sha = H`, and its
 own escrow and refs retained for the window. Its work is *in* the published head;
 holding it unresolved would be a deadlock in defence of nothing.
+
+Rows admitted *after* that transaction take the same decision from the same fact
+(the table above), so the answer does not depend on whether a record happened to
+exist when its descendant shipped. That symmetry is the point: containment is a
+property of the commits, and it must not become a property of arrival order.
 
 The artifact re-verification is not ceremony. Resolving an ancestor is the one place
 this contract marks work safe without publishing it, so it is gated on the same
@@ -648,7 +690,7 @@ recovery needs an evidence id and must never re-capture. A single request with
 `run_assets: SessionRunAssets | None` and `evidence_id: str = ""` describes their
 *union*, and a union type has to be narrowed at runtime by the owner — which is
 the moment a missing `run_assets` becomes a decision, and every available decision
-is a forbidden fallback: return `NONE` (a completed+validated run passes through
+is a forbidden fallback: report no work (a completed+validated run passes through
 teardown unseen), scan for the latest run, or rediscover paths from a worktree.
 The last two are explicitly outlawed by the repository's active-run contract
 (`control/AGENTS.md`, "Strongly Typed Session Run Ownership"). So the command is a
@@ -753,10 +795,23 @@ class OperatorResolution:
 
 @dataclass(frozen=True, slots=True)
 class ValidatedWorkDisposition:
-    """The typed result. Reported on IssueRuntimeTermination and to the UI."""
-    state: ValidatedWorkState
+    """The disposition OF ONE RECORD. It always names the work it disposes.
+
+    ``record_id`` and ``key`` are required, not decorative. A disposition that
+    carried only ``evidence_id`` could not identify its unit of work at all:
+    §2.1.1 deliberately allows several evidence ids per record, so a batch
+    validated for distinct evidence ids can still hold two members for one unit
+    — the exact invariant the batch exists to state. The same omission made
+    §8.3's event contract unbuildable from the returned value, forcing the
+    emitter back into the store for identity the typed boundary had claimed to
+    return.
+    """
+    record_id: str                # required, non-empty; the durable row's key
+    key: ValidatedWorkKey         # repo, issue, branch, validated head
+    evidence_id: str              # required, non-empty; the CURRENT evidence
+    state: ValidatedWorkState     # every state names a persisted row
+    lineage_role: LineageRole
     reason: str
-    evidence_id: str | None = None
     failure: ValidatedWorkFailure | None = None
     pr_number: int | None = None
     published_head_sha: str | None = None
@@ -769,10 +824,12 @@ class ValidatedWorkDisposition:
 
     def __post_init__(self) -> None:
         # fail-closed shape rules
+        if not self.record_id or not self.evidence_id:
+            raise ValueError("a disposition must name its record and its evidence")
+        if self.record_id != self.key.record_id:
+            raise ValueError("record_id must be the canonical id of the key it carries")
         if self.state is ValidatedWorkState.FAILED and self.failure is None:
             raise ValueError("FAILED disposition requires an enumerated failure")
-        if self.state is not ValidatedWorkState.NONE and not self.evidence_id:
-            raise ValueError("non-NONE disposition requires an evidence_id")
         if self.state is ValidatedWorkState.ABANDONED and self.resolution is None:
             raise ValueError("ABANDONED requires an explicit OperatorResolution")
         if self.state is not ValidatedWorkState.ABANDONED and self.resolution is not None:
@@ -788,19 +845,33 @@ class ValidatedWorkDispositionBatch:
     has two units of work; a result that can hold one meant capture had to pick
     one, and teardown then removed the worktree of the other. The lineage
     machinery cannot protect a record that admission never created.
+
+    **Empty is the no-work answer**, and it is the only one. There is no `NONE`
+    member (§2.1): "nothing admissible was found here" is the absence of
+    records, and modelling it as a member would mean a disposition with no
+    record and no key inside a collection whose invariant is that every member
+    names one.
     """
     issue_number: int
-    dispositions: tuple[ValidatedWorkDisposition, ...]
+    dispositions: tuple[ValidatedWorkDisposition, ...]   # empty == no work found
+    reason: str                                          # why, especially when empty
+
+    @classmethod
+    def no_work(cls, issue_number: int, reason: str) -> "ValidatedWorkDispositionBatch":
+        """The explicit no-work result. Reads at call sites as what it is."""
+        return cls(issue_number=issue_number, dispositions=(), reason=reason)
 
     def __post_init__(self) -> None:
-        if not self.dispositions:
-            raise ValueError("a batch always reports at least NONE")
-        states = [d.state for d in self.dispositions]
-        if ValidatedWorkState.NONE in states and len(states) != 1:
-            raise ValueError("NONE means nothing was found; it is never one of several")
-        ids = [d.evidence_id for d in self.dispositions if d.evidence_id]
-        if len(set(ids)) != len(ids):
-            raise ValueError("one disposition per distinct unit of work")
+        record_ids = [d.record_id for d in self.dispositions]
+        if len(set(record_ids)) != len(record_ids):
+            raise ValueError("one disposition per unit of work: duplicate record_id")
+        for d in self.dispositions:
+            if d.key.issue_number != self.issue_number:
+                raise ValueError("every member must belong to the terminated issue")
+
+    @property
+    def found_work(self) -> bool:
+        return bool(self.dispositions)
 
     @property
     def unresolved(self) -> bool:
@@ -1166,7 +1237,6 @@ phrased as **unresolved**, and the state sets from §2.1 are the definition:
 
 | State | `has_unresolved_work` | Reset / termination | Escrow + ref retention |
 |---|---|---|---|
-| `NONE` | false | proceeds | n/a |
 | `QUEUED` | **true** | stale-downgrades | indefinite |
 | `PARKED` | **true** | stale-downgrades | indefinite |
 | `PUBLISHING` | **true** | stale-downgrades | indefinite |
@@ -1186,7 +1256,7 @@ that resolves it, because every such heuristic is a fresh way to lose the work.
 |---|---|
 | `completion_review_exchange.py` — any non-ok outcome is a bare halt | Build a disposition request from the exchange terminal state. `STOPPED/MAX_ROUNDS_EXCEEDED` and `STOPPED/REVIEWER_REPORTS_NO_PROGRESS` carry `ReviewDisposition.ROUTE_TO_PR_REVIEW`; `ERROR/*` carries it too when completion+validation are conclusive. Publish-or-park, never discard (#7018 is this row). |
 | `domain/completion_finalization.py` — matrix sees runtime facts only | `CompletionFinalizationCommand` gains `validated_work_present: bool`. `TERMINAL_REVIEW_EXCHANGE_TIMEOUT` may only be returned once disposition is recorded; the matrix stays pure — the caller gathers the fact. |
-| `session_controller.py` / `session_completion.py` / `completion_action_planner.py` — classify to `TIMED_OUT`/`FAILED` | Consult `IssueRuntimeTermination.validated_work`. When the batch is anything other than a lone `NONE`, the recorded session outcome and the emitted event carry **every** member disposition; generic `timed_out` is no longer a legal classification for an issue whose batch reports any state in `UNRESOLVED_STATES` (`QUEUED`/`PARKED`/`PUBLISHING`/`FAILED`). |
+| `session_controller.py` / `session_completion.py` / `completion_action_planner.py` — classify to `TIMED_OUT`/`FAILED` | Consult `IssueRuntimeTermination.validated_work`. When the batch `found_work`, the recorded session outcome and the emitted event carry **every** member disposition; generic `timed_out` is no longer a legal classification for an issue whose batch reports any state in `UNRESOLVED_STATES` (`QUEUED`/`PARKED`/`PUBLISHING`/`FAILED`). |
 | `stuck_sweep.py` — "`failure_reason` is always `timed_out`" | Reads the disposition snapshot; a stranded-with-disposition issue is reported as owned recovery, not as an undiagnosed timeout, and is excluded from scratch-reset proposals. |
 | `control/tech_lead_reset_retry.py` + the dashboard reset — act on a boolean freshness check and then tear down | The returned `IssueRuntimeTermination.validated_work` is **consumed, not discarded**: a batch whose `.unresolved` is true aborts the reset with a typed stale-downgrade listing **every** blocking member's `state`/`failure`/`evidence_id`, so the operator is told which records blocked and what would resolve each. Ignoring the field is how a reset tears down work the boundary had already recorded; §9's guardrail asserts every call site binds it. |
 | Workspace freshness / detached HEAD (#7017) | A `WorkspaceIntegrity` precondition is evaluated **at exchange start** (don't run rounds on a broken workspace) and **at evidence capture**. At capture, a detached HEAD does not invalidate the commits — the resolved sha is pinned — but sets `branch_binding_verified=False`, which forces `PARKED` instead of `QUEUED`. |
@@ -1200,7 +1270,8 @@ SqliteIssueRunLedger(state_dir/"issue_run_ledger.sqlite")                    # �
 IssueRunEvidenceService(run_ledger, active_sessions_view)                    # §2.5
 SqliteValidatedWorkStore(state_dir/"validated_work.sqlite")
 FilesystemValidatedWorkEscrow(state_dir/"validated-work")
-GitValidatedHeadPublisher(working_copy, worktree_manager, repository_host)   # §4.4
+GitValidatedHeadExecutor(working_copy, worktree_manager, repository_host)    # §4.4
+FencedValidatedHeadPublisher(executor, store)                                # §4.4f
 StagedPublishedWorkFinalizer(                                                # §4.5b
     review_routing=RetryReviewRouting, phase_recorder=store,
     fresh_issue_reader=..., action_applier=..., label_manager=...,
@@ -1335,7 +1406,11 @@ CREATE TABLE IF NOT EXISTS validated_work_records (
     lineage_role          TEXT NOT NULL,              -- LineageRole
     superseded_by_record_id TEXT NOT NULL DEFAULT '', -- the HEAD this ancestor waits on
     waits_on_record_id    TEXT NOT NULL DEFAULT '',   -- §2.1.4 PENDING successor
-    active_fence          INTEGER NOT NULL DEFAULT 0, -- §4.4e; monotonic, never reused
+    owner_fence           INTEGER NOT NULL DEFAULT 0, -- §4.4e; monotonic, never reused
+    owner_host            TEXT NOT NULL DEFAULT '',   -- current claim holder
+    owner_pid             INTEGER NOT NULL DEFAULT 0,
+    owner_started_at      TEXT NOT NULL DEFAULT '',   -- pid reuse guard
+    owner_lease_expires_at TEXT NOT NULL DEFAULT '',  -- renewed at stage boundaries
     state                 TEXT NOT NULL,              -- ValidatedWorkState
     failure               TEXT NOT NULL DEFAULT '',   -- ValidatedWorkFailure
     reason                TEXT NOT NULL DEFAULT '',
@@ -1388,10 +1463,7 @@ CREATE TABLE IF NOT EXISTS validated_work_publish_attempts (
     target_head_sha       TEXT NOT NULL,
     expected_remote_head  TEXT NOT NULL DEFAULT '',
     phase                 TEXT NOT NULL,              -- DispositionPhase at claim time
-    fence                 INTEGER NOT NULL,           -- must equal records.active_fence to act
-    owner_host            TEXT NOT NULL,              -- liveness evidence for reclamation
-    owner_pid             INTEGER NOT NULL,
-    owner_started_at      TEXT NOT NULL,              -- pid reuse guard
+    fence                 INTEGER NOT NULL,           -- the owner_fence that claimed it
     started_at            TEXT NOT NULL,
     lease_expires_at      TEXT NOT NULL,
     outcome               TEXT NOT NULL DEFAULT '',   -- '' = no outcome yet (in flight or crashed)
@@ -1486,7 +1558,7 @@ covers `failed` because a failed disposition is work that still exists (§3.2).
 ### 4.2 State machine
 
 ```
-  termination ──► admission ──► NONE                        (resolved: nothing found)
+  termination ──► admission ──► (empty batch)               (nothing admissible found)
         │
         ├── conclusive + branch binding verified
         │   + worktree head == validated head ─────────────► QUEUED
@@ -1691,7 +1763,7 @@ equalities: the publisher (§4.4) receives the observed pair and returns
 were at the expectation and the write landed, and refuses on any mixture it cannot
 classify.
 
-### 4.4 The publication boundary — `ValidatedHeadPublisher`
+### 4.4 The publication boundary — `ValidatedHeadExecutor`
 
 This is the single named boundary the design review is required to specify, and it
 cannot be "call `PublishRecoveryService.retry_publish()` unchanged".
@@ -1839,10 +1911,8 @@ class RemoteHeadExpectation(StrEnum):
     UNCONSTRAINED = "unconstrained"  # manual retry: no captured expectation
 
 
-# PublishAttemptClaim (§4.4e) is the durable identity of ONE attempt at ONE
-# operation: record, attempt number, and the fence that authorizes it. The
-# publisher receives it so it can re-check the fence immediately before each
-# external write; it never invents one.
+# The executor below is deliberately free of admission-specific authority types.
+# See §4.4f for why, and for the fenced wrapper the disposition owner puts above it.
 
 
 @dataclass(frozen=True, slots=True)
@@ -1857,7 +1927,6 @@ class PublishValidatedHeadCommand:
     source_workspace: Path                # §4.4a; holds the objects, not the target
     pr_number: int | None
     pr_base_branch: str
-    attempt: PublishAttemptClaim          # claimed before this call; fenced (§4.4e)
 
 
 class PublishValidatedHeadStatus(StrEnum):
@@ -1885,7 +1954,19 @@ class PublishValidatedHeadOutcome:
         return self.status is PublishValidatedHeadStatus.TRANSIENT_FAILURE
 
 
-class ValidatedHeadPublisher(Protocol):
+class ValidatedHeadExecutor(Protocol):
+    """Remote execution. Two steps, so a caller can interpose between them."""
+
+    def push_validated_head(
+        self, command: PublishValidatedHeadCommand
+    ) -> PublishValidatedHeadOutcome: ...
+    """The branch write of §4.4b, and nothing else."""
+
+    def ensure_pull_request(
+        self, command: PublishValidatedHeadCommand
+    ) -> PublishValidatedHeadOutcome: ...
+    """The PR ensure/adopt/create of §4.4d, and nothing else."""
+
     def publish_or_reconcile(
         self, command: PublishValidatedHeadCommand
     ) -> PublishValidatedHeadOutcome: ...
@@ -1895,10 +1976,6 @@ class ValidatedHeadPublisher(Protocol):
     definitively failed. There is no in-flight state to poll: a process that
     dies mid-call leaves an attempt row with no recorded outcome, and §4.4e
     reconciles that against the remote rather than asking the publisher.
-
-    Re-checks ``holds_fence(command.attempt)`` immediately before the push and
-    again before PR ensure, and performs no external write when it is False —
-    a superseded caller must be unable to touch the remote.
     """
 ```
 
@@ -1949,39 +2026,64 @@ contiguous `attempt_no`, and **the row is written before the external call, in t
 same transaction that claims the right to make it**:
 
 ```python
-def begin_publish_attempt(
+def acquire_claim(
     self,
     record_id: str,
     *,
-    expected_states: frozenset[ValidatedWorkState],   # {QUEUED, PARKED} or {PUBLISHING}
-    expected_attempt_no: int,        # the highest attempt this drainer observed
+    expected_states: frozenset[ValidatedWorkState],  # {QUEUED, PARKED} or {PUBLISHING}
     evidence_id: str,                # must still be the CURRENT evidence
+    owner: ProcessIdentity,          # host + pid + process start time
+    now: str,
+    lease_expires_at: str,
+) -> ValidatedWorkClaim | None: ...
+    """Take exclusive ownership of the record for its whole PUBLISHING phase.
+
+    One transaction: verify no live owner holds it (or that the caller already
+    does), CAS `owner_fence = owner_fence + 1`, record the owner and lease, and
+    return a claim carrying the NEW fence. Returns None while a live owner holds
+    it. The fence bump is what makes the returned value a capability: a rival
+    cannot forge it by reading the column, because acquiring changes it.
+    """
+
+def renew_claim(self, claim: ValidatedWorkClaim, *, now: str, lease_expires_at: str) -> bool: ...
+    """Extend the lease WITHOUT bumping the fence. Called at stage boundaries."""
+
+def begin_publish_attempt(
+    self,
+    claim: ValidatedWorkClaim,
+    *,
+    expected_attempt_no: int,        # the highest attempt this drainer observed
     target_head_sha: str,
     expected_remote_head: str,
     phase: DispositionPhase,
     started_at: str,
     lease_expires_at: str,
-    owner: ProcessIdentity,          # host + pid + process start time
-) -> PublishAttemptClaim | None: ...
-    """One transaction: CAS the record into PUBLISHING (or keep it there),
-    bump `active_fence`, and INSERT attempt `expected_attempt_no + 1` with the
-    new fence and owner. Returns None if it lost, or if an outcome-less attempt
-    is still held by a live owner."""
+) -> PublishAttempt | None: ...
+    """Fence-gated. INSERT attempt `expected_attempt_no + 1` under the claim
+    and, on the first attempt, CAS the record into PUBLISHING. Returns None for
+    a stale claim or a lost race."""
 
 def record_attempt_outcome(
     self,
-    claim: PublishAttemptClaim,
+    claim: ValidatedWorkClaim,
+    attempt: PublishAttempt,
     *,
     outcome: PublishValidatedHeadStatus,
     failure: ValidatedWorkFailure | None,
     finished_at: str,
 ) -> bool: ...
-    """CAS on `active_fence == claim.fence`. Returns False for a stale claim,
+    """CAS on `owner_fence == claim.fence`. Returns False for a stale claim,
     whose outcome is DISCARDED — a late-returning publisher must not overwrite
-    the outcome of the attempt that superseded it."""
+    the outcome of the owner that superseded it."""
 
-def holds_fence(self, claim: PublishAttemptClaim) -> bool: ...
-    """Re-read immediately before every external mutation. False aborts it."""
+def holds_claim(self, claim: ValidatedWorkClaim) -> bool: ...
+    """Re-read immediately before every external mutation and before every
+    finalization stage. False aborts, with no remote write and no in-memory
+    routing mutation."""
+
+def release_claim(self, claim: ValidatedWorkClaim) -> bool: ...
+    """Called only in the terminal transition. Ownership is NOT released by a
+    successful attempt outcome — finalization is still ahead."""
 ```
 
 #### The fence: an expired timestamp is not proof the old caller is dead
@@ -1996,33 +2098,63 @@ branch write; it says nothing about PR creation, label routing, history mutation
 outcome recording.
 
 So the correctness mechanism is a **fence**, and the lease is only a hint about when
-to consider reclaiming:
+to consider reclaiming. Two properties make it work, and the second is the one an
+attempt-scoped fence was missing:
 
 ```python
 @dataclass(frozen=True, slots=True)
-class PublishAttemptClaim:
+class ValidatedWorkClaim:
+    """Exclusive ownership of ONE record for the WHOLE of its PUBLISHING phase.
+
+    Record-scoped, not attempt-scoped: ownership must survive from the first
+    attempt through `FinalizationPhase.COMPLETE`, because publication is only
+    half the mutation. Routing, history append and the staged label sequence
+    happen after the push outcome is durable, and they are exactly as
+    single-owner as the push.
+
+    Obtainable ONLY from `acquire_claim()`. Its fields are readable from the
+    store, but reading them does not confer it — see below.
+    """
     record_id: str
-    attempt_no: int
     fence: int          # monotonic per record; NEVER reused, never decreases
-    evidence_id: str
 ```
 
-`validated_work_records.active_fence` is bumped by every claim and every
-reclamation, and the claim's `fence` must equal it for anything to happen:
+**Acquiring is what bumps the fence.** `acquire_claim()` compare-and-sets
+`records.owner_fence = owner_fence + 1` and records the acquiring process as the
+owner; the returned claim carries the *new* value. That single rule is what makes
+the claim a capability rather than a struct:
 
-- **Every durable write takes the claim and compare-and-sets on `active_fence` in
-  the same transaction** — `record_attempt_outcome()`, `record_pr_number()`,
-  `record_finalization_phase()`, `resolve_attached_evidence()`, and the transition
-  to `RECOVERED`/`FAILED`. A stale claim's write is **rejected**, not merged. That
-  is the property the reviewer's test asks for: the stale attempt cannot change
-  durable state, so a late-returning publisher cannot overwrite the winner's
-  outcome.
-- **The fence is re-read and re-checked immediately before each external
-  mutation** — before the push, before PR ensure, and before each finalization
-  stage. A stale claim aborts there and performs no remote write at all.
-- **Reclamation bumps the fence**, so it permanently invalidates the previous claim
-  in the same act that authorizes the new one. There is no window in which both are
-  valid, regardless of what the old process is doing.
+> A process cannot obtain a valid claim by reading `owner_fence` and constructing
+> one, because the act of acquiring changes the value it would have copied. To act,
+> you must acquire; acquiring invalidates whoever held it before.
+
+That closes the window an attempt-scoped fence left open. Previously, once an
+attempt recorded `PUBLISHED` the record stayed `PUBLISHING` with its fence
+unchanged, so a second drainer could read the successful outcome, rebuild the same
+claim, pass the fence check, and finalize alongside the original owner — two
+processes appending review candidates, completed history and label sequences under
+one fence. `record_finalization_phase()` accepting both was never exclusivity,
+because both presented the same, still-current value.
+
+- **Ownership spans claim → terminal.** It is taken before the first attempt and
+  released only when the record reaches `RECOVERED`/`FAILED`/`ABANDONED` (or is
+  taken over). Recording a successful attempt outcome does **not** release it.
+- **Every durable write takes the claim and compare-and-sets on `owner_fence` in
+  the same transaction** — `begin_publish_attempt()`, `record_attempt_outcome()`,
+  `record_pr_number()`, `record_finalization_phase()`,
+  `resolve_attached_evidence()`, `classify_lineage_waiters()`, and the terminal
+  transition. A stale claim's write is **rejected**, not merged.
+- **The fence is re-checked immediately before each external mutation** — before
+  the push, before PR ensure, and before each finalization stage. A stale owner
+  aborts there and performs no remote write and no in-memory routing mutation.
+- **Ownership is renewed, not assumed.** `renew_claim(claim, now)` extends the
+  lease *without* bumping the fence, and the drain calls it at each stage boundary
+  (before the push, after the outcome, before each finalization stage). A single
+  external call that overruns the lease is therefore the only takeover window, and
+  a takeover in that window is safe by the fence rather than by luck.
+- **Takeover bumps the fence**, so it permanently invalidates the previous owner in
+  the same act that authorizes the new one. There is no moment when both are valid,
+  whatever the old process is doing.
 
 The recheck-then-mutate window is still not atomic, so the two external mutations
 are each independently fenced by the remote itself, and this is why those two and
@@ -2038,16 +2170,21 @@ If PR-ensure ever observes **two** open PRs for the branch carrying the
 orchestrator body marker, that is `FAILED(DUPLICATE_OPEN_PR)` — reported, never
 silently resolved by picking one.
 
-**Reclamation requires evidence, not just elapsed time.** The attempt row records
-the owning `process_identity` (host, pid, process start time). A reclaiming drainer
-may take an outcome-less attempt only when the recorded owner is provably gone —
+**Takeover requires evidence, not just elapsed time.** The record carries the
+owning `process_identity` (host, pid, process start time) and a lease. A drainer
+may take over a claim — at **any** point in the `PUBLISHING` phase, whether the
+current attempt has an outcome or not — only when the recorded owner is provably
+gone —
 same host, and no live process with that pid *and* start time — or, when liveness
 cannot be established (a different host, an unreadable process table), after the
 lease has been expired for a full `PUBLISH_RECLAIM_GRACE`, which is an order of
 magnitude longer than the call timeout. This is a *politeness* rule: it avoids
-reclaiming a healthy slow publisher and burning an attempt. It is emphatically not
-the safety argument — the fence is, and the fence holds even when the liveness
-probe is wrong.
+displacing a healthy slow owner mid-finalization. It is emphatically not the safety
+argument — the fence is, and the fence holds even when the liveness probe is wrong.
+
+Note this is deliberately stated over the whole phase rather than over
+"outcome-less attempts". Scoping the liveness rule to outcome-less attempts was
+what left the post-outcome finalization window unowned.
 
 Within one process the drain is single-threaded and `publish_or_reconcile()` is
 called from it, so a second concurrent attempt on one record is only ever
@@ -2086,12 +2223,17 @@ never exist for a record that is not `PUBLISHING`.
 
 **Every outcome has a defined transition** — the owner never has an unhandled state:
 
-| Attempt state at drain | Owner does |
+Every row below is reached only *after* `acquire_claim()` succeeded, so "the owner
+does" always means the current fence holder:
+
+| Record/attempt state at drain | Owner does |
 |---|---|
-| outcome `''`, lease **live** | another drainer owns it. No writes, re-check next drain. |
-| outcome `''`, lease expired, owner **provably alive** | do not reclaim; re-check next drain. Reclaiming would be safe (the fence protects it) but would waste an attempt. |
-| outcome `''`, lease expired, owner **gone or unprovable past the grace** | bump the fence, re-run §4.3 in `RECONCILING`, and claim a new attempt only if a write is still required. The previous claim is now inert. |
-| a stale claim tries to record anything | the CAS returns False; nothing is written and the attempt is logged as superseded. |
+| a **live owner** holds the claim (any attempt state, any finalization phase) | `acquire_claim()` returns None. No writes, re-check next drain. |
+| lease expired, owner **provably alive** | do not take over; re-check next drain. Taking over would be safe (the fence protects it) but would displace healthy work mid-stage. |
+| lease expired, owner **gone or unprovable past the grace** | `acquire_claim()` bumps the fence and takes ownership. The previous owner is now inert — including one paused between a successful outcome and finalization. |
+| claim held, latest attempt outcome `''` | re-run §4.3 in `RECONCILING`; begin a new attempt only if a write is still required. |
+| claim held, latest attempt outcome successful, `finalization_phase < COMPLETE` | resume §4.5b from the recorded phase. **This is a finalization resume, not a new attempt** — no push, no new attempt row. |
+| a stale claim tries to record anything | the CAS returns False; nothing is written and the caller is logged as superseded. |
 | `PUBLISHED` / `ALREADY_AT_TARGET` | re-read the branch; require it at `target_head_sha`; ensure the PR (§4.4d); finalize (§4.5); mark `RECOVERED`. A success whose branch is *not* at target is a hard `REMOTE_HEAD_CHANGED` ⇒ `FAILED`. |
 | `TRANSIENT_FAILURE` | stay `PUBLISHING`; claim attempt *n+1* next drain while `COUNT(attempts) < PUBLISH_ATTEMPT_LIMIT`; exhaustion ⇒ durable `FAILED`. |
 | `DIVERGED` / `REJECTED` | durable `FAILED` with the mapped `ValidatedWorkFailure`. Definitive: no retry. |
@@ -2104,6 +2246,62 @@ string.
 The lease duration is derived from the existing publish job timeout (config-free,
 for the same reason the attempt limit is), and an expired lease is never treated as
 a failure — only as "reconcile before deciding".
+
+#### 4.4f Two callers, one executor: where the fence lives
+
+The executor above is shared by both admission owners — that is the point of §4.6,
+and it is what fixes the manual path's existing-PR shortcut in the same stroke. But
+the fence of §4.4e belongs to the **validated-work record**, and only
+`ValidatedWorkDispositionService` has one. An earlier draft put a required
+`ValidatedWorkClaim` on `PublishValidatedHeadCommand` and simultaneously forbade
+every module but the disposition service from acquiring a claim, which left
+`PublishRecoveryService` unable to construct the command of a port it is explicitly
+allowed to call. That is an unimplementable boundary, not a typing detail: the
+manual path owns `PublishRetryLocators` and a background-job lifecycle, and
+`RemoteHeadExpectation.UNCONSTRAINED` names its *semantics* without granting it
+*authority*.
+
+The split is therefore by layer, not by parameter:
+
+| Layer | Type | Who calls it | Authorization |
+|---|---|---|---|
+| Remote execution | `ValidatedHeadExecutor` | **both** admission owners | none of its own — it executes what it is told |
+| Fenced validated-work publication | `FencedValidatedHeadPublisher` | `ValidatedWorkDispositionService` only | holds a `ValidatedWorkClaim`; re-checks `holds_claim()` before each executor step |
+| Manual publication | `PublishRecoveryService`, calling the executor directly | manual retry only | its existing locator + background-job authority, unchanged |
+
+`FencedValidatedHeadPublisher` is a thin wrapper constructed by the disposition
+service around the shared executor and its own claim. Its whole body is
+check-then-delegate:
+
+```python
+def publish(self, claim: ValidatedWorkClaim, command: PublishValidatedHeadCommand):
+    if not self._store.holds_claim(claim):
+        return Superseded()                  # no remote write at all
+    push = self._executor.push_validated_head(command)
+    if not push.landed:
+        return push
+    if not self._store.holds_claim(claim):   # re-check between the two writes
+        return Superseded()
+    return self._executor.ensure_pull_request(command)
+```
+
+That is why the executor exposes its two steps separately: the interposition point
+has to be *between* the branch write and the PR ensure, and putting it there must
+not require the executor to know what a claim is.
+
+Three properties this buys:
+
+- **Neither caller forges the other's authority.** The manual owner never
+  constructs a `ValidatedWorkClaim`; the disposition owner never constructs
+  `PublishRetryLocators` (§4.6). Each reaches the same executor through its own.
+- **The guardrails become statable.** "Only `ValidatedWorkDispositionService`
+  acquires claims" and "both admission owners may call `ValidatedHeadExecutor`" are
+  now compatible sentences, and "the disposition path reaches the executor only
+  through `FencedValidatedHeadPublisher`" is mechanically checkable (§9).
+- **The manual regression is preserved.** `retry_publish()` still goes through the
+  executor with `UNCONSTRAINED`, so an open PR at `R` no longer short-circuits
+  publishing target `L`, and its duplicate-submission/tombstone behaviour is
+  untouched.
 
 ### 4.5 The finalization boundary — `PublishedWorkFinalizer`
 
@@ -2183,7 +2381,7 @@ an effect of the transition, never evidence of it.
 @dataclass(frozen=True, slots=True)
 class PublishedWorkFinalizationRequest:
     state: OrchestratorState              # the caller supplies it; no hidden state
-    claim: PublishAttemptClaim            # §4.4e fence; every stage is gated on it
+    claim: ValidatedWorkClaim             # §4.4e; every stage is gated on it
     resume_from: FinalizationPhase        # NOT_STARTED on the first pass
     issue_number: int
     issue_title: str
@@ -2229,7 +2427,7 @@ class FinalizationOutcome:
 class FinalizationPhaseRecorder(Protocol):
     """The narrow durability the staged owner needs. Implemented by the store."""
     def record_finalization_phase(
-        self, claim: PublishAttemptClaim, phase: FinalizationPhase
+        self, claim: ValidatedWorkClaim, phase: FinalizationPhase
     ) -> bool: ...
     """Fence-gated (§4.4e): False for a stale claim, which then performs no
     further stage. A superseded publisher cannot drive the staged machine."""
@@ -2262,7 +2460,8 @@ routing decision, not the ordering.
 | Admission (validated work) | `ValidatedWorkDispositionService` | evidence admission, escrow/refs, lineage, §4.3 checks, state machine | yes, via `drain(state)`/`recover(command, state)` |
 | Run evidence | `IssueRunEvidenceSource` (§2.5) | which runs exist for an issue, with exact assets | **no** |
 | Durable state | `ValidatedWorkStore` | records, evidence roles, publish attempts, finalization phase | **no** |
-| Remote execution | `ValidatedHeadPublisher` | exact-object/exact-lease branch write, PR ensure | **no** |
+| Remote execution | `ValidatedHeadExecutor` | exact-object/exact-lease branch write, PR ensure — two separately callable steps | **no** |
+| Fenced publication | `FencedValidatedHeadPublisher` | re-checks the claim between and before executor steps (§4.4f) | **no** |
 | Finalization | `PublishedWorkFinalizer` | staged labels → routing → recovery clear (§4.5b) | yes, carried on the request |
 
 Each row is one implementable responsibility, and neither admission owner depends
@@ -2310,8 +2509,8 @@ Admission answers: *which bytes on disk may become executable authority?*
 considers exactly the runs in `AutomaticCaptureCommand.run_evidence.runs` (§2.5) —
 each an exact `SessionRunAssets` recorded by the owner that allocated it. It never
 enumerates run directories, never picks a "latest run", and never resolves a run
-from a worktree or a session name. `NO_RUNS_RECORDED` yields `NONE`; an unreadable
-ledger raised before admission was ever reached.
+from a worktree or a session name. `NO_RUNS_RECORDED` yields an empty batch; an
+unreadable ledger raised before admission was ever reached.
 
 **Admissible sources within each such run, in this order:**
 
@@ -2616,12 +2815,26 @@ per the `schema-updates` skill.
 ### 8.4 Public contract + Control Center command
 
 - `contracts/public.py`: the issue-detail view model gains a `validated_work` block
-  — `state`, `unresolved`, `evidence_id`, `validated_head_sha`, `worktree_head_sha`,
-  `pr_number`, `failure`, `escrow_retained`, `lineage_role` (so an ancestor parked
-  behind a descendant reads as *waiting*, not *stuck*), `publish_attempts`,
-  `finalization_phase`, and the available operator actions (`recover`, and `abandon`
-  for a `PARKED`/`FAILED` record). A `DIVERGENT` row surfaces the sibling heads so
-  the operator's choice is informed rather than blind. Regenerate
+  whose items carry `state`, `unresolved`, `worktree_head_sha`, `failure`,
+  `escrow_retained`, `lineage_role` (so an ancestor parked behind a descendant reads
+  as *waiting*, not *stuck*), `publish_attempts`, `finalization_phase`, the
+  available operator actions (`recover`, and `abandon` for a `PARKED`/`FAILED`
+  record), **and a nested `authority` object carrying every field of
+  `ValidatedWorkAuthoritySnapshot` verbatim**: `record_id`, `evidence_id`,
+  `observation_revision`, `validated_head_sha`, `branch_name`, `repo_slug`,
+  `issue_number`, `pr_number`, `expected_remote_head_sha`.
+
+  The `authority` object is not redundancy. The operator command is only an
+  authorization if the browser can echo back **exactly what it rendered**, and a
+  public payload that omitted `record_id`, `branch_name`, `expected_remote_head_sha`
+  or `observation_revision` left the adapter no way to build the snapshot except by
+  reading them from fresh server state — which is precisely the escape §4.3 check 0
+  exists to close, moved one layer out. The endpoint therefore **must not populate
+  any authority field from the store**: a request missing a field, or carrying one
+  the client did not render, is rejected as malformed rather than completed.
+
+  A `DIVERGENT` row surfaces the sibling heads so the operator's choice is informed
+  rather than blind. Regenerate
   `contracts/public/*.json` with `scripts/generate_public_contracts.py`; drift is
   enforced by `tests/unit/test_public_contract_schemas.py`.
 - The block is a **list**, because an issue can hold several records (§2.1.4): a
@@ -2629,12 +2842,16 @@ per the `schema-updates` skill.
   awaiting a choice. Rendering one and hiding the rest is the same collapse-to-a-winner
   the batch exists to prevent, and it is worse in the UI than in the owner, because
   the operator is the one being asked to choose.
-- An operator action posts back the `ValidatedWorkAuthoritySnapshot` fields the UI
-  displayed — evidence id, observation revision, PR number, expected remote head —
-  and the endpoint builds the `StoredEvidenceCommand` from them. So the operator,
-  like the tech lead, approves *specific facts*: if the record moved between render
-  and click, check 0 refuses with zero writes and the UI re-renders the new facts
-  rather than acting on them silently.
+- An operator action posts the rendered `authority` object back **unchanged**, and
+  the endpoint builds the `StoredEvidenceCommand` from the request body alone. So
+  the operator, like the tech lead, approves *specific facts*: if the record moved
+  between render and click, check 0 refuses with zero writes and the UI re-renders
+  the new facts rather than acting on them silently. Registered in the UI OpenAPI
+  contract as a required request-body object per the `ui-openapi` skill.
+- The confirmation context must **show** what is being authorized — PR number,
+  branch, validated target sha, and remote baseline — not merely transmit it. An
+  approval the operator cannot read is not an informed one, and this is the dialog
+  where the destructive-by-consequence `abandon` also lives (§8.4 accessibility).
 - Availability comes from `ValidatedWorkDispositionOwner.snapshot()`, not from the
   route re-deriving policy — the same shape as the existing
   `can_retry_publish()`-gated `retry_publish` action in
@@ -2676,8 +2893,8 @@ per the `schema-updates` skill.
 - Missing ownership fails closed: a live `Session` with no ledger row raises
   `IssueRunEvidenceUnavailable`, and teardown aborts. An unreadable ledger does the
   same. Neither is ever reported as `NO_RUNS_RECORDED`.
-- `NO_RUNS_RECORDED` for an issue that genuinely never launched produces `NONE` and
-  a clean teardown — the positive fact is distinguishable from the failure.
+- `NO_RUNS_RECORDED` for an issue that genuinely never launched produces an empty
+  batch and a clean teardown — the positive fact is distinguishable from the failure.
 - The run-evidence fake **raises** on `find_run_dir`, latest-run selection,
   session-name search, and worktree traversal, so any rediscovery attempt fails the
   test rather than passing quietly.
@@ -2694,8 +2911,14 @@ per the `schema-updates` skill.
 - A group that cannot be escrowed raises and **nothing** is torn down — including the
   groups that had already been escrowed, which stay admitted and unresolved rather
   than being rolled back into invisibility.
-- `ValidatedWorkDispositionBatch` refuses an empty tuple, refuses `NONE` alongside
-  other members, and refuses duplicate evidence ids.
+- `ValidatedWorkDispositionBatch` refuses **two members for one `record_id`** —
+  including the case that previously slipped through, two *different* evidence ids
+  for the same record — refuses a member belonging to another issue, and accepts
+  distinct record ids. `no_work()` produces an empty batch whose `found_work` is
+  false and whose `unresolved` is false.
+- `VALIDATED_WORK_DISPOSITION_OBSERVED` and the `ActionResult` are constructed
+  **solely from the bound batch**, with no store lookup — asserted by building both
+  against a store double that fails the test if it is read.
 
 **Command → handler** (the consumption half):
 
@@ -2704,8 +2927,8 @@ per the `schema-updates` skill.
 - The tech-lead board renders a `recover_validated_work` gated op; removing
   `proposed-tech-lead` and the Control Center command reach the same owner and
   produce the same typed result.
-- `session_controller`/`session_completion` classification: an issue with a non-`NONE`
-  disposition is never recorded as generic `timed_out`.
+- `session_controller`/`session_completion` classification: an issue whose batch
+  `found_work` is never recorded as generic `timed_out`.
 - The reset path binds the returned disposition: a reset attempted against every
   `UNRESOLVED_STATES` value stale-downgrades with zero effects and surfaces the
   blocking `state`/`evidence_id`.
@@ -2725,16 +2948,21 @@ sweeps above:
 | §4.4b TOCTOU | The worktree advances from `V` to `L` *after* admission and before the push: the published object is still `V` (the refspec names the object, not a branch HEAD). |
 | §4.4b TOCTOU | The remote moves from `E` to `X` after observation and before the push: `LEASE_REJECTED` ⇒ `REMOTE_HEAD_CHANGED`, **zero remote writes**, and `X` is still the remote head afterwards. Asserted against a fake that records every git invocation, so a bare `--force-with-lease` or a preceding `fetch_for_push()` fails the test. |
 | §4.4b absent branch | Expectation `ABSENT` with the branch created by a third party between observation and push: empty-lease rejection, zero writes. |
-| §4.4 publisher | Open PR *P* at remote head `R`, target `L`: the publisher **pushes** and does not take an existing-PR shortcut; end state has remote head `L`. |
+| §4.4 publisher | Open PR *P* at remote head `R`, target `L`: the publisher **pushes** and does not take an existing-PR shortcut; end state has remote head `L`. Run through **both** owners — `PublishRecoveryService` with `UNCONSTRAINED`, and the disposition path through `FencedValidatedHeadPublisher` — since the manual regression must survive the split. |
+| §4.4f owners | A valid publisher request is constructible through **each** allowed owner using only that owner's own authority: the manual path from its locator/background-job authority, the disposition path from an acquired `ValidatedWorkClaim`. Neither test may construct the other's authority type. |
+| §4.4f owners | Guardrail: the disposition path reaches `ValidatedHeadExecutor` **only** through `FencedValidatedHeadPublisher`, and `PublishRecoveryService` never acquires a claim or constructs one. Manual duplicate-submission and tombstone behaviour is asserted unchanged. |
 | §4.4 publisher | Remote branch already at `L`: `ALREADY_AT_TARGET`, **no second push**, decided on the branch ref alone (no PR consulted). |
 | §4.4 publisher | Remote head is a third sha `X`: `DIVERGED`, no push, no PR write, no label writes. |
 | §4.4d PR ensure | Branch at `L`, `pr_number=None`, **no PR** (crashed after push, before create): restart creates exactly one PR, routes review, and does not re-push. |
 | §4.4d PR ensure | Branch at `L`, `pr_number=None`, an open PR for the branch already exists (crashed after create, before persisting the number): it is adopted, not duplicated; a prior-attempt PR on another branch is not adopted. |
 | §4.4e ordering | The record is `PUBLISHING` **and its attempt row exists** before the publisher is invoked — asserted by a publisher double that reads the store when called. A crash inside the publisher leaves `PUBLISHING` with an outcome-less attempt, never `QUEUED`-with-a-completed-push. |
 | §4.4e ordering | Two concurrent drains on one row, **and two drains in separate processes over one database file**: exactly one `begin_publish_attempt` wins, exactly one remote call is made, and the loser makes no writes. A rival arriving while the lease is live also gets `None`. |
-| §4.4e fencing | **Pause attempt 1 inside the publisher past its lease; let a second process reclaim and run attempt 2 to completion; then release attempt 1.** Assert exactly one effective PR ensure, one routing, one history finalization, and one accepted outcome; assert attempt 1's `record_attempt_outcome`, `record_pr_number`, and `record_finalization_phase` all return False and write nothing; and assert attempt 1's pre-mutation `holds_fence()` checks abort it before any remote call. |
+| §4.4e fencing | **Pause attempt 1 inside the publisher past its lease; let a second process take over and run attempt 2 to completion; then release attempt 1.** Assert exactly one effective PR ensure, one routing, one history finalization, and one accepted outcome; assert attempt 1's `record_attempt_outcome`, `record_pr_number`, and `record_finalization_phase` all return False and write nothing; and assert attempt 1's pre-mutation `holds_claim()` checks abort it before any remote call. |
+| §4.4e fencing | **Pause owner A *after* `record_attempt_outcome(PUBLISHED)` is durable and *before* finalization stage 1**, then run a second process's drain. While A is live, B's `acquire_claim()` returns None and B performs nothing. Then model A's death: B's takeover bumps the fence, B resumes finalization from the recorded phase, and releasing A afterwards produces **zero** accepted writes and zero effects. Assert exactly one routing, one history append, one label sequence, one phase progression, and one terminal transition across both processes. This is the window an attempt-scoped fence left open. |
+| §4.4e claims | A `ValidatedWorkClaim` reconstructed by hand from the store's current `owner_fence` is **not** honoured: the test acquires legitimately in one process, hand-builds an identical struct in another, and asserts every fenced store call from the hand-built one returns False. Ownership comes from `acquire_claim()` bumping the fence, not from matching a readable column. |
+| §4.4e claims | The claim is held across the whole phase: a successful attempt outcome does **not** release it, and `release_claim()` happens only in the terminal transition. Renewal at stage boundaries extends the lease without bumping the fence, so a healthy slow owner is not displaced mid-finalization. |
 | §4.4e fencing | The stale attempt's push is rejected by the exact ref lease, and its PR create is rejected by the remote's one-open-PR-per-(head,base) rule and mapped to adopt — asserted against a fake that records every remote call, so a second PR or a second push fails the test. Two marked open PRs for the branch produce `FAILED(DUPLICATE_OPEN_PR)`, never a silent pick. |
-| §4.4e reclamation | An expired lease whose owner is **provably alive** is not reclaimed; one whose owner is gone is reclaimed with a fence bump; one on an unreachable host is reclaimed only after `PUBLISH_RECLAIM_GRACE`. In all three the fence — not the liveness answer — is what the safety assertions are made against. |
+| §4.4e takeover | An expired lease whose owner is **provably alive** is not taken over; one whose owner is gone is taken over with a fence bump; one on an unreachable host is taken over only after `PUBLISH_RECLAIM_GRACE`. Asserted at **two** points in the phase — mid-attempt and mid-finalization — since the rule is stated over the whole claim, not over outcome-less attempts. In all cases the fence, not the liveness answer, is what the safety assertions are made against. |
 | §4.4e attempts | Restart at **every** attempt boundary: after the claim/before the call, after the call/before `record_attempt_outcome`, and after the outcome. Each resumes without a duplicate remote write. |
 | §4.4e attempts | A transient failure is followed by a **real second attempt**: attempt 2 is a distinct durable row with its own identity, the operation identity `(record_id, target_head_sha)` is unchanged, and the published head is still exactly one commit. |
 | §4.4e attempts | An outcome-less attempt with an **expired** lease re-runs `RECONCILING` and never resubmits blind; the same row with a **live** lease produces zero writes and a re-check next drain. |
@@ -2768,17 +2996,22 @@ sweeps above:
 | §2.1.4 waiters | Admit a **descendant**, an **ancestor**, and a **divergent** record while a predecessor is actively `PUBLISHING`. Each becomes its own `PARKED`/`PENDING` record with `waits_on_record_id` set — never an evidence role on the predecessor — and each blocks reset from the moment it exists. |
 | §2.1.4 waiters | Predecessor **success**: the descendant waiter is classified `HEAD` and its baseline advances to the published head, so it does **not** fail merely because the predecessor moved the remote to the exact contained head this owner published — the specific regression. The ancestor waiter resolves by containment; the divergent waiter parks. |
 | §2.1.4 waiters | The baseline advance is refused when the waiter's recorded expectation differs from the predecessor's recorded pre-push expectation: `PARKED(REMOTE_BASELINE_UNPROVEN)`, with **no remote read** involved in the decision. |
+| §2.1.4 post-resolution | **Fully recover `H`, then admit ancestor `V` afterwards** — by ordinary capture, by orphan repair, and by the slice-8 backfill path. `V` resolves directly as `RECOVERED(CONTAINED_IN_PUBLISHED_HEAD)` on verified escrow, is never `QUEUED`, never reaches check 8, and leaves nothing unresolved. With escrow that fails verification it is `FAILED(ARTIFACT_HASH_MISMATCH)` instead — never resolved by inference. |
+| §2.1.4 post-resolution | Late **descendant** after `H` is recovered: sequenced from the durable published fact when its captured expectation is `H` or the recorded pre-push baseline, `PARKED(REMOTE_BASELINE_UNPROVEN)` otherwise. Late **divergent** after `H`: `PARKED(DIVERGENT_VALIDATED_HEADS)`, never auto-published over. Together with the ancestor row above, the post-resolution matrix is total. |
+| §2.1.4 lineage fact | `validated_work_lineage` is written only by a `RECOVERED(PUBLISHED)` transition, never moves backward, and is the single source both the in-flight waiter rule and the post-resolution rules read — asserted by driving the same two heads through both orderings and requiring identical end states. |
 | §2.1.4 waiters | Predecessor **definitive failure** and **abandonment**: waiters are classified against the unpublished head by the ordinary §2.1.4 rules and no baseline moves. Predecessor **attempt expiry/reconciliation**: waiters stay `PENDING`, because reconciliation is not resolution. |
 | §2.1.4 lineage | `ux_validated_work_lineage_head` makes two simultaneously drainable rows on one lineage key unrepresentable, under concurrent admission. |
-| §3.5 history ordering | The selected ordering and **all** side effects, for a merged PR and a closed one: shipped-fix capture precedes the history mutation, the events are emitted, the terminator runs, and the bound disposition appears on the `ActionResult` and the `HISTORY_RECONCILED` payload. A merged PR containing `validated_head_sha` resolves the row; a merged PR that does not, and a closed PR, leave it unresolved with escrow intact. |
+| §3.5 history ordering | The selected ordering and **all** side effects, for a merged PR and a closed one: shipped-fix capture precedes the history mutation, the history events are emitted, the terminator runs, and the bound batch appears on the `ActionResult` and on `VALIDATED_WORK_DISPOSITION_OBSERVED` — with **no** disposition field on `HISTORY_RECONCILED` or `REVIEW_MERGED`, asserted positively on both. A merged PR containing `validated_head_sha` resolves the row; a merged PR that does not, and a closed PR, leave it unresolved with escrow intact. |
 | §3.5 history ordering | An escrow failure inside the terminator: the history mutation stands, the action reports the failure, and the **retry reaches the terminator through the no-op branch** — the regression for a runtime that is never released and a disposition that is never captured. |
 | §3.5 event payloads | For merged and closed PRs, on both the mutation and the no-op retry paths: `HISTORY_RECONCILED`/`REVIEW_MERGED` carry **no** disposition field and are emitted only on the mutation branch, and `VALIDATED_WORK_DISPOSITION_OBSERVED` is emitted after the terminator returns carrying the **actual bound batch**. Asserted by event order against a recording sink, so a payload promising data produced later fails the test. |
-| §2.1 state sets | Writing `NONE` to the store raises; `dispose_at_termination()` returning `NONE` creates no row; `PERSISTED_STATES` and the `ValidatedWorkState` enum do not drift. |
+| §2.1 state sets | Every `ValidatedWorkState` member is persistable and every disposition names a record — there is no state that cannot be stored and no member without an identity. `UNRESOLVED_STATES ∪ RESOLVED_STATES` covers the enum exactly, asserted at import. |
 | §4.5b finalization | The disposition path reaches `RetryReviewRouting` through `StagedPublishedWorkFinalizer` with the live state on the request; a `FreshIssueReadError` is a retry-next-drain transient carrying `phase_reached`, not `FAILED`. |
 | §4.5b staging | Crash/restart after **every** label and routing mutation — before routing, after routing but before the phase record, after `REVIEW_ROUTED`, after `RECOVERY_CLEARED`. For each: the issue is asserted **not scheduler-eligible** at any point between publication and durable review routing (`recovery-pending` present), routing and completed history occur exactly once, and the label writes are idempotent. |
 | §4.5b staging | `RECOVERED` is refused when `finalization_phase` is below `RECOVERY_CLEARED`, **even with every label already correct** — the regression for inferring the routing mutation from cleanup labels. |
 | §6 retention | The retention sweep releases escrow/refs only for `RESOLVED_STATES` past the window, never for a `FAILED` record regardless of age, and never for superseded evidence of an unresolved row. |
 | §4.3 check 0 authority | Approve at PR `P` / remote `R`, then refresh the same `evidence_id` to a different PR **or** a different expected remote head (or simply bump `observation_revision`). Execution is refused as stale with **zero** effects — no push, no PR write, no label write, no finalization, no state change — and the refusal names the fact that moved. Repeat for both the tech-lead op and the Control Center command. |
+| §8.4 authority payload | Owner snapshot → public payload → rendered action → POST body, asserted **field by field**: every `ValidatedWorkAuthoritySnapshot` field survives the round trip unchanged. Then mutate `observation_revision`, the PR, or the expected remote head in the store and re-post the **unchanged** rendered command: it stale-downgrades with zero push, PR, label, finalization or state effects. Covered at the authenticated API level and through the UI wiring. |
+| §8.4 authority payload | The endpoint **refuses** a request whose `authority` object is missing a field, rather than filling it from the current row — the regression for silently authorizing facts the operator never saw. |
 | §4.3 check 0 authority | A snapshot that still matches proceeds, and **every** §4.3 check still runs afterwards against freshly read state — the snapshot is not a substitute for revalidation. A `StoredTechLeadOp` for `recover_validated_work` without a snapshot, or any other op type with one, is rejected at load. |
 | §8.2 config | `validated_work.escrow_retention_days` parses from YAML, rejects `0`/non-int, survives a `to_dict`/`to_yaml_dict` round-trip, is omitted at default, and its `config_attr` resolves against a real `Config`. |
 
@@ -2804,8 +3037,8 @@ reset now stale-downgrades while unresolved work exists.
   only as `{IssueRuntimeOwnerKind.VALIDATED_WORK}` (§4.3 check 5). Any other
   exclusion, anywhere, is a guardrail failure — that parameter is the one lever in
   this contract that can make an activity probe stop looking at an owner.
-- Only `ValidatedWorkDispositionService` and `PublishRecoveryService` call
-  `ValidatedHeadPublisher.publish_or_reconcile`.
+- Only `ValidatedWorkDispositionService` (through `FencedValidatedHeadPublisher`)
+  and `PublishRecoveryService` call `ValidatedHeadExecutor`.
 - The disposition publish path never calls `fetch_for_push()` or
   `build_push_args()`; its only remote write is `push_exact()` (§4.4b). A guardrail
   over the publisher module keeps the bare-`--force-with-lease` path from creeping
@@ -2819,12 +3052,14 @@ reset now stale-downgrades while unresolved work exists.
 - No module outside the needs-human owner adds or removes `needs-human` or
   `tech-lead-needs-human` (§7). The disposition owner's only label is
   `recovery-pending`.
-- Only `ValidatedWorkDispositionService` calls `begin_publish_attempt()`, and no
-  module calls `ValidatedHeadPublisher.publish_or_reconcile()` without a claimed
-  attempt.
+- Only `ValidatedWorkDispositionService` calls `acquire_claim()`/`begin_publish_attempt()`,
+  and the disposition path reaches `ValidatedHeadExecutor` only through
+  `FencedValidatedHeadPublisher` (§4.4f). `PublishRecoveryService` may call the
+  executor directly and may never acquire a claim.
 - Every `ValidatedWorkStore` mutation on a `PUBLISHING` record takes a
-  `PublishAttemptClaim` — a store write that takes a bare `record_id` on that path
-  is a guardrail failure, because it is a write nothing fenced.
+  `ValidatedWorkClaim` — a store write that takes a bare `record_id` on that path
+  is a guardrail failure, because it is a write nothing fenced. No module
+  constructs a `ValidatedWorkClaim`; it is only ever returned by `acquire_claim()`.
 - `StoredTechLeadOp` for `recover_validated_work` cannot be constructed without a
   `ValidatedWorkAuthoritySnapshot`, and no module builds a `StoredEvidenceCommand`
   without one.
@@ -2916,7 +3151,7 @@ Ordered so each slice is independently shippable and leaves the tree green.
    without a repository.
 
 1a. **Batch + authority types.** `ValidatedWorkDispositionBatch`,
-   `ValidatedWorkAuthoritySnapshot`, `PublishAttemptClaim` and the fence column ship
+   `ValidatedWorkAuthoritySnapshot`, `ValidatedWorkClaim` and the owner-fence column ship
    with slice 1, because the store API is shaped by them: a fence-less store method
    would have to be re-signed later, and a singular disposition would have to be
    widened through every consumer.
@@ -2934,7 +3169,7 @@ Ordered so each slice is independently shippable and leaves the tree green.
    registration, shape validation, `to_dict`, YAML round-trip, settings field +
    section, generated reference, example, and the config/settings tests. The
    retention sweep has a real setting to read on the same day it exists.
-3. **Owner, admission-only.** `dispose_at_termination()` returning `NONE`/`PARKED`
+3. **Owner, admission-only.** `dispose_at_termination()` returning an empty batch or `PARKED` members
    plus evidence capture and the §1.1 target-identity rules, taking the
    `AutomaticCaptureCommand` built from slice 1b's evidence. Wire the disposition
    owner **and the run-evidence source** into `terminate_issue_runtime()`, and the
@@ -2948,13 +3183,15 @@ Ordered so each slice is independently shippable and leaves the tree green.
    mechanical instead of conventional. At this point nothing recovers, but
    **nothing is destroyed** — scratch reset already stale-downgrades, including for
    `FAILED`.
-4. **Publisher + finalizer, then automatic recovery.** Introduce
-   `ValidatedHeadPublisher` (§4.4c) over `push_exact()` plus PR ensure, and
+4. **Executor + finalizer, then automatic recovery.** Introduce
+   `ValidatedHeadExecutor` (§4.4c) over `push_exact()` plus PR ensure — with its two
+   steps separately callable so §4.4f's fenced wrapper can interpose — and
    `StagedPublishedWorkFinalizer` (§4.5b) composing the existing `RetryReviewRouting`
    policy; re-point manual `retry_publish()` at the publisher with `UNCONSTRAINED`,
    which independently fixes its existing-PR shortcut and is shippable on its own.
-   The manual path keeps `RetrySuccessFinalizer` unchanged — only the disposition
-   path needs the staging. Then the publication workspace, the
+   The manual path keeps `RetrySuccessFinalizer` unchanged and calls the executor
+   under its own authority — only the disposition path needs the staging and the
+   fenced wrapper. Then the publication workspace, the
    `begin_publish_attempt` CAS, and the `QUEUED` → `PUBLISHING` → `RECOVERED` drain with
    the phase-aware check set. Route `STOPPED/MAX_ROUNDS_EXCEEDED` in (this is #7018).
 5. **Classification cleanup.** Session/failure paths and the stuck sweep consume
