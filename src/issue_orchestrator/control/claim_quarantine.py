@@ -31,14 +31,17 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from enum import Enum
 from typing import Protocol
 
+from ..domain.pending_work import PendingWorkKind
 from ..events import EventName
 from ..ports import EventSink, make_trace_event
 from ..ports.pending_work_claim_store import (
     ClaimQuarantineStore,
     QuarantineLabelState,
     UnreadableClaim,
+    UnresolvedClaim,
 )
 from .actions import (
     AddCommentAction,
@@ -50,6 +53,134 @@ from .in_flight_work import QuarantinedSession
 from .label_manager import LabelManager
 
 logger = logging.getLogger(__name__)
+
+
+class QuarantineCause(Enum):
+    """Why a run is quarantined — a typed part of this owner's boundary.
+
+    Not one message with a boolean (#6999 A1). The two families say opposite
+    things about the queued work:
+
+    * an UNREADABLE CLAIM means nobody can name what the run is carrying, so an
+      operator has to work it out before re-queuing anything;
+    * an UNRESTORABLE RUN means the claim is perfectly intact and the work IS
+      named — it is deliberately not being requeued because a terminal is still
+      running it. Telling an operator that this work is "unknown" invites the
+      manual requeue, and therefore the duplicate execution, that protecting the
+      run was meant to prevent.
+
+    The fourth state is both at once and gets its own variant rather than an
+    implicit branch: a live terminal that can be neither rebuilt nor identified
+    (#6999 F2). It used to be protected from requeueing and reported to nobody.
+    """
+
+    #: A live terminal was rebuilt, but the claim it holds cannot be read.
+    CLAIM_UNREADABLE_LIVE_RUN = "claim_unreadable_live_run"
+    #: A ledger row nothing is running, whose payload cannot be rebuilt.
+    CLAIM_UNREADABLE_ENDED_RUN = "claim_unreadable_ended_run"
+    #: A live terminal whose session assets could not be rebuilt. Its claim
+    #: reads cleanly, so the work it holds is known exactly.
+    RUN_UNRESTORABLE = "run_unrestorable"
+    #: A live terminal that can be neither rebuilt nor identified.
+    RUN_UNRESTORABLE_CLAIM_UNREADABLE = "run_unrestorable_claim_unreadable"
+
+    @property
+    def still_running(self) -> bool:
+        """Whether a terminal for this run may still be alive."""
+        return self is not QuarantineCause.CLAIM_UNREADABLE_ENDED_RUN
+
+
+@dataclass(frozen=True, slots=True)
+class QuarantineSubject:
+    """One run, one cause, and everything its escalation needs to be truthful.
+
+    Built by the caller that observed the trouble, because that caller is the
+    only one that knows which of the four states it is looking at. The named
+    constructors each take the typed record their observation produced, so a
+    caller cannot assemble a subject out of fields it guessed.
+    """
+
+    quarantine_key: str
+    run_key: str
+    session_name: str
+    issue_number: int
+    error: str
+    cause: QuarantineCause
+    #: Known only when the claim reads cleanly; it is what makes the
+    #: unrestorable-run message able to name the work it is protecting.
+    work_kind: PendingWorkKind | None = None
+
+    @classmethod
+    def live_run_with_unreadable_claim(
+        cls, quarantined: "QuarantinedSession"
+    ) -> "QuarantineSubject":
+        """A restored terminal whose claim record could not be read."""
+        session = quarantined.session
+        return cls(
+            quarantine_key=quarantined.quarantine_key,
+            run_key=quarantined.run_key,
+            session_name=session.terminal_id,
+            # Trusted: the launching session's own issue, never parsed out of
+            # the terminal name (a review terminal is named for its PR).
+            issue_number=session.issue.number,
+            error=quarantined.error,
+            cause=QuarantineCause.CLAIM_UNREADABLE_LIVE_RUN,
+        )
+
+    @classmethod
+    def ended_run_with_unreadable_claim(
+        cls, unreadable: UnreadableClaim
+    ) -> "QuarantineSubject":
+        """A ledger row whose run is not live and cannot be rebuilt.
+
+        The issue number comes from the ledger row, recorded at hold time from
+        the launching session (#6999 F12). Deriving it from the terminal name
+        would escalate the PR number for every ``review-*`` claim - and the
+        payload, which is the other place it lives, is precisely what has
+        become unreadable.
+        """
+        return cls(
+            quarantine_key=unreadable.quarantine_key,
+            run_key=unreadable.run_key,
+            session_name=unreadable.session_name,
+            issue_number=unreadable.issue_number,
+            error=unreadable.error,
+            cause=QuarantineCause.CLAIM_UNREADABLE_ENDED_RUN,
+        )
+
+    @classmethod
+    def unrestorable_live_run(
+        cls, unresolved: UnresolvedClaim
+    ) -> "QuarantineSubject":
+        """A LIVE run whose session could not be rebuilt (#6999 F14).
+
+        Its claim is perfectly readable; what failed is the run's own assets, so
+        the orchestrator cannot track the terminal. Requeueing the work would
+        launch a second session beside one that is still running.
+        """
+        return cls(
+            quarantine_key=unresolved.quarantine_key,
+            run_key=unresolved.run_key,
+            session_name=unresolved.session_name,
+            issue_number=unresolved.issue_number,
+            error="the run's session assets could not be rebuilt",
+            cause=QuarantineCause.RUN_UNRESTORABLE,
+            work_kind=unresolved.claim.kind,
+        )
+
+    @classmethod
+    def unrestorable_live_run_with_unreadable_claim(
+        cls, unreadable: UnreadableClaim
+    ) -> "QuarantineSubject":
+        """A live run that can be neither rebuilt nor identified (#6999 F2)."""
+        return cls(
+            quarantine_key=unreadable.quarantine_key,
+            run_key=unreadable.run_key,
+            session_name=unreadable.session_name,
+            issue_number=unreadable.issue_number,
+            error=unreadable.error,
+            cause=QuarantineCause.RUN_UNRESTORABLE_CLAIM_UNREADABLE,
+        )
 
 
 class QuarantineLabelOps(Protocol):
@@ -90,87 +221,23 @@ class ClaimQuarantineOwner:
     labels: QuarantineLabelOps
     events: EventSink
 
-    def quarantine_session(self, quarantined: QuarantinedSession) -> None:
-        """Quarantine a live terminal whose claim could not be read."""
-        session = quarantined.session
-        logger.error(
-            "[WORK] Quarantined %s for issue #%d: its pending-work claim could "
-            "not be read (%s). It is NOT being tracked, so its completion "
-            "cannot settle as claimless and discard the queued work it holds.",
-            session.terminal_id,
-            session.issue.number,
-            quarantined.error,
-        )
-        self._escalate(
-            quarantine_key=quarantined.quarantine_key,
-            run_key=quarantined.run_key,
-            session_name=session.terminal_id,
-            # Trusted: the launching session's own issue, never parsed out of
-            # the terminal name (a review terminal is named for its PR).
-            issue_number=session.issue.number,
-            error=quarantined.error,
-            still_running=True,
-        )
+    def quarantine(self, subject: QuarantineSubject) -> None:
+        """Escalate one run under its own typed cause (#6999 A1).
 
-    def quarantine_unresolved(self, unreadable: UnreadableClaim) -> None:
-        """Quarantine a ledger row whose run is not live and cannot be rebuilt.
-
-        The issue number comes from the ledger row, recorded at hold time from
-        the launching session (#6999 F12). Deriving it from the terminal name
-        would escalate the PR number for every ``review-*`` claim - and the
-        payload, which is the other place it lives, is precisely what has
-        become unreadable.
+        The single entry point. Which of the four causes it is decides what the
+        operator is told and which event is published; everything else - the
+        durable row, the shared block, the retry-until-committed protocol - is
+        the same for all of them.
         """
         logger.error(
-            "[WORK] Unreadable pending-work claim for run %s (session %s, "
-            "issue #%d), and no live terminal is holding it: %s",
-            unreadable.run_key,
-            unreadable.session_name,
-            unreadable.issue_number,
-            unreadable.error,
+            "[WORK] Quarantined run %s (session %s, issue #%d): %s. %s",
+            subject.run_key,
+            subject.session_name,
+            subject.issue_number,
+            subject.error,
+            _ESCALATIONS[subject.cause].log_consequence,
         )
-        self._escalate(
-            quarantine_key=f"{unreadable.run_key}@{unreadable.started_at}",
-            run_key=unreadable.run_key,
-            session_name=unreadable.session_name,
-            issue_number=unreadable.issue_number,
-            error=unreadable.error,
-            still_running=False,
-        )
-
-    def quarantine_unrestorable(
-        self,
-        *,
-        quarantine_key: str,
-        run_key: str,
-        session_name: str,
-        issue_number: int,
-        error: str,
-    ) -> None:
-        """Quarantine a LIVE run whose session could not be rebuilt (#6999 F14).
-
-        Its claim is perfectly readable; what failed is the run's own assets, so
-        the orchestrator cannot track the terminal. Requeueing the work would
-        launch a second session beside one that is still running, so the run is
-        protected from recovery and surfaced instead.
-        """
-        logger.error(
-            "[WORK] Discovered live run %s (session %s, issue #%d) could not be "
-            "restored: %s. Its queued work is NOT being requeued - that would "
-            "run it twice - and the terminal is not being tracked.",
-            run_key,
-            session_name,
-            issue_number,
-            error,
-        )
-        self._escalate(
-            quarantine_key=quarantine_key,
-            run_key=run_key,
-            session_name=session_name,
-            issue_number=issue_number,
-            error=error,
-            still_running=True,
-        )
+        self._escalate(subject)
 
     def reconcile_released(self, live_quarantine_keys: frozenset[str]) -> None:
         """Advance every quarantine whose cause is gone, and retry what failed.
@@ -232,98 +299,180 @@ class ClaimQuarantineOwner:
             return
         self.store.release_quarantine(quarantine_key)
 
-    def _escalate(
-        self,
-        *,
-        quarantine_key: str,
-        run_key: str,
-        session_name: str,
-        issue_number: int,
-        error: str,
-        still_running: bool,
-    ) -> None:
+    def _escalate(self, subject: QuarantineSubject) -> None:
+        quarantine_key = subject.quarantine_key
         record = self.store.read_quarantine(quarantine_key)
         if record is None:
-            self.store.record_quarantine(
-                quarantine_key,
-                run_key=run_key,
-                session_name=session_name,
-                issue_number=issue_number,
-                error=error,
-            )
+            self._record(subject)
             record = self.store.read_quarantine(quarantine_key)
             assert record is not None
         elif record.releasing:
             # The cause came back before cleanup finished; it is live again.
-            self.store.record_quarantine(
-                quarantine_key,
-                run_key=run_key,
-                session_name=session_name,
-                issue_number=issue_number,
-                error=error,
-            )
+            self._record(subject)
         # Applied on EVERY pass, idempotently. The block is shared with owners
         # that lift it when a session for the issue looks active, and a
         # quarantined terminal is deliberately not one of those - so a sweep
         # that found it missing must put it back, whoever it belonged to.
         # Adding a label already present is a no-op, so this costs nothing.
-        outcome = self.labels.acquire_block(issue_number)
-        if record.block_unrecorded:
-            # First time: whatever this apply reports IS the provenance, and a
-            # quarantine with no block at all is not escalated at all.
-            if not outcome.applied:
-                logger.error(
-                    "[WORK] Could not apply the quarantine block on issue #%d; "
-                    "the next sweep retries",
-                    issue_number,
-                )
-                return
+        outcome = self.labels.acquire_block(subject.issue_number)
+        if record.records_ownership(outcome):
+            # Includes the reassertion case: a block this quarantine once found
+            # already present, then had removed underneath it, and has now put
+            # back itself. Recording that transition is what lets release take
+            # it off again instead of stranding needs-human (#6999 F3).
             self.store.record_quarantine_label_state(quarantine_key, outcome)
+        elif record.block_unrecorded:
+            # Nothing recorded and this apply did not commit either: a
+            # quarantine with no block at all is not escalated at all.
+            logger.error(
+                "[WORK] Could not apply the quarantine block on issue #%d; "
+                "the next sweep retries",
+                subject.issue_number,
+            )
+            return
         if record.announced:
             return
-        if not self.labels.announce(
-            issue_number, _comment(session_name, error, still_running)
-        ):
+        escalation = _ESCALATIONS[subject.cause]
+        if not self.labels.announce(subject.issue_number, escalation.comment(subject)):
             # Recorded but NOT announced, so the next sweep retries. The event
             # is deliberately withheld: announcing a quarantine whose durable
             # half never landed would show a warning that vanishes on restart.
             logger.error(
                 "[WORK] Durable quarantine escalation did not commit for %s; "
                 "leaving it unannounced so the next sweep retries",
-                session_name,
+                subject.session_name,
             )
             return
         self.store.mark_quarantine_announced(quarantine_key)
         self.events.publish(make_trace_event(
-            EventName.SESSION_CLAIM_UNREADABLE,
+            escalation.event,
             {
-                "issue_number": issue_number,
-                "session_name": session_name,
-                "run_key": run_key,
-                "error": error,
+                "issue_number": subject.issue_number,
+                "session_name": subject.session_name,
+                "run_key": subject.run_key,
+                "cause": subject.cause.value,
+                "error": subject.error,
             },
         ))
 
+    def _record(self, subject: QuarantineSubject) -> None:
+        self.store.record_quarantine(
+            subject.quarantine_key,
+            run_key=subject.run_key,
+            session_name=subject.session_name,
+            issue_number=subject.issue_number,
+            error=subject.error,
+        )
 
-def _comment(session_name: str, error: str, still_running: bool) -> str:
-    running_note = (
-        "The terminal may still be running. "
-        if still_running
-        else "The terminal has already ended. "
-    )
-    return (
-        "🔒 **Session quarantined: its pending-work claim is unreadable**\n\n"
-        f"`{session_name}` took a queued request off one of the "
-        "orchestrator's pending queues when it launched, and that record can "
-        "no longer be read — so which review, rework, validation retry or "
-        "tech-lead investigation it is carrying is unknown.\n\n"
-        f"{running_note}It is deliberately NOT being tracked: tracking it "
-        "would let its completion be recorded as holding no work at all, "
-        "silently discarding that request.\n\n"
-        f"Error: {error}\n\n"
-        "A human needs to work out what this session was doing, re-queue it "
-        "if necessary, and stop the terminal."
-    )
+
+@dataclass(frozen=True, slots=True)
+class _Escalation:
+    """What one cause tells an operator, and under which event name."""
+
+    event: EventName
+    log_consequence: str
+    headline: str
+    #: What is (or is not) known about the work, in the operator's terms.
+    finding: str
+    #: What the operator has to do about it.
+    instruction: str
+
+    def comment(self, subject: QuarantineSubject) -> str:
+        return (
+            f"🔒 **{self.headline}**\n\n"
+            f"`{subject.session_name}` took a queued request off one of the "
+            "orchestrator's pending queues when it launched.\n\n"
+            f"{self.finding.format(work=_work_phrase(subject.work_kind))}\n\n"
+            f"Error: {subject.error}\n\n"
+            f"{self.instruction}"
+        )
+
+
+def _work_phrase(work_kind: PendingWorkKind | None) -> str:
+    """How to name the queued work in a comment, when it is known at all."""
+    return "queued work" if work_kind is None else f"queued {work_kind.value} work"
+
+
+_UNKNOWN_WORK_FINDING = (
+    "That record can no longer be read, so which review, rework, validation "
+    "retry or tech-lead investigation it is carrying is unknown. It is "
+    "deliberately NOT being tracked: tracking it would let its completion be "
+    "recorded as holding no work at all, silently discarding that request."
+)
+
+# One entry per cause. A table rather than branches inside the escalation, so
+# "what does an operator read for this state" has a single enumerable answer and
+# a new cause cannot inherit another cause's story by accident (#6999 A1).
+_ESCALATIONS: dict[QuarantineCause, _Escalation] = {
+    QuarantineCause.CLAIM_UNREADABLE_LIVE_RUN: _Escalation(
+        event=EventName.SESSION_CLAIM_UNREADABLE,
+        log_consequence=(
+            "It is NOT being tracked, so its completion cannot settle as "
+            "claimless and discard the queued work it holds"
+        ),
+        headline="Session quarantined: its pending-work claim is unreadable",
+        finding=f"The terminal may still be running. {_UNKNOWN_WORK_FINDING}",
+        instruction=(
+            "A human needs to work out what this session was doing, re-queue it "
+            "if necessary, and stop the terminal."
+        ),
+    ),
+    QuarantineCause.CLAIM_UNREADABLE_ENDED_RUN: _Escalation(
+        event=EventName.SESSION_CLAIM_UNREADABLE,
+        log_consequence="No live terminal is holding it, and it cannot be recovered",
+        headline="Session quarantined: its pending-work claim is unreadable",
+        finding=f"The terminal has already ended. {_UNKNOWN_WORK_FINDING}",
+        instruction=(
+            "A human needs to work out what this session was doing and re-queue "
+            "it if necessary."
+        ),
+    ),
+    QuarantineCause.RUN_UNRESTORABLE: _Escalation(
+        event=EventName.SESSION_RUN_UNRESTORABLE,
+        log_consequence=(
+            "Its queued work is NOT being requeued - that would run it twice - "
+            "and the terminal is not being tracked"
+        ),
+        headline="Session quarantined: its run could not be rebuilt",
+        finding=(
+            "The terminal is still running and its pending-work record is "
+            "intact, so the orchestrator knows exactly what it is carrying: "
+            "{work}. What failed is the run's own session assets, so the "
+            "terminal cannot be tracked.\n\nThe work is deliberately NOT being "
+            "re-queued: a re-queue would start a second session beside the one "
+            "still running it."
+        ),
+        instruction=(
+            "A human needs to stop the terminal, after which the next sweep "
+            "re-queues the work automatically. Do not re-queue it by hand while "
+            "the terminal is alive."
+        ),
+    ),
+    QuarantineCause.RUN_UNRESTORABLE_CLAIM_UNREADABLE: _Escalation(
+        event=EventName.SESSION_RUN_UNRESTORABLE,
+        log_consequence=(
+            "The terminal can be neither rebuilt nor identified, so it is "
+            "untracked and its work cannot be recovered from the ledger"
+        ),
+        headline=(
+            "Session quarantined: its run could not be rebuilt and its "
+            "pending-work claim is unreadable"
+        ),
+        finding=(
+            "The terminal is still running, and BOTH halves of its record "
+            "failed: its session assets could not be rebuilt, so it cannot be "
+            "tracked, and its pending-work claim cannot be read, so which "
+            "review, rework, validation retry or tech-lead investigation it is "
+            "carrying is unknown.\n\nNothing is being re-queued: there is "
+            "nothing readable to re-queue, and a live terminal is still "
+            "working."
+        ),
+        instruction=(
+            "A human needs to inspect the terminal to work out what it is "
+            "doing, stop it, and re-queue that work by hand."
+        ),
+    ),
+}
 
 
 def build_claim_quarantine_owner(
@@ -381,6 +530,8 @@ def build_claim_quarantine_owner(
 
 __all__ = [
     "ClaimQuarantineOwner",
+    "QuarantineCause",
     "QuarantineLabelOps",
+    "QuarantineSubject",
     "build_claim_quarantine_owner",
 ]

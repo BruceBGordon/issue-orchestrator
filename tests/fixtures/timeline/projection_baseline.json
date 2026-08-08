@@ -857,6 +857,12 @@
     "status": "completed",
     "step": "resumed"
   },
+  "session.run_unrestorable": {
+    "level": "detail",
+    "phase": "in_progress",
+    "status": "failed",
+    "step": "run_unrestorable"
+  },
   "session.slow": {
     "level": "detail",
     "phase": "in_progress",

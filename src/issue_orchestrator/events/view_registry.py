@@ -221,6 +221,16 @@ VIEW_REGISTRY: dict[str, list[ViewEvent]] = {
             "orchestrator",
         ),
     ],
+    # The other quarantine family: the work IS identified, and is deliberately
+    # not being re-queued because a terminal nobody can track is still running
+    # it. Worded so a reader does not go and re-queue it by hand (#6999 A1).
+    "session.run_unrestorable": [
+        _user(
+            "session.run_unrestorable",
+            "Session quarantined — its run could not be rebuilt",
+            "orchestrator",
+        ),
+    ],
 
     # -- Tech Lead --
     "tech_lead.launching": [

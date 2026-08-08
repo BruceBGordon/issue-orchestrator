@@ -45,11 +45,13 @@ from issue_orchestrator.control.session_launcher import (
 )
 from issue_orchestrator.control.isolation import GRADLE_USER_HOME_ENV
 from issue_orchestrator.control.session_review_support import build_review_existing_work
-from issue_orchestrator.control.session_routing import (
+from issue_orchestrator.control.pending_session_queues import (
     TECH_LEAD_LAUNCH_RETRY_LIMIT,
     PendingSessionQueues,
     TechLeadQueueOutcome,
     TechLeadRetentionOutcome,
+)
+from issue_orchestrator.control.session_routing import (
     orchestrator_launch_session,
     orchestrator_launch_review_session,
     orchestrator_launch_rework_session,
@@ -1494,7 +1496,7 @@ class TestLaunchIssueSession:
 
         Round-2 F1 regression wired end-to-end through the real ``GitHubAdapter``
         cache and ``GitStackPredecessorFactsProvider``: the recheck re-runs
-        ``evaluate_work_gate`` (session_launcher ``_verify_dependencies_fresh``),
+        ``evaluate_work_gate`` (``LaunchDependencyGate.verify_fresh``),
         which gathers PR-scoped review labels and then issue labels. Before the
         cache-owner fix, the first evaluation's empty issue-label refresh
         corrupted the cached PR's ``code-reviewed``, so this second (recheck)
@@ -1578,7 +1580,7 @@ class TestLaunchIssueSession:
         # Just-before-launch recheck with NO PR-label change must still pass —
         # the issue-label refresh during gather must not corrupt the cached PR —
         # and it resolves the predecessor branch as the successor's stack base.
-        freshness = launcher_bundle.launcher._verify_dependencies_fresh(issue)  # noqa: SLF001
+        freshness = launcher_bundle.launcher._dependency_gate.verify_fresh(issue)  # noqa: SLF001
         assert freshness.failure is None
         assert freshness.stack_base_branch == "200-base"
 
@@ -1591,7 +1593,7 @@ class TestLaunchIssueSession:
             adapter.remove_label(201, "code-reviewed")
 
         # Now the recheck must block the stale stack work.
-        result = launcher_bundle.launcher._verify_dependencies_fresh(issue)  # noqa: SLF001
+        result = launcher_bundle.launcher._dependency_gate.verify_fresh(issue)  # noqa: SLF001
         assert result.failure is not None
         assert result.failure.success is False
         assert "Dependencies not satisfied" in result.failure.reason
@@ -5171,7 +5173,7 @@ def _no_claims_store():
 def _no_quarantine():
     """These terminals hold no claim, so none may be quarantined (#6999 F6)."""
     owner = MagicMock()
-    owner.quarantine_session.side_effect = AssertionError(
+    owner.quarantine.side_effect = AssertionError(
         "no terminal here holds a claim, so none may be quarantined"
     )
     return owner

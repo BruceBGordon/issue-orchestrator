@@ -7,13 +7,10 @@ SessionManager adapter calls.
 """
 
 import logging
-from dataclasses import dataclass
-from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Optional
 
 from ..domain.models import (
-    DiscoveredFailure,
     Issue,
     PendingReview,
     PendingRetrospectiveReview,
@@ -25,9 +22,8 @@ from ..domain.models import (
 from ..domain.pending_work import (
     PendingWorkClaim,
     PendingWorkKind,
-    PendingWorkRequest,
 )
-from ..domain.tech_lead_session import TechLeadLaunchScope, TechLeadSessionFlavor
+from ..domain.tech_lead_session import TechLeadLaunchScope
 from ..events import EventName
 from ..infra.config import Config
 from ..ports import EventSink, Issue as IssueProtocol, make_trace_event
@@ -38,7 +34,16 @@ from .existing_terminal_restoration import (
     _ExistingTerminalRestorationRequest,
     _restore_existing_terminal,
 )
-from .in_flight_work import InFlightWorkLedger, LaunchSettlement
+from .pending_session_queues import (
+    TECH_LEAD_LAUNCH_RETRY_LIMIT,
+    PendingSessionQueues,
+    TechLeadRetentionOutcome,
+)
+from .in_flight_work import (
+    InFlightWorkLedger,
+    LaunchSettlement,
+    PendingWorkLaunchClaim,
+)
 from .session_launch_types import LaunchDisposition
 from .session_launcher import SessionLauncher
 from .session_manager import SessionManager, SessionRef
@@ -54,286 +59,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-class TechLeadQueueOutcome(Enum):
-    """Explicit result of asking the queue owner to enqueue tech_lead work."""
-
-    QUEUED = "queued"
-    DUPLICATE = "duplicate"
-
-
-# Bound on retryable launch failures per queued tech_lead item. Three attempts
-# ride out a transient SQLite/log/filesystem blip without relaunch-looping a
-# genuinely broken input forever; after the third failure the item is dropped
-# and the drop is surfaced loudly (fail-fast-but-not-silent).
-TECH_LEAD_LAUNCH_RETRY_LIMIT = 3
-
-
-class TechLeadRetentionOutcome(Enum):
-    """Explicit result of retaining a queued tech_lead item after a retryable failure."""
-
-    RETAINED = "retained"
-    EXHAUSTED = "exhausted"
-
-
-@dataclass(frozen=True, slots=True)
-class PendingSessionQueues:
-    """Owner for pending session queues: launch-routing removals + tech_lead intake.
-
-    Tech Lead intake is behavior-level (#6768 round 3): producers say WHICH
-    variant they are queueing (batch review, failure investigation, or health
-    review) and this owner constructs the ``PendingTechLeadReview``, applies the
-    single deduplication rule (by issue number against the pending queue), and
-    returns an explicit :class:`TechLeadQueueOutcome`. Producers never touch the
-    dataclass or the state list.
-    """
-
-    state: "OrchestratorState"
-
-    def remove_review(self, pr_number: int) -> None:
-        self.state.pending_reviews[:] = [
-            r for r in self.state.pending_reviews if r.pr_number != pr_number
-        ]
-
-    def remove_retrospective_review(self, issue_number: int) -> None:
-        self.state.pending_retrospective_reviews[:] = [
-            r
-            for r in self.state.pending_retrospective_reviews
-            if r.issue_number != issue_number
-        ]
-
-    def remove_rework(self, rework: PendingRework) -> None:
-        self.state.pending_reworks[:] = [
-            r for r in self.state.pending_reworks if r.issue_key != rework.issue_key
-        ]
-
-    def remove_validation_retry(self, issue_number: int) -> None:
-        self.state.pending_validation_retries[:] = [
-            queued
-            for queued in self.state.pending_validation_retries
-            if queued.issue_number != issue_number
-        ]
-
-    def remove_tech_lead(self, issue_number: int) -> None:
-        self.state.pending_tech_lead_reviews[:] = [
-            t
-            for t in self.state.pending_tech_lead_reviews
-            if t.issue_number != issue_number
-        ]
-
-    def queue_batch_review(self, issue_number: int, title: str) -> TechLeadQueueOutcome:
-        """Queue a threshold-created batch tracking issue (audits the PR manifest)."""
-        return self._queue_tech_lead(
-            PendingTechLeadReview(
-                issue_number, title, flavor=TechLeadSessionFlavor.BATCH_REVIEW
-            )
-        )
-
-    def queue_health_review(
-        self,
-        issue_number: int,
-        title: str,
-        *,
-        problem_cohort: tuple[DiscoveredFailure, ...] = (),
-    ) -> TechLeadQueueOutcome:
-        """Queue an interval-created health-review anchor (ADR-0031 §4); like a
-        batch review it carries no singular failure context. An unscheduled
-        problem-storm review instead carries its typed cohort so the later
-        launch snapshot cannot lose the trigger facts at end-of-tick."""
-        return self._queue_tech_lead(
-            PendingTechLeadReview(
-                issue_number,
-                title,
-                flavor=TechLeadSessionFlavor.HEALTH_REVIEW,
-                problem_cohort=problem_cohort,
-            )
-        )
-
-    def remove_failure_investigations(
-        self, issue_numbers: frozenset[int]
-    ) -> None:
-        """Remove only storm-superseded individual investigation entries.
-
-        Batch and health anchors may share an issue number with other tech_lead
-        bookkeeping and must never be removed by a problem-cohort transition.
-        """
-        self.state.pending_tech_lead_reviews[:] = [
-            item
-            for item in self.state.pending_tech_lead_reviews
-            if not (
-                item.flavor is TechLeadSessionFlavor.FAILURE_INVESTIGATION
-                and item.issue_number in issue_numbers
-            )
-        ]
-
-    def queue_failure_investigation(
-        self, issue_number: int, title: str, *, failure: DiscoveredFailure
-    ) -> TechLeadQueueOutcome:
-        """Queue a focused investigation of one failed issue.
-
-        ``failure`` is required (non-optional): the queue item is the only
-        carrier of the typed triggering-failure context once the per-tick
-        ``discovered_failures`` buffer is cleared after planning (the
-        launch-time board snapshot reads it from here).
-        ``PendingTechLeadReview.__post_init__`` stays as defense-in-depth
-        against untyped callers passing ``None`` anyway.
-        """
-        return self._queue_tech_lead(
-            PendingTechLeadReview(
-                issue_number,
-                title,
-                flavor=TechLeadSessionFlavor.FAILURE_INVESTIGATION,
-                failure=failure,
-            )
-        )
-
-    def retain_tech_lead_for_retry(self, issue_number: int) -> TechLeadRetentionOutcome:
-        """Bounded retention of a queued tech_lead item after a retryable launch failure.
-
-        Before escalation starts, failure investigations have no labels-as-
-        truth recovery: the queued item is the only record (the per-tick
-        ``discovered_failures`` buffer is cleared after planning), so a
-        transient required-input prep failure must retain it for retry, not
-        delete it. Retention is bounded by ``TECH_LEAD_LAUNCH_RETRY_LIMIT``:
-        once exhausted ``EXHAUSTED`` is returned, but the item is NOT removed
-        here (#6771 round 4). Destructive queue removal must not precede the
-        lifecycle's committed needs-human transition, so the launch caller
-        commits the drop via
-        ``remove_tech_lead`` only after ``escalate_issue_needs_human`` succeeds;
-        on escalation failure the item is retained and re-attempted.
-
-        Asking to retain an item that is not queued is an invariant violation
-        upstream (the launch path holds the item it just failed to launch);
-        fail fast rather than silently absorbing it.
-        """
-        item = next(
-            (
-                t
-                for t in self.state.pending_tech_lead_reviews
-                if t.issue_number == issue_number
-            ),
-            None,
-        )
-        if item is None:
-            raise ValueError(
-                f"Cannot retain tech_lead item for issue #{issue_number} after a "
-                "retryable launch failure: no such item is queued"
-            )
-        item.retryable_launch_failures += 1
-        if item.retryable_launch_failures >= TECH_LEAD_LAUNCH_RETRY_LIMIT:
-            return TechLeadRetentionOutcome.EXHAUSTED
-        logger.warning(
-            "[TECH_LEAD] Retaining %s for issue #%d after retryable launch failure "
-            "%d/%d",
-            item.flavor.value,
-            issue_number,
-            item.retryable_launch_failures,
-            TECH_LEAD_LAUNCH_RETRY_LIMIT,
-        )
-        return TechLeadRetentionOutcome.RETAINED
-
-    def restore_deferred(self, claim: PendingWorkClaim) -> bool:
-        """Return a launched-but-provider-deferred request to its own queue.
-
-        The admission half of this owner (#6999 A1): every queue already
-        declares here how an item is removed, so it declares here how one comes
-        back. Admission is a decision TABLE rather than a branch chain, and each
-        entry delegates to the collection's own owner method, so the duplicate
-        rule for a queue lives in exactly one place whether the item is arriving
-        from discovery or coming back from a dead session.
-
-        The re-admitted object is the ORIGINAL request, preserving the context
-        that exists nowhere else - a failure investigation's typed
-        ``DiscoveredFailure``, a validation retry's prompt/error/count, a
-        rework's cycle number.
-
-        Returns True when the item was admitted, False when the queue already
-        held an equivalent request. Restoring costs no retry budget: nothing
-        about the request failed.
-        """
-        admit = _QUEUE_ADMISSION.get(claim.kind)
-        if admit is None:
-            # Named explicitly, like the launch-disposition switch: a queue kind
-            # added without an entry here must fail loudly rather than silently
-            # drop the only record of its work.
-            raise ValueError(f"unhandled pending work kind: {claim.kind}")
-        return admit(self, claim.request)
-
-    def queue_existing_tech_lead(
-        self, item: PendingTechLeadReview
-    ) -> TechLeadQueueOutcome:
-        """Re-admit an already-built tech_lead item under the same dedup rule.
-
-        Distinct from the ``queue_*`` producers above, which BUILD the item from
-        its parts. Restoring must not rebuild: the original carries its typed
-        failure context and its spent retry count (#6999 A1).
-        """
-        return self._queue_tech_lead(item)
-
-    def _queue_tech_lead(self, item: PendingTechLeadReview) -> TechLeadQueueOutcome:
-        """Apply the one dedup rule (issue number vs pending queue) and enqueue."""
-        queue = self.state.pending_tech_lead_reviews
-        if any(t.issue_number == item.issue_number for t in queue):
-            logger.info(
-                "[TECH_LEAD] Issue #%d already queued for tech_lead; skipping %s request",
-                item.issue_number,
-                item.flavor.value,
-            )
-            return TechLeadQueueOutcome.DUPLICATE
-        queue.append(item)
-        logger.info(
-            "[TECH_LEAD] Queued %s for issue #%d: %s",
-            item.flavor.value,
-            item.issue_number,
-            item.title,
-        )
-        return TechLeadQueueOutcome.QUEUED
-
-
-
-def _admit_review(queues: PendingSessionQueues, request: PendingWorkRequest) -> bool:
-    assert isinstance(request, PendingReview)
-    return queues.state.queue_pending_review(request)
-
-
-def _admit_retrospective_review(
-    queues: PendingSessionQueues, request: PendingWorkRequest
-) -> bool:
-    assert isinstance(request, PendingRetrospectiveReview)
-    return queues.state.queue_pending_retrospective_review(request)
-
-
-def _admit_rework(queues: PendingSessionQueues, request: PendingWorkRequest) -> bool:
-    assert isinstance(request, PendingRework)
-    return queues.state.queue_pending_rework(request)
-
-
-def _admit_validation_retry(
-    queues: PendingSessionQueues, request: PendingWorkRequest
-) -> bool:
-    assert isinstance(request, PendingValidationRetry)
-    return queues.state.queue_pending_validation_retry(request)
-
-
-def _admit_tech_lead(queues: PendingSessionQueues, request: PendingWorkRequest) -> bool:
-    assert isinstance(request, PendingTechLeadReview)
-    # Through the tech-lead intake owner, not the state list: this queue's
-    # duplicate rule carries logging and a typed outcome that the others do not.
-    return queues.queue_existing_tech_lead(request) is TechLeadQueueOutcome.QUEUED
-
-
-# One entry per pending queue. A decision table rather than a branch chain so
-# "which queue admits this" has a single, enumerable answer (#6999 A1).
-_QUEUE_ADMISSION: dict[
-    PendingWorkKind, Callable[[PendingSessionQueues, PendingWorkRequest], bool]
-] = {
-    PendingWorkKind.REVIEW: _admit_review,
-    PendingWorkKind.RETROSPECTIVE_REVIEW: _admit_retrospective_review,
-    PendingWorkKind.REWORK: _admit_rework,
-    PendingWorkKind.VALIDATION_RETRY: _admit_validation_retry,
-    PendingWorkKind.TECH_LEAD: _admit_tech_lead,
-}
-
-
 def orchestrator_launch_review_session(
     review: PendingReview,
     state: "OrchestratorState",
@@ -343,10 +68,17 @@ def orchestrator_launch_review_session(
 ) -> Optional[Session]:
     """Launch a review session and update orchestrator queues."""
     pending_queues = PendingSessionQueues(state)
-    result = session_launcher.launch_review_session(review, state.active_sessions)
+    # One object for the whole launch: the launcher holds the claim durably
+    # before it spawns anything, and the settlement below settles that same
+    # claim afterwards (#6999 A2).
+    work = PendingWorkLaunchClaim(
+        claim=PendingWorkClaim(PendingWorkKind.REVIEW, review), claims=claims
+    )
+    result = session_launcher.launch_review_session(
+        review, state.active_sessions, work_claim=work
+    )
     return LaunchSettlement(
-        claims=claims,
-        claim=PendingWorkClaim(PendingWorkKind.REVIEW, review),
+        work=work,
         remove=lambda: pending_queues.remove_review(review.pr_number),
         restore_existing=lambda: _restore_existing_terminal(
             request=_ExistingTerminalRestorationRequest(
@@ -371,13 +103,17 @@ def orchestrator_launch_retrospective_review_session(
 ) -> Optional[Session]:
     """Launch a retrospective review session and update orchestrator queues."""
     pending_queues = PendingSessionQueues(state)
+    work = PendingWorkLaunchClaim(
+        claim=PendingWorkClaim(PendingWorkKind.RETROSPECTIVE_REVIEW, review),
+        claims=claims,
+    )
     result = session_launcher.launch_retrospective_review_session(
         review,
         state.active_sessions,
+        work_claim=work,
     )
     return LaunchSettlement(
-        claims=claims,
-        claim=PendingWorkClaim(PendingWorkKind.RETROSPECTIVE_REVIEW, review),
+        work=work,
         remove=lambda: pending_queues.remove_retrospective_review(review.issue_number),
         restore_existing=lambda: _restore_existing_terminal(
             request=_ExistingTerminalRestorationRequest(
@@ -403,7 +139,12 @@ def orchestrator_launch_rework_session(
 ) -> Optional[Session]:
     """Launch a rework session and update orchestrator queues."""
     pending_queues = PendingSessionQueues(state)
-    result = session_launcher.launch_rework_session(rework, state.active_sessions)
+    work = PendingWorkLaunchClaim(
+        claim=PendingWorkClaim(PendingWorkKind.REWORK, rework), claims=claims
+    )
+    result = session_launcher.launch_rework_session(
+        rework, state.active_sessions, work_claim=work
+    )
     def _restore_rework() -> Optional[Session]:
         issue_number = rework.resolve_issue_number()
         if issue_number is None:
@@ -421,8 +162,7 @@ def orchestrator_launch_rework_session(
         )
 
     return LaunchSettlement(
-        claims=claims,
-        claim=PendingWorkClaim(PendingWorkKind.REWORK, rework),
+        work=work,
         remove=lambda: pending_queues.remove_rework(rework),
         restore_existing=_restore_rework,
     ).settle(result, state)
@@ -437,12 +177,14 @@ def orchestrator_launch_validation_retry_session(
 ) -> Optional[Session]:
     """Launch a validation retry session and update retry queue tracking."""
     pending_queues = PendingSessionQueues(state)
+    work = PendingWorkLaunchClaim(
+        claim=PendingWorkClaim(PendingWorkKind.VALIDATION_RETRY, retry), claims=claims
+    )
     result = session_launcher.launch_validation_retry_session(
-        retry, state.active_sessions
+        retry, state.active_sessions, work_claim=work
     )
     return LaunchSettlement(
-        claims=claims,
-        claim=PendingWorkClaim(PendingWorkKind.VALIDATION_RETRY, retry),
+        work=work,
         remove=lambda: pending_queues.remove_validation_retry(retry.issue_number),
         restore_existing=lambda: _restore_existing_terminal(
             request=_ExistingTerminalRestorationRequest(
@@ -503,10 +245,14 @@ def orchestrator_launch_tech_lead_session(
     if not agent or agent not in config.agents:
         raise ValueError(f"Invalid tech lead agent: {agent}")
     pending_queues = PendingSessionQueues(state)
+    work = PendingWorkLaunchClaim(
+        claim=PendingWorkClaim(PendingWorkKind.TECH_LEAD, tech_lead), claims=claims
+    )
     result = session_launcher.launch_issue_session(
         Issue(tech_lead.issue_number, tech_lead.title, [agent]),
         state.active_sessions,
         tech_lead_scope=tech_lead.launch_scope(),
+        work_claim=work,
     )
     def _retain_for_input_retry() -> None:
         outcome = pending_queues.retain_tech_lead_for_retry(tech_lead.issue_number)
@@ -516,8 +262,7 @@ def orchestrator_launch_tech_lead_session(
             )
 
     return LaunchSettlement(
-        claims=claims,
-        claim=PendingWorkClaim(PendingWorkKind.TECH_LEAD, tech_lead),
+        work=work,
         remove=lambda: pending_queues.remove_tech_lead(tech_lead.issue_number),
         restore_existing=lambda: _restore_existing_terminal(
             request=_ExistingTerminalRestorationRequest(
@@ -661,11 +406,15 @@ def restore_running_sessions(
     reconcile, including when discovery returns nothing: the case it exists for
     is precisely the one with no terminal left to discover.
     """
+    from .claim_quarantine import QuarantineSubject
+
     ledger = InFlightWorkLedger(state, claims)
     restored = session_restorer.restore_sessions(running, state.active_sessions)
     restoration = ledger.rehydrate(restored)
     for quarantined in restoration.quarantined:
-        quarantine.quarantine_session(quarantined)
+        quarantine.quarantine(
+            QuarantineSubject.live_run_with_unreadable_claim(quarantined)
+        )
     # Every DISCOVERED run gets a verdict, not only the ones that rebuilt into
     # a Session (#6999 F14). The ledger owns that accounting.
     accounting = ledger.account_for_discovered(running, restoration, quarantine)

@@ -72,6 +72,11 @@ class ClaimLookup:
         return self.claim if self.state is ClaimState.HELD else None
 
 
+def _quarantine_key(run_key: str, started_at: str) -> str:
+    """The one format for a generation-anchored quarantine key (#6999 F12)."""
+    return f"{run_key}@{started_at}"
+
+
 @dataclass(frozen=True, slots=True)
 class UnresolvedClaim:
     """A claim the ledger still holds, as seen by startup recovery.
@@ -92,6 +97,16 @@ class UnresolvedClaim:
     # its PR, and the payload is exactly what may have become unreadable.
     issue_number: int
     claim: PendingWorkClaim
+
+    @property
+    def quarantine_key(self) -> str:
+        """The key a quarantine against THIS row is recorded under.
+
+        Asked of the row rather than re-derived by each caller: the generation
+        anchoring is the whole point (#6999 F12), and a caller that formats it
+        by hand is a caller that can format it differently.
+        """
+        return _quarantine_key(self.run_key, self.started_at)
 
 
 class QuarantineLabelState(Enum):
@@ -147,6 +162,29 @@ class QuarantineRecord:
         """Whether no apply outcome has been recorded for it yet."""
         return self.label_state is QuarantineLabelState.UNKNOWN
 
+    def records_ownership(self, outcome: QuarantineLabelState) -> bool:
+        """Whether a fresh apply's ``outcome`` supersedes the stored provenance.
+
+        The block is re-applied on EVERY pass, so provenance is not a one-shot
+        fact and cannot be recorded only the first time (#6999 F3). Two
+        transitions are real:
+
+        * nothing recorded yet — the first apply that commits IS the provenance;
+        * ``PREEXISTING`` -> ``ACQUIRED`` — the label this quarantine once found
+          already present has since been removed, and THIS pass demonstrably put
+          it back. It is now ours to take off, and leaving the row saying
+          ``PREEXISTING`` strands the issue in ``needs-human`` forever: release
+          would delete the row without removing the label it re-added.
+
+        ``ACQUIRED`` never degrades to ``PREEXISTING``: a later pass finding the
+        label present is finding the one we applied.
+        """
+        if not outcome.applied:
+            return False
+        if self.block_unrecorded:
+            return True
+        return outcome is QuarantineLabelState.ACQUIRED and not self.block_is_ours
+
 
 @dataclass(frozen=True, slots=True)
 class UnreadableClaim:
@@ -161,6 +199,11 @@ class UnreadableClaim:
     # one session can reuse the path; started_at has sub-second precision and
     # is what tells the two apart (#6999 F12).
     started_at: str
+
+    @property
+    def quarantine_key(self) -> str:
+        """The key a quarantine against THIS row is recorded under."""
+        return _quarantine_key(self.run_key, self.started_at)
 
 
 class PendingWorkClaimStore(Protocol):

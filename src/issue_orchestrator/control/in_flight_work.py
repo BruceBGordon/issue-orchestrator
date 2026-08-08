@@ -28,14 +28,16 @@ labels, and none can quietly forget to.
 from __future__ import annotations
 
 import logging
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Optional, Sequence
+from typing import TYPE_CHECKING, Callable, Generator, Optional, Protocol, Sequence
 
 from ..domain.models import PendingRework, Session
 from ..domain.pending_work import InFlightWork, PendingWorkClaim, PendingWorkKind
 from ..domain.session_key import SessionKey, TaskKind
+from ..domain.session_run import SessionRunAssets
 from ..ports.pending_work_claim_store import ClaimState, PendingWorkClaimStore
 from ..ports.provider_resilience import ProviderErrorType
 from .active_sessions import append_unique_active_sessions
@@ -364,26 +366,35 @@ class InFlightWorkLedger:
     ) -> frozenset[str]:
         """Quarantine each live-but-unrebuildable run, returning the keys raised.
 
+        Both halves are escalated, under different causes (#6999 F14/F2). A run
+        whose claim reads cleanly is named exactly and protected from a requeue
+        that would run its work twice. A run whose claim ALSO cannot be read is
+        the worse of the two: a live terminal that can be neither tracked nor
+        identified. That state used to be protected from requeueing and reported
+        to nobody - the loop below only added a key, so no durable quarantine,
+        no ``needs-human``, no comment and no event was ever produced, and
+        ``recover_unresolved`` then deliberately skipped it for being live.
+
         The keys are returned so the release reconciliation that follows does
         not immediately undo the quarantines this pass just raised.
         """
+        from .claim_quarantine import QuarantineSubject
+
         raised: set[str] = set()
         for unresolved in self.claims.list_unresolved_claims():
             if unresolved.run_key not in run_keys:
                 continue
-            key = f"{unresolved.run_key}@{unresolved.started_at}"
-            quarantine.quarantine_unrestorable(
-                quarantine_key=key,
-                run_key=unresolved.run_key,
-                session_name=unresolved.session_name,
-                issue_number=unresolved.issue_number,
-                error="the run's session assets could not be rebuilt",
-            )
-            raised.add(key)
+            quarantine.quarantine(QuarantineSubject.unrestorable_live_run(unresolved))
+            raised.add(unresolved.quarantine_key)
         for unreadable in self.claims.list_unreadable_claims():
             if unreadable.run_key not in run_keys:
                 continue
-            raised.add(f"{unreadable.run_key}@{unreadable.started_at}")
+            quarantine.quarantine(
+                QuarantineSubject.unrestorable_live_run_with_unreadable_claim(
+                    unreadable
+                )
+            )
+            raised.add(unreadable.quarantine_key)
         return frozenset(raised)
 
     def recover_unresolved(
@@ -427,14 +438,21 @@ class InFlightWorkLedger:
             # against the queues, which dedupe by their own rules.
             self.claims.mark_deferred_by_run_key(unresolved.run_key)
             readmitted += 1
+        from .claim_quarantine import QuarantineSubject
+
         still_quarantined: set[str] = set()
         for unreadable in self.claims.list_unreadable_claims():
-            still_quarantined.add(f"{unreadable.run_key}@{unreadable.started_at}")
+            still_quarantined.add(unreadable.quarantine_key)
             if unreadable.run_key in live:
+                # A live one is already escalated under the cause that names
+                # BOTH of its failures (#6999 F2); re-escalating it here would
+                # overwrite that with the ended-run story.
                 continue
             # No work can be recovered from it, and it is not attached to any
             # live terminal, so the only honest move is to tell a human.
-            quarantine.quarantine_unresolved(unreadable)
+            quarantine.quarantine(
+                QuarantineSubject.ended_run_with_unreadable_claim(unreadable)
+            )
         # Anything still recorded but no longer in trouble has had its cause
         # repaired or removed; release it and the block it owns (#6999 F12).
         quarantine.reconcile_released(
@@ -457,7 +475,7 @@ class InFlightWorkLedger:
         # Local import: session_routing owns the pending queues and builds
         # LaunchSettlement from this module, so importing it at module scope
         # would be a cycle. Same idiom as health_review_trigger.
-        from .session_routing import PendingSessionQueues
+        from .pending_session_queues import PendingSessionQueues
 
         requeued = PendingSessionQueues(self.state).restore_deferred(claim)
         logger.warning(
@@ -496,6 +514,143 @@ def _reconcile_restored_identity(
     session.rework_cycle = request.rework_cycle
 
 
+class LaunchWorkClaim(Protocol):
+    """The durable claim a launch takes BEFORE it spawns anything (#6999 A2)."""
+
+    def hold_before_spawn(
+        self, run: SessionRunAssets, *, issue_number: int
+    ) -> LaunchResult | None:
+        """Record the claim. A non-``None`` result aborts the launch."""
+        ...
+
+    def abandon_unspawned(self, run: SessionRunAssets) -> None:
+        """Hand the work back because no terminal ever started."""
+        ...
+
+
+@dataclass(frozen=True, slots=True)
+class PendingWorkLaunchClaim:
+    """One queued request's durable ownership across a whole launch (#6999 A2).
+
+    The claim used to be recorded only once a live ``Session`` came back, which
+    put the durable record AFTER the terminal it describes. Two things followed
+    from that ordering, and both lose work:
+
+    * a crash between the spawn and the write - or between the spawn and the
+      launch's own destructive label transitions - left a running agent carrying
+      a request with no durable record anywhere. For a tech-lead failure
+      investigation the in-memory queue is the only other copy, so a restart
+      could not recover what that terminal owned;
+    * the store write had nowhere left to fail. By the time it ran the terminal
+      was irreversible, so a claim-store fault could only be reported, never
+      undone.
+
+    So the claim is taken as soon as the run identity exists and before anything
+    irreversible happens. A launch that never reaches a live terminal hands the
+    work back through the same owner, by DEFERRING the row rather than deleting
+    it: "deferred" already means *untouched, waiting to be relaunched*, which is
+    exactly true here, and it keeps a durable record for the startup sweep to
+    re-admit instead of trusting the in-memory queue to survive.
+    """
+
+    claim: PendingWorkClaim
+    claims: PendingWorkClaimStore
+
+    def hold_before_spawn(
+        self, run: SessionRunAssets, *, issue_number: int
+    ) -> LaunchResult | None:
+        """Record the claim durably, before this launch can spawn anything.
+
+        ``issue_number`` comes from the launch path itself, which is the only
+        place that also knows the issue the resulting ``Session`` will carry -
+        the two must agree, because the ledger row is what a quarantine
+        escalates against when the payload can no longer be read (#6999 F12).
+
+        A store failure returns an INPUT_RETRY launch result rather than raising:
+        nothing about the request failed, the queue item is untouched, and the
+        alternative - spawning anyway - is the crash window this exists to close.
+        """
+        try:
+            self.claims.hold_pending_work_claim(
+                run, self.claim, issue_number=issue_number
+            )
+        except Exception as exc:  # store-defined write/conflict failure
+            logger.error(
+                "[WORK] Refusing to spawn a terminal for %s work on issue #%d: "
+                "its pending-work claim could not be recorded, and a terminal "
+                "holding a claim nothing durable knows about cannot be settled "
+                "or recovered: %s",
+                self.claim.kind.value,
+                issue_number,
+                exc,
+            )
+            return LaunchResult(
+                None,
+                False,
+                f"Could not record the pending-work claim: {exc}",
+                disposition=LaunchDisposition.INPUT_RETRY,
+            )
+        return None
+
+    def abandon_unspawned(self, run: SessionRunAssets) -> None:
+        self.claims.defer_pending_work_claim(run)
+        logger.info(
+            "[WORK] No terminal started for %s; its claim is deferred and the "
+            "work is waiting to be relaunched",
+            self.claim.kind.value,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _ClaimlessLaunch:
+    """An ordinary issue session takes nothing off a pending queue.
+
+    An explicit null object rather than an optional every launch path would have
+    to re-check before touching (#6999 A2).
+    """
+
+    def hold_before_spawn(
+        self, run: SessionRunAssets, *, issue_number: int
+    ) -> LaunchResult | None:
+        return None
+
+    def abandon_unspawned(self, run: SessionRunAssets) -> None:
+        return None
+
+
+NO_LAUNCH_WORK_CLAIM: LaunchWorkClaim = _ClaimlessLaunch()
+
+
+@dataclass(slots=True)
+class SpawnGuard:
+    """Whether a launch reached the irreversible point of a live terminal."""
+
+    terminal_spawned: bool = False
+
+    def mark_spawned(self) -> None:
+        self.terminal_spawned = True
+
+
+@contextmanager
+def abandon_claim_unless_spawned(
+    work: LaunchWorkClaim, run: SessionRunAssets
+) -> Generator[SpawnGuard, None, None]:
+    """Give the queued work back on every launch exit that started no terminal.
+
+    The compensating half of :meth:`PendingWorkLaunchClaim.hold_before_spawn`
+    (#6999 A2). A launch has many pre-spawn failure exits - setup commands, a
+    label that would not apply, the spawn itself - and an exception can leave by
+    none of them; one guard covers the lot, so a new early return cannot forget
+    to hand the work back.
+    """
+    guard = SpawnGuard()
+    try:
+        yield guard
+    finally:
+        if not guard.terminal_spawned:
+            work.abandon_unspawned(run)
+
+
 @dataclass(frozen=True)
 class LaunchSettlement:
     """How one pending queue settles its item for each launch disposition.
@@ -508,11 +663,12 @@ class LaunchSettlement:
 
     Removal is not the end of the story. A consumed item is handed to
     :class:`InFlightWorkLedger` against the terminal that took it, so the claim
-    survives for as long as the session does (#6999 F2).
+    survives for as long as the session does (#6999 F2). ``work`` is the SAME
+    object the launch held its claim with, so the durable record spans the whole
+    launch rather than starting after it (#6999 A2).
     """
 
-    claim: PendingWorkClaim
-    claims: PendingWorkClaimStore
+    work: PendingWorkLaunchClaim
     remove: Callable[[], None]
     # Adopting an already-running terminal, and spending one unit of the
     # bounded required-input retry budget. Both default to doing nothing, for
@@ -564,16 +720,24 @@ class LaunchSettlement:
         # The ledger first: it is the thing that can refuse (a terminal already
         # holding a different claim is a bug, not a launch). Removing the queue
         # item only after it accepts means a refusal leaves the work queued.
-        InFlightWorkLedger(state, self.claims).take(session, self.claim)
+        # For a freshly spawned session this re-holds the claim the launch
+        # already took, which the store treats as idempotent; for an ADOPTED
+        # terminal it is the first hold, against that terminal's own run assets.
+        InFlightWorkLedger(state, self.work.claims).take(session, self.work.claim)
         self.remove()
 
 
 __all__ = [
+    "NO_LAUNCH_WORK_CLAIM",
     "ClaimRestoration",
     "StaleRun",
     "DuplicateClaimError",
     "InFlightWorkLedger",
     "LaunchSettlement",
+    "LaunchWorkClaim",
+    "PendingWorkLaunchClaim",
     "QuarantinedSession",
     "SettlementOutcome",
+    "SpawnGuard",
+    "abandon_claim_unless_spawned",
 ]

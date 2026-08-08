@@ -69,7 +69,7 @@ if TYPE_CHECKING:
     from ..ports import Issue, RepositoryHost
     from ..ports.queue_cache_store import QueueCacheStore
     from ..ports.tech_lead_authority import TechLeadAuthorityStore
-    from .session_routing import TechLeadQueueOutcome
+    from .pending_session_queues import TechLeadQueueOutcome
     from .workflows import TechLeadWorkflow
 
 
@@ -423,7 +423,7 @@ def _queue_anchor_by_marker(
     and startup recovery pick the matching operation on
     :class:`PendingSessionQueues` instead of overloading batch intake.
     """
-    from .session_routing import PendingSessionQueues
+    from .pending_session_queues import PendingSessionQueues
 
     queues = PendingSessionQueues(state)
     if has_health_review_marker(labels):
@@ -703,7 +703,7 @@ def recover_pending_tech_lead_anchors(
     ledgers. The same ``split_tech_lead_case_file_issues`` owner the fact gatherer
     uses excludes them here before anchor recovery.
     """
-    from .session_routing import TechLeadQueueOutcome
+    from .pending_session_queues import TechLeadQueueOutcome
     from .tech_lead_case_files import split_tech_lead_case_file_issues
     from .tech_lead_proposals import reconcile_tech_lead_proposals
 

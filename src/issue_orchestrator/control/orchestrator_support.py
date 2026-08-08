@@ -57,7 +57,7 @@ from ..domain.models import (
     PendingRetrospectiveReview,
     PendingReview, PendingRework,
 )
-from .session_routing import PendingSessionQueues
+from .pending_session_queues import PendingSessionQueues
 
 logger = logging.getLogger(__name__)
 

@@ -19,6 +19,7 @@ from issue_orchestrator.control.actions import (
     AddLabelAction,
     RemoveLabelAction,
 )
+from issue_orchestrator.control.claim_quarantine import QuarantineSubject
 from issue_orchestrator.control.label_manager import LabelManager
 from issue_orchestrator.control.reconciliation import (
     ExternalSnapshot,
@@ -602,12 +603,12 @@ class TestQuarantineProvenanceIsRespected:
         quarantined = QuarantinedSession(
             _session(903, tmp_path), "payload unreadable", "/runs/903", "/runs/903@t1"
         )
-        owner.quarantine_session(quarantined)
+        owner.quarantine(QuarantineSubject.live_run_with_unreadable_claim(quarantined))
         applier.applied.clear()
         # Something else takes the shared label off while the terminal runs on.
         applier.live[903].discard(labels.needs_human)
 
-        owner.quarantine_session(quarantined)  # a later scan
+        owner.quarantine(QuarantineSubject.live_run_with_unreadable_claim(quarantined))  # a later scan
 
         assert [
             action.label

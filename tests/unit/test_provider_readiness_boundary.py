@@ -22,14 +22,21 @@ from pathlib import Path
 import pytest
 
 from issue_orchestrator.control.actions import AddCommentAction, AddLabelAction
-from issue_orchestrator.control.in_flight_work import InFlightWorkLedger
+from issue_orchestrator.control.claim_quarantine import (
+    QuarantineCause,
+    QuarantineSubject,
+)
+from issue_orchestrator.control.in_flight_work import (
+    InFlightWorkLedger,
+    PendingWorkLaunchClaim,
+)
 from issue_orchestrator.control.provider_availability import ProviderAvailabilityPolicy
 from issue_orchestrator.control.provider_resilience import ProviderResilienceManager
 from issue_orchestrator.control.session_controller import SessionController
 from issue_orchestrator.control.tech_lead_reaction import (
     record_completed_session_problem,
 )
-from issue_orchestrator.domain.models import DiscoveredFailure, SessionStatus
+from issue_orchestrator.domain.models import DiscoveredFailure, Issue, SessionStatus
 from issue_orchestrator.domain.pending_work import PendingWorkKind
 from issue_orchestrator.ports.pending_work_claim_store import (
     ClaimState,
@@ -427,7 +434,14 @@ class _LauncherHarness:
     """
 
     def __init__(
-        self, tmp_path: Path, probe, *, manager=None, events=None, config=None
+        self,
+        tmp_path: Path,
+        probe,
+        *,
+        manager=None,
+        events=None,
+        config=None,
+        create_session=None,
     ) -> None:
         from unittest.mock import MagicMock
 
@@ -483,9 +497,10 @@ class _LauncherHarness:
             manifest_downloader=NullManifestDownloader(),
             tech_lead_authority=SqliteTechLeadAuthorityStore.for_repo(tmp_path),
             session_exists_fn=lambda name: False,
-            create_session_fn=lambda name, cmd, wd, title: (
-                self.created.append(name) or True
-            ),
+            # Injected rather than patched so a test can observe what the world
+            # looked like at the exact moment the terminal was spawned.
+            create_session_fn=create_session
+            or (lambda name, cmd, wd, title: self.created.append(name) or True),
             get_issue_machine=lambda issue: IssueStateMachine(issue),
             get_session_machine=lambda name, n, timeout: SessionStateMachine(
                 name, n, timeout_minutes=timeout
@@ -2552,7 +2567,14 @@ def _routing_config(tmp_path: Path):
 class _RefusingLauncherHarness(_LauncherHarness):
     """A real SessionLauncher whose provider gate refuses every launch."""
 
-    def __init__(self, tmp_path: Path, readiness: ProviderReadiness, *, threshold: int):
+    def __init__(
+        self,
+        tmp_path: Path,
+        readiness: ProviderReadiness,
+        *,
+        threshold: int,
+        create_session=None,
+    ):
         events = RecordingEvents()
         manager = ProviderResilienceManager(
             config=_resilience_config(threshold=threshold),
@@ -2566,6 +2588,7 @@ class _RefusingLauncherHarness(_LauncherHarness):
             manager=manager,
             events=events,
             config=_routing_config(tmp_path),
+            create_session=create_session,
         )
         self.manager = manager
         self.claims = _claims(tmp_path)
@@ -2825,7 +2848,7 @@ def test_a_refused_tech_lead_launch_keeps_its_full_retry_budget(
     so burning a retry against it would eventually drop the item for a reason
     that was never its fault (#6999 F10).
     """
-    from issue_orchestrator.control.session_routing import (
+    from issue_orchestrator.control.pending_session_queues import (
         PendingSessionQueues,
         TechLeadRetentionOutcome,
     )
@@ -2876,8 +2899,7 @@ def test_a_provider_deferral_touches_neither_restoration_nor_the_retry_budget(
         return None
 
     owner = LaunchSettlement(
-        claims=_claims(tmp_path),
-        claim=_claim("tech_lead", _pending_state("tech_lead")),
+        work=_launch_work("tech_lead", _pending_state("tech_lead"), tmp_path),
         remove=lambda: calls.append("remove"),
         restore_existing=_spy_restore_existing,
         retain_for_input_retry=lambda: calls.append("retain_for_input_retry"),
@@ -2941,8 +2963,7 @@ def test_an_unhandled_launch_disposition_never_silently_drops_the_work(
 
     removed: list[str] = []
     owner = LaunchSettlement(
-        claims=_claims(tmp_path),
-        claim=_claim("review", _pending_state("review")),
+        work=_launch_work("review", _pending_state("review"), tmp_path),
         remove=lambda: removed.append("removed"),
     )
     result = LaunchResult(session=None, success=False, reason="new kind of failure")
@@ -2976,10 +2997,36 @@ def _claim(queue: str, state):
     return PendingWorkClaim(PendingWorkKind(queue), _pending_items(state, queue)[0])
 
 
-def _ready_harness(tmp_path: Path):
+def _ready_harness(tmp_path: Path, *, create_session=None):
     """The same production launcher, with a provider that is authenticated."""
     return _RefusingLauncherHarness(
-        tmp_path, ProviderReadiness.ready(PROVIDER), threshold=1
+        tmp_path,
+        ProviderReadiness.ready(PROVIDER),
+        threshold=1,
+        create_session=create_session,
+    )
+
+
+def _launch_work(queue: str, state, tmp_path: Path):
+    """The launch-spanning claim owner the routing functions build (#6999 A2)."""
+    from issue_orchestrator.control.in_flight_work import PendingWorkLaunchClaim
+
+    return PendingWorkLaunchClaim(
+        claim=_claim(queue, state), claims=_claims(tmp_path)
+    )
+
+
+def _unrestorable_subject(
+    run_key: str, started_at: str, *, session_name: str = "issue-7", issue_number: int = 7
+):
+    """A live run whose session assets could not be rebuilt (#6999 F14)."""
+    return QuarantineSubject(
+        quarantine_key=f"{run_key}@{started_at}",
+        run_key=run_key,
+        session_name=session_name,
+        issue_number=issue_number,
+        error="the run's session assets could not be rebuilt",
+        cause=QuarantineCause.RUN_UNRESTORABLE,
     )
 
 
@@ -3291,7 +3338,7 @@ def test_an_unhandled_pending_work_kind_never_silently_drops_the_work() -> None:
     A queue kind added without a decision in ``restore_deferred`` would
     otherwise return None-ish and silently discard the only record of its work.
     """
-    from issue_orchestrator.control.session_routing import PendingSessionQueues
+    from issue_orchestrator.control.pending_session_queues import PendingSessionQueues
     from issue_orchestrator.domain.models import OrchestratorState
     from issue_orchestrator.domain.pending_work import PendingWorkClaim
 
@@ -3851,8 +3898,9 @@ def test_a_refused_claim_leaves_the_queue_item_alone(tmp_path: Path) -> None:
     removed: list[str] = []
 
     settlement = LaunchSettlement(
-        claims=harness.claims,
-        claim=_claim("review", review_state),
+        work=PendingWorkLaunchClaim(
+            claim=_claim("review", review_state), claims=harness.claims
+        ),
         remove=lambda: removed.append("removed"),
     )
 
@@ -4445,10 +4493,9 @@ def test_a_repeated_orphan_scan_quarantines_once(tmp_path: Path) -> None:
     quarantined = _quarantined(harness, tmp_path)
     owner = _quarantine_with(harness)
 
-    owner.quarantine_session(quarantined)
-    owner.quarantine_session(quarantined)
-    owner.quarantine_session(quarantined)
-
+    owner.quarantine(QuarantineSubject.live_run_with_unreadable_claim(quarantined))
+    owner.quarantine(QuarantineSubject.live_run_with_unreadable_claim(quarantined))
+    owner.quarantine(QuarantineSubject.live_run_with_unreadable_claim(quarantined))
     comments = [
         a for a in harness.quarantine_actions if isinstance(a, AddCommentAction)
     ]
@@ -4469,12 +4516,11 @@ def test_a_quarantine_survives_a_restart_without_re_commenting(
     """The marker is durable, so a fresh process does not re-announce it."""
     harness = _ready_harness(tmp_path)
     quarantined = _quarantined(harness, tmp_path)
-    _quarantine_with(harness).quarantine_session(quarantined)
+    _quarantine_with(harness).quarantine(QuarantineSubject.live_run_with_unreadable_claim(quarantined))
     harness.quarantine_actions.clear()
 
     # A brand-new owner over the SAME durable store, as after a restart.
-    _quarantine_with(harness).quarantine_session(quarantined)
-
+    _quarantine_with(harness).quarantine(QuarantineSubject.live_run_with_unreadable_claim(quarantined))
     assert [
         a for a in harness.quarantine_actions if isinstance(a, AddCommentAction)
     ] == []  # not re-announced
@@ -4493,11 +4539,10 @@ def test_a_failed_durable_escalation_is_retried_and_publishes_nothing(
     harness = _ready_harness(tmp_path)
     quarantined = _quarantined(harness, tmp_path)
 
-    _quarantine_with(harness, applies=False).quarantine_session(quarantined)
-
+    _quarantine_with(harness, applies=False).quarantine(QuarantineSubject.live_run_with_unreadable_claim(quarantined))
     assert EventName.SESSION_CLAIM_UNREADABLE.value not in harness.event_names()
     harness.quarantine_actions.clear()
-    _quarantine_with(harness).quarantine_session(quarantined)  # next sweep
+    _quarantine_with(harness).quarantine(QuarantineSubject.live_run_with_unreadable_claim(quarantined))  # next sweep
     assert len(harness.quarantine_actions) == 2  # really retried
     assert EventName.SESSION_CLAIM_UNREADABLE.value in harness.event_names()
 
@@ -4522,8 +4567,7 @@ def test_a_quarantine_does_not_reach_through_the_tech_lead_lifecycle(
         lambda **kwargs: launcher_escalations.append(kwargs) or True
     )
 
-    _quarantine_with(harness).quarantine_session(_quarantined(harness, tmp_path))
-
+    _quarantine_with(harness).quarantine(QuarantineSubject.live_run_with_unreadable_claim(_quarantined(harness, tmp_path)))
     assert launcher_escalations == []  # its own owner, not that one
     labels = [a for a in harness.quarantine_actions if isinstance(a, AddLabelAction)]
     comments = [
@@ -4554,9 +4598,8 @@ def test_two_runs_of_one_issue_quarantine_independently(tmp_path: Path) -> None:
     assert first.quarantine_key != second.quarantine_key
     owner = _quarantine_with(harness)
 
-    owner.quarantine_session(first)
-    owner.quarantine_session(second)
-
+    owner.quarantine(QuarantineSubject.live_run_with_unreadable_claim(first))
+    owner.quarantine(QuarantineSubject.live_run_with_unreadable_claim(second))
     assert (
         harness.event_names().count(EventName.SESSION_CLAIM_UNREADABLE.value) == 2
     )
@@ -4848,13 +4891,15 @@ def test_an_unresolved_review_claim_escalates_its_ISSUE_not_its_PR(
 
     harness = _ready_harness(tmp_path)
 
-    _quarantine_with(harness).quarantine_unresolved(
-        UnreadableClaim(
-            run_key="/runs/review-70",
-            session_name="review-70",  # named for the PR
-            issue_number=7,  # recorded at hold time, from the session's issue
-            error="payload unreadable",
-            started_at="2026-08-07T00:00:00+00:00",
+    _quarantine_with(harness).quarantine(
+        QuarantineSubject.ended_run_with_unreadable_claim(
+            UnreadableClaim(
+                run_key="/runs/review-70",
+                session_name="review-70",  # named for the PR
+                issue_number=7,  # recorded at hold time, from the session's issue
+                error="payload unreadable",
+                started_at="2026-08-07T00:00:00+00:00",
+            )
         )
     )
 
@@ -4883,8 +4928,8 @@ def test_an_unresolved_claim_quarantine_is_idempotent_across_sweeps(
     )
     owner = _quarantine_with(harness)
 
-    owner.quarantine_unresolved(unreadable)
-    owner.quarantine_unresolved(unreadable)
+    owner.quarantine(QuarantineSubject.ended_run_with_unreadable_claim(unreadable))
+    owner.quarantine(QuarantineSubject.ended_run_with_unreadable_claim(unreadable))
 
     assert len(
         [a for a in harness.quarantine_actions if isinstance(a, AddCommentAction)]
@@ -4905,7 +4950,7 @@ def test_a_released_quarantine_stops_holding_the_issue_open(
     harness = _ready_harness(tmp_path)
     quarantined = _quarantined(harness, tmp_path)
     owner = _quarantine_with(harness)
-    owner.quarantine_session(quarantined)
+    owner.quarantine(QuarantineSubject.live_run_with_unreadable_claim(quarantined))
     assert harness.claims.quarantined_issue_numbers() == frozenset({7})
     harness.quarantine_actions.clear()
 
@@ -4985,8 +5030,8 @@ def test_a_release_leaves_another_quarantines_block_alone(tmp_path: Path) -> Non
     )
     assert first.quarantine_key != second.quarantine_key
     owner = _quarantine_with(harness)
-    owner.quarantine_session(first)
-    owner.quarantine_session(second)
+    owner.quarantine(QuarantineSubject.live_run_with_unreadable_claim(first))
+    owner.quarantine(QuarantineSubject.live_run_with_unreadable_claim(second))
     harness.quarantine_actions.clear()
 
     owner.release(first.quarantine_key)
@@ -5025,9 +5070,7 @@ def test_a_replacement_run_reusing_the_directory_quarantines_independently(
         harness.claims.quarantine_key_for(session.run_assets),
     )
     owner = _quarantine_with(harness)
-    owner.quarantine_session(first)
-
-    # The first run finishes and its row goes; a replacement lands on the SAME
+    owner.quarantine(QuarantineSubject.live_run_with_unreadable_claim(first))  # The first run finishes and its row goes; a replacement lands on the SAME
     # directory with its own start instant.
     harness.claims.consume_pending_work_claim(session.run_assets)
     replacement_assets = dc_replace(
@@ -5051,8 +5094,7 @@ def test_a_replacement_run_reusing_the_directory_quarantines_independently(
     assert first.run_key == second.run_key  # the collision is real
     assert first.quarantine_key != second.quarantine_key
 
-    owner.quarantine_session(second)
-
+    owner.quarantine(QuarantineSubject.live_run_with_unreadable_claim(second))
     comments = [
         a for a in harness.quarantine_actions if isinstance(a, AddCommentAction)
     ]
@@ -5085,7 +5127,7 @@ def test_a_preexisting_block_is_never_removed_on_release(tmp_path: Path) -> None
     harness = _ready_harness(tmp_path)
     quarantined = _quarantined(harness, tmp_path)
     owner = _quarantine_with(harness, acquire=QuarantineLabelState.PREEXISTING)
-    owner.quarantine_session(quarantined)
+    owner.quarantine(QuarantineSubject.live_run_with_unreadable_claim(quarantined))
     assert (
         harness.claims.read_quarantine(quarantined.quarantine_key).label_state
         is QuarantineLabelState.PREEXISTING
@@ -5129,15 +5171,14 @@ def test_a_landed_label_with_a_failed_comment_is_retried_not_stranded(
         labels=_LabelOkCommentFails(harness),
         events=harness.events,
     )
-    failing.quarantine_session(quarantined)
-
+    failing.quarantine(QuarantineSubject.live_run_with_unreadable_claim(quarantined))
     record = harness.claims.read_quarantine(quarantined.quarantine_key)
     assert record.label_state is QuarantineLabelState.ACQUIRED  # it really landed
     assert not record.announced  # ...and the comment did not
     assert EventName.SESSION_CLAIM_UNREADABLE.value not in harness.event_names()
 
     harness.quarantine_actions.clear()
-    _quarantine_with(harness).quarantine_session(quarantined)  # the next sweep
+    _quarantine_with(harness).quarantine(QuarantineSubject.live_run_with_unreadable_claim(quarantined))  # the next sweep
 
     assert [
         a for a in harness.quarantine_actions if isinstance(a, AddCommentAction)
@@ -5158,8 +5199,7 @@ def test_a_failed_block_removal_is_retried_by_the_next_reconciliation(
 
     harness = _ready_harness(tmp_path)
     quarantined = _quarantined(harness, tmp_path)
-    _quarantine_with(harness).quarantine_session(quarantined)
-
+    _quarantine_with(harness).quarantine(QuarantineSubject.live_run_with_unreadable_claim(quarantined))
     class _RemovalFails(_RecordingLabels):
         def release_block(self, issue_number: int) -> bool:
             super().release_block(issue_number)
@@ -5239,13 +5279,7 @@ def test_a_second_quarantine_on_one_issue_does_not_strand_the_block(
     owner = _factory_owner(harness, applier, tmp_path)
     needs_human = LabelManager(_routing_config(tmp_path)).needs_human
     for key, run in (("/runs/a@t1", "/runs/a"), ("/runs/b@t2", "/runs/b")):
-        owner.quarantine_unrestorable(
-            quarantine_key=key,
-            run_key=run,
-            session_name="issue-7",
-            issue_number=7,
-            error="the run's session assets could not be rebuilt",
-        )
+        owner.quarantine(_unrestorable_subject(run, key.split("@", 1)[1]))
     states = {q.quarantine_key: q.label_state for q in harness.claims.list_quarantines()}
     assert states["/runs/a@t1"] is QuarantineLabelState.ACQUIRED
     assert states["/runs/b@t2"] is QuarantineLabelState.PREEXISTING
@@ -5286,13 +5320,7 @@ def test_a_block_whose_presence_could_not_be_checked_is_not_treated_as_ours(
     harness = _ready_harness(tmp_path)
     applier = _CannotCheckPresence()
     owner = _factory_owner(harness, applier, tmp_path)
-    owner.quarantine_unrestorable(
-        quarantine_key="/runs/a@t1",
-        run_key="/runs/a",
-        session_name="issue-7",
-        issue_number=7,
-        error="the run's session assets could not be rebuilt",
-    )
+    owner.quarantine(_unrestorable_subject("/runs/a", "t1"))
     assert (
         harness.claims.read_quarantine("/runs/a@t1").label_state
         is QuarantineLabelState.PREEXISTING
@@ -5443,8 +5471,11 @@ def test_a_live_run_that_cannot_be_rebuilt_keeps_its_work(
     # ...and crucially its work was NOT requeued beside the live terminal.
     assert restarted.pending_tech_lead_reviews == []
     assert len(harness.claims.list_unresolved_claims()) == 1
-    # A human is told, because a live terminal nobody can track is not routine.
-    assert EventName.SESSION_CLAIM_UNREADABLE.value in harness.event_names()
+    # A human is told, because a live terminal nobody can track is not routine -
+    # and told the TRUTH: the claim reads cleanly here, so this is the
+    # unrestorable-run story, not the unreadable-claim one (#6999 A1).
+    assert EventName.SESSION_RUN_UNRESTORABLE.value in harness.event_names()
+    assert EventName.SESSION_CLAIM_UNREADABLE.value not in harness.event_names()
 
 
 def test_an_unrestorable_run_is_not_requeued_on_repeated_scans(
@@ -5626,3 +5657,312 @@ def test_a_half_swapped_database_refuses_to_start(tmp_path: Path) -> None:
     conn = sqlite3.connect(db_path)
     assert conn.execute("SELECT COUNT(*) FROM pending_work_claim_old").fetchone()[0] == 1
     conn.close()
+
+
+# ---------------------------------------------------------------------------
+# A live run that can be neither rebuilt nor identified (#6999 F2)
+# ---------------------------------------------------------------------------
+
+
+def _discovered(session, *, is_review: bool):
+    from issue_orchestrator.ports.session_runner import DiscoveredSession
+
+    return DiscoveredSession(
+        issue_number=7,
+        tab_name="",
+        is_review=is_review,
+        session_name=session.terminal_id,
+        run_dir=str(session.run_assets.run_dir),
+    )
+
+
+def test_a_live_run_that_is_neither_rebuildable_nor_readable_is_escalated(
+    tmp_path: Path,
+) -> None:
+    """Both halves of the record failed at once, and nobody was told (#6999 F2).
+
+    The protection was there - the run was kept out of recovery so its work was
+    never requeued beside a live terminal - but the escalation was not: the
+    unreadable-claim branch of the discovery sweep only recorded a key, and the
+    ledger sweep then skipped the row for being live. The result was a running
+    agent the orchestrator does not track, carrying work nobody can name, with
+    no durable quarantine, no ``needs-human`` label, no comment and no event.
+    """
+    harness = _ready_harness(tmp_path)
+    state = _pending_state("tech_lead")
+    session = _route("tech_lead", state, harness)
+    assert session is not None
+    session.run_assets.manifest.path.unlink()  # cannot be rebuilt...
+    _corrupt_stored_claim(tmp_path, session.run_assets)  # ...and cannot be read
+
+    restarted, added = _restore_with_raw_discovery(
+        harness, [_discovered(session, is_review=False)]
+    )
+
+    assert added == []  # not admitted: nothing could be rebuilt
+    assert restarted.pending_tech_lead_reviews == []  # and NOT requeued
+    # The durable half: a quarantine row survives, so a restart still knows.
+    quarantines = harness.claims.list_quarantines()
+    assert [q.issue_number for q in quarantines] == [7]
+    assert quarantines[0].announced
+    assert quarantines[0].block_is_ours  # the needs-human block is held
+    labels = [a for a in harness.quarantine_actions if isinstance(a, AddLabelAction)]
+    comments = [
+        a for a in harness.quarantine_actions if isinstance(a, AddCommentAction)
+    ]
+    assert [a.issue_number for a in labels] == [7]
+    assert [a.number for a in comments] == [7]
+    # ...and the operator is told BOTH facts, not just one of them.
+    assert "could not be rebuilt" in comments[0].comment
+    assert "unreadable" in comments[0].comment
+    assert EventName.SESSION_RUN_UNRESTORABLE.value in harness.event_names()
+
+
+def test_the_combined_state_is_escalated_once_across_repeated_scans(
+    tmp_path: Path,
+) -> None:
+    """The orphan scan runs every 30 seconds; the human hears about it once."""
+    harness = _ready_harness(tmp_path)
+    state = _pending_state("review")
+    session = _route("review", state, harness)
+    assert session is not None
+    session.run_assets.manifest.path.unlink()
+    _corrupt_stored_claim(tmp_path, session.run_assets)
+    discovered = [_discovered(session, is_review=True)]
+
+    for _ in range(3):
+        restarted, added = _restore_with_raw_discovery(harness, discovered)
+        assert added == []
+        assert restarted.pending_reviews == []  # never a duplicate launch
+
+    comments = [
+        a for a in harness.quarantine_actions if isinstance(a, AddCommentAction)
+    ]
+    assert len(comments) == 1
+    assert len(harness.claims.list_quarantines()) == 1
+
+
+def test_the_two_quarantine_causes_do_not_borrow_each_others_story(
+    tmp_path: Path,
+) -> None:
+    """An unrestorable run's work is KNOWN, so it must not read as unknown.
+
+    The shared escalation used to publish ``claim_unreadable`` and comment that
+    the queued request could not be read for every cause. For a run whose claim
+    is intact that is false, and it points the operator straight at a manual
+    re-queue - a second session beside the one still running (#6999 A1).
+    """
+    harness = _ready_harness(tmp_path)
+    owner = _quarantine_with(harness)
+
+    owner.quarantine(_unrestorable_subject("/runs/a", "t1"))
+
+    comment = next(
+        a.comment
+        for a in harness.quarantine_actions
+        if isinstance(a, AddCommentAction)
+    )
+    assert "could not be rebuilt" in comment
+    assert "Do not re-queue it by hand" in comment
+    assert "is unknown" not in comment
+    assert EventName.SESSION_RUN_UNRESTORABLE.value in harness.event_names()
+    assert EventName.SESSION_CLAIM_UNREADABLE.value not in harness.event_names()
+
+
+# ---------------------------------------------------------------------------
+# A re-applied block becomes ours to remove (#6999 F3)
+# ---------------------------------------------------------------------------
+
+
+def test_a_reasserted_block_is_cleared_on_release(tmp_path: Path) -> None:
+    """Provenance is re-decided on every pass, not frozen at the first one.
+
+    A quarantine that first found ``needs-human`` already present records
+    PREEXISTING and will not remove it. If a human then takes the label off, the
+    next sweep re-applies it - and that apply is demonstrably OURS. Leaving the
+    row saying PREEXISTING stranded the issue in ``needs-human`` forever: on
+    release the row was deleted without removing the label it had re-added.
+    """
+    from issue_orchestrator.control.label_manager import LabelManager
+
+    harness = _ready_harness(tmp_path)
+    applier = _LiveLabelApplier()
+    owner = _factory_owner(harness, applier, tmp_path)
+    needs_human = LabelManager(_routing_config(tmp_path)).needs_human
+    applier.live.setdefault(7, set()).add(needs_human)  # a human got there first
+    subject = _unrestorable_subject("/runs/a", "t1")
+
+    owner.quarantine(subject)
+    assert not harness.claims.read_quarantine(subject.quarantine_key).block_is_ours
+
+    applier.live[7].discard(needs_human)  # the human's block is lifted
+    owner.quarantine(subject)  # the next sweep puts OUR block back
+
+    assert harness.claims.read_quarantine(subject.quarantine_key).block_is_ours
+    assert needs_human in applier.live[7]
+
+    owner.reconcile_released(frozenset())
+
+    assert needs_human not in applier.live[7]  # not stranded
+    assert harness.claims.list_quarantines() == ()
+
+
+def test_a_preexisting_block_that_is_never_reasserted_stays_preexisting(
+    tmp_path: Path,
+) -> None:
+    """The upgrade is evidence-driven: only a real apply changes provenance.
+
+    Re-scanning a quarantine whose block is still present must keep reporting
+    PREEXISTING, or every repeat sweep would quietly claim a human's label.
+    """
+    from issue_orchestrator.control.label_manager import LabelManager
+
+    harness = _ready_harness(tmp_path)
+    applier = _LiveLabelApplier()
+    owner = _factory_owner(harness, applier, tmp_path)
+    needs_human = LabelManager(_routing_config(tmp_path)).needs_human
+    applier.live.setdefault(7, set()).add(needs_human)
+    subject = _unrestorable_subject("/runs/a", "t1")
+
+    for _ in range(3):
+        owner.quarantine(subject)
+
+    assert not harness.claims.read_quarantine(subject.quarantine_key).block_is_ours
+
+    owner.reconcile_released(frozenset())
+
+    assert needs_human in applier.live[7]  # the human's block is left alone
+
+
+def test_an_acquired_block_is_not_downgraded_by_a_later_pass(
+    tmp_path: Path,
+) -> None:
+    """A later sweep finding the label present is finding the one we applied."""
+    harness = _ready_harness(tmp_path)
+    applier = _LiveLabelApplier()
+    owner = _factory_owner(harness, applier, tmp_path)
+    subject = _unrestorable_subject("/runs/a", "t1")
+
+    owner.quarantine(subject)  # ACQUIRED: nothing was there before
+    owner.quarantine(subject)  # a no-op apply must not demote it
+
+    assert harness.claims.read_quarantine(subject.quarantine_key).block_is_ours
+
+
+# ---------------------------------------------------------------------------
+# The claim is durable BEFORE the terminal exists (#6999 A2)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("queue", _PENDING_QUEUES)
+def test_the_claim_is_already_durable_when_the_terminal_spawns(
+    queue, tmp_path: Path
+) -> None:
+    """The crash window A2 named: a live terminal with no durable claim.
+
+    The claim used to be written only after a live ``Session`` came back, so a
+    crash between the spawn and that write left an agent running work whose only
+    other record was an in-memory queue. For a failure investigation that queue
+    IS the only other record, so a restart could not recover it at all.
+    """
+    at_spawn: list[tuple[str, ...]] = []
+    harness = _ready_harness(
+        tmp_path,
+        create_session=lambda name, cmd, wd, title: (
+            at_spawn.append(
+                tuple(u.claim.kind.value for u in harness.claims.list_unresolved_claims())
+            )
+            or True
+        ),
+    )
+    state = _pending_state(queue)
+
+    session = _route(queue, state, harness)
+
+    assert session is not None
+    # Observed from INSIDE the spawn: the ledger already knew.
+    assert at_spawn == [(queue,)]
+
+
+# The launch paths that report a failed terminal creation. ``review`` and
+# ``rework`` have always returned success regardless of it, so a spawn failure
+# is not observable from outside them; their pre-spawn hold is covered by the
+# durability test above.
+_SPAWN_CHECKING_QUEUES = ["retrospective_review", "validation_retry", "tech_lead"]
+
+
+@pytest.mark.parametrize("queue", _SPAWN_CHECKING_QUEUES)
+def test_a_launch_that_never_spawns_hands_the_work_back(
+    queue, tmp_path: Path
+) -> None:
+    """Compensation, not a stranded row (#6999 A2).
+
+    No terminal started, so the request is untouched and waiting to be
+    relaunched - which is exactly what a DEFERRED row means. Deleting the row
+    instead would be the failure this whole boundary exists to prevent: a
+    relaunch of already-deferred work supersedes the old row as it takes the
+    claim, so a failed relaunch that then deleted its own row would leave
+    nothing durable behind at all.
+
+    That durable row is what makes the work survive the settlement's own
+    disposal: a permanent launch failure drops the in-memory queue item, and a
+    fresh process still recovers exactly one request.
+    """
+    harness = _ready_harness(
+        tmp_path, create_session=lambda name, cmd, wd, title: False
+    )
+    state = _pending_state(queue)
+
+    assert _route(queue, state, harness) is None
+
+    unresolved = harness.claims.list_unresolved_claims()
+    assert [u.deferred for u in unresolved] == [True]
+    assert [u.claim.kind.value for u in unresolved] == [queue]
+
+    # ...and a fresh process recovers exactly that work, exactly once.
+    restarted = _recover_with_no_terminals(state, harness)
+    assert _pending_count(restarted, queue) == 1
+
+
+def test_a_claim_store_that_cannot_record_stops_the_launch(tmp_path: Path) -> None:
+    """A store fault must be survivable, which means failing BEFORE the spawn.
+
+    Recorded after the terminal, the write had nowhere left to fail: the
+    terminal was already irreversible. Before it, the launch simply does not
+    happen, the queue item keeps its full budget, and the next tick retries.
+    """
+    from issue_orchestrator.control.in_flight_work import PendingWorkLaunchClaim
+    from issue_orchestrator.control.session_launch_types import LaunchDisposition
+
+    class _RefusingStore:
+        def __init__(self, real):
+            self._real = real
+            self.deferred: list = []
+
+        def hold_pending_work_claim(self, run, claim, *, issue_number):
+            raise RuntimeError("ledger is unwritable")
+
+        def defer_pending_work_claim(self, run):
+            self.deferred.append(run)
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+    harness = _ready_harness(tmp_path)
+    store = _RefusingStore(harness.claims)
+    state = _pending_state("tech_lead")
+    work = PendingWorkLaunchClaim(
+        claim=_claim("tech_lead", state), claims=store
+    )
+
+    result = harness.launcher.launch_issue_session(
+        Issue(7, "Investigate: session failed", ["agent:tech-lead"]),
+        state.active_sessions,
+        work_claim=work,
+    )
+
+    assert not result.success
+    assert result.disposition is LaunchDisposition.INPUT_RETRY
+    assert harness.created == []  # no terminal was spawned
+    assert store.deferred == []  # nothing was held, so nothing to hand back
+    assert len(state.pending_tech_lead_reviews) == 1

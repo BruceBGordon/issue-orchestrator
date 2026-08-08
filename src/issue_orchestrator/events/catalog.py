@@ -115,6 +115,13 @@ class EventName(str, Enum):
     # this event is what the dashboard reacts to, the label is what survives a
     # restart.
     SESSION_CLAIM_UNREADABLE = "session.claim_unreadable"
+    # A live terminal the orchestrator discovered but could not rebuild into a
+    # session. Distinct from the name above on purpose (#6999 A1/F2): here the
+    # claim reads cleanly, so the work IS known and is deliberately not being
+    # re-queued while the terminal runs. Reporting it as "unreadable claim"
+    # would tell an operator to work out what the session was doing and re-queue
+    # it - the manual duplicate launch that protecting the run prevents.
+    SESSION_RUN_UNRESTORABLE = "session.run_unrestorable"
     SESSION_START_FAILED = "session.start_failed"
     SESSION_STOPPED = "session.stopped"
     SESSION_CLEANUP = "session.cleanup"
@@ -420,6 +427,7 @@ class PublicEventName(str, Enum):
     SESSION_LAUNCH_BLOCKED_PROVIDER = "session.launch_blocked_provider"
     SESSION_PROVIDER_AUTH_TERMINATED = "session.provider_auth_terminated"
     SESSION_CLAIM_UNREADABLE = "session.claim_unreadable"
+    SESSION_RUN_UNRESTORABLE = "session.run_unrestorable"
     SESSION_NO_COMPLETION_RECORD = "session.no_completion_record"
     SESSION_INVALID_COMPLETION_RECORD = "session.invalid_completion_record"
     SESSION_PROCESSING_COMPLETED = "session.processing_completed"

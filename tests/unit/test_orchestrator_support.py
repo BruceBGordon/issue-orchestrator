@@ -43,7 +43,7 @@ from issue_orchestrator.control.reconciliation import (
     get_pause_label,
 )
 from issue_orchestrator.control.session_history import CLOSED_ISSUE_HISTORY_STATUS_REASON
-from issue_orchestrator.control.session_routing import PendingSessionQueues
+from issue_orchestrator.control.pending_session_queues import PendingSessionQueues
 from issue_orchestrator.control.actions import (
     ActionResult,
     ActionType,

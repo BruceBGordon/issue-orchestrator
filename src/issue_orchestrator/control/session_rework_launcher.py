@@ -27,6 +27,11 @@ from ..ports.event_sink import make_run_scoped_event, make_trace_event
 from ..ports.session_output import SessionOutput
 from ..ports.worktree_manager import WorktreeManager, WorktreeReuseOptions
 from .actions import Action, AddCommentAction, AddLabelAction, RemoveLabelAction
+from .in_flight_work import (
+    NO_LAUNCH_WORK_CLAIM,
+    LaunchWorkClaim,
+    abandon_claim_unless_spawned,
+)
 from .session_launch_types import LaunchDisposition, LaunchResult
 from .stack_base import StackBaseDecision
 from .session_review_support import copy_review_feedback_to_rework, format_reviewer_feedback
@@ -187,25 +192,44 @@ def _rework_preflight(
     return LaunchResult(None, False, f"Stack dependencies not satisfied: {reason}"), None
 
 
+def _rework_launch_identity(
+    rework: PendingRework, deps: ReworkLaunchDependencies
+) -> "LaunchResult | tuple[AgentConfig, int]":
+    """Everything a rework launch must know before it reads anything remote.
+
+    The agent it will run as, the issue it belongs to, and whether that agent's
+    provider is even usable. Kept ahead of :func:`resolve_rework_pr` on purpose:
+    a provider that is not ready must refuse the launch without spending a
+    GitHub read on it.
+    """
+    agent_config = deps.config.agents.get(rework.agent_type)
+    if not agent_config:
+        return LaunchResult(None, False, f"No agent config for {rework.agent_type}")
+    issue_number = rework.resolve_issue_number()
+    if issue_number is None:
+        return LaunchResult(
+            None, False, f"Unresolved issue number for rework {rework.issue_key}"
+        )
+    if result := deps.check_provider_ready(agent_config.provider, issue_number):
+        return result
+    return agent_config, issue_number
+
+
 def launch_rework_session(
     rework: PendingRework,
     active_sessions: list[Session],
     deps: ReworkLaunchDependencies,
+    *,
+    work_claim: LaunchWorkClaim = NO_LAUNCH_WORK_CLAIM,
 ) -> LaunchResult:
     """Launch a rework session to fix issues found in review."""
-    agent_config = deps.config.agents.get(rework.agent_type)
-    if not agent_config:
-        return LaunchResult(None, False, f"No agent config for {rework.agent_type}")
+    resolved = _rework_launch_identity(rework, deps)
+    if isinstance(resolved, LaunchResult):
+        return resolved
+    agent_config, issue_number = resolved
 
     issue_key = rework.issue_key
     session_key = SessionKey(issue=issue_key, task=TaskKind.REWORK)
-    issue_number = rework.resolve_issue_number()
-    if issue_number is None:
-        return LaunchResult(None, False, f"Unresolved issue number for rework {issue_key}")
-
-    if result := deps.check_provider_ready(agent_config.provider, issue_number):
-        return result
-
     pr_number, branch_name = resolve_rework_pr(deps.repository_host, rework, issue_number)
 
     session_name = f"rework-{issue_number}"
@@ -296,206 +320,215 @@ def launch_rework_session(
     run = ctx.run
     claude_project_dir = ctx.claude_project_dir
 
-    ctx.write_worktree_note()
-    ctx.write_session_identity({
-        "task": TaskKind.REWORK.value,
-        "issue_key": issue_key.stable_id(),
-        "pr_number": pr_number,
-        "session_key": session_key.stable_id(),
-        "agent": rework.agent_type,
-        "rework_cycle": rework.rework_cycle,
-        **deps.session_identity_launch_metadata(
-            agent_config,
-            extra_provider_args=None,
-        ),
-    })
-    deps.clear_interrupted_retry_guard_label(
-        issue_number=issue_number,
-        mode="coding",
-        context="launch_clear_interrupted_guard_rework",
-    )
-    deps.clear_reset_retry_pending_label(
-        issue_number=issue_number,
-        context="launch_clear_reset_retry_pending_rework",
-    )
-    deps.clear_reset_retry_scratch_pending_label(
-        issue_number=issue_number,
-        context="launch_clear_reset_retry_scratch_pending_rework",
-    )
+    # Durable before anything irreversible (#6999 A2).
+    if failure := work_claim.hold_before_spawn(run, issue_number=issue_number):
+        return failure
 
-    logger.info(
-        "[SESSION_RUN_START] run_id=%s session=%s issue=%s",
-        run.run_id,
-        session_name,
-        issue_number,
-        extra=log_context(issue_key=issue_key.stable_id(), session_id=session_name),
-    )
-    logger.info(
-        "[launch] Rework session paths: issue=%s pr=%s worktree=%s branch=%s",
-        issue_number,
-        pr_number,
-        worktree_path,
-        branch_name,
-    )
-    logger.info(
-        "[launch] Claude project dir: session=%s path=%s exists=%s",
-        session_name,
-        claude_project_dir,
-        claude_project_dir.exists(),
-    )
+    with abandon_claim_unless_spawned(work_claim, run) as spawn:
 
-    existing_work = build_rework_existing_work(worktree_info.rebase_failed)
-    if existing_work:
-        logger.warning("[launch] Rebase failed for rework - agent will need to resolve merge conflicts")
-
-    copy_review_feedback_to_rework(
-        worktree_path=worktree_path,
-        pr_number=pr_number,
-        rework_run_assets=run,
-    )
-
-    feedback_sections: list[str] = []
-    if rework.feedback:
-        feedback_sections.append(rework.feedback)
-
-    reviewer_feedback = format_reviewer_feedback(
-        pr_number=pr_number,
-        repository_host=deps.repository_host,
-        cache_minutes=deps.config.reviewer_feedback_cache_minutes,
-        run_assets=run,
-        sleep_fn=time.sleep,
-    )
-    if reviewer_feedback:
-        feedback_sections.append(reviewer_feedback)
-
-    if feedback_sections:
-        combined_feedback = "\n\n".join(feedback_sections)
-        existing_work = f"{existing_work}\n\n{combined_feedback}" if existing_work else combined_feedback
-        logger.info("[launch] Including rework feedback in session prompt")
-        deps.session_output.save_review_feedback(
-            worktree_path=worktree_path,
-            cycle=rework.rework_cycle,
-            feedback=combined_feedback,
-            pr_number=pr_number,
+        ctx.write_worktree_note()
+        ctx.write_session_identity({
+            "task": TaskKind.REWORK.value,
+            "issue_key": issue_key.stable_id(),
+            "pr_number": pr_number,
+            "session_key": session_key.stable_id(),
+            "agent": rework.agent_type,
+            "rework_cycle": rework.rework_cycle,
+            **deps.session_identity_launch_metadata(
+                agent_config,
+                extra_provider_args=None,
+            ),
+        })
+        deps.clear_interrupted_retry_guard_label(
+            issue_number=issue_number,
+            mode="coding",
+            context="launch_clear_interrupted_guard_rework",
+        )
+        deps.clear_reset_retry_pending_label(
+            issue_number=issue_number,
+            context="launch_clear_reset_retry_pending_rework",
+        )
+        deps.clear_reset_retry_scratch_pending_label(
+            issue_number=issue_number,
+            context="launch_clear_reset_retry_scratch_pending_rework",
         )
 
-    issue_title = f"Rework PR #{pr_number} (cycle {rework.rework_cycle})"
-    rendered_prompt = agent_config.render_initial_prompt(
-        issue_number=issue_number,
-        issue_title=issue_title,
-        worktree=worktree_path,
-        pr_number=pr_number,
-        existing_work=existing_work,
-    )
-    prompt_path = deps.persist_session_prompt(run.run_dir, rendered_prompt)
-    base_command = agent_config.get_command(
-        issue_number=issue_number,
-        issue_title=issue_title,
-        worktree=worktree_path,
-        pr_number=pr_number,
-        existing_work=existing_work,
-        task_kind=TaskKind.REWORK.value,
-    )
-    base_command = deps.wrap_provider_command(base_command, agent_config, run.run_dir)
-    completion_path = get_completion_path(rework.agent_type, run_dir=run.run_dir.name)
-    deps.session_output.update_manifest(
-        run.run_dir,
-        {
+        logger.info(
+            "[SESSION_RUN_START] run_id=%s session=%s issue=%s",
+            run.run_id,
+            session_name,
+            issue_number,
+            extra=log_context(issue_key=issue_key.stable_id(), session_id=session_name),
+        )
+        logger.info(
+            "[launch] Rework session paths: issue=%s pr=%s worktree=%s branch=%s",
+            issue_number,
+            pr_number,
+            worktree_path,
+            branch_name,
+        )
+        logger.info(
+            "[launch] Claude project dir: session=%s path=%s exists=%s",
+            session_name,
+            claude_project_dir,
+            claude_project_dir.exists(),
+        )
+
+        existing_work = build_rework_existing_work(worktree_info.rebase_failed)
+        if existing_work:
+            logger.warning("[launch] Rebase failed for rework - agent will need to resolve merge conflicts")
+
+        copy_review_feedback_to_rework(
+            worktree_path=worktree_path,
+            pr_number=pr_number,
+            rework_run_assets=run,
+        )
+
+        feedback_sections: list[str] = []
+        if rework.feedback:
+            feedback_sections.append(rework.feedback)
+
+        reviewer_feedback = format_reviewer_feedback(
+            pr_number=pr_number,
+            repository_host=deps.repository_host,
+            cache_minutes=deps.config.reviewer_feedback_cache_minutes,
+            run_assets=run,
+            sleep_fn=time.sleep,
+        )
+        if reviewer_feedback:
+            feedback_sections.append(reviewer_feedback)
+
+        if feedback_sections:
+            combined_feedback = "\n\n".join(feedback_sections)
+            existing_work = f"{existing_work}\n\n{combined_feedback}" if existing_work else combined_feedback
+            logger.info("[launch] Including rework feedback in session prompt")
+            deps.session_output.save_review_feedback(
+                worktree_path=worktree_path,
+                cycle=rework.rework_cycle,
+                feedback=combined_feedback,
+                pr_number=pr_number,
+            )
+
+        issue_title = f"Rework PR #{pr_number} (cycle {rework.rework_cycle})"
+        rendered_prompt = agent_config.render_initial_prompt(
+            issue_number=issue_number,
+            issue_title=issue_title,
+            worktree=worktree_path,
+            pr_number=pr_number,
+            existing_work=existing_work,
+        )
+        prompt_path = deps.persist_session_prompt(run.run_dir, rendered_prompt)
+        base_command = agent_config.get_command(
+            issue_number=issue_number,
+            issue_title=issue_title,
+            worktree=worktree_path,
+            pr_number=pr_number,
+            existing_work=existing_work,
+            task_kind=TaskKind.REWORK.value,
+        )
+        base_command = deps.wrap_provider_command(base_command, agent_config, run.run_dir)
+        completion_path = get_completion_path(rework.agent_type, run_dir=run.run_dir.name)
+        deps.session_output.update_manifest(
+            run.run_dir,
+            {
+                "completion_path": completion_path,
+                "session_prompt_path": prompt_path,
+            },
+        )
+        env_exports = deps.build_session_env(
+            completion_path=completion_path,
+            session_id=run.session_name,
+            agent_label=rework.agent_type,
+            issue_number=issue_number,
+            run_assets=run,
+            worktree_path=worktree_path,
+        )
+        command = f"{env_exports} && {base_command}"
+        logger.info(
+            "[launch] Rework session command: issue=%s pr=%s session=%s worktree=%s completion=%s command=%s",
+            issue_number,
+            pr_number,
+            session_name,
+            worktree_path,
+            completion_path,
+            command,
+        )
+
+        session_created = deps.create_session(session_name, command, worktree_path, f"Rework #{issue_number}")
+        logger.info(
+            "[launch] Rework session create result: issue=%s pr=%s session=%s created=%s",
+            issue_number,
+            pr_number,
+            session_name,
+            session_created,
+        )
+        # This path reports success regardless of ``session_created`` (it has
+        # always done so), so the launch hands back a live session from here on.
+        spawn.mark_spawned()
+
+        rework_issue = Issue(
+            number=issue_number,
+            title=f"Rework #{pr_number}",
+            labels=[rework.agent_type],
+        )
+        session = Session(
+            key=session_key,
+            issue=rework_issue,
+            agent_config=agent_config,
+            terminal_id=session_name,
+            worktree_path=worktree_path,
+            branch_name=branch_name,
+            completion_path=completion_path,
+            run_assets=run,
+            agent_label=rework.agent_type,
+            pr_number=pr_number,
+            rework_cycle=rework.rework_cycle,
+            original_prompt=rendered_prompt,
+        )
+
+        log_transition("rework", issue_number, "LAUNCHING", "ACTIVE", f"session launched, cycle={rework.rework_cycle}")
+        logger.info("Launched rework session for issue #%d (cycle %d)", issue_number, rework.rework_cycle)
+
+        full_completion_path = (worktree_path / completion_path).resolve()
+        deps.events.publish(make_run_scoped_event(EventName.REWORK_STARTED, {
+            "issue_number": issue_number,
+            "pr_number": pr_number,
+            "agent": rework.agent_type,
+            "task": "rework",
+            "session_name": session_name,
+            "rework_cycle": rework.rework_cycle,
+            "run_id": run.run_id,
+            "run_dir": str(run.run_dir),
             "completion_path": completion_path,
+            "completion_path_absolute": str(full_completion_path),
             "session_prompt_path": prompt_path,
-        },
-    )
-    env_exports = deps.build_session_env(
-        completion_path=completion_path,
-        session_id=run.session_name,
-        agent_label=rework.agent_type,
-        issue_number=issue_number,
-        run_assets=run,
-        worktree_path=worktree_path,
-    )
-    command = f"{env_exports} && {base_command}"
-    logger.info(
-        "[launch] Rework session command: issue=%s pr=%s session=%s worktree=%s completion=%s command=%s",
-        issue_number,
-        pr_number,
-        session_name,
-        worktree_path,
-        completion_path,
-        command,
-    )
+        }))
 
-    session_created = deps.create_session(session_name, command, worktree_path, f"Rework #{issue_number}")
-    logger.info(
-        "[launch] Rework session create result: issue=%s pr=%s session=%s created=%s",
-        issue_number,
-        pr_number,
-        session_name,
-        session_created,
-    )
+        update_rework_cycle_label(
+            pr_number,
+            issue_number,
+            issue_key,
+            rework.rework_cycle,
+            label_manager=deps.label_manager,
+            apply_actions=deps.apply_actions,
+            events=deps.events,
+        )
 
-    rework_issue = Issue(
-        number=issue_number,
-        title=f"Rework #{pr_number}",
-        labels=[rework.agent_type],
-    )
-    session = Session(
-        key=session_key,
-        issue=rework_issue,
-        agent_config=agent_config,
-        terminal_id=session_name,
-        worktree_path=worktree_path,
-        branch_name=branch_name,
-        completion_path=completion_path,
-        run_assets=run,
-        agent_label=rework.agent_type,
-        pr_number=pr_number,
-        rework_cycle=rework.rework_cycle,
-        original_prompt=rendered_prompt,
-    )
+        deps.apply_actions([
+            RemoveLabelAction(
+                issue_number=pr_number,
+                label=deps.label_manager.needs_rework,
+                reason="rework started",
+            ),
+        ], context="rework_remove_needs_rework")
+        deps.events.publish(make_trace_event(EventName.PR_VIEW_CHANGED, {
+            "pr_number": pr_number,
+            "issue_number": issue_number,
+            "issue_key": issue_key.stable_id(),
+            "removed": [deps.label_manager.needs_rework],
+        }))
 
-    log_transition("rework", issue_number, "LAUNCHING", "ACTIVE", f"session launched, cycle={rework.rework_cycle}")
-    logger.info("Launched rework session for issue #%d (cycle %d)", issue_number, rework.rework_cycle)
-
-    full_completion_path = (worktree_path / completion_path).resolve()
-    deps.events.publish(make_run_scoped_event(EventName.REWORK_STARTED, {
-        "issue_number": issue_number,
-        "pr_number": pr_number,
-        "agent": rework.agent_type,
-        "task": "rework",
-        "session_name": session_name,
-        "rework_cycle": rework.rework_cycle,
-        "run_id": run.run_id,
-        "run_dir": str(run.run_dir),
-        "completion_path": completion_path,
-        "completion_path_absolute": str(full_completion_path),
-        "session_prompt_path": prompt_path,
-    }))
-
-    update_rework_cycle_label(
-        pr_number,
-        issue_number,
-        issue_key,
-        rework.rework_cycle,
-        label_manager=deps.label_manager,
-        apply_actions=deps.apply_actions,
-        events=deps.events,
-    )
-
-    deps.apply_actions([
-        RemoveLabelAction(
-            issue_number=pr_number,
-            label=deps.label_manager.needs_rework,
-            reason="rework started",
-        ),
-    ], context="rework_remove_needs_rework")
-    deps.events.publish(make_trace_event(EventName.PR_VIEW_CHANGED, {
-        "pr_number": pr_number,
-        "issue_number": issue_number,
-        "issue_key": issue_key.stable_id(),
-        "removed": [deps.label_manager.needs_rework],
-    }))
-
-    return LaunchResult(session, True)
+        return LaunchResult(session, True)
 
 
 def check_rework_conflicts(

@@ -3071,7 +3071,7 @@ class TestFailureInvestigationCleanupLifecycle:
             FactGatherer,
             clear_discovered_facts,
         )
-        from issue_orchestrator.control.session_routing import PendingSessionQueues
+        from issue_orchestrator.control.pending_session_queues import PendingSessionQueues
         from issue_orchestrator.domain.models import (
             ImmediateCleanup,
             OrchestratorState,
@@ -3199,7 +3199,7 @@ class TestStormCohortCleanupLifecycle:
         from issue_orchestrator.control.health_review_trigger import (
             intake_created_tech_lead_anchor,
         )
-        from issue_orchestrator.control.session_routing import PendingSessionQueues
+        from issue_orchestrator.control.pending_session_queues import PendingSessionQueues
         from issue_orchestrator.domain.models import (
             ImmediateCleanup,
             OrchestratorState,
