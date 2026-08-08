@@ -84,13 +84,29 @@ Four concrete mechanisms in today's code destroy or strand the work:
    worktree that has advanced past its validation is preserved and parked, never
    published: ancestry is not identity.
 
-3. **One owner, three initiators.** Automatic recovery at the boundary, the gated
-   tech-lead `recover_validated_work` op, and the operator Control Center command
-   all call the same owner and receive the same typed result. The owner — not the
-   initiators — owns trusted artifact admission, stale checks, idempotency, durable
-   state, the publication workspace, and partial-write reconciliation, and it
-   *composes* (rather than reimplements) the publisher and the finalizer of
-   decision 8.
+3. **One owner, three initiators, two commands.** Automatic recovery at the
+   boundary, the gated tech-lead `recover_validated_work` op, and the operator
+   Control Center command all call the same owner and receive the same typed result.
+   The owner — not the initiators — owns trusted artifact admission, stale checks,
+   idempotency, durable state, the publication workspace, and partial-write
+   reconciliation, and it *composes* (rather than reimplements) the publisher and
+   the finalizer of decision 8.
+
+   The initiators split across **two command types, not one optional-laden
+   request**: automatic capture carries the exact run assets, stored-evidence
+   recovery carries an evidence id, and neither has an optional or sentinel field.
+   A single union request would force the owner to decide what to do when the run
+   assets are absent, and every available answer is a forbidden fallback — report
+   "nothing found", scan for the latest run, or rediscover paths from a worktree.
+
+   The exact assets reach the boundary through `IssueRunEvidenceSource`, a
+   behavior-level port written by the owner that **allocates** the run (the launch
+   transaction, in the same step that constructs `SessionRunAssets`) and read by
+   the termination boundary, which holds only an issue number. Its result is an
+   explicit fact about which runs were considered, and "no runs recorded" is a
+   distinct type from "the ledger could not be read" — the latter raises and aborts
+   teardown. A live session with no ledger row also raises: two owners disagreeing
+   about what exists is never resolved in favour of destroying it.
 
 4. **Escrow outside the worktree; commits pinned by refs.** Admitted evidence is
    copied to `<state_dir>/validated-work/<issue>/<evidence_id>/`, together with a
@@ -105,10 +121,26 @@ Four concrete mechanisms in today's code destroy or strand the work:
    Identity is split in two. `record_id` hashes *which work* this is (repo, issue,
    branch, validated head) and is the durable row's **primary key**, so two rows for
    one unit of work are unrepresentable in any state. `evidence_id` hashes *which
-   evidence* carries it; new evidence for the same work supersedes in place, with
-   the prior evidence audited and its escrow retained. Neither hash covers capture
-   timestamps, mutable external observations, the moving worktree head, or
-   filesystem paths, so a crash-and-retry re-derives both and converges.
+   evidence* carries it. Neither hash covers capture timestamps, mutable external
+   observations, the moving worktree head, or filesystem paths, so a crash-and-retry
+   re-derives both and converges.
+
+   Evidence is a **normalized relation**, not a column plus a JSON array: each
+   `evidence_id` is a row related to its record with an explicit role — `current`,
+   `attached` (admitted while a submission was in flight), or `superseded`. Exact
+   lookup, approval-identity refusal, the post-submission drain of attached
+   candidates, and retention are all queries against that relation. As a JSON array
+   they were unqueryable: a superseded handle resolved to nothing, and an attached
+   capture existed only as a directory on disk that no same-process drain could find.
+
+   Because `record_id` includes the validated head, two validations on one branch
+   are two records — so records on one issue+branch also carry a **lineage role**.
+   A descendant validation becomes the single drainable head, ancestors park behind
+   it and are resolved as recovered when the head publishes and their evidence still
+   verifies, and genuinely divergent heads park for an explicit choice. Without that
+   relation, whichever record published first left the other failing against a
+   remote it no longer recognised — blocking reset over work that was already
+   shipped.
 
 5. **Publication reads a dedicated workspace and writes an immutable object.**
    Recovery publishes from a per-evidence worktree detached at the pinned validated
@@ -161,8 +193,40 @@ Four concrete mechanisms in today's code destroy or strand the work:
    | Layer | Owner | Needs orchestrator state |
    |---|---|---|
    | Remote execution | `ValidatedHeadPublisher` — exact-object/exact-lease branch write, then ensure exactly one PR | no |
-   | Finalization | `PublishedWorkFinalizer` — labels, history, review routing, wrapping the existing `RetrySuccessFinalizer`/`RetryReviewRouting` | yes, on the request |
+   | Finalization | `PublishedWorkFinalizer` — staged review routing, then recovery-block clearing, composing the existing `RetryReviewRouting` policy | yes, on the request |
    | Admission | `PublishRecoveryService` (manual) and `ValidatedWorkDispositionService` (validated work), as **siblings** | yes |
+
+   **Publication is synchronous, and its durability lives in numbered attempt
+   rows.** The port makes one call and returns what happened; there is no
+   "submitted, poll later" state, because nothing in this design owns a job runner
+   or a submission store to make such a state durable. What *is* durable is the
+   attempt: the operation is identified by record and target commit and never
+   changes, while each attempt at it is a row written **before** the external call,
+   claimed by a compare-and-set with a lease. A retry is therefore an explicit new
+   attempt rather than a re-use of an idempotency key that already names a failed
+   one, exactly one attempt is live across drainers and processes, the retry budget
+   survives restart by counting rows, and a crash mid-call leaves an outcome-less
+   row that is reconciled against the remote rather than resubmitted blind.
+
+   **Finalization is staged and durable, and it routes before it clears.** The
+   review-routing transition is applied and observed, and only then is the
+   `recovery-pending` block removed. The reverse order — the manual retry path's
+   order, which is correct for *its* job — has a crash window in which the block is
+   gone and the routing, which lived only in process memory, is not: an issue
+   scheduler-eligible again with a published head nobody will review. The phase is
+   persisted, restart replays the missing stages idempotently, and `RECOVERED` is
+   never inferred from labels looking correct, because cleanup labels do not prove
+   the routing mutation happened.
+
+9. **This owner writes exactly one label of its own.** A failed disposition keeps
+   `recovery-pending` and registers its escalation through the needs-human owner's
+   behavior API as its own enumerated cause. It does not write
+   `tech-lead-needs-human`, which ADR-0013 defines as provenance for a *different*
+   lifecycle: a marker written here would be read on restart as an interrupted
+   tech-lead escalation and re-blocked as one, and — because it would be added after
+   the recovery observed its blocking labels — would survive a successful recovery
+   and reassert `needs-human` over work that was already published. Ownership of a
+   label includes ownership of its removal.
 
    The publisher is execution-only precisely because finalization needs
    `OrchestratorState` and the publisher does not; folding the two together would
