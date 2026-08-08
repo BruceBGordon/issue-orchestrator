@@ -4013,3 +4013,85 @@ class TestPublicCompletionFacadeSettlesClaims:
 
         assert orchestrator.state.pending_reviews == []
         assert orchestrator.deps.pending_work_claims.list_unresolved_claims() == ()
+
+
+class TestReconcileSweepsThePendingWorkLedger:
+    """The runtime reconcile must sweep even with nothing untracked (#6999 F8).
+
+    The two early returns in ``_reconcile_running_sessions`` used to skip
+    recovery entirely, and the ledger rows that recovery exists for belong to
+    runs whose terminals are already gone - so those are exactly the branches
+    where the row is the only remaining record of the work. Driven through the
+    real facade so either return regaining its short-circuit fails here.
+    """
+
+    def _seed_unresolved_claim(self, orchestrator, tmp_path: Path):
+        from issue_orchestrator.domain.models import (
+            DiscoveredFailure,
+            PendingTechLeadReview,
+        )
+        from issue_orchestrator.domain.pending_work import (
+            PendingWorkClaim,
+            PendingWorkKind,
+        )
+        from issue_orchestrator.domain.tech_lead_session import TechLeadSessionFlavor
+        from tests.unit.session_run_helpers import make_session_run_assets
+
+        claim = PendingWorkClaim(
+            PendingWorkKind.TECH_LEAD,
+            PendingTechLeadReview(
+                issue_number=7,
+                title="Investigate: session failed",
+                flavor=TechLeadSessionFlavor.FAILURE_INVESTIGATION,
+                failure=DiscoveredFailure(7, "Test", "failed", blocking_label="blocked-failed"),
+            ),
+        )
+        orchestrator.deps.pending_work_claims.hold_pending_work_claim(
+            make_session_run_assets(tmp_path / "gone-wt", session_name="issue-7"),
+            claim,
+            issue_number=7,
+        )
+
+    def _force_scan(self, orchestrator):
+        orchestrator._last_orphan_reconcile_scan_at = 0.0  # noqa: SLF001
+        orchestrator._last_orphan_reconcile_active_count = -1  # noqa: SLF001
+
+    def test_nothing_discovered_still_recovers_the_work(
+        self, sample_config, mock_repository_host, tmp_path: Path
+    ):
+        orchestrator = create_test_orchestrator(sample_config, mock_repository_host)
+        self._seed_unresolved_claim(orchestrator, tmp_path)
+        orchestrator.deps.runner.discover_running_sessions = MagicMock(return_value=[])
+        self._force_scan(orchestrator)
+
+        orchestrator._reconcile_running_sessions()  # noqa: SLF001
+
+        assert [
+            t.issue_number for t in orchestrator.state.pending_tech_lead_reviews
+        ] == [7]
+
+    def test_everything_already_tracked_still_recovers_the_work(
+        self, sample_config, mock_repository_host, tmp_path: Path
+    ):
+        """The other early return: discovery found only terminals we track."""
+        from tests.unit.session_run_helpers import make_session_run_assets
+
+        orchestrator = create_test_orchestrator(sample_config, mock_repository_host)
+        self._seed_unresolved_claim(orchestrator, tmp_path)
+        tracked = MagicMock(spec=Session)
+        tracked.terminal_id = "issue-99"
+        tracked.run_assets = make_session_run_assets(
+            tmp_path / "live-wt", session_name="issue-99"
+        )
+        orchestrator.state.active_sessions = [tracked]
+        orchestrator.deps.runner.discover_running_sessions = MagicMock(return_value=[
+            {"issue_number": 99, "tab_name": "issue-99", "is_review": False,
+             "session_name": "issue-99"}
+        ])
+        self._force_scan(orchestrator)
+
+        orchestrator._reconcile_running_sessions()  # noqa: SLF001
+
+        assert [
+            t.issue_number for t in orchestrator.state.pending_tech_lead_reviews
+        ] == [7]

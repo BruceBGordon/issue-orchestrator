@@ -4387,7 +4387,10 @@ def _quarantined(harness, tmp_path: Path):
     session = _route("tech_lead", state, harness)
     assert session is not None
     return QuarantinedSession(
-        session, "payload unreadable", harness.claims.run_key_for(session.run_assets)
+        session,
+        "payload unreadable",
+        harness.claims.run_key_for(session.run_assets),
+        harness.claims.quarantine_key_for(session.run_assets),
     )
 
 
@@ -4504,8 +4507,9 @@ def test_two_runs_of_one_issue_quarantine_independently(tmp_path: Path) -> None:
         second_session,
         "payload unreadable",
         harness.claims.run_key_for(second_session.run_assets),
+        harness.claims.quarantine_key_for(second_session.run_assets),
     )
-    assert first.run_key != second.run_key
+    assert first.quarantine_key != second.quarantine_key
     owner = _quarantine_with(harness)
 
     owner.quarantine_session(first)
@@ -4591,12 +4595,21 @@ def test_an_upgrade_carries_every_in_flight_claim_forward(
     assert store.look_up_pending_work_claim(run).held is not None
 
 
-def test_an_unmigratable_row_is_preserved_not_dropped(tmp_path: Path) -> None:
-    """A row that cannot be decoded is kept for inspection, never discarded."""
+def test_an_unmigratable_row_fails_startup_and_keeps_the_old_table(
+    tmp_path: Path,
+) -> None:
+    """Migration is all-or-nothing, and the legacy table stays authoritative.
+
+    Archiving the bad row and carrying on was worse than the drop it replaced:
+    every lookup, enumeration and recovery path queries only the live table, so
+    an archived row is operationally invisible - a surviving terminal for it
+    reads ABSENT and can be admitted claimless (#6999 F13).
+    """
     import sqlite3
 
     from issue_orchestrator.execution.pending_work_claim_store import (
         STORE_FILENAME,
+        PendingWorkClaimMigrationError,
         SqlitePendingWorkClaimStore,
     )
     from issue_orchestrator.infra.repo_identity import state_dir
@@ -4613,13 +4626,55 @@ def test_an_unmigratable_row_is_preserved_not_dropped(tmp_path: Path) -> None:
     conn.commit()
     conn.close()
 
+    with pytest.raises(PendingWorkClaimMigrationError, match="/runs/broken"):
+        SqlitePendingWorkClaimStore.for_repo(tmp_path)
+
+    # Nothing was renamed, created or dropped: the original authority is intact
+    # and still holds BOTH rows for a human to work with.
+    survivors = sqlite3.connect(db_path).execute(
+        "SELECT run_key FROM pending_work_claim ORDER BY run_key"
+    ).fetchall()
+    assert [row[0] for row in survivors] == ["/runs/a", "/runs/broken"]
+    tables = sqlite3.connect(db_path).execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table'"
+    ).fetchall()
+    assert [t[0] for t in tables] == ["pending_work_claim"]
+
+
+def test_a_repaired_legacy_row_migrates_on_the_next_start(tmp_path: Path) -> None:
+    """Failing startup is recoverable, not a dead end."""
+    import sqlite3
+
+    from issue_orchestrator.execution.pending_work_claim_store import (
+        STORE_FILENAME,
+        PendingWorkClaimMigrationError,
+        SqlitePendingWorkClaimStore,
+    )
+    from issue_orchestrator.infra.repo_identity import state_dir
+
+    db_path = state_dir(tmp_path) / STORE_FILENAME
+    _write_legacy_claim_row(
+        db_path, run_key="/runs/a", claim=_claim("review", _pending_state("review"))
+    )
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        "INSERT INTO pending_work_claim VALUES (?, ?, ?, ?, ?)",
+        ("/runs/broken", "issue-8", "run-2", "2026-08-07T00:00:00+00:00", "{not json"),
+    )
+    conn.commit()
+    conn.close()
+    with pytest.raises(PendingWorkClaimMigrationError):
+        SqlitePendingWorkClaimStore.for_repo(tmp_path)
+
+    # A human removes the unreadable row.
+    conn = sqlite3.connect(db_path)
+    conn.execute("DELETE FROM pending_work_claim WHERE run_key = '/runs/broken'")
+    conn.commit()
+    conn.close()
+
     store = SqlitePendingWorkClaimStore.for_repo(tmp_path)
 
-    assert len(store.list_unresolved_claims()) == 1  # the good one came across
-    kept = sqlite3.connect(db_path).execute(
-        "SELECT run_key FROM pending_work_claim_unmigrated"
-    ).fetchall()
-    assert [row[0] for row in kept] == ["/runs/a", "/runs/broken"]
+    assert [u.run_key for u in store.list_unresolved_claims()] == ["/runs/a"]
 
 
 # ---------------------------------------------------------------------------
@@ -4627,14 +4682,13 @@ def test_an_unmigratable_row_is_preserved_not_dropped(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_the_runtime_reconcile_sweeps_the_ledger_with_nothing_discovered(
-    tmp_path: Path,
-) -> None:
+def test_the_ledger_sweep_runs_when_nothing_is_discovered(tmp_path: Path) -> None:
     """The branch that returns early is exactly where the sweep matters.
 
     A run whose terminal is already gone is invisible to discovery, so "nothing
     untracked was found" is the case where its ledger row is the only remaining
-    record of the work.
+    record of the work. Driven through the shared operation; the two REAL
+    callers are pinned separately, in test_startup_manager and test_orchestrator.
     """
     from issue_orchestrator.control.session_routing import recover_unresolved_work
 
@@ -4758,6 +4812,7 @@ def test_an_unresolved_review_claim_escalates_its_ISSUE_not_its_PR(
             session_name="review-70",  # named for the PR
             issue_number=7,  # recorded at hold time, from the session's issue
             error="payload unreadable",
+            started_at="2026-08-07T00:00:00+00:00",
         )
     )
 
@@ -4782,6 +4837,7 @@ def test_an_unresolved_claim_quarantine_is_idempotent_across_sweeps(
         session_name="review-70",
         issue_number=7,
         error="payload unreadable",
+        started_at="2026-08-07T00:00:00+00:00",
     )
     owner = _quarantine_with(harness)
 
@@ -4796,36 +4852,168 @@ def test_an_unresolved_claim_quarantine_is_idempotent_across_sweeps(
 def test_a_released_quarantine_stops_holding_the_issue_open(
     tmp_path: Path,
 ) -> None:
-    """The explicit human-clear seam.
+    """The explicit clear seam, including the block it owns.
 
     A quarantine ends when its cause is gone - never because another session
-    for the issue happened to start.
+    for the issue happened to start - and the needs-human label it applied
+    comes off with it.
     """
+    from issue_orchestrator.control.actions import RemoveLabelAction
+
     harness = _ready_harness(tmp_path)
     quarantined = _quarantined(harness, tmp_path)
     owner = _quarantine_with(harness)
     owner.quarantine_session(quarantined)
     assert harness.claims.quarantined_issue_numbers() == frozenset({7})
+    harness.quarantine_actions.clear()
 
-    owner.release(quarantined.run_key)
+    owner.release(quarantined.quarantine_key)
 
     assert harness.claims.quarantined_issue_numbers() == frozenset()
+    removed = [
+        a for a in harness.quarantine_actions if isinstance(a, RemoveLabelAction)
+    ]
+    assert [a.label for a in removed] == ["needs-human"]
 
 
-def test_two_runs_in_one_second_do_not_share_a_quarantine_marker(
+def test_a_repaired_claim_releases_its_quarantine_on_the_next_restore(
     tmp_path: Path,
 ) -> None:
-    """Run roots are named from a second-resolution timestamp.
+    """The production caller F12 said release() was missing.
 
-    Two runs that collide on that name must still be told apart, or one
-    terminal's quarantine would silently satisfy the other's (#6999 F12).
+    A human repairs the unreadable row; the next restoration reads it cleanly,
+    so the marker and the block it owns must come off by themselves rather than
+    holding the issue forever.
     """
+    from issue_orchestrator.control.actions import RemoveLabelAction
+
+    harness = _ready_harness(tmp_path)
+    state = _pending_state("tech_lead")
+    session = _route("tech_lead", state, harness)
+    assert session is not None
+    _corrupt_stored_claim(tmp_path, session.run_assets)
+    _restore_pair(None, [session], harness)
+    assert harness.claims.quarantined_issue_numbers() == frozenset({7})
+    harness.quarantine_actions.clear()
+
+    # The human repairs the stored payload so the claim reads again.
+    import sqlite3
+
+    from issue_orchestrator.execution.pending_work_claim_store import STORE_FILENAME
+    from issue_orchestrator.execution.pending_work_codec import encode_claim
+    from issue_orchestrator.infra.repo_identity import state_dir
+
+    conn = sqlite3.connect(state_dir(tmp_path) / STORE_FILENAME)
+    conn.execute(
+        "UPDATE pending_work_claim SET payload = ? WHERE run_key = ?",
+        (
+            json.dumps(
+                encode_claim(_claim("tech_lead", _pending_state("tech_lead"))),
+                sort_keys=True,
+            ),
+            harness.claims.run_key_for(session.run_assets),
+        ),
+    )
+    conn.commit()
+    conn.close()
+    _restore_pair(None, [session], harness)
+
+    assert harness.claims.quarantined_issue_numbers() == frozenset()
+    removed = [
+        a for a in harness.quarantine_actions if isinstance(a, RemoveLabelAction)
+    ]
+    assert [a.label for a in removed] == ["needs-human"]
+
+
+def test_a_release_leaves_another_quarantines_block_alone(tmp_path: Path) -> None:
+    """Two runs of one issue: clearing one must not unblock the other."""
+    from dataclasses import replace as dc_replace
+
+    from issue_orchestrator.control.actions import RemoveLabelAction
+    from issue_orchestrator.control.in_flight_work import QuarantinedSession
+
     harness = _ready_harness(tmp_path)
     first = _quarantined(harness, tmp_path)
-    second_state = _pending_state("tech_lead")
-    second_session = _route("tech_lead", second_state, harness)
-    assert second_session is not None
+    other_assets = dc_replace(
+        first.session.run_assets,
+        identity=dc_replace(
+            first.session.run_assets.identity, started_at="2026-08-07T12:00:00.5+00:00"
+        ),
+    )
+    second = QuarantinedSession(
+        first.session,
+        "payload unreadable",
+        harness.claims.run_key_for(other_assets),
+        harness.claims.quarantine_key_for(other_assets),
+    )
+    owner = _quarantine_with(harness)
+    owner.quarantine_session(first)
+    owner.quarantine_session(second)
+    harness.quarantine_actions.clear()
 
-    assert harness.claims.run_key_for(
-        first.session.run_assets
-    ) != harness.claims.run_key_for(second_session.run_assets)
+    owner.release(first.quarantine_key)
+
+    assert harness.claims.quarantined_issue_numbers() == frozenset({7})
+    assert [
+        a for a in harness.quarantine_actions if isinstance(a, RemoveLabelAction)
+    ] == []
+
+
+def test_a_replacement_run_reusing_the_directory_quarantines_independently(
+    tmp_path: Path,
+) -> None:
+    """Run roots are named to the second and created with ``exist_ok``.
+
+    So a replacement run of one session really can land on the same directory.
+    An escalated marker from the previous generation must not suppress the new
+    run's comment and event - the two are different terminals holding
+    different work (#6999 F12). Forced deterministically rather than hoping two
+    allocations collide.
+    """
+    from dataclasses import replace as dc_replace
+
+    from issue_orchestrator.control.actions import AddCommentAction
+    from issue_orchestrator.control.in_flight_work import QuarantinedSession
+
+    harness = _ready_harness(tmp_path)
+    state = _pending_state("tech_lead")
+    session = _route("tech_lead", state, harness)
+    assert session is not None
+    # The same run directory, a later start instant: exactly what a same-second
+    # replacement produces.
+    replacement_assets = dc_replace(
+        session.run_assets,
+        identity=dc_replace(
+            session.run_assets.identity, started_at="2026-08-07T12:00:00.500000+00:00"
+        ),
+    )
+    assert harness.claims.run_key_for(replacement_assets) == harness.claims.run_key_for(
+        session.run_assets
+    )
+    first = QuarantinedSession(
+        session,
+        "payload unreadable",
+        harness.claims.run_key_for(session.run_assets),
+        harness.claims.quarantine_key_for(session.run_assets),
+    )
+    second = QuarantinedSession(
+        session,
+        "payload unreadable",
+        harness.claims.run_key_for(replacement_assets),
+        harness.claims.quarantine_key_for(replacement_assets),
+    )
+    assert first.run_key == second.run_key  # the collision is real
+    assert first.quarantine_key != second.quarantine_key
+    owner = _quarantine_with(harness)
+
+    owner.quarantine_session(first)
+    owner.quarantine_session(second)
+
+    comments = [
+        a for a in harness.quarantine_actions if isinstance(a, AddCommentAction)
+    ]
+    assert len(comments) == 2  # each generation told a human on its own account
+    assert (
+        harness.event_names().count(EventName.SESSION_CLAIM_UNREADABLE.value) == 2
+    )
+    assert len(harness.claims.quarantine_keys_for_run(first.run_key)) == 2

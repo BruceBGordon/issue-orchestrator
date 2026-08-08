@@ -36,7 +36,7 @@ from typing import TYPE_CHECKING
 from ..events import EventName
 from ..ports import EventSink, make_trace_event
 from ..ports.pending_work_claim_store import ClaimQuarantineStore, UnreadableClaim
-from .actions import Action, AddCommentAction, AddLabelAction
+from .actions import Action, AddCommentAction, AddLabelAction, RemoveLabelAction
 from .in_flight_work import QuarantinedSession
 from .label_manager import LabelManager
 from .session_rework_launcher import ActionApplierFn
@@ -68,6 +68,7 @@ class ClaimQuarantineOwner:
             quarantined.error,
         )
         self._escalate(
+            quarantine_key=quarantined.quarantine_key,
             run_key=quarantined.run_key,
             session_name=session.terminal_id,
             # Trusted: the launching session's own issue, never parsed out of
@@ -96,6 +97,7 @@ class ClaimQuarantineOwner:
             unreadable.error,
         )
         self._escalate(
+            quarantine_key=f"{unreadable.run_key}@{unreadable.started_at}",
             run_key=unreadable.run_key,
             session_name=unreadable.session_name,
             issue_number=issue_number,
@@ -106,13 +108,14 @@ class ClaimQuarantineOwner:
     def _escalate(
         self,
         *,
+        quarantine_key: str,
         run_key: str,
         session_name: str,
         issue_number: int,
         error: str,
         still_running: bool,
     ) -> None:
-        if self.store.is_quarantine_escalated(run_key):
+        if self.store.is_quarantine_escalated(quarantine_key):
             # Already told a human about THIS run: the orphan scan rediscovers
             # an untracked terminal every 30 seconds and must not re-comment.
             # The LABEL is still reasserted, because it is shared with owners
@@ -121,7 +124,8 @@ class ClaimQuarantineOwner:
             self._reassert_block(issue_number)
             return
         self.store.record_quarantine(
-            run_key,
+            quarantine_key,
+            run_key=run_key,
             session_name=session_name,
             issue_number=issue_number,
             error=error,
@@ -139,7 +143,7 @@ class ClaimQuarantineOwner:
                 session_name,
             )
             return
-        self.store.mark_quarantine_escalated(run_key)
+        self.store.mark_quarantine_escalated(quarantine_key)
         self.events.publish(make_trace_event(
             EventName.SESSION_CLAIM_UNREADABLE,
             {
@@ -150,14 +154,54 @@ class ClaimQuarantineOwner:
             },
         ))
 
-    def release(self, run_key: str) -> None:
-        """End a quarantine whose cause is gone.
+    def release(self, quarantine_key: str) -> None:
+        """End a quarantine whose cause is gone, and clear what it owns.
 
         The explicit clear (#6999 F12): a quarantine ends when the run's claim
-        can be read again or its row is gone - a human having fixed or removed
-        it - never because some other session for the issue happened to start.
+        can be read again or its row is gone - a human having repaired or
+        removed it - never because some other session for the issue happened to
+        start. Called by restoration and by the ledger sweep, so a repaired
+        claim does not leave a marker holding its issue open forever.
+
+        The blocking label is removed only when this owner put it there and no
+        OTHER quarantine still holds the same issue. A ``needs-human`` applied
+        by anything else keeps its own provenance and is left alone.
         """
-        self.store.release_quarantine(run_key)
+        issue_number = self.store.quarantine_issue_number(quarantine_key)
+        was_escalated = self.store.is_quarantine_escalated(quarantine_key)
+        self.store.release_quarantine(quarantine_key)
+        if issue_number is None or not was_escalated:
+            return
+        if issue_number in self.store.quarantined_issue_numbers():
+            # Another run of the same issue is still quarantined; its block
+            # stands on its own provenance.
+            return
+        self.apply_actions(
+            [
+                RemoveLabelAction(
+                    issue_number=issue_number,
+                    label=self.label_manager.needs_human,
+                    reason="pending-work claim quarantine resolved",
+                )
+            ],
+            context="pending_work_claim_quarantine_release",
+        )
+
+    def reconcile_released(self, live_quarantine_keys: frozenset[str]) -> None:
+        """Release every quarantine whose run is no longer quarantined.
+
+        Restoration and the ledger sweep report which runs are STILL in
+        trouble; anything recorded but absent from that set has had its cause
+        repaired or removed, so the marker and the block it owns come off.
+        """
+        for run_key in self.store.quarantined_run_keys():
+            for key in self._keys_for_run(run_key):
+                if key not in live_quarantine_keys:
+                    self.release(key)
+
+    def _keys_for_run(self, run_key: str) -> tuple[str, ...]:
+        """Quarantine keys recorded against ``run_key`` (one per generation)."""
+        return self.store.quarantine_keys_for_run(run_key)
 
     def _reassert_block(self, issue_number: int) -> None:
         """Re-apply the shared blocking label, idempotently.

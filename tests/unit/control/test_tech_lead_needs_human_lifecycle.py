@@ -572,7 +572,7 @@ class TestQuarantineProvenanceIsRespected:
             events=MagicMock(),
         )
         quarantined = QuarantinedSession(
-            _session(903, tmp_path), "payload unreadable", "/runs/903"
+            _session(903, tmp_path), "payload unreadable", "/runs/903", "/runs/903@t1"
         )
         owner.quarantine_session(quarantined)
         applied.clear()

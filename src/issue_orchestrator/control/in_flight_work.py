@@ -94,10 +94,12 @@ class QuarantinedSession:
 
     session: Session
     error: str
-    # The store's own key for the run, so the quarantine marker is per-RUN.
-    # Two runs of one issue quarantine independently, and a rediscovered
-    # terminal maps back to the same marker rather than a new one (#6999 F12).
+    # The store's own key for the run, so a rediscovered terminal maps back to
+    # the same record rather than a new one.
     run_key: str
+    # ...and the generation-aware key the quarantine marker itself uses, so a
+    # replacement run reusing the directory gets its own (#6999 F12).
+    quarantine_key: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,6 +123,10 @@ class ClaimRestoration:
     admitted: tuple[Session, ...]
     quarantined: tuple[QuarantinedSession, ...]
     stale: tuple[StaleRun, ...] = ()
+
+    def live_quarantine_keys(self) -> frozenset[str]:
+        """Quarantines this pass re-confirmed, for release reconciliation."""
+        return frozenset(q.quarantine_key for q in self.quarantined)
 
     def observed_run_keys(self, claims: PendingWorkClaimStore) -> set[str]:
         """Every run this pass saw alive, whatever verdict it reached.
@@ -270,6 +276,7 @@ class InFlightWorkLedger:
                         session,
                         str(exc),
                         self.claims.run_key_for(session.run_assets),
+                        self.claims.quarantine_key_for(session.run_assets),
                     )
                 )
                 continue
@@ -303,6 +310,7 @@ class InFlightWorkLedger:
         quarantine: "ClaimQuarantineOwner",
         *,
         live_run_keys: frozenset[str] = frozenset(),
+        live_quarantine_keys: frozenset[str] = frozenset(),
     ) -> int:
         """Re-admit ledger work that no live terminal is holding (#6999 F8).
 
@@ -319,7 +327,9 @@ class InFlightWorkLedger:
         ``live_run_keys`` carries every run this pass observed alive whatever
         verdict it reached - including quarantined ones, which are deliberately
         missing from ``active_sessions`` and would otherwise look orphaned
-        (#6999 F11).
+        (#6999 F11). ``live_quarantine_keys`` names the quarantines that are
+        still justified this pass; every other recorded one is released
+        (#6999 F12).
         """
         live = live_run_keys | {
             self.claims.run_key_for(session.run_assets)
@@ -336,12 +346,19 @@ class InFlightWorkLedger:
             # against the queues, which dedupe by their own rules.
             self.claims.mark_deferred_by_run_key(unresolved.run_key)
             readmitted += 1
+        still_quarantined: set[str] = set()
         for unreadable in self.claims.list_unreadable_claims():
+            still_quarantined.add(f"{unreadable.run_key}@{unreadable.started_at}")
             if unreadable.run_key in live:
                 continue
             # No work can be recovered from it, and it is not attached to any
             # live terminal, so the only honest move is to tell a human.
             quarantine.quarantine_unresolved(unreadable)
+        # Anything still recorded but no longer in trouble has had its cause
+        # repaired or removed; release it and the block it owns (#6999 F12).
+        quarantine.reconcile_released(
+            frozenset(still_quarantined | live_quarantine_keys)
+        )
         return readmitted
 
     def holds(self, terminal_id: str) -> PendingWorkClaim | None:

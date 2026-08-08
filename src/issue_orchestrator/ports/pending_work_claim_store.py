@@ -98,6 +98,11 @@ class UnreadableClaim:
     session_name: str
     issue_number: int
     error: str
+    # Distinguishes run GENERATIONS. Run roots are named from a second-
+    # resolution timestamp and created with exist_ok, so a replacement run of
+    # one session can reuse the path; started_at has sub-second precision and
+    # is what tells the two apart (#6999 F12).
+    started_at: str
 
 
 class PendingWorkClaimStore(Protocol):
@@ -165,6 +170,16 @@ class PendingWorkClaimStore(Protocol):
         """The opaque key this store addresses ``run`` by."""
         ...
 
+    def quarantine_key_for(self, run: SessionRunAssets) -> str:
+        """The opaque key a QUARANTINE against ``run`` is recorded under.
+
+        Distinct from :meth:`run_key_for` because it must survive a replacement
+        run reusing the same directory: an escalated marker from a previous
+        generation would otherwise suppress the new one's comment and event
+        (#6999 F12).
+        """
+        ...
+
 
 class ClaimQuarantineStore(Protocol):
     """Durable record of runs whose claim could not be read (#6999 F12).
@@ -176,18 +191,40 @@ class ClaimQuarantineStore(Protocol):
     """
 
     def record_quarantine(
-        self, run_key: str, *, session_name: str, issue_number: int, error: str
+        self,
+        quarantine_key: str,
+        *,
+        run_key: str,
+        session_name: str,
+        issue_number: int,
+        error: str,
     ) -> None:
         """Record (or refresh) that this run is quarantined."""
         ...
 
-    def release_quarantine(self, run_key: str) -> None:
+    def release_quarantine(self, quarantine_key: str) -> None:
         """Clear a quarantine once its cause is gone.
 
-        The explicit human-clear seam: a quarantine ends when the run's claim
-        can be read again or its row has been removed, never because some other
-        session happened to start.
+        The explicit clear seam: a quarantine ends when the run's claim can be
+        read again or its row has been removed - a human having repaired or
+        removed it - never because some other session happened to start.
         """
+        ...
+
+    def quarantined_run_keys(self) -> frozenset[str]:
+        """Run keys with a live quarantine, for release reconciliation."""
+        ...
+
+    def quarantine_keys_for_run(self, run_key: str) -> tuple[str, ...]:
+        """Every recorded quarantine key for one run root.
+
+        A replacement run can reuse a directory, so one run key may carry more
+        than one generation's marker (#6999 F12).
+        """
+        ...
+
+    def quarantine_issue_number(self, quarantine_key: str) -> int | None:
+        """The issue a quarantine is holding open, if it is still recorded."""
         ...
 
     def quarantined_issue_numbers(self) -> frozenset[int]:
@@ -200,11 +237,11 @@ class ClaimQuarantineStore(Protocol):
         """
         ...
 
-    def mark_quarantine_escalated(self, run_key: str) -> None:
+    def mark_quarantine_escalated(self, quarantine_key: str) -> None:
         """Record that the durable operator surface committed for this run."""
         ...
 
-    def is_quarantine_escalated(self, run_key: str) -> bool:
+    def is_quarantine_escalated(self, quarantine_key: str) -> bool:
         """Whether the durable operator surface already committed.
 
         Idempotency is the point: the orphan scan re-discovers an untracked

@@ -675,7 +675,9 @@ def restore_running_sessions(
     # this pass is passed through, quarantined and stale ones included, so a
     # row belonging to a terminal that IS here cannot look orphaned (F11).
     ledger.recover_unresolved(
-        quarantine, live_run_keys=frozenset(restoration.observed_run_keys(claims))
+        quarantine,
+        live_run_keys=frozenset(restoration.observed_run_keys(claims)),
+        live_quarantine_keys=restoration.live_quarantine_keys(),
     )
     if added:
         logger.info(
