@@ -30,6 +30,7 @@ from .bootstrap_provider import (
     build_provider_readiness_probe,
     build_provider_resilience,
 )
+from .bootstrap_claims import ClaimComponents, assemble_claim_components, lease_config_from
 from .bootstrap_pair_registry import build_pair_registry_with_worktree_hook
 from .bootstrap_pending_work import (
     build_pending_work_wiring,
@@ -103,8 +104,6 @@ from ..control.completion_dispatcher import (
 )
 from ..control.dependency_evaluator import DependencyEvaluator
 from ..control.workflows import ReviewWorkflow, RetrospectiveReviewWorkflow, ReworkWorkflow, TechLeadWorkflow
-from ..control.claim_gate import ClaimGate
-from ..control.lease_renewer import LeaseRenewer
 from ..control.worktree_manager import extract_issue_branches
 from ..infra import gh_audit, runtime_identity
 from .bootstrap_tech_lead import (
@@ -118,10 +117,7 @@ from ..infra.secret_env import (
 )
 from ..control.tech_lead_run_ownership import TechLeadRunOwnership
 from ..ports.claim_manager import ClaimManager, NullClaimManager
-from ..ports.run_ledger_store import (
-    SingleInstanceRunLedgerStore,
-    TechLeadRunLedgerStore,
-)
+from ..ports.run_ledger_store import SingleInstanceRunLedgerStore
 from ..domain.lease_config import LeaseConfig
 
 if TYPE_CHECKING:
@@ -262,60 +258,27 @@ def _create_claim_components(
     github: GitHubAdapter | None,
     events: EventSink,
     io_claimed_label: str = "io:claimed",
-) -> tuple[ClaimGate, LeaseRenewer, LeaseConfig, ClaimManager, TechLeadRunOwnership]:
-    """Create claim management components.
-
-    Both key spaces are wired here from ONE decision (``claims.enabled``): issue
-    claims and logical-run claims must never disagree about whether this
-    deployment coordinates across instances.
-    """
+) -> ClaimComponents:
+    """Choose both coordination stores from one deployment setting."""
+    lease = lease_config_from(config) if github and config.claims.enabled else LeaseConfig()
     if github and config.claims.enabled:
-        lease_config = LeaseConfig(
-            lease_seconds=config.claims.lease_seconds,
-            renew_interval_seconds=config.claims.renew_before_expiry_seconds,
-            convergence_timeout_seconds=config.claims.convergence_timeout_seconds,
-            convergence_poll_min_ms=config.claims.convergence_poll_min_ms,
-            convergence_poll_max_ms=config.claims.convergence_poll_max_ms,
-        )
         claimant_id = config.claims.claimant_id or f"orchestrator-{os.getpid()}"
-        claim_manager = GitHubRefClaimAdapter(
-            client=github.http_client,
-            claimant_id=claimant_id,
-            config=lease_config,
-            events=events,
-            label_adapter=github,
-            io_claimed_label=io_claimed_label,
+        manager = GitHubRefClaimAdapter(
+            client=github.http_client, claimant_id=claimant_id, config=lease,
+            events=events, label_adapter=github, io_claimed_label=io_claimed_label,
         )
-        run_ledger_store: TechLeadRunLedgerStore = GitHubRefRunLedgerAdapter(
-            client=github.http_client,
-            claimant_id=claimant_id,
-            config=lease_config,
+        ledger = GitHubRefRunLedgerAdapter(
+            client=github.http_client, claimant_id=claimant_id, config=lease,
         )
-        logger.info("Claims enabled: claimant_id=%s, lease=%ds", claimant_id, lease_config.lease_seconds)
+        logger.info("Claims enabled: claimant_id=%s, lease=%ds", claimant_id, lease.lease_seconds)
     else:
-        lease_config = LeaseConfig()
-        claim_manager = NullClaimManager()
-        run_ledger_store = SingleInstanceRunLedgerStore(
-            lease_seconds=lease_config.lease_seconds
-        )
+        manager = NullClaimManager()
+        ledger = SingleInstanceRunLedgerStore(lease_seconds=lease.lease_seconds)
         logger.info(
             "Claims disabled: running in single-orchestrator mode. "
-            "Multi-machine coordination is OFF. To enable, set "
-            "claims.enabled=true in config."
+            "Multi-machine coordination is OFF. To enable, set claims.enabled=true in config."
         )
-
-    claim_gate = ClaimGate(claim_manager=claim_manager, events=events)
-    lease_renewer = LeaseRenewer(
-        claim_manager=claim_manager,
-        events=events,
-        config=lease_config,
-    )
-    run_ownership = TechLeadRunOwnership(
-        run_ledger_store,
-        lease_seconds=lease_config.lease_seconds,
-        renew_before_expiry_seconds=lease_config.renew_interval_seconds,
-    )
-    return claim_gate, lease_renewer, lease_config, claim_manager, run_ownership
+    return assemble_claim_components(manager, ledger, lease, events)
 
 
 def _create_planner(
@@ -1204,17 +1167,14 @@ def build_orchestrator_for_testing(
     # Create claim components for testing (NullClaimManager by default).
     lease_config = LeaseConfig()
     claim_manager = claim_manager or NullClaimManager()
-    claim_gate = ClaimGate(claim_manager=claim_manager, events=events)
-    lease_renewer = LeaseRenewer(
-        claim_manager=claim_manager,
-        events=events,
-        config=lease_config,
-    )
-    run_ownership = run_ownership or TechLeadRunOwnership(
+    claims = assemble_claim_components(
+        claim_manager,
         SingleInstanceRunLedgerStore(lease_seconds=lease_config.lease_seconds),
-        lease_seconds=lease_config.lease_seconds,
-        renew_before_expiry_seconds=lease_config.renew_interval_seconds,
+        lease_config,
+        events,
     )
+    claim_gate, lease_renewer = claims.claim_gate, claims.lease_renewer
+    run_ownership = run_ownership or claims.run_ownership
 
     publish_recovery = _build_publish_recovery(
         repository_host=github,

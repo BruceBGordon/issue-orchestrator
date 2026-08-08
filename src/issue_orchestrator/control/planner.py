@@ -30,12 +30,9 @@ from ..infra.logging_config import issue_log
 from ..ports.issue import Issue
 from ..domain.models import (
     PendingTechLeadReview,
-    TechLeadFacts,
     active_retrospective_review_issue_numbers,
 )
 from ..domain.post_publish_escalation import build_post_publish_escalation_comment
-from ..domain.tech_lead_naming import TECH_LEAD_DISPLAY_NAME
-from ..domain.tech_lead_session import TechLeadCreationOrigin
 
 if TYPE_CHECKING:
     from .provider_resilience import ProviderResilienceManager
@@ -93,9 +90,7 @@ from .reconciliation import build_expected_for_mutation
 from .stuck_sweep import build_stuck_sweep_escalation_actions
 from .planner_types import OrchestratorSnapshot, Plan, PlanContext, SkippedItem
 from .tech_lead_issue_policy import (
-    apply_tech_lead_priority_prefix,
-    batch_review_issue_labels,
-    tech_lead_issue_milestone_intent,
+    plan_batch_review_issue,
 )
 from .needs_human_block import NeedsHumanCause
 
@@ -801,55 +796,7 @@ class Planner:
         """Plan tech_lead issue creation if threshold is met."""
         if not snapshot.tech_lead_facts:
             return None
-
-        facts = snapshot.tech_lead_facts
-        if not self._should_create_tech_lead_issue(facts):
-            return None
-
-        title, body = self._build_tech_lead_issue_content(facts)
-        labels = batch_review_issue_labels(self.config, source_labels=facts.source_labels)
-        # Milestone travels as INTENT; the applier resolves an explicit name
-        # at the create-issue execution boundary (#6769 finding 4).
-        milestone = tech_lead_issue_milestone_intent(self.config, facts.source_milestones)
-
-        logger.info("Planner: creating tech_lead issue for %d PRs (labels=%s, milestone=%s)", facts.pr_count, labels, milestone)
-        return CreateTechLeadIssueAction(
-            title=title, body=body, labels=labels, pr_count=facts.pr_count,
-            milestone=milestone, reason=f"threshold met: {facts.pr_count} >= {facts.threshold}",
-            # This IS the anchor: no prior issue to reconcile against (#6957 F6).
-            origin=TechLeadCreationOrigin.authors_anchor(),
-        )
-
-    def _should_create_tech_lead_issue(self, facts: "TechLeadFacts") -> bool:
-        """Check if tech_lead issue should be created."""
-        if facts.threshold <= 0:
-            # Batch trigger disabled; facts may exist for the health review
-            # alone (ADR-0031 §4), which plans its own anchor creation.
-            return False
-        if facts.pr_count < facts.threshold:
-            logger.debug("Planner: tech_lead threshold not met (%d/%d)", facts.pr_count, facts.threshold)
-            return False
-        if facts.existing_tech_lead_issue:
-            logger.debug("Planner: tech_lead issue #%d already exists", facts.existing_tech_lead_issue)
-            return False
-        return True
-
-    def _build_tech_lead_issue_content(self, facts: "TechLeadFacts") -> tuple[str, str]:
-        """Build title and body for tech_lead issue."""
-        pr_list = "\n".join(f"- PR #{pr[0]}: {pr[1]}" for pr in facts.prs)
-        body = f"""## Tech Lead Batch Review Triggered
-
-{facts.pr_count} PRs have passed code review and are ready for tech_lead review:
-
-{pr_list}
-
-Review these PRs for patterns, architectural concerns, and process improvements.
-Flip labels from `{facts.watch_label}` to `{self.config.tech_lead_reviewed_label}` after review.
-"""
-        title = apply_tech_lead_priority_prefix(
-            self.config, f"{TECH_LEAD_DISPLAY_NAME} Batch Review: {facts.pr_count} PRs pending"
-        )
-        return title, body
+        return plan_batch_review_issue(self.config, snapshot.tech_lead_facts)
 
     def _plan_discovered_reworks(self, snapshot: OrchestratorSnapshot) -> list[Action]:
         """Plan queue actions for discovered reworks from scans.
