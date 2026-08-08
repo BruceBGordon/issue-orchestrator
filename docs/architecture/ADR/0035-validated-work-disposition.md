@@ -227,6 +227,15 @@ Four concrete mechanisms in today's code destroy or strand the work:
    publish-retry owner itself — reaching into four siblings, one of which this ADR
    forbids it to depend on at all.
 
+   Those bundles are the **call boundary**, not advice about what to pass:
+   `terminate_issue_runtime()` and `has_active_issue_runtime()` become methods on
+   the full lifecycle value rather than free functions with one parameter per
+   owner, and both views evaluate the same single `core.probe()`. A callable
+   surface that still accepts the pieces can always be handed a different set, and
+   no bootstrap assertion can catch that; removing the pieces from the surface can.
+   The run-evidence source rides the same bundle, because termination needs it at
+   every call site and three of the four hold only an issue number.
+
    The seam is scoped by **construction, not by an argument**: an immutable
    `CoreIssueRuntimeOwners` bundle holds the four pre-existing owners;
    `OtherRuntimeActivity` wraps it and exposes one method with no exclusion
@@ -246,7 +255,7 @@ Four concrete mechanisms in today's code destroy or strand the work:
    the winner's, and the Git ref lease bounds only the branch write, not PR
    creation, label routing, history mutation, or outcome recording. Correctness
    therefore rests on a **monotonic fence** per record, bumped by every claim and
-   every reclamation. Every durable write compare-and-sets on it (so a stale claim's
+   every takeover. Every durable write compare-and-sets on it (so a stale claim's
    write is discarded, not merged), the fence is re-checked immediately before each
    external mutation, and the two remote writes are each independently fenced by the
    remote itself — the exact ref lease for the push, and GitHub's one-open-PR-per
@@ -275,23 +284,33 @@ Four concrete mechanisms in today's code destroy or strand the work:
 
    Death must be proven from the **exclusion primitive**, which is the `flock`
    gate — not from `lock.json`, which `repo_lock.py` states is an advertisement and
-   not the primitive. A typed `OrchestratorLivenessPort` answers it: in
-   single-instance mode this process's own held repo gate proves no other
-   orchestrator exists; in multi-instance mode a non-blocking probe of the owner's
-   instance gate distinguishes gone from alive without disturbing it; a different
-   host is never provable and therefore never taken over. Elapsed time authorizes
-   nothing anywhere in this path, so there is no lease on the record at all. Process-liveness evidence gates *reclamation*
-   so a healthy slow publisher is not displaced needlessly, but it is never the
-   safety argument; the fence holds even when the liveness probe is wrong. The port makes one call and returns what happened; there is no
+   not the primitive. A typed `OrchestratorLivenessPort` answers it from the
+   relationship between the recorded owner and the current process: a gate this
+   process already holds (its own instance's, or the exclusive repo gate) was
+   admitted by the kernel only because the previous holder released it, so the
+   startup acquisition *is* the proof and that gate is never probed; a *different*
+   named instance's gate is probed non-blockingly, which distinguishes gone from
+   alive without disturbing it; a different host is never provable and therefore
+   never taken over. Elapsed time authorizes nothing anywhere in this path, so
+   there is no lease on the record at all.
+
+   **The death proof is part of the safety argument, not a politeness
+   optimization.** A fence cannot make a false-positive safe: deciding a live owner
+   is dead is precisely what would let it apply a late, unfenced process-local
+   history/routing effect beside its successor. The predicate therefore answers
+   `False` whenever evidence is absent, and every `True` is backed by an exclusion
+   the kernel already enforced.
+
+   The publisher itself makes one call and returns what happened; there is no
    "submitted, poll later" state, because nothing in this design owns a job runner
    or a submission store to make such a state durable. What *is* durable is the
    attempt: the operation is identified by record and target commit and never
-   changes, while each attempt at it is a row written **before** the external call,
-   claimed by a compare-and-set with a lease. A retry is therefore an explicit new
+   changes, while each attempt at it is an append-only row written **before** the
+   external call, under the owner's claim. A retry is therefore an explicit new
    attempt rather than a re-use of an idempotency key that already names a failed
-   one, exactly one attempt is live across drainers and processes, the retry budget
-   survives restart by counting rows, and a crash mid-call leaves an outcome-less
-   row that is reconciled against the remote rather than resubmitted blind.
+   one, the retry budget survives restart by counting rows, and a crash mid-call
+   leaves an outcome-less row that the next proven owner reconciles against the
+   remote rather than resubmitting blind.
 
    **Finalization is staged and durable, and it routes before it clears.** The
    review-routing transition is applied and observed, and only then is the
@@ -303,7 +322,18 @@ Four concrete mechanisms in today's code destroy or strand the work:
    never inferred from labels looking correct, because cleanup labels do not prove
    the routing mutation happened.
 
-9. **Publication resolution is one atomic store command per verified route.**
+9. **The wedged-owner escape is a Repository Engine command, not an issue action.**
+   Because a claim is never taken from a live owner, an owner that wedges is
+   resolved by stopping its engine — which must therefore be reachable. The
+   disposition owner exposes the claim holder as a typed `EngineIdentity` **fact**
+   on its read model and nothing more; Control Center presents it on the issue and
+   dispatches the standard `Stop engine` action from the engine surface through the
+   existing Repository Engine lifecycle owner, extended to accept the instance to
+   target. An issue-detail handler must never reach into supervisor state or build
+   a stop call from persisted PID fields, and an engine on another host is
+   presented as unavailable rather than offered.
+
+10. **Publication resolution is one atomic store command per verified route.**
    Marking a record recovered, advancing the forward-only published-lineage fact
    with its provenance, resolving verified contained ancestors, and classifying
    waiting successors are four effects of one decision, and splitting them across
@@ -314,7 +344,7 @@ Four concrete mechanisms in today's code destroy or strand the work:
    handle crossing the port, and the observed-merge route refuses outright while a
    live claim owns the record.
 
-10. **An approved operation binds the facts it was approved against.** The evidence
+11. **An approved operation binds the facts it was approved against.** The evidence
    id binds the immutable half — repo, issue, branch, validated head, run identity,
    artifact hashes — and deliberately excludes the mutable observations, which is
    what makes it crash-stable. That exclusion means the id alone cannot authorize:
@@ -330,7 +360,7 @@ Four concrete mechanisms in today's code destroy or strand the work:
    authorization input, never a competing source of truth: every stale check still
    runs against freshly read state after it matches.
 
-11. **This owner writes exactly one label of its own.** A failed disposition keeps
+12. **This owner writes exactly one label of its own.** A failed disposition keeps
    `recovery-pending` and registers its escalation through the needs-human owner's
    behavior API as its own enumerated cause. It does not write
    `tech-lead-needs-human`, which ADR-0013 defines as provenance for a *different*
