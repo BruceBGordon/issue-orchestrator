@@ -66,10 +66,23 @@ Four concrete mechanisms in today's code destroy or strand the work:
    raises; teardown does not proceed.
 
 2. `IssueRuntimeTermination` gains a required `validated_work: ValidatedWorkDisposition`
-   field with five states: `NONE`, `QUEUED` (automatic recovery), `PARKED`
-   (awaiting approval), `RECOVERED`, `FAILED`. An unverifiable or failed
-   disposition preserves artifacts and must never collapse into generic
-   `timed_out`, cleanup success, or scratch-reset eligibility.
+   field with **seven** states, partitioned into two sets that the contract keeps
+   distinct because conflating them is how work gets destroyed:
+
+   | Set | States | Meaning |
+   |---|---|---|
+   | Unresolved | `QUEUED` (automatic recovery), `PARKED` (awaiting approval), `PUBLISHING` (submission in flight), `FAILED` (fail-closed) | work exists and must not be lost; blocks teardown-with-destruction and scratch reset |
+   | Resolved | `NONE` (no work here), `RECOVERED` (published + routed), `ABANDONED` (operator explicitly accepted the loss) | nothing is at risk |
+
+   An unverifiable or failed disposition preserves artifacts and must never
+   collapse into generic `timed_out`, cleanup success, or scratch-reset
+   eligibility. **`FAILED` is unresolved, not terminal** — the only routes out are a
+   durable recovery or an explicit `ABANDONED` carrying an operator identity and
+   reason. No timeout, sweep, or age heuristic resolves it.
+
+   The publishable commit is the validation record's `head_sha` **exactly**. A
+   worktree that has advanced past its validation is preserved and parked, never
+   published: ancestry is not identity.
 
 3. **One owner, three initiators.** Automatic recovery at the boundary, the gated
    tech-lead `recover_validated_work` op, and the operator Control Center command
@@ -78,15 +91,26 @@ Four concrete mechanisms in today's code destroy or strand the work:
    durable state, publish-retry reconstruction, fast-forward publication, review
    routing, label finalization, and partial-write reconciliation.
 
-4. **Escrow outside the worktree; commits pinned by a ref.** Admitted evidence is
+4. **Escrow outside the worktree; commits pinned by refs.** Admitted evidence is
    copied to `<state_dir>/validated-work/<issue>/<evidence_id>/` and the validated
    commit is pinned by `refs/issue-orchestrator/validated/<issue>/<evidence_id>` in
-   the shared object store. Worktree removal stops being a data-loss event.
+   the shared object store; unvalidated commits sitting on top of it are pinned
+   separately under `refs/issue-orchestrator/observed/...` so that refusing to
+   publish them never means allowing them to be collected. Worktree removal stops
+   being a data-loss event. `evidence_id` is a canonical hash over stable semantic
+   facts and admitted content hashes only — capture timestamps and mutable
+   observations are excluded — so a crash-and-retry re-derives the same identity
+   and converges on one record instead of minting a second.
 
-5. **`has_active_issue_runtime()` gains a fifth probe** — a pending disposition
-   counts as active runtime. The reset-freshness predicate and the teardown
-   boundary keep reading the same owner set, so scratch reset can never discard
-   work the predicate did not observe.
+5. **`has_active_issue_runtime()` gains a fifth probe** — `has_unresolved_work()`,
+   true for every state in the unresolved set above. The predicate is named for the
+   question its callers ask ("is there work here that must not be destroyed?")
+   rather than for a workflow phase, because a `pending`-shaped predicate reads
+   false for a `FAILED` record and would hand exactly the work this ADR protects to
+   the nuclear reset. The reset-freshness predicate and the teardown boundary keep
+   reading the same owner set, and callers must **consume** the returned
+   disposition rather than discard it, so scratch reset can never discard work the
+   predicate did not observe.
 
 6. **Authority rides the existing gated lane.** `recover_validated_work` is added
    to `ACT_LEVEL_TECH_LEAD_ACTIONS` and bound through the existing immutable
@@ -95,10 +119,23 @@ Four concrete mechanisms in today's code destroy or strand the work:
    it may never call the reset-from-scratch owner, force-push, delete work, or
    clear blocking state before publication and review routing succeed.
 
-7. **Existing Retry Publish stays the publication executor.** The disposition
-   owner is the single boundary that *admits* and *reconstructs* recovery state
-   when the original failure occurred before publish locators were recorded;
-   `PublishRecoveryService` is not extended with admission policy.
+7. **Publication is an execution-only port, composed by both callers.** The
+   existing `PublishRecoveryService.retry_publish()` entry point cannot serve the
+   disposition owner: it treats *any* matching open PR as an already-recovered
+   state and finalizes without ever pushing, never comparing the PR's head with the
+   commit to be landed — so in the canonical strand (open PR at the old remote head,
+   validated commits local-only) it would report success while the work stayed
+   unpublished. The execution half is therefore extracted behind
+   `ValidatedHeadPublisher.publish_or_reconcile()`, a narrow command carrying
+   evidence identity, expected remote head, target validated head, branch/PR
+   identity, review disposition, and a derived submission token, and returning a
+   durable owner-observable outcome that distinguishes "publish", "already at
+   target — reconcile only", and "diverged — write nothing".
+
+   Admission policy stays with each caller: manual Retry Publish keeps its board
+   and locator admission and the Control Center surface; the disposition owner
+   keeps evidence admission and its stale checks. Neither duplicates the other's
+   finalization. This also fixes the existing-PR shortcut for the manual path.
 
 ## Consequences
 
@@ -110,7 +147,16 @@ Four concrete mechanisms in today's code destroy or strand the work:
   That is deliberate and fail-closed — losing validated work is the worse outcome.
 - A new registered SQLite store and an escrow directory join the orchestrator-owned
   state dir, with their own retention boundary that `session_output_retention_days`
-  and worktree cleanup must not cross.
+  and worktree cleanup must not cross. That boundary is driven by a new top-level
+  config section, `Config.validated_work`, which brings the full set of surfaces a
+  new section requires in this codebase (model, section key, parser, shape
+  validation, serialization, settings schema, generated reference, example, tests);
+  escrow and refs are released only for resolved records past the window, and never
+  for unresolved ones at any age.
+- Unresolved work has no automatic exit. That is a deliberate cost: an issue can sit
+  blocked indefinitely on a `FAILED` disposition until a human recovers or
+  explicitly abandons it. The alternative — any time- or sweep-based resolution — is
+  a rediscovery of the bug this ADR closes.
 - #7018 (route `MAX_ROUNDS_EXCEEDED` into disposition) becomes a consumer of this
   contract rather than a standalone point fix; #6914 becomes its behavior-complete
   implementation.
