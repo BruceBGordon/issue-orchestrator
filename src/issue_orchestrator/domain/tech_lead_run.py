@@ -160,6 +160,34 @@ def scope_kind_of_flavor(flavor: TechLeadSessionFlavor) -> TechLeadRunScopeKind:
         ) from None
 
 
+def scope_kind_of_run_key(run_key: str) -> TechLeadRunScopeKind:
+    """The scope a run key names. Fails loudly on anything it does not name.
+
+    Run keys travel through the shared coordination ledger, where a key and its
+    declared scope arriving from a peer must be checked against each other — a
+    ``global:health_review`` row declaring itself issue-scoped would be given
+    the wrong exclusivity. This is also the one place ``release``-style callers,
+    which hold a key and no scope value, recover the kind, so a key can never be
+    classified two different ways (#6994 round 2 F7).
+    """
+    if run_key.startswith(_ISSUE_KEY_PREFIX):
+        subject = run_key[len(_ISSUE_KEY_PREFIX) :]
+        if subject.isdigit() and int(subject) > 0:
+            return TechLeadRunScopeKind.ISSUE
+        raise ValueError(f"run key {run_key!r} names no positive issue number")
+    kind = _GLOBAL_KIND_BY_RUN_KEY.get(run_key)
+    if kind is None:
+        raise ValueError(f"run key {run_key!r} names no known tech-lead run scope")
+    return kind
+
+
+_ISSUE_KEY_PREFIX = "issue:"
+_GLOBAL_KIND_BY_RUN_KEY: dict[str, TechLeadRunScopeKind] = {
+    GlobalHealthReviewScope().run_key: TechLeadRunScopeKind.GLOBAL_HEALTH_REVIEW,
+    GlobalBatchReviewScope().run_key: TechLeadRunScopeKind.GLOBAL_BATCH_REVIEW,
+}
+
+
 def global_scope_for_flavor(flavor: TechLeadSessionFlavor) -> TechLeadRunScope:
     """The global scope value for a whole-repository flavor."""
     kind = scope_kind_of_flavor(flavor)
@@ -266,6 +294,15 @@ REASON_ISSUE_CLOSED = "issue_closed"
 REASON_NO_LONGER_BLOCKED = "no_longer_blocked"
 REASON_CLAIMED_BY_PEER = "claimed_by_peer"
 REASON_ANCHOR_UNAVAILABLE = "anchor_unavailable"
+# The whole-repository anchor this queued run points at has been CLOSED — the
+# usual cause being that a peer engine completed the very same recovered run.
+# The run is withdrawn: a closed anchor is a finished logical run, and starting
+# a second session on it would duplicate the review (#6994 round 2 F9).
+REASON_ANCHOR_CLOSED = "anchor_closed"
+# The anchor could not be read at launch time. A global run fails CLOSED here
+# rather than launching on ignorance: the cost of waiting a tick is one tick,
+# whereas launching a duplicate whole-repository review is a duplicate audit.
+REASON_ANCHOR_UNREADABLE = "anchor_unreadable"
 # The shared run-claim store could not be reached, so ownership of the logical
 # run could not be established. Admission fails CLOSED on this rather than
 # guessing, because guessing is what creates the duplicate run.

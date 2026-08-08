@@ -13,10 +13,10 @@ re-decides everything that could have changed since planning, in the order that
 makes each answer cheap before the expensive one:
 
 1. **Subject eligibility**, re-asked against GitHub right now. A run can wait
-   many ticks behind the global barrier and its subject can be closed or
-   unblocked in that window; only POSITIVE evidence withdraws it, so an
-   unreadable subject keeps the run rather than cancelling it on a transient
-   failure.
+   many ticks behind the global barrier and its subject can be closed, unblocked
+   or (for a whole-repository review) already completed by a peer in that
+   window. A focused investigation withdraws only on POSITIVE evidence; a global
+   run fails CLOSED and must prove its anchor is still open (round 2 F9).
 2. **Scope exclusivity against LIVE state** — this engine's pending queue and
    active sessions as they are at this instant, not as a plan-time snapshot
    remembered them. That closes the within-tick bypass where a tick creates a
@@ -39,6 +39,8 @@ from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
 from ..domain.models import PendingTechLeadReview
 from ..domain.tech_lead_run import (
+    REASON_ANCHOR_CLOSED,
+    REASON_ANCHOR_UNREADABLE,
     REASON_CLAIMED_BY_PEER,
     REASON_RUN_CLAIM_UNAVAILABLE,
     TechLeadRunScope,
@@ -149,18 +151,22 @@ class TechLeadLaunchAuthority:
     def _revalidate_subject(
         self, tech_lead: PendingTechLeadReview, scope: TechLeadRunScope
     ) -> Optional[TechLeadLaunchRefusal]:
-        """Re-ask the eligibility rule about a focused investigation's subject.
+        """Re-ask whether this run's subject is still worth a session.
 
-        A whole-repository review is never subject to this: an anchor is not a
-        blocked work item, and blocked-label eligibility says nothing about
-        whether the board is worth auditing.
+        The two scopes get OPPOSITE benefit of the doubt, because their failure
+        costs are opposite:
 
-        Only POSITIVE evidence withdraws. An unreadable subject proves nothing,
-        and turning a transient GitHub failure into a cancelled investigation is
-        strictly worse than launching one run too many.
+        * a focused investigation withdraws only on POSITIVE evidence — an
+          unreadable subject proves nothing, and turning a transient GitHub
+          failure into a cancelled investigation is worse than one extra run;
+        * a whole-repository review fails CLOSED — it must prove its anchor is
+          still open before starting, or a recovered copy relaunches an audit a
+          peer engine already finished (round 2 F9).
         """
-        if scope.kind.is_global or self._repository_host is None:
+        if self._repository_host is None:
             return None
+        if scope.kind.is_global:
+            return self._revalidate_anchor(tech_lead, scope)
         issue = self._read_issue(tech_lead.issue_number)
         if issue is None:
             return None
@@ -177,6 +183,48 @@ class TechLeadLaunchAuthority:
             verdict[1],
             retained=False,
         )
+
+    def _revalidate_anchor(
+        self, tech_lead: PendingTechLeadReview, scope: TechLeadRunScope
+    ) -> Optional[TechLeadLaunchRefusal]:
+        """Prove the whole-repository run's anchor is still open and runnable.
+
+        Every engine requeues the same open anchor at startup, and a contended
+        copy is deliberately RETAINED rather than withdrawn (round 2 F4). That
+        retention is only safe if the loser re-checks the durable anchor before
+        launching: when the winner finishes it CLOSES the anchor and releases
+        the ledger hold, at which point the loser would otherwise acquire the
+        now-free run and start a second session from its stale in-memory copy.
+
+        The lease alone cannot express this — it says who may run, not whether
+        the logical run is already done — so the durable anchor is the authority
+        (round 2 A6).
+        """
+        issue = self._read_issue(tech_lead.issue_number)
+        if issue is None:
+            return TechLeadLaunchRefusal(
+                scope.run_key,
+                tech_lead.issue_number,
+                REASON_ANCHOR_UNREADABLE,
+                (
+                    f"The {scope.kind.value} anchor #{tech_lead.issue_number}"
+                    " could not be read; holding the run rather than starting a"
+                    " whole-repository review we cannot vouch for."
+                ),
+            )
+        lifecycle = (getattr(issue, "state", "") or "").casefold()
+        if lifecycle and lifecycle != "open":
+            return TechLeadLaunchRefusal(
+                scope.run_key,
+                tech_lead.issue_number,
+                REASON_ANCHOR_CLOSED,
+                (
+                    f"Anchor #{tech_lead.issue_number} is closed; this"
+                    " whole-repository review has already been completed."
+                ),
+                retained=False,
+            )
+        return None
 
     def _local_scope_barrier(
         self, tech_lead: PendingTechLeadReview

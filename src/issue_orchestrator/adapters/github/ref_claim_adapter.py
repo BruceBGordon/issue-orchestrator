@@ -25,6 +25,7 @@ from ...domain.claim import (
 from ...domain.lease_config import LeaseConfig
 from ...domain.run_ledger import (
     RunLedger,
+    RunLedgerDecodeError,
     RunLedgerOutcome,
     RunLedgerRequest,
     RunLedgerRequestKind,
@@ -204,7 +205,13 @@ class GitHubRefRunLedgerAdapter:
         self._store = _GitRefClaimStore(client=client, ref_prefix=ref_prefix)
 
     def submit(self, request: "RunLedgerRequest") -> "RunLedgerOutcome":
-        """One atomic read-decide-write against the shared ledger."""
+        """One atomic read-decide-write against the shared ledger.
+
+        A ledger this build cannot decode EXACTLY is treated as unreachable:
+        the request is refused and NOTHING is written. Reading a partial ledger
+        would make the repository look free — the one answer an exclusivity
+        store must never invent (#6994 round 2 F7).
+        """
         request = self._with_minted_lease(request)
         try:
             for _ in range(MAX_CAS_ATTEMPTS):
@@ -235,6 +242,18 @@ class GitHubRefRunLedgerAdapter:
                 request.run_key,
                 "the tech-lead run ledger kept changing during the update",
             )
+        except RunLedgerDecodeError as exc:
+            logger.error(
+                "Refusing to %s run %s: the shared tech-lead run ledger is"
+                " unreadable by this build (%s). No write was made.",
+                request.kind.value,
+                request.run_key,
+                exc,
+            )
+            return RunLedgerOutcome.unavailable(
+                request.run_key,
+                f"the shared tech-lead run ledger could not be decoded: {exc}",
+            )
         except Exception as exc:
             logger.warning(
                 "Failed to %s run %s in the shared ledger: %s",
@@ -245,8 +264,12 @@ class GitHubRefRunLedgerAdapter:
             return RunLedgerOutcome.unavailable(request.run_key, str(exc))
 
     def read(self) -> "RunLedger | None":
+        """The live ledger, or None when it is unreachable OR undecodable."""
         try:
             return _ledger_of(self._store.read(RUN_LEDGER_REF_KEY))
+        except RunLedgerDecodeError as exc:
+            logger.error("The shared tech-lead run ledger is unreadable: %s", exc)
+            return None
         except Exception as exc:
             logger.warning("Failed to read the tech-lead run ledger: %s", exc)
             return None

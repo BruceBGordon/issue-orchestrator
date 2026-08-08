@@ -117,6 +117,11 @@ class TechLeadTerminationOutcome:
     terminal_stopped: bool = True
     machine_removed: bool = True
     claim_released: bool = True
+    # The repository-wide SCOPE hold, which is a different coordination layer
+    # from the per-issue claim above. Termination owns both, or a timed-out
+    # one-shot leaves every conflicting tech-lead run blocked until the lease
+    # expires — there is no later tick to reconcile it (#6994 round 2 F10/A7).
+    run_released: bool = True
     worktree_removed: bool = True
     # Path of the disposable scratch worktree that could NOT be removed (a leak
     # requiring explicit operator action); None when there was nothing to remove
@@ -129,6 +134,7 @@ class TechLeadTerminationOutcome:
             self.terminal_stopped
             and self.machine_removed
             and self.claim_released
+            and self.run_released
             and self.worktree_removed
         )
 
@@ -138,6 +144,7 @@ class TechLeadTerminationOutcome:
             "terminal_stopped": "terminal stop",
             "machine_removed": "state-machine removal",
             "claim_released": "claim release",
+            "run_released": "tech-lead run release",
             "worktree_removed": "scratch-worktree removal",
         }
         return tuple(

@@ -21,6 +21,7 @@ terminating a healthy session.
 
 from __future__ import annotations
 
+import threading
 from datetime import datetime
 from typing import Callable, Optional, Protocol
 
@@ -62,6 +63,13 @@ class SingleInstanceRunLedgerStore:
     memory, so exclusivity between a global run and targeted work holds for a
     single engine exactly as it does across two. Only the contention it can
     observe differs, because with one engine there is no peer to contend with.
+
+    One process is not one thread. The tick runs in a worker thread while the
+    dashboard command surface answers on the event loop, so read-decide-write
+    is serialized by a lock HERE (#6994 round 2 F8): the port promises
+    atomicity, and an implementation that leaves it to its callers has not
+    implemented the port. The GitHub adapter gets the same guarantee from ref
+    compare-and-swap; this one has to provide it itself.
     """
 
     def __init__(
@@ -75,21 +83,24 @@ class SingleInstanceRunLedgerStore:
         self._lease_seconds = lease_seconds
         self._now = now or datetime.now
         self._ledger = RunLedger()
+        self._lock = threading.Lock()
 
     def submit(self, request: RunLedgerRequest) -> RunLedgerOutcome:
-        resolution = resolve(
-            self._ledger,
-            request,
-            claimant=self._claimant,
-            now=self._now(),
-            lease_seconds=self._lease_seconds,
-        )
-        if resolution.ledger is not None:
-            self._ledger = resolution.ledger
-        return resolution.outcome
+        with self._lock:
+            resolution = resolve(
+                self._ledger,
+                request,
+                claimant=self._claimant,
+                now=self._now(),
+                lease_seconds=self._lease_seconds,
+            )
+            if resolution.ledger is not None:
+                self._ledger = resolution.ledger
+            return resolution.outcome
 
     def read(self) -> Optional[RunLedger]:
-        return self._ledger
+        with self._lock:
+            return self._ledger
 
 
 __all__ = ["SingleInstanceRunLedgerStore", "TechLeadRunLedgerStore"]

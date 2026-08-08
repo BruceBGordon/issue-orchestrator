@@ -42,6 +42,7 @@ project's GitHub API discipline forbids.
 from __future__ import annotations
 
 import logging
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import Enum
@@ -55,7 +56,7 @@ from ..domain.run_ledger import (
 )
 
 if TYPE_CHECKING:
-    from ..domain.tech_lead_run import TechLeadRunScope
+    from ..domain.tech_lead_run import TechLeadRunScope, TechLeadRunScopeKind
     from ..ports.run_ledger_store import TechLeadRunLedgerStore
 
 logger = logging.getLogger(__name__)
@@ -297,6 +298,12 @@ class TechLeadRunOwnership:
         self._renew_before_expiry_seconds = renew_before_expiry_seconds
         self._now = now or datetime.now
         self._held: dict[str, _Lease] = {}
+        # Reentrant: ``begin_run`` reserves through ``claim`` and ``reconcile``
+        # both claims and releases, and the whole sequence must be one
+        # transaction against the shared store AND this bookkeeping. Leaving
+        # ``_held`` unsynchronized let the dashboard thread and the tick thread
+        # disagree about which runs this engine owns (#6994 round 2 F8).
+        self._lock = threading.RLock()
 
     # ------------------------------------------------------------------
     # Acquisition
@@ -310,34 +317,37 @@ class TechLeadRunOwnership:
         the coordination store on every click.
         """
         run_key = scope.run_key
-        if run_key in self._held:
-            return RunOwnership(RunOwnershipVerdict.OWNED, run_key)
-        outcome = self._submit(RunLedgerRequestKind.RESERVE, scope)
-        self._apply_lease_effect(run_key, outcome)
-        return RunOwnership(
-            _OWNERSHIP_VERDICT[outcome.status],
-            run_key,
-            holder=outcome.holder,
-            detail=_ownership_detail(outcome),
-        )
+        with self._lock:
+            if run_key in self._held:
+                return RunOwnership(RunOwnershipVerdict.OWNED, run_key)
+            outcome = self._submit(RunLedgerRequestKind.RESERVE, scope)
+            self._apply_lease_effect(run_key, outcome)
+            return RunOwnership(
+                _OWNERSHIP_VERDICT[outcome.status],
+                run_key,
+                holder=outcome.holder,
+                detail=_ownership_detail(outcome),
+            )
 
     def owns(self, run_key: str) -> bool:
         """True when this engine currently holds ``run_key``."""
-        return run_key in self._held
+        with self._lock:
+            return run_key in self._held
 
     def release(self, run_key: str) -> None:
         """Hand ``run_key`` back so a peer need not wait out the lease."""
-        lease = self._held.pop(run_key, None)
-        if lease is None:
-            return
-        self._store.submit(
-            RunLedgerRequest(
-                kind=RunLedgerRequestKind.RELEASE,
-                run_key=run_key,
-                scope_kind=_kind_of(run_key),
-                lease_id=lease.lease_id,
+        with self._lock:
+            lease = self._held.pop(run_key, None)
+            if lease is None:
+                return
+            self._store.submit(
+                RunLedgerRequest(
+                    kind=RunLedgerRequestKind.RELEASE,
+                    run_key=run_key,
+                    scope_kind=_kind_of(run_key),
+                    lease_id=lease.lease_id,
+                )
             )
-        )
 
     # ------------------------------------------------------------------
     # Execution — the atomic exclusivity decision
@@ -352,30 +362,31 @@ class TechLeadRunOwnership:
         exists to prevent, and a launch deferred by one tick costs nothing.
         """
         run_key = scope.run_key
-        lease = self._held.get(run_key)
-        if lease is None:
-            # Not reserved here — reserve first (exactly once), so the CLI's
-            # direct launch path cannot start a run this engine never owned.
-            ownership = self.claim(scope)
+        with self._lock:
             lease = self._held.get(run_key)
             if lease is None:
-                return RunExecutionAdmission(
-                    _EXECUTION_FROM_OWNERSHIP[ownership.verdict],
-                    run_key,
-                    holder=ownership.holder,
-                    detail=ownership.detail,
-                )
-        outcome = self._submit(
-            RunLedgerRequestKind.PROMOTE, scope, lease_id=lease.lease_id
-        )
-        self._apply_lease_effect(run_key, outcome, fallback=lease.lease_id)
-        return RunExecutionAdmission(
-            _EXECUTION_VERDICT[outcome.status],
-            run_key,
-            barrier_reason=outcome.barrier_reason,
-            holder=outcome.holder,
-            detail=outcome.detail,
-        )
+                # Not reserved here — reserve first (exactly once), so the CLI's
+                # direct launch path cannot start a run this engine never owned.
+                ownership = self.claim(scope)
+                lease = self._held.get(run_key)
+                if lease is None:
+                    return RunExecutionAdmission(
+                        _EXECUTION_FROM_OWNERSHIP[ownership.verdict],
+                        run_key,
+                        holder=ownership.holder,
+                        detail=ownership.detail,
+                    )
+            outcome = self._submit(
+                RunLedgerRequestKind.PROMOTE, scope, lease_id=lease.lease_id
+            )
+            self._apply_lease_effect(run_key, outcome, fallback=lease.lease_id)
+            return RunExecutionAdmission(
+                _EXECUTION_VERDICT[outcome.status],
+                run_key,
+                barrier_reason=outcome.barrier_reason,
+                holder=outcome.holder,
+                detail=outcome.detail,
+            )
 
     def end_run(self, run_key: str) -> None:
         """A session for ``run_key`` is over; the run is no longer exclusive."""
@@ -397,13 +408,14 @@ class TechLeadRunOwnership:
         run is queued or executing.
         """
         live = {scope.run_key: scope for scope in live_runs}
-        for run_key in [key for key in self._held if key not in live]:
-            self.release(run_key)
+        with self._lock:
+            for run_key in [key for key in self._held if key not in live]:
+                self.release(run_key)
 
-        outcomes = [
-            self._reconcile_one(live[run_key]) for run_key in sorted(live)
-        ]
-        return RunOwnershipReconciliation(tuple(outcomes))
+            outcomes = [
+                self._reconcile_one(live[run_key]) for run_key in sorted(live)
+            ]
+            return RunOwnershipReconciliation(tuple(outcomes))
 
     def _reconcile_one(self, scope: "TechLeadRunScope") -> RunOwnershipOutcome:
         run_key = scope.run_key
@@ -483,21 +495,17 @@ class TechLeadRunOwnership:
         return remaining <= self._renew_before_expiry_seconds
 
 
-def _kind_of(run_key: str):
+def _kind_of(run_key: str) -> "TechLeadRunScopeKind":
     """The scope kind a held run key belongs to.
 
     Release is the one operation a caller can reach holding only a key (a
     withdrawal knows the run, not the scope value), so the kind is recovered
-    from the key's own namespace rather than making every caller carry a scope
-    it does not have.
+    from the key's own namespace by the DOMAIN owner of that mapping rather
+    than by a second, looser copy of it here.
     """
-    from ..domain.tech_lead_run import TechLeadRunScopeKind
+    from ..domain.tech_lead_run import scope_kind_of_run_key
 
-    if run_key.startswith("issue:"):
-        return TechLeadRunScopeKind.ISSUE
-    if run_key == "global:batch_review":
-        return TechLeadRunScopeKind.GLOBAL_BATCH_REVIEW
-    return TechLeadRunScopeKind.GLOBAL_HEALTH_REVIEW
+    return scope_kind_of_run_key(run_key)
 
 
 def single_instance_run_ownership() -> TechLeadRunOwnership:

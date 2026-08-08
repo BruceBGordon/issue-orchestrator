@@ -20,6 +20,11 @@ from issue_orchestrator.domain.models import (
     ORCHESTRATOR_PR_MARKER,
 )
 from issue_orchestrator.domain.issue_key import FakeIssueKey
+from issue_orchestrator.domain.tech_lead_run import IssueInvestigationScope
+from issue_orchestrator.domain.tech_lead_session import (
+    TechLeadLaunchScope,
+    TechLeadSessionFlavor,
+)
 from issue_orchestrator.domain.session_key import SessionKey, TaskKind
 from issue_orchestrator.infra.config import Config
 from issue_orchestrator.control.scheduler import Scheduler
@@ -220,16 +225,24 @@ def test_terminate_tech_lead_session_is_behavior_complete(sample_config, tmp_pat
     tech_lead = SimpleNamespace(
         terminal_id="tech-lead-77", issue=SimpleNamespace(number=77), lease_id="lease-1",
         scratch_worktree=True, worktree_path=scratch,
+        tech_lead_scope=TechLeadLaunchScope(
+            flavor=TechLeadSessionFlavor.FAILURE_INVESTIGATION
+        ),
     )
     other = SimpleNamespace(
         terminal_id="issue-88", issue=SimpleNamespace(number=88), lease_id=None,
-        scratch_worktree=False, worktree_path=None,
+        scratch_worktree=False, worktree_path=None, tech_lead_scope=None,
     )
     orchestrator.state.active_sessions = [tech_lead, other]
+    # The run this session holds across engines — termination owns BOTH
+    # coordination layers, so it must go back too (#6994 round 2 F10).
+    assert orchestrator.deps.run_ownership.claim(IssueInvestigationScope(77)).owned
 
     outcome = orchestrator.terminate_tech_lead_session(tech_lead)
 
     assert outcome.clean is True  # every effect succeeded
+    assert outcome.run_released is True
+    assert orchestrator.deps.run_ownership.owns("issue:77") is False
     # State machine terminalized (removed)...
     smm.remove_session_machine.assert_called_once_with("tech-lead-77")
     # ...terminal stopped through the real session-routing boundary...

@@ -32,6 +32,8 @@ from issue_orchestrator.domain.run_ledger import (
 from issue_orchestrator.domain.tech_lead_run import (
     GlobalHealthReviewScope,
     IssueInvestigationScope,
+    REASON_ANCHOR_CLOSED,
+    REASON_ANCHOR_UNREADABLE,
     REASON_ISSUE_CLOSED,
     REASON_NO_LONGER_BLOCKED,
 )
@@ -143,13 +145,14 @@ class _Harness:
         shared: Optional[SharedRunLedger] = None,
         repository_host: object = None,
         launch_fails: bool = False,
+        claimant: str = "engine-a",
     ) -> None:
         self.state = OrchestratorState()
         self.state.pending_tech_lead_reviews = list(pending or [])
         self.state.active_sessions = list(active or [])
         self.config = _config()
         self.shared = shared or SharedRunLedger()
-        self.ownership = self.shared.ownership("engine-a")
+        self.ownership = self.shared.ownership(claimant)
         self.events = RecordingEvents()
         self.repository_host = (
             repository_host
@@ -216,6 +219,7 @@ def test_the_direct_launch_path_makes_a_GLOBAL_run_wait_for_drain():
     harness = _Harness(
         pending=[anchor],
         active=[FakeSession(42, TechLeadSessionFlavor.FAILURE_INVESTIGATION)],
+        issues={900: FakeIssue(900, labels=())},
     )
 
     session = harness.launch(anchor)
@@ -333,13 +337,14 @@ def test_an_unreadable_subject_keeps_its_run_rather_than_cancelling_it():
 
 
 def test_a_global_anchor_is_never_subject_to_blocked_label_eligibility():
-    """An anchor is not a blocked work item; re-reading it would prove nothing."""
+    """An anchor is not a blocked work item — but it MUST still be open (F9)."""
     anchor = _health_anchor()
     repo = FakeRepositoryHost({900: FakeIssue(900, labels=())})
     harness = _Harness(pending=[anchor], repository_host=repo)
 
     assert harness.launch(anchor) is not None
-    assert repo.reads == [], "a global run costs no subject read"
+    # Read once, to prove the anchor is still open — never for blocked labels.
+    assert repo.reads == [900]
 
 
 # ---------------------------------------------------------------------------
@@ -350,7 +355,11 @@ def test_a_global_anchor_is_never_subject_to_blocked_label_eligibility():
 def test_a_launch_that_produced_no_session_hands_the_exclusive_hold_back():
     """Otherwise every other tech-lead run waits out a lease for nothing."""
     anchor = _health_anchor()
-    harness = _Harness(pending=[anchor], launch_fails=True)
+    harness = _Harness(
+        pending=[anchor],
+        launch_fails=True,
+        issues={900: FakeIssue(900, labels=())},
+    )
 
     assert harness.launch(anchor) is None
     assert harness.launched == [anchor]
@@ -372,3 +381,77 @@ def test_the_refusal_reason_is_published_not_only_logged():
     assert payload["reason"] == "global_run_queued"
     assert payload["retained"] is True
     assert payload["detail"]
+
+
+# ---------------------------------------------------------------------------
+# Recovered whole-repository runs (#6994 round 2 F9)
+#
+# Every engine requeues the same open anchor at startup and a contended copy is
+# deliberately retained. That is only safe if the loser proves the DURABLE
+# anchor is still open before launching — otherwise, the moment the winner
+# finishes and releases the hold, the loser starts a second audit.
+# ---------------------------------------------------------------------------
+
+
+def test_a_recovered_anchor_a_peer_already_COMPLETED_is_never_relaunched():
+    """The full F9 chain, one beat at a time.
+
+    Both engines recover the same open anchor at startup. Engine B loses the
+    contest and RETAINS its copy (round 2 F4). Engine A runs the review,
+    completes it — closing the anchor — and releases the hold. Engine B then
+    legitimately acquires the now-free run, and must still refuse to launch it.
+    """
+    shared = SharedRunLedger()
+    winner = shared.ownership("engine-a")
+    anchor = _health_anchor()
+    open_anchor = FakeIssue(900, labels=())
+    loser = _Harness(
+        pending=[anchor],
+        issues={900: open_anchor},
+        shared=shared,
+        claimant="engine-b",
+    )
+
+    # Engine A wins the recovered run and starts it.
+    assert winner.claim(HEALTH).owned
+    assert winner.begin_run(HEALTH).started
+
+    # Engine B reconciles: contended, so it RETAINS its queued copy.
+    reconciliation = loser.ownership.reconcile([HEALTH])
+    assert reconciliation.contended == (HEALTH.run_key,)
+    assert reconciliation.lost == ()
+
+    # Engine A completes: the anchor is closed and the hold handed back.
+    loser.repository_host.issues[900] = FakeIssue(900, state="closed", labels=())
+    winner.end_run(HEALTH.run_key)
+
+    # Engine B now acquires the free run — and must still refuse to run it.
+    assert loser.ownership.reconcile([HEALTH]).outcomes[0].status.value == "owned"
+
+    assert loser.launch(anchor) is None
+    assert loser.launched == [], "a completed whole-repository run must not rerun"
+    assert loser.state.pending_tech_lead_reviews == []
+    withdrawn = loser.events.payloads(EventName.TECH_LEAD_RUN_WITHDRAWN)
+    assert [w["reason"] for w in withdrawn] == [REASON_ANCHOR_CLOSED]
+    # ...and the hold goes back, so nothing else waits on a run that is over.
+    assert shared.live_keys() == ()
+
+
+def test_an_UNREADABLE_anchor_holds_the_global_run_rather_than_launching_it():
+    """Fail closed: a duplicate whole-repository audit is the expensive mistake."""
+    anchor = _health_anchor()
+    harness = _Harness(pending=[anchor], repository_host=UnreadableRepositoryHost())
+
+    assert harness.launch(anchor) is None
+    assert harness.launched == []
+    assert harness.held_reasons() == [REASON_ANCHOR_UNREADABLE]
+    # Held, not withdrawn: the anchor may well still be open.
+    assert [i.issue_number for i in harness.state.pending_tech_lead_reviews] == [900]
+
+
+def test_an_ABSENT_anchor_also_holds_rather_than_launching():
+    anchor = _health_anchor()
+    harness = _Harness(pending=[anchor], issues={})
+
+    assert harness.launch(anchor) is None
+    assert harness.held_reasons() == [REASON_ANCHOR_UNREADABLE]

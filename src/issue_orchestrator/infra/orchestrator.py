@@ -1052,13 +1052,19 @@ class Orchestrator:
     def _github_workflow(self) -> GitHubWorkflow: return GitHubWorkflow(self.config, self.deps.events, self.deps.repository_host, self.deps.fact_gatherer, self.deps.pr_scanner, self.deps.label_sync, self._event_context, self.deps.label_manager, self.scheduler.dependency_evaluator)
     def launch_review_session(self, review: PendingReview) -> Optional[Session]: return _launch_review_session(review, self.state, self._session_launcher, self.deps.session_restorer)
     def launch_retrospective_review_session(self, review: PendingRetrospectiveReview) -> Optional[Session]: return _launch_retrospective_review_session(review, self.state, self._session_launcher, self.deps.session_restorer)
-    # #6994 R2 F2: `launch_tech_lead_session` is the ONE entry point — it re-decides
+    # #6994 R2 F2/F8: `launch_tech_lead_session` is the ONE entry point — it re-decides
     # subject eligibility, scope exclusivity and cross-engine ownership immediately
     # before starting. `launch_queued_*` is the raw step that authority delegates to.
+    # Both tech-lead transitions run under `_state_lock` (reentrant, so the tick's
+    # own launch nests safely) because admission and launch each read the pending
+    # queue and then mutate it, and the dashboard command surface runs on a
+    # different thread from the tick.
     def launch_queued_tech_lead_session(self, tech_lead: PendingTechLeadReview) -> Optional[Session]: return _launch_tech_lead_session(tech_lead, self.state, self.config, self._session_launcher, self.deps.session_restorer)
-    def launch_tech_lead_session(self, tech_lead: PendingTechLeadReview) -> Optional[Session]: return _launch_tech_lead_run(self, tech_lead)
+    def launch_tech_lead_session(self, tech_lead: PendingTechLeadReview) -> Optional[Session]:
+        with self._state_lock: return _launch_tech_lead_run(self, tech_lead)
     def ensure_health_review_anchor(self) -> Optional[PendingTechLeadReview]: return _ensure_health_review_anchor(self)
-    def request_tech_lead_run(self, request: TechLeadRunRequest) -> TechLeadRunAdmission: return _admit_tech_lead_run(self, request)
+    def request_tech_lead_run(self, request: TechLeadRunRequest) -> TechLeadRunAdmission:
+        with self._state_lock: return _admit_tech_lead_run(self, request)
     def process_deferred_cleanups(self) -> None: self.state.pending_cleanups = self._github_workflow.process_deferred_cleanups(self.state.pending_cleanups, self._cleanup_manager)
     def _recover_orphaned_cleanups(self) -> None: self._plan_applier.recover_orphaned_cleanups()
     def scan_needs_code_review_prs(self) -> None: self._github_workflow.scan_needs_code_review_prs(self.state)

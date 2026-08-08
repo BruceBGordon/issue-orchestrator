@@ -9,8 +9,16 @@ produces rather than inside a facade method.
 this runs NO further tick afterwards — so a recorded cleanup fact would never be
 applied. The termination is therefore self-contained, mirroring the outcomes
 normal completion produces: remove the session state machine, stop the terminal,
-reconcile the session out of ``active_sessions``, release its claim, and
+reconcile the session out of ``active_sessions``, release BOTH coordination
+holds (the per-issue claim and the repository-wide tech-lead run), and
 FORCE-remove the disposable scratch worktree.
+
+Both coordination layers, deliberately (#6994 round 2 F10/A7). The per-issue
+claim says who may write to an issue; the run hold says which whole-repository
+or focused tech-lead run is executing. Releasing only the first leaves every
+conflicting tech-lead run blocked until the lease expires, with no later tick to
+notice — so the run release is its own independent effect with its own field in
+the typed outcome.
 
 A failure of one effect never aborts the others, and the result is a typed
 :class:`~.tech_lead_trigger.TechLeadTerminationOutcome` — the SOLE owner of a
@@ -75,6 +83,9 @@ def terminate_tech_lead_session(
         else None,
         "release claim",
     )
+    run_released = attempt(
+        lambda: _release_run_hold(deps, session), "release the tech-lead run"
+    )
 
     worktrees = getattr(deps, "worktree_manager", None)
     disposable = bool(
@@ -90,6 +101,7 @@ def terminate_tech_lead_session(
         terminal_stopped=terminal_stopped,
         machine_removed=machine_removed,
         claim_released=claim_released,
+        run_released=run_released,
         worktree_removed=worktree_removed,
         # A failed removal surfaces the EXACT leaked path for explicit operator
         # action before exit — this is the single cleanup-failure owner.
@@ -99,6 +111,23 @@ def terminate_tech_lead_session(
             else None
         ),
     )
+
+
+def _release_run_hold(deps: object, session: "Session") -> None:
+    """Hand the terminated session's repository-wide run hold back.
+
+    The scope is derived from the SESSION's own launch stamp, so a global review
+    releases ``global:*`` and a focused investigation releases ``issue:N`` — the
+    same identity the launch authority took. A session carrying no stamp has no
+    run to release.
+    """
+    from .tech_lead_run_admission import scope_of_session
+
+    ownership = getattr(deps, "run_ownership", None)
+    scope = scope_of_session(session)
+    if ownership is None or scope is None:
+        return
+    ownership.end_run(scope.run_key)
 
 
 def _effect_runner(issue_number: int) -> Callable[[Callable[[], object], str], bool]:

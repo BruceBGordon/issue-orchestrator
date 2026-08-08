@@ -15,6 +15,8 @@ pauses planning, so it cannot coexist with the engine this dashboard is serving.
 
 from __future__ import annotations
 
+import asyncio
+
 import logging
 
 from fastapi import APIRouter
@@ -103,10 +105,13 @@ async def request_tech_lead_run(
         scope=_domain_scope(payload),
         trigger=TechLeadRunTrigger.DASHBOARD,
     )
+    # Off the event loop: admission takes the engine's state lock, so a tick
+    # in flight would otherwise block every other dashboard request until it
+    # finished (#6994 round 2 F8).
     admission = (
         TechLeadRunAdmission.engine_not_running(request.scope, request.trigger)
         if orchestrator is None
-        else orchestrator.request_tech_lead_run(request)
+        else await asyncio.to_thread(orchestrator.request_tech_lead_run, request)
     )
     logger.info(
         "[tech-lead] Dashboard run request: scope=%s run_key=%s outcome=%s reason=%s",

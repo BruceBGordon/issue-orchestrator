@@ -15,15 +15,22 @@ threads, no sleeps, and a hand-advanced clock.
 
 from __future__ import annotations
 
+import json
+from dataclasses import replace
+
+import pytest
+
 from issue_orchestrator.control.tech_lead_run_ownership import (
     RunExecutionVerdict,
     RunOwnershipVerdict,
 )
 from issue_orchestrator.domain.run_ledger import (
+    RUN_LEDGER_VERSION,
     BARRIER_GLOBAL_AWAITING_DRAIN,
     BARRIER_GLOBAL_RUN_ACTIVE,
     BARRIER_GLOBAL_RUN_QUEUED,
     RunLedger,
+    RunLedgerDecodeError,
     RunLedgerRequest,
     RunLedgerRequestKind,
     RunLifecycle,
@@ -213,17 +220,81 @@ def test_the_ledger_survives_a_round_trip_through_its_wire_format():
     assert health is not None and health.lifecycle is RunLifecycle.RUNNING
 
 
-def test_a_row_this_build_cannot_understand_is_dropped_not_guessed_at():
-    """Inventing a scope kind would put a fabricated entry in the matrix."""
-    text = format_run_ledger(RunLedger()).replace(
-        "</io-run-ledger>",
-        "run_key=global:from_the_future scope_kind=global_time_travel"
-        " lifecycle=queued claimant=peer lease_id=x"
-        " started_at=2026-08-07T12:00:00 expires_at=2999-01-01T00:00:00\n"
-        "</io-run-ledger>",
+def _encoded(**overrides) -> str:
+    """One live global row, encoded, with fields overridden for a defect case."""
+    row = {
+        "run_key": HEALTH.run_key,
+        "scope_kind": HEALTH.kind.value,
+        "lifecycle": "queued",
+        "claimant": "engine-b",
+        "lease_id": "peer-1",
+        "started_at": "2026-08-07T12:00:00",
+        "expires_at": "2999-01-01T00:00:00",
+    }
+    row.update(overrides)
+    payload = {"version": RUN_LEDGER_VERSION, "entries": [row]}
+    return f"<io-run-ledger>\n{json.dumps(payload)}\n</io-run-ledger>"
+
+
+@pytest.mark.parametrize(
+    "text,why",
+    [
+        (_encoded(scope_kind="global_time_travel"), "a forward-version scope kind"),
+        (_encoded(lifecycle="paused"), "an unknown lifecycle"),
+        (_encoded(started_at="whenever"), "an unparseable timestamp"),
+        (_encoded(run_key="issue:7"), "a run key that contradicts its scope"),
+        (_encoded(run_key=""), "an empty run key"),
+        ("<io-run-ledger>\nnot json\n</io-run-ledger>", "a malformed payload"),
+        ("no ledger block at all", "a missing block"),
+        (
+            f"<io-run-ledger>\n{json.dumps({'version': 2, 'entries': []})}\n"
+            "</io-run-ledger>",
+            "an unsupported schema version",
+        ),
+    ],
+)
+def test_a_ledger_this_build_cannot_read_EXACTLY_is_refused_not_partially_read(
+    text: str, why: str
+):
+    """A dropped row makes a BUSY repository look free (#6994 round 2 F7).
+
+    The dropped row could be the live global that makes everything else wait,
+    so decoding is all-or-nothing and the caller fails closed.
+    """
+    with pytest.raises(RunLedgerDecodeError):
+        parse_run_ledger(text)
+    assert why  # names the defect this case pins
+
+
+def test_a_duplicate_run_key_is_refused_rather_than_silently_deduplicated():
+    row = {
+        "run_key": HEALTH.run_key,
+        "scope_kind": HEALTH.kind.value,
+        "lifecycle": "queued",
+        "claimant": "engine-b",
+        "lease_id": "peer-1",
+        "started_at": "2026-08-07T12:00:00",
+        "expires_at": "2999-01-01T00:00:00",
+    }
+    payload = {"version": RUN_LEDGER_VERSION, "entries": [row, dict(row)]}
+    text = f"<io-run-ledger>\n{json.dumps(payload)}\n</io-run-ledger>"
+
+    with pytest.raises(RunLedgerDecodeError):
+        parse_run_ledger(text)
+
+
+def test_field_values_containing_the_delimiter_survive_a_round_trip():
+    """Token splitting could not round-trip these; the codec must."""
+    shared, engine_a, _engine_b = _two_engines()
+    assert engine_a.claim(HEALTH).owned
+    entry = shared.ledger.entries[0]
+    awkward = replace(
+        entry, claimant="engine a=b c", lease_id="lease with spaces\tand tabs"
     )
 
-    assert parse_run_ledger(text).entries == ()
+    restored = parse_run_ledger(format_run_ledger(RunLedger((awkward,))))
+
+    assert restored.entries == (awkward,)
 
 
 def test_an_unreadable_store_answers_unavailable_rather_than_free():

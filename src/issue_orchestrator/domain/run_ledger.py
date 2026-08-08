@@ -29,12 +29,13 @@ two cannot drift, and the whole matrix is unit-testable without a network.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from enum import Enum
-from typing import Iterable, Optional
+from typing import Iterable, Optional, TypeVar
 
-from .tech_lead_run import TechLeadRunScopeKind
+from .tech_lead_run import TechLeadRunScopeKind, scope_kind_of_run_key
 
 # Why a promotion was refused. Shares the launch gate's vocabulary
 # (``domain.tech_lead_run.BARRIER_*``) so an operator reads the same phrase
@@ -451,19 +452,45 @@ def _mint_lease_id(run_key: str, now: datetime) -> str:
 
 
 # ----------------------------------------------------------------------
-# Wire format
+# Wire format — STRICT and versioned (#6994 round 2 F7/A4)
+#
+# An exclusivity ledger must never be read approximately. A row this build does
+# not understand — a forward-version scope written by a newer peer during a
+# rolling upgrade, a truncated line, a duplicate key — could be the very global
+# run that makes the repository busy, and silently dropping it makes the
+# repository look FREE. So decoding is all-or-nothing: any defect raises, and
+# the adapter turns that into ``UNAVAILABLE`` with no write, exactly as it
+# treats an unreachable store.
+#
+# The payload is JSON rather than delimited tokens, because token splitting
+# cannot round-trip a claimant id (or any field) that happens to contain the
+# delimiter — a format that can silently mis-parse valid data is the same class
+# of bug one layer down.
 # ----------------------------------------------------------------------
 
-_LEDGER_HEADER = "io-run-ledger"
-_FIELD_ORDER = (
-    "run_key",
-    "scope_kind",
-    "lifecycle",
-    "claimant",
-    "lease_id",
-    "started_at",
-    "expires_at",
+RUN_LEDGER_VERSION = 1
+_LEDGER_OPEN = "<io-run-ledger>"
+_LEDGER_CLOSE = "</io-run-ledger>"
+_ENTRY_FIELDS = frozenset(
+    {
+        "run_key",
+        "scope_kind",
+        "lifecycle",
+        "claimant",
+        "lease_id",
+        "started_at",
+        "expires_at",
+    }
 )
+
+
+class RunLedgerDecodeError(ValueError):
+    """The shared ledger could not be decoded EXACTLY.
+
+    Raised rather than returning a partial ledger, because a partial
+    exclusivity ledger is indistinguishable from a free repository and is the
+    one answer this type must never be able to give.
+    """
 
 
 def format_run_ledger(ledger: RunLedger) -> str:
@@ -471,68 +498,122 @@ def format_run_ledger(ledger: RunLedger) -> str:
 
     Deterministic because two engines racing on the SAME logical content must
     not produce two different bytes and thereby two different compare-and-swap
-    outcomes.
+    outcomes: entries are sorted, and ``json.dumps`` is given sorted keys and a
+    fixed separator.
     """
-    lines = [f"<{_LEDGER_HEADER}>"]
-    for entry in sorted(ledger.entries, key=_entry_order):
-        fields = {
-            "run_key": entry.run_key,
-            "scope_kind": entry.scope_kind.value,
-            "lifecycle": entry.lifecycle.value,
-            "claimant": entry.claimant,
-            "lease_id": entry.lease_id,
-            "started_at": entry.started_at.isoformat(),
-            "expires_at": entry.expires_at.isoformat(),
-        }
-        lines.append(" ".join(f"{name}={fields[name]}" for name in _FIELD_ORDER))
-    lines.append(f"</{_LEDGER_HEADER}>")
-    return "\n".join(lines)
+    payload = {
+        "version": RUN_LEDGER_VERSION,
+        "entries": [
+            {
+                "run_key": entry.run_key,
+                "scope_kind": entry.scope_kind.value,
+                "lifecycle": entry.lifecycle.value,
+                "claimant": entry.claimant,
+                "lease_id": entry.lease_id,
+                "started_at": entry.started_at.isoformat(),
+                "expires_at": entry.expires_at.isoformat(),
+            }
+            for entry in sorted(ledger.entries, key=_entry_order)
+        ],
+    }
+    body = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return f"{_LEDGER_OPEN}\n{body}\n{_LEDGER_CLOSE}"
 
 
 def parse_run_ledger(text: str) -> RunLedger:
-    """Read a ledger back. Unreadable rows are dropped, never guessed at.
+    """Read a ledger back, or refuse. Never partially.
 
-    A row this build cannot understand (an unknown scope kind from a newer
-    peer, a corrupted line) is skipped rather than defaulted: inventing a scope
-    kind would put a fabricated entry into the exclusivity matrix.
+    Raises :class:`RunLedgerDecodeError` on a missing/duplicated block, invalid
+    JSON, an unknown schema version, an unexpected field set, an unknown scope
+    kind or lifecycle, an unparseable timestamp, a run key that disagrees with
+    its declared scope, or a duplicate run key.
     """
-    entries: list[RunLedgerEntry] = []
-    inside = False
-    for raw in text.splitlines():
-        line = raw.strip()
-        if line == f"<{_LEDGER_HEADER}>":
-            inside = True
-            continue
-        if line == f"</{_LEDGER_HEADER}>":
-            break
-        if not inside or not line:
-            continue
-        entry = _parse_entry(line)
-        if entry is not None:
-            entries.append(entry)
+    payload = _ledger_payload(text)
+    version = payload.get("version")
+    if version != RUN_LEDGER_VERSION:
+        raise RunLedgerDecodeError(
+            f"unsupported run-ledger schema version {version!r};"
+            f" this build reads version {RUN_LEDGER_VERSION}"
+        )
+    rows = payload.get("entries")
+    if not isinstance(rows, list):
+        raise RunLedgerDecodeError("run-ledger 'entries' must be a list")
+    entries = [_decode_entry(row) for row in rows]
+    keys = [entry.run_key for entry in entries]
+    if len(set(keys)) != len(keys):
+        raise RunLedgerDecodeError(f"run-ledger has duplicate run keys: {keys}")
     return RunLedger(tuple(sorted(entries, key=_entry_order)))
 
 
-def _parse_entry(line: str) -> Optional[RunLedgerEntry]:
-    fields: dict[str, str] = {}
-    for token in line.split(" "):
-        name, sep, value = token.partition("=")
-        if sep:
-            fields[name] = value
-    if not all(name in fields for name in _FIELD_ORDER):
-        return None
-    try:
-        return RunLedgerEntry(
-            run_key=fields["run_key"],
-            scope_kind=TechLeadRunScopeKind(fields["scope_kind"]),
-            lifecycle=RunLifecycle(fields["lifecycle"]),
-            claimant=fields["claimant"],
-            lease_id=fields["lease_id"],
-            started_at=datetime.fromisoformat(fields["started_at"]),
-            expires_at=datetime.fromisoformat(fields["expires_at"]),
+def _ledger_payload(text: str) -> dict[str, object]:
+    """The single JSON object between the ledger markers."""
+    if text.count(_LEDGER_OPEN) != 1 or text.count(_LEDGER_CLOSE) != 1:
+        raise RunLedgerDecodeError(
+            "run-ledger block must appear exactly once in the record"
         )
-    except ValueError:
-        return None
+    opened = text.index(_LEDGER_OPEN) + len(_LEDGER_OPEN)
+    closed = text.index(_LEDGER_CLOSE)
+    if closed < opened:
+        raise RunLedgerDecodeError("run-ledger block markers are out of order")
+    try:
+        payload = json.loads(text[opened:closed])
+    except ValueError as exc:
+        raise RunLedgerDecodeError(f"run-ledger payload is not valid JSON: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise RunLedgerDecodeError("run-ledger payload must be a JSON object")
+    return payload
+
+
+def _decode_entry(row: object) -> RunLedgerEntry:
+    if not isinstance(row, dict):
+        raise RunLedgerDecodeError(f"run-ledger entry must be an object: {row!r}")
+    names: set[str] = {str(name) for name in row}
+    unexpected = names.symmetric_difference(_ENTRY_FIELDS)
+    if unexpected:
+        raise RunLedgerDecodeError(
+            f"run-ledger entry has an unexpected field set: {sorted(unexpected)}"
+        )
+    values = {name: row[name] for name in _ENTRY_FIELDS}
+    if not all(isinstance(value, str) for value in values.values()):
+        raise RunLedgerDecodeError(
+            f"every run-ledger entry field must be a string: {row!r}"
+        )
+    run_key = str(values["run_key"])
+    scope_kind = _decode_enum(TechLeadRunScopeKind, values["scope_kind"], "scope kind")
+    try:
+        declared = scope_kind_of_run_key(run_key)
+    except ValueError as exc:
+        raise RunLedgerDecodeError(str(exc)) from exc
+    if declared is not scope_kind:
+        raise RunLedgerDecodeError(
+            f"run key {run_key!r} does not name a {scope_kind.value} run"
+        )
+    return RunLedgerEntry(
+        run_key=run_key,
+        scope_kind=scope_kind,
+        lifecycle=_decode_enum(RunLifecycle, values["lifecycle"], "lifecycle"),
+        claimant=str(values["claimant"]),
+        lease_id=str(values["lease_id"]),
+        started_at=_decode_timestamp(values["started_at"]),
+        expires_at=_decode_timestamp(values["expires_at"]),
+    )
+
+
+_EnumT = TypeVar("_EnumT", bound=Enum)
+
+
+def _decode_enum(enum_type: type[_EnumT], raw: object, what: str) -> _EnumT:
+    try:
+        return enum_type(raw)
+    except ValueError as exc:
+        raise RunLedgerDecodeError(f"unknown run-ledger {what}: {raw!r}") from exc
+
+
+def _decode_timestamp(raw: object) -> datetime:
+    try:
+        return datetime.fromisoformat(str(raw))
+    except ValueError as exc:
+        raise RunLedgerDecodeError(f"unparseable run-ledger timestamp: {raw!r}") from exc
 
 
 __all__ = [
@@ -545,8 +626,10 @@ __all__ = [
     "RunLedgerRequest",
     "RunLedgerRequestKind",
     "RunLedgerResolution",
+    "RunLedgerDecodeError",
     "RunLedgerStatus",
     "RunLifecycle",
+    "RUN_LEDGER_VERSION",
     "format_run_ledger",
     "parse_run_ledger",
     "resolve",
