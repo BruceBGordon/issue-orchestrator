@@ -100,19 +100,22 @@ class LaunchStatus(StrEnum):
         """Whether startup did not happen.
 
         Raises:
-            UnclassifiedLaunchStatusError: if this member appears in neither
-                disposition set. Never defaults to ``False``.
+            UnclassifiedLaunchStatusError: if this member does not appear in
+                exactly one disposition set. Never defaults to ``False``.
         """
         cls = type(self)
-        if self in cls.failure_statuses():
-            return True
-        if self in cls.success_statuses():
-            return False
-        raise UnclassifiedLaunchStatusError(
-            f"launcher status {self.value!r} is in neither the success nor the "
-            "failure set; classify it explicitly rather than letting it read "
-            "as a successful start"
+        membership = (
+            self in cls.success_statuses(),
+            self in cls.failure_statuses(),
         )
+        try:
+            return _IS_FAILURE_BY_DISPOSITION_MEMBERSHIP[membership]
+        except KeyError:
+            raise UnclassifiedLaunchStatusError(
+                f"launcher status {self.value!r} must be in exactly one of the "
+                "success or failure sets; classify it explicitly rather than "
+                "letting it read as a successful start"
+            ) from None
 
     @classmethod
     def parse(cls, value: "LaunchStatus | str") -> "LaunchStatus":
@@ -135,6 +138,10 @@ _SUCCESS_STATUSES = frozenset(
     {LaunchStatus.OK, LaunchStatus.DOCTOR_WARNING, LaunchStatus.ALREADY_RUNNING}
 )
 _FAILURE_STATUSES = frozenset({LaunchStatus.DOCTOR_ERROR, LaunchStatus.LAUNCH_ERROR})
+_IS_FAILURE_BY_DISPOSITION_MEMBERSHIP = {
+    (True, False): False,
+    (False, True): True,
+}
 
 
 def _verify_every_status_is_classified() -> None:

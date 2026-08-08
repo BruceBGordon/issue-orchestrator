@@ -90,6 +90,25 @@ class TestLaunchStatus:
 
         assert "doctor_error" in str(excinfo.value)
 
+    def test_is_failure_rejects_conflicting_dispositions(self, monkeypatch):
+        """Membership in both sets is as invalid as membership in neither."""
+        doctor_error = frozenset({LaunchStatus.DOCTOR_ERROR})
+        monkeypatch.setattr(
+            LaunchStatus,
+            "failure_statuses",
+            classmethod(lambda cls: doctor_error),
+        )
+        monkeypatch.setattr(
+            LaunchStatus,
+            "success_statuses",
+            classmethod(lambda cls: doctor_error),
+        )
+
+        with pytest.raises(UnclassifiedLaunchStatusError) as excinfo:
+            LaunchStatus.DOCTOR_ERROR.is_failure
+
+        assert "exactly one" in str(excinfo.value)
+
     @pytest.mark.parametrize(
         "value",
         ["ok", "doctor_warning", "already_running", "doctor_error", "launch_error"],

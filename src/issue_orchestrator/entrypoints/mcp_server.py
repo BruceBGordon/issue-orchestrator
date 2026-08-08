@@ -40,6 +40,7 @@ from mcp.server.fastmcp import FastMCP
 if TYPE_CHECKING:
     from ..infra.launcher import LaunchResult
 
+from ..contracts.mcp import McpErrorPayload, McpUiHintPayload
 from ..infra import supervisor
 from ..infra.config import Config, get_config_path
 from ..infra.client_urls import resolve_client_base_url
@@ -81,22 +82,52 @@ def _doctor_error_message(launch_result: "LaunchResult") -> str:
     return f"Doctor checks failed — {detail}"
 
 
-def _launch_failure_message(
-    launch_result: "LaunchResult", status: LaunchStatus
-) -> str:
-    """Always a non-empty description of why the launch failed.
+def _launcher_error_message(launch_result: "LaunchResult") -> str:
+    """Return a non-empty description of a launcher process failure.
 
     Emptiness matters: clients test the presence of a message to decide a start
     failed, so an empty one would read as success and silently drop the
     operator back into a "started" UI.
     """
-    if status is LaunchStatus.DOCTOR_ERROR:
-        return _doctor_error_message(launch_result)
     launcher_message = (launch_result.error or "").strip()
-    return launcher_message or f"Orchestrator failed to start ({status.value})"
+    return launcher_message or "Orchestrator failed to start (launch_error)"
 
 
-def launch_failure_error(launch_result: "LaunchResult") -> dict[str, str] | None:
+_LAUNCH_FAILURE_MESSAGE_BUILDERS: dict[
+    LaunchStatus, Callable[["LaunchResult"], str]
+] = {
+    LaunchStatus.DOCTOR_ERROR: _doctor_error_message,
+    LaunchStatus.LAUNCH_ERROR: _launcher_error_message,
+}
+
+
+def _build_launch_failure_error(
+    launch_result: "LaunchResult", status: LaunchStatus
+) -> McpErrorPayload:
+    return {
+        "message": _LAUNCH_FAILURE_MESSAGE_BUILDERS[status](launch_result),
+        "type": LAUNCH_FAILURE_ERROR_TYPES[status],
+    }
+
+
+def _no_launch_failure_error(
+    _launch_result: "LaunchResult", _status: LaunchStatus
+) -> None:
+    return None
+
+
+_LAUNCH_ERROR_BY_FAILURE_DISPOSITION: dict[
+    bool,
+    Callable[["LaunchResult", LaunchStatus], McpErrorPayload | None],
+] = {
+    False: _no_launch_failure_error,
+    True: _build_launch_failure_error,
+}
+
+
+def launch_failure_error(
+    launch_result: "LaunchResult",
+) -> McpErrorPayload | None:
     """Map a launcher outcome onto the MCP error object, or ``None`` on success.
 
     This is the single owner of the ``LaunchResult`` → ``orchestrator.start``
@@ -111,12 +142,9 @@ def launch_failure_error(launch_result: "LaunchResult") -> dict[str, str] | None
     receives a structured error — never a silent "started".
     """
     status = LaunchStatus.parse(launch_result.status)
-    if not status.is_failure:
-        return None
-    return {
-        "message": _launch_failure_message(launch_result, status),
-        "type": LAUNCH_FAILURE_ERROR_TYPES[status],
-    }
+    return _LAUNCH_ERROR_BY_FAILURE_DISPOSITION[status.is_failure](
+        launch_result, status
+    )
 
 
 def _mcp_repos_allowlist() -> list[Path] | None:
@@ -378,7 +406,7 @@ class McpApp:
             return result
         return {**result, "ui_hint": self._doctor_ui_hint()}
 
-    def _doctor_ui_hint(self) -> dict[str, Any]:
+    def _doctor_ui_hint(self) -> McpUiHintPayload:
         """Build the doctor hint for a failed start. Never raises.
 
         The URL is a convenience for opening the doctor panel, and resolving it
@@ -391,10 +419,10 @@ class McpApp:
         dropped, and a hint without one still routes the operator to the doctor
         panel, which is where the underlying fault will be diagnosed anyway.
         """
-        hint: dict[str, Any] = {"kind": "doctor"}
+        hint = McpUiHintPayload(kind="doctor")
         try:
             doctor_url = self._client.doctor_url()
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.exception(
                 "resolving the doctor URL failed; returning the start error "
                 "with a URL-less doctor hint"
