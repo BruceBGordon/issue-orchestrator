@@ -182,6 +182,12 @@ _SELF_RECORDING_CAUSES = frozenset(
     {NeedsHumanCause.TECH_LEAD_ESCALATION, NeedsHumanCause.CLAIM_QUARANTINE}
 )
 
+#: ...and because their records live in their own lifecycles, they are also the
+#: causes a force-clear CANNOT settle (#6999 F3 round 4). Both re-assert the
+#: block on their next pass, so clearing the label around them would be undone
+#: within a tick - after an operator had been told the issue was unblocked.
+_UNSETTLEABLE_BY_FORCE = _SELF_RECORDING_CAUSES
+
 
 @dataclass(frozen=True, slots=True)
 class NeedsHumanBlock:
@@ -224,17 +230,26 @@ class NeedsHumanBlock:
         cause arriving second is exactly the case that used to leave no trace
         and lose its block.
         """
+        # Provenance FIRST, then the label (#6999 F4 round 4). Labelling first
+        # left a window where the external write had committed and the cause
+        # store had not: a LIVE block nobody owns, which the next remover takes
+        # away because it can find no reason for it. This order can only leave
+        # the opposite - a recorded cause with no label - which is self-healing,
+        # because a cause is read against the live label and a row standing over
+        # an absent one is pruned on sight.
+        self._record(request)
         try:
             self.labels.add_label(request.target, self.needs_human_label)
         except Exception:
             logger.exception(
                 "[BLOCK] Could not apply the shared needs-human block to #%d "
-                "for %s; recording nothing, so the next tick retries cleanly",
+                "for %s; withdrawing the cause just recorded so nothing claims "
+                "a block that does not exist",
                 request.target,
                 request.cause.value,
             )
+            self._withdraw(request)
             return BlockOutcome.FAILED
-        self._record(request)
         return BlockOutcome.HELD
 
     def release(self, request: HumanBlockRequest) -> BlockOutcome:
@@ -246,8 +261,11 @@ class NeedsHumanBlock:
         this owner closes, and it now holds for every remover rather than for
         the two that remembered to ask.
         """
-        self._withdraw(request)
         if self.held_by_another_cause(request.target, excluding=request.cause):
+            # Asked BEFORE withdrawing, because the question is about the other
+            # causes and this one does not count itself. Only then is this
+            # cause discharged - the label stays for whoever else needs it.
+            self._withdraw(request)
             logger.info(
                 "[BLOCK] #%d keeps needs-human after %s withdrew: another "
                 "lifecycle still requires it",
@@ -255,18 +273,50 @@ class NeedsHumanBlock:
                 request.cause.value,
             )
             return BlockOutcome.HELD_BY_ANOTHER_CAUSE
+        # Last cause standing. The LABEL goes first and the cause is discharged
+        # only once it is actually gone (#6999 F4 round 4): withdrawing first
+        # meant a failed removal returned FAILED with the label still on the
+        # issue and its last cause already erased - the unowned live block this
+        # owner exists to make impossible.
         return self._take_label_off(request.target, request.reason)
 
     def force_clear(self, target: int, reason: str) -> BlockOutcome:
-        """End EVERY cause and take the label off (#6999 F2 round 3).
+        """End every cause this owner can settle, or REFUSE (#6999 F3 round 4).
 
-        Operator and terminal-recovery intent, which is categorically different
-        from a lifecycle giving its own block back: it OVERRIDES the other
-        causes rather than asking them. Naming that intent is what stops a
-        force-clear reading as one cause's release - and, in the other
-        direction, what stops a bypassing removal leaving rows behind for a
-        later re-added label to inherit.
+        Operator and terminal-recovery intent: it overrides the causes recorded
+        here rather than asking them, because those exist only while the label
+        does. But two causes are not this owner's to settle, and pretending
+        otherwise was a lie with teeth:
+
+        * a QUARANTINE row means a terminal nobody can account for may still be
+          running the issue's work. It re-applies the block on every scan, so
+          clearing the label here would be undone within a tick - after the
+          operator had been told the issue was requeued, and after the queue had
+          acted on that. Relaunching work whose quarantined terminal is still
+          alive is the duplicate execution the quarantine exists to prevent.
+        * a TECH-LEAD escalation keeps its own marker label, which this owner
+          does not remove; its lifecycle recovers the block from that marker on
+          the next reconcile, so the clear would not stick either.
+
+        So a force-clear that meets either one is REFUSED, with the label left
+        exactly where it is. ``HELD_BY_ANOTHER_CAUSE`` is the honest answer: the
+        operator learns the issue is still blocked and why, instead of being
+        told it was cleared by a command that could not clear it.
         """
+        held = [
+            cause
+            for cause in _UNSETTLEABLE_BY_FORCE
+            if self._holds(cause, target)
+        ]
+        if held:
+            logger.warning(
+                "[BLOCK] Refusing to force-clear needs-human on #%d (%s): %s "
+                "still requires it, and this command cannot settle that owner",
+                target,
+                reason,
+                ", ".join(cause.value for cause in held),
+            )
+            return BlockOutcome.HELD_BY_ANOTHER_CAUSE
         return self._take_label_off(target, reason)
 
     def held_by_another_cause(

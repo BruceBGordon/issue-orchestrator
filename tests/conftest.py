@@ -1071,7 +1071,8 @@ def build_test_orchestrator_deps(
     needs_human_block = NeedsHumanBlock(
         needs_human_label=label_manager.needs_human,
         tech_lead_marker=label_manager.tech_lead_needs_human,
-        labels=_action_applier.labels,
+        # The RAW writer: the owner is the one holder that may write this label.
+        labels=repo_host,
         read_labels=repo_host.get_issue_labels_fresh,
         quarantined_issue_numbers=pending_work_claims.quarantined_issue_numbers,
         causes=pending_work_claims,

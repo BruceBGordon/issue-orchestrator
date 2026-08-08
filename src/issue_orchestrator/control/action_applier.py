@@ -58,6 +58,7 @@ if TYPE_CHECKING:
 from .label_mutation_stats import LabelMutationStatField, LabelMutationStats
 from .escalation_notice import escalation_comment, publish_escalation_events
 from .mutation_gate import ReconciliationGate
+from .sync_reconciliation import check_sync_reconciliation
 from .needs_human_block import (
     NO_OTHER_NEEDS_HUMAN_CAUSES,
     UNCAUSED_BLOCK_MUTATION,
@@ -807,57 +808,16 @@ class ActionApplier:
         add_labels: tuple[str, ...],
         remove_labels: tuple[str, ...],
     ) -> tuple[bool, str, set[str]]:
-        """Check reconciliation for a sync operation.
-
-        Args:
-            issue_number: Issue to check
-            add_labels: Labels we plan to add
-            remove_labels: Labels we plan to remove
-
-        Returns:
-            Tuple of (should_proceed, message, current_labels).
-            If reconciliation is not enabled or can't run, returns (True, "", current_labels).
-        """
+        """Soft reconciliation for a sync. See :mod:`.sync_reconciliation`."""
         if not self.reconcile:
             return True, "", set()
-
-        current = self._fetch_current_labels(issue_number)
-        if current is None:
-            # Can't verify - proceed with warning
-            logger.warning(
-                issue_log(issue_number, "Reconciliation enabled but cannot fetch labels"),
-            )
-            return True, "Cannot fetch current labels", set()
-
-        # Check 1: Labels we plan to remove should exist
-        missing_to_remove = set(remove_labels) - current
-        if missing_to_remove:
-            msg = f"Labels to remove not present: {missing_to_remove}"
-            logger.warning(issue_log(issue_number, "Reconciliation: %s"), msg)
-            # This is a warning, not a hard failure - label may have been
-            # removed externally which is fine
-            self.events.publish(make_trace_event(
-                EventName.RECONCILIATION_WARNING,
-                {
-                    "issue_number": issue_number,
-                    "message": msg,
-                    "missing_labels": list(missing_to_remove),
-                },
-            ))
-
-        # Check 2: Labels we expect to be there for this transition
-        # For now, we just log what we found vs expected
-        self.events.publish(make_trace_event(
-            EventName.RECONCILIATION_CHECKED,
-            {
-                "issue_number": issue_number,
-                "current_labels": list(current),
-                "add_labels": list(add_labels),
-                "remove_labels": list(remove_labels),
-            },
-        ))
-
-        return True, "", current
+        return check_sync_reconciliation(
+            self.events,
+            issue_number,
+            add_labels,
+            remove_labels,
+            self._fetch_current_labels(issue_number),
+        )
 
     def _apply_sync_labels(self, action: Action) -> ActionResult:
         """Synchronize labels on an issue.
@@ -886,7 +846,9 @@ class ActionApplier:
 
         errors = []
 
-        # Add labels
+        # Add labels. A collection is exactly where the governed block could be
+        # smuggled past its owner, so the capability refuses it by value and the
+        # refusal is reported rather than swallowed (#6999 F2 round 4).
         for label in action.add_labels:
             self._record_label_stat(action.issue_number, "label_add_attempted")
             try:
@@ -957,13 +919,24 @@ class ActionApplier:
             self._record_label_stat(action.issue_number, "label_remove_attempted")
             try:
                 if self.needs_human_block.owns(label):
-                    # Terminal recovery OVERRIDES every cause rather than
-                    # withdrawing one, and the causes must end with the label
-                    # (#6999 F2 round 3). Removing it directly left rows behind
-                    # for a later re-added label to inherit.
-                    if not self.needs_human_block.force_clear(
+                    # Terminal recovery overrides the causes recorded by this
+                    # owner, and they must end with the label (#6999 F2 r3).
+                    outcome = self.needs_human_block.force_clear(
                         action.issue_number, action.reason
-                    ).committed:
+                    )
+                    if outcome is BlockOutcome.HELD_BY_ANOTHER_CAUSE:
+                        # A quarantine or tech-lead escalation still requires
+                        # the block and this command cannot settle it (#6999 F3
+                        # round 4). Shedding the REST is still correct and the
+                        # recovery still finalizes: one label legitimately held
+                        # by another owner is not a failure of the shed, and
+                        # failing here would wedge terminal recovery behind a
+                        # quarantine until a human intervened.
+                        self._record_label_stat(
+                            action.issue_number, "label_remove_noop"
+                        )
+                        continue
+                    if not outcome.committed:
                         raise RuntimeError("shared block could not be cleared")
                 else:
                     self.labels.remove_label(action.issue_number, label)

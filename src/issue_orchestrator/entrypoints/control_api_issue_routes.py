@@ -48,8 +48,18 @@ def _clear_operator_label(
     if not block.owns(label):
         orchestrator.repository_host.remove_label(issue_number, label)
         return
-    if not block.force_clear(issue_number, f"operator {intent}").committed:
-        raise RuntimeError("shared needs-human block could not be cleared")
+    outcome = block.force_clear(issue_number, f"operator {intent}")
+    if outcome.committed:
+        return
+    # Reported as a failure to clear, which is exactly what it is (#6999 F3
+    # round 4). The caller keeps the label in its `failed` list, so retry does
+    # NOT prune its gates and does not tell an operator the issue was requeued
+    # while a quarantine or tech-lead escalation still blocks it - a claim the
+    # very next reconciliation pass would contradict.
+    raise RuntimeError(
+        f"shared needs-human block on #{issue_number} was not cleared "
+        f"({outcome.value}): another lifecycle still requires it"
+    )
 
 
 @control_issue_router.post("/api/preflight-push")

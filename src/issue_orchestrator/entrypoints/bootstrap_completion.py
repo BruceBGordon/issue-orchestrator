@@ -20,6 +20,7 @@ from ..infra.config import Config
 from ..ports import EventSink
 
 if TYPE_CHECKING:
+    from ..control.needs_human_block import SharedNeedsHumanBlock
     from ..control.open_issue_corpus import OpenIssueCorpusManager
     from ..ports.completion_handler_factory import CompletionHandlerFactory
     from ..ports.repository_host import RepositoryHost
@@ -100,6 +101,10 @@ def create_completion_components(
     *,
     # Required: the composition root owns the single shared endpoint.
     agent_callback_endpoint: "AgentCallbackEndpoint",
+    # The one owner of the shared needs-human block. The agent-requested
+    # NEEDS_HUMAN completion outcome routes through it, and the label adapter
+    # below refuses that label by value, so the two halves cannot disagree.
+    needs_human_block: "SharedNeedsHumanBlock",
 ) -> tuple[
     "CompletionProcessor | None",
     "SessionController | None",
@@ -122,6 +127,7 @@ def create_completion_components(
     from ..execution.persistent_review_exchange_runner import (
         PersistentReviewExchangeRunner,
     )
+    from ..control.governed_label_set import GovernedLabelSet
     from ..control.review_exchange_lifecycle import (
         ReviewExchangeCancellation,
         cancel_issue_review_exchange,
@@ -147,7 +153,13 @@ def create_completion_components(
         )
 
     completion_processor = CompletionProcessor(
-        label_adapter=github,
+        # The governed shared block is refused here BY VALUE, so an
+        # agent-supplied ``pr_labels`` entry cannot mint a cause-free block
+        # (#6999 F2 round 4). The typed NEEDS_HUMAN completion outcome routes
+        # through the owner instead, which is where a cause gets recorded.
+        label_adapter=GovernedLabelSet(
+            labels=github, governed_label=label_manager.needs_human
+        ),
         pr_adapter=github,
         git_adapter=working_copy,
         session_output=session_output,
@@ -167,6 +179,7 @@ def create_completion_components(
         review_artifact_reader=ManifestReviewArtifactReader(),
         runtime_identity=runtime_identity.resolve_runtime_identity(),
         tech_lead_authority=tech_lead_authority,
+        needs_human_block=needs_human_block,
     )
 
     session_controller_instance = SessionController(

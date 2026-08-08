@@ -24,9 +24,36 @@ from ..execution.pending_work_claim_store import SqlitePendingWorkClaimStore
 
 if TYPE_CHECKING:
     from ..control.action_applier import ActionApplier
+    from ..control.governed_label_set import LabelWriter
     from ..control.label_manager import LabelManager
     from ..ports import EventSink
     from ..ports.repository_host import RepositoryHost
+
+
+def require_repository_host(
+    github: "RepositoryHost | None",
+) -> "RepositoryHost":
+    """The repository host, or the operator-facing error explaining its absence.
+
+    Hoisted out of :func:`_validate_required_deps` so the same message can be
+    raised at the first point that genuinely needs a host, rather than letting
+    a downstream ``None`` surface as an AttributeError. The shared-block owner
+    is that point: it reads live labels and writes the governed label, so it
+    cannot be built without one (#6999 F2 round 4).
+    """
+    if github is not None:
+        return github
+    raise ValueError(
+        "Could not determine GitHub repository.\n\n"
+        "Either:\n"
+        "  1. Set 'repo.name' in your config file:\n"
+        "       repo:\n"
+        "         name: owner/repo-name\n\n"
+        "  2. Or ensure you're running from a git repo with a GitHub remote:\n"
+        "       git remote get-url origin\n"
+        "       # Should show: https://github.com/owner/repo.git"
+    )
+
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,6 +70,10 @@ def build_pending_work_wiring(
     repo_root: Path,
     repository_host: "RepositoryHost",
     action_applier: "ActionApplier",
+    # The RAW label writer. The owner is the one holder that may write the
+    # governed label, so it deliberately does NOT receive the guarded
+    # capability every other writer gets (#6999 F2 round 4).
+    label_writer: "LabelWriter",
     label_manager: "LabelManager",
     events: "EventSink",
 ) -> PendingWorkWiring:
@@ -50,7 +81,7 @@ def build_pending_work_wiring(
     claims = SqlitePendingWorkClaimStore.for_repo(repo_root)
     needs_human_block = NeedsHumanBlock(
         needs_human_label=label_manager.needs_human,
-        labels=action_applier.labels,
+        labels=label_writer,
         tech_lead_marker=label_manager.tech_lead_needs_human,
         read_labels=repository_host.get_issue_labels_fresh,
         quarantined_issue_numbers=claims.quarantined_issue_numbers,
@@ -77,4 +108,8 @@ def build_pending_work_wiring(
     )
 
 
-__all__ = ["PendingWorkWiring", "build_pending_work_wiring"]
+__all__ = [
+    "PendingWorkWiring",
+    "build_pending_work_wiring",
+    "require_repository_host",
+]

@@ -10,6 +10,31 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
+def _run_capturing(tmp_path: Path, code: str, rel_path: str):
+    """Run the checker and return (exit code, combined output)."""
+    target = tmp_path / rel_path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(textwrap.dedent(code))
+
+    tools_dir = tmp_path / "tools"
+    tools_dir.mkdir(exist_ok=True)
+    repo_tools = _repo_root() / "tools"
+    (tools_dir / "check_arch_guardrails.py").write_text(
+        (repo_tools / "check_arch_guardrails.py").read_text()
+    )
+    (tools_dir / "ast_guardrails.yml").write_text(
+        (repo_tools / "ast_guardrails.yml").read_text()
+    )
+
+    proc = subprocess.run(
+        [sys.executable, "tools/check_arch_guardrails.py", "src"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+    )
+    return proc.returncode, proc.stdout + proc.stderr
+
+
 def _run(tmp_path: Path, code: str, rel_path: str) -> int:
     target = tmp_path / rel_path
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -235,4 +260,146 @@ def test_blocks_persistent_pair_run_rebind(tmp_path: Path) -> None:
             "src/issue_orchestrator/execution/anywhere.py",
         )
         == 2
+    )
+
+
+# ---------------------------------------------------------------------------
+# The shared needs-human block boundary (#6999 F2)
+# ---------------------------------------------------------------------------
+#
+# A guardrail nobody has watched fail is a guardrail nobody knows works. These
+# pin the two supported bypass forms - a direct write of the governed label, and
+# a label action that names it without a cause - and the one audited escape.
+# What the checker CANNOT see is pinned too, because that limit is the reason
+# the runtime capability exists beside it.
+
+_CONTROL = "src/issue_orchestrator/control/x.py"
+# Direct label writes are separately forbidden in control by the older
+# ``control_no_direct_label_mutations`` rule, so the ALLOW cases below live
+# where that rule does not apply - otherwise they would prove nothing about
+# this one.
+_EXECUTION = "src/issue_orchestrator/execution/x.py"
+
+
+def test_blocks_a_direct_write_of_the_governed_label(tmp_path: Path) -> None:
+    code, out = _run_capturing(
+        tmp_path,
+        """
+        def sneak(labels, lm, issue_number):
+            labels.add_label(issue_number, lm.needs_human)
+        """,
+        _CONTROL,
+    )
+    assert code == 2
+    assert "shared-needs-human-block-bypass" in out
+
+
+def test_blocks_a_direct_removal_of_the_governed_label(tmp_path: Path) -> None:
+    code, out = _run_capturing(
+        tmp_path,
+        """
+        def sneak(labels, lm, issue_number):
+            labels.remove_label(issue_number, lm.needs_human)
+        """,
+        _CONTROL,
+    )
+    assert code == 2
+    assert "shared-needs-human-block-bypass" in out
+
+
+def test_blocks_a_label_action_that_names_no_cause(tmp_path: Path) -> None:
+    code, out = _run_capturing(
+        tmp_path,
+        """
+        from .actions import AddLabelAction
+
+        def sneak(lm, issue_number):
+            return AddLabelAction(
+                issue_number=issue_number, label=lm.needs_human, reason="x"
+            )
+        """,
+        _CONTROL,
+    )
+    assert code == 2
+    assert "shared-needs-human-block-uncaused" in out
+
+
+def test_allows_a_label_action_that_names_its_cause(tmp_path: Path) -> None:
+    assert (
+        _run(
+            tmp_path,
+            """
+            from .actions import AddLabelAction
+            from .needs_human_block import NeedsHumanCause
+
+            def owned(lm, issue_number):
+                return AddLabelAction(
+                    issue_number=issue_number,
+                    label=lm.needs_human,
+                    reason="x",
+                    needs_human_cause=NeedsHumanCause.SESSION_LIFECYCLE,
+                )
+            """,
+            _CONTROL,
+        )
+        == 0
+    )
+
+
+def test_allows_the_one_audited_ungoverned_fallback(tmp_path: Path) -> None:
+    """A composition with no owner must still perform the write.
+
+    Turning a real mutation into a silent no-op is worse than the bypass, so
+    the escape exists - spelled out at the call site so it stays greppable and
+    has to be justified.
+    """
+    assert (
+        _run(
+            tmp_path,
+            """
+            def fallback(labels, action):
+                labels.add_label(  # shared-block: ungoverned fallback
+                    action.pr_number, action.needs_human_label
+                )
+            """,
+            _EXECUTION,
+        )
+        == 0
+    )
+
+
+def test_leaves_ordinary_labels_alone(tmp_path: Path) -> None:
+    assert (
+        _run(
+            tmp_path,
+            """
+            def ordinary(labels, lm, issue_number):
+                labels.add_label(issue_number, lm.in_progress)
+                labels.remove_label(issue_number, lm.pr_pending)
+            """,
+            _EXECUTION,
+        )
+        == 0
+    )
+
+
+def test_a_dynamic_label_value_is_beyond_the_checker(tmp_path: Path) -> None:
+    """The documented limit, pinned so nobody mistakes it for coverage.
+
+    A value that arrives at runtime - an agent's ``pr_labels`` entry, a member
+    of a planner-assembled collection - has no spelling for an AST check to
+    recognise. That is exactly why ``GovernedLabelSet`` refuses the label BY
+    VALUE at the capability: the two together cover what neither can alone.
+    """
+    assert (
+        _run(
+            tmp_path,
+            """
+            def dynamic(labels, issue_number, agent_supplied):
+                for label in agent_supplied:
+                    labels.add_label(issue_number, label)
+            """,
+            _EXECUTION,
+        )
+        == 0
     )

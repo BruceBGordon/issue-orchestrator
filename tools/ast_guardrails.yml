@@ -97,6 +97,11 @@ deny_attr_calls:
       # and operator force-clear routes through it - and the companion
       # shared-needs-human-block-bypass check enforces the other direction.
       - src/issue_orchestrator/control/needs_human_block.py
+      # ...and the capability wrapper it hands to everyone else. This file is a
+      # pass-through with one refusal in it: it makes direct label mutation of
+      # the governed label impossible for its holders, which is the opposite of
+      # bypassing the applier boundary.
+      - src/issue_orchestrator/control/governed_label_set.py
       # tech_lead_proposals hosts ActionApplier execution boundaries extracted
       # for the applier line budget (#6778): apply_create_tech_lead_issue and
       # finalize_tech_lead_op_execution run ONLY inside applier handlers, so

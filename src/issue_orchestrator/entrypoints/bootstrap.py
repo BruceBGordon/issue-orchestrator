@@ -19,7 +19,7 @@ import logging
 import os
 import sys
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 from uuid import uuid4
 
 from ..control.background_job_supervisor import BackgroundJobSupervisor
@@ -30,7 +30,11 @@ from .bootstrap_provider import (
     build_provider_readiness_probe,
     build_provider_resilience,
 )
-from .bootstrap_pending_work import build_pending_work_wiring
+from .bootstrap_pair_registry import build_pair_registry_with_worktree_hook
+from .bootstrap_pending_work import (
+    build_pending_work_wiring,
+    require_repository_host,
+)
 from .bootstrap_session_launcher import build_session_launcher_factory
 from .bootstrap_completion import (
     _validation_attempt_key_factory,
@@ -72,6 +76,7 @@ from ..control import (
     LabelSync,
 )
 from ..control.action_applier import ActionApplier
+from ..control.governed_label_set import GovernedLabelSet
 from ..control.fact_gatherer import FactGatherer
 from ..control.health_gate import HealthGate
 from ..adapters.github import GitHubAuth, GitHubIssueResolver, GitHubCache, build_github_auth
@@ -111,6 +116,7 @@ from ..ports.claim_manager import ClaimManager, NullClaimManager
 from ..domain.lease_config import LeaseConfig
 
 if TYPE_CHECKING:
+    from ..ports.label_set import LabelSet
     from ..control.label_manager import LabelManager
     from ..infra.orchestrator import Orchestrator
     from ..ports.attempt_store import AttemptStore
@@ -145,55 +151,6 @@ def export_orchestrator_python() -> None:
     at a different interpreter) are never clobbered.
     """
     os.environ.setdefault(ISSUE_ORCHESTRATOR_PYTHON_ENV, sys.executable)
-
-
-def _build_pair_registry_with_worktree_hook():  # noqa: ANN201
-    """Build the persistent pair registry with the worktree-reclaim hook.
-
-    The hook reclaims the reviewer worktree at the same lifecycle
-    boundary that closes the subprocesses (PR #6212 review feedback).
-    Without it, B2's removal of the per-exchange
-    ``remove_reviewer_worktree`` call would leave sibling worktrees
-    on disk after every release path (escalation / reset / shutdown
-    / merge). Hook is best-effort: errors are logged inside the
-    registry's ``_tear_down`` so a failed ``git worktree remove``
-    doesn't mask whatever brought us into the release path.
-
-    Extracted to a module-level helper so the production and testing
-    bootstrap paths share one wiring (single owner) and so tests
-    that patch ``remove_reviewer_worktree`` at the source module see
-    a real registry that delegates to the patched function.
-    """
-    from ..execution.persistent_exchange_pair_registry_inmemory import (
-        InMemoryPersistentExchangePairRegistry,
-        PersistentExchangePair,
-    )
-
-    def _reclaim_reviewer_worktree(
-        pair: PersistentExchangePair, reason: str,
-    ) -> None:
-        # Resolve the worktree helpers lazily inside the hook so
-        # tests can patch
-        # ``issue_orchestrator.execution.reviewer_worktree.remove_reviewer_worktree``
-        # at the source module and have the patch take effect.
-        # ``coder_branch`` is unused by ``remove_reviewer_worktree`` —
-        # it only needs the path — so stamping a placeholder keeps
-        # the helper's existing signature working without forcing the
-        # pair to remember the branch.
-        from ..execution import reviewer_worktree as _rw  # noqa: PLR0402
-
-        del reason  # only used in the registry's structured log
-        _rw.remove_reviewer_worktree(
-            _rw.ReviewerWorktree(
-                path=pair.reviewer_worktree_path,
-                coder_branch="<unused-on-removal>",
-            ),
-            force=True,
-        )
-
-    return InMemoryPersistentExchangePairRegistry(
-        on_release=_reclaim_reviewer_worktree,
-    )
 
 
 def _resolve_repo(config: Config) -> str | None:
@@ -370,7 +327,12 @@ def _create_planner(
 
     scheduler = Scheduler(config=config, dependency_evaluator=dependency_evaluator)
 
-    label_sync = LabelSync(labels=github, events=events, pr_tracker=github, label_manager=label_manager) if github else None
+    # The governed block is refused BY VALUE here, so a computed sync
+    # collection cannot smuggle it past its owner (#6999 F2 round 4).
+    label_sync = LabelSync(
+        labels=GovernedLabelSet(labels=github, governed_label=label_manager.needs_human),
+        events=events, pr_tracker=github, label_manager=label_manager,
+    ) if github and label_manager else None
 
     review_workflow = ReviewWorkflow(config=config, events=events)
     retrospective_review_workflow = RetrospectiveReviewWorkflow(config=config, events=events)
@@ -498,17 +460,7 @@ def _validate_required_deps(
 ) -> None:
     """Validate all required dependencies are present."""
     # GitHub requires special error message
-    if github is None:
-        raise ValueError(
-            "Could not determine GitHub repository.\n\n"
-            "Either:\n"
-            "  1. Set 'repo.name' in your config file:\n"
-            "       repo:\n"
-            "         name: owner/repo-name\n\n"
-            "  2. Or ensure you're running from a git repo with a GitHub remote:\n"
-            "       git remote get-url origin\n"
-            "       # Should show: https://github.com/owner/repo.git"
-        )
+    require_repository_host(github)
     # Check all other required deps with a data-driven approach
     deps_to_check = [
         (event_hub, "EventHub"),
@@ -673,9 +625,18 @@ def build_orchestrator(
 
     e2e_issue_tracker = GitHubE2EIssueTracker(github.http_client) if github else None
 
+    # Every label writer EXCEPT the shared-block owner gets a capability that
+    # refuses the governed label by value (#6999 F2 round 4): a check the caller
+    # never received cannot be routed around.
+    governed_labels = GovernedLabelSet(
+        labels=github, governed_label=label_manager.needs_human
+    ) if github else None
+
     # Create action applier (IO boundary)
     action_applier = ActionApplier(
-        labels=github,
+        # ``github`` is None only on the no-repository path, which fails with a
+        # ValueError further down; the applier is never used before then.
+        labels=cast("LabelSet", governed_labels),
         sessions=session_manager,
         events=events,
         repository_host=github,
@@ -725,7 +686,7 @@ def build_orchestrator(
     # review exchange. Built here (above completion components and
     # InfraServices) so the shutdown / reset / escalation paths can
     # reach it through ``deps.pair_registry``.
-    pair_registry = _build_pair_registry_with_worktree_hook()
+    pair_registry = build_pair_registry_with_worktree_hook()
 
     # Process-scoped rendezvous between the exchange worker thread and the
     # agent-facing ``exchange-respond`` Control API handler. One instance,
@@ -741,7 +702,17 @@ def build_orchestrator(
     agent_callback_endpoint = RuntimeAgentCallbackEndpoint()
 
 
-    # Create completion components
+    # Built here, before the completion pipeline, because that pipeline needs
+    # the shared-block owner: the agent's typed needs_human outcome routes
+    # through it (#6999 F2 round 4).
+    repository_host = require_repository_host(github)
+    pending_work = build_pending_work_wiring(
+        repo_root=config.repo_root,
+        repository_host=repository_host,
+        action_applier=cast("ActionApplier", action_applier),
+        label_writer=repository_host,
+        label_manager=label_manager, events=events)
+
     completion_processor, session_controller_instance, completion_handler_factory = create_completion_components(
         config, github, events, working_copy, session_output, command_runner, provider_resilience,
         label_manager=label_manager,
@@ -753,6 +724,7 @@ def build_orchestrator(
         tech_lead_authority=tech_lead_authority,
         open_issue_corpus=tech_lead.open_issue_corpus,
         repository_host=github,
+        needs_human_block=pending_work.needs_human_block,
     )
     _wire_stack_publish_gate(
         completion_processor, _dependency_evaluator, github, command_runner, config,
@@ -840,9 +812,6 @@ def build_orchestrator(
     # Bundle all dependencies into OrchestratorDeps (no nulls, no optionals)
     # Assembly of the session launcher lives here, at the composition
     # root, rather than in the facade or the control layer (#6924 A3-R2).
-    pending_work = build_pending_work_wiring(
-        repo_root=config.repo_root, repository_host=github,
-        action_applier=action_applier, label_manager=label_manager, events=events)
     session_launcher_factory = build_session_launcher_factory(
         config=config,
         events=events,
@@ -1046,7 +1015,9 @@ def build_orchestrator_for_testing(
     # Create default action applier
     if action_applier is None:
         action_applier = ActionApplier(
-            labels=github,
+            labels=GovernedLabelSet(
+                labels=github, governed_label=label_manager.needs_human
+            ),
             sessions=session_manager,
             events=events,
             repository_host=github,
@@ -1098,7 +1069,7 @@ def build_orchestrator_for_testing(
         ReviewExchangeCancellation,
         cancel_issue_review_exchange,
     )
-    pair_registry_for_testing = _build_pair_registry_with_worktree_hook()
+    pair_registry_for_testing = build_pair_registry_with_worktree_hook()
     from ..execution.review_exchange_turn_mailbox import InMemoryTurnMailbox
     turn_mailbox = InMemoryTurnMailbox()
 
@@ -1130,8 +1101,15 @@ def build_orchestrator_for_testing(
             job_supervisor=background_job_supervisor,
         )
 
+    pending_work = build_pending_work_wiring(
+        repo_root=config.repo_root, repository_host=github,
+        action_applier=action_applier, label_writer=github,
+        label_manager=label_manager, events=events)
+
     completion_processor = CompletionProcessor(
-        label_adapter=github,
+        label_adapter=GovernedLabelSet(
+            labels=github, governed_label=label_manager.needs_human
+        ),
         pr_adapter=github,
         git_adapter=working_copy,
         session_output=session_output,
@@ -1148,6 +1126,7 @@ def build_orchestrator_for_testing(
         review_artifact_reader=ManifestReviewArtifactReader(),
         runtime_identity=runtime_identity.resolve_runtime_identity(),
         tech_lead_authority=tech_lead_authority_for_testing,
+        needs_human_block=pending_work.needs_human_block,
     )
     _wire_stack_publish_gate(
         completion_processor, _dependency_evaluator, github, command_runner, config,
@@ -1169,7 +1148,7 @@ def build_orchestrator_for_testing(
     )
 
     # Create LabelSync for testing
-    label_sync = default_label_sync or LabelSync(labels=github, events=events, pr_tracker=github, label_manager=label_manager)
+    label_sync = default_label_sync or LabelSync(labels=GovernedLabelSet(labels=github, governed_label=label_manager.needs_human), events=events, pr_tracker=github, label_manager=label_manager)
 
     # Create EventHub for testing
     event_hub = EventHub()
@@ -1237,9 +1216,6 @@ def build_orchestrator_for_testing(
     # Bundle all dependencies into OrchestratorDeps (no nulls, no optionals)
     # Assembly of the session launcher lives here, at the composition
     # root, rather than in the facade or the control layer (#6924 A3-R2).
-    pending_work = build_pending_work_wiring(
-        repo_root=config.repo_root, repository_host=github,
-        action_applier=action_applier, label_manager=label_manager, events=events)
     session_launcher_factory = build_session_launcher_factory(
         config=config,
         events=events,

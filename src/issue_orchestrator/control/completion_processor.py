@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
 from ..domain.artifact_contracts import ValidationFailed
+from .governed_label_set import GovernedLabelError
 from .needs_human_block import (
     NO_OTHER_NEEDS_HUMAN_CAUSES,
     BlockOutcome,
@@ -2586,10 +2587,30 @@ class CompletionProcessor:
         # Skip for fake/dry-run PRs (numbers 90000-99999)
         is_dry_run_pr = 90000 <= pr.number <= 99999
         if record.pr_labels and not is_dry_run_pr:
+            applied: list[str] = []
             for label in record.pr_labels:
-                self.label_adapter.add_label(pr.number, label)
+                # An agent's completion record is untrusted input, and the
+                # shared block is not a label it may hand itself (#6999 F2
+                # round 4): applied here it would create a block with no cause
+                # recorded, which a later typed release then takes away from
+                # whoever did record one. The agent already has the typed
+                # NEEDS_HUMAN completion outcome, which routes through the
+                # owner and records the cause.
+                try:
+                    self.label_adapter.add_label(pr.number, label)
+                except GovernedLabelError:
+                    logger.error(
+                        "[COMPLETION] Refusing pr_labels entry %r on PR #%d: "
+                        "the shared needs-human block is not the agent's to "
+                        "apply; use the needs_human completion outcome",
+                        label,
+                        pr.number,
+                    )
+                    continue
+                applied.append(label)
                 logger.info("Added label '%s' to PR #%d", label, pr.number)
-            actions_taken.append(f"Added labels to PR: {record.pr_labels}")
+            if applied:
+                actions_taken.append(f"Added labels to PR: {applied}")
         elif record.pr_labels and is_dry_run_pr:
             logger.info("[E2E_DRY_RUN] Skipping PR label addition for fake PR #%d", pr.number)
 
