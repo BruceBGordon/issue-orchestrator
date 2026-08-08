@@ -107,6 +107,7 @@ from .tech_lead_proposals import (
     build_duplicate_proposal_comment,
     build_tech_lead_proposal_issue_action,
 )
+from .needs_human_block import NeedsHumanCause
 
 if TYPE_CHECKING:
     from ..domain.tech_lead_artifacts import TechLeadFinding
@@ -230,6 +231,7 @@ def _concrete_actions(
                 issue_number=action.target_number,
                 label=needs_human_label,
                 reason=f"tech_lead decision action {action.id}: escalate to human",
+                needs_human_cause=NeedsHumanCause.SESSION_LIFECYCLE,
                 expected=expected,
             ),
             AddCommentAction(

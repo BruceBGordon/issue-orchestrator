@@ -27,6 +27,13 @@ from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
 from ..domain.artifact_contracts import ValidationFailed
+from .needs_human_block import (
+    NO_OTHER_NEEDS_HUMAN_CAUSES,
+    BlockOutcome,
+    HumanBlockRequest,
+    NeedsHumanCause,
+    SharedNeedsHumanBlock,
+)
 from ..domain.completion_finalization import (
     CompletionFinalizationCommand,
     CompletionFinalizationPlan,
@@ -162,6 +169,15 @@ from .validation_record_containment import (
     open_contained_validation_record as _open_contained_validation_record,
 )
 
+# Completion actions that assert the shared needs-human block, and the cause
+# each one carries (#6999 F2 round 3). A table rather than a branch: a
+# completion action added later either appears here with a cause or does not
+# touch the block at all.
+_AGENT_BLOCK_CAUSES = {
+    RequestedAction.ADD_NEEDS_HUMAN_LABEL: NeedsHumanCause.AGENT_COMPLETION,
+}
+
+
 
 class CompletionProcessor:
     """Process agent completion records and execute requested actions.
@@ -196,6 +212,10 @@ class CompletionProcessor:
         review_artifact_reader: ReviewArtifactReader | None = None,
         runtime_identity: RuntimeIdentity | None = None,
         tech_lead_authority: "TechLeadAuthorityStore | None" = None,
+        # The one owner of the shared needs-human block (#6999 F2 round 3).
+        # An explicit null object rather than an optional: it governs no label,
+        # so a composition path without one behaves as it always did.
+        needs_human_block: "SharedNeedsHumanBlock" = NO_OTHER_NEEDS_HUMAN_CAUSES,
     ):
         """Initialize the processor with required adapters.
 
@@ -224,6 +244,7 @@ class CompletionProcessor:
                 processed; the fail-fast default raises on first use.
         """
         self.label_adapter = label_adapter
+        self.needs_human_block = needs_human_block
         self.pr_adapter = pr_adapter
         self.git_adapter = git_adapter
         self.session_output = session_output
@@ -1949,6 +1970,8 @@ class CompletionProcessor:
 
         label_key, target_number, operation = config
         label = self._get_label(label_key)
+        if owned := self._shared_block_request(action, issue_number, actions_taken):
+            return owned
         if is_timeline_trace_enabled():
             logger.info(
                 "[TIMELINE] completion.label_mutation issue=%s action=%s operation=%s label_key=%s label=%s target=%s",
@@ -1969,6 +1992,49 @@ class CompletionProcessor:
             self.label_adapter.remove_label(target_number, label)
             actions_taken.append(f"Removed '{label}' label from #{target_number}")
 
+        return self._ActionResult()
+
+    def _shared_block_request(
+        self,
+        action: RequestedAction,
+        issue_number: int,
+        actions_taken: list[str],
+    ) -> "_ActionResult | None":
+        """Route an agent-requested ``needs_human`` through the block owner.
+
+        The agent asked for the shared block by name, and that assertion needs
+        provenance exactly as the orchestrator's own do (#6999 F2 round 3).
+        Applying it straight through the label adapter was the MAIN completion
+        path bypassing the owner: a quarantine holding the same label could
+        resolve and take away a block the session had just asked for, because
+        nothing recorded that the session needed it.
+
+        ``None`` means "not mine" - a different action, or a composition with
+        no owner wired - and the caller's ordinary table handles it.
+        """
+        cause = _AGENT_BLOCK_CAUSES.get(action)
+        if cause is None:
+            return None
+        outcome = self.needs_human_block.acquire(
+            HumanBlockRequest(
+                target=issue_number,
+                cause=cause,
+                reason="agent requested needs_human on completion",
+            )
+        )
+        if outcome is BlockOutcome.UNGOVERNED:
+            # No owner in this composition; the ordinary adapter path applies.
+            return None
+        if not outcome.committed:
+            logger.error(
+                "[COMPLETION] Could not apply the shared needs-human block to "
+                "issue #%d; the next tick retries",
+                issue_number,
+            )
+            # Nothing recorded and nothing labelled, so the completion must
+            # not report a block it does not have.
+            return self._ActionResult(halt=True)
+        actions_taken.append(f"Added '{self._get_label('needs_human')}' label")
         return self._ActionResult()
 
     def _execute_push_action(

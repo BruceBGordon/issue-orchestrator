@@ -73,6 +73,7 @@ from .actions import (
     ResetRetryIssueAction,
     SurfaceTechLeadProposalAction,
 )
+from .needs_human_block import NeedsHumanCause
 
 if TYPE_CHECKING:
     from ..domain.models import SessionHistoryEntry
@@ -586,6 +587,7 @@ def build_required_act_level_failure_actions(
             issue_number=issue_number,
             label=needs_human_label,
             reason="mandated reset_retry did not commit; routing to needs-human",
+            needs_human_cause=NeedsHumanCause.SESSION_LIFECYCLE,
         ),
         AddCommentAction(
             number=issue_number,

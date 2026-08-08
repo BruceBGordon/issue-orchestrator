@@ -21,6 +21,7 @@ if TYPE_CHECKING:
     from ..ports.label_store import LabelStore
     from ..ports.pending_work_claim_store import PendingWorkClaimStore
     from .claim_quarantine import ClaimQuarantineOwner
+    from .needs_human_block import SharedNeedsHumanBlock
     from ..ports.queue_cache_store import QueueCacheStore
     from ..ports import (
         EventSink,
@@ -135,6 +136,10 @@ class OrchestratorDeps:
     # Owns what an unreadable claim means: its own durable per-run marker, its
     # own labels/comment, and the event only after those commit (#6999 F12/A5).
     claim_quarantine: "ClaimQuarantineOwner"
+    # The one owner of the shared needs-human block: every acquisition, cause
+    # release and operator force-clear of that label routes through it, so a
+    # block can never exist without a discoverable cause (#6999 F2 round 3).
+    needs_human_block: "SharedNeedsHumanBlock"
 
     # Claim/lease management (multi-orchestrator coordination)
     claim_manager: "ClaimManager"

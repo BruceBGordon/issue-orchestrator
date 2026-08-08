@@ -102,6 +102,25 @@ def create_mock_orchestrator():
     )
     lm.is_pr_pending = MagicMock(side_effect=lambda labels: "pr-pending" in labels)
 
+    # The shared needs-human block owner, faithful to production: it is the
+    # ONE writer of that label, and it writes through the same repository host
+    # the operator routes would otherwise have called directly (#6999 F2 r3).
+    class _SharedBlock:
+        def owns(self, label: str) -> bool:
+            return label == lm.needs_human
+
+        def force_clear(self, target: int, reason: str):
+            from issue_orchestrator.control.needs_human_block import BlockOutcome
+
+            del reason
+            try:
+                mock.repository_host.remove_label(target, lm.needs_human)
+            except Exception:
+                return BlockOutcome.FAILED
+            return BlockOutcome.CLEARED
+
+    mock.deps.needs_human_block = _SharedBlock()
+
     # Mock event context for snapshot (use public property)
     mock.event_context = MagicMock()
     mock.event_context.tick_id = 0

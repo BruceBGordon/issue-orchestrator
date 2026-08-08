@@ -79,13 +79,12 @@ class AddLabelAction(Action):
     label: str = ""
     issue_key: str = ""  # stable_id for SSE events; falls back to str(issue_number) when empty
     # Which lifecycle is asserting the shared needs-human block, when that is
-    # the label being added (#6999 F2 round 2). Ignored for every other label.
-    # It defaults to SESSION_LIFECYCLE - the catch-all for planner escalations -
-    # so a call site that adds the shared label without thinking about ownership
-    # still records provenance rather than creating an unowned block. The two
-    # lifecycles that keep their own durable provenance name themselves, which
-    # is what stops a re-assertion by one of them reading as a second cause.
-    needs_human_cause: NeedsHumanCause = NeedsHumanCause.SESSION_LIFECYCLE
+    # the label being added (#6999 F2 round 3). Ignored for every other label,
+    # and REQUIRED for that one: the applier refuses a governed-label action
+    # that names no cause rather than defaulting it. A catch-all default made
+    # every uncaused site look correct while collapsing independent assertions
+    # onto one row, where a single release erased them all.
+    needs_human_cause: NeedsHumanCause | None = None
     action_type: ActionType = field(default=ActionType.ADD_LABEL, init=False)
 
 
@@ -97,9 +96,11 @@ class RemoveLabelAction(Action):
     label: str = ""
     issue_key: str = ""  # stable_id for SSE events; falls back to str(issue_number) when empty
     # Which lifecycle is WITHDRAWING its claim on the shared needs-human block
-    # (#6999 F2 round 2). The withdrawal always happens; the label only comes
-    # off if no other cause still requires it.
-    needs_human_cause: NeedsHumanCause = NeedsHumanCause.SESSION_LIFECYCLE
+    # (#6999 F2 round 3). The withdrawal always happens; the label only comes
+    # off if no other cause still requires it. An operator or terminal-recovery
+    # clear is NOT one of these - it overrides every cause and goes through the
+    # owner's force_clear instead, so the two intents cannot be confused.
+    needs_human_cause: NeedsHumanCause | None = None
     action_type: ActionType = field(default=ActionType.REMOVE_LABEL, init=False)
 
 

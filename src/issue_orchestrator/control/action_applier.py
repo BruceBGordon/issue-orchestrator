@@ -56,10 +56,14 @@ if TYPE_CHECKING:
     from .tech_lead_kill_session import TechLeadKillSessionExecutor
     from .tech_lead_reset_retry import TechLeadResetRetryExecutor
 from .label_mutation_stats import LabelMutationStatField, LabelMutationStats
+from .escalation_notice import escalation_comment, publish_escalation_events
 from .mutation_gate import ReconciliationGate
 from .needs_human_block import (
     NO_OTHER_NEEDS_HUMAN_CAUSES,
-    BlockMutation,
+    UNCAUSED_BLOCK_MUTATION,
+    BlockOutcome,
+    HumanBlockRequest,
+    NeedsHumanCause,
     SharedNeedsHumanBlock,
 )
 from .reconciliation import ReconciliationRequired
@@ -306,13 +310,18 @@ class ActionApplier:
         # Verify claim ownership before write (raises ClaimLostError)
         self._verify_claim_before_write(action, action.issue_number)
 
+        governed = self.needs_human_block.owns(action.label)
+        if governed and action.needs_human_cause is None:
+            return self._uncaused_block_mutation(action)
+
         try:
             self._record_label_stat(action.issue_number, "label_add_attempted")
             has_label = self._has_label_safely(action.issue_number, action.label)
             if has_label is True:
                 # Already present, but THIS lifecycle now requires it too, and
                 # that is exactly the fact a later remover needs (#6999 F2 r2).
-                self._on_label_added(action)
+                if governed and not self._acquire_block(action).committed:
+                    return ActionResult.fail(action, "shared block not recorded")
                 self._record_label_stat(action.issue_number, "label_add_noop")
                 self._log_label_mutation(
                     level=logging.INFO,
@@ -329,9 +338,12 @@ class ActionApplier:
                     label=action.label,
                     no_op=True,
                 )
-            self.labels.add_label(action.issue_number, action.label)
+            if governed:
+                if not self._acquire_block(action).committed:
+                    return ActionResult.fail(action, "shared block not applied")
+            else:
+                self.labels.add_label(action.issue_number, action.label)
             self._persist_label_add(action.issue_number, action.label)
-            self._on_label_added(action)
             self._record_label_stat(action.issue_number, "label_add_applied")
             self._log_label_mutation(
                 level=logging.INFO,
@@ -366,49 +378,74 @@ class ActionApplier:
             )
             return ActionResult.fail(action, str(e))
 
-    def _on_label_added(self, action: AddLabelAction) -> None:
-        self.needs_human_block.blocks_mutation(
-            action.issue_number,
-            action.label,
-            BlockMutation.ACQUIRED,
-            cause=action.needs_human_cause,
-            reason=action.reason,
+    def _acquire_block(self, action: AddLabelAction) -> BlockOutcome:
+        """Hand the governed label to its owner, which applies AND records it."""
+        assert action.needs_human_cause is not None
+        return self.needs_human_block.acquire(
+            HumanBlockRequest(
+                target=action.issue_number,
+                cause=action.needs_human_cause,
+                reason=action.reason,
+            )
         )
 
-    def _withdraw_needs_human_cause(
-        self, action: RemoveLabelAction
-    ) -> Optional[ActionResult]:
-        """Withdraw this remover's cause; stop if another still holds the block.
+    def _release_block(self, action: RemoveLabelAction) -> ActionResult:
+        """Withdraw this cause; the owner decides whether the label follows.
 
-        A refusal is reported as a successful no-op, not a failure (#6999 F2
-        round 2). Nothing went wrong: this cause IS withdrawn, its obligation is
-        discharged, and the label correctly stays for someone else. Reporting
-        failure would make an owner retry forever against a block it no longer
-        has any claim on.
+        A block another lifecycle still requires is reported as a successful
+        no-op, not a failure (#6999 F2 round 2): nothing went wrong, this cause
+        IS discharged, and the label correctly stays for someone else.
+        Reporting failure would make an owner retry forever against a block it
+        no longer has any claim on.
         """
-        if not self.needs_human_block.blocks_mutation(
+        assert action.needs_human_cause is not None
+        self._record_label_stat(action.issue_number, "label_remove_attempted")
+        outcome = self.needs_human_block.release(
+            HumanBlockRequest(
+                target=action.issue_number,
+                cause=action.needs_human_cause,
+                reason=action.reason,
+            )
+        )
+        if outcome is BlockOutcome.FAILED:
+            self._record_label_stat(action.issue_number, "label_mutation_failed")
+            return ActionResult.fail(action, "shared block could not be cleared")
+        held = outcome is BlockOutcome.HELD_BY_ANOTHER_CAUSE
+        if not held:
+            self._persist_label_remove(action.issue_number, action.label)
+            self._emit_issue_labels_changed(
+                action.issue_number, [], [action.label], issue_key=action.issue_key
+            )
+        self._record_label_stat(
             action.issue_number,
-            action.label,
-            BlockMutation.RELEASING,
-            cause=action.needs_human_cause,
-        ):
-            return None
+            "label_remove_noop" if held else "label_remove_applied",
+        )
         self._log_label_mutation(
             level=logging.INFO,
             issue_number=action.issue_number,
             operation="remove",
-            outcome="noop",
+            outcome="noop" if held else "applied",
             label=action.label,
             reason=action.reason,
-            detail="another lifecycle still requires the shared block",
+            detail="another lifecycle still requires the shared block" if held else None,
         )
         return ActionResult.ok(
             action,
             issue_number=action.issue_number,
             label=action.label,
-            no_op=True,
-            blocked_by_other_cause=True,
+            no_op=held,
+            blocked_by_other_cause=held,
         )
+
+    def _uncaused_block_mutation(self, action: Action) -> ActionResult:
+        """Refuse a shared-block mutation that names no cause (#6999 F2 r3)."""
+        logger.error(
+            "[BLOCK] %s on #%d: %s",
+            UNCAUSED_BLOCK_MUTATION,
+            getattr(action, "issue_number", 0),
+            action.reason,
+        )
+        return ActionResult.fail(action, UNCAUSED_BLOCK_MUTATION)
 
     def _apply_remove_label(self, action: Action) -> ActionResult:
         """Remove a label from an issue."""
@@ -419,8 +456,10 @@ class ActionApplier:
         # Verify claim ownership before write (raises ClaimLostError)
         self._verify_claim_before_write(action, action.issue_number)
 
-        if blocked := self._withdraw_needs_human_cause(action):
-            return blocked
+        if self.needs_human_block.owns(action.label):
+            if action.needs_human_cause is None:
+                return self._uncaused_block_mutation(action)
+            return self._release_block(action)
 
         try:
             self._record_label_stat(action.issue_number, "label_remove_attempted")
@@ -453,12 +492,6 @@ class ActionApplier:
                 )
             self.labels.remove_label(action.issue_number, action.label)
             self._persist_label_remove(action.issue_number, action.label)
-            self.needs_human_block.blocks_mutation(
-                action.issue_number,
-                action.label,
-                BlockMutation.RELEASED,
-                cause=action.needs_human_cause,
-            )
             self._record_label_stat(action.issue_number, "label_remove_applied")
             self._log_label_mutation(
                 level=logging.INFO,
@@ -923,7 +956,17 @@ class ActionApplier:
         for label in to_remove:
             self._record_label_stat(action.issue_number, "label_remove_attempted")
             try:
-                self.labels.remove_label(action.issue_number, label)
+                if self.needs_human_block.owns(label):
+                    # Terminal recovery OVERRIDES every cause rather than
+                    # withdrawing one, and the causes must end with the label
+                    # (#6999 F2 round 3). Removing it directly left rows behind
+                    # for a later re-added label to inherit.
+                    if not self.needs_human_block.force_clear(
+                        action.issue_number, action.reason
+                    ).committed:
+                        raise RuntimeError("shared block could not be cleared")
+                else:
+                    self.labels.remove_label(action.issue_number, label)
                 self._persist_label_remove(action.issue_number, label)
                 self._record_label_stat(action.issue_number, "label_remove_applied")
                 self._log_label_mutation(
@@ -1199,7 +1242,26 @@ class ActionApplier:
         # Add needs-human label
         self._record_label_stat(action.issue_number, "label_add_attempted")
         try:
-            self.labels.add_label(action.pr_number, action.needs_human_label)
+            # Through the owner, and against the PR - the number actually
+            # labelled (#6999 F2 round 3). Recording this cause against the
+            # issue would leave the PR's block with no discoverable owner at
+            # all. A composition without an owner still writes directly: the
+            # boundary must never turn a real mutation into a silent no-op.
+            acquired = self.needs_human_block.acquire(
+                HumanBlockRequest(
+                    target=action.pr_number,
+                    cause=NeedsHumanCause.MERGE_ESCALATION,
+                    reason=action.reason or "escalated-to-human",
+                )
+            )
+            if acquired is BlockOutcome.UNGOVERNED:
+                # No owner in this composition, so the boundary must not turn a
+                # real mutation into a silent no-op.
+                self.labels.add_label(  # shared-block: ungoverned fallback
+                    action.pr_number, action.needs_human_label
+                )
+            elif not acquired.committed:
+                raise RuntimeError("shared needs-human block did not apply")
             self._persist_label_add(action.pr_number, action.needs_human_label)
             self._record_label_stat(action.issue_number, "label_add_applied")
             added_labels.append(action.needs_human_label)
@@ -1230,22 +1292,12 @@ class ActionApplier:
         # comment_override, use that verbatim (post-publish-stuck path
         # provides its own copy that doesn't mention rework cycles).
         if self.repository_host:
-            if action.comment_override is not None:
-                comment = action.comment_override
-            else:
-                latest_review_section = self._get_latest_review_section(
+            comment = escalation_comment(
+                action,
+                self._get_latest_review_section(
                     action.pr_number, action.latest_review_body
-                )
-                comment = f"""## ⚠️ Escalated to Human Review
-
-This PR has gone through {action.rework_cycles - 1} rework cycles without passing review.
-Maximum rework cycles ({action.max_rework_cycles}) exceeded.
-{latest_review_section}
-**A human needs to review and either:**
-- Approve the PR manually
-- Provide specific guidance for the agent
-- Take over the implementation
-"""
+                ),
+            )
             try:
                 comment_url = self.repository_host.add_comment(action.pr_number, comment)
             except Exception as e:
@@ -1257,31 +1309,7 @@ Maximum rework cycles ({action.max_rework_cycles}) exceeded.
             action.pr_number, action.needs_human_label, action.rework_cycles,
         )
 
-        # Emit trace event
-        self.events.publish(
-            make_trace_event(
-                EventName.REVIEW_ESCALATED,
-                {
-                    "pr_number": action.pr_number,
-                    "issue_number": action.issue_number,
-                    "rework_count": action.rework_cycles - 1,
-                    "rework_cycle": action.rework_cycles,
-                    "max_rework_cycles": action.max_rework_cycles,
-                },
-            )
-        )
-        if comment_url:
-            self.events.publish(
-                make_trace_event(
-                    EventName.REVIEW_COMMENT_ADDED,
-                    {
-                        "issue_number": action.issue_number,
-                        "pr_number": action.pr_number,
-                        "comment_url": comment_url,
-                        "summary": "Posted escalation comment",
-                    },
-                )
-            )
+        publish_escalation_events(self.events, action, comment_url)
 
         if errors:
             return ActionResult.fail(action, "; ".join(errors))

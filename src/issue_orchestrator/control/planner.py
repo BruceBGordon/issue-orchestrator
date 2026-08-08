@@ -96,6 +96,7 @@ from .tech_lead_issue_policy import (
     batch_review_issue_labels,
     tech_lead_issue_milestone_intent,
 )
+from .needs_human_block import NeedsHumanCause
 
 logger = logging.getLogger(__name__)
 
@@ -867,6 +868,8 @@ Flip labels from `{facts.watch_label}` to `{self.config.tech_lead_reviewed_label
                         actions.append(RemoveLabelAction(
                             issue_number=rework.pr_number, label=self._lm.needs_human,
                             reason="post-publish state now reworkable; clearing needs-human",
+                            # Withdraws EscalateToHumanAction's own cause on this PR.
+                            needs_human_cause=NeedsHumanCause.MERGE_ESCALATION,
                         ))
                     actions.append(AddLabelAction(
                         issue_number=rework.pr_number, label=self._lm.needs_rework,

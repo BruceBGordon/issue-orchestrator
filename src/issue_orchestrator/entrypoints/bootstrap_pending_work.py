@@ -50,6 +50,7 @@ def build_pending_work_wiring(
     claims = SqlitePendingWorkClaimStore.for_repo(repo_root)
     needs_human_block = NeedsHumanBlock(
         needs_human_label=label_manager.needs_human,
+        labels=action_applier.labels,
         tech_lead_marker=label_manager.tech_lead_needs_human,
         read_labels=repository_host.get_issue_labels_fresh,
         quarantined_issue_numbers=claims.quarantined_issue_numbers,

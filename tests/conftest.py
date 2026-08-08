@@ -1071,6 +1071,7 @@ def build_test_orchestrator_deps(
     needs_human_block = NeedsHumanBlock(
         needs_human_label=label_manager.needs_human,
         tech_lead_marker=label_manager.tech_lead_needs_human,
+        labels=_action_applier.labels,
         read_labels=repo_host.get_issue_labels_fresh,
         quarantined_issue_numbers=pending_work_claims.quarantined_issue_numbers,
         causes=pending_work_claims,
@@ -1111,6 +1112,7 @@ def build_test_orchestrator_deps(
             events=events,
             needs_human_block=needs_human_block,
         ),
+        needs_human_block=needs_human_block,
         # The same endpoint the completion processor got, mirroring how
         # bootstrap shares one instance. Nothing binds a port in tests, so
         # it honestly resolves to "no endpoint yet".

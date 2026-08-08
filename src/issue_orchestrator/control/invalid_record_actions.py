@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any
 from ..domain.models import Session
 from .actions import Action, AddCommentAction, AddLabelAction, RemoveLabelAction
 from .completion_record_validation import CompletionRecordLoadFailure
+from .needs_human_block import NeedsHumanCause
 
 if TYPE_CHECKING:
     from .label_manager import LabelManager
@@ -118,6 +119,7 @@ def invalid_record_actions(
                 issue_number=issue_number,
                 label=labels.needs_human,
                 reason="Completion record could not be accepted by orchestrator",
+                needs_human_cause=NeedsHumanCause.SESSION_LIFECYCLE,
                 expected=expected,
             ),
             AddCommentAction(

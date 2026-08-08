@@ -92,6 +92,11 @@ deny_attr_calls:
       - src/issue_orchestrator/control/action_applier.py
       - src/issue_orchestrator/control/completion_processor.py
       - src/issue_orchestrator/control/label_sync.py
+      # The shared needs-human block's one owner (#6999 F2 round 3). It is the
+      # only writer of that label BY DESIGN - every acquisition, cause release
+      # and operator force-clear routes through it - and the companion
+      # shared-needs-human-block-bypass check enforces the other direction.
+      - src/issue_orchestrator/control/needs_human_block.py
       # tech_lead_proposals hosts ActionApplier execution boundaries extracted
       # for the applier line budget (#6778): apply_create_tech_lead_issue and
       # finalize_tech_lead_op_execution run ONLY inside applier handlers, so

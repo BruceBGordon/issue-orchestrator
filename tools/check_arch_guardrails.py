@@ -703,6 +703,93 @@ def _check_denied_call_rules(
     return violations
 
 
+
+# --- shared needs-human block boundary (#6999 F2 round 3) -------------------
+#
+# The shared ``needs-human`` label has several independent causes, and a
+# remover that cannot see all of them takes a block away from a lifecycle that
+# still needs it. ``control/needs_human_block.py`` is the one owner that
+# applies, releases and force-clears that label; everything else consumes its
+# typed commands. These checks stop a future call site quietly reaching around
+# it, which is exactly how the four bypasses this rule was written for got in.
+
+_BLOCK_OWNER = "src/issue_orchestrator/control/needs_human_block.py"
+_BLOCK_LABEL_WRITES = {"add_label", "remove_label"}
+_BLOCK_LABEL_ACTIONS = {"AddLabelAction", "RemoveLabelAction"}
+_BLOCK_FALLBACK_MARKER = "# shared-block: ungoverned fallback"
+
+
+def _mentions_shared_block_label(node: ast.AST | None) -> bool:
+    """Whether an expression names the governed label (not the tech-lead marker)."""
+    if node is None:
+        return False
+    for sub in ast.walk(node):
+        name = None
+        if isinstance(sub, ast.Attribute):
+            name = sub.attr
+        elif isinstance(sub, ast.Name):
+            name = sub.id
+        if name is None:
+            continue
+        if "tech_lead_needs_human" in name:
+            continue
+        if name in {"needs_human", "needs_human_label"}:
+            return True
+    return False
+
+
+def check_shared_needs_human_block(
+    path: Path, tree: ast.AST, source: str
+) -> list[Violation]:
+    if path.as_posix().endswith(_BLOCK_OWNER):
+        return []
+
+    # One audited escape: a composition with no owner wired must still perform
+    # the write, or the boundary turns a real mutation into a silent no-op.
+    # Spelled out at the call site so it is greppable and has to be justified.
+    lines = source.splitlines()
+    violations: list[Violation] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+
+        if isinstance(node.func, ast.Attribute) and node.func.attr in _BLOCK_LABEL_WRITES:
+            label_arg = node.args[1] if len(node.args) > 1 else None
+            marked = _BLOCK_FALLBACK_MARKER in lines[node.lineno - 1]
+            if _mentions_shared_block_label(label_arg) and not marked:
+                violations.append(
+                    Violation(
+                        path.as_posix(),
+                        node.lineno,
+                        node.col_offset,
+                        "shared-needs-human-block-bypass",
+                        f"{node.func.attr}(...) writes the shared needs-human "
+                        "label directly; route it through NeedsHumanBlock "
+                        "acquire/release/force_clear",
+                    )
+                )
+            continue
+
+        constructor = _constructor_name(node.func)
+        if constructor not in _BLOCK_LABEL_ACTIONS:
+            continue
+        label = _keyword_value_for(node, "label")
+        if not _mentions_shared_block_label(label):
+            continue
+        if _keyword_value_for(node, "needs_human_cause") is None:
+            violations.append(
+                Violation(
+                    path.as_posix(),
+                    node.lineno,
+                    node.col_offset,
+                    "shared-needs-human-block-uncaused",
+                    f"{constructor} targets the shared needs-human label with "
+                    "no needs_human_cause; name the lifecycle that requires it",
+                )
+            )
+    return violations
+
+
 def check_file(
     path: Path, rules: dict, allow_prefixes: Sequence[str]
 ) -> list[Violation]:
@@ -722,6 +809,9 @@ def check_file(
     violations.extend(check_attr_call_rules(path, tree, rules))
     violations.extend(check_symbol_ref_rules(path, tree, rules))
     violations.extend(check_review_exchange_typed_flow_rules(path, tree))
+    violations.extend(
+        check_shared_needs_human_block(path, tree, path.read_text(encoding="utf-8"))
+    )
 
     deny_imports = set(rules.get("deny_imports", []) or [])
     deny_dynamic_imports = set(rules.get("deny_dynamic_imports", []) or [])

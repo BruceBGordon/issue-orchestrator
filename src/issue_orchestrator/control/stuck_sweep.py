@@ -56,6 +56,7 @@ from typing import TYPE_CHECKING
 
 from ..domain.models import DiscoveredFailure, SessionStatus
 from ..domain.tech_lead_session import PROPOSED_TECH_LEAD_LABEL, TECH_LEAD_OBSERVATION_LABEL
+from .needs_human_block import NeedsHumanCause
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -514,6 +515,7 @@ def build_stuck_sweep_escalation_actions(
             issue_number=issue_number,
             label=needs_human_label,
             reason="stuck-sweep recovery budget exhausted (#6824)",
+            needs_human_cause=NeedsHumanCause.SESSION_LIFECYCLE,
             expected=build_expected_for_mutation(),
         )
         for issue_number in label_issue_numbers

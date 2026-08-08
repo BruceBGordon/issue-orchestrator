@@ -33,6 +33,25 @@ logger = logging.getLogger(__name__)
 control_issue_router = APIRouter()
 
 
+def _clear_operator_label(
+    orchestrator, issue_number: int, label: str, intent: str
+) -> None:
+    """Take one label off on an operator's behalf. Raises if it did not commit.
+
+    The shared needs-human block goes through its owner (#6999 F2 round 3).
+    Operator intent OVERRIDES every recorded cause rather than withdrawing one,
+    so it force-clears: the causes must end with the label, or a row outlives
+    it and a later re-added block inherits a cause nobody is asserting.
+    Everything else is an ordinary label the operator route may clear directly.
+    """
+    block = orchestrator.deps.needs_human_block
+    if not block.owns(label):
+        orchestrator.repository_host.remove_label(issue_number, label)
+        return
+    if not block.force_clear(issue_number, f"operator {intent}").committed:
+        raise RuntimeError("shared needs-human block could not be cleared")
+
+
 @control_issue_router.post("/api/preflight-push")
 async def preflight_push(request: Request) -> JSONResponse:
     """Check if a git push would succeed (dry-run).
@@ -493,7 +512,7 @@ async def retry_issue(
         failed: list[str] = []
         for label in labels_to_remove:
             try:
-                orchestrator.repository_host.remove_label(issue_number, label)
+                _clear_operator_label(orchestrator, issue_number, label, "retry")
                 removed.append(label)
             except Exception:
                 failed.append(label)
@@ -576,7 +595,7 @@ async def dismiss_issue(
         removed = []
         for label in labels_to_remove:
             try:
-                orchestrator.repository_host.remove_label(issue_number, label)
+                _clear_operator_label(orchestrator, issue_number, label, "dismiss")
                 removed.append(label)
             except Exception:
                 pass

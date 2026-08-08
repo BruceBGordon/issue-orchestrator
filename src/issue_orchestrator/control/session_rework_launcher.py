@@ -41,6 +41,7 @@ from .session_worktree_diagnostics import (
 )
 from .transition_log import log_transition
 from .worktree_context import WorktreeContext
+from .needs_human_block import NeedsHumanCause
 
 if TYPE_CHECKING:
     from .label_manager import LabelManager
@@ -298,6 +299,7 @@ def launch_rework_session(
                 issue_number=issue_number,
                 label=needs_human_label,
                 reason="worktree preparation failed",
+                needs_human_cause=NeedsHumanCause.SESSION_LIFECYCLE,
             ),
             AddCommentAction(
                 number=issue_number,

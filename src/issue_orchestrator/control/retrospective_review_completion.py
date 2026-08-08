@@ -17,6 +17,7 @@ from .actions import (
     RemoveLabelAction,
     SetIssueStateAction,
 )
+from .needs_human_block import NeedsHumanCause
 
 if TYPE_CHECKING:
     from ..infra.config import Config
@@ -172,6 +173,7 @@ def _retrospective_review_needs_human_actions(
             issue_number=issue_number,
             label=label_manager.needs_human,
             reason=reason,
+            needs_human_cause=NeedsHumanCause.SESSION_LIFECYCLE,
         ),
         AddCommentAction(
             number=issue_number,

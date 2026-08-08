@@ -36,6 +36,7 @@ from .provider_blocked_completion import provider_blocked_actions
 from .reconciliation import ExpectedState, build_expected_for_mutation
 from .tech_lead_session_policy import is_tech_lead_session
 from ..ports.provider_resilience import ProviderErrorType
+from .needs_human_block import NeedsHumanCause
 
 logger = logging.getLogger(__name__)
 
@@ -437,6 +438,7 @@ class CompletionActionPlanner:
                     issue_number=issue_number,
                     label=self._lm.needs_human,
                     reason=f"Publishing failed {new_count} consecutive times — escalating to needs-human",
+                    needs_human_cause=NeedsHumanCause.SESSION_LIFECYCLE,
                     expected=expected,
                 ),
                 AddCommentAction(
@@ -610,6 +612,7 @@ class CompletionActionPlanner:
                     issue_number=issue_number,
                     label=self._lm.needs_human,
                     reason="Session terminated without calling completion command (mandatory)",
+                    needs_human_cause=NeedsHumanCause.SESSION_LIFECYCLE,
                     expected=expected,
                 ),
                 AddCommentAction(
