@@ -31,7 +31,6 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from enum import Enum
 from typing import Protocol
 
 from ..domain.pending_work import PendingWorkKind
@@ -39,6 +38,7 @@ from ..events import EventName
 from ..ports import EventSink, make_trace_event
 from ..ports.pending_work_claim_store import (
     ClaimQuarantineStore,
+    QuarantineCause,
     QuarantineLabelState,
     UnreadableClaim,
     UnresolvedClaim,
@@ -53,41 +53,6 @@ from .in_flight_work import QuarantinedSession
 from .label_manager import LabelManager
 
 logger = logging.getLogger(__name__)
-
-
-class QuarantineCause(Enum):
-    """Why a run is quarantined — a typed part of this owner's boundary.
-
-    Not one message with a boolean (#6999 A1). The two families say opposite
-    things about the queued work:
-
-    * an UNREADABLE CLAIM means nobody can name what the run is carrying, so an
-      operator has to work it out before re-queuing anything;
-    * an UNRESTORABLE RUN means the claim is perfectly intact and the work IS
-      named — it is deliberately not being requeued because a terminal is still
-      running it. Telling an operator that this work is "unknown" invites the
-      manual requeue, and therefore the duplicate execution, that protecting the
-      run was meant to prevent.
-
-    The fourth state is both at once and gets its own variant rather than an
-    implicit branch: a live terminal that can be neither rebuilt nor identified
-    (#6999 F2). It used to be protected from requeueing and reported to nobody.
-    """
-
-    #: A live terminal was rebuilt, but the claim it holds cannot be read.
-    CLAIM_UNREADABLE_LIVE_RUN = "claim_unreadable_live_run"
-    #: A ledger row nothing is running, whose payload cannot be rebuilt.
-    CLAIM_UNREADABLE_ENDED_RUN = "claim_unreadable_ended_run"
-    #: A live terminal whose session assets could not be rebuilt. Its claim
-    #: reads cleanly, so the work it holds is known exactly.
-    RUN_UNRESTORABLE = "run_unrestorable"
-    #: A live terminal that can be neither rebuilt nor identified.
-    RUN_UNRESTORABLE_CLAIM_UNREADABLE = "run_unrestorable_claim_unreadable"
-
-    @property
-    def still_running(self) -> bool:
-        """Whether a terminal for this run may still be alive."""
-        return self is not QuarantineCause.CLAIM_UNREADABLE_ENDED_RUN
 
 
 @dataclass(frozen=True, slots=True)
@@ -209,12 +174,21 @@ class ClaimQuarantineOwner:
     """The one place a run is quarantined for an unreadable claim.
 
     Escalation and release are a durable state machine, not a pair of one-shot
-    calls (#6999 F12). Three facts are persisted separately because they fail
+    calls (#6999 F12). Four facts are persisted separately because they change
     separately: whether this quarantine ACQUIRED the shared blocking label (as
     opposed to finding it already there), whether the operator comment
-    committed, and whether a resolved cause still has cleanup outstanding. The
-    row survives every one of those until its own step succeeds, so anything
-    that failed is retried by the next sweep rather than becoming final.
+    committed, whether a resolved cause still has cleanup outstanding, and WHICH
+    CAUSE the committed comment was written for. The row survives every one of
+    those until its own step succeeds, so anything that failed is retried by the
+    next sweep rather than becoming final.
+
+    The cause is durable for the same reason the announcement is (#6999 F6).
+    Every word an operator reads - and the event name the dashboard reacts to -
+    is chosen from the cause alone, so an announcement remembered without the
+    cause that produced it can only be re-asserted, never corrected. A run
+    announced as ended and then rediscovered alive kept telling a human it had
+    finished and could be re-queued by hand, over a terminal still doing the
+    work.
     """
 
     store: ClaimQuarantineStore
@@ -301,14 +275,16 @@ class ClaimQuarantineOwner:
 
     def _escalate(self, subject: QuarantineSubject) -> None:
         quarantine_key = subject.quarantine_key
+        # This pass's observation is written FIRST, unconditionally, and the
+        # store decides what it means for the announcement (#6999 F6). Recording
+        # only on the first sight of a run was how a changed cause kept the old
+        # story: a run announced as an ended terminal, then rediscovered alive
+        # and unrestorable, still told an operator it had finished and could be
+        # re-queued by hand. It also revives a row whose release had not yet
+        # committed - the cause is demonstrably back.
+        self._record(subject)
         record = self.store.read_quarantine(quarantine_key)
-        if record is None:
-            self._record(subject)
-            record = self.store.read_quarantine(quarantine_key)
-            assert record is not None
-        elif record.releasing:
-            # The cause came back before cleanup finished; it is live again.
-            self._record(subject)
+        assert record is not None
         # Applied on EVERY pass, idempotently. The block is shared with owners
         # that lift it when a session for the issue looks active, and a
         # quarantined terminal is deliberately not one of those - so a sweep
@@ -330,7 +306,7 @@ class ClaimQuarantineOwner:
                 subject.issue_number,
             )
             return
-        if record.announced:
+        if record.announces(subject.cause):
             return
         escalation = _ESCALATIONS[subject.cause]
         if not self.labels.announce(subject.issue_number, escalation.comment(subject)):
@@ -362,6 +338,8 @@ class ClaimQuarantineOwner:
             session_name=subject.session_name,
             issue_number=subject.issue_number,
             error=subject.error,
+            cause=subject.cause,
+            work_kind=subject.work_kind,
         )
 
 
@@ -449,7 +427,7 @@ _ESCALATIONS: dict[QuarantineCause, _Escalation] = {
         ),
     ),
     QuarantineCause.RUN_UNRESTORABLE_CLAIM_UNREADABLE: _Escalation(
-        event=EventName.SESSION_RUN_UNRESTORABLE,
+        event=EventName.SESSION_RUN_UNRESTORABLE_CLAIM_UNREADABLE,
         log_consequence=(
             "The terminal can be neither rebuilt nor identified, so it is "
             "untracked and its work cannot be recovered from the ledger"

@@ -78,7 +78,7 @@ from .action_applier import ActionApplier
 from .actions import Action, AddLabelAction, RemoveLabelAction
 from .tech_lead_needs_human_reconcile import TechLeadNeedsHumanLifecycle, discover_tech_lead_needs_human_issue_numbers
 from .session_manager import SessionManager, SessionRef
-from .in_flight_work import (
+from .launch_transaction import (
     NO_LAUNCH_WORK_CLAIM,
     LaunchWorkClaim,
     SpawnGuard,
@@ -721,7 +721,7 @@ class SessionLauncher:
             )
         self._discard_tech_lead_authority_after_failed_launch(issue, ctx)
         self._release_claim_if_held(issue.number, claim)
-        return LaunchResult(None, False, f"Tech Lead session data preparation failed: {error}", disposition=LaunchDisposition.INPUT_RETRY)
+        return LaunchResult(None, False, f"Tech Lead session data preparation failed: {error}", disposition=LaunchDisposition.RETRYABLE_FAILURE)
 
     def launch_issue_session(  # noqa: C901, PLR0912 - coordinator with claim acquisition, worktree setup, and error handling phases
         self,
@@ -1103,7 +1103,7 @@ class SessionLauncher:
                     issue.number, worktree_path, is_scratch_investigation
                 )
                 self._release_claim_if_held(issue.number, claim)
-                return LaunchResult(None, False, "Failed to create terminal session")
+                return LaunchResult.terminal_spawn_failed()
             spawn.mark_spawned()  # terminal RUNNING = irreversible (#6769 r5)
 
             log_transition("issue", issue.number, "LAUNCHING", "ACTIVE", "session launched", {"agent": issue.agent_type})
@@ -1375,7 +1375,7 @@ class SessionLauncher:
                     ),
                 ], context="launch_validation_retry_session_creation_failed")
                 self._release_claim_if_held(issue.number, claim)
-                return LaunchResult(None, False, "Failed to create terminal session")
+                return LaunchResult.terminal_spawn_failed()
             spawn.mark_spawned()  # terminal RUNNING = irreversible
 
             session = Session(
@@ -1785,10 +1785,29 @@ class SessionLauncher:
                 session_name,
                 session_created,
             )
-            # This path reports success regardless of ``session_created`` (it
-            # has always done so), so the launch hands back a live session from
-            # here on and the claim it holds stays held.
-            spawn.mark_spawned()
+            if not session_created:
+                # Reported success regardless of this until #6999 F5, which put
+                # a phantom review into ``active_sessions``, kept its durable
+                # claim held against a terminal that does not exist, and removed
+                # the pending item as though the work had started. Failing here
+                # - before the spawn is marked irreversible and before the
+                # REVIEW_STARTED event - hands the request back through the same
+                # compensation every other queue already used.
+                log_transition(
+                    "review",
+                    review.pr_number,
+                    "LAUNCHING",
+                    "FAILED",
+                    "session creation failed",
+                )
+                logger.error(
+                    issue_log(
+                        review.issue_number,
+                        "FAILED: review session creation failed",
+                    )
+                )
+                return LaunchResult.terminal_spawn_failed()
+            spawn.mark_spawned()  # terminal RUNNING = irreversible
 
             # Create pseudo-issue for session tracking
             pseudo_issue = Issue(
@@ -2064,7 +2083,7 @@ class SessionLauncher:
                     "FAILED",
                     "session creation failed",
                 )
-                return LaunchResult(None, False, "Failed to create terminal session")
+                return LaunchResult.terminal_spawn_failed()
             spawn.mark_spawned()  # terminal RUNNING = irreversible
 
             pseudo_issue = Issue(

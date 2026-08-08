@@ -479,7 +479,7 @@ class TestLaunchDispositionRetainsPendingWork:
         [
             ("EXISTING_TERMINAL", True),
             ("PROVIDER_DEFERRED", True),
-            ("INPUT_RETRY", True),
+            ("RETRYABLE_FAILURE", True),
             ("PERMANENT_FAILURE", False),
         ],
     )

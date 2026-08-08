@@ -37,7 +37,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Protocol
 
-from ..domain.pending_work import PendingWorkClaim
+from ..domain.pending_work import PendingWorkClaim, PendingWorkKind
 from ..domain.session_run import SessionRunAssets
 
 
@@ -109,6 +109,44 @@ class UnresolvedClaim:
         return _quarantine_key(self.run_key, self.started_at)
 
 
+class QuarantineCause(Enum):
+    """Why a run is quarantined — durable state, not a per-call argument.
+
+    Lives beside :class:`QuarantineRecord` because it is part of the record
+    (#6999 F6). Held only on the ephemeral subject, the cause could not be
+    compared against the one an earlier pass announced, so a run whose
+    observation CHANGED kept the operator story the first pass wrote — an
+    "the terminal has already ended, re-queue by hand if necessary"
+    instruction standing over a terminal that is in fact alive is precisely
+    the duplicate execution this whole boundary exists to prevent.
+
+    The four states are not one message with flags. Two families say opposite
+    things about the queued work:
+
+    * an UNREADABLE CLAIM means nobody can name what the run is carrying, so an
+      operator has to work it out before re-queuing anything;
+    * an UNRESTORABLE RUN means the claim is perfectly intact and the work IS
+      named — it is deliberately not being requeued because a terminal is still
+      running it. Telling an operator that this work is "unknown" invites the
+      manual requeue, and therefore the duplicate execution, that protecting the
+      run was meant to prevent.
+
+    The fourth state is both at once and gets its own variant rather than an
+    implicit branch: a live terminal that can be neither rebuilt nor identified
+    (#6999 F2). It used to be protected from requeueing and reported to nobody.
+    """
+
+    #: A live terminal was rebuilt, but the claim it holds cannot be read.
+    CLAIM_UNREADABLE_LIVE_RUN = "claim_unreadable_live_run"
+    #: A ledger row nothing is running, whose payload cannot be rebuilt.
+    CLAIM_UNREADABLE_ENDED_RUN = "claim_unreadable_ended_run"
+    #: A live terminal whose session assets could not be rebuilt. Its claim
+    #: reads cleanly, so the work it holds is known exactly.
+    RUN_UNRESTORABLE = "run_unrestorable"
+    #: A live terminal that can be neither rebuilt nor identified.
+    RUN_UNRESTORABLE_CLAIM_UNREADABLE = "run_unrestorable_claim_unreadable"
+
+
 class QuarantineLabelState(Enum):
     """Whether a quarantine owns the shared blocking label it needed.
 
@@ -151,6 +189,26 @@ class QuarantineRecord:
     label_state: QuarantineLabelState
     announced: bool
     releasing: bool
+    #: The observation this row's announcement was written for (#6999 F6).
+    #: ``None`` only for a row recorded before the cause became durable; it is
+    #: deliberately not collapsed into a default, because "no cause recorded"
+    #: must read as *different from whatever is observed next* so the story is
+    #: rewritten rather than silently kept.
+    cause: QuarantineCause | None = None
+    #: The queued work this run is carrying, when the claim reads cleanly. It
+    #: is what lets the unrestorable-run story name what it is protecting, so
+    #: it is durable for the same reason the cause is.
+    work_kind: PendingWorkKind | None = None
+
+    def announces(self, cause: QuarantineCause) -> bool:
+        """Whether this row's committed announcement already tells ``cause``'s story.
+
+        The one predicate the escalation's idempotency rests on (#6999 F6):
+        re-observing the SAME cause must not re-comment, and observing a
+        DIFFERENT one must, because the message and event a cause produces are
+        chosen from the cause alone.
+        """
+        return self.announced and self.cause is cause
 
     @property
     def block_is_ours(self) -> bool:
@@ -257,6 +315,35 @@ class PendingWorkClaimStore(Protocol):
         """Stored rows that cannot be rebuilt, for the same recovery sweep."""
         ...
 
+    def retire_deferred_claim(self, work_key: str) -> None:
+        """Delete the deferred row for work a launch has now DROPPED (#6999 F4).
+
+        The other half of the unspawned-launch compensation. Deferring the row
+        says "untouched, waiting to be relaunched", which stops being true the
+        moment the launch transaction commits a drop — the queue item is gone
+        and, for a tech-lead investigation, an exhausted budget has already been
+        escalated to a human. Leaving the row behind lets the startup sweep
+        re-admit work that was deliberately dropped, so "permanent" would not be.
+
+        Addressed by ``work_key`` rather than by run: the row that has to go is
+        the one holding THIS work, whichever run last deferred it.
+        """
+        ...
+
+    def refresh_deferred_claim(self, work_key: str, claim: PendingWorkClaim) -> None:
+        """Re-persist a deferred row's payload from the current request (#6999 F4).
+
+        The payload is written when the claim is HELD, before the launch fails,
+        so state the queue owner mutates while settling that failure — notably a
+        tech-lead item's spent retry budget — is not in it. Without this a
+        restart re-admits the request with a refunded budget and relaunches an
+        investigation whose retries are already exhausted.
+
+        A no-op when no deferred row exists: a launch that never held the claim
+        has nothing to refresh.
+        """
+        ...
+
     def mark_deferred_by_run_key(self, run_key: str) -> None:
         """Move an enumerated row to deferred without deleting it.
 
@@ -308,8 +395,22 @@ class ClaimQuarantineStore(Protocol):
         session_name: str,
         issue_number: int,
         error: str,
+        cause: QuarantineCause,
+        work_kind: PendingWorkKind | None,
     ) -> None:
-        """Record (or refresh) that this run is quarantined."""
+        """Record this pass's observation of a quarantined run.
+
+        One durable transition, and the ONLY place the cause-change rule lives
+        (#6999 F6). Recording a DIFFERENT cause than the row carries clears its
+        announcement, because the comment and event a quarantine produces are
+        chosen from the cause alone: keeping the flag would leave an operator
+        reading a story the orchestrator no longer believes. Recording the SAME
+        cause preserves it, so a run re-observed on every 30-second scan is
+        announced exactly once.
+
+        A resolved-but-uncleaned row (``releasing``) is revived by this call:
+        the cause it was being released for has come back.
+        """
         ...
 
     def read_quarantine(self, quarantine_key: str) -> QuarantineRecord | None:
@@ -358,6 +459,7 @@ __all__ = [
     "ClaimLookup",
     "ClaimQuarantineStore",
     "ClaimState",
+    "QuarantineCause",
     "QuarantineLabelState",
     "QuarantineRecord",
     "ConflictingPendingWorkClaimError",

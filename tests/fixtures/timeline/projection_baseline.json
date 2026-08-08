@@ -863,6 +863,12 @@
     "status": "failed",
     "step": "run_unrestorable"
   },
+  "session.run_unrestorable_claim_unreadable": {
+    "level": "detail",
+    "phase": "in_progress",
+    "status": "failed",
+    "step": "run_unrestorable_claim_unreadable"
+  },
   "session.slow": {
     "level": "detail",
     "phase": "in_progress",

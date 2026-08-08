@@ -3232,8 +3232,9 @@ class TestOrchestratorLaunchTechLeadSession:
     def test_existing_terminal_launch_retains_item_for_retry(self, sample_config):
         """EXISTING_TERMINAL (not yet restorable) retains the item.
 
-        (The other retention cases are ``INPUT_RETRY`` — a transient
-        required-input prep failure — covered by the bounded-retention tests.)
+        (The other retention cases are ``RETRYABLE_FAILURE`` — a transient
+        required-input prep failure, or a terminal that never came up — covered
+        by the bounded-retention tests.)
         """
         sample_config.tech_lead_review_agent = "agent:web"
         state = OrchestratorState()

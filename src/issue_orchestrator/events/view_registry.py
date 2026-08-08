@@ -231,6 +231,17 @@ VIEW_REGISTRY: dict[str, list[ViewEvent]] = {
             "orchestrator",
         ),
     ],
+    # Both at once, and worded so neither half is implied away (#6999 F6): the
+    # terminal cannot be tracked AND its queued work cannot be named. Borrowing
+    # the line above would tell a reader the work is identified when it is not.
+    "session.run_unrestorable_claim_unreadable": [
+        _user(
+            "session.run_unrestorable_claim_unreadable",
+            "Session quarantined — its run could not be rebuilt and its queued "
+            "work could not be identified",
+            "orchestrator",
+        ),
+    ],
 
     # -- Tech Lead --
     "tech_lead.launching": [

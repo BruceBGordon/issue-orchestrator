@@ -38,7 +38,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
-from ..domain.pending_work import PendingWorkClaim
+from ..domain.pending_work import PendingWorkClaim, PendingWorkKind
 from ..domain.session_run import SessionRunAssets
 from ..infra.repo_identity import state_dir
 from ..infra.sqlite_connection import open_sqlite
@@ -46,6 +46,7 @@ from ..ports.pending_work_claim_store import (
     ClaimLookup,
     ClaimState,
     ConflictingPendingWorkClaimError,
+    QuarantineCause,
     QuarantineLabelState,
     QuarantineRecord,
     UnreadableClaim,
@@ -84,9 +85,29 @@ CREATE TABLE IF NOT EXISTS pending_work_claim_quarantine (
     -- committed, so the row survives to be retried.
     label_state TEXT NOT NULL DEFAULT 'unknown',
     announced INTEGER NOT NULL DEFAULT 0,
-    releasing INTEGER NOT NULL DEFAULT 0
+    releasing INTEGER NOT NULL DEFAULT 0,
+    -- The observation the announcement was written for, and the work it names
+    -- (#6999 F6). Durable because ``announced`` is: a quarantine re-observed
+    -- under a DIFFERENT cause has to rewrite the operator's story, and the only
+    -- way to know it changed is to have kept the one that was announced.
+    -- Nullable on purpose - a row from before this column read as "no cause
+    -- recorded", which must differ from every observable cause so the next
+    -- scan re-announces rather than standing on a story nothing vouches for.
+    cause TEXT,
+    work_kind TEXT
 );
 """
+
+# Additive columns the quarantine table gained after it shipped. ``CREATE TABLE
+# IF NOT EXISTS`` leaves an existing table exactly as it is, so a database
+# written by an earlier build keeps the old shape and every later statement
+# referencing these columns fails. Unlike the claim table this needs no
+# all-or-nothing rebuild: quarantines carry no queued work, so a NULL cause is
+# recoverable by the next scan re-announcing (#6999 F6).
+_QUARANTINE_ADDED_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("cause", "TEXT"),
+    ("work_kind", "TEXT"),
+)
 
 STORE_FILENAME = "pending_work_claims.sqlite"
 
@@ -126,6 +147,8 @@ def _quarantine_record(row: sqlite3.Row) -> QuarantineRecord:
         label_state=QuarantineLabelState(row["label_state"]),
         announced=bool(row["announced"]),
         releasing=bool(row["releasing"]),
+        cause=QuarantineCause(row["cause"]) if row["cause"] else None,
+        work_kind=PendingWorkKind(row["work_kind"]) if row["work_kind"] else None,
     )
 
 
@@ -162,7 +185,22 @@ class SqlitePendingWorkClaimStore:
         self._migrate(conn)
         for statement in _schema_statements():
             conn.execute(statement)
+        self._add_missing_quarantine_columns(conn)
         conn.commit()
+
+    @staticmethod
+    def _add_missing_quarantine_columns(conn: sqlite3.Connection) -> None:
+        """Bring an earlier quarantine table up to the current column set."""
+        existing = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(pending_work_claim_quarantine)")
+        }
+        for column, declaration in _QUARANTINE_ADDED_COLUMNS:
+            if column not in existing:
+                conn.execute(
+                    "ALTER TABLE pending_work_claim_quarantine "
+                    f"ADD COLUMN {column} {declaration}"
+                )
 
     @staticmethod
     def _migrate(conn: sqlite3.Connection) -> None:
@@ -394,6 +432,26 @@ class SqlitePendingWorkClaimStore:
                 )
         return tuple(unreadable)
 
+    def retire_deferred_claim(self, work_key: str) -> None:
+        """Drop the deferred row for work a launch transaction gave up on."""
+        with self._write_lock, self._transaction() as conn:
+            conn.execute(
+                "DELETE FROM pending_work_claim WHERE work_key = ? AND deferred = 1",
+                (work_key,),
+            )
+
+    def refresh_deferred_claim(
+        self, work_key: str, claim: PendingWorkClaim
+    ) -> None:
+        """Rewrite the deferred row's payload from the current request."""
+        payload = json.dumps(encode_claim(claim), sort_keys=True)
+        with self._write_lock, self._transaction() as conn:
+            conn.execute(
+                "UPDATE pending_work_claim SET payload = ? "
+                "WHERE work_key = ? AND deferred = 1",
+                (payload, work_key),
+            )
+
     def mark_deferred_by_run_key(self, run_key: str) -> None:
         """Keep the row; only a relaunch of the same work may retire it."""
         with self._write_lock, self._transaction() as conn:
@@ -455,22 +513,43 @@ class SqlitePendingWorkClaimStore:
         session_name: str,
         issue_number: int,
         error: str,
+        cause: QuarantineCause,
+        work_kind: PendingWorkKind | None,
     ) -> None:
         with self._write_lock, self._transaction() as conn:
             conn.execute(
                 "INSERT INTO pending_work_claim_quarantine "
-                "(quarantine_key, run_key, session_name, issue_number, error) "
-                "VALUES (?, ?, ?, ?, ?) "
+                "(quarantine_key, run_key, session_name, issue_number, error, "
+                "cause, work_kind) VALUES (?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(quarantine_key) DO UPDATE SET "
-                "error = excluded.error, releasing = 0",
-                (quarantine_key, run_key, session_name, issue_number, error),
+                "error = excluded.error, releasing = 0, "
+                "work_kind = excluded.work_kind, "
+                # The announcement belongs to the cause that produced it. A
+                # changed cause invalidates the comment and the event, so the
+                # flag is cleared in the same statement that records the new
+                # cause - the two can never disagree (#6999 F6). An unchanged
+                # cause keeps it, which is what makes a re-observed quarantine
+                # comment exactly once.
+                "announced = CASE WHEN pending_work_claim_quarantine.cause "
+                "IS excluded.cause THEN pending_work_claim_quarantine.announced "
+                "ELSE 0 END, "
+                "cause = excluded.cause",
+                (
+                    quarantine_key,
+                    run_key,
+                    session_name,
+                    issue_number,
+                    error,
+                    cause.value,
+                    work_kind.value if work_kind is not None else None,
+                ),
             )
 
     def read_quarantine(self, quarantine_key: str) -> QuarantineRecord | None:
         row = self._get_connection().execute(
             "SELECT quarantine_key, run_key, session_name, issue_number, error, "
-            "label_state, announced, releasing FROM pending_work_claim_quarantine "
-            "WHERE quarantine_key = ?",
+            "label_state, announced, releasing, cause, work_kind "
+            "FROM pending_work_claim_quarantine WHERE quarantine_key = ?",
             (quarantine_key,),
         ).fetchone()
         return _quarantine_record(row) if row else None
@@ -514,7 +593,7 @@ class SqlitePendingWorkClaimStore:
             _quarantine_record(row)
             for row in self._get_connection().execute(
                 "SELECT quarantine_key, run_key, session_name, issue_number, "
-                "error, label_state, announced, releasing "
+                "error, label_state, announced, releasing, cause, work_kind "
                 "FROM pending_work_claim_quarantine"
             )
         )

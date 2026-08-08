@@ -122,6 +122,15 @@ class EventName(str, Enum):
     # would tell an operator to work out what the session was doing and re-queue
     # it - the manual duplicate launch that protecting the run prevents.
     SESSION_RUN_UNRESTORABLE = "session.run_unrestorable"
+    # BOTH halves failed: a live terminal that can be neither rebuilt nor
+    # identified (#6999 F6). It gets its own name rather than borrowing either
+    # neighbour's, because both of those make a promise this state cannot keep
+    # - "the work is known" (run_unrestorable) and "the terminal has stopped or
+    # can be reasoned about from its claim" (claim_unreadable). A reader acting
+    # on either would re-queue by hand beside a session still doing the work.
+    SESSION_RUN_UNRESTORABLE_CLAIM_UNREADABLE = (
+        "session.run_unrestorable_claim_unreadable"
+    )
     SESSION_START_FAILED = "session.start_failed"
     SESSION_STOPPED = "session.stopped"
     SESSION_CLEANUP = "session.cleanup"
@@ -428,6 +437,9 @@ class PublicEventName(str, Enum):
     SESSION_PROVIDER_AUTH_TERMINATED = "session.provider_auth_terminated"
     SESSION_CLAIM_UNREADABLE = "session.claim_unreadable"
     SESSION_RUN_UNRESTORABLE = "session.run_unrestorable"
+    SESSION_RUN_UNRESTORABLE_CLAIM_UNREADABLE = (
+        "session.run_unrestorable_claim_unreadable"
+    )
     SESSION_NO_COMPLETION_RECORD = "session.no_completion_record"
     SESSION_INVALID_COMPLETION_RECORD = "session.invalid_completion_record"
     SESSION_PROCESSING_COMPLETED = "session.processing_completed"

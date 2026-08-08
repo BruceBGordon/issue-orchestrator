@@ -27,7 +27,7 @@ from ..ports.event_sink import make_run_scoped_event, make_trace_event
 from ..ports.session_output import SessionOutput
 from ..ports.worktree_manager import WorktreeManager, WorktreeReuseOptions
 from .actions import Action, AddCommentAction, AddLabelAction, RemoveLabelAction
-from .in_flight_work import (
+from .launch_transaction import (
     NO_LAUNCH_WORK_CLAIM,
     LaunchWorkClaim,
     abandon_claim_unless_spawned,
@@ -462,9 +462,22 @@ def launch_rework_session(
             session_name,
             session_created,
         )
-        # This path reports success regardless of ``session_created`` (it has
-        # always done so), so the launch hands back a live session from here on.
-        spawn.mark_spawned()
+        if not session_created:
+            # Reported success regardless of this until #6999 F5. The damage was
+            # worse here than for a review: the launch went on to publish
+            # REWORK_STARTED and to strip the ``needs-rework`` trigger from the
+            # PR, so the one label that could have re-queued the rework was
+            # removed on behalf of a terminal that never existed. Failing before
+            # any of that leaves the trigger in place and hands the request back
+            # through the same compensation every other queue uses.
+            log_transition(
+                "rework", issue_number, "LAUNCHING", "FAILED", "session creation failed"
+            )
+            logger.error(
+                issue_log(issue_number, "FAILED: rework session creation failed")
+            )
+            return LaunchResult.terminal_spawn_failed()
+        spawn.mark_spawned()  # terminal RUNNING = irreversible
 
         rework_issue = Issue(
             number=issue_number,

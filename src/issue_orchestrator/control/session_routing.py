@@ -39,10 +39,11 @@ from .pending_session_queues import (
     PendingSessionQueues,
     TechLeadRetentionOutcome,
 )
-from .in_flight_work import (
-    InFlightWorkLedger,
+from .in_flight_work import InFlightWorkLedger
+from .launch_transaction import (
     LaunchSettlement,
     PendingWorkLaunchClaim,
+    WorkDisposal,
 )
 from .session_launch_types import LaunchDisposition
 from .session_launcher import SessionLauncher
@@ -230,16 +231,24 @@ def orchestrator_launch_tech_lead_session(
       attempted. Nothing about the investigation failed, so it keeps its full
       retry budget and simply waits for a tick when the provider is ready
       (#6999 F10);
-    - ``INPUT_RETRY`` — required-input prep failed transiently BEFORE the
-      session started. For failure investigations the queued item is the only
-      record of the investigation (no labels-as-truth recovery), so one
-      transient SQLite/log/filesystem error must not delete it. Retention is
+    - ``RETRYABLE_FAILURE`` — the launch attempt failed transiently BEFORE the
+      session started: required-input prep, or a terminal that never came up.
+      For failure investigations the queued item is the only record of the
+      investigation (no labels-as-truth recovery), so one transient
+      SQLite/log/filesystem/terminal error must not delete it. Retention is
       bounded by the queue owner (``retain_tech_lead_for_retry``); on exhaustion
       the item is dropped as a DURABLE needs-human transition — the
       needs-human label plus an explanatory comment applied through the
       launcher's owning action boundary, then the ``ISSUE_NEEDS_HUMAN``
       event (#6771 round 3: a log line and an event alone do not survive an
       orchestrator restart; labels are the source of truth).
+
+    Every one of those outcomes settles the DURABLE claim too, in the same
+    transaction (#6999 F4). A retained item keeps its deferred row, rewritten
+    with the retry budget the retention just spent; a dropped one - permanent
+    failure, or a committed escalation after exhaustion - has its row retired
+    with it, so the startup sweep cannot re-admit an investigation the bound
+    already ended.
     """
     agent = config.tech_lead_review_agent
     if not agent or agent not in config.agents:
@@ -254,12 +263,21 @@ def orchestrator_launch_tech_lead_session(
         tech_lead_scope=tech_lead.launch_scope(),
         work_claim=work,
     )
-    def _retain_for_input_retry() -> None:
+    def _retain_for_retry() -> WorkDisposal:
+        """Spend one unit of the budget and report what became of the item.
+
+        The return value is what keeps the durable ledger honest (#6999 F4). An
+        exhausted budget whose needs-human escalation COMMITS drops the item for
+        good, so its deferred row has to go too; anything else leaves the item
+        queued with a spent retry, which the row must record or a restart
+        refunds it.
+        """
         outcome = pending_queues.retain_tech_lead_for_retry(tech_lead.issue_number)
         if outcome is TechLeadRetentionOutcome.EXHAUSTED:
-            _commit_or_retain_dropped_tech_lead(
+            return _commit_or_retain_dropped_tech_lead(
                 tech_lead, result.reason, session_launcher, pending_queues
             )
+        return WorkDisposal.RETAINED
 
     return LaunchSettlement(
         work=work,
@@ -274,7 +292,7 @@ def orchestrator_launch_tech_lead_session(
             session_launcher=session_launcher,
             session_restorer=session_restorer,
         ),
-        retain_for_input_retry=_retain_for_input_retry,
+        retain_for_retry=_retain_for_retry,
     ).settle(result, state)
 
 
@@ -283,7 +301,7 @@ def _commit_or_retain_dropped_tech_lead(
     last_error: str,
     session_launcher: SessionLauncher,
     pending_queues: PendingSessionQueues,
-) -> None:
+) -> WorkDisposal:
     """Commit protocol for a tech_lead item that exhausted its launch retries.
 
     The queued item is the only record before escalation starts, so it is
@@ -292,6 +310,9 @@ def _commit_or_retain_dropped_tech_lead(
     crash-recoverable, while this process retains the richer queued context for
     retry. The failure is surfaced and no ISSUE_NEEDS_HUMAN event is emitted for
     a non-transition.
+
+    Returns which of those two happened, so the launch transaction can retire or
+    keep the durable claim to match (#6999 F4).
     """
     logger.error(
         "[TECH_LEAD] Escalating dropped %s for issue #%d after %d retryable "
@@ -328,7 +349,7 @@ def _commit_or_retain_dropped_tech_lead(
     )
     if committed:
         pending_queues.remove_tech_lead(tech_lead.issue_number)
-        return
+        return WorkDisposal.DROPPED
     logger.error(
         "[TECH_LEAD] Durable needs-human escalation did NOT commit for issue "
         "#%d; retaining queued %s context for retry (any committed marker "
@@ -336,6 +357,7 @@ def _commit_or_retain_dropped_tech_lead(
         tech_lead.issue_number,
         tech_lead.flavor.value,
     )
+    return WorkDisposal.RETAINED
 
 
 def session_launcher_callback(

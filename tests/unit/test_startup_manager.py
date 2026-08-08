@@ -5,7 +5,6 @@ from pathlib import Path
 
 import pytest
 
-from issue_orchestrator.execution.session_output_adapter import FileSystemSessionOutput
 from unittest.mock import MagicMock, call, patch
 
 from issue_orchestrator.control.session_launch_types import LaunchResult
@@ -1019,8 +1018,13 @@ class TestStartupManagerTechLeadRecovery:
         sample_state,
         mock_repository_host,
         mock_config,
+        tmp_path,
     ):
         """Startup-recovery -> launch boundary keeps the batch flavor (#6768 B5)."""
+        from issue_orchestrator.execution.pending_work_claim_store import (
+            SqlitePendingWorkClaimStore,
+        )
+
         mock_config.agents = {"agent:tech-lead": MagicMock()}
         mock_config.tech_lead_review_agent = "agent:tech-lead"
 
@@ -1042,7 +1046,9 @@ class TestStartupManagerTechLeadRecovery:
 
         orchestrator_launch_tech_lead_session(
             recovered, sample_state, mock_config, launcher, MagicMock(),
-            FileSystemSessionOutput(),
+            # The real orchestrator-owned ledger, because the launch settles a
+            # durable claim as well as the queue item (#6999 F4).
+            SqlitePendingWorkClaimStore.for_repo(tmp_path),
         )
 
         launch_call = launcher.launch_issue_session.call_args

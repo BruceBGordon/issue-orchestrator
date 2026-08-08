@@ -29,10 +29,16 @@ class LaunchDisposition(Enum):
     #: tick when the provider is ready. Deliberately distinct from a retry
     #: budget: there is no failure here to count against the work.
     PROVIDER_DEFERRED = "provider_deferred"
-    #: Required input could not be prepared (a transient DB/log/filesystem
-    #: read). The item is retained, but on a bounded retry budget owned by the
-    #: queue — this one IS a failure of the request itself.
-    INPUT_RETRY = "input_retry"
+    #: The launch attempt itself failed and may work next time: required input
+    #: could not be prepared (a transient DB/log/filesystem read), or the
+    #: terminal never came up. The item is retained, but on a bounded retry
+    #: budget owned by the queue — unlike a provider refusal, this attempt DID
+    #: fail, and an input or a terminal that never recovers must not relaunch
+    #: forever. Named for the retry rather than for one of its causes (#6999
+    #: F5): a failed ``create_session`` is the same decision for the queue as a
+    #: failed input read, and calling it an input failure would have made
+    #: routing it here a lie.
+    RETRYABLE_FAILURE = "retryable_failure"
     #: The launcher gave up. The queue drops the item.
     PERMANENT_FAILURE = "permanent_failure"
 
@@ -53,6 +59,29 @@ class LaunchResult:
     def __post_init__(self) -> None:
         if self.success:
             self.disposition = LaunchDisposition.LAUNCHED
+
+    @classmethod
+    def terminal_spawn_failed(cls) -> "LaunchResult":
+        """The terminal never came up, on any launch path (#6999 F5).
+
+        A factory rather than five hand-built results, because every launch
+        path has to agree on what a failed ``create_session`` means and two of
+        them did not: review and rework returned SUCCESS, handing back a
+        phantom session for a terminal that does not exist. One constructor is
+        what makes "did the terminal start?" impossible to answer differently
+        per queue.
+
+        The disposition is deliberately RETRYABLE rather than permanent:
+        nothing about the request failed, so the queue keeps it on its bounded
+        budget instead of destroying a review, rework or investigation because
+        the terminal manager hiccuped once.
+        """
+        return cls(
+            None,
+            False,
+            "Failed to create terminal session",
+            disposition=LaunchDisposition.RETRYABLE_FAILURE,
+        )
 
     @property
     def defers_to_provider(self) -> bool:

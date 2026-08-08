@@ -21,15 +21,17 @@ from pathlib import Path
 
 import pytest
 
-from issue_orchestrator.control.actions import AddCommentAction, AddLabelAction
+from issue_orchestrator.control.actions import (
+    AddCommentAction,
+    AddLabelAction,
+    RemoveLabelAction,
+)
 from issue_orchestrator.control.claim_quarantine import (
     QuarantineCause,
     QuarantineSubject,
 )
-from issue_orchestrator.control.in_flight_work import (
-    InFlightWorkLedger,
-    PendingWorkLaunchClaim,
-)
+from issue_orchestrator.control.in_flight_work import InFlightWorkLedger
+from issue_orchestrator.control.launch_transaction import PendingWorkLaunchClaim
 from issue_orchestrator.control.provider_availability import ProviderAvailabilityPolicy
 from issue_orchestrator.control.provider_resilience import ProviderResilienceManager
 from issue_orchestrator.control.session_controller import SessionController
@@ -484,11 +486,15 @@ class _LauncherHarness:
 
         self.created: list[str] = []
         self.events = events if events is not None else MockEventSink()
+        # Kept rather than passed inline: a launch's label mutations all go
+        # through this applier, so it is the only place a test can see whether
+        # a failed launch nevertheless committed a destructive transition.
+        self.action_applier = MagicMock()
         self.launcher = SessionLauncher(
             config=config,
             events=self.events,
             repository_host=MockRepositoryHost(),
-            action_applier=MagicMock(),
+            action_applier=self.action_applier,
             session_manager=MagicMock(),
             worktree_manager=MockWorktreeManager(tmp_path),
             working_copy=MockWorkingCopy(),
@@ -2885,7 +2891,10 @@ def test_a_provider_deferral_touches_neither_restoration_nor_the_retry_budget(
     future edit that reorders the branch cannot spend the only queued
     failure-investigation record's budget (#6999 F12).
     """
-    from issue_orchestrator.control.in_flight_work import LaunchSettlement
+    from issue_orchestrator.control.launch_transaction import (
+        LaunchSettlement,
+        WorkDisposal,
+    )
     from issue_orchestrator.control.session_launch_types import (
         LaunchDisposition,
         LaunchResult,
@@ -2898,11 +2907,15 @@ def test_a_provider_deferral_touches_neither_restoration_nor_the_retry_budget(
         calls.append("restore_existing")
         return None
 
+    def _spy_retain_for_retry():
+        calls.append("retain_for_retry")
+        return WorkDisposal.RETAINED
+
     owner = LaunchSettlement(
         work=_launch_work("tech_lead", _pending_state("tech_lead"), tmp_path),
         remove=lambda: calls.append("remove"),
         restore_existing=_spy_restore_existing,
-        retain_for_input_retry=lambda: calls.append("retain_for_input_retry"),
+        retain_for_retry=_spy_retain_for_retry,
     )
 
     settled = owner.settle(
@@ -2954,7 +2967,7 @@ def test_an_unhandled_launch_disposition_never_silently_drops_the_work(
     land in it silently — which is how the provider refusal deleted work in the
     first place (#6999 A1).
     """
-    from issue_orchestrator.control.in_flight_work import LaunchSettlement
+    from issue_orchestrator.control.launch_transaction import LaunchSettlement
     from issue_orchestrator.control.session_launch_types import (
         LaunchDisposition,
         LaunchResult,
@@ -3009,7 +3022,7 @@ def _ready_harness(tmp_path: Path, *, create_session=None):
 
 def _launch_work(queue: str, state, tmp_path: Path):
     """The launch-spanning claim owner the routing functions build (#6999 A2)."""
-    from issue_orchestrator.control.in_flight_work import PendingWorkLaunchClaim
+    from issue_orchestrator.control.launch_transaction import PendingWorkLaunchClaim
 
     return PendingWorkLaunchClaim(
         claim=_claim(queue, state), claims=_claims(tmp_path)
@@ -3886,8 +3899,8 @@ def test_a_refused_claim_leaves_the_queue_item_alone(tmp_path: Path) -> None:
     from issue_orchestrator.control.in_flight_work import (
         DuplicateClaimError,
         InFlightWorkLedger,
-        LaunchSettlement,
     )
+    from issue_orchestrator.control.launch_transaction import LaunchSettlement
     from issue_orchestrator.control.session_launch_types import LaunchResult
 
     harness = _ready_harness(tmp_path)
@@ -4643,6 +4656,78 @@ def _write_legacy_claim_row(
     )
     conn.commit()
     conn.close()
+
+
+def test_an_upgrade_teaches_an_older_quarantine_table_the_typed_cause(
+    tmp_path: Path,
+) -> None:
+    """A quarantine row written before the cause was durable still works.
+
+    ``CREATE TABLE IF NOT EXISTS`` leaves an existing table exactly as it was,
+    so the columns #6999 F6 added arrive only if something adds them. Without
+    that, every read and write of a quarantine on an upgraded database raises
+    and the orphan sweep stops escalating anything at all.
+
+    A carried-forward row has no recorded cause, which must read as *different
+    from whatever is observed next* so the next scan re-announces under a cause
+    it can vouch for, rather than standing on a story nothing recorded.
+    """
+    import sqlite3
+
+    from issue_orchestrator.execution.pending_work_claim_store import (
+        STORE_FILENAME,
+        SqlitePendingWorkClaimStore,
+    )
+    from issue_orchestrator.infra.repo_identity import state_dir
+    from issue_orchestrator.ports.pending_work_claim_store import QuarantineCause
+
+    db_path = state_dir(tmp_path) / STORE_FILENAME
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS pending_work_claim_quarantine (
+            quarantine_key TEXT PRIMARY KEY,
+            run_key TEXT NOT NULL,
+            session_name TEXT NOT NULL,
+            issue_number INTEGER NOT NULL,
+            error TEXT NOT NULL,
+            label_state TEXT NOT NULL DEFAULT 'unknown',
+            announced INTEGER NOT NULL DEFAULT 0,
+            releasing INTEGER NOT NULL DEFAULT 0
+        );
+        INSERT INTO pending_work_claim_quarantine
+            (quarantine_key, run_key, session_name, issue_number, error,
+             label_state, announced, releasing)
+        VALUES ('/runs/a@t1', '/runs/a', 'issue-7', 7, 'legacy', 'acquired', 1, 0);
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    store = SqlitePendingWorkClaimStore(db_path)
+
+    (carried,) = store.list_quarantines()
+    assert carried.issue_number == 7
+    assert carried.announced  # the old flag survived...
+    assert carried.cause is None  # ...but says nothing about which story
+    assert not carried.announces(QuarantineCause.CLAIM_UNREADABLE_ENDED_RUN)
+
+    store.record_quarantine(
+        "/runs/a@t1",
+        run_key="/runs/a",
+        session_name="issue-7",
+        issue_number=7,
+        error="still unreadable",
+        cause=QuarantineCause.CLAIM_UNREADABLE_ENDED_RUN,
+        work_kind=None,
+    )
+
+    refreshed = store.read_quarantine("/runs/a@t1")
+    assert refreshed is not None
+    assert refreshed.cause is QuarantineCause.CLAIM_UNREADABLE_ENDED_RUN
+    assert not refreshed.announced  # re-announced under the cause it now holds
+    assert refreshed.block_is_ours  # ...without disturbing the block it owns
 
 
 @pytest.mark.parametrize("queue", _PENDING_QUEUES)
@@ -5715,7 +5800,13 @@ def test_a_live_run_that_is_neither_rebuildable_nor_readable_is_escalated(
     # ...and the operator is told BOTH facts, not just one of them.
     assert "could not be rebuilt" in comments[0].comment
     assert "unreadable" in comments[0].comment
-    assert EventName.SESSION_RUN_UNRESTORABLE.value in harness.event_names()
+    # The machine-readable half says both too (#6999 F6). It must not borrow
+    # either neighbour: ``run_unrestorable`` contracts that the work IS
+    # identified, and ``claim_unreadable`` that the run was rebuilt.
+    names = harness.event_names()
+    assert EventName.SESSION_RUN_UNRESTORABLE_CLAIM_UNREADABLE.value in names
+    assert EventName.SESSION_RUN_UNRESTORABLE.value not in names
+    assert EventName.SESSION_CLAIM_UNREADABLE.value not in names
 
 
 def test_the_combined_state_is_escalated_once_across_repeated_scans(
@@ -5740,6 +5831,141 @@ def test_the_combined_state_is_escalated_once_across_repeated_scans(
     ]
     assert len(comments) == 1
     assert len(harness.claims.list_quarantines()) == 1
+
+
+def _quarantine_narratives(harness) -> list[str]:
+    """What a reader of the timeline is told, for each quarantine event.
+
+    Projected through the production fan-out and timeline projection rather
+    than read off the registry, because "the operator's story changed" is only
+    true if the USER-visible narrative changed (#6999 F6).
+    """
+    from issue_orchestrator.events.fan_out_pipeline import produce_external_records
+    from issue_orchestrator.timeline import project_timeline
+
+    narratives: list[str] = []
+    for index, event in enumerate(harness.events.published):
+        name = (
+            event.event_type.value
+            if hasattr(event.event_type, "value")
+            else str(event.event_type)
+        )
+        if not name.startswith("session.claim_unreadable") and not name.startswith(
+            "session.run_unrestorable"
+        ):
+            continue
+        records = produce_external_records(
+            internal_event_name=name,
+            enriched_data=dict(event.data),
+            base_event_id=f"evt-{index}",
+            timestamp_iso="2026-05-04T00:00:00+00:00",
+        )
+        narratives.extend(
+            projected.narrative or ""
+            for projected in project_timeline(list(records), issue_number=7)
+        )
+    return narratives
+
+
+def _comment_texts(harness) -> list[str]:
+    return [
+        a.comment
+        for a in harness.quarantine_actions
+        if isinstance(a, AddCommentAction)
+    ]
+
+
+def _break_both_halves(harness, tmp_path: Path, queue: str):
+    """One run that can be neither rebuilt nor identified, launched for real."""
+    state = _pending_state(queue)
+    session = _route(queue, state, harness)
+    assert session is not None
+    session.run_assets.manifest.path.unlink()  # cannot be rebuilt...
+    _corrupt_stored_claim(tmp_path, session.run_assets)  # ...and cannot be read
+    return session
+
+
+def test_a_quarantine_rewrites_its_story_when_the_run_turns_out_to_be_live(
+    tmp_path: Path,
+) -> None:
+    """ended-unreadable -> live-combined: the false instruction must be replaced.
+
+    One discovery pass can miss a terminal that is very much alive - the run
+    directory is there but the manifest will not rebuild, so nothing reports it
+    - and the ledger sweep then announces the run as ENDED, telling an operator
+    to re-queue its work by hand if necessary. When the next pass DOES see the
+    terminal, the announced flag alone suppressed everything: no new comment, no
+    new event, and the instruction to re-queue still standing over a session
+    that is still doing the work. That is the duplicate execution the whole
+    quarantine exists to prevent (#6999 F6).
+    """
+    from issue_orchestrator.ports.pending_work_claim_store import QuarantineCause
+
+    harness = _ready_harness(tmp_path)
+    session = _break_both_halves(harness, tmp_path, "tech_lead")
+
+    # Pass 1: nothing discoverable, so the ledger sweep calls the run ended.
+    _recover_with_no_terminals(None, harness)
+    assert "already ended" in _comment_texts(harness)[0]
+    assert EventName.SESSION_CLAIM_UNREADABLE.value in harness.event_names()
+
+    # Pass 2: the terminal is discovered alive, and neither half of its record
+    # can be read.
+    _restore_with_raw_discovery(harness, [_discovered(session, is_review=False)])
+
+    comments = _comment_texts(harness)
+    assert len(comments) == 2, "a changed cause must reach the operator again"
+    assert "still running" in comments[1]
+    assert "could not be rebuilt" in comments[1]
+    assert "already ended" not in comments[1]
+    assert (
+        EventName.SESSION_RUN_UNRESTORABLE_CLAIM_UNREADABLE.value
+        in harness.event_names()
+    )
+    # The durable row carries the cause it last announced, which is what makes
+    # the NEXT unchanged scan silent rather than a third comment.
+    (record,) = harness.claims.list_quarantines()
+    assert record.cause is QuarantineCause.RUN_UNRESTORABLE_CLAIM_UNREADABLE
+    assert record.announced
+    _restore_with_raw_discovery(harness, [_discovered(session, is_review=False)])
+    assert len(_comment_texts(harness)) == 2
+
+    # ...and the timeline a human reads says two different things, in order.
+    first, second = _quarantine_narratives(harness)
+    assert first != second
+    assert "could not be identified" in first
+    assert "could not be rebuilt" in second
+
+
+def test_a_quarantine_rewrites_its_story_when_the_live_run_ends(
+    tmp_path: Path,
+) -> None:
+    """live-combined -> ended-unreadable: the same rule in the other direction.
+
+    The operator was told a terminal is still working and must be stopped by
+    hand before anything is re-queued. Once it is gone that instruction is stale
+    in the opposite way: there is nothing left to stop, and the work can be
+    dealt with. A durable cause is what lets the sweep notice (#6999 F6).
+    """
+    from issue_orchestrator.ports.pending_work_claim_store import QuarantineCause
+
+    harness = _ready_harness(tmp_path)
+    session = _break_both_halves(harness, tmp_path, "review")
+
+    _restore_with_raw_discovery(harness, [_discovered(session, is_review=True)])
+    assert "still running" in _comment_texts(harness)[0]
+
+    # The terminal is gone: discovery returns nothing at all.
+    _recover_with_no_terminals(None, harness)
+
+    comments = _comment_texts(harness)
+    assert len(comments) == 2
+    assert "already ended" in comments[1]
+    assert "still running" not in comments[1]
+    (record,) = harness.claims.list_quarantines()
+    assert record.cause is QuarantineCause.CLAIM_UNREADABLE_ENDED_RUN
+    first, second = _quarantine_narratives(harness)
+    assert first != second
 
 
 def test_the_two_quarantine_causes_do_not_borrow_each_others_story(
@@ -5884,29 +6110,42 @@ def test_the_claim_is_already_durable_when_the_terminal_spawns(
     assert at_spawn == [(queue,)]
 
 
-# The launch paths that report a failed terminal creation. ``review`` and
-# ``rework`` have always returned success regardless of it, so a spawn failure
-# is not observable from outside them; their pre-spawn hold is covered by the
-# durability test above.
-_SPAWN_CHECKING_QUEUES = ["retrospective_review", "validation_retry", "tech_lead"]
+# Every event a launch publishes only once its terminal is genuinely running,
+# plus the label transition a rework commits on the same assumption. None of
+# them may appear when ``create_session`` said no (#6999 F5).
+_SPAWN_ONLY_EFFECTS = (
+    EventName.SESSION_STARTED.value,
+    EventName.REVIEW_STARTED.value,
+    EventName.REWORK_STARTED.value,
+    EventName.PR_VIEW_CHANGED.value,
+)
+
+# Labels whose removal is what tells the orchestrator "this work is under way".
+# Retiring one for a terminal that never started is how a rework loses the only
+# thing that could re-queue it.
+_LAUNCH_TRIGGER_LABELS = frozenset({"needs-rework", "review-first"})
 
 
-@pytest.mark.parametrize("queue", _SPAWN_CHECKING_QUEUES)
+@pytest.mark.parametrize("queue", _PENDING_QUEUES)
 def test_a_launch_that_never_spawns_hands_the_work_back(
     queue, tmp_path: Path
 ) -> None:
-    """Compensation, not a stranded row (#6999 A2).
+    """Compensation, not a stranded row - on every queue (#6999 F5/A2).
 
-    No terminal started, so the request is untouched and waiting to be
-    relaunched - which is exactly what a DEFERRED row means. Deleting the row
-    instead would be the failure this whole boundary exists to prevent: a
-    relaunch of already-deferred work supersedes the old row as it takes the
-    claim, so a failed relaunch that then deleted its own row would leave
-    nothing durable behind at all.
+    ``review`` and ``rework`` used to be exempt from this, because they reported
+    success no matter what ``create_session`` answered. The consequences were
+    not cosmetic: a phantom ``Session`` joined ``active_sessions``, its durable
+    claim stayed HELD against a terminal that does not exist, the pending item
+    was removed as though the work had started, and the rework path went on to
+    publish REWORK_STARTED and strip the ``needs-rework`` trigger from the PR -
+    deleting the one label that could have re-queued it.
 
-    That durable row is what makes the work survive the settlement's own
-    disposal: a permanent launch failure drops the in-memory queue item, and a
-    fresh process still recovers exactly one request.
+    What every queue does instead: no terminal started, so the request is
+    untouched and waiting to be relaunched - which is exactly what a DEFERRED
+    row means. Deleting the row instead would be the failure this whole boundary
+    exists to prevent: a relaunch of already-deferred work supersedes the old
+    row as it takes the claim, so a failed relaunch that then deleted its own
+    row would leave nothing durable behind at all.
     """
     harness = _ready_harness(
         tmp_path, create_session=lambda name, cmd, wd, title: False
@@ -5914,6 +6153,19 @@ def test_a_launch_that_never_spawns_hands_the_work_back(
     state = _pending_state(queue)
 
     assert _route(queue, state, harness) is None
+
+    # No phantom session, and nothing claiming the work began.
+    assert state.active_sessions == []
+    assert [n for n in harness.event_names() if n in _SPAWN_ONLY_EFFECTS] == []
+    # ...and no trigger label was retired on behalf of a terminal that does not
+    # exist. For rework that label IS the recovery path: removing it while the
+    # launch failed would leave the PR with nothing to re-queue it from.
+    applied = [c.args[0] for c in harness.action_applier.apply.call_args_list]
+    assert [
+        a
+        for a in applied
+        if isinstance(a, RemoveLabelAction) and a.label in _LAUNCH_TRIGGER_LABELS
+    ] == []
 
     unresolved = harness.claims.list_unresolved_claims()
     assert [u.deferred for u in unresolved] == [True]
@@ -5924,6 +6176,101 @@ def test_a_launch_that_never_spawns_hands_the_work_back(
     assert _pending_count(restarted, queue) == 1
 
 
+# ---------------------------------------------------------------------------
+# The launch transaction settles the queue AND the ledger together (#6999 F4)
+# ---------------------------------------------------------------------------
+
+
+def _failing_spawn_harness(tmp_path: Path):
+    return _ready_harness(
+        tmp_path, create_session=lambda name, cmd, wd, title: False
+    )
+
+
+def test_a_permanently_dropped_request_is_not_resurrected_by_a_restart(
+    tmp_path: Path,
+) -> None:
+    """PERMANENT_FAILURE has to mean permanent on BOTH sides of the transaction.
+
+    The queue side and the durable side used to settle independently: the
+    settlement removed the item, while the unspawned-launch compensation had
+    already deferred the row and never heard about the drop. A deferred row is
+    exactly what the startup sweep is built to re-admit, so the very next
+    restart put the dropped request back on its queue and launched it - a
+    launcher that gave up, undone by the recovery that protects work it did not
+    give up on.
+    """
+    harness = _failing_spawn_harness(tmp_path)
+    state = _pending_state("review")
+
+    # A transient spawn failure first, so a durable deferred row really exists.
+    assert _route("review", state, harness) is None
+    assert len(harness.claims.list_unresolved_claims()) == 1
+
+    # Then the launcher gives up for good.
+    harness.launcher.config.repo = None
+    assert _route("review", state, harness) is None
+
+    assert _pending_count(state, "review") == 0  # dropped from its queue...
+    assert harness.claims.list_unresolved_claims() == ()  # ...and from the ledger
+    restarted = _recover_with_no_terminals(state, harness)
+    assert _pending_count(restarted, "review") == 0
+
+
+def test_an_exhausted_investigation_is_not_resurrected_by_a_restart(
+    tmp_path: Path,
+) -> None:
+    """An escalated, exhausted budget must not be refunded by recovery.
+
+    The third failure commits a durable ``needs-human`` transition and drops the
+    queued investigation - the bounded-retry policy's whole point. Leaving its
+    deferred row behind let the next restart re-admit the investigation with the
+    escalation still standing on the issue, so the "this will not retry on its
+    own" comment was false and the bound was not a bound (#6999 F4).
+    """
+    from issue_orchestrator.control.pending_session_queues import (
+        TECH_LEAD_LAUNCH_RETRY_LIMIT,
+    )
+
+    harness = _failing_spawn_harness(tmp_path)
+    state = _pending_state("tech_lead")
+
+    for _ in range(TECH_LEAD_LAUNCH_RETRY_LIMIT):
+        assert _route("tech_lead", state, harness) is None
+
+    assert state.pending_tech_lead_reviews == []
+    assert harness.claims.list_unresolved_claims() == ()
+    restarted = _recover_with_no_terminals(state, harness)
+    assert restarted.pending_tech_lead_reviews == []
+
+
+def test_a_restart_before_exhaustion_keeps_the_budget_already_spent(
+    tmp_path: Path,
+) -> None:
+    """The other half: retained work must come back with its budget as spent.
+
+    The durable payload is written when the claim is HELD - before the launch
+    fails and therefore before the queue owner increments the retry count. A
+    restart that read that payload refunded every attempt, so an investigation
+    whose input is permanently broken could relaunch forever, two failures at a
+    time, and never reach the escalation that tells a human (#6999 F4).
+    """
+    harness = _failing_spawn_harness(tmp_path)
+    state = _pending_state("tech_lead")
+
+    assert _route("tech_lead", state, harness) is None
+    assert _route("tech_lead", state, harness) is None
+    assert state.pending_tech_lead_reviews[0].retryable_launch_failures == 2
+
+    restarted = _recover_with_no_terminals(state, harness)
+
+    (recovered,) = restarted.pending_tech_lead_reviews
+    assert recovered.retryable_launch_failures == 2
+    # ...and the typed trigger context survived the round trip with it.
+    assert recovered.failure is not None
+    assert recovered.failure.issue_number == 7
+
+
 def test_a_claim_store_that_cannot_record_stops_the_launch(tmp_path: Path) -> None:
     """A store fault must be survivable, which means failing BEFORE the spawn.
 
@@ -5931,7 +6278,7 @@ def test_a_claim_store_that_cannot_record_stops_the_launch(tmp_path: Path) -> No
     terminal was already irreversible. Before it, the launch simply does not
     happen, the queue item keeps its full budget, and the next tick retries.
     """
-    from issue_orchestrator.control.in_flight_work import PendingWorkLaunchClaim
+    from issue_orchestrator.control.launch_transaction import PendingWorkLaunchClaim
     from issue_orchestrator.control.session_launch_types import LaunchDisposition
 
     class _RefusingStore:
@@ -5962,7 +6309,7 @@ def test_a_claim_store_that_cannot_record_stops_the_launch(tmp_path: Path) -> No
     )
 
     assert not result.success
-    assert result.disposition is LaunchDisposition.INPUT_RETRY
+    assert result.disposition is LaunchDisposition.RETRYABLE_FAILURE
     assert harness.created == []  # no terminal was spawned
     assert store.deferred == []  # nothing was held, so nothing to hand back
     assert len(state.pending_tech_lead_reviews) == 1
