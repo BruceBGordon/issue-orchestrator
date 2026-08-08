@@ -86,6 +86,9 @@
           "title": "Startupcomplete",
           "type": "boolean"
         },
+        "techLeadRuns": {
+          "$ref": "#/$defs/TechLeadRunActionsContract"
+        },
         "validationConfigured": {
           "title": "Validationconfigured",
           "type": "boolean"
@@ -102,7 +105,8 @@
         "githubRepo",
         "agents",
         "validationConfigured",
-        "providerCircuit"
+        "providerCircuit",
+        "techLeadRuns"
       ],
       "title": "DashboardDataContract",
       "type": "object"
@@ -227,6 +231,85 @@
         "summary_text"
       ],
       "title": "ProviderCircuitStatusContract",
+      "type": "object"
+    },
+    "TechLeadRunActionsContract": {
+      "additionalProperties": true,
+      "description": "State powering the two scoped tech-lead dashboard actions (#6994).\n\nAdvisory affordance data only. ``POST /api/tech-lead/runs`` re-decides\nadmission server-side on every click, so these flags shape what the operator\nSEES, never what the engine allows.",
+      "properties": {
+        "configured": {
+          "title": "Configured",
+          "type": "boolean"
+        },
+        "globalBarrierActive": {
+          "title": "Globalbarrieractive",
+          "type": "boolean"
+        },
+        "globalBarrierNote": {
+          "default": "",
+          "title": "Globalbarriernote",
+          "type": "string"
+        },
+        "globalStatus": {
+          "title": "Globalstatus",
+          "type": "string"
+        },
+        "globalStatusLabel": {
+          "title": "Globalstatuslabel",
+          "type": "string"
+        },
+        "healthReviewStatus": {
+          "title": "Healthreviewstatus",
+          "type": "string"
+        },
+        "healthReviewStatusLabel": {
+          "title": "Healthreviewstatuslabel",
+          "type": "string"
+        },
+        "needsSettings": {
+          "default": false,
+          "title": "Needssettings",
+          "type": "boolean"
+        },
+        "paused": {
+          "title": "Paused",
+          "type": "boolean"
+        },
+        "queuedIssueNumbers": {
+          "items": {
+            "type": "integer"
+          },
+          "title": "Queuedissuenumbers",
+          "type": "array"
+        },
+        "running": {
+          "default": true,
+          "title": "Running",
+          "type": "boolean"
+        },
+        "runningIssueNumbers": {
+          "items": {
+            "type": "integer"
+          },
+          "title": "Runningissuenumbers",
+          "type": "array"
+        },
+        "unavailableReason": {
+          "default": "",
+          "title": "Unavailablereason",
+          "type": "string"
+        }
+      },
+      "required": [
+        "configured",
+        "paused",
+        "globalStatus",
+        "globalStatusLabel",
+        "healthReviewStatus",
+        "healthReviewStatusLabel",
+        "globalBarrierActive"
+      ],
+      "title": "TechLeadRunActionsContract",
       "type": "object"
     }
   },

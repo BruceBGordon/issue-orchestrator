@@ -974,10 +974,38 @@
     background: var(--bg-panel-soft);
 }
 
-.context-menu-item.disabled {
+.context-menu-item.disabled,
+.context-menu-item[aria-disabled="true"] {
     opacity: 0.45;
     cursor: not-allowed;
 }
+
+/* aria-disabled, not the native property, so the control keeps its place in the
+   tab order and its visible focus ring — that is what makes the adjacent reason
+   and Settings remedy reachable without a mouse (#6994 round 2 F6). */
+.context-menu-item:focus-visible,
+.context-menu-item:focus {
+    outline: 2px solid var(--accent, currentColor);
+    outline-offset: -2px;
+}
+
+/* The compact menu's tech-lead action carries its own status sibling, so the
+   blocked reason is visible text with a resolvable aria-describedby instead of
+   a detached id (#6994 round 2 F6). */
+.context-menu-row {
+    display: block;
+}
+
+.context-menu-status {
+    display: block;
+    font-size: 11px;
+    color: var(--text-muted, var(--text));
+    padding: 0 10px 4px;
+    white-space: normal;
+    overflow-wrap: anywhere;
+}
+
+.context-menu-status:empty { display: none; }
 
 .context-menu-item.danger {
     color: var(--danger);

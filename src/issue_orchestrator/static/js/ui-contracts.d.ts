@@ -1171,6 +1171,30 @@ export interface SwitchE2ETimelineViewCommandPayload {
   view: TimelineView;
 }
 
+export interface TechLeadGlobalHealthReviewScopePayload {
+  kind: "global_health_review";
+}
+
+export interface TechLeadIssueScopePayload {
+  issue_number: number;
+  kind: "issue";
+}
+
+export interface TechLeadRunAdmissionPayload {
+  admitted: boolean;
+  behind_global_barrier: boolean;
+  detail: string;
+  issue_number: number | null;
+  outcome: "queued" | "already_queued" | "already_running" | "paused" | "not_running" | "not_configured" | "not_eligible" | "claim_conflict" | "failed";
+  reason: string;
+  run_key: string;
+  scope_kind: "global_health_review" | "global_batch_review" | "issue";
+}
+
+export interface TechLeadRunRequestPayload {
+  scope: TechLeadRunScopePayload;
+}
+
 export interface TestCaseHistoryPayload {
   outcome: string;
   run_id: number;
@@ -1300,6 +1324,8 @@ export type ReviewStagePayload = ReviewNotReachedPayload | ReviewSkippedPayload 
 export type ReviewTranscriptEvidencePayload = ReviewTranscriptAvailablePayload | ReviewTranscriptUnavailablePayload;
 
 export type SessionRecordingEvidencePayload = SessionRecordingAvailablePayload | SessionRecordingUnavailablePayload;
+
+export type TechLeadRunScopePayload = TechLeadGlobalHealthReviewScopePayload | TechLeadIssueScopePayload;
 
 export type TimelineCommandPayload = ShowEventDetailsCommandPayload | OpenCompletionRecordCommandPayload | OpenValidationDetailsCommandPayload | OpenSessionRecordingCommandPayload | OpenReviewFeedbackCommandPayload | OpenReviewArtifactCommandPayload | OpenIssueTimelineCommandPayload | OpenE2ERunCommandPayload | ExpandE2ERunCommandPayload | SwitchE2ETimelineViewCommandPayload | CreateE2EUntriagedIssuesCommandPayload | OpenInlineAgentAttemptsCommandPayload;
 

@@ -69,7 +69,10 @@ from ..control.action_applier import ActionApplier
 from ..control.fact_gatherer import FactGatherer
 from ..control.health_gate import HealthGate
 from ..adapters.github import GitHubAuth, GitHubIssueResolver, GitHubCache, build_github_auth
-from ..adapters.github.ref_claim_adapter import GitHubRefClaimAdapter
+from ..adapters.github.ref_claim_adapter import (
+    GitHubRefClaimAdapter,
+    GitHubRefRunLedgerAdapter,
+)
 from ..execution.verification_service import DefaultVerificationService
 from ..ports.verification import VerificationBudget
 from ..execution.worktree_adapter import GitWorktreeManager
@@ -97,7 +100,12 @@ from ..infra.repo_identity import state_dir
 from ..infra.secret_env import (
     configure_extra_forbidden_env_vars,
 )
+from ..control.tech_lead_run_ownership import TechLeadRunOwnership
 from ..ports.claim_manager import ClaimManager, NullClaimManager
+from ..ports.run_ledger_store import (
+    SingleInstanceRunLedgerStore,
+    TechLeadRunLedgerStore,
+)
 from ..domain.lease_config import LeaseConfig
 
 if TYPE_CHECKING:
@@ -286,8 +294,13 @@ def _create_claim_components(
     github: GitHubAdapter | None,
     events: EventSink,
     io_claimed_label: str = "io:claimed",
-) -> tuple[ClaimGate, LeaseRenewer, LeaseConfig, ClaimManager]:
-    """Create claim management components."""
+) -> tuple[ClaimGate, LeaseRenewer, LeaseConfig, ClaimManager, TechLeadRunOwnership]:
+    """Create claim management components.
+
+    Both key spaces are wired here from ONE decision (``claims.enabled``): issue
+    claims and logical-run claims must never disagree about whether this
+    deployment coordinates across instances.
+    """
     if github and config.claims.enabled:
         lease_config = LeaseConfig(
             lease_seconds=config.claims.lease_seconds,
@@ -305,10 +318,18 @@ def _create_claim_components(
             label_adapter=github,
             io_claimed_label=io_claimed_label,
         )
+        run_ledger_store: TechLeadRunLedgerStore = GitHubRefRunLedgerAdapter(
+            client=github.http_client,
+            claimant_id=claimant_id,
+            config=lease_config,
+        )
         logger.info("Claims enabled: claimant_id=%s, lease=%ds", claimant_id, lease_config.lease_seconds)
     else:
         lease_config = LeaseConfig()
         claim_manager = NullClaimManager()
+        run_ledger_store = SingleInstanceRunLedgerStore(
+            lease_seconds=lease_config.lease_seconds
+        )
         logger.info(
             "Claims disabled: running in single-orchestrator mode. "
             "Multi-machine coordination is OFF. To enable, set "
@@ -321,7 +342,12 @@ def _create_claim_components(
         events=events,
         config=lease_config,
     )
-    return claim_gate, lease_renewer, lease_config, claim_manager
+    run_ownership = TechLeadRunOwnership(
+        run_ledger_store,
+        lease_seconds=lease_config.lease_seconds,
+        renew_before_expiry_seconds=lease_config.renew_interval_seconds,
+    )
+    return claim_gate, lease_renewer, lease_config, claim_manager, run_ownership
 
 
 def _create_planner(
@@ -626,7 +652,7 @@ def build_orchestrator(
     label_manager = _LabelManager(config)
 
     # Create claim management components
-    claim_gate, lease_renewer, _lease_config, claim_manager = _create_claim_components(
+    claim_gate, lease_renewer, _lease_config, claim_manager, run_ownership = _create_claim_components(
         config, github, events, io_claimed_label=label_manager.io_claimed,
     )
 
@@ -672,6 +698,9 @@ def build_orchestrator(
         fresh_issue_reader=fresh_issue_reader,
         label_manager=label_manager,
         reconcile=True,
+        # A whole-repository anchor must be RESERVED before it is created, so
+        # the applier that owns the create owns the reservation too (#6994).
+        run_ownership=run_ownership,
     ) if github else None
 
     tech_lead = create_tech_lead_composition(
@@ -694,7 +723,10 @@ def build_orchestrator(
         else None
     )
     session_restorer = SessionRestorer(
-        config=config, repository_host=github, working_copy=working_copy
+        config=config,
+        repository_host=github,
+        working_copy=working_copy,
+        tech_lead_authority=tech_lead_authority,
     ) if github else None
 
     # Create state machine manager
@@ -876,6 +908,7 @@ def build_orchestrator(
         claim_manager=claim_manager,
         claim_gate=claim_gate,
         lease_renewer=lease_renewer,
+        run_ownership=run_ownership,
         publish_recovery=publish_recovery,
         services=infra_services,
     )
@@ -922,6 +955,7 @@ def build_orchestrator_for_testing(
     action_applier: ActionApplier | None = None,
     fact_gatherer: FactGatherer | None = None,
     claim_manager: ClaimManager | None = None,
+    run_ownership: TechLeadRunOwnership | None = None,
 ) -> "Orchestrator":
     """Build an orchestrator for testing with mock dependencies.
 
@@ -1049,6 +1083,7 @@ def build_orchestrator_for_testing(
         config=config,
         repository_host=github,
         working_copy=working_copy,
+        tech_lead_authority=tech_lead_authority_for_testing,
     )
 
     # Create StateMachineManager for testing
@@ -1154,6 +1189,11 @@ def build_orchestrator_for_testing(
         events=events,
         config=lease_config,
     )
+    run_ownership = run_ownership or TechLeadRunOwnership(
+        SingleInstanceRunLedgerStore(lease_seconds=lease_config.lease_seconds),
+        lease_seconds=lease_config.lease_seconds,
+        renew_before_expiry_seconds=lease_config.renew_interval_seconds,
+    )
 
     publish_recovery = _build_publish_recovery(
         repository_host=github,
@@ -1181,6 +1221,7 @@ def build_orchestrator_for_testing(
     if action_applier is not None:
         action_applier.label_store = label_store
         action_applier.publish_recovery = publish_recovery
+        action_applier.run_ownership = run_ownership
 
     infra_services = InfraServices(
         label_manager=label_manager,
@@ -1254,6 +1295,7 @@ def build_orchestrator_for_testing(
         claim_manager=claim_manager,
         claim_gate=claim_gate,
         lease_renewer=lease_renewer,
+        run_ownership=run_ownership,
         publish_recovery=publish_recovery,
         services=infra_services,
     )

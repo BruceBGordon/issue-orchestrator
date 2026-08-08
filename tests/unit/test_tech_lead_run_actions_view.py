@@ -1,0 +1,359 @@
+"""The dashboard's tech-lead affordances project live run state (#6994).
+
+The projection is the producer half of the command surface: the route decides
+whether a run may start, and this decides what the operator sees before they
+click. Both must read the SAME notion of "a global run" — a projection that
+disagreed would show an enabled button the server then refuses (or hide one it
+would have accepted), which is exactly the drift the run-admission owner exists
+to prevent.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Optional
+
+from issue_orchestrator.domain.models import (
+    DiscoveredFailure,
+    OrchestratorState,
+    PendingTechLeadReview,
+)
+from issue_orchestrator.domain.tech_lead_session import (
+    TechLeadLaunchScope,
+    TechLeadSessionFlavor,
+)
+from issue_orchestrator.infra.config import Config
+from issue_orchestrator.view_models.tech_lead_run_actions import (
+    STATUS_IDLE,
+    STATUS_QUEUED,
+    STATUS_RUNNING,
+    TechLeadRunActionsView,
+    read_tech_lead_run_actions,
+)
+
+
+def _payload(view: TechLeadRunActionsView) -> dict:
+    """The exact serialization ``dashboard_data`` publishes."""
+    return view.model_dump(mode="json", by_alias=True)
+
+TECH_LEAD_AGENT = "agent:tech-lead"
+
+
+class FakeIssue:
+    def __init__(self, number: int) -> None:
+        self.number = number
+        self.title = f"Issue {number}"
+        self.labels: tuple[str, ...] = ()
+
+
+class FakeSession:
+    def __init__(
+        self,
+        issue_number: int,
+        *,
+        agent_label: str = TECH_LEAD_AGENT,
+        flavor: Optional[TechLeadSessionFlavor] = None,
+    ) -> None:
+        self.issue = FakeIssue(issue_number)
+        self.agent_label = agent_label
+        self.lease_id = None
+        self.tech_lead_scope = (
+            TechLeadLaunchScope(flavor=flavor) if flavor is not None else None
+        )
+
+
+def _config(agent: Optional[str] = TECH_LEAD_AGENT) -> Config:
+    config = Config()
+    config.tech_lead_review_agent = agent
+    return config
+
+
+def _state(**kwargs: Any) -> OrchestratorState:
+    state = OrchestratorState()
+    for key, value in kwargs.items():
+        setattr(state, key, value)
+    return state
+
+
+def _investigation(number: int) -> PendingTechLeadReview:
+    return PendingTechLeadReview(
+        number,
+        f"Investigate #{number}",
+        flavor=TechLeadSessionFlavor.FAILURE_INVESTIGATION,
+        failure=DiscoveredFailure(number, f"Investigate #{number}", "timed_out"),
+    )
+
+
+def _health_review(anchor: int = 900) -> PendingTechLeadReview:
+    return PendingTechLeadReview(
+        anchor, "Health Review", flavor=TechLeadSessionFlavor.HEALTH_REVIEW
+    )
+
+
+def test_idle_board_enables_both_actions_with_no_status_text():
+    view = read_tech_lead_run_actions(_config(), _state())
+
+    assert view.configured is True
+    assert view.paused is False
+    assert view.global_status == STATUS_IDLE
+    assert view.global_status_label == ""
+    assert view.queued_issue_numbers == ()
+    assert view.running_issue_numbers == ()
+    assert view.global_barrier_active is False
+
+
+def test_missing_tech_lead_agent_keeps_the_feature_discoverable_but_disabled():
+    view = read_tech_lead_run_actions(_config(agent=None), _state())
+
+    assert view.configured is False
+
+
+def test_paused_engine_is_reported_so_the_ui_does_not_promise_a_run():
+    view = read_tech_lead_run_actions(_config(), _state(paused=True))
+
+    assert view.paused is True
+
+
+def test_a_queued_health_review_reads_as_queued_with_non_colour_text():
+    view = read_tech_lead_run_actions(
+        _config(), _state(pending_tech_lead_reviews=[_health_review()])
+    )
+
+    assert view.global_status == STATUS_QUEUED
+    assert view.global_status_label == "Tech lead queued"
+    assert view.global_barrier_active is True
+    # The anchor is not a board card, so it never shows as a per-issue run.
+    assert view.queued_issue_numbers == ()
+
+
+def test_a_running_health_review_reads_as_running():
+    view = read_tech_lead_run_actions(
+        _config(),
+        _state(
+            active_sessions=[
+                FakeSession(900, flavor=TechLeadSessionFlavor.HEALTH_REVIEW)
+            ]
+        ),
+    )
+
+    assert view.global_status == STATUS_RUNNING
+    assert view.global_status_label == "Tech lead running"
+    assert view.global_barrier_active is True
+    assert view.running_issue_numbers == ()
+
+
+def test_targeted_runs_are_reported_per_issue():
+    view = read_tech_lead_run_actions(
+        _config(),
+        _state(
+            pending_tech_lead_reviews=[_investigation(42)],
+            active_sessions=[
+                FakeSession(73, flavor=TechLeadSessionFlavor.FAILURE_INVESTIGATION)
+            ],
+        ),
+    )
+
+    assert view.queued_issue_numbers == (42,)
+    assert view.running_issue_numbers == (73,)
+    assert view.issue_status(42) == STATUS_QUEUED
+    assert view.issue_status(73) == STATUS_RUNNING
+    assert view.issue_status(7) == STATUS_IDLE
+    assert view.global_barrier_active is False
+
+
+def test_non_tech_lead_sessions_are_not_reported_as_tech_lead_runs():
+    view = read_tech_lead_run_actions(
+        _config(),
+        _state(active_sessions=[FakeSession(42, agent_label="agent:backend")]),
+    )
+
+    assert view.running_issue_numbers == ()
+    assert view.global_status == STATUS_IDLE
+
+
+def test_a_missing_engine_projects_not_running_rather_than_unconfigured():
+    """"Start the engine" and "add a tech lead agent" are different remedies.
+
+    With no engine we cannot know whether an agent is configured, so claiming it
+    is missing would send the operator to Settings for a problem they may not
+    have (#6994 round 1 F5).
+    """
+    view = read_tech_lead_run_actions(None, None)
+
+    assert view == TechLeadRunActionsView.empty()
+    assert view.running is False
+    assert view.configured is True
+
+
+def test_the_payload_is_the_camel_case_shape_the_dashboard_reads():
+    view = read_tech_lead_run_actions(
+        _config(), _state(pending_tech_lead_reviews=[_investigation(42)])
+    )
+
+    assert _payload(view) == {
+        "configured": True,
+        "running": True,
+        "paused": False,
+        "globalStatus": STATUS_IDLE,
+        "globalStatusLabel": "",
+        "healthReviewStatus": STATUS_IDLE,
+        "healthReviewStatusLabel": "",
+        "globalBarrierNote": "",
+        "queuedIssueNumbers": [42],
+        "runningIssueNumbers": [],
+        "globalBarrierActive": False,
+        "unavailableReason": "",
+        "needsSettings": False,
+    }
+
+
+def test_the_dashboard_data_payload_carries_the_projection():
+    """The producer -> command-payload half of the boundary.
+
+    ``dashboard_data`` is what the browser reads on load; without this the
+    projection could exist server-side and never reach the two actions.
+    """
+    from issue_orchestrator.view_models.dashboard import DashboardViewModel
+
+    fields = DashboardViewModel.__dataclass_fields__
+    assert "tech_lead_runs" in fields
+
+    view = read_tech_lead_run_actions(
+        _config(), _state(active_sessions=[
+            FakeSession(900, flavor=TechLeadSessionFlavor.HEALTH_REVIEW)
+        ])
+    )
+    payload = _payload(view)
+    assert payload["globalStatus"] == STATUS_RUNNING
+    assert payload["globalBarrierActive"] is True
+
+
+# ---------------------------------------------------------------------------
+# Engine availability is decided HERE, not in the browser (#6994 round 1 F5/F7)
+#
+# The dashboard renders `unavailableReason` verbatim. Keeping the order that
+# produces it on this side of the boundary is what stops a disabled button from
+# contradicting the rejection the operator would get by clicking anyway.
+# ---------------------------------------------------------------------------
+
+
+def test_a_ready_engine_publishes_no_unavailable_reason():
+    view = read_tech_lead_run_actions(_config(), _state())
+
+    assert view.unavailable_reason == ""
+    assert view.needs_settings is False
+
+
+def test_a_missing_tech_lead_agent_names_settings_as_the_remedy():
+    view = read_tech_lead_run_actions(_config(agent=None), _state())
+
+    assert "No tech lead agent is configured" in view.unavailable_reason
+    assert view.needs_settings is True
+
+
+def test_a_paused_engine_says_resume_not_configure():
+    view = read_tech_lead_run_actions(_config(), _state(paused=True))
+
+    assert "paused" in view.unavailable_reason
+    assert view.needs_settings is False
+
+
+def test_a_stopped_engine_says_start_and_is_not_a_settings_problem():
+    view = TechLeadRunActionsView.empty()
+
+    assert "not running" in view.unavailable_reason
+    assert view.needs_settings is False
+
+
+def test_configuration_outranks_pause_the_way_admission_does():
+    """Same order the coordinator applies, so the two cannot disagree."""
+    view = read_tech_lead_run_actions(_config(agent=None), _state(paused=True))
+
+    assert "No tech lead agent is configured" in view.unavailable_reason
+
+
+# ---------------------------------------------------------------------------
+# Distinct global flavors (#6994 round 2 F5)
+#
+# Round 1 derived ONE ``globalStatus`` from any global run and the browser
+# disabled the health action from it, so a batch review made "Run board health
+# review" look already-requested and refused the operator's click — even though
+# admission deliberately keeps the two identities distinct and queues one behind
+# the other.
+# ---------------------------------------------------------------------------
+
+
+def _batch_review(anchor: int = 800) -> PendingTechLeadReview:
+    return PendingTechLeadReview(
+        anchor, "Batch Review", flavor=TechLeadSessionFlavor.BATCH_REVIEW
+    )
+
+
+def test_a_queued_BATCH_review_leaves_the_health_action_available():
+    view = read_tech_lead_run_actions(
+        _config(), _state(pending_tech_lead_reviews=[_batch_review()])
+    )
+
+    assert view.global_status == STATUS_QUEUED
+    assert view.global_barrier_active is True
+    # ...but the health review itself has not been requested.
+    assert view.health_review_status == STATUS_IDLE
+    assert view.health_review_available is True
+
+
+def test_a_queued_batch_review_SAYS_the_health_review_would_wait():
+    """"It will queue" is a different message from "it is already queued"."""
+    view = read_tech_lead_run_actions(
+        _config(), _state(pending_tech_lead_reviews=[_batch_review()])
+    )
+
+    assert "will start after it" in view.global_barrier_note
+
+
+def test_a_RUNNING_batch_review_also_leaves_the_health_action_available():
+    view = read_tech_lead_run_actions(
+        _config(),
+        _state(
+            active_sessions=[
+                FakeSession(800, flavor=TechLeadSessionFlavor.BATCH_REVIEW)
+            ]
+        ),
+    )
+
+    assert view.global_status == STATUS_RUNNING
+    assert view.health_review_status == STATUS_IDLE
+    assert view.health_review_available is True
+    assert "is running" in view.global_barrier_note
+
+
+def test_a_queued_HEALTH_review_is_what_makes_the_health_action_unavailable():
+    view = read_tech_lead_run_actions(
+        _config(), _state(pending_tech_lead_reviews=[_health_review()])
+    )
+
+    assert view.health_review_status == STATUS_QUEUED
+    assert view.health_review_status_label == "Tech lead queued"
+    assert view.health_review_available is False
+    # A run is not waiting behind ITSELF, so there is no "you will wait" note.
+    assert view.global_barrier_note == ""
+
+
+def test_a_RUNNING_health_review_makes_the_health_action_unavailable():
+    view = read_tech_lead_run_actions(
+        _config(),
+        _state(
+            active_sessions=[
+                FakeSession(900, flavor=TechLeadSessionFlavor.HEALTH_REVIEW)
+            ]
+        ),
+    )
+
+    assert view.health_review_status == STATUS_RUNNING
+    assert view.health_review_available is False
+    assert view.global_barrier_note == ""
+
+
+def test_an_unavailable_engine_still_outranks_an_idle_health_review():
+    view = read_tech_lead_run_actions(_config(), _state(paused=True))
+
+    assert view.health_review_status == STATUS_IDLE
+    assert view.health_review_available is False

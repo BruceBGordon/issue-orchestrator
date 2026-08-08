@@ -418,6 +418,58 @@ h1 {
 }
 .settings-menu-item:hover { background: var(--bg-panel-soft); }
 .settings-menu-item:active { background: var(--bg-hover); }
+/* A disabled dashboard action stays readable (not colour-only): the adjacent
+   status text says WHY, and the reduced opacity is a secondary cue (#6994). */
+.settings-menu-item[disabled],
+.settings-menu-item[aria-disabled="true"] {
+    opacity: 0.6;
+    cursor: not-allowed;
+}
+/* An unavailable action keeps its focus ring: it is aria-disabled rather than
+   natively disabled precisely so its explanation and remedy stay reachable by
+   keyboard (#6994 round 2 F6). */
+.settings-menu-item:focus-visible,
+.settings-menu-item:focus {
+    outline: 2px solid var(--accent, currentColor);
+    outline-offset: -2px;
+}
+/* The status text and the Settings remedy are SIBLINGS of the action, never
+   nested inside the button — a button inside a button is invalid interactive
+   markup and hides both from assistive technology (#6994 round 2 F6). */
+.settings-menu-row {
+    display: block;
+    padding-bottom: 2px;
+}
+.settings-menu-status {
+    display: block;
+    font-size: 11px;
+    color: var(--text-muted, var(--text));
+    margin: 2px 0 0 8px;
+    /* Never clipped: the blocked reason is a full sentence. */
+    white-space: normal;
+    overflow-wrap: anywhere;
+}
+.settings-menu-status:empty { display: none; }
+/* The remedy for "no tech lead agent configured" has to be operable: a disabled
+   button cannot take anyone to Settings, so the path is its own focusable
+   control with a visible focus ring (#6994 round 1 F7). */
+.tech-lead-settings-link {
+    display: block;
+    width: 100%;
+    text-align: left;
+    background: none;
+    border: none;
+    padding: 2px 0 4px;
+    font-size: 11px;
+    color: var(--accent, var(--text));
+    text-decoration: underline;
+    cursor: pointer;
+}
+.tech-lead-settings-link:focus-visible,
+.tech-lead-settings-link:focus {
+    outline: 2px solid var(--accent, currentColor);
+    outline-offset: 2px;
+}
 
 .gh-usage-wrap {
     position: relative;

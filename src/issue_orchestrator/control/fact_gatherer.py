@@ -219,6 +219,7 @@ class FactGatherer:
         # recovered failures this tick (a next-tick capture would be dropped by
         # the end-of-tick discovered-fact clear).
         tech_lead_facts = self.gather_tech_lead_facts(state)
+        tech_lead_subjects = self.gather_tech_lead_subject_facts(state, issues)
         cleanup_facts = self.gather_cleanup_facts(state)
         e2e_occupies_slot, e2e_due = self._read_e2e_slot_facts()
 
@@ -255,6 +256,7 @@ class FactGatherer:
             discovered_failures=tuple(state.discovered_failures),
             stuck_sweep_escalations=tuple(state.stuck_sweep_escalations),
             tech_lead_facts=tech_lead_facts,
+            tech_lead_subjects=tech_lead_subjects,
             cleanup_facts=cleanup_facts,
             stale_in_progress_issues=tuple(stale_in_progress_issues or []),
             stale_claim_issues=tuple(stale_claim_issues or []),
@@ -276,6 +278,60 @@ class FactGatherer:
             return False, False
         signals = self.e2e_slot_reader()
         return signals.occupies_slot, signals.due
+
+    def gather_tech_lead_subject_facts(
+        self,
+        state: "OrchestratorState",
+        board: list["Issue"],
+    ) -> tuple["Issue", ...]:
+        """Authoritative lifecycle reads for queued investigation subjects (#6994).
+
+        Launch-time revalidation must be able to see a subject that was CLOSED
+        while its investigation waited behind the global barrier. It cannot get
+        that from ``board``: the board fetch is filtered by agent label,
+        milestone, and ``filtering.exclude_labels``, and it asks GitHub only for
+        OPEN issues — so a closed subject is simply ABSENT, and absence is the
+        one signal revalidation must never act on (a filtered-out issue is
+        absent too). Before round 1 F4 that made the closed-while-queued rule
+        unreachable in production.
+
+        So the gap is closed HERE, where fact gathering belongs, and only for
+        the subjects that actually need it: a queued FAILURE_INVESTIGATION whose
+        subject the board did not carry. GitHub API discipline is why the read
+        is scoped that narrowly — a tick with no queued investigations, or whose
+        subjects are all on the board, makes ZERO extra calls, and the queue is
+        bounded by ``tech_lead.max_concurrent`` plus its backlog.
+        """
+        from ..domain.tech_lead_session import TechLeadSessionFlavor
+
+        on_board = {issue.number for issue in board}
+        wanted = sorted(
+            {
+                item.issue_number
+                for item in state.pending_tech_lead_reviews
+                if item.flavor is TechLeadSessionFlavor.FAILURE_INVESTIGATION
+                and item.issue_number not in on_board
+            }
+        )
+        if not wanted:
+            return ()
+        read: list["Issue"] = []
+        for number in wanted:
+            try:
+                issue = self.repository_host.get_issue(number)
+            except Exception as exc:  # pragma: no cover - transport-specific
+                logger.warning(
+                    "[TECH_LEAD] Could not re-read queued subject #%d: %s",
+                    number,
+                    exc,
+                )
+                continue
+            # A subject that cannot be read yields NO fact: revalidation then
+            # keeps the run, which is the same conservative direction absence
+            # from the filtered board takes.
+            if issue is not None:
+                read.append(issue)
+        return tuple(read)
 
     def gather_tech_lead_facts(
         self,

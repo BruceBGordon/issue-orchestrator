@@ -905,36 +905,6 @@
     "status": "completed",
     "step": "stale.persistent_detected"
   },
-  "tick.completed": {
-    "level": "detail",
-    "phase": "system",
-    "status": "completed",
-    "step": "tick.completed"
-  },
-  "tick.slow": {
-    "level": "detail",
-    "phase": "system",
-    "status": "completed",
-    "step": "tick.slow"
-  },
-  "tick.started": {
-    "level": "detail",
-    "phase": "system",
-    "status": "started",
-    "step": "tick.started"
-  },
-  "transition.applied": {
-    "level": "detail",
-    "phase": "system",
-    "status": "completed",
-    "step": "transition.applied"
-  },
-  "transition.rejected": {
-    "level": "detail",
-    "phase": "system",
-    "status": "completed",
-    "step": "transition.rejected"
-  },
   "tech_lead.action_executed": {
     "level": "detail",
     "phase": "system",
@@ -965,6 +935,30 @@
     "status": "started",
     "step": "tech_lead.launching"
   },
+  "tech_lead.run_held": {
+    "level": "detail",
+    "phase": "system",
+    "status": "completed",
+    "step": "tech_lead.run_held"
+  },
+  "tech_lead.run_ownership_changed": {
+    "level": "detail",
+    "phase": "system",
+    "status": "completed",
+    "step": "tech_lead.run_ownership_changed"
+  },
+  "tech_lead.run_requested": {
+    "level": "detail",
+    "phase": "system",
+    "status": "completed",
+    "step": "tech_lead.run_requested"
+  },
+  "tech_lead.run_withdrawn": {
+    "level": "detail",
+    "phase": "system",
+    "status": "completed",
+    "step": "tech_lead.run_withdrawn"
+  },
   "tech_lead.skipped": {
     "level": "detail",
     "phase": "system",
@@ -976,6 +970,36 @@
     "phase": "system",
     "status": "completed",
     "step": "tech_lead.stuck_sweep"
+  },
+  "tick.completed": {
+    "level": "detail",
+    "phase": "system",
+    "status": "completed",
+    "step": "tick.completed"
+  },
+  "tick.slow": {
+    "level": "detail",
+    "phase": "system",
+    "status": "completed",
+    "step": "tick.slow"
+  },
+  "tick.started": {
+    "level": "detail",
+    "phase": "system",
+    "status": "started",
+    "step": "tick.started"
+  },
+  "transition.applied": {
+    "level": "detail",
+    "phase": "system",
+    "status": "completed",
+    "step": "transition.applied"
+  },
+  "transition.rejected": {
+    "level": "detail",
+    "phase": "system",
+    "status": "completed",
+    "step": "transition.rejected"
   },
   "validation.completed": {
     "level": "detail",

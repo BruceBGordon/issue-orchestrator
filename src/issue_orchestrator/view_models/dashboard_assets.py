@@ -56,6 +56,10 @@ DASHBOARD_JS_CHUNKS: tuple[str, ...] = (
     "diagnostics_actions.js",
     "shell_actions.js",
     "retrospective_review.js",
+    # Scoped tech-lead run requests (#6994): the dashboard actions menu's
+    # "Run board health review" and the blocked-item "Investigate with tech
+    # lead". Loaded after ``issue_menus.js`` so the context-menu wiring exists.
+    "tech_lead_runs.js",
     "e2e_runtime.js",
     "e2e_triage.js",
     # ``e2e_canonical_payload.js`` provides the pure translator from

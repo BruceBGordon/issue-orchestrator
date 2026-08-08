@@ -46,6 +46,10 @@ function loadDrawer(fetchImpl) {
     const elements = {};
     const fetchCalls = [];
     const context = {
+        // Cross-chunk owner: ``tech_lead_runs.js`` owns the targeted tech-lead
+        // action's visibility/state; the drawer only names its elements (#6994).
+        resetTechLeadIssueAction: () => {},
+        updateTechLeadIssueAction: () => false,
         console,
         // Owned by issue_detail_modals.js, which this harness deliberately
         // does not load. Focus-return behavior is covered by

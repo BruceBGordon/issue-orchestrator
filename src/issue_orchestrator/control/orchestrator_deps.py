@@ -39,6 +39,7 @@ if TYPE_CHECKING:
     from ..ports.worktree_manager import WorktreeManager
     from ..ports.working_copy import WorkingCopy
     from ..ports.claim_manager import ClaimManager
+    from .tech_lead_run_ownership import TechLeadRunOwnership
     from .infra_services import InfraServices
     from .label_manager import LabelManager
     from .planner import Planner
@@ -126,6 +127,10 @@ class OrchestratorDeps:
     claim_manager: "ClaimManager"
     claim_gate: "ClaimGate"
     lease_renewer: "LeaseRenewer"
+    # Cross-instance ownership of LOGICAL tech-lead runs (#6994). Long-lived on
+    # purpose: a run is owned from admission until its session ends, which is
+    # many ticks, so the holder cannot be rebuilt per request.
+    run_ownership: "TechLeadRunOwnership"
 
     # Manual publish recovery ("Retry publish"): off-thread republish + reconcile
     publish_recovery: "PublishRecoveryService"

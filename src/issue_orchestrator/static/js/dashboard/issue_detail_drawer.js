@@ -88,6 +88,7 @@ async function openIssueDetail(issueNumber, triggerEl = null, opts = {}) {
         retryPublishBtn.style.display = 'none';
         retryPublishBtn.disabled = true;
     }
+    resetTechLeadIssueAction(techLeadDrawerAction());
     const closeBtn = document.getElementById('issueDetailCloseBtn');
     if (closeBtn) closeBtn.focus();
 
@@ -120,6 +121,16 @@ async function openIssueDetail(issueNumber, triggerEl = null, opts = {}) {
         console.error('Failed to load issue detail:', err);
         document.getElementById('issueDetailStatus').textContent = 'Failed to load issue detail.';
     }
+}
+
+// The drawer's half of the targeted tech-lead action (#6994). Its visibility,
+// disabled state, and status text belong to the owner in ``tech_lead_runs.js``;
+// the drawer only says WHICH elements carry them.
+function techLeadDrawerAction() {
+    return {
+        button: document.getElementById('issueDetailInvestigateTechLeadBtn'),
+        statusEl: document.getElementById('issueDetailTechLeadStatus'),
+    };
 }
 
 function closeIssueDetail() {
@@ -848,8 +859,14 @@ function renderIssueDetail() {
             : 'Retry Publish';
         retryPublishBtn.onclick = () => retryPublishFromDrawer();
     }
+    // Targeted tech-lead action (#6994) — same eligibility rule and the same
+    // queued/running text the compact card menu uses, so the two surfaces stay
+    // in parity rather than each deciding for themselves.
+    const techLeadVisible = updateTechLeadIssueAction(
+        techLeadDrawerAction(), Number(d.issue_number), isBlocked,
+    );
     if (actionsEl) {
-        actionsEl.style.display = isBlocked || Boolean(retryPublishAction) ? '' : 'none';
+        actionsEl.style.display = isBlocked || Boolean(retryPublishAction) || techLeadVisible ? '' : 'none';
     }
 
     // Status explanation with color-coded border
