@@ -227,11 +227,14 @@ def _ownership(store: SharedRunClaimStore) -> TechLeadRunOwnership:
     return store.ownership()
 
 
-def _config(agent: Optional[str] = TECH_LEAD_AGENT) -> Any:
+def _config(
+    agent: Optional[str] = TECH_LEAD_AGENT, *, enabled: Optional[bool] = None
+) -> Any:
     from issue_orchestrator.infra.config import Config
 
     config = Config()
     config.tech_lead_review_agent = agent
+    config.tech_lead.enabled = enabled
     return config
 
 
@@ -487,6 +490,27 @@ def test_missing_tech_lead_agent_is_reported_not_configured():
     assert admission.outcome is TechLeadRunOutcome.NOT_CONFIGURED
     assert admission.reason == REASON_NO_TECH_LEAD_AGENT
     assert state.pending_tech_lead_reviews == []
+
+
+def test_master_switch_refuses_new_work_without_touching_external_owners():
+    state = _state()
+    repository_host = FakeRepositoryHost({42: FakeIssue(42)})
+    anchor_host = FakeAnchorHost(state)
+    claim_store = SharedRunClaimStore()
+    admission = _coordinator(
+        state,
+        config=_config(enabled=False),
+        repository_host=repository_host,
+        anchor_host=anchor_host,
+        ownership=claim_store.ownership(),
+    ).admit(_issue_request(42))
+
+    assert admission.outcome is TechLeadRunOutcome.NOT_CONFIGURED
+    assert admission.reason == REASON_NO_TECH_LEAD_AGENT
+    assert state.pending_tech_lead_reviews == []
+    assert repository_host.get_issue_calls == []
+    assert anchor_host.calls == 0
+    assert claim_store.shared.submissions == []
 
 
 def test_paused_engine_refuses_rather_than_promising_a_run():

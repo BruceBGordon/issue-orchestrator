@@ -447,6 +447,25 @@ class TestSettingsEndpoints:
         finally:
             web._orchestrator = None
 
+    def test_settings_page_renders_accessible_tech_lead_master_switch(self):
+        """The one-place switch is a labelled native checkbox in Review settings."""
+        from issue_orchestrator.entrypoints import web
+
+        mock_orch = create_mock_orchestrator()
+        mock_orch.config.tech_lead_review_agent = "agent:tech-lead"
+
+        web._orchestrator = mock_orch
+        try:
+            response = TestClient(app).get("/settings")
+
+            assert response.status_code == 200
+            html = response.text
+            assert 'type="checkbox" id="review__tech_lead_enabled"' in html
+            assert 'data-field="tech_lead_enabled" data-type="boolean"' in html
+            assert '<label for="review__tech_lead_enabled">Enable Tech Lead</label>' in html
+        finally:
+            web._orchestrator = None
+
     def test_settings_page_uses_server_classified_control_tokens(self):
         """GET /settings carries server-classified data-type tokens and the
         shared form-controls module instead of embedded schema JSON.

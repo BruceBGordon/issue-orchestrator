@@ -276,12 +276,12 @@ class TechLeadRunCoordinator:
 
     def _decide(self, request: TechLeadRunRequest) -> TechLeadRunAdmission:
         """The admission matrix itself, free of emission concerns."""
-        if not self._config.tech_lead_review_agent:
+        if not self._config.tech_lead_enabled:
             return self._reject(
                 request,
                 TechLeadRunOutcome.NOT_CONFIGURED,
                 REASON_NO_TECH_LEAD_AGENT,
-                "No tech lead agent is configured for this repository.",
+                "Tech lead is disabled or has no configured agent for this repository.",
             )
         if self._state.paused:
             return self._reject(

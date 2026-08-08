@@ -190,7 +190,7 @@ def read_tech_lead_run_actions(
 
     health_status = _health_review_status(config, state)
     global_run_numbers = _global_run_issue_numbers(config, state)
-    configured = bool(config.tech_lead_review_agent)
+    configured = config.tech_lead_enabled
     paused = bool(state.paused)
     return TechLeadRunActionsView(
         configured=configured,

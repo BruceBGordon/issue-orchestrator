@@ -133,7 +133,7 @@ class ProviderAvailabilityPolicy:
                 providers_by_issue.setdefault(issue_num, set()).add(provider)
 
         tech_lead_provider = self.provider_for_agent_label(self.config.tech_lead_review_agent)
-        if tech_lead_provider:
+        if self.config.tech_lead_enabled and tech_lead_provider:
             for tech_lead in snapshot.pending_tech_lead:
                 providers_by_issue.setdefault(tech_lead.issue_number, set()).add(tech_lead_provider)
 

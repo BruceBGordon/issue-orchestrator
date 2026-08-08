@@ -1009,7 +1009,7 @@ class CompletionHandler:
 
         if status == SessionStatus.COMPLETED and is_work_session and pr_url and pr_number:
             # Check if we should defer cleanup based on review workflow
-            if self.config.tech_lead_review_agent:
+            if self.config.tech_lead_enabled:
                 # Tech Lead workflow: defer until tech_lead review passes
                 should_defer = self.config.cleanup.with_tech_lead.close_ai_session_tabs
             elif self.config.code_review_agent:

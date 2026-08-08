@@ -101,6 +101,17 @@ class TestActivation:
         # an operator decision, and the durable rows are kept.
         assert readiness.problems == ()
 
+    def test_master_switch_deactivates_the_lane_without_erasing_its_agent(self):
+        config = _config()
+        config.tech_lead.enabled = False
+
+        readiness = promotion_lane_readiness(config)
+
+        assert not readiness.active
+        assert "tech_lead.enabled" in readiness.inactive_reason
+        assert config.tech_lead_review_agent == "agent:tech-lead"
+        assert readiness.problems == ()
+
     def test_no_repo_deactivates_the_lane(self):
         config = _config()
         config.repo = None
@@ -195,6 +206,19 @@ class TestBoundariesConsumeTheSameDecision:
         class Exploding(InMemoryPromotionTargetHost):
             def read_outcome(self, *, repo: str, issue_number: int):
                 raise AssertionError("an inactive lane must make no cross-repo read")
+
+        promotable, updates, settled = self._gather(config, authority, Exploding())
+
+        assert (promotable, updates, settled) == ((), (), ())
+
+    def test_master_switch_makes_the_lane_a_zero_read_no_op(self):
+        config = _config()
+        config.tech_lead.enabled = False
+        authority = _authority_with_work()
+
+        class Exploding(InMemoryPromotionTargetHost):
+            def read_outcome(self, *, repo: str, issue_number: int):
+                raise AssertionError("a disabled lane must make no cross-repo read")
 
         promotable, updates, settled = self._gather(config, authority, Exploding())
 

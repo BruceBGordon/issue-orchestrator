@@ -275,7 +275,7 @@ class StartupManager:
             self._recover_pr_pending_history(state, issue_branches)
 
         # Step 9: Recover pending tech_lead reviews
-        if self.config.tech_lead_review_agent:
+        if self.config.tech_lead_enabled:
             with self._phase("recover_pending_tech_lead", timings):
                 await self._recover_pending_tech_lead(state)
 

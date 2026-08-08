@@ -3013,6 +3013,8 @@ class TestTechLeadConfig:
         """TechLeadConfig should have sensible defaults."""
         config = Config()
 
+        assert config.tech_lead.enabled is None
+        assert config.tech_lead_enabled is False
         assert config.tech_lead.inherit_labels == []
         assert config.tech_lead.explicit_labels == []
         assert config.tech_lead.milestone_strategy.inherit_from_issues == "latest"
@@ -3020,6 +3022,59 @@ class TestTechLeadConfig:
         assert config.tech_lead.priority is None
         assert config.tech_lead.dedup.enabled is True
         assert config.tech_lead.dedup.similarity_threshold == 0.72
+
+    def test_legacy_agent_presence_enables_tech_lead_when_switch_is_omitted(self):
+        config = Config()
+        config.tech_lead_review_agent = "agent:tech-lead"
+
+        assert config.tech_lead.enabled is None
+        assert config.tech_lead_enabled is True
+
+    def test_explicit_switch_overrides_legacy_agent_presence(self):
+        config = Config()
+        config.tech_lead_review_agent = "agent:tech-lead"
+
+        config.tech_lead.enabled = False
+        assert config.tech_lead_enabled is False
+
+        config.tech_lead.enabled = True
+        assert config.tech_lead_enabled is True
+
+    @pytest.mark.parametrize(("raw", "expected"), (("false", False), ("true", True)))
+    def test_tech_lead_enabled_from_yaml(self, tmp_path, raw: str, expected: bool):
+        config_file = tmp_path / ".issue-orchestrator.yaml"
+        config_file.write_text(
+            f"""
+agents:
+  agent:tech-lead:
+    prompt: /tmp/tech-lead.md
+review:
+  tech_lead_review_agent: agent:tech-lead
+  tech_lead_follow_up_agent: agent:tech-lead
+tech_lead:
+  enabled: {raw}
+"""
+        )
+
+        config = Config.load(config_file)
+
+        assert config.tech_lead.enabled is expected
+        assert config.tech_lead_enabled is expected
+
+    def test_tech_lead_enabled_rejects_non_boolean_yaml(self, tmp_path):
+        config_file = tmp_path / ".issue-orchestrator.yaml"
+        config_file.write_text('tech_lead:\n  enabled: "false"\n')
+
+        with pytest.raises(ValueError, match="tech_lead.enabled must be a boolean"):
+            Config.load(config_file)
+
+    def test_explicit_enable_without_agent_fails_validation(self):
+        config = Config()
+        config.tech_lead.enabled = True
+
+        errors = config.validate()
+
+        assert any("tech_lead.enabled is true" in error for error in errors)
 
     def test_tech_lead_dedup_from_yaml(self, tmp_path):
         config_file = tmp_path / ".issue-orchestrator.yaml"

@@ -1340,6 +1340,7 @@ class TestWizardNewProject:
         assert config["review"]["tech_lead_follow_up_agent"] == "agent:backend"
         assert config["review"]["tech_lead_reviewed_label"] == "tech-lead-reviewed"
         assert config["review"]["tech_lead_review_threshold"] == 5
+        assert config["tech_lead"]["enabled"] is True
 
     @patch("issue_orchestrator.entrypoints.cli_tools.setup_wizard.detect_repo")
     @patch("issue_orchestrator.entrypoints.cli_tools.setup_wizard._get_repository_host")

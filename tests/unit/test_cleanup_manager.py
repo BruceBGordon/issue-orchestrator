@@ -60,6 +60,9 @@ def make_pending_cleanup(
 def mock_config():
     """Create a mock config with reasonable defaults."""
     config = MagicMock()
+    # Most tests in this file exercise the tech-lead cleanup branch; tests for
+    # the no-tech-lead/code-review branch override this explicitly.
+    config.tech_lead_enabled = True
     config.tech_lead_review_agent = None
     config.code_review_agent = None
     config.tech_lead_reviewed_label = "tech-lead-reviewed"
@@ -168,6 +171,7 @@ class TestProcessDeferredCleanups:
     ):
         """Without review workflow configured, cleanups are not processed."""
         mock_config.tech_lead_review_agent = None
+        mock_config.tech_lead_enabled = False
         mock_config.code_review_agent = None
 
         pending = [
@@ -219,6 +223,7 @@ class TestProcessDeferredCleanups:
     ):
         """With code review workflow, PRs with code-reviewed label are cleaned."""
         mock_config.tech_lead_review_agent = None
+        mock_config.tech_lead_enabled = False
         mock_config.code_review_agent = "agent:reviewer"
         mock_config.code_reviewed_label = "code-reviewed"
 
@@ -517,6 +522,7 @@ class TestRecoverOrphanedCleanups:
     def test_returns_zero_without_review_workflow(self, cleanup_manager, mock_config):
         """Without review workflow, returns 0 (no cleanup needed)."""
         mock_config.tech_lead_review_agent = None
+        mock_config.tech_lead_enabled = False
         mock_config.code_review_agent = None
 
         result = cleanup_manager.recover_orphaned_cleanups()
