@@ -5,6 +5,9 @@ from unittest.mock import MagicMock
 
 from issue_orchestrator.infra.launcher import (
     LaunchResult,
+    LaunchStatus,
+    UnclassifiedLaunchStatusError,
+    UnknownLaunchStatusError,
     launch_preflight_only,
     launch_subprocess,
     preflight,
@@ -43,10 +46,92 @@ def _mock_supervisor():
     return sv
 
 
+class TestLaunchStatus:
+    """The shared vocabulary every consumer classifies outcomes with."""
+
+    def test_only_doctor_and_launch_errors_are_failures(self):
+        assert {status for status in LaunchStatus if status.is_failure} == {
+            LaunchStatus.DOCTOR_ERROR,
+            LaunchStatus.LAUNCH_ERROR,
+        }
+
+    def test_a_warning_or_lost_race_still_means_the_orchestrator_is_up(self):
+        assert not LaunchStatus.OK.is_failure
+        assert not LaunchStatus.DOCTOR_WARNING.is_failure
+        assert not LaunchStatus.ALREADY_RUNNING.is_failure
+
+    def test_every_status_declares_a_success_or_failure_disposition(self):
+        """The guard: a member added to the enum cannot stay unclassified.
+
+        Compared against ``set(LaunchStatus)`` — the enum itself — rather than
+        against either disposition set, so adding ``SUPERVISOR_ERROR`` and
+        forgetting to classify it fails here instead of quietly reading as a
+        successful start at every consumer.
+        """
+        successes = LaunchStatus.success_statuses()
+        failures = LaunchStatus.failure_statuses()
+
+        assert successes | failures == set(LaunchStatus)
+        assert not successes & failures
+
+    def test_is_failure_never_defaults_to_success_for_an_unclassified_member(
+        self, monkeypatch
+    ):
+        """Omission must raise, because "not a known failure" is not "started"."""
+        monkeypatch.setattr(
+            LaunchStatus, "failure_statuses", classmethod(lambda cls: frozenset())
+        )
+        monkeypatch.setattr(
+            LaunchStatus, "success_statuses", classmethod(lambda cls: frozenset())
+        )
+
+        with pytest.raises(UnclassifiedLaunchStatusError) as excinfo:
+            LaunchStatus.DOCTOR_ERROR.is_failure
+
+        assert "doctor_error" in str(excinfo.value)
+
+    def test_is_failure_rejects_conflicting_dispositions(self, monkeypatch):
+        """Membership in both sets is as invalid as membership in neither."""
+        doctor_error = frozenset({LaunchStatus.DOCTOR_ERROR})
+        monkeypatch.setattr(
+            LaunchStatus,
+            "failure_statuses",
+            classmethod(lambda cls: doctor_error),
+        )
+        monkeypatch.setattr(
+            LaunchStatus,
+            "success_statuses",
+            classmethod(lambda cls: doctor_error),
+        )
+
+        with pytest.raises(UnclassifiedLaunchStatusError) as excinfo:
+            LaunchStatus.DOCTOR_ERROR.is_failure
+
+        assert "exactly one" in str(excinfo.value)
+
+    @pytest.mark.parametrize(
+        "value",
+        ["ok", "doctor_warning", "already_running", "doctor_error", "launch_error"],
+    )
+    def test_parse_accepts_every_wire_value(self, value):
+        assert LaunchStatus.parse(value).value == value
+
+    def test_parse_is_idempotent_for_members(self):
+        assert LaunchStatus.parse(LaunchStatus.OK) is LaunchStatus.OK
+
+    @pytest.mark.parametrize("value", ["doctor_eror", "supervisor_error", "", "OK"])
+    def test_parse_rejects_anything_else(self, value):
+        """An unknown status must never quietly take a consumer's happy path."""
+        with pytest.raises(UnknownLaunchStatusError) as excinfo:
+            LaunchStatus.parse(value)
+
+        assert repr(value) in str(excinfo.value)
+
+
 class TestLaunchResult:
     def test_to_dict_minimal(self):
         doctor = DoctorResult(checks=[Check(name="Test", status="ok", detail="good")])
-        result = LaunchResult(doctor=doctor, launched=False, status="ok")
+        result = LaunchResult(doctor=doctor, launched=False, status=LaunchStatus.OK)
         d = result.to_dict()
         assert d["launched"] is False
         assert d["status"] == "ok"
@@ -57,7 +142,10 @@ class TestLaunchResult:
     def test_to_dict_with_error(self):
         doctor = DoctorResult(checks=[Check(name="Test", status="error", detail="bad")])
         result = LaunchResult(
-            doctor=doctor, launched=False, status="doctor_error", error="check failed"
+            doctor=doctor,
+            launched=False,
+            status=LaunchStatus.DOCTOR_ERROR,
+            error="check failed",
         )
         d = result.to_dict()
         assert d["error"] == "check failed"
@@ -68,7 +156,7 @@ class TestLaunchResult:
         result = LaunchResult(
             doctor=doctor,
             launched=True,
-            status="ok",
+            status=LaunchStatus.OK,
             supervisor={"pid": 123, "port": 8080},
         )
         d = result.to_dict()

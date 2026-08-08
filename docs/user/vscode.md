@@ -6,6 +6,7 @@ This extension gives you a native VS Code experience for Issue Orchestrator: liv
 
 1. **Install Issue Orchestrator (Python package)** so the MCP entrypoint exists on your PATH:
    - You should be able to run `issue-orchestrator-mcp --help`.
+   - See [MCP Server](mcp.md) for what that entrypoint is and what it exposes.
 2. **Create a repo config** in your repo:
    - `.issue-orchestrator/config/default.yaml`
    - Start from `examples/config.example.yaml` if you’re new.
@@ -42,10 +43,18 @@ The extension starts the MCP server and (by default) auto-starts the orchestrato
 
 - See **Active**, **Queue**, **Blocked**, and **History** sessions.
 - Open worktrees, PRs, issues, and logs.
-- Open a live **session console** and send messages to running agents.
+- Open a read-only **session console** for a running agent, or **focus** its
+  terminal when the client supports it, and drive the agent from that terminal
+  directly.
 - Pause/Resume/Stop the orchestrator without leaving VS Code.
 - Open the web **Dashboard** inside VS Code or in your browser.
 - Run diagnostics in the **Doctor** panel (re-run, copy report, open Control Center/Dashboard) and surface issues in the Problems panel.
+
+The extension deliberately cannot inject text into a running agent's prompt.
+The MCP server does not register a session-send tool, because any client
+holding the transport could use it to steer an agent — see
+[the MCP security notes](mcp.md#security-and-operational-notes). Focusing the terminal keeps
+that in your hands rather than the client's.
 
 ## Settings You’ll Actually Use
 
@@ -66,13 +75,25 @@ The Control Center runs in a VS Code terminal and serves the web UI.
 
 ## MCP Server (Optional)
 
-You can run the MCP server manually:
+The extension drives the same MCP server you can connect any other MCP client
+to. You can run it manually as a smoke check that the entrypoint resolves and
+your config loads:
 
 ```bash
 issue-orchestrator-mcp --repo-root /path/to/repo --auto-start
 ```
 
-The extension will detect and use it if running.
+It will then sit waiting for MCP traffic on stdin; press `Ctrl-C` to stop it.
+
+The extension does **not** attach to a process you started yourself. The
+transport is stdio, so the extension always spawns its own
+`issue-orchestrator-mcp` subprocess (the command is the
+`issueOrchestrator.mcpCommand` setting) and talks to it over that pipe. Leaving
+a manual one running is harmless but unused.
+
+For the full flag list, the `orchestrator.*` tool reference, a copy-paste
+client config, and the security posture (stdio-only transport, the repos
+allowlist, confirm-gated shutdown), see [MCP Server](mcp.md).
 
 ## Extension Tests
 

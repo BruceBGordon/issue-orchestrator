@@ -33,18 +33,118 @@ import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Awaitable
+from typing import TYPE_CHECKING, Any, Callable, Awaitable
 import inspect
 from mcp.server.fastmcp import FastMCP
 
+if TYPE_CHECKING:
+    from ..infra.launcher import LaunchResult
+
+from ..contracts.mcp import McpErrorPayload, McpUiHintPayload
 from ..infra import supervisor
 from ..infra.config import Config, get_config_path
 from ..infra.client_urls import resolve_client_base_url
+from ..infra.launcher import LaunchStatus
 from ..execution.orchestrator_http_api import OrchestratorAsyncHttpApi
 
 logger = logging.getLogger(__name__)
 
 _REPOS_ALLOWLIST_ENV = "ISSUE_ORCHESTRATOR_MCP_REPOS_ALLOWLIST"
+
+# The ``error.type`` each failing launcher status maps to. Keyed by the shared
+# ``LaunchStatus`` vocabulary rather than raw strings, and asserted in
+# ``tests/unit/test_mcp_server.py`` to cover exactly
+# ``LaunchStatus.failure_statuses()`` — which the launcher in turn proves is a
+# partition of the enum, so a new failure status cannot slip through as a
+# success by being omitted from both sets.
+#
+# ``LAUNCH_ERROR`` carries the exception text in ``LaunchResult.error``;
+# ``DOCTOR_ERROR`` carries none, so the message is built from the failing
+# checks. Both must surface as the top-level structured error that
+# ``docs/user/mcp.md`` documents and the VS Code start command consumes —
+# otherwise an ordinary failed launch reads as success to every client.
+LAUNCH_FAILURE_ERROR_TYPES: dict[LaunchStatus, str] = {
+    LaunchStatus.DOCTOR_ERROR: "DoctorError",
+    LaunchStatus.LAUNCH_ERROR: "LaunchError",
+}
+
+
+def _doctor_error_message(launch_result: "LaunchResult") -> str:
+    failing = [
+        check for check in launch_result.doctor.checks if check.status == "error"
+    ]
+    if not failing:
+        return "Doctor checks failed"
+    detail = "; ".join(
+        f"{check.name}: {check.detail}" if check.detail else check.name
+        for check in failing
+    )
+    return f"Doctor checks failed — {detail}"
+
+
+def _launcher_error_message(launch_result: "LaunchResult") -> str:
+    """Return a non-empty description of a launcher process failure.
+
+    Emptiness matters: clients test the presence of a message to decide a start
+    failed, so an empty one would read as success and silently drop the
+    operator back into a "started" UI.
+    """
+    launcher_message = (launch_result.error or "").strip()
+    return launcher_message or "Orchestrator failed to start (launch_error)"
+
+
+_LAUNCH_FAILURE_MESSAGE_BUILDERS: dict[
+    LaunchStatus, Callable[["LaunchResult"], str]
+] = {
+    LaunchStatus.DOCTOR_ERROR: _doctor_error_message,
+    LaunchStatus.LAUNCH_ERROR: _launcher_error_message,
+}
+
+
+def _build_launch_failure_error(
+    launch_result: "LaunchResult", status: LaunchStatus
+) -> McpErrorPayload:
+    return {
+        "message": _LAUNCH_FAILURE_MESSAGE_BUILDERS[status](launch_result),
+        "type": LAUNCH_FAILURE_ERROR_TYPES[status],
+    }
+
+
+def _no_launch_failure_error(
+    _launch_result: "LaunchResult", _status: LaunchStatus
+) -> None:
+    return None
+
+
+_LAUNCH_ERROR_BY_FAILURE_DISPOSITION: dict[
+    bool,
+    Callable[["LaunchResult", LaunchStatus], McpErrorPayload | None],
+] = {
+    False: _no_launch_failure_error,
+    True: _build_launch_failure_error,
+}
+
+
+def launch_failure_error(
+    launch_result: "LaunchResult",
+) -> McpErrorPayload | None:
+    """Map a launcher outcome onto the MCP error object, or ``None`` on success.
+
+    This is the single owner of the ``LaunchResult`` → ``orchestrator.start``
+    mapping. Callers must not re-derive failure from ``status`` or ``launched``
+    themselves; the VS Code consumer likewise keys off the returned top-level
+    ``error`` rather than reinterpreting the nested launch payload.
+
+    The classification is total, with no default-to-success branch anywhere: a
+    status outside the enum raises ``UnknownLaunchStatusError``, and an enum
+    member with no declared disposition raises ``UnclassifiedLaunchStatusError``.
+    ``orchestrator.start`` runs inside ``_safe``, so either way the caller
+    receives a structured error — never a silent "started".
+    """
+    status = LaunchStatus.parse(launch_result.status)
+    return _LAUNCH_ERROR_BY_FAILURE_DISPOSITION[status.is_failure](
+        launch_result, status
+    )
 
 
 def _mcp_repos_allowlist() -> list[Path] | None:
@@ -124,7 +224,7 @@ class OrchestratorHttpClient:
             config_name=self._settings.config_path.name,
             instance_id=self._settings.instance_id,
         )
-        if result.status == "already_running":
+        if LaunchStatus.parse(result.status) is LaunchStatus.ALREADY_RUNNING:
             if result.supervisor and "port" in result.supervisor:
                 self._cached_port = result.supervisor["port"]
             return supervisor.status(self._settings.repo_root, instance_id=self._settings.instance_id)
@@ -286,21 +386,51 @@ class McpApp:
         return await self._safe("orchestrator.status", self.status)
 
     async def tool_start(self) -> dict[str, Any]:
+        """Start the orchestrator, pointing failures at the doctor report.
+
+        Both failure routes land on a top-level ``error`` before they get
+        here: ``_safe`` converts exceptions, and ``start`` normalises a failed
+        ``LaunchResult`` via ``launch_failure_error``. So the hint is attached
+        by inspecting the result rather than by catching — an outer ``except``
+        here would never fire, and a returned doctor/launch failure would
+        never reach one anyway.
+
+        Attaching the hint must not be able to undo that. It runs after
+        ``_safe`` has already produced the structured error, so anything raised
+        while building it would escape the tool and cross the protocol boundary
+        as a transport-level exception — losing the very error the contract
+        promises. :meth:`_doctor_ui_hint` therefore cannot raise.
+        """
+        result = await self._safe("orchestrator.start", self.start)
+        if "error" not in result:
+            return result
+        return {**result, "ui_hint": self._doctor_ui_hint()}
+
+    def _doctor_ui_hint(self) -> McpUiHintPayload:
+        """Build the doctor hint for a failed start. Never raises.
+
+        The URL is a convenience for opening the doctor panel, and resolving it
+        re-reads supervisor state — the same read that may have just failed the
+        start. An unreadable lock or state directory would then raise here,
+        *after* the structured error was built, and destroy it.
+
+        This is not a fallback that hides a problem: the failure being reported
+        is unchanged and the exception is logged. Only the optional URL is
+        dropped, and a hint without one still routes the operator to the doctor
+        panel, which is where the underlying fault will be diagnosed anyway.
+        """
+        hint = McpUiHintPayload(kind="doctor")
         try:
-            return await self._safe("orchestrator.start", self.start)
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("MCP tool orchestrator.start failed")
-            ui_hint: dict[str, Any] = {"kind": "doctor"}
             doctor_url = self._client.doctor_url()
-            if doctor_url:
-                ui_hint["url"] = doctor_url
-            return {
-                "error": {
-                    "message": str(exc),
-                    "type": exc.__class__.__name__,
-                },
-                "ui_hint": ui_hint,
-            }
+        except Exception:
+            logger.exception(
+                "resolving the doctor URL failed; returning the start error "
+                "with a URL-less doctor hint"
+            )
+            return hint
+        if doctor_url:
+            hint["url"] = doctor_url
+        return hint
 
     async def tool_stop(self, force: bool = False) -> dict[str, Any]:
         return await self._safe("orchestrator.stop", lambda: self.stop(force))
@@ -476,22 +606,29 @@ class McpApp:
 
     def start(self) -> dict[str, Any]:
         status = self._client.status()
-        if status.state != "running":
-            from ..infra.launcher import launch_subprocess
+        if status.state == "running":
+            return {"supervisor": status.to_dict()}
 
-            config = Config.load(self._settings.config_path)
-            launch_result = launch_subprocess(
-                repo_root=self._settings.repo_root,
-                config=config,
-                config_name=self._settings.config_path.name,
-                instance_id=self._settings.instance_id,
-            )
-            result: dict[str, Any] = {"launch": launch_result.to_dict()}
-            # Update cached port from supervisor data
-            if launch_result.supervisor and "port" in launch_result.supervisor:
-                self._client.update_port(launch_result.supervisor["port"])
-            return result
-        return {"supervisor": status.to_dict()}
+        from ..infra.launcher import launch_subprocess
+
+        config = Config.load(self._settings.config_path)
+        launch_result = launch_subprocess(
+            repo_root=self._settings.repo_root,
+            config=config,
+            config_name=self._settings.config_path.name,
+            instance_id=self._settings.instance_id,
+        )
+        # Update cached port from supervisor data
+        if launch_result.supervisor and "port" in launch_result.supervisor:
+            self._client.update_port(launch_result.supervisor["port"])
+        result: dict[str, Any] = {"launch": launch_result.to_dict()}
+        # A doctor/launch failure is an ordinary return value, not an
+        # exception, so normalise it onto the documented top-level error here.
+        # ``tool_start`` then attaches the doctor ui_hint uniformly.
+        error = launch_failure_error(launch_result)
+        if error is not None:
+            result["error"] = error
+        return result
 
     def stop(
         self,

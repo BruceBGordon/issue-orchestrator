@@ -7,12 +7,13 @@ actually spawning Claude and testing that --no-verify commands are blocked
 Uses static fixtures in tests/fixtures/ with local bare git repos as remotes.
 """
 
-import os
 import shutil
 import subprocess
 from pathlib import Path
 
 import pytest
+
+from tests.git_push_authorization import authorized_local_fixture_git_env
 
 from .conftest import xdist_timeout
 
@@ -45,18 +46,17 @@ def _clean_git_env() -> dict[str, str]:
     This is xdist-safe because it builds a fresh env per subprocess call
     rather than relying on module-scope os.environ mutations.
     """
-    env = os.environ.copy()
-    for var in ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY"]:
-        env.pop(var, None)
+    # The fixtures push to local bare repos, so they need the shared test-only
+    # push authorization (see tests/git_push_authorization.py).
+    env = authorized_local_fixture_git_env(
+        strip=["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY"]
+    )
     # Remove orchestrator session vars that leak into test subprocesses
     for key in list(env):
         if key.startswith("ISSUE_ORCHESTRATOR_"):
             del env[key]
     # Ensure hook scripts can import issue_orchestrator
     env["ORCHESTRATOR_HOOK_PYTHONPATH"] = str(_REPO_ROOT / "src")
-    # Allow git push to local bare repos when running inside an orchestrator
-    # session (the orchestrator's git wrapper blocks pushes by default).
-    env["ORCHESTRATOR_GH_AUTH"] = "agent-done-authorized"
     return env
 
 

@@ -52,7 +52,7 @@ Timeline artifact buttons open details such as reviewer feedback, review reports
 
 Session recordings let you see exactly what an agent did: terminal output rendered in an emulator replay. This is useful for debugging failures, auditing completion claims, and understanding why an issue moved to rework or needs-human.
 
-Any client can connect: browser, VS Code ([MCP integration](docs/user/vscode.md)), or AI agents via the MCP tools. There is also a contracted subset of HTTP routes described by [`docs/api/ui-openapi.json`](docs/api/ui-openapi.json); the remaining routes are internal engine transport. See [Stability & API Surface](docs/user/stability.md) before integrating against HTTP.
+Any client can connect: browser, VS Code ([MCP integration](docs/user/vscode.md)), or AI agents and other MCP clients via the [MCP server](docs/user/mcp.md). There is also a contracted subset of HTTP routes described by [`docs/api/ui-openapi.json`](docs/api/ui-openapi.json); the remaining routes are internal engine transport. See [Stability & API Surface](docs/user/stability.md) before integrating against HTTP.
 
 ## Guardrails
 
@@ -147,7 +147,7 @@ Reference docs:
 - **User:** [Installation](docs/user/installation.md) · [Tutorial](docs/user/tutorial.md) · [Configuration](docs/user/configuration.md) · [Configuration Reference](docs/user/configuration_reference.md) · [Stability & API Surface](docs/user/stability.md) · [FAQ](docs/user/faq.md)
 - **Architecture:** [Overview](docs/architecture/README.md) · [Internal Architecture](docs/architecture/internal-architecture.md) · [ADRs](docs/architecture/ADR/README.md) · [Guardrails](docs/design/guardrails.md) · [Hooks](docs/architecture/hooks.md)
 - **Development:** [Testing](docs/development/TESTING.md) · [Creating Guardrails](docs/development/CREATE_GUARDRAILS.md) · [Troubleshooting](docs/development/TROUBLESHOOTING.md) · [Review Workflow](docs/development/REVIEW_WORKFLOW.md)
-- **Features:** [Feature List](docs/user/features.md) · [Test Integrations](docs/user/test-integrations.md) · [E2E Runner](docs/user/e2e.md) · [VS Code](docs/user/vscode.md)
+- **Features:** [Feature List](docs/user/features.md) · [Test Integrations](docs/user/test-integrations.md) · [E2E Runner](docs/user/e2e.md) · [VS Code](docs/user/vscode.md) · [MCP Server](docs/user/mcp.md)
 
 ## License and contributions
 

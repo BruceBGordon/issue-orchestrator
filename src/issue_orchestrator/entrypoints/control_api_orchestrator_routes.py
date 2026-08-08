@@ -191,7 +191,7 @@ async def control_start(  # noqa: C901, PLR0912 - startup orchestration spans va
 
         set_selected_config(repo_root, config_name)
 
-        from ..infra.launcher import launch_subprocess
+        from ..infra.launcher import LaunchStatus, launch_subprocess
 
         config_path = get_config_path(repo_root, config_name)
         config = Config.load(config_path)
@@ -205,7 +205,7 @@ async def control_start(  # noqa: C901, PLR0912 - startup orchestration spans va
             start_paused=start_paused,
         )
 
-        if launch_result.status == "doctor_error":
+        if LaunchStatus.parse(launch_result.status) is LaunchStatus.DOCTOR_ERROR:
             return JSONResponse(
                 {
                     "error": "doctor_failed",
@@ -215,7 +215,7 @@ async def control_start(  # noqa: C901, PLR0912 - startup orchestration spans va
                 status_code=422,
             )
 
-        if launch_result.status == "already_running":
+        if LaunchStatus.parse(launch_result.status) is LaunchStatus.ALREADY_RUNNING:
             response = {
                 "error": "already_running",
                 "detail": launch_result.error or "Orchestrator already running",

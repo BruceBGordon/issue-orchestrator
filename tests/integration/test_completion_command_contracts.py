@@ -45,6 +45,7 @@ from issue_orchestrator.entrypoints.setup_wizard_prompts import (
 )
 from issue_orchestrator.control.label_manager import LabelManager
 from issue_orchestrator.resources import get_coding_done_instructions, get_reviewer_done_instructions
+from tests.git_push_authorization import authorized_local_fixture_git_env
 from tests.conftest import make_provider_availability
 from tests.unit.session_run_helpers import make_session_run_assets
 
@@ -529,7 +530,7 @@ def test_wrapper_and_git_guardrail_path_resolution(tmp_path: Path) -> None:
     passthrough_push = subprocess.run(
         [str(git_wrapper), "push"],
         cwd=repo,
-        env={**os.environ, "ORCHESTRATOR_GH_AUTH": "agent-done-authorized"},
+        env=authorized_local_fixture_git_env(),
         text=True,
         capture_output=True,
         timeout=_CONTRACT_COMMAND_TIMEOUT_SECONDS,
