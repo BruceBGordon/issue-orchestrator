@@ -174,11 +174,14 @@ Four concrete mechanisms in today's code destroy or strand the work:
    observe. Two mechanical consequences the contract makes explicit rather than
    leaving to the implementer:
 
-   - The predicate must be able to **exclude one named owner**, because the record
-     being drained is itself unresolved. Without that, the owner's own probe blocks
-     its own drain on every pass and automatic recovery never publishes anything.
-     Exclusion is narrower than omission — the owner stays required, and exactly
-     one caller may exclude exactly one kind.
+   - The disposition owner needs a **narrower question**, because the record being
+     drained is itself unresolved: consulting the full predicate would make the
+     owner's own probe block its own drain on every pass, and automatic recovery
+     would never publish anything. That narrowing is done by **scope, not by an
+     argument** — a separate core bundle without the validated-work owner, behind
+     its own port — because an exclusion parameter is a lever any future caller
+     could use to stop looking at sessions, pairs, jobs, or publish retry. The full
+     predicate keeps evaluating all five owners, always.
    - `IssueRuntimeTerminator`, the injected callable
      (`control/history_reconciliation.py`) through which awaiting-merge
      reconciliation reaches the boundary, is typed `Callable[[int, str], object]`.
@@ -203,7 +206,7 @@ Four concrete mechanisms in today's code destroy or strand the work:
 
    | Layer | Owner | Needs orchestrator state |
    |---|---|---|
-   | Remote execution | `ValidatedHeadExecutor` — exact-object/exact-lease branch write, then ensure exactly one PR, as two separately callable steps with **stage-specific result types** composed by one named composer | no |
+   | Remote execution | `ValidatedHeadExecutor` — exact-object/exact-lease branch write, then ensure exactly one PR, as two separately callable steps with **stage-specific result types** composed by one named composer, plus a separate constructor for the two claim-loss points that fabricates no branch result | no |
    | Fenced publication | `FencedValidatedHeadPublisher` — the disposition owner's claim re-checked before and between those steps | no |
    | Finalization | `PublishedWorkFinalizer` — staged review routing, then recovery-block clearing, composing the existing `RetryReviewRouting` policy | yes, on the request |
    | Admission | `PublishRecoveryService` (manual) and `ValidatedWorkDispositionService` (validated work), as **siblings** | yes |
@@ -219,13 +222,22 @@ Four concrete mechanisms in today's code destroy or strand the work:
    than by convention.
 
    The disposition owner reaches the *other* runtime owners the same way it reaches
-   the remote: through one narrow seam. "Is another issue-runtime owner active?" is
-   answered by an `IssueRuntimeActivityPort` implemented by the lifecycle boundary
-   that already owns teardown and the freshness predicate, constructed once in
-   bootstrap and shared by all three. Without it the disposition service would have
-   had to gather the session manager, pair registry, job supervisor and publish-retry
-   owner itself — reaching into four siblings, one of which this ADR forbids it to
-   depend on at all.
+   the remote: through one narrow seam. Without it the disposition service would
+   have had to gather the session manager, pair registry, job supervisor and
+   publish-retry owner itself — reaching into four siblings, one of which this ADR
+   forbids it to depend on at all.
+
+   The seam is scoped by **construction, not by an argument**: an immutable
+   `CoreIssueRuntimeOwners` bundle holds the four pre-existing owners;
+   `OtherRuntimeActivity` wraps it and exposes one method with no exclusion
+   parameter; the disposition service consumes that; and the full
+   `IssueRuntimeLifecycleOwners` for teardown and reset is then built from the same
+   core bundle plus the completed validated-work owner. That ordering is acyclic —
+   a single value serving both would have to exist before itself — and the shared
+   four owners are the same objects, so the two boundaries cannot drift. An
+   exclusion parameter would have been a lever every future caller could pull to
+   stop looking at sessions or pairs; a bundle that does not contain an owner cannot
+   be asked to skip anything else.
 
    **Publication is fenced, synchronous, and its durability lives in numbered
    attempt rows.** A lease expiring proves only that time passed, never that the
@@ -249,17 +261,26 @@ Four concrete mechanisms in today's code destroy or strand the work:
    presenting process *is* the recorded owner. A fence bump alone could not do
    this — the bumped value is as readable as the old one.
 
-   **Takeover requires positive proof the previous owner is dead, and there is no
-   grace timer.** `holds_claim()` and the mutation it guards are not atomic, so a
-   fence cannot by itself stop a former owner from performing one more effect —
-   and while remote writes converge and label writes are idempotent, the staged
-   finalizer also mutates process-local `OrchestratorState`, which no durable fence
-   reaches. The proof already exists in this system: `infra/repo_lock.py` admits one
-   orchestrator per repository via `flock`, and the kernel releases that lock when
-   the holder dies. Takeover is therefore permitted only when the recorded owner is
-   no longer the live lock holder; a live-but-wedged owner is displaced only by an
-   explicit, audited operator command. Waiting costs visibility, never data, because
-   the record stays unresolved throughout. Process-liveness evidence gates *reclamation*
+   **A claim changes hands only when its owner stopped existing.** `holds_claim()`
+   and the mutation it guards are not atomic, so a fence cannot by itself stop a
+   former owner from performing one more effect — and while remote writes converge
+   and label writes are idempotent, the staged finalizer also mutates process-local
+   `OrchestratorState`, which no durable fence reaches. There are therefore exactly
+   two paths to a new owner, and neither can overlap an in-flight effect: the owner
+   **died**, or the owner **relinquished** at a stage boundary where nothing was in
+   flight. There is deliberately no operation that takes a claim from a live
+   process — an audit record does not create mutual exclusion, so the operator's
+   remedy is to stop the owning engine (which makes death provable), not to seize
+   the record beside it.
+
+   Death must be proven from the **exclusion primitive**, which is the `flock`
+   gate — not from `lock.json`, which `repo_lock.py` states is an advertisement and
+   not the primitive. A typed `OrchestratorLivenessPort` answers it: in
+   single-instance mode this process's own held repo gate proves no other
+   orchestrator exists; in multi-instance mode a non-blocking probe of the owner's
+   instance gate distinguishes gone from alive without disturbing it; a different
+   host is never provable and therefore never taken over. Elapsed time authorizes
+   nothing anywhere in this path, so there is no lease on the record at all. Process-liveness evidence gates *reclamation*
    so a healthy slow publisher is not displaced needlessly, but it is never the
    safety argument; the fence holds even when the liveness probe is wrong. The port makes one call and returns what happened; there is no
    "submitted, poll later" state, because nothing in this design owns a job runner
@@ -282,7 +303,18 @@ Four concrete mechanisms in today's code destroy or strand the work:
    never inferred from labels looking correct, because cleanup labels do not prove
    the routing mutation happened.
 
-9. **An approved operation binds the facts it was approved against.** The evidence
+9. **Publication resolution is one atomic store command per verified route.**
+   Marking a record recovered, advancing the forward-only published-lineage fact
+   with its provenance, resolving verified contained ancestors, and classifying
+   waiting successors are four effects of one decision, and splitting them across
+   port calls put the invariant in the caller's memory: resolve-then-advance with a
+   crash in between recreates the arrival-order stranding the fact exists to
+   prevent. Both routes — our own push, and an observed merged PR — are therefore
+   single store-owned commands returning a typed resolution, with no transaction
+   handle crossing the port, and the observed-merge route refuses outright while a
+   live claim owns the record.
+
+10. **An approved operation binds the facts it was approved against.** The evidence
    id binds the immutable half — repo, issue, branch, validated head, run identity,
    artifact hashes — and deliberately excludes the mutable observations, which is
    what makes it crash-stable. That exclusion means the id alone cannot authorize:
@@ -298,7 +330,7 @@ Four concrete mechanisms in today's code destroy or strand the work:
    authorization input, never a competing source of truth: every stale check still
    runs against freshly read state after it matches.
 
-10. **This owner writes exactly one label of its own.** A failed disposition keeps
+11. **This owner writes exactly one label of its own.** A failed disposition keeps
    `recovery-pending` and registers its escalation through the needs-human owner's
    behavior API as its own enumerated cause. It does not write
    `tech-lead-needs-human`, which ADR-0013 defines as provenance for a *different*

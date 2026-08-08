@@ -1229,14 +1229,14 @@ probes: Mapping[IssueRuntimeOwnerKind, Callable[[], bool]] = {
 return any(
     _owner_active_or_unverifiable(probe)
     for kind, probe in probes.items()
-    if kind not in exclude_owners                           # §4.3 check 5 only
 )
 ```
 
-The tuple becomes a keyed mapping for one reason: §4.3 check 5 needs to ask "is any
-owner *other than me* active?", and a positional tuple cannot express which element
-to skip. `exclude_owners` defaults to empty, so this is a no-op for every existing
-caller; the rule that keeps it a no-op for every *future* one is in §4.3.
+The tuple becomes a keyed mapping so the *result* can name which owners were
+active — a blocked drain reports `RUNTIME_ACTIVE: pair_registry` rather than a bare
+false. It gains no exclusion parameter: §4.3 check 5's "is any owner *other than
+me* active?" is answered by a differently-scoped object, not by asking this one to
+look away.
 
 `validated_work` is a **required keyword parameter of `has_active_issue_runtime()`,
 exactly as it is of `terminate_issue_runtime()`** — not `| None = None`. The two
@@ -1309,14 +1309,17 @@ StagedPublishedWorkFinalizer(                                                # �
     review_routing=RetryReviewRouting, phase_recorder=store,
     fresh_issue_reader=..., action_applier=..., label_manager=...,
 )
-IssueRuntimeLifecycleOwners(                                                 # §4.3 check 5
+CoreIssueRuntimeOwners(                                      # the four pre-existing owners
     session_manager, active_sessions, pair_registry, job_supervisor, publish_recovery,
-)   # implements IssueRuntimeActivityPort; the SAME value teardown and reset use
+)
+OtherRuntimeActivity(core)                                   # §4.3 check 5; no exclusion knob
+RepoLockLiveness(repo_root, instance_id)                     # §4.4e gate-backed death proof
 ValidatedWorkDispositionService(
     store, escrow, working_copy, worktree_manager, repository_host,
-    publisher, finalizer, runtime_activity, action_applier, label_manager,
+    publisher, finalizer, other_activity, liveness, action_applier, label_manager,
     needs_human_block, events,
 )
+IssueRuntimeLifecycleOwners(core, validated_work)            # the FULL five: teardown + reset
 ```
 
 `IssueRunEvidenceService` is also injected into the **launch** owner, which calls
@@ -1405,7 +1408,7 @@ resolves the row:
 
 | Observed | Row transition |
 |---|---|
-| PR **merged**, and `validated_head_sha` is contained in the merged head | `RECOVERED` with `resolution_kind = CONTAINED_IN_PUBLISHED_HEAD`, **and the `validated_work_lineage` fact is advanced to the merged head with `published_via = OBSERVED_MERGE`** in the same transaction (§2.1.4). Without that write this ordinary ending left no published fact, and a later ancestor stranded exactly as it did before the fact existed. The work shipped; nothing is stranded. |
+| PR **merged**, and `validated_head_sha` is contained in the merged head | one `resolve_observed_merge()` command (§4.1): `RECOVERED(CONTAINED_IN_PUBLISHED_HEAD)`, the `validated_work_lineage` fact advanced to the merged head as `OBSERVED_MERGE`, contained ancestors resolved, and waiters classified — **all in one store transaction**, so no crash can leave the resolution without its fact (§2.1.4). A record that is `PUBLISHING` under a live claim is refused (`PUBLICATION_IN_FLIGHT`) and left to its owner's drain. Without that write this ordinary ending left no published fact, and a later ancestor stranded exactly as it did before the fact existed. The work shipped; nothing is stranded. |
 | PR **merged**, `validated_head_sha` **not** contained | `PARKED(PUBLISHED_HEAD_LACKS_VALIDATED_WORK)`. Something else was merged; this work was not. Unresolved, escrow retained, surfaced for a human. |
 | PR **closed**, not merged | `QUEUED`/`PUBLISHING` ⇒ `PARKED(PR_CLOSED_OR_MERGED)` — the automatic exit is gone, so only an explicit decision may proceed. `PARKED`/`FAILED` are left where they are. Never auto-resolved. |
 
@@ -1450,9 +1453,9 @@ CREATE TABLE IF NOT EXISTS validated_work_records (
     owner_host            TEXT NOT NULL DEFAULT '',   -- current claim holder
     owner_pid             INTEGER NOT NULL DEFAULT 0,
     owner_started_at      TEXT NOT NULL DEFAULT '',   -- pid reuse guard
-    owner_lease_expires_at TEXT NOT NULL DEFAULT '',  -- liveness HINT, not authority
     owner_claim_hash      TEXT NOT NULL DEFAULT '',   -- sha256 of the claim secret
     owner_instance_id     TEXT NOT NULL DEFAULT '',   -- repo-lock instance, for the death proof
+    owner_claimed_at      TEXT NOT NULL DEFAULT '',   -- diagnostics/UI only, never authority
     state                 TEXT NOT NULL,              -- ValidatedWorkState
     failure               TEXT NOT NULL DEFAULT '',   -- ValidatedWorkFailure
     reason                TEXT NOT NULL DEFAULT '',
@@ -1507,7 +1510,6 @@ CREATE TABLE IF NOT EXISTS validated_work_publish_attempts (
     phase                 TEXT NOT NULL,              -- DispositionPhase at claim time
     fence                 INTEGER NOT NULL,           -- the owner_fence that claimed it
     started_at            TEXT NOT NULL,
-    lease_expires_at      TEXT NOT NULL,
     outcome               TEXT NOT NULL DEFAULT '',   -- '' = no outcome yet (in flight or crashed)
     failure               TEXT NOT NULL DEFAULT '',
     finished_at           TEXT NOT NULL DEFAULT '',
@@ -1588,15 +1590,77 @@ def evidence_for_retention(self, *, released_before: str) -> tuple[EvidenceRow, 
 
 def lineage_publication(self, lineage_key: str) -> LineagePublication | None: ...
     """The durable published fact (§2.1.4). Read by EVERY classification."""
-
-def advance_lineage_publication(
-    self, claim_or_txn, *, lineage_key: str, head_sha: str,
-    by_record_id: str, via: PublicationProvenance, pre_push_expected: str,
-) -> bool: ...
-    """Written in the SAME transaction as the resolution it describes, by both
-    verified routes. Refuses a head that is not a descendant of the recorded
-    one, so the fact only ever moves forward."""
 ```
+
+**Resolution is one store-owned command per verified route, not a sequence the
+caller is trusted to complete.** An earlier draft exposed
+`advance_lineage_publication(claim_or_txn, ...)` beside the record transition. That
+handed the invariant to the consumer: it could resolve the record and then advance
+the fact (or the reverse), and a crash between the two recreated the exact
+arrival-order stranding §2.1.4 exists to close — a resolved record with no published
+fact. It also left ancestor resolution and waiter classification as two further
+mutations somebody had to remember. And `claim_or_txn` leaked a transaction handle
+through the port, which means the store no longer owns its own atomicity.
+
+So there is no standalone advance, and no transaction handle crosses the boundary.
+Each route is a single command that performs **all four** effects in the store's own
+transaction:
+
+```python
+@dataclass(frozen=True, slots=True)
+class PublicationResolution:
+    """Everything the four effects produced — no re-read needed to emit events."""
+    record: ValidatedWorkDisposition                    # the subject, now RECOVERED
+    lineage: LineagePublication                         # the fact after advancing
+    resolved_ancestors: tuple[ValidatedWorkDisposition, ...]
+    failed_ancestors: tuple[ValidatedWorkDisposition, ...]   # escrow no longer verifies
+    classified_waiters: tuple[ValidatedWorkDisposition, ...]
+
+
+class LineageResolutionRefusal(StrEnum):
+    STALE_CLAIM          = "stale_claim"           # fence lost; nothing written
+    PUBLICATION_IN_FLIGHT = "publication_in_flight" # a live claim owns this record
+    NOT_A_DESCENDANT     = "not_a_descendant"      # the fact only moves forward
+    CONTAINMENT_UNPROVEN = "containment_unproven"   # merged head does not contain it
+
+
+def resolve_published(
+    self,
+    claim: ValidatedWorkClaim,          # the §4.4e owner; fence-gated
+    *,
+    record_id: str,
+    published_head_sha: str,
+    pre_push_expected: str,
+    finalized_at: str,
+) -> PublicationResolution | LineageResolutionRefusal: ...
+    """Route 1: we pushed it. ONE transaction: RECOVERED(PUBLISHED) + advance
+    the fact as PUSHED_BY_OWNER + resolve verified contained ancestors + classify
+    waiters (§2.1.4)."""
+
+
+def resolve_observed_merge(
+    self,
+    *,
+    record_id: str,
+    merged_head_sha: str,
+    observed_at: str,
+) -> PublicationResolution | LineageResolutionRefusal: ...
+    """Route 2: a merged PR contains it (§3.5). Same four effects in one
+    transaction, advancing the fact as OBSERVED_MERGE with no pre-push baseline.
+
+    Takes no claim because no publication attempt was made — and therefore
+    REFUSES with `PUBLICATION_IN_FLIGHT` when the record is `PUBLISHING`, so it
+    can never resolve a record out from under a live owner. The drain reconciles
+    that case itself against the merged PR.
+    """
+```
+
+Both commands verify ancestry through the injected typed predicate (the same one
+slice 1 uses, so the store stays testable without a repository) *inside* the
+transaction, and both refuse rather than write when the head is not a descendant of
+the recorded fact. Because the four effects share one transaction, neither "a
+resolved record without its lineage fact" nor "a lineage fact without its matching
+resolution" is an observable state — not merely an unlikely one.
 
 An approval (tech-lead op or Control Center command) naming an `evidence_id` whose
 role is not `CURRENT` is **refused** by `evidence_for_id()`'s role, with the current
@@ -1756,26 +1820,19 @@ def has_active_issue_runtime(
     *,
     ...,                                                   # unchanged owner params
     validated_work: ValidatedWorkDispositionOwner,         # required (§3.2)
-    exclude_owners: frozenset[IssueRuntimeOwnerKind] = frozenset(),
 ) -> bool: ...
 ```
 
-The probe tuple becomes a `Mapping[IssueRuntimeOwnerKind, Callable[[], bool]]`, and
-the predicate evaluates every kind **not** in `exclude_owners`. Three properties keep
-this from becoming a fresh way to stop looking at an owner:
+The probe tuple becomes a `Mapping[IssueRuntimeOwnerKind, Callable[[], bool]]` and
+the predicate evaluates **every** kind, always. It has no exclusion parameter,
+because there is no caller that wants a narrower answer from *this* function: the
+one that does asks `OtherRuntimeActivityPort` instead, an object whose owner bundle
+simply lacks the validated-work probe.
 
-- **Empty by default.** Every existing caller keeps today's behaviour without
-  naming the parameter, so the freshness/teardown symmetry is unchanged.
-- **Exclusion is narrower than omission.** The owner is still a *required*
-  parameter; `exclude_owners` only suppresses one probe for one call. A caller
-  cannot use it to avoid knowing about an owner — it has to name the owner to skip
-  it, which is the opposite of forgetting.
-- **Exactly one caller may exclude anything.** §9's guardrail asserts that
-  `exclude_owners` is non-empty only inside `IssueRuntimeLifecycleOwners.activity()`
-  — the seam above, serving the disposition service — and
-  only as `{IssueRuntimeOwnerKind.VALIDATED_WORK}`. Every other call site passes the
-  default. A second exclusion is a guardrail failure, not a code review judgement
-  call.
+That is deliberately not a constrained parameter. A parameter guarded by "only one
+caller may pass it" is a lever every future caller can still reach and a guardrail
+that has to keep catching them; a bundle that does not contain the owner cannot be
+asked to skip anything else in the first place.
 
 **The disposition service must not gather that owner set itself.** `has_active_issue_runtime()`
 needs the session manager, the active-session registry, the pair registry, the
@@ -1806,29 +1863,56 @@ class IssueRuntimeActivity:
         return bool(self.active_owners or self.unverifiable_owners)
 
 
-class IssueRuntimeActivityPort(Protocol):
-    def activity(
-        self,
-        issue_number: int,
-        *,
-        excluding: frozenset[IssueRuntimeOwnerKind] = frozenset(),
-    ) -> IssueRuntimeActivity: ...
+class OtherRuntimeActivityPort(Protocol):
+    """The activity of every issue-runtime owner OTHER than validated work.
+
+    Deliberately has **no** ``excluding`` parameter. An exclusion argument is
+    the one lever in this contract that can make an activity probe stop looking
+    at an owner, and a public parameter offers it to every future caller — a
+    caller who suppressed SESSIONS here would let publication race a live agent.
+    The self-exclusion is structural instead: this port is constructed from a
+    bundle that does not contain the validated-work owner, so there is nothing
+    to exclude and no way to ask for more.
+    """
+
+    def other_runtime_activity(self, issue_number: int) -> IssueRuntimeActivity: ...
 ```
 
-`IssueRuntimeLifecycleOwners` — the bootstrap-constructed value that already carries
-the owner set for teardown and for `_ResetRetryRuntimeOwners` (§3.2) — implements
-it. That single construction site is the point: the seam and the teardown read the
-**same** owner set by construction, so they cannot drift, which is the property §1.2
-says the whole design rests on. The disposition service never sees a pair registry,
-a supervisor, a session manager, or the publish-retry owner; it sees one port
-returning one typed fact.
+**The construction is layered, because the naive single value is cyclic.**
+`has_active_issue_runtime()` requires the validated-work owner (§3.2), and the
+validated-work service requires an activity seam — so one `IssueRuntimeLifecycleOwners`
+serving both would have to exist before itself. Bootstrap therefore builds three
+things in order, each immutable:
 
-So check 5 reads, in full: `activity(issue, excluding={VALIDATED_WORK}).any_active`
-is false. A raising probe still counts as active (`unverifiable_owners`,
-fail-safe). Another issue-scoped owner being live blocks the drain
-(`RUNTIME_ACTIVE`, retried next drain, and the blocking kinds are *named* in the
-result so the reason is legible) — publication must never race a live session — but
-the owner's own record no longer blocks itself.
+```
+1. core = CoreIssueRuntimeOwners(session_manager, active_sessions,
+                                 pair_registry, job_supervisor, publish_recovery)
+2. other_activity = OtherRuntimeActivity(core)        # implements the port above
+3. validated_work = ValidatedWorkDispositionService(..., other_activity, ...)
+4. lifecycle = IssueRuntimeLifecycleOwners(core, validated_work)   # the FULL five
+```
+
+`lifecycle` is what `terminate_issue_runtime()`, `has_active_issue_runtime()` and
+`_ResetRetryRuntimeOwners` (§3.2) use; `other_activity` is what the disposition
+service uses. Both are built from **the same `core` value**, passed by reference and
+never copied, so the four shared owners cannot drift — the property §1.2 says the
+whole design rests on — while the fifth is added exactly where it belongs and
+nowhere else. The disposition service never sees a pair registry, a supervisor, a
+session manager, or the publish-retry owner; it sees one port returning one typed
+fact.
+
+So check 5 reads, in full: `other_runtime_activity(issue).any_active` is false. A
+raising probe still counts as active (`unverifiable_owners`, fail-safe). Another
+issue-scoped owner being live blocks the drain (`RUNTIME_ACTIVE`, retried next
+drain, and the blocking kinds are *named* in the result so the reason is legible) —
+publication must never race a live session — but the owner's own record cannot block
+itself, because the bundle it is asking about does not contain it.
+
+With the self-exclusion made structural, `has_active_issue_runtime()` needs no
+`exclude_owners` parameter at all: it always evaluates all five owners, and the one
+caller that needed a narrower question now asks a different, narrower object. The
+parameter is removed rather than merely constrained — a lever that does not exist
+cannot be pulled by a future caller.
 
 Phase-dependent remote checks — the allowed-state tables:
 
@@ -2146,11 +2230,32 @@ class ValidatedHeadExecutor(Protocol):
     """
 
 
+class SupersededStage(StrEnum):
+    """WHERE the claim was lost. Both points are real; both need a result."""
+    BEFORE_BRANCH_WRITE = "before_branch_write"   # nothing was attempted at all
+    BETWEEN_STEPS       = "between_steps"         # the branch effect stands
+
+
+def superseded_outcome(
+    stage: SupersededStage,
+    branch: BranchWriteOutcome | None,   # required iff stage is BETWEEN_STEPS
+) -> PublishValidatedHeadOutcome: ...
+    """The stale-owner result, WITHOUT fabricating a branch outcome.
+
+    Loss before the branch write has no branch result to report — there was no
+    branch write — so `BranchWriteStatus` gains no phantom `NOT_ATTEMPTED`
+    member to satisfy a composer that should never have been called. The two
+    cases differ in exactly one observable way, and the type says so:
+    `observed_remote_head_sha`/`push_outcome` are None before the write and
+    carry the branch stage's values after it.
+    """
+
+
 def compose_publication_outcome(
     branch: BranchWriteOutcome,
     pr: PrEnsureOutcome | None,          # None when the branch is not at target
-    *, superseded: bool = False,         # the claim was lost between the two steps
 ) -> PublishValidatedHeadOutcome: ...
+    """Composes two REAL stage results. Supersession is not one of its inputs."""
 ```
 
 **The composer is the single place stage results become a publication result**, and
@@ -2162,12 +2267,14 @@ it is total over the pairs that can occur:
 | `ALREADY_AT_TARGET` | `RECONCILED`/`ADOPTED`/`CREATED` | `ALREADY_AT_TARGET` |
 | `PUSHED`/`ALREADY_AT_TARGET` | `REFUSED` | `REJECTED`, carrying the PR `failure` — the branch is at target, the PR is not usable |
 | `PUSHED`/`ALREADY_AT_TARGET` | `TRANSIENT_FAILURE` | `TRANSIENT_FAILURE` — retried; the next attempt's branch step returns `ALREADY_AT_TARGET` and only the PR step re-runs |
-| `PUSHED`/`ALREADY_AT_TARGET` | `None` with `superseded=True` | `SUPERSEDED` — the branch effect stands and is durable at the remote; this caller simply stops |
+
 | `DIVERGED` | `None` | `DIVERGED` |
 | `REJECTED` | `None` | `REJECTED` |
 | `TRANSIENT_FAILURE` | `None` | `TRANSIENT_FAILURE` |
 
-`observed_remote_head_sha` and `push_outcome` always come from the branch stage;
+The table is total over the pairs `compose_publication_outcome()` can actually
+receive: `pr` is non-`None` exactly when `branch.at_target`, and supersession never
+reaches it. `observed_remote_head_sha` and `push_outcome` always come from the branch stage;
 `pr_number`/`pr_url`/`pr_head_sha` from the PR stage when it ran, and from the
 command's recorded `pr_number` otherwise. `PublishValidatedHeadStatus` gains
 `SUPERSEDED` for the row above — the fenced wrapper needs a real member of the
@@ -2227,27 +2334,29 @@ def acquire_claim(
     *,
     expected_states: frozenset[ValidatedWorkState],  # {QUEUED, PARKED} or {PUBLISHING}
     evidence_id: str,                # must still be the CURRENT evidence
-    owner: ProcessIdentity,          # host + pid + process start time
-    owner_is_live: Callable[[ProcessIdentity], bool],   # repo-lock holder check
-    now: str,
-    lease_expires_at: str,
+    liveness: OrchestratorLivenessPort,   # gate-backed death proof (see below)
 ) -> ValidatedWorkClaim | None: ...
     """Take exclusive ownership of the record for its whole PUBLISHING phase.
 
-    One transaction: admit the caller only when the record is unowned, already
-    owned by this exact process, or owned by a process ``owner_is_live``
-    reports gone (the repo-lock death proof above). Then generate a fresh
+    One transaction: admit the caller only when the record is unowned or its
+    recorded owner is ``liveness.is_provably_dead``. Then generate a fresh
     ``ClaimSecret``, store only its sha256, CAS `owner_fence = owner_fence + 1`,
-    record the owner and lease, and return the claim carrying the new fence and
-    the secret. Returns None while the recorded owner is still live.
+    record ``liveness.current()`` as the owner, and return the claim carrying
+    the new fence and the secret. Returns None whenever death is not proven —
+    including "this process already owns it", which is impossible in practice
+    because a live owner keeps its claim in memory (below).
 
     The secret — not the fence — is what makes the result a capability: the row
     stores only its hash, so no reader of the row can construct a claim the
-    predicates accept.
+    predicates accept. There is no `now`/`lease` parameter: elapsed time never
+    authorizes anything here.
     """
 
-def renew_claim(self, claim: ValidatedWorkClaim, *, now: str, lease_expires_at: str) -> bool: ...
-    """Extend the lease WITHOUT bumping the fence. Called at stage boundaries."""
+def relinquish_claim(self, claim: ValidatedWorkClaim) -> bool: ...
+    """Called BY THE OWNER at a stage boundary — graceful shutdown, or a drain
+    that finished a tick — so nothing can be in flight. Clears the owner and
+    bumps the fence, letting the next drain proceed without waiting for a death
+    proof. There is no counterpart that takes a claim from someone else."""
 
 def begin_publish_attempt(
     self,
@@ -2258,7 +2367,6 @@ def begin_publish_attempt(
     expected_remote_head: str,
     phase: DispositionPhase,
     started_at: str,
-    lease_expires_at: str,
 ) -> PublishAttempt | None: ...
     """Fence-gated. INSERT attempt `expected_attempt_no + 1` under the claim
     and, on the first attempt, CAS the record into PUBLISHING. Returns None for
@@ -2283,11 +2391,9 @@ def holds_claim(self, claim: ValidatedWorkClaim) -> bool: ...
     before every finalization stage. False aborts, with no remote write and no
     in-memory routing mutation."""
 
-def release_ownership(
-    self, record_id: str, resolution: OperatorResolution
-) -> bool: ...
-    """The ONLY way to take a claim from a still-live owner: an explicit,
-    audited operator action. Bumps the fence. Never automatic, never a timer."""
+def owner_of(self, record_id: str) -> ProcessIdentity | None: ...
+    """Diagnostics and the UI's "owned by engine X, still running" state.
+    Never an authorization input."""
 
 def release_claim(self, claim: ValidatedWorkClaim) -> bool: ...
     """Called only in the terminal transition. Ownership is NOT released by a
@@ -2305,8 +2411,9 @@ outcome over the winner's. The exact ref lease (§4.4b) bounds the damage to the
 branch write; it says nothing about PR creation, label routing, history mutation, or
 outcome recording.
 
-So the correctness mechanism is a **fence**, and the lease is only a hint about when
-to consider reclaiming. Two properties make it work, and the second is the one an
+So the correctness mechanism is a **fence plus a proof of death**, and there is no
+lease on the record at all — elapsed time authorizes nothing here (see the takeover
+rule below). Two properties make it work, and the second is the one an
 attempt-scoped fence was missing:
 
 ```python
@@ -2374,11 +2481,10 @@ because both presented the same, still-current, publicly readable value.
 - **The fence is re-checked immediately before each external mutation** — before
   the push, before PR ensure, and before each finalization stage. A stale owner
   aborts there and performs no remote write and no in-memory routing mutation.
-- **Ownership is renewed, not assumed.** `renew_claim(claim, now)` extends the
-  lease *without* bumping the fence, and the drain calls it at each stage boundary
-  (before the push, after the outcome, before each finalization stage). A single
-  external call that overruns the lease is therefore the only takeover window, and
-  a takeover in that window is safe by the fence rather than by luck.
+- **Ownership persists until death or relinquish.** There is nothing to renew: a
+  slow external call cannot cost the owner its claim, because no clock is consulted.
+  A drain that finishes a tick with the record still `PUBLISHING` keeps the claim in
+  memory and continues on the next tick.
 - **Takeover bumps the fence**, so it permanently invalidates the previous owner in
   the same act that authorizes the new one. There is no moment when both are valid,
   whatever the old process is doing.
@@ -2397,67 +2503,96 @@ If PR-ensure ever observes **two** open PRs for the branch carrying the
 orchestrator body marker, that is `FAILED(DUPLICATE_OPEN_PR)` — reported, never
 silently resolved by picking one.
 
-**Takeover requires positive proof the owner is gone. There is no grace timer.**
+**Takeover requires positive proof the owner is gone. There is no grace timer, and
+no way to take a claim from a living process.**
 
-The earlier draft allowed takeover "after the lease has been expired for
-`PUBLISH_RECLAIM_GRACE`" when liveness could not be established, and leaned on the
-fence for safety. That was not sound, and the reason is worth being precise about:
-`holds_claim()` and the mutation it guards are not atomic. A former owner can pass
-the check, lose the fence a microsecond later, and still perform the *next* effect.
-For the remote writes that is harmless — the ref lease and GitHub's one-open-PR rule
-make them converge — and label writes are idempotent. But §4.5b stage 1 also appends
-the review candidate and the completed-history entry to `OrchestratorState`, and no
-durable fence reaches into another process's memory. "Exactly one routing and one
-history append" was therefore an assertion, not a mechanism.
+The earlier draft allowed takeover after a grace period and leaned on the fence for
+safety. That was not sound: `holds_claim()` and the mutation it guards are not
+atomic, so a former owner can pass the check, lose the fence a microsecond later,
+and still perform the *next* effect. For the remote writes that is harmless — the
+ref lease and GitHub's one-open-PR rule make them converge — and label writes are
+idempotent. But §4.5b stage 1 also appends the review candidate and the
+completed-history entry to `OrchestratorState`, and no durable fence reaches into
+another process's memory. "Exactly one routing and one history append" was an
+assertion, not a mechanism.
 
-The system already has the proof this needs. **Only one orchestrator may run per
-repository (or per instance), enforced by `infra/repo_lock.py`** — a `flock` on a
-gate file plus a PID/liveness record, raising `AlreadyRunning` otherwise. Two
-properties follow, and together they make the guarantee real:
+**So the only way a claim changes hands is that its owner stopped existing.** Two
+paths, and neither can race an in-flight effect:
 
-- The drain runs only in the orchestrator process, and only one such process can
-  exist. Within it the drain is single-threaded, so a *concurrent* second
-  finalization is impossible without a second orchestrator.
-- A second orchestrator can only start once the first has released the gate — and
-  `flock` is released by the **kernel** when the holding process dies. That is
-  positive death proof, not a heuristic and not a timeout.
+| Path | Why it cannot overlap |
+|---|---|
+| The owner **died** | A dead process performs no further effect. Proof is required (below), never inferred. |
+| The owner **relinquished** | `relinquish_claim(claim)` is called *by the owner itself*, only at a stage boundary where nothing is in flight — graceful shutdown, or a drain that finished a tick. Quiescence is guaranteed because the caller is the thing that would otherwise be mid-effect. |
 
-So the takeover rule is: a claim may be taken over — at any point in the
-`PUBLISHING` phase, whether the current attempt has an outcome or not — **only**
-when the recorded owner is no longer the live holder of the repo/instance lock
-(`read_lock()` shows a different pid / `started_at` / `instance_id`, or no holder
-at all). A dead process cannot resume, so it cannot append to its own
-`OrchestratorState`, and the exactly-once claim for routing and history is
-established by the same fact that lets the new owner exist at all.
+There is deliberately **no operation that takes a claim from a live owner.** An
+earlier draft offered `release_ownership()` as an audited operator command, but an
+audit record does not create mutual exclusion: the old process could pass
+`holds_claim()`, be fenced a microsecond later by the operator, and still apply its
+in-memory review/history append beside the new owner. That is precisely the window
+the death rule exists to close, so the operation is removed. What the operator gets
+instead is the honest sequence: the Control Center shows the record as owned by a
+named, still-running engine and offers **stop that engine** — an existing lifecycle
+control. Stopping it releases the gate, death becomes provable, and the next drain
+takes over automatically. The fence never moves while the owner is alive.
 
-When the recorded owner **is** still the live lock holder, the record simply stays
-owned. No timer eventually overrides that, because a timer would be exactly the
-"it has been long enough" heuristic §3.2 refuses everywhere else. A genuinely
-wedged orchestrator is resolved the way this contract resolves every other stuck
-state — by an explicit, recorded human action: stopping it (which releases the
-gate), or the operator **release-ownership** command, which takes an actor and a
-non-empty reason, is audited like `OperatorResolution`, and bumps the fence. The
-record is `PUBLISHING` throughout, therefore unresolved, therefore blocking reset
-and retaining escrow, so waiting costs visibility rather than data.
+#### Proving death from the gate, not from the advertisement
 
-Two honest consequences, stated rather than papered over:
+The proof must come from the **exclusion primitive**, which is the `flock` gate
+(`repo.lock`, and `locks/{instance_id}.lock` in multi-instance mode). It must *not*
+come from `lock.json`: `repo_lock.py` is explicit that the metadata file "remains
+the on-disk advertisement (pid/port/heartbeat) … it is no longer the exclusion
+primitive", and `read_lock()` reads only that file. A stale or hand-edited
+advertisement must never be able to authorize a takeover.
 
-- **Cross-process exactly-once holds for the durable *and* in-memory effects**
-  because takeover implies the predecessor is dead. It is not claimed against a
-  live rival, because with the repo lock there cannot be one.
-- **The remote effects are convergent-idempotent regardless**: the exact ref lease,
-  GitHub's one-open-PR-per-(head, base) rule, and idempotent label writes mean even
-  a hypothetical overlap yields one branch head and one PR. That is a second line of
-  defence, not the argument.
+So death proof is a typed behavior-level capability, injected like every other:
 
-The lease on the record does not authorize anything; it is a liveness *hint* that
-tells the drain when it is worth consulting the repo lock at all. `renew_claim()`
-keeps it fresh at stage boundaries so the common case never reads the lock file.
+```python
+@dataclass(frozen=True, slots=True)
+class ProcessIdentity:
+    """Full identity. `pid` alone is reusable; `started_at` closes that."""
+    host: str
+    pid: int
+    started_at: str            # process start time
+    instance_id: str | None    # repo-lock instance; None = single-instance mode
 
-This rule is deliberately stated over the whole phase rather than over
-"outcome-less attempts". Scoping it to outcome-less attempts was what left the
-post-outcome finalization window unowned.
 
+class OrchestratorLivenessPort(Protocol):
+    def current(self) -> ProcessIdentity: ...
+    def is_provably_dead(self, owner: ProcessIdentity) -> bool: ...
+    """True ONLY on positive evidence. Unknown, unreachable, or different host
+    all return False — this predicate never guesses, and False costs visibility
+    while True costs data."""
+```
+
+`RepoLockLiveness` implements it against the real gate:
+
+| Case | Answer | Evidence |
+|---|---|---|
+| `owner == current()` | `False` | it is us |
+| `owner.host != current().host` | `False` | we cannot observe another host's processes or gates. **No automatic takeover ever crosses a host**, by construction |
+| single-instance mode | `True` for any other owner | *this* process holds `repo.lock` `LOCK_EX`, and every orchestrator must hold it to run — so no other orchestrator exists. The successful startup acquisition **is** the proof; nothing needs probing |
+| named-instance mode | probe `locks/{owner.instance_id}.lock` with `LOCK_EX|LOCK_NB`, releasing immediately on success | success ⇒ that instance holds no gate ⇒ it is gone. `BlockingIOError` ⇒ it is alive ⇒ `False`. Non-blocking, so a live owner is never disturbed |
+
+This is the same `flock` semantics `_acquire_gate()` already relies on, used as a
+read rather than as an acquisition, and it answers the question the metadata file
+cannot. Multi-instance mode is the case that makes the probe necessary at all: named
+instances coexist by design (`LOCK_SH` on the repo gate), so two draining processes
+against one repository *are* possible there, and the single-instance shortcut would
+be wrong.
+
+#### The owner keeps its own secret; `acquire_claim()` never hands one back
+
+The row stores only `sha256(secret)`, so nothing can reconstruct an existing claim —
+including the store. `ValidatedWorkDispositionService` therefore holds the claims it
+acquired in memory for the lifetime of the process and re-presents them on later
+ticks; `acquire_claim()` is called only for a record it does not already hold.
+
+There is no case that needs reconstruction. A process that lost its in-memory claim
+has, by definition, a different `ProcessIdentity` — a restart changes the pid and
+`started_at` — so it is not the recorded owner, and it reaches ownership through the
+death path like any other successor. `acquire_claim()` accordingly has one behaviour:
+mint a new secret, bump the fence, record the new owner. It never returns an
+existing claim, because it cannot.
 
 A durable claim is still the right shape rather than an in-process lock, because
 the state it guards outlives the process: a record left `PUBLISHING` by a crash must
@@ -2501,16 +2636,18 @@ does" always means the current fence holder:
 
 | Record/attempt state at drain | Owner does |
 |---|---|
-| the recorded owner is the **live repo-lock holder** (any attempt state, any finalization phase) | `acquire_claim()` returns None. No writes, re-check next drain. This is the normal case, including a slow owner mid-finalization. |
-| the recorded owner is **this** process | `acquire_claim()` returns the existing claim renewed; the drain continues where it left off. |
-| the recorded owner **no longer holds the repo lock** (different pid/`started_at`/`instance_id`, or none) | it is dead by kernel-released `flock`. `acquire_claim()` mints a new secret, bumps the fence, and takes ownership. The previous owner is inert **and gone** — including one that died between a successful outcome and finalization. |
-| the owner is live but wedged | nothing automatic. The record stays `PUBLISHING` (unresolved, escrow retained, reset blocked) until a human stops that orchestrator or issues the audited `release_ownership` command. |
+| the recorded owner is **this** process | the service still holds the claim in memory; it continues where it left off without calling `acquire_claim()` at all. |
+| the recorded owner is **alive** (gate held), any attempt state, any finalization phase | `acquire_claim()` returns None. No writes, re-check next drain. The normal case, including a slow owner mid-finalization. |
+| the recorded owner is **provably dead** (`OrchestratorLivenessPort`) | `acquire_claim()` mints a new secret, bumps the fence, and takes ownership. The previous owner is gone, so it cannot apply a late in-memory effect — including one that died between a successful outcome and finalization. |
+| the owner **relinquished** at a stage boundary | the record is unowned; the next drain acquires normally, with no death proof needed. |
+| the owner is alive but wedged | nothing automatic and nothing forced. The record stays `PUBLISHING` (unresolved, escrow retained, reset blocked) and the Control Center shows which engine owns it, offering **stop that engine**. Stopping releases the gate, which makes death provable. |
 | claim held, latest attempt outcome `''` | re-run §4.3 in `RECONCILING`; begin a new attempt only if a write is still required. |
 | claim held, latest attempt outcome successful, `finalization_phase < COMPLETE` | resume §4.5b from the recorded phase. **This is a finalization resume, not a new attempt** — no push, no new attempt row. |
 | a stale claim tries to record anything | the CAS returns False; nothing is written and the caller is logged as superseded. |
 | `PUBLISHED` / `ALREADY_AT_TARGET` | re-read the branch; require it at `target_head_sha`; ensure the PR (§4.4d); finalize (§4.5); mark `RECOVERED`. A success whose branch is *not* at target is a hard `REMOTE_HEAD_CHANGED` ⇒ `FAILED`. |
 | `TRANSIENT_FAILURE` | stay `PUBLISHING`; claim attempt *n+1* next drain while `COUNT(attempts) < PUBLISH_ATTEMPT_LIMIT`; exhaustion ⇒ durable `FAILED`. |
 | `DIVERGED` / `REJECTED` | durable `FAILED` with the mapped `ValidatedWorkFailure`. Definitive: no retry. |
+| `SUPERSEDED` | **stop, and change nothing.** This caller is no longer the owner, so it records no outcome, consumes no retry budget, advances no phase, and makes no state transition — every such write would be refused by the fence anyway, and attempting them would only produce misleading log noise. The record belongs to whoever took it over; if nobody has, the next drain acquires it and reconciles in `RECONCILING`. Not a failure and never counted as an attempt. |
 
 The transient/definitive split is `PublishValidatedHeadOutcome.retryable` — an enum
 comparison over `PublishValidatedHeadStatus`, mapped from the enumerated
@@ -2518,8 +2655,8 @@ comparison over `PublishValidatedHeadStatus`, mapped from the enumerated
 string.
 
 The lease duration is derived from the existing publish job timeout (config-free,
-for the same reason the attempt limit is), and an expired lease is never treated as
-a failure — only as "reconcile before deciding".
+for the same reason the attempt limit is). An attempt whose owner died is never
+treated as a failure — only as "reconcile before deciding".
 
 #### 4.4f Two callers, one executor: where the fence lives
 
@@ -2552,12 +2689,12 @@ def publish(
     self, claim: ValidatedWorkClaim, command: PublishValidatedHeadCommand
 ) -> PublishValidatedHeadOutcome:
     if not self._store.holds_claim(claim):
-        return compose_publication_outcome(_not_attempted(), None, superseded=True)
+        return superseded_outcome(SupersededStage.BEFORE_BRANCH_WRITE, None)
     branch = self._executor.push_validated_head(command)
     if not branch.at_target:
         return compose_publication_outcome(branch, None)
     if not self._store.holds_claim(claim):        # re-check BETWEEN the two writes
-        return compose_publication_outcome(branch, None, superseded=True)
+        return superseded_outcome(SupersededStage.BETWEEN_STEPS, branch)
     return compose_publication_outcome(branch, self._executor.ensure_pull_request(command))
 ```
 
@@ -2740,7 +2877,8 @@ routing decision, not the ordering.
 | Admission (manual) | `PublishRecoveryService` | `_retry_decision()`, board/locator gates, `PublishRetryLocators` | yes (already) |
 | Admission (validated work) | `ValidatedWorkDispositionService` | evidence admission, escrow/refs, lineage, §4.3 checks, state machine | yes, via `drain(state)`/`recover(command, state)` |
 | Run evidence | `IssueRunEvidenceSource` (§2.5) | which runs exist for an issue, with exact assets | **no** |
-| Runtime activity | `IssueRuntimeActivityPort` (§4.3 check 5) | which *other* issue-runtime owners are live, as one typed fact | **no** |
+| Runtime activity | `OtherRuntimeActivityPort` (§4.3 check 5) | which *other* issue-runtime owners are live, as one typed fact | **no** |
+| Owner liveness | `OrchestratorLivenessPort` (§4.4e) | gate-backed proof that a claim's owner is dead | **no** |
 | Durable state | `ValidatedWorkStore` | records, evidence roles, publish attempts, finalization phase | **no** |
 | Remote execution | `ValidatedHeadExecutor` | exact-object/exact-lease branch write, PR ensure — two separately callable steps | **no** |
 | Fenced publication | `FencedValidatedHeadPublisher` | re-checks the claim between and before executor steps (§4.4f) | **no** |
@@ -2775,8 +2913,12 @@ construction and the disposition path satisfies by not needing them.
 6. `store.record_attempt_outcome(...)` — before anything is read from the outcome.
 7. `finalizer.finalize(request)` with the live state and `resume_from` — staged
    routing, observation, then recovery clear (§4.5b).
-8. Mark `RECOVERED` and resolve contained ancestors (§2.1.4) in one transaction;
-   remove the workspace; retain escrow and refs for the window.
+8. `store.resolve_published(claim, ...)` — one command marking `RECOVERED`,
+   advancing the lineage fact, resolving contained ancestors and classifying
+   waiters in a single transaction (§4.1). Then remove the workspace; retain
+   escrow and refs for the window.
+9. `store.relinquish_claim(claim)` — the record is terminal, so ownership ends at a
+   quiescent point rather than waiting for this process to die (§4.4e).
 
 Only `ValidatedWorkDispositionService` claims disposition publish attempts. This is
 enforced mechanically (§9).
@@ -3236,7 +3378,8 @@ sweeps above:
 | §4.4b absent branch | Expectation `ABSENT` with the branch created by a third party between observation and push: empty-lease rejection, zero writes. |
 | §4.4 publisher | Open PR *P* at remote head `R`, target `L`: the publisher **pushes** and does not take an existing-PR shortcut; end state has remote head `L`. Run through **both** owners — `PublishRecoveryService` with `UNCONSTRAINED`, and the disposition path through `FencedValidatedHeadPublisher` — since the manual regression must survive the split. |
 | §4.4f composition | The manual combined path and the fenced two-step path produce an **identical** `PublishValidatedHeadOutcome` — compared field by field, not by final remote head — for push success, already-at-target, PR reconcile, PR adoption, PR creation, PR refusal, PR transient failure, branch diverged, and branch transient failure. Driven through the composer table so every (branch status × PR status) pair named there has a case. |
-| §4.4f composition | Superseded-between-steps: the claim is lost after a successful branch write and before PR ensure. The result is `SUPERSEDED`, the branch effect stands at the remote, `ensure_pull_request` is never called, and the manual path — having no claim — cannot produce that status at all. |
+| §4.4f composition | Both supersession points, field by field. **Before the branch write**: `SUPERSEDED` with `observed_remote_head_sha` and `push_outcome` None, and `push_validated_head` never called. **Between the steps**: `SUPERSEDED` carrying the branch stage's observed head and push outcome, the branch effect standing at the remote, and `ensure_pull_request` never called. Neither constructs a fabricated `BranchWriteStatus`. The manual path, having no claim, cannot produce either. |
+| §4.4e outcomes | The owner's outcome cases are **derived from `PublishValidatedHeadStatus`**, not enumerated by hand, so a new member cannot silently drop out of coverage. `SUPERSEDED` asserts zero store writes, no attempt recorded, no retry budget consumed, and no phase advance. |
 | §4.4f owners | A valid publisher request is constructible through **each** allowed owner using only that owner's own authority: the manual path from its locator/background-job authority, the disposition path from an acquired `ValidatedWorkClaim`. Neither test may construct the other's authority type. |
 | §4.4f owners | Guardrail: the disposition path reaches `ValidatedHeadExecutor` **only** through `FencedValidatedHeadPublisher`, and `PublishRecoveryService` never acquires a claim or constructs one. Manual duplicate-submission and tombstone behaviour is asserted unchanged. |
 | §4.4 publisher | Remote branch already at `L`: `ALREADY_AT_TARGET`, **no second push**, decided on the branch ref alone (no PR consulted). |
@@ -3245,18 +3388,20 @@ sweeps above:
 | §4.4d PR ensure | Branch at `L`, `pr_number=None`, an open PR for the branch already exists (crashed after create, before persisting the number): it is adopted, not duplicated; a prior-attempt PR on another branch is not adopted. |
 | §4.4e ordering | The record is `PUBLISHING` **and its attempt row exists** before the publisher is invoked — asserted by a publisher double that reads the store when called. A crash inside the publisher leaves `PUBLISHING` with an outcome-less attempt, never `QUEUED`-with-a-completed-push. |
 | §4.4e ordering | Two concurrent drains on one row, **and two drains in separate processes over one database file**: exactly one `begin_publish_attempt` wins, exactly one remote call is made, and the loser makes no writes. A rival arriving while the lease is live also gets `None`. |
-| §4.4e fencing | **Pause attempt 1 inside the publisher past its lease; let a second process take over and run attempt 2 to completion; then release attempt 1.** Assert exactly one effective PR ensure, one routing, one history finalization, and one accepted outcome; assert attempt 1's `record_attempt_outcome`, `record_pr_number`, and `record_finalization_phase` all return False and write nothing; and assert attempt 1's pre-mutation `holds_claim()` checks abort it before any remote call. |
-| §4.4e fencing | **Pause owner A *after* `record_attempt_outcome(PUBLISHED)` is durable and *before* finalization stage 1**, then run a second process's drain. While A is live, B's `acquire_claim()` returns None and B performs nothing. Then model A's death: B's takeover bumps the fence, B resumes finalization from the recorded phase, and releasing A afterwards produces **zero** accepted writes and zero effects. Assert exactly one routing, one history append, one label sequence, one phase progression, and one terminal transition across both processes. This is the window an attempt-scoped fence left open. |
+| §4.4e fencing | **Pause attempt 1 inside the publisher; model its process as dead; let a second process take over and run attempt 2 to completion; then revive attempt 1.** Assert exactly one effective PR ensure, one routing, one history finalization, and one accepted outcome; assert attempt 1's `record_attempt_outcome`, `record_pr_number`, and `record_finalization_phase` all return False and write nothing; and assert attempt 1's pre-mutation `holds_claim()` checks abort it before any remote call. The takeover is driven by the modelled death, **not** by elapsed time — the earlier version of this case advanced past a lease, which the contract no longer honours. |
+| §4.4e fencing | **Pause owner A *after* `record_attempt_outcome(PUBLISHED)` is durable and *before* finalization stage 1**, then run a second process's drain. While A is live, B's `acquire_claim()` returns None and B performs nothing — **however long A is paused**, since no clock participates. Then model A's death (its gate released): B takes over, bumps the fence, and resumes finalization from the recorded phase. The fixture then "revives" A and asserts **zero** accepted writes and zero effects. Exactly one routing, one history append, one label sequence, one phase progression, and one terminal transition across both processes. This is the window an attempt-scoped fence left open. |
 | §4.4e claims | A `ValidatedWorkClaim` built from **everything the row discloses** — `record_id`, the current `owner_fence`, the recorded owner identity, and `owner_claim_hash` — is rejected by every fenced store call, because the row never contains the secret those calls verify. This is the regression that the previous `(record_id, fence)` shape could not pass. |
 | §4.4e claims | A claim carrying the correct secret but presented from a **different process** is rejected by the calling-process equality check, so a leaked or serialized claim confers nothing. |
 | §4.4e claims | The claim is held across the whole phase: a successful attempt outcome does **not** release it, and `release_claim()` happens only in the terminal transition. Renewal at stage boundaries extends the lease without bumping the fence, so a healthy slow owner is not displaced mid-finalization. |
 | §4.4e fencing | The stale attempt's push is rejected by the exact ref lease, and its PR create is rejected by the remote's one-open-PR-per-(head,base) rule and mapped to adopt — asserted against a fake that records every remote call, so a second PR or a second push fails the test. Two marked open PRs for the branch produce `FAILED(DUPLICATE_OPEN_PR)`, never a silent pick. |
-| §4.4e takeover | Takeover is admitted **only** on repo-lock death proof: an owner still holding the lock is never displaced no matter how long its lease has been expired (assert zero writes and no fence bump), and an owner whose lock holder changed is taken over with a fresh secret and a fence bump. Asserted at **two** points in the phase — mid-attempt and mid-finalization — since the rule is stated over the whole claim. No test may advance a clock to obtain ownership; there is no timer to advance. |
-| §4.4e takeover | `release_ownership()` is the only path that displaces a **live** owner, requires an actor and a non-empty reason, bumps the fence, and is recorded. Absent it, a wedged live owner leaves the record `PUBLISHING` — asserted unresolved, escrow retained, reset blocked. |
+| §4.4e takeover | Takeover is admitted **only** on gate-backed death proof. A live owner is never displaced, no matter how long it has been working (assert zero writes and no fence bump) — asserted at **two** points in the phase, mid-attempt and mid-finalization, since the rule is stated over the whole claim. **No test may advance a clock to obtain ownership; there is no clock in the path.** A modelled-dead owner never resumes: the fixture that "revives" it asserts every fenced call returns False. |
+| §4.4e liveness | `RepoLockLiveness` proves death from the **gate**, never from `lock.json`: a hand-written or stale advertisement naming a dead pid does not authorize takeover, and a named instance still holding `locks/{id}.lock` is reported alive by the non-blocking probe (which does not disturb it). A different host is always `False` — no automatic cross-host takeover exists. |
+| §4.4e relinquish | `relinquish_claim()` is callable only by the owner at a stage boundary, clears ownership and bumps the fence, and lets the next drain proceed with no death proof. There is **no** operation that takes a claim from a live owner — asserted by the absence of such a method on the port and by a guardrail. |
+| §4.4e takeover | There is **no** operation that displaces a live owner: the store port exposes none, and a guardrail asserts none is added. A wedged live owner leaves the record `PUBLISHING` — asserted unresolved, escrow retained, reset blocked — and the UI surfaces the owning engine. Stopping that engine (releasing its gate) is what lets the next drain acquire. |
 | §4.4e attempts | Restart at **every** attempt boundary: after the claim/before the call, after the call/before `record_attempt_outcome`, and after the outcome. Each resumes without a duplicate remote write. |
 | §4.4e attempts | A transient failure is followed by a **real second attempt**: attempt 2 is a distinct durable row with its own identity, the operation identity `(record_id, target_head_sha)` is unchanged, and the published head is still exactly one commit. |
 | §4.4e attempts | An outcome-less attempt with an **expired** lease re-runs `RECONCILING` and never resubmits blind; the same row with a **live** lease produces zero writes and a re-check next drain. |
-| §4.4e outcomes | One test per `PublishValidatedHeadStatus` — `PUBLISHED`/`ALREADY_AT_TARGET` (branch verified, PR ensured, `RECOVERED`), a success whose branch is *not* at target (`FAILED`), `TRANSIENT_FAILURE` (stays `PUBLISHING`, bounded retries, exhaustion ⇒ durable `FAILED`), `DIVERGED`/`REJECTED` (durable `FAILED`, no retry). |
+| §4.4e outcomes | One case per `PublishValidatedHeadStatus` member — `PUBLISHED`/`ALREADY_AT_TARGET` (branch verified, PR ensured, `RECOVERED`), a success whose branch is *not* at target (`FAILED`), `TRANSIENT_FAILURE` (stays `PUBLISHING`, bounded retries, exhaustion ⇒ durable `FAILED`), `DIVERGED`/`REJECTED` (durable `FAILED`, no retry), `SUPERSEDED` (no writes at all). |
 | §2.1.1 identity | Capture the same work twice at different `captured_at`, with different remote heads, after a human adds a blocking label, **and after the worktree advances**: identical `record_id` *and* `evidence_id`, exactly one row. |
 | §2.1.1 identity | Requested actions supplied in a different order produce the same id; a different completion artifact hash produces a different `evidence_id` but the **same** `record_id`. |
 | §2.1.3 admission | Different evidence for the same key supersedes in place: one record row, the prior evidence row at role `superseded`, both escrows and both ref sets retained. Superseding a `FAILED` row transitions *that* row; no rival row exists at any point. Recovery against a superseded-from-`FAILED` key leaves nothing unresolved. |
@@ -3278,7 +3423,8 @@ sweeps above:
 | §3.2 owner symmetry | `has_active_issue_runtime()` cannot be called without the disposition owner (required parameter), and `_ResetRetryRuntimeOwners` carries it into both the freshness check and the teardown. |
 | §4.3 check 5 liveness | A `QUEUED` record with **no** other active owner drains to `RECOVERED`. This is the regression test for the self-deadlock: without the exclusion, the owner's own `has_unresolved_work()` reads true, check 5 fails, and the record never publishes on this or any later drain. A companion case adds a live pair and asserts the drain *is* blocked with `RUNTIME_ACTIVE` and zero writes, so the exclusion did not disable the check it narrows. |
 | §4.3 check 5 scope | `excluding` suppresses **only** `VALIDATED_WORK`: one test per other owner — active session, pair, supervised job, publish retry — each still blocks the drain, and the blocking kind is named in the returned fact. A probe that raises lands in `unverifiable_owners` and also blocks. |
-| §4.3 check 5 seam | Bootstrap wiring: `IssueRuntimeLifecycleOwners` is constructed once and is the same value passed to `terminate_issue_runtime`, the reset freshness check, and the disposition service — asserted by identity, so the owner sets cannot drift. The service is constructed successfully with **only** the port, and a guardrail asserts it imports no runtime-owner module. |
+| §4.3 check 5 seam | Bootstrap wiring is acyclic and shares by identity: `CoreIssueRuntimeOwners` is constructed once and is the *same object* inside both `OtherRuntimeActivity` and `IssueRuntimeLifecycleOwners` (asserted with `is`), the full lifecycle value contains the validated-work owner while the core bundle does not, and the disposition service is constructed successfully with only the port. A guardrail asserts the service imports no runtime-owner module, and that neither activity API accepts an exclusion argument. |
+| §4.3 check 5 seam | The **full** path still sees validated work: `has_active_issue_runtime()` through `IssueRuntimeLifecycleOwners` reports an unresolved record as active, so reset/teardown freshness is unchanged by the split. |
 | §3.1 terminator seam | The narrowed `IssueRuntimeTerminator` return type makes a terminator that discards the disposition a type error, and the seam is enumerated by the call-site guardrail rather than being invisible to it. |
 | §4.4e durability | The attempt rows and `publishing_started_at` survive a simulated restart: a record that has burned N transient attempts resumes at N (not 0) and reaches durable `FAILED` at `PUBLISH_ATTEMPT_LIMIT` overall, not per process. |
 | §2.1.4 lineage | Two validated heads `V` then `L` (descendant) on one issue+branch, admitted in **both orders**: exactly one row is drainable, `V`'s row is `ANCESTOR`/`PARKED`, and publishing `L` resolves `V` as `RECOVERED(CONTAINED_IN_PUBLISHED_HEAD)` — leaving **nothing** unresolved and reset unblocked. |
@@ -3289,6 +3435,8 @@ sweeps above:
 | §2.1.4 waiters | The baseline advance is refused when the waiter's recorded expectation differs from the predecessor's recorded pre-push expectation: `PARKED(REMOTE_BASELINE_UNPROVEN)`, with **no remote read** involved in the decision. |
 | §2.1.4 post-resolution | **Fully recover `H`, then admit ancestor `V` afterwards** — by ordinary capture, by orphan repair, and by the slice-8 backfill path. `V` resolves directly as `RECOVERED(CONTAINED_IN_PUBLISHED_HEAD)` on verified escrow, is never `QUEUED`, never reaches check 8, and leaves nothing unresolved. With escrow that fails verification it is `FAILED(ARTIFACT_HASH_MISMATCH)` instead — never resolved by inference. |
 | §2.1.4 post-resolution | Late **descendant** after `H` is recovered: sequenced from the durable published fact when its captured expectation is `H` or the recorded pre-push baseline, `PARKED(REMOTE_BASELINE_UNPROVEN)` otherwise. Late **divergent** after `H`: `PARKED(DIVERGENT_VALIDATED_HEADS)`, never auto-published over. Together with the ancestor row above, the post-resolution matrix is total. |
+| §2.1.4 atomicity | Fault injection inside `resolve_published()` and `resolve_observed_merge()` — after the record transition, after the fact advance, after ancestor resolution — rolls the **whole** command back. Assert that neither a resolved record without its lineage fact nor a lineage fact without its matching resolution is ever observable, in either route. |
+| §2.1.4 atomicity | `resolve_observed_merge()` refuses a `PUBLISHING` record with `PUBLICATION_IN_FLIGHT` and zero writes, so history reconciliation can never resolve a record out from under a live publisher; `resolve_published()` refuses a stale claim the same way. Neither command exposes a transaction handle. |
 | §2.1.4 lineage fact | `validated_work_lineage` is advanced by **both** verified routes — the §4.4 drain (`PUSHED_BY_OWNER`) and §3.5's merged-PR containment (`OBSERVED_MERGE`) — never moves backward, and is the single source both the in-flight waiter rule and the post-resolution rules read. Asserted by driving the same two heads through both orderings and requiring identical end states. |
 | §2.1.4 lineage fact | **Resolve `H` through history reconciliation** (merged PR, no push by this owner), then admit a late **ancestor**, **descendant** and **divergent** record through ordinary capture, orphan repair, and the slice-8 backfill path. The ancestor resolves by verified containment; the descendant parks `REMOTE_BASELINE_UNPROVEN` unless its captured expectation is the recorded published head, because `OBSERVED_MERGE` proves no baseline of ours; the divergent parks. Nothing is left unresolved by arrival order, and no route reaches check 8 with a stale expectation. |
 | §2.1.4 waiters | Predecessor **definitive failure** and **abandonment**: waiters are classified against the unpublished head by the ordinary §2.1.4 rules and no baseline moves. Predecessor **attempt expiry/reconciliation**: waiters stay `PENDING`, because reconciliation is not resolution. |
@@ -3325,11 +3473,12 @@ reset now stale-downgrades while unresolved work exists.
   enumerates the seam in §3.1 as a call site, so the injected
   `IssueRuntimeTerminator` path is covered rather than invisible, and it fails if
   the alias is ever widened back to an `object` return.
-- `exclude_owners` is non-empty only inside `IssueRuntimeLifecycleOwners.activity()`,
-  and only as `{IssueRuntimeOwnerKind.VALIDATED_WORK}` (§4.3 check 5). Any other
-  exclusion, anywhere, is a guardrail failure — that parameter is the one lever in
-  this contract that can make an activity probe stop looking at an owner. The
-  disposition service never names it, because it never calls the predicate.
+- No activity predicate anywhere takes an exclusion parameter. `has_active_issue_runtime()`
+  evaluates all five owners; `OtherRuntimeActivityPort` has one no-argument-beyond-issue
+  method. A reintroduced `exclude_owners` — on either — is a guardrail failure.
+- `CoreIssueRuntimeOwners` is constructed exactly once and passed by reference to
+  both `OtherRuntimeActivity` and `IssueRuntimeLifecycleOwners`; neither copies it,
+  so the four shared owners are the same objects.
 - Only `ValidatedWorkDispositionService` (through `FencedValidatedHeadPublisher`)
   and `PublishRecoveryService` call `ValidatedHeadExecutor`.
 - The disposition publish path never calls `fetch_for_push()` or
@@ -3351,9 +3500,7 @@ reset now stale-downgrades while unresolved work exists.
   executor directly and may never acquire a claim.
 - `ValidatedWorkDispositionService` imports no runtime-owner module — not the
   session manager, pair registry, job supervisor, or publish-retry owner. Its only
-  route to check 5 is `IssueRuntimeActivityPort`, and `IssueRuntimeLifecycleOwners`
-  is constructed exactly once, in bootstrap, and passed to teardown, the reset
-  freshness check, and this seam alike.
+  route to check 5 is `OtherRuntimeActivityPort`.
 - Every `ValidatedWorkStore` mutation on a `PUBLISHING` record takes a
   `ValidatedWorkClaim` — a store write that takes a bare `record_id` on that path
   is a guardrail failure, because it is a write nothing fenced. No module
@@ -3413,7 +3560,7 @@ makes a successful-but-unacknowledged push a recoverable state rather than a
 | Escrow renamed / ref pinned, insert lost | — | `reconcile_escrow_orphans()` rebuilds the row from `capture.json` — identity, observations, initial state and ref names all persisted in the envelope — after validating that the recomputed `evidence_id` and artifact hashes match. Works with the worktree already deleted. Nothing is deleted; the orphan is inert until then because admission reads rows, not directories. |
 | Row `QUEUED`, before the publishing CAS | `PRE_SUBMISSION` | Re-runs the checks and re-admits. Remote is still at `R`. Idempotent. |
 | Attempt 1 claimed, before the publisher was invoked | `RECONCILING` | The attempt row has no outcome and its lease has expired. Remote is still at `R` ⇒ allowed ⇒ claim attempt 2 and publish. This state exists *because* the attempt row precedes the call (§4.4e) — the alternative ordering produces a `QUEUED` row with a completed push, which no phase can safely interpret. |
-| Push landed, process died before the outcome was recorded | `RECONCILING` | The attempt row has no outcome and an expired lease — the crash window, not a failure. Remote at `L` ⇒ allowed ⇒ `ALREADY_AT_TARGET`, reconcile without pushing and record the outcome on a new attempt. Remote at `R` ⇒ allowed ⇒ publish. Any third sha ⇒ `REMOTE_HEAD_CHANGED` ⇒ `FAILED`. |
+| Push landed, process died before the outcome was recorded | `RECONCILING` | The attempt row has no outcome and its owner is provably dead — the crash window, not a failure. Remote at `L` ⇒ allowed ⇒ `ALREADY_AT_TARGET`, reconcile without pushing and record the outcome on a new attempt. Remote at `R` ⇒ allowed ⇒ publish. Any third sha ⇒ `REMOTE_HEAD_CHANGED` ⇒ `FAILED`. |
 | **Push succeeded, no PR created** (`pr_number` is `None`, no PR exists) | `RECONCILING` | The branch decision returns `ALREADY_AT_TARGET` on the **branch ref alone**, so the missing PR is not a gap in the table. PR-ensure (§4.4d) finds no open PR for `b`, creates exactly one, persists its number, then routes review. No re-push. |
 | PR created, its number not yet persisted | `RECONCILING` | PR-ensure discovers the open PR for `b` (scoped to the active issue branch, matched by the orchestrator body marker) and adopts it. No duplicate PR. |
 | Push succeeded, PR reconcile/link failed | `RECONCILING` | Remote head and PR head are `L` — an **allowed** state for this phase, not a divergence. `ALREADY_AT_TARGET`, then finalize; no second push. |
@@ -3422,7 +3569,7 @@ makes a successful-but-unacknowledged push a recoverable state rather than a
 | `REVIEW_ROUTED` recorded, crash before `recovery-pending` was removed | `RECONCILING` | The recovery block is **still on the issue** — this is the window the old cleanup-first ordering left open, and it is now closed by construction. Re-runs stage 1's in-memory half (memory did not survive), then stages 3–4. |
 | `RECOVERY_CLEARED` recorded, row not marked `RECOVERED` | `RECONCILING` | Verifies remote head == `L` and the PR is open, then marks `RECOVERED` and resolves contained ancestors (§2.1.4). **`RECOVERED` is never inferred from "labels correct"** — the durable phase, not the label state, is what proves the routing mutation happened. |
 | Branch-absent variant, push landed | `RECONCILING` | The recorded expectation was "absent", but the branch now exists at `L` — allowed for this phase (that is our push), so reconcile. A branch at any other sha ⇒ `FAILED`. A *read failure* is `REMOTE_UNREADABLE` and retries; it never re-authorizes a branch-creating push. |
-| Anywhere, with a rival drainer live | either | Its `begin_publish_attempt()` sees an unexpired lease on an outcome-less attempt and returns `None`; it makes no remote call and no state change. |
+| Anywhere, with a rival drainer live | either | Its `acquire_claim()` cannot prove the owner dead and returns `None`; it makes no remote call and no state change. |
 | Anywhere, with the publication workspace lost | either | Recreated idempotently from the pinned ref at the top of the next drain (§4.4a). The workspace holds no unique state. |
 
 Every row converges on exactly one published head, one PR, one review routing, and
@@ -3475,7 +3622,8 @@ Ordered so each slice is independently shippable and leaves the tree green.
    owner **and the run-evidence source** into `terminate_issue_runtime()`, and the
    disposition owner into `has_active_issue_runtime()`, as required parameters; add
    the fifth activity probe (`has_unresolved_work`), convert the probe tuple to the
-   `IssueRuntimeOwnerKind`-keyed mapping with `exclude_owners`, narrow
+   `IssueRuntimeOwnerKind`-keyed mapping, add the `CoreIssueRuntimeOwners` /
+   `OtherRuntimeActivity` / `IssueRuntimeLifecycleOwners` layering, narrow
    `IssueRuntimeTerminator` to return `IssueRuntimeTermination`, and make **every**
    call site — including `history_reconciliation`, whose no-op branch must also
    reach the terminator (§3.5) — consume the result. The typing changes ship here
