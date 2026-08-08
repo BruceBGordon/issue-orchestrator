@@ -798,33 +798,87 @@ def check_shared_needs_human_block(
 # was a startup failure on one path and a 90-minute timeout on the other.
 #
 # The first check pins the vocabulary (a copy of the owner's banner phrases
-# somewhere else) and the second pins the shape (a *new* token table, so a
-# second classifier cannot evade the guardrail merely by choosing other words).
-# Both read the owner's table out of the source tree being scanned, so the rule
-# can never be a stale duplicate of it.
+# somewhere else, read out of the owner's own table so the rule can never be a
+# stale duplicate of it) and the second pins the shape, so a second classifier
+# cannot evade the guardrail merely by choosing different words.
 #
-# Residual limit, stated plainly: a lone new literal outside any token table -
-# ``if "please relogin" in out.lower():`` - matches neither check. Single
-# literal comparisons are ordinary everywhere in this codebase, so flagging
-# them repo-wide would be noise. The cross-path banner tests in
-# tests/unit/test_provider_readiness_boundary.py cover that residue by
-# behaviour.
+# The shape rule keys on *normalization*: a membership test against text that
+# has been lowered or casefolded. That is what reading a banner looks like, and
+# it is the one structural signal available to an AST check - a matcher that
+# skips normalization is matching case-sensitively, which no banner reader
+# survives. Left operand is deliberately unconstrained: a bare literal, a token
+# table, an attribute constant and a parameter all read the same way here.
+#
+# The exemption below is keyed by FUNCTION, not by module. A module-level
+# exemption for infra/hooks/_ai_gate.py would let its deleted auth table return
+# beside its legitimate hook-block classifier - the precise regression this
+# guardrail exists to prevent. The vocabulary rule is not exemptible at all, so
+# an exempted function still cannot host the owner's banner phrases.
 
 _CLASSIFICATION_OWNER = "execution/agent_runner_errors.py"
 _PROVIDER_ADAPTER_SURFACE = "execution/agent_runner_providers/"
 _AUTH_TABLE_NAME = "_AUTH_TOKENS"
+_TEXT_NORMALIZERS = {"lower", "casefold"}
+_MODULE_SCOPE = "<module>"
 
-# Text matchers that are not provider output. Each one has to be named here,
-# which is the point: a new entry is a visible claim in review that the text
-# being classified does not come from a provider CLI.
-_NON_PROVIDER_TEXT_MATCHERS = {
-    # Session-log search: matches an operator's query terms against log lines.
-    "adapters/session_log/registry.py",
-    # Doctor guardrail check: reads this checker's own stdout.
-    "infra/doctor/checks/guardrails.py",
-    # Lexical masking: matches prompt/report vocabulary, never CLI output.
-    "control/lexical_masking.py",
-}
+# Functions that classify text which is NOT provider CLI output. Every entry is
+# a claim, made in review, about where the text comes from - that is the point
+# of naming them one function at a time.
+_NON_PROVIDER_TEXT_CLASSIFIERS = frozenset(
+    {
+        # --- git and GitHub responses, not a provider CLI ---
+        "adapters/github/github_adapter.py::GitHubAdapter.create_issue._check",
+        "adapters/github/http_client.py::classify_github_http_failure",
+        "adapters/worktree/_worktree.py::_delete_remote_branch",
+        "adapters/worktree/worktree_policy.py::ValidateOrDeletePolicy._check_broken_git_state",
+        "control/completion_pr_collision.py::is_pr_collision_error",
+        "control/completion_pr_collision.py::_is_raw_no_commits_error",
+        "control/completion_processor.py::CompletionProcessor._is_non_fast_forward",
+        "control/issue_fetch_resilience.py::_looks_like_rate_limit",
+        "execution/git_push_operations.py::determine_retryable",
+        "execution/git_push_operations.py::get_preflight_fix_hint",
+        "execution/git_working_copy.py::GitWorkingCopy.push_preflight",
+        "execution/verification_service.py::DefaultVerificationService.classify_error",
+        # --- this orchestrator's own artifacts: labels, reasons, summaries ---
+        "control/lexical_masking.py::LiteralMasker._literal_at",
+        "control/planner.py::Planner._plan_issues",
+        "control/publish_retry_finalize.py::_is_publish_failure_history",
+        "control/session_completion.py::_is_session_already_gone_error",
+        "control/stuck_sweep.py::_reconciler_owns",
+        "control/stuck_sweep.py::_scan_stuck_issues",
+        "execution/repository_setup_artifacts.py::plan_missing_setup_prompts",
+        "view_models/issue_detail.py::_project_review_terminal_story_event",
+        "view_models/journey_projection.py::_coerce_non_review_latest_outcome",
+        "view_models/journey_projection.py::_round_completed_outcome_label",
+        # --- local tooling, configuration and filenames ---
+        "adapters/hooks/codex.py::CodexAdapter._execpolicy_allows",
+        "entrypoints/cli.py::cmd_default",
+        "entrypoints/cli_tools/setup_wizard.py::_prompt_manual_existing_agent",
+        "entrypoints/cli_tools/setup_wizard.py::wizard_existing_project",
+        "infra/ai_systems_config.py::AISystemsConfig.detect_from_tags",
+        "infra/doctor/checks/guardrails.py::_check_completion_commands_available",
+        "infra/doctor/checks/guardrails.py::_check_git_push_bypass",
+        "infra/e2e_reports.py::_artifact_record_for_path",
+        # The AI gate's hook-block classifier answers "did the hook stop the
+        # command", never "are these credentials dead". Named ALONE, so the auth
+        # table this guardrail removed from the same module cannot come back
+        # beside it.
+        "infra/hooks/_ai_gate.py::_detect_blocked_from_output",
+        # --- session transcripts, read after the fact ---
+        #
+        # These four do read agent output, so the exemption is narrower than it
+        # looks: they answer "did this session finish", "which AI wrote this
+        # log", "what should a human read first" - never a credential question,
+        # and never on the launch or live-session path. The vocabulary rule is
+        # not exemptible, so none of them can start listing banner phrases.
+        "adapters/session_log/registry.py::DataDrivenLogProvider._parse_markdown_log",
+        "adapters/session_log/registry.py::DataDrivenLogProvider._extract_errors_from_entries",
+        "adapters/session_log/registry.py::DataDrivenLogProvider._extract_permission_issues",
+        "adapters/session_log/registry.py::DataDrivenLogProvider._check_completion_marker",
+        "infra/session_failure_diagnosis.py::_build_warnings_and_suggestions",
+        "ports/session_log.py::detect_ai_system_from_output",
+    }
+)
 
 
 def _provider_surface_relpath(path: Path) -> str | None:
@@ -894,58 +948,93 @@ def _matching_string_literals(tree: ast.AST) -> list[tuple[ast.Constant, str]]:
     return literals
 
 
-def _token_table_names(tree: ast.AST) -> set[str]:
-    """Names bound to a collection of two or more string literals."""
-    names: set[str] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Assign):
-            targets: list[ast.AST] = list(node.targets)
-        elif isinstance(node, ast.AnnAssign):
-            targets = [node.target]
-        else:
-            continue
-        if len(_string_elements(node.value)) < 2:
-            continue
-        for target in targets:
-            if isinstance(target, ast.Name):
-                names.add(target.id)
-            elif isinstance(target, ast.Attribute):
-                names.add(target.attr)
-    return names
+def _is_normalizing_call(node: ast.AST) -> bool:
+    """Whether an expression is ``<text>.lower()`` / ``<text>.casefold()``."""
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr in _TEXT_NORMALIZERS
+    )
 
 
-def _iterated_name(node: ast.AST) -> str | None:
-    if isinstance(node, ast.Name):
-        return node.id
-    if isinstance(node, ast.Attribute):
-        return node.attr
-    return None
+def _normalized_aliases(body: Iterable[ast.stmt]) -> set[str]:
+    """Local names bound to normalized text inside one scope.
+
+    ``lowered = output.lower()`` then ``token in lowered`` reads exactly like
+    the direct form, and the AI gate's own hook-block classifier is written
+    that way, so an alias must not be an escape hatch.
+    """
+    aliases: set[str] = set()
+    for statement in body:
+        for node in ast.walk(statement):
+            if isinstance(node, ast.Assign) and _is_normalizing_call(node.value):
+                aliases.update(
+                    t.id for t in node.targets if isinstance(t, ast.Name)
+                )
+            elif (
+                isinstance(node, ast.AnnAssign)
+                and node.value is not None
+                and _is_normalizing_call(node.value)
+                and isinstance(node.target, ast.Name)
+            ):
+                aliases.add(node.target.id)
+            elif (
+                isinstance(node, ast.NamedExpr)
+                and _is_normalizing_call(node.value)
+                and isinstance(node.target, ast.Name)
+            ):
+                aliases.add(node.target.id)
+    return aliases
 
 
-def _token_loop_variables(tree: ast.AST, table_names: set[str]) -> set[str]:
-    """Loop/comprehension variables that walk a token table."""
-    variables: set[str] = set()
-    targets_and_iters: list[tuple[ast.AST, ast.AST]] = []
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.For, ast.AsyncFor)):
-            targets_and_iters.append((node.target, node.iter))
-        elif isinstance(
-            node, (ast.ListComp, ast.SetComp, ast.GeneratorExp, ast.DictComp)
-        ):
-            targets_and_iters.extend((g.target, g.iter) for g in node.generators)
-    for target, iterated in targets_and_iters:
-        is_table = (
-            _iterated_name(iterated) in table_names
-            or len(_string_elements(iterated)) >= 2
-        )
-        if is_table and isinstance(target, ast.Name):
-            variables.add(target.id)
-    return variables
+def _normalized_membership_tests(
+    tree: ast.Module,
+) -> list[tuple[ast.Compare, str]]:
+    """Every ``x in <normalized text>`` in the module, with its owning scope.
+
+    The scope is the dotted path of enclosing classes and functions, so the
+    exemption list can name one function rather than a whole module.
+    """
+    found: list[tuple[ast.Compare, str]] = []
+
+    def visit(body: list[ast.stmt], scope: str, inherited: set[str]) -> None:
+        aliases = inherited | _normalized_aliases(body)
+        nested: list[tuple[list[ast.stmt], str]] = []
+        for statement in body:
+            for node in ast.walk(statement):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    child = node.name if scope == _MODULE_SCOPE else f"{scope}.{node.name}"
+                    nested.append((node.body, child))
+                    continue
+                if not isinstance(node, ast.Compare):
+                    continue
+                if not any(isinstance(op, ast.In) for op in node.ops):
+                    continue
+                normalized = any(
+                    _is_normalizing_call(c)
+                    or (isinstance(c, ast.Name) and c.id in aliases)
+                    for c in node.comparators
+                )
+                if normalized:
+                    found.append((node, scope))
+        for child_body, child_scope in nested:
+            visit(child_body, child_scope, aliases)
+
+    visit(tree.body, _MODULE_SCOPE, set())
+    # A nested scope's statements are also reachable from ast.walk above, so
+    # the same comparison can be recorded twice; the innermost scope wins.
+    innermost: dict[tuple[int, int], tuple[ast.Compare, str]] = {}
+    for node, scope in found:
+        key = (node.lineno, node.col_offset)
+        previous = innermost.get(key)
+        if previous is None or len(scope) > len(previous[1]):
+            innermost[key] = (node, scope)
+    return [innermost[key] for key in sorted(innermost)]
 
 
 def check_provider_output_classification(path: Path, tree: ast.AST) -> list[Violation]:
     relpath = _provider_surface_relpath(path)
-    if relpath is None:
+    if relpath is None or not isinstance(tree, ast.Module):
         return []
     if relpath == _CLASSIFICATION_OWNER or relpath.startswith(
         _PROVIDER_ADAPTER_SURFACE
@@ -971,35 +1060,20 @@ def check_provider_output_classification(path: Path, tree: ast.AST) -> list[Viol
                 )
             )
 
-    if relpath in _NON_PROVIDER_TEXT_MATCHERS:
-        return violations
-
-    token_variables = _token_loop_variables(tree, _token_table_names(tree))
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Compare):
-            continue
-        if not any(isinstance(op, ast.In) for op in node.ops):
-            continue
-        if not isinstance(node.left, ast.Name) or node.left.id not in token_variables:
-            continue
-        lowered = any(
-            isinstance(c, ast.Call)
-            and isinstance(c.func, ast.Attribute)
-            and c.func.attr == "lower"
-            for c in node.comparators
-        )
-        if not lowered:
+    for node, scope in _normalized_membership_tests(tree):
+        if f"{relpath}::{scope}" in _NON_PROVIDER_TEXT_CLASSIFIERS:
             continue
         violations.append(
             Violation(
                 path.as_posix(),
                 node.lineno,
                 node.col_offset,
-                "provider-output-token-table",
-                "a token table is matched against lowered text here; provider "
-                f"output has one classifier ({_CLASSIFICATION_OWNER}). If this "
-                "text is not provider output, name the module in "
-                "_NON_PROVIDER_TEXT_MATCHERS",
+                "provider-output-classifier",
+                f"{scope} matches text against normalized output; provider "
+                f"output has one classifier ({_CLASSIFICATION_OWNER}) and "
+                "consumers ask a provider adapter for a typed "
+                "ProviderErrorType. If this text is not provider output, name "
+                "this function in _NON_PROVIDER_TEXT_CLASSIFIERS",
             )
         )
     return violations

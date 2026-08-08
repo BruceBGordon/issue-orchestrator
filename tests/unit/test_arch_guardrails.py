@@ -429,7 +429,41 @@ def test_blocks_a_second_provider_output_token_table(tmp_path: Path) -> None:
         "src/issue_orchestrator/infra/watcher.py",
     )
     assert code == 2
-    assert "provider-output-token-table" in out
+    assert "provider-output-classifier" in out
+
+
+def test_blocks_a_direct_literal_matcher_with_new_vocabulary(tmp_path: Path) -> None:
+    """No token table, no borrowed words - still a second classifier."""
+    code, out = _run_capturing(
+        tmp_path,
+        """
+        def looks_dead(output):
+            return "please re-login now" in output.lower()
+        """,
+        "src/issue_orchestrator/infra/watcher.py",
+    )
+    assert code == 2
+    assert "provider-output-classifier" in out
+
+
+def test_blocks_a_token_table_matched_through_a_normalized_local(
+    tmp_path: Path,
+) -> None:
+    """Normalizing into a local first is the same matcher, one line later."""
+    code, out = _run_capturing(
+        tmp_path,
+        """
+        _MY_AUTH_MARKERS = ("please re-login now", "handshake rejected")
+
+
+        def looks_dead(output):
+            lowered = output.lower()
+            return any(marker in lowered for marker in _MY_AUTH_MARKERS)
+        """,
+        "src/issue_orchestrator/infra/watcher.py",
+    )
+    assert code == 2
+    assert "provider-output-classifier" in out
 
 
 def test_allows_a_provider_adapter_to_read_its_own_cli_banners(tmp_path: Path) -> None:
@@ -448,3 +482,32 @@ def test_allows_a_provider_adapter_to_read_its_own_cli_banners(tmp_path: Path) -
         )
         == 0
     )
+
+
+def test_an_exempt_function_does_not_shelter_its_module(tmp_path: Path) -> None:
+    """The exemption is per function - the AI gate is the reason why.
+
+    ``_detect_blocked_from_output`` legitimately classifies hook-block text and
+    is named in the exemption list. The auth table that used to sit beside it
+    must not be able to return under that cover.
+    """
+    code, out = _run_capturing(
+        tmp_path,
+        """
+        _CLAUDE_AUTH_FAILURE_MARKERS = ("session gone", "creds stale")
+
+
+        def _detect_blocked_from_output(output):
+            output_lower = output.lower()
+            return any(ind in output_lower for ind in ("blocked", "denied"))
+
+
+        def _is_claude_auth_failure(output):
+            lowered = output.lower()
+            return any(m in lowered for m in _CLAUDE_AUTH_FAILURE_MARKERS)
+        """,
+        "src/issue_orchestrator/infra/hooks/_ai_gate.py",
+    )
+    assert code == 2
+    assert "provider-output-classifier] _is_claude_auth_failure" in out
+    assert "_detect_blocked_from_output" not in out

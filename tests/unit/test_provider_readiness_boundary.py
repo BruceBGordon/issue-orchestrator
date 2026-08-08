@@ -679,19 +679,120 @@ class TestSingleClassificationTable:
 
         assert violations == []
 
-    def test_the_guardrail_catches_a_second_table_that_invents_new_words(
+    @pytest.mark.parametrize(
+        ("label", "source"),
+        [
+            (
+                "token table",
+                '''
+                _MY_OWN_MARKERS = ("please re-login now", "handshake rejected")
+
+
+                def looks_dead(output: str) -> bool:
+                    return any(m in output.lower() for m in _MY_OWN_MARKERS)
+                ''',
+            ),
+            (
+                "direct literal",
+                '''
+                def looks_dead(output: str) -> bool:
+                    return "please re-login now" in output.lower()
+                ''',
+            ),
+            (
+                "token table behind a normalized local",
+                '''
+                _MY_OWN_MARKERS = ("please re-login now", "handshake rejected")
+
+
+                def looks_dead(output: str) -> bool:
+                    lowered = output.lower()
+                    return any(m in lowered for m in _MY_OWN_MARKERS)
+                ''',
+            ),
+            (
+                "casefold instead of lower",
+                '''
+                def looks_dead(output: str) -> bool:
+                    folded = output.casefold()
+                    return "please re-login now" in folded
+                ''',
+            ),
+        ],
+    )
+    def test_the_guardrail_catches_a_second_classifier_however_it_is_spelled(
+        self, label: str, source: str, tmp_path: Path
+    ) -> None:
+        """Proof the guardrail is not vacuous, and not evadable by rewording.
+
+        None of these repeat a single word the owner's table knows. The rule
+        keys on *normalization* instead — lowering or casefolding text before
+        matching it is what reading a banner looks like, and a matcher that
+        skips it is matching case-sensitively, which no banner reader survives.
+        """
+        module = _synthetic_package_module(tmp_path, "control/watcher.py", source)
+        checker = _arch_guardrails()
+
+        kinds = [
+            v.kind
+            for v in checker.check_provider_output_classification(
+                module, ast.parse(module.read_text(encoding="utf-8"))
+            )
+        ]
+
+        assert kinds == ["provider-output-classifier"], label
+
+    def test_an_exempt_function_does_not_shelter_the_rest_of_its_module(
         self, tmp_path: Path
     ) -> None:
-        """Proof the guardrail is not vacuous, and not evadable by rewording."""
+        """The exemption is per function, and that is the whole point.
+
+        ``_ai_gate.py`` legitimately classifies hook-block text, and it is
+        also where the deleted auth table lived. A module-level exemption
+        would let that table walk back in beside the classifier that earned
+        the exemption.
+        """
         module = _synthetic_package_module(
             tmp_path,
-            "control/watcher.py",
+            "infra/hooks/_ai_gate.py",
             '''
-            _MY_OWN_MARKERS = ("please re-login now", "handshake rejected")
+            _CLAUDE_AUTH_FAILURE_MARKERS = ("session gone", "creds stale")
 
 
-            def looks_dead(output: str) -> bool:
-                return any(m in output.lower() for m in _MY_OWN_MARKERS)
+            def _detect_blocked_from_output(output: str) -> bool:
+                output_lower = output.lower()
+                return any(ind in output_lower for ind in ("blocked", "denied"))
+
+
+            def _is_claude_auth_failure(output: str) -> bool:
+                lowered = output.lower()
+                return any(m in lowered for m in _CLAUDE_AUTH_FAILURE_MARKERS)
+            ''',
+        )
+        checker = _arch_guardrails()
+
+        offenders = [
+            (v.kind, v.detail.split(" matches")[0])
+            for v in checker.check_provider_output_classification(
+                module, ast.parse(module.read_text(encoding="utf-8"))
+            )
+        ]
+
+        assert offenders == [("provider-output-classifier", "_is_claude_auth_failure")]
+
+    def test_the_guardrail_catches_a_copy_of_the_owners_banner_text(
+        self, tmp_path: Path
+    ) -> None:
+        """Re-listing a banner is caught on its own, with no matching at all."""
+        module = _synthetic_package_module(
+            tmp_path,
+            "observation/watcher.py",
+            '''
+            _KNOWN_STALLS = ("login expired", "disk full")
+
+
+            def describe(index: int) -> str:
+                return _KNOWN_STALLS[index]
             ''',
         )
         checker = _arch_guardrails()
@@ -703,18 +804,25 @@ class TestSingleClassificationTable:
             )
         ]
 
-        assert kinds == ["provider-output-token-table"]
+        assert kinds == ["provider-banner-vocabulary"]
 
-    def test_the_guardrail_catches_a_copy_of_the_owners_banner_text(
+    def test_even_an_exempt_function_may_not_list_the_owners_banners(
         self, tmp_path: Path
     ) -> None:
-        """A single re-listed banner is caught even without a second table."""
+        """The vocabulary rule has no exemption, by design.
+
+        A function exempted for classifying non-provider text must not be able
+        to quietly acquire provider banner knowledge under that cover.
+        """
         module = _synthetic_package_module(
             tmp_path,
-            "observation/watcher.py",
+            "infra/hooks/_ai_gate.py",
             '''
-            def looks_dead(output: str) -> bool:
-                return "login expired" in output.lower()
+            def _detect_blocked_from_output(output: str) -> bool:
+                output_lower = output.lower()
+                return any(
+                    ind in output_lower for ind in ("blocked", "login expired")
+                )
             ''',
         )
         checker = _arch_guardrails()
