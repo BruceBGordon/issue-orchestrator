@@ -537,6 +537,21 @@ class SqlitePendingWorkClaimStore:
                 (issue_number, cause, reason),
             )
 
+    def restart_needs_human_causes(
+        self, issue_number: int, cause: str, *, reason: str
+    ) -> None:
+        """Replace every cause with this one, in a single transaction."""
+        with self._write_lock, self._transaction() as conn:
+            conn.execute(
+                "DELETE FROM needs_human_cause WHERE issue_number = ?",
+                (issue_number,),
+            )
+            conn.execute(
+                "INSERT INTO needs_human_cause (issue_number, cause, reason) "
+                "VALUES (?, ?, ?)",
+                (issue_number, cause, reason),
+            )
+
     def needs_human_causes(self, issue_number: int) -> frozenset[str]:
         return frozenset(
             str(row["cause"])

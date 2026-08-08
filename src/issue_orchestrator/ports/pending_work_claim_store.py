@@ -420,6 +420,20 @@ class NeedsHumanCauseStore(Protocol):
         """
         ...
 
+    def restart_needs_human_causes(
+        self, issue_number: int, cause: str, *, reason: str
+    ) -> None:
+        """Make ``cause`` the ONLY cause, atomically (#6999 F4 round 5).
+
+        Used when the shared label is absent and is about to be applied again:
+        every row from the previous generation of that label is stale by
+        definition, and a new cause must not inherit it. Replacing them in ONE
+        transaction is what makes that safe under interruption - a separate
+        clear-then-record could die in between and leave the new cause recorded
+        beside a stale one, which is the very state this prevents.
+        """
+        ...
+
     def needs_human_causes(self, issue_number: int) -> frozenset[str]:
         """Every cause currently recorded against ``issue_number``."""
         ...

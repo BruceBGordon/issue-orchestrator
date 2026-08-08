@@ -164,13 +164,23 @@ class SharedNeedsHumanBlock(Protocol):
         ...
 
     def force_clear(self, target: int, reason: str) -> BlockOutcome:
-        """End EVERY cause and take the label off. Operator/terminal intent."""
+        """Override the causes this owner records and take the label off.
+
+        REFUSES with ``HELD_BY_ANOTHER_CAUSE`` when a cause it cannot settle -
+        a quarantine, a tech-lead escalation - still requires the block. Those
+        two re-assert it within a tick, so clearing around them would report a
+        success the next reconciliation pass contradicts (#6999 F3).
+        """
         ...
 
     def held_by_another_cause(
         self, issue_number: int, *, excluding: NeedsHumanCause
     ) -> bool:
         """Whether a cause OTHER than ``excluding`` still requires the block."""
+        ...
+
+    def unsettleable_holders(self, issue_number: int) -> tuple[NeedsHumanCause, ...]:
+        """The causes a force-clear cannot settle, for an operator to act on."""
         ...
 
 
@@ -186,7 +196,10 @@ _SELF_RECORDING_CAUSES = frozenset(
 #: causes a force-clear CANNOT settle (#6999 F3 round 4). Both re-assert the
 #: block on their next pass, so clearing the label around them would be undone
 #: within a tick - after an operator had been told the issue was unblocked.
-_UNSETTLEABLE_BY_FORCE = _SELF_RECORDING_CAUSES
+_UNSETTLEABLE_BY_FORCE = (
+    NeedsHumanCause.CLAIM_QUARANTINE,
+    NeedsHumanCause.TECH_LEAD_ESCALATION,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -234,10 +247,19 @@ class NeedsHumanBlock:
         # left a window where the external write had committed and the cause
         # store had not: a LIVE block nobody owns, which the next remover takes
         # away because it can find no reason for it. This order can only leave
-        # the opposite - a recorded cause with no label - which is self-healing,
-        # because a cause is read against the live label and a row standing over
-        # an absent one is pruned on sight.
-        self._record(request)
+        # the opposite - a recorded cause with no label - which the read path
+        # prunes on sight.
+        #
+        # Which write records it depends on whether this is a NEW GENERATION of
+        # the label (#6999 F4 round 5). Rows only ever mean "while this label is
+        # present, X requires it", so an absent label makes every existing row
+        # stale - and a clear that failed after a committed removal leaves
+        # exactly that. Inheriting one would give the incoming cause a companion
+        # nothing is asserting, and releasing the new cause would then find the
+        # ghost and keep the block forever. Relying on some later read to prune
+        # it first is not a fix; it is a race this owner happened to win.
+        if not self._recorded(request):
+            return BlockOutcome.FAILED
         try:
             self.labels.add_label(request.target, self.needs_human_label)
         except Exception:
@@ -303,11 +325,7 @@ class NeedsHumanBlock:
         operator learns the issue is still blocked and why, instead of being
         told it was cleared by a command that could not clear it.
         """
-        held = [
-            cause
-            for cause in _UNSETTLEABLE_BY_FORCE
-            if self._holds(cause, target)
-        ]
+        held = self.unsettleable_holders(target)
         if held:
             logger.warning(
                 "[BLOCK] Refusing to force-clear needs-human on #%d (%s): %s "
@@ -326,6 +344,18 @@ class NeedsHumanBlock:
             self._holds(cause, issue_number)
             for cause in NeedsHumanCause
             if cause is not excluding
+        )
+
+    def unsettleable_holders(self, issue_number: int) -> tuple[NeedsHumanCause, ...]:
+        """Which of the causes this owner cannot settle are holding the block.
+
+        Named for the operator: a refusal that cannot say WHICH lifecycle is
+        holding an issue leaves them with nothing to act on.
+        """
+        return tuple(
+            cause
+            for cause in _UNSETTLEABLE_BY_FORCE
+            if self._holds(cause, issue_number)
         )
 
     def forget(self, target: int) -> None:
@@ -350,11 +380,38 @@ class NeedsHumanBlock:
         self.forget(target)
         return BlockOutcome.CLEARED
 
-    def _record(self, request: HumanBlockRequest) -> None:
-        if request.cause not in _SELF_RECORDING_CAUSES:
-            self.causes.record_needs_human_cause(
-                request.target, request.cause.value, reason=request.reason
+    def _recorded(self, request: HumanBlockRequest) -> bool:
+        """Record this cause against the CURRENT generation of the label.
+
+        When the label is absent the incoming cause opens a new generation, so
+        every earlier row is replaced in ONE transaction rather than cleared and
+        then written: a clear-then-record can die in between and leave the new
+        cause recorded beside the stale one, which is precisely the state being
+        prevented.
+
+        A failure here aborts the acquisition rather than proceeding, because
+        the alternative is applying a live block whose provenance is wrong.
+        """
+        if request.cause in _SELF_RECORDING_CAUSES:
+            return True
+        try:
+            if self.needs_human_label in self._live_labels(request.target):
+                self.causes.record_needs_human_cause(
+                    request.target, request.cause.value, reason=request.reason
+                )
+            else:
+                self.causes.restart_needs_human_causes(
+                    request.target, request.cause.value, reason=request.reason
+                )
+        except Exception:
+            logger.exception(
+                "[BLOCK] Could not record %s as a cause of the shared block on "
+                "#%d; refusing to apply a block whose provenance is unknown",
+                request.cause.value,
+                request.target,
             )
+            return False
+        return True
 
     def _withdraw(self, request: HumanBlockRequest) -> None:
         if request.cause not in _SELF_RECORDING_CAUSES:
@@ -458,6 +515,10 @@ class _NoOtherCauses:
     ) -> bool:
         del issue_number, excluding  # no second owner to ask
         return False
+
+    def unsettleable_holders(self, issue_number: int) -> tuple[NeedsHumanCause, ...]:
+        del issue_number
+        return ()
 
 
 NO_OTHER_NEEDS_HUMAN_CAUSES: SharedNeedsHumanBlock = _NoOtherCauses()

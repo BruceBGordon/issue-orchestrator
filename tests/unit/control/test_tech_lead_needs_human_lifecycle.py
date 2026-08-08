@@ -1098,7 +1098,7 @@ class TestTheBlockOwnerIsNotBypassableInProduction:
         )
 
     def _process_completion(self, tmp_path, block, labels, record_actions, *,
-                            issue_number=903, pr_labels=()):
+                            issue_number=903, pr_labels=(), outcome="needs_human"):
         """Drive the REAL public completion path with a real record on disk."""
         import json
         from unittest.mock import MagicMock
@@ -1108,6 +1108,7 @@ class TestTheBlockOwnerIsNotBypassableInProduction:
         )
         from issue_orchestrator.control.governed_label_set import GovernedLabelSet
         from issue_orchestrator.execution import FileSystemSessionOutput
+        from issue_orchestrator.ports.pull_request_tracker import PRInfo
 
         worktree = tmp_path / f"wt-{issue_number}"
         worktree.mkdir(parents=True, exist_ok=True)
@@ -1122,7 +1123,7 @@ class TestTheBlockOwnerIsNotBypassableInProduction:
         completion = {
             "session_id": "session-1",
             "timestamp": "2026-08-08T00:00:00Z",
-            "outcome": "needs_human",
+            "outcome": outcome,
             "summary": "needs a human",
             "requested_actions": list(record_actions),
             "question": "what now?",
@@ -1132,6 +1133,19 @@ class TestTheBlockOwnerIsNotBypassableInProduction:
         (run_assets.run_dir / "completion.json").write_text(json.dumps(completion))
 
         adapter = MagicMock()
+        pr_adapter = MagicMock()
+        # A real PR comes back, so the label-applying path is genuinely reached.
+        pr_adapter.create_pr.return_value = PRInfo(
+            number=77,
+            title="t",
+            url="https://example.test/pr/77",
+            branch="b",
+            body="",
+            state="open",
+            labels=[],
+        )
+        git_adapter = MagicMock()
+        git_adapter.get_current_branch.return_value = "branch"
         processor = CompletionProcessor(
             # Wired exactly as the composition root wires it: the governed
             # label is refused at the capability, and the typed outcome routes
@@ -1139,8 +1153,8 @@ class TestTheBlockOwnerIsNotBypassableInProduction:
             label_adapter=GovernedLabelSet(
                 labels=adapter, governed_label=labels.needs_human
             ),
-            pr_adapter=MagicMock(),
-            git_adapter=MagicMock(),
+            pr_adapter=pr_adapter,
+            git_adapter=git_adapter,
             session_output=session_output,
             agent_callback_endpoint=MagicMock(),
             label_config={"needs_human": labels.needs_human},
@@ -1200,34 +1214,105 @@ class TestTheBlockOwnerIsNotBypassableInProduction:
     ):
         """``pr_labels`` is agent-supplied, so it is untrusted input.
 
-        Nothing in record validation stops an agent naming the configured
-        shared label there, and applied it would create a block with no cause -
-        which a later typed release then takes away from whoever did record
+        Nothing in record validation stopped an agent naming the configured
+        shared label there. Applied, it creates a block with no cause recorded
+        - which a later typed release then takes away from whoever did record
         one. The agent already has the typed needs_human outcome for this, and
         that one goes through the owner.
+
+        Driven with a REAL ``CREATE_PR`` completion that returns a PR, because
+        the label-applying code is reachable only on that path: a record that
+        requests nothing never gets there, and a test that stops short of it
+        would pass with the whole branch deleted.
         """
         live: dict[int, set[str]] = {903: set(), 77: set()}
         labels, _applier, _quarantine, block, claims = self._wiring(
             sample_config, tmp_path, live
         )
 
-        _result, adapter = self._process_completion(
+        result, adapter = self._process_completion(
             tmp_path,
             block,
             labels,
-            [],
+            ["create_pr"],
             pr_labels=[labels.needs_human, "size:small"],
+            outcome="completed",
         )
 
-        # Refused by VALUE at the capability, whatever the record said, and the
-        # ordinary label beside it is unaffected.
-        refused = [
-            call for call in adapter.add_label.call_args_list
-            if call.args[1] == labels.needs_human
-        ]
-        assert refused == []
+        # The whole completion is refused, at the door, before any side effect.
+        assert not result.success
+        assert any("reserved shared block" in error for error in result.errors)
+        # No PR, and NOTHING was labelled - not even the ordinary label beside
+        # the reserved one, because the record itself was rejected.
+        assert adapter.add_label.call_args_list == []
         assert claims.needs_human_causes(77) == frozenset()
         assert claims.needs_human_causes(903) == frozenset()
+
+    def test_an_ordinary_pr_label_still_lands_on_a_created_pr(
+        self, sample_config, tmp_path
+    ):
+        """The other half: the rejection is scoped to the reserved label.
+
+        Without it the same record creates its PR and applies its labels, so
+        the guard above is proven to be about the reserved value rather than
+        about ``pr_labels`` being present at all.
+        """
+        live: dict[int, set[str]] = {903: set(), 77: set()}
+        labels, _applier, _quarantine, block, _claims = self._wiring(
+            sample_config, tmp_path, live
+        )
+
+        result, adapter = self._process_completion(
+            tmp_path,
+            block,
+            labels,
+            ["create_pr"],
+            pr_labels=["size:small"],
+            outcome="completed",
+        )
+
+        assert result.success, result.errors
+        assert (77, "size:small") in [
+            (call.args[0], call.args[1]) for call in adapter.add_label.call_args_list
+        ]
+
+    def test_a_refusal_at_the_capability_fails_the_completion(
+        self, sample_config, tmp_path
+    ):
+        """The backstop, when the door check and the capability disagree.
+
+        The two consult different objects - the block owner at the door, the
+        label capability at the write - so a composition can wire the governed
+        capability without an owner that claims the label, which is exactly
+        what happens here. The refusal must FAIL the completion rather than
+        drop the entry: an untrusted request for a human block that is silently
+        skipped is one nothing downstream can see.
+        """
+        from issue_orchestrator.control.needs_human_block import (
+            NO_OTHER_NEEDS_HUMAN_CAUSES,
+        )
+
+        live: dict[int, set[str]] = {903: set(), 77: set()}
+        labels, _applier, _quarantine, _block, _claims = self._wiring(
+            sample_config, tmp_path, live
+        )
+
+        result, adapter = self._process_completion(
+            tmp_path,
+            NO_OTHER_NEEDS_HUMAN_CAUSES,
+            labels,
+            ["create_pr"],
+            pr_labels=[labels.needs_human, "size:small"],
+            outcome="completed",
+        )
+
+        assert not result.success
+        assert any("governed_label" in error for error in result.errors)
+        # ...and the reserved label never reached the raw adapter.
+        assert [
+            call for call in adapter.add_label.call_args_list
+            if call.args[1] == labels.needs_human
+        ] == []
 
     def test_recovered_terminal_shedding_ends_the_causes_with_the_label(
         self, sample_config, tmp_path
@@ -1538,15 +1623,20 @@ class TestTheOwnerSurvivesAHalfWrittenTransition:
             {NeedsHumanCause.SESSION_LIFECYCLE.value}
         ), "the cause must survive so the next attempt can retry the removal"
 
-    def test_a_cause_store_failure_after_removal_cannot_reattach(
+    def test_a_stale_cause_is_not_inherited_by_the_next_generation(
         self, sample_config, tmp_path
     ):
-        """Stale rows left by a failed clear must not revive on a re-add.
+        """The re-add sequence, driven with NO preparatory read.
 
-        The removal commits before the rows are dropped, so a store fault can
-        leave them behind. They are only ever read against the live label, so
-        the moment the label is gone they are stale - and a LATER acquisition
-        by a different cause does not inherit them.
+        Removal commits and the clear then fails, so the label is absent while
+        the old row survives. A DIFFERENT cause acquires next. If it simply
+        recorded itself beside the ghost, releasing it would find a cause
+        nothing is asserting and keep the shared block forever - and a read
+        that happens to prune first is a race, not a fix.
+
+        Rows only ever mean "while this label is present, X requires it", so an
+        absent label opens a new generation and the incoming cause REPLACES
+        everything from the old one, in a single transaction.
         """
         live: dict[int, set[str]] = {903: set()}
         real = SqlitePendingWorkClaimStore.for_repo(tmp_path)
@@ -1557,6 +1647,9 @@ class TestTheOwnerSurvivesAHalfWrittenTransition:
 
             def record_needs_human_cause(self, issue_number, cause, *, reason):
                 real.record_needs_human_cause(issue_number, cause, reason=reason)
+
+            def restart_needs_human_causes(self, issue_number, cause, *, reason):
+                real.restart_needs_human_causes(issue_number, cause, reason=reason)
 
             def needs_human_causes(self, issue_number):
                 return real.needs_human_causes(issue_number)
@@ -1575,18 +1668,80 @@ class TestTheOwnerSurvivesAHalfWrittenTransition:
         )
         assert block.acquire(self._request(labels)) is BlockOutcome.HELD
 
+        # The removal commits; the clear that should have followed it does not.
         causes.refuse = True
         with pytest.raises(RuntimeError):
             block.release(self._request(labels))
-
-        # The label is gone; the row survived the fault.
         assert labels.needs_human not in live[903]
-        assert real.needs_human_causes(903) != frozenset()
+        assert real.needs_human_causes(903) != frozenset(), "the ghost survived"
 
-        # A different cause now needs the block. It must not inherit the stale
-        # row - the reader prunes it against the absent label first.
+        # A different cause acquires. No read has pruned anything.
         causes.refuse = False
-        assert not block.held_by_another_cause(
-            903, excluding=NeedsHumanCause.MERGE_ESCALATION
+        merge = self._request(labels, NeedsHumanCause.MERGE_ESCALATION)
+        assert block.acquire(merge) is BlockOutcome.HELD
+        assert real.needs_human_causes(903) == frozenset(
+            {NeedsHumanCause.MERGE_ESCALATION.value}
+        ), "a new generation of the label inherits nothing from the old one"
+
+        # ...and releasing it takes the block off, rather than finding a ghost.
+        assert block.release(merge) is BlockOutcome.CLEARED
+        assert labels.needs_human not in live[903]
+
+    def test_a_failed_compensation_does_not_haunt_the_next_acquisition(
+        self, sample_config, tmp_path
+    ):
+        """The other way a ghost is born: compensation itself fails.
+
+        Acquisition records its cause, the label write fails, and the
+        compensating withdrawal fails too - leaving a row over a label that was
+        never applied. The next cause must not inherit that either.
+        """
+        live: dict[int, set[str]] = {903: set()}
+        real = SqlitePendingWorkClaimStore.for_repo(tmp_path)
+
+        class _RefusingWithdraw:
+            def record_needs_human_cause(self, issue_number, cause, *, reason):
+                real.record_needs_human_cause(issue_number, cause, reason=reason)
+
+            def restart_needs_human_causes(self, issue_number, cause, *, reason):
+                real.restart_needs_human_causes(issue_number, cause, reason=reason)
+
+            def needs_human_causes(self, issue_number):
+                return real.needs_human_causes(issue_number)
+
+            def withdraw_needs_human_cause(self, issue_number, cause):
+                raise RuntimeError("sqlite write failed")
+
+            def clear_needs_human_causes(self, issue_number):
+                real.clear_needs_human_causes(issue_number)
+
+        class _RefusingAdd(_LiveLabelWriter):
+            def __init__(self, live_labels, *, refuse: bool) -> None:
+                super().__init__(live_labels)
+                self.refuse = refuse
+
+            def add_label(self, issue_number: int, label: str) -> None:
+                if self.refuse:
+                    raise RuntimeError("github write failed")
+                super().add_label(issue_number, label)
+
+        writer = _RefusingAdd(live, refuse=True)
+        labels, block, _claims = self._block(
+            sample_config, tmp_path, live,
+            labels_writer=writer, causes=_RefusingWithdraw(),
         )
-        assert real.needs_human_causes(903) == frozenset()
+
+        with pytest.raises(RuntimeError):
+            block.acquire(self._request(labels))
+        assert labels.needs_human not in live[903]
+        assert real.needs_human_causes(903) != frozenset(), "the ghost survived"
+
+        writer.refuse = False
+        merge = self._request(labels, NeedsHumanCause.MERGE_ESCALATION)
+        assert block.acquire(merge) is BlockOutcome.HELD
+
+        assert real.needs_human_causes(903) == frozenset(
+            {NeedsHumanCause.MERGE_ESCALATION.value}
+        )
+        assert block.release(merge) is BlockOutcome.CLEARED
+        assert labels.needs_human not in live[903]

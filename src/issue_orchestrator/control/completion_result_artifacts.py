@@ -20,6 +20,7 @@ from .completion_failure_reporting import (
 )
 from .completion_types import (
     ERROR_PREFIX_CREATE_PR,
+    ERROR_PREFIX_GOVERNED_LABEL,
     ERROR_PREFIX_PUSH,
     ProcessingResult,
     REVIEW_EXCHANGE_ERROR_PREFIX,
@@ -68,6 +69,13 @@ def build_processing_result(
         and "Pushed branch to remote" in actions_taken
     )
     if any(error.startswith(REVIEW_EXCHANGE_ERROR_PREFIX) for error in errors):
+        success = False
+    # Forced false, with no "but the push worked" escape (#6999 F2 round 5). The
+    # clause above lets a successful push carry a completion to success despite
+    # errors; a refused shared-block write must never ride along on that,
+    # because the whole point of refusing it is that something downstream has to
+    # SEE the request was dropped.
+    if any(error.startswith(ERROR_PREFIX_GOVERNED_LABEL) for error in errors):
         success = False
     logger.info(
         "Completion result: issue=%s success=%s actions=%s errors=%s pr_url=%s",

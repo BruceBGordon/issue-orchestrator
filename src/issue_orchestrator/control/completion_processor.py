@@ -27,7 +27,6 @@ from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
 from ..domain.artifact_contracts import ValidationFailed
-from .governed_label_set import GovernedLabelError
 from .needs_human_block import (
     NO_OTHER_NEEDS_HUMAN_CAUSES,
     BlockOutcome,
@@ -97,6 +96,7 @@ from .completion_result_artifacts import (
 )
 from .completion_review_exchange import CompletionReviewExchange
 from .completion_ports import GitAdapter, LabelAdapter, PRAdapter
+from .completion_pr_labels import apply_pr_labels, reserved_pr_label_error
 from .completion_types import (
     ERROR_PREFIX_CREATE_PR,
     ERROR_PREFIX_PUBLISH_BLOCKED,
@@ -1064,6 +1064,18 @@ class CompletionProcessor:
                 success=False,
                 message="No completion record found",
                 errors=["Completion record not found or invalid"],
+            )
+        # Rejected at the door, BEFORE any side effect (#6999 F2 round 5).
+        # ``pr_labels`` is whatever the agent wrote, and the shared human-block
+        # label is not among the things it may hand itself: applied, it would
+        # create a block with no cause recorded, which a later typed release
+        # then takes away from whoever did record one. The agent has the typed
+        # needs_human outcome for that, which goes through the block owner.
+        # The completion FAILS rather than dropping the entry quietly - a
+        # silently ignored request is one nothing downstream can see.
+        if reserved := reserved_pr_label_error(record, self.needs_human_block):
+            return None, None, ProcessingResult(
+                success=False, message=reserved, errors=[reserved]
             )
 
         session_name = self.session_output.session_name_from_path(completion_path) or record.session_id
@@ -2315,22 +2327,18 @@ class CompletionProcessor:
         )
 
         if pr:
-            # ``create_pr`` is idempotent by head branch, so it can return an
-            # existing PR targeting the wrong base even when the issue-scoped
-            # reuse preflight missed it. Enforce the stack base invariant on the
-            # returned PR too — retarget through the owned op or fail closed —
-            # before it inherits labels/review finalization (#6596 F2).
-            base_failure = self._enforce_created_pr_base(
+            settle_failure = self._settle_created_pr(
                 pr=pr,
+                record=record,
                 stack_decision=stack_decision,
                 expected_base=expected_base,
                 issue_number=issue_number,
+                branch=branch,
                 actions_taken=actions_taken,
                 errors=errors,
             )
-            if base_failure is not None:
-                return base_failure
-            self._apply_pr_labels(pr, record, actions_taken)
+            if settle_failure is not None:
+                return settle_failure
             review_exchange_completed = False
             if exchange_mode in {"via-mcp", "via-local-loop"} and exchange_result:
                 review_exchange_completed = True
@@ -2574,45 +2582,49 @@ class CompletionProcessor:
             event_context=self._event_context,
         )
 
-    def _apply_pr_labels(
+    def _settle_created_pr(
         self,
+        *,
         pr: PRInfo,
         record: CompletionRecord,
+        stack_decision: Any,
+        expected_base: str,
+        issue_number: int,
+        branch: str | None,
         actions_taken: list[str],
-    ) -> None:
-        """Apply extra labels to PR if specified."""
-        actions_taken.append(f"Created PR #{pr.number}")
-        logger.info("Created PR #%d: %s", pr.number, pr.url)
+        errors: list[str],
+    ) -> "_ActionResult | None":
+        """Everything a freshly returned PR must satisfy before it is used.
 
-        # Skip for fake/dry-run PRs (numbers 90000-99999)
-        is_dry_run_pr = 90000 <= pr.number <= 99999
-        if record.pr_labels and not is_dry_run_pr:
-            applied: list[str] = []
-            for label in record.pr_labels:
-                # An agent's completion record is untrusted input, and the
-                # shared block is not a label it may hand itself (#6999 F2
-                # round 4): applied here it would create a block with no cause
-                # recorded, which a later typed release then takes away from
-                # whoever did record one. The agent already has the typed
-                # NEEDS_HUMAN completion outcome, which routes through the
-                # owner and records the cause.
-                try:
-                    self.label_adapter.add_label(pr.number, label)
-                except GovernedLabelError:
-                    logger.error(
-                        "[COMPLETION] Refusing pr_labels entry %r on PR #%d: "
-                        "the shared needs-human block is not the agent's to "
-                        "apply; use the needs_human completion outcome",
-                        label,
-                        pr.number,
-                    )
-                    continue
-                applied.append(label)
-                logger.info("Added label '%s' to PR #%d", label, pr.number)
-            if applied:
-                actions_taken.append(f"Added labels to PR: {applied}")
-        elif record.pr_labels and is_dry_run_pr:
-            logger.info("[E2E_DRY_RUN] Skipping PR label addition for fake PR #%d", pr.number)
+        One guard rather than two, because both answer the same question - is
+        this PR fit to inherit review finalization? - and both halt when it is
+        not:
+
+        * its BASE, because ``create_pr`` is idempotent by head branch and can
+          return an existing PR targeting the wrong one even when the
+          issue-scoped reuse preflight missed it (#6596 F2);
+        * its LABELS, because the record that produced it is agent-authored and
+          may have asked for the shared human block (#6999 F2).
+        """
+        base_failure = self._enforce_created_pr_base(
+            pr=pr,
+            stack_decision=stack_decision,
+            expected_base=expected_base,
+            issue_number=issue_number,
+            actions_taken=actions_taken,
+            errors=errors,
+        )
+        if base_failure is not None:
+            return base_failure
+        if not apply_pr_labels(
+            pr=pr,
+            record=record,
+            labels=self.label_adapter,
+            actions_taken=actions_taken,
+            errors=errors,
+        ):
+            return self._ActionResult(branch=branch, pr_url=pr.url, halt=True)
+        return None
 
     def _cleanup_completion_record(
         self,

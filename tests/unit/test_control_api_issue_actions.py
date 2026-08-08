@@ -1013,21 +1013,228 @@ class TestDismissIssueEndpoint:
         data = response.json()
         assert data["success"] is True
 
-    def test_dismiss_handles_label_removal_failure_gracefully(
+    def test_dismiss_handles_ordinary_label_removal_failure_gracefully(
         self, client_with_orchestrator
     ):
-        """Dismiss continues even when label removal fails (label may not exist)."""
+        """Dismiss continues when an ORDINARY label removal fails.
+
+        A label that is already gone raises here too, and that is not a reason
+        to refuse the operator. Scoped to ordinary labels since #6999 F3: the
+        shared needs-human block is the one label whose failure to clear stops
+        the command, because dismissing past it is what left an issue blocked
+        on GitHub, pruned locally, and reported as done. See
+        ``TestOperatorCommandsRespectTheSharedBlockOwner``.
+        """
         client, mock_orch = client_with_orchestrator
+        lm = mock_orch.deps.label_manager
 
         mock_orch.state.session_history = []
-        mock_orch.repository_host = MagicMock()
         mock_orch.repository_host.remove_label = MagicMock(
-            side_effect=Exception("Label not found")
+            side_effect=lambda number, label: (_ for _ in ()).throw(
+                Exception("Label not found")
+            )
+            if label != lm.needs_human
+            else None
         )
 
         response = client.post("/api/issues/123/dismiss")
 
-        # Should still succeed (silent exception handling is acceptable for missing labels)
         assert response.status_code == 200
         data = response.json()
         assert data["success"] is True
+
+
+class TestOperatorCommandsRespectTheSharedBlockOwner:
+    """Retry and dismiss against a REAL shared-block owner (#6999 F3 round 5).
+
+    The existing endpoint tests use an ungoverned mock, so they cannot see the
+    case that matters: a block whose owner refuses to release it. Dismiss used
+    to catch that refusal, discard it, prune the issue's queue and history
+    state, and report success - leaving ``blocked-needs-human`` on GitHub, the
+    issue invisible locally, and an operator told it was done. With tech-lead
+    provenance it was worse: the same loop went on to strip the marker, so the
+    shared label was left standing with nothing to explain or recover it.
+
+    Both endpoints now consume one owner command, so a refusal means the same
+    thing to each of them.
+    """
+
+    def _wire_real_block(self, mock_orch, tmp_path, live, *, quarantined=()):
+        from issue_orchestrator.control.needs_human_block import NeedsHumanBlock
+        from issue_orchestrator.execution.pending_work_claim_store import (
+            SqlitePendingWorkClaimStore,
+        )
+
+        lm = mock_orch.deps.label_manager
+
+        class _Labels:
+            def add_label(self, issue_number: int, label: str) -> None:
+                live.setdefault(issue_number, set()).add(label)
+
+            def remove_label(self, issue_number: int, label: str) -> None:
+                live.setdefault(issue_number, set()).discard(label)
+
+        mock_orch.deps.needs_human_block = NeedsHumanBlock(
+            needs_human_label=lm.needs_human,
+            tech_lead_marker=lm.tech_lead_needs_human,
+            labels=_Labels(),
+            read_labels=lambda number: sorted(live.get(number, set())),
+            quarantined_issue_numbers=lambda: frozenset(quarantined),
+            causes=SqlitePendingWorkClaimStore.for_repo(tmp_path),
+        )
+        mock_orch.repository_host.remove_label.side_effect = (
+            lambda number, label: live.setdefault(number, set()).discard(label)
+        )
+        mock_orch.repository_host.get_issue_labels.return_value = sorted(
+            live.get(123, set())
+        )
+        return lm
+
+    def test_dismiss_refuses_while_a_quarantine_holds_the_block(
+        self, client_with_orchestrator, tmp_path
+    ):
+        """The exact round-4 failure: refused, yet reported as dismissed."""
+        from issue_orchestrator.domain.models import SessionHistoryEntry
+
+        client, mock_orch = client_with_orchestrator
+        live = {123: {"blocked", "blocked-needs-human", "in-progress"}}
+        lm = self._wire_real_block(mock_orch, tmp_path, live, quarantined=(123,))
+        history_entry = SessionHistoryEntry(
+            issue_number=123,
+            title="Test Issue",
+            agent_type="agent:claude",
+            status="needs_human",
+            runtime_minutes=10,
+        )
+        mock_orch.state.session_history = [history_entry]
+
+        response = client.post("/api/issues/123/dismiss")
+
+        assert response.status_code == 409
+        body = response.json()
+        assert body["success"] is False
+        assert lm.needs_human in body["failed_labels"]
+        assert "claim_quarantine" in body["held_by"]
+        # The block is still on GitHub...
+        assert lm.needs_human in live[123]
+        # ...and the issue is still visible locally, so the operator can see
+        # what is holding it rather than losing track of it entirely.
+        assert mock_orch.state.session_history == [history_entry]
+
+    def test_dismiss_does_not_strip_the_provenance_of_its_own_refusal(
+        self, client_with_orchestrator, tmp_path
+    ):
+        """Tech-lead provenance survives a refused dismiss.
+
+        The marker is frequently the very reason the shared label could not be
+        cleared. Removing it in the same pass left the block standing with
+        nothing to explain it and nothing to recover it from.
+        """
+        client, mock_orch = client_with_orchestrator
+        live = {123: {"blocked-needs-human", "tech-lead-needs-human"}}
+        lm = self._wire_real_block(mock_orch, tmp_path, live)
+
+        response = client.post("/api/issues/123/dismiss")
+
+        assert response.status_code == 409
+        assert "tech_lead_escalation" in response.json()["held_by"]
+        assert lm.needs_human in live[123]
+        assert lm.tech_lead_needs_human in live[123]
+
+    def test_retry_refuses_while_a_quarantine_holds_the_block(
+        self, client_with_orchestrator, tmp_path
+    ):
+        """Retry reports the same refusal, and keeps its retry gates.
+
+        ``session_history`` is the gate: ``QueueCache.evaluate_issue`` skips any
+        issue listed there, so clearing it is what actually requeues the issue.
+        Clearing it while GitHub still carries the block is how the planner
+        relaunches into a quarantined issue.
+        """
+        from issue_orchestrator.domain.models import SessionHistoryEntry
+
+        client, mock_orch = client_with_orchestrator
+        live = {123: {"blocked", "blocked-needs-human"}}
+        lm = self._wire_real_block(mock_orch, tmp_path, live, quarantined=(123,))
+        gate = SessionHistoryEntry(
+            issue_number=123,
+            title="Test Issue",
+            agent_type="agent:claude",
+            status="needs_human",
+            runtime_minutes=10,
+        )
+        mock_orch.state.session_history = [gate]
+        mock_orch.state.failed_this_cycle = {123}
+
+        response = client.post("/api/issues/123/retry")
+
+        assert response.status_code == 409
+        body = response.json()
+        assert body["success"] is False
+        assert lm.needs_human in body["failed_labels"]
+        assert "claim_quarantine" in body["held_by"]
+        assert lm.needs_human in live[123]
+        # The gates are untouched, so the planner still skips the issue.
+        assert mock_orch.state.session_history == [gate]
+        assert mock_orch.state.failed_this_cycle == {123}
+
+    def test_retry_refuses_and_keeps_the_tech_lead_marker_that_caused_it(
+        self, client_with_orchestrator, tmp_path
+    ):
+        """Retry must not strip the provenance it is being refused over.
+
+        The marker IS the tech-lead lifecycle's record of why the shared block
+        exists. Removing it while the block stays leaves a label with nothing
+        left to explain it and nothing to recover it from.
+        """
+        client, mock_orch = client_with_orchestrator
+        live = {123: {"blocked", "blocked-needs-human", "tech-lead-needs-human"}}
+        lm = self._wire_real_block(mock_orch, tmp_path, live)
+        mock_orch.state.session_history = []
+
+        response = client.post("/api/issues/123/retry")
+
+        assert response.status_code == 409
+        assert "tech_lead_escalation" in response.json()["held_by"]
+        assert lm.needs_human in live[123]
+        assert lm.tech_lead_needs_human in live[123]
+
+    def test_retry_succeeds_once_nothing_else_requires_the_block(
+        self, client_with_orchestrator, tmp_path
+    ):
+        """The other side: with no unsettleable cause, retry clears and requeues."""
+        from issue_orchestrator.domain.models import SessionHistoryEntry
+
+        client, mock_orch = client_with_orchestrator
+        live = {123: {"blocked", "blocked-needs-human"}}
+        lm = self._wire_real_block(mock_orch, tmp_path, live)
+        mock_orch.state.session_history = [
+            SessionHistoryEntry(
+                issue_number=123,
+                title="Test Issue",
+                agent_type="agent:claude",
+                status="needs_human",
+                runtime_minutes=10,
+            )
+        ]
+
+        response = client.post("/api/issues/123/retry")
+
+        assert response.status_code == 200
+        assert response.json()["success"] is True
+        assert lm.needs_human not in live[123]
+        assert mock_orch.state.session_history == []
+
+    def test_dismiss_succeeds_once_nothing_else_requires_the_block(
+        self, client_with_orchestrator, tmp_path
+    ):
+        """The refusal is scoped: with no other cause, dismiss clears it."""
+        client, mock_orch = client_with_orchestrator
+        live = {123: {"blocked", "blocked-needs-human", "in-progress"}}
+        lm = self._wire_real_block(mock_orch, tmp_path, live)
+
+        response = client.post("/api/issues/123/dismiss")
+
+        assert response.status_code == 200
+        assert response.json()["success"] is True
+        assert lm.needs_human not in live[123]

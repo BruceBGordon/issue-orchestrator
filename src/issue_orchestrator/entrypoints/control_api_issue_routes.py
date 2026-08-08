@@ -15,6 +15,7 @@ from fastapi.responses import JSONResponse
 
 from ..control.actions import ActionResultType, CloseIssueAction
 from ..control.claim_gate import ClaimLostError
+from ..control.operator_unblock import OperatorUnblocker
 from ..control.queue_cache import QueueCache
 from ..control.reconciliation import ReconciliationRequired, build_expected_for_mutation
 from ..control.worktree_manager import get_worktree_path
@@ -33,32 +34,18 @@ logger = logging.getLogger(__name__)
 control_issue_router = APIRouter()
 
 
-def _clear_operator_label(
-    orchestrator, issue_number: int, label: str, intent: str
-) -> None:
-    """Take one label off on an operator's behalf. Raises if it did not commit.
+def _unblocker(orchestrator) -> "OperatorUnblocker":
+    """The one command behind retry and dismiss (#6999 A2 round 5).
 
-    The shared needs-human block goes through its owner (#6999 F2 round 3).
-    Operator intent OVERRIDES every recorded cause rather than withdrawing one,
-    so it force-clears: the causes must end with the label, or a row outlives
-    it and a later re-added block inherits a cause nobody is asserting.
-    Everything else is an ordinary label the operator route may clear directly.
+    Both endpoints consume it, so which labels an operator command clears, what
+    a refusal means, and how it is described cannot drift apart between them.
+    All that is left here is the HTTP shell: a refusal is a 409, not a 500 and
+    certainly not a success, because the issue is genuinely still blocked.
     """
-    block = orchestrator.deps.needs_human_block
-    if not block.owns(label):
-        orchestrator.repository_host.remove_label(issue_number, label)
-        return
-    outcome = block.force_clear(issue_number, f"operator {intent}")
-    if outcome.committed:
-        return
-    # Reported as a failure to clear, which is exactly what it is (#6999 F3
-    # round 4). The caller keeps the label in its `failed` list, so retry does
-    # NOT prune its gates and does not tell an operator the issue was requeued
-    # while a quarantine or tech-lead escalation still blocks it - a claim the
-    # very next reconciliation pass would contradict.
-    raise RuntimeError(
-        f"shared needs-human block on #{issue_number} was not cleared "
-        f"({outcome.value}): another lifecycle still requires it"
+    return OperatorUnblocker(
+        repository_host=orchestrator.repository_host,
+        labels=orchestrator.deps.label_manager,
+        block=orchestrator.deps.needs_human_block,
     )
 
 
@@ -512,20 +499,19 @@ async def retry_issue(
         )
 
     try:
-        lm = orchestrator.deps.label_manager
-        from ..control.retry_policy import labels_to_remove_for_retry
-
-        current_labels = orchestrator.repository_host.get_issue_labels(issue_number)
-        labels_to_remove = labels_to_remove_for_retry(current_labels, lm)
-
-        removed: list[str] = []
-        failed: list[str] = []
-        for label in labels_to_remove:
-            try:
-                _clear_operator_label(orchestrator, issue_number, label, "retry")
-                removed.append(label)
-            except Exception:
-                failed.append(label)
+        outcome = _unblocker(orchestrator).retry(
+            issue_number,
+            orchestrator.repository_host.get_issue_labels(issue_number),
+        )
+        removed = list(outcome.removed)
+        failed = list(outcome.failed)
+        if outcome.blocked is not None:
+            # Same contract as the partial-failure branch below, reached before
+            # it: the retry gates stay in place, so the planner does not
+            # relaunch into an issue GitHub still blocks (#6999 F3).
+            return JSONResponse(
+                outcome.refusal(issue_number, "retried"), status_code=409
+            )
 
         # Only clear in-memory retry gates once every retry-gating label is
         # confirmed absent on GitHub. If a remove_label() call failed, the
@@ -593,22 +579,20 @@ async def dismiss_issue(
         )
 
     try:
-        lm = orchestrator.deps.label_manager
-        labels_to_remove = [
-            lm.blocked,
-            lm.needs_human,
-            lm.tech_lead_needs_human,
-            lm.blocked_failed,
-            lm.in_progress,
-        ]
-
-        removed = []
-        for label in labels_to_remove:
-            try:
-                _clear_operator_label(orchestrator, issue_number, label, "dismiss")
-                removed.append(label)
-            except Exception:
-                pass
+        outcome = _unblocker(orchestrator).dismiss(issue_number)
+        removed = list(outcome.removed)
+        if outcome.blocked is not None:
+            # The same contract retry has always had, which dismiss used to
+            # throw away (#6999 F3 round 5): a refused shared block means the
+            # issue is NOT dismissed, so its queue and history state stay put.
+            # Pruning them would hide an issue GitHub still blocks, and the
+            # tech-lead marker that may be causing the refusal is deliberately
+            # left standing rather than stripped out from under it. An ORDINARY
+            # label that would not come off stays tolerated, exactly as dismiss
+            # has always tolerated it.
+            return JSONResponse(
+                outcome.refusal(issue_number, "dismissed"), status_code=409
+            )
 
         def _prune_state() -> None:
             orchestrator.state.session_history = [

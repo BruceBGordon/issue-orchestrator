@@ -94,3 +94,104 @@ def test_reads_are_never_refused() -> None:
     raw.present.add((903, "blocked-needs-human"))
 
     assert guarded.has_label(903, "blocked-needs-human") is True
+
+
+class TestTheCollectionWritersCannotSmuggleIt:
+    """The two public surfaces that write labels from a COLLECTION.
+
+    Both were named as bypasses because their values are computed, not spelled:
+    ``SyncLabelsAction`` carries a planner-assembled tuple and ``LabelSync``
+    computes its own add/remove sets. Wiring them to the guarded capability is
+    what closes them, and these drive the public surfaces so a composition that
+    forgot the wrapper cannot pass while the decorator's own tests still do.
+    """
+
+    def _live_labels(self):
+        live: dict[int, set[str]] = {}
+
+        class _Labels:
+            def add_label(self, issue_number: int, label: str) -> None:
+                live.setdefault(issue_number, set()).add(label)
+
+            def remove_label(self, issue_number: int, label: str) -> None:
+                live.setdefault(issue_number, set()).discard(label)
+
+            def has_label(self, issue_number: int, label: str) -> bool:
+                return label in live.get(issue_number, set())
+
+        return live, GovernedLabelSet(
+            labels=_Labels(), governed_label="blocked-needs-human"
+        )
+
+    def test_a_sync_action_cannot_add_the_reserved_label(self) -> None:
+        from unittest.mock import MagicMock
+
+        from issue_orchestrator.control.action_applier import ActionApplier
+        from issue_orchestrator.control.actions import SyncLabelsAction
+
+        live, guarded = self._live_labels()
+        applier = ActionApplier(
+            labels=guarded, sessions=MagicMock(), events=MagicMock()
+        )
+
+        result = applier.apply(
+            SyncLabelsAction(
+                issue_number=903,
+                add_labels=("blocked-needs-human", "in-progress"),
+                remove_labels=(),
+                reason="sync",
+            )
+        )
+
+        assert not result.success
+        assert "blocked-needs-human" not in live.get(903, set())
+        # ...and the ordinary label in the same collection still landed.
+        assert "in-progress" in live[903]
+
+    def test_a_sync_action_cannot_remove_the_reserved_label(self) -> None:
+        from unittest.mock import MagicMock
+
+        from issue_orchestrator.control.action_applier import ActionApplier
+        from issue_orchestrator.control.actions import SyncLabelsAction
+
+        live, guarded = self._live_labels()
+        live[903] = {"blocked-needs-human", "pr-pending"}
+        applier = ActionApplier(
+            labels=guarded, sessions=MagicMock(), events=MagicMock()
+        )
+
+        result = applier.apply(
+            SyncLabelsAction(
+                issue_number=903,
+                add_labels=(),
+                remove_labels=("blocked-needs-human", "pr-pending"),
+                reason="sync",
+            )
+        )
+
+        assert not result.success
+        assert "blocked-needs-human" in live[903], (
+            "removing it here would retract a block with no owner consulted"
+        )
+        assert "pr-pending" not in live[903]
+
+    def test_label_sync_cannot_add_the_reserved_label(self) -> None:
+        from unittest.mock import MagicMock
+
+        from issue_orchestrator.control.label_sync import (
+            DesiredLabels,
+            LabelSync,
+        )
+
+        live, guarded = self._live_labels()
+        sync = LabelSync(labels=guarded, events=MagicMock())
+
+        result = sync.sync(
+            903,
+            current=set(),
+            desired=DesiredLabels.add("blocked-needs-human", "in-progress"),
+        )
+
+        assert "blocked-needs-human" not in live.get(903, set())
+        assert "blocked-needs-human" in result.errors
+        assert "in-progress" in live[903]
