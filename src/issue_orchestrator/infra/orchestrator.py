@@ -44,7 +44,7 @@ from ..control.session_completion import (
 )
 from ..control.session_launcher import SessionLauncher
 from ..control.board_snapshot_builder import StateBoardSnapshotProvider
-from ..control.tech_lead_run_wiring import TechLeadRunAdmission, TechLeadRunRequest, orchestrator_health_review_anchor as _ensure_health_review_anchor, orchestrator_tech_lead_run as _admit_tech_lead_run, reconcile_orchestrator_tech_lead_ownership as _reconcile_tech_lead_ownership
+from ..control.tech_lead_run_wiring import TechLeadRunAdmission, TechLeadRunRequest, orchestrator_health_review_anchor as _ensure_health_review_anchor, orchestrator_launch_tech_lead_run as _launch_tech_lead_run, orchestrator_tech_lead_run as _admit_tech_lead_run, reconcile_orchestrator_tech_lead_ownership as _reconcile_tech_lead_ownership
 from ..control.session_routing import (
     orchestrator_launch_review_session as _launch_review_session,
     orchestrator_launch_retrospective_review_session as _launch_retrospective_review_session,
@@ -180,78 +180,14 @@ class Orchestrator:
         """Kill a session by terminal ID (public wrapper)."""
         self._kill_session(name)
 
-    def terminate_tech_lead_session(
-        self, session: "Session"
-    ) -> "TechLeadTerminationOutcome":
-        """Behavior-complete termination of a tech_lead session on timeout (#6824 R7).
+    def terminate_tech_lead_session(self, session: "Session") -> "TechLeadTerminationOutcome":
+        """Behaviour-complete termination of a tech_lead session (#6824 R7).
 
-        ``kill_session`` only stops the terminal, and a one-shot command runs NO
-        further tick after this — so a recorded cleanup fact would never be
-        applied. The termination is therefore self-contained, mirroring the
-        outcomes normal completion produces: remove the session state machine,
-        stop the terminal, reconcile the session out of ``active_sessions`` (via
-        the state owner), release its claim, and FORCE-remove the disposable
-        scratch worktree.
-
-        EVERY effect is attempted independently — a failure of one (e.g. the
-        terminal stop) never aborts the others — and the result is a typed
-        :class:`TechLeadTerminationOutcome`, the SOLE owner of a failed one-shot
-        cleanup: on a scratch-worktree removal failure the outcome carries the
-        exact ``leaked_worktree`` path so the command can require explicit
-        operator removal. (No engine tick ever runs after this — the only caller
-        is the on-demand driver, which pauses and ``close()``s — so there is no
-        second, tick-based retry mechanism; #6824 R7.)
+        The facade coordinates; the effects and their independence are owned by
+        :mod:`..control.tech_lead_termination`.
         """
-        from ..control.tech_lead_trigger import TechLeadTerminationOutcome
-
-        n = session.issue.number
-
-        def _effect(fn, what: str) -> bool:  # attempt one effect independently
-            try:
-                fn()
-                return True
-            except Exception:
-                logger.warning(
-                    "[TECH_LEAD] Failed to %s for issue #%d on timeout terminate",
-                    what, n, exc_info=True,
-                )
-                return False
-
-        smm = getattr(self.deps, "state_machine_manager", None)
-        machine_removed = _effect(
-            lambda: smm.remove_session_machine(session.terminal_id) if smm else None,
-            "remove state machine",
-        )
-        terminal_stopped = _effect(
-            lambda: self._kill_session(session.terminal_id), "stop terminal"
-        )
-        self.state.drop_active_session(session.terminal_id)  # pure in-memory owner op
-        cm = getattr(self.deps, "claim_manager", None)
-        lease_id = getattr(session, "lease_id", None)
-        claim_released = _effect(
-            lambda: cm.release_claim(n, lease_id) if (cm and lease_id) else None,
-            "release claim",
-        )
-        wtm = getattr(self.deps, "worktree_manager", None)
-        disposable = getattr(session, "scratch_worktree", False) and session.worktree_path
-        worktree_removed = _effect(
-            lambda: wtm.remove(session.worktree_path, force=True)
-            if (disposable and wtm) else None,
-            "remove scratch worktree",
-        )
-        # A failed removal surfaces the EXACT leaked path in the outcome for
-        # explicit operator action before exit — the single cleanup-failure owner
-        # (no dead engine-tick retry, #6824 R7).
-        leaked_worktree = (
-            str(session.worktree_path) if (disposable and not worktree_removed) else None
-        )
-        return TechLeadTerminationOutcome(
-            terminal_stopped=terminal_stopped,
-            machine_removed=machine_removed,
-            claim_released=claim_released,
-            worktree_removed=worktree_removed,
-            leaked_worktree=leaked_worktree,
-        )
+        from ..control.tech_lead_termination import terminate_tech_lead_session
+        return terminate_tech_lead_session(self, session)
 
     def cancel_review_exchange_for_issue(
         self,
@@ -1116,7 +1052,11 @@ class Orchestrator:
     def _github_workflow(self) -> GitHubWorkflow: return GitHubWorkflow(self.config, self.deps.events, self.deps.repository_host, self.deps.fact_gatherer, self.deps.pr_scanner, self.deps.label_sync, self._event_context, self.deps.label_manager, self.scheduler.dependency_evaluator)
     def launch_review_session(self, review: PendingReview) -> Optional[Session]: return _launch_review_session(review, self.state, self._session_launcher, self.deps.session_restorer)
     def launch_retrospective_review_session(self, review: PendingRetrospectiveReview) -> Optional[Session]: return _launch_retrospective_review_session(review, self.state, self._session_launcher, self.deps.session_restorer)
-    def launch_tech_lead_session(self, tech_lead: PendingTechLeadReview) -> Optional[Session]: return _launch_tech_lead_session(tech_lead, self.state, self.config, self._session_launcher, self.deps.session_restorer)
+    # #6994 R2 F2: `launch_tech_lead_session` is the ONE entry point — it re-decides
+    # subject eligibility, scope exclusivity and cross-engine ownership immediately
+    # before starting. `launch_queued_*` is the raw step that authority delegates to.
+    def launch_queued_tech_lead_session(self, tech_lead: PendingTechLeadReview) -> Optional[Session]: return _launch_tech_lead_session(tech_lead, self.state, self.config, self._session_launcher, self.deps.session_restorer)
+    def launch_tech_lead_session(self, tech_lead: PendingTechLeadReview) -> Optional[Session]: return _launch_tech_lead_run(self, tech_lead)
     def ensure_health_review_anchor(self) -> Optional[PendingTechLeadReview]: return _ensure_health_review_anchor(self)
     def request_tech_lead_run(self, request: TechLeadRunRequest) -> TechLeadRunAdmission: return _admit_tech_lead_run(self, request)
     def process_deferred_cleanups(self) -> None: self.state.pending_cleanups = self._github_workflow.process_deferred_cleanups(self.state.pending_cleanups, self._cleanup_manager)

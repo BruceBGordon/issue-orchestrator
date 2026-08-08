@@ -110,6 +110,10 @@ def applier(
     mock_fresh_issue_reader,
 ):
     """Create an ActionApplier with mocks."""
+    from issue_orchestrator.control.tech_lead_run_ownership import (
+        single_instance_run_ownership,
+    )
+
     return ActionApplier(
         labels=mock_labels,
         sessions=mock_sessions,
@@ -118,6 +122,9 @@ def applier(
         worktree_manager=mock_worktree_manager,
         fresh_issue_reader=mock_fresh_issue_reader,
         reconcile=False,
+        # A whole-repository anchor is RESERVED before it is created (#6994
+        # round 2 F3), so the applier that owns the create needs the run owner.
+        run_ownership=single_instance_run_ownership(),
     )
 
 
@@ -3323,6 +3330,10 @@ class TestTechLeadIssueCreationCrossesTheReconciliationGate:
         """An applier with reconciliation live and the ANCHOR issue PAUSED."""
         from issue_orchestrator.control.action_applier import ActionApplier
 
+        from issue_orchestrator.control.tech_lead_run_ownership import (
+            single_instance_run_ownership,
+        )
+
         reader = MagicMock()
         reader.read_issue_labels.return_value = ["tech-lead", "io:needs-reconcile"]
         authority = MagicMock()
@@ -3334,6 +3345,7 @@ class TestTechLeadIssueCreationCrossesTheReconciliationGate:
             fresh_issue_reader=reader,
             reconcile=True,
             tech_lead_ops=authority,
+            run_ownership=single_instance_run_ownership(),
         )
         return applier, authority, mock_repository_host
 

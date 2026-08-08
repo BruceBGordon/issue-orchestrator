@@ -71,7 +71,7 @@ from ..control.health_gate import HealthGate
 from ..adapters.github import GitHubAuth, GitHubIssueResolver, GitHubCache, build_github_auth
 from ..adapters.github.ref_claim_adapter import (
     GitHubRefClaimAdapter,
-    GitHubRefRunClaimAdapter,
+    GitHubRefRunLedgerAdapter,
 )
 from ..execution.verification_service import DefaultVerificationService
 from ..ports.verification import VerificationBudget
@@ -102,7 +102,10 @@ from ..infra.secret_env import (
 )
 from ..control.tech_lead_run_ownership import TechLeadRunOwnership
 from ..ports.claim_manager import ClaimManager, NullClaimManager
-from ..ports.run_claim_store import NullRunClaimStore, RunClaimStore
+from ..ports.run_ledger_store import (
+    SingleInstanceRunLedgerStore,
+    TechLeadRunLedgerStore,
+)
 from ..domain.lease_config import LeaseConfig
 
 if TYPE_CHECKING:
@@ -315,7 +318,7 @@ def _create_claim_components(
             label_adapter=github,
             io_claimed_label=io_claimed_label,
         )
-        run_claim_store: RunClaimStore = GitHubRefRunClaimAdapter(
+        run_ledger_store: TechLeadRunLedgerStore = GitHubRefRunLedgerAdapter(
             client=github.http_client,
             claimant_id=claimant_id,
             config=lease_config,
@@ -324,7 +327,9 @@ def _create_claim_components(
     else:
         lease_config = LeaseConfig()
         claim_manager = NullClaimManager()
-        run_claim_store = NullRunClaimStore()
+        run_ledger_store = SingleInstanceRunLedgerStore(
+            lease_seconds=lease_config.lease_seconds
+        )
         logger.info(
             "Claims disabled: running in single-orchestrator mode. "
             "Multi-machine coordination is OFF. To enable, set "
@@ -338,7 +343,7 @@ def _create_claim_components(
         config=lease_config,
     )
     run_ownership = TechLeadRunOwnership(
-        run_claim_store,
+        run_ledger_store,
         lease_seconds=lease_config.lease_seconds,
         renew_before_expiry_seconds=lease_config.renew_interval_seconds,
     )
@@ -693,6 +698,9 @@ def build_orchestrator(
         fresh_issue_reader=fresh_issue_reader,
         label_manager=label_manager,
         reconcile=True,
+        # A whole-repository anchor must be RESERVED before it is created, so
+        # the applier that owns the create owns the reservation too (#6994).
+        run_ownership=run_ownership,
     ) if github else None
 
     tech_lead = create_tech_lead_composition(
@@ -1182,7 +1190,7 @@ def build_orchestrator_for_testing(
         config=lease_config,
     )
     run_ownership = run_ownership or TechLeadRunOwnership(
-        NullRunClaimStore(),
+        SingleInstanceRunLedgerStore(lease_seconds=lease_config.lease_seconds),
         lease_seconds=lease_config.lease_seconds,
         renew_before_expiry_seconds=lease_config.renew_interval_seconds,
     )
@@ -1213,6 +1221,7 @@ def build_orchestrator_for_testing(
     if action_applier is not None:
         action_applier.label_store = label_store
         action_applier.publish_recovery = publish_recovery
+        action_applier.run_ownership = run_ownership
 
     infra_services = InfraServices(
         label_manager=label_manager,

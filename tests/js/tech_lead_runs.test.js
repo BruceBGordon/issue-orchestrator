@@ -71,8 +71,14 @@ function loadModule(overrides = {}) {
         return el;
     }
 
+    // The REAL template topology (#6994 round 2 F6): on every surface the
+    // status text is a SIBLING of the action inside a container element, so the
+    // Settings remedy is inserted beside the button rather than inside it —
+    // modelling them as siblings of each other but children of the *button*
+    // was what let a button-inside-a-button ship.
     const globalHost = fakeParent();
     const drawerHost = fakeParent();
+    const menuHost = fakeParent();
     elements.set('techLeadHealthReviewItem', fakeElement('techLeadHealthReviewItem', globalHost));
     elements.set('techLeadHealthReviewStatus', fakeElement('techLeadHealthReviewStatus', globalHost));
     elements.set(
@@ -83,7 +89,13 @@ function loadModule(overrides = {}) {
         'issueDetailTechLeadStatus',
         fakeElement('issueDetailTechLeadStatus', drawerHost),
     );
-    for (const id of ['settingsMenu', 'contextMenu', 'menuInvestigateTechLead']) {
+    elements.set('menuInvestigateTechLeadRow', fakeElement('menuInvestigateTechLeadRow'));
+    elements.set('menuInvestigateTechLead', fakeElement('menuInvestigateTechLead', menuHost));
+    elements.set(
+        'menuInvestigateTechLeadStatus',
+        fakeElement('menuInvestigateTechLeadStatus', menuHost),
+    );
+    for (const id of ['settingsMenu', 'contextMenu']) {
         elements.set(id, fakeElement(id));
     }
 
@@ -123,7 +135,7 @@ function loadModule(overrides = {}) {
     context.document.getElementById = (id) => {
         const found = originalGetById(id);
         if (found) return found;
-        for (const host of [globalHost, drawerHost]) {
+        for (const host of [globalHost, drawerHost, menuHost]) {
             const hit = host.children.find((child) => child.id === id);
             if (hit) return hit;
         }
@@ -149,6 +161,12 @@ function ready(overrides = {}) {
     return {
         globalStatus: 'idle',
         globalStatusLabel: '',
+        // The HEALTH REVIEW's own status, projected separately from the
+        // any-global barrier so a batch review cannot make the health action
+        // look already-requested (#6994 round 2 F5).
+        healthReviewStatus: 'idle',
+        healthReviewStatusLabel: '',
+        globalBarrierNote: '',
         queuedIssueNumbers: [],
         runningIssueNumbers: [],
         globalBarrierActive: false,
@@ -305,9 +323,10 @@ test('a successful admission refreshes the view model', async () => {
 // ---------------------------------------------------------------------------
 
 test('an unconfigured engine explains itself in VISIBLE, associated text', () => {
-    // A natively disabled button is not keyboard focusable, so a `title`
-    // tooltip is an explanation no keyboard or screen-reader user can reach.
-    // The reason has to be on screen and programmatically associated (F7).
+    // A natively disabled button is not keyboard focusable, so neither a
+    // `title` tooltip nor an adjacent explanation is reachable from the
+    // keyboard. The control stays focusable (aria-disabled, not `disabled`) and
+    // its reason is on screen and programmatically associated (round 2 F6).
     const { context, elements } = loadModule();
     context.window.dashboardData.techLeadRuns = ready(UNCONFIGURED);
 
@@ -315,10 +334,15 @@ test('an unconfigured engine explains itself in VISIBLE, associated text', () =>
 
     const item = elements.get('techLeadHealthReviewItem');
     const status = elements.get('techLeadHealthReviewStatus');
-    assert.equal(item.disabled, true);
     assert.equal(item.attributes['aria-disabled'], 'true');
+    assert.equal(item.disabled, false, 'the control must stay keyboard reachable');
     assert.match(status.textContent, /No tech lead agent is configured/);
     assert.equal(item.attributes['aria-describedby'], status.id);
+    assert.equal(
+        context.document.getElementById(item.attributes['aria-describedby']),
+        status,
+        'aria-describedby must resolve to a real element in the document',
+    );
 });
 
 test('an unconfigured engine offers a keyboard-reachable Settings control', () => {
@@ -328,9 +352,15 @@ test('an unconfigured engine offers a keyboard-reachable Settings control', () =
     context.refreshTechLeadRunControls();
 
     const link = context.document.getElementById('techLeadHealthReviewItemSettingsLink');
+    const item = elements.get('techLeadHealthReviewItem');
+    const status = elements.get('techLeadHealthReviewStatus');
     assert.ok(link, 'a Settings path must exist when configuration is missing');
     assert.equal(link.disabled, false, 'the remedy must stay operable');
     assert.equal(link.textContent, 'Open Settings');
+    // A button inside a button is invalid interactive markup and unreachable by
+    // keyboard: the remedy is a SIBLING of the action (round 2 F6).
+    assert.notEqual(link.parentNode, item, 'the remedy must not nest in the button');
+    assert.equal(link.parentNode, status.parentNode);
 
     // It is a real control, not prose: activating it opens Settings.
     const handler = link.__clickHandler;
@@ -373,21 +403,31 @@ test('a paused engine disables the global action instead of promising a run', ()
     context.refreshTechLeadMenuState();
 
     const item = elements.get('techLeadHealthReviewItem');
-    assert.equal(item.disabled, true);
+    assert.equal(item.attributes['aria-disabled'], 'true');
+    assert.equal(item.disabled, false, 'the control must stay keyboard reachable');
     assert.match(item.title, /paused/i);
+    assert.match(
+        elements.get('techLeadHealthReviewStatus').textContent, /paused/i,
+    );
 });
 
-test('a running global review shows non-colour status text on the menu item', () => {
+test('a running HEALTH review shows non-colour status text on the menu item', () => {
     const { context, elements } = loadModule();
     context.window.dashboardData.techLeadRuns = ready({
         globalStatus: 'running',
         globalStatusLabel: 'Tech lead running',
+        healthReviewStatus: 'running',
+        healthReviewStatusLabel: 'Tech lead running',
+        globalBarrierActive: true,
     });
 
     context.refreshTechLeadMenuState();
 
     assert.equal(elements.get('techLeadHealthReviewStatus').textContent, 'Tech lead running');
-    assert.equal(elements.get('techLeadHealthReviewItem').disabled, true);
+    assert.equal(
+        elements.get('techLeadHealthReviewItem').attributes['aria-disabled'],
+        'true',
+    );
 });
 
 test('a blocked-state action click while disabled warns and sends nothing', async () => {
@@ -431,8 +471,8 @@ test('a queued investigation disables the targeted action with matching status t
 
     context.updateTechLeadIssueAction({ button, statusEl }, 42, true);
 
-    assert.equal(button.disabled, true);
     assert.equal(attrs['aria-disabled'], 'true');
+    assert.equal(button.disabled, false, 'the control must stay keyboard reachable');
     assert.equal(statusEl.textContent, 'Tech lead queued');
 });
 
@@ -465,13 +505,16 @@ test('an open drawer re-renders from idle to queued when the payload changes', (
     const button = elements.get('issueDetailInvestigateTechLeadBtn');
     const status = elements.get('issueDetailTechLeadStatus');
     context.updateTechLeadIssueAction({ button, statusEl: status }, 42, true);
-    assert.equal(button.disabled, false);
+    assert.equal(button.attributes['aria-disabled'], 'false');
     assert.equal(status.textContent, '');
 
     context.window.dashboardData.techLeadRuns = ready({ queuedIssueNumbers: [42] });
     context.refreshTechLeadRunControls();
 
-    assert.equal(button.disabled, true, 'the open drawer must not stay enabled');
+    assert.equal(
+        button.attributes['aria-disabled'], 'true',
+        'the open drawer must not stay enabled',
+    );
     assert.equal(status.textContent, 'Tech lead queued');
 });
 
@@ -479,14 +522,42 @@ test('the compact card action re-renders and relabels itself on refresh', () => 
     const { context, elements } = loadModule();
     context.window.dashboardData.techLeadRuns = ready();
     const button = elements.get('menuInvestigateTechLead');
+    const status = elements.get('menuInvestigateTechLeadStatus');
     button.dataset.issue = '42';
-    button.style.display = '';
+    elements.get('menuInvestigateTechLeadRow').style.display = '';
 
     context.window.dashboardData.techLeadRuns = ready({ runningIssueNumbers: [42] });
     context.refreshTechLeadRunControls();
 
-    assert.equal(button.disabled, true);
+    assert.equal(button.attributes['aria-disabled'], 'true');
     assert.equal(button.textContent, 'Investigate with tech lead — Tech lead running');
+    // The compact menu carries a REAL status sibling: its reason is visible
+    // text with a resolvable description, not a detached id (round 2 F6).
+    assert.equal(status.textContent, 'Tech lead running');
+    assert.equal(button.attributes['aria-describedby'], status.id);
+    assert.equal(
+        context.document.getElementById(button.attributes['aria-describedby']),
+        status,
+    );
+});
+
+test('the compact menu offers the SAME keyboard-reachable Settings remedy', () => {
+    // The compact surface used to pass a detached null sink, so an unconfigured
+    // engine left it with an unresolvable description and no remedy at all
+    // (round 2 F6).
+    const { context, elements } = loadModule();
+    const button = elements.get('menuInvestigateTechLead');
+    const status = elements.get('menuInvestigateTechLeadStatus');
+    button.dataset.issue = '42';
+    context.window.dashboardData.techLeadRuns = ready(UNCONFIGURED);
+
+    context.refreshTechLeadRunControls();
+
+    assert.match(status.textContent, /No tech lead agent is configured/);
+    const link = context.document.getElementById('menuInvestigateTechLeadSettingsLink');
+    assert.ok(link, 'the compact menu needs its own reachable remedy');
+    assert.equal(link.parentNode, status.parentNode);
+    assert.notEqual(link.parentNode, button);
 });
 
 test('a hidden targeted action is left alone by the refresh owner', () => {
@@ -516,7 +587,8 @@ test('the targeted action stays VISIBLE but disabled when the engine cannot run 
 
     assert.equal(visible, true);
     assert.equal(button.style.display, '');
-    assert.equal(button.disabled, true);
+    assert.equal(button.attributes['aria-disabled'], 'true');
+    assert.equal(button.disabled, false, 'the control must stay keyboard reachable');
     assert.match(status.textContent, /No tech lead agent is configured/);
 });
 
@@ -537,6 +609,72 @@ test('an admission response refreshes every visible surface, not just the one cl
 
     await context.investigateWithTechLead(42);
 
-    assert.equal(drawerButton.disabled, true);
+    assert.equal(drawerButton.attributes['aria-disabled'], 'true');
     assert.equal(drawerStatus.textContent, 'Tech lead queued');
+});
+
+
+// ---------------------------------------------------------------------------
+// Distinct global flavors (#6994 round 2 F5)
+//
+// Health and batch reviews are separate identities that SERIALIZE. A batch
+// review in front of a health request is a queue position, never a refusal.
+// ---------------------------------------------------------------------------
+
+test('a queued BATCH review still lets the operator request a health review', () => {
+    const { context, elements, fetches } = loadModule();
+    context.window.dashboardData.techLeadRuns = ready({
+        globalStatus: 'queued',
+        globalStatusLabel: 'Tech lead queued',
+        globalBarrierActive: true,
+        globalBarrierNote:
+            'Another whole-repository tech-lead review is queued; a health review will start after it.',
+    });
+
+    context.refreshTechLeadMenuState();
+
+    const item = elements.get('techLeadHealthReviewItem');
+    assert.equal(item.attributes['aria-disabled'], 'false');
+    // ...and it SAYS it will wait, rather than looking like a no-op.
+    assert.match(
+        elements.get('techLeadHealthReviewStatus').textContent,
+        /will start after it/,
+    );
+    void fetches;
+});
+
+test('a queued batch review does not stop the health request reaching the server', async () => {
+    const { context, fetches } = loadModule();
+    context.window.dashboardData.techLeadRuns = ready({
+        globalStatus: 'queued',
+        globalStatusLabel: 'Tech lead queued',
+        globalBarrierActive: true,
+        globalBarrierNote: 'Another whole-repository tech-lead review is queued;'
+            + ' a health review will start after it.',
+    });
+
+    await context.runBoardHealthReview();
+
+    assert.equal(fetches.length, 1);
+    assert.deepEqual(JSON.parse(fetches[0].init.body), {
+        scope: { kind: 'global_health_review' },
+    });
+});
+
+test('an ACTIVE health review is what disables the health action', () => {
+    const { context, elements, fetches } = loadModule();
+    context.window.dashboardData.techLeadRuns = ready({
+        globalStatus: 'running',
+        globalStatusLabel: 'Tech lead running',
+        healthReviewStatus: 'running',
+        healthReviewStatusLabel: 'Tech lead running',
+        globalBarrierActive: true,
+    });
+
+    context.refreshTechLeadMenuState();
+
+    assert.equal(
+        elements.get('techLeadHealthReviewItem').attributes['aria-disabled'], 'true',
+    );
+    assert.equal(fetches.length, 0);
 });

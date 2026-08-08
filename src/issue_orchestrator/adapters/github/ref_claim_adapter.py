@@ -7,6 +7,7 @@ swap cell, with claim metadata stored in the referenced commit message.
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import random
 import time
@@ -20,10 +21,17 @@ from ...domain.claim import (
     ClaimFetchError,
     ClaimResult,
     ClaimState,
-    RunClaim,
-    RunClaimAcquisition,
 )
 from ...domain.lease_config import LeaseConfig
+from ...domain.run_ledger import (
+    RunLedger,
+    RunLedgerOutcome,
+    RunLedgerRequest,
+    RunLedgerRequestKind,
+    format_run_ledger,
+    parse_run_ledger,
+    resolve,
+)
 from ...infra import gh_audit
 from ...ports.claim_manager import ClaimManager
 from .claim_parser import format_claim_comment, parse_claim_comment
@@ -60,7 +68,7 @@ class _GitRefClaimStore:
     """CAS-oriented storage helper for one-record-per-ref GitHub refs.
 
     Keyed by an opaque ref key, not by issue number: an issue claim uses
-    ``issue-42`` and a run claim uses ``run-global-health-review``, which is
+    ``issue-42`` and the tech-lead run ledger uses ``tech-lead-runs``, which is
     what lets a whole-repository run be coordinated before any issue exists.
     """
 
@@ -157,34 +165,31 @@ def _issue_ref_key(issue_number: int) -> str:
     return f"issue-{issue_number}"
 
 
-def _run_ref_key(run_key: str) -> str:
-    """Ref key for the RUN claim key space (#6994).
-
-    ``run_key`` is logical identity (``global:health_review``, ``issue:42``) and
-    may contain characters a Git ref cannot. Slugging is total and injective for
-    the identities in use: every non-``[A-Za-z0-9-]`` character becomes ``-``,
-    so the two key spaces stay disjoint by their ``run-``/``issue-`` prefixes.
-    """
-    slug = "".join(
-        char if char.isalnum() or char == "-" else "-" for char in run_key
-    ).strip("-")
-    if not slug:
-        raise ValueError(f"run_key {run_key!r} has no ref-safe representation")
-    return f"run-{slug}"
+# The ONE ref that carries every live tech-lead run in the repository. A single
+# cell, not one per run: the invariant being protected is a relationship BETWEEN
+# runs, and independent per-key cells cannot decide a relationship atomically
+# (#6994 round 2 F1/A1).
+RUN_LEDGER_REF_KEY = "tech-lead-runs"
 
 
-class GitHubRefRunClaimAdapter:
-    """:class:`RunClaimStore` over the same ref compare-and-swap cell (#6994).
+class GitHubRefRunLedgerAdapter:
+    """:class:`TechLeadRunLedgerStore` over one ref compare-and-swap cell (#6994).
 
-    Ownership of a logical run lives at
-    ``refs/issue-orchestrator/claims/run-<slug>``. Reusing the issue claim's CAS
-    mechanism (rather than inventing a second coordination primitive) is the
-    point: one algorithm, one failure mode, two key spaces.
+    The whole repository's tech-lead run ledger lives at
+    ``refs/issue-orchestrator/claims/tech-lead-runs``. Reusing the issue claim's
+    CAS mechanism (rather than inventing a second coordination primitive) is the
+    point: one algorithm, one failure mode.
 
-    Every method absorbs transport failure into a typed "unavailable"/``None``
-    answer rather than raising, because this store's callers are admission
-    decisions: they must be able to tell "a peer owns it" from "we cannot tell",
-    and the port's contract is that the distinction is always available.
+    The adapter owns exactly two things — the record format and the atomic
+    read-decide-write cycle. It decides NO policy: the conflict matrix is
+    :func:`...domain.run_ledger.resolve`, the same pure function the
+    single-instance store evaluates, so the rule cannot differ by deployment.
+
+    Every method absorbs transport failure into a typed ``UNAVAILABLE`` answer
+    rather than raising, because this store's callers are admission and launch
+    decisions: they must be able to tell "a peer owns it" from "we held it and
+    lost it" from "we cannot tell", and the port's contract is that those three
+    are always distinguishable.
     """
 
     def __init__(
@@ -198,146 +203,90 @@ class GitHubRefRunClaimAdapter:
         self._config = config or LeaseConfig()
         self._store = _GitRefClaimStore(client=client, ref_prefix=ref_prefix)
 
-    def acquire(self, run_key: str) -> "RunClaimAcquisition":
-        now = datetime.now()
-        priority = int(now.timestamp() * 1000)
-        lease_id = f"{uuid.uuid4().hex[:12]}-{priority}"
-        claim = RunClaim(
-            lease_id=lease_id,
-            claimant=self._claimant_id,
-            run_key=run_key,
-            started_at=now,
-            expires_at=now + timedelta(seconds=self._config.lease_seconds),
-            priority=priority,
-        )
-        key = _run_ref_key(run_key)
+    def submit(self, request: "RunLedgerRequest") -> "RunLedgerOutcome":
+        """One atomic read-decide-write against the shared ledger."""
+        request = self._with_minted_lease(request)
         try:
             for _ in range(MAX_CAS_ATTEMPTS):
-                snapshot = self._store.read(key)
-                holder = self._live_claim(snapshot, run_key)
-                if holder is not None:
-                    return RunClaimAcquisition.held_by(holder)
-                with gh_audit.context(
-                    reason=gh_audit.AuditReason.GH_WRITE,
-                    issue_key=run_key,
-                    scope=gh_audit.AuditScope.UNKNOWN,
-                ):
-                    message = _format_run_claim_commit_message(claim)
-                    acquired = (
-                        self._store.create(key, message)
-                        if snapshot is None
-                        else self._store.update(snapshot, message)
-                    )
-                if not acquired:
-                    # Lost the CAS to a concurrent writer: re-read and re-decide
-                    # rather than assuming either outcome.
-                    continue
-                logger.info(
-                    "Acquired run claim %s: lease_id=%s, claimant=%s",
-                    run_key,
-                    lease_id,
-                    self._claimant_id,
+                snapshot = self._store.read(RUN_LEDGER_REF_KEY)
+                resolution = resolve(
+                    _ledger_of(snapshot),
+                    request,
+                    claimant=self._claimant_id,
+                    now=datetime.now(),
+                    lease_seconds=self._config.lease_seconds,
                 )
-                return RunClaimAcquisition.acquired(lease_id)
-            return RunClaimAcquisition.unavailable(
-                f"run claim ref for {run_key} kept changing during acquisition"
+                if resolution.ledger is None:
+                    # A refusal needs no write, so a contended request never
+                    # burns a GitHub write on the shared cell.
+                    return resolution.outcome
+                if self._commit(snapshot, resolution.ledger):
+                    logger.info(
+                        "Run ledger %s %s: run=%s claimant=%s",
+                        request.kind.value,
+                        resolution.outcome.status.value,
+                        request.run_key,
+                        self._claimant_id,
+                    )
+                    return resolution.outcome
+                # Lost the CAS to a concurrent writer: re-read and re-decide
+                # rather than assuming either outcome.
+            return RunLedgerOutcome.unavailable(
+                request.run_key,
+                "the tech-lead run ledger kept changing during the update",
             )
         except Exception as exc:
-            logger.warning("Failed to acquire run claim %s: %s", run_key, exc)
-            return RunClaimAcquisition.unavailable(str(exc))
+            logger.warning(
+                "Failed to %s run %s in the shared ledger: %s",
+                request.kind.value,
+                request.run_key,
+                exc,
+            )
+            return RunLedgerOutcome.unavailable(request.run_key, str(exc))
 
-    def renew(self, run_key: str, lease_id: str) -> bool:
-        key = _run_ref_key(run_key)
+    def read(self) -> "RunLedger | None":
         try:
-            snapshot = self._store.read(key)
+            return _ledger_of(self._store.read(RUN_LEDGER_REF_KEY))
         except Exception as exc:
-            logger.warning("Failed to read run claim %s for renewal: %s", run_key, exc)
-            return False
-        held = self._live_claim(snapshot, run_key)
-        if held is None or held.lease_id != lease_id or snapshot is None:
-            return False
-        now = datetime.now()
-        renewed = RunClaim(
-            lease_id=lease_id,
-            claimant=held.claimant,
-            run_key=run_key,
-            started_at=held.started_at,
-            expires_at=now + timedelta(seconds=self._config.lease_seconds),
-            priority=held.priority,
+            logger.warning("Failed to read the tech-lead run ledger: %s", exc)
+            return None
+
+    def _with_minted_lease(self, request: "RunLedgerRequest") -> "RunLedgerRequest":
+        """Give a reservation a globally unique lease id.
+
+        Minted by the ADAPTER because uniqueness is a property of the shared
+        store's namespace, not of the control-layer owner that asks.
+        """
+        if request.kind is not RunLedgerRequestKind.RESERVE or request.lease_id:
+            return request
+        priority = int(datetime.now().timestamp() * 1000)
+        return dataclasses.replace(
+            request, lease_id=f"{uuid.uuid4().hex[:12]}-{priority}"
         )
-        try:
-            return self._store.update(
-                snapshot, _format_run_claim_commit_message(renewed)
-            )
-        except Exception as exc:
-            logger.warning("Failed to renew run claim %s: %s", run_key, exc)
-            return False
 
-    def release(self, run_key: str, lease_id: str) -> None:
-        key = _run_ref_key(run_key)
-        try:
-            snapshot = self._store.read(key)
+    def _commit(
+        self, snapshot: _ClaimRefSnapshot | None, ledger: "RunLedger"
+    ) -> bool:
+        with gh_audit.context(
+            reason=gh_audit.AuditReason.GH_WRITE,
+            issue_key=RUN_LEDGER_REF_KEY,
+            scope=gh_audit.AuditScope.UNKNOWN,
+        ):
+            message = _format_run_ledger_commit_message(ledger)
             if snapshot is None:
-                return
-            held = _parse_run_claim(snapshot.message, run_key)
-            if held is None or held.lease_id != lease_id:
-                return
-            self._store.delete(snapshot)
-            logger.info("Released run claim %s (lease_id=%s)", run_key, lease_id)
-        except Exception as exc:
-            logger.warning("Failed to release run claim %s: %s", run_key, exc)
-
-    def current(self, run_key: str) -> "RunClaim | None":
-        try:
-            return self._live_claim(self._store.read(_run_ref_key(run_key)), run_key)
-        except Exception as exc:
-            logger.warning("Failed to read run claim %s: %s", run_key, exc)
-            return None
-
-    @staticmethod
-    def _live_claim(
-        snapshot: _ClaimRefSnapshot | None, run_key: str
-    ) -> "RunClaim | None":
-        """The holder, or None when unheld OR expired (an expired run is free)."""
-        if snapshot is None:
-            return None
-        claim = _parse_run_claim(snapshot.message, run_key)
-        if claim is None or claim.is_expired(datetime.now()):
-            return None
-        return claim
+                return self._store.create(RUN_LEDGER_REF_KEY, message)
+            return self._store.update(snapshot, message)
 
 
-def _parse_run_claim(message: str, run_key: str) -> "RunClaim | None":
-    """Read a run claim out of a ref commit message.
-
-    Shares the ``io-claim`` block format with the issue claim, so the two key
-    spaces are inspectable with the same tooling.
-    """
-    parsed = parse_claim_comment(message, issue_number=0)
-    if parsed is None:
-        return None
-    return RunClaim(
-        lease_id=parsed.lease_id,
-        claimant=parsed.claimant,
-        run_key=run_key,
-        started_at=parsed.started_at,
-        expires_at=parsed.expires_at,
-        priority=parsed.priority,
-    )
+def _ledger_of(snapshot: _ClaimRefSnapshot | None) -> "RunLedger":
+    """The ledger a ref snapshot carries; an absent ref is an empty ledger."""
+    if snapshot is None:
+        return RunLedger()
+    return parse_run_ledger(snapshot.message)
 
 
-def _format_run_claim_commit_message(claim: "RunClaim") -> str:
-    block = format_claim_comment(
-        Claim(
-            lease_id=claim.lease_id,
-            claimant=claim.claimant,
-            issue_number=0,
-            started_at=claim.started_at,
-            expires_at=claim.expires_at,
-            priority=claim.priority,
-        )
-    )
-    return f"{CLAIM_COMMIT_PREFIX} run {claim.run_key}\n\n{block}\n"
+def _format_run_ledger_commit_message(ledger: "RunLedger") -> str:
+    return f"{CLAIM_COMMIT_PREFIX} tech-lead runs\n\n{format_run_ledger(ledger)}\n"
 
 
 class GitHubRefClaimAdapter(ClaimManager):

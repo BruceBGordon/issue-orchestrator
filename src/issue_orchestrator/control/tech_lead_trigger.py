@@ -11,7 +11,10 @@ It reuses the REAL tech-lead-launch machinery
 (``orchestrator.launch_tech_lead_session``) so evidence-map staging, authority
 recording, and agent sandboxing are byte-for-byte identical to a reactive
 launch: this module builds the same :class:`PendingTechLeadReview` a discovered
-failure would and hands it to the same facade method. It then drives the
+failure would and hands it to the same facade method — which since #6994
+round 2 routes through the single
+:class:`~.tech_lead_launch_authority.TechLeadLaunchAuthority`, so this path
+cannot start a run the scope matrix or the shared ledger would refuse. It then drives the
 launched session to completion with the planner PAUSED, so no OTHER board work
 starts while the investigation runs — a paused planner returns an empty plan,
 yet ``tick()`` still drives already-active sessions to completion and drains
@@ -347,7 +350,11 @@ def run_health_review(
         )
         return HealthReviewResult(
             tech_lead.issue_number, status=TechLeadOutcomeStatus.NOT_LAUNCHED,
-            detail=f"health-review launch failed for anchor #{tech_lead.issue_number}",
+            detail=(
+                f"health review not started for anchor #{tech_lead.issue_number}:"
+                " the launch authority held or refused it (scope exclusivity,"
+                " cross-engine ownership, or a launch failure) — it stays queued"
+            ),
         )
     identity = _session_identity(session)
     logger.info(
@@ -411,7 +418,11 @@ def _investigate_one(
         )
         return InvestigationResult(
             issue_number, status=TechLeadOutcomeStatus.NOT_LAUNCHED,
-            detail=f"tech_lead launch failed for issue #{issue_number}",
+            detail=(
+                f"investigation of issue #{issue_number} not started: the launch"
+                " authority held or refused it (scope exclusivity, cross-engine"
+                " ownership, subject no longer eligible, or a launch failure)"
+            ),
         )
 
     identity = _session_identity(session)

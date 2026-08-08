@@ -83,68 +83,6 @@ class Claim:
 
 
 @dataclass(frozen=True)
-class RunClaim:
-    """Ownership of one LOGICAL RUN, keyed by run identity, not by issue (#6994).
-
-    The issue :class:`Claim` answers "who may write to issue #42?". This answers
-    a different question — "who owns the run identified by ``run_key``?" — and
-    the two are deliberately separate records:
-
-    * A whole-repository review has NO subject issue until its anchor exists, so
-      it cannot be coordinated by an issue claim at all; the race it must win is
-      the one BEFORE the anchor is created.
-    * A run is owned from admission through launch, which is a longer and
-      differently-shaped lifetime than the write claim a session holds.
-
-    Storage is the same compare-and-swap primitive the issue claim uses
-    (ADR-0033), so there is one coordination mechanism with two key spaces
-    rather than two mechanisms.
-    """
-
-    lease_id: str
-    claimant: str
-    run_key: str
-    started_at: datetime
-    expires_at: datetime
-    priority: int
-
-    def is_expired(self, now: datetime | None = None) -> bool:
-        """True when the owner stopped renewing and the run may be taken over."""
-        if now is None:
-            now = datetime.now()
-        return now >= self.expires_at
-
-
-@dataclass(frozen=True)
-class RunClaimAcquisition:
-    """The outcome of one atomic attempt to own a logical run.
-
-    Three states, kept distinct because they need three different answers from
-    the caller: we won (``won``), a live peer owns it (``holder``), or the
-    coordination store could not be read/written (``error``). Collapsing the
-    last two would report a transient GitHub outage to an operator as "another
-    orchestrator is already doing this", which is a lie they cannot act on.
-    """
-
-    won: bool
-    lease_id: str | None = None
-    holder: RunClaim | None = None
-    error: str | None = None
-
-    @classmethod
-    def acquired(cls, lease_id: str) -> "RunClaimAcquisition":
-        return cls(won=True, lease_id=lease_id)
-
-    @classmethod
-    def held_by(cls, holder: RunClaim) -> "RunClaimAcquisition":
-        return cls(won=False, holder=holder)
-
-    @classmethod
-    def unavailable(cls, error: str) -> "RunClaimAcquisition":
-        return cls(won=False, error=error)
-
-
-@dataclass(frozen=True)
 class ClaimResult:
     """Result of attempting to claim an issue.
 

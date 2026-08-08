@@ -33,6 +33,7 @@ from .tech_lead_run_admission import (
     TechLeadRunCoordinator,
     logger,
 )
+from .tech_lead_run_ownership import RunOwnershipOutcome, RunReconcileStatus
 
 if TYPE_CHECKING:
     from ..domain.models import OrchestratorState
@@ -40,6 +41,7 @@ if TYPE_CHECKING:
     from ..ports import EventSink, RepositoryHost
     from ..ports.queue_cache_store import QueueCacheStore
     from ..ports.tech_lead_authority import TechLeadAuthorityStore
+    from ..domain.models import Session
     from .action_applier import ActionResult
     from .tech_lead_run_ownership import TechLeadRunOwnership
     from .actions import (
@@ -196,36 +198,99 @@ def admit_planned_tech_lead_investigation(
     return admission
 
 
+def authors_global_tech_lead_anchor(action: "CreateTechLeadIssueAction") -> bool:
+    """True when this creation AUTHORS a whole-repository run's anchor.
+
+    One apply-time owner creates every tech-lead-authored issue — anchors,
+    gated proposals, case files — but only an anchor IS a logical run. The
+    distinction is read from the action's declared origin and type rather than
+    from its labels, so a proposal issue can never be mistaken for a run and
+    made to wait on (or hold) whole-repository exclusivity.
+    """
+    from ..domain.tech_lead_session import TechLeadCreationKind
+    from .action_base import ActionType as _ActionType
+
+    return (
+        action.action_type is _ActionType.CREATE_TECH_LEAD_ISSUE
+        and action.origin.kind is TechLeadCreationKind.AUTHORS_ANCHOR
+    )
+
+
+def create_owned_tech_lead_issue(
+    action: "CreateTechLeadIssueAction",
+    *,
+    ownership: "Optional[TechLeadRunOwnership]",
+    create: "Callable[[CreateTechLeadIssueAction], ActionResult]",
+) -> "ActionResult":
+    """Reserve the whole-repository run, THEN create its anchor (#6994 R2 F3/A3).
+
+    Claiming after the create is a scan-then-create gap wearing a claim's
+    clothes: two engines both find no open anchor, both create one, and only
+    afterwards does one of them discover it lost — by which point the duplicate
+    GitHub issue exists and no claim can un-create it. So reservation, creation
+    and compensation are ONE workflow with explicit outcomes, owned here rather
+    than assembled by the apply seam.
+
+    The creating owner already DECLARED which variant it authored, so the run
+    identity is read from the action rather than re-derived from marker labels
+    at this boundary (#6780's rule, reused here).
+    """
+    from ..domain.tech_lead_run import global_scope_for_flavor
+    from .actions import ActionResult
+
+    if not authors_global_tech_lead_anchor(action):
+        # A gated proposal or a case file is not a logical run: it holds no
+        # whole-repository exclusivity and must not wait on any.
+        return create(action)
+    if ownership is None:
+        return ActionResult.fail(
+            action,
+            "No tech-lead run ownership wired; refusing to create an anchor that"
+            " could not be coordinated across orchestrators",
+        )
+    scope = global_scope_for_flavor(action.flavor)
+    reservation = ownership.claim(scope)
+    if not reservation.owned:
+        return ActionResult.fail(
+            action,
+            f"Not creating a {action.flavor.value} anchor: {reservation.detail}",
+        )
+    result = create(action)
+    if not result.success:
+        # Compensation: a reserved-but-uncreated run would make every other
+        # tech-lead run queue behind a review that does not exist.
+        ownership.release(scope.run_key)
+    return result
+
+
 def intake_owned_tech_lead_anchor(
     action: "CreateTechLeadIssueAction",
     issue_number: int,
     tick: TechLeadTickDependencies,
 ) -> bool:
-    """Take shared ownership of a freshly created anchor, then queue it (#6994).
+    """Queue a freshly created anchor this engine already reserved (#6994).
 
-    The periodic/storm health-review path creates its anchor through the
-    planner's action pipeline rather than through :meth:`admit`, so this is
-    where it meets the SAME run-ownership owner every other trigger uses. Losing
-    the claim means a peer engine already owns this whole-repository run: the
-    anchor issue stays open (the next discovery reuses it) but it is NOT queued
-    here, so the two engines cannot both run the review.
+    The reservation happened BEFORE the create
+    (:func:`create_owned_tech_lead_issue`), so this is the second half of one
+    owner workflow rather than a claim in a post-create callback. Ownership is re-asserted (not re-raced): it is
+    idempotent for the engine that holds it, and a hold that vanished between
+    the create and here means a peer now owns the whole-repository run — the
+    anchor issue stays open for the next discovery, but it is NOT queued here,
+    so the two engines cannot both run the review.
 
     Returns whether the anchor was queued for this engine.
     """
     from ..domain.tech_lead_run import global_scope_for_flavor
     from .health_review_trigger import intake_created_tech_lead_anchor
 
-    # The creating owner already DECLARED which variant it authored, so the
-    # run identity is read from the action rather than re-derived from marker
-    # labels at this boundary (#6780's rule, reused here).
-    run_key = global_scope_for_flavor(action.flavor).run_key
-    if not tick.run_ownership.claim(run_key).owned:
+    scope = global_scope_for_flavor(action.flavor)
+    if not tick.run_ownership.claim(scope).owned:
         logger.warning(
             "[TECH_LEAD] Not queueing anchor #%d (%s): another orchestrator owns"
             " run %s",
             issue_number,
             action.flavor.value,
-            run_key,
+            scope.run_key,
         )
         return False
     intake_created_tech_lead_anchor(
@@ -324,6 +389,12 @@ class TechLeadFacadeHost(Protocol):
 
     def ensure_health_review_anchor(self) -> Optional[PendingTechLeadReview]: ...
 
+    def launch_queued_tech_lead_session(
+        self, tech_lead: PendingTechLeadReview
+    ) -> "Optional[Session]": ...
+
+    def terminate_tech_lead_session(self, session: "Session") -> object: ...
+
 
 def orchestrator_health_review_anchor(
     orchestrator: TechLeadFacadeHost,
@@ -367,19 +438,46 @@ def tech_lead_run_coordinator(
 def reconcile_orchestrator_tech_lead_ownership(
     orchestrator: TechLeadFacadeHost,
 ) -> None:
-    """Renew claims for live tech-lead runs; withdraw the ones we lost (#6994).
+    """Renew leases for live tech-lead runs and apply what changed (#6994).
 
-    One call per tick. The coordinator decides which runs this engine may still
-    act on; the CONSEQUENCE — a run whose shared claim went to a peer must leave
-    our queue, or we would launch work another engine is already doing — is
-    applied here, next to that policy, rather than in the facade.
+    One call per tick. The ownership owner decides WHAT each run's lease looks
+    like; the CONSEQUENCES are applied here, next to that policy, and they are
+    deliberately different per status (round 2 F4):
+
+    * ``LOST`` — we held this run and no longer do. A queued run leaves our
+      queue (or we would launch work another engine is already doing) and an
+      ACTIVE session is TERMINATED: a session that cannot prove ownership is a
+      session running concurrently with a peer's conflicting scope, which is the
+      exact outcome the shared ledger exists to prevent.
+    * ``CONTENDED`` — a peer holds it and we never did (the restart-behind-an-
+      unexpired-lease case). The run is RETAINED and retried: the hold will
+      lapse or be released, and withdrawing here strands a recovered anchor
+      until somebody restarts the engine again.
+    * ``UNAVAILABLE`` — the coordination store could not be read. Nothing is
+      withdrawn and nothing is stopped, because a transport failure is not
+      evidence about ownership.
+
+    Every non-owned run is published as ``TECH_LEAD_RUN_OWNERSHIP_CHANGED`` so
+    the retry loop is observable rather than a silent stall.
     """
+    reconciliation = tech_lead_run_coordinator(orchestrator).reconcile_ownership()
+    for outcome in reconciliation.outcomes:
+        if outcome.status is RunReconcileStatus.OWNED:
+            continue
+        _publish_ownership_change(orchestrator, outcome)
+    lost = set(reconciliation.lost)
+    if not lost:
+        return
+    _withdraw_lost_queued_runs(orchestrator, lost)
+    _stop_unowned_active_sessions(orchestrator, lost)
+
+
+def _withdraw_lost_queued_runs(
+    orchestrator: TechLeadFacadeHost, lost: set[str]
+) -> None:
     from .session_routing import PendingSessionQueues
     from .tech_lead_run_admission import run_key_of_pending
 
-    lost = set(tech_lead_run_coordinator(orchestrator).reconcile_ownership())
-    if not lost:
-        return
     queues = PendingSessionQueues(orchestrator.state)
     for item in list(orchestrator.state.pending_tech_lead_reviews):
         if run_key_of_pending(item) in lost:
@@ -390,6 +488,79 @@ def reconcile_orchestrator_tech_lead_ownership(
                 item.issue_number,
             )
             queues.remove_tech_lead(item.issue_number)
+
+
+def _stop_unowned_active_sessions(
+    orchestrator: TechLeadFacadeHost, lost: set[str]
+) -> None:
+    """Terminate every ACTIVE tech-lead session we can no longer prove we own.
+
+    Withdrawing the queue entry alone was never enough: the run that matters
+    most is the one already executing, and leaving it running is what let two
+    engines audit the same repository at once.
+    """
+    from .tech_lead_run_admission import active_tech_lead_sessions, scope_of_session
+
+    for session in active_tech_lead_sessions(
+        orchestrator.config, list(orchestrator.state.active_sessions)
+    ):
+        scope = scope_of_session(session)
+        if scope is None or scope.run_key not in lost:
+            continue
+        logger.warning(
+            "[TECH_LEAD] Terminating active %s session for #%d: this engine can"
+            " no longer prove it owns run %s",
+            session.agent_label,
+            session.issue.number,
+            scope.run_key,
+        )
+        orchestrator.terminate_tech_lead_session(session)
+
+
+def _publish_ownership_change(
+    orchestrator: TechLeadFacadeHost, outcome: "RunOwnershipOutcome"
+) -> None:
+    from ..events import EventName
+    from ..ports import make_trace_event
+
+    deps = orchestrator.deps
+    events = deps.events  # type: ignore[attr-defined]
+    events.publish(
+        make_trace_event(
+            EventName.TECH_LEAD_RUN_OWNERSHIP_CHANGED,
+            {
+                "run_key": outcome.run_key,
+                "status": outcome.status.value,
+                "holder": outcome.holder,
+                "detail": outcome.detail,
+            },
+        )
+    )
+
+
+def orchestrator_launch_tech_lead_run(
+    orchestrator: TechLeadFacadeHost, tech_lead: PendingTechLeadReview
+) -> "Optional[Session]":
+    """Start one queued tech-lead run through the SINGLE launch authority.
+
+    Both launch paths — the in-tick applier (via the session-launcher callback)
+    and the one-shot CLI — reach the facade's ``launch_tech_lead_session``, so
+    routing that method here is what makes the authority unbypassable rather
+    than merely available (round 2 F2 / A2).
+    """
+    from .label_manager import LabelManager
+    from .tech_lead_launch_authority import TechLeadLaunchAuthority
+
+    deps = orchestrator.deps
+    return TechLeadLaunchAuthority(
+        state=orchestrator.state,
+        config=orchestrator.config,
+        ownership=deps.run_ownership,  # type: ignore[attr-defined]
+        repository_host=deps.repository_host,  # type: ignore[attr-defined]
+        is_blocking_any=LabelManager(orchestrator.config).is_blocking_any,
+        events=deps.events,  # type: ignore[attr-defined]
+        launch=orchestrator.launch_queued_tech_lead_session,
+    ).launch(tech_lead)
 
 
 def _facade_anchor_lifecycle(

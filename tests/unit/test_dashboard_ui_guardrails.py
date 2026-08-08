@@ -4045,3 +4045,107 @@ def test_provider_impact_events_trigger_live_row_refresh() -> None:
     source = _read(DASHBOARD_JS_DIR / "issue_metadata.js")
     assert "'provider.issue_blocked'" in source
     assert "'provider.issue_unblocked'" in source
+
+
+# ---------------------------------------------------------------------------
+# Tech-lead action DOM validity + reachable remedies (#6994 round 2 F6)
+#
+# The JS harness in ``tests/js/tech_lead_runs.test.js`` models the real
+# topology, but only the template can prove the real topology IS that. These
+# assertions are about structure the browser tests take as given.
+# ---------------------------------------------------------------------------
+
+
+def test_the_health_review_status_is_a_SIBLING_of_its_button_not_a_child() -> None:
+    """A status inside the button makes the Settings remedy a nested button.
+
+    ``applyTechLeadSettingsLink`` inserts the remedy into the status element's
+    PARENT. When the status lived inside the button, that parent WAS the button
+    — invalid interactive markup, and a remedy no keyboard user could reach.
+    """
+    html = _read(DASHBOARD_TEMPLATE)
+    button_attrs, button_text = _html_element(html, "button", "techLeadHealthReviewItem")
+    status_attrs, _ = _html_element(html, "span", "techLeadHealthReviewStatus")
+
+    assert 'id="techLeadHealthReviewStatus"' not in button_text, (
+        "the status must not be nested inside the action button"
+    )
+    assert 'class="settings-menu-row"' in html, (
+        "the action and its status need a shared container to be siblings in"
+    )
+    assert button_attrs["role"] == "menuitem"
+    assert status_attrs["role"] == "status"
+    assert status_attrs["aria-live"] == "polite"
+
+
+def test_the_compact_card_action_carries_a_REAL_status_sibling() -> None:
+    """The compact menu used to pass a detached null sink.
+
+    That left ``aria-describedby`` pointing at an id no element had, gave the
+    blocked reason nowhere to render, and left the Settings remedy impossible to
+    insert at all.
+    """
+    html = _read(DASHBOARD_TEMPLATE)
+    button_attrs, button_text = _html_element(html, "button", "menuInvestigateTechLead")
+    status_attrs, _ = _html_element(html, "span", "menuInvestigateTechLeadStatus")
+    row_attrs, _ = _html_element(html, "div", "menuInvestigateTechLeadRow")
+
+    assert 'id="menuInvestigateTechLeadStatus"' not in button_text
+    assert button_attrs["role"] == "menuitem"
+    assert status_attrs["role"] == "status"
+    assert status_attrs["aria-live"] == "polite"
+    # The row (not the button) carries the hidden default, so hiding the action
+    # takes its status text and its remedy with it.
+    assert "display:none" in row_attrs.get("style", "")
+    assert "display:none" not in button_attrs.get("style", "")
+
+
+def test_tech_lead_actions_are_aria_disabled_rather_than_natively_disabled() -> None:
+    """A natively disabled control is not focusable, so its reason is unreachable."""
+    js = _read(DASHBOARD_JS_DIR / "tech_lead_runs.js")
+
+    assert "button.disabled = false;" in js
+    assert "aria-disabled" in js
+    assert "button.disabled = Boolean(" not in js
+    assert "nullStatusSink" not in js, (
+        "every surface must own a real status element"
+    )
+
+
+def _rule_body_containing(css: str, selector: str) -> str:
+    """The declaration block of the rule whose selector list names ``selector``."""
+    # Comments carry commas, which would corrupt the selector-list split.
+    css = re.sub(r"/\*.*?\*/", "", css, flags=re.DOTALL)
+    for match in re.finditer(r"(?P<selectors>[^{}]+)\{(?P<body>[^{}]*)\}", css):
+        names = [part.strip() for part in match.group("selectors").split(",")]
+        if selector in names:
+            return match.group("body")
+    raise AssertionError(f"no CSS rule declares {selector!r}")
+
+
+def test_unavailable_tech_lead_actions_keep_a_visible_focus_style() -> None:
+    """aria-disabled keeps the control focusable, so it must LOOK focused."""
+    css = _read_dashboard_css_bundle()
+
+    for selector in (
+        ".settings-menu-item:focus-visible",
+        ".context-menu-item:focus-visible",
+    ):
+        assert "outline" in _rule_body_containing(css, selector)
+    for selector in (
+        '.settings-menu-item[aria-disabled="true"]',
+        '.context-menu-item[aria-disabled="true"]',
+    ):
+        # Not colour alone: the adjacent status text carries the reason, and
+        # this is the secondary cue.
+        assert "opacity" in _rule_body_containing(css, selector)
+
+
+def test_tech_lead_status_text_wraps_rather_than_clipping_the_reason() -> None:
+    """The blocked reason is a full sentence; clipping it hides the remedy."""
+    css = _read_dashboard_css_bundle()
+
+    for selector in (".settings-menu-status", ".context-menu-status"):
+        body = _last_css_rule_body(css, selector)
+        assert "overflow-wrap" in body
+        assert "white-space: normal" in body

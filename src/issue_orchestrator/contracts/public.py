@@ -68,10 +68,20 @@ class TechLeadRunActionsContract(ContractBase):
     # True when the Repository Engine is paused; both actions disable rather
     # than promise a run that nothing would start.
     paused: bool
-    # "idle" | "queued" | "running" for the whole-board health review.
+    # "idle" | "queued" | "running" for ANY whole-repository run — the BARRIER's
+    # status, not the health review's. A batch review makes it non-idle too, so
+    # it must never gate the health action (#6994 round 2 F5).
     globalStatus: str
     # Colour-independent status text ("" when idle) — never colour alone.
     globalStatusLabel: str
+    # "idle" | "queued" | "running" for the HEALTH REVIEW specifically. Health
+    # and batch reviews are distinct identities that serialize, so the health
+    # action reads this and not ``globalStatus``.
+    healthReviewStatus: str
+    healthReviewStatusLabel: str
+    # "" when nothing is in the way; otherwise the sentence explaining that a
+    # newly requested health review will WAIT behind a different global run.
+    globalBarrierNote: str = ""
     queuedIssueNumbers: list[int] = Field(default_factory=list)
     runningIssueNumbers: list[int] = Field(default_factory=list)
     # True when a global run is queued or running, so newly requested targeted

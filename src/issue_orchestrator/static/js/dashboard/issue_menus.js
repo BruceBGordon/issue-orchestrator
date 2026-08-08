@@ -13,6 +13,11 @@ const menuResetRetryScratch = document.getElementById('menuResetRetryScratch');
 const menuRetry = document.getElementById('menuRetry');
 const menuCloseIssue = document.getElementById('menuCloseIssue');
 const menuInvestigateTechLead = document.getElementById('menuInvestigateTechLead');
+// The compact menu's action carries REAL sibling elements — a status span and
+// the row that hides them together — so its blocked reason and Settings remedy
+// have somewhere valid to render (#6994 round 2 F6).
+const menuInvestigateTechLeadStatus = document.getElementById('menuInvestigateTechLeadStatus');
+const menuInvestigateTechLeadRow = document.getElementById('menuInvestigateTechLeadRow');
 const menuHistoryDivider = document.getElementById('menuHistoryDivider');
 const menuDepsDivider = document.getElementById('menuDepsDivider');
 const menuDepsLabel = document.getElementById('menuDepsLabel');
@@ -170,12 +175,18 @@ function showContextMenu(e, row) {
     // card menu and the issue detail drawer cannot drift apart.
     if (menuInvestigateTechLead) {
         menuInvestigateTechLead.dataset.issue = String(issueNumber || '');
+        // The label goes on FIRST, so the run owner's status/aria work is the
+        // last write and cannot be clobbered by a later label update (F6).
+        menuInvestigateTechLead.textContent = techLeadIssueActionLabel(Number(issueNumber));
         updateTechLeadIssueAction(
-            { button: menuInvestigateTechLead },
+            {
+                button: menuInvestigateTechLead,
+                statusEl: menuInvestigateTechLeadStatus,
+                container: menuInvestigateTechLeadRow,
+            },
             Number(issueNumber),
             isBlockedHistory,
         );
-        menuInvestigateTechLead.textContent = techLeadIssueActionLabel(Number(issueNumber));
     }
 
     // Position menu (clamped to viewport so right-edge triggers still show)

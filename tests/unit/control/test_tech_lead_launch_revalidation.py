@@ -22,7 +22,9 @@ from issue_orchestrator.control.scheduler import Scheduler
 from issue_orchestrator.control.session_manager import SessionType
 from issue_orchestrator.control.workflows.tech_lead_workflow import TechLeadWorkflow
 from issue_orchestrator.control.tech_lead_run_ownership import TechLeadRunOwnership
-from issue_orchestrator.ports.run_claim_store import NullRunClaimStore
+from issue_orchestrator.ports.run_ledger_store import (
+    SingleInstanceRunLedgerStore,
+)
 from issue_orchestrator.domain.models import (
     AgentConfig,
     DiscoveredFailure,
@@ -282,7 +284,9 @@ def _apply_withdrawal(state: OrchestratorState, action: DropTechLeadAction) -> l
     # The apply seam hands the run's shared claim back; a real ownership owner
     # over the single-instance store keeps that observable without a fake.
     tick.run_ownership = TechLeadRunOwnership(  # type: ignore[attr-defined]
-        NullRunClaimStore(), lease_seconds=900, renew_before_expiry_seconds=300
+        SingleInstanceRunLedgerStore(lease_seconds=900),
+        lease_seconds=900,
+        renew_before_expiry_seconds=300,
     )
     withdraw_revalidated_tech_lead_run(action, tick)  # type: ignore[arg-type]
     return events.published

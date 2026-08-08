@@ -245,12 +245,25 @@
           "title": "Globalbarrieractive",
           "type": "boolean"
         },
+        "globalBarrierNote": {
+          "default": "",
+          "title": "Globalbarriernote",
+          "type": "string"
+        },
         "globalStatus": {
           "title": "Globalstatus",
           "type": "string"
         },
         "globalStatusLabel": {
           "title": "Globalstatuslabel",
+          "type": "string"
+        },
+        "healthReviewStatus": {
+          "title": "Healthreviewstatus",
+          "type": "string"
+        },
+        "healthReviewStatusLabel": {
+          "title": "Healthreviewstatuslabel",
           "type": "string"
         },
         "needsSettings": {
@@ -292,6 +305,8 @@
         "paused",
         "globalStatus",
         "globalStatusLabel",
+        "healthReviewStatus",
+        "healthReviewStatusLabel",
         "globalBarrierActive"
       ],
       "title": "TechLeadRunActionsContract",

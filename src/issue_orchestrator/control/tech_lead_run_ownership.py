@@ -1,8 +1,9 @@
 """Which logical tech-lead runs THIS engine owns, across instances (#6994).
 
 The admission matrix in :mod:`.tech_lead_run_admission` decides whether a run
-*should* exist. This module decides whether this engine *may own* it — the
-question that a second Repository Engine makes non-trivial.
+*should* exist. This module decides whether this engine *may own* it, and — the
+part a second Repository Engine makes non-trivial — whether it may EXECUTE it
+right now.
 
 Why it is a separate owner from the coordinator: the coordinator is constructed
 per request from live state and holds nothing, whereas ownership is exactly the
@@ -11,22 +12,29 @@ ticks it waits behind a barrier, until its session ends). Folding the two
 together would either give the coordinator a lifetime it must not have, or push
 lease bookkeeping out to every call site.
 
-The three operations, and the invariant each preserves:
+Four operations, and the invariant each preserves:
 
-* :meth:`TechLeadRunOwnership.claim` — atomic acquisition. Exactly one engine
-  wins a given ``run_key``; the loser is told WHO won. This is what closes the
-  two check-then-act gaps admission cannot close locally: "no anchor exists, so
-  create one" and "no local queue entry exists, so enqueue one".
+* :meth:`TechLeadRunOwnership.claim` — atomic reservation of a run identity.
+  Exactly one engine wins a given ``run_key``; the loser is told WHO won. This
+  closes the two check-then-act gaps admission cannot close locally: "no anchor
+  exists, so create one" and "no local queue entry exists, so enqueue one".
+* :meth:`TechLeadRunOwnership.begin_run` — the atomic EXCLUSIVITY decision, made
+  at the moment a session would start. Reserving a run never consults the
+  barrier (queuing behind a global review is the designed behaviour); starting
+  one always does, against every engine's live runs at once. Composing
+  independent per-key claims could never decide this, which is why the shared
+  store is a ledger (round 2 F1/A1).
 * :meth:`TechLeadRunOwnership.reconcile` — one call per tick that renews every
-  live run's lease, drops ownership of runs that ended, and re-acquires runs
-  recovered from shared truth after a restart. Runs it can no longer own come
-  back as ``lost`` so the caller can withdraw them rather than launch work a
-  peer already owns.
+  live run's lease, drops ownership of runs that ended, and re-establishes
+  ownership of runs recovered from shared truth after a restart. It reports a
+  TYPED outcome per run, because "a peer holds it", "we held it and lost it",
+  and "we could not tell" demand three different behaviours from the caller
+  (round 2 F4).
 * :meth:`TechLeadRunOwnership.release` — explicit hand-back when a run is
   withdrawn or completes, so a peer need not wait out the lease.
 
 Leases are tracked in memory as well as in the store so the renewal decision
-costs no GitHub read: acquisition already told us when the lease expires, and
+costs no GitHub read: reservation already told us when the lease expires, and
 re-reading it every tick to discover that would be exactly the polling the
 project's GitHub API discipline forbids.
 """
@@ -39,8 +47,16 @@ from datetime import datetime, timedelta
 from enum import Enum
 from typing import TYPE_CHECKING, Callable, Collection, Optional
 
+from ..domain.run_ledger import (
+    RunLedgerOutcome,
+    RunLedgerRequest,
+    RunLedgerRequestKind,
+    RunLedgerStatus,
+)
+
 if TYPE_CHECKING:
-    from ..ports.run_claim_store import RunClaimStore
+    from ..domain.tech_lead_run import TechLeadRunScope
+    from ..ports.run_ledger_store import TechLeadRunLedgerStore
 
 logger = logging.getLogger(__name__)
 
@@ -70,18 +86,207 @@ class RunOwnership:
         return self.verdict is RunOwnershipVerdict.OWNED
 
 
+class RunExecutionVerdict(str, Enum):
+    """Whether this engine may START a session for a run, right now.
+
+    ``BARRIER`` is not a failure: the run keeps its reservation and retries on a
+    later tick. It is separate from ``LOST`` precisely so a caller cannot
+    withdraw a perfectly healthy run that is merely waiting its turn.
+    """
+
+    STARTED = "started"
+    BARRIER = "barrier"
+    LOST = "lost"
+    UNAVAILABLE = "unavailable"
+
+
+@dataclass(frozen=True, slots=True)
+class RunExecutionAdmission:
+    """The answer to "may this engine start ``run_key`` now?"."""
+
+    verdict: RunExecutionVerdict
+    run_key: str
+    barrier_reason: str = ""
+    holder: str = ""
+    detail: str = ""
+
+    @property
+    def started(self) -> bool:
+        return self.verdict is RunExecutionVerdict.STARTED
+
+
+class RunReconcileStatus(str, Enum):
+    """What one live run's lease looks like after a tick's reconciliation."""
+
+    OWNED = "owned"
+    # A live peer holds this run and we never did. RETAIN and retry: the holder
+    # will release or its lease will lapse. Withdrawing here is how a restart
+    # strands its own recovered anchor behind an unexpired pre-crash lease.
+    CONTENDED = "contended"
+    # We held it and no longer do. Queued work is withdrawn; an active session
+    # cannot prove ownership and must be stopped.
+    LOST = "lost"
+    # We could not tell. Never a reason to stop a running session.
+    UNAVAILABLE = "unavailable"
+
+
+@dataclass(frozen=True, slots=True)
+class RunOwnershipOutcome:
+    """One run's reconciliation result."""
+
+    run_key: str
+    status: RunReconcileStatus
+    holder: str = ""
+    detail: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class RunOwnershipReconciliation:
+    """Every live run's reconciliation result, grouped by what it demands.
+
+    Grouped HERE rather than by each caller so the "contention is not loss"
+    rule has one implementation: a caller that iterated raw outcomes would be
+    free to invent its own grouping, which is exactly the drift that made a
+    transient store outage look like ownership loss.
+    """
+
+    outcomes: tuple[RunOwnershipOutcome, ...] = ()
+
+    def _keys(self, status: RunReconcileStatus) -> tuple[str, ...]:
+        return tuple(o.run_key for o in self.outcomes if o.status is status)
+
+    @property
+    def lost(self) -> tuple[str, ...]:
+        """Runs this engine definitively no longer owns."""
+        return self._keys(RunReconcileStatus.LOST)
+
+    @property
+    def contended(self) -> tuple[str, ...]:
+        """Runs a peer holds. Retained and retried, never withdrawn."""
+        return self._keys(RunReconcileStatus.CONTENDED)
+
+    @property
+    def unavailable(self) -> tuple[str, ...]:
+        """Runs whose ownership could not be established or verified."""
+        return self._keys(RunReconcileStatus.UNAVAILABLE)
+
+    def outcome_for(self, run_key: str) -> Optional[RunOwnershipOutcome]:
+        return next((o for o in self.outcomes if o.run_key == run_key), None)
+
+
 @dataclass(frozen=True, slots=True)
 class _Lease:
     lease_id: str
     expires_at: datetime
 
 
+class _LeaseEffect(str, Enum):
+    """What one ledger verdict implies for our in-memory lease bookkeeping."""
+
+    REFRESH = "refresh"
+    KEEP = "keep"
+    DROP = "drop"
+
+
+# ----------------------------------------------------------------------
+# Translation tables
+#
+# Every ledger verdict maps to exactly one answer per question, declared once
+# here instead of re-derived by a branch chain in each method. A table is also
+# what makes "did we cover every verdict?" answerable by reading, and a new
+# ledger verdict fails loudly at the lookup rather than falling into whichever
+# branch happened to be last.
+# ----------------------------------------------------------------------
+
+_OWNERSHIP_VERDICT: dict[RunLedgerStatus, RunOwnershipVerdict] = {
+    RunLedgerStatus.GRANTED: RunOwnershipVerdict.OWNED,
+    RunLedgerStatus.ADOPTED: RunOwnershipVerdict.OWNED,
+    RunLedgerStatus.HELD_BY_PEER: RunOwnershipVerdict.HELD_BY_PEER,
+    RunLedgerStatus.LOST: RunOwnershipVerdict.HELD_BY_PEER,
+    RunLedgerStatus.BARRIER: RunOwnershipVerdict.HELD_BY_PEER,
+    RunLedgerStatus.UNAVAILABLE: RunOwnershipVerdict.UNAVAILABLE,
+}
+
+_EXECUTION_VERDICT: dict[RunLedgerStatus, RunExecutionVerdict] = {
+    RunLedgerStatus.GRANTED: RunExecutionVerdict.STARTED,
+    RunLedgerStatus.ADOPTED: RunExecutionVerdict.STARTED,
+    RunLedgerStatus.BARRIER: RunExecutionVerdict.BARRIER,
+    RunLedgerStatus.UNAVAILABLE: RunExecutionVerdict.UNAVAILABLE,
+    RunLedgerStatus.HELD_BY_PEER: RunExecutionVerdict.LOST,
+    RunLedgerStatus.LOST: RunExecutionVerdict.LOST,
+}
+
+# An engine that could not even RESERVE the run cannot execute it. Contention is
+# reported as LOST here (not BARRIER) because a peer owning the identity is not
+# something waiting will resolve for this launch attempt.
+_EXECUTION_FROM_OWNERSHIP: dict[RunOwnershipVerdict, RunExecutionVerdict] = {
+    RunOwnershipVerdict.HELD_BY_PEER: RunExecutionVerdict.LOST,
+    RunOwnershipVerdict.UNAVAILABLE: RunExecutionVerdict.UNAVAILABLE,
+}
+
+_RECONCILE_FROM_OWNERSHIP: dict[RunOwnershipVerdict, RunReconcileStatus] = {
+    RunOwnershipVerdict.OWNED: RunReconcileStatus.OWNED,
+    # Never LOST: we never held this one, so there is nothing to have lost. It
+    # is retained and retried until the holder's lease lapses (round 2 F4).
+    RunOwnershipVerdict.HELD_BY_PEER: RunReconcileStatus.CONTENDED,
+    RunOwnershipVerdict.UNAVAILABLE: RunReconcileStatus.UNAVAILABLE,
+}
+
+_RECONCILE_STATUS: dict[RunLedgerStatus, RunReconcileStatus] = {
+    RunLedgerStatus.GRANTED: RunReconcileStatus.OWNED,
+    RunLedgerStatus.ADOPTED: RunReconcileStatus.OWNED,
+    RunLedgerStatus.BARRIER: RunReconcileStatus.OWNED,
+    RunLedgerStatus.UNAVAILABLE: RunReconcileStatus.UNAVAILABLE,
+    RunLedgerStatus.HELD_BY_PEER: RunReconcileStatus.LOST,
+    RunLedgerStatus.LOST: RunReconcileStatus.LOST,
+}
+
+_LEASE_EFFECT: dict[RunLedgerStatus, _LeaseEffect] = {
+    RunLedgerStatus.GRANTED: _LeaseEffect.REFRESH,
+    RunLedgerStatus.ADOPTED: _LeaseEffect.REFRESH,
+    # A barrier is a queue position and an outage is ignorance; neither is
+    # evidence that our lease is gone, so both KEEP it.
+    RunLedgerStatus.BARRIER: _LeaseEffect.KEEP,
+    RunLedgerStatus.UNAVAILABLE: _LeaseEffect.KEEP,
+    RunLedgerStatus.HELD_BY_PEER: _LeaseEffect.DROP,
+    RunLedgerStatus.LOST: _LeaseEffect.DROP,
+}
+
+_RECONCILE_LOG: dict[RunReconcileStatus, str] = {
+    RunReconcileStatus.CONTENDED: (
+        "[TECH_LEAD_RUN] Run %s is held by %s; retaining it and retrying until"
+        " the hold lapses"
+    ),
+    RunReconcileStatus.LOST: "[TECH_LEAD_RUN] Lost ownership of run %s to %s",
+    RunReconcileStatus.UNAVAILABLE: (
+        "[TECH_LEAD_RUN] Could not verify ownership of run %s: %s"
+    ),
+}
+
+_UNAVAILABLE_OWNERSHIP_DETAIL = (
+    "Tech-lead run ownership could not be established: {detail}."
+)
+
+
+def _ownership_detail(outcome: RunLedgerOutcome) -> str:
+    """The operator-facing sentence for one reservation verdict."""
+    template = _OWNERSHIP_DETAIL_TEMPLATE.get(outcome.status, "{detail}")
+    return template.format(
+        detail=outcome.detail or "the coordination store is unreachable"
+    )
+
+
+_OWNERSHIP_DETAIL_TEMPLATE: dict[RunLedgerStatus, str] = {
+    RunLedgerStatus.UNAVAILABLE: _UNAVAILABLE_OWNERSHIP_DETAIL,
+}
+
+
 class TechLeadRunOwnership:
-    """This engine's set of owned tech-lead runs, backed by shared claims."""
+    """This engine's set of owned tech-lead runs, backed by the shared ledger."""
 
     def __init__(
         self,
-        store: "RunClaimStore",
+        store: "TechLeadRunLedgerStore",
         *,
         lease_seconds: int,
         renew_before_expiry_seconds: int,
@@ -97,40 +302,23 @@ class TechLeadRunOwnership:
     # Acquisition
     # ------------------------------------------------------------------
 
-    def claim(self, run_key: str) -> RunOwnership:
-        """Atomically take ownership of ``run_key``.
+    def claim(self, scope: "TechLeadRunScope") -> RunOwnership:
+        """Atomically reserve ``scope``'s run identity.
 
         Idempotent for the engine that already holds it: repeated requests for
-        the same logical run coalesce onto one claim instead of churning the
-        coordination store on every click.
+        the same logical run coalesce onto one reservation instead of churning
+        the coordination store on every click.
         """
+        run_key = scope.run_key
         if run_key in self._held:
             return RunOwnership(RunOwnershipVerdict.OWNED, run_key)
-
-        acquisition = self._store.acquire(run_key)
-        if acquisition.won and acquisition.lease_id:
-            self._held[run_key] = _Lease(
-                lease_id=acquisition.lease_id,
-                expires_at=self._now() + timedelta(seconds=self._lease_seconds),
-            )
-            return RunOwnership(RunOwnershipVerdict.OWNED, run_key)
-        if acquisition.holder is not None:
-            return RunOwnership(
-                RunOwnershipVerdict.HELD_BY_PEER,
-                run_key,
-                holder=acquisition.holder.claimant,
-                detail=(
-                    f"Another orchestrator instance ({acquisition.holder.claimant})"
-                    f" already owns this tech-lead run."
-                ),
-            )
+        outcome = self._submit(RunLedgerRequestKind.RESERVE, scope)
+        self._apply_lease_effect(run_key, outcome)
         return RunOwnership(
-            RunOwnershipVerdict.UNAVAILABLE,
+            _OWNERSHIP_VERDICT[outcome.status],
             run_key,
-            detail=(
-                "Tech-lead run ownership could not be established: "
-                f"{acquisition.error or 'the coordination store is unreachable'}."
-            ),
+            holder=outcome.holder,
+            detail=_ownership_detail(outcome),
         )
 
     def owns(self, run_key: str) -> bool:
@@ -140,79 +328,206 @@ class TechLeadRunOwnership:
     def release(self, run_key: str) -> None:
         """Hand ``run_key`` back so a peer need not wait out the lease."""
         lease = self._held.pop(run_key, None)
-        if lease is not None:
-            self._store.release(run_key, lease.lease_id)
+        if lease is None:
+            return
+        self._store.submit(
+            RunLedgerRequest(
+                kind=RunLedgerRequestKind.RELEASE,
+                run_key=run_key,
+                scope_kind=_kind_of(run_key),
+                lease_id=lease.lease_id,
+            )
+        )
+
+    # ------------------------------------------------------------------
+    # Execution — the atomic exclusivity decision
+    # ------------------------------------------------------------------
+
+    def begin_run(self, scope: "TechLeadRunScope") -> RunExecutionAdmission:
+        """Take the right to EXECUTE ``scope`` now, against every engine's runs.
+
+        Called immediately before a session starts, by the single launch
+        authority. Fails CLOSED on an unreadable store: starting a global review
+        alongside a peer's targeted work is precisely the outcome the ledger
+        exists to prevent, and a launch deferred by one tick costs nothing.
+        """
+        run_key = scope.run_key
+        lease = self._held.get(run_key)
+        if lease is None:
+            # Not reserved here — reserve first (exactly once), so the CLI's
+            # direct launch path cannot start a run this engine never owned.
+            ownership = self.claim(scope)
+            lease = self._held.get(run_key)
+            if lease is None:
+                return RunExecutionAdmission(
+                    _EXECUTION_FROM_OWNERSHIP[ownership.verdict],
+                    run_key,
+                    holder=ownership.holder,
+                    detail=ownership.detail,
+                )
+        outcome = self._submit(
+            RunLedgerRequestKind.PROMOTE, scope, lease_id=lease.lease_id
+        )
+        self._apply_lease_effect(run_key, outcome, fallback=lease.lease_id)
+        return RunExecutionAdmission(
+            _EXECUTION_VERDICT[outcome.status],
+            run_key,
+            barrier_reason=outcome.barrier_reason,
+            holder=outcome.holder,
+            detail=outcome.detail,
+        )
+
+    def end_run(self, run_key: str) -> None:
+        """A session for ``run_key`` is over; the run is no longer exclusive."""
+        self.release(run_key)
 
     # ------------------------------------------------------------------
     # Per-tick reconciliation
     # ------------------------------------------------------------------
 
-    def reconcile(self, live_run_keys: Collection[str]) -> tuple[str, ...]:
-        """Align held claims with the runs that actually exist right now.
+    def reconcile(
+        self, live_runs: "Collection[TechLeadRunScope]"
+    ) -> RunOwnershipReconciliation:
+        """Align held leases with the runs that actually exist right now.
 
-        Returns the run keys this engine may no longer act on, so the caller
-        can withdraw them. Called once per tick with the union of queued and
-        active tech-lead runs — the caller owns WHAT is live, this owns what
-        that implies for the claims.
+        Called once per tick with the union of queued and active tech-lead runs
+        — the caller owns WHAT is live, this owns what that implies for the
+        leases. Every live run comes back with a typed status; the caller
+        decides the consequence, because the consequence differs by whether the
+        run is queued or executing.
         """
-        live = set(live_run_keys)
-        lost: list[str] = []
-
+        live = {scope.run_key: scope for scope in live_runs}
         for run_key in [key for key in self._held if key not in live]:
             self.release(run_key)
 
-        for run_key in sorted(live):
-            lease = self._held.get(run_key)
-            if lease is None:
-                # A run recovered from shared truth after a restart, or one a
-                # peer produced: ownership has to be (re-)established before we
-                # may launch it.
-                if not self.claim(run_key).owned:
-                    lost.append(run_key)
-                continue
-            if not self._needs_renewal(lease):
-                continue
-            if self._store.renew(run_key, lease.lease_id):
-                self._held[run_key] = _Lease(
-                    lease_id=lease.lease_id,
-                    expires_at=self._now() + timedelta(seconds=self._lease_seconds),
-                )
-                continue
-            logger.warning(
-                "[TECH_LEAD_RUN] Lost ownership of run %s; withdrawing it", run_key
-            )
-            self._held.pop(run_key, None)
-            lost.append(run_key)
+        outcomes = [
+            self._reconcile_one(live[run_key]) for run_key in sorted(live)
+        ]
+        return RunOwnershipReconciliation(tuple(outcomes))
 
-        return tuple(lost)
+    def _reconcile_one(self, scope: "TechLeadRunScope") -> RunOwnershipOutcome:
+        run_key = scope.run_key
+        lease = self._held.get(run_key)
+        if lease is None:
+            # A run recovered from shared truth after a restart, or one a peer
+            # produced: ownership has to be (re-)established before we may
+            # launch it. A reservation ADOPTS this engine's own live pre-crash
+            # lease rather than reporting it as a peer's (round 2 F4).
+            ownership = self.claim(scope)
+            return self._report(
+                run_key,
+                _RECONCILE_FROM_OWNERSHIP[ownership.verdict],
+                ownership.holder,
+                ownership.detail,
+            )
+        if not self._needs_renewal(lease):
+            return RunOwnershipOutcome(run_key, RunReconcileStatus.OWNED)
+        outcome = self._submit(
+            RunLedgerRequestKind.RENEW, scope, lease_id=lease.lease_id
+        )
+        self._apply_lease_effect(run_key, outcome, fallback=lease.lease_id)
+        return self._report(
+            run_key,
+            _RECONCILE_STATUS[outcome.status],
+            outcome.holder,
+            outcome.detail,
+        )
+
+    # ------------------------------------------------------------------
+    # Internals
+    # ------------------------------------------------------------------
+
+    def _report(
+        self, run_key: str, status: RunReconcileStatus, holder: str, detail: str
+    ) -> RunOwnershipOutcome:
+        """Log the non-owned reconciliation results, then hand back the typed one."""
+        message = _RECONCILE_LOG.get(status)
+        if message:
+            logger.warning(message, run_key, holder or detail or "an unknown peer")
+        return RunOwnershipOutcome(run_key, status, holder=holder, detail=detail)
+
+    def _apply_lease_effect(
+        self, run_key: str, outcome: RunLedgerOutcome, *, fallback: str = ""
+    ) -> None:
+        """Keep, refresh, or drop our in-memory lease, per the ledger's verdict."""
+        effect = _LEASE_EFFECT[outcome.status]
+        if effect is _LeaseEffect.REFRESH:
+            self._remember(run_key, outcome.lease_id or fallback)
+        elif effect is _LeaseEffect.DROP:
+            self._held.pop(run_key, None)
+
+    def _submit(
+        self,
+        kind: RunLedgerRequestKind,
+        scope: "TechLeadRunScope",
+        *,
+        lease_id: str = "",
+    ) -> RunLedgerOutcome:
+        return self._store.submit(
+            RunLedgerRequest(
+                kind=kind,
+                run_key=scope.run_key,
+                scope_kind=scope.kind,
+                lease_id=lease_id,
+            )
+        )
+
+    def _remember(self, run_key: str, lease_id: str) -> None:
+        self._held[run_key] = _Lease(
+            lease_id=lease_id,
+            expires_at=self._now() + timedelta(seconds=self._lease_seconds),
+        )
 
     def _needs_renewal(self, lease: _Lease) -> bool:
         remaining = (lease.expires_at - self._now()).total_seconds()
         return remaining <= self._renew_before_expiry_seconds
 
 
+def _kind_of(run_key: str):
+    """The scope kind a held run key belongs to.
+
+    Release is the one operation a caller can reach holding only a key (a
+    withdrawal knows the run, not the scope value), so the kind is recovered
+    from the key's own namespace rather than making every caller carry a scope
+    it does not have.
+    """
+    from ..domain.tech_lead_run import TechLeadRunScopeKind
+
+    if run_key.startswith("issue:"):
+        return TechLeadRunScopeKind.ISSUE
+    if run_key == "global:batch_review":
+        return TechLeadRunScopeKind.GLOBAL_BATCH_REVIEW
+    return TechLeadRunScopeKind.GLOBAL_HEALTH_REVIEW
+
+
 def single_instance_run_ownership() -> TechLeadRunOwnership:
     """Run ownership for a deployment with no peer engines.
 
-    Backed by :class:`NullRunClaimStore`, which always wins — correct precisely
-    because with claims disabled there IS no other claimant. It lives here, with
-    the owner it constructs, so a caller that needs a default never has to know
-    which store and lease numbers make one.
+    Backed by :class:`SingleInstanceRunLedgerStore`, which evaluates the SAME
+    conflict matrix in memory — so scope exclusivity is a real invariant for one
+    engine too, not a rule that only switches on when claims are configured. It
+    lives here, with the owner it constructs, so a caller that needs a default
+    never has to know which store and lease numbers make one.
     """
     from ..domain.lease_config import LeaseConfig
-    from ..ports.run_claim_store import NullRunClaimStore
+    from ..ports.run_ledger_store import SingleInstanceRunLedgerStore
 
     lease = LeaseConfig()
     return TechLeadRunOwnership(
-        NullRunClaimStore(),
+        SingleInstanceRunLedgerStore(lease_seconds=lease.lease_seconds),
         lease_seconds=lease.lease_seconds,
         renew_before_expiry_seconds=lease.renew_interval_seconds,
     )
 
 
 __all__ = [
+    "RunExecutionAdmission",
+    "RunExecutionVerdict",
     "RunOwnership",
+    "RunOwnershipOutcome",
+    "RunOwnershipReconciliation",
     "RunOwnershipVerdict",
+    "RunReconcileStatus",
     "TechLeadRunOwnership",
     "single_instance_run_ownership",
 ]

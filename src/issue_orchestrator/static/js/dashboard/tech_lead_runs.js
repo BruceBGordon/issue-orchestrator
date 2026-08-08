@@ -11,6 +11,17 @@
 // an admission response, opening the drawer, opening a card menu — ends in
 // `refreshTechLeadRunControls()`, so no surface can be left showing "idle" for
 // a run the server has already queued (#6994 round 1 F6).
+//
+// Accessibility rules this module keeps (round 2 F6):
+//
+// * Unavailability is `aria-disabled`, never the native `disabled` property. A
+//   natively disabled button is removed from the tab order, which is exactly
+//   where the explanation and the Settings remedy would become unreachable for
+//   keyboard and screen-reader users. The control stays focusable, announces
+//   itself as disabled, and its handler refuses the action with the reason.
+// * Every surface owns a REAL status element that is a SIBLING of its button,
+//   so the reason is visible text with a resolvable `aria-describedby`, and the
+//   Settings remedy is inserted beside the button rather than inside it.
 
 const TECH_LEAD_STATUS_LABELS = {
     idle: '',
@@ -26,6 +37,9 @@ const TECH_LEAD_STATUS_LABELS = {
 const TECH_LEAD_RUNS_UNKNOWN = {
     globalStatus: 'idle',
     globalStatusLabel: '',
+    healthReviewStatus: 'idle',
+    healthReviewStatusLabel: '',
+    globalBarrierNote: '',
     queuedIssueNumbers: [],
     runningIssueNumbers: [],
     globalBarrierActive: false,
@@ -49,35 +63,34 @@ function techLeadIssueStatus(issueNumber) {
 //
 // Both halves come from the server: the ENGINE-level sentence is published as
 // `unavailableReason` (resolved by `read_tech_lead_run_actions` in the same
-// order `TechLeadRunCoordinator` applies), and an in-flight run supplies its own
-// reason from the shared status vocabulary. Nothing about availability is
-// decided here — a second copy of that order in the browser is exactly how a
-// disabled button ends up contradicting the server's rejection.
+// order `TechLeadRunCoordinator` applies), and an in-flight run of THIS scope
+// supplies its own reason from the shared status vocabulary. Nothing about
+// availability is decided here — a second copy of that order in the browser is
+// exactly how a disabled button ends up contradicting the server's rejection.
 function techLeadActionBlockedReason(runStatus) {
     return techLeadRunState().unavailableReason
         || TECH_LEAD_STATUS_LABELS[runStatus]
         || '';
 }
 
+// The health review's OWN status. Deliberately not `globalStatus`, which is the
+// any-global BARRIER: a queued batch review must not make the health action
+// look already-requested, because admission keeps the two identities distinct
+// and queues one behind the other (#6994 round 2 F5).
+function techLeadHealthReviewStatus() {
+    return techLeadRunState().healthReviewStatus || 'idle';
+}
+
+// The advisory note shown when a request would QUEUE behind a different global
+// run. It is not a blocked reason: the click still does what the operator asked.
+function techLeadGlobalBarrierNote() {
+    return techLeadRunState().globalBarrierNote || '';
+}
+
 // Whether the operator's remedy is Settings. Published by the projection, not
 // inferred here, so the UI never decides which remedy a state deserves.
 function techLeadNeedsSettings() {
     return Boolean(techLeadRunState().needsSettings);
-}
-
-// Where an action writes its state text. Surfaces that carry their state in the
-// action's own label (the compact card menu) get this null object rather than
-// `null`, so the renderer below has NO presence checks to make: it always has
-// somewhere to write and something to associate. Each caller gets its own, so a
-// shared sink can never lend one control's id to another.
-function nullStatusSink() {
-    return {
-        id: '',
-        textContent: '',
-        parentNode: null,
-        setAttribute() {},
-        removeAttribute() {},
-    };
 }
 
 // Set an attribute, or remove it when the value is empty. One helper so the
@@ -94,35 +107,38 @@ function setOrRemoveAttribute(element, name, value) {
 //
 // The reason is VISIBLE text in the status element and is programmatically
 // associated with the control via `aria-describedby` — not a `title` tooltip.
-// A natively disabled button is not keyboard focusable, so a tooltip is an
-// explanation no keyboard or screen-reader user can reach (#6994 round 1 F7).
 // `title` is kept as well, purely as a pointer-user convenience.
-function applyTechLeadDisabledState(button, blockedReason, sink, runLabel) {
-    if (!button) return;
-    button.disabled = Boolean(blockedReason);
-    // aria mirrors the real disabled state by construction, so the two cannot
-    // drift; the reason itself becomes the visible text below.
-    button.setAttribute('aria-disabled', String(button.disabled));
+function applyTechLeadDisabledState(button, blockedReason, sink, runLabel, note) {
+    if (!button || !sink) return;
+    const blocked = Boolean(blockedReason);
+    // aria-disabled rather than the native property: the control must stay
+    // focusable so its explanation and its Settings remedy remain reachable
+    // (round 2 F6). The click handlers refuse the action themselves.
+    button.disabled = false;
+    button.setAttribute('aria-disabled', String(blocked));
+    button.classList.toggle('is-unavailable', blocked);
     button.title = blockedReason;
     // Text, never colour alone: the queued/running/blocked state stays readable
     // with no styling applied.
-    const visible = blockedReason || runLabel;
-    sink.id = sink.id || `${button.id || 'techLeadAction'}Status`;
+    const visible = blockedReason || runLabel || note || '';
+    if (!sink.id) sink.id = `${button.id || 'techLeadAction'}Status`;
     setOrRemoveAttribute(button, 'aria-describedby', visible ? sink.id : '');
     sink.textContent = visible;
     applyTechLeadSettingsLink(button, sink);
 }
 
 // A keyboard-reachable path to Settings, rendered beside the explanation when
-// (and only when) configuration is what is missing. A disabled button cannot
-// carry the operator anywhere, so the remedy has to be its own operable
-// control (#6994 round 1 F7).
+// (and only when) configuration is what is missing. The disabled button itself
+// cannot carry the operator anywhere, so the remedy is its own operable control
+// — inserted into the status element's PARENT, which every surface makes a
+// container element rather than the button (round 2 F6: inserting it into the
+// button produced a button nested inside a button).
 function applyTechLeadSettingsLink(button, sink) {
     const host = sink.parentNode;
     if (!host || typeof document === 'undefined' || !document.createElement) return;
     const linkId = `${button.id || 'techLeadAction'}SettingsLink`;
     let link = document.getElementById(linkId);
-    const wanted = techLeadNeedsSettings() && !button.hidden && button.style.display !== 'none';
+    const wanted = techLeadNeedsSettings() && techLeadActionVisible(button);
     if (!wanted) {
         if (link && link.parentNode) link.parentNode.removeChild(link);
         return;
@@ -143,14 +159,28 @@ function applyTechLeadSettingsLink(button, sink) {
     if (link.parentNode !== host) host.insertBefore(link, sink.nextSibling);
 }
 
+// Whether an action is on screen. Checked on the button AND on the container a
+// surface hides it with, so a remedy is never rendered next to a hidden action.
+function techLeadActionVisible(button) {
+    for (let node = button; node; node = node.parentNode) {
+        if (node.hidden) return false;
+        if (node.style && node.style.display === 'none') return false;
+        if (!node.parentNode) break;
+    }
+    return true;
+}
+
 function refreshTechLeadMenuState() {
     const state = techLeadRunState();
-    const globalStatus = state.globalStatus || 'idle';
+    const status = techLeadHealthReviewStatus();
     applyTechLeadDisabledState(
         document.getElementById('techLeadHealthReviewItem'),
-        techLeadActionBlockedReason(globalStatus),
+        // The BARRIER never blocks the request; only an unavailable engine or a
+        // health review that already exists does.
+        state.unavailableReason || TECH_LEAD_STATUS_LABELS[status] || '',
         document.getElementById('techLeadHealthReviewStatus'),
-        state.globalStatusLabel || TECH_LEAD_STATUS_LABELS[globalStatus] || '',
+        state.healthReviewStatusLabel || TECH_LEAD_STATUS_LABELS[status] || '',
+        techLeadGlobalBarrierNote(),
     );
 }
 
@@ -175,21 +205,28 @@ function refreshTechLeadDrawerAction() {
         techLeadActionBlockedReason(techLeadIssueStatus(number)),
         document.getElementById('issueDetailTechLeadStatus'),
         TECH_LEAD_STATUS_LABELS[techLeadIssueStatus(number)],
+        techLeadGlobalBarrierNote(),
     );
 }
 
 function refreshTechLeadCardMenuAction() {
     const button = document.getElementById('menuInvestigateTechLead');
-    if (!button || button.style.display === 'none') return;
+    const row = document.getElementById('menuInvestigateTechLeadRow');
+    if (!button || (row && row.style.display === 'none')) return;
     const number = Number(button.dataset && button.dataset.issue);
     if (!Number.isInteger(number) || number <= 0) return;
+    // The label is set BEFORE the state is applied: writing `textContent`
+    // afterwards would erase nothing here (the reason lives in the sibling
+    // status element), but doing it in this order keeps that true by
+    // construction rather than by luck (round 2 F6).
+    button.textContent = techLeadIssueActionLabel(number);
     applyTechLeadDisabledState(
         button,
         techLeadActionBlockedReason(techLeadIssueStatus(number)),
-        nullStatusSink(),
+        document.getElementById('menuInvestigateTechLeadStatus'),
         TECH_LEAD_STATUS_LABELS[techLeadIssueStatus(number)],
+        techLeadGlobalBarrierNote(),
     );
-    button.textContent = techLeadIssueActionLabel(number);
 }
 
 async function submitTechLeadRunRequest(request, pendingMessage) {
@@ -223,17 +260,19 @@ async function submitTechLeadRunRequest(request, pendingMessage) {
 
 async function runBoardHealthReview() {
     closeSettingsMenu();
-    const button = document.getElementById('techLeadHealthReviewItem');
-    const blocked = techLeadActionBlockedReason(techLeadRunState().globalStatus);
+    const state = techLeadRunState();
+    const blocked = state.unavailableReason
+        || TECH_LEAD_STATUS_LABELS[techLeadHealthReviewStatus()]
+        || '';
     if (blocked) {
         showToast(blocked, 'warning');
         return null;
     }
-    if (button) button.disabled = true;
     try {
         return await submitTechLeadRunRequest(
             uiActionContract.buildGlobalHealthReviewRunRequest(),
-            'Board health review requested.',
+            techLeadGlobalBarrierNote()
+                || 'Board health review requested.',
         );
     } catch (err) {
         showToast(`Board health review request failed: ${err.message || err}`, 'error');
@@ -288,23 +327,26 @@ function resetTechLeadIssueAction(elements) {
 //
 // Eligibility is the ISSUE's property (is this a blocked work item?), never the
 // engine's availability: an unconfigured or stopped engine leaves the action
-// VISIBLE and disabled, with its reason on screen, so the capability stays
+// VISIBLE and aria-disabled, with its reason on screen, so the capability stays
 // discoverable instead of vanishing (#6994 round 1 F7).
 // Returns whether the action ended up visible.
 function updateTechLeadIssueAction(elements, issueNumber, isBlocked) {
     const eligible = Boolean(isBlocked);
-    const { button, statusEl } = elements;
-    const sink = statusEl || nullStatusSink();
-    if (!button) return false;
-    button.style.display = eligible ? '' : 'none';
+    const { button, statusEl, container } = elements;
+    if (!button || !statusEl) return false;
+    // A surface that wraps its action in a container hides the container, so the
+    // status element and the Settings remedy travel with the button instead of
+    // being orphaned on screen.
+    (container || button).style.display = eligible ? '' : 'none';
     const runStatus = eligible ? techLeadIssueStatus(issueNumber) : 'idle';
     const blockedReason = eligible ? techLeadActionBlockedReason(runStatus) : '';
     button.classList.toggle('disabled', Boolean(blockedReason));
     applyTechLeadDisabledState(
         button,
         blockedReason,
-        sink,
+        statusEl,
         eligible ? TECH_LEAD_STATUS_LABELS[runStatus] : '',
+        eligible ? techLeadGlobalBarrierNote() : '',
     );
     return eligible;
 }

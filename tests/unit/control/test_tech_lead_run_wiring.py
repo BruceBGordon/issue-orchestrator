@@ -9,7 +9,7 @@ healthy in isolation and only misbehaves when a second Repository Engine exists.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import timedelta
 from types import SimpleNamespace
 from typing import Optional
 
@@ -21,20 +21,24 @@ from issue_orchestrator.control.health_review_trigger import (
     HEALTH_REVIEW_MARKER_LABEL,
 )
 from issue_orchestrator.control.tech_lead_run_ownership import TechLeadRunOwnership
+
+from .run_ledger_doubles import LEASE_SECONDS, SharedRunLedger
 from issue_orchestrator.control.tech_lead_run_wiring import (
     admit_planned_tech_lead_investigation,
     intake_owned_tech_lead_anchor,
 )
-from issue_orchestrator.domain.claim import RunClaim, RunClaimAcquisition
+from issue_orchestrator.domain.run_ledger import RunLedgerEntry, RunLifecycle
 from issue_orchestrator.domain.models import (
     DiscoveredFailure,
     OrchestratorState,
 )
 from issue_orchestrator.domain.tech_lead_run import (
+    GlobalBatchReviewScope,
     GlobalHealthReviewScope,
     IssueInvestigationScope,
     REASON_CLAIMED_BY_PEER,
     TechLeadRunOutcome,
+    TechLeadRunScopeKind,
 )
 from issue_orchestrator.domain.tech_lead_session import (
     TechLeadCreationOrigin,
@@ -46,39 +50,43 @@ TECH_LEAD_AGENT = "agent:tech-lead"
 
 
 class _Store:
-    """One shared CAS cell per run key, seedable with a peer's ownership."""
+    """One shared run-ledger cell, seedable with a peer engine's hold.
+
+    Evaluates the REAL conflict matrix rather than a stub of it, so a wiring
+    test proves the wired owner enforces the shipped rule.
+    """
 
     def __init__(self) -> None:
-        self.holders: dict[str, RunClaim] = {}
+        self.shared = SharedRunLedger()
 
     def hold(self, run_key: str, claimant: str = "peer-engine") -> None:
-        self.holders[run_key] = RunClaim(
-            lease_id=f"peer-{run_key}",
-            claimant=claimant,
-            run_key=run_key,
-            started_at=datetime(2026, 8, 7, 12, 0, 0),
-            expires_at=datetime(2999, 1, 1),
-            priority=1,
+        now = self.shared.clock()
+        self.shared.ledger = self.shared.ledger.upsert(
+            RunLedgerEntry(
+                run_key=run_key,
+                scope_kind=(
+                    TechLeadRunScopeKind.GLOBAL_BATCH_REVIEW
+                    if run_key == GlobalBatchReviewScope().run_key
+                    else (
+                        TechLeadRunScopeKind.ISSUE
+                        if run_key.startswith("issue:")
+                        else TechLeadRunScopeKind.GLOBAL_HEALTH_REVIEW
+                    )
+                ),
+                lifecycle=RunLifecycle.QUEUED,
+                claimant=claimant,
+                lease_id=f"peer-{run_key}",
+                started_at=now,
+                expires_at=now + timedelta(seconds=LEASE_SECONDS),
+            ),
+            now,
         )
 
-    def acquire(self, run_key: str) -> RunClaimAcquisition:
-        holder = self.holders.get(run_key)
-        if holder is not None:
-            return RunClaimAcquisition.held_by(holder)
-        self.hold(run_key, claimant="this-engine")
-        return RunClaimAcquisition.acquired(self.holders[run_key].lease_id)
+    def ownership(self, claimant: str = "this-engine") -> TechLeadRunOwnership:
+        return self.shared.ownership(claimant)
 
-    def renew(self, run_key: str, lease_id: str) -> bool:
-        holder = self.holders.get(run_key)
-        return holder is not None and holder.lease_id == lease_id
-
-    def release(self, run_key: str, lease_id: str) -> None:
-        holder = self.holders.get(run_key)
-        if holder is not None and holder.lease_id == lease_id:
-            del self.holders[run_key]
-
-    def current(self, run_key: str) -> Optional[RunClaim]:
-        return self.holders.get(run_key)
+    def current(self, run_key: str):
+        return self.shared.entry(run_key)
 
 
 class _Tick:
@@ -94,11 +102,7 @@ class _Tick:
         self.action_applier = None
         self.queue_cache_store = None
         self.tech_lead_authority = None
-        self.run_ownership = TechLeadRunOwnership(
-            store,  # type: ignore[arg-type]
-            lease_seconds=900,
-            renew_before_expiry_seconds=300,
-        )
+        self.run_ownership = store.ownership()
 
 
 def _failure(number: int) -> DiscoveredFailure:
@@ -243,7 +247,7 @@ def test_the_tick_seam_defaults_to_single_instance_ownership_not_to_none():
 
     ownership = single_instance_run_ownership()
 
-    assert ownership.claim("issue:42").owned is True
+    assert ownership.claim(IssueInvestigationScope(42)).owned is True
     assert ownership.owns("issue:42") is True
 
 
@@ -261,13 +265,13 @@ def test_claims_disabled_still_yields_a_usable_ownership_owner():
     )
 
     assert isinstance(lease, LeaseConfig)
-    assert ownership.claim(GlobalHealthReviewScope().run_key).owned is True
+    assert ownership.claim(GlobalHealthReviewScope()).owned is True
 
 
 def test_claims_enabled_backs_run_ownership_with_the_shared_ref_store():
     """Both key spaces come from ONE decision, so they cannot disagree."""
     from issue_orchestrator.adapters.github.ref_claim_adapter import (
-        GitHubRefRunClaimAdapter,
+        GitHubRefRunLedgerAdapter,
     )
     from issue_orchestrator.entrypoints.bootstrap import _create_claim_components
 
@@ -281,4 +285,4 @@ def test_claims_enabled_backs_run_ownership_with_the_shared_ref_store():
     )
 
     store = ownership._store  # noqa: SLF001 - composition assertion
-    assert isinstance(store, GitHubRefRunClaimAdapter)
+    assert isinstance(store, GitHubRefRunLedgerAdapter)

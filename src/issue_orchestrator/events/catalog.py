@@ -213,6 +213,18 @@ class EventName(str, Enum):
     # or unblocked, so the run is removed instead of spending an agent session
     # on work that no longer exists. Internal trace event.
     TECH_LEAD_RUN_WITHDRAWN = "tech_lead.run_withdrawn"
+    # The single launch authority refused to start a queued tech-lead run
+    # (#6994 round 2 F2): scope exclusivity, the shared run ledger, or
+    # launch-time subject revalidation said no at the very last moment. Carries
+    # the typed refusal so a queued-but-idle run is machine-readable rather than
+    # only a log line. Internal trace event.
+    TECH_LEAD_RUN_HELD = "tech_lead.run_held"
+    # A tech-lead run's cross-engine ownership changed under us (#6994 round 2
+    # F4). ``status`` distinguishes definitive loss (queued work withdrawn,
+    # active session stopped) from contention and from an unreadable
+    # coordination store, both of which are RETRIED rather than acted on.
+    # Internal trace event.
+    TECH_LEAD_RUN_OWNERSHIP_CHANGED = "tech_lead.run_ownership_changed"
 
     # =========================================================================
     # Cleanup operations

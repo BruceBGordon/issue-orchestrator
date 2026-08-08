@@ -69,7 +69,11 @@ from ..domain.tech_lead_run import (
 from ..domain.tech_lead_session import TechLeadSessionFlavor
 from ..events import EventName
 from ..ports import make_trace_event
-from .tech_lead_run_ownership import RunOwnershipVerdict, TechLeadRunOwnership
+from .tech_lead_run_ownership import (
+    RunOwnershipReconciliation,
+    RunOwnershipVerdict,
+    TechLeadRunOwnership,
+)
 from .tech_lead_session_policy import is_tech_lead_session
 
 if TYPE_CHECKING:
@@ -118,23 +122,27 @@ def scope_of_session(session: "Session") -> Optional[TechLeadRunScope]:
     return global_scope_for_flavor(scope.flavor)
 
 
-def live_run_keys(
+def live_run_scopes(
     config: "Config",
     pending: "Sequence[PendingTechLeadReview]",
     active_sessions: "Sequence[Session]",
-) -> tuple[str, ...]:
+) -> tuple[TechLeadRunScope, ...]:
     """Every logical run this engine currently has queued or running.
 
     The input to :meth:`TechLeadRunOwnership.reconcile`: ownership must cover a
     run for its WHOLE life, and a run's life spans the queue and the session, so
-    neither collection alone is the answer.
+    neither collection alone is the answer. Scopes rather than bare keys,
+    because the shared ledger judges the CONFLICT MATRIX and cannot do that
+    without knowing which runs are whole-repository ones.
     """
-    keys = {run_key_of_pending(item) for item in pending}
+    scopes: dict[str, TechLeadRunScope] = {
+        run_key_of_pending(item): scope_of_pending(item) for item in pending
+    }
     for session in active_tech_lead_sessions(config, active_sessions):
         scope = scope_of_session(session)
         if scope is not None:
-            keys.add(scope.run_key)
-    return tuple(sorted(keys))
+            scopes.setdefault(scope.run_key, scope)
+    return tuple(scopes[key] for key in sorted(scopes))
 
 
 def active_tech_lead_sessions(
@@ -438,7 +446,7 @@ class TechLeadRunCoordinator:
         prevent, and an operator who is told "could not establish ownership" can
         retry, whereas one told "queued" cannot discover it was not.
         """
-        ownership = self._ownership.claim(scope.run_key)
+        ownership = self._ownership.claim(scope)
         if ownership.owned:
             return None
         if ownership.verdict is RunOwnershipVerdict.HELD_BY_PEER:
@@ -459,14 +467,16 @@ class TechLeadRunCoordinator:
     # Ownership lifecycle
     # ------------------------------------------------------------------
 
-    def reconcile_ownership(self) -> tuple[str, ...]:
-        """Renew/settle claims for every run this engine has live (one per tick).
+    def reconcile_ownership(self) -> "RunOwnershipReconciliation":
+        """Renew/settle leases for every run this engine has live (one per tick).
 
-        Returns the run keys ownership was lost for, so the caller withdraws
-        them instead of launching work a peer now owns.
+        Returns the TYPED per-run outcome rather than a flat "lost" list: the
+        caller must treat contention (retain and retry) differently from
+        definitive loss (withdraw / stop the session) and from an unreadable
+        store (change nothing), and a flat list cannot express that (round 2 F4).
         """
         return self._ownership.reconcile(
-            live_run_keys(
+            live_run_scopes(
                 self._config,
                 self._state.pending_tech_lead_reviews,
                 self._state.active_sessions,

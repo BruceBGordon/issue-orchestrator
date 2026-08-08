@@ -41,7 +41,9 @@ from issue_orchestrator.entrypoints import web as web_module
 from issue_orchestrator.execution.session_output_adapter import (
     FileSystemSessionOutput,
 )
-from issue_orchestrator.ports.run_claim_store import NullRunClaimStore
+from issue_orchestrator.ports.run_ledger_store import (
+    SingleInstanceRunLedgerStore,
+)
 from tests.e2e_web.conftest import (
     FlowWebMockOrchestrator,
     UvicornTestServer,
@@ -62,7 +64,7 @@ class TechLeadWebOrchestrator(FlowWebMockOrchestrator):
         self.config.tech_lead_review_agent = TECH_LEAD_AGENT
         self.issues: dict[int, Issue] = {}
         self._ownership = TechLeadRunOwnership(
-            NullRunClaimStore(),
+            SingleInstanceRunLedgerStore(lease_seconds=900),
             lease_seconds=900,
             renew_before_expiry_seconds=300,
         )
@@ -202,7 +204,11 @@ def test_the_global_action_requests_a_run_and_the_dashboard_reports_it_queued(
         timeout=10_000,
     )
     expect(page.locator("#techLeadHealthReviewStatus")).to_have_text("Tech lead queued")
-    expect(page.locator("#techLeadHealthReviewItem")).to_be_disabled()
+    # aria-disabled, NOT the native property: the control must stay focusable so
+    # its reason is reachable by keyboard (#6994 round 2 F6).
+    expect(page.locator("#techLeadHealthReviewItem")).to_have_attribute(
+        "aria-disabled", "true"
+    )
 
 
 def test_a_repeated_global_request_coalesces_instead_of_queueing_twice(
@@ -253,7 +259,9 @@ def test_the_queued_state_survives_a_dashboard_refresh(
 
     assert _global_status(page) == "queued"
     page.click("#settingsMenuBtn")
-    expect(page.locator("#techLeadHealthReviewItem")).to_be_disabled()
+    expect(page.locator("#techLeadHealthReviewItem")).to_have_attribute(
+        "aria-disabled", "true"
+    )
     expect(page.locator("#techLeadHealthReviewStatus")).to_have_text("Tech lead queued")
 
 
@@ -344,3 +352,160 @@ def test_a_stopped_engine_answers_the_command_surface_with_a_typed_refusal(
     assert body["reason"] == "engine_not_running"
     assert body["admitted"] is False
     assert body["run_key"] == "global:health_review"
+
+
+# ---------------------------------------------------------------------------
+# Accessibility of the tech-lead affordances in a REAL browser (#6994 R2 F6)
+#
+# The JS-vm layer pins the rendering rules exhaustively and cheaply; what only a
+# browser can prove is that the resulting DOM is valid and operable — that the
+# control is in the tab order, that its description resolves to an element that
+# exists, and that the Settings remedy is a sibling rather than a nested button.
+# ---------------------------------------------------------------------------
+
+
+def _health_action_a11y(page: Page) -> dict:
+    return page.evaluate(
+        """() => {
+            const item = document.getElementById('techLeadHealthReviewItem');
+            const describedBy = item.getAttribute('aria-describedby');
+            const described = describedBy ? document.getElementById(describedBy) : null;
+            const link = document.getElementById('techLeadHealthReviewItemSettingsLink');
+            return {
+                ariaDisabled: item.getAttribute('aria-disabled'),
+                nativelyDisabled: item.disabled,
+                describedBy,
+                describedText: described ? described.textContent : null,
+                describedIsChildOfButton: described ? item.contains(described) : null,
+                nestedButtons: item.querySelectorAll('button').length,
+                remedyIsChildOfButton: link ? item.contains(link) : null,
+                remedyPresent: Boolean(link),
+            };
+        }"""
+    )
+
+
+def test_a_queued_global_run_stays_keyboard_operable_with_a_resolvable_reason(
+    page: Page, tech_lead_server
+) -> None:
+    orchestrator = tech_lead_server["orchestrator"]
+    _reset(orchestrator)
+    _open(page, tech_lead_server)
+    page.click("#settingsMenuBtn")
+    page.click("#techLeadHealthReviewItem")
+    page.wait_for_function(
+        "() => window.dashboardData.techLeadRuns.healthReviewStatus === 'queued'",
+        timeout=10_000,
+    )
+    # Requesting a run closes the actions menu; reopen it to inspect the
+    # affordance as the operator would next see it.
+    page.click("#settingsMenuBtn")
+
+    a11y = _health_action_a11y(page)
+
+    assert a11y["ariaDisabled"] == "true"
+    assert a11y["nativelyDisabled"] is False, "an unfocusable control hides its reason"
+    assert a11y["describedText"] == "Tech lead queued"
+    assert a11y["describedIsChildOfButton"] is False
+    assert a11y["nestedButtons"] == 0
+    # Focusable in the real browser, not merely styled that way.
+    page.focus("#techLeadHealthReviewItem")
+    assert page.evaluate(
+        "() => document.activeElement.id"
+    ) == "techLeadHealthReviewItem"
+
+
+def test_a_running_global_run_reports_its_state_on_the_action(
+    page: Page, tech_lead_server
+) -> None:
+    orchestrator = tech_lead_server["orchestrator"]
+    _reset(orchestrator)
+    orchestrator.start_global_run()
+    _open(page, tech_lead_server)
+    page.click("#settingsMenuBtn")
+
+    expect(page.locator("#techLeadHealthReviewStatus")).to_have_text(
+        "Tech lead running"
+    )
+    a11y = _health_action_a11y(page)
+    assert a11y["ariaDisabled"] == "true"
+    assert a11y["nativelyDisabled"] is False
+    assert a11y["nestedButtons"] == 0
+
+
+def test_an_unconfigured_engine_offers_a_sibling_settings_remedy_in_the_browser(
+    page: Page, tech_lead_server
+) -> None:
+    """The remedy must be operable markup, not a button inside a button."""
+    orchestrator = tech_lead_server["orchestrator"]
+    _reset(orchestrator)
+    original_agent = orchestrator.config.tech_lead_review_agent
+    orchestrator.config.tech_lead_review_agent = ""
+    try:
+        _open(page, tech_lead_server)
+        page.click("#settingsMenuBtn")
+        a11y = _health_action_a11y(page)
+
+        assert a11y["remedyPresent"] is True
+        assert a11y["remedyIsChildOfButton"] is False
+        assert a11y["nestedButtons"] == 0
+        assert "No tech lead agent is configured" in (a11y["describedText"] or "")
+        page.focus("#techLeadHealthReviewItemSettingsLink")
+        assert page.evaluate(
+            "() => document.activeElement.id"
+        ) == "techLeadHealthReviewItemSettingsLink"
+    finally:
+        orchestrator.config.tech_lead_review_agent = original_agent
+
+
+def test_a_paused_engine_disables_the_action_but_keeps_its_reason_reachable(
+    page: Page, tech_lead_server
+) -> None:
+    orchestrator = tech_lead_server["orchestrator"]
+    _reset(orchestrator)
+    orchestrator.state.paused = True
+    try:
+        _open(page, tech_lead_server)
+        page.click("#settingsMenuBtn")
+        a11y = _health_action_a11y(page)
+
+        assert a11y["ariaDisabled"] == "true"
+        assert a11y["nativelyDisabled"] is False
+        assert "paused" in (a11y["describedText"] or "").lower()
+        assert a11y["remedyPresent"] is False, "a pause is not a Settings problem"
+    finally:
+        orchestrator.state.paused = False
+
+
+def test_a_queued_BATCH_review_still_lets_the_operator_request_a_health_review(
+    page: Page, tech_lead_server
+) -> None:
+    """Distinct global flavors serialize; they do not suppress each other (F5)."""
+    orchestrator = tech_lead_server["orchestrator"]
+    _reset(orchestrator)
+    orchestrator.state.pending_tech_lead_reviews.append(
+        PendingTechLeadReview(
+            800, "Batch Review", flavor=TechLeadSessionFlavor.BATCH_REVIEW
+        )
+    )
+    try:
+        _open(page, tech_lead_server)
+        page.click("#settingsMenuBtn")
+
+        assert _global_status(page) == "queued"
+        a11y = _health_action_a11y(page)
+        assert a11y["ariaDisabled"] == "false", (
+            "a batch review must not make the health action look already-requested"
+        )
+        assert "will start after it" in (a11y["describedText"] or "")
+
+        page.click("#techLeadHealthReviewItem")
+        page.wait_for_function(
+            "() => window.dashboardData.techLeadRuns.healthReviewStatus === 'queued'",
+            timeout=10_000,
+        )
+        assert sorted(
+            i.issue_number for i in orchestrator.state.pending_tech_lead_reviews
+        ) == [800, ANCHOR]
+    finally:
+        _reset(orchestrator)

@@ -211,7 +211,10 @@
                     </button>
                     <button class="settings-menu-item" onclick="refreshFromGitHub()" role="menuitem"><span aria-hidden="true">&#x1F504;</span> Refresh from GitHub</button>
                     <button class="settings-menu-item" onclick="openRetrospectiveReviewDialog()" role="menuitem"><span aria-hidden="true">&#x21BB;</span> Review Existing Implementation</button>
-                    <button class="settings-menu-item" id="techLeadHealthReviewItem" onclick="runBoardHealthReview()" role="menuitem"><span aria-hidden="true">&#x1F9ED;</span> Run board health review<span class="settings-menu-status" id="techLeadHealthReviewStatus"></span></button>
+                    <div class="settings-menu-row" role="presentation">
+                        <button class="settings-menu-item" id="techLeadHealthReviewItem" onclick="runBoardHealthReview()" role="menuitem"><span aria-hidden="true">&#x1F9ED;</span> Run board health review</button>
+                        <span class="settings-menu-status" id="techLeadHealthReviewStatus" role="status" aria-live="polite"></span>
+                    </div>
                     <button class="settings-menu-item" onclick="openFlowRefreshPrefs()" role="menuitem"><span aria-hidden="true">&#x26A1;</span> Flow refresh preferences</button>
                     <button class="settings-menu-item" onclick="showGitHubUsage()" role="menuitem"><span aria-hidden="true">&#x1F4CA;</span> Show GitHub usage</button>
                     <button class="settings-menu-item" onclick="goToSettings()" role="menuitem"><span aria-hidden="true">&#x2699;</span> Settings</button>
@@ -610,7 +613,10 @@
         <button id="menuCloseIssue" class="context-menu-item" role="menuitem" style="display:none;">Close Issue</button>
         <button id="menuResetRetry" class="context-menu-item" role="menuitem" style="display:none;">Reset &amp; Retry</button>
         <button id="menuResetRetryScratch" class="context-menu-item" role="menuitem" style="display:none;">Reset and Retry From Scratch</button>
-        <button id="menuInvestigateTechLead" class="context-menu-item" role="menuitem" style="display:none;">Investigate with tech lead</button>
+        <div class="context-menu-row" id="menuInvestigateTechLeadRow" role="presentation" style="display:none;">
+            <button id="menuInvestigateTechLead" class="context-menu-item" role="menuitem">Investigate with tech lead</button>
+            <span class="context-menu-status" id="menuInvestigateTechLeadStatus" role="status" aria-live="polite"></span>
+        </div>
     </div>
     <div id="toast" role="status" aria-live="polite"></div>
 

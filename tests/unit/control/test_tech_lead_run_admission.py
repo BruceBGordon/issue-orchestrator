@@ -46,7 +46,13 @@ from issue_orchestrator.domain.tech_lead_run import (
     TechLeadRunTrigger,
 )
 from issue_orchestrator.control.tech_lead_run_ownership import TechLeadRunOwnership
-from issue_orchestrator.domain.claim import RunClaim, RunClaimAcquisition
+
+from .run_ledger_doubles import LEASE_SECONDS, SharedRunLedger
+from issue_orchestrator.domain.run_ledger import (
+    RunLedgerEntry,
+    RunLedgerRequestKind,
+    RunLifecycle,
+)
 from issue_orchestrator.domain.models import (
     DiscoveredFailure,
     OrchestratorState,
@@ -142,74 +148,83 @@ class RecordingEvents:
 
 
 class SharedRunClaimStore:
-    """One in-memory compare-and-swap cell per run key, shared by N engines.
+    """One shared run-ledger cell, driven by two named engines.
 
-    Stands in for the GitHub ref the real store uses. Deterministic and
-    ordering-explicit: a test drives two "engines" by interleaving their calls,
-    so the race is reproduced exactly rather than raced for.
+    Stands in for the GitHub ref the real store uses, and evaluates the REAL
+    conflict matrix (``domain.run_ledger.resolve``) rather than a stub of it:
+    a double that re-implemented the rule would only prove the tests agree with
+    themselves. Deterministic and ordering-explicit — a test drives two
+    "engines" by interleaving their calls, so the race is reproduced exactly
+    rather than raced for.
     """
 
     def __init__(self, *, unreachable: bool = False) -> None:
-        self.holders: dict[str, RunClaim] = {}
-        self.unreachable = unreachable
-        self.acquired: list[str] = []
-        self.released: list[str] = []
+        self.shared = SharedRunLedger()
+        self.shared.unavailable = unreachable
+        self._engines = 0
 
-    def acquire(self, run_key: str) -> RunClaimAcquisition:
-        if self.unreachable:
-            return RunClaimAcquisition.unavailable("backing store unreachable")
-        holder = self.holders.get(run_key)
-        if holder is not None and not holder.is_expired():
-            return RunClaimAcquisition.held_by(holder)
-        lease_id = f"lease-{run_key}-{len(self.acquired)}"
-        self.holders[run_key] = RunClaim(
-            lease_id=lease_id,
-            claimant=f"engine-{len(self.acquired)}",
+    def ownership(self, claimant: Optional[str] = None) -> TechLeadRunOwnership:
+        """A run-ownership owner for one engine over this shared cell."""
+        if claimant is None:
+            self._engines += 1
+            claimant = f"engine-{self._engines}"
+        return self.shared.ownership(claimant)
+
+    @property
+    def acquired(self) -> list[str]:
+        return [
+            request.run_key
+            for request in self.shared.submissions
+            if request.kind is RunLedgerRequestKind.RESERVE
+        ]
+
+    @property
+    def released(self) -> list[str]:
+        return [
+            request.run_key
+            for request in self.shared.submissions
+            if request.kind is RunLedgerRequestKind.RELEASE
+        ]
+
+    def current(self, run_key: str) -> Optional[RunLedgerEntry]:
+        return self.shared.entry(run_key)
+
+    def hold(
+        self,
+        run_key: str,
+        *,
+        claimant: str,
+        expired: bool = False,
+        running: bool = False,
+    ) -> None:
+        """Seed a peer engine's live (or dead) hold on a run."""
+        now = self.shared.clock()
+        entry = RunLedgerEntry(
             run_key=run_key,
-            started_at=datetime(2026, 8, 7, 12, 0, 0),
-            # Far-future expiry: lease EXPIRY is exercised explicitly by
-            # ``hold(expired=True)``, so it must never depend on the wall clock
-            # the suite happens to run at.
-            expires_at=datetime(2999, 1, 1),
-            priority=1,
-        )
-        self.acquired.append(run_key)
-        return RunClaimAcquisition.acquired(lease_id)
-
-    def renew(self, run_key: str, lease_id: str) -> bool:
-        holder = self.holders.get(run_key)
-        return holder is not None and holder.lease_id == lease_id
-
-    def release(self, run_key: str, lease_id: str) -> None:
-        holder = self.holders.get(run_key)
-        if holder is not None and holder.lease_id == lease_id:
-            del self.holders[run_key]
-            self.released.append(run_key)
-
-    def current(self, run_key: str) -> Optional[RunClaim]:
-        return self.holders.get(run_key)
-
-    def hold(self, run_key: str, *, claimant: str, expired: bool = False) -> None:
-        """Seed a peer engine's live (or dead) ownership of a run."""
-        started = datetime(2026, 8, 7, 12, 0, 0)
-        self.holders[run_key] = RunClaim(
-            lease_id=f"peer-{run_key}",
+            scope_kind=_scope_kind_of(run_key),
+            lifecycle=RunLifecycle.RUNNING if running else RunLifecycle.QUEUED,
             claimant=claimant,
-            run_key=run_key,
-            started_at=started,
+            lease_id=f"peer-{run_key}",
+            started_at=now - timedelta(seconds=60),
             expires_at=(
-                datetime(1999, 1, 1) if expired else datetime(2999, 1, 1)
+                now - timedelta(seconds=1)
+                if expired
+                else now + timedelta(seconds=LEASE_SECONDS)
             ),
-            priority=1,
         )
+        self.shared.ledger = self.shared.ledger.upsert(entry, now)
+
+
+def _scope_kind_of(run_key: str) -> TechLeadRunScopeKind:
+    if run_key.startswith("issue:"):
+        return TechLeadRunScopeKind.ISSUE
+    if run_key == GlobalBatchReviewScope().run_key:
+        return TechLeadRunScopeKind.GLOBAL_BATCH_REVIEW
+    return TechLeadRunScopeKind.GLOBAL_HEALTH_REVIEW
 
 
 def _ownership(store: SharedRunClaimStore) -> TechLeadRunOwnership:
-    return TechLeadRunOwnership(
-        store,  # type: ignore[arg-type]
-        lease_seconds=900,
-        renew_before_expiry_seconds=300,
-    )
+    return store.ownership()
 
 
 def _config(agent: Optional[str] = TECH_LEAD_AGENT) -> Any:
@@ -677,35 +692,42 @@ def test_ownership_is_handed_back_when_the_run_leaves_the_queue():
     assert store.current(IssueInvestigationScope(42).run_key) is None
 
 
-def test_a_run_whose_claim_a_peer_took_is_reported_so_the_tick_withdraws_it():
-    """A restarted engine must not launch work a peer now owns.
+def test_a_run_a_peer_holds_is_contended_not_lost_so_it_is_retried():
+    """Contention is not loss (#6994 round 2 F4).
 
-    The queue survives the restart (it is rebuilt from the recovered run), but
-    the lease bookkeeping does not — so reconcile has to re-establish ownership,
-    and when a peer holds it the run comes back as LOST.
+    A restarted engine has the run (the queue was rebuilt) but no lease
+    bookkeeping. When a peer's live hold answers, the run must come back as
+    CONTENDED — retained and retried until the hold lapses — because reporting
+    it as LOST is what strands recovered work until somebody restarts again.
     """
     store = SharedRunClaimStore()
     state = _state(pending_tech_lead_reviews=[_investigation(42)])
     store.hold(IssueInvestigationScope(42).run_key, claimant="other-host")
 
     # A fresh coordinator + fresh ownership IS the restarted process.
-    restarted = _coordinator(state, ownership=_ownership(store))
+    reconciliation = _coordinator(
+        state, ownership=_ownership(store)
+    ).reconcile_ownership()
 
-    assert restarted.reconcile_ownership() == (IssueInvestigationScope(42).run_key,)
+    assert reconciliation.contended == (IssueInvestigationScope(42).run_key,)
+    assert reconciliation.lost == ()
 
 
 def test_a_run_recovered_after_restart_reclaims_its_shared_ownership():
     """Restart recovery: the queue survives, so ownership must be re-established.
 
     A restarted engine holds no lease bookkeeping, but it still has the run. If
-    the shared claim is free (its own lease expired with the old process), it
+    the shared hold is free (its own lease expired with the old process), it
     takes it back rather than launching unowned work.
     """
     store = SharedRunClaimStore()
     state = _state(pending_tech_lead_reviews=[_investigation(42)])
     coordinator = _coordinator(state, ownership=_ownership(store))
 
-    assert coordinator.reconcile_ownership() == ()
+    reconciliation = coordinator.reconcile_ownership()
+
+    assert reconciliation.lost == ()
+    assert reconciliation.contended == ()
     assert store.acquired == [IssueInvestigationScope(42).run_key]
 
 

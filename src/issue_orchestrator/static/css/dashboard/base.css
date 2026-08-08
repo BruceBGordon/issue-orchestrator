@@ -425,11 +425,29 @@ h1 {
     opacity: 0.6;
     cursor: not-allowed;
 }
+/* An unavailable action keeps its focus ring: it is aria-disabled rather than
+   natively disabled precisely so its explanation and remedy stay reachable by
+   keyboard (#6994 round 2 F6). */
+.settings-menu-item:focus-visible,
+.settings-menu-item:focus {
+    outline: 2px solid var(--accent, currentColor);
+    outline-offset: -2px;
+}
+/* The status text and the Settings remedy are SIBLINGS of the action, never
+   nested inside the button — a button inside a button is invalid interactive
+   markup and hides both from assistive technology (#6994 round 2 F6). */
+.settings-menu-row {
+    display: block;
+    padding-bottom: 2px;
+}
 .settings-menu-status {
     display: block;
     font-size: 11px;
     color: var(--text-muted, var(--text));
-    margin-top: 2px;
+    margin: 2px 0 0 8px;
+    /* Never clipped: the blocked reason is a full sentence. */
+    white-space: normal;
+    overflow-wrap: anywhere;
 }
 .settings-menu-status:empty { display: none; }
 /* The remedy for "no tech lead agent configured" has to be operable: a disabled

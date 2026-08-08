@@ -77,10 +77,26 @@ class TechLeadRunActionsView(BaseModel):
     # True when the Repository Engine is paused. A paused engine must not claim
     # the action will run, so both actions disable.
     paused: bool
-    # Whole-board run status: idle / queued / running.
+    # ANY whole-board run's status: idle / queued / running. This is the
+    # BARRIER's status, not the health review's — a batch review makes it
+    # non-idle too — so it must never be used to decide whether the health
+    # action is available (#6994 round 2 F5).
     global_status: str = Field(serialization_alias="globalStatus")
-    # Colour-independent label for the global action ("" when idle).
+    # Colour-independent label for the barrier ("" when idle).
     global_status_label: str = Field(serialization_alias="globalStatusLabel")
+    # The HEALTH REVIEW's own status: idle / queued / running. Projected
+    # separately because health and batch reviews are distinct identities that
+    # SERIALIZE — a queued batch review must not make the health action look
+    # already-requested and refuse the operator's click.
+    health_review_status: str = Field(serialization_alias="healthReviewStatus")
+    # Colour-independent label for the health action ("" when idle).
+    health_review_status_label: str = Field(
+        serialization_alias="healthReviewStatusLabel"
+    )
+    # "" when nothing is in the way; otherwise the sentence explaining that a
+    # newly requested run will WAIT (rather than not happen). Only meaningful
+    # when the requested scope is not itself the barrier.
+    global_barrier_note: str = Field(serialization_alias="globalBarrierNote")
     # Issues with a queued tech-lead investigation.
     queued_issue_numbers: tuple[int, ...] = Field(
         serialization_alias="queuedIssueNumbers"
@@ -110,6 +126,17 @@ class TechLeadRunActionsView(BaseModel):
             return STATUS_QUEUED
         return STATUS_IDLE
 
+    @property
+    def health_review_available(self) -> bool:
+        """True when clicking "Run board health review" would achieve something.
+
+        A barrier does NOT make it unavailable: the request would queue behind
+        the run in front of it, which is exactly what admission does and what
+        the operator asked for. Only an unavailable engine, or a health review
+        that already exists, makes the action a no-op.
+        """
+        return not self.unavailable_reason and self.health_review_status == STATUS_IDLE
+
     @classmethod
     def empty(cls) -> "TechLeadRunActionsView":
         """The projection when no engine is running.
@@ -126,6 +153,9 @@ class TechLeadRunActionsView(BaseModel):
             paused=False,
             global_status=STATUS_IDLE,
             global_status_label="",
+            health_review_status=STATUS_IDLE,
+            health_review_status_label="",
+            global_barrier_note="",
             queued_issue_numbers=(),
             running_issue_numbers=(),
             global_barrier_active=False,
@@ -158,6 +188,7 @@ def read_tech_lead_run_actions(
     else:
         global_status = STATUS_IDLE
 
+    health_status = _health_review_status(config, state)
     global_run_numbers = _global_run_issue_numbers(config, state)
     configured = bool(config.tech_lead_review_agent)
     paused = bool(state.paused)
@@ -167,6 +198,9 @@ def read_tech_lead_run_actions(
         paused=paused,
         global_status=global_status,
         global_status_label=_STATUS_LABELS[global_status],
+        health_review_status=health_status,
+        health_review_status_label=_STATUS_LABELS[health_status],
+        global_barrier_note=_barrier_note(global_status, health_status),
         queued_issue_numbers=tuple(
             sorted(
                 item.issue_number for item in pending if not is_global_pending(item)
@@ -183,6 +217,45 @@ def read_tech_lead_run_actions(
         unavailable_reason=_unavailable_reason(configured, paused),
         needs_settings=not configured,
     )
+
+
+def _health_review_status(config: "Config", state: "OrchestratorState") -> str:
+    """The HEALTH REVIEW's own status, independent of any other global run.
+
+    Asked per flavor because the admission owner deduplicates per flavor: a
+    queued batch review is a barrier the health request waits behind, never a
+    reason to refuse it (#6994 round 2 F5).
+    """
+    for session in active_tech_lead_sessions(config, state.active_sessions):
+        if _is_health_review_scope(session.tech_lead_scope):
+            return STATUS_RUNNING
+    for item in state.pending_tech_lead_reviews:
+        if item.flavor is TechLeadSessionFlavor.HEALTH_REVIEW:
+            return STATUS_QUEUED
+    return STATUS_IDLE
+
+
+def _barrier_note(global_status: str, health_status: str) -> str:
+    """What a NEW request would do when a different global run is in front.
+
+    Empty when the health review is itself the barrier — a run is not waiting
+    behind itself, and saying so would read as a stall.
+    """
+    if global_status == STATUS_IDLE or health_status != STATUS_IDLE:
+        return ""
+    if global_status == STATUS_RUNNING:
+        return (
+            "Another whole-repository tech-lead review is running; a health"
+            " review will start after it."
+        )
+    return (
+        "Another whole-repository tech-lead review is queued; a health review"
+        " will start after it."
+    )
+
+
+def _is_health_review_scope(scope: "TechLeadLaunchScope | None") -> bool:
+    return scope is not None and scope.flavor is TechLeadSessionFlavor.HEALTH_REVIEW
 
 
 def _unavailable_reason(configured: bool, paused: bool) -> str:

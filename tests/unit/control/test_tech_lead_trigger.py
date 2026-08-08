@@ -19,7 +19,9 @@ from issue_orchestrator.control.tech_lead_run_ownership import TechLeadRunOwners
 from issue_orchestrator.domain.models import PendingTechLeadReview
 from issue_orchestrator.domain.tech_lead_session import TechLeadSessionFlavor
 from issue_orchestrator.infra.config import Config
-from issue_orchestrator.ports.run_claim_store import NullRunClaimStore
+from issue_orchestrator.ports.run_ledger_store import (
+    SingleInstanceRunLedgerStore,
+)
 
 
 def _clock(values):
@@ -103,7 +105,7 @@ class _FakeHost:
             repository_host=self.repository_host,
             anchor_host=self.anchor_host,
             ownership=TechLeadRunOwnership(
-                NullRunClaimStore(),
+                SingleInstanceRunLedgerStore(lease_seconds=900),
                 lease_seconds=900,
                 renew_before_expiry_seconds=300,
             ),
@@ -207,7 +209,7 @@ def test_launch_declined_reports_not_launched() -> None:
     assert len(host.launched) == 1  # attempted
     assert results[0].launched is False
     assert results[0].completed is False
-    assert "launch failed" in results[0].detail
+    assert "not started" in results[0].detail
     assert host.tick_count == 0  # no drive loop when launch declined
 
 
@@ -286,7 +288,7 @@ class _FakeHealthHost:
             repository_host=SimpleNamespace(get_issue=lambda _n: None),
             anchor_host=self,
             ownership=TechLeadRunOwnership(
-                NullRunClaimStore(),
+                SingleInstanceRunLedgerStore(lease_seconds=900),
                 lease_seconds=900,
                 renew_before_expiry_seconds=300,
             ),
@@ -382,7 +384,7 @@ def test_health_review_launch_declined_reports_not_launched() -> None:
     assert result.anchor_issue_number == 200
     assert result.launched is False
     assert result.completed is False
-    assert "launch failed" in result.detail
+    assert "not started" in result.detail
     assert host.tick_count == 0  # no drive loop when launch declined
 
 

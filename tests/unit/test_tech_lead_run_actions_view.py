@@ -195,6 +195,9 @@ def test_the_payload_is_the_camel_case_shape_the_dashboard_reads():
         "paused": False,
         "globalStatus": STATUS_IDLE,
         "globalStatusLabel": "",
+        "healthReviewStatus": STATUS_IDLE,
+        "healthReviewStatusLabel": "",
+        "globalBarrierNote": "",
         "queuedIssueNumbers": [42],
         "runningIssueNumbers": [],
         "globalBarrierActive": False,
@@ -266,3 +269,91 @@ def test_configuration_outranks_pause_the_way_admission_does():
     view = read_tech_lead_run_actions(_config(agent=None), _state(paused=True))
 
     assert "No tech lead agent is configured" in view.unavailable_reason
+
+
+# ---------------------------------------------------------------------------
+# Distinct global flavors (#6994 round 2 F5)
+#
+# Round 1 derived ONE ``globalStatus`` from any global run and the browser
+# disabled the health action from it, so a batch review made "Run board health
+# review" look already-requested and refused the operator's click — even though
+# admission deliberately keeps the two identities distinct and queues one behind
+# the other.
+# ---------------------------------------------------------------------------
+
+
+def _batch_review(anchor: int = 800) -> PendingTechLeadReview:
+    return PendingTechLeadReview(
+        anchor, "Batch Review", flavor=TechLeadSessionFlavor.BATCH_REVIEW
+    )
+
+
+def test_a_queued_BATCH_review_leaves_the_health_action_available():
+    view = read_tech_lead_run_actions(
+        _config(), _state(pending_tech_lead_reviews=[_batch_review()])
+    )
+
+    assert view.global_status == STATUS_QUEUED
+    assert view.global_barrier_active is True
+    # ...but the health review itself has not been requested.
+    assert view.health_review_status == STATUS_IDLE
+    assert view.health_review_available is True
+
+
+def test_a_queued_batch_review_SAYS_the_health_review_would_wait():
+    """"It will queue" is a different message from "it is already queued"."""
+    view = read_tech_lead_run_actions(
+        _config(), _state(pending_tech_lead_reviews=[_batch_review()])
+    )
+
+    assert "will start after it" in view.global_barrier_note
+
+
+def test_a_RUNNING_batch_review_also_leaves_the_health_action_available():
+    view = read_tech_lead_run_actions(
+        _config(),
+        _state(
+            active_sessions=[
+                FakeSession(800, flavor=TechLeadSessionFlavor.BATCH_REVIEW)
+            ]
+        ),
+    )
+
+    assert view.global_status == STATUS_RUNNING
+    assert view.health_review_status == STATUS_IDLE
+    assert view.health_review_available is True
+    assert "is running" in view.global_barrier_note
+
+
+def test_a_queued_HEALTH_review_is_what_makes_the_health_action_unavailable():
+    view = read_tech_lead_run_actions(
+        _config(), _state(pending_tech_lead_reviews=[_health_review()])
+    )
+
+    assert view.health_review_status == STATUS_QUEUED
+    assert view.health_review_status_label == "Tech lead queued"
+    assert view.health_review_available is False
+    # A run is not waiting behind ITSELF, so there is no "you will wait" note.
+    assert view.global_barrier_note == ""
+
+
+def test_a_RUNNING_health_review_makes_the_health_action_unavailable():
+    view = read_tech_lead_run_actions(
+        _config(),
+        _state(
+            active_sessions=[
+                FakeSession(900, flavor=TechLeadSessionFlavor.HEALTH_REVIEW)
+            ]
+        ),
+    )
+
+    assert view.health_review_status == STATUS_RUNNING
+    assert view.health_review_available is False
+    assert view.global_barrier_note == ""
+
+
+def test_an_unavailable_engine_still_outranks_an_idle_health_review():
+    view = read_tech_lead_run_actions(_config(), _state(paused=True))
+
+    assert view.health_review_status == STATUS_IDLE
+    assert view.health_review_available is False
