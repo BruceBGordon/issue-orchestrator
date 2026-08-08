@@ -403,3 +403,48 @@ def test_a_dynamic_label_value_is_beyond_the_checker(tmp_path: Path) -> None:
         )
         == 0
     )
+
+
+# --- one owner for provider-output classification (#6999) -------------------
+#
+# The startup AI gate had grown its own auth-banner table beside the provider
+# classifier's, and the two had already drifted apart. These pin that the CLI
+# entrypoint - the form CI runs - rejects a second classifier, and that the
+# provider adapters keep the interpretation that legitimately belongs to them.
+
+_PROVIDER_ADAPTER = "src/issue_orchestrator/execution/agent_runner_providers/newcli.py"
+
+
+def test_blocks_a_second_provider_output_token_table(tmp_path: Path) -> None:
+    """Caught by shape, so new wording is not an escape route."""
+    code, out = _run_capturing(
+        tmp_path,
+        """
+        _MY_OWN_MARKERS = ("please re-login now", "handshake rejected")
+
+
+        def looks_dead(output):
+            return any(m in output.lower() for m in _MY_OWN_MARKERS)
+        """,
+        "src/issue_orchestrator/infra/watcher.py",
+    )
+    assert code == 2
+    assert "provider-output-token-table" in out
+
+
+def test_allows_a_provider_adapter_to_read_its_own_cli_banners(tmp_path: Path) -> None:
+    """Raw interpretation inside a provider adapter is the boundary working."""
+    assert (
+        _run(
+            tmp_path,
+            """
+            _BANNERS = ("login expired", "please run /login")
+
+
+            def looks_dead(output):
+                return any(b in output.lower() for b in _BANNERS)
+            """,
+            _PROVIDER_ADAPTER,
+        )
+        == 0
+    )

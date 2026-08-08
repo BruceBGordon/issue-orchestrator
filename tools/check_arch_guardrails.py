@@ -790,6 +790,221 @@ def check_shared_needs_human_block(
     return violations
 
 
+# --- one owner for provider-output classification (#6999 F2 round 6) --------
+#
+# "Is this provider output an auth failure" must have exactly one answer. The
+# startup AI gate had grown a second marker table, and the two had already
+# drifted: each recognised banners the other missed, so the same expired login
+# was a startup failure on one path and a 90-minute timeout on the other.
+#
+# The first check pins the vocabulary (a copy of the owner's banner phrases
+# somewhere else) and the second pins the shape (a *new* token table, so a
+# second classifier cannot evade the guardrail merely by choosing other words).
+# Both read the owner's table out of the source tree being scanned, so the rule
+# can never be a stale duplicate of it.
+#
+# Residual limit, stated plainly: a lone new literal outside any token table -
+# ``if "please relogin" in out.lower():`` - matches neither check. Single
+# literal comparisons are ordinary everywhere in this codebase, so flagging
+# them repo-wide would be noise. The cross-path banner tests in
+# tests/unit/test_provider_readiness_boundary.py cover that residue by
+# behaviour.
+
+_CLASSIFICATION_OWNER = "execution/agent_runner_errors.py"
+_PROVIDER_ADAPTER_SURFACE = "execution/agent_runner_providers/"
+_AUTH_TABLE_NAME = "_AUTH_TOKENS"
+
+# Text matchers that are not provider output. Each one has to be named here,
+# which is the point: a new entry is a visible claim in review that the text
+# being classified does not come from a provider CLI.
+_NON_PROVIDER_TEXT_MATCHERS = {
+    # Session-log search: matches an operator's query terms against log lines.
+    "adapters/session_log/registry.py",
+    # Doctor guardrail check: reads this checker's own stdout.
+    "infra/doctor/checks/guardrails.py",
+    # Lexical masking: matches prompt/report vocabulary, never CLI output.
+    "control/lexical_masking.py",
+}
+
+
+def _provider_surface_relpath(path: Path) -> str | None:
+    """Path relative to the package root, or ``None`` if outside the package."""
+    parts = path.as_posix().split("/")
+    if "issue_orchestrator" not in parts:
+        return None
+    return "/".join(parts[parts.index("issue_orchestrator") + 1 :])
+
+
+def _string_elements(node: ast.AST | None) -> list[tuple[ast.Constant, str]]:
+    """The string-literal members of a collection literal, with their text."""
+    if not isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+        return []
+    return [
+        (e, e.value)
+        for e in node.elts
+        if isinstance(e, ast.Constant) and isinstance(e.value, str)
+    ]
+
+
+def _auth_banner_phrases(package_root: Path) -> tuple[str, ...]:
+    """Read the owner's distinctive auth banner phrases out of its own table.
+
+    Only multi-word phrases count. Single tokens like ``forbidden`` or ``401``
+    are ordinary English and HTTP vocabulary that other modules use for their
+    own unrelated reasons; a banner phrase is what a copy looks like.
+    """
+    owner = package_root / _CLASSIFICATION_OWNER
+    if not owner.exists():
+        return ()
+    try:
+        tree = ast.parse(owner.read_text(encoding="utf-8"), filename=owner.as_posix())
+    except (OSError, SyntaxError):
+        return ()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        names = {t.id for t in node.targets if isinstance(t, ast.Name)}
+        if _AUTH_TABLE_NAME not in names:
+            continue
+        return tuple(
+            sorted(
+                {
+                    text.lower()
+                    for _, text in _string_elements(node.value)
+                    if " " in text or "/" in text
+                }
+            )
+        )
+    return ()
+
+
+def _matching_string_literals(tree: ast.AST) -> list[tuple[ast.Constant, str]]:
+    """String literals used *as matchers*: ``in`` operands and token tables."""
+    literals: list[tuple[ast.Constant, str]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Compare):
+            left = node.left
+            if isinstance(left, ast.Constant) and isinstance(left.value, str):
+                if any(isinstance(op, ast.In) for op in node.ops):
+                    literals.append((left, left.value))
+        elif isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+            elements = _string_elements(node)
+            if len(elements) >= 2:
+                literals.extend(elements)
+    return literals
+
+
+def _token_table_names(tree: ast.AST) -> set[str]:
+    """Names bound to a collection of two or more string literals."""
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            targets: list[ast.AST] = list(node.targets)
+        elif isinstance(node, ast.AnnAssign):
+            targets = [node.target]
+        else:
+            continue
+        if len(_string_elements(node.value)) < 2:
+            continue
+        for target in targets:
+            if isinstance(target, ast.Name):
+                names.add(target.id)
+            elif isinstance(target, ast.Attribute):
+                names.add(target.attr)
+    return names
+
+
+def _iterated_name(node: ast.AST) -> str | None:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    return None
+
+
+def _token_loop_variables(tree: ast.AST, table_names: set[str]) -> set[str]:
+    """Loop/comprehension variables that walk a token table."""
+    variables: set[str] = set()
+    targets_and_iters: list[tuple[ast.AST, ast.AST]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.For, ast.AsyncFor)):
+            targets_and_iters.append((node.target, node.iter))
+        elif isinstance(
+            node, (ast.ListComp, ast.SetComp, ast.GeneratorExp, ast.DictComp)
+        ):
+            targets_and_iters.extend((g.target, g.iter) for g in node.generators)
+    for target, iterated in targets_and_iters:
+        is_table = (
+            _iterated_name(iterated) in table_names
+            or len(_string_elements(iterated)) >= 2
+        )
+        if is_table and isinstance(target, ast.Name):
+            variables.add(target.id)
+    return variables
+
+
+def check_provider_output_classification(path: Path, tree: ast.AST) -> list[Violation]:
+    relpath = _provider_surface_relpath(path)
+    if relpath is None:
+        return []
+    if relpath == _CLASSIFICATION_OWNER or relpath.startswith(
+        _PROVIDER_ADAPTER_SURFACE
+    ):
+        return []
+
+    package_root = Path(path.as_posix()[: -len(relpath) - 1])
+    violations: list[Violation] = []
+
+    for phrase in _auth_banner_phrases(package_root):
+        for literal, text in _matching_string_literals(tree):
+            if phrase not in text.lower():
+                continue
+            violations.append(
+                Violation(
+                    path.as_posix(),
+                    literal.lineno,
+                    literal.col_offset,
+                    "provider-banner-vocabulary",
+                    f"{text!r} matches provider banner text owned by "
+                    f"{_CLASSIFICATION_OWNER}; ask the provider adapter for a "
+                    "typed ProviderErrorType instead of re-listing its banners",
+                )
+            )
+
+    if relpath in _NON_PROVIDER_TEXT_MATCHERS:
+        return violations
+
+    token_variables = _token_loop_variables(tree, _token_table_names(tree))
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Compare):
+            continue
+        if not any(isinstance(op, ast.In) for op in node.ops):
+            continue
+        if not isinstance(node.left, ast.Name) or node.left.id not in token_variables:
+            continue
+        lowered = any(
+            isinstance(c, ast.Call)
+            and isinstance(c.func, ast.Attribute)
+            and c.func.attr == "lower"
+            for c in node.comparators
+        )
+        if not lowered:
+            continue
+        violations.append(
+            Violation(
+                path.as_posix(),
+                node.lineno,
+                node.col_offset,
+                "provider-output-token-table",
+                "a token table is matched against lowered text here; provider "
+                f"output has one classifier ({_CLASSIFICATION_OWNER}). If this "
+                "text is not provider output, name the module in "
+                "_NON_PROVIDER_TEXT_MATCHERS",
+            )
+        )
+    return violations
+
+
 def check_file(
     path: Path, rules: dict, allow_prefixes: Sequence[str]
 ) -> list[Violation]:
@@ -812,6 +1027,7 @@ def check_file(
     violations.extend(
         check_shared_needs_human_block(path, tree, path.read_text(encoding="utf-8"))
     )
+    violations.extend(check_provider_output_classification(path, tree))
 
     deny_imports = set(rules.get("deny_imports", []) or [])
     deny_dynamic_imports = set(rules.get("deny_dynamic_imports", []) or [])

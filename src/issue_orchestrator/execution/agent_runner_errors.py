@@ -60,11 +60,17 @@ _AUTH_TOKENS = (
     "invalid_api_key",
     "401",
     "403",
+    # "authentication" does not match "authenticate", so both stems are listed.
+    # The startup AI gate saw "Failed to authenticate: ..." (#6999 F2 round 6)
+    # and had grown its own table because this one could not read that banner.
+    "authenticate",
     # Claude Code TUI: "Login expired · Please run /login"
     "login expired",
     "please run /login",
     "run /login to",
-    "session expired. please run",
+    # Covers both "Session expired. Please run /login" and the AI gate's
+    # "OAuth session expired and could not be refreshed".
+    "session expired",
     # Codex TUI / CLI: "Not logged in", "Please run `codex login`"
     "not logged in",
     "codex login",

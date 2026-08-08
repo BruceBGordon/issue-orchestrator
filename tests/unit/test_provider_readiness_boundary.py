@@ -13,8 +13,12 @@ importantly — pin that the boundary has exactly ONE owner per concern:
 
 from __future__ import annotations
 
+import ast
+import importlib.util
 import json
 import os
+import sys
+import textwrap
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -58,6 +62,7 @@ from issue_orchestrator.execution.provider_readiness_probe import (
     CLIProviderReadinessProbe,
 )
 from issue_orchestrator.execution.session_output_adapter import FileSystemSessionOutput
+from issue_orchestrator.infra.hooks.hooks import evaluate_claude_ai_gate_result
 from issue_orchestrator.observation.observation import (
     SessionObservation,
     SessionObservationResult,
@@ -78,11 +83,68 @@ from tests.unit.test_session_controller import (
 )
 
 
-SRC_ROOT = Path(__file__).resolve().parents[2] / "src" / "issue_orchestrator"
+REPO_ROOT = Path(__file__).resolve().parents[2]
+SRC_ROOT = REPO_ROOT / "src" / "issue_orchestrator"
 
 # The banner an expired Claude Code login renders, verbatim from the terminal
 # recordings in the incident (offset 2740 ms for #6463, 522 ms for #5336).
 EXPIRED_LOGIN_BANNER = "Login expired · Please run /login"
+
+# The banner the startup AI gate sees, verbatim from tests/unit/test_hooks.py.
+# It reaches a different surface than the TUI banner above — a one-shot
+# ``claude --print`` rather than a live session — which is precisely why it
+# ended up in a second, private marker table.
+AI_GATE_OAUTH_BANNER = (
+    "Failed to authenticate: OAuth session expired and could not be refreshed"
+)
+
+# Every real auth banner any surface of this system has seen. Classification is
+# parametrized over the whole corpus so a banner learned for one surface cannot
+# stay unknown to another.
+CLAUDE_AUTH_BANNERS = (
+    EXPIRED_LOGIN_BANNER,
+    AI_GATE_OAUTH_BANNER,
+    "Invalid API key · Please run /login",
+)
+CODEX_AUTH_BANNERS = ("Not logged in. Please run `codex login`.",)
+PROVIDER_AUTH_BANNERS = CLAUDE_AUTH_BANNERS + CODEX_AUTH_BANNERS
+
+
+def _arch_guardrails():
+    """Load the CI guardrail checker so tests assert the same rule CI runs."""
+    name = "_arch_guardrails_under_test"
+    cached = sys.modules.get(name)
+    if cached is not None:
+        return cached
+    path = REPO_ROOT / "tools" / "check_arch_guardrails.py"
+    spec = importlib.util.spec_from_file_location(name, path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    # Registered before execution: the checker defines dataclasses, and
+    # ``dataclasses`` resolves their annotations through ``sys.modules``.
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _synthetic_package_module(root: Path, relpath: str, source: str) -> Path:
+    """Write one module into a throwaway ``issue_orchestrator`` package tree.
+
+    The vocabulary half of the guardrail reads the owner's table out of the
+    tree it is scanning, so the real one is copied in rather than restated —
+    a guardrail whose expectations are a duplicate of the thing it guards is
+    the same defect it exists to catch.
+    """
+    package = root / "src" / "issue_orchestrator"
+    owner_relpath = "execution/agent_runner_errors.py"
+    owner = package / owner_relpath
+    owner.parent.mkdir(parents=True, exist_ok=True)
+    owner.write_text((SRC_ROOT / owner_relpath).read_text(encoding="utf-8"))
+
+    module = package / relpath
+    module.parent.mkdir(parents=True, exist_ok=True)
+    module.write_text(textwrap.dedent(source).lstrip())
+    return module
 
 
 # The provider adapter intentionally checks PATH before asking CommandRunner to
@@ -584,20 +646,204 @@ class TestSingleClassificationTable:
 
         assert classified is ProviderErrorType.TRANSIENT
 
-    def test_exactly_one_module_knows_the_banner_text(self) -> None:
-        """Guardrail: a watcher-local token list would show up here.
+    @pytest.mark.parametrize("banner", PROVIDER_AUTH_BANNERS)
+    def test_every_banner_any_surface_has_seen_classifies_as_auth(
+        self, banner: str
+    ) -> None:
+        """One corpus, so no surface can know a banner the others don't.
 
-        The whole design constraint of #6999 is one classification table. If a
-        second module starts matching provider banner text, this fails and
-        names the file.
+        The startup AI gate used to keep its own markers, and the two tables
+        had already drifted: the gate read ``Failed to authenticate: OAuth
+        session expired`` and this table did not. Same expiry, two answers.
         """
-        owners = sorted(
-            path.relative_to(SRC_ROOT).as_posix()
+        assert classify_provider_output(banner) is ProviderErrorType.AUTH
+
+    def test_no_second_provider_output_classifier_exists_in_src(self) -> None:
+        """Guardrail: one owner decides what an auth failure looks like.
+
+        Text search for one banner was the old form of this check, and it was
+        evadable by any second table that chose different words — which is
+        exactly how the AI gate's markers hid in plain sight. The checker below
+        pins both the vocabulary and the *shape*, and runs in CI over all of
+        ``src`` via ``tools/check_arch_guardrails.py``.
+        """
+        checker = _arch_guardrails()
+
+        violations = [
+            v.fmt()
             for path in SRC_ROOT.rglob("*.py")
-            if "login expired" in path.read_text(encoding="utf-8").lower()
+            for v in checker.check_provider_output_classification(
+                path, ast.parse(path.read_text(encoding="utf-8"))
+            )
+        ]
+
+        assert violations == []
+
+    def test_the_guardrail_catches_a_second_table_that_invents_new_words(
+        self, tmp_path: Path
+    ) -> None:
+        """Proof the guardrail is not vacuous, and not evadable by rewording."""
+        module = _synthetic_package_module(
+            tmp_path,
+            "control/watcher.py",
+            '''
+            _MY_OWN_MARKERS = ("please re-login now", "handshake rejected")
+
+
+            def looks_dead(output: str) -> bool:
+                return any(m in output.lower() for m in _MY_OWN_MARKERS)
+            ''',
+        )
+        checker = _arch_guardrails()
+
+        kinds = [
+            v.kind
+            for v in checker.check_provider_output_classification(
+                module, ast.parse(module.read_text(encoding="utf-8"))
+            )
+        ]
+
+        assert kinds == ["provider-output-token-table"]
+
+    def test_the_guardrail_catches_a_copy_of_the_owners_banner_text(
+        self, tmp_path: Path
+    ) -> None:
+        """A single re-listed banner is caught even without a second table."""
+        module = _synthetic_package_module(
+            tmp_path,
+            "observation/watcher.py",
+            '''
+            def looks_dead(output: str) -> bool:
+                return "login expired" in output.lower()
+            ''',
+        )
+        checker = _arch_guardrails()
+
+        kinds = [
+            v.kind
+            for v in checker.check_provider_output_classification(
+                module, ast.parse(module.read_text(encoding="utf-8"))
+            )
+        ]
+
+        assert kinds == ["provider-banner-vocabulary"]
+
+    def test_the_provider_adapters_may_still_interpret_their_own_output(
+        self, tmp_path: Path
+    ) -> None:
+        """The owner surface is the table plus the provider adapters.
+
+        A provider adapter reading its own CLI's banners is the boundary
+        working, not a violation — that is where raw interpretation belongs.
+        """
+        module = _synthetic_package_module(
+            tmp_path,
+            "execution/agent_runner_providers/newcli.py",
+            '''
+            _BANNERS = ("login expired", "please run /login")
+
+
+            def looks_dead(output: str) -> bool:
+                return any(b in output.lower() for b in _BANNERS)
+            ''',
+        )
+        checker = _arch_guardrails()
+
+        assert (
+            checker.check_provider_output_classification(
+                module, ast.parse(module.read_text(encoding="utf-8"))
+            )
+            == []
         )
 
-        assert owners == ["execution/agent_runner_errors.py"]
+
+# ---------------------------------------------------------------------------
+# 2b. Every consumer of provider output reads the same owner
+# ---------------------------------------------------------------------------
+
+
+class TestEveryConsumerReadsTheSameOwner:
+    """The startup AI gate and the live-session probe agree on every banner.
+
+    These two surfaces are where the drift actually happened: the gate knew
+    ``Failed to authenticate: OAuth session expired`` and the shared table did
+    not, so the same expired credential was a clean startup failure on one path
+    and a 90-minute timeout on the other. Both paths are exercised with the
+    same corpus here, so a banner cannot be learned by one alone again.
+    """
+
+    @pytest.mark.parametrize("banner", CLAUDE_AUTH_BANNERS)
+    def test_the_gate_reports_auth_remediation_for_every_claude_banner(
+        self, banner: str, tmp_path: Path
+    ) -> None:
+        success, message = evaluate_claude_ai_gate_result(
+            returncode=1, stdout=banner, stderr="", work_repo=tmp_path
+        )
+
+        assert success is False
+        assert message.startswith(
+            "Claude is not authenticated; run 'claude auth login'\n"
+            "Verify with 'claude auth status', then retry startup."
+        )
+
+    @pytest.mark.parametrize("banner", CLAUDE_AUTH_BANNERS)
+    def test_a_live_session_fails_on_every_banner_the_gate_knows(
+        self, banner: str
+    ) -> None:
+        """The other consumer, same corpus, confirmed by the credential probe."""
+        probe = CLIProviderReadinessProbe(
+            FakeCommandRunner(
+                CommandResult(returncode=0, stdout='{"loggedIn": false}', stderr="")
+            )
+        )
+
+        readiness = probe.diagnose_session_output("claude-code", banner)
+
+        assert readiness.state is ProviderReadinessState.AUTH_EXPIRED
+        assert readiness.human_fixable
+
+    def test_an_exit_zero_auth_banner_still_reaches_remediation(
+        self, tmp_path: Path
+    ) -> None:
+        """A provider that prints its banner and exits clean is still dead."""
+        success, message = evaluate_claude_ai_gate_result(
+            returncode=0, stdout=AI_GATE_OAUTH_BANNER, stderr="", work_repo=tmp_path
+        )
+
+        assert success is False
+        assert message.startswith("Claude is not authenticated")
+
+    def test_a_gate_pass_is_never_re_read_as_an_auth_failure(
+        self, tmp_path: Path
+    ) -> None:
+        """The shared table is broader than the gate's four markers were.
+
+        It knows generic auth words like "forbidden", and Claude reporting a
+        blocked push is free to use them. Evidence that the gate did its job
+        outranks a word in the report.
+        """
+        report = "The push was forbidden: a hook blocked git push --no-verify."
+
+        success, message = evaluate_claude_ai_gate_result(
+            returncode=0, stdout=report, stderr="", work_repo=tmp_path
+        )
+
+        assert success is True
+        assert "AI gate test passed" in message
+
+    def test_a_non_auth_provider_failure_keeps_the_generic_remediation(
+        self, tmp_path: Path
+    ) -> None:
+        success, message = evaluate_claude_ai_gate_result(
+            returncode=1,
+            stdout="Cannot connect to the Anthropic API\n",
+            stderr="",
+            work_repo=tmp_path,
+        )
+
+        assert success is False
+        assert message.startswith("Claude AI gate could not run (exit 1)")
+        assert "Resolve the Claude CLI error below" in message
 
 
 # ---------------------------------------------------------------------------
