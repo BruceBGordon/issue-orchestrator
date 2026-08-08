@@ -471,6 +471,7 @@ def _mint_lease_id(run_key: str, now: datetime) -> str:
 RUN_LEDGER_VERSION = 1
 _LEDGER_OPEN = "<io-run-ledger>"
 _LEDGER_CLOSE = "</io-run-ledger>"
+_TOP_LEVEL_FIELDS = frozenset({"version", "entries"})
 _ENTRY_FIELDS = frozenset(
     {
         "run_key",
@@ -524,11 +525,17 @@ def parse_run_ledger(text: str) -> RunLedger:
     """Read a ledger back, or refuse. Never partially.
 
     Raises :class:`RunLedgerDecodeError` on a missing/duplicated block, invalid
-    JSON, an unknown schema version, an unexpected field set, an unknown scope
-    kind or lifecycle, an unparseable timestamp, a run key that disagrees with
-    its declared scope, or a duplicate run key.
+    JSON, a DUPLICATE JSON member at any depth, an unexpected top-level or entry
+    field set, an unknown schema version, an unknown scope kind or lifecycle, an
+    unparseable timestamp, a run key that disagrees with its declared scope, or a
+    duplicate run key.
     """
     payload = _ledger_payload(text)
+    unexpected = set(payload).symmetric_difference(_TOP_LEVEL_FIELDS)
+    if unexpected:
+        raise RunLedgerDecodeError(
+            f"run-ledger payload has an unexpected field set: {sorted(unexpected)}"
+        )
     version = payload.get("version")
     if version != RUN_LEDGER_VERSION:
         raise RunLedgerDecodeError(
@@ -556,12 +563,31 @@ def _ledger_payload(text: str) -> dict[str, object]:
     if closed < opened:
         raise RunLedgerDecodeError("run-ledger block markers are out of order")
     try:
-        payload = json.loads(text[opened:closed])
+        payload = json.loads(text[opened:closed], object_pairs_hook=_exact_object)
     except ValueError as exc:
-        raise RunLedgerDecodeError(f"run-ledger payload is not valid JSON: {exc}") from exc
+        raise RunLedgerDecodeError(
+            f"run-ledger payload could not be decoded: {exc}"
+        ) from exc
     if not isinstance(payload, dict):
         raise RunLedgerDecodeError("run-ledger payload must be a JSON object")
     return payload
+
+
+def _exact_object(pairs: "list[tuple[str, object]]") -> dict[str, object]:
+    """Build a JSON object, refusing duplicate member names at ANY depth.
+
+    ``json.loads`` is last-value-wins by default, so a record carrying a live
+    global run in one ``entries`` member and ``[]`` in a second would decode as
+    an EMPTY ledger — the fail-open read the strict codec exists to prevent
+    (#6994 round 2 F13). One malformed record is not worth guessing about, so a
+    duplicate member is a decode failure rather than a resolution rule.
+    """
+    seen: set[str] = set()
+    for name, _value in pairs:
+        if name in seen:
+            raise ValueError(f"duplicate member name {name!r}")
+        seen.add(name)
+    return dict(pairs)
 
 
 def _decode_entry(row: object) -> RunLedgerEntry:

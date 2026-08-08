@@ -30,7 +30,7 @@ operator removal; there is no second, tick-based retry mechanism to defer to.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Callable, Protocol
+from typing import TYPE_CHECKING, Callable, Optional, Protocol
 
 if TYPE_CHECKING:
     from ..domain.models import OrchestratorState, Session
@@ -67,22 +67,26 @@ def terminate_tech_lead_session(
 
     smm = getattr(deps, "state_machine_manager", None)
     machine_removed = attempt(
-        lambda: smm.remove_session_machine(session.terminal_id) if smm else None,
+        _void(lambda: smm.remove_session_machine(session.terminal_id) if smm else None),
         "remove state machine",
     )
     terminal_stopped = attempt(
-        lambda: host.kill_session(session.terminal_id), "stop terminal"
+        _void(lambda: host.kill_session(session.terminal_id)), "stop terminal"
     )
     host.state.drop_active_session(session.terminal_id)  # pure in-memory owner op
 
     claims = getattr(deps, "claim_manager", None)
     lease_id = getattr(session, "lease_id", None)
     claim_released = attempt(
-        lambda: claims.release_claim(number, lease_id)
-        if (claims and lease_id)
-        else None,
+        _void(
+            lambda: claims.release_claim(number, lease_id)
+            if (claims and lease_id)
+            else None
+        ),
         "release claim",
     )
+    # NOT "did it raise?": the run-ownership owner reports an unreachable
+    # coordination store as a typed refusal, so the verdict is its own.
     run_released = attempt(
         lambda: _release_run_hold(deps, session), "release the tech-lead run"
     )
@@ -92,9 +96,11 @@ def terminate_tech_lead_session(
         getattr(session, "scratch_worktree", False) and session.worktree_path
     )
     worktree_removed = attempt(
-        lambda: worktrees.remove(session.worktree_path, force=True)
-        if (disposable and worktrees)
-        else None,
+        _void(
+            lambda: worktrees.remove(session.worktree_path, force=True)
+            if (disposable and worktrees)
+            else None
+        ),
         "remove scratch worktree",
     )
     return TechLeadTerminationOutcome(
@@ -113,30 +119,62 @@ def terminate_tech_lead_session(
     )
 
 
-def _release_run_hold(deps: object, session: "Session") -> None:
+def _release_run_hold(deps: object, session: "Session") -> bool:
     """Hand the terminated session's repository-wide run hold back.
 
     The scope is derived from the SESSION's own launch stamp, so a global review
     releases ``global:*`` and a focused investigation releases ``issue:N`` — the
-    same identity the launch authority took. A session carrying no stamp has no
-    run to release.
+    same identity the launch authority took. A session carrying no stamp holds
+    no run, and that is a genuine success rather than a skipped effect.
+
+    A session that DOES hold a run with no ownership owner wired is a
+    composition error, and it fails loudly: reporting it as a clean release
+    would claim the repository-wide hold is gone when nothing ever looked.
     """
     from .tech_lead_run_admission import scope_of_session
 
-    ownership = getattr(deps, "run_ownership", None)
     scope = scope_of_session(session)
-    if ownership is None or scope is None:
-        return
-    ownership.end_run(scope.run_key)
+    if scope is None:
+        return True
+    ownership = getattr(deps, "run_ownership", None)
+    if ownership is None:
+        raise RuntimeError(
+            f"no tech-lead run ownership is wired, so run {scope.run_key} cannot"
+            " be handed back"
+        )
+    return ownership.end_run(scope.run_key).released
 
 
-def _effect_runner(issue_number: int) -> Callable[[Callable[[], object], str], bool]:
-    """Attempt one effect, reporting success without letting it stop the rest."""
+def _void(effect: Callable[[], object]) -> Callable[[], Optional[bool]]:
+    """An effect that can only signal failure by RAISING.
 
-    def attempt(effect: Callable[[], object], what: str) -> bool:
+    Its return value is discarded explicitly, so a collaborator that happens to
+    return something falsy can never be misread as a failed effect.
+    """
+
+    def run() -> Optional[bool]:
+        effect()
+        return None
+
+    return run
+
+
+def _effect_runner(
+    issue_number: int,
+) -> Callable[[Callable[[], Optional[bool]], str], bool]:
+    """Attempt one effect, reporting success without letting it stop the rest.
+
+    An effect that can fail WITHOUT raising returns its own boolean verdict, and
+    that verdict is reported verbatim; an effect wrapped in :func:`_void`
+    returns ``None`` and succeeds by not raising. Both shapes are needed because
+    the two coordination layers report failure differently — the run ledger
+    returns a typed refusal rather than raising (#6994 round 3 F12).
+    """
+
+    def attempt(effect: Callable[[], Optional[bool]], what: str) -> bool:
         try:
-            effect()
-            return True
+            verdict = effect()
+            return True if verdict is None else verdict
         except Exception:
             logger.warning(
                 "[TECH_LEAD] Failed to %s for issue #%d on timeout terminate",

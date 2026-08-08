@@ -270,8 +270,52 @@ def test_the_run_is_released_even_when_another_cleanup_effect_FAILS():
     assert host.shared.live_keys() == ()
 
 
-def test_a_failed_run_release_is_reported_rather_than_silently_clean():
-    """``clean`` must not claim success while a repository-wide hold survives."""
+def test_an_UNAVAILABLE_ledger_is_reported_as_a_failed_release_not_a_clean_one():
+    """The production contract: the store REFUSES, it does not raise (F12).
+
+    A caller that inferred success from "no exception" would report a leak-free
+    teardown while the durable entry was still there, blocking every conflicting
+    run until its lease expired.
+    """
+    host = _Host(flavor=TechLeadSessionFlavor.HEALTH_REVIEW)
+    session = FakeSession(ANCHOR, TechLeadSessionFlavor.HEALTH_REVIEW)
+    host.state.active_sessions.append(session)
+    assert host.ownership.claim(GlobalHealthReviewScope()).owned
+    host.shared.unavailable = True
+
+    outcome = host.terminate_tech_lead_session(session)
+
+    assert outcome.run_released is False
+    assert outcome.clean is False
+    assert "tech-lead run release" in outcome.failures()
+    assert host.shared.live_keys() == (GlobalHealthReviewScope().run_key,), (
+        "the durable hold is still there, so the outcome must not claim otherwise"
+    )
+
+
+def test_an_unavailable_release_KEEPS_the_lease_so_a_later_tick_retries():
+    """Dropping the lease would strand the durable entry until it expired."""
+    host = _Host(flavor=TechLeadSessionFlavor.HEALTH_REVIEW)
+    session = FakeSession(ANCHOR, TechLeadSessionFlavor.HEALTH_REVIEW)
+    host.state.active_sessions.append(session)
+    assert host.ownership.claim(GlobalHealthReviewScope()).owned
+    host.shared.unavailable = True
+    host.terminate_tech_lead_session(session)
+
+    assert host.ownership.owns(GlobalHealthReviewScope().run_key), (
+        "the engine must still remember the hold in order to retry it"
+    )
+
+    # The store comes back; the next reconciliation finds a held run that is no
+    # longer live and hands it back.
+    host.shared.unavailable = False
+    host.ownership.reconcile([])
+
+    assert host.shared.live_keys() == ()
+
+
+def test_a_raising_release_is_also_reported_rather_than_silently_clean():
+    """The other failure shape: an owner that blows up must not read as clean."""
 
     class RefusingOwnership:
         def end_run(self, run_key: str) -> None:
@@ -287,6 +331,19 @@ def test_a_failed_run_release_is_reported_rather_than_silently_clean():
     assert outcome.run_released is False
     assert outcome.clean is False
     assert "tech-lead run release" in outcome.failures()
+
+
+def test_a_stamped_session_with_NO_run_ownership_wired_fails_loudly():
+    """A composition error must not masquerade as a successful no-op."""
+    host = _Host(flavor=TechLeadSessionFlavor.HEALTH_REVIEW)
+    host.deps.run_ownership = None
+    session = FakeSession(ANCHOR, TechLeadSessionFlavor.HEALTH_REVIEW)
+    host.state.active_sessions.append(session)
+
+    outcome = host.terminate_tech_lead_session(session)
+
+    assert outcome.run_released is False
+    assert outcome.clean is False
 
 
 def test_a_session_with_no_launch_stamp_has_no_run_to_release():

@@ -72,6 +72,7 @@ from ..ports import make_trace_event
 from .tech_lead_run_ownership import (
     RunOwnershipReconciliation,
     RunOwnershipVerdict,
+    RunRelease,
     TechLeadRunOwnership,
 )
 from .tech_lead_session_policy import is_tech_lead_session
@@ -483,9 +484,14 @@ class TechLeadRunCoordinator:
             )
         )
 
-    def release_run(self, run_key: str) -> None:
-        """Hand a finished or withdrawn run back to the shared store."""
-        self._ownership.release(run_key)
+    def release_run(self, run_key: str) -> "RunRelease":
+        """Hand a finished or withdrawn run back to the shared store.
+
+        The typed result is passed through rather than swallowed: an
+        unavailable coordination store means the hold is still live, and only
+        the caller can decide whether that matters to what it is reporting.
+        """
+        return self._ownership.release(run_key)
 
     # ------------------------------------------------------------------
     # The global barrier, as it applies to a NEW request

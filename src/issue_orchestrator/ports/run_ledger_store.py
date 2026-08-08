@@ -22,6 +22,7 @@ terminating a healthy session.
 from __future__ import annotations
 
 import threading
+from contextlib import AbstractContextManager as ContextManager
 from datetime import datetime
 from typing import Callable, Optional, Protocol
 
@@ -78,12 +79,16 @@ class SingleInstanceRunLedgerStore:
         claimant: str = "single-instance",
         lease_seconds: int = 900,
         now: Optional[Callable[[], datetime]] = None,
+        lock: Optional[ContextManager[object]] = None,
     ) -> None:
         self._claimant = claimant
         self._lease_seconds = lease_seconds
         self._now = now or datetime.now
         self._ledger = RunLedger()
-        self._lock = threading.Lock()
+        # Injectable for the same reason ``now`` is: serialization is a
+        # collaborator, and a test that needs to OBSERVE the boundary
+        # substitutes an instrumented lock rather than reaching into internals.
+        self._lock: ContextManager[object] = lock or threading.Lock()
 
     def submit(self, request: RunLedgerRequest) -> RunLedgerOutcome:
         with self._lock:

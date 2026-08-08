@@ -116,6 +116,38 @@ class RunExecutionAdmission:
         return self.verdict is RunExecutionVerdict.STARTED
 
 
+class RunReleaseStatus(str, Enum):
+    """What happened when this engine tried to hand a run back.
+
+    Separate from a bare ``None`` return because the durable store reports
+    transport and codec failure as a typed ``UNAVAILABLE`` rather than by
+    raising: a caller that inferred success from "no exception" would report a
+    clean teardown while the shared ledger entry was still there, blocking every
+    conflicting run until its lease expired (#6994 round 2 F12).
+    """
+
+    RELEASED = "released"
+    # We held nothing, so there is nothing to give back. Success, not failure.
+    NOT_HELD = "not_held"
+    # The coordination store could not be reached. The local lease is KEPT so a
+    # later reconciliation retries the release rather than losing it.
+    UNAVAILABLE = "unavailable"
+
+
+@dataclass(frozen=True, slots=True)
+class RunRelease:
+    """The answer to "is this run definitively handed back?"."""
+
+    status: RunReleaseStatus
+    run_key: str
+    detail: str = ""
+
+    @property
+    def released(self) -> bool:
+        """True only when the durable hold is gone (or never existed)."""
+        return self.status is not RunReleaseStatus.UNAVAILABLE
+
+
 class RunReconcileStatus(str, Enum):
     """What one live run's lease looks like after a tick's reconciliation."""
 
@@ -242,6 +274,19 @@ _RECONCILE_STATUS: dict[RunLedgerStatus, RunReconcileStatus] = {
     RunLedgerStatus.LOST: RunReconcileStatus.LOST,
 }
 
+# What a RELEASE request's verdict means for us. Anything other than "we could
+# not tell" leaves nothing of ours in the shared cell — a peer holding the key
+# means our entry is already gone — so only UNAVAILABLE keeps the lease alive
+# for a retry.
+_RELEASE_STATUS: dict[RunLedgerStatus, RunReleaseStatus] = {
+    RunLedgerStatus.GRANTED: RunReleaseStatus.RELEASED,
+    RunLedgerStatus.ADOPTED: RunReleaseStatus.RELEASED,
+    RunLedgerStatus.BARRIER: RunReleaseStatus.RELEASED,
+    RunLedgerStatus.HELD_BY_PEER: RunReleaseStatus.RELEASED,
+    RunLedgerStatus.LOST: RunReleaseStatus.RELEASED,
+    RunLedgerStatus.UNAVAILABLE: RunReleaseStatus.UNAVAILABLE,
+}
+
 _LEASE_EFFECT: dict[RunLedgerStatus, _LeaseEffect] = {
     RunLedgerStatus.GRANTED: _LeaseEffect.REFRESH,
     RunLedgerStatus.ADOPTED: _LeaseEffect.REFRESH,
@@ -334,13 +379,20 @@ class TechLeadRunOwnership:
         with self._lock:
             return run_key in self._held
 
-    def release(self, run_key: str) -> None:
-        """Hand ``run_key`` back so a peer need not wait out the lease."""
+    def release(self, run_key: str) -> RunRelease:
+        """Hand ``run_key`` back so a peer need not wait out the lease.
+
+        Returns a TYPED result rather than nothing, because the durable store
+        can refuse without raising. On ``UNAVAILABLE`` the local lease is kept:
+        the run is no longer live, so the next reconciliation sees a held key
+        that is not live and retries the release — which is only possible if we
+        still remember holding it.
+        """
         with self._lock:
-            lease = self._held.pop(run_key, None)
+            lease = self._held.get(run_key)
             if lease is None:
-                return
-            self._store.submit(
+                return RunRelease(RunReleaseStatus.NOT_HELD, run_key)
+            outcome = self._store.submit(
                 RunLedgerRequest(
                     kind=RunLedgerRequestKind.RELEASE,
                     run_key=run_key,
@@ -348,6 +400,19 @@ class TechLeadRunOwnership:
                     lease_id=lease.lease_id,
                 )
             )
+            release = RunRelease(
+                _RELEASE_STATUS[outcome.status], run_key, detail=outcome.detail
+            )
+            if release.released:
+                del self._held[run_key]
+            else:
+                logger.warning(
+                    "[TECH_LEAD_RUN] Could not hand run %s back (%s); keeping the"
+                    " lease so the next reconciliation retries it",
+                    run_key,
+                    release.detail,
+                )
+            return release
 
     # ------------------------------------------------------------------
     # Execution — the atomic exclusivity decision
@@ -388,9 +453,14 @@ class TechLeadRunOwnership:
                 detail=outcome.detail,
             )
 
-    def end_run(self, run_key: str) -> None:
-        """A session for ``run_key`` is over; the run is no longer exclusive."""
-        self.release(run_key)
+    def end_run(self, run_key: str) -> RunRelease:
+        """A session for ``run_key`` is over; the run is no longer exclusive.
+
+        The typed result matters here more than anywhere else: the one-shot
+        timeout path terminates and then runs no further tick, so a caller that
+        assumed success would report a leak-free teardown that had not happened.
+        """
+        return self.release(run_key)
 
     # ------------------------------------------------------------------
     # Per-tick reconciliation
@@ -536,6 +606,8 @@ __all__ = [
     "RunOwnershipReconciliation",
     "RunOwnershipVerdict",
     "RunReconcileStatus",
+    "RunRelease",
+    "RunReleaseStatus",
     "TechLeadRunOwnership",
     "single_instance_run_ownership",
 ]

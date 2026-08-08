@@ -115,7 +115,14 @@ class Orchestrator:
     _loop_error_count: int = field(default=0, init=False)
     _loop_error_limit: int = field(default=3, init=False)
     _last_tick_time: float = field(default=0.0, init=False)
-    _state_lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
+    # The serialization boundary for every state-mutating transition: the tick,
+    # the control API, and the dashboard's tech-lead command surface all take it,
+    # so read-then-mutate sequences on `state` cannot interleave across threads
+    # (#6994 round 2 F8). Reentrant, so a transition nested inside a tick is
+    # free. A public, injectable collaborator rather than a hidden attribute:
+    # a test that needs to observe the boundary substitutes an instrumented
+    # lock instead of reaching into internals.
+    state_lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
     _external_close_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
     _external_resources_closed: bool = field(default=False, init=False, repr=False)
     _last_backup_check: float = field(default=0.0, init=False)
@@ -171,10 +178,6 @@ class Orchestrator:
     def last_tick_time(self) -> float:
         """Get the timestamp of the last tick."""
         return self._last_tick_time
-
-    @property
-    def state_lock(self) -> threading.RLock:
-        return self._state_lock
 
     def kill_session(self, name: str) -> None:
         """Kill a session by terminal ID (public wrapper)."""
@@ -381,7 +384,7 @@ class Orchestrator:
     def handle_session_completion(self, session: Session, status: SessionStatus) -> None: _handle_session_completion(session, status, self.state, self._completion_handler, self.deps.action_applier, self.observer, self.deps.worktree_manager, self._kill_session, self.config, self.deps.session_output, publish_recovery=self.deps.publish_recovery)
 
     def tick(self) -> bool:
-        with self._state_lock:
+        with self.state_lock:
             self._last_tick_time = time.time()
             self.deps.provider_resilience.close_expired()
             self.deps.services.state_health_check()
@@ -781,7 +784,7 @@ class Orchestrator:
         # Capture and clear the state-owned refresh flag before the cycle.
         # If request_refresh() is called during the cycle, it sets the state
         # flag again and the next tick will process that new request.
-        with self._state_lock:
+        with self.state_lock:
             refresh_to_process = self.state.queue_refresh_requested
             self.state.queue_refresh_requested = False
         # Promote any gated expedite follow-ups whose proposed-tech-lead gate an
@@ -848,7 +851,7 @@ class Orchestrator:
                 "mode": "web" if hasattr(self, "_web_mode") else "headless",
             }),
         ))
-        with self._state_lock:
+        with self.state_lock:
             if self.state.paused:
                 self.deps.events.publish(TraceEvent(
                     EventName.ORCHESTRATOR_PAUSED,
@@ -956,7 +959,7 @@ class Orchestrator:
     def request_shutdown(self, force: bool = False) -> None:
         """Request graceful or forced shutdown."""
         self._shutdown_requested = True
-        with self._state_lock:
+        with self.state_lock:
             active = self.state.active_sessions
         self.deps.events.publish(TraceEvent(
             EventName.ORCHESTRATOR_SHUTDOWN_REQUESTED,
@@ -976,7 +979,7 @@ class Orchestrator:
                     self._kill_session(s.terminal_id)
                 except Exception as e:
                     logger.warning("Failed to kill session %s: %s", s.terminal_id, e)
-            with self._state_lock:
+            with self.state_lock:
                 self.state.active_sessions = []
         else:
             logger.info("Shutdown requested - waiting for %d session(s)", len(active))
@@ -986,7 +989,7 @@ class Orchestrator:
         self._close_external_resources()
 
     def request_refresh(self, inflight_stable_ids: set[str] | None = None) -> None:
-        with self._state_lock:
+        with self.state_lock:
             self.state.queue_refresh_requested = True
             self._plan_applier.request_refresh(
                 inflight_stable_ids,
@@ -995,7 +998,7 @@ class Orchestrator:
             )
 
     def pause(self) -> None:
-        with self._state_lock:
+        with self.state_lock:
             self.state.paused = True
         logger.info("Orchestrator paused")
         self.deps.events.publish(TraceEvent(
@@ -1010,13 +1013,13 @@ class Orchestrator:
         needs one read-only refresh because warm cache state may be stale before
         the dashboard first renders.
         """
-        with self._state_lock:
+        with self.state_lock:
             self.state.paused = True
             self.state.queue_refresh_requested = True
         logger.info("Orchestrator marked paused for startup")
 
     def resume(self) -> None:
-        with self._state_lock:
+        with self.state_lock:
             self.state.paused = False
         logger.info("Orchestrator resumed")
         self.deps.events.publish(TraceEvent(
@@ -1055,16 +1058,16 @@ class Orchestrator:
     # #6994 R2 F2/F8: `launch_tech_lead_session` is the ONE entry point — it re-decides
     # subject eligibility, scope exclusivity and cross-engine ownership immediately
     # before starting. `launch_queued_*` is the raw step that authority delegates to.
-    # Both tech-lead transitions run under `_state_lock` (reentrant, so the tick's
+    # Both tech-lead transitions run under `state_lock` (reentrant, so the tick's
     # own launch nests safely) because admission and launch each read the pending
     # queue and then mutate it, and the dashboard command surface runs on a
     # different thread from the tick.
     def launch_queued_tech_lead_session(self, tech_lead: PendingTechLeadReview) -> Optional[Session]: return _launch_tech_lead_session(tech_lead, self.state, self.config, self._session_launcher, self.deps.session_restorer)
     def launch_tech_lead_session(self, tech_lead: PendingTechLeadReview) -> Optional[Session]:
-        with self._state_lock: return _launch_tech_lead_run(self, tech_lead)
+        with self.state_lock: return _launch_tech_lead_run(self, tech_lead)
     def ensure_health_review_anchor(self) -> Optional[PendingTechLeadReview]: return _ensure_health_review_anchor(self)
     def request_tech_lead_run(self, request: TechLeadRunRequest) -> TechLeadRunAdmission:
-        with self._state_lock: return _admit_tech_lead_run(self, request)
+        with self.state_lock: return _admit_tech_lead_run(self, request)
     def process_deferred_cleanups(self) -> None: self.state.pending_cleanups = self._github_workflow.process_deferred_cleanups(self.state.pending_cleanups, self._cleanup_manager)
     def _recover_orphaned_cleanups(self) -> None: self._plan_applier.recover_orphaned_cleanups()
     def scan_needs_code_review_prs(self) -> None: self._github_workflow.scan_needs_code_review_prs(self.state)

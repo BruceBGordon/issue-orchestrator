@@ -279,6 +279,20 @@ def test_a_transport_error_is_UNAVAILABLE_and_writes_nothing():
             ' "expires_at": "2999-01-01T00:00:00"}]}\n</io-run-ledger>',
             "a live row this build cannot classify",
         ),
+        (
+            '<io-run-ledger>\n{"version": 1, "entries": [{"run_key":'
+            ' "global:health_review", "scope_kind": "global_health_review",'
+            ' "lifecycle": "running", "claimant": "engine-b", "lease_id": "x",'
+            ' "started_at": "2026-08-07T12:00:00",'
+            ' "expires_at": "2999-01-01T00:00:00"}], "entries": []}'
+            "\n</io-run-ledger>",
+            "a duplicate member hiding a live global run",
+        ),
+        (
+            '<io-run-ledger>\n{"version": 1, "entries": [], "extra": 1}'
+            "\n</io-run-ledger>",
+            "an unexpected top-level member",
+        ),
     ],
 )
 def test_an_undecodable_ledger_refuses_the_request_and_writes_NOTHING(

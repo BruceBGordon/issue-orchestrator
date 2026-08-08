@@ -247,6 +247,12 @@ def _encoded(**overrides) -> str:
         ("<io-run-ledger>\nnot json\n</io-run-ledger>", "a malformed payload"),
         ("no ledger block at all", "a missing block"),
         (
+            "<io-run-ledger>\n"
+            + json.dumps({"version": RUN_LEDGER_VERSION, "entries": [], "extra": 1})
+            + "\n</io-run-ledger>",
+            "an unexpected top-level member",
+        ),
+        (
             f"<io-run-ledger>\n{json.dumps({'version': 2, 'entries': []})}\n"
             "</io-run-ledger>",
             "an unsupported schema version",
@@ -320,3 +326,45 @@ def test_a_promote_request_must_name_the_lease_it_holds():
         assert "lease" in str(exc)
     else:  # pragma: no cover - the guard is the point of the test
         raise AssertionError("a promote with no lease must fail fast")
+
+
+def test_a_DUPLICATE_top_level_member_cannot_hide_a_live_run():
+    """json.loads is last-value-wins; that would read a busy repo as free (F13).
+
+    A record carrying a live global run in one ``entries`` member and ``[]`` in
+    a second would otherwise decode as an empty ledger, and the adapter would
+    grant a conflicting reservation and overwrite the shared ref.
+    """
+    live = {
+        "run_key": HEALTH.run_key,
+        "scope_kind": HEALTH.kind.value,
+        "lifecycle": "running",
+        "claimant": "engine-b",
+        "lease_id": "peer-1",
+        "started_at": "2026-08-07T12:00:00",
+        "expires_at": "2999-01-01T00:00:00",
+    }
+    body = (
+        f'{{"version": {RUN_LEDGER_VERSION},'
+        f' "entries": [{json.dumps(live)}],'
+        f' "entries": []}}'
+    )
+
+    with pytest.raises(RunLedgerDecodeError):
+        parse_run_ledger(f"<io-run-ledger>\n{body}\n</io-run-ledger>")
+
+
+def test_a_DUPLICATE_member_inside_an_entry_is_refused_too():
+    """The rule is recursive: a shadowed scope kind is the same fail-open."""
+    body = (
+        f'{{"version": {RUN_LEDGER_VERSION}, "entries": [{{'
+        f'"run_key": "{HEALTH.run_key}",'
+        f' "scope_kind": "{HEALTH.kind.value}",'
+        f' "scope_kind": "issue",'
+        ' "lifecycle": "queued", "claimant": "engine-b", "lease_id": "peer-1",'
+        ' "started_at": "2026-08-07T12:00:00",'
+        ' "expires_at": "2999-01-01T00:00:00"}]}'
+    )
+
+    with pytest.raises(RunLedgerDecodeError):
+        parse_run_ledger(f"<io-run-ledger>\n{body}\n</io-run-ledger>")
