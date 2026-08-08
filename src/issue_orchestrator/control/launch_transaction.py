@@ -137,9 +137,12 @@ class PendingWorkLaunchClaim:
         the two must agree, because the ledger row is what a quarantine
         escalates against when the payload can no longer be read (#6999 F12).
 
-        A store failure returns a RETRYABLE_FAILURE launch result rather than raising:
-        nothing about the request failed, the queue item is untouched, and the
-        alternative - spawning anyway - is the crash window this exists to close.
+        A store failure returns a CLAIM_UNRECORDED launch result rather than
+        raising: nothing about the request failed, so the queue item is left
+        untouched with its retry budget unspent - which is exactly what
+        separates this from a RETRYABLE_FAILURE, whose spend would be written
+        against the deferred row this write just failed to create - and the
+        alternative, spawning anyway, is the crash window this exists to close.
         """
         try:
             self.claims.hold_pending_work_claim(
