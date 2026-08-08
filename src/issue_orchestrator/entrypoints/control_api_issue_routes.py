@@ -6,7 +6,7 @@ import json
 import logging
 import sys
 from collections.abc import Mapping
-from dataclasses import dataclass, is_dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -21,6 +21,11 @@ from ..control.worktree_manager import get_worktree_path
 from ..domain.models import get_completion_path
 from ..domain.review_exchange_verdict import ExchangeVerdict
 from ..domain.session_run import SessionRunAssets
+from ..ports.operator_issue_commands import (
+    OperatorCommandIntent,
+    OperatorCommandOutcome,
+    OperatorCommandStatus,
+)
 from ..infra.env import ENV_PREFIX
 from .control_api_issue_support import ControlApiIssueDependency, StateLockFn
 
@@ -31,6 +36,117 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 control_issue_router = APIRouter()
+
+
+#: What each command is called once it has happened, for the operator reading
+#: the toast. Wording is transport policy: the command reports the transition,
+#: this decides how to say it (#6999 F6 round 7).
+_OPERATOR_COMMAND_WORDING = {
+    OperatorCommandIntent.RETRY: ("queued for retry", "retried"),
+    OperatorCommandIntent.DISMISS: ("dismissed", "dismissed"),
+}
+
+
+def _operator_command(
+    deps: "ControlApiIssueDependency", issue_number: int, intent: OperatorCommandIntent
+) -> JSONResponse:
+    """Run one operator command and map its typed outcome to HTTP (#6999 F5).
+
+    ALL that is left here is transport. The command owns which labels it
+    clears, that the shared block goes first, that a refusal stops everything
+    after it, and that local retry/queue state is settled only once the GitHub
+    side committed. Both buttons route through this one function, so neither
+    can grow its own version of that ordering - which is precisely how dismiss
+    came to prune its state and report success over a refusal retry honoured.
+    """
+    orchestrator = deps.get_orchestrator()
+    if orchestrator is None:
+        return JSONResponse(
+            {"success": False, "error": "Orchestrator not initialized"},
+            status_code=503,
+        )
+    commands = orchestrator.operator_issue_commands
+    invoke = {
+        OperatorCommandIntent.RETRY: commands.retry,
+        OperatorCommandIntent.DISMISS: commands.dismiss,
+    }[intent]
+    try:
+        outcome = invoke(issue_number)
+    except Exception as exc:
+        logger.exception(
+            "Error running %s on issue #%d: %s", intent.value, issue_number, exc
+        )
+        return JSONResponse({"success": False, "error": str(exc)}, status_code=500)
+    return _operator_command_response(outcome)
+
+
+def _settled_body(outcome: OperatorCommandOutcome, done: str, attempted: str) -> dict:
+    del attempted
+    return {
+        "success": True,
+        "message": f"Issue #{outcome.issue_number} {done}",
+        "removed_labels": list(outcome.removed),
+    }
+
+
+def _still_blocked_body(
+    outcome: OperatorCommandOutcome, done: str, attempted: str
+) -> dict:
+    del done
+    cause = (
+        f"{', '.join(outcome.held_by)} still requires it"
+        if outcome.held_by
+        else "it could not be cleared"
+    )
+    return {
+        "success": False,
+        "error": (
+            f"Issue #{outcome.issue_number} was not {attempted}: "
+            f"{outcome.blocked} is still on the issue because {cause}."
+        ),
+        "removed_labels": list(outcome.removed),
+        "failed_labels": [outcome.blocked],
+        "held_by": list(outcome.held_by),
+    }
+
+
+def _incomplete_body(
+    outcome: OperatorCommandOutcome, done: str, attempted: str
+) -> dict:
+    del done
+    return {
+        "success": False,
+        "error": (
+            f"Issue #{outcome.issue_number} was not {attempted}: failed to "
+            f"remove {list(outcome.failed)} from GitHub. Removed "
+            f"{list(outcome.removed)} successfully; retry the action."
+        ),
+        "removed_labels": list(outcome.removed),
+        "failed_labels": list(outcome.failed),
+    }
+
+
+#: One row per outcome the command can produce: how to describe it, and what
+#: that means over HTTP. A table rather than a branch chain because the set is
+#: closed and exhaustive - a new outcome should fail loudly with a KeyError
+#: here, not fall through some `else` into a plausible-looking response.
+#:
+#: Neither unsettled row is a 500 (nothing went wrong; the command did exactly
+#: what it should) and neither is a 200 (the issue really is still blocked).
+#: 409 with the labels still on the issue lets the dashboard say so instead of
+#: showing an optimistic toast.
+_OPERATOR_RESPONSE_BY_STATUS = {
+    OperatorCommandStatus.COMMITTED: (_settled_body, 200),
+    OperatorCommandStatus.STILL_BLOCKED: (_still_blocked_body, 409),
+    OperatorCommandStatus.INCOMPLETE: (_incomplete_body, 409),
+}
+
+
+def _operator_command_response(outcome: OperatorCommandOutcome) -> JSONResponse:
+    """Turn one typed outcome into this API's response contract."""
+    done, attempted = _OPERATOR_COMMAND_WORDING[outcome.intent]
+    build, code = _OPERATOR_RESPONSE_BY_STATUS[outcome.status]
+    return JSONResponse(build(outcome, done, attempted), status_code=code)
 
 
 @control_issue_router.post("/api/preflight-push")
@@ -475,79 +591,7 @@ async def retry_issue(
     deps: ControlApiIssueDependency,
 ) -> JSONResponse:
     """Retry a blocked issue by removing the blocked label and re-queueing."""
-    orchestrator = deps.get_orchestrator()
-    if orchestrator is None:
-        return JSONResponse(
-            {"success": False, "error": "Orchestrator not initialized"},
-            status_code=503,
-        )
-
-    try:
-        lm = orchestrator.deps.label_manager
-        from ..control.retry_policy import labels_to_remove_for_retry
-
-        current_labels = orchestrator.repository_host.get_issue_labels(issue_number)
-        labels_to_remove = labels_to_remove_for_retry(current_labels, lm)
-
-        removed: list[str] = []
-        failed: list[str] = []
-        for label in labels_to_remove:
-            try:
-                orchestrator.repository_host.remove_label(issue_number, label)
-                removed.append(label)
-            except Exception:
-                failed.append(label)
-
-        # Only clear in-memory retry gates once every retry-gating label is
-        # confirmed absent on GitHub. If a remove_label() call failed, the
-        # issue is still GitHub-side blocked; pruning session_history and
-        # failed_this_cycle would just make the planner re-launch into a
-        # still-blocked issue. Skip the state reset AND report partial
-        # failure so the UI does not optimistically requeue the issue and
-        # show a misleading "queued for retry" toast.
-        if failed:
-            logger.warning(
-                "[retry] Issue #%d retry incomplete: removed=%s, "
-                "remove_label failed for=%s; in-memory retry gates left in "
-                "place so the planner won't relaunch into a still-blocked issue",
-                issue_number,
-                removed,
-                failed,
-            )
-            return JSONResponse(
-                {
-                    "success": False,
-                    "error": (
-                        f"Issue #{issue_number} not queued for retry: failed to "
-                        f"remove retry-gating labels {failed} from GitHub. "
-                        f"Removed {removed} successfully; retry the action."
-                    ),
-                    "removed_labels": removed,
-                    "failed_labels": failed,
-                },
-                status_code=409,
-            )
-
-        _reset_state_for_retry(
-            orchestrator,
-            issue_number,
-            removed,
-            deps.with_state_lock,
-        )
-
-        logger.info("[retry] Issue #%d retried, removed labels: %s", issue_number, removed)
-        return JSONResponse({
-            "success": True,
-            "message": f"Issue #{issue_number} queued for retry",
-            "removed_labels": removed,
-        })
-
-    except Exception as exc:
-        logger.exception("Error retrying issue #%d: %s", issue_number, exc)
-        return JSONResponse({
-            "success": False,
-            "error": str(exc),
-        }, status_code=500)
+    return _operator_command(deps, issue_number, OperatorCommandIntent.RETRY)
 
 
 @control_issue_router.post("/api/issues/{issue_number}/dismiss")
@@ -556,57 +600,7 @@ async def dismiss_issue(
     deps: ControlApiIssueDependency,
 ) -> JSONResponse:
     """Dismiss a blocked issue without retrying."""
-    orchestrator = deps.get_orchestrator()
-    if orchestrator is None:
-        return JSONResponse(
-            {"success": False, "error": "Orchestrator not initialized"},
-            status_code=503,
-        )
-
-    try:
-        lm = orchestrator.deps.label_manager
-        labels_to_remove = [
-            lm.blocked,
-            lm.needs_human,
-            lm.tech_lead_needs_human,
-            lm.blocked_failed,
-            lm.in_progress,
-        ]
-
-        removed = []
-        for label in labels_to_remove:
-            try:
-                orchestrator.repository_host.remove_label(issue_number, label)
-                removed.append(label)
-            except Exception:
-                pass
-
-        def _prune_state() -> None:
-            orchestrator.state.session_history = [
-                entry for entry in orchestrator.state.session_history
-                if entry.issue_number != issue_number
-            ]
-            QueueCache(
-                orchestrator.config,
-                orchestrator.state,
-                orchestrator.deps.queue_cache_store,
-            ).remove_issue_and_save(issue_number)
-
-        deps.with_state_lock(_prune_state)
-
-        logger.info("[dismiss] Issue #%d dismissed, removed labels: %s", issue_number, removed)
-        return JSONResponse({
-            "success": True,
-            "message": f"Issue #{issue_number} dismissed",
-            "removed_labels": removed,
-        })
-
-    except Exception as exc:
-        logger.exception("Error dismissing issue #%d: %s", issue_number, exc)
-        return JSONResponse({
-            "success": False,
-            "error": str(exc),
-        }, status_code=500)
+    return _operator_command(deps, issue_number, OperatorCommandIntent.DISMISS)
 
 
 @control_issue_router.post("/api/issues/{issue_number}/close")
@@ -679,68 +673,6 @@ async def close_issue(
             "success": False,
             "error": str(exc),
         }, status_code=500)
-
-
-def _reset_state_for_retry(
-    orchestrator: "Orchestrator",
-    issue_number: int,
-    removed_labels: list[str],
-    with_state_lock: StateLockFn,
-) -> None:
-    """Make a timed-out / blocked-failed issue eligible for the planner again.
-
-    Removing the GitHub label is not enough: ``QueueCache.evaluate_issue``
-    rejects any issue whose number is in ``state.session_history`` (or
-    ``state.failed_this_cycle``), so the planner keeps skipping it on every
-    refresh until the orchestrator restarts.
-
-    The retry-gate clearing itself is owned by
-    :meth:`RetryHistoryState.make_retryable`; this function coordinates
-    the surrounding queue-cache refresh so the planner sees the issue
-    back in the queue on its next tick instead of waiting for a GitHub
-    refresh. Callers must pass only labels that were successfully
-    removed from GitHub — leaving retry-gating labels in place server-
-    side while clearing local state would let the planner re-launch
-    into an issue GitHub still considers blocked.
-    """
-    from ..control.retry_history_state import RetryHistoryState
-
-    def _reset() -> None:
-        state = orchestrator.state
-        RetryHistoryState(state).make_retryable(issue_number)
-
-        # Cached queue/scope copies still carry the stale labels; use the
-        # scope copy (queue copy will have been rejected after timeout) and
-        # let `upsert_refreshed_issue` re-evaluate against the freshly
-        # pruned state.
-        cached = next(
-            (
-                issue for issue in state.cached_scope_issues
-                if issue.number == issue_number
-            ),
-            None,
-        )
-        if cached is None or not is_dataclass(cached) or isinstance(cached, type):
-            return
-        new_labels = tuple(
-            label for label in cached.labels
-            if label not in removed_labels
-        )
-        updated_issue = replace(cached, labels=new_labels)
-        queue_cache = QueueCache(
-            orchestrator.config,
-            state,
-            orchestrator.deps.queue_cache_store,
-        )
-        queue_cache.upsert_refreshed_issue(updated_issue)
-        queue_cache.save_snapshot()
-        logger.debug(
-            "[cache] Reset issue #%d for retry: removed labels=%s",
-            issue_number,
-            removed_labels,
-        )
-
-    with_state_lock(_reset)
 
 
 def _get_issue_title(

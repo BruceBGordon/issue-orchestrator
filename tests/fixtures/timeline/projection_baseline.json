@@ -443,6 +443,12 @@
     "status": "completed",
     "step": "pr.view_changed"
   },
+  "provider.auth_failed": {
+    "level": "detail",
+    "phase": "system",
+    "status": "completed",
+    "step": "provider.auth_failed"
+  },
   "provider.issue_blocked": {
     "level": "phase",
     "phase": "blocked",
@@ -761,6 +767,12 @@
     "status": "failed",
     "step": "blocked"
   },
+  "session.claim_unreadable": {
+    "level": "detail",
+    "phase": "in_progress",
+    "status": "failed",
+    "step": "claim_unreadable"
+  },
   "session.cleanup": {
     "level": "detail",
     "phase": "in_progress",
@@ -784,6 +796,12 @@
     "phase": "in_progress",
     "status": "failed",
     "step": "invalid_completion_record"
+  },
+  "session.launch_blocked_provider": {
+    "level": "detail",
+    "phase": "in_progress",
+    "status": "failed",
+    "step": "launch_blocked_provider"
   },
   "session.launched": {
     "level": "detail",
@@ -821,6 +839,12 @@
     "status": "completed",
     "step": "processing_completed"
   },
+  "session.provider_auth_terminated": {
+    "level": "detail",
+    "phase": "in_progress",
+    "status": "failed",
+    "step": "provider_auth_terminated"
+  },
   "session.restored": {
     "level": "detail",
     "phase": "in_progress",
@@ -832,6 +856,18 @@
     "phase": "in_progress",
     "status": "completed",
     "step": "resumed"
+  },
+  "session.run_unrestorable": {
+    "level": "detail",
+    "phase": "in_progress",
+    "status": "failed",
+    "step": "run_unrestorable"
+  },
+  "session.run_unrestorable_claim_unreadable": {
+    "level": "detail",
+    "phase": "in_progress",
+    "status": "failed",
+    "step": "run_unrestorable_claim_unreadable"
   },
   "session.slow": {
     "level": "detail",

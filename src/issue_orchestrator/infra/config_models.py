@@ -169,6 +169,18 @@ class ProviderCircuitBreakerConfig:
     cooldown_seconds: int = 1800
     max_cooldowns: int = 6
     label: str = "blocked:provider-unavailable"
+    # Auth failures trip on their own threshold. The default is 1 because the
+    # credential probe reads local state and is deterministic: one confirmed
+    # "not logged in" is evidence, not a blip. Raise it only if a provider's
+    # probe proves flaky.
+    auth_failure_threshold: int = 1
+    # An expired login is human-fixable, so the auth cooldown is long: retrying
+    # on the transient cooldown would just re-burn the fleet until a human
+    # notices. Recovery does not wait it out, and does not need a session to
+    # succeed either — while the circuit is open nothing launches, so the
+    # credential probe itself is what observes the human re-authenticating and
+    # clears the circuit before the next launch.
+    auth_cooldown_seconds: int = 21600
 
 
 @dataclass

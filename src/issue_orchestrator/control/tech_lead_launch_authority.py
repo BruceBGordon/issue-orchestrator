@@ -286,7 +286,7 @@ class TechLeadLaunchAuthority:
         self, tech_lead: PendingTechLeadReview, refusal: TechLeadLaunchRefusal
     ) -> None:
         """Remove a run whose subject stopped being worth investigating."""
-        from .session_routing import PendingSessionQueues
+        from .pending_session_queues import PendingSessionQueues
 
         PendingSessionQueues(self._state).remove_tech_lead(tech_lead.issue_number)
         self._ownership.release(refusal.run_key)

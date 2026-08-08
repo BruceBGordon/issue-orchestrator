@@ -28,11 +28,13 @@ from ..domain.models import (
     AwaitingMergeTerminalStatus,
     DiscoveredFailure,
 )
+from .needs_human_block import NeedsHumanCause
 from .action_base import Action as Action, ActionType as ActionType
 # Action result types are the Apply/report half of this boundary. They live in
 # `action_results.py` and remain re-exported here for existing importers.
 from .action_results import ActionResult as ActionResult
 from .action_results import ActionResultType as ActionResultType
+from .action_results import SupportsApplyAction as SupportsApplyAction
 
 # Tech-lead action types live in their own module for cohesion and line budget;
 # re-exported here (including the domain value objects their fields use) so
@@ -76,6 +78,13 @@ class AddLabelAction(Action):
     issue_number: int = 0
     label: str = ""
     issue_key: str = ""  # stable_id for SSE events; falls back to str(issue_number) when empty
+    # Which lifecycle is asserting the shared needs-human block, when that is
+    # the label being added (#6999 F2 round 3). Ignored for every other label,
+    # and REQUIRED for that one: the applier refuses a governed-label action
+    # that names no cause rather than defaulting it. A catch-all default made
+    # every uncaused site look correct while collapsing independent assertions
+    # onto one row, where a single release erased them all.
+    needs_human_cause: NeedsHumanCause | None = None
     action_type: ActionType = field(default=ActionType.ADD_LABEL, init=False)
 
 
@@ -86,6 +95,12 @@ class RemoveLabelAction(Action):
     issue_number: int = 0
     label: str = ""
     issue_key: str = ""  # stable_id for SSE events; falls back to str(issue_number) when empty
+    # Which lifecycle is WITHDRAWING its claim on the shared needs-human block
+    # (#6999 F2 round 3). The withdrawal always happens; the label only comes
+    # off if no other cause still requires it. An operator or terminal-recovery
+    # clear is NOT one of these - it overrides every cause and goes through the
+    # owner's force_clear instead, so the two intents cannot be confused.
+    needs_human_cause: NeedsHumanCause | None = None
     action_type: ActionType = field(default=ActionType.REMOVE_LABEL, init=False)
 
 

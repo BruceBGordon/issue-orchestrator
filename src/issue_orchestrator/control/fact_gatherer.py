@@ -31,6 +31,7 @@ from ..infra.config import Config
 from ..events import EventName
 from ..ports.repository_host import RepositoryHost, RepositoryHostError
 from ..ports import EventSink,  make_trace_event
+from .provider_launch_readiness import ProviderLaunchReadiness
 from .health_review_trigger import (
     classify_tech_lead_anchor_issues,
     discover_open_tech_lead_anchor_issues,
@@ -198,6 +199,7 @@ class FactGatherer:
         issues: list["Issue"],
         stale_in_progress_issues: list["Issue"] | None = None,
         stale_claim_issues: list["Issue"] | None = None,
+        provider_launch: ProviderLaunchReadiness | None = None,
     ) -> "OrchestratorSnapshot":
         """Create an immutable snapshot for planning.
 
@@ -206,6 +208,10 @@ class FactGatherer:
             issues: Current list of issues from GitHub
             stale_in_progress_issues: Issues with in-progress label but no running session
             stale_claim_issues: Issues with io:claimed label but expired/invalid claim
+            provider_launch: Provider launch eligibility the tick sampled before
+                planning (#6999 A3). Passed in rather than sampled here because
+                sampling probes a CLI and writes circuit state, which this
+                read-only gatherer must not do.
 
         Returns:
             Immutable snapshot of orchestrator state for Planner
@@ -264,6 +270,7 @@ class FactGatherer:
             session_history_issue_numbers=frozenset(e.issue_number for e in state.session_history),
             e2e_occupies_slot=e2e_occupies_slot,
             e2e_due=e2e_due,
+            provider_launch=provider_launch or ProviderLaunchReadiness.empty(),
         )
 
     def _read_e2e_slot_facts(self) -> tuple[bool, bool]:

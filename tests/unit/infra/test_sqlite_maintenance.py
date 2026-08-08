@@ -156,3 +156,54 @@ def test_open_issue_corpus_db_is_backed_up_when_due(tmp_path):
     results = run_backups_if_due(config)
 
     assert any(db.db.key == "open_issue_corpus" and db.performed for db in results)
+
+
+def test_pending_work_claims_is_registered_for_backup_and_pragmas(tmp_path):
+    """The only durable record of dequeued work must not be unmanaged (#6999 F10).
+
+    Losing or corrupting this database is direct queued-work loss, so it needs
+    the same startup integrity checks, pragma enforcement and backups as every
+    other authoritative store.
+    """
+    config = Config()
+    config.repo_root = tmp_path
+
+    registered = {db.key: db for db in list_sqlite_databases(config)}
+
+    claims = registered["pending_work_claims"]
+    assert claims.backup
+    assert claims.enforce_pragmas
+    assert claims.enabled_fn(config)
+    assert claims.path_fn(config) == state_dir(tmp_path) / "pending_work_claims.sqlite"
+
+
+def test_pending_work_claims_is_backed_up(tmp_path):
+    from datetime import datetime, timezone
+
+    config = Config()
+    config.repo_root = tmp_path
+    _create_sqlite_db(state_dir(tmp_path) / "pending_work_claims.sqlite")
+
+    results = run_backups_if_due(config)
+
+    assert any(r.db.key == "pending_work_claims" and r.performed for r in results)
+    date_str = datetime.now(timezone.utc).date().isoformat()
+    backup = (
+        tmp_path / ".issue-orchestrator" / "backups" / "sqlite"
+        / "pending_work_claims" / "daily" / f"{date_str}.db"
+    )
+    assert backup.exists()
+
+
+def test_the_real_claim_store_writes_where_the_registry_says(tmp_path):
+    """The registry entry and the adapter must not drift apart."""
+    from issue_orchestrator.execution.pending_work_claim_store import (
+        SqlitePendingWorkClaimStore,
+    )
+
+    config = Config()
+    config.repo_root = tmp_path
+    SqlitePendingWorkClaimStore.for_repo(tmp_path)
+
+    registered = {db.key: db for db in list_sqlite_databases(config)}
+    assert registered["pending_work_claims"].path_fn(config).is_file()

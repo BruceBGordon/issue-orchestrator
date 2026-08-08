@@ -6,6 +6,8 @@ import shutil
 from pathlib import Path
 
 from ...adapters.git.git_cli import GitCLI, SubprocessCommandRunner
+from ...execution.agent_runner_providers import get_provider
+from ...ports.provider_resilience import ProviderErrorType
 
 
 AI_GATE_MESSAGE_SUMMARY_LIMIT = 240
@@ -14,12 +16,15 @@ AI_GATE_MESSAGE_SUMMARY_LIMIT = 240
 AI_GATE_CONSOLE_DETAILS_LIMIT = 2_000
 """Maximum detail length for command surfaces without expandable diagnostics."""
 
-_CLAUDE_AUTH_FAILURE_MARKERS = (
-    "failed to authenticate",
-    "oauth session expired",
-    "not logged in",
-    "please run /login",
-)
+CLAUDE_GATE_PROVIDER = "claude-code"
+"""The provider adapter that owns interpretation of this gate's CLI output.
+
+The gate spawns the ``claude`` CLI, so the Claude Code provider adapter is the
+one that knows what its auth banners look like (#6999). The gate used to keep
+its own four-marker table, which had already drifted from the provider's: each
+side recognised banners the other missed, so an expiry that the gate caught at
+startup could still run a session to its 90-minute timeout, and vice versa.
+"""
 
 
 def _test_ai_gate_env(project_root: Path) -> dict[str, str]:
@@ -127,7 +132,16 @@ def _detect_blocked_from_output(output: str) -> bool:
 
 
 def _is_claude_auth_failure(output: str) -> bool:
-    return any(marker in output.lower() for marker in _CLAUDE_AUTH_FAILURE_MARKERS)
+    """Ask the provider adapter whether this CLI output is an auth failure.
+
+    The gate carries no banner text of its own: it hands the raw output to the
+    provider that produced it and reads back a typed
+    :class:`ProviderErrorType`. Same owner the readiness probe and live-session
+    diagnosis consult, so a banner learned for one is known to all three.
+    """
+    return get_provider(CLAUDE_GATE_PROVIDER).classify_output(output) is (
+        ProviderErrorType.AUTH
+    )
 
 
 def _claude_process_failure_message(
@@ -156,9 +170,17 @@ def _claude_process_failure_message(
 def evaluate_claude_ai_gate_result(
     *, returncode: int, stdout: str, stderr: str, work_repo: Path
 ) -> tuple[bool, str]:
-    """Classify Claude execution, provider, and hook outcomes for the AI gate."""
+    """Classify Claude execution, provider, and hook outcomes for the AI gate.
+
+    A clean exit that reports the hook block is checked before the provider
+    auth question. The provider's table is broader than the four markers this
+    module used to keep — it also knows generic auth words like "forbidden" —
+    and Claude describing a blocked push is free to use them. A gate run that
+    produced its own success evidence is not an auth failure, whatever words
+    the report happens to contain.
+    """
     output = stdout + stderr
-    if returncode != 0 or _is_claude_auth_failure(output):
+    if returncode != 0:
         return False, _claude_process_failure_message(
             returncode=returncode,
             stdout=stdout,
@@ -170,6 +192,13 @@ def evaluate_claude_ai_gate_result(
             True,
             "AI gate test passed: Claude was blocked from running --no-verify\n"
             f"Output: {output[:500]}",
+        )
+    if _is_claude_auth_failure(output):
+        return False, _claude_process_failure_message(
+            returncode=returncode,
+            stdout=stdout,
+            stderr=stderr,
+            work_repo=work_repo,
         )
     return (
         False,
@@ -208,6 +237,7 @@ def format_ai_gate_console_details(message: str) -> str:
 
 
 __all__ = [
+    "CLAUDE_GATE_PROVIDER",
     "_copy_hook_dir",
     "_detect_blocked_from_output",
     "_init_test_ai_gate_repo",

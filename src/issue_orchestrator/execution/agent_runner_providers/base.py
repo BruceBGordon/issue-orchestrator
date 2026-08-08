@@ -11,8 +11,14 @@ import subprocess
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING
 
+from issue_orchestrator.ports.provider_readiness import ProviderReadiness
+from issue_orchestrator.ports.provider_resilience import ProviderErrorType
+
+from ..agent_runner_errors import classify_provider_output
+
 if TYPE_CHECKING:
     from issue_orchestrator.domain.sandbox_scope import SandboxScope
+    from issue_orchestrator.ports.command_runner import CommandRunner
 
 
 class CLIProvider(ABC):
@@ -24,8 +30,12 @@ class CLIProvider(ABC):
     - build_command: Build the full command argv
 
     Subclasses may override:
-    - is_authenticated: Check if CLI is authenticated (default: True if available)
+    - check_readiness: Run the CLI's own cheap auth probe (default: no probe)
     - description: Human-readable description
+
+    Provider adapters are the **only** place raw CLI text is interpreted
+    (#6999). ``check_readiness`` and ``classify_output`` return typed values;
+    control never sees a banner string or an exit code.
     """
 
     @property
@@ -114,13 +124,57 @@ class CLIProvider(ABC):
         """Check if the CLI executable is installed and in PATH."""
         return shutil.which(self.executable) is not None
 
-    def is_authenticated(self) -> bool:
-        """Check if the CLI is authenticated and ready to use.
+    def check_readiness(self, runner: "CommandRunner") -> ProviderReadiness:
+        """Run this CLI's cheapest non-interactive credential probe.
 
-        Default implementation just checks availability.
-        Subclasses can override to perform actual auth checks.
+        Default: report installation only. A provider that ships no auth probe
+        answers ``UNKNOWN`` rather than ``READY`` — "I could not tell" must
+        never be recorded as "credentials confirmed" — and ``UNKNOWN`` is still
+        launchable, so an unprobeable provider behaves exactly as it did before
+        this boundary existed.
+
+        Subclasses override this (not ``is_authenticated``) so there is one
+        implementation of "is this provider logged in" per provider.
         """
-        return self.is_available()
+        del runner  # the default probe runs nothing
+        if not self.is_available():
+            return ProviderReadiness.not_installed(
+                self.name, f"{self.executable} not found in PATH"
+            )
+        return ProviderReadiness.unknown(
+            self.name, f"{self.executable} has no non-interactive auth probe"
+        )
+
+    def classify_output(self, output: str) -> ProviderErrorType | None:
+        """Classify raw provider output through the one classification table.
+
+        Providers may override to add a provider-specific pre-pass, but must
+        delegate the token matching itself so no second table appears.
+        """
+        return classify_provider_output(output)
+
+    def is_authenticated(self, runner: "CommandRunner | None" = None) -> bool:
+        """Whether a probe positively confirmed working credentials.
+
+        Delegates to :meth:`check_readiness` so the probe has exactly one
+        implementation. Without a ``runner`` no probe can be executed, so this
+        degrades to the availability answer it has always given.
+        """
+        if runner is None:
+            return self.is_available()
+        return self.check_readiness(runner).authenticated
+
+    # Credential probes must fail fast: they run on the launch path, and a
+    # hung probe would reintroduce the very stall this boundary removes.
+    AUTH_PROBE_TIMEOUT_SECONDS = 15
+
+    def _run_auth_probe(
+        self, runner: "CommandRunner", argv: list[str]
+    ) -> tuple[str, int | None, bool]:
+        """Run one credential probe, returning (combined output, exit code, timed out)."""
+        result = runner.run(argv, timeout_seconds=self.AUTH_PROBE_TIMEOUT_SECONDS)
+        combined = f"{result.stdout}\n{result.stderr}"
+        return combined, result.returncode, result.timed_out
 
     def check_version(self) -> str | None:
         """Get the CLI version string, if available."""

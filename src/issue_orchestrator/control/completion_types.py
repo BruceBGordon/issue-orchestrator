@@ -14,6 +14,13 @@ ERROR_PREFIX_TECH_LEAD_DECISION = "tech_lead_decision"
 # no longer match it — tamper evidence. Critical like the decision prefix
 # (#6761 re-review finding 1).
 ERROR_PREFIX_TECH_LEAD_AUTHORITY = "tech_lead_authority"
+# A label that only NeedsHumanBlock may write reached an ordinary label writer
+# (#6999 F2 round 5). Its own prefix, and NOT one of the publish prefixes,
+# because the two consequences differ: a publish error is retried by the
+# publish-recovery lane, whereas re-running this one would refuse again. What it
+# must do instead is force the completion to FAIL, so an untrusted block request
+# that was dropped can never be reported as a success.
+ERROR_PREFIX_GOVERNED_LABEL = "governed_label"
 REVIEW_EXCHANGE_ERROR_PREFIX = "review_exchange:"
 
 

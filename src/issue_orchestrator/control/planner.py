@@ -30,12 +30,9 @@ from ..infra.logging_config import issue_log
 from ..ports.issue import Issue
 from ..domain.models import (
     PendingTechLeadReview,
-    TechLeadFacts,
     active_retrospective_review_issue_numbers,
 )
 from ..domain.post_publish_escalation import build_post_publish_escalation_comment
-from ..domain.tech_lead_naming import TECH_LEAD_DISPLAY_NAME
-from ..domain.tech_lead_session import TechLeadCreationOrigin
 
 if TYPE_CHECKING:
     from .provider_resilience import ProviderResilienceManager
@@ -93,10 +90,9 @@ from .reconciliation import build_expected_for_mutation
 from .stuck_sweep import build_stuck_sweep_escalation_actions
 from .planner_types import OrchestratorSnapshot, Plan, PlanContext, SkippedItem
 from .tech_lead_issue_policy import (
-    apply_tech_lead_priority_prefix,
-    batch_review_issue_labels,
-    tech_lead_issue_milestone_intent,
+    plan_batch_review_issue,
 )
+from .needs_human_block import NeedsHumanCause
 
 logger = logging.getLogger(__name__)
 
@@ -157,7 +153,9 @@ class Planner:
         self.rework_workflow = rework_workflow
         self.tech_lead_workflow = tech_lead_workflow
         self.provider_resilience = provider_resilience
-        self.provider_policy = ProviderAvailabilityPolicy(config, provider_resilience) if provider_resilience else None
+        self.provider_policy = ProviderAvailabilityPolicy(
+            config, provider_resilience
+        ) if provider_resilience else None
         if label_manager is None:
             from .label_manager import LabelManager
             label_manager = LabelManager(config)
@@ -548,7 +546,7 @@ class Planner:
                     tech_lead_launch_count, capacity,
                 )
             issue_actions, issue_skipped, _ = self._plan_issues(
-                snapshot, capacity, worker_active_count
+                snapshot, capacity, worker_active_count, plan_context
             )
             actions.extend(issue_actions)
             skipped.extend(issue_skipped)
@@ -741,6 +739,23 @@ class Planner:
 
         return actions
 
+    def _provider_blocking_launch(
+        self, snapshot: OrchestratorSnapshot, agent_label: str | None
+    ) -> str | None:
+        """The provider this queue item must not launch against, if any.
+
+        A pure read of the tick's sampled fact: the probe ran, and the circuit
+        was consulted and updated, before planning began (#6999 A3). Every
+        queue asks it the same way, so eligibility cannot drift between them.
+        """
+        policy = self.provider_policy
+        if policy is None:
+            return None
+        provider = policy.provider_for_agent_label(agent_label)
+        if provider and snapshot.provider_launch.blocks(provider):
+            return provider
+        return None
+
     def _record_provider_skip(
         self,
         issue_number: int,
@@ -781,55 +796,7 @@ class Planner:
         """Plan tech_lead issue creation if threshold is met."""
         if not snapshot.tech_lead_facts:
             return None
-
-        facts = snapshot.tech_lead_facts
-        if not self._should_create_tech_lead_issue(facts):
-            return None
-
-        title, body = self._build_tech_lead_issue_content(facts)
-        labels = batch_review_issue_labels(self.config, source_labels=facts.source_labels)
-        # Milestone travels as INTENT; the applier resolves an explicit name
-        # at the create-issue execution boundary (#6769 finding 4).
-        milestone = tech_lead_issue_milestone_intent(self.config, facts.source_milestones)
-
-        logger.info("Planner: creating tech_lead issue for %d PRs (labels=%s, milestone=%s)", facts.pr_count, labels, milestone)
-        return CreateTechLeadIssueAction(
-            title=title, body=body, labels=labels, pr_count=facts.pr_count,
-            milestone=milestone, reason=f"threshold met: {facts.pr_count} >= {facts.threshold}",
-            # This IS the anchor: no prior issue to reconcile against (#6957 F6).
-            origin=TechLeadCreationOrigin.authors_anchor(),
-        )
-
-    def _should_create_tech_lead_issue(self, facts: "TechLeadFacts") -> bool:
-        """Check if tech_lead issue should be created."""
-        if facts.threshold <= 0:
-            # Batch trigger disabled; facts may exist for the health review
-            # alone (ADR-0031 §4), which plans its own anchor creation.
-            return False
-        if facts.pr_count < facts.threshold:
-            logger.debug("Planner: tech_lead threshold not met (%d/%d)", facts.pr_count, facts.threshold)
-            return False
-        if facts.existing_tech_lead_issue:
-            logger.debug("Planner: tech_lead issue #%d already exists", facts.existing_tech_lead_issue)
-            return False
-        return True
-
-    def _build_tech_lead_issue_content(self, facts: "TechLeadFacts") -> tuple[str, str]:
-        """Build title and body for tech_lead issue."""
-        pr_list = "\n".join(f"- PR #{pr[0]}: {pr[1]}" for pr in facts.prs)
-        body = f"""## Tech Lead Batch Review Triggered
-
-{facts.pr_count} PRs have passed code review and are ready for tech_lead review:
-
-{pr_list}
-
-Review these PRs for patterns, architectural concerns, and process improvements.
-Flip labels from `{facts.watch_label}` to `{self.config.tech_lead_reviewed_label}` after review.
-"""
-        title = apply_tech_lead_priority_prefix(
-            self.config, f"{TECH_LEAD_DISPLAY_NAME} Batch Review: {facts.pr_count} PRs pending"
-        )
-        return title, body
+        return plan_batch_review_issue(self.config, snapshot.tech_lead_facts)
 
     def _plan_discovered_reworks(self, snapshot: OrchestratorSnapshot) -> list[Action]:
         """Plan queue actions for discovered reworks from scans.
@@ -862,6 +829,8 @@ Flip labels from `{facts.watch_label}` to `{self.config.tech_lead_reviewed_label
                         actions.append(RemoveLabelAction(
                             issue_number=rework.pr_number, label=self._lm.needs_human,
                             reason="post-publish state now reworkable; clearing needs-human",
+                            # Withdraws EscalateToHumanAction's own cause on this PR.
+                            needs_human_cause=NeedsHumanCause.MERGE_ESCALATION,
                         ))
                     actions.append(AddLabelAction(
                         issue_number=rework.pr_number, label=self._lm.needs_rework,
@@ -1155,6 +1124,7 @@ Flip labels from `{facts.watch_label}` to `{self.config.tech_lead_reviewed_label
         snapshot: OrchestratorSnapshot,
         capacity: int,
         worker_active_count: int,
+        plan_context: PlanContext,
     ) -> tuple[list[Action], list[SkippedItem], int]:
         """Plan which issues to launch.
 
@@ -1218,21 +1188,25 @@ Flip labels from `{facts.watch_label}` to `{self.config.tech_lead_reviewed_label
                     issue_key=issue.key.stable_id(),
                 ))
 
-        # Filter out providers with open circuit
-        if self.provider_policy:
-            filtered: list[Issue] = []
-            for issue in available:
-                provider = self.provider_policy.provider_for_issue(issue)
-                if provider and self.provider_policy.is_open(provider):
-                    skipped.append(SkippedItem(
-                        item_type="issue",
-                        number=issue.number,
-                        reason=f"provider unavailable: {provider}",
-                    ))
-                    logger.info(issue_log(issue.number, "Skipped: reason=provider_unavailable provider=%s"), provider)
-                    continue
-                filtered.append(issue)
-            available = filtered
+        # Filter out issues whose provider cannot be launched against. Routed
+        # through the shared skip owner like every other queue, so the issue
+        # gets the provider-impact transition (blocked label + durable record)
+        # rather than vanishing from the plan unexplained (#6999 F6).
+        filtered: list[Issue] = []
+        for issue in available:
+            if provider := self._provider_blocking_launch(snapshot, issue.agent_type):
+                self._record_provider_skip(
+                    issue_number=issue.number,
+                    item_type="issue",
+                    item_number=issue.number,
+                    provider=provider,
+                    actions=actions,
+                    skipped=skipped,
+                    plan_context=plan_context,
+                )
+                continue
+            filtered.append(issue)
+        available = filtered
 
         # Filter out issues already being worked on, just completed, or failed this cycle.
         # Include both discovered (new this tick) and pending (queued for launch) reviews/reworks
@@ -1379,8 +1353,7 @@ Flip labels from `{facts.watch_label}` to `{self.config.tech_lead_reviewed_label
         if decision.should_launch:
             for review in decision.reviews_to_launch[:capacity]:
                 reviewer_label = self.config.get_reviewer_for_agent(review.agent_label) if review.agent_label else self.config.code_review_agent
-                provider = self.provider_policy.provider_for_agent_label(reviewer_label) if self.provider_policy else None
-                if provider and self.provider_policy and self.provider_policy.is_open(provider):
+                if provider := self._provider_blocking_launch(snapshot, reviewer_label):
                     self._record_provider_skip(
                         issue_number=review.issue_number,
                         item_type="review",
@@ -1436,12 +1409,7 @@ Flip labels from `{facts.watch_label}` to `{self.config.tech_lead_reviewed_label
         if decision.should_launch:
             for review in decision.reviews_to_launch[:capacity]:
                 reviewer_label = self.config.get_reviewer_for_agent(review.agent_label)
-                provider = (
-                    self.provider_policy.provider_for_agent_label(reviewer_label)
-                    if self.provider_policy
-                    else None
-                )
-                if provider and self.provider_policy and self.provider_policy.is_open(provider):
+                if provider := self._provider_blocking_launch(snapshot, reviewer_label):
                     self._record_provider_skip(
                         issue_number=review.issue_number,
                         item_type="retrospective_review",
@@ -1511,8 +1479,7 @@ Flip labels from `{facts.watch_label}` to `{self.config.tech_lead_reviewed_label
                 if issue_num is None:
                     logger.warning("Planner: skipping rework with unresolved issue number: %s", rework.issue_key)
                     continue
-                provider = self.provider_policy.provider_for_agent_label(rework.agent_type) if self.provider_policy else None
-                if provider and self.provider_policy and self.provider_policy.is_open(provider):
+                if provider := self._provider_blocking_launch(snapshot, rework.agent_type):
                     self._record_provider_skip(
                         issue_number=issue_num,
                         item_type="rework",
@@ -1590,17 +1557,13 @@ Flip labels from `{facts.watch_label}` to `{self.config.tech_lead_reviewed_label
                 logger.info(issue_log(issue_number, "Skipped validation retry: reason=active_session"))
                 continue
 
-            provider = (
-                self.provider_policy.provider_for_agent_label(retry.agent_label)
-                if self.provider_policy and retry.agent_label
-                else None
-            )
-            if provider and self.provider_policy and self.provider_policy.is_open(provider):
+            blocking_provider = self._provider_blocking_launch(snapshot, retry.agent_label)
+            if blocking_provider:
                 self._record_provider_skip(
                     issue_number=issue_number,
                     item_type="validation_retry",
                     item_number=issue_number,
-                    provider=provider,
+                    provider=blocking_provider,
                     actions=actions,
                     skipped=skipped,
                     plan_context=plan_context,
@@ -1651,8 +1614,7 @@ Flip labels from `{facts.watch_label}` to `{self.config.tech_lead_reviewed_label
         # Provider eligibility precedes the workflow decision so the launching
         # event can never claim a launch the provider gate then suppresses
         # (#6892). One shared agent/provider => one gate for the whole queue.
-        provider = self.provider_policy.provider_for_agent_label(self.config.tech_lead_review_agent) if self.provider_policy else None
-        if provider and self.provider_policy and self.provider_policy.is_open(provider):
+        if provider := self._provider_blocking_launch(snapshot, self.config.tech_lead_review_agent):
             for tech_lead in pending_tech_lead:
                 self._record_provider_skip(
                     issue_number=tech_lead.issue_number,

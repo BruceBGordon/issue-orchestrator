@@ -26,6 +26,7 @@ from ..domain.models import (
 )
 from ..ports.issue import Issue
 from .actions import Action, ActionType
+from .provider_launch_readiness import ProviderLaunchReadiness
 
 
 @dataclass(frozen=True)
@@ -117,6 +118,12 @@ class OrchestratorSnapshot:
     #     letting a due suite beat new issues without preempting reviews/reworks.
     e2e_occupies_slot: bool = False
     e2e_due: bool = False
+    # Provider launch eligibility, sampled once per tick BEFORE planning
+    # (#6999 A3). Planning reads it; planning never takes the sample,
+    # because sampling probes a CLI and writes circuit state.
+    provider_launch: ProviderLaunchReadiness = field(
+        default_factory=ProviderLaunchReadiness.empty
+    )
 
     @property
     def active_count(self) -> int:

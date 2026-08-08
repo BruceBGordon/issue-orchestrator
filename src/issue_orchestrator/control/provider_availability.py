@@ -19,6 +19,11 @@ from typing import Iterable
 from typing import TYPE_CHECKING
 
 from ..ports.issue import Issue
+from ..ports.provider_readiness import (
+    NO_PROVIDER_READINESS_PROBE,
+    ProviderReadiness,
+    ProviderReadinessProbe,
+)
 from ..infra.config import Config
 from .actions import Action
 from .provider_impact import (
@@ -41,10 +46,51 @@ def _now() -> datetime:
 
 
 @dataclass(frozen=True)
+class ProviderLaunchOutcome:
+    """The one typed answer to "may I launch against this provider?" (#6999 A1).
+
+    Carries both halves of the question so no consumer has to re-ask either:
+    what the provider's own credential probe said, and whether the circuit
+    owner is holding launches back. Planning and launch control consume the
+    same value, which is why they cannot drift apart on eligibility.
+    """
+
+    provider: str
+    readiness: ProviderReadiness
+    circuit_open: bool
+
+    @property
+    def may_launch(self) -> bool:
+        """Whether a session may be spawned for this provider right now."""
+        return self.readiness.launchable and not self.circuit_open
+
+    @property
+    def blocked_by_readiness(self) -> bool:
+        """Whether the provider's own probe refused, whatever the reason.
+
+        Covers an expired login and a provider that is not installed. Both are
+        human-fixable in the sense that agent retries are pure waste, but only
+        the former is an *auth* failure — the circuit owner is told about that
+        one alone (#6999 F6).
+        """
+        return not self.readiness.launchable
+
+    @classmethod
+    def no_provider(cls) -> "ProviderLaunchOutcome":
+        """The outcome for work that names no provider: nothing to gate on."""
+        return cls(
+            provider="",
+            readiness=ProviderReadiness.unknown("", "no provider configured"),
+            circuit_open=False,
+        )
+
+
+@dataclass(frozen=True)
 class ProviderAvailabilityPolicy:
     config: Config
     provider_resilience: ProviderResilienceManager
     label_manager: "LabelManager | None" = None
+    readiness_probe: ProviderReadinessProbe = NO_PROVIDER_READINESS_PROBE
 
     def blocked_label(self) -> str:
         if self.label_manager is not None:
@@ -93,10 +139,17 @@ class ProviderAvailabilityPolicy:
 
         return providers_by_issue
 
-    def is_open(self, provider: str | None) -> bool:
-        """Single-provider launch gate ("should I start work right now?").
+    def circuit_is_open(self, provider: str | None) -> bool:
+        """Raw circuit read — "does the resilience owner still hold this?".
 
-        Deliberately NOT used to decide what a provider-impact record says:
+        Deliberately NOT a launch gate: it takes no readiness sample, so on its
+        own it can never observe a human re-authenticating and would keep the
+        fleet parked for the whole auth cooldown (#6999 F1). Launch paths call
+        :meth:`assess_launch` instead (via the per-tick sampler). This remains for
+        the readers that genuinely ask about circuit *ownership* rather than
+        eligibility, such as the tech-lead stuck sweep.
+
+        Also deliberately NOT used to decide what a provider-impact record says:
         anything that ends up in an issue's history goes through :meth:`assess`,
         so the record cannot describe a different instant or a wider set of
         providers than the decision that produced it (#5980 F4/A2).
@@ -104,6 +157,55 @@ class ProviderAvailabilityPolicy:
         if not provider:
             return False
         return self.provider_resilience.is_open(provider)
+
+    # ------------------------------------------------------------------
+    # Bounded provider launch assessment (#6999 A1)
+    #
+    # ONE answer to "may I launch against this provider right now?". Both
+    # halves of the question — the credential sample and the circuit — are
+    # resolved here, in that order, and the sample's circuit consequence is
+    # recorded exactly once. Callers are the per-tick sampler (whose result
+    # planning reads as a fact) and the launch-time gate. No call site reads
+    # the raw circuit to make a launch decision, so an open auth circuit can
+    # never suppress the very probe that would retire it.
+    # ------------------------------------------------------------------
+
+    def assess_launch(
+        self, provider: str | None, *, now: datetime | None = None
+    ) -> ProviderLaunchOutcome:
+        """Take one readiness sample, feed the circuit, and read the result.
+
+        Order matters and is the whole fix: the probe runs *before* the circuit
+        is consulted. While an auth circuit is open no session runs, so a gate
+        that short-circuited on the open circuit could never observe the human
+        re-authenticating (#6999 F1). The circuit is then read *after* the
+        sample is recorded, so this one outcome reflects the sample it was
+        derived from.
+
+        Both directions are reported to
+        :class:`~.provider_resilience.ProviderResilienceManager` here rather
+        than at the call sites, so the circuit is the only thing that decides
+        how many failures are tolerated, how long launches stay paused, and when
+        an outage is over. Control receives only the typed outcome — never a
+        banner or exit code.
+        """
+        if not provider:
+            return ProviderLaunchOutcome.no_provider()
+        readiness = self.readiness_probe.check_launch_readiness(provider)
+        if readiness.human_fixable:
+            self.provider_resilience.record_auth_failure(
+                provider,
+                error_summary=readiness.detail or "provider is not authenticated",
+                sample_id=readiness.sample_id,
+                now=now,
+            )
+        elif readiness.authenticated:
+            self.provider_resilience.clear_auth_failures(provider, now=now)
+        return ProviderLaunchOutcome(
+            provider=provider,
+            readiness=readiness,
+            circuit_open=self.provider_resilience.is_open(provider, now),
+        )
 
     def should_add_blocked_label(self, issue_labels: Iterable[str], planned_labels: set[str]) -> bool:
         label = self.blocked_label()

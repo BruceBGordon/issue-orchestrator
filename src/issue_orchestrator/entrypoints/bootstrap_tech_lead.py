@@ -173,7 +173,9 @@ def _make_provider_circuit_reader(
     policy = ProviderAvailabilityPolicy(config, provider_resilience, LabelManager(config))
 
     def is_open(issue: "Issue") -> bool:
-        return policy.is_open(policy.provider_for_issue(issue))
+        # A circuit-ownership question, not a launch decision: the sweep must
+        # not take a credential sample or move circuit state (#6999 F1).
+        return policy.circuit_is_open(policy.provider_for_issue(issue))
 
     return is_open
 

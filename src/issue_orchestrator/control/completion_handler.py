@@ -19,7 +19,9 @@ if TYPE_CHECKING:
     from ..domain.state_machines.review_machine import ReviewStateMachine
     from ..domain.models import PendingReview, PendingRework, PendingTechLeadReview
     from ..ports.tech_lead_authority import TechLeadAuthorityStore
+    from ..ports.provider_resilience import ProviderErrorType
     from .open_issue_corpus import OpenIssueCorpusManager
+    from .provider_availability import ProviderAvailabilityPolicy
     from .state_machine_manager import StateMachineManager
     from .label_manager import LabelManager
 
@@ -45,16 +47,15 @@ from .actions import (
 )
 from .completion_action_planner import (
     CompletionActionPlanner,
-    critical_processing_errors,
     has_review_exchange_errors,
 )
 from .tech_lead_completion import discard_tech_lead_authority_after_completion
 from .invalid_record_actions import (
     failure_event_reason,
     invalid_record_event_fields,
-    invalid_record_failure_reason,
 )
 from .reconciliation import build_expected_for_mutation
+from .completion_history_status import resolve_history_status
 from .retrospective_review_completion import retrospective_review_completion_actions
 from .review_routing import should_queue_pr_review
 from .session_run_resolution import resolve_session_run_dir
@@ -62,40 +63,6 @@ from pathlib import Path
 from ..infra.run_audit import write_run_audit
 
 logger = logging.getLogger(__name__)
-
-
-_PUBLISH_STAGE_LABELS = {"push_branch": "Push", "create_pr": "PR creation"}
-
-# Maximum length of the blocked-card status-reason line. Cards render the
-# reason inline; anything longer wraps ugly or truncates without ellipsis
-# depending on the surface. Kept near the body-column width used by the
-# dashboard templates so tweaks to layout have one obvious knob to turn.
-_PUBLISH_FAILURE_SUMMARY_CHAR_CAP = 160
-
-
-def _summarize_publish_failure(critical_errors: list[str]) -> str:
-    """Card-friendly one-line summary from raw publish error strings.
-
-    Strips the ``push_branch:``/``create_pr:`` stage prefix and caps length so it
-    renders inside a card; falls back to generic text on an unexpected shape.
-    """
-    if not critical_errors:
-        return "Push or PR creation failed"
-    raw = critical_errors[0].strip()
-    stage_prefix, sep, remainder = raw.partition(":")
-    stage_label = _PUBLISH_STAGE_LABELS.get(stage_prefix.strip())
-    if sep and stage_label:
-        message = remainder.strip()
-    else:
-        message = raw
-    message = " ".join(message.split())  # collapse whitespace/newlines
-    if not message:
-        return "Push or PR creation failed"
-    prefix = f"{stage_label} failed: " if stage_label else ""
-    available = _PUBLISH_FAILURE_SUMMARY_CHAR_CAP - len(prefix)
-    if len(message) > available:
-        message = message[: available - 1].rstrip() + "…"
-    return f"{prefix}{message}"
 
 
 class RunAuditTrigger(str, Enum):
@@ -139,6 +106,7 @@ class CompletionHandler:
         tech_lead_authority: "TechLeadAuthorityStore",
         open_issue_corpus: "OpenIssueCorpusManager",
         active_session_run_id: Callable[[int], str | None],
+        provider_availability: "ProviderAvailabilityPolicy",
         remove_session_machine_fn: Callable[[str], None] | None = None,
         label_manager: "LabelManager | None" = None,
     ):
@@ -157,7 +125,7 @@ class CompletionHandler:
         self._lm = label_manager
         self._action_planner = CompletionActionPlanner(
             config, repository_host, label_manager, tech_lead_authority,
-            open_issue_corpus, active_session_run_id,
+            open_issue_corpus, active_session_run_id, provider_availability,
         )
 
     def mark_session_retry(self, session: Session, reason: str) -> None:
@@ -192,6 +160,7 @@ class CompletionHandler:
         blocked_reason: Optional[str] = None,
         completion_detail: Optional[dict[str, Any]] = None,
         finalize_terminal: bool = True,
+        provider_error_type: "ProviderErrorType | None" = None,
     ) -> CompletionResult:
         """Process a session completion and update all state machines.
 
@@ -230,38 +199,19 @@ class CompletionHandler:
                 issue_number=session.issue.number,
             )
 
-        # Determine history status: if agent said COMPLETED but push/PR failed,
-        # use FAILED for history to show red dot in UI
-        history_status = status
-        history_status_reason: Optional[str] = None
-        critical_errors, _downgraded_errors = critical_processing_errors(
-            processing_errors,
-            pr_url=pr_url,
+        # What history shows is a policy of its own (a failed push makes a
+        # self-reported "completed" a red dot), owned next door.
+        history = resolve_history_status(
+            status=status,
             issue_number=session.issue.number,
-            log_downgraded=True,
-            context="history",
+            pr_url=pr_url,
+            processing_errors=processing_errors,
+            review_exchange_halted=review_exchange_halted,
+            completion_detail=completion_detail,
         )
-
-        if status == SessionStatus.COMPLETED and critical_errors:
-            logger.info(
-                "[COMPLETION] Agent reported completed but push/PR failed - using FAILED for history: issue=%d",
-                session.issue.number,
-            )
-            history_status = SessionStatus.FAILED
-            history_status_reason = _summarize_publish_failure(critical_errors)
-        elif status == SessionStatus.COMPLETED and review_exchange_halted:
-            logger.info(
-                "[COMPLETION] Review exchange halted - using FAILED for history/trace: issue=%d",
-                session.issue.number,
-            )
-            history_status = SessionStatus.FAILED
-            history_status_reason = "Review exchange halted"
-        else:
-            history_status_reason = invalid_record_failure_reason(completion_detail)
-
-        # Create history entry
+        history_status = history.status
         history_entry = self._create_history_entry(
-            session, history_status, pr_url, status_reason_override=history_status_reason
+            session, history_status, pr_url, status_reason_override=history.reason
         )
 
         # The terminal trace event AND the cached state-machine transition are the
@@ -299,6 +249,7 @@ class CompletionHandler:
                 blocked_reason=blocked_reason,
                 pr_url=pr_url,
                 completion_detail=completion_detail,
+                provider_error_type=provider_error_type,
             )
         )
         completion_actions.extend(

@@ -7,12 +7,13 @@ from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar, Optional, cast
 
 if TYPE_CHECKING:
+    from ..ports.provider_resilience import ProviderErrorType
     from ..control.planner_types import OrchestratorSnapshot, Plan
     from ..control.session_manager import SessionRef, SessionType
     from ..control.tech_lead_trigger import TechLeadTerminationOutcome
     from ..domain.tech_lead_session import TechLeadLaunchScope
+    from ..ports.operator_issue_commands import OperatorIssueCommands
     from ..ports.session_runner import DiscoveredSession
-    from .e2e_db import E2ERun
 
 from ..events import EventName, EventContext, EventHub
 from ..control.orchestrator_support import (
@@ -52,6 +53,7 @@ from ..control.session_routing import (
     orchestrator_launch_validation_retry_session as _launch_validation_retry_session,
     orchestrator_launch_tech_lead_session as _launch_tech_lead_session,
     session_launcher_callback as _session_launcher_callback,
+    recover_unresolved_work as _recover_unresolved_work,
     restore_running_sessions as _restore_running_sessions,
     parse_session_ref as _parse_session_ref,
     create_session as _create_session,
@@ -88,6 +90,7 @@ from .startup_errors import StartupError, write_startup_failure
 from ..control.health_gate import HealthDecision
 from ..control.orchestrator_deps import OrchestratorDeps
 from .e2e_runner import maybe_trigger_e2e, get_e2e_runner_manager
+from .e2e_timeline import snapshot_agent_events
 from .sqlite_maintenance import run_backups_if_due
 
 
@@ -179,6 +182,23 @@ class Orchestrator:
         """Get the timestamp of the last tick."""
         return self._last_tick_time
 
+    @cached_property
+    def operator_issue_commands(self) -> "OperatorIssueCommands":
+        """Operator "retry"/"dismiss", bound to this facade's state and lock.
+
+        The Control API asks for the COMMAND rather than assembling one: the
+        transition it performs spans GitHub labels and the local retry/queue
+        state and must settle them in that order, which is not a rule a
+        transport can be trusted to re-derive twice (#6999 F5).
+        """
+        return self.deps.operator_issue_command_factory(
+            state=lambda: self.state,
+            run_locked=self._run_locked,
+        )
+
+    def _run_locked(self, fn):
+        with self.state_lock:
+            return fn()
     def kill_session(self, name: str) -> None:
         """Kill a session by terminal ID (public wrapper)."""
         self._kill_session(name)
@@ -239,13 +259,9 @@ class Orchestrator:
 
     @cached_property
     def _completion_handler(self) -> CompletionHandler:
-        from ..control.active_sessions import active_session_run_id
-        smm = self.deps.state_machine_manager
-        return CompletionHandler(
-            self.config, self.deps.events, self.deps.repository_host,
-            lambda issue: smm.issue_machines.get(issue.number), lambda s: smm.session_machines.get(s), lambda n: smm.review_machines.get(n),
-            self.deps.session_output, self.deps.tech_lead_authority, self.deps.open_issue_corpus, lambda n: active_session_run_id(self.state.active_sessions, n),
-            remove_session_machine_fn=smm.remove_session_machine, label_manager=self.deps.label_manager,
+        return self.deps.completion_handler_factory(
+            state_machines=self.deps.state_machine_manager,
+            active_sessions=lambda: self.state.active_sessions,
         )
 
     @cached_property
@@ -288,14 +304,14 @@ class Orchestrator:
         retry = next((r for r in self.state.pending_validation_retries if r.issue_number == n), None)
         if retry is None:
             return None
-        return _launch_validation_retry_session(retry, self.state, self._session_launcher, self.deps.session_restorer)
+        return _launch_validation_retry_session(retry, self.state, self._session_launcher, self.deps.session_restorer, self.deps.pending_work_claims)
     def _launch_tech_lead_by_number(self, n: int) -> Optional[Session]: return _ch_launch_tech_lead_by_number(n, self.state.pending_tech_lead_reviews, self.launch_tech_lead_session)
 
     def _get_issue_machine(self, issue: Issue) -> Optional[IssueStateMachine]: return _gw_get_issue_machine(issue, self.deps.state_machine_manager)
     def _get_session_machine(self, name: str, n: int, timeout: int) -> Optional[SessionStateMachine]: return _sl_get_session_machine(name, n, timeout, self.deps.state_machine_manager)
     def _get_review_machine(self, pr: int, issue: int) -> Optional[ReviewStateMachine]: return _ch_get_review_machine(pr, issue, self.deps.state_machine_manager)
 
-    def _restore_running_sessions(self, running: list["DiscoveredSession"]) -> None: _restore_running_sessions(running, self.state.active_sessions, self.deps.session_restorer)
+    def _restore_running_sessions(self, running: list["DiscoveredSession"]) -> None: _restore_running_sessions(running, self.state, self.deps.session_restorer, self.deps.pending_work_claims, self.deps.claim_quarantine)
     def _parse_session_ref(self, session_name: str, operation: str) -> "SessionRef": return _parse_session_ref(session_name, operation, self.deps.events)
     def _create_session(self, name: str, cmd: str, wd: Path, title: str | None = None) -> bool: return _create_session(name, cmd, wd, title, self.deps.session_manager, self.deps.events)
     def _session_exists(self, name: str) -> bool: return _session_exists(name, self.deps.session_manager, self.deps.events)
@@ -381,7 +397,7 @@ class Orchestrator:
 
     def launch_session(self, issue: Issue, *, tech_lead_scope: "TechLeadLaunchScope | None" = None) -> Optional[Session]:
         return _launch_session(issue, self.state, self._session_launcher, self.deps.session_restorer, tech_lead_scope=tech_lead_scope)
-    def handle_session_completion(self, session: Session, status: SessionStatus) -> None: _handle_session_completion(session, status, self.state, self._completion_handler, self.deps.action_applier, self.observer, self.deps.worktree_manager, self._kill_session, self.config, self.deps.session_output, publish_recovery=self.deps.publish_recovery)
+    def handle_session_completion(self, session: Session, status: SessionStatus, *, provider_error_type: "ProviderErrorType | None" = None) -> None: _handle_session_completion(session, status, self.state, self._completion_handler, self.deps.action_applier, self.observer, self.deps.worktree_manager, self._kill_session, self.config, self.deps.session_output, publish_recovery=self.deps.publish_recovery, pending_work_claims=self.deps.pending_work_claims, provider_error_type=provider_error_type)
 
     def tick(self) -> bool:
         with self.state_lock:
@@ -482,7 +498,11 @@ class Orchestrator:
             # Snapshot agent events from the E2E worktree timeline into the
             # base repo timeline so they persist across worktree refreshes.
             if last_run is not None:
-                self._snapshot_e2e_agent_events(last_run)
+                snapshot_agent_events(
+                    last_run,
+                    repo_root=self.config.repo_root,
+                    timeline_store=self.deps.timeline_store,
+                )
 
             event_name = EventName.E2E_COMPLETED if status == "passed" else EventName.E2E_FAILED
             self.deps.events.publish(TraceEvent(
@@ -492,59 +512,6 @@ class Orchestrator:
                     "status": status,
                 }),
             ))
-
-    def _snapshot_e2e_agent_events(self, run: "E2ERun") -> None:
-        """Copy agent timeline events from the E2E worktree to the base repo.
-
-        Agent sessions run in the E2E worktree, so their timeline events
-        are in that worktree's timeline.sqlite which gets wiped on refresh.
-        We snapshot them into the base repo's timeline under the same E2E
-        run key (negative int) so the nesting endpoints can split them
-        from the pytest events by event name prefix (e2e.* vs session.*/etc).
-        """
-        try:
-            from .e2e_worktree import get_e2e_worktree_path
-            from ..domain.timeline_key import TimelineKey
-            from .e2e_timeline import read_orchestrator_events_by_window
-
-            wt_timeline = get_e2e_worktree_path(self.config.repo_root) / ".issue-orchestrator" / "state" / "timeline.sqlite"
-            if not wt_timeline.exists():
-                return
-
-            agent_events = read_orchestrator_events_by_window(
-                wt_timeline,
-                started_at=run.started_at,
-                finished_at=run.finished_at,
-            )
-            if not agent_events:
-                return
-
-            # Write agent events to the base repo's timeline under the E2E run's key.
-            # Use a distinct event name prefix so they're identifiable as snapshots.
-            from ..ports.timeline_store import TimelineRecord
-            store = self.deps.timeline_store
-            store_key = TimelineKey.for_e2e_run(run.id).to_store_key()
-
-            for evt in agent_events:
-                # Store as e2e.agent_snapshot to avoid the run-scoped
-                # CHECK constraint.  The data blob contains the complete
-                # pre-rendered event dict; the read path returns it directly
-                # rather than re-deriving through TimelineStream.
-                record = TimelineRecord(
-                    event_id=f"snap-{evt.get('event_id', '')}",
-                    timestamp=evt.get("timestamp", ""),
-                    event="e2e.agent_snapshot",
-                    data=evt,
-                    source_event="e2e.agent_snapshot",
-                )
-                store.append(store_key, record)
-
-            logger.info(
-                "Snapshot %d agent events for E2E run %d",
-                len(agent_events), run.id,
-            )
-        except Exception:
-            logger.debug("Could not snapshot E2E agent events for run %d", run.id, exc_info=True)
 
     def _maybe_run_sqlite_backups(self) -> None:
         if not self.config.sqlite_backup.enabled:
@@ -613,6 +580,7 @@ class Orchestrator:
                 completion_dispatcher=self.deps.completion_dispatcher,
                 provider_resilience=self.deps.provider_resilience,
                 publish_recovery=self.deps.publish_recovery,
+                pending_work_claims=self.deps.pending_work_claims,
             )
             # Check lease renewals for active sessions
             self._check_lease_renewals()
@@ -649,9 +617,6 @@ class Orchestrator:
             discovery_elapsed_ms,
         )
 
-        if not running:
-            return
-
         tracked_names = {s.terminal_id for s in self.state.active_sessions}
         discovered = [
             (info, self.deps.session_restorer.canonical_terminal_id(info))
@@ -663,6 +628,7 @@ class Orchestrator:
             if session_name not in tracked_names
         ]
         if not untracked:
+            _recover_unresolved_work(self.state, self.deps.pending_work_claims, self.deps.claim_quarantine)
             return
 
         logger.warning(
@@ -677,8 +643,10 @@ class Orchestrator:
         )
         restored = _restore_running_sessions(
             [info for info, _ in untracked],
-            self.state.active_sessions,
+            self.state,
             self.deps.session_restorer,
+            self.deps.pending_work_claims,
+            self.deps.claim_quarantine,
         )
         self._last_orphan_reconcile_active_count = len(self.state.active_sessions)
         restored_names = {s.terminal_id for s in restored}
@@ -791,7 +759,7 @@ class Orchestrator:
         # operator has removed onto the worker lane before this tick plans (#6870).
         if (applier := self.deps.action_applier) and applier.expedite_lane:
             applier.expedite_lane.promote_ungated()
-        self._last_network_sync, _ = _run_planning_cycle_impl(self.config, self.deps.events, self._event_context, self.state, self.deps.fact_gatherer, self.deps.planner, self.deps.repository_host, self.scheduler, self._github_workflow, self._apply_plan, self._clear_discovered_facts, self._last_network_sync, refresh_to_process, self._inflight_stable_ids, self._issue_fetch_resilience, self.observer, self.deps.claim_manager, queue_cache_store=self.deps.queue_cache_store, io_claimed_label=self.deps.label_manager.io_claimed, open_issue_corpus=self.deps.open_issue_corpus)
+        self._last_network_sync, _ = _run_planning_cycle_impl(self.config, self.deps.events, self._event_context, self.state, self.deps.fact_gatherer, self.deps.planner, self.deps.repository_host, self.scheduler, self._github_workflow, self._apply_plan, self._clear_discovered_facts, self._last_network_sync, refresh_to_process, self._inflight_stable_ids, self._issue_fetch_resilience, self.observer, self.deps.claim_manager, queue_cache_store=self.deps.queue_cache_store, io_claimed_label=self.deps.label_manager.io_claimed, open_issue_corpus=self.deps.open_issue_corpus, provider_launch_sampler=self.deps.services.provider_launch_sampler)
 
     def _clear_discovered_facts(self, tick: "OrchestratorSnapshot") -> None: self._plan_applier.clear_discovered_facts(tick)
     def _emit_heartbeat_if_needed(self) -> None: self._plan_applier.emit_heartbeat_if_needed()
@@ -1053,8 +1021,8 @@ class Orchestrator:
     def _update_dependency_problems(self, dep_blocked: list[tuple["Issue", str]]) -> None: self._github_workflow.update_dependency_problems(self.state, dep_blocked)
     @property
     def _github_workflow(self) -> GitHubWorkflow: return GitHubWorkflow(self.config, self.deps.events, self.deps.repository_host, self.deps.fact_gatherer, self.deps.pr_scanner, self.deps.label_sync, self._event_context, self.deps.label_manager, self.scheduler.dependency_evaluator)
-    def launch_review_session(self, review: PendingReview) -> Optional[Session]: return _launch_review_session(review, self.state, self._session_launcher, self.deps.session_restorer)
-    def launch_retrospective_review_session(self, review: PendingRetrospectiveReview) -> Optional[Session]: return _launch_retrospective_review_session(review, self.state, self._session_launcher, self.deps.session_restorer)
+    def launch_review_session(self, review: PendingReview) -> Optional[Session]: return _launch_review_session(review, self.state, self._session_launcher, self.deps.session_restorer, self.deps.pending_work_claims)
+    def launch_retrospective_review_session(self, review: PendingRetrospectiveReview) -> Optional[Session]: return _launch_retrospective_review_session(review, self.state, self._session_launcher, self.deps.session_restorer, self.deps.pending_work_claims)
     # #6994 R2 F2/F8: `launch_tech_lead_session` is the ONE entry point — it re-decides
     # subject eligibility, scope exclusivity and cross-engine ownership immediately
     # before starting. `launch_queued_*` is the raw step that authority delegates to.
@@ -1062,7 +1030,7 @@ class Orchestrator:
     # own launch nests safely) because admission and launch each read the pending
     # queue and then mutate it, and the dashboard command surface runs on a
     # different thread from the tick.
-    def launch_queued_tech_lead_session(self, tech_lead: PendingTechLeadReview) -> Optional[Session]: return _launch_tech_lead_session(tech_lead, self.state, self.config, self._session_launcher, self.deps.session_restorer)
+    def launch_queued_tech_lead_session(self, tech_lead: PendingTechLeadReview) -> Optional[Session]: return _launch_tech_lead_session(tech_lead, self.state, self.config, self._session_launcher, self.deps.session_restorer, self.deps.pending_work_claims)
     def launch_tech_lead_session(self, tech_lead: PendingTechLeadReview) -> Optional[Session]:
         with self.state_lock: return _launch_tech_lead_run(self, tech_lead)
     def ensure_health_review_anchor(self) -> Optional[PendingTechLeadReview]: return _ensure_health_review_anchor(self)
@@ -1073,7 +1041,7 @@ class Orchestrator:
     def scan_needs_code_review_prs(self) -> None: self._github_workflow.scan_needs_code_review_prs(self.state)
     def scan_needs_rework_prs(self) -> None: self._github_workflow.scan_needs_rework_prs(self.state)
     def reconcile_orphaned_pr_labels(self) -> int: return self._github_workflow.reconcile_orphaned_pr_labels(ORCHESTRATOR_PR_MARKER)
-    def launch_rework_session(self, rework: PendingRework) -> Optional[Session]: return _launch_rework_session(rework, self.state, self._session_launcher, self.deps.session_restorer)
+    def launch_rework_session(self, rework: PendingRework) -> Optional[Session]: return _launch_rework_session(rework, self.state, self._session_launcher, self.deps.session_restorer, self.deps.pending_work_claims)
 
 async def run_orchestrator(config_path: Optional[Path] = None) -> None:
     from ..entrypoints.bootstrap import build_orchestrator

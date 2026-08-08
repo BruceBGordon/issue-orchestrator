@@ -60,6 +60,18 @@ def list_sqlite_databases(config: Config) -> list[SQLiteDatabase]:
             enforce_pragmas=True,
         ),
         SQLiteDatabase(
+            # The only durable record of work that has LEFT its pending queue
+            # (#6999 F10). Losing or corrupting it is direct queued-work loss,
+            # so it gets the same startup integrity checks, pragma enforcement
+            # and backups as every other authoritative store.
+            key="pending_work_claims",
+            label="Pending Work Claims",
+            path_fn=lambda cfg: _state_db(cfg, "pending_work_claims.sqlite"),
+            enabled_fn=lambda cfg: True,
+            backup=True,
+            enforce_pragmas=True,
+        ),
+        SQLiteDatabase(
             key="queue_cache",
             label="Queue Cache",
             path_fn=lambda cfg: _state_db(cfg, "queue_cache.sqlite"),

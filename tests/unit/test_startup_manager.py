@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 import pytest
+
 from unittest.mock import MagicMock, call, patch
 
 from issue_orchestrator.control.session_launch_types import LaunchResult
@@ -1017,8 +1018,13 @@ class TestStartupManagerTechLeadRecovery:
         sample_state,
         mock_repository_host,
         mock_config,
+        tmp_path,
     ):
         """Startup-recovery -> launch boundary keeps the batch flavor (#6768 B5)."""
+        from issue_orchestrator.execution.pending_work_claim_store import (
+            SqlitePendingWorkClaimStore,
+        )
+
         mock_config.agents = {"agent:tech-lead": MagicMock()}
         mock_config.tech_lead_review_agent = "agent:tech-lead"
 
@@ -1039,7 +1045,10 @@ class TestStartupManagerTechLeadRecovery:
         launcher.session_manager.runner.discover_running_sessions.return_value = []
 
         orchestrator_launch_tech_lead_session(
-            recovered, sample_state, mock_config, launcher, MagicMock()
+            recovered, sample_state, mock_config, launcher, MagicMock(),
+            # The real orchestrator-owned ledger, because the launch settles a
+            # durable claim as well as the queue item (#6999 F4).
+            SqlitePendingWorkClaimStore.for_repo(tmp_path),
         )
 
         launch_call = launcher.launch_issue_session.call_args
@@ -1974,3 +1983,47 @@ class TestRetrospectiveRecoveryCallBudget:
         mock_repository_host.search_pr_refs_for_issue.assert_not_called()
         mock_repository_host.get_prs_for_issue.assert_not_called()
         mock_repository_host.get_pr.assert_not_called()
+
+
+class TestStartupSweepsThePendingWorkLedger:
+    """Startup restoration must run even when discovery finds nothing (#6999 F8).
+
+    The durable pending-work ledger holds requests that have already left their
+    in-memory queue. The rows it exists for belong to runs whose terminals are
+    already gone - so "no running sessions were discovered" is exactly the case
+    where that row is the only remaining record of the work. Guarding the
+    restoration call on a non-empty discovery is the bug this pins.
+    """
+
+    @pytest.mark.asyncio
+    async def test_restoration_runs_with_no_discovered_sessions(
+        self,
+        mock_config,
+        mock_events,
+        mock_runner,
+        mock_repository_host,
+        mock_action_applier,
+        mock_issue_branches_fn,
+        mock_label_store,
+        sample_state,
+    ):
+        mock_runner.discover_running_sessions = MagicMock(return_value=[])
+        restore_sessions_fn = MagicMock()
+        manager = StartupManager(
+            config=mock_config,
+            events=mock_events,
+            runner=mock_runner,
+            repository_host=mock_repository_host,
+            action_applier=mock_action_applier,
+            issue_branches_fn=mock_issue_branches_fn,
+            session_exists_fn=lambda name: False,
+            restore_sessions_fn=restore_sessions_fn,
+            launch_session_fn=lambda issue: None,
+            update_queue_cache_fn=lambda: None,
+            issue_fetch_resilience=IssueFetchResilience("owner/repo"),
+            label_store=mock_label_store,
+        )
+
+        await manager.run_startup(sample_state)
+
+        restore_sessions_fn.assert_called_once_with([])

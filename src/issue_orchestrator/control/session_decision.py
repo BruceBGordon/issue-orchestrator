@@ -7,6 +7,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from ..domain.models import SessionStatus
+from ..ports.provider_readiness import ProviderReadiness
+from ..ports.provider_resilience import ProviderErrorType
 
 if TYPE_CHECKING:
     from .completion_processor import ProcessingResult
@@ -20,6 +22,102 @@ class ProviderTransientFailureDecision:
     provider: str | None
     error_summary: str | None
     attempts: int | None
+
+
+@dataclass(frozen=True)
+class ProviderAuthFailureDecision:
+    """Provider-circuit AUTH effect to apply on the tick thread (#6999).
+
+    A separate type from the transient one on purpose: the circuit owner treats
+    the two differently (its own threshold, its own long cooldown), and a caller
+    must not be able to smuggle a credential outage into the transient ladder.
+
+    ``sample_id`` is the identity of the credential probe result this verdict
+    was confirmed against, carried so the circuit owner counts one physical
+    observation once even when a launch check already saw the same sample
+    (#6999 F2).
+    """
+
+    provider: str
+    error_summary: str
+    sample_id: str = ""
+
+
+@dataclass(frozen=True)
+class ProviderAuthOutcome:
+    """What an auth-dead session means, in one place (#6999).
+
+    Owns the whole consequence of "this session's provider is not
+    authenticated": the wording, the event payload, the circuit effect, and the
+    resulting :class:`SessionDecision`. The controller reads none of that back
+    out — it logs, emits, and returns.
+    """
+
+    provider: str
+    detail: str
+    sample_id: str = ""
+
+    @classmethod
+    def from_readiness(
+        cls, readiness: ProviderReadiness | None
+    ) -> "ProviderAuthOutcome":
+        """Build from the observation's typed readiness, or fail loudly.
+
+        A missing, unnamed or non-auth readiness cannot produce a usable
+        outcome: the
+        circuit owner would get no provider to record against and the
+        provider-impact command would have nothing to assess, so the session
+        would end BLOCKED with the outage invisible. Manufacturing an empty
+        provider to keep going is exactly the silent degradation this codebase
+        forbids — the malformed observation is the bug, and it should surface
+        as one (#6999 F9).
+        """
+        if readiness is None or not readiness.provider or not readiness.human_fixable:
+            raise ValueError(
+                "a PROVIDER_AUTH_FAILED observation must carry a named, "
+                f"auth-expired ProviderReadiness; got {readiness!r}"
+            )
+        return cls(
+            provider=readiness.provider,
+            detail=readiness.detail or "provider is not authenticated",
+            sample_id=readiness.sample_id,
+        )
+
+    def event_payload(self, issue_number: int, session_name: str) -> dict[str, Any]:
+        return {
+            "issue_number": issue_number,
+            "session_name": session_name,
+            "provider": self.provider,
+            "detail": self.detail,
+        }
+
+    def as_decision(self) -> "SessionDecision":
+        """Blocked, never failed or timed out.
+
+        The work is untouched and becomes launchable again the moment a human
+        re-authenticates. The typed AUTH verdict rides along so the circuit
+        owner can act on it and the reaction model can decline to mint a
+        substance investigation for a credential problem.
+
+        No ``blocked_label`` is set. The provider-blocked label and its durable
+        issue-scoped record are two halves of one transition owned by
+        :class:`~.provider_impact.ApplyProviderImpactAction`; naming a label
+        here would route it through generic blocked handling as a bare
+        ``AddLabelAction`` and leave the history behind (#6999 F5). The typed
+        ``provider_error_type`` is what tells completion planning to ask the
+        provider-impact owner instead.
+        """
+        return SessionDecision(
+            status=SessionStatus.BLOCKED,
+            reason=f"Provider not authenticated: {self.detail}",
+            blocked_reason=self.detail,
+            provider_error_type=ProviderErrorType.AUTH,
+            provider_auth_failure=ProviderAuthFailureDecision(
+                provider=self.provider,
+                error_summary=self.detail,
+                sample_id=self.sample_id,
+            ),
+        )
 
 
 def provider_success_from_status(status: "ProviderStatus | None") -> str | None:
@@ -56,3 +154,9 @@ class SessionDecision:
     diagnostic_path: str | None = None
     provider_success: str | None = None
     provider_transient_failure: ProviderTransientFailureDecision | None = None
+    provider_auth_failure: ProviderAuthFailureDecision | None = None
+    # The typed provider verdict this session ended on, when there was one.
+    # Downstream owners (notably the tech-lead reaction model) branch on this
+    # rather than re-reading labels or log text: an AUTH outcome says nothing
+    # about the issue's substance, so it must not mint an investigation.
+    provider_error_type: ProviderErrorType | None = None

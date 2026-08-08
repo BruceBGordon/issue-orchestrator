@@ -1920,6 +1920,44 @@ class AdvancedSettings(BaseModel):
             "yaml_path": "provider_resilience.circuit_breaker.label",
         },
     )
+    provider_auth_failure_threshold: int = Field(
+        1,
+        title="Provider Auth Failure Threshold",
+        description="Consecutive provider auth failures before the circuit opens",
+        ge=1,
+        le=10,
+        json_schema_extra={
+            "doc_examples": ["1", "2", "3"],
+            "doc_notes": (
+                "The credential probe reads local CLI state and is deterministic, "
+                "so one confirmed failure is normally enough. Raise it only if a "
+                "provider's probe proves flaky."
+            ),
+            "section": "Provider Resilience",
+            "config_attr": "provider_resilience.circuit_breaker.auth_failure_threshold",
+            "yaml_path": "provider_resilience.circuit_breaker.auth_failure_threshold",
+        },
+    )
+    provider_auth_cooldown_seconds: int = Field(
+        21600,
+        title="Provider Auth Cooldown (seconds)",
+        description="How long the circuit stays open after a provider auth failure",
+        ge=60,
+        le=604800,
+        json_schema_extra={
+            "doc_examples": ["3600", "21600", "86400"],
+            "doc_notes": (
+                "An expired login only a human can fix, so this is much longer "
+                "than the transient cooldown. Recovery does not wait it out, and "
+                "does not need a successful session: while the circuit is open "
+                "nothing launches, so the credential probe is what notices the "
+                "re-authentication and clears the circuit before the next launch."
+            ),
+            "section": "Provider Resilience",
+            "config_attr": "provider_resilience.circuit_breaker.auth_cooldown_seconds",
+            "yaml_path": "provider_resilience.circuit_breaker.auth_cooldown_seconds",
+        },
+    )
     session_interactions_enabled: bool = Field(
         False,
         title="Enable Session Interaction Rules",

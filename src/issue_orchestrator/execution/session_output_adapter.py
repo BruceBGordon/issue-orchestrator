@@ -11,7 +11,6 @@ from __future__ import annotations
 import json
 import logging
 import threading
-import uuid
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -40,6 +39,7 @@ from ..domain.exchange_chapter import (
     ExchangeChapter,
     ExchangeChapterSidecar,
 )
+from .run_directory_artifacts import RunDirectoryArtifacts
 from ..ports.session_output import (
     ReviewExchangeSummary,
     SessionRunAssets,
@@ -91,7 +91,7 @@ EXCHANGE_CHAPTERS_NAME = "chapters.json"
 REVIEW_FEEDBACK_DIR_NAME = "review-feedback"
 
 
-class FileSystemSessionOutput:
+class FileSystemSessionOutput(RunDirectoryArtifacts):
     """Filesystem-backed implementation of SessionOutput port.
 
     All artifacts for a session are stored in a single run directory:
@@ -1241,44 +1241,6 @@ Timestamp: {self._now_iso()}
             symlink_path.symlink_to(target, target_is_directory=True)
         except OSError:
             return
-
-    @staticmethod
-    def _read_json(path: Path) -> dict[str, Any] | None:
-        try:
-            if not path.exists():
-                return None
-            return json.loads(path.read_text())
-        except Exception:
-            return None
-
-    @staticmethod
-    def _write_json(path: Path, payload: dict[str, Any]) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-        temp_path.write_text(json.dumps(payload, indent=2, sort_keys=True))
-        temp_path.replace(path)
-
-    @staticmethod
-    def _write_text(path: Path, content: str) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-        temp_path.write_text(content)
-        temp_path.replace(path)
-
-    @staticmethod
-    def _append_run_log_line(run_dir: Path, line: str) -> None:
-        log_path = run_dir / TERMINAL_RECORDING_NAME
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        append_output_event(log_path, f"{line}\n")
-
-    @staticmethod
-    def _delete_tree(path: Path) -> None:
-        for child in path.iterdir():
-            if child.is_dir():
-                FileSystemSessionOutput._delete_tree(child)
-            else:
-                child.unlink()
-        path.rmdir()
 
     def _update_latest(self, worktree_path: Path, manifest: dict[str, Any]) -> None:
         payload = {

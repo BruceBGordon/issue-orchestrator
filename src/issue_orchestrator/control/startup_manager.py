@@ -246,7 +246,7 @@ class StartupManager:
             if running:
                 logger.info("Found %d running sessions to restore tracking", len(running))
                 print(f"  Found {len(running)} running sessions to restore tracking")
-                self._restore_sessions(running)
+            self._restore_sessions(running)  # unconditional: sweeps the ledger too
 
         # Step 5: Restore + sync queue cache (moved early so Steps 6/8 use cache)
         with self._phase("restore_and_sync_queue", timings):

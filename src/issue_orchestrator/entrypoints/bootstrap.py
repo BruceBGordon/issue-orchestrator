@@ -19,14 +19,28 @@ import logging
 import os
 import sys
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 from uuid import uuid4
 
 from ..control.background_job_supervisor import BackgroundJobSupervisor
 from ..infra.agent_callback_endpoint import RuntimeAgentCallbackEndpoint
+from .bootstrap_provider import (
+    build_provider_circuit_store,
+    build_provider_launch_sampler,
+    build_provider_readiness_probe,
+    build_provider_resilience,
+)
+from .bootstrap_claims import ClaimComponents, assemble_claim_components, lease_config_from
+from .bootstrap_pair_registry import build_pair_registry_with_worktree_hook
+from .bootstrap_pending_work import (
+    build_pending_work_wiring,
+    require_repository_host,
+)
 from .bootstrap_session_launcher import build_session_launcher_factory
+from .bootstrap_operator_commands import build_operator_issue_command_factory
 from .bootstrap_completion import (
     _validation_attempt_key_factory,
+    build_completion_handler_factory,
     create_completion_components,
 )
 from ..infra.config import Config
@@ -34,7 +48,6 @@ from ..infra.env import ENV_PREFIX
 from ..adapters.github.repo import get_repo_from_git, GitRepoError
 from ..ports.event_sink import EventSink, NullEventSink
 from ..ports.issue_tracker import IssueTracker
-from ..ports.provider_resilience import InMemoryProviderCircuitStore
 from ..ports.session_runner import SessionRunner, NullSessionRunner
 from ..ports.timeline_reader import NullTimelineReader
 from ..ports.timeline_store import NullTimelineStore, TimelineStore
@@ -49,7 +62,6 @@ from ..execution import (
     GitHubAdapter,
     CompositeEventSink,
     SqliteGoalPilotStore,
-    SQLiteProviderCircuitStore,
     QueueCacheStore,
     TimelineEventSink,
     DefaultTimelineReader,
@@ -66,6 +78,7 @@ from ..control import (
     LabelSync,
 )
 from ..control.action_applier import ActionApplier
+from ..control.governed_label_set import GovernedLabelSet
 from ..control.fact_gatherer import FactGatherer
 from ..control.health_gate import HealthGate
 from ..adapters.github import GitHubAuth, GitHubIssueResolver, GitHubCache, build_github_auth
@@ -78,6 +91,10 @@ from ..ports.verification import VerificationBudget
 from ..execution.worktree_adapter import GitWorktreeManager
 from ..execution.git_working_copy import GitWorkingCopy
 from ..execution.command_runner import LocalCommandRunner
+from ..ports.provider_readiness import (
+    NO_PROVIDER_READINESS_PROBE,
+    ProviderReadinessProbe,
+)
 from ..execution.session_output_adapter import FileSystemSessionOutput
 from ..execution.review_artifact_reader import ManifestReviewArtifactReader
 from ..execution.thread_background_job_runner import ThreadBackgroundJobRunner
@@ -87,8 +104,6 @@ from ..control.completion_dispatcher import (
 )
 from ..control.dependency_evaluator import DependencyEvaluator
 from ..control.workflows import ReviewWorkflow, RetrospectiveReviewWorkflow, ReworkWorkflow, TechLeadWorkflow
-from ..control.claim_gate import ClaimGate
-from ..control.lease_renewer import LeaseRenewer
 from ..control.worktree_manager import extract_issue_branches
 from ..infra import gh_audit, runtime_identity
 from .bootstrap_tech_lead import (
@@ -102,13 +117,11 @@ from ..infra.secret_env import (
 )
 from ..control.tech_lead_run_ownership import TechLeadRunOwnership
 from ..ports.claim_manager import ClaimManager, NullClaimManager
-from ..ports.run_ledger_store import (
-    SingleInstanceRunLedgerStore,
-    TechLeadRunLedgerStore,
-)
+from ..ports.run_ledger_store import SingleInstanceRunLedgerStore
 from ..domain.lease_config import LeaseConfig
 
 if TYPE_CHECKING:
+    from ..ports.label_set import LabelSet
     from ..control.label_manager import LabelManager
     from ..infra.orchestrator import Orchestrator
     from ..ports.attempt_store import AttemptStore
@@ -143,55 +156,6 @@ def export_orchestrator_python() -> None:
     at a different interpreter) are never clobbered.
     """
     os.environ.setdefault(ISSUE_ORCHESTRATOR_PYTHON_ENV, sys.executable)
-
-
-def _build_pair_registry_with_worktree_hook():  # noqa: ANN201
-    """Build the persistent pair registry with the worktree-reclaim hook.
-
-    The hook reclaims the reviewer worktree at the same lifecycle
-    boundary that closes the subprocesses (PR #6212 review feedback).
-    Without it, B2's removal of the per-exchange
-    ``remove_reviewer_worktree`` call would leave sibling worktrees
-    on disk after every release path (escalation / reset / shutdown
-    / merge). Hook is best-effort: errors are logged inside the
-    registry's ``_tear_down`` so a failed ``git worktree remove``
-    doesn't mask whatever brought us into the release path.
-
-    Extracted to a module-level helper so the production and testing
-    bootstrap paths share one wiring (single owner) and so tests
-    that patch ``remove_reviewer_worktree`` at the source module see
-    a real registry that delegates to the patched function.
-    """
-    from ..execution.persistent_exchange_pair_registry_inmemory import (
-        InMemoryPersistentExchangePairRegistry,
-        PersistentExchangePair,
-    )
-
-    def _reclaim_reviewer_worktree(
-        pair: PersistentExchangePair, reason: str,
-    ) -> None:
-        # Resolve the worktree helpers lazily inside the hook so
-        # tests can patch
-        # ``issue_orchestrator.execution.reviewer_worktree.remove_reviewer_worktree``
-        # at the source module and have the patch take effect.
-        # ``coder_branch`` is unused by ``remove_reviewer_worktree`` —
-        # it only needs the path — so stamping a placeholder keeps
-        # the helper's existing signature working without forcing the
-        # pair to remember the branch.
-        from ..execution import reviewer_worktree as _rw  # noqa: PLR0402
-
-        del reason  # only used in the registry's structured log
-        _rw.remove_reviewer_worktree(
-            _rw.ReviewerWorktree(
-                path=pair.reviewer_worktree_path,
-                coder_branch="<unused-on-removal>",
-            ),
-            force=True,
-        )
-
-    return InMemoryPersistentExchangePairRegistry(
-        on_release=_reclaim_reviewer_worktree,
-    )
 
 
 def _resolve_repo(config: Config) -> str | None:
@@ -294,60 +258,27 @@ def _create_claim_components(
     github: GitHubAdapter | None,
     events: EventSink,
     io_claimed_label: str = "io:claimed",
-) -> tuple[ClaimGate, LeaseRenewer, LeaseConfig, ClaimManager, TechLeadRunOwnership]:
-    """Create claim management components.
-
-    Both key spaces are wired here from ONE decision (``claims.enabled``): issue
-    claims and logical-run claims must never disagree about whether this
-    deployment coordinates across instances.
-    """
+) -> ClaimComponents:
+    """Choose both coordination stores from one deployment setting."""
+    lease = lease_config_from(config) if github and config.claims.enabled else LeaseConfig()
     if github and config.claims.enabled:
-        lease_config = LeaseConfig(
-            lease_seconds=config.claims.lease_seconds,
-            renew_interval_seconds=config.claims.renew_before_expiry_seconds,
-            convergence_timeout_seconds=config.claims.convergence_timeout_seconds,
-            convergence_poll_min_ms=config.claims.convergence_poll_min_ms,
-            convergence_poll_max_ms=config.claims.convergence_poll_max_ms,
-        )
         claimant_id = config.claims.claimant_id or f"orchestrator-{os.getpid()}"
-        claim_manager = GitHubRefClaimAdapter(
-            client=github.http_client,
-            claimant_id=claimant_id,
-            config=lease_config,
-            events=events,
-            label_adapter=github,
-            io_claimed_label=io_claimed_label,
+        manager = GitHubRefClaimAdapter(
+            client=github.http_client, claimant_id=claimant_id, config=lease,
+            events=events, label_adapter=github, io_claimed_label=io_claimed_label,
         )
-        run_ledger_store: TechLeadRunLedgerStore = GitHubRefRunLedgerAdapter(
-            client=github.http_client,
-            claimant_id=claimant_id,
-            config=lease_config,
+        ledger = GitHubRefRunLedgerAdapter(
+            client=github.http_client, claimant_id=claimant_id, config=lease,
         )
-        logger.info("Claims enabled: claimant_id=%s, lease=%ds", claimant_id, lease_config.lease_seconds)
+        logger.info("Claims enabled: claimant_id=%s, lease=%ds", claimant_id, lease.lease_seconds)
     else:
-        lease_config = LeaseConfig()
-        claim_manager = NullClaimManager()
-        run_ledger_store = SingleInstanceRunLedgerStore(
-            lease_seconds=lease_config.lease_seconds
-        )
+        manager = NullClaimManager()
+        ledger = SingleInstanceRunLedgerStore(lease_seconds=lease.lease_seconds)
         logger.info(
             "Claims disabled: running in single-orchestrator mode. "
-            "Multi-machine coordination is OFF. To enable, set "
-            "claims.enabled=true in config."
+            "Multi-machine coordination is OFF. To enable, set claims.enabled=true in config."
         )
-
-    claim_gate = ClaimGate(claim_manager=claim_manager, events=events)
-    lease_renewer = LeaseRenewer(
-        claim_manager=claim_manager,
-        events=events,
-        config=lease_config,
-    )
-    run_ownership = TechLeadRunOwnership(
-        run_ledger_store,
-        lease_seconds=lease_config.lease_seconds,
-        renew_before_expiry_seconds=lease_config.renew_interval_seconds,
-    )
-    return claim_gate, lease_renewer, lease_config, claim_manager, run_ownership
+    return assemble_claim_components(manager, ledger, lease, events)
 
 
 def _create_planner(
@@ -386,7 +317,12 @@ def _create_planner(
 
     scheduler = Scheduler(config=config, dependency_evaluator=dependency_evaluator)
 
-    label_sync = LabelSync(labels=github, events=events, pr_tracker=github, label_manager=label_manager) if github else None
+    # The governed block is refused BY VALUE here, so a computed sync
+    # collection cannot smuggle it past its owner (#6999 F2 round 4).
+    label_sync = LabelSync(
+        labels=GovernedLabelSet(labels=github, governed_label=label_manager.needs_human),
+        events=events, pr_tracker=github, label_manager=label_manager,
+    ) if github and label_manager else None
 
     review_workflow = ReviewWorkflow(config=config, events=events)
     retrospective_review_workflow = RetrospectiveReviewWorkflow(config=config, events=events)
@@ -514,17 +450,7 @@ def _validate_required_deps(
 ) -> None:
     """Validate all required dependencies are present."""
     # GitHub requires special error message
-    if github is None:
-        raise ValueError(
-            "Could not determine GitHub repository.\n\n"
-            "Either:\n"
-            "  1. Set 'repo.name' in your config file:\n"
-            "       repo:\n"
-            "         name: owner/repo-name\n\n"
-            "  2. Or ensure you're running from a git repo with a GitHub remote:\n"
-            "       git remote get-url origin\n"
-            "       # Should show: https://github.com/owner/repo.git"
-        )
+    require_repository_host(github)
     # Check all other required deps with a data-driven approach
     deps_to_check = [
         (event_hub, "EventHub"),
@@ -656,24 +582,25 @@ def build_orchestrator(
         config, github, events, io_claimed_label=label_manager.io_claimed,
     )
 
-    provider_circuit_store = SQLiteProviderCircuitStore(
-        state_dir(config.repo_root) / "provider_circuit.sqlite"
-    )
     queue_cache_store = QueueCacheStore(
         state_dir(config.repo_root) / "queue_cache.sqlite"
     )
-    provider_resilience = ProviderResilienceManager(
-        config.provider_resilience,
-        store=provider_circuit_store,
-        events=events,
+    provider_resilience = build_provider_resilience(
+        config, events, build_provider_circuit_store(state_dir(config.repo_root))
+    )
+
+    # Create IO adapters
+    worktree_manager, working_copy, command_runner, session_output = _create_io_adapters(github_auth)
+
+    provider_readiness_probe = build_provider_readiness_probe(command_runner)
+    provider_launch_sampler = build_provider_launch_sampler(
+        config, provider_resilience, provider_readiness_probe, label_manager
     )
 
     # Create planner and control plane components
     planner, _scheduler, _dependency_evaluator, label_sync = _create_planner(config, github, events, provider_resilience, label_manager=label_manager)
     session_manager = SessionManager(runner=runner, events=events, config=config)
 
-    # Create IO adapters
-    worktree_manager, working_copy, command_runner, session_output = _create_io_adapters(github_auth)
     goal_pilot_store = SqliteGoalPilotStore(repo_root=config.repo_root)
     attempt_store = create_attempt_store(config)
 
@@ -688,9 +615,18 @@ def build_orchestrator(
 
     e2e_issue_tracker = GitHubE2EIssueTracker(github.http_client) if github else None
 
+    # Every label writer EXCEPT the shared-block owner gets a capability that
+    # refuses the governed label by value (#6999 F2 round 4): a check the caller
+    # never received cannot be routed around.
+    governed_labels = GovernedLabelSet(
+        labels=github, governed_label=label_manager.needs_human
+    ) if github else None
+
     # Create action applier (IO boundary)
     action_applier = ActionApplier(
-        labels=github,
+        # ``github`` is None only on the no-repository path, which fails with a
+        # ValueError further down; the applier is never used before then.
+        labels=cast("LabelSet", governed_labels),
         sessions=session_manager,
         events=events,
         repository_host=github,
@@ -746,7 +682,7 @@ def build_orchestrator(
     # review exchange. Built here (above completion components and
     # InfraServices) so the shutdown / reset / escalation paths can
     # reach it through ``deps.pair_registry``.
-    pair_registry = _build_pair_registry_with_worktree_hook()
+    pair_registry = build_pair_registry_with_worktree_hook()
 
     # Process-scoped rendezvous between the exchange worker thread and the
     # agent-facing ``exchange-respond`` Control API handler. One instance,
@@ -762,8 +698,18 @@ def build_orchestrator(
     agent_callback_endpoint = RuntimeAgentCallbackEndpoint()
 
 
-    # Create completion components
-    completion_processor, session_controller_instance = create_completion_components(
+    # Built here, before the completion pipeline, because that pipeline needs
+    # the shared-block owner: the agent's typed needs_human outcome routes
+    # through it (#6999 F2 round 4).
+    repository_host = require_repository_host(github)
+    pending_work = build_pending_work_wiring(
+        repo_root=config.repo_root,
+        repository_host=repository_host,
+        action_applier=cast("ActionApplier", action_applier),
+        label_writer=repository_host,
+        label_manager=label_manager, events=events)
+
+    completion_processor, session_controller_instance, completion_handler_factory = create_completion_components(
         config, github, events, working_copy, session_output, command_runner, provider_resilience,
         label_manager=label_manager,
         background_job_supervisor=background_job_supervisor,
@@ -772,6 +718,9 @@ def build_orchestrator(
         attempt_store=attempt_store,
         turn_mailbox=turn_mailbox,
         tech_lead_authority=tech_lead_authority,
+        open_issue_corpus=tech_lead.open_issue_corpus,
+        repository_host=github,
+        needs_human_block=pending_work.needs_human_block,
     )
     _wire_stack_publish_gate(
         completion_processor, _dependency_evaluator, github, command_runner, config,
@@ -802,6 +751,7 @@ def build_orchestrator(
     assert session_restorer is not None
     assert completion_processor is not None
     assert session_controller_instance is not None
+    assert completion_handler_factory is not None
     assert fresh_issue_reader is not None
     assert manifest_downloader is not None
     assert e2e_issue_tracker is not None
@@ -838,6 +788,8 @@ def build_orchestrator(
         label_store=label_store,
         queue_cache_store=queue_cache_store,
         provider_resilience=provider_resilience,
+        provider_readiness_probe=provider_readiness_probe,
+        provider_launch_sampler=provider_launch_sampler,
         timeline_reader=timeline_reader,
         timeline_store=timeline_store,
         timeline_writer=timeline_writer,
@@ -873,6 +825,8 @@ def build_orchestrator(
         state_machine_manager=state_machine_manager,
         label_manager=label_manager,
         agent_callback_endpoint=agent_callback_endpoint,
+        provider_readiness_probe=provider_readiness_probe,
+        needs_human_block=pending_work.needs_human_block,
     )
     deps = OrchestratorDeps(
         events=events,
@@ -893,6 +847,9 @@ def build_orchestrator(
         command_runner=command_runner,
         session_output=session_output,
         manifest_downloader=manifest_downloader,
+        pending_work_claims=pending_work.claims,
+        claim_quarantine=pending_work.quarantine,
+        needs_human_block=pending_work.needs_human_block,
         state_machine_manager=state_machine_manager,
         completion_processor=completion_processor,
         session_controller=session_controller_instance,
@@ -902,6 +859,15 @@ def build_orchestrator(
         health_gate=health_gate,
         agent_callback_endpoint=agent_callback_endpoint,
         session_launcher_factory=session_launcher_factory,
+        completion_handler_factory=completion_handler_factory,
+        operator_issue_command_factory=build_operator_issue_command_factory(
+            config,
+            repository_host=github,
+            label_manager=label_manager,
+            needs_human_block=pending_work.needs_human_block,
+            fresh_issue_reader=fresh_issue_reader,
+            queue_cache_store=queue_cache_store,
+        ),
         board_snapshot_builder=create_board_snapshot_builder(
             config, timeline_store, tech_lead_board_publisher, working_copy
         ),
@@ -955,6 +921,7 @@ def build_orchestrator_for_testing(
     action_applier: ActionApplier | None = None,
     fact_gatherer: FactGatherer | None = None,
     claim_manager: ClaimManager | None = None,
+    provider_readiness_probe: "ProviderReadinessProbe | None" = None,
     run_ownership: TechLeadRunOwnership | None = None,
 ) -> "Orchestrator":
     """Build an orchestrator for testing with mock dependencies.
@@ -972,6 +939,10 @@ def build_orchestrator_for_testing(
         session_manager: Mock SessionManager (defaults to creating one)
         action_applier: Mock ActionApplier (defaults to creating one from github)
         fact_gatherer: Mock FactGatherer (defaults to creating one from github)
+        provider_readiness_probe: Fake provider-readiness port. Defaults to the
+            explicit "no probe wired" reader — a test composition must never
+            shell out to a real provider CLI (#6999 F6).
+        run_ownership: Optional cross-engine tech-lead run owner for tests.
 
     Returns:
         Orchestrator configured with test dependencies
@@ -988,11 +959,7 @@ def build_orchestrator_for_testing(
     events = SequencedEventSink(events)
     background_job_supervisor = BackgroundJobSupervisor(NullBackgroundJobRunner())
 
-    provider_resilience = ProviderResilienceManager(
-        config.provider_resilience,
-        store=InMemoryProviderCircuitStore(),
-        events=events,
-    )
+    provider_resilience = build_provider_resilience(config, events)
 
     # Create label manager (shared instance for all control-layer components)
     from ..control.label_manager import LabelManager as _LabelManager
@@ -1002,6 +969,20 @@ def build_orchestrator_for_testing(
     # Only bound when this root builds the planner; a caller-injected planner
     # carries its own evaluator, so the stack publish-gate stays unwired there.
     _dependency_evaluator: DependencyEvaluator | None = None
+
+    # Create adapters for IO operations
+    worktree_manager = GitWorktreeManager()
+    working_copy = GitWorkingCopy()
+    command_runner = LocalCommandRunner()
+    session_output = FileSystemSessionOutput()
+
+    # A test composition must never shell out to a real provider CLI: readiness
+    # defaults to the explicit "no probe wired" reader (UNKNOWN => launchable,
+    # no circuit writes) and tests inject a fake when they mean to exercise it.
+    provider_readiness_probe = provider_readiness_probe or NO_PROVIDER_READINESS_PROBE
+    provider_launch_sampler = build_provider_launch_sampler(
+        config, provider_resilience, provider_readiness_probe, label_manager
+    )
 
     # Create default planner if not provided
     if planner is None:
@@ -1016,12 +997,6 @@ def build_orchestrator_for_testing(
     # Create default session manager if not provided
     if session_manager is None:
         session_manager = SessionManager(runner=runner, events=events, config=config)
-
-    # Create adapters for IO operations
-    worktree_manager = GitWorktreeManager()
-    working_copy = GitWorkingCopy()
-    command_runner = LocalCommandRunner()
-    session_output = FileSystemSessionOutput()
     goal_pilot_store = SqliteGoalPilotStore(repo_root=config.repo_root)
     attempt_store = create_attempt_store(config)
 
@@ -1047,7 +1022,9 @@ def build_orchestrator_for_testing(
     # Create default action applier
     if action_applier is None:
         action_applier = ActionApplier(
-            labels=github,
+            labels=GovernedLabelSet(
+                labels=github, governed_label=label_manager.needs_human
+            ),
             sessions=session_manager,
             events=events,
             repository_host=github,
@@ -1100,7 +1077,7 @@ def build_orchestrator_for_testing(
         ReviewExchangeCancellation,
         cancel_issue_review_exchange,
     )
-    pair_registry_for_testing = _build_pair_registry_with_worktree_hook()
+    pair_registry_for_testing = build_pair_registry_with_worktree_hook()
     from ..execution.review_exchange_turn_mailbox import InMemoryTurnMailbox
     turn_mailbox = InMemoryTurnMailbox()
 
@@ -1132,8 +1109,15 @@ def build_orchestrator_for_testing(
             job_supervisor=background_job_supervisor,
         )
 
+    pending_work = build_pending_work_wiring(
+        repo_root=config.repo_root, repository_host=github,
+        action_applier=action_applier, label_writer=github,
+        label_manager=label_manager, events=events)
+
     completion_processor = CompletionProcessor(
-        label_adapter=github,
+        label_adapter=GovernedLabelSet(
+            labels=github, governed_label=label_manager.needs_human
+        ),
         pr_adapter=github,
         git_adapter=working_copy,
         session_output=session_output,
@@ -1150,6 +1134,7 @@ def build_orchestrator_for_testing(
         review_artifact_reader=ManifestReviewArtifactReader(),
         runtime_identity=runtime_identity.resolve_runtime_identity(),
         tech_lead_authority=tech_lead_authority_for_testing,
+        needs_human_block=pending_work.needs_human_block,
     )
     _wire_stack_publish_gate(
         completion_processor, _dependency_evaluator, github, command_runner, config,
@@ -1167,12 +1152,11 @@ def build_orchestrator_for_testing(
         validation_timeout_seconds=config.validation.quick.timeout_seconds,
         attempt_store=attempt_store,
         validation_attempt_key_factory=_validation_attempt_key_factory(config),
-        provider_blocked_label=label_manager.provider_unavailable,
         review_exchange_canceller=_cancel_review_exchange_for_testing,
     )
 
     # Create LabelSync for testing
-    label_sync = default_label_sync or LabelSync(labels=github, events=events, pr_tracker=github, label_manager=label_manager)
+    label_sync = default_label_sync or LabelSync(labels=GovernedLabelSet(labels=github, governed_label=label_manager.needs_human), events=events, pr_tracker=github, label_manager=label_manager)
 
     # Create EventHub for testing
     event_hub = EventHub()
@@ -1183,17 +1167,14 @@ def build_orchestrator_for_testing(
     # Create claim components for testing (NullClaimManager by default).
     lease_config = LeaseConfig()
     claim_manager = claim_manager or NullClaimManager()
-    claim_gate = ClaimGate(claim_manager=claim_manager, events=events)
-    lease_renewer = LeaseRenewer(
-        claim_manager=claim_manager,
-        events=events,
-        config=lease_config,
-    )
-    run_ownership = run_ownership or TechLeadRunOwnership(
+    claims = assemble_claim_components(
+        claim_manager,
         SingleInstanceRunLedgerStore(lease_seconds=lease_config.lease_seconds),
-        lease_seconds=lease_config.lease_seconds,
-        renew_before_expiry_seconds=lease_config.renew_interval_seconds,
+        lease_config,
+        events,
     )
+    claim_gate, lease_renewer = claims.claim_gate, claims.lease_renewer
+    run_ownership = run_ownership or claims.run_ownership
 
     publish_recovery = _build_publish_recovery(
         repository_host=github,
@@ -1228,6 +1209,8 @@ def build_orchestrator_for_testing(
         label_store=label_store,
         queue_cache_store=queue_cache_store,
         provider_resilience=provider_resilience,
+        provider_readiness_probe=provider_readiness_probe,
+        provider_launch_sampler=provider_launch_sampler,
         timeline_reader=timeline_reader,
         timeline_store=timeline_store,
         timeline_writer=timeline_writer,
@@ -1261,6 +1244,18 @@ def build_orchestrator_for_testing(
         state_machine_manager=state_machine_manager,
         label_manager=label_manager,
         agent_callback_endpoint=agent_callback_endpoint,
+        provider_readiness_probe=provider_readiness_probe,
+        needs_human_block=pending_work.needs_human_block,
+    )
+    completion_handler_factory = build_completion_handler_factory(
+        config,
+        events=events,
+        repository_host=github,
+        session_output=session_output,
+        tech_lead_authority=tech_lead_authority_for_testing,
+        open_issue_corpus=tech_lead.open_issue_corpus,
+        label_manager=label_manager,
+        provider_resilience=provider_resilience,
     )
     deps = OrchestratorDeps(
         events=events,
@@ -1281,6 +1276,9 @@ def build_orchestrator_for_testing(
         command_runner=command_runner,
         session_output=session_output,
         manifest_downloader=manifest_downloader,
+        pending_work_claims=pending_work.claims,
+        claim_quarantine=pending_work.quarantine,
+        needs_human_block=pending_work.needs_human_block,
         state_machine_manager=state_machine_manager,
         completion_processor=completion_processor,
         session_controller=session_controller,
@@ -1289,6 +1287,15 @@ def build_orchestrator_for_testing(
         health_gate=health_gate,
         agent_callback_endpoint=agent_callback_endpoint,
         session_launcher_factory=session_launcher_factory,
+        completion_handler_factory=completion_handler_factory,
+        operator_issue_command_factory=build_operator_issue_command_factory(
+            config,
+            repository_host=github,
+            label_manager=label_manager,
+            needs_human_block=pending_work.needs_human_block,
+            fresh_issue_reader=fresh_issue_reader,
+            queue_cache_store=queue_cache_store,
+        ),
         board_snapshot_builder=create_board_snapshot_builder(
             config, timeline_store, tech_lead_board_publisher_for_testing, working_copy
         ),

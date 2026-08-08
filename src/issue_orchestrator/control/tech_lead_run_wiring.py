@@ -317,7 +317,7 @@ def withdraw_revalidated_tech_lead_run(
     """
     from ..events import EventName
     from ..ports import make_trace_event
-    from .session_routing import PendingSessionQueues
+    from .pending_session_queues import PendingSessionQueues
 
     scope = IssueInvestigationScope(action.issue_number)
     PendingSessionQueues(tick.state).remove_tech_lead(action.issue_number)
@@ -475,7 +475,7 @@ def reconcile_orchestrator_tech_lead_ownership(
 def _withdraw_lost_queued_runs(
     orchestrator: TechLeadFacadeHost, lost: set[str]
 ) -> None:
-    from .session_routing import PendingSessionQueues
+    from .pending_session_queues import PendingSessionQueues
     from .tech_lead_run_admission import run_key_of_pending
 
     queues = PendingSessionQueues(orchestrator.state)

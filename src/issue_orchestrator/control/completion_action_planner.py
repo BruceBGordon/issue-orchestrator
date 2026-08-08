@@ -31,8 +31,12 @@ from .invalid_record_actions import (
     invalid_record_allows_interrupted_retry,
 )
 from .label_manager import LabelManager
+from .provider_availability import ProviderAvailabilityPolicy
+from .provider_blocked_completion import provider_blocked_actions
 from .reconciliation import ExpectedState, build_expected_for_mutation
 from .tech_lead_session_policy import is_tech_lead_session
+from ..ports.provider_resilience import ProviderErrorType
+from .needs_human_block import NeedsHumanCause
 
 logger = logging.getLogger(__name__)
 
@@ -104,12 +108,17 @@ class CompletionActionPlanner:
         tech_lead_authority: TechLeadAuthorityStore,
         open_issue_corpus: OpenIssueCorpusManager,
         active_session_run_id: Callable[[int], str | None],
+        provider_availability: "ProviderAvailabilityPolicy",
     ) -> None:
         self.config = config
         self.repository_host = repository_host
         self._lm = label_manager
         self._tech_lead_authority = tech_lead_authority
         self._open_issue_corpus = open_issue_corpus
+        # The only way this planner is allowed to move the provider-blocked
+        # label: through the owner command that carries the durable
+        # issue-scoped record with it (#5980 F1 / #6999 F5/A2).
+        self._provider_availability = provider_availability
         # Resolves the target issue's live session run id so a gated
         # kill_hung_session proposal binds approval to that generation (#6779 R1).
         self._active_session_run_id = active_session_run_id
@@ -294,11 +303,16 @@ class CompletionActionPlanner:
         blocked_reason: Optional[str] = None,
         pr_url: Optional[str] = None,
         completion_detail: Optional[dict[str, Any]] = None,
+        provider_error_type: ProviderErrorType | None = None,
     ) -> tuple[Action, ...]:
         """Generate label/comment actions for session completion.
 
         This encapsulates the POLICY logic for what labels to add/remove
         when a session completes with various statuses.
+
+        ``provider_error_type`` carries the typed verdict a provider-caused
+        block ended on. It is what routes the block to the provider-impact
+        owner instead of generic blocked handling, for every session kind.
         """
         expected = build_expected_for_mutation()
 
@@ -361,6 +375,7 @@ class CompletionActionPlanner:
                     expected,
                     blocked_label=blocked_label,
                     blocked_reason=blocked_reason,
+                    provider_error_type=provider_error_type,
                 )
             )
 
@@ -423,6 +438,7 @@ class CompletionActionPlanner:
                     issue_number=issue_number,
                     label=self._lm.needs_human,
                     reason=f"Publishing failed {new_count} consecutive times — escalating to needs-human",
+                    needs_human_cause=NeedsHumanCause.SESSION_LIFECYCLE,
                     expected=expected,
                 ),
                 AddCommentAction(
@@ -596,6 +612,7 @@ class CompletionActionPlanner:
                     issue_number=issue_number,
                     label=self._lm.needs_human,
                     reason="Session terminated without calling completion command (mandatory)",
+                    needs_human_cause=NeedsHumanCause.SESSION_LIFECYCLE,
                     expected=expected,
                 ),
                 AddCommentAction(
@@ -649,8 +666,21 @@ class CompletionActionPlanner:
         expected: ExpectedState,
         blocked_label: Optional[str] = None,
         blocked_reason: Optional[str] = None,
+        provider_error_type: ProviderErrorType | None = None,
     ) -> list[Action]:
-        """Generate actions when agent explicitly reported blocked."""
+        """Generate actions for a BLOCKED completion.
+
+        Two routes, decided here rather than by the caller so "what a block
+        means" has one owner: a typed provider verdict is an outage impacting
+        the issue, and anything else is the agent reporting it cannot proceed.
+        """
+        if provider_error_type is not None:
+            return provider_blocked_actions(
+                session,
+                expected,
+                label_manager=self._lm,
+                provider_availability=self._provider_availability,
+            )
         is_issue_session = session.terminal_id.startswith("issue-")
         label = blocked_label or self._lm.blocked
 

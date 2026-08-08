@@ -415,6 +415,7 @@ class TestSessionCompletionClaimRelease:
             session_output=MagicMock(),
             claim_manager=mock_claim_manager,
             events=mock_events,
+            pending_work_claims=_test_claim_store(),
         )
 
         # Verify claim was released
@@ -485,7 +486,22 @@ class TestSessionCompletionClaimRelease:
             session_output=MagicMock(),
             claim_manager=mock_claim_manager,
             events=mock_events,
+            pending_work_claims=_test_claim_store(),
         )
 
         # Verify no release was attempted
         assert len(mock_claim_manager.release_claim_calls) == 0
+
+
+def _test_claim_store(tmp_path=None):
+    """The orchestrator-owned claim store completion now requires (#6999 F9)."""
+    import tempfile
+    from pathlib import Path as _Path
+
+    from issue_orchestrator.execution.pending_work_claim_store import (
+        SqlitePendingWorkClaimStore,
+    )
+
+    return SqlitePendingWorkClaimStore.for_repo(
+        _Path(tmp_path) if tmp_path is not None else _Path(tempfile.mkdtemp())
+    )

@@ -30,20 +30,27 @@ planning or completion time (#6769 finding 4).
 
 from __future__ import annotations
 
+import logging
 import re
 from collections.abc import Callable, Collection, Iterable, Sequence
 from typing import TYPE_CHECKING, Any, Mapping
 
+from ..domain.tech_lead_naming import TECH_LEAD_DISPLAY_NAME
 from ..domain.tech_lead_session import (
     HEALTH_REVIEW_MARKER_LABEL,
     TECH_LEAD_AREA_LABEL_PREFIX,
     TECH_LEAD_OBSERVATION_LABEL,
+    TechLeadCreationOrigin,
 )
-from .actions import TechLeadMilestoneIntent
+from .actions import CreateTechLeadIssueAction, TechLeadMilestoneIntent
 from .label_manager import LabelManager
 
 if TYPE_CHECKING:
+    from ..domain.models import TechLeadFacts
     from ..infra.config import Config
+
+
+logger = logging.getLogger(__name__)
 
 
 # Workflow label families that no agent-proposed label may match. These are
@@ -197,6 +204,68 @@ def batch_review_issue_labels(
     if config.filtering.label:
         base.append(config.filtering.label)
     return _with_configured_labels(config, base, source_labels=source_labels)
+
+
+def plan_batch_review_issue(
+    config: "Config", facts: "TechLeadFacts"
+) -> CreateTechLeadIssueAction | None:
+    """Build the batch-review tracking issue when its threshold is met.
+
+    This policy lives beside the labels, milestone intent, and title prefix it
+    stamps.  The planner offers observed facts; this owner decides the complete
+    shape of the resulting tech-lead anchor.
+    """
+    if facts.threshold <= 0:
+        # Batch trigger disabled; facts may exist for the health review alone.
+        return None
+    if facts.pr_count < facts.threshold:
+        logger.debug(
+            "Planner: tech_lead threshold not met (%d/%d)",
+            facts.pr_count,
+            facts.threshold,
+        )
+        return None
+    if facts.existing_tech_lead_issue:
+        logger.debug(
+            "Planner: tech_lead issue #%d already exists",
+            facts.existing_tech_lead_issue,
+        )
+        return None
+
+    pr_list = "\n".join(f"- PR #{number}: {title}" for number, title in facts.prs)
+    body = f"""## Tech Lead Batch Review Triggered
+
+{facts.pr_count} PRs have passed code review and are ready for tech_lead review:
+
+{pr_list}
+
+Review these PRs for patterns, architectural concerns, and process improvements.
+Flip labels from `{facts.watch_label}` to `{config.tech_lead_reviewed_label}` after review.
+"""
+    title = apply_tech_lead_priority_prefix(
+        config,
+        f"{TECH_LEAD_DISPLAY_NAME} Batch Review: {facts.pr_count} PRs pending",
+    )
+    labels = batch_review_issue_labels(config, source_labels=facts.source_labels)
+    # Milestone travels as intent; the applier resolves explicit names at the
+    # create-issue execution boundary (#6769 finding 4).
+    milestone = tech_lead_issue_milestone_intent(config, facts.source_milestones)
+    logger.info(
+        "Planner: creating tech_lead issue for %d PRs (labels=%s, milestone=%s)",
+        facts.pr_count,
+        labels,
+        milestone,
+    )
+    return CreateTechLeadIssueAction(
+        title=title,
+        body=body,
+        labels=labels,
+        pr_count=facts.pr_count,
+        milestone=milestone,
+        reason=f"threshold met: {facts.pr_count} >= {facts.threshold}",
+        # This IS the anchor: no prior issue to reconcile against (#6957 F6).
+        origin=TechLeadCreationOrigin.authors_anchor(),
+    )
 
 
 def health_review_issue_labels(config: "Config") -> tuple[str, ...]:

@@ -96,6 +96,41 @@ class EventName(str, Enum):
     SESSION_INVALID_COMPLETION_RECORD = "session.invalid_completion_record"
     SESSION_TIMEOUT_RECOVERED = "session.timeout_recovered"
     SESSION_PROCESSING_COMPLETED = "session.processing_completed"
+    # Two distinct, deliberately non-timeout provider outcomes. Keeping both
+    # out of SESSION_TIMEOUT is the point: a timeout mints a substance
+    # failure-investigation, and a provider problem has none.
+    #
+    # A launch that never happened: the gate asked the provider before spawning
+    # and it refused — an expired login, or a CLI that is not installed. Nothing
+    # ran, so there is nothing to explain about the work itself.
+    SESSION_LAUNCH_BLOCKED_PROVIDER = "session.launch_blocked_provider"
+    # A session that *did* launch and is being terminated because its provider
+    # is not authenticated. A separate name because the reader's question is
+    # different — "what happened to my running session" versus "why did nothing
+    # start" — and because exactly one owner announces each (#6999 F5).
+    SESSION_PROVIDER_AUTH_TERMINATED = "session.provider_auth_terminated"
+    # A restored terminal whose durable pending-work claim could not be read, so
+    # the orchestrator does not know which queued request it is holding and
+    # refuses to track it (#6999 F6). Paired with a durable needs-human label:
+    # this event is what the dashboard reacts to, the label is what survives a
+    # restart.
+    SESSION_CLAIM_UNREADABLE = "session.claim_unreadable"
+    # A live terminal the orchestrator discovered but could not rebuild into a
+    # session. Distinct from the name above on purpose (#6999 A1/F2): here the
+    # claim reads cleanly, so the work IS known and is deliberately not being
+    # re-queued while the terminal runs. Reporting it as "unreadable claim"
+    # would tell an operator to work out what the session was doing and re-queue
+    # it - the manual duplicate launch that protecting the run prevents.
+    SESSION_RUN_UNRESTORABLE = "session.run_unrestorable"
+    # BOTH halves failed: a live terminal that can be neither rebuilt nor
+    # identified (#6999 F6). It gets its own name rather than borrowing either
+    # neighbour's, because both of those make a promise this state cannot keep
+    # - "the work is known" (run_unrestorable) and "the terminal has stopped or
+    # can be reasoned about from its claim" (claim_unreadable). A reader acting
+    # on either would re-queue by hand beside a session still doing the work.
+    SESSION_RUN_UNRESTORABLE_CLAIM_UNREADABLE = (
+        "session.run_unrestorable_claim_unreadable"
+    )
     SESSION_START_FAILED = "session.start_failed"
     SESSION_STOPPED = "session.stopped"
     SESSION_CLEANUP = "session.cleanup"
@@ -244,6 +279,16 @@ class EventName(str, Enum):
     # observability, but they can never reach an issue timeline (the timeline
     # writer is keyed by ``issue_number``).
     PROVIDER_TRANSIENT_ERROR = "provider.transient_error"
+    # A typed AUTH outcome reached the circuit owner: the provider's own
+    # credential probe says it is not logged in. Fleet-scoped like its
+    # neighbours — it names a circuit, not an issue. Which issue-scoped event
+    # follows depends on where the work was when it hit the outage:
+    #   * circuit still closed (sub-threshold): the launch gate refuses the
+    #     launch => SESSION_LAUNCH_BLOCKED_PROVIDER
+    #   * circuit open: planning parks the work up front => PROVIDER_ISSUE_BLOCKED
+    #   * a session already running: it is terminated
+    #     => SESSION_PROVIDER_AUTH_TERMINATED
+    PROVIDER_AUTH_FAILED = "provider.auth_failed"
     PROVIDER_OUTAGE_ENTERED = "provider.outage_entered"
     PROVIDER_RETRY_SCHEDULED = "provider.retry_scheduled"
     PROVIDER_RETRY_ATTEMPTED = "provider.retry_attempted"
@@ -411,6 +456,13 @@ class PublicEventName(str, Enum):
     SESSION_FAILED = "session.failed"
     SESSION_TIMEOUT = "session.timeout"
     SESSION_BLOCKED = "session.blocked"
+    SESSION_LAUNCH_BLOCKED_PROVIDER = "session.launch_blocked_provider"
+    SESSION_PROVIDER_AUTH_TERMINATED = "session.provider_auth_terminated"
+    SESSION_CLAIM_UNREADABLE = "session.claim_unreadable"
+    SESSION_RUN_UNRESTORABLE = "session.run_unrestorable"
+    SESSION_RUN_UNRESTORABLE_CLAIM_UNREADABLE = (
+        "session.run_unrestorable_claim_unreadable"
+    )
     SESSION_NO_COMPLETION_RECORD = "session.no_completion_record"
     SESSION_INVALID_COMPLETION_RECORD = "session.invalid_completion_record"
     SESSION_PROCESSING_COMPLETED = "session.processing_completed"

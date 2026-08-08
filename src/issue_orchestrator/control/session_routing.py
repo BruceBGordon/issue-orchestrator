@@ -7,13 +7,10 @@ SessionManager adapter calls.
 """
 
 import logging
-from dataclasses import dataclass
-from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Optional
 
 from ..domain.models import (
-    DiscoveredFailure,
     Issue,
     PendingReview,
     PendingRetrospectiveReview,
@@ -22,17 +19,38 @@ from ..domain.models import (
     PendingValidationRetry,
     Session,
 )
-from ..domain.tech_lead_session import TechLeadLaunchScope, TechLeadSessionFlavor
+from ..domain.pending_work import (
+    PendingWorkClaim,
+    PendingWorkKind,
+)
+from ..domain.tech_lead_session import TechLeadLaunchScope
 from ..events import EventName
 from ..infra.config import Config
 from ..ports import EventSink, Issue as IssueProtocol, make_trace_event
+from ..ports.pending_work_claim_store import PendingWorkClaimStore
 from ..ports.session_runner import DiscoveredSession
 from .active_sessions import append_unique_active_sessions
+from .existing_terminal_restoration import (
+    _ExistingTerminalRestorationRequest,
+    _restore_existing_terminal,
+)
+from .pending_session_queues import (
+    TECH_LEAD_LAUNCH_RETRY_LIMIT,
+    PendingSessionQueues,
+)
+from .in_flight_work import InFlightWorkLedger
+from .launch_transaction import (
+    LaunchSettlement,
+    PendingWorkLaunchClaim,
+    RetryPlan,
+)
+from .session_launch_types import LaunchDisposition
 from .session_launcher import SessionLauncher
 from .session_manager import SessionManager, SessionRef
 
 if TYPE_CHECKING:
     from ..domain.models import OrchestratorState
+    from .claim_quarantine import ClaimQuarantineOwner
     from ..domain.state_machines.session_machine import SessionStateMachine
     from .session_manager import SessionType
     from .session_restorer import SessionRestorer
@@ -41,227 +59,28 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-@dataclass(frozen=True, slots=True)
-class _ExistingTerminalRestorationRequest:
-    """Typed request to restore one known terminal from runner discovery."""
-
-    issue_number: int
-    session_name: str
-    is_review: bool
-    tab_name: str = ""
-
-
-class TechLeadQueueOutcome(Enum):
-    """Explicit result of asking the queue owner to enqueue tech_lead work."""
-
-    QUEUED = "queued"
-    DUPLICATE = "duplicate"
-
-
-# Bound on retryable launch failures per queued tech_lead item. Three attempts
-# ride out a transient SQLite/log/filesystem blip without relaunch-looping a
-# genuinely broken input forever; after the third failure the item is dropped
-# and the drop is surfaced loudly (fail-fast-but-not-silent).
-TECH_LEAD_LAUNCH_RETRY_LIMIT = 3
-
-
-class TechLeadRetentionOutcome(Enum):
-    """Explicit result of retaining a queued tech_lead item after a retryable failure."""
-
-    RETAINED = "retained"
-    EXHAUSTED = "exhausted"
-
-
-@dataclass(frozen=True, slots=True)
-class PendingSessionQueues:
-    """Owner for pending session queues: launch-routing removals + tech_lead intake.
-
-    Tech Lead intake is behavior-level (#6768 round 3): producers say WHICH
-    variant they are queueing (batch review, failure investigation, or health
-    review) and this owner constructs the ``PendingTechLeadReview``, applies the
-    single deduplication rule (by issue number against the pending queue), and
-    returns an explicit :class:`TechLeadQueueOutcome`. Producers never touch the
-    dataclass or the state list.
-    """
-
-    state: "OrchestratorState"
-
-    def remove_review(self, pr_number: int) -> None:
-        self.state.pending_reviews[:] = [
-            r for r in self.state.pending_reviews if r.pr_number != pr_number
-        ]
-
-    def remove_retrospective_review(self, issue_number: int) -> None:
-        self.state.pending_retrospective_reviews[:] = [
-            r
-            for r in self.state.pending_retrospective_reviews
-            if r.issue_number != issue_number
-        ]
-
-    def remove_rework(self, rework: PendingRework) -> None:
-        self.state.pending_reworks[:] = [
-            r for r in self.state.pending_reworks if r.issue_key != rework.issue_key
-        ]
-
-    def remove_validation_retry(self, issue_number: int) -> None:
-        self.state.pending_validation_retries[:] = [
-            queued
-            for queued in self.state.pending_validation_retries
-            if queued.issue_number != issue_number
-        ]
-
-    def remove_tech_lead(self, issue_number: int) -> None:
-        self.state.pending_tech_lead_reviews[:] = [
-            t
-            for t in self.state.pending_tech_lead_reviews
-            if t.issue_number != issue_number
-        ]
-
-    def queue_batch_review(self, issue_number: int, title: str) -> TechLeadQueueOutcome:
-        """Queue a threshold-created batch tracking issue (audits the PR manifest)."""
-        return self._queue_tech_lead(
-            PendingTechLeadReview(
-                issue_number, title, flavor=TechLeadSessionFlavor.BATCH_REVIEW
-            )
-        )
-
-    def queue_health_review(
-        self,
-        issue_number: int,
-        title: str,
-        *,
-        problem_cohort: tuple[DiscoveredFailure, ...] = (),
-    ) -> TechLeadQueueOutcome:
-        """Queue an interval-created health-review anchor (ADR-0031 §4); like a
-        batch review it carries no singular failure context. An unscheduled
-        problem-storm review instead carries its typed cohort so the later
-        launch snapshot cannot lose the trigger facts at end-of-tick."""
-        return self._queue_tech_lead(
-            PendingTechLeadReview(
-                issue_number,
-                title,
-                flavor=TechLeadSessionFlavor.HEALTH_REVIEW,
-                problem_cohort=problem_cohort,
-            )
-        )
-
-    def remove_failure_investigations(
-        self, issue_numbers: frozenset[int]
-    ) -> None:
-        """Remove only storm-superseded individual investigation entries.
-
-        Batch and health anchors may share an issue number with other tech_lead
-        bookkeeping and must never be removed by a problem-cohort transition.
-        """
-        self.state.pending_tech_lead_reviews[:] = [
-            item
-            for item in self.state.pending_tech_lead_reviews
-            if not (
-                item.flavor is TechLeadSessionFlavor.FAILURE_INVESTIGATION
-                and item.issue_number in issue_numbers
-            )
-        ]
-
-    def queue_failure_investigation(
-        self, issue_number: int, title: str, *, failure: DiscoveredFailure
-    ) -> TechLeadQueueOutcome:
-        """Queue a focused investigation of one failed issue.
-
-        ``failure`` is required (non-optional): the queue item is the only
-        carrier of the typed triggering-failure context once the per-tick
-        ``discovered_failures`` buffer is cleared after planning (the
-        launch-time board snapshot reads it from here).
-        ``PendingTechLeadReview.__post_init__`` stays as defense-in-depth
-        against untyped callers passing ``None`` anyway.
-        """
-        return self._queue_tech_lead(
-            PendingTechLeadReview(
-                issue_number,
-                title,
-                flavor=TechLeadSessionFlavor.FAILURE_INVESTIGATION,
-                failure=failure,
-            )
-        )
-
-    def retain_tech_lead_for_retry(self, issue_number: int) -> TechLeadRetentionOutcome:
-        """Bounded retention of a queued tech_lead item after a retryable launch failure.
-
-        Before escalation starts, failure investigations have no labels-as-
-        truth recovery: the queued item is the only record (the per-tick
-        ``discovered_failures`` buffer is cleared after planning), so a
-        transient required-input prep failure must retain it for retry, not
-        delete it. Retention is bounded by ``TECH_LEAD_LAUNCH_RETRY_LIMIT``:
-        once exhausted ``EXHAUSTED`` is returned, but the item is NOT removed
-        here (#6771 round 4). Destructive queue removal must not precede the
-        lifecycle's committed needs-human transition, so the launch caller
-        commits the drop via
-        ``remove_tech_lead`` only after ``escalate_issue_needs_human`` succeeds;
-        on escalation failure the item is retained and re-attempted.
-
-        Asking to retain an item that is not queued is an invariant violation
-        upstream (the launch path holds the item it just failed to launch);
-        fail fast rather than silently absorbing it.
-        """
-        item = next(
-            (
-                t
-                for t in self.state.pending_tech_lead_reviews
-                if t.issue_number == issue_number
-            ),
-            None,
-        )
-        if item is None:
-            raise ValueError(
-                f"Cannot retain tech_lead item for issue #{issue_number} after a "
-                "retryable launch failure: no such item is queued"
-            )
-        item.retryable_launch_failures += 1
-        if item.retryable_launch_failures >= TECH_LEAD_LAUNCH_RETRY_LIMIT:
-            return TechLeadRetentionOutcome.EXHAUSTED
-        logger.warning(
-            "[TECH_LEAD] Retaining %s for issue #%d after retryable launch failure "
-            "%d/%d",
-            item.flavor.value,
-            issue_number,
-            item.retryable_launch_failures,
-            TECH_LEAD_LAUNCH_RETRY_LIMIT,
-        )
-        return TechLeadRetentionOutcome.RETAINED
-
-    def _queue_tech_lead(self, item: PendingTechLeadReview) -> TechLeadQueueOutcome:
-        """Apply the one dedup rule (issue number vs pending queue) and enqueue."""
-        queue = self.state.pending_tech_lead_reviews
-        if any(t.issue_number == item.issue_number for t in queue):
-            logger.info(
-                "[TECH_LEAD] Issue #%d already queued for tech_lead; skipping %s request",
-                item.issue_number,
-                item.flavor.value,
-            )
-            return TechLeadQueueOutcome.DUPLICATE
-        queue.append(item)
-        logger.info(
-            "[TECH_LEAD] Queued %s for issue #%d: %s",
-            item.flavor.value,
-            item.issue_number,
-            item.title,
-        )
-        return TechLeadQueueOutcome.QUEUED
-
-
 def orchestrator_launch_review_session(
     review: PendingReview,
     state: "OrchestratorState",
     session_launcher: SessionLauncher,
     session_restorer: "SessionRestorer",
+    claims: PendingWorkClaimStore,
 ) -> Optional[Session]:
     """Launch a review session and update orchestrator queues."""
     pending_queues = PendingSessionQueues(state)
-    result = session_launcher.launch_review_session(review, state.active_sessions)
-    if result.success and result.session:
-        pending_queues.remove_review(review.pr_number)
-        append_unique_active_sessions(state.active_sessions, [result.session])
-    elif result.keep_queued:
-        restored = _restore_existing_terminal(
+    # One object for the whole launch: the launcher holds the claim durably
+    # before it spawns anything, and the settlement below settles that same
+    # claim afterwards (#6999 A2).
+    work = PendingWorkLaunchClaim(
+        claim=PendingWorkClaim(PendingWorkKind.REVIEW, review), claims=claims
+    )
+    result = session_launcher.launch_review_session(
+        review, state.active_sessions, work_claim=work
+    )
+    return LaunchSettlement(
+        work=work,
+        remove=lambda: pending_queues.remove_review(review.pr_number),
+        restore_existing=lambda: _restore_existing_terminal(
             request=_ExistingTerminalRestorationRequest(
                 issue_number=review.issue_number,
                 session_name=f"review-{review.pr_number}",
@@ -271,13 +90,8 @@ def orchestrator_launch_review_session(
             state=state,
             session_launcher=session_launcher,
             session_restorer=session_restorer,
-        )
-        if restored:
-            pending_queues.remove_review(review.pr_number)
-            return restored
-    else:
-        pending_queues.remove_review(review.pr_number)
-    return result.session if result.success else None
+        ),
+    ).settle(result, state)
 
 
 def orchestrator_launch_retrospective_review_session(
@@ -285,18 +99,23 @@ def orchestrator_launch_retrospective_review_session(
     state: "OrchestratorState",
     session_launcher: SessionLauncher,
     session_restorer: "SessionRestorer",
+    claims: PendingWorkClaimStore,
 ) -> Optional[Session]:
     """Launch a retrospective review session and update orchestrator queues."""
     pending_queues = PendingSessionQueues(state)
+    work = PendingWorkLaunchClaim(
+        claim=PendingWorkClaim(PendingWorkKind.RETROSPECTIVE_REVIEW, review),
+        claims=claims,
+    )
     result = session_launcher.launch_retrospective_review_session(
         review,
         state.active_sessions,
+        work_claim=work,
     )
-    if result.success and result.session:
-        pending_queues.remove_retrospective_review(review.issue_number)
-        append_unique_active_sessions(state.active_sessions, [result.session])
-    elif result.keep_queued:
-        restored = _restore_existing_terminal(
+    return LaunchSettlement(
+        work=work,
+        remove=lambda: pending_queues.remove_retrospective_review(review.issue_number),
+        restore_existing=lambda: _restore_existing_terminal(
             request=_ExistingTerminalRestorationRequest(
                 issue_number=review.issue_number,
                 session_name=SessionRef.for_retrospective_review(
@@ -307,13 +126,8 @@ def orchestrator_launch_retrospective_review_session(
             state=state,
             session_launcher=session_launcher,
             session_restorer=session_restorer,
-        )
-        if restored:
-            pending_queues.remove_retrospective_review(review.issue_number)
-            return restored
-    else:
-        pending_queues.remove_retrospective_review(review.issue_number)
-    return result.session if result.success else None
+        ),
+    ).settle(result, state)
 
 
 def orchestrator_launch_rework_session(
@@ -321,19 +135,22 @@ def orchestrator_launch_rework_session(
     state: "OrchestratorState",
     session_launcher: SessionLauncher,
     session_restorer: "SessionRestorer",
+    claims: PendingWorkClaimStore,
 ) -> Optional[Session]:
     """Launch a rework session and update orchestrator queues."""
     pending_queues = PendingSessionQueues(state)
-    result = session_launcher.launch_rework_session(rework, state.active_sessions)
-    if result.success and result.session:
-        pending_queues.remove_rework(rework)
-        append_unique_active_sessions(state.active_sessions, [result.session])
-    elif result.keep_queued:
+    work = PendingWorkLaunchClaim(
+        claim=PendingWorkClaim(PendingWorkKind.REWORK, rework), claims=claims
+    )
+    result = session_launcher.launch_rework_session(
+        rework, state.active_sessions, work_claim=work
+    )
+    def _restore_rework() -> Optional[Session]:
         issue_number = rework.resolve_issue_number()
         if issue_number is None:
             logger.warning("[ORPHAN] Rework missing issue number: %s", rework.issue_key)
             return None
-        restored = _restore_existing_terminal(
+        return _restore_existing_terminal(
             request=_ExistingTerminalRestorationRequest(
                 issue_number=issue_number,
                 session_name=f"rework-{issue_number}",
@@ -343,12 +160,12 @@ def orchestrator_launch_rework_session(
             session_launcher=session_launcher,
             session_restorer=session_restorer,
         )
-        if restored:
-            pending_queues.remove_rework(rework)
-            return restored
-    else:
-        pending_queues.remove_rework(rework)
-    return result.session if result.success else None
+
+    return LaunchSettlement(
+        work=work,
+        remove=lambda: pending_queues.remove_rework(rework),
+        restore_existing=_restore_rework,
+    ).settle(result, state)
 
 
 def orchestrator_launch_validation_retry_session(
@@ -356,17 +173,20 @@ def orchestrator_launch_validation_retry_session(
     state: "OrchestratorState",
     session_launcher: SessionLauncher,
     session_restorer: "SessionRestorer",
+    claims: PendingWorkClaimStore,
 ) -> Optional[Session]:
     """Launch a validation retry session and update retry queue tracking."""
     pending_queues = PendingSessionQueues(state)
-    result = session_launcher.launch_validation_retry_session(
-        retry, state.active_sessions
+    work = PendingWorkLaunchClaim(
+        claim=PendingWorkClaim(PendingWorkKind.VALIDATION_RETRY, retry), claims=claims
     )
-    if result.success and result.session:
-        pending_queues.remove_validation_retry(retry.issue_number)
-        append_unique_active_sessions(state.active_sessions, [result.session])
-    elif result.keep_queued:
-        restored = _restore_existing_terminal(
+    result = session_launcher.launch_validation_retry_session(
+        retry, state.active_sessions, work_claim=work
+    )
+    return LaunchSettlement(
+        work=work,
+        remove=lambda: pending_queues.remove_validation_retry(retry.issue_number),
+        restore_existing=lambda: _restore_existing_terminal(
             request=_ExistingTerminalRestorationRequest(
                 issue_number=retry.issue_number,
                 session_name=f"issue-{retry.issue_number}",
@@ -375,11 +195,9 @@ def orchestrator_launch_validation_retry_session(
             state=state,
             session_launcher=session_launcher,
             session_restorer=session_restorer,
-        )
-        if restored:
-            pending_queues.remove_validation_retry(retry.issue_number)
-            return restored
-    return result.session if result.success else None
+        ),
+        drop_on_permanent_failure=False,
+    ).settle(result, state)
 
 
 def orchestrator_launch_tech_lead_session(
@@ -388,6 +206,7 @@ def orchestrator_launch_tech_lead_session(
     config: Config,
     session_launcher: SessionLauncher,
     session_restorer: "SessionRestorer",
+    claims: PendingWorkClaimStore,
 ) -> Optional[Session]:
     """Launch a queued tech_lead session and update orchestrator queues.
 
@@ -404,34 +223,70 @@ def orchestrator_launch_tech_lead_session(
     :class:`PendingSessionQueues` on success, on restore of an existing
     terminal, and on permanent launch failure (labels-as-truth recovers a
     dropped batch at startup; a dropped investigation is a best-effort audit).
-    It is retained in exactly two cases:
+    It is retained in exactly three cases:
 
-    - ``keep_queued`` — an existing terminal that could not be restored yet;
-    - ``retry_queued`` — required-input prep failed transiently BEFORE the
-      session started. For failure investigations the queued item is the only
-      record of the investigation (no labels-as-truth recovery), so one
-      transient SQLite/log/filesystem error must not delete it. Retention is
-      bounded by the queue owner (``retain_tech_lead_for_retry``); on exhaustion
+    - ``EXISTING_TERMINAL`` — a terminal that could not be restored yet;
+    - ``PROVIDER_DEFERRED`` — the provider refused before anything was
+      attempted. Nothing about the investigation failed, so it keeps its full
+      retry budget and simply waits for a tick when the provider is ready
+      (#6999 F10);
+    - ``RETRYABLE_FAILURE`` — the launch attempt failed transiently BEFORE the
+      session started: required-input prep, or a terminal that never came up.
+      For failure investigations the queued item is the only record of the
+      investigation (no labels-as-truth recovery), so one transient
+      SQLite/log/filesystem/terminal error must not delete it. Retention is
+      bounded by the queue owner (``plan_tech_lead_retry``); on exhaustion
       the item is dropped as a DURABLE needs-human transition — the
       needs-human label plus an explanatory comment applied through the
       launcher's owning action boundary, then the ``ISSUE_NEEDS_HUMAN``
       event (#6771 round 3: a log line and an event alone do not survive an
       orchestrator restart; labels are the source of truth).
+
+    Every one of those outcomes settles the DURABLE claim too, in the same
+    transaction (#6999 F4), and the ledger hears first (#6999 F2). A retained
+    item keeps its deferred row, rewritten with the retry budget the retention
+    just spent BEFORE that spend reaches the queue; a dropped one - permanent
+    failure, or a committed escalation after exhaustion - has its row retired
+    before the queue item goes, so the startup sweep cannot re-admit an
+    investigation the bound already ended.
     """
     agent = config.tech_lead_review_agent
     if not agent or agent not in config.agents:
         raise ValueError(f"Invalid tech lead agent: {agent}")
     pending_queues = PendingSessionQueues(state)
+    work = PendingWorkLaunchClaim(
+        claim=PendingWorkClaim(PendingWorkKind.TECH_LEAD, tech_lead), claims=claims
+    )
     result = session_launcher.launch_issue_session(
         Issue(tech_lead.issue_number, tech_lead.title, [agent]),
         state.active_sessions,
         tech_lead_scope=tech_lead.launch_scope(),
+        work_claim=work,
     )
-    if result.success and result.session:
-        append_unique_active_sessions(state.active_sessions, [result.session])
-        pending_queues.remove_tech_lead(tech_lead.issue_number)
-    elif result.keep_queued:
-        restored = _restore_existing_terminal(
+
+    def _plan_retry(_claim: PendingWorkClaim) -> RetryPlan:
+        """Plan one unit of the budget; act on it only once it is durable.
+
+        The plan is what keeps the durable ledger honest (#6999 F4/F2). The
+        advanced request is handed back as a COPY so the launch transaction can
+        write it to the ledger before this queue is touched, and the exhausted
+        branch's needs-human transition - the one irreversible act in the whole
+        settlement - runs only after that write.
+        """
+        plan = pending_queues.plan_tech_lead_retry(tech_lead.issue_number)
+        return RetryPlan(
+            spent=PendingWorkClaim(PendingWorkKind.TECH_LEAD, plan.item),
+            exhausted=plan.exhausted,
+            apply=lambda: pending_queues.apply_tech_lead_retry(plan),
+            commit_exhaustion=lambda: _commit_dropped_tech_lead(
+                tech_lead, result.reason, session_launcher
+            ),
+        )
+
+    return LaunchSettlement(
+        work=work,
+        remove=lambda: pending_queues.remove_tech_lead(tech_lead.issue_number),
+        restore_existing=lambda: _restore_existing_terminal(
             request=_ExistingTerminalRestorationRequest(
                 issue_number=tech_lead.issue_number,
                 session_name=f"issue-{tech_lead.issue_number}",
@@ -440,27 +295,16 @@ def orchestrator_launch_tech_lead_session(
             state=state,
             session_launcher=session_launcher,
             session_restorer=session_restorer,
-        )
-        if restored:
-            pending_queues.remove_tech_lead(tech_lead.issue_number)
-            return restored
-    elif result.retry_queued:
-        outcome = pending_queues.retain_tech_lead_for_retry(tech_lead.issue_number)
-        if outcome is TechLeadRetentionOutcome.EXHAUSTED:
-            _commit_or_retain_dropped_tech_lead(
-                tech_lead, result.reason, session_launcher, pending_queues
-            )
-    else:
-        pending_queues.remove_tech_lead(tech_lead.issue_number)
-    return result.session if result.success else None
+        ),
+        plan_retry=_plan_retry,
+    ).settle(result, state)
 
 
-def _commit_or_retain_dropped_tech_lead(
+def _commit_dropped_tech_lead(
     tech_lead: PendingTechLeadReview,
     last_error: str,
     session_launcher: SessionLauncher,
-    pending_queues: PendingSessionQueues,
-) -> None:
+) -> bool:
     """Commit protocol for a tech_lead item that exhausted its launch retries.
 
     The queued item is the only record before escalation starts, so it is
@@ -469,6 +313,11 @@ def _commit_or_retain_dropped_tech_lead(
     crash-recoverable, while this process retains the richer queued context for
     retry. The failure is surfaced and no ISSUE_NEEDS_HUMAN event is emitted for
     a non-transition.
+
+    Reports ONLY whether the transition committed; neither queue nor ledger is
+    touched here (#6999 F2). The caller owns that order - ledger first, queue
+    second - and this is the irreversible step that has to run between the
+    durable spend and either of them.
     """
     logger.error(
         "[TECH_LEAD] Escalating dropped %s for issue #%d after %d retryable "
@@ -504,8 +353,7 @@ def _commit_or_retain_dropped_tech_lead(
         },
     )
     if committed:
-        pending_queues.remove_tech_lead(tech_lead.issue_number)
-        return
+        return True
     logger.error(
         "[TECH_LEAD] Durable needs-human escalation did NOT commit for issue "
         "#%d; retaining queued %s context for retry (any committed marker "
@@ -513,6 +361,7 @@ def _commit_or_retain_dropped_tech_lead(
         tech_lead.issue_number,
         tech_lead.flavor.value,
     )
+    return False
 
 
 def session_launcher_callback(
@@ -537,21 +386,84 @@ def session_launcher_callback(
     return handlers[session_type](number)
 
 
+def recover_unresolved_work(
+    state: "OrchestratorState",
+    claims: PendingWorkClaimStore,
+    quarantine: "ClaimQuarantineOwner",
+) -> int:
+    """Sweep the durable ledger when there is nothing to restore (#6999 F8).
+
+    The same sweep :func:`restore_running_sessions` ends with, exposed for the
+    paths that short-circuit before restoring anything. It must run there too:
+    a row whose terminal has already gone is invisible to discovery, so the
+    branch that says "nothing to restore" is the branch where that row is the
+    only record of the work left.
+    """
+    return InFlightWorkLedger(state, claims).recover_unresolved(quarantine)
+
+
 def restore_running_sessions(
     running: list["DiscoveredSession"],
-    active_sessions: list[Session],
+    state: "OrchestratorState",
     session_restorer: "SessionRestorer",
+    claims: PendingWorkClaimStore,
+    quarantine: "ClaimQuarantineOwner",
 ) -> list[Session]:
-    """Restore running terminal sessions into active-session tracking."""
-    restored = session_restorer.restore_sessions(running, active_sessions)
-    added = append_unique_active_sessions(active_sessions, restored)
+    """Restore running terminal sessions into active-session tracking.
+
+    Restoring the terminal is only half of it. A session launched off a pending
+    queue is still carrying that queue's request, and after a restart the
+    request lives only in the orchestrator's claim store - so the claim is
+    rehydrated here, before the session is admitted (#6999 F4). Without it a
+    provider failure observed after a restart would find no claim and the work
+    would be gone for good.
+
+    Admission is deliberately gated on that rehydration (#6999 F6). A terminal
+    whose claim RECORD EXISTS but cannot be read is not admitted at all: it is
+    alive and doing queued work nobody can now name, so processing it normally
+    would end with its completion settling as claimless and destroying that
+    work. It is quarantined and escalated instead, where a human can see it.
+    Healthy neighbours restore regardless.
+
+    Finally the ledger is swept for work no live terminal is holding at all
+    (#6999 F8) - a run killed mid-settlement leaves a row discovery will never
+    surface, and for a failure investigation that row is the only record there
+    is. That sweep is why this function must be called on EVERY startup and
+    reconcile, including when discovery returns nothing: the case it exists for
+    is precisely the one with no terminal left to discover.
+    """
+    from .claim_quarantine import QuarantineSubject
+
+    ledger = InFlightWorkLedger(state, claims)
+    restored = session_restorer.restore_sessions(running, state.active_sessions)
+    restoration = ledger.rehydrate(restored)
+    for quarantined in restoration.quarantined:
+        quarantine.quarantine(
+            QuarantineSubject.live_run_with_unreadable_claim(quarantined)
+        )
+    # Every DISCOVERED run gets a verdict, not only the ones that rebuilt into
+    # a Session (#6999 F14). The ledger owns that accounting.
+    accounting = ledger.account_for_discovered(running, restoration, quarantine)
+    added = append_unique_active_sessions(
+        state.active_sessions, list(restoration.admitted)
+    )
+    # Then the half discovery cannot reach: ledger rows whose run ended while
+    # its settlement was interrupted, and deferred rows whose in-memory
+    # re-queue did not survive the restart (#6999 F8). Every run observed alive
+    # this pass is passed through, quarantined and stale ones included, so a
+    # row belonging to a terminal that IS here cannot look orphaned (F11).
+    ledger.recover_unresolved(
+        quarantine,
+        live_run_keys=accounting.live_run_keys,
+        live_quarantine_keys=accounting.live_quarantine_keys,
+    )
     if added:
         logger.info(
             "[ORPHAN] Restored %d running terminal session(s): %s",
             len(added),
             ", ".join(str(session.terminal_id) for session in added),
         )
-    elif running:
+    elif running and not restoration.quarantined:
         logger.warning(
             "[ORPHAN] Found %d running terminal session(s), but none could be restored",
             len(running),
@@ -632,7 +544,7 @@ def orchestrator_launch_session(
     )
     if result.success and result.session:
         append_unique_active_sessions(state.active_sessions, [result.session])
-    elif result.keep_queued and session_restorer is not None:
+    elif result.disposition is LaunchDisposition.EXISTING_TERMINAL and session_restorer is not None:
         restored = _restore_existing_terminal(
             request=_ExistingTerminalRestorationRequest(
                 issue_number=issue.number,
@@ -646,153 +558,3 @@ def orchestrator_launch_session(
         if restored:
             return restored
     return result.session if result.success else None
-
-
-def _restore_existing_terminal(
-    *,
-    request: _ExistingTerminalRestorationRequest,
-    state: "OrchestratorState",
-    session_launcher: SessionLauncher,
-    session_restorer: "SessionRestorer",
-) -> Optional[Session]:
-    discovered = _discover_existing_terminal(
-        request=request,
-        session_launcher=session_launcher,
-        session_restorer=session_restorer,
-    )
-    if discovered is None:
-        _log_unrestorable_existing_terminal(request.session_name)
-        return None
-
-    run_dir = _recorded_run_dir_from_discovered(discovered, request.session_name)
-    if run_dir is None:
-        return None
-
-    restored = session_restorer.restore_known_terminal(
-        issue_number=request.issue_number,
-        session_name=request.session_name,
-        run_dir=run_dir,
-        is_review=request.is_review,
-        already_tracked=list(state.active_sessions),
-        tab_name=request.tab_name,
-    )
-    added = append_unique_active_sessions(state.active_sessions, restored)
-    if not added:
-        _log_unrestorable_existing_terminal(request.session_name)
-        return None
-    logger.info(
-        "[ORPHAN] Restored existing terminal %s from discovered run assets: %s",
-        request.session_name,
-        run_dir,
-    )
-    return added[0]
-
-
-def _discover_existing_terminal(
-    *,
-    request: _ExistingTerminalRestorationRequest,
-    session_launcher: SessionLauncher,
-    session_restorer: "SessionRestorer",
-) -> "DiscoveredSession | None":
-    try:
-        running = session_launcher.session_manager.runner.discover_running_sessions()
-    except Exception:
-        logger.exception(
-            "[ORPHAN] Failed to discover running terminal sessions for %s",
-            request.session_name,
-        )
-        return None
-
-    for raw_session_info in running:
-        session_info = _discovered_session_from_raw(raw_session_info)
-        if session_info is None:
-            continue
-        if _matches_existing_terminal(
-            session_info=session_info,
-            request=request,
-            session_restorer=session_restorer,
-        ):
-            return session_info
-    return None
-
-
-def _discovered_session_from_raw(raw: object) -> DiscoveredSession | None:
-    if not isinstance(raw, dict):
-        return None
-
-    raw_issue_number = raw.get("issue_number")
-    raw_tab_name = raw.get("tab_name")
-    raw_is_review = raw.get("is_review")
-    raw_run_dir = raw.get("run_dir")
-    if isinstance(raw_issue_number, bool) or not isinstance(raw_issue_number, int):
-        return None
-    if not isinstance(raw_tab_name, str):
-        return None
-    if not isinstance(raw_is_review, bool):
-        return None
-    run_dir = raw_run_dir if isinstance(raw_run_dir, str) else ""
-    raw_session_name = raw.get("session_name")
-    if isinstance(raw_session_name, str):
-        return DiscoveredSession(
-            issue_number=raw_issue_number,
-            tab_name=raw_tab_name,
-            is_review=raw_is_review,
-            run_dir=run_dir,
-            session_name=raw_session_name,
-        )
-    return DiscoveredSession(
-        issue_number=raw_issue_number,
-        tab_name=raw_tab_name,
-        is_review=raw_is_review,
-        run_dir=run_dir,
-    )
-
-
-def _matches_existing_terminal(
-    *,
-    session_info: "DiscoveredSession",
-    request: _ExistingTerminalRestorationRequest,
-    session_restorer: "SessionRestorer",
-) -> bool:
-    discovered_names = {
-        str(session_info.get("session_name") or ""),
-        str(session_info.get("tab_name") or ""),
-    }
-    try:
-        discovered_names.add(session_restorer.canonical_terminal_id(session_info))
-    except Exception:
-        logger.debug(
-            "[ORPHAN] Could not derive canonical terminal id from discovered session",
-            exc_info=True,
-        )
-    return request.session_name in discovered_names
-
-
-def _recorded_run_dir_from_discovered(
-    session_info: "DiscoveredSession",
-    session_name: str,
-) -> Path | None:
-    raw: object = session_info.get("run_dir")
-    if type(raw) is not str or not raw.strip():
-        logger.warning(
-            "[ORPHAN] Existing terminal %s has no recorded run_dir from runner discovery",
-            session_name,
-        )
-        return None
-    run_dir = Path(raw)
-    if not run_dir.is_absolute():
-        logger.warning(
-            "[ORPHAN] Existing terminal %s reported non-absolute run_dir: %s",
-            session_name,
-            run_dir,
-        )
-        return None
-    return run_dir
-
-
-def _log_unrestorable_existing_terminal(session_name: str) -> None:
-    logger.warning(
-        "[ORPHAN] Existing terminal %s cannot be restored from launch routing; "
-        "active restoration requires discovered run assets",
-        session_name,
-    )

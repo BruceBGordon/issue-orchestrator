@@ -8,10 +8,14 @@ Previously in ``_vendor/agent_runner/providers/codex.py``.
 from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
+from issue_orchestrator.ports.provider_readiness import ProviderReadiness
+from issue_orchestrator.ports.provider_resilience import ProviderErrorType
+
 from .base import CLIProvider
 
 if TYPE_CHECKING:
     from issue_orchestrator.domain.sandbox_scope import SandboxScope
+    from issue_orchestrator.ports.command_runner import CommandRunner
 
 
 class CodexProvider(CLIProvider):
@@ -38,6 +42,43 @@ class CodexProvider(CLIProvider):
     @property
     def interactive(self) -> bool:
         return True
+
+    # ``codex login status`` reads local credential state only — no API call,
+    # no tokens spent — so it is affordable on every launch (#6999).
+    AUTH_STATUS_ARGV = ("login", "status")
+    _LOGGED_IN_MARKER = "logged in using"
+
+    def check_readiness(self, runner: "CommandRunner") -> ProviderReadiness:
+        """Probe Codex's local credential state without spawning a TUI."""
+        if not self.is_available():
+            return ProviderReadiness.not_installed(
+                self.name, f"{self.executable} not found in PATH"
+            )
+        output, exit_code, timed_out = self._run_auth_probe(
+            runner, [self.executable, *self.AUTH_STATUS_ARGV]
+        )
+        if timed_out:
+            return ProviderReadiness.unknown(
+                self.name,
+                f"`{self.executable} login status` timed out after "
+                f"{self.AUTH_PROBE_TIMEOUT_SECONDS}s",
+            )
+        # Auth classification first: "not logged in" also contains the
+        # logged-in marker's substring, so a positive match must never win.
+        if self.classify_output(output) is ProviderErrorType.AUTH:
+            return ProviderReadiness.auth_expired(
+                self.name,
+                f"{self.executable} login status reports not logged in — "
+                "run `codex login`",
+            )
+        if exit_code == 0 and self._LOGGED_IN_MARKER in output.lower():
+            return ProviderReadiness.ready(
+                self.name, f"{self.executable} login status: logged in"
+            )
+        return ProviderReadiness.unknown(
+            self.name,
+            f"`{self.executable} login status` gave no verdict (exit={exit_code})",
+        )
 
     def runs_interactively(self, **kwargs: object) -> bool:
         return self._execution_mode(kwargs) == "interactive"

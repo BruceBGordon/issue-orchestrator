@@ -15,7 +15,6 @@ the orchestrator focused on coordination and main loop logic.
 
 import logging
 import time
-from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional, Callable, Mapping, Sequence
@@ -49,9 +48,7 @@ from ..domain.models import (
     get_completion_path,
 )
 from ..domain.session_run import SessionRunAssets
-from ..domain.dependency_gates import Gate
 from .worktree_context import WorktreeContext
-from .stack_base import StackBaseDecision
 from ..infra.validation_state import DEFAULT_RETRY_TEMPLATE
 from ..domain.tech_lead_session import TechLeadLaunchScope
 from .tech_lead_session_policy import (
@@ -67,16 +64,35 @@ from ..ports import (
     WorkingCopy,
     CommandRunner,
 )
+from ..ports.provider_readiness import (
+    NO_PROVIDER_READINESS_PROBE,
+    ProviderReadinessProbe,
+)
 from ..ports.session_output import SessionOutput
 from ..ports.event_sink import SessionStartedEventPayload, make_session_started_event
 from ..ports.worktree_manager import WorktreeManager, WorktreeReuseOptions
 from ..ports.event_sink import make_run_scoped_event, make_trace_event
 from .provider_availability import ProviderAvailabilityPolicy
+from .provider_launch_gate import ProviderLaunchGate
 from .action_applier import ActionApplier
 from .actions import Action, AddLabelAction, RemoveLabelAction
+from .needs_human_block import (
+    NO_OTHER_NEEDS_HUMAN_CAUSES,
+    SharedNeedsHumanBlock,
+)
 from .tech_lead_needs_human_reconcile import TechLeadNeedsHumanLifecycle, discover_tech_lead_needs_human_issue_numbers
 from .session_manager import SessionManager, SessionRef
-from .session_launch_types import ClaimAcquisitionResult, LaunchResult
+from .launch_transaction import (
+    NO_LAUNCH_WORK_CLAIM,
+    LaunchWorkClaim,
+    SpawnGuard,
+    abandon_claim_unless_spawned,
+)
+from .session_launch_types import (
+    ClaimAcquisitionResult,
+    LaunchDisposition,
+    LaunchResult,
+)
 from .session_rework_launcher import (
     ReworkLaunchDependencies,
     launch_rework_session as launch_rework_flow,
@@ -95,6 +111,7 @@ from .session_worktree_diagnostics import (
 )
 from .transition_log import log_transition
 from .isolation import build_runtime_tool_env
+from .launch_dependency_gate import LaunchDependencyGate
 from .launch_guards import (
     callback_endpoint_not_ready,
     retrospective_session_conflict,
@@ -105,21 +122,6 @@ from .provider_command_wrapper import ProviderCommandWrapper
 logger = logging.getLogger(__name__)
 _TRUNCATION_MARKER_BUDGET = 30
 _MIN_USEFUL_TRUNCATED_HEAD = 100
-
-
-@dataclass(frozen=True)
-class _DependencyFreshness:
-    """Outcome of the just-before-launch dependency recheck (ADR-0029 / #6596).
-
-    ``failure`` is a non-``None`` :class:`LaunchResult` when the work gate is no
-    longer open (the launch must abort). ``stack_base_branch`` carries the same
-    gate report's selected stack base so the launcher can seed the successor's
-    worktree from the predecessor branch without re-evaluating (and re-gathering
-    predecessor facts), avoiding a second round of GitHub reads.
-    """
-
-    failure: "LaunchResult | None" = None
-    stack_base_branch: str | None = None
 
 
 def detect_existing_work(
@@ -154,6 +156,45 @@ def detect_existing_work(
     except Exception as e:
         logger.warning("Failed to detect existing work: %s", e)
         return None
+
+
+_REBASE_CONFLICT_WARNING = (
+    "WARNING: This branch could not be rebased onto main due to merge conflicts. "
+    "The code is out of date. You should resolve the conflicts by running: "
+    "git fetch origin main && git rebase origin/main. "
+    "If conflicts occur, resolve them and continue with: git rebase --continue. "
+    "This is critical to ensure tests pass with the latest code."
+)
+
+
+def describe_worktree_state(
+    worktree_path: Path,
+    working_copy: WorkingCopy,
+    *,
+    seed_ref: str | None = None,
+    rebase_failed: bool = False,
+) -> Optional[str]:
+    """What the agent needs to know about the worktree it is being handed.
+
+    Prior commits and an unresolved rebase are two facts about the same
+    workspace and reach the agent as one briefing, so they are decided together
+    rather than stitched at the call site.
+    """
+    existing_work = detect_existing_work(
+        worktree_path, working_copy, seed_ref=seed_ref
+    )
+    if existing_work:
+        logger.info(
+            "[launch] Found existing work - agent will evaluate before starting fresh"
+        )
+    if not rebase_failed:
+        return existing_work
+    logger.warning(
+        "[launch] Rebase failed - agent will need to resolve merge conflicts"
+    )
+    if existing_work:
+        return f"{existing_work}\n\n{_REBASE_CONFLICT_WARNING}"
+    return _REBASE_CONFLICT_WARNING
 
 
 def _truncate_with_tail(text: str, max_length: int = 4000, tail_length: int = 2000) -> str:
@@ -213,6 +254,13 @@ class SessionLauncher:
         # produce one. Tests inject a null-object/fake provider, never None.
         board_snapshot_provider: "BoardSnapshotProvider",
         agent_callback_endpoint: "AgentCallbackEndpoint",
+        # The typed provider-readiness boundary (#6999). Defaults to the
+        # explicit "nothing to probe" reader so a composition path that has no
+        # provider adapter names that fact instead of silently claiming the
+        # provider is authenticated.
+        provider_readiness_probe: ProviderReadinessProbe = NO_PROVIDER_READINESS_PROBE,
+        # Every OTHER durable cause of the shared needs-human label (#6999 F4).
+        needs_human_block: SharedNeedsHumanBlock = NO_OTHER_NEEDS_HUMAN_CAUSES,
     ):
         self.config = config
         self.events = events
@@ -236,7 +284,21 @@ class SessionLauncher:
         self._dependency_evaluator = dependency_evaluator
         self._claim_manager = claim_manager
         self._provider_resilience = provider_resilience
-        self._provider_policy = ProviderAvailabilityPolicy(config, provider_resilience) if provider_resilience else None
+        self._provider_gate = (
+            ProviderLaunchGate(
+                policy=ProviderAvailabilityPolicy(
+                    config,
+                    provider_resilience,
+                    readiness_probe=provider_readiness_probe,
+                ),
+                events=events,
+                apply_actions=lambda actions, context: self._apply_actions(
+                    actions, context=context
+                ),
+            )
+            if provider_resilience
+            else None
+        )
         self._provider_command_wrapper: ProviderCommandWrapper | None = None
         self._remove_session_machine = remove_session_machine
         self._send_to_session = send_to_session_fn
@@ -252,6 +314,21 @@ class SessionLauncher:
             apply_actions=lambda actions, context: self._apply_actions(
                 actions, context=context
             ),
+            needs_human_block=needs_human_block,
+        )
+
+    @property
+    def _dependency_gate(self) -> LaunchDependencyGate:
+        """The launch-time work/stack gate over this launcher's collaborators.
+
+        Built per read rather than cached: the evaluator and the issue-refresh
+        callback are the launcher's injected dependencies, so they - not a copy
+        taken at construction - stay the source of truth.
+        """
+        return LaunchDependencyGate(
+            dependency_evaluator=self._dependency_evaluator,
+            refresh_issue=self._refresh_issue,
+            events=self.events,
         )
 
     def _worktree_reuse_options(
@@ -479,150 +556,9 @@ class SessionLauncher:
 
         if self._session_exists(session_name):
             log_transition("issue", issue.number, "AVAILABLE", "SKIP", "terminal session already running")
-            return LaunchResult(None, False, "Terminal session already running", keep_queued=True)
+            return LaunchResult(None, False, "Terminal session already running", disposition=LaunchDisposition.EXISTING_TERMINAL)
 
         return None
-
-    def _verify_dependencies_fresh(self, issue: "IssueProtocol") -> _DependencyFreshness:
-        """CAS check: verify dependencies haven't changed since scheduling.
-
-        Returns a :class:`_DependencyFreshness`: ``failure`` set when the work
-        gate is no longer open (abort the launch), otherwise the selected stack
-        base branch from the same gate report so the caller can seed a stack
-        successor's worktree from the predecessor branch.
-        """
-        if not self._dependency_evaluator:
-            return _DependencyFreshness()
-
-        # Prefer the freshest body for the just-before-launch recheck, but fall
-        # back to the already-known issue body when refresh is unavailable/empty
-        # so a transient read miss does not collapse a stack successor into an
-        # ordinary issue. If no body can be obtained at all, the launch cannot
-        # prove the slice is non-stack and must fail closed (retryable) rather
-        # than seed the worktree from the default base (#6596 F1).
-        fresh_issue = self._refresh_issue(issue.number) if self._refresh_issue else None
-        body = (fresh_issue.body if fresh_issue else None) or issue.body
-        milestone = fresh_issue.milestone if fresh_issue else issue.milestone
-        if body is None:
-            reason = f"could not read issue #{issue.number} body to confirm stack base"
-            log_transition(
-                "issue", issue.number, "AVAILABLE", "SKIP", reason
-            )
-            self.events.publish(make_trace_event(
-                EventName.ISSUE_DEPENDENCY_BLOCKED,
-                {
-                    "issue_number": issue.number,
-                    "issue_title": issue.title,
-                    "reason": reason,
-                    "gate": Gate.WORK.value,
-                    "retryable": True,
-                },
-            ))
-            return _DependencyFreshness(
-                failure=LaunchResult(None, False, f"Dependencies not satisfied: {reason}")
-            )
-
-        # Re-gather predecessor facts at launch time so a predecessor branch or
-        # review-state change between scheduling and launch cannot start stale
-        # stack work (ADR-0029 just-before-launch recheck).
-        report = self._dependency_evaluator.evaluate_work_gate(
-            issue_number=issue.number,
-            issue_body=body,
-            source_milestone=milestone,
-        )
-        if not report.can_start_work:
-            summary = report.work_summary()
-            log_transition(
-                "issue", issue.number, "AVAILABLE", "SKIP",
-                f"dependencies changed: {summary}"
-            )
-            self.events.publish(make_trace_event(
-                EventName.ISSUE_DEPENDENCY_BLOCKED,
-                {
-                    "issue_number": issue.number,
-                    "issue_title": issue.title,
-                    "reason": summary,
-                    "gate": Gate.WORK.value,
-                    "blocked_reasons": [
-                        record.as_dict()
-                        for record in report.gate_block_records(Gate.WORK)
-                    ],
-                },
-            ))
-            return _DependencyFreshness(
-                failure=LaunchResult(None, False, f"Dependencies not satisfied: {summary}")
-            )
-
-        return _DependencyFreshness(stack_base_branch=report.stack_base_branch)
-
-    def _stack_base_decision(
-        self,
-        issue_number: int,
-        issue_body: str | None,
-        source_milestone: str | None,
-    ) -> StackBaseDecision:
-        """Typed stack base decision for a launch (ADR-0029 / #6596).
-
-        The single launch-side reader of stack base selection. Returns a
-        :class:`StackBaseDecision` so callers can distinguish a non-stack issue
-        (proceed on the default base) from an allowed stack successor (seed/reset
-        from the predecessor branch) from a blocked stack successor (predecessor
-        not ready, ambiguous base, etc. — fail closed and do NOT reset onto the
-        default base).
-
-        Absence semantics mirror the publish/work gate: when stack gating is
-        wired but ``issue_body`` is unavailable, the launch cannot *prove* the
-        slice is non-stack, so it returns a retryable blocked decision rather than
-        collapsing an unreadable issue into "ordinary issue" and seeding from the
-        default base. When the evaluator is not wired at all, stack gating is off
-        and the launch proceeds normally. A present body with no ``Stack-after:``
-        edge short-circuits to non-stack with no extra predecessor-fact I/O.
-        """
-        if not self._dependency_evaluator:
-            return StackBaseDecision.not_stack()
-        if issue_body is None:
-            return StackBaseDecision.blocked(
-                f"could not read issue #{issue_number} body to confirm stack base",
-                retryable=True,
-                is_stack=False,
-            )
-        if "stack-after" not in issue_body.lower():
-            return StackBaseDecision.not_stack()
-        report = self._dependency_evaluator.evaluate_work_gate(
-            issue_number=issue_number,
-            issue_body=issue_body,
-            source_milestone=source_milestone,
-            emit_event=False,
-        )
-        return StackBaseDecision.from_stack_report(report, Gate.WORK)
-
-    def _stack_relaunch_blocked_result(
-        self,
-        *,
-        issue_number: int,
-        issue_title: str,
-        decision: StackBaseDecision,
-        context: str,
-    ) -> LaunchResult:
-        """Emit the dependency-blocked signal and build a blocked launch result.
-
-        Shared by validation retry and rework so a closed stack work gate is
-        recorded consistently before any claim/worktree work, instead of silently
-        resetting the successor worktree onto the default base.
-        """
-        reason = decision.reason or "stack work gate blocked"
-        log_transition("issue", issue_number, "LAUNCHING", "SKIP", f"{context}: {reason}")
-        self.events.publish(make_trace_event(
-            EventName.ISSUE_DEPENDENCY_BLOCKED,
-            {
-                "issue_number": issue_number,
-                "issue_title": issue_title,
-                "reason": reason,
-                "gate": Gate.WORK.value,
-                "retryable": decision.retryable,
-            },
-        ))
-        return LaunchResult(None, False, f"Stack dependencies not satisfied: {reason}")
 
     def _acquire_issue_claim(self, issue: "IssueProtocol") -> ClaimAcquisitionResult:
         """Acquire distributed claim for an issue if claim manager is configured.
@@ -790,7 +726,7 @@ class SessionLauncher:
             )
         self._discard_tech_lead_authority_after_failed_launch(issue, ctx)
         self._release_claim_if_held(issue.number, claim)
-        return LaunchResult(None, False, f"Tech Lead session data preparation failed: {error}", retry_queued=True)
+        return LaunchResult(None, False, f"Tech Lead session data preparation failed: {error}", disposition=LaunchDisposition.RETRYABLE_FAILURE)
 
     def launch_issue_session(  # noqa: C901, PLR0912 - coordinator with claim acquisition, worktree setup, and error handling phases
         self,
@@ -798,12 +734,13 @@ class SessionLauncher:
         active_sessions: list[Session],
         *,
         tech_lead_scope: "TechLeadLaunchScope | None" = None,
+        work_claim: LaunchWorkClaim = NO_LAUNCH_WORK_CLAIM,
     ) -> LaunchResult:
         """Launch a session for an issue.
 
         This is a coordinator function that orchestrates the multi-step launch process.
         Meaningful phases are extracted as helpers (_check_launch_preconditions,
-        _verify_dependencies_fresh, _acquire_issue_claim). Remaining complexity is
+        the injected launch dependency gate, _acquire_issue_claim). Remaining complexity is
         error handling for worktree/label/session failures - these belong inline
         with their operations rather than scattered across separate functions.
 
@@ -816,6 +753,11 @@ class SessionLauncher:
                 ordinary issues, and for a tech_lead anchor picked up outside the
                 pending queue — the flavor then comes from the marker label and
                 the cohort from the durable ledger.
+            work_claim: The queued request this launch is taking off a pending
+                queue, if any. Held durably as soon as the run identity exists
+                and BEFORE the terminal spawns, and handed back if no terminal
+                ever starts (#6999 A2). An ordinary issue pickup takes nothing
+                off a queue and passes the explicit claimless null object.
 
         Returns:
             LaunchResult with session if successful
@@ -848,12 +790,12 @@ class SessionLauncher:
         )
 
         # Phase 2: Verify dependencies haven't changed (CAS check)
-        freshness = self._verify_dependencies_fresh(issue)
+        freshness = self._dependency_gate.verify_fresh(issue)
         if freshness.failure:
             return freshness.failure
 
         # Provider circuit breaker check
-        if result := self._check_provider_circuit(agent_config.provider, issue.number):
+        if result := self._check_provider_ready(agent_config.provider, issue.number):
             return result
 
         log_transition("issue", issue.number, "AVAILABLE", "LAUNCHING", "no conflicts")
@@ -961,22 +903,33 @@ class SessionLauncher:
                 "review_cache_boundary_started_at": run.started_at,
             })
 
-        # Tech Lead inputs (manifest/assignment/board snapshot) are REQUIRED —
-        # the prompt calls board-snapshot.json authoritative — so prep
-        # failure fails the launch loudly (setup-command seam). The returned
-        # evidence read-roots grant a sandboxed tech lead its god-view (#6824 R5).
-        evidence_read_roots: tuple[Path, ...] = ()
+        # Durable before anything irreversible: no terminal, no label
+        # transitions, no queue removal (#6999 A2).
+        if failure := work_claim.hold_before_spawn(run, issue_number=issue.number):
+            self._release_claim_if_held(issue.number, claim)
+            return failure
+
+        # Two obligations now ride on the same question - did a terminal really
+        # start? - so one guard answers it for both: the tech_lead launch
+        # authority (#6769 r4) and the pending-work claim just held (#6999 A2).
+        # This path keeps them in its own finally rather than the shared
+        # context manager the flat launch paths use, because the authority half
+        # also needs the worktree context this scope owns.
+        spawn = SpawnGuard()
         try:
-            evidence_read_roots = self._prepare_tech_lead_session_data(
-                issue, ctx, tech_lead_scope
-            )
-        except Exception as e:
-            return self._fail_launch_for_tech_lead_prep(
-                issue, ctx, session_name, worktree_path, claim, e
-            )
-        # Launch-authority guard (#6769 r4): discard on every pre-start exit; single owner.
-        launch_reached_active = False
-        try:
+            # Tech Lead inputs (manifest/assignment/board snapshot) are REQUIRED —
+            # the prompt calls board-snapshot.json authoritative — so prep
+            # failure fails the launch loudly (setup-command seam). The returned
+            # evidence read-roots grant a sandboxed tech lead its god-view (#6824 R5).
+            evidence_read_roots: tuple[Path, ...] = ()
+            try:
+                evidence_read_roots = self._prepare_tech_lead_session_data(
+                    issue, ctx, tech_lead_scope
+                )
+            except Exception as e:
+                return self._fail_launch_for_tech_lead_prep(
+                    issue, ctx, session_name, worktree_path, claim, e
+                )
 
             logger.info(
                 "[SESSION_RUN_START] run_id=%s session=%s issue=%s",
@@ -1071,28 +1024,12 @@ class SessionLauncher:
             logger.info("[launch] Label added in %.1fs", label_time)
 
             # Check for existing work and rebase status
-            existing_work = detect_existing_work(
+            existing_work = describe_worktree_state(
                 worktree_path,
                 self._working_copy,
                 seed_ref=self.config.worktree_seed_ref,
+                rebase_failed=worktree_info.rebase_failed,
             )
-            if existing_work:
-                logger.info("[launch] Found existing work - agent will evaluate before starting fresh")
-
-            # Add merge conflict warning if rebase failed
-            if worktree_info.rebase_failed:
-                conflict_warning = (
-                    "WARNING: This branch could not be rebased onto main due to merge conflicts. "
-                    "The code is out of date. You should resolve the conflicts by running: "
-                    "git fetch origin main && git rebase origin/main. "
-                    "If conflicts occur, resolve them and continue with: git rebase --continue. "
-                    "This is critical to ensure tests pass with the latest code."
-                )
-                if existing_work:
-                    existing_work = f"{existing_work}\n\n{conflict_warning}"
-                else:
-                    existing_work = conflict_warning
-                logger.warning("[launch] Rebase failed - agent will need to resolve merge conflicts")
 
             # Build command
             rendered_prompt = agent_config.render_initial_prompt(
@@ -1171,8 +1108,8 @@ class SessionLauncher:
                     issue.number, worktree_path, is_scratch_investigation
                 )
                 self._release_claim_if_held(issue.number, claim)
-                return LaunchResult(None, False, "Failed to create terminal session")
-            launch_reached_active = True  # terminal RUNNING = irreversible (#6769 r5)
+                return LaunchResult.terminal_spawn_failed()
+            spawn.mark_spawned()  # terminal RUNNING = irreversible (#6769 r5)
 
             log_transition("issue", issue.number, "LAUNCHING", "ACTIVE", "session launched", {"agent": issue.agent_type})
 
@@ -1231,15 +1168,19 @@ class SessionLauncher:
 
             return LaunchResult(session, True)
         finally:
-            if not launch_reached_active:
+            if not spawn.terminal_spawned:
                 self._discard_tech_lead_authority_after_failed_launch(issue, ctx)
+                work_claim.abandon_unspawned(run)
 
-    def launch_validation_retry_session(
-        self,
-        retry: PendingValidationRetry,
-        active_sessions: list[Session],
-    ) -> LaunchResult:
-        """Launch a coding session that continues after validation failure."""
+    def _admit_validation_retry(
+        self, retry: PendingValidationRetry, active_sessions: list[Session]
+    ) -> "LaunchResult | tuple[Issue, AgentConfig, str]":
+        """Resolve who a validation retry runs as, and whether it may run now.
+
+        The retry's whole admission phase in one place: which issue and agent it
+        belongs to, the ordinary session-conflict preconditions, and whether that
+        agent's provider is usable at all.
+        """
         resolved = self._resolve_validation_retry_issue(retry)
         if resolved is None:
             return LaunchResult(
@@ -1248,12 +1189,26 @@ class SessionLauncher:
                 f"No agent config available for validation retry #{retry.issue_number}",
             )
         issue, agent_config, agent_label = resolved
-
         session_name = f"issue-{issue.number}"
         if result := self._check_launch_preconditions(issue, active_sessions, session_name):
             return result
-        if result := self._check_provider_circuit(agent_config.provider, issue.number):
+        if result := self._check_provider_ready(agent_config.provider, issue.number):
             return result
+        return issue, agent_config, agent_label
+
+    def launch_validation_retry_session(
+        self,
+        retry: PendingValidationRetry,
+        active_sessions: list[Session],
+        *,
+        work_claim: LaunchWorkClaim = NO_LAUNCH_WORK_CLAIM,
+    ) -> LaunchResult:
+        """Launch a coding session that continues after validation failure."""
+        admitted = self._admit_validation_retry(retry, active_sessions)
+        if isinstance(admitted, LaunchResult):
+            return admitted
+        issue, agent_config, agent_label = admitted
+        session_name = f"issue-{issue.number}"
 
         retry_count = max(1, retry.retry_count)
         issue_key = issue.key
@@ -1280,11 +1235,11 @@ class SessionLauncher:
         # Honor the stack work gate before claim/worktree work: a blocked or
         # ambiguous stack predecessor must not reset this successor's worktree
         # (and a None base must not silently fall back to the default branch).
-        stack_decision = self._stack_base_decision(
+        stack_decision = self._dependency_gate.stack_base_decision(
             issue.number, issue.body, issue.milestone
         )
         if not stack_decision.allowed:
-            return self._stack_relaunch_blocked_result(
+            return self._dependency_gate.relaunch_blocked_result(
                 issue_number=issue.number,
                 issue_title=issue.title,
                 decision=stack_decision,
@@ -1322,150 +1277,158 @@ class SessionLauncher:
         worktree_path = ctx.worktree_path
         branch_name = ctx.branch_name
         run = ctx.run
-        extra_args = self._extra_provider_args_from_labels(issue.labels)
-        retry_prompt = self._render_validation_retry_prompt(
-            retry=retry,
-            issue=issue,
-            agent_config=agent_config,
-            retry_count=retry_count,
-        )
 
-        ctx.write_worktree_note()
-        ctx.write_session_identity({
-            "task": TaskKind.CODE.value,
-            "issue_key": issue_key.stable_id(),
-            "session_key": session_key.stable_id(),
-            "agent": agent_label,
-            "validation_retry": True,
-            "validation_retry_count": retry_count,
-            "validation_error_file": retry.validation_error_file,
-            **self._session_identity_launch_metadata(
-                agent_config,
-                extra_provider_args=extra_args,
-            ),
-        })
-        ctx.update_manifest({
-            "validation_retry": True,
-            "validation_retry_count": retry_count,
-            "validation_error": retry.validation_error,
-            "validation_error_file": retry.validation_error_file,
-        })
-
-        if setup_failure := self._run_validation_retry_setup(issue, worktree_path, claim):
-            return setup_failure
-
-        self._clear_launch_retry_guards(
-            issue_number=issue.number,
-            mode="coding",
-            suffix="validation_retry",
-        )
-
-        label_ok = self._apply_actions([
-            AddLabelAction(
-                issue_number=issue.number,
-                label=self._lm.in_progress,
-                reason="validation retry launched",
-                issue_key=issue.key.stable_id(),
-            ),
-        ], context="launch_validation_retry_in_progress_label")
-        if not label_ok:
-            log_transition("issue", issue.number, "LAUNCHING", "FAILED", "in-progress label failed")
+        # Durable before anything irreversible (#6999 A2).
+        if failure := work_claim.hold_before_spawn(run, issue_number=issue.number):
             self._release_claim_if_held(issue.number, claim)
-            return LaunchResult(None, False, "Failed to add in-progress label")
+            return failure
 
-        prompt_path = self._persist_session_prompt(run.run_dir, retry_prompt)
-        self._session_output.write_retry_prompt(run.run_dir, retry_prompt)
-        base_command = agent_config.get_command_for_prompt(
-            retry_prompt,
-            issue_number=issue.number,
-            issue_title=issue.title,
-            worktree=worktree_path,
-            task_kind=TaskKind.CODE.value,
-            extra_provider_args=extra_args,
-        )
-        base_command = self._wrap_provider_command(base_command, agent_config, run.run_dir, extra_provider_args=extra_args)
-        completion_path = get_completion_path(agent_label, run_dir=run.run_dir.name)
-        self._session_output.update_manifest(
-            run.run_dir,
-            {
-                "completion_path": completion_path,
-                "session_prompt_path": prompt_path,
-            },
-        )
-        env_exports = self._build_session_env(
-            completion_path=completion_path,
-            session_id=run.session_name,
-            agent_label=agent_label,
-            issue_number=issue.number,
-            run_assets=run,
-            worktree_path=worktree_path,
-        )
-        command = f"{env_exports} && {base_command}"
-        logger.info(
-            "[launch] Validation retry command: issue=%s session=%s worktree=%s "
-            "completion=%s command=%s",
-            issue.number,
-            session_name,
-            worktree_path,
-            completion_path,
-            command,
-        )
+        with abandon_claim_unless_spawned(work_claim, run) as spawn:
+            extra_args = self._extra_provider_args_from_labels(issue.labels)
+            retry_prompt = self._render_validation_retry_prompt(
+                retry=retry,
+                issue=issue,
+                agent_config=agent_config,
+                retry_count=retry_count,
+            )
 
-        session_created = self._create_session(session_name, command, worktree_path, issue.title)
-        if not session_created:
-            log_transition("issue", issue.number, "LAUNCHING", "FAILED", "session creation failed")
-            self._apply_actions([
-                RemoveLabelAction(
+            ctx.write_worktree_note()
+            ctx.write_session_identity({
+                "task": TaskKind.CODE.value,
+                "issue_key": issue_key.stable_id(),
+                "session_key": session_key.stable_id(),
+                "agent": agent_label,
+                "validation_retry": True,
+                "validation_retry_count": retry_count,
+                "validation_error_file": retry.validation_error_file,
+                **self._session_identity_launch_metadata(
+                    agent_config,
+                    extra_provider_args=extra_args,
+                ),
+            })
+            ctx.update_manifest({
+                "validation_retry": True,
+                "validation_retry_count": retry_count,
+                "validation_error": retry.validation_error,
+                "validation_error_file": retry.validation_error_file,
+            })
+
+            if setup_failure := self._run_validation_retry_setup(issue, worktree_path, claim):
+                return setup_failure
+
+            self._clear_launch_retry_guards(
+                issue_number=issue.number,
+                mode="coding",
+                suffix="validation_retry",
+            )
+
+            label_ok = self._apply_actions([
+                AddLabelAction(
                     issue_number=issue.number,
                     label=self._lm.in_progress,
-                    reason="validation retry session creation failed",
+                    reason="validation retry launched",
                     issue_key=issue.key.stable_id(),
                 ),
-            ], context="launch_validation_retry_session_creation_failed")
-            self._release_claim_if_held(issue.number, claim)
-            return LaunchResult(None, False, "Failed to create terminal session")
+            ], context="launch_validation_retry_in_progress_label")
+            if not label_ok:
+                log_transition("issue", issue.number, "LAUNCHING", "FAILED", "in-progress label failed")
+                self._release_claim_if_held(issue.number, claim)
+                return LaunchResult(None, False, "Failed to add in-progress label")
 
-        session = Session(
-            key=session_key,
-            issue=issue,
-            agent_config=agent_config,
-            terminal_id=session_name,
-            worktree_path=worktree_path,
-            branch_name=branch_name,
-            completion_path=completion_path,
-            run_assets=run,
-            agent_label=agent_label,
-            validation_retry_count=retry_count,
-            original_prompt=retry.original_prompt,
-            lease_id=claim.lease_id,
-            lease_acquired_at=claim.lease_acquired_at,
-            lease_expires_at=claim.lease_expires_at,
-        )
-        log_transition(
-            "issue",
-            issue.number,
-            "LAUNCHING",
-            "ACTIVE",
-            f"validation retry launched retry_count={retry_count}",
-        )
+            prompt_path = self._persist_session_prompt(run.run_dir, retry_prompt)
+            self._session_output.write_retry_prompt(run.run_dir, retry_prompt)
+            base_command = agent_config.get_command_for_prompt(
+                retry_prompt,
+                issue_number=issue.number,
+                issue_title=issue.title,
+                worktree=worktree_path,
+                task_kind=TaskKind.CODE.value,
+                extra_provider_args=extra_args,
+            )
+            base_command = self._wrap_provider_command(base_command, agent_config, run.run_dir, extra_provider_args=extra_args)
+            completion_path = get_completion_path(agent_label, run_dir=run.run_dir.name)
+            self._session_output.update_manifest(
+                run.run_dir,
+                {
+                    "completion_path": completion_path,
+                    "session_prompt_path": prompt_path,
+                },
+            )
+            env_exports = self._build_session_env(
+                completion_path=completion_path,
+                session_id=run.session_name,
+                agent_label=agent_label,
+                issue_number=issue.number,
+                run_assets=run,
+                worktree_path=worktree_path,
+            )
+            command = f"{env_exports} && {base_command}"
+            logger.info(
+                "[launch] Validation retry command: issue=%s session=%s worktree=%s "
+                "completion=%s command=%s",
+                issue.number,
+                session_name,
+                worktree_path,
+                completion_path,
+                command,
+            )
 
-        full_completion_path = (worktree_path / completion_path).resolve()
-        self.events.publish(make_session_started_event({
-            "issue_number": issue.number,
-            "session_id": session_name,
-            "agent": agent_label,
-            "task": "code",
-            "worktree_path": str(worktree_path),
-            "branch_name": branch_name,
-            "run_id": run.run_id,
-            "run_dir": str(run.run_dir),
-            "completion_path": completion_path,
-            "completion_path_absolute": str(full_completion_path),
-            "session_prompt_path": prompt_path,
-            "retry_count": retry_count,
-        }))
-        self._trigger_issue_session_state_transitions(issue, session_name, agent_config.timeout_minutes)
-        return LaunchResult(session, True)
+            session_created = self._create_session(session_name, command, worktree_path, issue.title)
+            if not session_created:
+                log_transition("issue", issue.number, "LAUNCHING", "FAILED", "session creation failed")
+                self._apply_actions([
+                    RemoveLabelAction(
+                        issue_number=issue.number,
+                        label=self._lm.in_progress,
+                        reason="validation retry session creation failed",
+                        issue_key=issue.key.stable_id(),
+                    ),
+                ], context="launch_validation_retry_session_creation_failed")
+                self._release_claim_if_held(issue.number, claim)
+                return LaunchResult.terminal_spawn_failed()
+            spawn.mark_spawned()  # terminal RUNNING = irreversible
+
+            session = Session(
+                key=session_key,
+                issue=issue,
+                agent_config=agent_config,
+                terminal_id=session_name,
+                worktree_path=worktree_path,
+                branch_name=branch_name,
+                completion_path=completion_path,
+                run_assets=run,
+                agent_label=agent_label,
+                validation_retry_count=retry_count,
+                original_prompt=retry.original_prompt,
+                lease_id=claim.lease_id,
+                lease_acquired_at=claim.lease_acquired_at,
+                lease_expires_at=claim.lease_expires_at,
+            )
+            log_transition(
+                "issue",
+                issue.number,
+                "LAUNCHING",
+                "ACTIVE",
+                f"validation retry launched retry_count={retry_count}",
+            )
+
+            full_completion_path = (worktree_path / completion_path).resolve()
+            self.events.publish(make_session_started_event({
+                "issue_number": issue.number,
+                "session_id": session_name,
+                "agent": agent_label,
+                "task": "code",
+                "worktree_path": str(worktree_path),
+                "branch_name": branch_name,
+                "run_id": run.run_id,
+                "run_dir": str(run.run_dir),
+                "completion_path": completion_path,
+                "completion_path_absolute": str(full_completion_path),
+                "session_prompt_path": prompt_path,
+                "retry_count": retry_count,
+            }))
+            self._trigger_issue_session_state_transitions(issue, session_name, agent_config.timeout_minutes)
+            return LaunchResult(session, True)
 
     def _run_validation_retry_setup(
         self,
@@ -1559,28 +1522,18 @@ class SessionLauncher:
             retries_remaining=max(0, display_max - display_count),
         )
 
-    def launch_review_session(
+    def _check_review_preconditions(
         self,
         review: PendingReview,
         active_sessions: list[Session],
-    ) -> LaunchResult:
-        """Launch a code review session for a PR."""
-        if result := callback_endpoint_not_ready(self._agent_callback_endpoint):
-            return result
-        # Get the reviewer for this agent (per-agent override or default)
-        agent_label = self.config.get_reviewer_for_agent(review.agent_label) if review.agent_label else self.config.code_review_agent
-        if not agent_label:
-            return LaunchResult(None, False, "No code review agent configured")
+        session_name: str,
+    ) -> LaunchResult | None:
+        """Validate that this queued review is still launchable.
 
-        agent_config = self.config.agents.get(agent_label)
-        if not agent_config:
-            return LaunchResult(None, False, f"No agent config for {agent_label}")
-
-        if result := self._check_provider_circuit(agent_config.provider, review.issue_number):
-            return result
-
-        # Check for conflicts
-        session_name = f"review-{review.pr_number}"
+        The review counterpart of :meth:`_check_launch_preconditions`: staleness
+        against the live labels, then the two conflict checks and the repo
+        config. Returns a :class:`LaunchResult` on failure, ``None`` to proceed.
+        """
         validity = review_launch_validity(
             review=review,
             config=self.config,
@@ -1621,10 +1574,39 @@ class SessionLauncher:
 
         if self._session_exists(session_name):
             log_transition("review", review.pr_number, "QUEUED", "SKIP", "terminal session already running")
-            return LaunchResult(None, False, "Terminal session already running", keep_queued=True)
+            return LaunchResult(None, False, "Terminal session already running", disposition=LaunchDisposition.EXISTING_TERMINAL)
 
         if not self.config.repo:
             return LaunchResult(None, False, "No repo configured")
+        return None
+
+    def launch_review_session(
+        self,
+        review: PendingReview,
+        active_sessions: list[Session],
+        *,
+        work_claim: LaunchWorkClaim = NO_LAUNCH_WORK_CLAIM,
+    ) -> LaunchResult:
+        """Launch a code review session for a PR."""
+        if result := callback_endpoint_not_ready(self._agent_callback_endpoint):
+            return result
+        # Get the reviewer for this agent (per-agent override or default)
+        agent_label = self.config.get_reviewer_for_agent(review.agent_label) if review.agent_label else self.config.code_review_agent
+        if not agent_label:
+            return LaunchResult(None, False, "No code review agent configured")
+
+        agent_config = self.config.agents.get(agent_label)
+        if not agent_config:
+            return LaunchResult(None, False, f"No agent config for {agent_label}")
+
+        if result := self._check_provider_ready(agent_config.provider, review.issue_number):
+            return result
+
+        session_name = f"review-{review.pr_number}"
+        if result := self._check_review_preconditions(
+            review, active_sessions, session_name
+        ):
+            return result
         issue_key = review.issue_key
         session_key = SessionKey(issue=issue_key, task=TaskKind.REVIEW)
         log_transition("review", review.pr_number, "QUEUED", "LAUNCHING", "no conflicts")
@@ -1694,166 +1676,215 @@ class SessionLauncher:
         worktree_path = ctx.worktree_path
         worktree_info = ctx.worktree_info
         run = ctx.run
-        claude_project_dir = ctx.claude_project_dir
 
-        # Write session metadata
-        ctx.write_worktree_note()
-        ctx.write_session_identity({
-            "task": TaskKind.REVIEW.value,
-            "issue_key": issue_key.stable_id(),
-            "pr_number": review.pr_number,
-            "session_key": session_key.stable_id(),
-            "agent": agent_label,
-            **self._session_identity_launch_metadata(
-                agent_config,
+        # Durable before anything irreversible (#6999 A2).
+        if failure := work_claim.hold_before_spawn(
+            run, issue_number=review.issue_number
+        ):
+            return failure
+
+        with abandon_claim_unless_spawned(work_claim, run) as spawn:
+            claude_project_dir = ctx.claude_project_dir
+
+            # Write session metadata
+            ctx.write_worktree_note()
+            ctx.write_session_identity({
+                "task": TaskKind.REVIEW.value,
+                "issue_key": issue_key.stable_id(),
+                "pr_number": review.pr_number,
+                "session_key": session_key.stable_id(),
+                "agent": agent_label,
+                **self._session_identity_launch_metadata(
+                    agent_config,
+                    extra_provider_args=extra_args,
+                ),
+            })
+            # New review attempt starts now; clear interrupted retry guard.
+            self._clear_launch_retry_guards(
+                issue_number=review.issue_number,
+                mode="review",
+                suffix="review",
+            )
+
+            logger.info(
+                "[SESSION_RUN_START] run_id=%s session=%s issue=%s",
+                run.run_id,
+                session_name,
+                review.issue_number,
+                extra=log_context(issue_key=issue_key.stable_id(), session_id=session_name),
+            )
+            logger.info(
+                "[launch] Review session paths: issue=%s pr=%s worktree=%s branch=%s",
+                review.issue_number,
+                review.pr_number,
+                worktree_path,
+                review.branch_name,
+            )
+            logger.info(
+                "[launch] Claude project dir: session=%s path=%s exists=%s",
+                session_name,
+                claude_project_dir,
+                claude_project_dir.exists(),
+            )
+
+            existing_work = build_review_existing_work(
+                worktree_info=worktree_info,
+                pr_number=review.pr_number,
+                repository_host=self.repository_host,
+                keep_current_label=self._lm.review_keep_approach,
+            )
+
+            # Build command
+            rendered_prompt = agent_config.render_initial_prompt(
+                issue_number=review.issue_number,
+                issue_title=f"Review PR #{review.pr_number}",
+                worktree=worktree_path,
+                pr_number=review.pr_number,
+                existing_work=existing_work,
+                task_kind=TaskKind.REVIEW.value,
+            )
+            prompt_path = self._persist_session_prompt(run.run_dir, rendered_prompt)
+            base_command = agent_config.get_command(
+                issue_number=review.issue_number,
+                issue_title=f"Review PR #{review.pr_number}",
+                worktree=worktree_path,
+                pr_number=review.pr_number,
+                existing_work=existing_work,
+                task_kind=TaskKind.REVIEW.value,
                 extra_provider_args=extra_args,
-            ),
-        })
-        # New review attempt starts now; clear interrupted retry guard.
-        self._clear_launch_retry_guards(
-            issue_number=review.issue_number,
-            mode="review",
-            suffix="review",
-        )
+            )
+            base_command = self._wrap_provider_command(
+                base_command,
+                agent_config,
+                run.run_dir,
+                extra_provider_args=extra_args,
+            )
+            completion_path = get_completion_path(agent_label, run_dir=run.run_dir.name)
+            self._session_output.update_manifest(
+                run.run_dir,
+                {
+                    "completion_path": completion_path,
+                    "session_prompt_path": prompt_path,
+                },
+            )
+            env_exports = self._build_session_env(
+                completion_path=completion_path,
+                session_id=run.session_name,
+                agent_label=agent_label,
+                issue_number=review.issue_number,
+                run_assets=run,
+                worktree_path=worktree_path,
+            )
+            command = f"{env_exports} && {base_command}"
+            logger.info(
+                "[launch] Review session command: issue=%s pr=%s session=%s worktree=%s completion=%s command=%s",
+                review.issue_number,
+                review.pr_number,
+                session_name,
+                worktree_path,
+                completion_path,
+                command,
+            )
 
-        logger.info(
-            "[SESSION_RUN_START] run_id=%s session=%s issue=%s",
-            run.run_id,
-            session_name,
-            review.issue_number,
-            extra=log_context(issue_key=issue_key.stable_id(), session_id=session_name),
-        )
-        logger.info(
-            "[launch] Review session paths: issue=%s pr=%s worktree=%s branch=%s",
-            review.issue_number,
-            review.pr_number,
-            worktree_path,
-            review.branch_name,
-        )
-        logger.info(
-            "[launch] Claude project dir: session=%s path=%s exists=%s",
-            session_name,
-            claude_project_dir,
-            claude_project_dir.exists(),
-        )
+            # Create session
+            session_created = self._create_session(session_name, command, worktree_path, f"Review PR #{review.pr_number}")
+            logger.info(
+                "[launch] Review session create result: issue=%s pr=%s session=%s created=%s",
+                review.issue_number,
+                review.pr_number,
+                session_name,
+                session_created,
+            )
+            if not session_created:
+                # Reported success regardless of this until #6999 F5, which put
+                # a phantom review into ``active_sessions``, kept its durable
+                # claim held against a terminal that does not exist, and removed
+                # the pending item as though the work had started. Failing here
+                # - before the spawn is marked irreversible and before the
+                # REVIEW_STARTED event - hands the request back through the same
+                # compensation every other queue already used.
+                log_transition(
+                    "review",
+                    review.pr_number,
+                    "LAUNCHING",
+                    "FAILED",
+                    "session creation failed",
+                )
+                logger.error(
+                    issue_log(
+                        review.issue_number,
+                        "FAILED: review session creation failed",
+                    )
+                )
+                return LaunchResult.terminal_spawn_failed()
+            spawn.mark_spawned()  # terminal RUNNING = irreversible
 
-        existing_work = build_review_existing_work(
-            worktree_info=worktree_info,
-            pr_number=review.pr_number,
-            repository_host=self.repository_host,
-            keep_current_label=self._lm.review_keep_approach,
-        )
+            # Create pseudo-issue for session tracking
+            pseudo_issue = Issue(
+                number=review.issue_number,
+                title=f"Review PR #{review.pr_number}",
+                labels=[agent_label],
+            )
 
-        # Build command
-        rendered_prompt = agent_config.render_initial_prompt(
-            issue_number=review.issue_number,
-            issue_title=f"Review PR #{review.pr_number}",
-            worktree=worktree_path,
-            pr_number=review.pr_number,
-            existing_work=existing_work,
-            task_kind=TaskKind.REVIEW.value,
-        )
-        prompt_path = self._persist_session_prompt(run.run_dir, rendered_prompt)
-        base_command = agent_config.get_command(
-            issue_number=review.issue_number,
-            issue_title=f"Review PR #{review.pr_number}",
-            worktree=worktree_path,
-            pr_number=review.pr_number,
-            existing_work=existing_work,
-            task_kind=TaskKind.REVIEW.value,
-            extra_provider_args=extra_args,
-        )
-        base_command = self._wrap_provider_command(
-            base_command,
-            agent_config,
-            run.run_dir,
-            extra_provider_args=extra_args,
-        )
-        completion_path = get_completion_path(agent_label, run_dir=run.run_dir.name)
-        self._session_output.update_manifest(
-            run.run_dir,
-            {
+            # Create session with domain identity (REVIEW task type)
+            session = Session(
+                key=session_key,
+                issue=pseudo_issue,
+                agent_config=agent_config,
+                terminal_id=session_name,
+                worktree_path=worktree_path,
+                branch_name=review.branch_name,
+                completion_path=completion_path,
+                run_assets=run,
+                agent_label=agent_label,
+                pr_number=review.pr_number,
+                rework_cycle=rework_count if rework_count > 0 else None,
+            )
+
+            log_transition("review", review.pr_number, "LAUNCHING", "ACTIVE", "session launched")
+
+            # Emit event
+            full_completion_path = (worktree_path / completion_path).resolve()
+            self.events.publish(make_run_scoped_event(EventName.REVIEW_STARTED, {
+                "pr_number": review.pr_number,
+                "issue_number": review.issue_number,
+                "agent": agent_label,
+                "task": "review",
+                "session_name": session_name,
+                "run_id": run.run_id,
+                "run_dir": str(run.run_dir),
                 "completion_path": completion_path,
+                "completion_path_absolute": str(full_completion_path),
                 "session_prompt_path": prompt_path,
-            },
-        )
-        env_exports = self._build_session_env(
-            completion_path=completion_path,
-            session_id=run.session_name,
-            agent_label=agent_label,
-            issue_number=review.issue_number,
-            run_assets=run,
-            worktree_path=worktree_path,
-        )
-        command = f"{env_exports} && {base_command}"
-        logger.info(
-            "[launch] Review session command: issue=%s pr=%s session=%s worktree=%s completion=%s command=%s",
-            review.issue_number,
-            review.pr_number,
-            session_name,
-            worktree_path,
-            completion_path,
-            command,
-        )
+            }))
 
-        # Create session
-        session_created = self._create_session(session_name, command, worktree_path, f"Review PR #{review.pr_number}")
-        logger.info(
-            "[launch] Review session create result: issue=%s pr=%s session=%s created=%s",
-            review.issue_number,
-            review.pr_number,
-            session_name,
-            session_created,
-        )
+            # State machine transition
+            self._trigger_review_state_transition(review.pr_number, review.issue_number)
 
-        # Create pseudo-issue for session tracking
-        pseudo_issue = Issue(
-            number=review.issue_number,
-            title=f"Review PR #{review.pr_number}",
-            labels=[agent_label],
-        )
+            return LaunchResult(session, True)
 
-        # Create session with domain identity (REVIEW task type)
-        session = Session(
-            key=session_key,
-            issue=pseudo_issue,
-            agent_config=agent_config,
-            terminal_id=session_name,
-            worktree_path=worktree_path,
-            branch_name=review.branch_name,
-            completion_path=completion_path,
-            run_assets=run,
-            agent_label=agent_label,
-            pr_number=review.pr_number,
-            rework_cycle=rework_count if rework_count > 0 else None,
-        )
-
-        log_transition("review", review.pr_number, "LAUNCHING", "ACTIVE", "session launched")
-
-        # Emit event
-        full_completion_path = (worktree_path / completion_path).resolve()
-        self.events.publish(make_run_scoped_event(EventName.REVIEW_STARTED, {
-            "pr_number": review.pr_number,
-            "issue_number": review.issue_number,
-            "agent": agent_label,
-            "task": "review",
-            "session_name": session_name,
-            "run_id": run.run_id,
-            "run_dir": str(run.run_dir),
-            "completion_path": completion_path,
-            "completion_path_absolute": str(full_completion_path),
-            "session_prompt_path": prompt_path,
-        }))
-
-        # State machine transition
-        self._trigger_review_state_transition(review.pr_number, review.issue_number)
-
-        return LaunchResult(session, True)
+    def _check_retrospective_preconditions(
+        self,
+        review: PendingRetrospectiveReview,
+        active_sessions: list[Session],
+        session_name: str,
+    ) -> LaunchResult | None:
+        """Validate that this queued retrospective review is still launchable."""
+        if result := retrospective_session_conflict(
+            session_name, review.issue_number, active_sessions,
+            session_exists=self._session_exists,
+        ):
+            return result
+        if not self.config.repo:
+            return LaunchResult(None, False, "No repo configured")
+        return None
 
     def launch_retrospective_review_session(
         self,
         review: PendingRetrospectiveReview,
         active_sessions: list[Session],
+        *,
+        work_claim: LaunchWorkClaim = NO_LAUNCH_WORK_CLAIM,
     ) -> LaunchResult:
         """Launch a reviewer session to audit an existing implementation."""
         if result := callback_endpoint_not_ready(self._agent_callback_endpoint):
@@ -1870,18 +1901,14 @@ class SessionLauncher:
         if not agent_config:
             return LaunchResult(None, False, f"No agent config for {agent_label}")
 
-        if result := self._check_provider_circuit(agent_config.provider, review.issue_number):
+        if result := self._check_provider_ready(agent_config.provider, review.issue_number):
             return result
 
         session_name = SessionRef.for_retrospective_review(review.issue_number).name
-        if result := retrospective_session_conflict(
-            session_name, review.issue_number, active_sessions,
-            session_exists=self._session_exists,
+        if result := self._check_retrospective_preconditions(
+            review, active_sessions, session_name
         ):
             return result
-
-        if not self.config.repo:
-            return LaunchResult(None, False, "No repo configured")
 
         # Resolve the prior orchestrator PR now that we know the launch will
         # proceed — lazily, for this one issue, so discovery (startup recovery
@@ -1956,159 +1983,170 @@ class SessionLauncher:
         worktree_path = ctx.worktree_path
         worktree_info = ctx.worktree_info
         run = ctx.run
-        extra_args = self._extra_provider_args_from_labels(review.issue_labels)
 
-        ctx.write_worktree_note()
-        ctx.write_session_identity({
-            "task": TaskKind.RETROSPECTIVE_REVIEW.value,
-            "issue_key": issue_key.stable_id(),
-            "session_key": session_key.stable_id(),
-            "agent": agent_label,
-            "source_agent": review.agent_label,
-            "trigger_label": review.trigger_label,
-            "prior_pr_number": review.prior_pr_number,
-            "prior_pr_url": review.prior_pr_url,
-            **self._session_identity_launch_metadata(
-                agent_config,
-                extra_provider_args=extra_args,
-            ),
-        })
+        # Durable before anything irreversible (#6999 A2).
+        if failure := work_claim.hold_before_spawn(
+            run, issue_number=review.issue_number
+        ):
+            return failure
 
-        self._clear_launch_retry_guards(
-            issue_number=review.issue_number,
-            mode="review",
-            suffix="retrospective_review",
-        )
+        with abandon_claim_unless_spawned(work_claim, run) as spawn:
+            extra_args = self._extra_provider_args_from_labels(review.issue_labels)
 
-        existing_work = build_retrospective_review_existing_work(review)
-        if worktree_info.rebase_failed:
-            existing_work = (
-                f"{existing_work}\n\nWARNING: This review worktree could not be "
-                "rebased onto main due to merge conflicts. Include that risk in "
-                "your verdict."
+            ctx.write_worktree_note()
+            ctx.write_session_identity({
+                "task": TaskKind.RETROSPECTIVE_REVIEW.value,
+                "issue_key": issue_key.stable_id(),
+                "session_key": session_key.stable_id(),
+                "agent": agent_label,
+                "source_agent": review.agent_label,
+                "trigger_label": review.trigger_label,
+                "prior_pr_number": review.prior_pr_number,
+                "prior_pr_url": review.prior_pr_url,
+                **self._session_identity_launch_metadata(
+                    agent_config,
+                    extra_provider_args=extra_args,
+                ),
+            })
+
+            self._clear_launch_retry_guards(
+                issue_number=review.issue_number,
+                mode="review",
+                suffix="retrospective_review",
             )
-        prompt_pr_number = review.prior_pr_number or review.issue_number
-        issue_title = (
-            f"Review Existing Implementation #{review.issue_number}: "
-            f"{review.issue_title}"
-        )
-        rendered_prompt = agent_config.render_initial_prompt(
-            issue_number=review.issue_number,
-            issue_title=issue_title,
-            worktree=worktree_path,
-            pr_number=prompt_pr_number,
-            existing_work=existing_work,
-            task_kind=TaskKind.RETROSPECTIVE_REVIEW.value,
-        )
-        prompt_path = self._persist_session_prompt(run.run_dir, rendered_prompt)
-        base_command = agent_config.get_command_for_prompt(
-            rendered_prompt,
-            issue_number=review.issue_number,
-            issue_title=issue_title,
-            worktree=worktree_path,
-            pr_number=prompt_pr_number,
-            task_kind=TaskKind.RETROSPECTIVE_REVIEW.value,
-            extra_provider_args=extra_args,
-        )
-        base_command = self._wrap_provider_command(
-            base_command,
-            agent_config,
-            run.run_dir,
-            extra_provider_args=extra_args,
-        )
-        completion_path = get_completion_path(agent_label, run_dir=run.run_dir.name)
-        self._session_output.update_manifest(
-            run.run_dir,
-            {
-                "completion_path": completion_path,
-                "session_prompt_path": prompt_path,
-            },
-        )
-        env_exports = self._build_session_env(
-            completion_path=completion_path,
-            session_id=run.session_name,
-            agent_label=agent_label,
-            issue_number=review.issue_number,
-            run_assets=run,
-            worktree_path=worktree_path,
-        )
-        command = f"{env_exports} && {base_command}"
-        logger.info(
-            "[launch] Retrospective review command: issue=%s session=%s worktree=%s "
-            "completion=%s command=%s",
-            review.issue_number,
-            session_name,
-            worktree_path,
-            completion_path,
-            command,
-        )
 
-        session_created = self._create_session(session_name, command, worktree_path, issue_title)
-        logger.info(
-            "[launch] Retrospective review create result: issue=%s session=%s created=%s",
-            review.issue_number,
-            session_name,
-            session_created,
-        )
-        if not session_created:
+            existing_work = build_retrospective_review_existing_work(review)
+            if worktree_info.rebase_failed:
+                existing_work = (
+                    f"{existing_work}\n\nWARNING: This review worktree could not be "
+                    "rebased onto main due to merge conflicts. Include that risk in "
+                    "your verdict."
+                )
+            prompt_pr_number = review.prior_pr_number or review.issue_number
+            issue_title = (
+                f"Review Existing Implementation #{review.issue_number}: "
+                f"{review.issue_title}"
+            )
+            rendered_prompt = agent_config.render_initial_prompt(
+                issue_number=review.issue_number,
+                issue_title=issue_title,
+                worktree=worktree_path,
+                pr_number=prompt_pr_number,
+                existing_work=existing_work,
+                task_kind=TaskKind.RETROSPECTIVE_REVIEW.value,
+            )
+            prompt_path = self._persist_session_prompt(run.run_dir, rendered_prompt)
+            base_command = agent_config.get_command_for_prompt(
+                rendered_prompt,
+                issue_number=review.issue_number,
+                issue_title=issue_title,
+                worktree=worktree_path,
+                pr_number=prompt_pr_number,
+                task_kind=TaskKind.RETROSPECTIVE_REVIEW.value,
+                extra_provider_args=extra_args,
+            )
+            base_command = self._wrap_provider_command(
+                base_command,
+                agent_config,
+                run.run_dir,
+                extra_provider_args=extra_args,
+            )
+            completion_path = get_completion_path(agent_label, run_dir=run.run_dir.name)
+            self._session_output.update_manifest(
+                run.run_dir,
+                {
+                    "completion_path": completion_path,
+                    "session_prompt_path": prompt_path,
+                },
+            )
+            env_exports = self._build_session_env(
+                completion_path=completion_path,
+                session_id=run.session_name,
+                agent_label=agent_label,
+                issue_number=review.issue_number,
+                run_assets=run,
+                worktree_path=worktree_path,
+            )
+            command = f"{env_exports} && {base_command}"
+            logger.info(
+                "[launch] Retrospective review command: issue=%s session=%s worktree=%s "
+                "completion=%s command=%s",
+                review.issue_number,
+                session_name,
+                worktree_path,
+                completion_path,
+                command,
+            )
+
+            session_created = self._create_session(session_name, command, worktree_path, issue_title)
+            logger.info(
+                "[launch] Retrospective review create result: issue=%s session=%s created=%s",
+                review.issue_number,
+                session_name,
+                session_created,
+            )
+            if not session_created:
+                log_transition(
+                    "retrospective-review",
+                    review.issue_number,
+                    "LAUNCHING",
+                    "FAILED",
+                    "session creation failed",
+                )
+                return LaunchResult.terminal_spawn_failed()
+            spawn.mark_spawned()  # terminal RUNNING = irreversible
+
+            pseudo_issue = Issue(
+                number=review.issue_number,
+                title=issue_title,
+                labels=list(dict.fromkeys([*review.issue_labels, review.agent_label, agent_label, review.trigger_label])),
+            )
+            session = Session(
+                key=session_key,
+                issue=pseudo_issue,
+                agent_config=agent_config,
+                terminal_id=session_name,
+                worktree_path=worktree_path,
+                branch_name=ctx.branch_name,
+                completion_path=completion_path,
+                run_assets=run,
+                agent_label=agent_label,
+                pr_number=review.prior_pr_number,
+                original_prompt=rendered_prompt,
+            )
+
             log_transition(
                 "retrospective-review",
                 review.issue_number,
                 "LAUNCHING",
-                "FAILED",
-                "session creation failed",
+                "ACTIVE",
+                "session launched",
             )
-            return LaunchResult(None, False, "Failed to create terminal session")
+            full_completion_path = (worktree_path / completion_path).resolve()
+            self.events.publish(make_run_scoped_event(EventName.REVIEW_STARTED, {
+                "issue_number": review.issue_number,
+                "prior_pr_number": review.prior_pr_number,
+                "prior_pr_url": review.prior_pr_url,
+                "agent": agent_label,
+                "source_agent": review.agent_label,
+                "task": TaskKind.RETROSPECTIVE_REVIEW.value,
+                "session_name": session_name,
+                "run_id": run.run_id,
+                "run_dir": str(run.run_dir),
+                "completion_path": completion_path,
+                "completion_path_absolute": str(full_completion_path),
+                "session_prompt_path": prompt_path,
+                "trigger_label": review.trigger_label,
+            }))
 
-        pseudo_issue = Issue(
-            number=review.issue_number,
-            title=issue_title,
-            labels=list(dict.fromkeys([*review.issue_labels, review.agent_label, agent_label, review.trigger_label])),
-        )
-        session = Session(
-            key=session_key,
-            issue=pseudo_issue,
-            agent_config=agent_config,
-            terminal_id=session_name,
-            worktree_path=worktree_path,
-            branch_name=ctx.branch_name,
-            completion_path=completion_path,
-            run_assets=run,
-            agent_label=agent_label,
-            pr_number=review.prior_pr_number,
-            original_prompt=rendered_prompt,
-        )
-
-        log_transition(
-            "retrospective-review",
-            review.issue_number,
-            "LAUNCHING",
-            "ACTIVE",
-            "session launched",
-        )
-        full_completion_path = (worktree_path / completion_path).resolve()
-        self.events.publish(make_run_scoped_event(EventName.REVIEW_STARTED, {
-            "issue_number": review.issue_number,
-            "prior_pr_number": review.prior_pr_number,
-            "prior_pr_url": review.prior_pr_url,
-            "agent": agent_label,
-            "source_agent": review.agent_label,
-            "task": TaskKind.RETROSPECTIVE_REVIEW.value,
-            "session_name": session_name,
-            "run_id": run.run_id,
-            "run_dir": str(run.run_dir),
-            "completion_path": completion_path,
-            "completion_path_absolute": str(full_completion_path),
-            "session_prompt_path": prompt_path,
-            "trigger_label": review.trigger_label,
-        }))
-
-        return LaunchResult(session, True)
+            return LaunchResult(session, True)
 
     def launch_rework_session(
         self,
         rework: PendingRework,
         active_sessions: list[Session],
+        *,
+        work_claim: LaunchWorkClaim = NO_LAUNCH_WORK_CLAIM,
     ) -> LaunchResult:
         """Launch a rework session to fix issues found in review."""
         if result := callback_endpoint_not_ready(self._agent_callback_endpoint):
@@ -2131,26 +2169,12 @@ class SessionLauncher:
             persist_session_prompt=self._persist_session_prompt,
             wrap_provider_command=self._wrap_provider_command,
             build_session_env=self._build_session_env,
-            check_provider_circuit=self._check_provider_circuit,
-            resolve_stack_decision=self._stack_decision_for_issue_number,
+            check_provider_ready=self._check_provider_ready,
+            resolve_stack_decision=self._dependency_gate.stack_base_decision_for_issue,
         )
-        return launch_rework_flow(rework, active_sessions, deps)
-
-    def _stack_decision_for_issue_number(self, issue_number: int) -> StackBaseDecision:
-        """Resolve a rework issue's stack base decision from its freshest body.
-
-        Rework reuses the existing successor branch, so its worktree must be
-        reset onto the predecessor branch just like the initial launch — else the
-        reuse preflight would rebase the successor onto the default branch and the
-        publish ancestry gate would block it. Resolves the issue body via refresh
-        and delegates to :meth:`_stack_base_decision`, which fails the rework
-        closed (retryable) when stack gating is wired but the body cannot be read
-        — never collapsing an unreadable issue into "ordinary issue" (#6596 F1).
-        """
-        fresh_issue = self._refresh_issue(issue_number) if self._refresh_issue else None
-        body = fresh_issue.body if fresh_issue else None
-        milestone = fresh_issue.milestone if fresh_issue else None
-        return self._stack_base_decision(issue_number, body, milestone)
+        return launch_rework_flow(
+            rework, active_sessions, deps, work_claim=work_claim
+        )
 
     def _run_setup_commands(self, worktree_path: Path) -> None:
         """Run setup commands in worktree."""
@@ -2224,20 +2248,11 @@ class SessionLauncher:
             )
         return self._provider_command_wrapper
 
-    def _check_provider_circuit(self, provider: str | None, issue_number: int) -> Optional["LaunchResult"]:
-        if not provider or not self._provider_policy:
+    def _check_provider_ready(self, provider: str | None, issue_number: int) -> Optional["LaunchResult"]:
+        """Ask the provider launch gate whether this provider can do work now."""
+        if self._provider_gate is None:
             return None
-        # One point-in-time assessment drives both the launch gate and the
-        # provider-impact command (blocked label + durable record), so the two
-        # can never describe different instants (#5980 F4/A2).
-        assessment = self._provider_policy.assess((provider,))
-        if not assessment.blocked:
-            return None
-        self._apply_actions(
-            [self._provider_policy.blocked_transition(issue_number, assessment)],
-            context="provider_unavailable",
-        )
-        return LaunchResult(None, False, f"Provider unavailable: {provider}")
+        return self._provider_gate.check(provider, issue_number)
 
     def _trigger_issue_session_state_transitions(
         self,

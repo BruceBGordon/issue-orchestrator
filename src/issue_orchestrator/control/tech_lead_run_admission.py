@@ -335,7 +335,7 @@ class TechLeadRunCoordinator:
         outcome = self._queues().queue_failure_investigation(
             number, title, failure=failure
         )
-        from .session_routing import TechLeadQueueOutcome
+        from .pending_session_queues import TechLeadQueueOutcome
 
         if outcome is TechLeadQueueOutcome.DUPLICATE:
             return self._existing(
@@ -523,7 +523,7 @@ class TechLeadRunCoordinator:
         return list(self._state.pending_tech_lead_reviews)
 
     def _queues(self):
-        from .session_routing import PendingSessionQueues
+        from .pending_session_queues import PendingSessionQueues
 
         return PendingSessionQueues(self._state)
 

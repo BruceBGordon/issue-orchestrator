@@ -51,7 +51,7 @@ def _manager(*states: ProviderCircuitState) -> ProviderResilienceManager:
 def _open(provider: str, seconds_remaining: int, *, outages: int = 1, error: str | None = None):
     return ProviderCircuitState(
         provider=provider,
-        open_until=NOW + timedelta(seconds=seconds_remaining),
+        transient_open_until=NOW + timedelta(seconds=seconds_remaining),
         consecutive_outages=outages,
         last_error_summary=error,
         updated_at=NOW,
@@ -62,7 +62,7 @@ def _recovering(provider: str, *, outages: int = 1):
     # close_expired() leaves the row with open_until=None until a retry succeeds.
     return ProviderCircuitState(
         provider=provider,
-        open_until=None,
+        transient_open_until=None,
         consecutive_outages=outages,
         last_error_summary="prior failure",
         updated_at=NOW,

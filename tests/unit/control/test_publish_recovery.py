@@ -1017,6 +1017,7 @@ def test_locators_persisted_before_publish_failed_labels_applied(make_session, t
             session_output=session_output,
             processing_errors=["push_branch: Push failed: remote rejected"],
             publish_recovery=service,
+            pending_work_claims=_test_claim_store(),
         )
 
     # Even though the label application crashed, the durable locators were
@@ -1401,3 +1402,17 @@ def test_a_finalize_read_failure_does_not_abort_the_rest_of_the_drain(
     assert store.get(4058) is None
     assert (4058, lm.publish_failed) in repo.removed
     assert [entry.issue_number for entry in state.session_history] == [4058]
+
+
+def _test_claim_store(tmp_path=None):
+    """The orchestrator-owned claim store completion now requires (#6999 F9)."""
+    import tempfile
+    from pathlib import Path as _Path
+
+    from issue_orchestrator.execution.pending_work_claim_store import (
+        SqlitePendingWorkClaimStore,
+    )
+
+    return SqlitePendingWorkClaimStore.for_repo(
+        _Path(tmp_path) if tmp_path is not None else _Path(tempfile.mkdtemp())
+    )

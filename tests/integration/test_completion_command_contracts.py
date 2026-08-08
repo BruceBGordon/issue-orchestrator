@@ -45,6 +45,7 @@ from issue_orchestrator.entrypoints.setup_wizard_prompts import (
 )
 from issue_orchestrator.control.label_manager import LabelManager
 from issue_orchestrator.resources import get_coding_done_instructions, get_reviewer_done_instructions
+from tests.conftest import make_provider_availability
 from tests.unit.session_run_helpers import make_session_run_assets
 
 from .conftest import xdist_timeout
@@ -475,6 +476,7 @@ def test_publish_failure_multi_attempt_contract(tmp_path: Path, lm: LabelManager
             is_enabled=lambda: config.tech_lead.dedup.enabled,
         ),
         active_session_run_id=lambda _n: None,
+        provider_availability=make_provider_availability(config),
     )
 
     for _ in range(3):

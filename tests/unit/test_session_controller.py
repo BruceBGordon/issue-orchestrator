@@ -352,7 +352,6 @@ class TestSessionControllerTerminated:
             events=NullEventSink(),
             session_output=session_output,
             working_copy=StubWorkingCopy(),
-            provider_blocked_label="blocked:provider-unavailable",
         )
         session_name = "issue-123"
         worktree = tmp_path / "worktree"
@@ -381,6 +380,10 @@ class TestSessionControllerTerminated:
         )
 
         assert decision.status == SessionStatus.BLOCKED
+        # No raw provider-blocked label: the typed verdict routes the label and
+        # its durable record through the provider-impact owner (#6999 F5).
+        assert decision.blocked_label is None
+        assert decision.provider_error_type is ProviderErrorType.TRANSIENT
         assert decision.provider_transient_failure is not None
         assert decision.provider_transient_failure.provider == "codex"
         assert decision.provider_transient_failure.error_summary == "provider overloaded"

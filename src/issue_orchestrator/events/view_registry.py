@@ -191,6 +191,57 @@ VIEW_REGISTRY: dict[str, list[ViewEvent]] = {
     "provider.issue_unblocked": [
         _user("provider.issue_unblocked", "Provider block cleared", "orchestrator"),
     ],
+    # User-visible on purpose: this is the story replacing "timed out" when a
+    # provider refuses. A reader must be able to tell at a glance that the
+    # issue's substance was never the problem — the provider was (#6999). Worded
+    # for every refusal the gate can report, not only an expired login.
+    "session.launch_blocked_provider": [
+        _user(
+            "session.launch_blocked_provider",
+            "Provider not ready — launch blocked",
+            "orchestrator",
+        ),
+    ],
+    # The live-session counterpart. Worded for what actually happened: work was
+    # already running and was stopped, which is a different story from a launch
+    # that never started (#6999 F5).
+    "session.provider_auth_terminated": [
+        _user(
+            "session.provider_auth_terminated",
+            "Provider not authenticated — session stopped",
+            "orchestrator",
+        ),
+    ],
+    # A live terminal the orchestrator will not track because it cannot tell
+    # what queued work it holds. User-visible: it needs a human (#6999 F6).
+    "session.claim_unreadable": [
+        _user(
+            "session.claim_unreadable",
+            "Session quarantined — its queued work could not be identified",
+            "orchestrator",
+        ),
+    ],
+    # The other quarantine family: the work IS identified, and is deliberately
+    # not being re-queued because a terminal nobody can track is still running
+    # it. Worded so a reader does not go and re-queue it by hand (#6999 A1).
+    "session.run_unrestorable": [
+        _user(
+            "session.run_unrestorable",
+            "Session quarantined — its run could not be rebuilt",
+            "orchestrator",
+        ),
+    ],
+    # Both at once, and worded so neither half is implied away (#6999 F6): the
+    # terminal cannot be tracked AND its queued work cannot be named. Borrowing
+    # the line above would tell a reader the work is identified when it is not.
+    "session.run_unrestorable_claim_unreadable": [
+        _user(
+            "session.run_unrestorable_claim_unreadable",
+            "Session quarantined — its run could not be rebuilt and its queued "
+            "work could not be identified",
+            "orchestrator",
+        ),
+    ],
 
     # -- Tech Lead --
     "tech_lead.launching": [

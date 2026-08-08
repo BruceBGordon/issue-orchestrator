@@ -22,7 +22,13 @@ from issue_orchestrator.control.actions import (
 )
 from issue_orchestrator.control.planner import Planner
 from issue_orchestrator.control.planner_types import OrchestratorSnapshot
-from issue_orchestrator.control.provider_availability import ProviderAvailabilityPolicy
+from issue_orchestrator.control.provider_availability import (
+    ProviderAvailabilityPolicy,
+    ProviderLaunchOutcome,
+)
+from issue_orchestrator.control.provider_launch_readiness import (
+    ProviderLaunchReadiness,
+)
 from issue_orchestrator.control.provider_impact import ApplyProviderImpactAction
 from issue_orchestrator.control.provider_resilience import ProviderResilienceManager
 from issue_orchestrator.control.scheduler import Scheduler
@@ -38,6 +44,7 @@ from issue_orchestrator.domain.session_key import TaskKind
 from issue_orchestrator.domain.tech_lead_session import TechLeadSessionFlavor
 from issue_orchestrator.infra.config import Config
 from issue_orchestrator.ports.event_sink import InMemoryEventSink
+from issue_orchestrator.ports.provider_readiness import ProviderReadiness
 from issue_orchestrator.ports.provider_resilience import ProviderCircuitStatus
 from tests.unit.test_planner import make_snapshot
 
@@ -51,7 +58,7 @@ def _provider_policy(
 ) -> ProviderAvailabilityPolicy:
     """Build the real policy owner around a deterministic circuit collaborator."""
     resilience = Mock(spec=ProviderResilienceManager)
-    resilience.is_open.side_effect = lambda provider: provider in open_providers
+    resilience.is_open.side_effect = lambda provider, now=None: provider in open_providers
 
     def status(provider: str, _now: datetime) -> ProviderCircuitStatus | None:
         if provider not in open_providers:
@@ -69,6 +76,24 @@ def _provider_policy(
     resilience.status.side_effect = status
     return ProviderAvailabilityPolicy(config, resilience)
 
+
+
+def _blocked_launch(*providers: str) -> ProviderLaunchReadiness:
+    """The tick's sampled fact with these providers ineligible (#6999 A3).
+
+    Planning reads this fact; it no longer probes or touches the circuit
+    itself, so a provider outage arrives here rather than through the policy.
+    """
+    return ProviderLaunchReadiness(
+        outcomes={
+            provider: ProviderLaunchOutcome(
+                provider=provider,
+                readiness=ProviderReadiness.ready(provider),
+                circuit_open=True,
+            )
+            for provider in providers
+        }
+    )
 
 def _planner() -> Planner:
     config = Config(repo="test/repo", max_concurrent_sessions=1)
@@ -235,7 +260,9 @@ def test_provider_skipped_review_does_not_steal_the_tech_lead_slot(caplog) -> No
         config, open_providers=frozenset({"prov-review"})
     )
     snapshot = make_snapshot(
-        pending_reviews=[review], pending_tech_lead=[_health_review()]
+        pending_reviews=[review],
+        pending_tech_lead=[_health_review()],
+        provider_launch=_blocked_launch("prov-review"),
     )  # review issue 10 absent from snapshot.issues
     with caplog.at_level(logging.INFO, logger=PLANNER_LOGGER):
         plan = planner.plan(snapshot)
@@ -358,7 +385,12 @@ def test_provider_open_tech_lead_no_launch_and_no_launching_event() -> None:
     planner.provider_policy = _provider_policy(
         config, open_providers=frozenset({"prov-tl"})
     )
-    plan = planner.plan(make_snapshot(pending_tech_lead=[_health_review()]))
+    plan = planner.plan(
+        make_snapshot(
+            pending_tech_lead=[_health_review()],
+            provider_launch=_blocked_launch("prov-tl"),
+        )
+    )
     assert not any(
         isinstance(a, LaunchSessionAction) and a.session_type is SessionType.TECH_LEAD
         for a in plan.actions

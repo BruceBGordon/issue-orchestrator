@@ -7,7 +7,9 @@ now extracts a human-readable reason from the underlying error strings.
 
 from __future__ import annotations
 
-from issue_orchestrator.control.completion_handler import _summarize_publish_failure
+from issue_orchestrator.control.completion_history_status import (
+    _summarize_publish_failure,
+)
 from issue_orchestrator.control.completion_types import (
     ERROR_PREFIX_CREATE_PR,
     ERROR_PREFIX_PUSH,

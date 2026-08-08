@@ -16,8 +16,13 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from ..events import EventHub
     from ..ports.agent_callback_endpoint import AgentCallbackEndpoint
+    from ..ports.completion_handler_factory import CompletionHandlerFactory
+    from ..ports.operator_issue_commands import OperatorIssueCommandFactory
     from ..ports.session_launcher_factory import SessionLauncherFactory
     from ..ports.label_store import LabelStore
+    from ..ports.pending_work_claim_store import PendingWorkClaimStore
+    from .claim_quarantine import ClaimQuarantineOwner
+    from .needs_human_block import SharedNeedsHumanBlock
     from ..ports.queue_cache_store import QueueCacheStore
     from ..ports import (
         EventSink,
@@ -59,6 +64,7 @@ if TYPE_CHECKING:
     from .lease_renewer import LeaseRenewer
     from .provider_resilience import ProviderResilienceManager
     from .board_snapshot_builder import BoardSnapshotBuilder
+    from ..ports.provider_readiness import ProviderReadinessProbe
 
 
 @dataclass(frozen=True)
@@ -115,6 +121,14 @@ class OrchestratorDeps:
     # Builds the session launcher. Assembly lives at the composition
     # root; the facade supplies only its own callbacks (#6924 A3-R2).
     session_launcher_factory: "SessionLauncherFactory"
+    # Same split for the completion handler: the facade supplies only its own
+    # runtime state, never the dependency-container layout (#6999 A4).
+    completion_handler_factory: "CompletionHandlerFactory"
+    # Operator "retry"/"dismiss": one settled transition across GitHub labels
+    # and the local retry/queue state, in that order (#6999 F5). A factory for
+    # the same reason as the two above - the live state and its lock belong to
+    # the facade, everything else to this container.
+    operator_issue_command_factory: "OperatorIssueCommandFactory"
 
     # IO adapters
     worktree_manager: "WorktreeManager"
@@ -122,6 +136,17 @@ class OrchestratorDeps:
     command_runner: "CommandRunner"
     session_output: "SessionOutput"
     manifest_downloader: "ManifestDownloader"
+    # Orchestrator-owned, OUTSIDE every agent-writable worktree (#6999 F7): it
+    # records which queued request each running session is carrying, and
+    # restoration accepts it as authority.
+    pending_work_claims: "PendingWorkClaimStore"
+    # Owns what an unreadable claim means: its own durable per-run marker, its
+    # own labels/comment, and the event only after those commit (#6999 F12/A5).
+    claim_quarantine: "ClaimQuarantineOwner"
+    # The one owner of the shared needs-human block: every acquisition, cause
+    # release and operator force-clear of that label routes through it, so a
+    # block can never exist without a discoverable cause (#6999 F2 round 3).
+    needs_human_block: "SharedNeedsHumanBlock"
 
     # Claim/lease management (multi-orchestrator coordination)
     claim_manager: "ClaimManager"
@@ -169,6 +194,10 @@ class OrchestratorDeps:
     @property
     def provider_resilience(self) -> "ProviderResilienceManager":
         return self.services.provider_resilience
+
+    @property
+    def provider_readiness_probe(self) -> "ProviderReadinessProbe":
+        return self.services.provider_readiness_probe
 
     @property
     def queue_cache_store(self) -> "QueueCacheStore":
