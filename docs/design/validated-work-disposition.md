@@ -62,7 +62,7 @@ When `validated_head_sha` is not reachable in the object store at all (rewritten
 history, pruned objects, a foreign clone), the evidence is unverifiable:
 `VALIDATION_SHA_MISMATCH` ⇒ `FAILED`, artifacts preserved.
 
-### 1.1 Why the existing owner, extended
+### 1.2 Why the existing owner, extended
 
 `control/review_exchange_lifecycle.py` already owns issue terminal boundaries and
 already maintains the hard-won symmetry between `terminate_issue_runtime()` and
@@ -105,6 +105,13 @@ RESOLVED_STATES = frozenset({            # nothing is at risk; reset/teardown ma
     ValidatedWorkState.RECOVERED,
     ValidatedWorkState.ABANDONED,
 })
+
+# NONE is a DISPOSITION state, never a ROW state. "No completed+validated work at
+# this edge" means no evidence was admitted, so no row exists to hold it; a stored
+# NONE would be a row asserting its own absence. Only the six remaining states are
+# ever persisted, and §2.1.3's `row.state in RESOLVED_STATES` branch therefore
+# reaches only RECOVERED and ABANDONED. The store rejects an attempt to write NONE.
+PERSISTED_STATES = frozenset(ValidatedWorkState) - {ValidatedWorkState.NONE}
 
 assert UNRESOLVED_STATES | RESOLVED_STATES == set(ValidatedWorkState)
 assert not (UNRESOLVED_STATES & RESOLVED_STATES)
@@ -182,6 +189,7 @@ class ValidatedWorkKey:
     @property
     def record_id(self) -> str:
         """Stable primary key. Independent of which evidence carries the work."""
+        return canonical_record_id(self)
 
 
 @dataclass(frozen=True, slots=True)
@@ -421,12 +429,24 @@ commit and a specific set of artifacts, and consent does not transfer.
 ### 2.2 Command / result
 
 ```python
+class DispositionInitiator(StrEnum):
+    """WHO asked. Recorded on the row; never widens what the owner will do.
+
+    The three initiators of the "one owner, three initiators" rule. This
+    selects the *authority path* (and therefore what may be approved without a
+    human), not the policy: every §4.3 check runs identically for all three.
+    """
+    AUTOMATIC = "automatic"   # terminate_issue_runtime, at the boundary
+    TECH_LEAD = "tech_lead"   # approved recover_validated_work gated op (§8.1)
+    OPERATOR  = "operator"    # Control Center command (§8.4)
+
+
 @dataclass(frozen=True, slots=True)
 class ValidatedWorkDispositionRequest:
     """Typed command. Built by the initiator; policy lives in the owner."""
     issue_number: int
     reason: str                       # the terminate_issue_runtime reason string
-    initiator: DispositionInitiator    # AUTOMATIC | TECH_LEAD | OPERATOR
+    initiator: DispositionInitiator
     worktree_path: Path | None        # None once the worktree is already gone
     run_assets: SessionRunAssets | None
     evidence_id: str = ""             # required for TECH_LEAD/OPERATOR, empty for AUTOMATIC
@@ -466,6 +486,28 @@ class ValidatedWorkDisposition:
             raise ValueError("ABANDONED requires an explicit OperatorResolution")
         if self.state is not ValidatedWorkState.ABANDONED and self.resolution is not None:
             raise ValueError("only ABANDONED carries an OperatorResolution")
+
+
+@dataclass(frozen=True, slots=True)
+class ValidatedWorkSnapshot:
+    """Read model for the view-model layer (§8.4). Facts + availability only.
+
+    Returned by ``snapshot()``. The UI renders this; it never re-derives
+    policy, which is why the two ``can_*`` flags are computed by the owner
+    from the state machine (§4.2) rather than by the route from ``state``.
+    """
+    disposition: ValidatedWorkDisposition
+    record_id: str
+    validated_head_sha: str
+    worktree_head_sha: str
+    branch_name: str
+    expected_remote_head_sha: str | None
+    superseded_evidence_ids: tuple[str, ...]
+    escrow_retained: bool
+    publish_attempts: int             # §4.4e; surfaced so a retry loop is visible
+    updated_at: str
+    can_recover: bool                 # PARKED, or FAILED after the condition is fixed
+    can_abandon: bool                 # PARKED/FAILED only — never QUEUED/PUBLISHING
 ```
 
 ### 2.3 Ports
@@ -557,28 +599,83 @@ run directory *before* any of them is released.
 ```
 
 `validated_work` becomes a **required keyword parameter** of
-`terminate_issue_runtime()` — not `| None = None`. There are four production call
-sites (`infra/orchestrator.py`, `control/action_applier.py`,
-`entrypoints/web_retry_history_routes.py`, and the tech-lead kill wiring via
-`Orchestrator.terminate_issue_runtime_for_issue`); each must pass the owner. A
-required parameter is the mechanical guardrail (ADR-0012) that stops a future
-terminal path from opting out.
+`terminate_issue_runtime()` — not `| None = None`. A required parameter is the
+mechanical guardrail (ADR-0012) that stops a future terminal path from opting out.
+
+There are **three direct call sites and one typed-callable seam**, and the seam is
+the one that matters:
+
+| Path | Site | Today |
+|---|---|---|
+| Orchestrator facade (also how the tech-lead kill wiring arrives) | `infra/orchestrator.py:240`, inside `Orchestrator.terminate_issue_runtime_for_issue` | returns `IssueRuntimeTermination` |
+| Action applier | `control/action_applier.py:1134` | returns it |
+| Dashboard / tech-lead reset | `entrypoints/web_retry_history_routes.py:554` | **result discarded** |
+| Awaiting-merge reconciliation | `control/history_reconciliation.py:85`, through the injected `IssueRuntimeTerminator` | **result discarded, and its type is erased** |
+
+**`IssueRuntimeTerminator` is a hole in the guardrail, and it must be closed by this
+contract.** It is declared as `Callable[[int, str], object]`
+(`control/history_reconciliation.py:25`) — a positional alias whose return type is
+`object`. Three things follow, none of them visible from the module function's
+signature:
+
+- A required keyword parameter on `terminate_issue_runtime()` does **not** reach
+  this path. Whoever *builds* the terminator supplies the owner; the alias itself
+  can be satisfied by any two-argument callable, including one that never heard of
+  the disposition owner.
+- `object` erases `IssueRuntimeTermination`, so the §9 rule "every call site
+  **binds** the returned `validated_work`" is not merely unenforced here — it is
+  unstatable. `history_reconciliation.py:85` discards the result today.
+- This is a genuine terminal edge, not a bookkeeping one. It fires on
+  `issue-completed` when the PR was **closed** as well as when it was merged, so an
+  issue can be torn down through it while a `PARKED` or `FAILED` record is sitting
+  in escrow.
+
+The fix is part of the slice, not a follow-up: narrow the alias to
+`Callable[[int, str], IssueRuntimeTermination]`, have
+`history_reconciliation.py` bind the result and treat `.validated_work.unresolved`
+as a refusal to finish the terminal transition (the same stale-downgrade the reset
+paths take, §3.3), and add the seam to the §9 call-site guardrail. An alias that
+returns `object` is exactly how a fifth terminal path gets added next year without
+anyone noticing it never disposed anything.
 
 Step 1 raising is the invariant's teeth: if evidence exists but escrow cannot be
 written, the boundary refuses to tear down. The caller surfaces a hard failure and
 the work stays exactly where it is.
 
+**`ESCROW_WRITE_FAILED` is therefore a raise at capture and a state everywhere
+else, and the difference is whether a row exists.** At capture there is nothing
+durable yet — a `FAILED` row would have to point at escrow that was never written,
+which is a record asserting the existence of evidence it cannot produce. So capture
+raises, teardown aborts, and the worktree (still present, because teardown stopped)
+remains the source for the next attempt. Once a row exists, the same condition
+reached from `drain()` or `reconcile_escrow_orphans()` is a durable
+`FAILED(ESCROW_WRITE_FAILED)`: the row is the thing that keeps the work from being
+lost, and it is already there to be transitioned. §10's "partial escrow write" row
+is the second case, not a contradiction of the first.
+
 ### 3.2 `has_active_issue_runtime()` — fifth probe
 
 ```python
-probes = (
-    ...,                                                    # sessions
-    ...,                                                    # pair registry
-    ...,                                                    # supervised jobs
-    lambda: publish_recovery is not None and publish_recovery.has_active_retry(n),
-    lambda: validated_work.has_unresolved_work(n),          # NEW — not optional
+probes: Mapping[IssueRuntimeOwnerKind, Callable[[], bool]] = {
+    IssueRuntimeOwnerKind.SESSIONS:       ...,              # unchanged
+    IssueRuntimeOwnerKind.PAIR_REGISTRY:  ...,              # unchanged
+    IssueRuntimeOwnerKind.SUPERVISED_JOB: ...,              # unchanged
+    IssueRuntimeOwnerKind.PUBLISH_RETRY:
+        lambda: publish_recovery is not None and publish_recovery.has_active_retry(n),
+    IssueRuntimeOwnerKind.VALIDATED_WORK:
+        lambda: validated_work.has_unresolved_work(n),      # NEW — not optional
+}
+return any(
+    _owner_active_or_unverifiable(probe)
+    for kind, probe in probes.items()
+    if kind not in exclude_owners                           # §4.3 check 5 only
 )
 ```
+
+The tuple becomes a keyed mapping for one reason: §4.3 check 5 needs to ask "is any
+owner *other than me* active?", and a positional tuple cannot express which element
+to skip. `exclude_owners` defaults to empty, so this is a no-op for every existing
+caller; the rule that keeps it a no-op for every *future* one is in §4.3.
 
 `validated_work` is a **required keyword parameter of `has_active_issue_runtime()`,
 exactly as it is of `terminate_issue_runtime()`** — not `| None = None`. The two
@@ -697,6 +794,8 @@ CREATE TABLE IF NOT EXISTS validated_work_records (
     pinned_ref            TEXT NOT NULL,              -- validated commit
     observed_ref          TEXT NOT NULL DEFAULT '',   -- unvalidated worktree head, if any
     submission_token      TEXT NOT NULL DEFAULT '',   -- set while PUBLISHING
+    publishing_started_at TEXT NOT NULL DEFAULT '',   -- set by the begin_publishing CAS
+    publish_attempts      INTEGER NOT NULL DEFAULT 0, -- transient-retry budget (§4.4e)
     published_head_sha    TEXT NOT NULL DEFAULT '',
     resolved_by           TEXT NOT NULL DEFAULT '',   -- OperatorResolution.actor
     resolution_reason     TEXT NOT NULL DEFAULT '',
@@ -812,11 +911,60 @@ Phase-independent checks:
    assertion, not the primary defence: the publisher pushes the immutable object
    `target_head_sha` by explicit refspec, so no worktree HEAD — moving or
    otherwise — can change which commit is published.
-5. `has_active_issue_runtime()` (excluding this owner's own probe) is false.
+5. **No other runtime owner is active** — see the self-exclusion rule below.
 6. The row's `record_id` still matches the key being acted on and its
    `evidence_id` is still the one this drain admitted — i.e. no supersession
    (§2.1.3) landed underneath us. Re-read inside the same transaction that
    compare-and-sets the state; a mismatch aborts the drain step with no writes.
+
+**Check 5 must exclude the caller's own probe, and the predicate must be able to
+say so.** A record being drained is by definition in `UNRESOLVED_STATES`, so
+`has_unresolved_work()` — the fifth probe this design adds (§3.2) — returns `True`
+for it. A check 5 that consulted the whole probe set would therefore observe the
+owner's own record, abort the drain, and do so again on every subsequent drain: the
+contract would never publish anything, and the "automatic recovery" initiator would
+be dead on arrival. The self-exclusion is not an implementation detail to be left to
+the implementer — today `has_active_issue_runtime()` builds its probes as a fixed
+local tuple with no way to express it (`control/review_exchange_lifecycle.py:216-229`),
+so the capability has to be part of this contract:
+
+```python
+class IssueRuntimeOwnerKind(StrEnum):
+    SESSIONS       = "sessions"
+    PAIR_REGISTRY  = "pair_registry"
+    SUPERVISED_JOB = "supervised_job"
+    PUBLISH_RETRY  = "publish_retry"
+    VALIDATED_WORK = "validated_work"
+
+
+def has_active_issue_runtime(
+    *,
+    ...,                                                   # unchanged owner params
+    validated_work: ValidatedWorkDispositionOwner,         # required (§3.2)
+    exclude_owners: frozenset[IssueRuntimeOwnerKind] = frozenset(),
+) -> bool: ...
+```
+
+The probe tuple becomes a `Mapping[IssueRuntimeOwnerKind, Callable[[], bool]]`, and
+the predicate evaluates every kind **not** in `exclude_owners`. Three properties keep
+this from becoming a re-run of F5:
+
+- **Empty by default.** Every existing caller keeps today's behaviour without
+  naming the parameter, so the freshness/teardown symmetry is unchanged.
+- **Exclusion is narrower than omission.** The owner is still a *required*
+  parameter; `exclude_owners` only suppresses one probe for one call. A caller
+  cannot use it to avoid knowing about an owner — it has to name the owner to skip
+  it, which is the opposite of forgetting.
+- **Exactly one caller may exclude anything.** §9's guardrail asserts that
+  `exclude_owners` is non-empty only inside `ValidatedWorkDispositionService`, and
+  only as `{IssueRuntimeOwnerKind.VALIDATED_WORK}`. Every other call site passes the
+  default. A second exclusion is a guardrail failure, not a code review judgement
+  call.
+
+So check 5 reads, in full: `has_active_issue_runtime(..., exclude_owners={VALIDATED_WORK})`
+is false. Another issue-scoped owner being live still blocks the drain (`RUNTIME_ACTIVE`,
+retried next drain) — publication must never race a live session — but the owner's
+own record no longer blocks itself.
 
 Phase-dependent remote checks — the allowed-state tables:
 
@@ -1029,6 +1177,33 @@ class PublishValidatedHeadOutcome:
     message: str
 
 
+class SubmissionState(StrEnum):
+    PENDING   = "pending"     # a submission for this token is in flight
+    SUCCEEDED = "succeeded"   # it completed and reported success
+    FAILED    = "failed"      # it completed and reported failure
+    UNKNOWN   = "unknown"     # no record of this token — crash, or never started
+
+
+@dataclass(frozen=True, slots=True)
+class PublishSubmissionStatus:
+    """Durable, owner-observable outcome of a token, survives restart.
+
+    ``UNKNOWN`` is the post-crash answer and is never treated as failure: the
+    owner re-runs §4.3 in ``RECONCILING`` and lets the allowed-state tables
+    decide, because the push may well have landed (§10).
+    """
+    state: SubmissionState
+    outcome: ExactPushOutcome | None   # set iff state is SUCCEEDED/FAILED
+    failure: ValidatedWorkFailure | None
+    observed_at: str
+    message: str
+
+    @property
+    def transient(self) -> bool:
+        """§4.4e's transient/definitive split, by enum — never by substring."""
+        return self.outcome in (ExactPushOutcome.TRANSIENT, ExactPushOutcome.AUTH_FAILED)
+
+
 class ValidatedHeadPublisher(Protocol):
     def publish_or_reconcile(
         self, command: PublishValidatedHeadCommand
@@ -1036,7 +1211,7 @@ class ValidatedHeadPublisher(Protocol):
     """Branch write (§4.4b) followed by PR ensure/reconcile. Idempotent."""
 
     def submission_status(self, token: str) -> PublishSubmissionStatus: ...
-    """Durable, owner-observable: PENDING | SUCCEEDED | FAILED | UNKNOWN."""
+    """Durable, owner-observable status for a derived token (§4.4e)."""
 ```
 
 **The branch decision** (which `retry_publish()` does not make today):
@@ -1091,9 +1266,14 @@ there is nothing to wait for the executor to return, so the order is simply:
 
 ```
 1. store.begin_publishing(record_id, expected_state in {QUEUED, PARKED},
-                          token, expected_remote_head)   # durable CAS; false -> abort
+                          token, expected_remote_head, started_at)
+                                                         # durable CAS; false -> abort
 2. publisher.publish_or_reconcile(command)               # only if the CAS won
 ```
+
+The CAS is also where `publishing_started_at` is stamped and `publish_attempts`
+is reset to `0` — one transaction, so a row can never be `PUBLISHING` without the
+timeout baseline that decides when its `PENDING` becomes `UNKNOWN`.
 
 The CAS is also the concurrency guard: two drains racing the same row produce one
 winner, and the loser does nothing.
@@ -1101,11 +1281,23 @@ winner, and the loser does nothing.
 **Every `submission_status` value has a defined transition** — the owner never has
 an unhandled state:
 
+**The retry budget and the timeout are durable, because a restart must not reset
+them.** `begin_publishing()` stamps `publishing_started_at` in the same CAS that
+sets the token, and every transient re-attempt increments `publish_attempts` in the
+same transaction that re-invokes the publisher. Both live on the row (§4.1), not in
+process memory: a counter held in memory is reset by exactly the crash the retry is
+recovering from, which turns "bounded retries then durable `FAILED`" into an
+unbounded loop that re-pushes on every orchestrator start. `PUBLISH_ATTEMPT_LIMIT`
+is a module constant (5), not a setting — the correct number of times to retry a
+transient push is not an operator decision, and every knob here is another way to
+configure the work into oblivion. Exhaustion is `FAILED`, which is *unresolved*
+(§3.2), so hitting the bound still loses nothing.
+
 | `submission_status(token)` | Owner does |
 |---|---|
-| `PENDING` | stay `PUBLISHING`, no writes, re-check next drain. Past `publish_submission_timeout` (bounded, config-free — derived from the existing publish job timeout), treat as `UNKNOWN`. |
+| `PENDING` | stay `PUBLISHING`, no writes, re-check next drain. Once `now - publishing_started_at` exceeds `publish_submission_timeout` (derived from the existing publish job timeout, config-free), treat as `UNKNOWN` — which re-runs §4.3 in `RECONCILING` rather than resubmitting blind. |
 | `SUCCEEDED` | re-read the branch; require it at `target_head_sha`; ensure the PR (§4.4d); finalize (§4.5); mark `RECOVERED`. A `SUCCEEDED` token whose branch is *not* at target is a hard `REMOTE_HEAD_CHANGED` ⇒ `FAILED`. |
-| `FAILED` — transient (`TRANSIENT`, `AUTH_FAILED` on a rotatable token, `REMOTE_UNREADABLE`, issue unreadable) | stay `PUBLISHING`, no state change, retry next drain, up to a bounded attempt count; exhaustion ⇒ durable `FAILED` (which is *unresolved*, so nothing is lost). |
+| `FAILED` — transient (`TRANSIENT`, `AUTH_FAILED` on a rotatable token, `REMOTE_UNREADABLE`, issue unreadable) | stay `PUBLISHING`, no state change, increment `publish_attempts`, retry next drain while `publish_attempts < PUBLISH_ATTEMPT_LIMIT`; exhaustion ⇒ durable `FAILED` (which is *unresolved*, so nothing is lost). |
 | `FAILED` — definitive (`LEASE_REJECTED`, `NOT_FAST_FORWARD`, `PR_CLOSED_OR_MERGED`, `PR_BRANCH_MISMATCH`, `ARTIFACT_*`) | durable `FAILED` with the mapped `ValidatedWorkFailure`. |
 | `UNKNOWN` | re-run §4.3 in `RECONCILING` and act on the allowed-state tables — never resubmit blind. |
 
@@ -1138,6 +1330,32 @@ class PublishedWorkFinalizationRequest:
     worktree_path: str | None
 
 
+class FinalizationStatus(StrEnum):
+    FINALIZED = "finalized"   # labels applied and review routed
+    TRANSIENT = "transient"   # retry next drain; record stays where it is
+    FAILED    = "failed"      # durable FAILED with the mapped failure
+
+
+@dataclass(frozen=True, slots=True)
+class FinalizationOutcome:
+    """Why this is a value and not ``None``.
+
+    ``RetrySuccessFinalizer.finalize()`` returns ``None`` today
+    (``control/publish_retry_finalize.py:73-84``), so its caller learns nothing
+    about *how* it ended and a ``FreshIssueReadError`` is indistinguishable
+    from success. The disposition owner cannot work that way: the difference
+    between "retry next drain" and "durable FAILED" is the difference between
+    keeping the work and stranding it, and §4.4e's table has to be driven by an
+    enum rather than by an exception escaping (or not escaping) a void call.
+    """
+    status: FinalizationStatus
+    review_disposition: ReviewDisposition
+    labels_added: tuple[str, ...]
+    labels_removed: tuple[str, ...]
+    failure: ValidatedWorkFailure | None   # required iff status is FAILED
+    message: str
+
+
 class PublishedWorkFinalizer(Protocol):
     def finalize(
         self, request: PublishedWorkFinalizationRequest
@@ -1146,9 +1364,12 @@ class PublishedWorkFinalizer(Protocol):
 
 The implementation wraps the existing `RetrySuccessFinalizer` + `RetryReviewRouting`
 pair unchanged — one review-routing policy in the system, reached by two admission
-owners. `FreshIssueReadError` surfaces as a typed transient outcome (it already does
-in `retry_publish()`), which the disposition owner treats as retry-next-drain rather
-than `FAILED`.
+owners. It adapts their `None` return into the outcome above: a clean return is
+`FINALIZED`, a `FreshIssueReadError` is `TRANSIENT` (the disposition owner retries
+next drain rather than failing the record), and a review-routing failure is
+`FAILED(REVIEW_ROUTING_FAILED)`. The manual path keeps its current
+exception-based behaviour; only the disposition path reads the outcome, so no
+existing caller changes.
 
 ### 4.6 Composition, and who owns what
 
@@ -1495,6 +1716,11 @@ sweeps above:
 | §4.3 check 8 | Fast-forward legality is proven against the **recorded expectation**, not a freshly observed head: a remote that moved to a descendant of `E` after observation still yields zero writes. |
 | §3.2 / F5 | Scratch-reset freshness for **every** state, with `FAILED` asserted reset-**ineligible**, and `ABANDONED` asserted eligible only after a recorded `OperatorResolution`. |
 | §3.2 / F5 | `has_active_issue_runtime()` cannot be called without the disposition owner (required parameter), and `_ResetRetryRuntimeOwners` carries it into both the freshness check and the teardown. |
+| §4.3 check 5 liveness | A `QUEUED` record with **no** other active owner drains to `RECOVERED`. This is the regression test for the self-deadlock: without `exclude_owners`, the owner's own `has_unresolved_work()` reads true, check 5 fails, and the record never publishes on this or any later drain. A companion case adds a live pair and asserts the drain *is* blocked with `RUNTIME_ACTIVE` and zero writes, so the exclusion did not disable the check it narrows. |
+| §4.3 check 5 scope | `exclude_owners` suppresses **only** `VALIDATED_WORK`: with the flag set, an active session, pair, supervised job, or publish retry each still block the drain. |
+| §3.1 terminator seam | `history_reconciliation` refuses to finish an `issue-completed` transition while `.validated_work.unresolved` is true — asserted for a merged PR *and* a closed one — and the narrowed `IssueRuntimeTerminator` return type makes a terminator that discards the disposition a type error. |
+| §4.4e durability | `publish_attempts` and `publishing_started_at` survive a simulated restart: a record that has burned N transient attempts resumes at N (not 0) and reaches durable `FAILED` at `PUBLISH_ATTEMPT_LIMIT` overall, not per process. A `PENDING` token older than `publish_submission_timeout` is re-read as `UNKNOWN` and re-runs `RECONCILING` instead of resubmitting. |
+| §2.1 state sets | Writing `NONE` to the store raises; `dispose_at_termination()` returning `NONE` creates no row; `PERSISTED_STATES` and the `ValidatedWorkState` enum do not drift. |
 | §4.5 finalization | The disposition path reaches `RetrySuccessFinalizer`/`RetryReviewRouting` through `PublishedWorkFinalizer` with the live state on the request; a `FreshIssueReadError` is a retry-next-drain transient, not `FAILED`. |
 | §6 retention | The retention sweep releases escrow/refs only for `RESOLVED_STATES` past the window, never for a `FAILED` record regardless of age, and never for superseded evidence of an unresolved row. |
 | §8.2 config | `validated_work.escrow_retention_days` parses from YAML, rejects `0`/non-int, survives a `to_dict`/`to_yaml_dict` round-trip, is omitted at default, and its `config_attr` resolves against a real `Config`. |
@@ -1513,7 +1739,14 @@ reset now stale-downgrades while unresolved work exists.
 - Every `terminate_issue_runtime()` **and** `has_active_issue_runtime()` call site
   passes the disposition owner, and every `terminate_issue_runtime()` call site
   **binds** the returned `validated_work` — a discarded result, or an activity
-  check that skipped the owner, is the F5 failure mode in miniature.
+  check that skipped the owner, is the F5 failure mode in miniature. The guardrail
+  enumerates the seam in §3.1 as a call site, so the injected
+  `IssueRuntimeTerminator` path is covered rather than invisible, and it fails if
+  the alias is ever widened back to an `object` return.
+- `exclude_owners` is non-empty only inside `ValidatedWorkDispositionService`, and
+  only as `{IssueRuntimeOwnerKind.VALIDATED_WORK}` (§4.3 check 5). Any other
+  exclusion, anywhere, is a guardrail failure — that parameter is the one lever in
+  this contract that can make an activity probe stop looking at an owner.
 - Only `ValidatedWorkDispositionService` and `PublishRecoveryService` call
   `ValidatedHeadPublisher.publish_or_reconcile`.
 - The disposition publish path never calls `fetch_for_push()` or
@@ -1555,7 +1788,7 @@ remedy — scratch reset — would delete `L`.
 | Publish | The publisher sees the branch at `R` — the expectation, **not** the target — so it writes: `git push --atomic origin --force-with-lease=refs/heads/b:R L:refs/heads/b`. The object published is `L` itself, and the lease guarantees the remote was still at `R`. PR *P* is then ensured: it is open on `b`, so it is reconciled, and its head is now `L`. This is the row the old contract got wrong twice — `retry_publish()` would have found an open PR for `b` and finalized without pushing, and a bare `--force-with-lease` would have re-leased to whatever the preceding fetch saw. No new PR, no supersede, no force-push, no reset. |
 | Review | `PublishedWorkFinalizer` composes `RetrySuccessFinalizer` + `RetryReviewRouting` with the live state — review resumes on `L` through normal discovery. No approval label is applied, so there is no false ready-to-merge state. |
 | Finalize | `recovery-pending` and `blocked-failed` removed (no `publish-failed` was ever added); `pr-pending` applied by the finalizer; record `RECOVERED`; workspace removed; escrow + ref retained for `escrow_retention_days`. |
-| Divergence variant | If `L` were **not** a descendant of `R`, step 6 of §4.3 fails ⇒ `REMOTE_DIVERGED` ⇒ `FAILED`, artifacts preserved, `tech-lead-needs-human` added. A human resolves the divergence; nothing is force-pushed and nothing is deleted. |
+| Divergence variant | If `L` were **not** a descendant of `R`, §4.3 check 8 (fast-forward legality, proven against the recorded expectation `R`) fails ⇒ `REMOTE_DIVERGED` ⇒ `FAILED`, artifacts preserved, `tech-lead-needs-human` added. A human resolves the divergence; nothing is force-pushed and nothing is deleted. |
 
 **Crash points around the non-atomic GitHub writes:**
 
@@ -1607,8 +1840,13 @@ Ordered so each slice is independently shippable and leaves the tree green.
 3. **Owner, admission-only.** `dispose_at_termination()` returning `NONE`/`PARKED`
    plus evidence capture and the §1.1 target-identity rules. Wire into
    `terminate_issue_runtime()` **and** `has_active_issue_runtime()` as a required
-   parameter; add the fifth activity probe (`has_unresolved_work`) and make the
-   reset call sites consume the result. At this point nothing recovers, but
+   parameter; add the fifth activity probe (`has_unresolved_work`), convert the
+   probe tuple to the `IssueRuntimeOwnerKind`-keyed mapping with `exclude_owners`,
+   narrow `IssueRuntimeTerminator` to return `IssueRuntimeTermination`, and make
+   **every** call site — including `history_reconciliation` — consume the result.
+   The two typing changes ship here rather than with the publisher because they are
+   what makes slice 3's guarantee mechanical instead of conventional. At this point
+   nothing recovers, but
    **nothing is destroyed** — scratch reset already stale-downgrades, including for
    `FAILED`.
 4. **Publisher + finalizer, then automatic recovery.** Introduce

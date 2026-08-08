@@ -128,7 +128,20 @@ Four concrete mechanisms in today's code destroy or strand the work:
    read the same owner set only by convention, and convention is what a future
    caller forgets. Callers must also **consume** the returned disposition rather
    than discard it, so scratch reset can never discard work the predicate did not
-   observe.
+   observe. Two mechanical consequences the contract makes explicit rather than
+   leaving to the implementer:
+
+   - The predicate must be able to **exclude one named owner**, because the record
+     being drained is itself unresolved. Without that, the owner's own probe blocks
+     its own drain on every pass and automatic recovery never publishes anything.
+     Exclusion is narrower than omission — the owner stays required, and exactly
+     one caller may exclude exactly one kind.
+   - `IssueRuntimeTerminator`, the injected callable
+     (`control/history_reconciliation.py`) through which awaiting-merge
+     reconciliation reaches the boundary, is typed `Callable[[int, str], object]`.
+     That erased return type makes "bind the disposition" unstatable on a real
+     terminal edge — one that fires when a PR is **closed**, not only merged. It is
+     narrowed to return `IssueRuntimeTermination` as part of this decision.
 
 7. **Authority rides the existing gated lane.** `recover_validated_work` is added
    to `ACT_LEVEL_TECH_LEAD_ACTIONS` and bound through the existing immutable
