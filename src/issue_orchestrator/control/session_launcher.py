@@ -227,6 +227,7 @@ class SessionLauncher:
         # provider adapter names that fact instead of silently claiming the
         # provider is authenticated.
         provider_readiness_probe: ProviderReadinessProbe = NO_PROVIDER_READINESS_PROBE,
+        quarantined_issue_numbers: Callable[[], frozenset[int]] = frozenset,
     ):
         self.config = config
         self.events = events
@@ -280,6 +281,7 @@ class SessionLauncher:
             apply_actions=lambda actions, context: self._apply_actions(
                 actions, context=context
             ),
+            quarantined_issue_numbers=quarantined_issue_numbers,
         )
 
     def _worktree_reuse_options(

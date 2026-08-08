@@ -493,3 +493,94 @@ class TestPrefixResolvedPauseLabel:
             "bot:needs-reconcile" in a.expected.forbidden_labels
             for a in applier.applied
         )
+
+
+class TestQuarantineProvenanceIsRespected:
+    """A quarantined claim holds the shared needs-human label open (#6999 F12).
+
+    ``ClaimQuarantineOwner`` keeps a terminal OUT of ``active_sessions`` on
+    purpose - its work cannot be named, so letting it complete would discard
+    that work. This lifecycle clears its own escalation whenever a session for
+    the issue looks active, so without knowing about the quarantine a healthy
+    sibling session on the SAME issue silently retracts the operator's warning
+    about a live agent nobody can account for.
+    """
+
+    def test_a_healthy_sibling_session_does_not_lift_a_quarantine_block(
+        self, sample_config, mock_event_sink, tmp_path
+    ):
+        labels = LabelManager(sample_config)
+        live = {903: {labels.tech_lead_needs_human, labels.needs_human}}
+        applier = GuardEnforcingApplier(live)
+        lifecycle = TechLeadNeedsHumanLifecycle(
+            labels=labels,
+            events=mock_event_sink,
+            read_labels=lambda issue_number: list(live[issue_number]),
+            discover_marked_issue_numbers=lambda: (903,),
+            apply_actions=applier,
+            quarantined_issue_numbers=lambda: frozenset({903}),
+        )
+
+        # A perfectly healthy session for the same issue is running.
+        lifecycle.reconcile([_session(903, tmp_path)])
+
+        assert labels.needs_human in live[903]
+        assert labels.tech_lead_needs_human in live[903]
+
+    def test_without_a_quarantine_the_sibling_still_clears_as_before(
+        self, sample_config, mock_event_sink, tmp_path
+    ):
+        """The guard is scoped to quarantined issues and changes nothing else."""
+        labels = LabelManager(sample_config)
+        live = {903: {labels.tech_lead_needs_human, labels.needs_human}}
+        applier = GuardEnforcingApplier(live)
+        lifecycle = TechLeadNeedsHumanLifecycle(
+            labels=labels,
+            events=mock_event_sink,
+            read_labels=lambda issue_number: list(live[issue_number]),
+            discover_marked_issue_numbers=lambda: (903,),
+            apply_actions=applier,
+            quarantined_issue_numbers=frozenset,
+        )
+
+        lifecycle.reconcile([_session(903, tmp_path)])
+
+        assert live[903] == set()
+
+    def test_a_removed_block_is_reasserted_on_the_next_quarantine_scan(
+        self, sample_config, tmp_path
+    ):
+        """Even if something else removes it, the next sweep puts it back.
+
+        Two owners disagreeing once is survivable; the label staying gone while
+        an unaccountable terminal runs is not.
+        """
+        from unittest.mock import MagicMock
+
+        from issue_orchestrator.control.claim_quarantine import ClaimQuarantineOwner
+        from issue_orchestrator.control.in_flight_work import QuarantinedSession
+        from issue_orchestrator.execution.pending_work_claim_store import (
+            SqlitePendingWorkClaimStore,
+        )
+
+        labels = LabelManager(sample_config)
+        applied: list = []
+        owner = ClaimQuarantineOwner(
+            store=SqlitePendingWorkClaimStore.for_repo(tmp_path),
+            apply_actions=lambda actions, context: applied.extend(actions) or True,
+            label_manager=labels,
+            events=MagicMock(),
+        )
+        quarantined = QuarantinedSession(
+            _session(903, tmp_path), "payload unreadable", "/runs/903"
+        )
+        owner.quarantine_session(quarantined)
+        applied.clear()
+
+        owner.quarantine_session(quarantined)  # a later scan
+
+        assert [
+            action.label
+            for action in applied
+            if isinstance(action, AddLabelAction)
+        ] == [labels.needs_human]

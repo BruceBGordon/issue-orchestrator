@@ -841,6 +841,10 @@ def build_orchestrator(
     # Bundle all dependencies into OrchestratorDeps (no nulls, no optionals)
     # Assembly of the session launcher lives here, at the composition
     # root, rather than in the facade or the control layer (#6924 A3-R2).
+    pending_work_claims = SqlitePendingWorkClaimStore.for_repo(config.repo_root)
+    claim_quarantine = build_claim_quarantine_owner(
+        store=pending_work_claims, action_applier=action_applier,
+        label_manager=label_manager, events=events)
     session_launcher_factory = build_session_launcher_factory(
         config=config,
         events=events,
@@ -859,11 +863,7 @@ def build_orchestrator(
         label_manager=label_manager,
         agent_callback_endpoint=agent_callback_endpoint,
         provider_readiness_probe=provider_readiness_probe,
-    )
-    pending_work_claims = SqlitePendingWorkClaimStore.for_repo(config.repo_root)
-    claim_quarantine = build_claim_quarantine_owner(
-        store=pending_work_claims, action_applier=action_applier,
-        label_manager=label_manager, events=events,
+        quarantined_issue_numbers=pending_work_claims.quarantined_issue_numbers,
     )
     deps = OrchestratorDeps(
         events=events,
@@ -1238,6 +1238,10 @@ def build_orchestrator_for_testing(
     # Bundle all dependencies into OrchestratorDeps (no nulls, no optionals)
     # Assembly of the session launcher lives here, at the composition
     # root, rather than in the facade or the control layer (#6924 A3-R2).
+    pending_work_claims = SqlitePendingWorkClaimStore.for_repo(config.repo_root)
+    claim_quarantine = build_claim_quarantine_owner(
+        store=pending_work_claims, action_applier=action_applier,
+        label_manager=label_manager, events=events)
     session_launcher_factory = build_session_launcher_factory(
         config=config,
         events=events,
@@ -1256,6 +1260,7 @@ def build_orchestrator_for_testing(
         label_manager=label_manager,
         agent_callback_endpoint=agent_callback_endpoint,
         provider_readiness_probe=provider_readiness_probe,
+        quarantined_issue_numbers=pending_work_claims.quarantined_issue_numbers,
     )
     completion_handler_factory = build_completion_handler_factory(
         config,
@@ -1266,11 +1271,6 @@ def build_orchestrator_for_testing(
         open_issue_corpus=tech_lead.open_issue_corpus,
         label_manager=label_manager,
         provider_resilience=provider_resilience,
-    )
-    pending_work_claims = SqlitePendingWorkClaimStore.for_repo(config.repo_root)
-    claim_quarantine = build_claim_quarantine_owner(
-        store=pending_work_claims, action_applier=action_applier,
-        label_manager=label_manager, events=events,
     )
     deps = OrchestratorDeps(
         events=events,

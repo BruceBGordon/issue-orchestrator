@@ -35,7 +35,7 @@ from typing import TYPE_CHECKING, Callable, Optional, Sequence
 from ..domain.models import PendingRework, Session
 from ..domain.pending_work import InFlightWork, PendingWorkClaim, PendingWorkKind
 from ..domain.session_key import SessionKey, TaskKind
-from ..ports.pending_work_claim_store import PendingWorkClaimStore
+from ..ports.pending_work_claim_store import ClaimState, PendingWorkClaimStore
 from ..ports.provider_resilience import ProviderErrorType
 from .active_sessions import append_unique_active_sessions
 from .session_launch_types import LaunchDisposition, LaunchResult
@@ -101,11 +101,44 @@ class QuarantinedSession:
 
 
 @dataclass(frozen=True, slots=True)
+class StaleRun:
+    """A live terminal whose claim has already been deferred (#6999 F8).
+
+    Its work is back on a queue, so the terminal must not be admitted: settling
+    it would let a run the orchestrator has already written off consume work
+    the queue now owns. Reported rather than merely skipped so the anomaly is
+    visible.
+    """
+
+    session: Session
+    claim: PendingWorkClaim
+
+
+@dataclass(frozen=True, slots=True)
 class ClaimRestoration:
     """Per-session verdicts from rehydrating a restart's live terminals."""
 
     admitted: tuple[Session, ...]
     quarantined: tuple[QuarantinedSession, ...]
+    stale: tuple[StaleRun, ...] = ()
+
+    def observed_run_keys(self, claims: PendingWorkClaimStore) -> set[str]:
+        """Every run this pass saw alive, whatever verdict it reached.
+
+        Recovery must treat ALL of them as live, not just the admitted ones
+        (#6999 F11): a quarantined run is deliberately kept out of
+        ``active_sessions``, and without this its row would look orphaned, be
+        re-queued and deleted - after which the same terminal reads as
+        claimless and is admitted normally.
+        """
+        return {
+            claims.run_key_for(session.run_assets)
+            for session in (
+                list(self.admitted)
+                + [q.session for q in self.quarantined]
+                + [stale.session for stale in self.stale]
+            )
+        }
 
 
 class DuplicateClaimError(RuntimeError):
@@ -157,7 +190,9 @@ class InFlightWorkLedger:
         # Written every time, including the idempotent path: the durable record
         # is what a restart reads, and an in-memory hit is no evidence that the
         # on-disk one was ever produced.
-        self.claims.hold_pending_work_claim(session.run_assets, claim)
+        self.claims.hold_pending_work_claim(
+            session.run_assets, claim, issue_number=session.issue.number
+        )
         logger.debug("[WORK] %s holds %s", terminal_id, claim.kind.value)
 
     def settle(
@@ -219,9 +254,10 @@ class InFlightWorkLedger:
         """
         admitted: list[Session] = []
         quarantined: list[QuarantinedSession] = []
+        stale: list[StaleRun] = []
         for session in sessions:
             try:
-                claim = self.claims.read_pending_work_claim(session.run_assets)
+                lookup = self.claims.look_up_pending_work_claim(session.run_assets)
             except Exception as exc:  # adapter-defined decode/identity failure
                 logger.error(
                     "[WORK] Quarantining %s: its claim record exists but could "
@@ -237,6 +273,17 @@ class InFlightWorkLedger:
                     )
                 )
                 continue
+            if lookup.state is ClaimState.DEFERRED:
+                assert lookup.claim is not None
+                logger.error(
+                    "[WORK] NOT restoring %s: its claim was already deferred, so "
+                    "the work is back on its queue. Admitting it would let a "
+                    "written-off run settle work the queue now owns.",
+                    session.terminal_id,
+                )
+                stale.append(StaleRun(session, lookup.claim))
+                continue
+            claim = lookup.held
             if claim is not None:
                 if self.holds(session.terminal_id) is None:
                     self.state.in_flight_work.append(
@@ -249,9 +296,14 @@ class InFlightWorkLedger:
                     claim.kind.value,
                 )
             admitted.append(session)
-        return ClaimRestoration(tuple(admitted), tuple(quarantined))
+        return ClaimRestoration(tuple(admitted), tuple(quarantined), tuple(stale))
 
-    def recover_unresolved(self, quarantine: "ClaimQuarantineOwner") -> int:
+    def recover_unresolved(
+        self,
+        quarantine: "ClaimQuarantineOwner",
+        *,
+        live_run_keys: frozenset[str] = frozenset(),
+    ) -> int:
         """Re-admit ledger work that no live terminal is holding (#6999 F8).
 
         The enumerable half of recovery. ``rehydrate`` can only reach terminals
@@ -264,22 +316,29 @@ class InFlightWorkLedger:
         Deferred rows are re-admitted for the same reason: their in-memory
         re-queue did not survive the restart, only the row did.
 
-        Runs that ARE live keep their claims untouched. A row is dropped only
-        after its work has been admitted to a queue, so an admission that
-        raises leaves it for the next sweep.
+        ``live_run_keys`` carries every run this pass observed alive whatever
+        verdict it reached - including quarantined ones, which are deliberately
+        missing from ``active_sessions`` and would otherwise look orphaned
+        (#6999 F11).
         """
-        live = {
+        live = live_run_keys | {
             self.claims.run_key_for(session.run_assets)
             for session in self.state.active_sessions
         }
         readmitted = 0
         for unresolved in self.claims.list_unresolved_claims():
-            if unresolved.run_key in live and not unresolved.deferred:
+            if unresolved.run_key in live:
                 continue
             self._restore(unresolved.session_name, unresolved.claim)
-            self.claims.resolve_by_run_key(unresolved.run_key)
+            # The row STAYS, moved to deferred. An in-memory queue is not a
+            # durable destination, so only a relaunch taking the same work may
+            # retire it (#6999 F8). Re-running this sweep is therefore a no-op
+            # against the queues, which dedupe by their own rules.
+            self.claims.mark_deferred_by_run_key(unresolved.run_key)
             readmitted += 1
         for unreadable in self.claims.list_unreadable_claims():
+            if unreadable.run_key in live:
+                continue
             # No work can be recovered from it, and it is not attached to any
             # live terminal, so the only honest move is to tell a human.
             quarantine.quarantine_unresolved(unreadable)
@@ -413,6 +472,7 @@ class LaunchSettlement:
 
 __all__ = [
     "ClaimRestoration",
+    "StaleRun",
     "DuplicateClaimError",
     "InFlightWorkLedger",
     "LaunchSettlement",

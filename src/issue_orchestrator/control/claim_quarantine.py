@@ -70,24 +70,23 @@ class ClaimQuarantineOwner:
         self._escalate(
             run_key=quarantined.run_key,
             session_name=session.terminal_id,
+            # Trusted: the launching session's own issue, never parsed out of
+            # the terminal name (a review terminal is named for its PR).
             issue_number=session.issue.number,
             error=quarantined.error,
             still_running=True,
         )
 
     def quarantine_unresolved(self, unreadable: UnreadableClaim) -> None:
-        """Quarantine a ledger row whose run is not live and cannot be rebuilt."""
-        issue_number = _issue_number_from_session_name(unreadable.session_name)
-        if issue_number is None:
-            # Nothing to label. Loud in the log is all that is honestly left.
-            logger.error(
-                "[WORK] Unreadable pending-work claim for run %s (session %s) "
-                "with no recoverable issue number: %s",
-                unreadable.run_key,
-                unreadable.session_name,
-                unreadable.error,
-            )
-            return
+        """Quarantine a ledger row whose run is not live and cannot be rebuilt.
+
+        The issue number comes from the ledger row, recorded at hold time from
+        the launching session (#6999 F12). Deriving it from the terminal name
+        would escalate the PR number for every ``review-*`` claim - and the
+        payload, which is the other place it lives, is precisely what has
+        become unreadable.
+        """
+        issue_number = unreadable.issue_number
         logger.error(
             "[WORK] Unreadable pending-work claim for run %s (session %s, "
             "issue #%d), and no live terminal is holding it: %s",
@@ -114,9 +113,12 @@ class ClaimQuarantineOwner:
         still_running: bool,
     ) -> None:
         if self.store.is_quarantine_escalated(run_key):
-            # Already told a human about THIS run. The orphan scan rediscovers
-            # an untracked terminal every 30 seconds; each rediscovery must not
-            # add another comment.
+            # Already told a human about THIS run: the orphan scan rediscovers
+            # an untracked terminal every 30 seconds and must not re-comment.
+            # The LABEL is still reasserted, because it is shared with owners
+            # that remove it when any session for the issue looks active - and
+            # a quarantined terminal is deliberately not one of those (F12).
+            self._reassert_block(issue_number)
             return
         self.store.record_quarantine(
             run_key,
@@ -147,6 +149,33 @@ class ClaimQuarantineOwner:
                 "error": error,
             },
         ))
+
+    def release(self, run_key: str) -> None:
+        """End a quarantine whose cause is gone.
+
+        The explicit clear (#6999 F12): a quarantine ends when the run's claim
+        can be read again or its row is gone - a human having fixed or removed
+        it - never because some other session for the issue happened to start.
+        """
+        self.store.release_quarantine(run_key)
+
+    def _reassert_block(self, issue_number: int) -> None:
+        """Re-apply the shared blocking label, idempotently.
+
+        Adding a label that is already present is a no-op at the applier, so
+        this costs nothing in the common case and repairs the case that
+        matters: another owner removed it while this quarantine was still open.
+        """
+        self.apply_actions(
+            [
+                AddLabelAction(
+                    issue_number=issue_number,
+                    label=self.label_manager.needs_human,
+                    reason="pending-work claim still unreadable",
+                )
+            ],
+            context="pending_work_claim_quarantine_reassert",
+        )
 
     def _actions(
         self, session_name: str, issue_number: int, error: str, still_running: bool
@@ -185,19 +214,6 @@ class ClaimQuarantineOwner:
         ]
 
 
-def _issue_number_from_session_name(session_name: str) -> int | None:
-    """Best-effort issue number for a terminal that is no longer around.
-
-    Inspection only: the session is gone, so there is nothing typed left to ask.
-    A name that yields nothing is reported in the log rather than guessed at.
-    """
-    _, _, tail = session_name.rpartition("-")
-    try:
-        return int(tail)
-    except ValueError:
-        return None
-
-
 def build_claim_quarantine_owner(
     *,
     store: ClaimQuarantineStore,
@@ -208,8 +224,8 @@ def build_claim_quarantine_owner(
     """Assemble the owner from composition-root collaborators.
 
     The ActionApplier-to-``ActionApplierFn`` adaptation lives here rather than
-    at each composition site so both roots (production and testing) wire the
-    same behaviour, including what "the durable surface committed" means.
+    at each composition site so both roots wire the same behaviour, including
+    what "the durable surface committed" means.
     """
 
     def _apply(actions: list[Action], *, context: str) -> bool:

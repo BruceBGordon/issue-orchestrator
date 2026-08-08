@@ -1121,6 +1121,7 @@ def build_test_orchestrator_deps(
             label_manager=label_manager,
             agent_callback_endpoint=agent_callback_endpoint,
             provider_readiness_probe=readiness_probe,
+            quarantined_issue_numbers=pending_work_claims.quarantined_issue_numbers,
         ),
         # Same shape again for the completion handler (#6999 A4).
         completion_handler_factory=build_completion_handler_factory(

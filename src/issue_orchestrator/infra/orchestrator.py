@@ -55,6 +55,7 @@ from ..control.session_routing import (
     orchestrator_launch_validation_retry_session as _launch_validation_retry_session,
     orchestrator_launch_tech_lead_session as _launch_tech_lead_session,
     session_launcher_callback as _session_launcher_callback,
+    recover_unresolved_work as _recover_unresolved_work,
     restore_running_sessions as _restore_running_sessions,
     parse_session_ref as _parse_session_ref,
     create_session as _create_session,
@@ -709,9 +710,6 @@ class Orchestrator:
             discovery_elapsed_ms,
         )
 
-        if not running:
-            return
-
         tracked_names = {s.terminal_id for s in self.state.active_sessions}
         discovered = [
             (info, self.deps.session_restorer.canonical_terminal_id(info))
@@ -723,6 +721,7 @@ class Orchestrator:
             if session_name not in tracked_names
         ]
         if not untracked:
+            _recover_unresolved_work(self.state, self.deps.pending_work_claims, self.deps.claim_quarantine)
             return
 
         logger.warning(

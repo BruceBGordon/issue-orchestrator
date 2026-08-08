@@ -33,6 +33,7 @@ recorded field fails closed rather than reading as "no claim".
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum
 from typing import Protocol
 
 from ..domain.pending_work import PendingWorkClaim
@@ -41,6 +42,33 @@ from ..domain.session_run import SessionRunAssets
 
 class ConflictingPendingWorkClaimError(RuntimeError):
     """A different claim already exists for this run."""
+
+
+class ClaimState(Enum):
+    """What the ledger says about one run's claim.
+
+    ``DEFERRED`` is deliberately NOT collapsed into ``ABSENT`` (#6999 F8): a
+    deferred run's work has been re-queued, so a terminal still discoverable
+    for that run must never be admitted to ordinary completion processing as
+    though it were carrying nothing. Losing that distinction is how a stale
+    terminal settles work the queue already owns.
+    """
+
+    ABSENT = "absent"
+    HELD = "held"
+    DEFERRED = "deferred"
+
+
+@dataclass(frozen=True, slots=True)
+class ClaimLookup:
+    """A typed answer to "what is this run holding?"."""
+
+    state: ClaimState
+    claim: PendingWorkClaim | None = None
+
+    @property
+    def held(self) -> PendingWorkClaim | None:
+        return self.claim if self.state is ClaimState.HELD else None
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,6 +83,10 @@ class UnresolvedClaim:
     run_key: str
     session_name: str
     deferred: bool
+    # Recorded at hold time from the launching session, NOT derived from the
+    # payload or the terminal name (#6999 F12): a review session is named for
+    # its PR, and the payload is exactly what may have become unreadable.
+    issue_number: int
     claim: PendingWorkClaim
 
 
@@ -64,6 +96,7 @@ class UnreadableClaim:
 
     run_key: str
     session_name: str
+    issue_number: int
     error: str
 
 
@@ -71,7 +104,7 @@ class PendingWorkClaimStore(Protocol):
     """The durable side of the launch-to-settlement lifecycle."""
 
     def hold_pending_work_claim(
-        self, run: SessionRunAssets, claim: PendingWorkClaim
+        self, run: SessionRunAssets, claim: PendingWorkClaim, *, issue_number: int
     ) -> None:
         """Record that ``run`` has taken ``claim`` off its queue.
 
@@ -95,12 +128,10 @@ class PendingWorkClaimStore(Protocol):
         """Delete ``run``'s claim. Only a true terminal work outcome may."""
         ...
 
-    def read_pending_work_claim(
-        self, run: SessionRunAssets
-    ) -> PendingWorkClaim | None:
-        """The claim ``run`` currently HOLDS, or None when it holds none.
+    def look_up_pending_work_claim(self, run: SessionRunAssets) -> ClaimLookup:
+        """What ``run`` is holding, as a typed state rather than a maybe-value.
 
-        Raises rather than returning None when a record exists but cannot be
+        Raises rather than answering ABSENT when a record exists but cannot be
         trusted or rebuilt: "no claim" and "a claim I cannot read" are different
         facts, and conflating them drops work while looking like a clean start.
         """
@@ -120,8 +151,14 @@ class PendingWorkClaimStore(Protocol):
         """Stored rows that cannot be rebuilt, for the same recovery sweep."""
         ...
 
-    def resolve_by_run_key(self, run_key: str) -> None:
-        """Delete an enumerated row once its work has been re-admitted."""
+    def mark_deferred_by_run_key(self, run_key: str) -> None:
+        """Move an enumerated row to deferred without deleting it.
+
+        Recovery re-admits work to an IN-MEMORY queue, which is not a durable
+        destination, so the row must stay authoritative until a relaunch takes
+        the same work again and supersedes it (#6999 F8). Deleting here would
+        lose the work to any crash before that relaunch.
+        """
         ...
 
     def run_key_for(self, run: SessionRunAssets) -> str:
@@ -144,6 +181,25 @@ class ClaimQuarantineStore(Protocol):
         """Record (or refresh) that this run is quarantined."""
         ...
 
+    def release_quarantine(self, run_key: str) -> None:
+        """Clear a quarantine once its cause is gone.
+
+        The explicit human-clear seam: a quarantine ends when the run's claim
+        can be read again or its row has been removed, never because some other
+        session happened to start.
+        """
+        ...
+
+    def quarantined_issue_numbers(self) -> frozenset[int]:
+        """Issues currently held open by a quarantine.
+
+        Read by every owner that might otherwise remove the shared
+        ``needs-human`` label (#6999 F12). A quarantined terminal is
+        deliberately absent from ``active_sessions``, so "some session for this
+        issue is running" is NOT evidence that the block can be lifted.
+        """
+        ...
+
     def mark_quarantine_escalated(self, run_key: str) -> None:
         """Record that the durable operator surface committed for this run."""
         ...
@@ -160,7 +216,9 @@ class ClaimQuarantineStore(Protocol):
 
 
 __all__ = [
+    "ClaimLookup",
     "ClaimQuarantineStore",
+    "ClaimState",
     "ConflictingPendingWorkClaimError",
     "PendingWorkClaimStore",
     "UnreadableClaim",

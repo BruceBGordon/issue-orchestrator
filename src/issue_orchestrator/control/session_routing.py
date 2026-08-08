@@ -615,6 +615,22 @@ def session_launcher_callback(
     return handlers[session_type](number)
 
 
+def recover_unresolved_work(
+    state: "OrchestratorState",
+    claims: PendingWorkClaimStore,
+    quarantine: "ClaimQuarantineOwner",
+) -> int:
+    """Sweep the durable ledger when there is nothing to restore (#6999 F8).
+
+    The same sweep :func:`restore_running_sessions` ends with, exposed for the
+    paths that short-circuit before restoring anything. It must run there too:
+    a row whose terminal has already gone is invisible to discovery, so the
+    branch that says "nothing to restore" is the branch where that row is the
+    only record of the work left.
+    """
+    return InFlightWorkLedger(state, claims).recover_unresolved(quarantine)
+
+
 def restore_running_sessions(
     running: list["DiscoveredSession"],
     state: "OrchestratorState",
@@ -641,7 +657,9 @@ def restore_running_sessions(
     Finally the ledger is swept for work no live terminal is holding at all
     (#6999 F8) - a run killed mid-settlement leaves a row discovery will never
     surface, and for a failure investigation that row is the only record there
-    is.
+    is. That sweep is why this function must be called on EVERY startup and
+    reconcile, including when discovery returns nothing: the case it exists for
+    is precisely the one with no terminal left to discover.
     """
     ledger = InFlightWorkLedger(state, claims)
     restored = session_restorer.restore_sessions(running, state.active_sessions)
@@ -653,8 +671,12 @@ def restore_running_sessions(
     )
     # Then the half discovery cannot reach: ledger rows whose run ended while
     # its settlement was interrupted, and deferred rows whose in-memory
-    # re-queue did not survive the restart (#6999 F8).
-    ledger.recover_unresolved(quarantine)
+    # re-queue did not survive the restart (#6999 F8). Every run observed alive
+    # this pass is passed through, quarantined and stale ones included, so a
+    # row belonging to a terminal that IS here cannot look orphaned (F11).
+    ledger.recover_unresolved(
+        quarantine, live_run_keys=frozenset(restoration.observed_run_keys(claims))
+    )
     if added:
         logger.info(
             "[ORPHAN] Restored %d running terminal session(s): %s",

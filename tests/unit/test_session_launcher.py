@@ -5145,8 +5145,13 @@ def _no_claims_store():
         def consume_pending_work_claim(self, run) -> None:
             raise AssertionError("restoration must not consume claims")
 
-        def read_pending_work_claim(self, run):
-            return None
+        def look_up_pending_work_claim(self, run):
+            from issue_orchestrator.ports.pending_work_claim_store import (
+                ClaimLookup,
+                ClaimState,
+            )
+
+            return ClaimLookup(ClaimState.ABSENT)
 
         def list_unresolved_claims(self):
             return ()
@@ -5154,8 +5159,8 @@ def _no_claims_store():
         def list_unreadable_claims(self):
             return ()
 
-        def resolve_by_run_key(self, run_key) -> None:
-            raise AssertionError("nothing to resolve")
+        def mark_deferred_by_run_key(self, run_key) -> None:
+            raise AssertionError("nothing to defer")
 
         def run_key_for(self, run) -> str:
             return str(run.run_dir)

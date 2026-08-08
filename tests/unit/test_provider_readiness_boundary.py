@@ -21,6 +21,7 @@ from pathlib import Path
 
 import pytest
 
+from issue_orchestrator.control.actions import AddCommentAction, AddLabelAction
 from issue_orchestrator.control.in_flight_work import InFlightWorkLedger
 from issue_orchestrator.control.provider_availability import ProviderAvailabilityPolicy
 from issue_orchestrator.control.provider_resilience import ProviderResilienceManager
@@ -30,6 +31,7 @@ from issue_orchestrator.control.tech_lead_reaction import (
 )
 from issue_orchestrator.domain.models import DiscoveredFailure, SessionStatus
 from issue_orchestrator.domain.pending_work import PendingWorkKind
+from issue_orchestrator.ports.pending_work_claim_store import ClaimState
 from issue_orchestrator.events import EventName
 from issue_orchestrator.execution.agent_runner_errors import (
     classify_provider_error,
@@ -3839,8 +3841,8 @@ def test_every_claim_kind_round_trips_through_the_authoritative_store(
     store = _claims(tmp_path)
     run = _run(tmp_path)
 
-    store.hold_pending_work_claim(run, claim)
-    restored = store.read_pending_work_claim(run)
+    store.hold_pending_work_claim(run, issue_number=7, claim=claim)
+    restored = store.look_up_pending_work_claim(run).held
 
     assert restored is not None
     assert restored.kind is PendingWorkKind(queue)
@@ -3859,8 +3861,11 @@ def test_every_claim_kind_round_trips_through_the_authoritative_store(
         assert restored.request == claim.request  # every field, structurally
 
 
-def test_reading_a_run_that_holds_no_claim_returns_none(tmp_path: Path) -> None:
-    assert _claims(tmp_path).read_pending_work_claim(_run(tmp_path)) is None
+def test_reading_a_run_that_holds_no_claim_is_absent(tmp_path: Path) -> None:
+    assert (
+        _claims(tmp_path).look_up_pending_work_claim(_run(tmp_path)).state
+        is ClaimState.ABSENT
+    )
 
 
 def test_consuming_a_claim_is_idempotent(tmp_path: Path) -> None:
@@ -3868,11 +3873,11 @@ def test_consuming_a_claim_is_idempotent(tmp_path: Path) -> None:
     run = _run(tmp_path)
 
     store.consume_pending_work_claim(run)  # nothing to consume
-    store.hold_pending_work_claim(run, _claim("review", _pending_state("review")))
+    store.hold_pending_work_claim(run, issue_number=7, claim=_claim("review", _pending_state("review")))
     store.consume_pending_work_claim(run)
     store.consume_pending_work_claim(run)
 
-    assert store.read_pending_work_claim(run) is None
+    assert store.look_up_pending_work_claim(run).state is ClaimState.ABSENT
 
 
 def test_re_holding_the_same_claim_is_idempotent(tmp_path: Path) -> None:
@@ -3881,10 +3886,10 @@ def test_re_holding_the_same_claim_is_idempotent(tmp_path: Path) -> None:
     run = _run(tmp_path)
     claim = _claim("tech_lead", _pending_state("tech_lead"))
 
-    store.hold_pending_work_claim(run, claim)
-    store.hold_pending_work_claim(run, claim)
+    store.hold_pending_work_claim(run, issue_number=7, claim=claim)
+    store.hold_pending_work_claim(run, issue_number=7, claim=claim)
 
-    assert store.read_pending_work_claim(run) is not None
+    assert store.look_up_pending_work_claim(run).held is not None
 
 
 def test_a_conflicting_authoritative_write_fails_loudly(tmp_path: Path) -> None:
@@ -3900,12 +3905,12 @@ def test_a_conflicting_authoritative_write_fails_loudly(tmp_path: Path) -> None:
     store = _claims(tmp_path)
     run = _run(tmp_path)
     first = _claim("tech_lead", _pending_state("tech_lead"))
-    store.hold_pending_work_claim(run, first)
+    store.hold_pending_work_claim(run, issue_number=7, claim=first)
 
     with pytest.raises(ConflictingPendingWorkClaimError, match="already holds"):
-        store.hold_pending_work_claim(run, _claim("review", _pending_state("review")))
+        store.hold_pending_work_claim(run, issue_number=7, claim=_claim("review", _pending_state("review")))
 
-    restored = store.read_pending_work_claim(run)
+    restored = store.look_up_pending_work_claim(run).held
     assert restored is not None
     assert restored.kind is first.kind
 
@@ -3928,14 +3933,14 @@ def test_a_rewritten_run_identity_is_refused_rather_than_read_as_absent(
     store = _claims(tmp_path)
     run = _run(tmp_path)
     store.hold_pending_work_claim(
-        run, _claim("tech_lead", _pending_state("tech_lead"))
+        run, issue_number=7, claim=_claim("tech_lead", _pending_state("tech_lead"))
     )
     renamed = dc_replace(
         run, identity=dc_replace(run.identity, session_name="rework-9")
     )
 
     with pytest.raises(PendingWorkClaimDecodeError, match="rework-9"):
-        store.read_pending_work_claim(renamed)
+        store.look_up_pending_work_claim(renamed)
 
 
 def test_an_undecodable_claim_is_never_read_as_absent(tmp_path: Path) -> None:
@@ -3954,7 +3959,7 @@ def test_an_undecodable_claim_is_never_read_as_absent(tmp_path: Path) -> None:
 
     store = _claims(tmp_path)
     run = _run(tmp_path)
-    store.hold_pending_work_claim(run, _claim("review", _pending_state("review")))
+    store.hold_pending_work_claim(run, issue_number=7, claim=_claim("review", _pending_state("review")))
     corrupt = sqlite3.connect(state_dir(tmp_path) / STORE_FILENAME)
     corrupt.execute(
         "UPDATE pending_work_claim SET payload = ? WHERE run_key = ?",
@@ -3964,7 +3969,7 @@ def test_an_undecodable_claim_is_never_read_as_absent(tmp_path: Path) -> None:
     corrupt.close()
 
     with pytest.raises(PendingWorkClaimDecodeError):
-        _claims(tmp_path).read_pending_work_claim(run)
+        _claims(tmp_path).look_up_pending_work_claim(run)
 
 
 # ---------------------------------------------------------------------------
@@ -3992,7 +3997,7 @@ def test_the_authoritative_claim_is_not_written_into_the_agent_worktree(
     planted = [p.name for p in run_dir.rglob("*") if "claim" in p.name.lower()]
     assert planted == []
     # And it really was recorded - just somewhere the agent cannot reach.
-    assert harness.claims.read_pending_work_claim(session.run_assets) is not None
+    assert harness.claims.look_up_pending_work_claim(session.run_assets).held is not None
 
 
 def test_a_worktree_side_claim_file_cannot_change_what_is_restored(
@@ -4250,7 +4255,7 @@ def test_recovery_leaves_live_work_alone(tmp_path: Path) -> None:
     InFlightWorkLedger(state, harness.claims).recover_unresolved(_quarantine(harness))
 
     assert state.pending_tech_lead_reviews == []
-    assert harness.claims.read_pending_work_claim(session.run_assets) is not None
+    assert harness.claims.look_up_pending_work_claim(session.run_assets).held is not None
 
 
 def test_recovered_work_is_not_recovered_twice(tmp_path: Path) -> None:
@@ -4267,7 +4272,10 @@ def test_recovered_work_is_not_recovered_twice(tmp_path: Path) -> None:
     )
 
     assert len(restarted.pending_tech_lead_reviews) == 1
-    assert harness.claims.list_unresolved_claims() == ()
+    # The row STAYS, deferred: an in-memory queue is not a durable destination,
+    # so only a relaunch taking the same work may retire it (#6999 F8).
+    unresolved = harness.claims.list_unresolved_claims()
+    assert [u.deferred for u in unresolved] == [True]
 
 
 def test_a_relaunch_supersedes_its_own_deferred_row(tmp_path: Path) -> None:
@@ -4308,13 +4316,13 @@ def test_a_rewritten_started_at_is_refused(tmp_path: Path) -> None:
 
     store = _claims(tmp_path)
     run = _run(tmp_path)
-    store.hold_pending_work_claim(run, _claim("tech_lead", _pending_state("tech_lead")))
+    store.hold_pending_work_claim(run, issue_number=7, claim=_claim("tech_lead", _pending_state("tech_lead")))
     retimed = dc_replace(
         run, identity=dc_replace(run.identity, started_at="1999-01-01T00:00:00+00:00")
     )
 
     with pytest.raises(PendingWorkClaimDecodeError, match="1999-01-01"):
-        store.read_pending_work_claim(retimed)
+        store.look_up_pending_work_claim(retimed)
 
 
 def test_the_run_key_is_not_recomputed_through_symlinks(tmp_path: Path) -> None:
@@ -4331,12 +4339,12 @@ def test_the_run_key_is_not_recomputed_through_symlinks(tmp_path: Path) -> None:
 
     store = _claims(tmp_path)
     run = _run(tmp_path)
-    store.hold_pending_work_claim(run, _claim("review", _pending_state("review")))
+    store.hold_pending_work_claim(run, issue_number=7, claim=_claim("review", _pending_state("review")))
     decoy = make_session_run_assets(
         run.worktree_path, session_name="issue-9", run_id="run-2"
     )
     store.hold_pending_work_claim(
-        decoy, _claim("tech_lead", _pending_state("tech_lead"))
+        decoy, issue_number=9, claim=_claim("tech_lead", _pending_state("tech_lead"))
     )
     key_before = store.run_key_for(run)
 
@@ -4345,7 +4353,7 @@ def test_the_run_key_is_not_recomputed_through_symlinks(tmp_path: Path) -> None:
     run.run_dir.symlink_to(decoy.run_dir, target_is_directory=True)
 
     assert store.run_key_for(run) == key_before  # lexical, unmoved
-    restored = store.read_pending_work_claim(run)
+    restored = store.look_up_pending_work_claim(run).held
     assert restored is not None
     assert restored.kind is PendingWorkKind.REVIEW  # still its OWN claim
 
@@ -4396,10 +4404,18 @@ def test_a_repeated_orphan_scan_quarantines_once(tmp_path: Path) -> None:
     owner.quarantine_session(quarantined)
     owner.quarantine_session(quarantined)
 
-    assert len(harness.quarantine_actions) == 2  # one label + one comment, once
+    comments = [
+        a for a in harness.quarantine_actions if isinstance(a, AddCommentAction)
+    ]
+    assert len(comments) == 1  # told a human exactly once
     assert (
         harness.event_names().count(EventName.SESSION_CLAIM_UNREADABLE.value) == 1
     )
+    # The LABEL is reasserted on every scan on purpose: it is shared with owners
+    # that remove it when a session for the issue looks active, and a
+    # quarantined terminal is deliberately not one of those (#6999 F12).
+    labels = [a for a in harness.quarantine_actions if isinstance(a, AddLabelAction)]
+    assert len(labels) == 3
 
 
 def test_a_quarantine_survives_a_restart_without_re_commenting(
@@ -4414,7 +4430,11 @@ def test_a_quarantine_survives_a_restart_without_re_commenting(
     # A brand-new owner over the SAME durable store, as after a restart.
     _quarantine_with(harness).quarantine_session(quarantined)
 
-    assert harness.quarantine_actions == []
+    assert [
+        a for a in harness.quarantine_actions if isinstance(a, AddCommentAction)
+    ] == []  # not re-announced
+    # ...but the block is still reasserted, because it may have been removed.
+    assert [a.label for a in harness.quarantine_actions] == ["needs-human"]
 
 
 def test_a_failed_durable_escalation_is_retried_and_publishes_nothing(
@@ -4494,3 +4514,318 @@ def test_two_runs_of_one_issue_quarantine_independently(tmp_path: Path) -> None:
     assert (
         harness.event_names().count(EventName.SESSION_CLAIM_UNREADABLE.value) == 2
     )
+
+
+# ---------------------------------------------------------------------------
+# An upgrade must not delete in-flight claims (#6999 F13)
+# ---------------------------------------------------------------------------
+
+
+def _write_legacy_claim_row(
+    db_path: Path, *, run_key: str, claim, identity=None
+) -> None:
+    """A row in the shape the previous release wrote."""
+    import sqlite3
+
+    from issue_orchestrator.execution.pending_work_codec import encode_claim
+
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS pending_work_claim (
+            run_key TEXT PRIMARY KEY,
+            session_name TEXT NOT NULL,
+            run_id TEXT NOT NULL,
+            started_at TEXT NOT NULL,
+            payload TEXT NOT NULL
+        );
+        """
+    )
+    conn.execute(
+        "INSERT OR REPLACE INTO pending_work_claim VALUES (?, ?, ?, ?, ?)",
+        (
+            run_key,
+            identity.session_name if identity else "issue-7",
+            identity.run_id if identity else "run-1",
+            identity.started_at if identity else "2026-08-07T00:00:00+00:00",
+            json.dumps(encode_claim(claim), sort_keys=True),
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
+@pytest.mark.parametrize("queue", _PENDING_QUEUES)
+def test_an_upgrade_carries_every_in_flight_claim_forward(
+    queue, tmp_path: Path
+) -> None:
+    """Dropping the old table would delete the only copy of live work.
+
+    That branch existed because terminal discovery CANNOT reconstruct a typed
+    queued request - which is precisely why the rows must survive the upgrade
+    (#6999 F13).
+    """
+    from issue_orchestrator.execution.pending_work_claim_store import (
+        STORE_FILENAME,
+        SqlitePendingWorkClaimStore,
+    )
+    from issue_orchestrator.infra.repo_identity import state_dir
+
+    state = _pending_state(queue)
+    claim = _claim(queue, state)
+    run = _run(tmp_path)
+    _write_legacy_claim_row(
+        state_dir(tmp_path) / STORE_FILENAME,
+        run_key=os.path.normpath(str(run.run_dir)),
+        claim=claim,
+        identity=run.identity,
+    )
+
+    store = SqlitePendingWorkClaimStore.for_repo(tmp_path)
+
+    unresolved = store.list_unresolved_claims()
+    assert len(unresolved) == 1
+    assert unresolved[0].claim.kind is claim.kind
+    assert not unresolved[0].deferred  # carried over as held, as written
+    assert store.look_up_pending_work_claim(run).held is not None
+
+
+def test_an_unmigratable_row_is_preserved_not_dropped(tmp_path: Path) -> None:
+    """A row that cannot be decoded is kept for inspection, never discarded."""
+    import sqlite3
+
+    from issue_orchestrator.execution.pending_work_claim_store import (
+        STORE_FILENAME,
+        SqlitePendingWorkClaimStore,
+    )
+    from issue_orchestrator.infra.repo_identity import state_dir
+
+    db_path = state_dir(tmp_path) / STORE_FILENAME
+    _write_legacy_claim_row(
+        db_path, run_key="/runs/a", claim=_claim("review", _pending_state("review"))
+    )
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        "INSERT INTO pending_work_claim VALUES (?, ?, ?, ?, ?)",
+        ("/runs/broken", "issue-8", "run-2", "2026-08-07T00:00:00+00:00", "{not json"),
+    )
+    conn.commit()
+    conn.close()
+
+    store = SqlitePendingWorkClaimStore.for_repo(tmp_path)
+
+    assert len(store.list_unresolved_claims()) == 1  # the good one came across
+    kept = sqlite3.connect(db_path).execute(
+        "SELECT run_key FROM pending_work_claim_unmigrated"
+    ).fetchall()
+    assert [row[0] for row in kept] == ["/runs/a", "/runs/broken"]
+
+
+# ---------------------------------------------------------------------------
+# Recovery reaches the real seams, and survives a second restart (#6999 F8)
+# ---------------------------------------------------------------------------
+
+
+def test_the_runtime_reconcile_sweeps_the_ledger_with_nothing_discovered(
+    tmp_path: Path,
+) -> None:
+    """The branch that returns early is exactly where the sweep matters.
+
+    A run whose terminal is already gone is invisible to discovery, so "nothing
+    untracked was found" is the case where its ledger row is the only remaining
+    record of the work.
+    """
+    from issue_orchestrator.control.session_routing import recover_unresolved_work
+
+    harness = _ready_harness(tmp_path)
+    state = _pending_state("tech_lead")
+    session = _route("tech_lead", state, harness)
+    assert session is not None
+    state.active_sessions.clear()  # the terminal is gone
+    state.pending_tech_lead_reviews.clear()
+
+    recover_unresolved_work(state, harness.claims, _quarantine(harness))
+
+    assert len(state.pending_tech_lead_reviews) == 1
+
+
+@pytest.mark.parametrize("queue", _PENDING_QUEUES)
+def test_a_second_restart_before_relaunch_still_has_the_work(
+    queue, tmp_path: Path
+) -> None:
+    """Recovery re-admits into an in-memory queue, which is not durable.
+
+    So the row must stay authoritative until a relaunch takes the same work
+    again; otherwise the second restart before that relaunch loses it (#6999 F8).
+    """
+    harness = _ready_harness(tmp_path)
+    state = _pending_state(queue)
+    session = _route(queue, state, harness)
+    assert session is not None
+    once = _recover_with_no_terminals(state, harness)
+    assert _pending_count(once, queue) == 1
+
+    twice = _recover_with_no_terminals(once, harness)
+
+    assert _pending_count(twice, queue) == 1
+
+
+def test_a_still_discovered_run_whose_claim_is_deferred_is_not_admitted(
+    tmp_path: Path,
+) -> None:
+    """Its work is back on a queue; admitting it would let it settle that work.
+
+    The lookup keeps deferred distinct from absent precisely so this terminal
+    cannot be treated as carrying nothing (#6999 F8).
+    """
+    from issue_orchestrator.control.in_flight_work import InFlightWorkLedger
+
+    harness = _ready_harness(tmp_path)
+    state = _pending_state("tech_lead")
+    session = _route("tech_lead", state, harness)
+    assert session is not None
+    harness.claims.defer_pending_work_claim(session.run_assets)
+
+    restoration = InFlightWorkLedger(state, harness.claims).rehydrate([session])
+
+    assert restoration.admitted == ()
+    assert [s.session.terminal_id for s in restoration.stale] == [
+        session.terminal_id
+    ]
+
+
+# ---------------------------------------------------------------------------
+# A quarantined run stays ineligible for orphan recovery (#6999 F11)
+# ---------------------------------------------------------------------------
+
+
+def test_repeated_scans_never_admit_a_mismatched_identity_terminal(
+    tmp_path: Path,
+) -> None:
+    """The bypass F11 named: quarantine once, then recover-and-delete the row.
+
+    A quarantined run is deliberately absent from active_sessions, so without
+    passing every OBSERVED run key into recovery its row looks orphaned, gets
+    re-queued and retired - after which the same terminal reads as claimless
+    and is admitted normally on the next scan.
+    """
+    import sqlite3
+
+    from issue_orchestrator.execution.pending_work_claim_store import STORE_FILENAME
+    from issue_orchestrator.infra.repo_identity import state_dir
+
+    harness = _ready_harness(tmp_path)
+    state = _pending_state("tech_lead")
+    session = _route("tech_lead", state, harness)
+    assert session is not None
+    # The agent rewrites its manifest identity; the row no longer matches.
+    conn = sqlite3.connect(state_dir(tmp_path) / STORE_FILENAME)
+    conn.execute(
+        "UPDATE pending_work_claim SET started_at = ? WHERE run_key = ?",
+        ("1999-01-01T00:00:00+00:00", harness.claims.run_key_for(session.run_assets)),
+    )
+    conn.commit()
+    conn.close()
+
+    for _ in range(3):
+        restarted, added, _ = _restore_pair(None, [session], harness)
+        assert added == []  # never admitted, on any scan
+        assert restarted.active_sessions == []
+        # ...and its row is still authoritative, never re-queued beside it.
+        assert len(harness.claims.list_unresolved_claims()) == 1
+        assert restarted.pending_tech_lead_reviews == []
+
+
+def test_an_unresolved_review_claim_escalates_its_ISSUE_not_its_PR(
+    tmp_path: Path,
+) -> None:
+    """The trusted issue number comes from the ledger, not the terminal name.
+
+    A review terminal is named ``review-<pr_number>``, so deriving the issue
+    from that name labels and comments on the PR instead of the issue that
+    owns the work - and the payload, the other place it lives, is exactly what
+    has become unreadable (#6999 F12).
+    """
+    from issue_orchestrator.control.actions import AddCommentAction, AddLabelAction
+    from issue_orchestrator.ports.pending_work_claim_store import UnreadableClaim
+
+    harness = _ready_harness(tmp_path)
+
+    _quarantine_with(harness).quarantine_unresolved(
+        UnreadableClaim(
+            run_key="/runs/review-70",
+            session_name="review-70",  # named for the PR
+            issue_number=7,  # recorded at hold time, from the session's issue
+            error="payload unreadable",
+        )
+    )
+
+    labels = [a for a in harness.quarantine_actions if isinstance(a, AddLabelAction)]
+    comments = [
+        a for a in harness.quarantine_actions if isinstance(a, AddCommentAction)
+    ]
+    assert [a.issue_number for a in labels] == [7]
+    assert [a.number for a in comments] == [7]
+
+
+def test_an_unresolved_claim_quarantine_is_idempotent_across_sweeps(
+    tmp_path: Path,
+) -> None:
+    """The ledger sweep runs on every reconcile, not only at startup."""
+    from issue_orchestrator.control.actions import AddCommentAction
+    from issue_orchestrator.ports.pending_work_claim_store import UnreadableClaim
+
+    harness = _ready_harness(tmp_path)
+    unreadable = UnreadableClaim(
+        run_key="/runs/review-70",
+        session_name="review-70",
+        issue_number=7,
+        error="payload unreadable",
+    )
+    owner = _quarantine_with(harness)
+
+    owner.quarantine_unresolved(unreadable)
+    owner.quarantine_unresolved(unreadable)
+
+    assert len(
+        [a for a in harness.quarantine_actions if isinstance(a, AddCommentAction)]
+    ) == 1
+
+
+def test_a_released_quarantine_stops_holding_the_issue_open(
+    tmp_path: Path,
+) -> None:
+    """The explicit human-clear seam.
+
+    A quarantine ends when its cause is gone - never because another session
+    for the issue happened to start.
+    """
+    harness = _ready_harness(tmp_path)
+    quarantined = _quarantined(harness, tmp_path)
+    owner = _quarantine_with(harness)
+    owner.quarantine_session(quarantined)
+    assert harness.claims.quarantined_issue_numbers() == frozenset({7})
+
+    owner.release(quarantined.run_key)
+
+    assert harness.claims.quarantined_issue_numbers() == frozenset()
+
+
+def test_two_runs_in_one_second_do_not_share_a_quarantine_marker(
+    tmp_path: Path,
+) -> None:
+    """Run roots are named from a second-resolution timestamp.
+
+    Two runs that collide on that name must still be told apart, or one
+    terminal's quarantine would silently satisfy the other's (#6999 F12).
+    """
+    harness = _ready_harness(tmp_path)
+    first = _quarantined(harness, tmp_path)
+    second_state = _pending_state("tech_lead")
+    second_session = _route("tech_lead", second_state, harness)
+    assert second_session is not None
+
+    assert harness.claims.run_key_for(
+        first.session.run_assets
+    ) != harness.claims.run_key_for(second_session.run_assets)

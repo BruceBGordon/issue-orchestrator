@@ -46,6 +46,7 @@ def build_session_launcher_factory(
     label_manager,
     agent_callback_endpoint: "AgentCallbackEndpoint",
     provider_readiness_probe: ProviderReadinessProbe,
+    quarantined_issue_numbers: Callable[[], frozenset[int]],
 ) -> "SessionLauncherFactory":
     """Bind the application dependencies; return the facade-facing factory."""
 
@@ -81,6 +82,7 @@ def build_session_launcher_factory(
             board_snapshot_provider=board_snapshot_provider,
             agent_callback_endpoint=agent_callback_endpoint,
             provider_readiness_probe=provider_readiness_probe,
+            quarantined_issue_numbers=quarantined_issue_numbers,
         )
 
     return _factory

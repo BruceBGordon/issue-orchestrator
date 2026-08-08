@@ -58,12 +58,19 @@ class TechLeadNeedsHumanLifecycle:
         read_labels: ReadLabels,
         discover_marked_issue_numbers: DiscoverMarkedIssueNumbers,
         apply_actions: ApplyActions,
+        quarantined_issue_numbers: Callable[[], frozenset[int]] = frozenset,
     ) -> None:
         self._labels = labels
         self._events = events
         self._read_labels = read_labels
         self._discover_marked_issue_numbers = discover_marked_issue_numbers
         self._apply_actions = apply_actions
+        # #6999 F12: issues held open by an unreadable-claim quarantine. That
+        # owner keeps a terminal OUT of active_sessions on purpose, so "a
+        # session for this issue is active" is not evidence its block can be
+        # lifted - and lifting it would retract a warning about a live agent
+        # nobody can account for.
+        self._quarantined_issue_numbers = quarantined_issue_numbers
 
     def _expected(
         self,
@@ -242,6 +249,14 @@ class TechLeadNeedsHumanLifecycle:
 
             if issue_number not in active_issue_numbers:
                 self._recover_interrupted_escalation(issue_number, current)
+                continue
+
+            if issue_number in self._quarantined_issue_numbers():
+                logger.info(
+                    "[TECH_LEAD] Leaving needs-human on issue #%d: an unreadable "
+                    "pending-work claim is quarantined against it",
+                    issue_number,
+                )
                 continue
 
             self._clear_superseded_escalation(issue_number, current)

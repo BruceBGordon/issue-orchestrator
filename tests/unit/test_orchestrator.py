@@ -1009,8 +1009,15 @@ class TestLaunchSession:
     ):
         """Review tab names resolve to review-PR ids when deciding if tracked."""
         orchestrator = create_test_orchestrator(sample_config, mock_repository_host)
+        from tests.unit.session_run_helpers import make_session_run_assets
+
         existing = MagicMock(spec=Session)
         existing.terminal_id = "review-456"
+        # An active session always carries typed run assets; the ledger sweep
+        # that now runs on every reconcile reads its run key (#6999 F8).
+        existing.run_assets = make_session_run_assets(
+            sample_config.repo_root, session_name="review-456"
+        )
         orchestrator.state.active_sessions = [existing]
         orchestrator.deps.runner.discover_running_sessions = MagicMock(return_value=[
             {"issue_number": 100, "tab_name": "#100 Review PR #456", "is_review": True}

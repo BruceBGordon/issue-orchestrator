@@ -1457,6 +1457,7 @@ class TestLaunchSessionDependencyCAS:
                 label_manager=orch.deps.label_manager,
                 agent_callback_endpoint=ready_callback_endpoint(),
                 provider_readiness_probe=orch.deps.provider_readiness_probe,
+                quarantined_issue_numbers=frozenset,
             )
 
         # Original issue had no dependencies
@@ -1549,6 +1550,7 @@ class TestLaunchSessionDependencyCAS:
                 label_manager=orch.deps.label_manager,
                 agent_callback_endpoint=ready_callback_endpoint(),
                 provider_readiness_probe=orch.deps.provider_readiness_probe,
+                quarantined_issue_numbers=frozenset,
             )
 
         issue = Issue(

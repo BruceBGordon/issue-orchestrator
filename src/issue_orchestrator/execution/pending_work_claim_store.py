@@ -30,6 +30,7 @@ could not read and is cleared by a human, never by a session outcome.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sqlite3
 import threading
@@ -42,6 +43,8 @@ from ..domain.session_run import SessionRunAssets
 from ..infra.repo_identity import state_dir
 from ..infra.sqlite_connection import open_sqlite
 from ..ports.pending_work_claim_store import (
+    ClaimLookup,
+    ClaimState,
     ConflictingPendingWorkClaimError,
     UnreadableClaim,
     UnresolvedClaim,
@@ -60,6 +63,7 @@ CREATE TABLE IF NOT EXISTS pending_work_claim (
     session_name TEXT NOT NULL,
     run_id TEXT NOT NULL,
     started_at TEXT NOT NULL,
+    issue_number INTEGER NOT NULL,
     payload TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS pending_work_claim_work
@@ -74,6 +78,17 @@ CREATE TABLE IF NOT EXISTS pending_work_claim_quarantine (
 """
 
 STORE_FILENAME = "pending_work_claims.sqlite"
+
+logger = logging.getLogger(__name__)
+
+
+def _issue_number_of(claim: PendingWorkClaim) -> int:
+    """Trusted issue number for a claim being migrated forward."""
+    request = claim.request
+    resolver = getattr(request, "resolve_issue_number", None)
+    if resolver is not None:
+        return int(resolver() or 0)
+    return int(getattr(request, "issue_number", 0))
 
 
 class SqlitePendingWorkClaimStore:
@@ -102,28 +117,78 @@ class SqlitePendingWorkClaimStore:
 
     @staticmethod
     def _migrate(conn: sqlite3.Connection) -> None:
-        """Reshape a table written before the durable states existed.
+        """Carry an older table forward WITHOUT losing a single claim.
 
         ``CREATE TABLE IF NOT EXISTS`` leaves an existing table untouched, so a
-        database written against the earlier run-keyed-only schema would keep a
-        shape with no ``work_key`` or ``deferred`` column and every later
-        statement would fail. The rows describe runs of a process that is no
-        longer running, so they are dropped rather than migrated: a restart
-        already re-derives live claims from discovery, and keeping a row whose
-        state cannot be known would be worse than starting clean.
+        database written against an earlier shape would keep columns the new
+        statements do not know about. Dropping it is not an option (#6999 F13):
+        these rows are the only authoritative copy of work that has already left
+        its queue, and the whole reason this table exists is that terminal
+        discovery CANNOT reconstruct a typed queued request. An upgrade with a
+        live review, validation retry, rework or failure investigation would
+        delete exactly the record restoration is about to need.
+
+        So every row is carried over: identity and payload verbatim, ``work_key``
+        derived by decoding the payload, ``issue_number`` recovered from the
+        decoded request, and prior rows treated as held (the state they were
+        written in). A row that cannot be decoded is preserved in
+        ``pending_work_claim_unmigrated`` and reported, never silently dropped.
         """
         columns = {
             row[1]
             for row in conn.execute("PRAGMA table_info(pending_work_claim)")
         }
-        if columns and not {"work_key", "deferred"} <= columns:
-            conn.execute("DROP TABLE pending_work_claim")
-            conn.commit()
+        if not columns or {"work_key", "deferred", "issue_number"} <= columns:
+            return
+        legacy = list(
+            conn.execute(
+                "SELECT run_key, session_name, run_id, started_at, payload "
+                "FROM pending_work_claim"
+            )
+        )
+        conn.execute(
+            "ALTER TABLE pending_work_claim RENAME TO pending_work_claim_unmigrated"
+        )
+        conn.executescript(_SCHEMA)
+        carried = 0
+        for row in legacy:
+            try:
+                claim = decode_claim(json.loads(row["payload"]))
+            except (PendingWorkClaimDecodeError, json.JSONDecodeError, TypeError):
+                logger.error(
+                    "[WORK] Could not migrate pending-work claim for run %s; it "
+                    "is preserved in pending_work_claim_unmigrated",
+                    row["run_key"],
+                )
+                continue
+            conn.execute(
+                "INSERT OR REPLACE INTO pending_work_claim "
+                "(run_key, work_key, deferred, session_name, run_id, started_at, "
+                "issue_number, payload) VALUES (?, ?, 0, ?, ?, ?, ?, ?)",
+                (
+                    row["run_key"],
+                    claim.work_key(),
+                    row["session_name"],
+                    row["run_id"],
+                    row["started_at"],
+                    _issue_number_of(claim),
+                    row["payload"],
+                ),
+            )
+            carried += 1
+        if carried == len(legacy):
+            conn.execute("DROP TABLE pending_work_claim_unmigrated")
+        conn.commit()
+        logger.info(
+            "[WORK] Migrated %d/%d pending-work claim(s) to the current schema",
+            carried,
+            len(legacy),
+        )
 
     # -- claim lifecycle ---------------------------------------------------
 
     def hold_pending_work_claim(
-        self, run: SessionRunAssets, claim: PendingWorkClaim
+        self, run: SessionRunAssets, claim: PendingWorkClaim, *, issue_number: int
     ) -> None:
         key = self.run_key_for(run)
         payload = json.dumps(encode_claim(claim), sort_keys=True)
@@ -158,13 +223,14 @@ class SqlitePendingWorkClaimStore:
             conn.execute(
                 "INSERT INTO pending_work_claim "
                 "(run_key, work_key, deferred, session_name, run_id, started_at, "
-                "payload) VALUES (?, ?, 0, ?, ?, ?, ?)",
+                "issue_number, payload) VALUES (?, ?, 0, ?, ?, ?, ?, ?)",
                 (
                     key,
                     work_key,
                     identity.session_name,
                     identity.run_id,
                     identity.started_at,
+                    issue_number,
                     payload,
                 ),
             )
@@ -183,9 +249,7 @@ class SqlitePendingWorkClaimStore:
                 (self.run_key_for(run),),
             )
 
-    def read_pending_work_claim(
-        self, run: SessionRunAssets
-    ) -> PendingWorkClaim | None:
+    def look_up_pending_work_claim(self, run: SessionRunAssets) -> ClaimLookup:
         key = self.run_key_for(run)
         row = self._get_connection().execute(
             "SELECT session_name, run_id, started_at, deferred, payload "
@@ -193,7 +257,7 @@ class SqlitePendingWorkClaimStore:
             (key,),
         ).fetchone()
         if row is None:
-            return None
+            return ClaimLookup(ClaimState.ABSENT)
         identity = run.identity
         if not self._identity_matches(row, identity):
             # The run root matched but the identity recorded against it did not.
@@ -206,11 +270,13 @@ class SqlitePendingWorkClaimStore:
                 f"asked for run {identity.run_id}, session "
                 f"{identity.session_name!r}, started {identity.started_at!r}"
             )
+        claim = self._decode(row["payload"], key)
         if row["deferred"]:
-            # Deferred work belongs to the queue, not to this run. Reporting it
-            # as held would let a stale terminal settle work already re-queued.
-            return None
-        return self._decode(row["payload"], key)
+            # Deferred work belongs to the queue, not to this run. Answering
+            # ABSENT would let a stale terminal be admitted as claimless and
+            # settle work the queue already owns (#6999 F8).
+            return ClaimLookup(ClaimState.DEFERRED, claim)
+        return ClaimLookup(ClaimState.HELD, claim)
 
     # -- startup recovery --------------------------------------------------
 
@@ -226,6 +292,7 @@ class SqlitePendingWorkClaimStore:
                     run_key=row["run_key"],
                     session_name=row["session_name"],
                     deferred=bool(row["deferred"]),
+                    issue_number=int(row["issue_number"]),
                     claim=claim,
                 )
             )
@@ -241,15 +308,18 @@ class SqlitePendingWorkClaimStore:
                     UnreadableClaim(
                         run_key=row["run_key"],
                         session_name=row["session_name"],
+                        issue_number=int(row["issue_number"]),
                         error=str(exc),
                     )
                 )
         return tuple(unreadable)
 
-    def resolve_by_run_key(self, run_key: str) -> None:
+    def mark_deferred_by_run_key(self, run_key: str) -> None:
+        """Keep the row; only a relaunch of the same work may retire it."""
         with self._write_lock, self._transaction() as conn:
             conn.execute(
-                "DELETE FROM pending_work_claim WHERE run_key = ?", (run_key,)
+                "UPDATE pending_work_claim SET deferred = 1 WHERE run_key = ?",
+                (run_key,),
             )
 
     def run_key_for(self, run: SessionRunAssets) -> str:
@@ -276,6 +346,21 @@ class SqlitePendingWorkClaimStore:
                 "ON CONFLICT(run_key) DO UPDATE SET error = excluded.error",
                 (run_key, session_name, issue_number, error),
             )
+
+    def release_quarantine(self, run_key: str) -> None:
+        with self._write_lock, self._transaction() as conn:
+            conn.execute(
+                "DELETE FROM pending_work_claim_quarantine WHERE run_key = ?",
+                (run_key,),
+            )
+
+    def quarantined_issue_numbers(self) -> frozenset[int]:
+        return frozenset(
+            int(row["issue_number"])
+            for row in self._get_connection().execute(
+                "SELECT issue_number FROM pending_work_claim_quarantine"
+            )
+        )
 
     def mark_quarantine_escalated(self, run_key: str) -> None:
         with self._write_lock, self._transaction() as conn:
@@ -316,7 +401,7 @@ class SqlitePendingWorkClaimStore:
     def _all_rows(self) -> list[sqlite3.Row]:
         return list(
             self._get_connection().execute(
-                "SELECT run_key, session_name, deferred, payload "
+                "SELECT run_key, session_name, deferred, issue_number, payload "
                 "FROM pending_work_claim"
             )
         )
