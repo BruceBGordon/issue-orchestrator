@@ -106,15 +106,13 @@ RESOLVED_STATES = frozenset({            # nothing is at risk; reset/teardown ma
     ValidatedWorkState.ABANDONED,
 })
 
-OPEN_STATES = frozenset({                # at most one of these per dedup key (§4.1)
-    ValidatedWorkState.QUEUED,
-    ValidatedWorkState.PARKED,
-    ValidatedWorkState.PUBLISHING,
-})
-
 assert UNRESOLVED_STATES | RESOLVED_STATES == set(ValidatedWorkState)
 assert not (UNRESOLVED_STATES & RESOLVED_STATES)
-assert OPEN_STATES < UNRESOLVED_STATES
+
+# There is deliberately no third "open" set. Uniqueness is not state-scoped:
+# `record_id` is the table's primary key (§4.1), so there is at most ONE row per
+# unit of work in every state. A state-scoped uniqueness rule is what let a rival
+# row be admitted beside an unresolved FAILED one.
 
 
 class ValidatedWorkFailure(StrEnum):
@@ -146,28 +144,58 @@ class ReviewDisposition(StrEnum):
     EXCHANGE_APPROVED   = "exchange_approved"    # exchange reached OK/REVIEWER_OK
 
 
+class ArtifactSlot(StrEnum):
+    """The fixed vocabulary of escrowed artifacts. A slot, not a path."""
+    COMPLETION        = "completion"
+    VALIDATION        = "validation"
+    EXCHANGE_SUMMARY  = "exchange_summary"
+
+
 @dataclass(frozen=True, slots=True)
 class AdmittedArtifact:
-    """One admitted artifact. IDENTITY-BEARING — every field enters evidence_id."""
-    relative_path: str      # POSIX, relative to escrow root; never absolute/'..'
+    """One admitted artifact. IDENTITY-BEARING — every field enters evidence_id.
+
+    Deliberately carries NO path. The escrow filename is derived from the slot
+    (``<evidence_dir>/<slot>.json``); the source path the bytes were admitted
+    from is recorded in the observations for audit. A path that contains
+    ``<evidence_id>`` cannot participate in the hash that produces
+    ``<evidence_id>`` — the artifact's identity is its content, and its slot
+    says what role that content plays.
+    """
+    slot: ArtifactSlot
     sha256: str             # lowercase hex
     byte_size: int
 
 
 @dataclass(frozen=True, slots=True)
-class ValidatedWorkIdentity:
-    """The stable semantic facts that define WHICH work this is.
+class ValidatedWorkKey:
+    """WHICH WORK this is: one commit, on one branch, of one issue, in one repo.
 
-    Every field is either immutable for the life of the work or an admitted
-    content hash. Nothing here can change between two captures of the same work,
-    which is what makes ``evidence_id`` re-derivable after a crash (§2.1.1).
+    This is the natural key of the durable row (§4.1) and the unit the
+    "at most one unresolved record" invariant is stated over.
     """
-    schema_version: int                  # bumped when the identity field set changes
-    repo_slug: str                       # target repository identity
+    repo_slug: str
     issue_number: int
     branch_name: str
     validated_head_sha: str              # == validation record head_sha (§1.1)
-    worktree_head_sha: str               # observed HEAD at capture; may differ
+
+    @property
+    def record_id(self) -> str:
+        """Stable primary key. Independent of which evidence carries the work."""
+
+
+@dataclass(frozen=True, slots=True)
+class ValidatedWorkIdentity:
+    """WHICH EVIDENCE this is: the key plus the admitted content that proves it.
+
+    Every field is either part of the key or an admitted content hash. Nothing
+    here can change between two captures of the same evidence, which is what
+    makes ``evidence_id`` re-derivable after a crash (§2.1.1). In particular no
+    observation of external or mutable state appears here — see the exclusion
+    list below.
+    """
+    schema_version: int                  # bumped when the identity field set changes
+    key: ValidatedWorkKey
     run_identity: SessionRunIdentity     # session_name, run_id, started_at
     completion_artifact: AdmittedArtifact
     validation_artifact: AdmittedArtifact
@@ -179,39 +207,78 @@ class ValidatedWorkIdentity:
 
 
 @dataclass(frozen=True, slots=True)
-class ValidatedWorkEvidence:
-    """Identity plus the mutable observations a recovery reconciles against."""
-    identity: ValidatedWorkIdentity
-
-    # --- OBSERVED, MUTABLE, DELIBERATELY OUTSIDE evidence_id -----------------
+class ValidatedWorkObservations:
+    """Everything read from mutable state. NONE of it enters evidence_id."""
     captured_at: str                     # ISO-8601 UTC
+    worktree_head_sha: str               # issue worktree HEAD at capture; may move
     expected_remote_head_sha: str | None # remote branch head at capture; None = absent
     pr_number: int | None
     observed_blocking_labels: tuple[str, ...]  # exactly what this op may later clear
+    admitted_from_paths: Mapping[ArtifactSlot, str]  # audit only, never re-read
+
+
+@dataclass(frozen=True, slots=True)
+class ValidatedWorkEvidence:
+    """Identity plus the mutable observations a recovery reconciles against."""
+    identity: ValidatedWorkIdentity
+    observations: ValidatedWorkObservations
 
     @property
     def evidence_id(self) -> str:
-        """Canonical identity hash. The dedup key. Depends on `identity` only."""
+        """Canonical identity hash. Depends on `identity` only."""
         return canonical_evidence_id(self.identity)
+
+    @property
+    def record_id(self) -> str:
+        return self.identity.key.record_id
 ```
+
+**`worktree_head_sha` is an observation, not identity.** It moves — that is the
+entire premise of §1.1 — so hashing it would mean the same validated commit `V`
+re-captured after the worktree advanced to `L` derives a *different* `evidence_id`,
+which is precisely the crash-retry divergence §2.1.1 exists to prevent. It is
+recorded (and pinned, §6) so the unvalidated work survives and the operator can see
+it, and it is read **once**, at first capture, to choose the initial state (§5). It
+has no role after that, because publication no longer reads any worktree HEAD: the
+publisher pushes the pinned immutable object (§4.4). A worktree that moves after
+capture therefore cannot change what gets published, which is why it does not need
+to change the identity either.
 
 #### 2.1.1 `evidence_id` must survive the crash it deduplicates
 
 The whole idempotency story is that a repeated capture of the *same* work
-re-derives the *same* id and converges on the existing record. That only holds if
-the hash covers nothing that moves between captures. Two classes of field are
-therefore excluded by construction:
+re-derives the *same* ids and converges on the existing record. That only holds if
+neither hash covers anything that moves between captures. **Two** ids are derived,
+and the difference between them is what makes convergence structural:
+
+| Id | Over | Answers | Changes when |
+|---|---|---|---|
+| `record_id` | `ValidatedWorkKey` | *which work* | never, for a given commit on a given branch |
+| `evidence_id` | `ValidatedWorkIdentity` | *which evidence for that work* | the admitted artifacts, run, or routing differ |
+
+Excluded from both, by construction:
 
 - **Capture timestamps.** `captured_at` is when we looked, not what we found.
 - **Mutable external observations.** `expected_remote_head_sha`, `pr_number`, and
   `observed_blocking_labels` are reconciliation *inputs* read fresh from GitHub;
-  a label added by a human between two captures must not mint a second record.
+  a label added by a human between two captures must not change any id.
+- **Mutable local observations.** `worktree_head_sha` — see the note above.
+- **Filesystem paths.** Artifacts are identified by `ArtifactSlot` + content hash,
+  never by path. Escrow paths contain `<evidence_id>`, so a path inside the hash
+  that produces `<evidence_id>` would be circular; `admitted_from_paths` keeps the
+  source locations for audit, outside both hashes.
 
 ```python
 IDENTITY_SCHEMA_VERSION = 1
 
+def canonical_record_id(key: ValidatedWorkKey) -> str:
+    return "r%d:%s" % (
+        IDENTITY_SCHEMA_VERSION,
+        hashlib.sha256(_canonical_json(key).encode("utf-8")).hexdigest(),
+    )
+
 def canonical_evidence_id(identity: ValidatedWorkIdentity) -> str:
-    return "v%d:%s" % (
+    return "e%d:%s" % (
         identity.schema_version,
         hashlib.sha256(_canonical_json(identity).encode("utf-8")).hexdigest(),
     )
@@ -224,55 +291,132 @@ def canonical_evidence_id(identity: ValidatedWorkIdentity) -> str:
 | JSON encoding | `json.dumps(..., sort_keys=True, separators=(",", ":"), ensure_ascii=False)`, UTF-8 |
 | `StrEnum` | its `.value` |
 | SHAs | lowercase, full 40-hex; a short or mixed-case sha is a hard admission error |
-| Paths | POSIX separators, relative to the escrow root |
+| `repo_slug` / `branch_name` | exact bytes, case-sensitive; no normalization (git refs are case-sensitive) |
 | `requested_actions` | sorted by `.value`, duplicates removed — request order is not identity |
 | `None` | JSON `null` (never omitted — an omitted key and a null key must not collide) |
 | `bool`/`int` | native JSON |
 | Nested dataclasses | ordered dict of their own fields, same rules recursively |
 
-The `v<schema_version>:` prefix means a future identity-field change produces
-visibly different ids instead of silently colliding with v1 records.
+The `r1:`/`e1:` prefixes mean a future key- or identity-field change produces
+visibly different ids instead of silently colliding with v1 rows.
 
 **Reconciliation-observation refresh.** When a capture converges on an existing
-record, the observed fields are refreshed **only while the record is in `QUEUED` or
-`PARKED`** — pre-submission, where a newer remote head is simply better
-information. Once the record is `PUBLISHING`, its `expected_remote_head_sha` is
-frozen: it is the compare-and-set baseline the phase-aware checks (§4.3) depend on,
-and overwriting it mid-flight would destroy the ability to tell "push landed" from
-"someone else pushed".
+record, the observations are refreshed **only while the record is in `QUEUED`,
+`PARKED`, or `FAILED`** — all pre-submission, where a newer remote head is simply
+better information. Once the record is `PUBLISHING`, its `expected_remote_head_sha`
+is frozen: it is the compare-and-set baseline that both the phase-aware checks
+(§4.3) and the push lease (§4.4) are bound to, and overwriting it mid-flight would
+destroy the ability to tell "our push landed" from "someone else pushed".
 
 #### 2.1.2 Atomic capture, and repair of a partial one
 
 Capture writes three things that cannot be committed in one transaction. The order
 is chosen so that every prefix is *repairable* and no prefix is *misleading*:
 
-1. **Escrow** — artifacts written to `<escrow_root>/.tmp/<evidence_id>.<pid>/`,
-   fsynced, then `os.replace`d onto `<escrow_root>/<issue>/<evidence_id>/`.
+1. **Escrow** — the evidence directory is materialised in
+   `<escrow_root>/.tmp/<evidence_id>.<pid>/`, fsynced (files, then the directory),
+   then `os.replace`d onto `<escrow_root>/<issue>/<evidence_id>/`.
 2. **Ref pin** — `refs/issue-orchestrator/validated/<issue>/<evidence_id>` (and
    `.../observed/...` when the worktree head differs).
-3. **Record** — `INSERT INTO validated_work_records ... ON CONFLICT(evidence_id)
-   DO NOTHING`, then read back the row that now exists.
+3. **Record** — the transactional admission below.
+
+**The escrow directory is self-describing.** Repairing a lost row requires more
+than artifact bytes, so the directory holds a versioned **capture envelope**
+alongside them:
+
+```
+<escrow_root>/<issue>/<evidence_id>/
+    capture.json          # the envelope — fsynced inside the atomic rename
+    completion.json       # ArtifactSlot.COMPLETION
+    validation.json       # ArtifactSlot.VALIDATION
+    exchange-summary.md   # ArtifactSlot.EXCHANGE_SUMMARY (optional)
+```
+
+`capture.json` carries, in one document: `envelope_version`, `record_id`,
+`evidence_id`, the full `ValidatedWorkIdentity`, the full
+`ValidatedWorkObservations` (remote expectation, PR number, observed blocking
+labels, worktree head, admitted-from paths), the `initial_state` the owner chose
+and why, the pinned ref names, and a `checksum` over the rest of the document. It
+is **self-validating**: repair recomputes `canonical_evidence_id(identity)` and
+requires it to equal the directory name, and recomputes each artifact's sha256 and
+requires it to equal the envelope's. An envelope that fails either check is not
+repaired — it is reported, never guessed at.
 
 Steps 1 and 2 are content-addressed by `evidence_id`, so re-running them is a
 no-op rather than a duplicate. A crash between any two steps leaves an *orphan*
-escrow directory and/or ref with no record — inert, never admissible on its own,
-and never confused with real state because admission reads the **record**, never
-the directory.
+escrow directory and/or ref with no row — inert, never admissible on its own, and
+never confused with real state because admission reads the **row**, never the
+directory.
 
 `reconcile_escrow_orphans()` runs once per orchestrator start, on the owner's first
 `drain()` — the same seam that already performs restart reconciliation (§3.4), so
-no new scheduler is introduced. For each escrowed `evidence_id` with no record it
-re-runs step 3 from the escrowed identity, restoring the record whose insert was
-lost. It **never deletes**: an orphan it cannot re-admit (issue closed, identity
-unparseable) is left in place and reported — alongside the store's registry entry
-in `infra/sqlite_registry.py` — by a doctor check. Deleting escrow is the one thing
-this contract exists to prevent.
+no new scheduler is introduced. For each escrowed `evidence_id` with no row it
+re-runs step 3 from the envelope, restoring the row whose insert was lost —
+including the remote expectation, PR, labels and routing disposition that no amount
+of artifact hashing could recover. It needs **no worktree**: everything it reads is
+in the escrow directory and the pinned refs. It **never deletes**: an orphan it
+cannot re-admit (issue closed, envelope invalid, ref missing) is left in place and
+reported — alongside the store's registry entry in `infra/sqlite_registry.py` — by a
+doctor check. Deleting escrow is the one thing this contract exists to prevent.
 
-**Convergence onto a resolved record.** If a fresh capture re-derives an
-`evidence_id` whose record is already `RECOVERED` or `ABANDONED`, the owner returns
-that existing terminal disposition. It does not insert a second record, and it does
-not reopen a resolved one — the `ON CONFLICT DO NOTHING` primary key is what makes
-that structural rather than a race-prone read-then-write.
+#### 2.1.3 Transactional admission: one unresolved row per work, always
+
+Convergence cannot rest on `ON CONFLICT(evidence_id)` alone, because two *different*
+evidences — a second completion record at the same commit, a re-run with a new
+`run_id`, a different review disposition — legitimately produce different
+`evidence_id`s for the same `ValidatedWorkKey`. Admission is therefore keyed on
+`record_id` and runs in one `BEGIN IMMEDIATE` transaction:
+
+```
+BEGIN IMMEDIATE
+  row := SELECT * FROM validated_work_records WHERE record_id = :record_id
+  if row is NULL:
+      INSERT the new row (state := initial_state, evidence_id := new)
+      -> ADMITTED
+  if row.evidence_id == :evidence_id:
+      refresh observations iff row.state in (QUEUED, PARKED, FAILED)
+      -> CONVERGED                      # the crash-retry case
+  if row.state in RESOLVED_STATES:
+      # RECOVERED: this work is already published. ABANDONED: reopen, because new
+      # evidence for abandoned work is exactly the signal that made it recoverable.
+      -> RETURN row (RECOVERED) | REOPEN as PARKED (ABANDONED)
+  if row.state == PUBLISHING:
+      -> ATTACHED                        # do not disturb an in-flight submission;
+                                         # escrow is retained as an alternate
+  # row is QUEUED / PARKED / FAILED with DIFFERENT evidence for the SAME work
+  append row.evidence_id to row.superseded_evidence_ids
+  row.evidence_id := :evidence_id ; row.state := initial_state ; refresh observations
+  -> SUPERSEDED
+COMMIT
+```
+
+Three consequences, each closing a hole a partial-index scheme leaves open:
+
+- **A rival can never be minted beside an unresolved row.** `record_id` is the
+  table's primary key, so "two open records for the same work" is not a rule the
+  code has to remember — it is unrepresentable. This is what the §4.1 index tried
+  and failed to express by excluding `FAILED`.
+- **A `FAILED` row is always resolved by transitioning *that* row.** New evidence
+  supersedes it in place (`FAILED → QUEUED/PARKED`), so a recovery can never leave
+  the original failure unresolved-forever, still blocking reset.
+- **Superseded evidence is retained, not discarded.** Every superseded
+  `evidence_id` keeps its escrow directory and its pinned refs for the retention
+  window, and is listed on the row. Superseding changes which evidence is *acted
+  on*; it never deletes bytes.
+
+`ATTACHED` is the one case that defers: a capture arriving while a submission is in
+flight escrows itself and returns the in-flight disposition, and the next `drain()`
+after the submission resolves re-runs admission — where it either converges (same
+evidence) or supersedes (different evidence) against a row that is no longer
+`PUBLISHING`.
+
+**Operator handles resolve through the row.** The tech-lead op's
+`target_evidence_id` and the Control Center actions name an `evidence_id`, which
+resolves to its row through `ux_validated_work_evidence`. A handle naming
+*superseded* evidence resolves to the same row and is **refused** with an explicit
+"this evidence was superseded by `<evidence_id>`" message rather than silently
+acting on the current evidence — an approval is consent to publish a specific
+commit and a specific set of artifacts, and consent does not transfer.
 
 ### 2.2 Command / result
 
@@ -336,11 +480,11 @@ class ValidatedWorkDispositionOwner(Protocol):
     """Automatic initiator. Called by terminate_issue_runtime BEFORE teardown."""
 
     def recover(
-        self, request: ValidatedWorkDispositionRequest
+        self, request: ValidatedWorkDispositionRequest, state: OrchestratorState
     ) -> ValidatedWorkDisposition: ...
     """Explicit initiator: approved tech-lead op or operator command."""
 
-    def drain(self) -> tuple[ValidatedWorkDisposition, ...]: ...
+    def drain(self, state: OrchestratorState) -> tuple[ValidatedWorkDisposition, ...]: ...
     """Tick-driven progression of durable records; restart reconciliation."""
 
     def has_unresolved_work(self, issue_number: int) -> bool: ...
@@ -368,8 +512,17 @@ class ValidatedWorkDispositionOwner(Protocol):
     """Read model for the UI/view-model layer. Never re-derives policy."""
 ```
 
+`recover()` and `drain()` take `OrchestratorState` for the same reason
+`PublishRecoveryService.retry_publish(issue_number, state)` does today: publication
+ends in success finalization and review routing, which are control-layer policies
+over live orchestrator state (§4.5). `dispose_at_termination()` deliberately does
+**not** take it — capture and escrow touch no orchestrator state, which is what
+lets the termination boundary call it while everything else is still being torn
+down.
+
 `ports/validated_work_store.py` (new) — durable state, section 4.
-`ports/validated_head_publication.py` (new) — the execution boundary, section 4.4.
+`ports/validated_head_publication.py` (new) — remote execution only, section 4.4.
+`ports/published_work_finalization.py` (new) — labels + review routing, section 4.5.
 
 ### 2.4 Extended existing type
 
@@ -423,16 +576,31 @@ probes = (
     ...,                                                    # pair registry
     ...,                                                    # supervised jobs
     lambda: publish_recovery is not None and publish_recovery.has_active_retry(n),
-    lambda: validated_work is not None and validated_work.has_unresolved_work(n),  # NEW
+    lambda: validated_work.has_unresolved_work(n),          # NEW — not optional
 )
 ```
 
-The existing fail-safe wrapper (`_owner_active_or_unverifiable`) applies: a probe
-that raises counts as active. Consequence: `has_active_reset_retry_runtime()` in
-`entrypoints/web_retry_history_routes.py` — which the tech-lead reset executor and
-the dashboard reset both consult through `_reset_retry_runtime_owners()` — now
-stale-downgrades any scratch reset while **unresolved** work exists. That is the
-concrete mechanism by which the stuck sweep can no longer discard validated work.
+`validated_work` is a **required keyword parameter of `has_active_issue_runtime()`,
+exactly as it is of `terminate_issue_runtime()`** — not `| None = None`. The two
+boundaries are only safe because they read the same owner set; an owner that is
+mandatory on one side and optional on the other is not the same set, it is the same
+set *by convention*, and the convention is what a future caller forgets. An
+optional probe would let a new activity call site pass every existing owner, get
+`False`, and authorize a scratch reset over unresolved work without ever mentioning
+the disposition owner. The parameter being required makes that a `TypeError` at
+import time rather than data loss at 3am.
+
+Concretely: `_ResetRetryRuntimeOwners` in
+`entrypoints/web_retry_history_routes.py` gains a `validated_work` field resolved by
+`_reset_retry_runtime_owners()`, so `has_active_reset_retry_runtime()` and
+`_terminate_reset_retry_runtime()` — the tech-lead reset executor and the dashboard
+reset — keep passing one identical owner set to both functions. The existing
+fail-safe wrapper (`_owner_active_or_unverifiable`) still applies: a probe that
+raises counts as active. §9's guardrail covers **every** call site of both
+functions, not only termination.
+
+That is the concrete mechanism by which the stuck sweep can no longer discard
+validated work.
 
 **Which states block, and why `FAILED` is one of them.** ADR-0035 promises that a
 failed disposition never becomes scratch-reset eligible. A predicate phrased as
@@ -471,19 +639,36 @@ that resolves it, because every such heuristic is a fresh way to lose the work.
 
 ### 3.4 Composition root
 
-`entrypoints/bootstrap.py` constructs, in order: `SqliteValidatedWorkStore(state_dir/…)`
-→ `FilesystemValidatedWorkEscrow(state_dir/"validated-work")` → `ValidatedWorkDispositionService`
-(injected with the store, escrow, `WorkingCopy`, `WorktreeManager`, `RepositoryHost`,
-`PublishRetryLocatorStore`, `PublishRecoveryService`, `ActionApplier`, `LabelManager`,
-`EventSink`). It is exposed on `control/orchestrator_deps.py` as
+`entrypoints/bootstrap.py` constructs, in order:
+
+```
+SqliteValidatedWorkStore(state_dir/"validated_work.sqlite")
+FilesystemValidatedWorkEscrow(state_dir/"validated-work")
+GitValidatedHeadPublisher(working_copy, worktree_manager, repository_host)   # §4.4
+PublishedWorkFinalizer(RetrySuccessFinalizer, RetryReviewRouting)            # §4.5
+ValidatedWorkDispositionService(
+    store, escrow, working_copy, worktree_manager, repository_host,
+    publisher, finalizer, action_applier, label_manager, events,
+)
+```
+
+**The disposition owner does not depend on `PublishRecoveryService`.** That is the
+point of A1: the manual Retry Publish service is a *sibling* admission owner, not a
+collaborator. Both it and the disposition owner are constructed here and both are
+injected with the same two lower-level owners — the publisher and the finalizer —
+so neither reaches through the other. `PublishedWorkFinalizer` wraps the existing
+`RetrySuccessFinalizer`/`RetryReviewRouting` pair rather than reimplementing them,
+which is what keeps one review-routing policy in the system.
+
+The service is exposed on `control/orchestrator_deps.py` as
 `validated_work: ValidatedWorkDispositionOwner`, mirroring how `publish_recovery` is
 carried today. The store is registered in `infra/sqlite_registry.py` so doctor
 checks, backups, and startup maintenance cover it (the precedent set by
 `tech_lead_authority.sqlite`).
 
-`drain()` is called from the same tick drain point that already calls
-`PublishRecoveryService.drain_completed_retries()`, so restart reconciliation needs
-no new scheduler.
+`drain(state)` is called from the same tick drain point that already calls
+`PublishRecoveryService.drain_completed_retries()` and already holds
+`OrchestratorState`, so restart reconciliation needs no new scheduler.
 
 ---
 
@@ -493,7 +678,9 @@ no new scheduler.
 
 ```sql
 CREATE TABLE IF NOT EXISTS validated_work_records (
-    evidence_id           TEXT PRIMARY KEY,
+    record_id             TEXT PRIMARY KEY,           -- canonical ValidatedWorkKey
+    evidence_id           TEXT NOT NULL,              -- currently admitted evidence
+    superseded_evidence_ids TEXT NOT NULL DEFAULT '[]',  -- JSON array, retained
     repo_slug             TEXT NOT NULL,
     issue_number          INTEGER NOT NULL,
     branch_name           TEXT NOT NULL,
@@ -519,34 +706,34 @@ CREATE TABLE IF NOT EXISTS validated_work_records (
     terminal_at           TEXT NOT NULL DEFAULT ''    -- entry into a RESOLVED state
 );
 
--- Dedup: at most one OPEN record per target+branch+validated head.
--- OPEN_STATES only (§2.1) — 'failed' is deliberately outside this index because a
--- failed record is resolved by transitioning THAT record (FAILED -> PARKED via
--- operator re-submit, or FAILED -> ABANDONED), never by minting a rival one.
-CREATE UNIQUE INDEX IF NOT EXISTS ux_validated_work_open
-    ON validated_work_records (repo_slug, issue_number, branch_name, validated_head_sha)
-    WHERE state IN ('queued', 'parked', 'publishing');
-
--- The activity/reset probe's index: unresolved includes 'failed'.
+-- The activity/reset probe's index. UNRESOLVED includes 'failed'.
 CREATE INDEX IF NOT EXISTS ix_validated_work_unresolved
     ON validated_work_records (issue_number, state)
     WHERE state IN ('queued', 'parked', 'publishing', 'failed');
+
+-- Evidence lookup for orphan repair and the tech-lead op's target_evidence_id.
+CREATE UNIQUE INDEX IF NOT EXISTS ux_validated_work_evidence
+    ON validated_work_records (evidence_id);
 
 CREATE INDEX IF NOT EXISTS ix_validated_work_issue
     ON validated_work_records (issue_number, state);
 ```
 
-Records are **append-then-transition**, never deleted by normal operation. The
-unique partial index is the deduplication rule from #6914 expressed as a database
-constraint rather than as caller discipline: *target repository + issue + branch +
-validated HEAD*, with `evidence_id` (the canonical identity hash of §2.1.1) as the
-primary key covering the evidence-identity half.
+Rows are **append-then-transition**, never deleted by normal operation.
 
-The two partial indexes are deliberately different, and the difference is the F5
-fix made structural: `ux_validated_work_open` answers "may I admit another record
-for this key?" (`OPEN_STATES`), while `ix_validated_work_unresolved` answers "is
-there work here that must not be destroyed?" (`UNRESOLVED_STATES`). `failed`
-appears in the second and not the first.
+**`record_id` as the primary key is the deduplication rule made unrepresentable to
+violate.** The rule from #6914 — one recovery per *target repository + issue +
+branch + validated HEAD* — is the definition of `ValidatedWorkKey`, so "two rows
+for the same work" cannot exist at any state, in any order, under any race. A
+partial unique index over a subset of states cannot say this: whichever states it
+excludes become a hole through which a second row for the same work arrives, and
+the excluded row then sits unresolved forever behind the rival that replaced it.
+`evidence_id` moves to a plain unique column because it identifies *which evidence
+the row currently carries*, and §2.1.3 defines exactly how it changes (supersede,
+audited, escrow retained) rather than by minting a new row.
+
+`ix_validated_work_unresolved` is the index behind `has_unresolved_work()`, and it
+covers `failed` because a failed disposition is work that still exists (§3.2).
 
 ### 4.2 State machine
 
@@ -617,14 +804,19 @@ Phase-independent checks:
 3. Every escrowed artifact exists and its sha256 matches
    (`ARTIFACT_MISSING` / `ARTIFACT_HASH_MISMATCH`).
 4. **Publication target identity (§1.1).** `pinned_ref` resolves and equals
-   `validated_head_sha`; the publishing worktree's HEAD resolves to
-   `validated_head_sha`; and the command's `target_head_sha` equals it. All three,
-   checked in the same drain step that submits. Any inequality ⇒
+   `validated_head_sha`; the **publication workspace** (§4.4a — never the issue
+   worktree) is bound to that same ref; and the command's `target_head_sha` equals
+   it. All three, checked in the same drain step that submits. Any inequality ⇒
    `PUBLISH_TARGET_MISMATCH` (or `REF_PIN_LOST` when the ref is gone) ⇒ `FAILED`
-   **before any external write**. This is what stops an advanced worktree from
-   being published under an older validation.
+   **before any external write**. Note that this check is a belt-and-braces
+   assertion, not the primary defence: the publisher pushes the immutable object
+   `target_head_sha` by explicit refspec, so no worktree HEAD — moving or
+   otherwise — can change which commit is published.
 5. `has_active_issue_runtime()` (excluding this owner's own probe) is false.
-6. No other record in `OPEN_STATES` shares the dedup key.
+6. The row's `record_id` still matches the key being acted on and its
+   `evidence_id` is still the one this drain admitted — i.e. no supersession
+   (§2.1.3) landed underneath us. Re-read inside the same transaction that
+   compare-and-sets the state; a mismatch aborts the drain step with no writes.
 
 Phase-dependent remote checks — the allowed-state tables:
 
@@ -644,11 +836,16 @@ A third sha is always a hard divergence — never "probably fine". A *failed rea
 never collapsed into "absent", because "absent" authorizes a branch-creating push.
 
 **8. Fast-forward legality** (`PRE_SUBMISSION` with a present remote branch only):
-`validated_head_sha` must be a **descendant** of the observed remote head
-(`merge-base --is-ancestor`). Not a descendant ⇒ `REMOTE_DIVERGED` ⇒ `FAILED`.
-**Fast-forward only. Never force-push.** Skipped when the branch is absent (nothing
-to fast-forward from) and when reconciling a landed push (the remote already *is*
-the target).
+`validated_head_sha` must be a **descendant of `expected_remote_head_sha`**
+(`merge-base --is-ancestor`) — of the *recorded expectation*, not of "whatever the
+remote looked like just now". The distinction matters because that same expectation
+value is bound into the push lease (§4.4b): proving descent from `E` and then
+writing under a lease that requires the remote to *be* `E` makes the write a
+fast-forward by construction, with no window in between where a third party's
+commit could be silently accepted as the new baseline. Not a descendant ⇒
+`REMOTE_DIVERGED` ⇒ `FAILED`. **Fast-forward only. Never force-push.** Skipped when
+the branch is absent (nothing to fast-forward from) and when reconciling a landed
+push (the remote already *is* the target).
 
 **9. PR head**, when `pr_number` is set — the same allowed-set shape, so a PR
 whose head advanced to the target by our own push is recognized rather than
@@ -684,13 +881,116 @@ the service declares victory and finalizes, and `L` is never pushed. The scenari
 this contract is built to fix would silently produce a green-looking recovery with
 the validated commits still local-only.
 
-So the design defines the **execution-only** command the disposition owner actually
-needs, and lets both callers compose it. `ports/validated_head_publication.py`:
+So the design defines the narrow remote-execution port the disposition owner
+actually needs, and composes finalization policy *above* it (§4.5) rather than
+inside it.
+
+#### 4.4a The publication workspace is never the issue worktree
+
+The disposition owner **always** publishes from a dedicated per-evidence workspace
+bound to the pinned validated ref:
+
+```
+git worktree add --detach \
+    <state_dir>/validated-work/<issue>/<evidence_id>/workspace  <pinned_validated_ref>
+```
+
+Not "rehydrate if the original is gone" — *always*. The §1.1 exit that matters most
+is the one where validation passed at `V` and the issue worktree is still sitting at
+`L`: an operator or approved tech-lead op chooses to publish `V` as-is. If the
+publisher's source were the issue worktree, that approved recovery would read HEAD
+`L`, trip the target-identity check, and deterministically land in
+`FAILED(PUBLISH_TARGET_MISMATCH)` — the contract would promise an exit it can never
+take, and only in the case where recovery matters most.
+
+Properties that make the dedicated workspace the right answer rather than a second
+copy of the problem:
+
+- It is **detached at the pinned ref**, so its HEAD *is* `validated_head_sha` by
+  construction — not by a check that could have been forgotten.
+- It is **detached**, so git never refuses it for "branch already checked out
+  elsewhere", and it never competes with the issue worktree for `branch_name`.
+- It is **outside the issue worktree**, so `reset_issue(from_scratch=True)` and
+  agent activity cannot mutate or remove it, and it is never the working copy any
+  agent was given.
+- It is **per-evidence**, so a superseded evidence's workspace cannot be mistaken
+  for the current one.
+- It is disposable: removed when the row reaches a resolved state, recreated
+  idempotently by the next drain if missing. Its absence is never a data-loss
+  event, because the escrow and the pinned ref are the durable artifacts.
+
+`L` stays exactly where it is — in the issue worktree and pinned at the `observed`
+ref (§6) — preserved and unpublished.
+
+#### 4.4b The remote write: exact object, exact expectation, one atomic step
+
+Carrying `target_head_sha` in the command is not enough if the write still goes
+through the generic push path. Today `git_working_copy` runs `fetch_for_push()` to
+refresh tracking refs and then `build_push_args()` returns
+`["push", "--force-with-lease", ...]` with **no explicit expectation**
+(`execution/git_push_operations.py:143-156`). Bare `--force-with-lease` leases
+against the tracking ref that the immediately preceding fetch just updated, so if a
+third party moved the branch from `E` to `X` in the interim, the fetch adopts `X` as
+the lease and the push happily replaces `X`. That is a force-push in everything but
+name, and it contradicts both "a third sha means no write" and "never force-push".
+It also pushes the *current branch HEAD of the worktree*, so a worktree that moved
+after admission would publish a different commit than the one that was checked.
+
+The disposition path therefore does **not** reuse that path. A new `WorkingCopy`
+capability performs the write in one step:
+
+```python
+class ExactPushOutcome(StrEnum):
+    PUSHED            = "pushed"             # remote ref now == target
+    LEASE_REJECTED    = "lease_rejected"     # remote was NOT at the expectation
+    NOT_FAST_FORWARD  = "not_fast_forward"
+    AUTH_FAILED       = "auth_failed"
+    TRANSIENT         = "transient"          # network/5xx; retry, no state change
+
+def push_exact(
+    *, remote: str, branch: str, target_sha: str, expected_sha: str | None
+) -> ExactPushResult: ...
+```
+
+implemented as a single git invocation:
+
+```
+git push --atomic <remote> \
+    --force-with-lease=refs/heads/<branch>:<expected_sha_or_empty> \
+    <target_sha>:refs/heads/<branch>
+```
+
+Three properties, each closing one hole:
+
+- **The object is explicit.** `<target_sha>:refs/heads/<branch>` publishes an
+  immutable commit id. No worktree HEAD is consulted, so a worktree that advances
+  between admission and push cannot change what is published. (The §4.4a workspace
+  is still bound to the ref — it is where run assets live and a defence in depth —
+  but it is no longer load-bearing for *which commit* ships.)
+- **The expectation is explicit.** The `:<expected_sha>` form of
+  `--force-with-lease` compares against the value we pass, **not** against a
+  tracking ref, so no fetch can refresh the lease out from under the check. The
+  publisher must not call `fetch_for_push()` on this path; the absence of that call
+  is the fix, and §9 guards it.
+- **Absent-branch is expressible.** An empty expectation
+  (`--force-with-lease=refs/heads/<branch>:`) requires the ref not to exist, so
+  "create this branch, and only if nobody else did" is the same atomic primitive
+  rather than a check-then-push.
+
+Combined with §4.3 check 8 — `target` proven a descendant of the *same*
+`expected_sha` — a lease-matching write is necessarily a fast-forward. Divergence
+and interference both surface as `LEASE_REJECTED`/`NOT_FAST_FORWARD` with **zero
+remote writes**, which the owner maps to `REMOTE_HEAD_CHANGED`/`REMOTE_DIVERGED`.
+
+#### 4.4c The port
+
+`ports/validated_head_publication.py` — remote execution only. No labels, no review
+routing, no `OrchestratorState`, no `PublishRetryLocators`:
 
 ```python
 class RemoteHeadExpectation(StrEnum):
-    EXACT         = "exact"          # disposition: remote must be at expected_sha
-    ABSENT        = "absent"         # disposition: branch must not exist
+    EXACT         = "exact"          # remote must be at expected_remote_head_sha
+    ABSENT        = "absent"         # branch must not exist
     UNCONSTRAINED = "unconstrained"  # manual retry: no captured expectation
 
 
@@ -700,21 +1000,21 @@ class PublishValidatedHeadCommand:
     issue_number: int
     repo_slug: str
     branch_name: str
-    target_head_sha: str                  # the commit that MUST end up published
+    target_head_sha: str                  # the immutable commit to publish
     expectation: RemoteHeadExpectation
     expected_remote_head_sha: str | None  # required iff expectation is EXACT
+    source_workspace: Path                # §4.4a; holds the objects, not the target
     pr_number: int | None
-    review_disposition: ReviewDisposition
+    pr_base_branch: str
     submission_token: str                 # idempotency key; see below
-    locators: PublishRetryLocators        # what the executor pushes from
 
 
 class PublishValidatedHeadStatus(StrEnum):
-    SUBMITTED         = "submitted"           # push job in flight; poll by token
-    ALREADY_AT_TARGET = "already_at_target"   # branch+PR already at target: reconcile only
-    RECONCILED        = "reconciled"          # finalize + review routing completed
+    SUBMITTED         = "submitted"           # write in flight; poll by token
+    PUBLISHED         = "published"           # remote ref is now at target
+    ALREADY_AT_TARGET = "already_at_target"   # remote ref was ALREADY at target
     REJECTED          = "rejected"            # preconditions unmet; nothing written
-    DIVERGED          = "diverged"            # third-party head; nothing written
+    DIVERGED          = "diverged"            # lease/FF refused; nothing written
 
 
 @dataclass(frozen=True, slots=True)
@@ -722,9 +1022,9 @@ class PublishValidatedHeadOutcome:
     status: PublishValidatedHeadStatus
     submission_token: str
     observed_remote_head_sha: str | None
-    observed_pr_head_sha: str | None
-    pr_number: int | None
+    pr_number: int | None                 # the ONE PR for this branch, ensured
     pr_url: str | None
+    pr_head_sha: str | None
     failure: ValidatedWorkFailure | None
     message: str
 
@@ -733,77 +1033,161 @@ class ValidatedHeadPublisher(Protocol):
     def publish_or_reconcile(
         self, command: PublishValidatedHeadCommand
     ) -> PublishValidatedHeadOutcome: ...
+    """Branch write (§4.4b) followed by PR ensure/reconcile. Idempotent."""
 
     def submission_status(self, token: str) -> PublishSubmissionStatus: ...
-    """Durable, owner-observable: PENDING | SUCCEEDED | FAILED | UNKNOWN.
-
-    UNKNOWN (no live job, no recorded terminal) is what a crash looks like;
-    the disposition owner re-runs §4.3 in the RECONCILING phase rather than
-    assuming either outcome.
-    """
+    """Durable, owner-observable: PENDING | SUCCEEDED | FAILED | UNKNOWN."""
 ```
 
-**The decision the publisher owns** (and `retry_publish()` today does not make):
+**The branch decision** (which `retry_publish()` does not make today):
 
-| Observed branch head | Observed PR head | Verdict |
-|---|---|---|
-| == `expected_remote_head_sha` (or branch absent under `ABSENT`) | == expected, or no PR | **publish** — push `→ target_head_sha`, then finalize + route |
-| == `target_head_sha` | == `target_head_sha` | **`ALREADY_AT_TARGET`** — the push already landed; finalize + route, no second push |
-| == `target_head_sha` | == expected (PR view stale) | re-read once, then treat as `ALREADY_AT_TARGET` |
-| anything else | — | **`DIVERGED`** — no write; `REMOTE_HEAD_CHANGED`/`REMOTE_DIVERGED` |
-| under `UNCONSTRAINED` (manual retry) | — | publish when `target_head_sha` is a descendant of the observed head; `DIVERGED` otherwise |
+| Observed branch head | Verdict |
+|---|---|
+| == `expected_remote_head_sha`, or absent under `ABSENT` | **push** the exact object under the exact lease |
+| == `target_head_sha` | **`ALREADY_AT_TARGET`** — our push landed; no second write |
+| anything else | **`DIVERGED`** — no write |
+| `UNCONSTRAINED` (manual retry) | push when `target_head_sha` descends from the observed head; `DIVERGED` otherwise |
 
-"An open PR exists" is never on its own a reason to skip the push. Finalization is
-reached through `RetrySuccessFinalizer` + `RetryReviewRouting` exactly as today, but
-only after the head is confirmed at the target.
+Crucially, the branch decision does **not** consult the PR. "An open PR exists" is
+never a reason to skip the push, and `ALREADY_AT_TARGET` is decided on the branch
+ref alone — which is what makes the crash-after-push-before-PR state (§4.4d)
+recognisable instead of an unreachable gap.
+
+#### 4.4d PR ensure/reconcile — one PR, idempotently
+
+After the branch is confirmed at `target_head_sha`, the publisher ensures exactly
+one PR for it:
+
+| Observed | Action |
+|---|---|
+| `pr_number` set, PR open, head ref == `branch_name` | reconcile: report its head; no create |
+| `pr_number` set, PR closed or merged | `PR_CLOSED_OR_MERGED` ⇒ no write |
+| `pr_number` set, head ref != `branch_name` | `PR_BRANCH_MISMATCH` ⇒ no write |
+| `pr_number` **None**, an open PR exists for `branch_name` | adopt it — do not create a second |
+| `pr_number` **None**, no open PR for `branch_name` | **create one**, then persist its number before anything else |
+
+The fourth and fifth rows are the crash the previous draft had no state for: the
+process dies after the push and before PR creation, leaving branch at `L` with
+`pr_number=None` and no PR. Restart re-enters `RECONCILING`, the branch decision
+returns `ALREADY_AT_TARGET` **without requiring a PR**, and PR-ensure discovers or
+creates the single expected PR. Discovery uses the existing active-issue-branch
+scoping (`scope_prs_to_active_issue_branch`) so a prior-attempt PR is never adopted.
+Creation is keyed by the orchestrator body marker, so a crash *between* creation and
+persisting the number is repaired by discovery on the next drain rather than by
+opening a duplicate.
+
+#### 4.4e Submission identity and durable ordering
 
 **`submission_token` is derived, not generated:**
 `token = "vwd:" + evidence_id + ":" + target_head_sha`. A crash-and-retry re-derives
 the same token, so `submission_status()` finds the prior submission instead of
-starting a rival one, and duplicate submits collapse structurally rather than by
-timing.
+starting a rival one.
 
-**Composition (A1).** The execution half of `PublishRecoveryService` — locator
-push, `_submit_republish`, finalization, review routing — moves behind this port.
-Both callers then compose one executor with their own admission policy:
+**The record reaches `PUBLISHING` before the executor is invoked, not after.** A
+synchronous call cannot promise "the transition happens before the write is
+observable" — the callee may push before returning, and a crash inside the call
+would leave a `QUEUED` row with a completed push. Because the token is *derived*,
+there is nothing to wait for the executor to return, so the order is simply:
 
-| Caller | Admission policy (stays with the caller) | Command it builds |
-|---|---|---|
-| `PublishRecoveryService.retry_publish()` (manual, board/UI) | `_retry_decision()`, `board_block_reason()`, `locator_block_reason()` — unchanged | `expectation=UNCONSTRAINED`, `target_head_sha` = locator worktree HEAD, token = existing retry job key |
-| `ValidatedWorkDispositionService` | §4.3 phase-aware checks, escrow/ref identity, dedup | `expectation=EXACT`/`ABSENT`, `target_head_sha=validated_head_sha`, token derived from `evidence_id` |
+```
+1. store.begin_publishing(record_id, expected_state in {QUEUED, PARKED},
+                          token, expected_remote_head)   # durable CAS; false -> abort
+2. publisher.publish_or_reconcile(command)               # only if the CAS won
+```
 
-Manual Retry Publish keeps its current admission semantics and its current
-observable behaviour for the case it was built for; what changes is that the
-"an open PR already exists" shortcut becomes a head comparison instead of an
-existence check, which is a bug fix for that path too.
+The CAS is also the concurrency guard: two drains racing the same row produce one
+winner, and the loser does nothing.
+
+**Every `submission_status` value has a defined transition** — the owner never has
+an unhandled state:
+
+| `submission_status(token)` | Owner does |
+|---|---|
+| `PENDING` | stay `PUBLISHING`, no writes, re-check next drain. Past `publish_submission_timeout` (bounded, config-free — derived from the existing publish job timeout), treat as `UNKNOWN`. |
+| `SUCCEEDED` | re-read the branch; require it at `target_head_sha`; ensure the PR (§4.4d); finalize (§4.5); mark `RECOVERED`. A `SUCCEEDED` token whose branch is *not* at target is a hard `REMOTE_HEAD_CHANGED` ⇒ `FAILED`. |
+| `FAILED` — transient (`TRANSIENT`, `AUTH_FAILED` on a rotatable token, `REMOTE_UNREADABLE`, issue unreadable) | stay `PUBLISHING`, no state change, retry next drain, up to a bounded attempt count; exhaustion ⇒ durable `FAILED` (which is *unresolved*, so nothing is lost). |
+| `FAILED` — definitive (`LEASE_REJECTED`, `NOT_FAST_FORWARD`, `PR_CLOSED_OR_MERGED`, `PR_BRANCH_MISMATCH`, `ARTIFACT_*`) | durable `FAILED` with the mapped `ValidatedWorkFailure`. |
+| `UNKNOWN` | re-run §4.3 in `RECONCILING` and act on the allowed-state tables — never resubmit blind. |
+
+Transient and definitive are distinguished by an explicit mapping, not by a
+substring match on an error string: only the enumerated `ExactPushOutcome` values
+and typed host errors reach this table.
+
+### 4.5 The finalization boundary — `PublishedWorkFinalizer`
+
+Labels and review routing are **control-layer policy over live orchestrator state**,
+not remote execution. `RetrySuccessFinalizer.finalize()` already requires
+`OrchestratorState` (`control/publish_retry_finalize.py:73-83`), so folding it into
+the publisher would force either a hidden global or a back-reference from the
+publisher to `PublishRecoveryService` — reintroducing exactly the cross-owner
+coupling A1 exists to remove. It stays a separate, explicitly composed port:
+
+```python
+@dataclass(frozen=True, slots=True)
+class PublishedWorkFinalizationRequest:
+    state: OrchestratorState              # the caller supplies it; no hidden state
+    issue_number: int
+    issue_title: str
+    agent_label: str | None
+    branch_name: str
+    pr_number: int
+    pr_url: str
+    published_head_sha: str
+    review_disposition: ReviewDisposition  # -> skip_review / exchange completed|halted
+    history_reason: str
+    worktree_path: str | None
+
+
+class PublishedWorkFinalizer(Protocol):
+    def finalize(
+        self, request: PublishedWorkFinalizationRequest
+    ) -> FinalizationOutcome: ...
+```
+
+The implementation wraps the existing `RetrySuccessFinalizer` + `RetryReviewRouting`
+pair unchanged — one review-routing policy in the system, reached by two admission
+owners. `FreshIssueReadError` surfaces as a typed transient outcome (it already does
+in `retry_publish()`), which the disposition owner treats as retry-next-drain rather
+than `FAILED`.
+
+### 4.6 Composition, and who owns what
+
+| Layer | Owner | Responsibility | Needs `OrchestratorState`? |
+|---|---|---|---|
+| Admission (manual) | `PublishRecoveryService` | `_retry_decision()`, board/locator gates, `PublishRetryLocators` | yes (already) |
+| Admission (validated work) | `ValidatedWorkDispositionService` | evidence admission, escrow/refs, §4.3 checks, state machine | yes, via `drain(state)`/`recover(request, state)` |
+| Remote execution | `ValidatedHeadPublisher` | exact-object/exact-lease branch write, PR ensure | **no** |
+| Finalization | `PublishedWorkFinalizer` | labels, history, review routing | yes, carried on the request |
+
+Each row is one implementable responsibility, and neither admission owner depends
+on the other.
+
+**`PublishRetryLocators` stays entirely with the manual path.** The disposition
+owner does not synthesise them: it has its own escrowed artifacts, its own
+workspace, and its own publisher and finalizer, so the locator round-trip bought it
+nothing but a dependency on another owner's admission preconditions. Dropping it
+also removes the ugliest step of the previous draft — adding a `publish-failed`
+label the issue never earned, purely to satisfy `board_block_reason()` on a path
+that no longer runs (§7 loses that transition).
+
+Construction of `PublishRetryLocators` is centralised in a named
+`PublishRetryLocatorFactory` owned by `PublishRecoveryService`; the guardrail (§9)
+is that **no other module constructs them**, which the manual path satisfies by
+construction and the disposition path satisfies by not needing them.
 
 **Handoff performed by the disposition owner:**
 
-1. If the original worktree is gone, the owner **rehydrates** it: create a worktree
-   at the canonical issue path checked out at `pinned_ref` (so its HEAD *is*
-   `validated_head_sha`, satisfying §4.3 check 4), then restore the escrowed
-   completion and validation records into the run directory. This preserves
-   `locator_block_reason()` unchanged — the owner satisfies its preconditions rather
-   than weakening them.
-2. The owner writes `PublishRetryLocators` (worktree, branch, completion path, run
-   assets, `pr_number`, and the `skip_review`/`review_exchange_completed`/
-   `review_exchange_halted` routing flags derived from `ReviewDisposition`) through
-   `PublishRetryLocatorStore`.
-3. The owner applies the admission label transition (§7) so the board precondition
-   `board_block_reason()` enforces — the `publish-failed` label — is genuinely true
-   before submission. A max-rounds strand carries `blocked-failed`, not
-   `publish-failed`; the owner records the observed label set first so §7's targeted
-   clear can restore it exactly.
-4. The owner calls `ValidatedHeadPublisher.publish_or_reconcile(...)`, stores the
-   returned `submission_token`, and transitions to `PUBLISHING` **before** the
-   external write is observable — so a crash mid-push resumes in the `RECONCILING`
-   phase, which accepts both the pre-push and post-push remote states.
-5. On `SUBMITTED`, subsequent drains poll `submission_status(token)`;
-   `ALREADY_AT_TARGET`/`RECONCILED` with the head verified at `validated_head_sha`
-   marks `RECOVERED`. `UNKNOWN` re-runs §4.3 in `RECONCILING` rather than
-   resubmitting blind.
+1. Create or refresh the §4.4a publication workspace at the pinned validated ref;
+   restore the escrowed completion and validation records into its run directory.
+2. Run §4.3 in `PRE_SUBMISSION` (or `RECONCILING` for a row already `PUBLISHING`).
+3. `store.begin_publishing(...)` — durable CAS to `PUBLISHING` with the derived
+   token. Abort silently if it loses.
+4. `publisher.publish_or_reconcile(command)` — exact write, then PR ensure.
+5. `finalizer.finalize(request)` with the live state — labels, history, review
+   routing.
+6. Mark `RECOVERED`; remove the workspace; retain escrow and refs for the window.
 
-No other caller may reconstruct locators or call the publisher. This is enforced
+No other caller may call the publisher with a disposition token. This is enforced
 mechanically (§9).
 
 ---
@@ -846,6 +1230,13 @@ Note the second row is the one an ancestor-or-equal rule would have swallowed: i
 looks like success (validation passed, work exists, the worktree is "ahead") and is
 exactly the case where publishing the worktree would ship unvalidated code.
 
+This comparison is made **once, at capture**, to choose the initial state. It is
+not a standing precondition, because publication does not read the issue worktree
+at all: the publisher pushes the pinned immutable object from the dedicated
+workspace (§4.4a/§4.4b). A worktree that advances *after* capture therefore changes
+nothing about what can be published — which is also why `worktree_head_sha` is an
+observation rather than part of the evidence identity (§2.1).
+
 **Containment** is enforced with the existing `domain/path_guards.py`
 (`require_absolute_path`, `require_path_under`) plus symlink resolution before the
 containment test. A violation is `ARTIFACT_UNTRUSTED_PATH` ⇒ `FAILED`, never a
@@ -871,7 +1262,9 @@ The contract moves the retention boundary off the worktree:
 
 | Asset | Location | Deleted by |
 |---|---|---|
-| Escrowed completion/validation/exchange-summary copies | `<state_dir>/validated-work/<issue>/<evidence_id>/` | escrow retention sweep only |
+| Escrowed capture envelope + completion/validation/exchange-summary copies | `<state_dir>/validated-work/<issue>/<evidence_id>/` | escrow retention sweep only |
+| Superseded evidence (§2.1.3) | its own `<evidence_id>/` directory and refs | same window, measured from the row's `terminal_at` — superseding never deletes |
+| Publication workspace (§4.4a) | `<state_dir>/validated-work/<issue>/<evidence_id>/workspace/` | removed on a resolved row; recreated idempotently from the pinned ref, so its loss is never a data-loss event |
 | Validated commits | pinned by `refs/issue-orchestrator/validated/<issue>/<evidence_id>` in the shared object store | ref deletion on a RESOLVED record + retention window |
 | Unvalidated commits on top of them (§1.1) | pinned by `refs/issue-orchestrator/observed/<issue>/<evidence_id>` when the worktree head differs | same window as the validated ref |
 | Live run directory | inside the worktree (unchanged) | worktree removal (now non-fatal) |
@@ -891,6 +1284,11 @@ Rules:
   and `reset_issue(from_scratch=True)` is already blocked upstream by the §3.2
   unresolved-work probe.
 - `session_output_retention_days` cleanup must not traverse the escrow root.
+- Worktree maintenance (`git worktree prune`, issue-worktree cleanup, the stale
+  worktree sweep) must skip the escrow root. The publication workspace is
+  registered with git like any other worktree, so a blanket prune would remove it
+  mid-publish; it is recoverable, but a prune racing a push is a failure mode worth
+  not having.
 - New setting `validated_work.escrow_retention_days` (default `30`, §8.2): escrow
   and both refs are released only after a record has been in a **`RESOLVED_STATES`**
   state (`RECOVERED` or `ABANDONED`) for that long, measured from `terminal_at`.
@@ -908,8 +1306,8 @@ crash-safe truth, so a label must never claim an effect that did not happen).
 | Transition point | Effect that must succeed first | Labels |
 |---|---|---|
 | Evidence recorded (`QUEUED`/`PARKED`) | durable record + escrow committed | add `recovery-pending` (new, `LabelCategory.BLOCKING`). Existing blocking label is **kept** — the issue is not unblocked by being owned. |
-| Admission to publish (`PUBLISHING`) | locators stored | add `publish-failed` if absent (the executor's board precondition); the pre-existing set is already recorded in `observed_blocking_labels`. |
-| Publication + review routing succeeded (`RECOVERED`) | remote head == `validated_head_sha`, PR open, review routed | remove `recovery-pending`; remove **only** the labels in `observed_blocking_labels` plus the `publish-failed` this op added. Then normal routing applies `pr-pending`/review labels via `RetrySuccessFinalizer`. |
+| Admission to publish (`PUBLISHING`) | durable CAS to `PUBLISHING` succeeded | **no label change.** The previous draft added `publish-failed` here purely to satisfy the manual path's `board_block_reason()` precondition; §4.6 removes that round-trip, so the issue is no longer marked with a failure it did not have. |
+| Publication + review routing succeeded (`RECOVERED`) | remote head == `validated_head_sha`, PR open, review routed | remove `recovery-pending`; remove **only** the labels in `observed_blocking_labels`. Then normal routing applies `pr-pending`/review labels via the finalizer (§4.5). |
 | Disposition failed (`FAILED`) | — | keep `recovery-pending`; add `tech-lead-needs-human`. Never leave the issue in a plain `blocked-failed` state, never scratch-eligible — `recovery-pending` stays *because* `FAILED` is unresolved (§3.2). |
 | Operator abandoned (`ABANDONED`) | durable `OperatorResolution` recorded | remove `recovery-pending` (the work is now formally resolved and reset may proceed); keep `tech-lead-needs-human` and the pre-existing blocking labels untouched. Escrow and refs are still retained for the retention window. |
 
@@ -1075,17 +1473,30 @@ sweeps above:
 | Guards | Case |
 |---|---|
 | §1.1 target identity | Validation passes at `V`; the worktree advances to `L` (`V` an ancestor of `L`). Assert the record's `validated_head_sha == V`, the state is `PARKED`/`WORKTREE_AHEAD_OF_VALIDATION`, **no push occurs**, and `L` is never published under `V`'s record. A second case validates at `L` and asserts a *new* `evidence_id`. |
-| §1.1 submission check | A record reaches submission while the rehydrated worktree HEAD has been moved off `validated_head_sha`: `PUBLISH_TARGET_MISMATCH`, `FAILED`, zero external writes. |
+| §4.4a workspace | **The original worktree still exists at `L`** and an approved recovery chooses `V`: the publication workspace is a distinct path detached at the pinned ref, the pushed object is exactly `V`, the issue worktree is neither moved nor removed, and `L` remains pinned at the `observed` ref and unpublished. |
+| §4.4b TOCTOU | The worktree advances from `V` to `L` *after* admission and before the push: the published object is still `V` (the refspec names the object, not a branch HEAD). |
+| §4.4b TOCTOU | The remote moves from `E` to `X` after observation and before the push: `LEASE_REJECTED` ⇒ `REMOTE_HEAD_CHANGED`, **zero remote writes**, and `X` is still the remote head afterwards. Asserted against a fake that records every git invocation, so a bare `--force-with-lease` or a preceding `fetch_for_push()` fails the test. |
+| §4.4b absent branch | Expectation `ABSENT` with the branch created by a third party between observation and push: empty-lease rejection, zero writes. |
 | §4.4 publisher | Open PR *P* at remote head `R`, target `L`: the publisher **pushes** and does not take an existing-PR shortcut; end state has remote head `L`. |
-| §4.4 publisher | Remote branch and PR already at `L`: `ALREADY_AT_TARGET`, finalize + route, **no second push**. |
-| §4.4 publisher | Remote head is a third sha `X`: `DIVERGED`, no push, no finalize, no label writes. |
-| §4.4 publisher | Manual `retry_publish()` with `UNCONSTRAINED` keeps its existing admission behaviour, and its existing-PR path now compares heads. |
-| §2.1.1 identity | Capture the same work twice at different `captured_at`, with different remote heads, and after a human adds a blocking label: identical `evidence_id`, exactly one row. |
-| §2.1.1 identity | Requested actions supplied in a different order produce the same id; a different completion artifact hash produces a different id. |
-| §2.1.2 atomicity | Crash after escrow rename, after ref pin, and after insert; startup `reconcile_escrow_orphans()` converges to one record and deletes nothing. Re-capture converging on a `RECOVERED`/`ABANDONED` id returns that record and inserts nothing. |
+| §4.4 publisher | Remote branch already at `L`: `ALREADY_AT_TARGET`, **no second push**, decided on the branch ref alone (no PR consulted). |
+| §4.4 publisher | Remote head is a third sha `X`: `DIVERGED`, no push, no PR write, no label writes. |
+| §4.4d PR ensure | Branch at `L`, `pr_number=None`, **no PR** (crashed after push, before create): restart creates exactly one PR, routes review, and does not re-push. |
+| §4.4d PR ensure | Branch at `L`, `pr_number=None`, an open PR for the branch already exists (crashed after create, before persisting the number): it is adopted, not duplicated; a prior-attempt PR on another branch is not adopted. |
+| §4.4e ordering | The record is `PUBLISHING` with the derived token **before** the publisher is invoked — asserted by a publisher double that reads the store when called. A crash inside the publisher leaves `PUBLISHING`, never `QUEUED`-with-a-completed-push. |
+| §4.4e ordering | Two concurrent drains on one row: exactly one `begin_publishing` CAS wins and exactly one submission is made. |
+| §4.4e statuses | One test per `submission_status` value — `PENDING` (no writes, re-check), `SUCCEEDED` (branch verified, PR ensured, `RECOVERED`), `SUCCEEDED` with the branch *not* at target (`FAILED`), transient `FAILED` (stays `PUBLISHING`, bounded retries, exhaustion ⇒ `FAILED`), definitive `FAILED` (durable `FAILED`), `UNKNOWN` (re-runs `RECONCILING`). |
+| §2.1.1 identity | Capture the same work twice at different `captured_at`, with different remote heads, after a human adds a blocking label, **and after the worktree advances**: identical `record_id` *and* `evidence_id`, exactly one row. |
+| §2.1.1 identity | Requested actions supplied in a different order produce the same id; a different completion artifact hash produces a different `evidence_id` but the **same** `record_id`. |
+| §2.1.3 admission | Different evidence for the same key supersedes in place: one row, prior `evidence_id` in `superseded_evidence_ids`, both escrows and both ref sets retained. Superseding a `FAILED` row transitions *that* row; no rival row exists at any point. Recovery against a superseded-from-`FAILED` key leaves nothing unresolved. |
+| §2.1.3 admission | A capture arriving while the row is `PUBLISHING` returns `ATTACHED` without disturbing the submission, and the next drain converges or supersedes. |
+| §2.1.2 atomicity | Crash after escrow rename, after ref pin, and after insert; startup `reconcile_escrow_orphans()` rebuilds the row from `capture.json` — **with the original worktree deleted** — restoring remote expectation, PR, labels and routing, and deletes nothing. An envelope whose recomputed `evidence_id` or artifact hash mismatches is reported, not repaired. |
+| §2.1.2 atomicity | Re-capture converging on a `RECOVERED` id returns that record and inserts nothing; on an `ABANDONED` id it reopens as `PARKED`. |
 | §4.3 phases | One test per crash row in §10, asserting the allowed-state table: `RECONCILING` accepts remote at `expected` **and** remote at `validated_head_sha`; both branch-absent variants; a third sha fails in both phases. |
+| §4.3 check 8 | Fast-forward legality is proven against the **recorded expectation**, not a freshly observed head: a remote that moved to a descendant of `E` after observation still yields zero writes. |
 | §3.2 / F5 | Scratch-reset freshness for **every** state, with `FAILED` asserted reset-**ineligible**, and `ABANDONED` asserted eligible only after a recorded `OperatorResolution`. |
-| §6 retention | The retention sweep releases escrow/refs only for `RESOLVED_STATES` past the window, and never for a `FAILED` record regardless of age. |
+| §3.2 / F5 | `has_active_issue_runtime()` cannot be called without the disposition owner (required parameter), and `_ResetRetryRuntimeOwners` carries it into both the freshness check and the teardown. |
+| §4.5 finalization | The disposition path reaches `RetrySuccessFinalizer`/`RetryReviewRouting` through `PublishedWorkFinalizer` with the live state on the request; a `FreshIssueReadError` is a retry-next-drain transient, not `FAILED`. |
+| §6 retention | The retention sweep releases escrow/refs only for `RESOLVED_STATES` past the window, never for a `FAILED` record regardless of age, and never for superseded evidence of an unresolved row. |
 | §8.2 config | `validated_work.escrow_retention_days` parses from YAML, rejects `0`/non-int, survives a `to_dict`/`to_yaml_dict` round-trip, is omitted at default, and its `config_attr` resolves against a real `Config`. |
 
 **Non-regression**: Retry Publish, `request_rework` (#7008), reset-from-scratch, and
@@ -1094,14 +1505,23 @@ reset now stale-downgrades while unresolved work exists.
 
 **Mechanical guardrails** (ADR-0012), added to the existing AST guardrail suite:
 
-- No module outside the disposition owner constructs `PublishRetryLocators`.
+- `PublishRetryLocators` is constructed only by `PublishRetryLocatorFactory`
+  (§4.6). The disposition owner never constructs or stores them.
 - No module outside the owner adds/removes `recovery-pending`.
 - `IssueRuntimeTermination` cannot be constructed without `validated_work`
   (enforced by the type, verified by a test).
-- Every `terminate_issue_runtime()` call site **binds** the returned
-  `validated_work` — a discarded result is the F5 failure mode in miniature.
+- Every `terminate_issue_runtime()` **and** `has_active_issue_runtime()` call site
+  passes the disposition owner, and every `terminate_issue_runtime()` call site
+  **binds** the returned `validated_work` — a discarded result, or an activity
+  check that skipped the owner, is the F5 failure mode in miniature.
 - Only `ValidatedWorkDispositionService` and `PublishRecoveryService` call
   `ValidatedHeadPublisher.publish_or_reconcile`.
+- The disposition publish path never calls `fetch_for_push()` or
+  `build_push_args()`; its only remote write is `push_exact()` (§4.4b). A guardrail
+  over the publisher module keeps the bare-`--force-with-lease` path from creeping
+  back in.
+- `ValidatedWorkDispositionService` does not reference `PublishRecoveryService` —
+  the two admission owners are siblings, not a chain.
 
 ---
 
@@ -1128,12 +1548,13 @@ remedy — scratch reset — would delete `L`.
 |---|---|
 | Admission | Both records are run-scoped and therefore admissible *sources*. Selection (§5) rejects the invalid one because it does not parse, and selects the valid one because its `validation_record_path` resolves in-run to `passed=true` with `head_sha == L`. The worktree HEAD is also exactly `L`, so the target is fixed **by identity, not by ancestry**. The canonical path holds no privileged status. |
 | Evidence | Identity: `validated_head_sha=L`, `worktree_head_sha=L`, `branch_name=b`, `review_disposition=RESUME_REVIEW`, `branch_binding_verified=True`. Observations (outside `evidence_id`): `expected_remote_head_sha=R`, `pr_number=P`, `observed_blocking_labels=("blocked-failed",)`. |
-| Escrow | Completion + validation records copied to `<state_dir>/validated-work/N/<evidence_id>/` (temp dir + atomic rename); `L` pinned at `refs/issue-orchestrator/validated/N/<evidence_id>`. No `observed` ref — the two heads agree. |
+| Escrow | `capture.json` + completion + validation records written to `<state_dir>/validated-work/N/<evidence_id>/` (temp dir, fsync, atomic rename); `L` pinned at `refs/issue-orchestrator/validated/N/<evidence_id>`. No `observed` ref — the two heads agree. |
+| Admission | `record_id` derived from (repo, N, `b`, `L`); no existing row ⇒ `ADMITTED`. |
 | Disposition | Evidence conclusive ⇒ `QUEUED`. `recovery-pending` added; `blocked-failed` kept. `IssueRuntimeTermination.validated_work.state == QUEUED`, so the session is **not** classified `timed_out`. |
-| Drain | §4.3 in `PRE_SUBMISSION`: remote head is `R` as expected, PR *P*'s head is `R`, pinned ref == rehydrated worktree HEAD == `L`, and `L` is a descendant of `R` ⇒ fast-forward legal. Locators reconstructed (worktree rehydrated at the pinned ref if it is gone), `publish-failed` added, `publish_or_reconcile` called with `target_head_sha=L`, `expectation=EXACT(R)`; state `PUBLISHING` before the write is observable. |
-| Publish | The publisher sees branch and PR at `R` — the expectation, **not** the target — so it pushes. Fast-forward `b → L`; PR *P*'s head becomes `L`. This is the row the old contract got wrong: `retry_publish()` would have found an open PR for `b` and finalized it without pushing, leaving `L` local-only. No new PR, no supersede, no force-push, no reset. |
-| Review | `RetryReviewRouting` routes the new head through normal review discovery — review resumes on `L`. No approval label is applied, so there is no false ready-to-merge state. |
-| Finalize | `recovery-pending`, `blocked-failed`, and the op's own `publish-failed` removed; `pr-pending` applied by the normal finalizer; record `RECOVERED`; escrow + ref retained for `escrow_retention_days`. |
+| Drain | Publication workspace created detached at the pinned ref. §4.3 in `PRE_SUBMISSION`: remote head is `R` as expected, PR *P*'s head is `R`, pinned ref == workspace HEAD == `L`, and `L` descends from the **recorded expectation** `R` ⇒ fast-forward legal. `begin_publishing()` CAS to `PUBLISHING` with the derived token, **then** `publish_or_reconcile(target_head_sha=L, expectation=EXACT(R))`. |
+| Publish | The publisher sees the branch at `R` — the expectation, **not** the target — so it writes: `git push --atomic origin --force-with-lease=refs/heads/b:R L:refs/heads/b`. The object published is `L` itself, and the lease guarantees the remote was still at `R`. PR *P* is then ensured: it is open on `b`, so it is reconciled, and its head is now `L`. This is the row the old contract got wrong twice — `retry_publish()` would have found an open PR for `b` and finalized without pushing, and a bare `--force-with-lease` would have re-leased to whatever the preceding fetch saw. No new PR, no supersede, no force-push, no reset. |
+| Review | `PublishedWorkFinalizer` composes `RetrySuccessFinalizer` + `RetryReviewRouting` with the live state — review resumes on `L` through normal discovery. No approval label is applied, so there is no false ready-to-merge state. |
+| Finalize | `recovery-pending` and `blocked-failed` removed (no `publish-failed` was ever added); `pr-pending` applied by the finalizer; record `RECOVERED`; workspace removed; escrow + ref retained for `escrow_retention_days`. |
 | Divergence variant | If `L` were **not** a descendant of `R`, step 6 of §4.3 fails ⇒ `REMOTE_DIVERGED` ⇒ `FAILED`, artifacts preserved, `tech-lead-needs-human` added. A human resolves the divergence; nothing is force-pushed and nothing is deleted. |
 
 **Crash points around the non-atomic GitHub writes:**
@@ -1145,20 +1566,24 @@ makes a successful-but-unacknowledged push a recoverable state rather than a
 
 | Crash after | Phase on restart | On restart, `drain()` does |
 |---|---|---|
-| Nothing (before the record is written) | — | Re-derives the same `evidence_id` (§2.1.1 — `captured_at` and the observed remote head are outside the hash) at the next termination and converges on one record. |
-| Partial escrow write | — | The temp directory was never renamed ⇒ no admissible escrow ⇒ re-escrow from the worktree if present, else `FAILED(ESCROW_WRITE_FAILED)`. Never a half-admitted record. |
-| Escrow renamed / ref pinned, insert lost | — | `reconcile_escrow_orphans()` re-inserts the record from the escrowed identity. Nothing is deleted; the orphan is inert until then because admission reads records, not directories. |
-| Record `QUEUED`, before locators | `PRE_SUBMISSION` | Re-runs the checks and re-admits. Remote is still at `R`. Idempotent. |
-| Locators stored, before submission | `PRE_SUBMISSION` | Sees `QUEUED` with locators present; `PublishRetryLocatorStore` writes are keyed by issue, so the rewrite is a no-op. |
-| `PUBLISHING`, submission token orphaned | `RECONCILING` | `submission_status(token)` is `UNKNOWN`. Remote at `R` ⇒ allowed ⇒ resubmit with the **same derived token**, so no rival submission. Remote at `L` ⇒ allowed ⇒ `ALREADY_AT_TARGET`, reconcile without pushing. Remote at any third sha ⇒ `REMOTE_HEAD_CHANGED` ⇒ `FAILED`. |
-| Push succeeded, PR update/link failed | `RECONCILING` | Remote head and PR head are `L` — an **allowed** state for this phase, not a divergence. The publisher returns `ALREADY_AT_TARGET`; finalize + review routing run, no second push. |
+| Nothing (before the row is written) | — | Re-derives the same `record_id` and `evidence_id` (§2.1.1 — `captured_at`, the observed remote head, and the worktree head are all outside the hashes) at the next termination and converges on one row. |
+| Partial escrow write | — | The temp directory was never renamed ⇒ no admissible escrow ⇒ re-escrow from the worktree if present, else `FAILED(ESCROW_WRITE_FAILED)`. Never a half-admitted row. |
+| Escrow renamed / ref pinned, insert lost | — | `reconcile_escrow_orphans()` rebuilds the row from `capture.json` — identity, observations, initial state and ref names all persisted in the envelope — after validating that the recomputed `evidence_id` and artifact hashes match. Works with the worktree already deleted. Nothing is deleted; the orphan is inert until then because admission reads rows, not directories. |
+| Row `QUEUED`, before the publishing CAS | `PRE_SUBMISSION` | Re-runs the checks and re-admits. Remote is still at `R`. Idempotent. |
+| CAS to `PUBLISHING` won, before the publisher was invoked | `RECONCILING` | `submission_status(token)` is `UNKNOWN`; remote is still at `R` ⇒ allowed ⇒ publish with the **same derived token**. This state exists *because* the CAS precedes the call (§4.4e) — the alternative ordering produces a `QUEUED` row with a completed push, which no phase can safely interpret. |
+| Push landed, process died before the outcome was recorded | `RECONCILING` | `submission_status(token)` is `UNKNOWN`. Remote at `L` ⇒ allowed ⇒ `ALREADY_AT_TARGET`, reconcile without pushing. Remote at `R` ⇒ allowed ⇒ publish. Any third sha ⇒ `REMOTE_HEAD_CHANGED` ⇒ `FAILED`. |
+| **Push succeeded, no PR created** (`pr_number` is `None`, no PR exists) | `RECONCILING` | The branch decision returns `ALREADY_AT_TARGET` on the **branch ref alone**, so the missing PR is not a gap in the table. PR-ensure (§4.4d) finds no open PR for `b`, creates exactly one, persists its number, then routes review. No re-push. |
+| PR created, its number not yet persisted | `RECONCILING` | PR-ensure discovers the open PR for `b` (scoped to the active issue branch, matched by the orchestrator body marker) and adopts it. No duplicate PR. |
+| Push succeeded, PR reconcile/link failed | `RECONCILING` | Remote head and PR head are `L` — an **allowed** state for this phase, not a divergence. `ALREADY_AT_TARGET`, then finalize; no second push. |
 | PR reconciled, labels not applied | `RECONCILING` | Label add/remove through `ActionApplier` are idempotent; re-applies the §7 transition. |
-| Labels applied, record not marked `RECOVERED` | `RECONCILING` | Verifies remote head == `L`, PR open, labels correct ⇒ marks `RECOVERED` without re-writing GitHub. |
+| Labels applied, row not marked `RECOVERED` | `RECONCILING` | Verifies remote head == `L`, PR open, labels correct ⇒ marks `RECOVERED` without re-writing GitHub. |
 | Branch-absent variant, push landed | `RECONCILING` | The recorded expectation was "absent", but the branch now exists at `L` — allowed for this phase (that is our push), so reconcile. A branch at any other sha ⇒ `FAILED`. A *read failure* is `REMOTE_UNREADABLE` and retries; it never re-authorizes a branch-creating push. |
+| Anywhere, with the publication workspace lost | either | Recreated idempotently from the pinned ref at the top of the next drain (§4.4a). The workspace holds no unique state. |
 
 Every row converges on exactly one published head, one PR, one review routing, and
-one terminal record — which is what the derived submission token, the canonical
-`evidence_id`, the phase-aware allowed sets, and the fast-forward-only rule buy.
+one terminal row — which is what the derived submission token, the `record_id`
+primary key, the self-describing capture envelope, the CAS-before-invoke ordering,
+the phase-aware allowed sets, and the exact-object/exact-lease write buy.
 
 ---
 
@@ -1167,28 +1592,33 @@ one terminal record — which is what the derived submission token, the canonica
 Ordered so each slice is independently shippable and leaves the tree green.
 
 1. **Domain + store.** `domain/validated_work.py` (states, state sets,
-   `ValidatedWorkIdentity`, `canonical_evidence_id`), `ports/validated_work_store.py`,
-   `infra/validated_work_store.py` (+ sqlite registry entry). Pure unit tests,
-   including the identity-stability cases from §9.
-2. **Escrow + ref pinning + config.** Filesystem escrow with atomic rename and
-   `reconcile_escrow_orphans()`; `WorkingCopy` extension for creating/resolving/
-   deleting the `validated`/`observed` refs; **the whole §8.2(b) config slice ships
-   here** — `ValidatedWorkConfig` model, section key, parser + registration, shape
-   validation, `to_dict`, YAML round-trip, settings field + section, generated
-   reference, example, and the config/settings tests. The retention sweep has a
-   real setting to read on the same day it exists.
+   `ValidatedWorkKey`, `ValidatedWorkIdentity`, `canonical_record_id`,
+   `canonical_evidence_id`), `ports/validated_work_store.py`,
+   `infra/validated_work_store.py` with the `record_id`-keyed table and the §2.1.3
+   transactional admission (+ sqlite registry entry). Pure unit tests, including the
+   identity-stability and supersession cases from §9.
+2. **Escrow + ref pinning + config.** Filesystem escrow with the capture envelope,
+   atomic rename, and `reconcile_escrow_orphans()`; `WorkingCopy` extensions for the
+   `validated`/`observed` refs **and `push_exact()`** (§4.4b); **the whole §8.2(b)
+   config slice ships here** — `ValidatedWorkConfig` model, section key, parser +
+   registration, shape validation, `to_dict`, YAML round-trip, settings field +
+   section, generated reference, example, and the config/settings tests. The
+   retention sweep has a real setting to read on the same day it exists.
 3. **Owner, admission-only.** `dispose_at_termination()` returning `NONE`/`PARKED`
    plus evidence capture and the §1.1 target-identity rules. Wire into
-   `terminate_issue_runtime()` as a required parameter; add the fifth activity probe
-   (`has_unresolved_work`) and make the reset call sites consume the result. At this
-   point nothing recovers, but **nothing is destroyed** — scratch reset already
-   stale-downgrades, including for `FAILED`.
-4. **Publisher extraction + automatic recovery.** Extract
-   `ValidatedHeadPublisher` (§4.4) from `PublishRecoveryService`'s execution half,
-   including the existing-PR head comparison, and re-point manual `retry_publish()`
-   at it with `UNCONSTRAINED` — a standalone, independently testable fix. Then the
-   `QUEUED` → `PUBLISHING` → `RECOVERED` drain with the phase-aware check set and
-   locator reconstruction. Route `STOPPED/MAX_ROUNDS_EXCEEDED` in (this is #7018).
+   `terminate_issue_runtime()` **and** `has_active_issue_runtime()` as a required
+   parameter; add the fifth activity probe (`has_unresolved_work`) and make the
+   reset call sites consume the result. At this point nothing recovers, but
+   **nothing is destroyed** — scratch reset already stale-downgrades, including for
+   `FAILED`.
+4. **Publisher + finalizer, then automatic recovery.** Introduce
+   `ValidatedHeadPublisher` (§4.4c) over `push_exact()` plus PR ensure, and
+   `PublishedWorkFinalizer` (§4.5) wrapping the existing
+   `RetrySuccessFinalizer`/`RetryReviewRouting`; re-point manual `retry_publish()`
+   at both with `UNCONSTRAINED`, which independently fixes its existing-PR shortcut
+   and is shippable on its own. Then the publication workspace, the
+   `begin_publishing` CAS, and the `QUEUED` → `PUBLISHING` → `RECOVERED` drain with
+   the phase-aware check set. Route `STOPPED/MAX_ROUNDS_EXCEEDED` in (this is #7018).
 5. **Classification cleanup.** Session/failure paths and the stuck sweep consume
    `IssueRuntimeTermination.validated_work`; generic `timed_out` becomes illegal for
    an issue with a disposition.

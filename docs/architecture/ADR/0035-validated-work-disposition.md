@@ -87,55 +87,79 @@ Four concrete mechanisms in today's code destroy or strand the work:
 3. **One owner, three initiators.** Automatic recovery at the boundary, the gated
    tech-lead `recover_validated_work` op, and the operator Control Center command
    all call the same owner and receive the same typed result. The owner — not the
-   initiators — owns trusted artifact admission, stale checks, idempotency,
-   durable state, publish-retry reconstruction, fast-forward publication, review
-   routing, label finalization, and partial-write reconciliation.
+   initiators — owns trusted artifact admission, stale checks, idempotency, durable
+   state, the publication workspace, and partial-write reconciliation, and it
+   *composes* (rather than reimplements) the publisher and the finalizer of
+   decision 8.
 
 4. **Escrow outside the worktree; commits pinned by refs.** Admitted evidence is
-   copied to `<state_dir>/validated-work/<issue>/<evidence_id>/` and the validated
-   commit is pinned by `refs/issue-orchestrator/validated/<issue>/<evidence_id>` in
-   the shared object store; unvalidated commits sitting on top of it are pinned
-   separately under `refs/issue-orchestrator/observed/...` so that refusing to
-   publish them never means allowing them to be collected. Worktree removal stops
-   being a data-loss event. `evidence_id` is a canonical hash over stable semantic
-   facts and admitted content hashes only — capture timestamps and mutable
-   observations are excluded — so a crash-and-retry re-derives the same identity
-   and converges on one record instead of minting a second.
+   copied to `<state_dir>/validated-work/<issue>/<evidence_id>/`, together with a
+   self-validating capture envelope that carries everything needed to rebuild the
+   durable row without the worktree, and the validated commit is pinned by
+   `refs/issue-orchestrator/validated/<issue>/<evidence_id>` in the shared object
+   store; unvalidated commits sitting on top of it are pinned separately under
+   `refs/issue-orchestrator/observed/...` so that refusing to publish them never
+   means allowing them to be collected. Worktree removal stops being a data-loss
+   event.
 
-5. **`has_active_issue_runtime()` gains a fifth probe** — `has_unresolved_work()`,
+   Identity is split in two. `record_id` hashes *which work* this is (repo, issue,
+   branch, validated head) and is the durable row's **primary key**, so two rows for
+   one unit of work are unrepresentable in any state. `evidence_id` hashes *which
+   evidence* carries it; new evidence for the same work supersedes in place, with
+   the prior evidence audited and its escrow retained. Neither hash covers capture
+   timestamps, mutable external observations, the moving worktree head, or
+   filesystem paths, so a crash-and-retry re-derives both and converges.
+
+5. **Publication reads a dedicated workspace and writes an immutable object.**
+   Recovery publishes from a per-evidence worktree detached at the pinned validated
+   ref — never the issue worktree, which may have advanced — and the remote write
+   names the commit explicitly under an explicit expected-value lease
+   (`--force-with-lease=<ref>:<expected>`), never the fetch-refreshed bare lease the
+   generic push path uses. A worktree that moves cannot change what is published,
+   and a remote that moves produces zero writes rather than a force-push.
+
+6. **`has_active_issue_runtime()` gains a fifth probe** — `has_unresolved_work()`,
    true for every state in the unresolved set above. The predicate is named for the
    question its callers ask ("is there work here that must not be destroyed?")
    rather than for a workflow phase, because a `pending`-shaped predicate reads
    false for a `FAILED` record and would hand exactly the work this ADR protects to
-   the nuclear reset. The reset-freshness predicate and the teardown boundary keep
-   reading the same owner set, and callers must **consume** the returned
-   disposition rather than discard it, so scratch reset can never discard work the
-   predicate did not observe.
+   the nuclear reset. The owner is a **required parameter of the activity predicate
+   as well as of teardown** — optional on one side would mean the two boundaries
+   read the same owner set only by convention, and convention is what a future
+   caller forgets. Callers must also **consume** the returned disposition rather
+   than discard it, so scratch reset can never discard work the predicate did not
+   observe.
 
-6. **Authority rides the existing gated lane.** `recover_validated_work` is added
+7. **Authority rides the existing gated lane.** `recover_validated_work` is added
    to `ACT_LEVEL_TECH_LEAD_ACTIONS` and bound through the existing immutable
    `StoredTechLeadOp` / `tech_lead_proposal_ops` lifecycle. No second approval
    table, no second scanner. Recovery preserves branch/PR/review/rework lineage;
    it may never call the reset-from-scratch owner, force-push, delete work, or
    clear blocking state before publication and review routing succeed.
 
-7. **Publication is an execution-only port, composed by both callers.** The
+8. **Publication splits into three owners, each with one responsibility.** The
    existing `PublishRecoveryService.retry_publish()` entry point cannot serve the
    disposition owner: it treats *any* matching open PR as an already-recovered
    state and finalizes without ever pushing, never comparing the PR's head with the
    commit to be landed — so in the canonical strand (open PR at the old remote head,
    validated commits local-only) it would report success while the work stayed
-   unpublished. The execution half is therefore extracted behind
-   `ValidatedHeadPublisher.publish_or_reconcile()`, a narrow command carrying
-   evidence identity, expected remote head, target validated head, branch/PR
-   identity, review disposition, and a derived submission token, and returning a
-   durable owner-observable outcome that distinguishes "publish", "already at
-   target — reconcile only", and "diverged — write nothing".
+   unpublished.
 
-   Admission policy stays with each caller: manual Retry Publish keeps its board
-   and locator admission and the Control Center surface; the disposition owner
-   keeps evidence admission and its stale checks. Neither duplicates the other's
-   finalization. This also fixes the existing-PR shortcut for the manual path.
+   | Layer | Owner | Needs orchestrator state |
+   |---|---|---|
+   | Remote execution | `ValidatedHeadPublisher` — exact-object/exact-lease branch write, then ensure exactly one PR | no |
+   | Finalization | `PublishedWorkFinalizer` — labels, history, review routing, wrapping the existing `RetrySuccessFinalizer`/`RetryReviewRouting` | yes, on the request |
+   | Admission | `PublishRecoveryService` (manual) and `ValidatedWorkDispositionService` (validated work), as **siblings** | yes |
+
+   The publisher is execution-only precisely because finalization needs
+   `OrchestratorState` and the publisher does not; folding the two together would
+   force a hidden global or a back-reference from the executor to the manual
+   service, recreating the coupling this split removes. The two admission owners
+   compose the same executor and the same finalizer and never call each other, and
+   `PublishRetryLocators` stays entirely with the manual path — the disposition
+   owner has its own escrow, workspace, publisher and finalizer, so it needs no
+   locator round-trip and no borrowed board preconditions. This also fixes the
+   existing-PR shortcut for the manual path.
 
 ## Consequences
 
