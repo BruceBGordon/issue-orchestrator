@@ -160,6 +160,50 @@ def scope_kind_of_flavor(flavor: TechLeadSessionFlavor) -> TechLeadRunScopeKind:
         ) from None
 
 
+# The order queued whole-repository runs take their turn in — the ONE authority
+# on "which global goes next" (#6994 round 5 F16/A9).
+#
+# Deliberately a pure function of run IDENTITY, and deliberately not of when a
+# run was reserved. Two owners used to elect a winner independently — the local
+# launch gate by incidental pending-list order, the shared ledger by
+# ``(started_at, run_key)`` — and when a crash recovered the queue in the other
+# order the two never agreed: the gate offered health, the ledger insisted batch
+# was ahead, and every renewal preserved the disagreement. That deadlocked every
+# tech-lead run in the repository.
+#
+# ``started_at`` could not be that authority even in principle: it is stamped by
+# whichever engine wrote the entry, from ITS wall clock, so two engines a few
+# seconds apart order the same pair differently. An identity order is computable
+# by the planner without reading the shared cell, which is what lets one rule
+# serve both consumers instead of one approximating the other.
+_GLOBAL_TURN_ORDER: tuple[TechLeadRunScopeKind, ...] = (
+    TechLeadRunScopeKind.GLOBAL_HEALTH_REVIEW,
+    TechLeadRunScopeKind.GLOBAL_BATCH_REVIEW,
+)
+
+
+def global_run_precedence(run_key: str) -> tuple[int, str]:
+    """Where a whole-repository run sits in the single global turn order.
+
+    Lower sorts first. Both the launch gate (which queued global to offer) and
+    the shared ledger (which queued global may promote) sort by THIS, so the two
+    cannot elect different winners. A global identity not explicitly ranked
+    still gets a deterministic position rather than an arbitrary one.
+    """
+    kind = scope_kind_of_run_key(run_key)
+    if not kind.is_global:
+        raise ValueError(
+            f"run key {run_key!r} is not a whole-repository run, so it takes no"
+            " turn in the global order"
+        )
+    rank = (
+        _GLOBAL_TURN_ORDER.index(kind)
+        if kind in _GLOBAL_TURN_ORDER
+        else len(_GLOBAL_TURN_ORDER)
+    )
+    return (rank, run_key)
+
+
 def scope_kind_of_run_key(run_key: str) -> TechLeadRunScopeKind:
     """The scope a run key names. Fails loudly on anything it does not name.
 

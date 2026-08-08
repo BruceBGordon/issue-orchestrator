@@ -34,11 +34,13 @@ from ..domain.tech_lead_run import (
     BARRIER_GLOBAL_RUN_QUEUED,
     REASON_ISSUE_CLOSED,
     REASON_NO_LONGER_BLOCKED,
+    global_run_precedence,
 )
 from .tech_lead_run_admission import (
     active_tech_lead_sessions,
     has_active_global_run,
     is_global_pending,
+    run_key_of_pending,
 )
 
 if TYPE_CHECKING:
@@ -80,7 +82,10 @@ def plan_tech_lead_launch_gate(
     1. A queued global run is a BARRIER. Nothing else launches while it is
        queued, and the global run itself waits until every active tech-lead
        session has drained — that is what makes it exclusive rather than merely
-       first in line.
+       first in line. Which queued global gets the turn is decided by
+       :func:`...domain.tech_lead_run.global_run_precedence`, the same authority
+       the shared ledger promotes by, so the two can never nominate different
+       winners and stall each other (#6994 round 5 F16).
     2. An ACTIVE global run holds everything back until it completes.
     3. Otherwise every queued targeted run is launchable; the numeric budget
        (``worker_budget.tech_lead_slot_availability``) slices it downstream,
@@ -98,7 +103,17 @@ def plan_tech_lead_launch_gate(
     if global_queued:
         if active_tech_lead_sessions(config, active_sessions):
             return TechLeadLaunchGate((), items, BARRIER_GLOBAL_AWAITING_DRAIN)
-        first = global_queued[0]
+        # Whose turn it is comes from the SHARED authority, never from where a
+        # run happens to sit in this engine's list. Startup recovery preserves
+        # whatever order the repository scan returned, so electing
+        # ``global_queued[0]`` here meant this gate and the durable ledger could
+        # nominate different winners — and then renew that disagreement every
+        # tick, launching neither and barring every targeted run behind them
+        # (#6994 round 5 F16/A9).
+        first = min(
+            global_queued,
+            key=lambda item: global_run_precedence(run_key_of_pending(item)),
+        )
         held = tuple(item for item in items if item is not first)
         return TechLeadLaunchGate(
             (first,), held, BARRIER_GLOBAL_RUN_QUEUED if held else None

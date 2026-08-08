@@ -35,7 +35,11 @@ from datetime import datetime, timedelta
 from enum import Enum
 from typing import Iterable, Optional, TypeVar
 
-from .tech_lead_run import TechLeadRunScopeKind, scope_kind_of_run_key
+from .tech_lead_run import (
+    TechLeadRunScopeKind,
+    global_run_precedence,
+    scope_kind_of_run_key,
+)
 
 # Why a promotion was refused. Shares the launch gate's vocabulary
 # (``domain.tech_lead_run.BARRIER_*``) so an operator reads the same phrase
@@ -352,16 +356,26 @@ def _promote(
 def _global_promotion_barrier(
     ours: RunLedgerEntry, others: Iterable[RunLedgerEntry]
 ) -> Optional[tuple[str, str]]:
-    """Why an exclusive whole-repository run may not start yet."""
+    """Why an exclusive whole-repository run may not start yet.
+
+    Turn order comes from :func:`...tech_lead_run.global_run_precedence`, the
+    one authority both this promotion decision and the local launch gate sort
+    by. Electing a winner here independently of the gate is what let a recovered
+    queue disagree with the durable ledger forever (#6994 round 5 F16).
+    """
     peers = tuple(others)
     executing = next((entry for entry in peers if entry.is_running), None)
     if executing is not None:
         return (BARRIER_GLOBAL_AWAITING_DRAIN, executing.claimant)
+    our_turn = global_run_precedence(ours.run_key)
     ahead = next(
         (
             entry
-            for entry in sorted(peers, key=_queue_order)
-            if entry.is_global and _queue_order(entry) < _queue_order(ours)
+            for entry in sorted(
+                (peer for peer in peers if peer.is_global),
+                key=lambda peer: global_run_precedence(peer.run_key),
+            )
+            if global_run_precedence(entry.run_key) < our_turn
         ),
         None,
     )
@@ -381,11 +395,6 @@ def _targeted_promotion_barrier(
     if globals_live:
         return (BARRIER_GLOBAL_RUN_QUEUED, globals_live[0].claimant)
     return None
-
-
-def _queue_order(entry: RunLedgerEntry) -> tuple[datetime, str]:
-    """Total order over queued runs: oldest first, run key breaks exact ties."""
-    return (entry.started_at, entry.run_key)
 
 
 def _barrier_detail(reason: str, holder: str) -> str:

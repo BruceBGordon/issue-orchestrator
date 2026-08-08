@@ -142,8 +142,10 @@ def test_distinct_targeted_investigations_run_concurrently_on_two_engines():
 def test_two_queued_globals_pick_the_SAME_winner_on_both_engines():
     """Deterministic ordering, or both engines conclude they are next.
 
-    Oldest reservation first, with the run key breaking an exact tie — evaluated
-    over the shared cell, so the two engines cannot disagree.
+    The turn order is ``global_run_precedence`` — a pure function of run
+    IDENTITY, evaluated over the shared cell — so two engines cannot disagree
+    and neither can a local planner that has not read the cell (round 2 F1,
+    round 5 F16).
     """
     clock = FrozenClock()
     _shared, engine_a, engine_b = _two_engines(clock)
@@ -157,6 +159,26 @@ def test_two_queued_globals_pick_the_SAME_winner_on_both_engines():
     assert second.verdict is RunExecutionVerdict.BARRIER
     assert second.barrier_reason == BARRIER_GLOBAL_RUN_QUEUED
     assert first.started
+
+
+def test_reserving_the_LATER_turn_first_does_not_move_it_ahead():
+    """Reservation time is not the authority — two engines' clocks disagree.
+
+    ``started_at`` is stamped by whichever engine wrote the entry, from its own
+    wall clock, so ordering by it is not a total order any peer can reproduce.
+    """
+    clock = FrozenClock()
+    _shared, engine_a, engine_b = _two_engines(clock)
+    assert engine_a.claim(BATCH).owned  # reserved FIRST...
+    clock.advance(60)
+    assert engine_b.claim(HEALTH).owned  # ...but health still has the turn
+
+    batch = engine_a.begin_run(BATCH)
+    health = engine_b.begin_run(HEALTH)
+
+    assert batch.verdict is RunExecutionVerdict.BARRIER
+    assert batch.barrier_reason == BARRIER_GLOBAL_RUN_QUEUED
+    assert health.started
 
 
 def test_the_same_run_identity_cannot_be_owned_by_two_engines():
