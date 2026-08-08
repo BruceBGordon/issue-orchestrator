@@ -1013,35 +1013,46 @@ class TestDismissIssueEndpoint:
         data = response.json()
         assert data["success"] is True
 
-    def test_dismiss_handles_ordinary_label_removal_failure_gracefully(
+    def test_dismiss_reports_an_ordinary_label_removal_failure(
         self, client_with_orchestrator
     ):
-        """Dismiss continues when an ORDINARY label removal fails.
+        """Dismiss STOPS when an ordinary label removal fails (#6999 F5 r7).
 
-        A label that is already gone raises here too, and that is not a reason
-        to refuse the operator. Scoped to ordinary labels since #6999 F3: the
-        shared needs-human block is the one label whose failure to clear stops
-        the command, because dismissing past it is what left an issue blocked
-        on GitHub, pruned locally, and reported as done. See
-        ``TestOperatorCommandsRespectTheSharedBlockOwner``.
+        This asserted ``200 / success: true`` on the theory that an
+        already-absent label raises. It does not: ``GitHubAdapter.remove_label``
+        treats a 404 as idempotent success and retries transport faults itself,
+        so a raise reaching the command means GitHub still carries the label.
+        Reporting that as a dismissal - after pruning the board - is exactly the
+        GitHub/local disagreement this command was built to prevent.
         """
+        from issue_orchestrator.domain.models import SessionHistoryEntry
+
         client, mock_orch = client_with_orchestrator
         lm = mock_orch.deps.label_manager
-
-        mock_orch.state.session_history = []
-        mock_orch.repository_host.remove_label = MagicMock(
-            side_effect=lambda number, label: (_ for _ in ()).throw(
-                Exception("Label not found")
-            )
-            if label != lm.needs_human
-            else None
+        history_entry = SessionHistoryEntry(
+            issue_number=123,
+            title="Test Issue",
+            agent_type="agent:claude",
+            status="blocked",
+            runtime_minutes=10,
         )
+        mock_orch.state.session_history = [history_entry]
+
+        def _remove(number, label):
+            if label != lm.needs_human:
+                raise Exception("GitHub write failed")
+
+        mock_orch.repository_host.remove_label = MagicMock(side_effect=_remove)
 
         response = client.post("/api/issues/123/dismiss")
 
-        assert response.status_code == 200
+        assert response.status_code == 409
         data = response.json()
-        assert data["success"] is True
+        assert data["success"] is False
+        assert lm.blocked in data["failed_labels"]
+        assert lm.needs_human in data["removed_labels"]
+        # ...and the board still shows the issue, because GitHub still does.
+        assert mock_orch.state.session_history == [history_entry]
 
 
 class TestOperatorCommandsRespectTheSharedBlockOwner:
@@ -1238,3 +1249,148 @@ class TestOperatorCommandsRespectTheSharedBlockOwner:
         assert response.status_code == 200
         assert response.json()["success"] is True
         assert lm.needs_human not in live[123]
+
+
+class TestTheRouteMapsTheTypedOutcome:
+    """The transport half of the seam (#6999 F6 round 7).
+
+    The command reports FACTS - which labels came off, which would not, what is
+    still holding the block - and nothing about HTTP. Turning those into a
+    status code and this API's response body is the route's job, so it is
+    asserted here against outcomes handed in directly rather than produced by
+    driving the command: what is under test is the mapping, not the transition.
+    """
+
+    def _answering(self, mock_orch, **fields):
+        """Point the route at a command that returns one chosen outcome."""
+        from issue_orchestrator.ports.operator_issue_commands import (
+            OperatorCommandIntent,
+            OperatorCommandOutcome,
+            OperatorCommandStatus,
+        )
+
+        fields.setdefault("intent", OperatorCommandIntent.RETRY)
+        fields.setdefault("status", OperatorCommandStatus.COMMITTED)
+        fields.setdefault("issue_number", 123)
+        outcome = OperatorCommandOutcome(**fields)
+
+        class _Commands:
+            def retry(self, issue_number: int):
+                del issue_number
+                return outcome
+
+            def dismiss(self, issue_number: int):
+                del issue_number
+                return outcome
+
+        mock_orch.operator_issue_commands = _Commands()
+
+    def test_a_committed_retry_is_200_and_says_it_was_queued(
+        self, client_with_orchestrator
+    ):
+        client, mock_orch = client_with_orchestrator
+        self._answering(mock_orch, removed=("blocked",))
+
+        response = client.post("/api/issues/123/retry")
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["success"] is True
+        assert body["message"] == "Issue #123 queued for retry"
+        assert body["removed_labels"] == ["blocked"]
+
+    def test_a_committed_dismiss_is_200_and_says_it_was_dismissed(
+        self, client_with_orchestrator
+    ):
+        """Same status, different words - which is why intent is on the outcome."""
+        from issue_orchestrator.ports.operator_issue_commands import (
+            OperatorCommandIntent,
+        )
+
+        client, mock_orch = client_with_orchestrator
+        self._answering(
+            mock_orch, intent=OperatorCommandIntent.DISMISS, removed=("blocked",)
+        )
+
+        response = client.post("/api/issues/123/dismiss")
+
+        assert response.status_code == 200
+        assert response.json()["message"] == "Issue #123 dismissed"
+
+    def test_a_still_blocked_outcome_is_409_and_names_its_holders(
+        self, client_with_orchestrator
+    ):
+        from issue_orchestrator.ports.operator_issue_commands import (
+            OperatorCommandStatus,
+        )
+
+        client, mock_orch = client_with_orchestrator
+        self._answering(
+            mock_orch,
+            status=OperatorCommandStatus.STILL_BLOCKED,
+            blocked="blocked-needs-human",
+            held_by=("claim_quarantine",),
+        )
+
+        response = client.post("/api/issues/123/retry")
+
+        assert response.status_code == 409
+        body = response.json()
+        assert body["success"] is False
+        assert body["failed_labels"] == ["blocked-needs-human"]
+        assert body["held_by"] == ["claim_quarantine"]
+        assert "was not retried" in body["error"]
+        assert "claim_quarantine still requires it" in body["error"]
+
+    def test_a_still_blocked_outcome_with_no_holder_says_it_would_not_clear(
+        self, client_with_orchestrator
+    ):
+        """Refused by an owner, or simply not written - two different sentences."""
+        from issue_orchestrator.ports.operator_issue_commands import (
+            OperatorCommandIntent,
+            OperatorCommandStatus,
+        )
+
+        client, mock_orch = client_with_orchestrator
+        self._answering(
+            mock_orch,
+            intent=OperatorCommandIntent.DISMISS,
+            status=OperatorCommandStatus.STILL_BLOCKED,
+            blocked="blocked-needs-human",
+        )
+
+        response = client.post("/api/issues/123/dismiss")
+
+        assert response.status_code == 409
+        body = response.json()
+        assert body["held_by"] == []
+        assert "could not be cleared" in body["error"]
+        assert "was not dismissed" in body["error"]
+
+    def test_an_incomplete_outcome_is_409_and_names_the_failed_labels(
+        self, client_with_orchestrator
+    ):
+        """The status dismiss used to be unable to produce (#6999 F5 round 7)."""
+        from issue_orchestrator.ports.operator_issue_commands import (
+            OperatorCommandIntent,
+            OperatorCommandStatus,
+        )
+
+        client, mock_orch = client_with_orchestrator
+        self._answering(
+            mock_orch,
+            intent=OperatorCommandIntent.DISMISS,
+            status=OperatorCommandStatus.INCOMPLETE,
+            removed=("blocked-needs-human",),
+            failed=("blocked",),
+        )
+
+        response = client.post("/api/issues/123/dismiss")
+
+        assert response.status_code == 409
+        body = response.json()
+        assert body["success"] is False
+        assert body["failed_labels"] == ["blocked"]
+        assert body["removed_labels"] == ["blocked-needs-human"]
+        assert "was not dismissed" in body["error"]
+        assert "retry the action" in body["error"]

@@ -14,11 +14,14 @@ import pytest
 from issue_orchestrator.control.label_manager import LabelManager
 from issue_orchestrator.control.needs_human_block import BlockOutcome
 from issue_orchestrator.control.operator_issue_command_runner import (
-    OperatorCommandStatus,
     OperatorIssueCommandRunner,
 )
 from issue_orchestrator.control.operator_unblock import OperatorUnblocker
 from issue_orchestrator.domain.models import OrchestratorState, SessionHistoryEntry
+from issue_orchestrator.ports.operator_issue_commands import (
+    OperatorCommandIntent,
+    OperatorCommandStatus,
+)
 
 ISSUE = 903
 
@@ -90,7 +93,7 @@ def state() -> OrchestratorState:
     return state
 
 
-def _runner(sample_config, state, live, *, block=None, refuse=frozenset()):
+def _runner(sample_config, state, live, *, block=None, refuse=frozenset(), store=None):
     from unittest.mock import MagicMock
 
     labels = LabelManager(sample_config)
@@ -103,7 +106,7 @@ def _runner(sample_config, state, live, *, block=None, refuse=frozenset()):
         ),
         fresh_labels=_FreshLabels(live),
         config=sample_config,
-        queue_cache_store=MagicMock(),
+        queue_cache_store=store if store is not None else MagicMock(),
         state=lambda: state,
         run_locked=lambda fn: fn(),
     )
@@ -213,28 +216,95 @@ class TestTheGitHubSideSettlesFirst:
         assert labels.needs_human not in live[ISSUE]
         assert state.session_history == []
 
-    def test_dismiss_tolerates_an_ordinary_label_it_cannot_remove(
+    def test_dismiss_stops_on_an_ordinary_label_it_cannot_remove(
         self, sample_config, state
     ):
-        """A label that is already gone raises too.
+        """Dismiss obeys the SAME invariant retry does (#6999 F5 round 7).
 
-        That is not a reason to refuse an operator asking for the issue to go
-        away - only the shared block may stop this command.
+        This used to be excused as "a label that is already gone raises too".
+        It is not true of the production adapter: ``remove_label`` treats a 404
+        as idempotent success and retries transport faults itself, so a raise
+        reaching here means GitHub still carries the label. Pruning the board
+        over it leaves an issue blocked on GitHub, invisible locally, and an
+        operator told it was dismissed - which is the entire defect this
+        command exists to prevent, arriving through the other door.
+
+        Every local store is asserted, because "left in place" has to mean all
+        of them: the history gate, the retry gate, the cached copies the
+        planner reads, and the snapshot persisted behind them.
         """
+        from unittest.mock import MagicMock
+
+        from issue_orchestrator.domain.models import Issue
+
         labels = LabelManager(sample_config)
         live = {ISSUE: {labels.blocked, labels.needs_human}}
+        cached = Issue(number=ISSUE, title="Blocked issue", labels=["blocked"])
+        state.cached_scope_issues = [cached]
+        state.cached_queue_issues = [cached]
+        store = MagicMock()
         _labels, runner = _runner(
-            sample_config, state, live, refuse=frozenset({labels.blocked})
+            sample_config,
+            state,
+            live,
+            refuse=frozenset({labels.blocked}),
+            store=store,
         )
 
         outcome = runner.dismiss(ISSUE)
 
-        assert outcome.committed
-        assert state.session_history == []
+        assert outcome.status is OperatorCommandStatus.INCOMPLETE
+        assert not outcome.committed
+        assert labels.blocked in outcome.failed
+        # The shared block DID come off, and that is reported honestly...
+        assert labels.needs_human in outcome.removed
+        # ...but nothing local moved, because GitHub and the board would then
+        # disagree about an issue that is still gated.
+        assert [entry.issue_number for entry in state.session_history] == [ISSUE]
+        assert state.failed_this_cycle == {ISSUE}
+        assert state.cached_scope_issues == [cached]
+        assert state.cached_queue_issues == [cached]
+        assert store.mock_calls == [], "no queue snapshot may be persisted"
+
+    def test_retry_leaves_the_same_stores_alone_on_a_removal_failure(
+        self, sample_config, state
+    ):
+        """The retry half of the same assertion, so the pair cannot drift."""
+        from unittest.mock import MagicMock
+
+        from issue_orchestrator.domain.models import Issue
+
+        labels = LabelManager(sample_config)
+        live = {ISSUE: {labels.blocked, labels.needs_human}}
+        cached = Issue(number=ISSUE, title="Blocked issue", labels=["blocked"])
+        state.cached_scope_issues = [cached]
+        state.cached_queue_issues = [cached]
+        store = MagicMock()
+        _labels, runner = _runner(
+            sample_config,
+            state,
+            live,
+            refuse=frozenset({labels.blocked}),
+            store=store,
+        )
+
+        outcome = runner.retry(ISSUE)
+
+        assert outcome.status is OperatorCommandStatus.INCOMPLETE
+        assert [entry.issue_number for entry in state.session_history] == [ISSUE]
+        assert state.failed_this_cycle == {ISSUE}
+        assert state.cached_scope_issues == [cached]
+        assert store.mock_calls == []
 
 
 class TestTheOutcomeSaysWhatHappened:
-    """One typed result the transport maps, rather than a code it interprets."""
+    """FACTS, not a response body (#6999 F6 round 7).
+
+    The command reports what the transition did; how that is phrased and shaped
+    belongs to whoever is talking to the operator. So these assert the typed
+    fields, and the route tests assert the mapping - neither reaches into the
+    other's business.
+    """
 
     def test_a_refusal_names_the_label_and_who_is_holding_it(
         self, sample_config, state
@@ -250,18 +320,22 @@ class TestTheOutcomeSaysWhatHappened:
             ),
         )
 
-        body = runner.retry(ISSUE).payload()
+        outcome = runner.retry(ISSUE)
 
-        assert body["success"] is False
-        assert body["failed_labels"] == [labels.needs_human]
-        assert body["held_by"] == ["claim_quarantine"]
-        assert "claim_quarantine still requires it" in body["error"]
-        assert "was not retried" in body["error"]
+        assert outcome.intent is OperatorCommandIntent.RETRY
+        assert outcome.status is OperatorCommandStatus.STILL_BLOCKED
+        assert outcome.issue_number == ISSUE
+        assert outcome.blocked == labels.needs_human
+        assert outcome.held_by == ("claim_quarantine",)
 
-    def test_a_refusal_that_is_a_plain_write_failure_says_so_instead(
+    def test_a_refusal_that_is_a_plain_write_failure_names_no_holder(
         self, sample_config, state
     ):
-        """No holder to name: the block simply did not come off."""
+        """Nothing is holding it; the block simply did not come off.
+
+        A distinct fact from the refusal above, and the transport says
+        something different about each - so the outcome has to keep them apart.
+        """
         labels = LabelManager(sample_config)
         live = {ISSUE: {labels.needs_human}}
 
@@ -274,22 +348,39 @@ class TestTheOutcomeSaysWhatHappened:
             sample_config, state, live, block=_FailingBlock(labels.needs_human, live)
         )
 
-        body = runner.dismiss(ISSUE).payload()
+        outcome = runner.dismiss(ISSUE)
 
-        assert body["success"] is False
-        assert body["held_by"] == []
-        assert "could not be cleared" in body["error"]
-        assert "was not dismissed" in body["error"]
+        assert outcome.intent is OperatorCommandIntent.DISMISS
+        assert outcome.status is OperatorCommandStatus.STILL_BLOCKED
+        assert outcome.blocked == labels.needs_human
+        assert outcome.held_by == ()
 
-    def test_the_committed_payload_tells_the_operator_what_came_off(
-        self, sample_config, state
-    ):
+    def test_a_committed_outcome_reports_what_came_off(self, sample_config, state):
         labels = LabelManager(sample_config)
         live = {ISSUE: {labels.blocked, labels.needs_human}}
         _labels, runner = _runner(sample_config, state, live)
 
-        body = runner.retry(ISSUE).payload()
+        outcome = runner.retry(ISSUE)
 
-        assert body["success"] is True
-        assert "retry" in body["message"].lower()
-        assert labels.needs_human in body["removed_labels"]
+        assert outcome.status is OperatorCommandStatus.COMMITTED
+        assert outcome.blocked is None
+        assert outcome.failed == ()
+        assert labels.needs_human in outcome.removed
+
+    def test_the_outcome_carries_no_response_shape_at_all(
+        self, sample_config, state
+    ):
+        """The dependency direction, pinned.
+
+        A command that grows a ``payload()`` again has taken transport policy
+        back into the core, and the port would once more be describing one
+        concrete implementation rather than a contract.
+        """
+        labels = LabelManager(sample_config)
+        live = {ISSUE: {labels.needs_human}}
+        _labels, runner = _runner(sample_config, state, live)
+
+        outcome = runner.retry(ISSUE)
+
+        assert not hasattr(outcome, "payload")
+        assert not hasattr(outcome, "message")

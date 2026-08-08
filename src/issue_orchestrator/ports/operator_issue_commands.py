@@ -16,17 +16,73 @@ drifted between them.
 So the transport asks for a COMMAND and maps ONE typed outcome. It does not know
 the label owner, the retry-history representation, the queue cache, or the order
 they must be touched in.
+
+The outcome lives HERE rather than in the control implementation (#6999 F6): a
+port whose return type is owned by one concrete implementation is not a contract
+anybody can depend on, it is that implementation wearing a Protocol. And the
+outcome carries FACTS - what happened, to which labels, held by whom - never a
+response body. How those facts are phrased and shaped is transport policy, and
+lives at the transport edge.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
+from enum import Enum
 from typing import TYPE_CHECKING, Callable, Protocol, TypeVar
 
 if TYPE_CHECKING:
-    from ..control.operator_issue_command_runner import OperatorCommandOutcome
     from ..domain.models import OrchestratorState
 
 _T = TypeVar("_T")
+
+
+class OperatorCommandIntent(Enum):
+    """Which button the operator pressed.
+
+    Carried as an enum rather than a rendered verb so the command never has to
+    choose the operator's words: "queued for retry" and "dismissed" are things
+    to SAY about a transition, and saying them is the transport's job.
+    """
+
+    RETRY = "retry"
+    DISMISS = "dismiss"
+
+
+class OperatorCommandStatus(Enum):
+    """How far an operator command got. The transport maps only this."""
+
+    #: Labels cleared AND local state settled. The operator's request happened.
+    COMMITTED = "committed"
+    #: The shared needs-human block is still on the issue - its owner refused,
+    #: or the write did not commit. Nothing after it was touched.
+    STILL_BLOCKED = "still_blocked"
+    #: Ordinary gating labels would not come off GitHub, so local state was
+    #: deliberately left in place rather than letting the planner relaunch.
+    INCOMPLETE = "incomplete"
+
+
+@dataclass(frozen=True, slots=True)
+class OperatorCommandOutcome:
+    """One settled operator transition, as facts rather than as a response."""
+
+    intent: OperatorCommandIntent
+    status: OperatorCommandStatus
+    issue_number: int
+    removed: tuple[str, ...] = ()
+    #: Ordinary labels GitHub would not remove. A genuine failed write: the
+    #: repository adapter already treats an absent label as idempotent success
+    #: and already retries transport faults, so anything surfacing here means
+    #: the label is still on the issue (#6999 F5 round 7).
+    failed: tuple[str, ...] = ()
+    #: The shared block, when it is what stopped the command.
+    blocked: str | None = None
+    #: Which lifecycles are holding that block, for the operator to act on.
+    held_by: tuple[str, ...] = field(default_factory=tuple)
+
+    @property
+    def committed(self) -> bool:
+        return self.status is OperatorCommandStatus.COMMITTED
 
 
 class LockedRunner(Protocol):
@@ -38,11 +94,11 @@ class LockedRunner(Protocol):
 class OperatorIssueCommands(Protocol):
     """The two operator commands, each a single settled transition."""
 
-    def retry(self, issue_number: int) -> "OperatorCommandOutcome":
+    def retry(self, issue_number: int) -> OperatorCommandOutcome:
         """Unblock the issue and make the planner eligible to pick it up."""
         ...
 
-    def dismiss(self, issue_number: int) -> "OperatorCommandOutcome":
+    def dismiss(self, issue_number: int) -> OperatorCommandOutcome:
         """Unblock the issue and take it off the board without retrying."""
         ...
 
@@ -68,6 +124,9 @@ class OperatorIssueCommandFactory(Protocol):
 
 __all__ = [
     "LockedRunner",
+    "OperatorCommandIntent",
+    "OperatorCommandOutcome",
+    "OperatorCommandStatus",
     "OperatorIssueCommandFactory",
     "OperatorIssueCommands",
 ]

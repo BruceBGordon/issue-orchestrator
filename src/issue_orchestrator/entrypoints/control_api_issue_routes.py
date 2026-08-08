@@ -21,6 +21,11 @@ from ..control.worktree_manager import get_worktree_path
 from ..domain.models import get_completion_path
 from ..domain.review_exchange_verdict import ExchangeVerdict
 from ..domain.session_run import SessionRunAssets
+from ..ports.operator_issue_commands import (
+    OperatorCommandIntent,
+    OperatorCommandOutcome,
+    OperatorCommandStatus,
+)
 from ..infra.env import ENV_PREFIX
 from .control_api_issue_support import ControlApiIssueDependency, StateLockFn
 
@@ -33,8 +38,17 @@ logger = logging.getLogger(__name__)
 control_issue_router = APIRouter()
 
 
+#: What each command is called once it has happened, for the operator reading
+#: the toast. Wording is transport policy: the command reports the transition,
+#: this decides how to say it (#6999 F6 round 7).
+_OPERATOR_COMMAND_WORDING = {
+    OperatorCommandIntent.RETRY: ("queued for retry", "retried"),
+    OperatorCommandIntent.DISMISS: ("dismissed", "dismissed"),
+}
+
+
 def _operator_command(
-    deps: "ControlApiIssueDependency", issue_number: int, intent: str
+    deps: "ControlApiIssueDependency", issue_number: int, intent: OperatorCommandIntent
 ) -> JSONResponse:
     """Run one operator command and map its typed outcome to HTTP (#6999 F5).
 
@@ -44,9 +58,6 @@ def _operator_command(
     side committed. Both buttons route through this one function, so neither
     can grow its own version of that ordering - which is precisely how dismiss
     came to prune its state and report success over a refusal retry honoured.
-
-    A refusal is a 409: not a 500, because nothing went wrong, and not a 200,
-    because the issue really is still blocked.
     """
     orchestrator = deps.get_orchestrator()
     if orchestrator is None:
@@ -55,18 +66,87 @@ def _operator_command(
             status_code=503,
         )
     commands = orchestrator.operator_issue_commands
+    invoke = {
+        OperatorCommandIntent.RETRY: commands.retry,
+        OperatorCommandIntent.DISMISS: commands.dismiss,
+    }[intent]
     try:
-        outcome = (
-            commands.retry(issue_number)
-            if intent == "retry"
-            else commands.dismiss(issue_number)
-        )
+        outcome = invoke(issue_number)
     except Exception as exc:
-        logger.exception("Error running %s on issue #%d: %s", intent, issue_number, exc)
+        logger.exception(
+            "Error running %s on issue #%d: %s", intent.value, issue_number, exc
+        )
         return JSONResponse({"success": False, "error": str(exc)}, status_code=500)
-    return JSONResponse(
-        outcome.payload(), status_code=200 if outcome.committed else 409
+    return _operator_command_response(outcome)
+
+
+def _settled_body(outcome: OperatorCommandOutcome, done: str, attempted: str) -> dict:
+    del attempted
+    return {
+        "success": True,
+        "message": f"Issue #{outcome.issue_number} {done}",
+        "removed_labels": list(outcome.removed),
+    }
+
+
+def _still_blocked_body(
+    outcome: OperatorCommandOutcome, done: str, attempted: str
+) -> dict:
+    del done
+    cause = (
+        f"{', '.join(outcome.held_by)} still requires it"
+        if outcome.held_by
+        else "it could not be cleared"
     )
+    return {
+        "success": False,
+        "error": (
+            f"Issue #{outcome.issue_number} was not {attempted}: "
+            f"{outcome.blocked} is still on the issue because {cause}."
+        ),
+        "removed_labels": list(outcome.removed),
+        "failed_labels": [outcome.blocked],
+        "held_by": list(outcome.held_by),
+    }
+
+
+def _incomplete_body(
+    outcome: OperatorCommandOutcome, done: str, attempted: str
+) -> dict:
+    del done
+    return {
+        "success": False,
+        "error": (
+            f"Issue #{outcome.issue_number} was not {attempted}: failed to "
+            f"remove {list(outcome.failed)} from GitHub. Removed "
+            f"{list(outcome.removed)} successfully; retry the action."
+        ),
+        "removed_labels": list(outcome.removed),
+        "failed_labels": list(outcome.failed),
+    }
+
+
+#: One row per outcome the command can produce: how to describe it, and what
+#: that means over HTTP. A table rather than a branch chain because the set is
+#: closed and exhaustive - a new outcome should fail loudly with a KeyError
+#: here, not fall through some `else` into a plausible-looking response.
+#:
+#: Neither unsettled row is a 500 (nothing went wrong; the command did exactly
+#: what it should) and neither is a 200 (the issue really is still blocked).
+#: 409 with the labels still on the issue lets the dashboard say so instead of
+#: showing an optimistic toast.
+_OPERATOR_RESPONSE_BY_STATUS = {
+    OperatorCommandStatus.COMMITTED: (_settled_body, 200),
+    OperatorCommandStatus.STILL_BLOCKED: (_still_blocked_body, 409),
+    OperatorCommandStatus.INCOMPLETE: (_incomplete_body, 409),
+}
+
+
+def _operator_command_response(outcome: OperatorCommandOutcome) -> JSONResponse:
+    """Turn one typed outcome into this API's response contract."""
+    done, attempted = _OPERATOR_COMMAND_WORDING[outcome.intent]
+    build, code = _OPERATOR_RESPONSE_BY_STATUS[outcome.status]
+    return JSONResponse(build(outcome, done, attempted), status_code=code)
 
 
 @control_issue_router.post("/api/preflight-push")
@@ -511,7 +591,7 @@ async def retry_issue(
     deps: ControlApiIssueDependency,
 ) -> JSONResponse:
     """Retry a blocked issue by removing the blocked label and re-queueing."""
-    return _operator_command(deps, issue_number, "retry")
+    return _operator_command(deps, issue_number, OperatorCommandIntent.RETRY)
 
 
 @control_issue_router.post("/api/issues/{issue_number}/dismiss")
@@ -520,7 +600,7 @@ async def dismiss_issue(
     deps: ControlApiIssueDependency,
 ) -> JSONResponse:
     """Dismiss a blocked issue without retrying."""
-    return _operator_command(deps, issue_number, "dismiss")
+    return _operator_command(deps, issue_number, OperatorCommandIntent.DISMISS)
 
 
 @control_issue_router.post("/api/issues/{issue_number}/close")

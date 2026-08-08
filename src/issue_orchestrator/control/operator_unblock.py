@@ -19,6 +19,13 @@ consume it. Two rules live here rather than in either endpoint:
   tech-lead marker, which is frequently the very provenance the refusal was
   protecting: removing it would leave the shared label standing with nothing
   left to explain or recover it.
+
+Ordinary labels are attempted individually and each failure is REPORTED rather
+than swallowed. This owner does not decide what a failure means - its caller
+does, from the outcome - but it must not make one invisible: a removal that
+raises here has already been through the repository adapter's own idempotence
+(a 404 is success) and its own transport retries, so it is a label GitHub still
+carries (#6999 F5 round 7).
 """
 
 from __future__ import annotations
@@ -26,7 +33,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING
 
 from .needs_human_block import BlockOutcome, SharedNeedsHumanBlock
 from .retry_policy import labels_to_remove_for_retry
@@ -43,9 +50,12 @@ class OperatorUnblockOutcome:
     """What an operator command managed to clear, and what stopped it."""
 
     removed: tuple[str, ...] = ()
-    #: Ordinary labels that could not be removed. Historically tolerated on the
-    #: dismiss path - a label that is already gone raises here too - so it is
-    #: kept SEPARATE from the shared block, whose absence is the whole question.
+    #: Ordinary labels GitHub would not remove. A genuine FAILED WRITE, not a
+    #: label that was already gone: the repository adapter treats a 404 as
+    #: idempotent success and retries transport faults itself, so anything
+    #: surfacing here means the label is still on the issue (#6999 F5 round 7).
+    #: Kept separate from the shared block only because the block is the one
+    #: failure that must also stop the labels AFTER it from being touched.
     failed: tuple[str, ...] = ()
     #: The shared block, when it is still on the issue: its owner refused, or
     #: the write did not commit. Either way the issue is not unblocked, and
@@ -65,33 +75,6 @@ class OperatorUnblockOutcome:
         reconciliation pass contradicts.
         """
         return not self.failed and self.blocked is None
-
-    def refusal(self, issue_number: int, performed: str) -> dict[str, Any]:
-        """Describe a refusal for the operator who asked (#6999 F3 round 5).
-
-        Shaped here rather than in either endpoint because a refusal must mean
-        the same thing to both: the label that is still on the issue, the
-        lifecycles holding it, and what was cleared before the command stopped.
-        ``performed`` is the past participle of the command ("retried",
-        "dismissed"), so the operator reads what did NOT happen.
-        """
-        if self.blocked is None:
-            raise ValueError("not a refusal: nothing is blocking this issue")
-        cause = (
-            f"{', '.join(self.held_by)} still requires it"
-            if self.held_by
-            else "it could not be cleared"
-        )
-        return {
-            "success": False,
-            "error": (
-                f"Issue #{issue_number} was not {performed}: {self.blocked} is "
-                f"still on the issue because {cause}."
-            ),
-            "removed_labels": list(self.removed),
-            "failed_labels": [self.blocked],
-            "held_by": list(self.held_by),
-        }
 
 
 @dataclass(frozen=True, slots=True)
