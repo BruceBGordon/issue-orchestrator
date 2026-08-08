@@ -166,10 +166,13 @@ Four concrete mechanisms in today's code destroy or strand the work:
    question its callers ask ("is there work here that must not be destroyed?")
    rather than for a workflow phase, because a `pending`-shaped predicate reads
    false for a `FAILED` record and would hand exactly the work this ADR protects to
-   the nuclear reset. The owner is a **required parameter of the activity predicate
-   as well as of teardown** — optional on one side would mean the two boundaries
-   read the same owner set only by convention, and convention is what a future
-   caller forgets. Callers must also **consume** the returned disposition rather
+   the nuclear reset. The owner is not a *parameter* of either boundary:
+   both are methods on one immutable `IssueRuntimeLifecycleOwners` value that also
+   carries the run-evidence source, so the freshness predicate and the teardown read
+   the same owner set because they are two methods on one object — not because every
+   call site remembered to pass the same arguments. A parameter list can always be
+   satisfied with a different set; here there is nothing to pass and nothing to
+   omit. Callers must also **consume** the returned disposition rather
    than discard it, so scratch reset can never discard work the predicate did not
    observe. Two mechanical consequences the contract makes explicit rather than
    leaving to the implementer:
@@ -322,16 +325,32 @@ Four concrete mechanisms in today's code destroy or strand the work:
    never inferred from labels looking correct, because cleanup labels do not prove
    the routing mutation happened.
 
-9. **The wedged-owner escape is a Repository Engine command, not an issue action.**
+9. **The wedged-owner escape needs two owners, and one of them does not exist yet.**
    Because a claim is never taken from a live owner, an owner that wedges is
-   resolved by stopping its engine — which must therefore be reachable. The
-   disposition owner exposes the claim holder as a typed `EngineIdentity` **fact**
-   on its read model and nothing more; Control Center presents it on the issue and
-   dispatches the standard `Stop engine` action from the engine surface through the
-   existing Repository Engine lifecycle owner, extended to accept the instance to
-   target. An issue-detail handler must never reach into supervisor state or build
-   a stop call from persisted PID fields, and an engine on another host is
-   presented as unavailable rather than offered.
+   resolved by stopping its engine — which must therefore be reachable. There is no
+   Repository Engine lifecycle owner for *stopping* today: `ControlCenterActions`
+   owns pause/resume/refresh and friends but no stop command, and the stop routes
+   call `SupervisorOps` directly, one of them with the default `instance_id=None`,
+   which cannot target the named instance holding a claim. So this ADR defines
+   `RepositoryEngineLifecycle` over `SupervisorOps` and routes the **existing** stop
+   surfaces through it, giving engine lifecycle one boundary instead of three call
+   sites.
+
+   The recovery-specific guard is a *separate*, smaller owner. A plain
+   `StopEngineCommand` carries no record binding — engine lifecycle has no business
+   knowing about validated work, and the generic engine surface has no issue context
+   after a link — so "stop this engine only if it still owns this exact record"
+   becomes a bounded control-layer coordinator that re-reads the owner, refuses on
+   any mismatch or a non-local target with zero effect, and delegates a plain stop
+   only on an exact match. Without that command, the guard could only be scattered
+   between a UI route, the disposition store, and `SupervisorOps`.
+
+   The disposition owner stays read-only with respect to engine lifecycle: it
+   publishes the claim holder as a fact, with **stop availability computed by the
+   owner and carried as data** rather than by a read-model property consulting
+   process-global host state. An issue-detail handler must never reach into
+   supervisor state or build a stop call from persisted PID fields, and an engine on
+   another host is presented as unavailable rather than offered.
 
 10. **Publication resolution is one atomic store command per verified route.**
    Marking a record recovered, advancing the forward-only published-lineage fact

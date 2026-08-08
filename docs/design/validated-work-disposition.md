@@ -937,7 +937,8 @@ class ValidatedWorkSnapshot:
     escrow_retained: bool
     observation_revision: int                  # §2.1.1; posted back as authority (§8.4)
     waits_on_record_id: str                    # §2.1.4; '' unless PENDING behind a sibling
-    owner: EngineIdentity | None               # §4.4e claim holder; a FACT, not a control
+    owner: ClaimOwnerFact | None               # §4.4e claim holder + stop availability;
+                                               # a FACT the owner computes, not a control
     publish_attempts: int             # §4.4e attempt rows; a retry loop is visible
     finalization_phase: FinalizationPhase      # §4.5b; where a resumed finalize restarts
     updated_at: str
@@ -1320,7 +1321,10 @@ ValidatedWorkDispositionService(
     publisher, finalizer, other_activity, liveness, action_applier, label_manager,
     needs_human_block, events,
 )
-IssueRuntimeLifecycleOwners(core, validated_work)            # the FULL five: teardown + reset
+IssueRuntimeLifecycleOwners(core, validated_work, issue_run_evidence)
+    # the FULL five PLUS the run-evidence source; the one value teardown and reset use.
+    # `issue_run_evidence` is the SAME instance injected into the launch owner above,
+    # so the ledger read at teardown is the ledger written at launch (§2.5).
 ```
 
 `IssueRunEvidenceService` is also injected into the **launch** owner, which calls
@@ -1951,7 +1955,8 @@ things in order, each immutable:
                                  pair_registry, job_supervisor, publish_recovery)
 2. other_activity = OtherRuntimeActivity(core)        # implements the port above
 3. validated_work = ValidatedWorkDispositionService(..., other_activity, ...)
-4. lifecycle = IssueRuntimeLifecycleOwners(core, validated_work)   # the FULL five
+4. lifecycle = IssueRuntimeLifecycleOwners(core, validated_work, run_evidence)
+                                                      # the FULL five + evidence source
 ```
 
 `lifecycle` is what `terminate_issue_runtime()`, `has_active_issue_runtime()` and
@@ -3416,43 +3421,142 @@ modelled as one:
 
 | Concern | Owner | Shape |
 |---|---|---|
-| Who holds the claim | `ValidatedWorkDispositionOwner.snapshot()` | `owner: EngineIdentity or None` — a fact on the read model |
+| Who holds the claim | `ValidatedWorkDispositionOwner.snapshot()` | `owner: ClaimOwnerFact or None` — engine identity plus owner-computed stop availability |
 | Presenting it | Control Center issue detail | "Owned by engine `<label>` (`Running`)", with a link to that engine's surface. **No engine control is embedded in the issue view** |
-| Stopping it | the Repository Engine lifecycle owner | a typed, instance-targeted `StopEngineCommand(engine, actor, reason)` dispatched from the engine surface under the standard **`Stop engine`** label |
+| Guarding the stop | a control-layer coordinator | `StopValidatedWorkOwnerCommand(record_id, expected_engine, actor, reason)` — re-reads the owner and refuses on any mismatch |
+| Stopping it | `RepositoryEngineLifecycle` (new; §8.4) | a plain instance-targeted `StopEngineCommand(engine, actor, reason)` under the standard **`Stop engine`** label |
 
 ```python
 @dataclass(frozen=True, slots=True)
 class EngineIdentity:
-    """Stable, targetable name of a Repository Engine. Never a raw pid."""
+    """Stable, targetable name of a Repository Engine. Never a raw pid.
+
+    Identity only. It deliberately has no `targetable_here` property: a frozen
+    read-model fact that consults `local_host()` reads process-global state at
+    an arbitrary later moment, which is both a boundary leak and a value that
+    can disagree with the render it was shown in. Targetability is produced by
+    the owner (below) and carried as data.
+    """
 
     instance_id: str | None      # None == the single-instance engine
     host: str
     label: str                   # display name, e.g. "orchestrator-2"
 
-    @property
-    def targetable_here(self) -> bool:
-        """False for another host: we can present it, never stop it locally."""
-        return self.host == local_host()
+
+class EngineStopAvailability(StrEnum):
+    """Whether THIS Control Center can stop that engine. Owner-produced."""
+    AVAILABLE   = "available"
+    REMOTE_HOST = "remote_host"    # present it; never offer a control
+
+
+@dataclass(frozen=True, slots=True)
+class ClaimOwnerFact:
+    """What the read model reports about who holds a record's claim."""
+    engine: EngineIdentity
+    stop_availability: EngineStopAvailability   # computed at snapshot time
 ```
 
-- The lifecycle owner's stop path already accepts `instance_id`
-  (`Supervisor.stop(..., instance_id=...)`); the command names that value explicitly
-  instead of defaulting to `None`, which is what made the repository-scoped route
-  unable to target a named instance.
-- **A different host is presented, not offered.** `targetable_here` false renders the
-  owner as informational text naming the host, with the action absent (not a
-  disabled-looking control), because there is nothing this Control Center can do
-  about it. Same conservatism as row 2 of §4.4e's liveness matrix.
-- **A stale owner identity is refused, not guessed.** If the engine named by the
-  command is no longer the record's claim holder when it is dispatched, the handler
-  refuses with zero effect and the surface re-renders — the same render-time-facts
-  discipline as §4.3 check 0.
+#### The engine lifecycle owner does not exist yet, so this design defines it
+
+The earlier draft said this "extends the existing Repository Engine lifecycle
+owner". There is no such owner for stopping. `ControlCenterActions` owns commands
+for pause, resume, refresh, doctor, audit, trace, labels and stale worktrees
+(`execution/control_center_actions.py:357-381`) — but not stop; the Control Center
+stop route calls `SupervisorOps.stop_all_instances()` directly
+(`entrypoints/control_api_orchestrator_routes.py:393`), and the legacy repository
+route calls `SupervisorOps.stop()` with the default `instance_id=None`
+(`entrypoints/control_api.py:540`). So there was nothing to extend, and the
+instance-targeted stop this recovery needs had no home.
+
+Two owners are defined, at two different altitudes, because two different questions
+are being asked:
+
+```python
+@dataclass(frozen=True, slots=True)
+class StopEngineCommand:
+    """Plain engine lifecycle. Knows nothing about validated work."""
+    engine: EngineIdentity
+    actor: str
+    reason: str
+
+
+class StopEngineStatus(StrEnum):
+    STOPPED       = "stopped"
+    NOT_RUNNING   = "not_running"
+    REMOTE_HOST   = "remote_host"     # refused: not ours to stop
+    FAILED        = "failed"
+
+
+@dataclass(frozen=True, slots=True)
+class StopEngineOutcome:
+    status: StopEngineStatus
+    engine: EngineIdentity
+    message: str
+
+
+class RepositoryEngineLifecycle(Protocol):
+    """The named boundary every engine stop goes through, new and existing."""
+    def stop_engine(self, command: StopEngineCommand) -> StopEngineOutcome: ...
+    def engines(self) -> tuple[EngineIdentity, ...]: ...
+```
+
+`SupervisorRepositoryEngineLifecycle` implements it over `SupervisorOps`, composed
+in bootstrap, and calls `stop(repo_root, instance_id=command.engine.instance_id,
+reason=..., actor=...)` — naming the instance explicitly rather than defaulting to
+`None`, which is exactly what made the repository-scoped route unable to target a
+named engine. It becomes `ControlCenterActions.stop_cmd`, and the **existing** stop
+surfaces are re-pointed through it, so there is one stop boundary rather than three
+direct `SupervisorOps` call sites.
+
+#### The recovery guard is its own bounded coordinator
+
+`StopEngineCommand` deliberately carries no `record_id`: engine lifecycle has no
+business knowing about validated work, and the generic engine surface has even less
+context after a link from an issue. But the guard this recovery needs — *stop this
+engine only if it still owns this exact record* — has to live somewhere, and neither
+the route (which would re-derive policy) nor the disposition store (which would
+gain a lifecycle dependency) may hold it. So it is a small control-layer command of
+its own:
+
+```python
+@dataclass(frozen=True, slots=True)
+class StopValidatedWorkOwnerCommand:
+    """Stop the engine that owns this record — if it still does."""
+    record_id: str
+    expected_engine: EngineIdentity     # exactly what the operator was shown
+    actor: str
+    reason: str
+
+
+class StopOwnerRefusal(StrEnum):
+    NOT_OWNED      = "not_owned"        # the record has no claim holder now
+    OWNER_CHANGED  = "owner_changed"    # someone else holds it; re-render
+    REMOTE_HOST    = "remote_host"      # not ours to stop
+```
+
+The coordinator re-reads the record's current owner through
+`ValidatedWorkDispositionOwner.snapshot()`, refuses on **any** mismatch or a
+non-local target with zero effect, and only on an exact match delegates a plain
+`StopEngineCommand` to `RepositoryEngineLifecycle`. Three boundaries stay intact:
+the disposition owner remains read-only with respect to engine lifecycle, the engine
+owner remains ignorant of validated work, and the route dispatches a typed command
+instead of implementing policy.
+
+- **A different host is presented, not offered.** `EngineStopAvailability.REMOTE_HOST`
+  renders the owner as informational text naming the host, with the action absent
+  (not a disabled-looking control), because there is nothing this Control Center can
+  do about it. Same conservatism as row 2 of §4.4e's liveness matrix, and the
+  coordinator refuses it a second time server-side.
+- **A stale owner identity is refused, not guessed.** `expected_engine` is the
+  render-time fact; if the claim moved before the click, the coordinator returns
+  `OWNER_CHANGED` with zero effect and the surface re-renders — the same
+  render-time-facts discipline as §4.3 check 0.
 - The disposition owner exposes the holder and nothing else. It has no stop method,
   constructs no supervisor call, and reads no supervisor state; the issue-detail
   handler likewise never builds a stop call from persisted PID fields.
 - Accessibility matches the rest of §8.4: native `<button>`, keyboard reachable,
   visible focus ring, accessible name including the engine label, `Running`/`Not
-  running` conveyed as text rather than colour alone, and — since stopping an engine
+  running` and `REMOTE_HOST` conveyed as text rather than colour alone, and — since stopping an engine
   halts all of its work, not only this record — a confirm step stating that scope,
   focus-trapped and `Escape`-dismissible. Its failure toast does not auto-dismiss.
 - Terminology follows the `control-center-lifecycle` skill exactly: **Control Center**
@@ -3580,8 +3684,10 @@ sweeps above:
 | §4.4e liveness | `RepoLockLiveness` proves death from the **gate**, never from `lock.json`: a hand-written or stale advertisement naming a dead pid does not authorize takeover. |
 | §4.4e liveness matrix | One deterministic case per row, driven against real gate files: (1) self ⇒ False; (2) different host ⇒ False, with no filesystem access to that host attempted; (3) **same-instance restart** ⇒ True with **no probe issued** — asserted by a gate double that fails the test if the held gate is reopened, since probing it would self-conflict and strand the record forever; (4) single-instance current vs any other owner ⇒ True; (5) named current vs a former single-instance owner ⇒ True; (6) named current vs a *different* live named instance ⇒ False by non-blocking probe, and ⇒ True once that instance's gate is released, with the probe asserted not to disturb the live holder. |
 | §4.4e relinquish | `relinquish_claim()` is callable only by the owner at a stage boundary, clears ownership and bumps the fence, and lets the next drain proceed with no death proof. There is **no** operation that takes a claim from a live owner — asserted by the absence of such a method on the port and by a guardrail. |
-| §8.4 stop engine | Record owner → engine command → lifecycle handler, both sides: a `PUBLISHING` record under a live owner renders `owner` as an `EngineIdentity` fact with a link to the engine surface and **no engine control in the issue view**; the engine surface's `Stop engine` dispatches an instance-targeted command that reaches `Supervisor.stop(..., instance_id=<that instance>)` — asserted for a named instance in a multi-instance repository, where the repository-scoped route would have stopped the wrong engine. |
-| §8.4 stop engine | A different-host owner renders as informational text naming the host with the action **absent**, not disabled. A command naming an engine that no longer holds the claim is refused with zero effect and a re-render. The disposition owner exposes no stop method and reads no supervisor state, and the issue-detail handler builds no stop call from pid fields — both asserted by guardrail. |
+| §8.4 stop engine (producer) | Snapshot → rendered context → guarded request: a `PUBLISHING` record under a live owner renders `owner` as a `ClaimOwnerFact` with a link to the engine surface and **no engine control in the issue view**, and the action posts a `StopValidatedWorkOwnerCommand` whose `expected_engine` is byte-for-field the rendered identity. |
+| §8.4 stop engine (handler) | Guarded request → lifecycle: an exact match reaches `Supervisor.stop(..., instance_id=<that instance>)` through `RepositoryEngineLifecycle` — asserted for a **named** instance in a multi-instance repository, the case where the repository-scoped route would have stopped the wrong engine. `OWNER_CHANGED` (claim moved between render and click), `NOT_OWNED` (claim released), and `REMOTE_HOST` each return zero effect with no supervisor call at all. |
+| §8.4 stop engine | `EngineIdentity` has no `targetable_here` property and consults no process-global host state; availability arrives as owner-computed data, asserted by constructing the identity in a process whose local host differs from the snapshot's and checking the rendered availability is unchanged. |
+| §8.4 stop engine | `RepositoryEngineLifecycle` is the single stop boundary: the **existing** Control Center stop surfaces route through it, and a guardrail rejects any module outside its implementation that calls `SupervisorOps.stop`/`stop_all_instances`. The disposition owner exposes no stop method and reads no supervisor state; the issue-detail handler builds no stop call from pid fields. |
 | §4.4e takeover | There is **no** operation that displaces a live owner: the store port exposes none, and a guardrail asserts none is added. A wedged live owner leaves the record `PUBLISHING` — asserted unresolved, escrow retained, reset blocked — and the UI surfaces the owning engine. Stopping that engine (releasing its gate) is what lets the next drain acquire. |
 | §4.4e attempts | Restart at **every** attempt boundary: after the claim/before the call, after the call/before `record_attempt_outcome`, and after the outcome. Each resumes without a duplicate remote write. |
 | §4.4e attempts | A transient failure is followed by a **real second attempt**: attempt 2 is a distinct durable row with its own identity, the operation identity `(record_id, target_head_sha)` is unchanged, and the published head is still exactly one commit. |
@@ -3605,9 +3711,9 @@ sweeps above:
 | §7 label ownership | A validated-work `FAILED` writes **no** `tech-lead-needs-human` and **no** `needs-human`: it keeps `recovery-pending` and registers `NeedsHumanCause.VALIDATED_WORK_DISPOSITION` through the needs-human owner. Restarting the tech-lead reconciler over that issue fabricates **no** escalation and adds no explanatory comment. |
 | §7 label ownership | `FAILED → RECOVERED` and `FAILED → ABANDONED` both withdraw the cause, and no stale marker or `needs-human` survives either transition. A second, independent needs-human cause keeps the block — the withdrawal is targeted, not a blanket clear. |
 | §3.2 reset freshness | Scratch-reset freshness for **every** state, with `FAILED` asserted reset-**ineligible**, and `ABANDONED` asserted eligible only after a recorded `OperatorResolution`. |
-| §3.2 owner symmetry | `has_active_issue_runtime()` cannot be called without the disposition owner (required parameter), and `_ResetRetryRuntimeOwners` carries it into both the freshness check and the teardown. |
-| §4.3 check 5 liveness | A `QUEUED` record with **no** other active owner drains to `RECOVERED`. This is the regression test for the self-deadlock: without the exclusion, the owner's own `has_unresolved_work()` reads true, check 5 fails, and the record never publishes on this or any later drain. A companion case adds a live pair and asserts the drain *is* blocked with `RUNTIME_ACTIVE` and zero writes, so the exclusion did not disable the check it narrows. |
-| §4.3 check 5 scope | `excluding` suppresses **only** `VALIDATED_WORK`: one test per other owner — active session, pair, supervised job, publish retry — each still blocks the drain, and the blocking kind is named in the returned fact. A probe that raises lands in `unverifiable_owners` and also blocks. |
+| §3.2 owner symmetry | There is **no** way to call either boundary without the full owner set, because there is no per-owner surface to call: both are methods on one `IssueRuntimeLifecycleOwners` value, and `_ResetRetryRuntimeOwners` holds that same value. A test that tries to reconstruct the boundary from pieces has no function to call. |
+| §4.3 check 5 liveness | A `QUEUED` record with **no** other active owner drains to `RECOVERED`. This is the regression test for the self-deadlock: had the drain consulted the *full* predicate, the owner's own `has_unresolved_work()` would read true, check 5 would fail, and the record would never publish on this or any later drain. A companion case adds a live pair and asserts the drain *is* blocked with `RUNTIME_ACTIVE` and zero writes, so the narrower bundle did not weaken the check it narrows. |
+| §4.3 check 5 scope | Exercised against `OtherRuntimeActivity(core)` **with no exclusion argument, because none exists**: one case per core owner — active session, pair, supervised job, publish retry — each still blocks the drain with its kind named in the returned fact, and a probe that raises lands in `unverifiable_owners` and also blocks. Validated work is absent from the answer because it is absent from the bundle, not because it was filtered out. |
 | §4.3 check 5 seam | Bootstrap wiring is acyclic and shares by identity: `CoreIssueRuntimeOwners` is constructed once and is the *same object* inside both `OtherRuntimeActivity` and `IssueRuntimeLifecycleOwners` (asserted with `is`), the full lifecycle value contains the validated-work owner while the core bundle does not, and the disposition service is constructed successfully with only the port. A guardrail asserts the service imports no runtime-owner module, and that neither activity API accepts an exclusion argument. |
 | A10 boundary | Both views derive from **one** `core.probe()`: a fake core recording its calls proves the full predicate and `other_runtime_activity()` evaluate the same four probes, and adding a probe to the core reaches both without a second edit. A guardrail rejects any module that constructs `CoreIssueRuntimeOwners`/`IssueRuntimeLifecycleOwners` outside bootstrap, or that calls a per-owner termination/activity function — the individual-owner reconstruction path, not just the exclusion parameter. |
 | A10 boundary | `_ResetRetryRuntimeOwners` holds the same `IssueRuntimeLifecycleOwners` value the terminator uses (asserted with `is`), so the dashboard reset and the tech-lead reset cannot consult a different owner set than the teardown they authorize. |
@@ -3626,7 +3732,7 @@ sweeps above:
 | §2.1.4 atomicity | `resolve_observed_merge()` refuses a `PUBLISHING` record with `PUBLICATION_IN_FLIGHT` and zero writes, so history reconciliation can never resolve a record out from under a live publisher; `resolve_published()` refuses a stale claim the same way. Neither command exposes a transaction handle. |
 | §2.1.4 lineage fact | `validated_work_lineage` is advanced by **both** verified routes — the §4.4 drain (`PUSHED_BY_OWNER`) and §3.5's merged-PR containment (`OBSERVED_MERGE`) — never moves backward, and is the single source both the in-flight waiter rule and the post-resolution rules read. Asserted by driving the same two heads through both orderings and requiring identical end states. |
 | §2.1.4 lineage fact | **Resolve `H` through history reconciliation** (merged PR, no push by this owner), then admit a late **ancestor**, **descendant** and **divergent** record through ordinary capture, orphan repair, and the slice-8 backfill path. The ancestor resolves by verified containment; the descendant parks `REMOTE_BASELINE_UNPROVEN` unless its captured expectation is the recorded published head, because `OBSERVED_MERGE` proves no baseline of ours; the divergent parks. Nothing is left unresolved by arrival order, and no route reaches check 8 with a stale expectation. |
-| §2.1.4 waiters | Predecessor **definitive failure** and **abandonment**: waiters are classified against the unpublished head by the ordinary §2.1.4 rules and no baseline moves. Predecessor **attempt expiry/reconciliation**: waiters stay `PENDING`, because reconciliation is not resolution. |
+| §2.1.4 waiters | Predecessor **definitive failure** and **abandonment**: waiters are classified against the unpublished head by the ordinary §2.1.4 rules and no baseline moves. Predecessor **outcome-less attempt taken over by a proven-dead successor**: the record stays `PUBLISHING` while the successor reconciles it, and waiters stay `PENDING` — a change of owner is not a resolution, and there is no expiry that could make it one. |
 | §2.1.4 lineage | `ux_validated_work_lineage_head` makes two simultaneously drainable rows on one lineage key unrepresentable, under concurrent admission. |
 | §3.5 history ordering | The selected ordering and **all** side effects, for a merged PR and a closed one: shipped-fix capture precedes the history mutation, the history events are emitted, the terminator runs, and the bound batch appears on the `ActionResult` and on `VALIDATED_WORK_DISPOSITION_OBSERVED` — with **no** disposition field on `HISTORY_RECONCILED` or `REVIEW_MERGED`, asserted positively on both. A merged PR containing `validated_head_sha` resolves the row; a merged PR that does not, and a closed PR, leave it unresolved with escrow intact. |
 | §3.5 history ordering | An escrow failure inside the terminator: the history mutation stands, the action reports the failure, and the **retry reaches the terminator through the no-op branch** — the regression for a runtime that is never released and a disposition that is never captured. |
@@ -3677,8 +3783,13 @@ reset now stale-downgrades while unresolved work exists.
   back in.
 - `ValidatedWorkDispositionService` does not reference `PublishRecoveryService` —
   the two admission owners are siblings, not a chain.
-- Every `terminate_issue_runtime()` call site passes an `IssueRunEvidenceSource`,
-  and no disposition or termination module imports `RecordedSessionRunLookup`,
+- No call site passes an `IssueRunEvidenceSource`, a disposition owner, or any
+  individual runtime owner to a termination or activity boundary: each receives one
+  already-complete `IssueRuntimeLifecycleOwners` value and cannot supply or omit its
+  parts. Bootstrap asserts that value's `run_evidence` **is** the same
+  `IssueRunEvidenceSource` instance registered with the launch owner, so the ledger
+  read at teardown is the ledger written at run creation. No disposition or
+  termination module imports `RecordedSessionRunLookup`,
   `SessionOutput.find_run_dir`, or any latest-run/session-name/worktree-scan
   helper. Run assets reach the boundary by injection or not at all.
 - No module outside the needs-human owner adds or removes `needs-human` or
@@ -3808,12 +3919,15 @@ Ordered so each slice is independently shippable and leaves the tree green.
    retention sweep has a real setting to read on the same day it exists.
 3. **Owner, admission-only.** `dispose_at_termination()` returning an empty batch or `PARKED` members
    plus evidence capture and the §1.1 target-identity rules, taking the
-   `AutomaticCaptureCommand` built from slice 1b's evidence. Wire the disposition
-   owner **and the run-evidence source** into `terminate_issue_runtime()`, and the
-   disposition owner into `has_active_issue_runtime()`, as required parameters; add
-   the fifth activity probe (`has_unresolved_work`), convert the probe tuple to the
-   `IssueRuntimeOwnerKind`-keyed mapping, add the `CoreIssueRuntimeOwners` /
-   `OtherRuntimeActivity` / `IssueRuntimeLifecycleOwners` layering, narrow
+   `AutomaticCaptureCommand` built from slice 1b's evidence. Introduce
+   `CoreIssueRuntimeOwners`/`OtherRuntimeActivity`/`IssueRuntimeLifecycleOwners` and
+   move `terminate_issue_runtime()` and `has_active_issue_runtime()` onto it as
+   methods, **deleting the free functions and their per-owner parameters** so no
+   call site can assemble its own set; add the fifth activity probe
+   (`has_unresolved_work`), convert the probe tuple to the
+   `IssueRuntimeOwnerKind`-keyed mapping evaluated once in `core.probe()`, bind the
+   single `IssueRunEvidenceSource` instance into the lifecycle value beside the one
+   given to the launch owner, narrow
    `IssueRuntimeTerminator` to return `IssueRuntimeTermination`, and make **every**
    call site — including `history_reconciliation`, whose no-op branch must also
    reach the terminator (§3.5) — consume the result. The typing changes ship here
