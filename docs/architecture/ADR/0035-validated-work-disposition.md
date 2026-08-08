@@ -338,12 +338,24 @@ Four concrete mechanisms in today's code destroy or strand the work:
 
    The recovery-specific guard is a *separate*, smaller owner. A plain
    `StopEngineCommand` carries no record binding — engine lifecycle has no business
-   knowing about validated work, and the generic engine surface has no issue context
-   after a link — so "stop this engine only if it still owns this exact record"
-   becomes a bounded control-layer coordinator that re-reads the owner, refuses on
-   any mismatch or a non-local target with zero effect, and delegates a plain stop
-   only on an exact match. Without that command, the guard could only be scattered
-   between a UI route, the disposition store, and `SupervisorOps`.
+   knowing about validated work — so "stop this engine only if it still owns this
+   exact record" becomes a bounded control-layer coordinator that re-reads the owner
+   through an exact `snapshot_record(record_id)`, refuses on any mismatch or a
+   non-local target with zero effect, and delegates a plain stop only on an exact
+   match. Without that command, the guard could only be scattered between a UI
+   route, the disposition store, and `SupervisorOps`. The record context reaches the
+   engine surface through the issue-detail link, so the engine control stays where
+   engine controls belong while still being record-bound.
+
+   **The new boundary owns the targeted stop only, and the consolidation is
+   deferred with a tracked follow-up.** The existing stop routes also carry bulk,
+   force, graceful-timeout, port-fallback and shutdown-operation semantics, and the
+   tree has stop consumers in MCP, CLI, repository removal, restart and
+   reconciliation. Migrating all of that is a project of its own and does not belong
+   inside a validated-work design; asserting it in passing was a scoping error. The
+   guardrail is therefore narrowed to the surfaces this design introduces, with the
+   repo-wide version as the follow-up's exit criterion, and the recovery path
+   depends on none of it.
 
    The disposition owner stays read-only with respect to engine lifecycle: it
    publishes the claim holder as a fact, with **stop availability computed by the

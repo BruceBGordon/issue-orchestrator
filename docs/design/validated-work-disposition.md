@@ -447,11 +447,13 @@ BEGIN IMMEDIATE
   # --- 2. New evidence.
   if row is NULL:
       INSERT record (state := initial_state)
-      INSERT evidence (:evidence_id, role := CURRENT, observation_revision := 0)
+      INSERT evidence (:evidence_id, role := CURRENT, observation_revision := 0,
+                       initial_state, initial_failure, initial_reason)   # §5
       classify_lineage(row)              # §2.1.4, same transaction
       -> ADMITTED
   if row.state == PUBLISHING:
-      INSERT evidence (:evidence_id, role := ATTACHED)   # DURABLE, not just escrow
+      INSERT evidence (:evidence_id, role := ATTACHED,
+                       initial_state, initial_failure, initial_reason)   # §5; §2.1.3
       -> ATTACHED                        # do not disturb an in-flight submission
   if row.state == RECOVERED:
       # This validated head is already published, so this evidence's work is safe.
@@ -508,8 +510,27 @@ the moment the record leaves `PUBLISHING`:
 | Record reached | Every attached row becomes | Why |
 |---|---|---|
 | `RECOVERED` | `SUPERSEDED` (record untouched) | attached evidence is for the **same** `ValidatedWorkKey`, so its validated head is exactly the head that just published. Its work is safe; retain the bytes, act on nothing. |
-| `FAILED` | the **oldest** attached row becomes `CURRENT`, the failed current becomes `SUPERSEDED`, and the record re-opens to that evidence's initial state (`QUEUED`/`PARKED`); remaining attached rows stay attached | this is the "new evidence resolves a `FAILED` row in place" rule (§2.1.3), reached from the other direction. A failure must never be left blocking behind evidence that could clear it. |
-| `ABANDONED` | as `FAILED`, re-opening to `PARKED` | new evidence for abandoned work is the signal that made it recoverable. |
+| `FAILED` | the **oldest** attached row becomes `CURRENT`, the failed current becomes `SUPERSEDED`, and the record re-opens to **that row's persisted `initial_state`, `initial_failure` and `initial_reason`**; remaining attached rows stay attached | this is the "new evidence resolves a `FAILED` row in place" rule (§2.1.3), reached from the other direction. A failure must never be left blocking behind evidence that could clear it. |
+| `ABANDONED` | as `FAILED`, re-opening to that row's persisted initial disposition (never below `PARKED`) | new evidence for abandoned work is the signal that made it recoverable. |
+
+**The promoted row's disposition is read from the relation, never re-derived or
+defaulted, and that is a safety property rather than a convenience.** Evidence is
+admitted `PARKED` whenever §5's comparison says approval is required —
+`WORKTREE_AHEAD_OF_VALIDATION`, `branch_binding_verified=False` after a detached
+HEAD (#7017), and every other approval-required condition. An attached row can be
+promoted arbitrarily long after that judgement was made, in a different process,
+with the worktree long gone. If the store had to guess, default, or re-inspect,
+the plausible default is `QUEUED` — and `QUEUED` means the next drain publishes it
+automatically. Work that was deliberately parked for a human would ship without one.
+
+So `initial_state`/`initial_failure`/`initial_reason` are written on the evidence
+row **at admission**, in the same transaction that inserts it (§2.1.3), and
+`resolve_attached_evidence()` copies them onto the record verbatim. No envelope is
+read: §2.1.2's `capture.json` is consulted only on orphan repair's `ADMITTED`
+branch, and this transition must work without a filesystem and without a restart.
+A promotion may only ever *raise* the bar, never lower it — `ABANDONED` re-opens no
+lower than `PARKED` even for a row admitted `QUEUED`, because abandonment is a human
+decision that new evidence reopens for review rather than overrides.
 
 The transition is idempotent and runs under the record's fence (§4.4e), so a stale
 publisher cannot drive it. Rows are processed oldest-first by `admitted_at`, so the
@@ -991,6 +1012,9 @@ class ValidatedWorkDispositionOwner(Protocol):
     the in-flight work first), and retains escrow + refs for the retention
     window regardless. Never callable by an agent.
     """
+
+    def snapshot_record(self, record_id: str) -> ValidatedWorkSnapshot | None: ...
+    """Exact read by durable primary key (§8.4). None when no such record."""
 
     def snapshot(self, issue_number: int) -> tuple[ValidatedWorkSnapshot, ...]: ...
     """Read model for the UI/view-model layer. Never re-derives policy.
@@ -1491,6 +1515,12 @@ CREATE TABLE IF NOT EXISTS validated_work_evidence (
     pinned_ref            TEXT NOT NULL,              -- validated commit
     observed_ref          TEXT NOT NULL DEFAULT '',   -- unvalidated worktree head, if any
     observation_revision  INTEGER NOT NULL DEFAULT 0, -- §2.1.1; bumped by every refresh
+    -- The disposition THIS evidence was admitted with (§5). Durable because an
+    -- attached row may be promoted long after capture, and promoting it as QUEUED
+    -- when it was captured PARKED would auto-publish approval-required work.
+    initial_state         TEXT NOT NULL,              -- ValidatedWorkState: QUEUED or PARKED
+    initial_failure       TEXT NOT NULL DEFAULT '',   -- ValidatedWorkFailure, e.g. WORKTREE_AHEAD_OF_VALIDATION
+    initial_reason        TEXT NOT NULL DEFAULT '',
     admitted_at           TEXT NOT NULL,
     role_changed_at       TEXT NOT NULL,
     released_at           TEXT NOT NULL DEFAULT ''    -- retention release (§6)
@@ -2602,28 +2632,17 @@ audit record does not create mutual exclusion: the old process could pass
 in-memory review/history append beside the new owner. That is precisely the window
 the death rule exists to close, so the operation is removed. What the operator gets
 instead is the honest sequence: the Control Center shows the record as owned by a
-named, still-running engine and offers **stop that engine** — an existing lifecycle
-control. Stopping it releases the gate, death becomes provable, and the next drain
-takes over automatically. The fence never moves while the owner is alive.
+named, still-running engine, and the engine surface offers a record-guarded
+**`Stop engine`** (§8.4). Stopping it releases the gate, death becomes provable, and
+the next drain takes over automatically. The fence never moves while the owner is alive.
 
 **That remedy has to be reachable, so §8.4 makes it a real, targeted command.** The
 Control Center's existing stop route is repository-scoped and calls
 `Supervisor.stop(..., instance_id=None)`, which cannot stop the *particular named
 instance* holding a claim in multi-instance mode — so "stop that engine" would have
-been advice the UI could not act on. The design therefore requires three things,
-each on the side that owns it:
-
-- The disposition owner exposes the claim holder as a **fact**, never as a control:
-  `ValidatedWorkSnapshot.owner: EngineIdentity | None` (§2.2). It does not stop
-  anything and does not know how to.
-- **`EngineIdentity` is the stable, targetable name of a Repository Engine** —
-  `instance_id` (`None` for single-instance), `host`, and a display label — derived
-  from the recorded `ProcessIdentity` but deliberately *not* the raw pid: an
-  issue-detail handler must never build a stop call out of persisted PID fields.
-- Stopping goes through the **existing Repository Engine lifecycle owner**, extended
-  with an instance-targeted command (§8.4). Control Center dispatches it from the
-  engine surface with the standard `Stop engine` label; the issue detail links to
-  that surface rather than embedding an engine control in an issue view.
+been advice the UI could not act on. §8.4 defines the three pieces this needs: the
+disposition owner publishing the claim holder as a fact, a new targeted engine-stop
+boundary, and a record-guarded coordinator between them.
 
 #### Proving death from the gate, not from the advertisement
 
@@ -3438,6 +3457,7 @@ class EngineIdentity:
     the owner (below) and carried as data.
     """
 
+    repo_root: str               # the repository this engine serves; the adapter needs it
     instance_id: str | None      # None == the single-instance engine
     host: str
     label: str                   # display name, e.g. "orchestrator-2"
@@ -3501,12 +3521,58 @@ class RepositoryEngineLifecycle(Protocol):
 ```
 
 `SupervisorRepositoryEngineLifecycle` implements it over `SupervisorOps`, composed
-in bootstrap, and calls `stop(repo_root, instance_id=command.engine.instance_id,
+in bootstrap, and calls `stop(repo_root, force=False, instance_id=engine.instance_id,
 reason=..., actor=...)` — naming the instance explicitly rather than defaulting to
 `None`, which is exactly what made the repository-scoped route unable to target a
-named engine. It becomes `ControlCenterActions.stop_cmd`, and the **existing** stop
-surfaces are re-pointed through it, so there is one stop boundary rather than three
-direct `SupervisorOps` call sites.
+named engine. It becomes `ControlCenterActions.stop_cmd`.
+
+#### What this boundary owns today, and what it deliberately does not
+
+An earlier draft said the existing stop surfaces would be "re-pointed through it, so
+there is one stop boundary", and paired that with a guardrail rejecting **every**
+direct `SupervisorOps.stop`/`stop_all_instances` call outside the adapter. Both
+claims were wrong about the size of the job. The primary Control Center stop route
+carries materially more behaviour than a targeted stop — bulk `stop_all_instances`,
+`force`, `force_if_timeout`, a graceful timeout, a port-targeted fallback, and
+shutdown-operation admission/cleanup
+(`entrypoints/control_api_orchestrator_routes.py:340-400`) — and the tree has direct
+stop consumers well beyond the Control Center: MCP, CLI, repository removal,
+restart, and reconciliation paths. Migrating all of that is a real project, and
+asserting it in passing inside a validated-work design was the wrong place to
+decide it.
+
+So the boundary is scoped honestly:
+
+| Concern | This design | Where it lives today |
+|---|---|---|
+| Targeted graceful stop of **one** named or single-instance engine | **owned here** — `stop_engine()`, the only behaviour the wedged-owner recovery needs | new |
+| Bulk `stop_all_instances`, `force`, `force_if_timeout`, graceful-timeout policy, port-targeted fallback, shutdown-operation admission/cleanup | **explicitly out of scope** — enumerated so the consolidation knows exactly what must move | `control_api_orchestrator_routes.py`, unchanged |
+| MCP, CLI, repository-removal, restart and reconciliation stop consumers | **not migrated** | their current call sites, unchanged |
+
+`EngineIdentity` therefore carries `repo_root` alongside `instance_id`, `host` and
+`label`: the adapter needs a repository to stop, and a stop command that inferred it
+from ambient state would be the same mistake as `targetable_here`.
+
+**The guardrail is narrowed to match.** It rejects direct `SupervisorOps.stop` /
+`stop_all_instances` calls from the **validated-work, disposition and issue-detail**
+modules — the surfaces this design introduces — rather than repo-wide. A repo-wide
+guardrail is the *exit criterion of the consolidation*, not something this design
+can honestly assert while five other consumers still call the supervisor directly.
+
+**Deferred, with a tracked follow-up.** Consolidating every engine-stop surface
+behind `RepositoryEngineLifecycle` is deferred under the Final Abstraction Pass
+rule, because it materially expands scope and risk beyond #7024:
+
+| Field | Value |
+|---|---|
+| Scope | Move bulk/force/grace/port/shutdown-operation semantics onto `RepositoryEngineLifecycle`; migrate the Control Center, legacy repository, MCP, CLI, repository-removal, restart and reconciliation consumers; widen the guardrail repo-wide; non-regression tests for each existing behaviour |
+| Owner | the #7024 implementation owner (slice 7), handing off at that slice |
+| Due | the milestone that ships slice 7 |
+| Risk | until then, engine stop has **two** paths — the new targeted one and the existing routes — so a behaviour change made in one is not automatically reflected in the other. Bounded because the new path has exactly one caller (the guarded coordinator) and one behaviour (targeted graceful stop) |
+| Link | recorded as a follow-up proposal on this change; slice 7 references it |
+
+Nothing in the validated-work recovery path depends on the deferral: the guarded
+coordinator needs only `stop_engine()`, which ships here complete.
 
 #### The recovery guard is its own bounded coordinator
 
@@ -3528,19 +3594,74 @@ class StopValidatedWorkOwnerCommand:
     reason: str
 
 
-class StopOwnerRefusal(StrEnum):
-    NOT_OWNED      = "not_owned"        # the record has no claim holder now
-    OWNER_CHANGED  = "owner_changed"    # someone else holds it; re-render
-    REMOTE_HOST    = "remote_host"      # not ours to stop
+class StopOwnerStatus(StrEnum):
+    """Total. Every dispatch ends on exactly one of these."""
+    STOPPED           = "stopped"          # the owning engine was stopped
+    ALREADY_STOPPED   = "already_stopped"  # it was not running; claim is now takeable
+    NO_SUCH_RECORD    = "no_such_record"   # record_id resolves to nothing
+    NOT_OWNED         = "not_owned"        # the record has no claim holder now
+    OWNER_CHANGED     = "owner_changed"    # someone else holds it; re-render
+    REPO_MISMATCH     = "repo_mismatch"    # the engine serves a different repository
+    REMOTE_HOST       = "remote_host"      # not ours to stop
+    STOP_FAILED       = "stop_failed"      # the lifecycle owner reported failure
+
+
+@dataclass(frozen=True, slots=True)
+class StopOwnerOutcome:
+    status: StopOwnerStatus
+    observed_owner: ClaimOwnerFact | None   # what the re-read actually found
+    message: str
+
+
+class ValidatedWorkOwnerStopCoordinator(Protocol):
+    def stop_owning_engine(
+        self, command: StopValidatedWorkOwnerCommand
+    ) -> StopOwnerOutcome: ...
 ```
 
-The coordinator re-reads the record's current owner through
-`ValidatedWorkDispositionOwner.snapshot()`, refuses on **any** mismatch or a
-non-local target with zero effect, and only on an exact match delegates a plain
+The coordinator re-reads the record's current owner, refuses on **any** mismatch or
+a non-local target with zero effect, and only on an exact match delegates a plain
 `StopEngineCommand` to `RepositoryEngineLifecycle`. Three boundaries stay intact:
 the disposition owner remains read-only with respect to engine lifecycle, the engine
 owner remains ignorant of validated work, and the route dispatches a typed command
 instead of implementing policy.
+
+**The re-read needs an exact record lookup, so the owner port gains one.**
+`snapshot(issue_number)` is the wrong shape here: `record_id` is a canonical hash
+(§2.1.1), so a coordinator holding only a record id cannot derive the issue number
+and would have to reach into the store — the boundary this split exists to keep. The
+owner therefore exposes an exact read beside the per-issue one:
+
+```python
+def snapshot_record(self, record_id: str) -> ValidatedWorkSnapshot | None: ...
+    """Exact read by the durable primary key. `None` when no such record."""
+```
+
+It is a read model, not a new authority: it returns the same
+`ValidatedWorkSnapshot` §2.2 already defines, including the `ClaimOwnerFact` the
+comparison needs.
+
+**Composition.** `ValidatedWorkOwnerStopCoordinator` is constructed in bootstrap
+from exactly two collaborators — the disposition owner (read) and
+`RepositoryEngineLifecycle` (write) — and is reached by the Control Center as a
+command, never as loose logic in a route.
+
+**Where the control lives, and how the record context reaches it.** The engine
+control stays on the engine surface (the `control-center-lifecycle` rule that engine
+controls belong in engine surfaces), and the record binding travels with the link:
+
+| Step | Surface | What it carries |
+|---|---|---|
+| 1 | Issue detail | renders the `ClaimOwnerFact` as text — "Owned by engine `<label>` (`Running`)" — and a **link**, not a control, to that engine's surface with the record context: `…/engines/{instance}?stop_owner_of={record_id}` |
+| 2 | Engine surface | with that context present, renders the native **`Stop engine`** button whose accessible name includes the engine label, alongside the record it would unblock. Without the context it renders the ordinary engine controls, unchanged |
+| 3 | POST | `POST /api/engines/{instance_id}/stop-validated-work-owner` with body `{record_id, engine: {repo_root, instance_id, host, label}, reason}` — the engine object echoed **verbatim** from what step 2 rendered, exactly as §4.3 check 0's authority snapshot is echoed |
+| 4 | Handler | builds `StopValidatedWorkOwnerCommand` from the body alone and dispatches it to the coordinator; it re-derives nothing and decides nothing |
+
+The endpoint is registered in the UI OpenAPI contract per the `ui-openapi` skill
+with a required request body and the typed `StopOwnerOutcome` as its response, and
+it uses the **shared browser-session auth helper** for CSRF/SSE-token handling like
+every other engine control (`control-center-lifecycle` rule 8) rather than a
+bespoke path. `actor` comes from the authenticated session, never the body.
 
 - **A different host is presented, not offered.** `EngineStopAvailability.REMOTE_HOST`
   renders the owner as informational text naming the host, with the action absent
@@ -3572,8 +3693,12 @@ instead of implementing policy.
   `deps.validated_work.recover(...)`, and
   `POST /api/issues/{issue_number}/abandon-validated-work` →
   `deps.validated_work.abandon(...)` with the operator's identity and a
-  **required** non-empty reason from the request body. Register both endpoints and
-  their payloads in the UI OpenAPI contract per the `ui-openapi` skill.
+  **required** non-empty reason from the request body.
+- One endpoint on the **engine** surface, because it is an engine action:
+  `POST /api/engines/{instance_id}/stop-validated-work-owner` →
+  `deps.validated_work_owner_stop.stop_owning_engine(...)`, returning the typed
+  `StopOwnerOutcome`. Register all three endpoints and their payloads in the UI
+  OpenAPI contract per the `ui-openapi` skill.
 - Accessibility for the new action buttons: native `<button>`, keyboard reachable,
   visible focus ring, accessible name that includes the issue number, and a
   non-colour status signal (text + icon) for `PARKED`/`FAILED`/`ABANDONED` in both
@@ -3684,10 +3809,12 @@ sweeps above:
 | §4.4e liveness | `RepoLockLiveness` proves death from the **gate**, never from `lock.json`: a hand-written or stale advertisement naming a dead pid does not authorize takeover. |
 | §4.4e liveness matrix | One deterministic case per row, driven against real gate files: (1) self ⇒ False; (2) different host ⇒ False, with no filesystem access to that host attempted; (3) **same-instance restart** ⇒ True with **no probe issued** — asserted by a gate double that fails the test if the held gate is reopened, since probing it would self-conflict and strand the record forever; (4) single-instance current vs any other owner ⇒ True; (5) named current vs a former single-instance owner ⇒ True; (6) named current vs a *different* live named instance ⇒ False by non-blocking probe, and ⇒ True once that instance's gate is released, with the probe asserted not to disturb the live holder. |
 | §4.4e relinquish | `relinquish_claim()` is callable only by the owner at a stage boundary, clears ownership and bumps the fence, and lets the next drain proceed with no death proof. There is **no** operation that takes a claim from a live owner — asserted by the absence of such a method on the port and by a guardrail. |
-| §8.4 stop engine (producer) | Snapshot → rendered context → guarded request: a `PUBLISHING` record under a live owner renders `owner` as a `ClaimOwnerFact` with a link to the engine surface and **no engine control in the issue view**, and the action posts a `StopValidatedWorkOwnerCommand` whose `expected_engine` is byte-for-field the rendered identity. |
-| §8.4 stop engine (handler) | Guarded request → lifecycle: an exact match reaches `Supervisor.stop(..., instance_id=<that instance>)` through `RepositoryEngineLifecycle` — asserted for a **named** instance in a multi-instance repository, the case where the repository-scoped route would have stopped the wrong engine. `OWNER_CHANGED` (claim moved between render and click), `NOT_OWNED` (claim released), and `REMOTE_HOST` each return zero effect with no supervisor call at all. |
+| §8.4 stop engine (producer) | Snapshot → rendered context → guarded request, both hops: the issue detail renders the `ClaimOwnerFact` as text plus a **link carrying `stop_owner_of={record_id}`** and asserts **no engine control in the issue view**; the engine surface with that context renders the native `Stop engine` button and posts a body whose `engine` object is byte-for-field what it rendered. Without the context, the engine surface's ordinary controls are unchanged. |
+| §8.4 stop engine (handler) | Guarded request → coordinator → lifecycle: an exact match reaches `Supervisor.stop(..., instance_id=<that instance>, repo_root=<that repo>)` through `RepositoryEngineLifecycle` — asserted for a **named** instance in a multi-instance repository, the case where the repository-scoped route would have stopped the wrong engine. One case per `StopOwnerStatus` member, derived from the enum: `NO_SUCH_RECORD`, `NOT_OWNED` (claim released), `OWNER_CHANGED` (claim moved between render and click), `REPO_MISMATCH`, `REMOTE_HOST`, `ALREADY_STOPPED`, `STOP_FAILED` — every refusal with **zero** supervisor calls. |
+| §8.4 stop engine (transport) | The endpoint is registered in the UI OpenAPI contract with its required body and typed response; it uses the shared browser-session auth helper (CSRF/SSE token) rather than a bespoke path; `actor` comes from the session and a body-supplied `actor` is ignored. `snapshot_record()` is the only read the coordinator makes — a store double fails the test if the coordinator touches it directly. |
 | §8.4 stop engine | `EngineIdentity` has no `targetable_here` property and consults no process-global host state; availability arrives as owner-computed data, asserted by constructing the identity in a process whose local host differs from the snapshot's and checking the rendered availability is unchanged. |
-| §8.4 stop engine | `RepositoryEngineLifecycle` is the single stop boundary: the **existing** Control Center stop surfaces route through it, and a guardrail rejects any module outside its implementation that calls `SupervisorOps.stop`/`stop_all_instances`. The disposition owner exposes no stop method and reads no supervisor state; the issue-detail handler builds no stop call from pid fields. |
+| §8.4 stop engine | `RepositoryEngineLifecycle` owns the targeted graceful stop and **only** that: the guardrail rejects direct `SupervisorOps.stop`/`stop_all_instances` calls from validated-work, disposition and issue-detail modules, and a companion assertion records that the existing bulk/force/port routes are deliberately unmigrated (the tracked follow-up), so a later repo-wide widening is a visible change rather than a silent one. The disposition owner exposes no stop method and reads no supervisor state; the issue-detail handler builds no stop call from pid fields. |
+| §8.4 stop engine | `EngineIdentity` carries `repo_root`, and the adapter's `Supervisor.stop` call uses it rather than any ambient repository — asserted with two repositories present. |
 | §4.4e takeover | There is **no** operation that displaces a live owner: the store port exposes none, and a guardrail asserts none is added. A wedged live owner leaves the record `PUBLISHING` — asserted unresolved, escrow retained, reset blocked — and the UI surfaces the owning engine. Stopping that engine (releasing its gate) is what lets the next drain acquire. |
 | §4.4e attempts | Restart at **every** attempt boundary: after the claim/before the call, after the call/before `record_attempt_outcome`, and after the outcome. Each resumes without a duplicate remote write. |
 | §4.4e attempts | A transient failure is followed by a **real second attempt**: attempt 2 is a distinct durable row with its own identity, the operation identity `(record_id, target_head_sha)` is unchanged, and the published head is still exactly one commit. |
@@ -3700,6 +3827,8 @@ sweeps above:
 | §4.1 evidence relation | The `ux_validated_work_current_evidence` index makes two `current` rows for one record unrepresentable; a bug that tries produces an integrity error, not a silent second current. |
 | §2.1.3 attached | A capture arriving while the row is `PUBLISHING` durably records role `attached` and returns `ATTACHED` without disturbing the submission. **In the same process, without a restart**, the drain that resolves the submission then queries `attached_evidence()` and converges or supersedes. A second case restarts between the two and reaches the same end state. |
 | §2.1.3 attached | Attached evidence resolved after the current submission **fails**: `resolve_attached_evidence()` promotes the oldest attached row to `CURRENT`, supersedes the failed current, and the record leaves `FAILED` rather than staying blocked behind it. Multiple attached rows are processed oldest-first, deterministically. |
+| §2.1.3 attached | **Approval-required attached evidence stays approval-required.** Attach one row admitted `QUEUED` (worktree head == validated head, branch binding verified) and one admitted `PARKED(WORKTREE_AHEAD_OF_VALIDATION)`; fail the current publication; assert each promotes to **its own** persisted `initial_state`, that the parked one re-opens `PARKED` with its original failure and reason and is **not** drained, and that the auto-eligible one reaches `QUEUED`. Repeat the whole case **across a restart**, with the worktree deleted and no escrow envelope readable, so the values can only have come from the evidence relation. A store that defaults or re-derives publishes work a human was meant to approve. |
+| §2.1.3 attached | `ABANDONED` re-opens no lower than `PARKED` even for a row admitted `QUEUED`: promotion may raise the approval bar, never lower it. |
 | §2.1.3 attached | Resolution after the current submission **succeeds**: every attached row becomes `SUPERSEDED` and the record stays `RECOVERED`. The regression is the row that stayed `attached` forever — assert it is not re-selected on the next drain, or on any drain after that. |
 | §2.1.3 replay | **Repeating the same attached capture while the record is still `PUBLISHING`** returns `ATTACHED` with no insert and no integrity error. Repeating a `CURRENT` id converges; repeating a `SUPERSEDED` id returns `RETAINED` and changes nothing. Every role is replayed twice in a row. |
 | §2.1.2 orphan | Repair of an orphan **whose owning record and current evidence were created in the meantime** routes through the §2.1.3 transaction and lands on the branch that is correct *now* — `SUPERSEDES` or `ATTACHED` or `ALREADY_RECOVERED` — never writing `CURRENT` from the stale envelope. Assert the live current evidence is not demoted by the repair. |
@@ -3954,7 +4083,15 @@ Ordered so each slice is independently shippable and leaves the tree green.
    `UNWIRED_ACT_LEVEL_TECH_LEAD_ACTIONS` once the executor is wired.
 7. **Operator commands + contracts.** View model, public contract regeneration, UI
    OpenAPI, the `recover-validated-work` and `abandon-validated-work` endpoints, and
-   the dashboard actions (with the §8.4 accessibility requirements). `abandon()` is
+   the dashboard actions (with the §8.4 accessibility requirements). **Also the
+   wedged-owner recovery path**, which is its own body of work: the
+   `RepositoryEngineLifecycle` boundary and its `SupervisorOps` adapter, the
+   `ValidatedWorkOwnerStopCoordinator`, `snapshot_record()` on the owner port, the
+   `stop-validated-work-owner` endpoint with its OpenAPI/auth wiring, the engine-surface
+   control and the issue-detail link that carries `stop_owner_of`, and the narrowed
+   guardrail. The repo-wide stop consolidation is **deferred** with a tracked
+   follow-up (§8.4) and is explicitly *not* in this slice; slice 7 links it and
+   states the two-path risk it leaves open until then. `abandon()` is
    the last piece, deliberately: until it exists, unresolved work has no exit at all,
    which is the safe direction to be incomplete in.
 8. **Backfill the stranded cohort.** #6327/#6335/#6337 (#6914) and #5204/#5561
