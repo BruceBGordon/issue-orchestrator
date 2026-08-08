@@ -33,6 +33,7 @@ from .action_base import Action as Action, ActionType as ActionType
 # `action_results.py` and remain re-exported here for existing importers.
 from .action_results import ActionResult as ActionResult
 from .action_results import ActionResultType as ActionResultType
+from .action_results import SupportsApplyAction as SupportsApplyAction
 
 # Tech-lead action types live in their own module for cohesion and line budget;
 # re-exported here (including the domain value objects their fields use) so

@@ -380,6 +380,12 @@ class ActionApplier:
                 action,
                 issue_number=action.issue_number,
                 label=action.label,
+                # The presence check failed, so this add cannot prove the label
+                # was not already there. Callers that later REMOVE a label only
+                # when they added it need to know the difference (#6999 F12);
+                # reporting a bare success would let them retract someone
+                # else's block.
+                presence_unknown=has_label is None,
             )
         except Exception as e:
             self._record_label_stat(action.issue_number, "label_mutation_failed")

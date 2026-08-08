@@ -46,6 +46,8 @@ from ..ports.pending_work_claim_store import (
     ClaimLookup,
     ClaimState,
     ConflictingPendingWorkClaimError,
+    QuarantineLabelState,
+    QuarantineRecord,
     UnreadableClaim,
     UnresolvedClaim,
 )
@@ -74,11 +76,32 @@ CREATE TABLE IF NOT EXISTS pending_work_claim_quarantine (
     session_name TEXT NOT NULL,
     issue_number INTEGER NOT NULL,
     error TEXT NOT NULL,
-    escalated INTEGER NOT NULL DEFAULT 0
+    -- Durable state machine (#6999 F12). ``label_state`` records whether THIS
+    -- quarantine actually acquired the shared blocking label or found it
+    -- already there, so release can only ever remove a label it added.
+    -- ``announced`` is separate because AddLabel can land while the comment
+    -- fails. ``releasing`` marks a resolved cause whose cleanup has not yet
+    -- committed, so the row survives to be retried.
+    label_state TEXT NOT NULL DEFAULT 'unknown',
+    announced INTEGER NOT NULL DEFAULT 0,
+    releasing INTEGER NOT NULL DEFAULT 0
 );
 """
 
 STORE_FILENAME = "pending_work_claims.sqlite"
+
+
+def _schema_statements() -> tuple[str, ...]:
+    """The schema as individual statements.
+
+    ``executescript`` commits any pending transaction before it runs, so it
+    cannot be used inside the migration's single transaction (#6999 F13).
+    """
+    return tuple(
+        statement.strip()
+        for statement in _SCHEMA.split(";")
+        if statement.strip()
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +114,19 @@ class PendingWorkClaimMigrationError(RuntimeError):
     is running with an authoritative record the orchestrator cannot see, which
     is precisely how a live terminal gets admitted as carrying no work.
     """
+
+
+def _quarantine_record(row: sqlite3.Row) -> QuarantineRecord:
+    return QuarantineRecord(
+        quarantine_key=str(row["quarantine_key"]),
+        run_key=str(row["run_key"]),
+        session_name=str(row["session_name"]),
+        issue_number=int(row["issue_number"]),
+        error=str(row["error"]),
+        label_state=QuarantineLabelState(row["label_state"]),
+        announced=bool(row["announced"]),
+        releasing=bool(row["releasing"]),
+    )
 
 
 def _issue_number_of(claim: PendingWorkClaim) -> int:
@@ -124,7 +160,9 @@ class SqlitePendingWorkClaimStore:
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         conn = self._get_connection()
         self._migrate(conn)
-        conn.executescript(_SCHEMA)
+        for statement in _schema_statements():
+            conn.execute(statement)
+        conn.commit()
 
     @staticmethod
     def _migrate(conn: sqlite3.Connection) -> None:
@@ -147,6 +185,20 @@ class SqlitePendingWorkClaimStore:
         the row became operationally invisible, so a surviving terminal for it
         read as ABSENT and could be admitted claimless.
         """
+        leftover = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'pending_work_claim_old'"
+        ).fetchone()
+        if leftover is not None:
+            # Belt and braces: the single transaction below makes a surviving
+            # ``_old`` table unreachable, but a database that somehow reached
+            # that state must never be started against silently - the whole
+            # point of F13 is that its rows are still the authority.
+            raise PendingWorkClaimMigrationError(
+                "pending_work_claim_old is present, so a previous migration did "
+                "not complete. It still holds authoritative claims; resolve it "
+                "before starting again."
+            )
         columns = {
             row[1]
             for row in conn.execute("PRAGMA table_info(pending_work_claim)")
@@ -181,15 +233,30 @@ class SqlitePendingWorkClaimStore:
                     row["payload"],
                 )
             )
-        conn.execute("ALTER TABLE pending_work_claim RENAME TO pending_work_claim_old")
-        conn.executescript(_SCHEMA)
-        conn.executemany(
-            "INSERT OR REPLACE INTO pending_work_claim "
-            "(run_key, work_key, deferred, session_name, run_id, started_at, "
-            "issue_number, payload) VALUES (?, ?, 0, ?, ?, ?, ?, ?)",
-            migrated,
-        )
-        conn.execute("DROP TABLE pending_work_claim_old")
+        # ONE transaction for rename + create + copy + drop (#6999 F13).
+        # ``executescript`` would commit any pending transaction before running,
+        # which is exactly how a stop mid-migration could leave a current-shaped
+        # table beside the renamed original - after which the column check
+        # ABOVE returns early on the next start and the real rows are invisible.
+        # The schema statements are therefore executed individually, inside an
+        # explicit transaction that rolls back as a unit.
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute(
+                "ALTER TABLE pending_work_claim RENAME TO pending_work_claim_old"
+            )
+            for statement in _schema_statements():
+                conn.execute(statement)
+            conn.executemany(
+                "INSERT OR REPLACE INTO pending_work_claim "
+                "(run_key, work_key, deferred, session_name, run_id, started_at, "
+                "issue_number, payload) VALUES (?, ?, 0, ?, ?, ?, ?, ?)",
+                migrated,
+            )
+            conn.execute("DROP TABLE pending_work_claim_old")
+        except BaseException:
+            conn.rollback()
+            raise
         conn.commit()
         logger.info(
             "[WORK] Migrated %d pending-work claim(s) to the current schema",
@@ -303,6 +370,7 @@ class SqlitePendingWorkClaimStore:
                     run_key=row["run_key"],
                     session_name=row["session_name"],
                     deferred=bool(row["deferred"]),
+                    started_at=str(row["started_at"]),
                     issue_number=int(row["issue_number"]),
                     claim=claim,
                 )
@@ -335,14 +403,36 @@ class SqlitePendingWorkClaimStore:
             )
 
     def quarantine_key_for(self, run: SessionRunAssets) -> str:
-        """Run root PLUS the run's own start instant.
+        """Run root PLUS the start instant the ORCHESTRATOR recorded for it.
 
         Run roots are named from a second-resolution timestamp and created with
         ``exist_ok``, so a replacement run of one session can land on the same
-        directory. ``started_at`` has sub-second precision, so pairing the two
-        keeps each run generation's quarantine its own (#6999 F12).
+        directory; the start instant has sub-second precision and tells the
+        generations apart (#6999 F12).
+
+        It is read from this store's own row rather than from the run assets,
+        because those are rebuilt from the worktree manifest the agent can
+        write. Taking it from there would let a rewritten timestamp mint a fresh
+        quarantine key on every scan, re-commenting forever. Only when no row
+        exists at all - nothing was ever held for this run - does the run's own
+        value stand in, and no claim can be lost in that case.
         """
-        return f"{self.run_key_for(run)}@{run.identity.started_at}"
+        key = self.run_key_for(run)
+        row = self._get_connection().execute(
+            "SELECT started_at FROM pending_work_claim WHERE run_key = ?",
+            (key,),
+        ).fetchone()
+        recorded = row["started_at"] if row else run.identity.started_at
+        return f"{key}@{recorded}"
+
+    def run_key_for_path(self, run_dir: Path) -> str:
+        """The key for a run root the orchestrator recorded, before any parsing.
+
+        Discovery hands back a run directory long before ``SessionRunAssets``
+        can be rebuilt from it, and a run whose assets fail to parse must still
+        be recognised as live (#6999 F14).
+        """
+        return os.path.normpath(str(run_dir))
 
     def run_key_for(self, run: SessionRunAssets) -> str:
         """The run root, lexically normalised and never symlink-resolved.
@@ -353,7 +443,7 @@ class SqlitePendingWorkClaimStore:
         touching the filesystem, so the key is exactly the path the orchestrator
         allocated and the terminal registry recorded.
         """
-        return os.path.normpath(str(run.run_dir))
+        return self.run_key_for_path(run.run_dir)
 
     # -- quarantine --------------------------------------------------------
 
@@ -369,10 +459,47 @@ class SqlitePendingWorkClaimStore:
         with self._write_lock, self._transaction() as conn:
             conn.execute(
                 "INSERT INTO pending_work_claim_quarantine "
-                "(quarantine_key, run_key, session_name, issue_number, error, "
-                "escalated) VALUES (?, ?, ?, ?, ?, 0) "
-                "ON CONFLICT(quarantine_key) DO UPDATE SET error = excluded.error",
+                "(quarantine_key, run_key, session_name, issue_number, error) "
+                "VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(quarantine_key) DO UPDATE SET "
+                "error = excluded.error, releasing = 0",
                 (quarantine_key, run_key, session_name, issue_number, error),
+            )
+
+    def read_quarantine(self, quarantine_key: str) -> QuarantineRecord | None:
+        row = self._get_connection().execute(
+            "SELECT quarantine_key, run_key, session_name, issue_number, error, "
+            "label_state, announced, releasing FROM pending_work_claim_quarantine "
+            "WHERE quarantine_key = ?",
+            (quarantine_key,),
+        ).fetchone()
+        return _quarantine_record(row) if row else None
+
+    def record_quarantine_label_state(
+        self, quarantine_key: str, label_state: QuarantineLabelState
+    ) -> None:
+        with self._write_lock, self._transaction() as conn:
+            conn.execute(
+                "UPDATE pending_work_claim_quarantine SET label_state = ? "
+                "WHERE quarantine_key = ?",
+                (label_state.value, quarantine_key),
+            )
+
+    def mark_quarantine_announced(self, quarantine_key: str) -> None:
+        with self._write_lock, self._transaction() as conn:
+            conn.execute(
+                "UPDATE pending_work_claim_quarantine SET announced = 1 "
+                "WHERE quarantine_key = ?",
+                (quarantine_key,),
+            )
+
+    def mark_quarantine_releasing(self, quarantine_key: str) -> None:
+        """Record that the cause is gone but cleanup has not committed yet."""
+        with self._write_lock, self._transaction() as conn:
+            conn.execute(
+                "UPDATE pending_work_claim_quarantine SET releasing = 1 "
+                "WHERE quarantine_key = ?",
+                (quarantine_key,),
             )
 
     def release_quarantine(self, quarantine_key: str) -> None:
@@ -382,55 +509,29 @@ class SqlitePendingWorkClaimStore:
                 (quarantine_key,),
             )
 
-    def quarantined_run_keys(self) -> frozenset[str]:
-        return frozenset(
-            str(row["run_key"])
-            for row in self._get_connection().execute(
-                "SELECT run_key FROM pending_work_claim_quarantine"
-            )
-        )
-
-    def quarantine_keys_for_run(self, run_key: str) -> tuple[str, ...]:
+    def list_quarantines(self) -> tuple[QuarantineRecord, ...]:
         return tuple(
-            str(row["quarantine_key"])
+            _quarantine_record(row)
             for row in self._get_connection().execute(
-                "SELECT quarantine_key FROM pending_work_claim_quarantine "
-                "WHERE run_key = ?",
-                (run_key,),
+                "SELECT quarantine_key, run_key, session_name, issue_number, "
+                "error, label_state, announced, releasing "
+                "FROM pending_work_claim_quarantine"
             )
         )
-
-    def quarantine_issue_number(self, quarantine_key: str) -> int | None:
-        row = self._get_connection().execute(
-            "SELECT issue_number FROM pending_work_claim_quarantine "
-            "WHERE quarantine_key = ?",
-            (quarantine_key,),
-        ).fetchone()
-        return int(row["issue_number"]) if row else None
 
     def quarantined_issue_numbers(self) -> frozenset[int]:
+        """Issues held open by a quarantine whose cause is still present.
+
+        Rows already being released are excluded: their block is on its way
+        out, so nothing should treat them as a live reason to keep it.
+        """
         return frozenset(
             int(row["issue_number"])
             for row in self._get_connection().execute(
-                "SELECT issue_number FROM pending_work_claim_quarantine"
+                "SELECT issue_number FROM pending_work_claim_quarantine "
+                "WHERE releasing = 0"
             )
         )
-
-    def mark_quarantine_escalated(self, quarantine_key: str) -> None:
-        with self._write_lock, self._transaction() as conn:
-            conn.execute(
-                "UPDATE pending_work_claim_quarantine SET escalated = 1 "
-                "WHERE quarantine_key = ?",
-                (quarantine_key,),
-            )
-
-    def is_quarantine_escalated(self, quarantine_key: str) -> bool:
-        row = self._get_connection().execute(
-            "SELECT escalated FROM pending_work_claim_quarantine "
-            "WHERE quarantine_key = ?",
-            (quarantine_key,),
-        ).fetchone()
-        return bool(row and row["escalated"])
 
     # -- internals ---------------------------------------------------------
 

@@ -34,6 +34,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
 from typing import Protocol
 
 from ..domain.pending_work import PendingWorkClaim
@@ -83,11 +84,68 @@ class UnresolvedClaim:
     run_key: str
     session_name: str
     deferred: bool
+    # The orchestrator's own recorded start instant for this run, which is what
+    # quarantine keys are anchored on (#6999 F12).
+    started_at: str
     # Recorded at hold time from the launching session, NOT derived from the
     # payload or the terminal name (#6999 F12): a review session is named for
     # its PR, and the payload is exactly what may have become unreadable.
     issue_number: int
     claim: PendingWorkClaim
+
+
+class QuarantineLabelState(Enum):
+    """Whether a quarantine owns the shared blocking label it needed.
+
+    The distinction release depends on (#6999 F12): adding a label that is
+    already present succeeds, so "the apply worked" is not evidence the
+    quarantine put it there. Removing a label a human or another owner applied
+    would silently retract their block.
+    """
+
+    #: No apply has been recorded yet, so the next sweep tries again.
+    UNKNOWN = "unknown"
+    #: This quarantine demonstrably put the label on the issue, so it is the
+    #: one that takes it off.
+    ACQUIRED = "acquired"
+    #: NOT provably ours: the label was already present, or the adapter could
+    #: not determine whether it was. Release leaves it where it is.
+    PREEXISTING = "preexisting"
+
+    @property
+    def applied(self) -> bool:
+        """Whether the apply that produced this state actually committed."""
+        return self is not QuarantineLabelState.UNKNOWN
+
+
+@dataclass(frozen=True, slots=True)
+class QuarantineRecord:
+    """The durable state of one quarantine.
+
+    The two predicates below are the whole provenance rule, asked of the record
+    rather than pattern-matched on the enum by every caller (#6999 F12/A5):
+    only the quarantine that put the shared block there may take it off, and
+    only one that has never recorded an outcome still owes an apply.
+    """
+
+    quarantine_key: str
+    run_key: str
+    session_name: str
+    issue_number: int
+    error: str
+    label_state: QuarantineLabelState
+    announced: bool
+    releasing: bool
+
+    @property
+    def block_is_ours(self) -> bool:
+        """Whether THIS quarantine demonstrably applied the shared block."""
+        return self.label_state is QuarantineLabelState.ACQUIRED
+
+    @property
+    def block_unrecorded(self) -> bool:
+        """Whether no apply outcome has been recorded for it yet."""
+        return self.label_state is QuarantineLabelState.UNKNOWN
 
 
 @dataclass(frozen=True, slots=True)
@@ -170,6 +228,15 @@ class PendingWorkClaimStore(Protocol):
         """The opaque key this store addresses ``run`` by."""
         ...
 
+    def run_key_for_path(self, run_dir: Path) -> str:
+        """The same key, from a raw discovered run root.
+
+        Discovery hands back a directory long before typed run assets can be
+        rebuilt from it, and a run whose assets fail to parse must still be
+        recognised as live (#6999 F14).
+        """
+        ...
+
     def quarantine_key_for(self, run: SessionRunAssets) -> str:
         """The opaque key a QUARANTINE against ``run`` is recorded under.
 
@@ -202,33 +269,39 @@ class ClaimQuarantineStore(Protocol):
         """Record (or refresh) that this run is quarantined."""
         ...
 
+    def read_quarantine(self, quarantine_key: str) -> QuarantineRecord | None:
+        """The durable state of one quarantine, or None when there is none."""
+        ...
+
+    def record_quarantine_label_state(
+        self, quarantine_key: str, label_state: QuarantineLabelState
+    ) -> None:
+        """Record whether THIS quarantine acquired the shared blocking label."""
+        ...
+
+    def mark_quarantine_announced(self, quarantine_key: str) -> None:
+        """Record that the operator-visible comment committed."""
+        ...
+
+    def mark_quarantine_releasing(self, quarantine_key: str) -> None:
+        """Record that the cause is gone but cleanup has not committed yet.
+
+        The row SURVIVES this (#6999 F12): deleting it first would leave a
+        failed label removal with nothing to retry from, so the block could
+        stay forever.
+        """
+        ...
+
     def release_quarantine(self, quarantine_key: str) -> None:
-        """Clear a quarantine once its cause is gone.
-
-        The explicit clear seam: a quarantine ends when the run's claim can be
-        read again or its row has been removed - a human having repaired or
-        removed it - never because some other session happened to start.
-        """
+        """Delete a quarantine whose cleanup has committed."""
         ...
 
-    def quarantined_run_keys(self) -> frozenset[str]:
-        """Run keys with a live quarantine, for release reconciliation."""
-        ...
-
-    def quarantine_keys_for_run(self, run_key: str) -> tuple[str, ...]:
-        """Every recorded quarantine key for one run root.
-
-        A replacement run can reuse a directory, so one run key may carry more
-        than one generation's marker (#6999 F12).
-        """
-        ...
-
-    def quarantine_issue_number(self, quarantine_key: str) -> int | None:
-        """The issue a quarantine is holding open, if it is still recorded."""
+    def list_quarantines(self) -> tuple[QuarantineRecord, ...]:
+        """Every recorded quarantine, for release reconciliation and retry."""
         ...
 
     def quarantined_issue_numbers(self) -> frozenset[int]:
-        """Issues currently held open by a quarantine.
+        """Issues currently held open by a quarantine whose cause remains.
 
         Read by every owner that might otherwise remove the shared
         ``needs-human`` label (#6999 F12). A quarantined terminal is
@@ -237,25 +310,13 @@ class ClaimQuarantineStore(Protocol):
         """
         ...
 
-    def mark_quarantine_escalated(self, quarantine_key: str) -> None:
-        """Record that the durable operator surface committed for this run."""
-        ...
-
-    def is_quarantine_escalated(self, quarantine_key: str) -> bool:
-        """Whether the durable operator surface already committed.
-
-        Idempotency is the point: the orphan scan re-discovers an untracked
-        terminal every 30 seconds, and each rediscovery must not re-comment.
-        A quarantine recorded but NOT escalated is retried, so a failed label
-        or comment does not silently become the final state.
-        """
-        ...
-
 
 __all__ = [
     "ClaimLookup",
     "ClaimQuarantineStore",
     "ClaimState",
+    "QuarantineLabelState",
+    "QuarantineRecord",
     "ConflictingPendingWorkClaimError",
     "PendingWorkClaimStore",
     "UnreadableClaim",

@@ -88,6 +88,32 @@ class GuardEnforcingApplier:
         return True
 
 
+class _RecordingApplier:
+    """An ``ActionApplier``-shaped fake with the production label semantics.
+
+    Adding a label that is already present is a SUCCESS carrying ``no_op=True``
+    (#6999 F12) — the detail the quarantine owner's provenance rule reads, and
+    the reason a boolean applier could not be kept.
+    """
+
+    def __init__(self, live: dict[int, set[str]]) -> None:
+        self.live = live
+        self.applied: list = []
+
+    def apply(self, action):
+        from issue_orchestrator.control.action_results import ActionResult
+
+        self.applied.append(action)
+        if isinstance(action, AddLabelAction):
+            labels = self.live.setdefault(action.issue_number, set())
+            already = action.label in labels
+            labels.add(action.label)
+            return ActionResult.ok(action, no_op=already)
+        if isinstance(action, RemoveLabelAction):
+            self.live.setdefault(action.issue_number, set()).discard(action.label)
+        return ActionResult.ok(action)
+
+
 def _session(issue_number: int, tmp_path: Path) -> Session:
     """A real active-session shape; reconcile only reads ``issue.number``."""
     return Session(
@@ -557,17 +583,19 @@ class TestQuarantineProvenanceIsRespected:
         """
         from unittest.mock import MagicMock
 
-        from issue_orchestrator.control.claim_quarantine import ClaimQuarantineOwner
+        from issue_orchestrator.control.claim_quarantine import (
+            build_claim_quarantine_owner,
+        )
         from issue_orchestrator.control.in_flight_work import QuarantinedSession
         from issue_orchestrator.execution.pending_work_claim_store import (
             SqlitePendingWorkClaimStore,
         )
 
         labels = LabelManager(sample_config)
-        applied: list = []
-        owner = ClaimQuarantineOwner(
+        applier = _RecordingApplier(live={903: set()})
+        owner = build_claim_quarantine_owner(
             store=SqlitePendingWorkClaimStore.for_repo(tmp_path),
-            apply_actions=lambda actions, context: applied.extend(actions) or True,
+            action_applier=applier,
             label_manager=labels,
             events=MagicMock(),
         )
@@ -575,12 +603,17 @@ class TestQuarantineProvenanceIsRespected:
             _session(903, tmp_path), "payload unreadable", "/runs/903", "/runs/903@t1"
         )
         owner.quarantine_session(quarantined)
-        applied.clear()
+        applier.applied.clear()
+        # Something else takes the shared label off while the terminal runs on.
+        applier.live[903].discard(labels.needs_human)
 
         owner.quarantine_session(quarantined)  # a later scan
 
         assert [
             action.label
-            for action in applied
+            for action in applier.applied
             if isinstance(action, AddLabelAction)
         ] == [labels.needs_human]
+        assert labels.needs_human in applier.live[903]
+        # ...and the operator is not re-told about a quarantine already reported.
+        assert not [a for a in applier.applied if isinstance(a, AddCommentAction)]

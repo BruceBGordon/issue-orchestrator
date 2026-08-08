@@ -42,7 +42,7 @@ import logging
 import time
 from dataclasses import dataclass
 from datetime import datetime
-from typing import TYPE_CHECKING, Callable, Iterable, Optional, Protocol, Sequence
+from typing import TYPE_CHECKING, Callable, Iterable, Optional, Sequence
 
 from .health_review_body import PERIODIC_HEALTH_REVIEW_BODY, problem_storm_body
 from ..domain.tech_lead_session import (
@@ -50,7 +50,7 @@ from ..domain.tech_lead_session import (
     TechLeadCreationOrigin,
     TechLeadSessionFlavor,
 )
-from .actions import CreateTechLeadIssueAction
+from .actions import CreateTechLeadIssueAction, SupportsApplyAction
 from .board_review_fingerprint import board_review_fingerprint
 from .tech_lead_issue_policy import (
     apply_tech_lead_priority_prefix,
@@ -69,20 +69,9 @@ if TYPE_CHECKING:
     from ..ports import Issue, RepositoryHost
     from ..ports.queue_cache_store import QueueCacheStore
     from ..ports.tech_lead_authority import TechLeadAuthorityStore
-    from .actions import Action, ActionResult
     from .session_routing import TechLeadQueueOutcome
     from .workflows import TechLeadWorkflow
 
-
-class SupportsApplyAction(Protocol):
-    """The single-action apply seam the on-demand health trigger drives.
-
-    Named structurally so this control owner reuses the tick's real apply path
-    (the concrete ``ActionApplier``) without importing the infra facade, and a
-    test can supply a lightweight fake that returns a canned ``ActionResult``.
-    """
-
-    def apply(self, action: "Action") -> "ActionResult": ...
 
 logger = logging.getLogger(__name__)
 

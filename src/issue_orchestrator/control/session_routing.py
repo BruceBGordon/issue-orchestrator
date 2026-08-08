@@ -666,6 +666,9 @@ def restore_running_sessions(
     restoration = ledger.rehydrate(restored)
     for quarantined in restoration.quarantined:
         quarantine.quarantine_session(quarantined)
+    # Every DISCOVERED run gets a verdict, not only the ones that rebuilt into
+    # a Session (#6999 F14). The ledger owns that accounting.
+    accounting = ledger.account_for_discovered(running, restoration, quarantine)
     added = append_unique_active_sessions(
         state.active_sessions, list(restoration.admitted)
     )
@@ -676,8 +679,8 @@ def restore_running_sessions(
     # row belonging to a terminal that IS here cannot look orphaned (F11).
     ledger.recover_unresolved(
         quarantine,
-        live_run_keys=frozenset(restoration.observed_run_keys(claims)),
-        live_quarantine_keys=restoration.live_quarantine_keys(),
+        live_run_keys=accounting.live_run_keys,
+        live_quarantine_keys=accounting.live_quarantine_keys,
     )
     if added:
         logger.info(

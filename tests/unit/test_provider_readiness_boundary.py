@@ -31,7 +31,10 @@ from issue_orchestrator.control.tech_lead_reaction import (
 )
 from issue_orchestrator.domain.models import DiscoveredFailure, SessionStatus
 from issue_orchestrator.domain.pending_work import PendingWorkKind
-from issue_orchestrator.ports.pending_work_claim_store import ClaimState
+from issue_orchestrator.ports.pending_work_claim_store import (
+    ClaimState,
+    QuarantineLabelState,
+)
 from issue_orchestrator.events import EventName
 from issue_orchestrator.execution.agent_runner_errors import (
     classify_provider_error,
@@ -2980,20 +2983,76 @@ def _ready_harness(tmp_path: Path):
     )
 
 
-def _quarantine(harness):
-    """The real bounded quarantine owner, sharing the harness's store."""
+class _RecordingLabels:
+    """Typed blocking-label ops that record what they were asked to do.
+
+    Mirrors the production adapter's contract (#6999 F12): acquiring a label
+    reports whether it was already present, and every op can be made to fail so
+    retry behaviour is observable.
+    """
+
+    def __init__(self, harness, *, applies: bool = True, acquire=None):
+        from issue_orchestrator.ports.pending_work_claim_store import (
+            QuarantineLabelState,
+        )
+
+        self._harness = harness
+        self._applies = applies
+        self._acquire = acquire or QuarantineLabelState.ACQUIRED
+
+    def acquire_block(self, issue_number: int):
+        from issue_orchestrator.control.actions import AddLabelAction
+        from issue_orchestrator.ports.pending_work_claim_store import (
+            QuarantineLabelState,
+        )
+
+        self._harness.quarantine_actions.append(
+            AddLabelAction(
+                issue_number=issue_number,
+                label="needs-human",
+                reason="pending-work claim unreadable",
+            )
+        )
+        return self._acquire if self._applies else QuarantineLabelState.UNKNOWN
+
+    def release_block(self, issue_number: int) -> bool:
+        from issue_orchestrator.control.actions import RemoveLabelAction
+
+        self._harness.quarantine_actions.append(
+            RemoveLabelAction(
+                issue_number=issue_number,
+                label="needs-human",
+                reason="pending-work claim quarantine resolved",
+            )
+        )
+        return self._applies
+
+    def announce(self, issue_number: int, comment: str) -> bool:
+        from issue_orchestrator.control.actions import AddCommentAction
+
+        self._harness.quarantine_actions.append(
+            AddCommentAction(
+                number=issue_number,
+                comment=comment,
+                reason="pending-work claim unreadable",
+            )
+        )
+        return self._applies
+
+
+def _quarantine_with(harness, *, applies: bool = True, acquire=None):
     from issue_orchestrator.control.claim_quarantine import ClaimQuarantineOwner
-    from issue_orchestrator.control.label_manager import LabelManager
 
     return ClaimQuarantineOwner(
         store=harness.claims,
-        apply_actions=lambda actions, context: harness.quarantine_actions.extend(
-            actions
-        )
-        or True,
-        label_manager=LabelManager(harness.launcher.config),
+        labels=_RecordingLabels(harness, applies=applies, acquire=acquire),
         events=harness.events,
     )
+
+
+def _quarantine(harness):
+    """The real bounded quarantine owner, sharing the harness's store."""
+    return _quarantine_with(harness)
 
 
 def _claims(tmp_path: Path):
@@ -4363,23 +4422,6 @@ def test_the_run_key_is_not_recomputed_through_symlinks(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _quarantine_with(harness, *, applies: bool = True):
-    from issue_orchestrator.control.claim_quarantine import ClaimQuarantineOwner
-    from issue_orchestrator.control.label_manager import LabelManager
-
-    def _apply(actions, *, context):
-        del context
-        harness.quarantine_actions.extend(actions)
-        return applies
-
-    return ClaimQuarantineOwner(
-        store=harness.claims,
-        apply_actions=_apply,
-        label_manager=LabelManager(harness.launcher.config),
-        events=harness.events,
-    )
-
-
 def _quarantined(harness, tmp_path: Path):
     from issue_orchestrator.control.in_flight_work import QuarantinedSession
 
@@ -4927,25 +4969,21 @@ def test_a_repaired_claim_releases_its_quarantine_on_the_next_restore(
 
 def test_a_release_leaves_another_quarantines_block_alone(tmp_path: Path) -> None:
     """Two runs of one issue: clearing one must not unblock the other."""
-    from dataclasses import replace as dc_replace
-
     from issue_orchestrator.control.actions import RemoveLabelAction
     from issue_orchestrator.control.in_flight_work import QuarantinedSession
 
     harness = _ready_harness(tmp_path)
     first = _quarantined(harness, tmp_path)
-    other_assets = dc_replace(
-        first.session.run_assets,
-        identity=dc_replace(
-            first.session.run_assets.identity, started_at="2026-08-07T12:00:00.5+00:00"
-        ),
-    )
+    second_state = _pending_state("tech_lead")
+    second_session = _route("tech_lead", second_state, harness)
+    assert second_session is not None
     second = QuarantinedSession(
-        first.session,
+        second_session,
         "payload unreadable",
-        harness.claims.run_key_for(other_assets),
-        harness.claims.quarantine_key_for(other_assets),
+        harness.claims.run_key_for(second_session.run_assets),
+        harness.claims.quarantine_key_for(second_session.run_assets),
     )
+    assert first.quarantine_key != second.quarantine_key
     owner = _quarantine_with(harness)
     owner.quarantine_session(first)
     owner.quarantine_session(second)
@@ -4959,6 +4997,7 @@ def test_a_release_leaves_another_quarantines_block_alone(tmp_path: Path) -> Non
     ] == []
 
 
+
 def test_a_replacement_run_reusing_the_directory_quarantines_independently(
     tmp_path: Path,
 ) -> None:
@@ -4966,9 +5005,9 @@ def test_a_replacement_run_reusing_the_directory_quarantines_independently(
 
     So a replacement run of one session really can land on the same directory.
     An escalated marker from the previous generation must not suppress the new
-    run's comment and event - the two are different terminals holding
-    different work (#6999 F12). Forced deterministically rather than hoping two
-    allocations collide.
+    run's comment and event - the two are different terminals holding different
+    work (#6999 F12). Forced deterministically: the same run root, a different
+    recorded start instant, exactly as a same-second replacement produces.
     """
     from dataclasses import replace as dc_replace
 
@@ -4979,22 +5018,29 @@ def test_a_replacement_run_reusing_the_directory_quarantines_independently(
     state = _pending_state("tech_lead")
     session = _route("tech_lead", state, harness)
     assert session is not None
-    # The same run directory, a later start instant: exactly what a same-second
-    # replacement produces.
+    first = QuarantinedSession(
+        session,
+        "payload unreadable",
+        harness.claims.run_key_for(session.run_assets),
+        harness.claims.quarantine_key_for(session.run_assets),
+    )
+    owner = _quarantine_with(harness)
+    owner.quarantine_session(first)
+
+    # The first run finishes and its row goes; a replacement lands on the SAME
+    # directory with its own start instant.
+    harness.claims.consume_pending_work_claim(session.run_assets)
     replacement_assets = dc_replace(
         session.run_assets,
         identity=dc_replace(
             session.run_assets.identity, started_at="2026-08-07T12:00:00.500000+00:00"
         ),
     )
-    assert harness.claims.run_key_for(replacement_assets) == harness.claims.run_key_for(
-        session.run_assets
-    )
-    first = QuarantinedSession(
-        session,
-        "payload unreadable",
-        harness.claims.run_key_for(session.run_assets),
-        harness.claims.quarantine_key_for(session.run_assets),
+    assert harness.claims.run_key_for(replacement_assets) == first.run_key
+    harness.claims.hold_pending_work_claim(
+        replacement_assets,
+        _claim("tech_lead", _pending_state("tech_lead")),
+        issue_number=7,
     )
     second = QuarantinedSession(
         session,
@@ -5004,9 +5050,7 @@ def test_a_replacement_run_reusing_the_directory_quarantines_independently(
     )
     assert first.run_key == second.run_key  # the collision is real
     assert first.quarantine_key != second.quarantine_key
-    owner = _quarantine_with(harness)
 
-    owner.quarantine_session(first)
     owner.quarantine_session(second)
 
     comments = [
@@ -5016,4 +5060,569 @@ def test_a_replacement_run_reusing_the_directory_quarantines_independently(
     assert (
         harness.event_names().count(EventName.SESSION_CLAIM_UNREADABLE.value) == 2
     )
-    assert len(harness.claims.quarantine_keys_for_run(first.run_key)) == 2
+    recorded = [
+        q for q in harness.claims.list_quarantines() if q.run_key == first.run_key
+    ]
+    assert len(recorded) == 2  # two independent rows, one per generation
+
+
+# ---------------------------------------------------------------------------
+# Quarantine escalation/release is a durable state machine (#6999 F12)
+# ---------------------------------------------------------------------------
+
+
+def test_a_preexisting_block_is_never_removed_on_release(tmp_path: Path) -> None:
+    """Adding a label that is already there SUCCEEDS.
+
+    So "the apply worked" is not evidence this quarantine put it there, and
+    removing it on release would silently retract a human's block.
+    """
+    from issue_orchestrator.control.actions import RemoveLabelAction
+    from issue_orchestrator.ports.pending_work_claim_store import (
+        QuarantineLabelState,
+    )
+
+    harness = _ready_harness(tmp_path)
+    quarantined = _quarantined(harness, tmp_path)
+    owner = _quarantine_with(harness, acquire=QuarantineLabelState.PREEXISTING)
+    owner.quarantine_session(quarantined)
+    assert (
+        harness.claims.read_quarantine(quarantined.quarantine_key).label_state
+        is QuarantineLabelState.PREEXISTING
+    )
+    harness.quarantine_actions.clear()
+
+    owner.release(quarantined.quarantine_key)
+
+    assert [
+        a for a in harness.quarantine_actions if isinstance(a, RemoveLabelAction)
+    ] == []
+    assert harness.claims.read_quarantine(quarantined.quarantine_key) is None
+
+
+def test_a_landed_label_with_a_failed_comment_is_retried_not_stranded(
+    tmp_path: Path,
+) -> None:
+    """The two halves fail separately, so they are recorded separately.
+
+    A single ``escalated`` bit cannot say "the label landed but the comment did
+    not"; releasing on that state would delete the row and leave the label the
+    quarantine really did add (#6999 F12).
+    """
+    from issue_orchestrator.control.actions import AddCommentAction
+    from issue_orchestrator.ports.pending_work_claim_store import (
+        QuarantineLabelState,
+    )
+
+    harness = _ready_harness(tmp_path)
+    quarantined = _quarantined(harness, tmp_path)
+
+    class _LabelOkCommentFails(_RecordingLabels):
+        def announce(self, issue_number: int, comment: str) -> bool:
+            super().announce(issue_number, comment)
+            return False
+
+    from issue_orchestrator.control.claim_quarantine import ClaimQuarantineOwner
+
+    failing = ClaimQuarantineOwner(
+        store=harness.claims,
+        labels=_LabelOkCommentFails(harness),
+        events=harness.events,
+    )
+    failing.quarantine_session(quarantined)
+
+    record = harness.claims.read_quarantine(quarantined.quarantine_key)
+    assert record.label_state is QuarantineLabelState.ACQUIRED  # it really landed
+    assert not record.announced  # ...and the comment did not
+    assert EventName.SESSION_CLAIM_UNREADABLE.value not in harness.event_names()
+
+    harness.quarantine_actions.clear()
+    _quarantine_with(harness).quarantine_session(quarantined)  # the next sweep
+
+    assert [
+        a for a in harness.quarantine_actions if isinstance(a, AddCommentAction)
+    ]
+    assert EventName.SESSION_CLAIM_UNREADABLE.value in harness.event_names()
+
+
+def test_a_failed_block_removal_is_retried_by_the_next_reconciliation(
+    tmp_path: Path,
+) -> None:
+    """Deleting the row first would leave nothing to retry from.
+
+    The block would then stay on the issue forever, which is the failure the
+    row's survival exists to prevent (#6999 F12).
+    """
+    from issue_orchestrator.control.actions import RemoveLabelAction
+    from issue_orchestrator.control.claim_quarantine import ClaimQuarantineOwner
+
+    harness = _ready_harness(tmp_path)
+    quarantined = _quarantined(harness, tmp_path)
+    _quarantine_with(harness).quarantine_session(quarantined)
+
+    class _RemovalFails(_RecordingLabels):
+        def release_block(self, issue_number: int) -> bool:
+            super().release_block(issue_number)
+            return False
+
+    failing = ClaimQuarantineOwner(
+        store=harness.claims, labels=_RemovalFails(harness), events=harness.events
+    )
+    failing.release(quarantined.quarantine_key)
+
+    # Still recorded, so there is something to retry from.
+    assert harness.claims.read_quarantine(quarantined.quarantine_key) is not None
+    harness.quarantine_actions.clear()
+
+    _quarantine_with(harness).reconcile_released(frozenset())
+
+    assert [
+        a for a in harness.quarantine_actions if isinstance(a, RemoveLabelAction)
+    ]
+    assert harness.claims.read_quarantine(quarantined.quarantine_key) is None
+
+
+class _LiveLabelApplier:
+    """An ``ActionApplier``-shaped fake holding real live labels per issue.
+
+    Production semantics, which the provenance rule reads (#6999 F12): adding a
+    label that is already present is a SUCCESS carrying ``no_op=True``.
+    """
+
+    def __init__(self) -> None:
+        self.live: dict[int, set[str]] = {}
+
+    def apply(self, action):
+        from issue_orchestrator.control.action_results import ActionResult
+        from issue_orchestrator.control.actions import AddLabelAction, RemoveLabelAction
+
+        if isinstance(action, AddLabelAction):
+            labels = self.live.setdefault(action.issue_number, set())
+            already = action.label in labels
+            labels.add(action.label)
+            return ActionResult.ok(action, no_op=already)
+        if isinstance(action, RemoveLabelAction):
+            self.live.setdefault(action.issue_number, set()).discard(action.label)
+        return ActionResult.ok(action)
+
+
+def _factory_owner(harness, applier, tmp_path: Path):
+    """The owner as the composition roots build it, over a live label set."""
+    from issue_orchestrator.control.claim_quarantine import (
+        build_claim_quarantine_owner,
+    )
+    from issue_orchestrator.control.label_manager import LabelManager
+
+    return build_claim_quarantine_owner(
+        store=harness.claims,
+        action_applier=applier,
+        label_manager=LabelManager(_routing_config(tmp_path)),
+        events=harness.events,
+    )
+
+
+def test_a_second_quarantine_on_one_issue_does_not_strand_the_block(
+    tmp_path: Path,
+) -> None:
+    """Two quarantines, one issue, one shared label - and only one owner of it.
+
+    The second to escalate finds the label already there and records itself
+    PREEXISTING, so it will never take it off. If the first one then dropped
+    its row on release just because the issue was still quarantined, nothing
+    would be left holding the obligation and the block would stay forever
+    (#6999 F12).
+    """
+    from issue_orchestrator.control.label_manager import LabelManager
+
+    harness = _ready_harness(tmp_path)
+    applier = _LiveLabelApplier()
+    owner = _factory_owner(harness, applier, tmp_path)
+    needs_human = LabelManager(_routing_config(tmp_path)).needs_human
+    for key, run in (("/runs/a@t1", "/runs/a"), ("/runs/b@t2", "/runs/b")):
+        owner.quarantine_unrestorable(
+            quarantine_key=key,
+            run_key=run,
+            session_name="issue-7",
+            issue_number=7,
+            error="the run's session assets could not be rebuilt",
+        )
+    states = {q.quarantine_key: q.label_state for q in harness.claims.list_quarantines()}
+    assert states["/runs/a@t1"] is QuarantineLabelState.ACQUIRED
+    assert states["/runs/b@t2"] is QuarantineLabelState.PREEXISTING
+    assert needs_human in applier.live[7]
+
+    # The one that actually acquired the label is repaired first.
+    owner.release("/runs/a@t1")
+
+    assert needs_human in applier.live[7]  # the surviving quarantine still blocks
+    assert harness.claims.read_quarantine("/runs/a@t1") is not None  # obligation kept
+
+    # Now the survivor is repaired too, and the block finally comes off.
+    owner.reconcile_released(frozenset())
+
+    assert needs_human not in applier.live[7]
+    assert harness.claims.list_quarantines() == ()
+
+
+def test_a_block_whose_presence_could_not_be_checked_is_not_treated_as_ours(
+    tmp_path: Path,
+) -> None:
+    """``AddLabel`` still succeeds when the presence check itself failed.
+
+    It reports ``presence_unknown``, and an unprovable acquisition must not
+    become a licence to remove the label later (#6999 F12).
+    """
+    from issue_orchestrator.control.action_results import ActionResult
+    from issue_orchestrator.control.actions import RemoveLabelAction
+
+    class _CannotCheckPresence:
+        def __init__(self) -> None:
+            self.applied: list = []
+
+        def apply(self, action):
+            self.applied.append(action)
+            return ActionResult.ok(action, presence_unknown=True)
+
+    harness = _ready_harness(tmp_path)
+    applier = _CannotCheckPresence()
+    owner = _factory_owner(harness, applier, tmp_path)
+    owner.quarantine_unrestorable(
+        quarantine_key="/runs/a@t1",
+        run_key="/runs/a",
+        session_name="issue-7",
+        issue_number=7,
+        error="the run's session assets could not be rebuilt",
+    )
+    assert (
+        harness.claims.read_quarantine("/runs/a@t1").label_state
+        is QuarantineLabelState.PREEXISTING
+    )
+    applier.applied.clear()
+
+    owner.release("/runs/a@t1")
+
+    assert [a for a in applier.applied if isinstance(a, RemoveLabelAction)] == []
+    assert harness.claims.read_quarantine("/runs/a@t1") is None
+
+
+def test_a_rewritten_manifest_timestamp_does_not_mint_a_new_quarantine(
+    tmp_path: Path,
+) -> None:
+    """Generation identity is anchored in the orchestrator's own record.
+
+    Taking it from the run assets would let an agent rewrite its manifest and
+    mint a fresh quarantine key on every scan, re-commenting forever (#6999
+    F12).
+    """
+    from dataclasses import replace as dc_replace
+
+    harness = _ready_harness(tmp_path)
+    state = _pending_state("tech_lead")
+    session = _route("tech_lead", state, harness)
+    assert session is not None
+    original_key = harness.claims.quarantine_key_for(session.run_assets)
+
+    # The agent rewrites the manifest's start instant between scans.
+    for stamp in ("2030-01-01T00:00:00+00:00", "1999-01-01T00:00:00+00:00"):
+        rewritten = dc_replace(
+            session.run_assets,
+            identity=dc_replace(session.run_assets.identity, started_at=stamp),
+        )
+        assert harness.claims.quarantine_key_for(rewritten) == original_key
+
+
+def test_a_rewritten_manifest_across_real_scans_comments_once(
+    tmp_path: Path,
+) -> None:
+    """The same thing, driven through the real restoration seam."""
+    import sqlite3
+
+    from issue_orchestrator.control.actions import AddCommentAction
+    from issue_orchestrator.execution.pending_work_claim_store import STORE_FILENAME
+    from issue_orchestrator.infra.repo_identity import state_dir
+
+    harness = _ready_harness(tmp_path)
+    state = _pending_state("tech_lead")
+    session = _route("tech_lead", state, harness)
+    assert session is not None
+    _corrupt_stored_claim(tmp_path, session.run_assets)
+
+    for stamp in ("2030-01-01T00:00:00+00:00", "1999-01-01T00:00:00+00:00"):
+        # Restoration rebuilds identity from the manifest each scan; rewrite it.
+        conn = sqlite3.connect(state_dir(tmp_path) / STORE_FILENAME)
+        conn.execute("UPDATE pending_work_claim SET started_at = started_at")
+        conn.commit()
+        conn.close()
+        session.run_assets.manifest.path.write_text(
+            json.dumps(
+                {
+                    **json.loads(session.run_assets.manifest.path.read_text()),
+                    "started_at": stamp,
+                }
+            ),
+            encoding="utf-8",
+        )
+        _restore_pair(None, [session], harness)
+
+    comments = [
+        a for a in harness.quarantine_actions if isinstance(a, AddCommentAction)
+    ]
+    assert len(comments) == 1
+
+
+# ---------------------------------------------------------------------------
+# A live run that cannot be rebuilt is protected, not requeued (#6999 F14)
+# ---------------------------------------------------------------------------
+
+
+def _restore_with_raw_discovery(harness, discovered):
+    """The real restoration seam, given raw discovery records."""
+    from issue_orchestrator.control.session_restorer import SessionRestorer
+    from issue_orchestrator.control.session_routing import restore_running_sessions
+    from issue_orchestrator.domain.models import OrchestratorState
+    from tests.unit.test_session_restorer import MockRepositoryHost, MockWorkingCopy
+
+    restarted = OrchestratorState()
+    added = restore_running_sessions(
+        discovered,
+        restarted,
+        SessionRestorer(
+            harness.launcher.config, MockRepositoryHost(), MockWorkingCopy()
+        ),
+        harness.claims,
+        _quarantine(harness),
+    )
+    return restarted, added
+
+
+@pytest.mark.parametrize(
+    "break_manifest",
+    ["missing", "malformed", "identity_mismatch"],
+    ids=["missing", "malformed", "identity-mismatch"],
+)
+def test_a_live_run_that_cannot_be_rebuilt_keeps_its_work(
+    break_manifest, tmp_path: Path
+) -> None:
+    """SessionRestorer answers None for these, and the terminal is still alive.
+
+    Its run key would then be missing from the observed set, the sweep would
+    call the row orphaned, and the request would be requeued beside a process
+    still running it - launching the same review, rework, retry or
+    investigation twice (#6999 F14).
+    """
+    from issue_orchestrator.ports.session_runner import DiscoveredSession
+
+    harness = _ready_harness(tmp_path)
+    state = _pending_state("tech_lead")
+    session = _route("tech_lead", state, harness)
+    assert session is not None
+    manifest = session.run_assets.manifest.path
+    if break_manifest == "missing":
+        manifest.unlink()
+    elif break_manifest == "malformed":
+        manifest.write_text("{not json", encoding="utf-8")
+    else:
+        payload = json.loads(manifest.read_text())
+        payload["run_dir"] = str(manifest.parent.parent / "somewhere-else")
+        manifest.write_text(json.dumps(payload), encoding="utf-8")
+
+    restarted, added = _restore_with_raw_discovery(
+        harness,
+        [
+            DiscoveredSession(
+                issue_number=7,
+                tab_name="",
+                is_review=False,
+                session_name=session.terminal_id,
+                run_dir=str(session.run_assets.run_dir),
+            )
+        ],
+    )
+
+    assert added == []  # not admitted, since it could not be rebuilt
+    # ...and crucially its work was NOT requeued beside the live terminal.
+    assert restarted.pending_tech_lead_reviews == []
+    assert len(harness.claims.list_unresolved_claims()) == 1
+    # A human is told, because a live terminal nobody can track is not routine.
+    assert EventName.SESSION_CLAIM_UNREADABLE.value in harness.event_names()
+
+
+def test_an_unrestorable_run_is_not_requeued_on_repeated_scans(
+    tmp_path: Path,
+) -> None:
+    """The orphan scan runs every 30 seconds; none of them may requeue it."""
+    from issue_orchestrator.ports.session_runner import DiscoveredSession
+
+    harness = _ready_harness(tmp_path)
+    state = _pending_state("review")
+    session = _route("review", state, harness)
+    assert session is not None
+    session.run_assets.manifest.path.unlink()
+    discovered = [
+        DiscoveredSession(
+            issue_number=7,
+            tab_name="",
+            is_review=True,
+            session_name=session.terminal_id,
+            run_dir=str(session.run_assets.run_dir),
+        )
+    ]
+
+    for _ in range(3):
+        restarted, added = _restore_with_raw_discovery(harness, discovered)
+        assert added == []
+        assert restarted.pending_reviews == []
+        assert len(harness.claims.list_unresolved_claims()) == 1
+
+
+def test_the_factory_reports_an_already_present_label_as_preexisting(
+    tmp_path: Path,
+) -> None:
+    """The production mapping the release rule depends on (#6999 F12).
+
+    ``ActionApplier`` reports adding an already-present label as a SUCCESS with
+    ``no_op=True``. Collapsing that to a boolean is what let a quarantine
+    believe it had acquired a label a human applied - and then remove it.
+    """
+    from issue_orchestrator.control.action_results import ActionResult
+    from issue_orchestrator.control.claim_quarantine import (
+        build_claim_quarantine_owner,
+    )
+    from issue_orchestrator.control.label_manager import LabelManager
+    from issue_orchestrator.ports.pending_work_claim_store import (
+        QuarantineLabelState,
+    )
+
+    class _AlreadyLabelled:
+        def apply(self, action):
+            return ActionResult.ok(action, no_op=True)
+
+    class _NotYetLabelled:
+        def apply(self, action):
+            return ActionResult.ok(action)
+
+    class _Failing:
+        def apply(self, action):
+            return ActionResult.fail(action, "github said no")
+
+    labels = LabelManager(harness_config := _routing_config(tmp_path))
+    del harness_config
+
+    def _ops(applier):
+        return build_claim_quarantine_owner(
+            store=_claims(tmp_path),
+            action_applier=applier,
+            label_manager=labels,
+            events=RecordingEvents(),
+        ).labels
+
+    assert _ops(_AlreadyLabelled()).acquire_block(7) is (
+        QuarantineLabelState.PREEXISTING
+    )
+    assert _ops(_NotYetLabelled()).acquire_block(7) is QuarantineLabelState.ACQUIRED
+    assert _ops(_Failing()).acquire_block(7) is QuarantineLabelState.UNKNOWN
+
+
+def test_a_migration_interrupted_mid_copy_leaves_the_legacy_authority(
+    tmp_path: Path,
+) -> None:
+    """Rename, create, copy and drop are one transaction (#6999 F13).
+
+    ``executescript`` would commit before running its script, so a stop after
+    the rename could leave a current-shaped table beside the renamed original -
+    after which the column check returns early on the next start and the real
+    rows are invisible. Injected mid-copy, then the database is REOPENED.
+    """
+    import sqlite3
+
+    from issue_orchestrator.execution import pending_work_claim_store
+    from issue_orchestrator.execution.pending_work_claim_store import (
+        STORE_FILENAME,
+        SqlitePendingWorkClaimStore,
+    )
+    from issue_orchestrator.infra.repo_identity import state_dir
+
+    db_path = state_dir(tmp_path) / STORE_FILENAME
+    run = _run(tmp_path)
+    _write_legacy_claim_row(
+        db_path,
+        run_key=os.path.normpath(str(run.run_dir)),
+        claim=_claim("tech_lead", _pending_state("tech_lead")),
+        identity=run.identity,
+    )
+    # Fail inside the copy, after the rename and the new table exist.
+    real_open = pending_work_claim_store.open_sqlite
+
+    class _DiesMidCopy:
+        def __init__(self, conn):
+            self._conn = conn
+
+        def executemany(self, *args, **kwargs):
+            raise sqlite3.OperationalError("disk went away mid-copy")
+
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+
+    def _wrapped(*args, **kwargs):
+        return _DiesMidCopy(real_open(*args, **kwargs))
+
+    pending_work_claim_store.open_sqlite = _wrapped
+    try:
+        with pytest.raises(sqlite3.OperationalError):
+            SqlitePendingWorkClaimStore.for_repo(tmp_path)
+    finally:
+        pending_work_claim_store.open_sqlite = real_open
+
+    # Reopened: the legacy table is intact under its own name, nothing was left
+    # half-swapped, and the migration simply completes.
+    store = SqlitePendingWorkClaimStore.for_repo(tmp_path)
+
+    unresolved = store.list_unresolved_claims()
+    assert [u.run_key for u in unresolved] == [os.path.normpath(str(run.run_dir))]
+    assert store.look_up_pending_work_claim(run).held is not None
+
+
+def test_a_half_swapped_database_refuses_to_start(tmp_path: Path) -> None:
+    """A surviving ``_old`` table means authoritative rows nothing will read.
+
+    The transaction makes this state unreachable, but if a database ever
+    reaches it, starting quietly is the exact failure F13 exists to prevent:
+    the column check passes on the current-shaped table, and the real claims
+    sit in a table no lookup, enumeration or recovery path ever queries.
+    """
+    import sqlite3
+
+    from issue_orchestrator.execution.pending_work_claim_store import (
+        STORE_FILENAME,
+        PendingWorkClaimMigrationError,
+        SqlitePendingWorkClaimStore,
+    )
+    from issue_orchestrator.infra.repo_identity import state_dir
+
+    db_path = state_dir(tmp_path) / STORE_FILENAME
+    run = _run(tmp_path)
+    _write_legacy_claim_row(
+        db_path,
+        run_key=os.path.normpath(str(run.run_dir)),
+        claim=_claim("tech_lead", _pending_state("tech_lead")),
+        identity=run.identity,
+    )
+    conn = sqlite3.connect(db_path)
+    conn.execute("ALTER TABLE pending_work_claim RENAME TO pending_work_claim_old")
+    conn.execute(
+        "CREATE TABLE pending_work_claim (run_key TEXT PRIMARY KEY, "
+        "work_key TEXT NOT NULL, deferred INTEGER NOT NULL DEFAULT 0, "
+        "session_name TEXT NOT NULL, run_id TEXT NOT NULL, "
+        "started_at TEXT NOT NULL, issue_number INTEGER NOT NULL, "
+        "payload TEXT NOT NULL)"
+    )
+    conn.commit()
+    conn.close()
+
+    with pytest.raises(PendingWorkClaimMigrationError):
+        SqlitePendingWorkClaimStore.for_repo(tmp_path)
+
+    # ...and it said so without touching the rows a human still needs.
+    conn = sqlite3.connect(db_path)
+    assert conn.execute("SELECT COUNT(*) FROM pending_work_claim_old").fetchone()[0] == 1
+    conn.close()

@@ -30,6 +30,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
 from ..domain.models import PendingRework, Session
@@ -42,6 +43,7 @@ from .session_launch_types import LaunchDisposition, LaunchResult
 
 if TYPE_CHECKING:
     from ..domain.models import OrchestratorState
+    from ..ports.session_runner import DiscoveredSession
     from .claim_quarantine import ClaimQuarantineOwner
 
 logger = logging.getLogger(__name__)
@@ -145,6 +147,21 @@ class ClaimRestoration:
                 + [stale.session for stale in self.stale]
             )
         }
+
+
+@dataclass(frozen=True, slots=True)
+class DiscoveredRunAccounting:
+    """Every discovered live run given a verdict, not just the rebuilt ones.
+
+    The total that orphan recovery needs (#6999 F14/A6). ``SessionRestorer``
+    answers ``None`` for a run whose manifest is missing, malformed or
+    inconsistent, so the set of restored ``Session`` objects is NOT the set of
+    live runs. Deciding orphanhood from that partial set requeues work beside a
+    terminal that is still running it.
+    """
+
+    live_run_keys: frozenset[str]
+    live_quarantine_keys: frozenset[str]
 
 
 class DuplicateClaimError(RuntimeError):
@@ -304,6 +321,70 @@ class InFlightWorkLedger:
                 )
             admitted.append(session)
         return ClaimRestoration(tuple(admitted), tuple(quarantined), tuple(stale))
+
+    def account_for_discovered(
+        self,
+        discovered: Sequence["DiscoveredSession"],
+        restoration: "ClaimRestoration",
+        quarantine: "ClaimQuarantineOwner",
+    ) -> DiscoveredRunAccounting:
+        """Account for EVERY discovered run before anything is called orphaned.
+
+        Rehydration reports on the runs that rebuilt into a ``Session``. The
+        ones that did not are the dangerous half (#6999 F14): the terminal is
+        alive and still carrying the request it launched with, and only its
+        presentation failed. Left out of the live set it looks orphaned, its
+        claim goes back on the queue, and a later tick launches the same
+        review, rework, retry or investigation a second time.
+
+        So each of those is quarantined instead - protected from recovery and
+        put in front of a human - and the resulting total is what the sweep is
+        given. The discovered run root comes from the terminal registry, which
+        records the directory the orchestrator allocated, so it is knowable
+        without parsing anything the run wrote.
+        """
+        observed = restoration.observed_run_keys(self.claims)
+        discovered_keys = frozenset(
+            self.claims.run_key_for_path(Path(run_dir))
+            for run_dir in (info.get("run_dir") or "" for info in discovered)
+            if run_dir
+        )
+        return DiscoveredRunAccounting(
+            live_run_keys=frozenset(observed) | discovered_keys,
+            live_quarantine_keys=(
+                restoration.live_quarantine_keys()
+                | self._protect_unrestorable(discovered_keys - observed, quarantine)
+            ),
+        )
+
+    def _protect_unrestorable(
+        self,
+        run_keys: frozenset[str],
+        quarantine: "ClaimQuarantineOwner",
+    ) -> frozenset[str]:
+        """Quarantine each live-but-unrebuildable run, returning the keys raised.
+
+        The keys are returned so the release reconciliation that follows does
+        not immediately undo the quarantines this pass just raised.
+        """
+        raised: set[str] = set()
+        for unresolved in self.claims.list_unresolved_claims():
+            if unresolved.run_key not in run_keys:
+                continue
+            key = f"{unresolved.run_key}@{unresolved.started_at}"
+            quarantine.quarantine_unrestorable(
+                quarantine_key=key,
+                run_key=unresolved.run_key,
+                session_name=unresolved.session_name,
+                issue_number=unresolved.issue_number,
+                error="the run's session assets could not be rebuilt",
+            )
+            raised.add(key)
+        for unreadable in self.claims.list_unreadable_claims():
+            if unreadable.run_key not in run_keys:
+                continue
+            raised.add(f"{unreadable.run_key}@{unreadable.started_at}")
+        return frozenset(raised)
 
     def recover_unresolved(
         self,

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Optional, Protocol
 
 if TYPE_CHECKING:
     from .action_base import Action
@@ -97,3 +97,19 @@ class ActionResult:
             result_type=ActionResultType.SKIPPED,
             details={"skip_reason": reason, **details},
         )
+
+
+class SupportsApplyAction(Protocol):
+    """The single-action apply seam a control owner drives.
+
+    Named structurally so an owner reuses the tick's real apply path (the
+    concrete ``ActionApplier``) without importing the infra facade, and a test
+    can supply a lightweight fake returning a canned ``ActionResult``.
+
+    It lives beside ``ActionResult`` because the RESULT is what makes the seam
+    worth having: owners that decide from ``details`` - quarantine provenance
+    reads ``no_op`` to tell "I added this label" from "it was already there"
+    (#6999 F12) - cannot be given a boolean applier.
+    """
+
+    def apply(self, action: "Action") -> ActionResult: ...
