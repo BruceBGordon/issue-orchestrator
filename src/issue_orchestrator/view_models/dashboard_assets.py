@@ -7,6 +7,11 @@ DASHBOARD_JS_CHUNKS: tuple[str, ...] = (
     # first so every later chunk can call formatTimestamp().
     "timestamp_formatting.js",
     "core.js",
+    # ``provider_circuit.js`` renders the provider outage banner + health
+    # panel (issue #5980) from ``window.dashboardData.providerCircuit``.
+    # Loaded after ``core.js`` so ``escapeHtml`` / ``escapeAttr`` and after
+    # ``timestamp_formatting.js`` so ``formatTimestamp`` are in scope.
+    "provider_circuit.js",
     "session_replay.js",
     # ``validation_viewer.js`` defines the canonical JUnit viewer and
     # the Phase-0 plugin registry (issue #6310 follow-up).  Loaded
@@ -51,6 +56,10 @@ DASHBOARD_JS_CHUNKS: tuple[str, ...] = (
     "diagnostics_actions.js",
     "shell_actions.js",
     "retrospective_review.js",
+    # Scoped tech-lead run requests (#6994): the dashboard actions menu's
+    # "Run board health review" and the blocked-item "Investigate with tech
+    # lead". Loaded after ``issue_menus.js`` so the context-menu wiring exists.
+    "tech_lead_runs.js",
     "e2e_runtime.js",
     "e2e_triage.js",
     # ``e2e_canonical_payload.js`` provides the pure translator from

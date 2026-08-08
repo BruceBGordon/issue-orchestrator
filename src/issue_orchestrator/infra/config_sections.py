@@ -293,6 +293,8 @@ def parse_provider_resilience_config(data: dict) -> ProviderResilienceConfig:
         cooldown_seconds=int(circuit_data.get("cooldown_seconds", 1800)),
         max_cooldowns=int(circuit_data.get("max_cooldowns", 6)),
         label=str(circuit_data.get("label", "blocked:provider-unavailable")),
+        auth_failure_threshold=int(circuit_data.get("auth_failure_threshold", 1)),
+        auth_cooldown_seconds=int(circuit_data.get("auth_cooldown_seconds", 21600)),
     )
     return ProviderResilienceConfig(
         short_retry=short_retry,

@@ -96,6 +96,41 @@ class EventName(str, Enum):
     SESSION_INVALID_COMPLETION_RECORD = "session.invalid_completion_record"
     SESSION_TIMEOUT_RECOVERED = "session.timeout_recovered"
     SESSION_PROCESSING_COMPLETED = "session.processing_completed"
+    # Two distinct, deliberately non-timeout provider outcomes. Keeping both
+    # out of SESSION_TIMEOUT is the point: a timeout mints a substance
+    # failure-investigation, and a provider problem has none.
+    #
+    # A launch that never happened: the gate asked the provider before spawning
+    # and it refused — an expired login, or a CLI that is not installed. Nothing
+    # ran, so there is nothing to explain about the work itself.
+    SESSION_LAUNCH_BLOCKED_PROVIDER = "session.launch_blocked_provider"
+    # A session that *did* launch and is being terminated because its provider
+    # is not authenticated. A separate name because the reader's question is
+    # different — "what happened to my running session" versus "why did nothing
+    # start" — and because exactly one owner announces each (#6999 F5).
+    SESSION_PROVIDER_AUTH_TERMINATED = "session.provider_auth_terminated"
+    # A restored terminal whose durable pending-work claim could not be read, so
+    # the orchestrator does not know which queued request it is holding and
+    # refuses to track it (#6999 F6). Paired with a durable needs-human label:
+    # this event is what the dashboard reacts to, the label is what survives a
+    # restart.
+    SESSION_CLAIM_UNREADABLE = "session.claim_unreadable"
+    # A live terminal the orchestrator discovered but could not rebuild into a
+    # session. Distinct from the name above on purpose (#6999 A1/F2): here the
+    # claim reads cleanly, so the work IS known and is deliberately not being
+    # re-queued while the terminal runs. Reporting it as "unreadable claim"
+    # would tell an operator to work out what the session was doing and re-queue
+    # it - the manual duplicate launch that protecting the run prevents.
+    SESSION_RUN_UNRESTORABLE = "session.run_unrestorable"
+    # BOTH halves failed: a live terminal that can be neither rebuilt nor
+    # identified (#6999 F6). It gets its own name rather than borrowing either
+    # neighbour's, because both of those make a promise this state cannot keep
+    # - "the work is known" (run_unrestorable) and "the terminal has stopped or
+    # can be reasoned about from its claim" (claim_unreadable). A reader acting
+    # on either would re-queue by hand beside a session still doing the work.
+    SESSION_RUN_UNRESTORABLE_CLAIM_UNREADABLE = (
+        "session.run_unrestorable_claim_unreadable"
+    )
     SESSION_START_FAILED = "session.start_failed"
     SESSION_STOPPED = "session.stopped"
     SESSION_CLEANUP = "session.cleanup"
@@ -202,6 +237,29 @@ class EventName(str, Enum):
     # Tech-lead attention sweep re-injected stuck issues / flagged exhausted
     # ones (#6823); internal trace event only (not a public UI event).
     TECH_LEAD_STUCK_SWEEP = "tech_lead.stuck_sweep"
+    # One scoped tech-lead run request reached the admission owner (#6994) —
+    # from the dashboard, the CLI, or an automatic trigger — carrying the run
+    # identity, scope kind, subject issue, trigger source, and the typed
+    # outcome/deferral reason. Internal trace event: the UI synchronizes on the
+    # command response and the dashboard view model, never on this.
+    TECH_LEAD_RUN_REQUESTED = "tech_lead.run_requested"
+    # A queued tech-lead investigation was withdrawn by launch-time
+    # revalidation (#6994): between admission and launch its subject was closed
+    # or unblocked, so the run is removed instead of spending an agent session
+    # on work that no longer exists. Internal trace event.
+    TECH_LEAD_RUN_WITHDRAWN = "tech_lead.run_withdrawn"
+    # The single launch authority refused to start a queued tech-lead run
+    # (#6994 round 2 F2): scope exclusivity, the shared run ledger, or
+    # launch-time subject revalidation said no at the very last moment. Carries
+    # the typed refusal so a queued-but-idle run is machine-readable rather than
+    # only a log line. Internal trace event.
+    TECH_LEAD_RUN_HELD = "tech_lead.run_held"
+    # A tech-lead run's cross-engine ownership changed under us (#6994 round 2
+    # F4). ``status`` distinguishes definitive loss (queued work withdrawn,
+    # active session stopped) from contention and from an unreadable
+    # coordination store, both of which are RETRIED rather than acted on.
+    # Internal trace event.
+    TECH_LEAD_RUN_OWNERSHIP_CHANGED = "tech_lead.run_ownership_changed"
 
     # =========================================================================
     # Cleanup operations
@@ -217,11 +275,30 @@ class EventName(str, Enum):
     # =========================================================================
     # Provider resilience
     # =========================================================================
+    # Fleet-scoped: one circuit, no issue identity. Useful for fleet
+    # observability, but they can never reach an issue timeline (the timeline
+    # writer is keyed by ``issue_number``).
     PROVIDER_TRANSIENT_ERROR = "provider.transient_error"
+    # A typed AUTH outcome reached the circuit owner: the provider's own
+    # credential probe says it is not logged in. Fleet-scoped like its
+    # neighbours — it names a circuit, not an issue. Which issue-scoped event
+    # follows depends on where the work was when it hit the outage:
+    #   * circuit still closed (sub-threshold): the launch gate refuses the
+    #     launch => SESSION_LAUNCH_BLOCKED_PROVIDER
+    #   * circuit open: planning parks the work up front => PROVIDER_ISSUE_BLOCKED
+    #   * a session already running: it is terminated
+    #     => SESSION_PROVIDER_AUTH_TERMINATED
+    PROVIDER_AUTH_FAILED = "provider.auth_failed"
     PROVIDER_OUTAGE_ENTERED = "provider.outage_entered"
     PROVIDER_RETRY_SCHEDULED = "provider.retry_scheduled"
     PROVIDER_RETRY_ATTEMPTED = "provider.retry_attempted"
     PROVIDER_OUTAGE_EXITED = "provider.outage_exited"
+    # Issue-scoped provider-impact transitions (issue #5980). Emitted by the
+    # provider-impact owner command *after* the blocked-label transition has
+    # been applied, so the outage stays legible in an issue's history long
+    # after the circuit closed and the label was shed.
+    PROVIDER_ISSUE_BLOCKED = "provider.issue_blocked"
+    PROVIDER_ISSUE_UNBLOCKED = "provider.issue_unblocked"
 
     # =========================================================================
     # Configuration
@@ -379,6 +456,13 @@ class PublicEventName(str, Enum):
     SESSION_FAILED = "session.failed"
     SESSION_TIMEOUT = "session.timeout"
     SESSION_BLOCKED = "session.blocked"
+    SESSION_LAUNCH_BLOCKED_PROVIDER = "session.launch_blocked_provider"
+    SESSION_PROVIDER_AUTH_TERMINATED = "session.provider_auth_terminated"
+    SESSION_CLAIM_UNREADABLE = "session.claim_unreadable"
+    SESSION_RUN_UNRESTORABLE = "session.run_unrestorable"
+    SESSION_RUN_UNRESTORABLE_CLAIM_UNREADABLE = (
+        "session.run_unrestorable_claim_unreadable"
+    )
     SESSION_NO_COMPLETION_RECORD = "session.no_completion_record"
     SESSION_INVALID_COMPLETION_RECORD = "session.invalid_completion_record"
     SESSION_PROCESSING_COMPLETED = "session.processing_completed"
@@ -422,6 +506,9 @@ class PublicEventName(str, Enum):
     ISSUE_COMPLETED = "issue.completed"
     ISSUE_UNBLOCKED = "issue.unblocked"
     ISSUE_PR_CREATED = "issue.pr_created"
+
+    PROVIDER_ISSUE_BLOCKED = "provider.issue_blocked"
+    PROVIDER_ISSUE_UNBLOCKED = "provider.issue_unblocked"
 
     PUBLISH_FAILED = "publish.failed"
 

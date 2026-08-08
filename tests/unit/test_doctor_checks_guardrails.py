@@ -19,6 +19,55 @@ class _UnusedRunner:
         raise AssertionError("runner should not be invoked in this test")
 
 
+class _CompletionCommandRunner:
+    def __init__(self, result: CommandResult) -> None:
+        self.result = result
+        self.calls: list[tuple[list[str], int | None]] = []
+
+    def run(self, command, **kwargs) -> CommandResult:
+        self.calls.append((command, kwargs.get("timeout_seconds")))
+        return self.result
+
+
+def test_completion_command_checks_allow_bounded_python_startup_time(
+    tmp_path: Path,
+) -> None:
+    runner = _CompletionCommandRunner(CommandResult(0, "usage", ""))
+
+    checks = guardrail_checks._check_completion_commands_available(  # noqa: SLF001
+        tmp_path,
+        runner,
+        {},
+    )
+
+    assert [(check.name, check.status) for check in checks] == [
+        ("coding-done Available", "ok"),
+        ("reviewer-done Available", "ok"),
+    ]
+    assert runner.calls == [
+        (["coding-done", "--help"], 15),
+        (["reviewer-done", "--help"], 15),
+    ]
+
+
+def test_completion_command_timeout_reports_actionable_error(tmp_path: Path) -> None:
+    runner = _CompletionCommandRunner(
+        CommandResult(124, "", "", timed_out=True),
+    )
+
+    checks = guardrail_checks._check_completion_commands_available(  # noqa: SLF001
+        tmp_path,
+        runner,
+        {},
+    )
+
+    assert [check.status for check in checks] == ["error", "error"]
+    assert [check.detail for check in checks] == [
+        "coding-done --help timed out after 15 seconds",
+        "reviewer-done --help timed out after 15 seconds",
+    ]
+
+
 def test_check_guardrails_uses_config_repo_root_not_cwd(
     monkeypatch,
     tmp_path: Path,

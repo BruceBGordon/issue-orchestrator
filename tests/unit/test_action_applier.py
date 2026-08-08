@@ -5,6 +5,7 @@ import pytest
 from unittest.mock import MagicMock, Mock, patch
 from pathlib import Path
 
+from issue_orchestrator.domain.tech_lead_session import TechLeadCreationOrigin
 from issue_orchestrator.control.action_applier import ActionApplier
 from issue_orchestrator.control.claim_gate import ClaimGate, ClaimLostError
 from issue_orchestrator.control.actions import (
@@ -109,6 +110,10 @@ def applier(
     mock_fresh_issue_reader,
 ):
     """Create an ActionApplier with mocks."""
+    from issue_orchestrator.control.tech_lead_run_ownership import (
+        single_instance_run_ownership,
+    )
+
     return ActionApplier(
         labels=mock_labels,
         sessions=mock_sessions,
@@ -117,6 +122,9 @@ def applier(
         worktree_manager=mock_worktree_manager,
         fresh_issue_reader=mock_fresh_issue_reader,
         reconcile=False,
+        # A whole-repository anchor is RESERVED before it is created (#6994
+        # round 2 F3), so the applier that owns the create needs the run owner.
+        run_ownership=single_instance_run_ownership(),
     )
 
 
@@ -1422,6 +1430,7 @@ class TestCreateTechLeadIssueAction:
             body="Review these PRs...",
             labels=("agent:tech-lead",),
             pr_count=5,
+            origin=TechLeadCreationOrigin.authors_anchor(),
         )
 
         result = applier.apply(action)
@@ -1447,6 +1456,7 @@ class TestCreateTechLeadIssueAction:
             ),
             reason=trigger,
             flavor=TechLeadSessionFlavor.HEALTH_REVIEW,
+            origin=TechLeadCreationOrigin.authors_anchor(),
         )
 
         result = applier.apply(action)
@@ -1487,6 +1497,7 @@ class TestCreateTechLeadIssueAction:
             labels=(HEALTH_REVIEW_MARKER_LABEL,),
             reason="trigger",
             flavor=flavor,
+            origin=TechLeadCreationOrigin.authors_anchor(),
         )
 
         assert applier.apply(action).success
@@ -1506,6 +1517,7 @@ class TestCreateTechLeadIssueAction:
             body="Review these PRs...",
             labels=("agent:tech-lead",),
             pr_count=5,
+            origin=TechLeadCreationOrigin.authors_anchor(),
         )
 
         result = applier.apply(action)
@@ -1520,7 +1532,7 @@ class TestCreateTechLeadIssueAction:
         mock_repository_host.create_issue.return_value = {"number": 100}
 
         result = applier.apply(
-            CreateTechLeadIssueAction(title="T", body="B", labels=(), pr_count=1)
+            CreateTechLeadIssueAction(title="T", body="B", labels=(), pr_count=1, origin=TechLeadCreationOrigin.authors_anchor())
         )
 
         assert result.success
@@ -1547,6 +1559,7 @@ class TestCreateTechLeadIssueAction:
                 labels=(),
                 pr_count=1,
                 milestone=TechLeadMilestoneIntent(explicit_name="M5"),
+                origin=TechLeadCreationOrigin.authors_anchor(),
             )
         )
 
@@ -1572,6 +1585,7 @@ class TestCreateTechLeadIssueAction:
                 labels=(),
                 pr_count=1,
                 milestone=TechLeadMilestoneIntent(explicit_name="Nope"),
+                origin=TechLeadCreationOrigin.authors_anchor(),
             )
         )
 
@@ -2191,6 +2205,241 @@ class TestRecoverTerminalIssueAction:
         assert entry.status == "merged"
         assert entry.status_reason == "PR merged; awaiting merge reconciled"
 
+    _CLOSE_MERGED_AT = "2026-08-03T13:52:09Z"
+
+    def _close_on_merge_action(self):
+        return RecoverTerminalIssueAction(
+            issue_number=228,
+            pr_number=318,
+            pr_url="https://github.com/test/repo/pull/318",
+            status="merged",
+            source="pull_request",
+            status_reason="PR merged; awaiting merge reconciled",
+            issue_key="M1-228",
+            reason="awaiting-merge terminal: merged",
+            close_issue=True,
+            merged_at=self._CLOSE_MERGED_AT,
+        )
+
+    @staticmethod
+    def _stub_close_evidence(
+        mock_repository_host, *, issue_state="open", auto_close_fired=False,
+    ):
+        """Wire the apply-time revalidation reads (F4/A2): the live issue
+        state and the close-event evidence since the merge."""
+        mock_repository_host.get_issue.return_value = MagicMock(
+            state=issue_state,
+        )
+        mock_repository_host.issue_closed_on_or_after.return_value = (
+            auto_close_fired
+        )
+
+    def test_close_on_merge_close_is_first_mutation_then_comment_then_shed(
+        self, mock_labels, mock_sessions, mock_events, mock_repository_host,
+        real_label_manager,
+    ):
+        """F1 ordered-call regression (porchpin #81): the close is the FIRST
+        mutation after the owner gates — before the label shed, so a shed/
+        history failure after a successful close is safe (a closed issue
+        cannot re-enter the queue). The audit comment posts only AFTER the
+        successful close, and history terminalizes last."""
+        order: list[str] = []
+        mock_repository_host.update_issue_state.side_effect = (
+            lambda *a, **k: order.append("close")
+        )
+        mock_repository_host.add_comment.side_effect = (
+            lambda *a, **k: order.append("comment")
+        )
+        mock_labels.remove_label.side_effect = (
+            lambda *a, **k: order.append("shed")
+        )
+        self._stub_close_evidence(mock_repository_host)
+        entry = self._awaiting_merge_entry()
+        applier = self._make_applier(
+            mock_labels, mock_sessions, mock_events, mock_repository_host,
+            real_label_manager,
+            github_labels=["pr-pending", "agent:backend"],
+            history_entry=entry,
+        )
+
+        result = applier.apply(self._close_on_merge_action())
+
+        assert result.success
+        assert result.details["closed_issue"] is True
+        # Revalidation consulted the live evidence at the owner boundary.
+        mock_repository_host.issue_closed_on_or_after.assert_called_once_with(
+            228, self._CLOSE_MERGED_AT,
+        )
+        mock_repository_host.update_issue_state.assert_called_once_with(
+            228, "closed",
+        )
+        assert order[:2] == ["close", "comment"]
+        assert "shed" in order and order.index("shed") > 1
+        comment_body = mock_repository_host.add_comment.call_args.args[1]
+        assert "https://github.com/test/repo/pull/318" in comment_body
+        assert "no closing reference" in comment_body
+        assert entry.status == "merged"
+
+    def test_close_on_merge_failure_leaves_labels_and_history_untouched(
+        self, mock_labels, mock_sessions, mock_events, mock_repository_host,
+        real_label_manager,
+    ):
+        """A failed close must NOT shed labels, post the audit comment, or
+        terminalize history: labels-shed-but-open across a restart is exactly
+        the relaunch window this fallback exists to eliminate, and a comment
+        claiming the close happened would be a false audit trail repeated on
+        every retry. The entry stays reconcilable for the next pass."""
+        mock_repository_host.update_issue_state.side_effect = Exception(
+            "GitHub 502 closing issue"
+        )
+        self._stub_close_evidence(mock_repository_host)
+        entry = self._awaiting_merge_entry()
+        applier = self._make_applier(
+            mock_labels, mock_sessions, mock_events, mock_repository_host,
+            real_label_manager,
+            github_labels=["pr-pending", "agent:backend"],
+            history_entry=entry,
+        )
+
+        result = applier.apply(self._close_on_merge_action())
+
+        assert not result.success
+        assert "close-on-merge" in (result.error or "")
+        mock_labels.remove_label.assert_not_called()
+        mock_repository_host.add_comment.assert_not_called()
+        # Entry stays in its reconcilable status for the next discovery pass.
+        assert entry.status == "completed"
+
+    def test_apply_time_revalidation_preserves_human_reopen(
+        self, mock_labels, mock_sessions, mock_events, mock_repository_host,
+        real_label_manager,
+    ):
+        """F4/A2 regression: discovery planned close_issue=True, then a human
+        closed AND reopened the issue before apply. The owner command re-reads
+        the live evidence, sees a close event since the merge, and must NOT
+        close the intentional reopen — while shed + history still proceed."""
+        self._stub_close_evidence(mock_repository_host, auto_close_fired=True)
+        entry = self._awaiting_merge_entry()
+        applier = self._make_applier(
+            mock_labels, mock_sessions, mock_events, mock_repository_host,
+            real_label_manager,
+            github_labels=["pr-pending", "agent:backend"],
+            history_entry=entry,
+        )
+
+        result = applier.apply(self._close_on_merge_action())
+
+        assert result.success
+        assert result.details["closed_issue"] is False
+        mock_repository_host.update_issue_state.assert_not_called()
+        mock_repository_host.add_comment.assert_not_called()
+        # Recovery itself still completes: labels shed, history terminalized.
+        assert entry.status == "merged"
+
+    def test_apply_time_revalidation_skips_close_when_already_closed(
+        self, mock_labels, mock_sessions, mock_events, mock_repository_host,
+        real_label_manager,
+    ):
+        """A human closed the issue in the discovery→apply gap: nothing to
+        close; shed + history proceed."""
+        self._stub_close_evidence(mock_repository_host, issue_state="closed")
+        entry = self._awaiting_merge_entry()
+        applier = self._make_applier(
+            mock_labels, mock_sessions, mock_events, mock_repository_host,
+            real_label_manager,
+            github_labels=["pr-pending", "agent:backend"],
+            history_entry=entry,
+        )
+
+        result = applier.apply(self._close_on_merge_action())
+
+        assert result.success
+        assert result.details["closed_issue"] is False
+        mock_repository_host.update_issue_state.assert_not_called()
+        assert entry.status == "merged"
+
+    def test_apply_time_revalidation_unreadable_fails_without_mutation(
+        self, mock_labels, mock_sessions, mock_events, mock_repository_host,
+        real_label_manager,
+    ):
+        """Unreadable revalidation is not either answer: no close, no shed,
+        no history — the entry stays reconcilable for retry."""
+        from issue_orchestrator.ports.repository_host import (
+            RepositoryHostError,
+        )
+        mock_repository_host.get_issue.side_effect = RepositoryHostError(
+            "boom"
+        )
+        entry = self._awaiting_merge_entry()
+        applier = self._make_applier(
+            mock_labels, mock_sessions, mock_events, mock_repository_host,
+            real_label_manager,
+            github_labels=["pr-pending", "agent:backend"],
+            history_entry=entry,
+        )
+
+        result = applier.apply(self._close_on_merge_action())
+
+        assert not result.success
+        assert "revalidation unreadable" in (result.error or "")
+        mock_repository_host.update_issue_state.assert_not_called()
+        mock_labels.remove_label.assert_not_called()
+        assert entry.status == "completed"
+
+    def test_close_on_merge_comment_failure_still_closes(
+        self, mock_labels, mock_sessions, mock_events, mock_repository_host,
+        real_label_manager,
+    ):
+        """The comment is best-effort; the close is the safety-critical write."""
+        mock_repository_host.add_comment.side_effect = Exception("comment 502")
+        self._stub_close_evidence(mock_repository_host)
+        entry = self._awaiting_merge_entry()
+        applier = self._make_applier(
+            mock_labels, mock_sessions, mock_events, mock_repository_host,
+            real_label_manager,
+            github_labels=["pr-pending", "agent:backend"],
+            history_entry=entry,
+        )
+
+        result = applier.apply(self._close_on_merge_action())
+
+        assert result.success
+        mock_repository_host.update_issue_state.assert_called_once_with(
+            228, "closed",
+        )
+        assert entry.status == "merged"
+
+    def test_no_close_without_close_issue_flag(
+        self, mock_labels, mock_sessions, mock_events, mock_repository_host,
+        real_label_manager,
+    ):
+        """Default recovery (issue already closed, or closed-unmerged PR)
+        must never touch the issue's open/closed state."""
+        entry = self._awaiting_merge_entry()
+        applier = self._make_applier(
+            mock_labels, mock_sessions, mock_events, mock_repository_host,
+            real_label_manager,
+            github_labels=["pr-pending", "agent:backend"],
+            history_entry=entry,
+        )
+        action = RecoverTerminalIssueAction(
+            issue_number=228,
+            pr_number=318,
+            pr_url="https://github.com/test/repo/pull/318",
+            status="merged",
+            source="pull_request",
+            status_reason="PR merged; awaiting merge reconciled",
+            issue_key="M1-228",
+            reason="awaiting-merge terminal: merged",
+        )
+
+        result = applier.apply(action)
+
+        assert result.success
+        assert result.details["closed_issue"] is False
+        mock_repository_host.update_issue_state.assert_not_called()
+        assert entry.status == "merged"
+
     def test_shed_failure_leaves_history_reconcilable(
         self, mock_labels, mock_sessions, mock_events, mock_repository_host,
         real_label_manager,
@@ -2724,10 +2973,34 @@ class TestClaimGateAudit:
     #   (#6779 R7/R10) - confirms each absent proposal with a targeted READ
     #   (get_issue_state) and discards only the local authority-store op row;
     #   it never writes GitHub state and never touches a claimed coding issue.
+    # - APPLY_PROVIDER_IMPACT: owner command (#5980) - its only GitHub write is
+    #   the provider-blocked label, dispatched back through this applier's
+    #   claim-verified AddLabel/RemoveLabel handlers (same delegation shape as
+    #   RESET_RETRY_ISSUE); the extra half of the command is an event emit.
+    # - APPEND_PATTERN_OBSERVATION: comments on an orchestrator-owned pattern
+    #   case file and increments its durable observation count (#6781/#6957);
+    #   case files are observation-labeled evidence ledgers that are never
+    #   agent work items, so they are never claimed.
+    # - PROMOTE_TECH_LEAD_FINDING: creates a NEW gated issue in the ROUTED repo
+    #   (#6957) and records the promotion ledger row; it modifies nothing that
+    #   exists, let alone a claimed coding issue.
+    # - REPORT_PROMOTED_FINDING_EVIDENCE: comments on the routed promotion issue
+    #   and advances its local evidence watermark (#6957); that target is an
+    #   orchestrator-authored issue in the promotion lane, not a claimed coding
+    #   issue in this repository.
+    # - SETTLE_TECH_LEAD_PROMOTION: comments on / closes the orchestrator-owned
+    #   case file and writes the local shipped-fix + promotion ledger rows
+    #   (#6957); like APPEND_PATTERN_OBSERVATION the only GitHub target is a
+    #   case file, which is never claimed.
     # - CLEANUP_SESSION: post-completion cleanup
     # - RECONCILE_HISTORY_ENTRY: local session history mutation + event only
     # - CREATE_PR: not implemented in action_applier
     EXEMPT_ACTIONS = {
+        ActionType.APPLY_PROVIDER_IMPACT,
+        ActionType.APPEND_PATTERN_OBSERVATION,
+        ActionType.PROMOTE_TECH_LEAD_FINDING,
+        ActionType.REPORT_PROMOTED_FINDING_EVIDENCE,
+        ActionType.SETTLE_TECH_LEAD_PROMOTION,
         ActionType.LAUNCH_SESSION,
         ActionType.LAUNCH_VALIDATION_RETRY,
         ActionType.STOP_SESSION,
@@ -2736,6 +3009,9 @@ class TestClaimGateAudit:
         ActionType.QUEUE_RETROSPECTIVE_REVIEW,
         ActionType.QUEUE_REWORK,
         ActionType.QUEUE_TECH_LEAD,
+        # Withdraws a queued investigation from in-process state only (#6994
+        # launch-time revalidation). No GitHub write, so no claim to verify.
+        ActionType.DROP_TECH_LEAD,
         ActionType.CREATE_TECH_LEAD_ISSUE,
         ActionType.CREATE_TECH_LEAD_PROPOSAL_ISSUE,
         ActionType.CREATE_TECH_LEAD_CASE_FILE_ISSUE,
@@ -2797,3 +3073,463 @@ class TestClaimGateAudit:
                 f"_verify_claim_before_write — all GitHub writes on claimed "
                 f"issues must verify claim ownership first"
             )
+
+
+class TestTechLeadMutationsCrossTheReconciliationGate:
+    """#6957 round-5 review F15/A6: the extracted tech-lead dispatch is guarded.
+
+    Every tech-lead action carries ``build_expected_for_mutation()``, but the
+    extracted owners were invoked directly, so the applier's hard
+    optimistic-concurrency gate never ran on this branch. A case file paused
+    behind ``io:needs-reconcile`` could still have a promotion filed against it,
+    receive evidence comments, or be settled.
+    """
+
+    CASE_FILE = 65
+
+    @pytest.fixture
+    def guarded(self, mock_labels, mock_sessions, mock_events, mock_repository_host):
+        """An applier with reconciliation live and the case file PAUSED."""
+        from issue_orchestrator.control.action_applier import ActionApplier
+
+        reader = MagicMock()
+        reader.read_issue_labels.return_value = [
+            "tech-lead-observation",
+            "io:needs-reconcile",
+        ]
+        authority = MagicMock()
+        target = MagicMock()
+        applier = ActionApplier(
+            labels=mock_labels,
+            sessions=mock_sessions,
+            events=mock_events,
+            repository_host=mock_repository_host,
+            fresh_issue_reader=reader,
+            reconcile=True,
+            tech_lead_ops=authority,
+            promotion_target=target,
+        )
+        return applier, authority, target, mock_repository_host
+
+    @staticmethod
+    def _actions(case_file: int):
+        from issue_orchestrator.control.actions import (
+            AppendPatternObservationAction,
+            PromoteTechLeadFindingAction,
+            ReportPromotedFindingEvidenceAction,
+            SettleTechLeadPromotionAction,
+        )
+        from issue_orchestrator.control.reconciliation import (
+            build_expected_for_mutation,
+        )
+        from issue_orchestrator.domain.tech_lead_findings import PatternObservation
+
+        expected = build_expected_for_mutation()
+        marker = "<!-- issue-orchestrator:tech-lead-promotion:v1:abc -->"
+        return [
+            AppendPatternObservationAction(
+                issue_number=case_file,
+                pattern_signature="sig",
+                observation=PatternObservation(
+                    observation_id="r1:s:A1", comment="observed again"
+                ),
+                expected=expected,
+            ),
+            PromoteTechLeadFindingAction(
+                signature="sig",
+                case_file_issue_number=case_file,
+                target_repo="owner/upstream",
+                title="[tech-lead:repo] sig",
+                body=f"body\n\n{marker}",
+                labels=("agent:backend",),
+                observation_count=2,
+                idempotency_marker=marker,
+                expected=expected,
+            ),
+            ReportPromotedFindingEvidenceAction(
+                signature="sig",
+                case_file_issue_number=case_file,
+                target_repo="owner/upstream",
+                target_issue_number=500,
+                observation_count=3,
+                comment="more evidence",
+                expected=expected,
+            ),
+            SettleTechLeadPromotionAction(
+                signature="sig",
+                case_file_issue_number=case_file,
+                target_repo="owner/upstream",
+                target_issue_number=500,
+                shipped=True,
+                merged_pr_url="https://x/pull/1",
+                expected=expected,
+            ),
+        ]
+
+    def test_each_mutating_action_raises_and_writes_nothing(self, guarded):
+        from issue_orchestrator.control.reconciliation import ReconciliationRequired
+
+        applier, authority, target, repository_host = guarded
+
+        for action in self._actions(self.CASE_FILE):
+            with pytest.raises(ReconciliationRequired):
+                applier.apply(action)
+
+        # Zero writes anywhere: no cross-repo filing/commenting, no case-file
+        # comment, and no durable ledger row.
+        assert target.method_calls == []
+        assert authority.method_calls == []
+        repository_host.add_comment.assert_not_called()
+        repository_host.create_issue.assert_not_called()
+        repository_host.update_issue_state.assert_not_called()
+
+    def test_the_gate_checks_the_managed_repos_case_file(self, guarded):
+        """The promoted issue lives in another repo; the case file is the subject."""
+        from issue_orchestrator.control.reconciliation import ReconciliationRequired
+
+        applier, _authority, _target, _repository_host = guarded
+        reader = applier.fresh_issue_reader
+
+        for action in self._actions(self.CASE_FILE):
+            reader.read_issue_labels.reset_mock()
+            with pytest.raises(ReconciliationRequired):
+                applier.apply(action)
+            assert reader.read_issue_labels.call_args[0][0] == self.CASE_FILE
+
+    def test_an_unpaused_case_file_reaches_its_owner(self, guarded):
+        """The gate blocks a PAUSED case file, not every promotion action."""
+        applier, authority, _target, _repository_host = guarded
+        applier.fresh_issue_reader.read_issue_labels.return_value = [
+            "tech-lead-observation"
+        ]
+        authority.has_pattern_observation.return_value = True  # already recorded
+
+        [append, *_rest] = self._actions(self.CASE_FILE)
+        result = applier.apply(append)
+
+        assert result.success
+        authority.has_pattern_observation.assert_called_once()
+
+
+class TestActLevelOpsCrossTheGateExactlyOnce:
+    """#6957 round-2 review F5/A5: one reconciliation owner, one fresh read.
+
+    The centralized dispatch wrapper now gates every mutating tech-lead command,
+    but ``_apply_tech_lead_op`` kept its own ``_require_expected`` call. Since
+    the fresh reader deliberately bypasses every cache, an allowed reset or kill
+    performed TWO correctness-critical GitHub reads per dispatch — against this
+    repo's limited-API discipline — and left mutation policy owned in two
+    places. The registry test substitutes inert handlers, so only a boundary
+    test on the composed applier can see the duplicate.
+    """
+
+    TARGET = 12
+    PROPOSAL = 800
+
+    @pytest.fixture
+    def counted(self, mock_labels, mock_sessions, mock_events, mock_repository_host):
+        from issue_orchestrator.control.action_applier import ActionApplier
+        from issue_orchestrator.control.actions import ActionResult
+
+        reader = MagicMock()
+        # No pause label: the gate ALLOWS these, which is the case that used to
+        # pay for two reads. A blocked gate short-circuits after one either way.
+        reader.read_issue_labels.return_value = ["in-progress"]
+        # The kill path re-confirms consent through the repository host (a
+        # different port), so it never contributes to the fresh-read count.
+        mock_repository_host.get_issue.return_value = Issue(
+            number=self.PROPOSAL, title="Tech Lead proposal", labels=["agent:tech-lead"]
+        )
+        executor = MagicMock()
+        executor.apply.side_effect = lambda action: ActionResult.ok(action)
+        applier = ActionApplier(
+            labels=mock_labels,
+            sessions=mock_sessions,
+            events=mock_events,
+            repository_host=mock_repository_host,
+            fresh_issue_reader=reader,
+            reconcile=True,
+            tech_lead_ops=MagicMock(),
+            tech_lead_reset_retry=executor,
+            tech_lead_kill_session=executor,
+        )
+        return applier, reader, executor
+
+    def _reset(self):
+        from issue_orchestrator.control.actions import ResetRetryIssueAction
+        from issue_orchestrator.control.reconciliation import (
+            build_expected_for_mutation,
+        )
+
+        return ResetRetryIssueAction(
+            issue_number=self.TARGET,
+            proposal_id="A1",
+            expected=build_expected_for_mutation(),
+        )
+
+    def _kill(self):
+        from issue_orchestrator.control.actions import KillHungSessionAction
+        from issue_orchestrator.control.reconciliation import (
+            build_expected_for_mutation,
+        )
+
+        return KillHungSessionAction(
+            issue_number=self.TARGET,
+            proposal_id="A1",
+            proposal_issue_number=self.PROPOSAL,
+            expected=build_expected_for_mutation(),
+        )
+
+    def test_an_allowed_reset_reads_fresh_labels_once(self, counted):
+        applier, reader, executor = counted
+
+        applier.apply(self._reset())
+
+        assert reader.read_issue_labels.call_count == 1
+        assert reader.read_issue_labels.call_args[0][0] == self.TARGET
+        executor.apply.assert_called_once()
+
+    def test_an_allowed_kill_reads_fresh_labels_once(self, counted):
+        applier, reader, executor = counted
+
+        applier.apply(self._kill())
+
+        assert reader.read_issue_labels.call_count == 1
+        assert reader.read_issue_labels.call_args[0][0] == self.TARGET
+        executor.apply.assert_called_once()
+
+    @pytest.mark.parametrize("op", ("reset", "kill"))
+    def test_a_paused_target_still_stops_the_executor(self, counted, op):
+        """Removing the duplicate must not remove the gate itself."""
+        from issue_orchestrator.control.reconciliation import ReconciliationRequired
+
+        applier, reader, executor = counted
+        reader.read_issue_labels.return_value = ["in-progress", "io:needs-reconcile"]
+
+        with pytest.raises(ReconciliationRequired):
+            applier.apply(self._reset() if op == "reset" else self._kill())
+
+        executor.apply.assert_not_called()
+
+
+class TestTechLeadIssueCreationCrossesTheReconciliationGate:
+    """#6957 round-6 review F3/A3: creation is guarded like every other mutation.
+
+    The first fix wrapped the four commands whose subjects the dispatch table
+    happened to spell out by hand, and issue CREATION — a remote issue, its
+    labels, a ledger row and anchor comments, the largest mutation of the lot —
+    kept sailing past the gate. So a source anchor paused behind
+    ``io:needs-reconcile`` could still cause a brand-new case file or gated
+    proposal issue.
+    """
+
+    ANCHOR = 77
+
+    @pytest.fixture
+    def guarded(self, mock_labels, mock_sessions, mock_events, mock_repository_host):
+        """An applier with reconciliation live and the ANCHOR issue PAUSED."""
+        from issue_orchestrator.control.action_applier import ActionApplier
+
+        from issue_orchestrator.control.tech_lead_run_ownership import (
+            single_instance_run_ownership,
+        )
+
+        reader = MagicMock()
+        reader.read_issue_labels.return_value = ["tech-lead", "io:needs-reconcile"]
+        authority = MagicMock()
+        applier = ActionApplier(
+            labels=mock_labels,
+            sessions=mock_sessions,
+            events=mock_events,
+            repository_host=mock_repository_host,
+            fresh_issue_reader=reader,
+            reconcile=True,
+            tech_lead_ops=authority,
+            run_ownership=single_instance_run_ownership(),
+        )
+        return applier, authority, mock_repository_host
+
+    @classmethod
+    def _creations(cls):
+        from issue_orchestrator.control.actions import (
+            CreateTechLeadCaseFileIssueAction,
+            CreateTechLeadProposalIssueAction,
+        )
+        from issue_orchestrator.control.reconciliation import (
+            build_expected_for_mutation,
+        )
+        from issue_orchestrator.domain.tech_lead_findings import PatternObservation
+        from issue_orchestrator.domain.tech_lead_session import (
+            StoredTechLeadOp,
+            TechLeadCreationOrigin,
+        )
+
+        expected = build_expected_for_mutation()
+        origin = TechLeadCreationOrigin.derived_from_anchor(cls.ANCHOR)
+        marker = "<!-- issue-orchestrator:tech-lead-case-file:v1:abc -->"
+        return [
+            CreateTechLeadCaseFileIssueAction(
+                title="Pattern case file: sig",
+                body=f"documentation only\n\n{marker}",
+                labels=("agent:tech-lead", "tech-lead-observation"),
+                pattern_signature="sig",
+                origin=origin,
+                idempotency_marker=marker,
+                observations=(
+                    PatternObservation(observation_id="r1:s:A1", comment="observed"),
+                ),
+                expected=expected,
+            ),
+            CreateTechLeadProposalIssueAction(
+                title="Tech Lead proposal: reset_retry #12",
+                body="documentation only",
+                labels=("agent:tech-lead", "proposed-tech-lead"),
+                origin=origin,
+                op=StoredTechLeadOp(
+                    op_type="reset_retry",
+                    target_issue_number=12,
+                    rationale="stuck",
+                    source_run_id="r1",
+                    source_session_name="s",
+                    source_action_id="A1",
+                    created_at="2026-08-04T00:00:00Z",
+                ),
+                expected=expected,
+            ),
+        ]
+
+    def test_a_paused_anchor_creates_nothing_anywhere(self, guarded):
+        from issue_orchestrator.control.reconciliation import ReconciliationRequired
+
+        applier, authority, repository_host = guarded
+
+        for action in self._creations():
+            with pytest.raises(ReconciliationRequired):
+                applier.apply(action)
+
+        # No remote issue, no label provisioning, no ledger row, no comment.
+        repository_host.create_issue.assert_not_called()
+        repository_host.add_comment.assert_not_called()
+        assert authority.method_calls == []
+
+    def test_the_gate_checks_the_anchor_the_creation_was_decided_from(self, guarded):
+        from issue_orchestrator.control.reconciliation import ReconciliationRequired
+
+        applier, _authority, _repository_host = guarded
+        reader = applier.fresh_issue_reader
+
+        for action in self._creations():
+            reader.read_issue_labels.reset_mock()
+            with pytest.raises(ReconciliationRequired):
+                applier.apply(action)
+            assert reader.read_issue_labels.call_args[0][0] == self.ANCHOR
+
+    def test_an_unpaused_anchor_reaches_the_creation_owner(
+        self, mock_labels, mock_sessions, mock_events, mock_repository_host
+    ):
+        """The gate blocks a PAUSED anchor, not every tech-lead creation."""
+        from issue_orchestrator.control.action_applier import ActionApplier
+        from issue_orchestrator.ports.tech_lead_authority import (
+            InMemoryTechLeadAuthorityStore,
+        )
+
+        reader = MagicMock()
+        reader.read_issue_labels.return_value = ["tech-lead"]
+        mock_repository_host.find_issue_by_marker.return_value = None
+        mock_repository_host.list_labels.return_value = [
+            {"name": "agent:tech-lead"},
+            {"name": "tech-lead-observation"},
+        ]
+        mock_repository_host.create_issue.return_value = {"number": 900}
+        applier = ActionApplier(
+            labels=mock_labels,
+            sessions=mock_sessions,
+            events=mock_events,
+            repository_host=mock_repository_host,
+            fresh_issue_reader=reader,
+            reconcile=True,
+            tech_lead_ops=InMemoryTechLeadAuthorityStore(),
+        )
+
+        [case_file, _proposal] = self._creations()
+        result = applier.apply(case_file)
+
+        assert result.success, result.error
+        mock_repository_host.create_issue.assert_called_once()
+
+    def test_an_anchor_authoring_creation_needs_no_subject(self, guarded):
+        """The batch/health-review anchor IS the first issue — nothing to gate on."""
+        from issue_orchestrator.control.actions import CreateTechLeadIssueAction
+
+        applier, _authority, repository_host = guarded
+        repository_host.create_issue.return_value = 901
+
+        applier.apply(
+            CreateTechLeadIssueAction(
+                title="Tech Lead Batch Review",
+                body="b",
+                labels=("agent:tech-lead",),
+                pr_count=3,
+                origin=TechLeadCreationOrigin.authors_anchor(),
+            )
+        )
+
+        repository_host.create_issue.assert_called_once()
+        # ...and it cost no reconciliation read, because there is no subject.
+        applier.fresh_issue_reader.read_issue_labels.assert_not_called()
+
+    def test_a_dropped_subject_cannot_be_dispatched_at_all(self, guarded):
+        """A follow-up whose guard fields were dropped is unrepresentable.
+
+        The applier-level backstop only ever saw "expectations, no subject". A
+        composition that dropped BOTH looked exactly like anchor authoring and
+        wrote unguarded, so the command boundary is what rejects it now (#6957
+        round-2 review F6/A6) — before an action object exists to dispatch.
+        """
+        from issue_orchestrator.control.actions import CreateTechLeadIssueAction
+        from issue_orchestrator.control.reconciliation import (
+            build_expected_for_mutation,
+        )
+
+        _applier, _authority, repository_host = guarded
+
+        # One field dropped: the subject is gone but the expectations remain.
+        with pytest.raises(ValueError, match="reconciliation subject was dropped"):
+            CreateTechLeadIssueAction(
+                title="follow-up",
+                body="b",
+                labels=("agent:backend",),
+                origin=TechLeadCreationOrigin.authors_anchor(),
+                expected=build_expected_for_mutation(),
+            )
+        # Both dropped: the follow-up keeps its origin, so the missing
+        # ExpectedState is caught instead of passing as anchor authoring.
+        with pytest.raises(ValueError, match="must carry an ExpectedState"):
+            CreateTechLeadIssueAction(
+                title="follow-up",
+                body="b",
+                labels=("agent:backend",),
+                origin=TechLeadCreationOrigin.derived_from_anchor(self.ANCHOR),
+            )
+        repository_host.create_issue.assert_not_called()
+
+    def test_the_creation_command_cannot_omit_its_origin(self):
+        """The origin is required, not defaulted — omission is a TypeError.
+
+        This is what makes the two-field omission unrepresentable rather than
+        merely rejected: there is no value the caller can leave out and have
+        the command guess authority from (#6957 round-2 F6/A6).
+        """
+        from issue_orchestrator.control.actions import (
+            CreateTechLeadCaseFileIssueAction,
+            CreateTechLeadIssueAction,
+            CreateTechLeadProposalIssueAction,
+        )
+
+        for command in (
+            CreateTechLeadIssueAction,
+            CreateTechLeadProposalIssueAction,
+            CreateTechLeadCaseFileIssueAction,
+        ):
+            with pytest.raises(TypeError, match="origin"):
+                command(title="t", body="b", labels=("agent:backend",))  # type: ignore[call-arg]

@@ -9,6 +9,7 @@ import logging
 from pathlib import Path
 from unittest.mock import Mock, MagicMock
 
+from issue_orchestrator.domain.tech_lead_session import TechLeadCreationOrigin
 from issue_orchestrator.infra.config import Config
 from issue_orchestrator.control.planner import (
     Planner,
@@ -50,7 +51,11 @@ from issue_orchestrator.domain.models import (
 
 from issue_orchestrator.domain.issue_key import FakeIssueKey
 from issue_orchestrator.domain.session_key import SessionKey, TaskKind
-from issue_orchestrator.domain.tech_lead_session import TechLeadSessionFlavor
+from issue_orchestrator.domain.tech_lead_session import (
+    TechLeadLaunchScope,
+    TechLeadSessionFlavor,
+)
+from issue_orchestrator.control.provider_impact import ProviderImpactTransition
 from issue_orchestrator.control.provider_resilience import ProviderResilienceManager
 from issue_orchestrator.control.workflows import (
     RetrospectiveReviewWorkflow,
@@ -229,9 +234,27 @@ class TestProviderResilienceLabels:
 
         plan = planner.plan(snapshot)
 
-        removed = [a for a in plan.actions if getattr(a, "action_type", None) == ActionType.REMOVE_LABEL]
-        removed_numbers = {a.issue_number for a in removed}
-        assert removed_numbers == {1, 2, 3}
+        # The planner delegates to the provider-availability owner, which emits
+        # the typed provider-impact command (label transition + durable
+        # issue-scoped record) rather than a bare RemoveLabelAction (#5980 F1).
+        cleared = [
+            a for a in plan.actions
+            if getattr(a, "action_type", None) == ActionType.APPLY_PROVIDER_IMPACT
+            and a.transition is ProviderImpactTransition.CLEARED
+        ]
+        assert {a.issue_number for a in cleared} == {1, 2, 3}
+        # Each command still carries the blocked label it is shedding, and the
+        # provider(s) that recovered.
+        assert all(a.label == config.get_label_provider_unavailable() for a in cleared)
+        assert {p for a in cleared for p in a.providers} == {
+            "review-provider", "rework-provider", "tech-lead-provider",
+        }
+        # No raw label mutation bypasses the owner command.
+        assert not [
+            a for a in plan.actions
+            if getattr(a, "action_type", None) == ActionType.REMOVE_LABEL
+            and getattr(a, "label", "") == config.get_label_provider_unavailable()
+        ]
 
     def test_empty_plan_when_at_capacity(self):
         """Planner returns empty plan when at max capacity."""
@@ -788,6 +811,25 @@ class TestExplainSkip:
 
         assert "capacity" in reason.lower()
 
+    def test_explain_skip_ignores_reserved_tech_lead_for_worker_capacity(self):
+        """A reserved tech-lead session does not make the worker lane full."""
+        config = make_config(
+            max_concurrent_sessions=1,
+            tech_lead_review_agent="agent:tech-lead",
+        )
+        config.tech_lead.max_concurrent = 1
+        planner = Planner(config=config, scheduler=Scheduler(config))
+        tech_lead_session = make_session(make_issue(9))
+        tech_lead_session.agent_label = "agent:tech-lead"
+        snapshot = make_snapshot(
+            issues=[make_issue(2)],
+            active_sessions=[tech_lead_session],
+        )
+
+        reason = planner.explain_skip(2, snapshot)
+
+        assert reason == "Unknown reason"
+
 
 class TestPlanDiscoveredReviews:
     """Tests for Planner's _plan_discovered_reviews method.
@@ -1040,6 +1082,98 @@ class TestPlanAwaitingMergeReconciliations:
         assert action.issue_key == "M1-228"
         assert action.status == "merged"
         assert "merged" in action.reason
+
+    def test_merged_open_issue_plans_close_on_merge_fallback(self):
+        """A merged PR whose issue is still open (issue_open=True) means
+        GitHub's closing-keyword auto-close did not fire; the owner command
+        must carry close_issue=True so the applier closes the issue before
+        finalizing history (porchpin case file #81)."""
+        config = make_config()
+        scheduler = Scheduler(config)
+        planner = Planner(config=config, scheduler=scheduler)
+        discovered = DiscoveredAwaitingMergeReconciliation(
+            issue_number=228,
+            pr_number=318,
+            pr_url="https://github.com/test/repo/pull/318",
+            status="merged",
+            status_reason="PR merged; awaiting merge reconciled",
+            source="pull_request",
+            issue_key="M1-228",
+            issue_open=True,
+            merged_at="2026-08-03T13:52:09Z",
+        )
+
+        snapshot = make_snapshot(
+            discovered_awaiting_merge_reconciliations=(discovered,),
+        )
+
+        plan = planner.plan(snapshot)
+
+        actions = plan.actions_of_type(ActionType.RECOVER_TERMINAL_ISSUE)
+        assert len(actions) == 1
+        action = actions[0]
+        assert isinstance(action, RecoverTerminalIssueAction)
+        assert action.close_issue is True
+        # The merge evidence rides the owner command so the applier can
+        # revalidate the destructive precondition against live state.
+        assert action.merged_at == "2026-08-03T13:52:09Z"
+
+    def test_merged_closed_issue_plans_no_close(self):
+        """The common case — auto-close fired — must not order a close."""
+        config = make_config()
+        scheduler = Scheduler(config)
+        planner = Planner(config=config, scheduler=scheduler)
+        discovered = DiscoveredAwaitingMergeReconciliation(
+            issue_number=228,
+            pr_number=318,
+            pr_url="https://github.com/test/repo/pull/318",
+            status="merged",
+            status_reason="PR merged; awaiting merge reconciled",
+            source="pull_request",
+            issue_key="M1-228",
+        )
+
+        snapshot = make_snapshot(
+            discovered_awaiting_merge_reconciliations=(discovered,),
+        )
+
+        plan = planner.plan(snapshot)
+
+        actions = plan.actions_of_type(ActionType.RECOVER_TERMINAL_ISSUE)
+        assert len(actions) == 1
+        action = actions[0]
+        assert isinstance(action, RecoverTerminalIssueAction)
+        assert action.close_issue is False
+
+    def test_closed_status_never_plans_close_even_if_issue_open(self):
+        """Only a MERGED PR earns the close fallback: a closed-unmerged PR
+        with an open issue is the drift path's territory (blocked:pr-closed),
+        and the issue legitimately stays open for rework."""
+        config = make_config()
+        scheduler = Scheduler(config)
+        planner = Planner(config=config, scheduler=scheduler)
+        discovered = DiscoveredAwaitingMergeReconciliation(
+            issue_number=228,
+            pr_number=318,
+            pr_url="https://github.com/test/repo/pull/318",
+            status="closed",
+            status_reason="Issue closed; awaiting merge reconciled",
+            source="issue",
+            issue_key="M1-228",
+            issue_open=True,
+        )
+
+        snapshot = make_snapshot(
+            discovered_awaiting_merge_reconciliations=(discovered,),
+        )
+
+        plan = planner.plan(snapshot)
+
+        actions = plan.actions_of_type(ActionType.RECOVER_TERMINAL_ISSUE)
+        assert len(actions) == 1
+        action = actions[0]
+        assert isinstance(action, RecoverTerminalIssueAction)
+        assert action.close_issue is False
 
     def test_terminal_issue_closed_reconciliation_recovers_terminal_issue(self):
         """When the parent issue is closed (regardless of PR state), the same
@@ -2940,7 +3074,7 @@ class TestFailureInvestigationCleanupLifecycle:
             FactGatherer,
             clear_discovered_facts,
         )
-        from issue_orchestrator.control.session_routing import PendingSessionQueues
+        from issue_orchestrator.control.pending_session_queues import PendingSessionQueues
         from issue_orchestrator.domain.models import (
             ImmediateCleanup,
             OrchestratorState,
@@ -3068,7 +3202,7 @@ class TestStormCohortCleanupLifecycle:
         from issue_orchestrator.control.health_review_trigger import (
             intake_created_tech_lead_anchor,
         )
-        from issue_orchestrator.control.session_routing import PendingSessionQueues
+        from issue_orchestrator.control.pending_session_queues import PendingSessionQueues
         from issue_orchestrator.domain.models import (
             ImmediateCleanup,
             OrchestratorState,
@@ -3152,6 +3286,7 @@ class TestStormCohortCleanupLifecycle:
                 labels=("agent:tech-lead", HEALTH_REVIEW_MARKER_LABEL),
                 pr_count=0,
                 storm_problems=tuple(cohort),
+                origin=TechLeadCreationOrigin.authors_anchor(),
             ),
             999,
             state,
@@ -4548,6 +4683,13 @@ class TestReservedTechLeadDoesNotStealWorkerReviewCapacity:
     def _tech_lead_session(self, number: int, agent_label: str) -> Session:
         session = make_session(make_issue(number, labels=[agent_label]))
         session.agent_label = agent_label
+        # Faithful to the launch path, which always stamps the producer's grant.
+        # An UNSTAMPED tech-lead session is now read as global (the conservative
+        # direction — see ``has_active_global_run``), so a fake that omits it
+        # would be exercising a state production cannot produce (#6994 R1 F3).
+        session.tech_lead_scope = TechLeadLaunchScope(
+            flavor=TechLeadSessionFlavor.FAILURE_INVESTIGATION
+        )
         return session
 
     def _config(self, *, reserved: bool):
@@ -4698,6 +4840,13 @@ class TestE2EFirstClassWorkload:
     def _tech_lead_session(self, number: int, agent_label: str) -> Session:
         session = make_session(make_issue(number, labels=[agent_label]))
         session.agent_label = agent_label
+        # Faithful to the launch path, which always stamps the producer's grant.
+        # An UNSTAMPED tech-lead session is now read as global (the conservative
+        # direction — see ``has_active_global_run``), so a fake that omits it
+        # would be exercising a state production cannot produce (#6994 R1 F3).
+        session.tech_lead_scope = TechLeadLaunchScope(
+            flavor=TechLeadSessionFlavor.FAILURE_INVESTIGATION
+        )
         return session
 
     def _review_workflow(self):

@@ -116,6 +116,7 @@ class DashboardDataPayload(BaseModel):
     githubOwner: str
     githubRepo: str
     paused: bool
+    providerCircuit: ProviderCircuitStatusPayload
     queueRefreshSeconds: int
     repo: str
     repoRoot: str
@@ -556,6 +557,8 @@ class IssueItemPayload(BaseModel):
     issue_number: int | str | None = None
     issue_url: str | None = None
     open_run_command: OpenE2ERunCommandPayload | None = None
+    provider_badge: ProviderBadgeViewPayload | None = None
+    provider_signal: str | None = None
     runtime_label: str | None = None
     show_stale_badge: bool
     stack_chip: StackChipViewPayload | None = None
@@ -753,6 +756,32 @@ class PhaseDialogPayload(BaseModel):
     phase: dict[str, Any] | None
     phases: list[dict[str, Any]]
     title: str
+
+class ProviderBadgeViewPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    label_text: str
+    title: str
+    tone: str
+
+class ProviderCircuitEntryPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    consecutive_outages: int
+    cooldown_remaining_label: str | None
+    is_open: bool
+    last_error_summary: str | None
+    next_retry_at: str | None
+    provider: str
+    status_label: str
+
+class ProviderCircuitStatusPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    any_open: bool
+    entries: list[ProviderCircuitEntryPayload]
+    next_retry_at: str | None
+    open_count: int
+    open_providers: list[str]
+    status_unavailable: bool
+    summary_text: str
 
 class PublishFailedCodingAttemptPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -1166,6 +1195,30 @@ class SwitchE2ETimelineViewCommandPayload(BaseModel):
     run_id: int = Field(..., ge=1, strict=True)
     view: TimelineView
 
+class TechLeadGlobalHealthReviewScopePayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    kind: Literal['global_health_review']
+
+class TechLeadIssueScopePayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    issue_number: int = Field(..., ge=1, strict=True)
+    kind: Literal['issue']
+
+class TechLeadRunAdmissionPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    admitted: bool
+    behind_global_barrier: bool
+    detail: str
+    issue_number: int | None = Field(..., ge=1)
+    outcome: Literal['queued', 'already_queued', 'already_running', 'paused', 'not_running', 'not_configured', 'not_eligible', 'claim_conflict', 'failed']
+    reason: str
+    run_key: str
+    scope_kind: Literal['global_health_review', 'global_batch_review', 'issue']
+
+class TechLeadRunRequestPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    scope: TechLeadRunScopePayload
+
 class TestCaseHistoryPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
     outcome: str
@@ -1295,6 +1348,8 @@ ReviewStagePayload: TypeAlias = ReviewNotReachedPayload | ReviewSkippedPayload |
 ReviewTranscriptEvidencePayload: TypeAlias = ReviewTranscriptAvailablePayload | ReviewTranscriptUnavailablePayload
 
 SessionRecordingEvidencePayload: TypeAlias = SessionRecordingAvailablePayload | SessionRecordingUnavailablePayload
+
+TechLeadRunScopePayload: TypeAlias = TechLeadGlobalHealthReviewScopePayload | TechLeadIssueScopePayload
 
 TimelineCommandPayload: TypeAlias = ShowEventDetailsCommandPayload | OpenCompletionRecordCommandPayload | OpenValidationDetailsCommandPayload | OpenSessionRecordingCommandPayload | OpenReviewFeedbackCommandPayload | OpenReviewArtifactCommandPayload | OpenIssueTimelineCommandPayload | OpenE2ERunCommandPayload | ExpandE2ERunCommandPayload | SwitchE2ETimelineViewCommandPayload | CreateE2EUntriagedIssuesCommandPayload | OpenInlineAgentAttemptsCommandPayload
 

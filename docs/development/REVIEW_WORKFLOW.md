@@ -94,6 +94,63 @@ flowchart TD
   TFAIL -->|no| SKIP["No investigation"]
 ```
 
+## Requesting a Tech-Lead Run from the Dashboard
+
+Every tech-lead run — whether a timer, a failure, a problem storm, the one-shot
+CLI, or an operator's click started it — is admitted by one control-layer owner,
+`TechLeadRunCoordinator`. It models each run's **scope** explicitly:
+
+| Scope | Requested from | Concurrency |
+|---|---|---|
+| Global health review (whole board) | Dashboard actions menu → **Run board health review** | Exclusive: no other tech-lead run executes alongside it |
+| Issue investigation (one focus issue) | A blocked card's actions menu and the issue detail drawer → **Investigate with tech lead** | Up to `tech_lead.max_concurrent`, one run per issue |
+
+A queued global run acts as a **barrier**: targeted work queued behind it waits
+until it completes, and the global run itself waits for active tech-lead
+sessions to drain. `worker_budget.tech_lead_slot_availability` still owns the
+numeric capacity; the coordinator owns only the semantic conflicts, so the two
+cannot drift.
+
+Both dashboard actions POST one discriminated command to `/api/tech-lead/runs`:
+
+```json
+{"scope": {"kind": "issue", "issue_number": 42}}
+{"scope": {"kind": "global_health_review"}}
+```
+
+The response is a typed admission outcome — `queued`, `already_queued`,
+`already_running`, `paused`, `not_configured`, `not_eligible`, `claim_conflict`,
+or `failed` — with a machine-readable `reason` and human `detail` the dashboard
+surfaces as a durable toast. Repeated clicks coalesce onto one logical run
+(`run_key`), and an issue-scoped request is revalidated against GitHub right
+before it is queued, so a closed or no-longer-blocked target is refused rather
+than launched.
+
+Admission only ENQUEUES. The planner still launches, so a hand-aimed run gets
+byte-for-byte the same evidence map, launch authority, and sandboxing an
+automatic one does — and the dashboard never invokes the one-shot
+`orchestrator health-review` CLI, which would take the repository lock and pause
+planning under the running engine.
+
+### Launch-time revalidation
+
+Admission is not a standing licence to launch. A queued investigation can wait
+many ticks — behind the global barrier, behind capacity, behind an open provider
+circuit — and in that window a human can close or unblock its subject. So every
+tick the planner re-asks the same eligibility rule against the board it already
+fetched, and **withdraws** (not merely holds) any investigation whose subject is
+closed or no longer blocked, emitting `tech_lead.run_withdrawn` with the reason.
+Withdrawal removes the queue entry, because that entry is an investigation's only
+durable record: leaving it would strand the run and keep the dashboard's
+"Tech lead queued" affordance lit on an issue with nothing left to investigate.
+
+Only positive evidence withdraws a run. The board is filtered by agent label,
+milestone, and `filtering.exclude_labels` — which `tech_lead.inherit_labels`
+deliberately re-admits for tech-lead work — so a subject that is merely *absent*
+from the board proves nothing and its run is kept. Global runs are exempt: a
+health-review anchor is not a blocked work item, and blocked-label eligibility
+says nothing about whether the board is still worth auditing.
+
 ## Label State Transitions
 
 Labels are the source of truth for issue state. The orchestrator recovers from crashes by reading labels — no database required.

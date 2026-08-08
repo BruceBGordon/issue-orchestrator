@@ -3,6 +3,7 @@
 import argparse
 from collections.abc import Callable
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 
 CommandHandler = Callable[[argparse.Namespace], int]
@@ -43,7 +44,91 @@ class CLICommandHandlers:
     trace: CommandHandler
 
 
-__all__ = ["CLICommandHandlers", "build_parser"]
+class CLIStability(StrEnum):
+    """Stability tier a CLI command carries during ``0.x``.
+
+    Values are the exact strings ``docs/user/stability.md`` publishes, so the
+    doc cannot disagree with the code about what a command promises.
+    """
+
+    SUPPORTED = "Supported"
+    RETIRED = "Retired"
+    INTERNAL = "Internal"
+
+
+class CLIGroup(StrEnum):
+    """Grouping a CLI command is published under in the surface inventory."""
+
+    RUNTIME = "Runtime"
+    SETUP = "Setup"
+    CREDENTIALS = "Credentials"
+    DIAGNOSTICS = "Diagnostics"
+    DEVELOPMENT = "Development"
+
+
+@dataclass(frozen=True)
+class CLICommandSpec:
+    """One published CLI command: its name, grouping, and stability tier."""
+
+    name: str
+    group: CLIGroup
+    stability: CLIStability
+
+
+# The public CLI command surface, declared as data with the tier each command
+# actually carries. ``build_parser`` verifies the registered commands match this
+# declaration exactly, so the surface cannot drift silently, and
+# ``tests/unit/test_public_api_surface_docs.py`` requires the inventory table in
+# ``docs/user/stability.md`` to match it name-for-name, group, and tier.
+CLI_COMMAND_SURFACE: tuple[CLICommandSpec, ...] = (
+    # Runtime
+    CLICommandSpec("start", CLIGroup.RUNTIME, CLIStability.SUPPORTED),
+    CLICommandSpec("status", CLIGroup.RUNTIME, CLIStability.SUPPORTED),
+    # Retired: the parser still accepts these so an old script gets a pointer
+    # instead of an argparse error, but every one of them fails. See
+    # ``tests/unit/test_cli.py::TestRetiredCommandStubs``, which pins the tier
+    # to the handlers' actual behavior.
+    CLICommandSpec("attach", CLIGroup.RUNTIME, CLIStability.RETIRED),
+    CLICommandSpec("switch", CLIGroup.RUNTIME, CLIStability.RETIRED),
+    CLICommandSpec("dashboard", CLIGroup.RUNTIME, CLIStability.RETIRED),
+    CLICommandSpec("output", CLIGroup.RUNTIME, CLIStability.RETIRED),
+    CLICommandSpec("pause", CLIGroup.RUNTIME, CLIStability.SUPPORTED),
+    CLICommandSpec("resume", CLIGroup.RUNTIME, CLIStability.SUPPORTED),
+    CLICommandSpec("tech_lead", CLIGroup.RUNTIME, CLIStability.SUPPORTED),
+    CLICommandSpec("health-review", CLIGroup.RUNTIME, CLIStability.SUPPORTED),
+    CLICommandSpec("refresh", CLIGroup.RUNTIME, CLIStability.SUPPORTED),
+    CLICommandSpec("restart", CLIGroup.RUNTIME, CLIStability.SUPPORTED),
+    # Setup
+    CLICommandSpec("setup", CLIGroup.SETUP, CLIStability.SUPPORTED),
+    CLICommandSpec("init", CLIGroup.SETUP, CLIStability.SUPPORTED),
+    CLICommandSpec("verify", CLIGroup.SETUP, CLIStability.SUPPORTED),
+    CLICommandSpec("setup-hooks", CLIGroup.SETUP, CLIStability.SUPPORTED),
+    CLICommandSpec("setup-guardrails", CLIGroup.SETUP, CLIStability.SUPPORTED),
+    # Credentials
+    CLICommandSpec("auth", CLIGroup.CREDENTIALS, CLIStability.SUPPORTED),
+    CLICommandSpec("keys", CLIGroup.CREDENTIALS, CLIStability.SUPPORTED),
+    # Diagnostics
+    CLICommandSpec("doctor", CLIGroup.DIAGNOSTICS, CLIStability.SUPPORTED),
+    CLICommandSpec("audit", CLIGroup.DIAGNOSTICS, CLIStability.SUPPORTED),
+    CLICommandSpec("trace", CLIGroup.DIAGNOSTICS, CLIStability.SUPPORTED),
+    CLICommandSpec("demo", CLIGroup.DIAGNOSTICS, CLIStability.SUPPORTED),
+    # Development only - these operate on test and E2E state and carry no
+    # compatibility promise of any kind.
+    CLICommandSpec("test-reset", CLIGroup.DEVELOPMENT, CLIStability.INTERNAL),
+    CLICommandSpec("e2e-reset", CLIGroup.DEVELOPMENT, CLIStability.INTERNAL),
+)
+
+CLI_COMMANDS: tuple[str, ...] = tuple(spec.name for spec in CLI_COMMAND_SURFACE)
+
+__all__ = [
+    "CLICommandHandlers",
+    "CLICommandSpec",
+    "CLIGroup",
+    "CLIStability",
+    "CLI_COMMANDS",
+    "CLI_COMMAND_SURFACE",
+    "build_parser",
+]
 
 
 def build_parser(handlers: CLICommandHandlers) -> argparse.ArgumentParser:
@@ -70,8 +155,28 @@ def build_parser(handlers: CLICommandHandlers) -> argparse.ArgumentParser:
     _register_hook_commands(subparsers, handlers)
     _register_auth_commands(subparsers, handlers)
     _register_utility_commands(subparsers, handlers)
+    _verify_declared_command_surface(subparsers)
 
     return parser
+
+
+def _verify_declared_command_surface(subparsers) -> None:
+    """Fail fast when the registered commands drift from ``CLI_COMMAND_SURFACE``.
+
+    The declared surface is what the stability doc publishes, so a command that
+    exists but is undeclared (or vice versa) is a bug, not a nuance to discover
+    later from a user report.
+    """
+    registered = set(subparsers.choices)
+    declared = set(CLI_COMMANDS)
+    if registered == declared:
+        return
+    raise RuntimeError(
+        "CLI command surface drifted from CLI_COMMAND_SURFACE. "
+        f"Registered but undeclared: {sorted(registered - declared)}; "
+        f"declared but not registered: {sorted(declared - registered)}. "
+        "Update CLI_COMMAND_SURFACE and docs/user/stability.md together."
+    )
 
 
 def _register_runtime_commands(subparsers, handlers: CLICommandHandlers) -> None:
@@ -184,7 +289,7 @@ def _register_runtime_commands(subparsers, handlers: CLICommandHandlers) -> None
     status_parser.set_defaults(func=handlers.status)
 
     attach_parser = subparsers.add_parser(
-        "attach", help="(deprecated) Use web dashboard instead"
+        "attach", help="(retired) Always fails - use the web dashboard instead"
     )
     attach_parser.add_argument(
         "issue_number",
@@ -196,7 +301,7 @@ def _register_runtime_commands(subparsers, handlers: CLICommandHandlers) -> None
     attach_parser.set_defaults(func=handlers.attach)
 
     switch_parser = subparsers.add_parser(
-        "switch", help="(deprecated) Use web dashboard instead"
+        "switch", help="(retired) Always fails - use the web dashboard instead"
     )
     switch_parser.add_argument(
         "issue_number", type=int, help="GitHub issue number to switch to"
@@ -204,12 +309,13 @@ def _register_runtime_commands(subparsers, handlers: CLICommandHandlers) -> None
     switch_parser.set_defaults(func=handlers.switch)
 
     dashboard_parser = subparsers.add_parser(
-        "dashboard", help="(deprecated) Use web dashboard instead"
+        "dashboard", help="(retired) Always fails - use the web dashboard instead"
     )
     dashboard_parser.set_defaults(func=handlers.dashboard)
 
     output_parser = subparsers.add_parser(
-        "output", help="Show recent output from an issue's session"
+        "output",
+        help="(retired) Always fails - read the session terminal recording instead",
     )
     output_parser.add_argument("issue_number", type=int, help="GitHub issue number")
     output_parser.add_argument(

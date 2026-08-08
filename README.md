@@ -52,13 +52,13 @@ Timeline artifact buttons open details such as reviewer feedback, review reports
 
 Session recordings let you see exactly what an agent did: terminal output rendered in an emulator replay. This is useful for debugging failures, auditing completion claims, and understanding why an issue moved to rework or needs-human.
 
-Any client can connect: browser, VS Code ([MCP integration](docs/user/vscode.md)), any MCP client via the [MCP server](docs/user/mcp.md), or AI agents via the REST API.
+Any client can connect: browser, VS Code ([MCP integration](docs/user/vscode.md)), or AI agents and other MCP clients via the [MCP server](docs/user/mcp.md). There is also a contracted subset of HTTP routes described by [`docs/api/ui-openapi.json`](docs/api/ui-openapi.json); the remaining routes are internal engine transport. See [Stability & API Surface](docs/user/stability.md) before integrating against HTTP.
 
 ## Guardrails
 
 The operating rule is agent intent, orchestrator authority. Agents report what they did and what they want; the orchestrator re-observes GitHub, worktrees, validation records, and review output before changing state.
 
-Agents cannot merge PRs. Humans merge. Validation runs automatically before code can advance, and it can include tests, linting, type checks, architecture checks, and repo-specific policy scans.
+Agents cannot merge PRs. Humans merge. Validation runs automatically before code can advance, and it can include tests, linting, type checks, architecture checks, and repo-specific policy scans. See [Client Test Integrations](docs/user/test-integrations.md) for how to expose your repo's test results, reports, and artifacts in the dashboard.
 
 [Multi-layer hooks](docs/architecture/hooks.md) enforce these rules at the AI-agent level, git level, orchestrator level, and CI. The guardrails are installed and verified, not just described. See [Guardrails & Safety Model](docs/design/guardrails.md) for the guarantee and limitation boundaries.
 
@@ -101,6 +101,38 @@ If you want your AI assistant to drive the setup for you, use the [Agent-Guided 
 
 Issue-Orchestrator dogfoods the same discipline it expects from target repos: hexagonal architecture, import-linter and AST guardrails, ADRs, and a large automated test suite. See [Issue-Orchestrator Internal Architecture](docs/architecture/internal-architecture.md) for the implementation architecture.
 
+## Stability & API surface
+
+Issue-Orchestrator is `0.x`, so the public API is explicitly **not stable**: a
+minor release may break any surface below, and every `0.x` release is published
+as a GitHub pre-release. Full tier definitions, per-surface detail, release
+mechanics, and the path to `1.0` are in
+**[Stability & API Surface](docs/user/stability.md)**.
+
+| Surface | Public? | Tier during `0.x` |
+|---|---|---|
+| Config YAML schema (`.issue-orchestrator/config/*.yaml`) | Yes | Supported - keys may be added or renamed between minors |
+| CLI (`issue-orchestrator …`) | Yes | Supported - flags may change between minors |
+| Agent completion contracts (`coding-done`, `reviewer-done`) | Yes (agent-facing) | Supported - subcommand/flag shape may change |
+| MCP server tools (`orchestrator.*`) | Yes | **Experimental** - names, args, and returns may change in any release |
+| Repository Engine dashboard event stream (`GET /api/events`) | Yes | **Versioned** - `schema` on every event; a breaking change bumps it |
+| Schema-backed SSE payloads and view models (`contracts/public/*.json`) | Yes | Contracted - committed artifacts + drift tests, no runtime version |
+| All other SSE event payloads | Yes | Experimental - versioned envelope, but names and fields may change |
+| Other SSE streams (Control API, Control Center repo status) | No | Internal - no envelope version, not a third-party stream |
+| Contracted HTTP routes (`docs/api/ui-openapi.json`) | Yes | Contracted - generated and drift-tested, no runtime version |
+| All other `/api/*` and `/control/*` routes | No | Internal - bearer-token engine transport, not a third-party API |
+| Python package (`import issue_orchestrator`) | No | Internal - refactored freely |
+| Plugin entry points (`issue_orchestrator.plugins`, `…ai_provider_keys`) | Yes | Experimental - hook signatures may change |
+| VS Code extension (`packages/vscode`) | First-party | Run it from the same commit as the installed package |
+
+Only the Repository Engine dashboard event stream is `Versioned` - a single
+owner stamps `schema` onto every event at that broadcast boundary, so a client
+can check it at runtime. The other two SSE endpoints are internal and carry no
+envelope version.
+`Contracted` surfaces are backed by committed JSON Schema artifacts and drift
+tests, so a break is visible in review, but nothing in the payload lets a client
+detect it. That gap is what the other surfaces grow toward closing.
+
 ## Documentation
 
 Pick the path that fits:
@@ -112,10 +144,10 @@ Pick the path that fits:
 
 Reference docs:
 
-- **User:** [Installation](docs/user/installation.md) · [Tutorial](docs/user/tutorial.md) · [Configuration](docs/user/configuration.md) · [Configuration Reference](docs/user/configuration_reference.md) · [FAQ](docs/user/faq.md)
+- **User:** [Installation](docs/user/installation.md) · [Tutorial](docs/user/tutorial.md) · [Configuration](docs/user/configuration.md) · [Configuration Reference](docs/user/configuration_reference.md) · [Stability & API Surface](docs/user/stability.md) · [FAQ](docs/user/faq.md)
 - **Architecture:** [Overview](docs/architecture/README.md) · [Internal Architecture](docs/architecture/internal-architecture.md) · [ADRs](docs/architecture/ADR/README.md) · [Guardrails](docs/design/guardrails.md) · [Hooks](docs/architecture/hooks.md)
 - **Development:** [Testing](docs/development/TESTING.md) · [Creating Guardrails](docs/development/CREATE_GUARDRAILS.md) · [Troubleshooting](docs/development/TROUBLESHOOTING.md) · [Review Workflow](docs/development/REVIEW_WORKFLOW.md)
-- **Features:** [Feature List](docs/user/features.md) · [E2E Runner](docs/user/e2e.md) · [VS Code](docs/user/vscode.md) · [MCP Server](docs/user/mcp.md)
+- **Features:** [Feature List](docs/user/features.md) · [Test Integrations](docs/user/test-integrations.md) · [E2E Runner](docs/user/e2e.md) · [VS Code](docs/user/vscode.md) · [MCP Server](docs/user/mcp.md)
 
 ## License and contributions
 

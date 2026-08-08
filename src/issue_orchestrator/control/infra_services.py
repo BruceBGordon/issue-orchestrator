@@ -11,6 +11,11 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+from ..ports.provider_readiness import (
+    NO_PROVIDER_READINESS_PROBE,
+    ProviderReadinessProbe,
+)
+
 if TYPE_CHECKING:
     from ..ports.label_store import LabelStore
     from ..ports.queue_cache_store import QueueCacheStore
@@ -23,10 +28,12 @@ if TYPE_CHECKING:
     from ..ports.timeline_reader import TimelineReader
     from ..ports.timeline_store import TimelineStore
     from ..ports.timeline_writer import TimelineWriter
+    from ..ports.promotion_target import PromotionTargetHost
     from ..ports.tech_lead_authority import TechLeadAuthorityStore
     from .open_issue_corpus import OpenIssueCorpusManager
     from .background_job_supervisor import BackgroundJobSupervisor
     from .label_manager import LabelManager
+    from .provider_launch_readiness import ProviderLaunchReadinessSampler
     from .provider_resilience import ProviderResilienceManager
 
 
@@ -56,6 +63,17 @@ class InfraServices:
     tech_lead_authority: "TechLeadAuthorityStore"
     # Rebuildable GitHub open-issue corpus owner (#6881).
     open_issue_corpus: "OpenIssueCorpusManager"
+    # The typed provider-readiness/auth-failure boundary (#6999). Shared by the
+    # launch gate and the live-session observer so both consume one probe (and
+    # one short-lived result cache) rather than each spawning their own.
+    provider_readiness_probe: ProviderReadinessProbe = NO_PROVIDER_READINESS_PROBE
+    # Samples provider launch eligibility once per tick, before planning
+    # (#6999 A3). None means "no sampler wired", which blocks nothing — a
+    # production tick always has one.
+    provider_launch_sampler: "ProviderLaunchReadinessSampler | None" = None
+    # Cross-repo filing seam for the finding-promotion lane (#6957). None when
+    # the repository host is not a real GitHub adapter (offline/testing).
+    promotion_target: "PromotionTargetHost | None" = None
     pair_registry: "PersistentExchangePairRegistry | None" = None
     turn_mailbox: "TurnMailbox | None" = None
     background_job_supervisor: "BackgroundJobSupervisor | None" = None

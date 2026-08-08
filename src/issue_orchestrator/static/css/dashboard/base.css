@@ -149,6 +149,121 @@ html[data-embedded="true"] body > .container > header {
     border-radius: 3px;
 }
 
+/* Provider circuit-breaker outage banner + health panel (issue #5980). Uses
+   the danger palette plus a ⚠ icon and text status labels so colour is never
+   the only outage signal. Hidden (inline display:none) until JS renders an
+   open circuit. Theme-aware: every colour is a variable that flips in the
+   light-theme block. */
+.provider-circuit-banner {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    margin: 0 0 12px;
+    padding: 10px 12px;
+    border-radius: 10px;
+    border: 1px solid var(--danger);
+    background: color-mix(in srgb, var(--danger) 12%, var(--bg-panel));
+    color: var(--text);
+    font-size: 13px;
+    line-height: 1.4;
+}
+/* Dedicated assertive live region (issue #5980). Visually hidden -- the visible
+   summary/details carry the same information for sighted users -- but present in
+   the accessibility tree so an outage is announced once when it starts, not on
+   every countdown tick. Component-scoped so it holds wherever the banner renders. */
+.pcircuit-announcer {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+}
+.pcircuit-icon {
+    flex: 0 0 auto;
+    font-size: 15px;
+    line-height: 1.3;
+    color: var(--danger);
+}
+.pcircuit-body {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    min-width: 0;
+}
+/* Read/projection failure (status_unavailable): the status is unknown rather
+   than a confirmed outage. Keep the alert affordance but nudge the summary to
+   the warning tone so operators can tell "couldn't read" from "provider down".
+   Colour is not the only cue — the summary text itself says "unavailable". */
+.pcircuit-body--unavailable > .pcircuit-summary {
+    color: var(--warn, var(--danger));
+}
+.pcircuit-summary {
+    font-weight: 700;
+}
+.pcircuit-details > summary.pcircuit-summary-toggle {
+    cursor: pointer;
+    font-weight: 600;
+    color: var(--accent);
+    width: fit-content;
+}
+.pcircuit-details > summary.pcircuit-summary-toggle:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+    border-radius: 3px;
+}
+.pcircuit-list {
+    list-style: none;
+    margin: 6px 0 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+.pcircuit-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 8px;
+}
+.pcircuit-provider {
+    font-weight: 700;
+}
+.pcircuit-badge {
+    font-size: 11px;
+    font-weight: 700;
+    padding: 1px 6px;
+    border-radius: 999px;
+    border: 1px solid transparent;
+}
+.pcircuit-badge--open {
+    color: var(--danger);
+    border-color: var(--danger);
+    background: color-mix(in srgb, var(--danger) 14%, transparent);
+}
+.pcircuit-badge--recovering {
+    color: var(--warn);
+    border-color: var(--warn);
+    background: color-mix(in srgb, var(--warn) 14%, transparent);
+}
+.pcircuit-cooldown,
+.pcircuit-eta,
+.pcircuit-attempts {
+    color: var(--text-muted);
+}
+.pcircuit-error {
+    color: var(--text-muted);
+    font-style: italic;
+    /* Wrap rather than clip so long provider errors stay legible at any
+       viewport; the full text is also on the row's title attribute. */
+    white-space: normal;
+    word-break: break-word;
+    max-width: 100%;
+}
+
 body.column-focus-mode {
     height: 100vh;
     overflow: hidden;
@@ -303,6 +418,58 @@ h1 {
 }
 .settings-menu-item:hover { background: var(--bg-panel-soft); }
 .settings-menu-item:active { background: var(--bg-hover); }
+/* A disabled dashboard action stays readable (not colour-only): the adjacent
+   status text says WHY, and the reduced opacity is a secondary cue (#6994). */
+.settings-menu-item[disabled],
+.settings-menu-item[aria-disabled="true"] {
+    opacity: 0.6;
+    cursor: not-allowed;
+}
+/* An unavailable action keeps its focus ring: it is aria-disabled rather than
+   natively disabled precisely so its explanation and remedy stay reachable by
+   keyboard (#6994 round 2 F6). */
+.settings-menu-item:focus-visible,
+.settings-menu-item:focus {
+    outline: 2px solid var(--accent, currentColor);
+    outline-offset: -2px;
+}
+/* The status text and the Settings remedy are SIBLINGS of the action, never
+   nested inside the button — a button inside a button is invalid interactive
+   markup and hides both from assistive technology (#6994 round 2 F6). */
+.settings-menu-row {
+    display: block;
+    padding-bottom: 2px;
+}
+.settings-menu-status {
+    display: block;
+    font-size: 11px;
+    color: var(--text-muted, var(--text));
+    margin: 2px 0 0 8px;
+    /* Never clipped: the blocked reason is a full sentence. */
+    white-space: normal;
+    overflow-wrap: anywhere;
+}
+.settings-menu-status:empty { display: none; }
+/* The remedy for "no tech lead agent configured" has to be operable: a disabled
+   button cannot take anyone to Settings, so the path is its own focusable
+   control with a visible focus ring (#6994 round 1 F7). */
+.tech-lead-settings-link {
+    display: block;
+    width: 100%;
+    text-align: left;
+    background: none;
+    border: none;
+    padding: 2px 0 4px;
+    font-size: 11px;
+    color: var(--accent, var(--text));
+    text-decoration: underline;
+    cursor: pointer;
+}
+.tech-lead-settings-link:focus-visible,
+.tech-lead-settings-link:focus {
+    outline: 2px solid var(--accent, currentColor);
+    outline-offset: 2px;
+}
 
 .gh-usage-wrap {
     position: relative;

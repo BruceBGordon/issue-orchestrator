@@ -156,6 +156,53 @@
         }
       }
     },
+    "/api/tech-lead/runs": {
+      "post": {
+        "summary": "Request a tech-lead run with an explicit scope",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {"$ref": "#/components/schemas/TechLeadRunRequestPayload"}
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Typed admission outcome for the requested tech-lead run",
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "#/components/schemas/TechLeadRunAdmissionPayload"}
+              }
+            }
+          },
+          "409": {
+            "description": "The run was refused (paused, not configured, not eligible, or claimed by a peer). Same typed admission body.",
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "#/components/schemas/TechLeadRunAdmissionPayload"}
+              }
+            }
+          },
+          "502": {
+            "description": "The run was admissible but could not be prepared. Same typed admission body.",
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "#/components/schemas/TechLeadRunAdmissionPayload"}
+              }
+            }
+          },
+          "503": {
+            "description": "The Repository Engine is not running, so nothing can admit the request. Same typed admission body with outcome not_running.",
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "#/components/schemas/TechLeadRunAdmissionPayload"}
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/dialog/info": {
       "get": {
         "summary": "Get about dialog",
@@ -677,7 +724,14 @@
               {"$ref": "#/components/schemas/StackChipViewPayload"},
               {"type": "null"}
             ]
-          }
+          },
+          "provider_badge": {
+            "oneOf": [
+              {"$ref": "#/components/schemas/ProviderBadgeViewPayload"},
+              {"type": "null"}
+            ]
+          },
+          "provider_signal": {"type": ["string", "null"]}
         }
       },
       "StackChipViewPayload": {
@@ -688,6 +742,16 @@
           "tone": {"type": "string"},
           "mode_label": {"type": "string"},
           "status_text": {"type": "string"},
+          "title": {"type": "string"}
+        }
+      },
+      "ProviderBadgeViewPayload": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["tone", "label_text", "title"],
+        "properties": {
+          "tone": {"type": "string"},
+          "label_text": {"type": "string"},
           "title": {"type": "string"}
         }
       },
@@ -704,6 +768,50 @@
           "session_scoped": {"type": "boolean"}
         }
       },
+      "ProviderCircuitEntryPayload": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "provider",
+          "is_open",
+          "status_label",
+          "cooldown_remaining_label",
+          "next_retry_at",
+          "consecutive_outages",
+          "last_error_summary"
+        ],
+        "properties": {
+          "provider": {"type": "string"},
+          "is_open": {"type": "boolean"},
+          "status_label": {"type": "string"},
+          "cooldown_remaining_label": {"type": ["string", "null"]},
+          "next_retry_at": {"type": ["string", "null"]},
+          "consecutive_outages": {"type": "integer"},
+          "last_error_summary": {"type": ["string", "null"]}
+        }
+      },
+      "ProviderCircuitStatusPayload": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "any_open",
+          "open_count",
+          "open_providers",
+          "summary_text",
+          "next_retry_at",
+          "entries",
+          "status_unavailable"
+        ],
+        "properties": {
+          "any_open": {"type": "boolean"},
+          "open_count": {"type": "integer"},
+          "open_providers": {"type": "array", "items": {"type": "string"}},
+          "summary_text": {"type": "string"},
+          "next_retry_at": {"type": ["string", "null"]},
+          "entries": {"type": "array", "items": {"$ref": "#/components/schemas/ProviderCircuitEntryPayload"}},
+          "status_unavailable": {"type": "boolean"}
+        }
+      },
       "DashboardDataPayload": {
         "type": "object",
         "additionalProperties": true,
@@ -717,7 +825,8 @@
           "githubOwner",
           "githubRepo",
           "agents",
-          "validationConfigured"
+          "validationConfigured",
+          "providerCircuit"
         ],
         "properties": {
           "startupComplete": {"type": "boolean"},
@@ -730,7 +839,8 @@
           "githubRepo": {"type": "string"},
           "e2eLastRun": {"type": ["object", "null"], "additionalProperties": true},
           "agents": {"type": "array", "items": {"type": "string"}},
-          "validationConfigured": {"type": "boolean"}
+          "validationConfigured": {"type": "boolean"},
+          "providerCircuit": {"$ref": "#/components/schemas/ProviderCircuitStatusPayload"}
         }
       },
       "DashboardViewModelPayload": {
@@ -3082,6 +3192,53 @@
           "issue_number": {"type": "integer"},
           "phase": {"type": ["object", "null"], "additionalProperties": true},
           "phases": {"type": "array", "items": {"type": "object", "additionalProperties": true}}
+        }
+      },
+      "TechLeadGlobalHealthReviewScopePayload": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind"],
+        "properties": {
+          "kind": {"const": "global_health_review"}
+        }
+      },
+      "TechLeadIssueScopePayload": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "issue_number"],
+        "properties": {
+          "kind": {"const": "issue"},
+          "issue_number": {"type": "integer", "minimum": 1}
+        }
+      },
+      "TechLeadRunScopePayload": {
+        "oneOf": [
+          {"$ref": "#/components/schemas/TechLeadGlobalHealthReviewScopePayload"},
+          {"$ref": "#/components/schemas/TechLeadIssueScopePayload"}
+        ],
+        "discriminator": {"propertyName": "kind"}
+      },
+      "TechLeadRunRequestPayload": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["scope"],
+        "properties": {
+          "scope": {"$ref": "#/components/schemas/TechLeadRunScopePayload"}
+        }
+      },
+      "TechLeadRunAdmissionPayload": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["outcome", "scope_kind", "run_key", "reason", "detail", "issue_number", "behind_global_barrier", "admitted"],
+        "properties": {
+          "outcome": {"enum": ["queued", "already_queued", "already_running", "paused", "not_running", "not_configured", "not_eligible", "claim_conflict", "failed"]},
+          "scope_kind": {"enum": ["global_health_review", "global_batch_review", "issue"]},
+          "run_key": {"type": "string"},
+          "reason": {"type": "string"},
+          "detail": {"type": "string"},
+          "issue_number": {"type": ["integer", "null"], "minimum": 1},
+          "behind_global_barrier": {"type": "boolean"},
+          "admitted": {"type": "boolean"}
         }
       }
     }

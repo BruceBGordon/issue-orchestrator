@@ -32,7 +32,7 @@ from issue_orchestrator.domain.tech_lead_session import (
     TechLeadSessionFlavor,
     TechLeadShippedFixSummary,
 )
-from issue_orchestrator.control.session_routing import PendingSessionQueues
+from issue_orchestrator.control.pending_session_queues import PendingSessionQueues
 from issue_orchestrator.domain.models import (
     AgentConfig,
     DependencyProblem,

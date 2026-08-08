@@ -367,7 +367,8 @@ class TestAiGate:
         mock_adapter.supports_ai_gate.return_value = True
         mock_adapter.test_ai_gate.return_value = (
             False,
-            "Did not block dangerous command",
+            "Claude is not authenticated; run 'claude auth login'\n"
+            "Verify with 'claude auth status', then retry startup.",
         )
         monkeypatch.setattr(
             "issue_orchestrator.infra.doctor.checks.hooks.get_adapter",
@@ -383,7 +384,14 @@ class TestAiGate:
 
         assert result is not None
         assert result.status == "error"
-        assert "Failed" in result.detail
+        assert result.detail == (
+            "Failed: claude-code: Claude is not authenticated; run 'claude auth login'"
+        )
+        assert result.expandable is not None
+        assert (
+            "claude auth status"
+            in result.expandable["results"]["claude-code"]["message"]
+        )
 
     def test_ai_gate_failure_warns_when_allowed(self, tmp_path, monkeypatch):
         """Test that AI gate test failure only warns when dangerous_allow_failure=True."""

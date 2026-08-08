@@ -102,6 +102,75 @@ def create_mock_orchestrator():
     )
     lm.is_pr_pending = MagicMock(side_effect=lambda labels: "pr-pending" in labels)
 
+    # The shared needs-human block owner, faithful to production: it is the
+    # ONE writer of that label, and it writes through the same repository host
+    # the operator routes would otherwise have called directly (#6999 F2 r3).
+    class _SharedBlock:
+        def owns(self, label: str) -> bool:
+            return label == lm.needs_human
+
+        def force_clear(self, target: int, reason: str):
+            from issue_orchestrator.control.needs_human_block import BlockOutcome
+
+            del reason
+            try:
+                mock.repository_host.remove_label(target, lm.needs_human)
+            except Exception:
+                return BlockOutcome.FAILED
+            return BlockOutcome.CLEARED
+
+        def unsettleable_holders(self, issue_number: int):
+            del issue_number
+            return ()
+
+    mock.deps.needs_human_block = _SharedBlock()
+
+    # The REAL operator retry/dismiss command, composed through the REAL
+    # bootstrap builder (#6999 F5). Endpoint tests must exercise the actual
+    # transition - labels first, local state only if that committed - rather
+    # than a mock that would report success for either order.
+    class _FreshLabels:
+        """Fresh reads, delegated exactly as ``build_orchestrator_for_testing``."""
+
+        def read_issue_labels(self, issue_number: int) -> list[str]:
+            return mock.repository_host.get_issue_labels(issue_number)
+
+    def _compose_operator_commands():
+        """Compose against the mock's CURRENT collaborators.
+
+        Production composes once, at bootstrap. Tests rewire the repository
+        host, the block owner and the queue-cache store per case, so the
+        composition is deferred to call time here — the builder, the command
+        and the transition under test are the real ones either way.
+        """
+        from issue_orchestrator.entrypoints.bootstrap_operator_commands import (
+            build_operator_issue_command_factory,
+        )
+
+        mock.deps.operator_issue_command_factory = (
+            build_operator_issue_command_factory(
+                mock.config,
+                repository_host=mock.repository_host,
+                label_manager=lm,
+                needs_human_block=mock.deps.needs_human_block,
+                fresh_issue_reader=_FreshLabels(),
+                queue_cache_store=mock.deps.queue_cache_store,
+            )
+        )
+        return mock.deps.operator_issue_command_factory(
+            state=lambda: mock.state,
+            run_locked=lambda fn: fn(),
+        )
+
+    class _LiveOperatorCommands:
+        def retry(self, issue_number: int):
+            return _compose_operator_commands().retry(issue_number)
+
+        def dismiss(self, issue_number: int):
+            return _compose_operator_commands().dismiss(issue_number)
+
+    mock.operator_issue_commands = _LiveOperatorCommands()
+
     # Mock event context for snapshot (use public property)
     mock.event_context = MagicMock()
     mock.event_context.tick_id = 0

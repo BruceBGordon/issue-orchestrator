@@ -148,6 +148,76 @@ hooks:
         # Should fail because AI gate test failed
         assert exit_code == 1
 
+    @pytest.mark.parametrize(
+        ("gate_message", "expected_output"),
+        [
+            (
+                "Claude is not authenticated; run 'claude auth login'\n"
+                "Verify with 'claude auth status', then retry startup.\n"
+                "The AI gate did not reach a result, so startup remains blocked.\n"
+                "Stderr (72 chars): Failed to authenticate: OAuth session expired",
+                (
+                    "Claude is not authenticated; run 'claude auth login'",
+                    "Verify with 'claude auth status', then retry startup.",
+                    "Failed to authenticate: OAuth session expired",
+                ),
+            ),
+            (
+                "Claude AI gate could not run (exit 1)\n"
+                "Resolve the Claude CLI error below, then retry startup.\n"
+                "The AI gate did not reach a result, so startup remains blocked.\n"
+                "Stderr (42 chars): Cannot connect to the Anthropic API",
+                (
+                    "Claude AI gate could not run (exit 1)",
+                    "Resolve the Claude CLI error below, then retry startup.",
+                    "Cannot connect to the Anthropic API",
+                ),
+            ),
+        ],
+    )
+    def test_setup_hooks_prints_actionable_ai_gate_failure_details(
+        self,
+        repo_with_config,
+        monkeypatch,
+        capsys,
+        gate_message,
+        expected_output,
+    ):
+        """setup-hooks keeps remediation and provider diagnostics visible."""
+        from issue_orchestrator.entrypoints.cli import cmd_setup_hooks
+        from issue_orchestrator.infra.hooks.hooks import (
+            AiAgentType,
+            ClaudeCodeAdapter,
+            VerificationResult,
+        )
+
+        repo_path, config_file = repo_with_config
+        monkeypatch.setattr(ClaudeCodeAdapter, "install_hooks", lambda self, path: [])
+        monkeypatch.setattr(
+            ClaudeCodeAdapter,
+            "verify_hooks",
+            lambda self, path: VerificationResult(
+                success=True,
+                meta_agent=AiAgentType.CLAUDE_CODE,
+                checks_passed=["hook_script"],
+                checks_failed=[],
+            ),
+        )
+        monkeypatch.setattr(
+            ClaudeCodeAdapter,
+            "test_ai_gate",
+            lambda self, path, timeout=30: (False, gate_message),
+        )
+
+        exit_code = cmd_setup_hooks(
+            argparse.Namespace(config=str(config_file), target=str(repo_path))
+        )
+        output = capsys.readouterr().out
+
+        assert exit_code == 1
+        for expected in expected_output:
+            assert expected in output
+
     def test_doctor_shows_ai_gate_with_cached_results(
         self, repo_with_config, monkeypatch
     ):

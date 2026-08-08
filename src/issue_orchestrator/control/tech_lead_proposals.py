@@ -57,6 +57,7 @@ from ..domain.tech_lead_session import (
     PROPOSED_TECH_LEAD_LABEL,
     ApprovedTechLeadOp,
     StoredTechLeadOp,
+    TechLeadCreationOrigin,
     is_proposed_tech_lead_gate,
 )
 from .actions import (
@@ -240,7 +241,7 @@ def build_tech_lead_proposal_issue_action(
         labels=proposal_issue_labels(config),
         pr_count=0,
         op=op,
-        anchor_issue_number=anchor_issue_number,
+        origin=TechLeadCreationOrigin.derived_from_anchor(anchor_issue_number),
         reason=(
             f"tech_lead decision action {proposed.id}: gated {op.op_type} proposal"
             f" for issue #{op.target_issue_number} (#6778)"

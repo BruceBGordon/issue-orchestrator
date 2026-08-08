@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
+
 if TYPE_CHECKING:
     from ..domain.artifact_contracts import ValidationOutcome
     from ..domain.exchange_chapter import ExchangeChapterSidecar

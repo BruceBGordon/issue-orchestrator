@@ -15,16 +15,10 @@ from ...ports.git import GitResult
 from ...ports.worktree_policy import WorktreePolicy
 from ...ports.worktree_manager import WorktreeReuseOptions
 from ...infra.worktree_base import resolve_base_branch
+from ._worktree_errors import WorktreeError as WorktreeError
 from ._worktree_git import _git, _git_env_no_prompt, _git_run
-from ._worktree_hooks import HOOKS_DIR as HOOKS_DIR, install_hooks
-from ._worktree_runtime import (
-    _configure_no_verify_dry_run,
-    _hide_runtime_artifacts_from_git_status,
-    _install_worktree_identity,
-    _link_repo_venv_into_worktree,
-    install_claude_settings,
-    sync_cli_tools,
-)
+from ._worktree_hooks import HOOKS_DIR as HOOKS_DIR
+from ._worktree_runtime_setup import WorktreeRuntimeSetup
 
 
 @dataclass
@@ -78,12 +72,6 @@ def _ensure_origin_branch(repo_root: Path, branch: str) -> None:
     )
     if ref_result.returncode != 0:
         raise WorktreeError(f"origin/{branch} does not exist after fetch")
-
-
-class WorktreeError(Exception):
-    """Raised when a worktree operation fails."""
-
-    pass
 
 
 def get_default_branch(repo_root: Path) -> str:
@@ -593,24 +581,6 @@ def _remove_existing_worktree_path(repo_root: Path, worktree_path: Path) -> None
         shutil.rmtree(worktree_path, ignore_errors=True)
 
 
-def _finalize_worktree(
-    worktree_path: Path,
-    repo_root: Path,
-    enforce_hooks: bool,
-    pre_push_hook: Path | None,
-    allow_no_verify_dry_run_preflight: bool,
-) -> None:
-    """Install hooks, settings, cli_tools, and identity marker on a worktree."""
-    if enforce_hooks:
-        install_hooks(worktree_path, pre_push_hook)
-    install_claude_settings(worktree_path)
-    _configure_no_verify_dry_run(worktree_path, allow_no_verify_dry_run_preflight)
-    _link_repo_venv_into_worktree(repo_root, worktree_path)
-    synced_cli_tool_paths = list(sync_cli_tools(worktree_path) or [])
-    _install_worktree_identity(worktree_path)
-    _hide_runtime_artifacts_from_git_status(worktree_path, synced_cli_tool_paths)
-
-
 def _try_reuse_worktree(
     worktree_path: Path,
     branch_name: str,
@@ -826,8 +796,7 @@ class _WorktreeCreateContext:
     issue_number: int
     policy: WorktreePolicy
     reuse_options: WorktreeReuseOptions
-    enforce_hooks: bool
-    pre_push_hook: Path | None
+    runtime_setup: WorktreeRuntimeSetup
     disable_reuse: bool
 
 
@@ -884,8 +853,14 @@ def _init_worktree_context(
         issue_number=issue_number,
         policy=policy,
         reuse_options=reuse_options,
-        enforce_hooks=enforce_hooks,
-        pre_push_hook=pre_push_hook,
+        runtime_setup=WorktreeRuntimeSetup(
+            repo_root=repo_root,
+            enforce_hooks=enforce_hooks,
+            pre_push_hook=pre_push_hook,
+            allow_no_verify_dry_run_preflight=(
+                reuse_options.allow_no_verify_dry_run_preflight
+            ),
+        ),
         disable_reuse=disable_reuse,
     )
 
@@ -958,7 +933,7 @@ def create_worktree(
 
         return _create_fresh_worktree(
             ctx.repo_root, ctx.worktree_path, final_branch, ctx.base_branch, ctx.seed_ref, ctx.issue_number,
-            ctx.enforce_hooks, ctx.pre_push_hook, ctx.reuse_options, recreated_reason,
+            ctx.runtime_setup, recreated_reason,
         )
     except WorktreeError:
         raise
@@ -979,7 +954,7 @@ def _attempt_reuse(
 
     reuse_result, reuse_recreated_reason = _try_reuse_by_branch(
         ctx.repo_root, ctx.branch_name, ctx.issue_number, ctx.policy,
-        ctx.reuse_options, ctx.enforce_hooks, ctx.pre_push_hook, ctx.base_branch,
+        ctx.reuse_options, ctx.runtime_setup, ctx.base_branch,
     )
     if reuse_result is not None:
         return reuse_result, None
@@ -989,7 +964,7 @@ def _attempt_reuse(
     if ctx.worktree_path.exists():
         reuse_result, reuse_recreated_reason = _try_reuse_by_path(
             ctx.worktree_path, ctx.repo_root, ctx.issue_number, ctx.policy,
-            ctx.reuse_options, ctx.enforce_hooks, ctx.pre_push_hook, ctx.base_branch,
+            ctx.reuse_options, ctx.runtime_setup, ctx.base_branch,
         )
         if reuse_result is not None:
             return reuse_result, None
@@ -1025,8 +1000,7 @@ def _try_reuse_by_branch(
     issue_number: int,
     policy: WorktreePolicy,
     reuse_options: WorktreeReuseOptions,
-    enforce_hooks: bool,
-    pre_push_hook: Path | None,
+    runtime_setup: WorktreeRuntimeSetup,
     base_branch: str | None,
 ) -> tuple[tuple[Path, str, str, str | None, bool, int, int] | None, str | None]:
     """Try to reuse an existing worktree by branch name.
@@ -1059,10 +1033,7 @@ def _try_reuse_by_branch(
         return (None, result.recreated_reason)
 
     # Success - finalize and return
-    _finalize_worktree(
-        existing_worktree, repo_root, enforce_hooks, pre_push_hook,
-        reuse_options.allow_no_verify_dry_run_preflight,
-    )
+    runtime_setup.apply(existing_worktree)
     logger.info(issue_log(issue_number, "Worktree reuse complete: path=%s"), existing_worktree)
     reset_info = result.reset_info or ResetInfo(success=True)
     return (
@@ -1085,8 +1056,7 @@ def _try_reuse_by_path(
     issue_number: int,
     policy: WorktreePolicy,
     reuse_options: WorktreeReuseOptions,
-    enforce_hooks: bool,
-    pre_push_hook: Path | None,
+    runtime_setup: WorktreeRuntimeSetup,
     base_branch: str | None,
 ) -> tuple[tuple[Path, str, str, str | None, bool, int, int] | None, str | None]:
     """Try to reuse an existing worktree by path.
@@ -1139,10 +1109,7 @@ def _try_reuse_by_path(
         return (None, result.recreated_reason)
 
     # Success - finalize and return
-    _finalize_worktree(
-        worktree_path, repo_root, enforce_hooks, pre_push_hook,
-        reuse_options.allow_no_verify_dry_run_preflight,
-    )
+    runtime_setup.apply(worktree_path)
     logger.info(issue_log(issue_number, "Worktree reuse complete: path=%s"), worktree_path)
     reset_info = result.reset_info or ResetInfo(success=True)
     return (
@@ -1166,9 +1133,7 @@ def _create_fresh_worktree(
     base_branch: str | None,
     seed_ref: str | None,
     issue_number: int,
-    enforce_hooks: bool,
-    pre_push_hook: Path | None,
-    reuse_options: WorktreeReuseOptions,
+    runtime_setup: WorktreeRuntimeSetup,
     recreated_reason: str | None,
 ) -> tuple[Path, str, str, str | None, bool, int, int]:
     """Create a fresh worktree."""
@@ -1200,10 +1165,7 @@ def _create_fresh_worktree(
             )
             raise WorktreeError(f"Failed to create worktree: {result.stderr}")
 
-        _finalize_worktree(
-            worktree_path, repo_root, enforce_hooks, pre_push_hook,
-            reuse_options.allow_no_verify_dry_run_preflight,
-        )
+        runtime_setup.apply(worktree_path)
 
         logger.info(issue_log(issue_number, "Worktree created: branch=%s path=%s"), branch_name, worktree_path)
         reuse_status = "recreated" if recreated_reason else "created"

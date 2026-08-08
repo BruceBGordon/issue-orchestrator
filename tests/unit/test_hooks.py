@@ -489,6 +489,70 @@ class TestClaudeCodeAdapter:
         assert success is False
         assert "timed out after 1s" in message
 
+    def test_ai_gate_reports_claude_auth_remediation(
+        self, adapter, temp_project, monkeypatch
+    ):
+        from issue_orchestrator.infra.hooks import hooks as hooks_module
+
+        adapter.install_hooks(temp_project)
+        auth_error = (
+            "Failed to authenticate: OAuth session expired and could not be refreshed\n"
+        )
+        monkeypatch.setattr(
+            hooks_module,
+            "run_command_in_process_group",
+            lambda *args, **kwargs: subprocess.CompletedProcess(
+                args=args[0],
+                returncode=1,
+                stdout=auth_error,
+                stderr="",
+            ),
+        )
+
+        success, message = adapter.test_ai_gate(temp_project)
+
+        assert success is False
+        assert message.startswith(
+            "Claude is not authenticated; run 'claude auth login'\n"
+            "Verify with 'claude auth status', then retry startup."
+        )
+        assert "AI gate did not reach a result" in message
+        assert auth_error.strip() in message
+        assert "Claude was NOT blocked" not in message
+
+    @pytest.mark.parametrize(
+        "provider_error",
+        [
+            "Permission denied while reading Claude credentials",
+            "Cannot connect to the Anthropic API",
+            "Request blocked by provider network policy",
+        ],
+    )
+    def test_ai_gate_reports_nonzero_provider_failure_before_blocked_text(
+        self, adapter, temp_project, monkeypatch, provider_error
+    ):
+        from issue_orchestrator.infra.hooks import hooks as hooks_module
+
+        adapter.install_hooks(temp_project)
+        monkeypatch.setattr(
+            hooks_module,
+            "run_command_in_process_group",
+            lambda *args, **kwargs: subprocess.CompletedProcess(
+                args=args[0],
+                returncode=1,
+                stdout=f"{provider_error}\n",
+                stderr="",
+            ),
+        )
+
+        success, message = adapter.test_ai_gate(temp_project)
+
+        assert success is False
+        assert message.startswith("Claude AI gate could not run (exit 1)")
+        assert "Resolve the Claude CLI error below" in message
+        assert provider_error in message
+        assert "Claude was NOT blocked" not in message
+
     def test_hook_blocks_no_verify(self, adapter, temp_project):
         adapter.install_hooks(temp_project)
         decision = evaluate_command("git push --no-verify")

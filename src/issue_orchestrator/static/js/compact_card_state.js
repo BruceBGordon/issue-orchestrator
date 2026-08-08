@@ -36,6 +36,11 @@
         // The server precomputes stack_signal (stack_signal() in
         // view_models/dashboard.py), so both sides fingerprint identically.
         const stackSignal = card?.stack_signal ?? '';
+        // provider_signal encodes the precomputed provider-outage badge
+        // (provider_signal() in view_models/issue_card_labels.py). It carries no
+        // cooldown/ETA, so an outage that is merely counting down does not
+        // re-fingerprint the card; gaining or losing the badge does.
+        const providerSignal = card?.provider_signal ?? '';
         // run_dir binds the reused card node to a specific run. If it changes
         // (e.g. a rework-<issue> slot replaced by a new run) the node must be
         // rebuilt so the stale data-run-dir — read by the launch-prompt
@@ -61,6 +66,7 @@
             githubAriaLabel,
             labels,
             stackSignal,
+            providerSignal,
             runDir,
         ].join('|');
     }

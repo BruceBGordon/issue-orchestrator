@@ -8,10 +8,14 @@ Previously in ``_vendor/agent_runner/providers/codex.py``.
 from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
+from issue_orchestrator.ports.provider_readiness import ProviderReadiness
+from issue_orchestrator.ports.provider_resilience import ProviderErrorType
+
 from .base import CLIProvider
 
 if TYPE_CHECKING:
     from issue_orchestrator.domain.sandbox_scope import SandboxScope
+    from issue_orchestrator.ports.command_runner import CommandRunner
 
 
 class CodexProvider(CLIProvider):
@@ -38,6 +42,43 @@ class CodexProvider(CLIProvider):
     @property
     def interactive(self) -> bool:
         return True
+
+    # ``codex login status`` reads local credential state only — no API call,
+    # no tokens spent — so it is affordable on every launch (#6999).
+    AUTH_STATUS_ARGV = ("login", "status")
+    _LOGGED_IN_MARKER = "logged in using"
+
+    def check_readiness(self, runner: "CommandRunner") -> ProviderReadiness:
+        """Probe Codex's local credential state without spawning a TUI."""
+        if not self.is_available():
+            return ProviderReadiness.not_installed(
+                self.name, f"{self.executable} not found in PATH"
+            )
+        output, exit_code, timed_out = self._run_auth_probe(
+            runner, [self.executable, *self.AUTH_STATUS_ARGV]
+        )
+        if timed_out:
+            return ProviderReadiness.unknown(
+                self.name,
+                f"`{self.executable} login status` timed out after "
+                f"{self.AUTH_PROBE_TIMEOUT_SECONDS}s",
+            )
+        # Auth classification first: "not logged in" also contains the
+        # logged-in marker's substring, so a positive match must never win.
+        if self.classify_output(output) is ProviderErrorType.AUTH:
+            return ProviderReadiness.auth_expired(
+                self.name,
+                f"{self.executable} login status reports not logged in — "
+                "run `codex login`",
+            )
+        if exit_code == 0 and self._LOGGED_IN_MARKER in output.lower():
+            return ProviderReadiness.ready(
+                self.name, f"{self.executable} login status: logged in"
+            )
+        return ProviderReadiness.unknown(
+            self.name,
+            f"`{self.executable} login status` gave no verdict (exit={exit_code})",
+        )
 
     def runs_interactively(self, **kwargs: object) -> bool:
         return self._execution_mode(kwargs) == "interactive"
@@ -92,9 +133,6 @@ class CodexProvider(CLIProvider):
         scope_argv = self.apply_scope(sandbox_scope) if sandbox_scope is not None else []
 
         cmd = [self.executable, *scope_argv]
-        if execution_mode == "exec":
-            cmd.append("exec")
-
         approval_mode = kwargs.get("approval_mode", "full-auto")
         if sandbox_scope is None:
             self._append_approval_flags(
@@ -102,6 +140,9 @@ class CodexProvider(CLIProvider):
                 approval_mode=approval_mode,
                 execution_mode=execution_mode,
             )
+
+        if execution_mode == "exec":
+            cmd.append("exec")
 
         # Model (optional - Codex will use default if not specified)
         if model:
@@ -114,7 +155,6 @@ class CodexProvider(CLIProvider):
                 cmd,
                 kwargs,
                 approval_mode=approval_mode,
-                execution_mode=execution_mode,
             )
 
         if json_output:
@@ -142,7 +182,7 @@ class CodexProvider(CLIProvider):
             cmd.append("--dangerously-bypass-approvals-and-sandbox")
         elif approval_mode == "full-auto":
             if execution_mode == "exec":
-                cmd.append("--full-auto")
+                cmd.extend(["--ask-for-approval", "on-request"])
             else:
                 cmd.extend(["--ask-for-approval", "never"])
 
@@ -163,10 +203,9 @@ class CodexProvider(CLIProvider):
         kwargs: Mapping[str, object],
         *,
         approval_mode: str,
-        execution_mode: str,
     ) -> None:
         sandbox = kwargs.get("sandbox")
-        if sandbox is None and approval_mode == "full-auto" and execution_mode == "interactive":
+        if sandbox is None and approval_mode == "full-auto":
             sandbox = "workspace-write"
         if sandbox and approval_mode != "yolo":
             cmd.extend(["--sandbox", str(sandbox)])

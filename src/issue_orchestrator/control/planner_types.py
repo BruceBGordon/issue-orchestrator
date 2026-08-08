@@ -26,6 +26,7 @@ from ..domain.models import (
 )
 from ..ports.issue import Issue
 from .actions import Action, ActionType
+from .provider_launch_readiness import ProviderLaunchReadiness
 
 
 @dataclass(frozen=True)
@@ -93,6 +94,11 @@ class OrchestratorSnapshot:
     # planner emits the idempotent label via the Applier (#6824 R1, label-only).
     stuck_sweep_escalations: tuple[int, ...] = field(default_factory=tuple)
     tech_lead_facts: Optional[TechLeadFacts] = None
+    # Authoritative lifecycle reads of queued investigation subjects the
+    # filtered board did not carry (#6994 F4). Launch-time revalidation
+    # consults these so a subject CLOSED while queued is observed as closed
+    # rather than merely absent.
+    tech_lead_subjects: tuple["Issue", ...] = ()
     cleanup_facts: Optional[CleanupFacts] = None
     # Issues with stale in-progress labels (label present but no active session)
     stale_in_progress_issues: tuple[Issue, ...] = field(default_factory=tuple)
@@ -112,6 +118,12 @@ class OrchestratorSnapshot:
     #     letting a due suite beat new issues without preempting reviews/reworks.
     e2e_occupies_slot: bool = False
     e2e_due: bool = False
+    # Provider launch eligibility, sampled once per tick BEFORE planning
+    # (#6999 A3). Planning reads it; planning never takes the sample,
+    # because sampling probes a CLI and writes circuit state.
+    provider_launch: ProviderLaunchReadiness = field(
+        default_factory=ProviderLaunchReadiness.empty
+    )
 
     @property
     def active_count(self) -> int:
@@ -147,6 +159,7 @@ class OrchestratorSnapshot:
         ] = (),
         discovered_failures: Sequence[DiscoveredFailure] = (),
         tech_lead_facts: Optional[TechLeadFacts] = None,
+        tech_lead_subjects: tuple["Issue", ...] = (),
         cleanup_facts: Optional[CleanupFacts] = None,
         stale_in_progress_issues: Sequence[Issue] = (),
         stale_claim_issues: Sequence[Issue] = (),
@@ -200,6 +213,7 @@ class OrchestratorSnapshot:
             ),
             discovered_failures=tuple(discovered_failures),
             tech_lead_facts=tech_lead_facts,
+            tech_lead_subjects=tech_lead_subjects,
             cleanup_facts=cleanup_facts,
             stale_in_progress_issues=tuple(stale_in_progress_issues),
             stale_claim_issues=tuple(stale_claim_issues),

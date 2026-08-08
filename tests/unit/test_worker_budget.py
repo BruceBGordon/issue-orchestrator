@@ -9,6 +9,7 @@ when ``tech_lead.max_concurrent`` is set, otherwise every active session counts.
 from issue_orchestrator.control.worker_budget import (
     active_tech_lead_session_count,
     active_worker_session_count,
+    worker_slot_availability,
     worker_slot_free,
 )
 
@@ -74,6 +75,35 @@ class TestWorkerSlotFree:
             tech_lead_review_agent="agent:tech-lead", max_concurrent_sessions=1
         )
         assert worker_slot_free(config, [_tech_lead_session(9, "agent:tech-lead")]) is False
+
+
+class TestWorkerSlotAvailability:
+    def test_reserved_tech_lead_reports_free_worker_capacity(self):
+        config = make_config(
+            tech_lead_review_agent="agent:tech-lead", max_concurrent_sessions=1
+        )
+        config.tech_lead.max_concurrent = 1
+
+        slot = worker_slot_availability(
+            config, [_tech_lead_session(9, "agent:tech-lead")]
+        )
+
+        assert slot.active == 0
+        assert slot.maximum == 1
+        assert slot.remaining == 1
+        assert slot.is_free is True
+
+    def test_over_capacity_preserves_negative_remaining_count(self):
+        config = make_config(max_concurrent_sessions=1)
+
+        slot = worker_slot_availability(
+            config,
+            [make_session(make_issue(1)), make_session(make_issue(2))],
+        )
+
+        assert slot.active == 2
+        assert slot.remaining == -1
+        assert slot.is_free is False
 
 
 class TestTechLeadSlotAvailability:

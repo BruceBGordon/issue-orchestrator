@@ -28,7 +28,7 @@ Usage:
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Literal, Optional, Sequence, TypeVar
+from typing import TYPE_CHECKING, Callable, Optional, Sequence, TypeVar
 
 from ..events import EventName
 from ..infra.logging_config import issue_log
@@ -49,26 +49,37 @@ if TYPE_CHECKING:
     from ..ports.persistent_exchange_pair_registry import (
         PersistentExchangePairRegistry,
     )
+    from ..ports.promotion_target import PromotionTargetHost
     from ..ports.tech_lead_authority import TechLeadAuthorityStore
     from .retry_history_state import ExpediteLane
     from .session_history import SessionHistoryOwner
     from .tech_lead_kill_session import TechLeadKillSessionExecutor
     from .tech_lead_reset_retry import TechLeadResetRetryExecutor
-from .reconciliation import (
-    ExternalSnapshot,
-    ReconciliationRequired,
-    require_reconciliation,
+    from .tech_lead_run_ownership import TechLeadRunOwnership
+
+from .label_mutation_stats import LabelMutationStatField, LabelMutationStats
+from .escalation_notice import escalation_comment, publish_escalation_events
+from .mutation_gate import ReconciliationGate
+from .sync_reconciliation import check_sync_reconciliation
+from .needs_human_block import (
+    NO_OTHER_NEEDS_HUMAN_CAUSES,
+    UNCAUSED_BLOCK_MUTATION,
+    BlockOutcome,
+    HumanBlockRequest,
+    NeedsHumanCause,
+    SharedNeedsHumanBlock,
 )
+from .reconciliation import ReconciliationRequired
 from .claim_gate import ClaimGate, ClaimLostError
 from .review_exchange_lifecycle import (
     cancel_issue_review_exchange,
     terminate_issue_runtime,
 )
+from .close_on_merge import run_close_on_merge_fallback
 from .actions import (
     Action,
     ActionResult,
     ActionType,
-    TECH_LEAD_ISSUE_CREATION_ACTION_TYPES,
     AddLabelAction,
     RemoveLabelAction,
     SyncLabelsAction,
@@ -92,10 +103,12 @@ from .actions import (
     RecoverTerminalIssueAction,
     ResetRetryIssueAction,
 )
+from .provider_impact import ApplyProviderImpactAction, apply_provider_impact
 from .session_manager import SessionManager, SessionRef, SessionType, SessionContext
+from .tech_lead_applier_handlers import tech_lead_action_handlers
 from .tech_lead_issue_creation import apply_create_tech_lead_issue
 from .history_reconciliation import apply_history_reconciliation
-from .tech_lead_proposals import apply_discard_terminal_tech_lead_proposal_ops, execute_approved_tech_lead_op
+from .tech_lead_proposals import execute_approved_tech_lead_op
 from .tech_lead_reset_retry import apply_surface_tech_lead_proposal
 
 logger = logging.getLogger(__name__)
@@ -111,56 +124,6 @@ ValidationRetryLauncherCallback = Callable[[int], Optional[Session]]
 LeaseIdLookup = Callable[[int], str | None]
 # Act-level tech_lead op actions share one dispatch shape (#6764/#6778).
 _TechLeadOpAction = TypeVar("_TechLeadOpAction", ResetRetryIssueAction, KillHungSessionAction)
-LabelMutationStatField = Literal[
-    "label_add_attempted",
-    "label_add_applied",
-    "label_add_noop",
-    "label_remove_attempted",
-    "label_remove_applied",
-    "label_remove_noop",
-    "label_mutation_failed",
-]
-
-
-@dataclass
-class _LabelMutationStats:
-    """Per-batch label mutation counters for churn observability."""
-
-    label_add_attempted: int = 0
-    label_add_applied: int = 0
-    label_add_noop: int = 0
-    label_remove_attempted: int = 0
-    label_remove_applied: int = 0
-    label_remove_noop: int = 0
-    label_mutation_failed: int = 0
-
-    @property
-    def attempted(self) -> int:
-        return self.label_add_attempted + self.label_remove_attempted
-
-    @property
-    def applied(self) -> int:
-        return self.label_add_applied + self.label_remove_applied
-
-    @property
-    def noop(self) -> int:
-        return self.label_add_noop + self.label_remove_noop
-
-    def to_payload(self) -> dict[str, int]:
-        return {
-            "label_add_attempted": self.label_add_attempted,
-            "label_add_applied": self.label_add_applied,
-            "label_add_noop": self.label_add_noop,
-            "label_remove_attempted": self.label_remove_attempted,
-            "label_remove_applied": self.label_remove_applied,
-            "label_remove_noop": self.label_remove_noop,
-            "label_mutation_attempted": self.attempted,
-            "label_mutation_applied": self.applied,
-            "label_mutation_noop": self.noop,
-            "label_mutation_failed": self.label_mutation_failed,
-        }
-
-
 @dataclass
 class ActionApplier:
     """Applies actions via ports/adapters.
@@ -196,6 +159,12 @@ class ActionApplier:
     # which decides the labels to remove from the issue's live labels at apply
     # time. Optional so unrelated tests need not wire it.
     label_manager: Optional["LabelManager"] = None
+    # The one owner of the shared needs-human block's provenance (#6999 F2
+    # round 2). Every add of that label records the asserting cause and every
+    # remove withdraws one, so a remover can tell whether it is the last cause
+    # standing. An explicit null object rather than an optional: it governs no
+    # label, so an applier holding it behaves exactly as it did before.
+    needs_human_block: SharedNeedsHumanBlock = NO_OTHER_NEEDS_HUMAN_CAUSES
     # Issue-scoped persistent coder/reviewer subprocess pair registry.
     # Used with the background supervisor to terminate hidden review-exchange
     # runtime work at issue lifecycle boundaries. ADR 0026 / B2.
@@ -220,12 +189,19 @@ class ActionApplier:
     tech_lead_reset_retry: Optional["TechLeadResetRetryExecutor"] = None
     tech_lead_kill_session: Optional["TechLeadKillSessionExecutor"] = None
     tech_lead_ops: Optional["TechLeadAuthorityStore"] = None
+    # Cross-repo filing seam for the finding-promotion lane (#6957). Unwired
+    # means promotion actions fail loudly instead of silently no-oping — the
+    # lane is only ever planned when tech_lead.findings is enabled.
+    promotion_target: Optional["PromotionTargetHost"] = None
     # Expedite-lane owner seam (#6870), wired post-construction; unwired = no-op.
     expedite_lane: Optional["ExpediteLane"] = None
-    _active_label_mutation_stats: _LabelMutationStats | None = field(
+    # Cross-engine tech-lead run ownership (#6994 R2 F3). Unwired means anchor
+    # creation fails loudly rather than racing a peer.
+    run_ownership: Optional["TechLeadRunOwnership"] = None
+    _active_label_mutation_stats: LabelMutationStats | None = field(
         default=None, init=False, repr=False
     )
-    _active_label_mutation_by_issue: dict[int, _LabelMutationStats] = field(
+    _active_label_mutation_by_issue: dict[int, LabelMutationStats] = field(
         default_factory=dict, init=False, repr=False
     )
 
@@ -264,7 +240,7 @@ class ActionApplier:
         Returns:
             List of ActionResults
         """
-        self._active_label_mutation_stats = _LabelMutationStats()
+        self._active_label_mutation_stats = LabelMutationStats()
         self._active_label_mutation_by_issue = {}
         try:
             return [self.apply(action) for action in actions]
@@ -279,6 +255,7 @@ class ActionApplier:
             ActionType.ADD_LABEL: self._apply_add_label,
             ActionType.REMOVE_LABEL: self._apply_remove_label,
             ActionType.SYNC_LABELS: self._apply_sync_labels,
+            ActionType.APPLY_PROVIDER_IMPACT: self._apply_provider_impact,
             # SHED_RECOVERED_WORKFLOW_LABELS is intentionally NOT dispatchable:
             # shedding transient workflow labels is a private sub-step of the
             # RECOVER_TERMINAL_ISSUE owner command, which enforces the
@@ -293,17 +270,22 @@ class ActionApplier:
             ActionType.QUEUE_RETROSPECTIVE_REVIEW: self._apply_queue_operation,
             ActionType.QUEUE_REWORK: self._apply_queue_operation,
             ActionType.QUEUE_TECH_LEAD: self._apply_queue_operation,
+            ActionType.DROP_TECH_LEAD: self._apply_queue_operation,
             ActionType.ESCALATE_TO_HUMAN: self._apply_escalate,
             ActionType.ENQUEUE_TO_MERGE_QUEUE: self._apply_enqueue_to_merge_queue,
-            # All tech-lead-authored issues share one apply-time creation owner.
-            **dict.fromkeys(TECH_LEAD_ISSUE_CREATION_ACTION_TYPES, self._apply_create_tech_lead_issue),
-            # Tech Lead decision proposals - event-only, no GitHub calls (ADR-0031)
-            ActionType.SURFACE_TECH_LEAD_PROPOSAL: self._apply_surface_tech_lead_proposal,
-            # Act-level tech_lead execution via the reset owner (#6764)
-            ActionType.RESET_RETRY_ISSUE: self._apply_reset_retry_issue,
-            # Approved kill_hung_session ops via the termination owner (#6778)
-            ActionType.KILL_HUNG_SESSION: self._apply_kill_hung_session,
-            ActionType.DISCARD_TERMINAL_TECH_LEAD_PROPOSAL_OPS: lambda action: apply_discard_terminal_tech_lead_proposal_ops(action, tracker=self.repository_host, authority=self.tech_lead_ops),
+            # Every tech-lead action type -> its extracted apply-time owner.
+            **tech_lead_action_handlers(
+                create_tech_lead_issue=self._apply_create_tech_lead_issue,
+                surface_proposal=self._apply_surface_tech_lead_proposal,
+                reset_retry=self._apply_reset_retry_issue,
+                kill_hung_session=self._apply_kill_hung_session,
+                # Mutation policy stays HERE: the extracted owners get the
+                # applier's own expected-state gate, not a copy of it (#6957 F15).
+                require_expected=self._require_expected,
+                repository_host=self.repository_host,
+                authority=self.tech_lead_ops,
+                promotion_target=self.promotion_target,
+            ),
             # Cleanup operations
             ActionType.CLEANUP_SESSION: self._apply_cleanup_session,
             ActionType.REMOVE_WORKTREE: self._apply_remove_worktree,
@@ -335,10 +317,18 @@ class ActionApplier:
         # Verify claim ownership before write (raises ClaimLostError)
         self._verify_claim_before_write(action, action.issue_number)
 
+        governed = self.needs_human_block.owns(action.label)
+        if governed and action.needs_human_cause is None:
+            return self._uncaused_block_mutation(action)
+
         try:
             self._record_label_stat(action.issue_number, "label_add_attempted")
             has_label = self._has_label_safely(action.issue_number, action.label)
             if has_label is True:
+                # Already present, but THIS lifecycle now requires it too, and
+                # that is exactly the fact a later remover needs (#6999 F2 r2).
+                if governed and not self._acquire_block(action).committed:
+                    return ActionResult.fail(action, "shared block not recorded")
                 self._record_label_stat(action.issue_number, "label_add_noop")
                 self._log_label_mutation(
                     level=logging.INFO,
@@ -355,7 +345,11 @@ class ActionApplier:
                     label=action.label,
                     no_op=True,
                 )
-            self.labels.add_label(action.issue_number, action.label)
+            if governed:
+                if not self._acquire_block(action).committed:
+                    return ActionResult.fail(action, "shared block not applied")
+            else:
+                self.labels.add_label(action.issue_number, action.label)
             self._persist_label_add(action.issue_number, action.label)
             self._record_label_stat(action.issue_number, "label_add_applied")
             self._log_label_mutation(
@@ -371,6 +365,12 @@ class ActionApplier:
                 action,
                 issue_number=action.issue_number,
                 label=action.label,
+                # The presence check failed, so this add cannot prove the label
+                # was not already there. Callers that later REMOVE a label only
+                # when they added it need to know the difference (#6999 F12);
+                # reporting a bare success would let them retract someone
+                # else's block.
+                presence_unknown=has_label is None,
             )
         except Exception as e:
             self._record_label_stat(action.issue_number, "label_mutation_failed")
@@ -385,6 +385,75 @@ class ActionApplier:
             )
             return ActionResult.fail(action, str(e))
 
+    def _acquire_block(self, action: AddLabelAction) -> BlockOutcome:
+        """Hand the governed label to its owner, which applies AND records it."""
+        assert action.needs_human_cause is not None
+        return self.needs_human_block.acquire(
+            HumanBlockRequest(
+                target=action.issue_number,
+                cause=action.needs_human_cause,
+                reason=action.reason,
+            )
+        )
+
+    def _release_block(self, action: RemoveLabelAction) -> ActionResult:
+        """Withdraw this cause; the owner decides whether the label follows.
+
+        A block another lifecycle still requires is reported as a successful
+        no-op, not a failure (#6999 F2 round 2): nothing went wrong, this cause
+        IS discharged, and the label correctly stays for someone else.
+        Reporting failure would make an owner retry forever against a block it
+        no longer has any claim on.
+        """
+        assert action.needs_human_cause is not None
+        self._record_label_stat(action.issue_number, "label_remove_attempted")
+        outcome = self.needs_human_block.release(
+            HumanBlockRequest(
+                target=action.issue_number,
+                cause=action.needs_human_cause,
+                reason=action.reason,
+            )
+        )
+        if outcome is BlockOutcome.FAILED:
+            self._record_label_stat(action.issue_number, "label_mutation_failed")
+            return ActionResult.fail(action, "shared block could not be cleared")
+        held = outcome is BlockOutcome.HELD_BY_ANOTHER_CAUSE
+        if not held:
+            self._persist_label_remove(action.issue_number, action.label)
+            self._emit_issue_labels_changed(
+                action.issue_number, [], [action.label], issue_key=action.issue_key
+            )
+        self._record_label_stat(
+            action.issue_number,
+            "label_remove_noop" if held else "label_remove_applied",
+        )
+        self._log_label_mutation(
+            level=logging.INFO,
+            issue_number=action.issue_number,
+            operation="remove",
+            outcome="noop" if held else "applied",
+            label=action.label,
+            reason=action.reason,
+            detail="another lifecycle still requires the shared block" if held else None,
+        )
+        return ActionResult.ok(
+            action,
+            issue_number=action.issue_number,
+            label=action.label,
+            no_op=held,
+            blocked_by_other_cause=held,
+        )
+
+    def _uncaused_block_mutation(self, action: Action) -> ActionResult:
+        """Refuse a shared-block mutation that names no cause (#6999 F2 r3)."""
+        logger.error(
+            "[BLOCK] %s on #%d: %s",
+            UNCAUSED_BLOCK_MUTATION,
+            getattr(action, "issue_number", 0),
+            action.reason,
+        )
+        return ActionResult.fail(action, UNCAUSED_BLOCK_MUTATION)
+
     def _apply_remove_label(self, action: Action) -> ActionResult:
         """Remove a label from an issue."""
         assert isinstance(action, RemoveLabelAction)
@@ -393,6 +462,11 @@ class ActionApplier:
         self._require_expected(action, action.issue_number)
         # Verify claim ownership before write (raises ClaimLostError)
         self._verify_claim_before_write(action, action.issue_number)
+
+        if self.needs_human_block.owns(action.label):
+            if action.needs_human_cause is None:
+                return self._uncaused_block_mutation(action)
+            return self._release_block(action)
 
         try:
             self._record_label_stat(action.issue_number, "label_remove_attempted")
@@ -452,6 +526,13 @@ class ActionApplier:
                 detail=str(e),
             )
             return ActionResult.fail(action, str(e))
+
+    def _apply_provider_impact(self, action: Action) -> ActionResult:
+        """Move an issue across the provider-availability boundary (#5980)."""
+        assert isinstance(action, ApplyProviderImpactAction)
+        return apply_provider_impact(
+            action, apply_label=self._dispatch, publish=self.events.publish
+        )
 
     def _apply_add_comment(self, action: Action) -> ActionResult:
         """Add a comment to an issue or PR."""
@@ -583,6 +664,23 @@ class ActionApplier:
         try:
             self.repository_host.update_issue_state(action.issue_number, "closed")
             logger.info(issue_log(action.issue_number, "Issue closed"))
+            if action.comment:
+                # Only after a successful close — a comment claiming "the
+                # orchestrator closed it" before the close would leave a false
+                # audit trail on failure and repeat on every retry. Best-effort:
+                # a failed comment must never fail an already-applied close.
+                try:
+                    self.repository_host.add_comment(
+                        action.issue_number, action.comment,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        issue_log(
+                            action.issue_number,
+                            "Failed to post close comment: %s",
+                        ),
+                        e,
+                    )
             return ActionResult.ok(
                 action,
                 issue_number=action.issue_number,
@@ -622,65 +720,30 @@ class ActionApplier:
             )
             return ActionResult.fail(action, str(e), issue_number=action.issue_number)
 
-    def _fetch_current_labels(self, issue_number: int) -> set[str] | None:
-        """Fetch current labels for an issue if fresh_issue_reader is available.
+    @property
+    def _gate(self) -> ReconciliationGate:
+        """The owner that decides whether a mutation may happen at all.
 
-        Returns:
-            Set of label names, or None if fresh_issue_reader not configured
+        Extracted so "unknown is not empty, and unknown fails closed" lives in
+        one named place instead of two methods inside this dispatcher (#6957
+        round-2 review F4/A5). Built per access from the applier's own
+        collaborators, which tests reassign after construction.
         """
-        if self.fresh_issue_reader is None:
-            return None
-        try:
-            labels = self.fresh_issue_reader.read_issue_labels(issue_number)
-            return set(labels)
-        except Exception as e:
-            logger.warning(
-                issue_log(issue_number, "Failed to fetch labels for reconciliation: %s"),
-                e,
-            )
-            return None
+        return ReconciliationGate(
+            fresh_issue_reader=self.fresh_issue_reader, reconcile=self.reconcile
+        )
+
+    def _fetch_current_labels(self, issue_number: int) -> set[str] | None:
+        """Current labels, or None when they could not be OBSERVED."""
+        return self._gate.current_labels(issue_number)
 
     def _require_expected(self, action: Action, issue_number: int) -> None:
-        """Enforce reconciliation before a mutation if action has expected state.
-
-        This is the hard gate for optimistic concurrency control. If the action
-        has an ExpectedState attached, we fetch current state and verify it
-        satisfies the constraints. If not, we raise ReconciliationRequired.
-
-        Args:
-            action: The action being applied (checks action.expected)
-            issue_number: The issue/PR number to check
+        """Refuse the mutation unless the board still satisfies its expectations.
 
         Raises:
-            ReconciliationRequired: If current state doesn't satisfy expected
+            ReconciliationRequired: the expectation is violated, or unverifiable.
         """
-        if action.expected is None:
-            # No expected state attached - allow (for backwards compatibility)
-            return
-
-        if not self.reconcile:
-            # Reconciliation disabled - skip enforcement
-            return
-
-        # Fetch current state
-        current_labels = self._fetch_current_labels(issue_number)
-        if current_labels is None:
-            # Can't verify - fail closed (require fresh_issue_reader for reconciliation)
-            logger.warning(
-                issue_log(issue_number, "Reconciliation required but cannot fetch labels - failing closed"),
-            )
-            raise ReconciliationRequired(
-                entity_type="issue",
-                entity_id=issue_number,
-                expected=ExternalSnapshot.for_issue(issue_number, set(action.expected.required_labels)),
-                actual=ExternalSnapshot.for_issue(issue_number, set()),
-                reason="Cannot fetch current labels to verify expected state",
-            )
-
-        actual = ExternalSnapshot.for_issue(issue_number, current_labels)
-
-        # This raises ReconciliationRequired if constraints not satisfied
-        require_reconciliation(action.expected, actual, entity_type="issue")
+        self._gate.require_expected(action, issue_number)
 
     def _verify_claim_before_write(self, action: Action, issue_number: int) -> None:
         """Verify claim ownership before a write operation.
@@ -751,57 +814,16 @@ class ActionApplier:
         add_labels: tuple[str, ...],
         remove_labels: tuple[str, ...],
     ) -> tuple[bool, str, set[str]]:
-        """Check reconciliation for a sync operation.
-
-        Args:
-            issue_number: Issue to check
-            add_labels: Labels we plan to add
-            remove_labels: Labels we plan to remove
-
-        Returns:
-            Tuple of (should_proceed, message, current_labels).
-            If reconciliation is not enabled or can't run, returns (True, "", current_labels).
-        """
+        """Soft reconciliation for a sync. See :mod:`.sync_reconciliation`."""
         if not self.reconcile:
             return True, "", set()
-
-        current = self._fetch_current_labels(issue_number)
-        if current is None:
-            # Can't verify - proceed with warning
-            logger.warning(
-                issue_log(issue_number, "Reconciliation enabled but cannot fetch labels"),
-            )
-            return True, "Cannot fetch current labels", set()
-
-        # Check 1: Labels we plan to remove should exist
-        missing_to_remove = set(remove_labels) - current
-        if missing_to_remove:
-            msg = f"Labels to remove not present: {missing_to_remove}"
-            logger.warning(issue_log(issue_number, "Reconciliation: %s"), msg)
-            # This is a warning, not a hard failure - label may have been
-            # removed externally which is fine
-            self.events.publish(make_trace_event(
-                EventName.RECONCILIATION_WARNING,
-                {
-                    "issue_number": issue_number,
-                    "message": msg,
-                    "missing_labels": list(missing_to_remove),
-                },
-            ))
-
-        # Check 2: Labels we expect to be there for this transition
-        # For now, we just log what we found vs expected
-        self.events.publish(make_trace_event(
-            EventName.RECONCILIATION_CHECKED,
-            {
-                "issue_number": issue_number,
-                "current_labels": list(current),
-                "add_labels": list(add_labels),
-                "remove_labels": list(remove_labels),
-            },
-        ))
-
-        return True, "", current
+        return check_sync_reconciliation(
+            self.events,
+            issue_number,
+            add_labels,
+            remove_labels,
+            self._fetch_current_labels(issue_number),
+        )
 
     def _apply_sync_labels(self, action: Action) -> ActionResult:
         """Synchronize labels on an issue.
@@ -830,7 +852,9 @@ class ActionApplier:
 
         errors = []
 
-        # Add labels
+        # Add labels. A collection is exactly where the governed block could be
+        # smuggled past its owner, so the capability refuses it by value and the
+        # refusal is reported rather than swallowed (#6999 F2 round 4).
         for label in action.add_labels:
             self._record_label_stat(action.issue_number, "label_add_attempted")
             try:
@@ -900,7 +924,28 @@ class ActionApplier:
         for label in to_remove:
             self._record_label_stat(action.issue_number, "label_remove_attempted")
             try:
-                self.labels.remove_label(action.issue_number, label)
+                if self.needs_human_block.owns(label):
+                    # Terminal recovery overrides the causes recorded by this
+                    # owner, and they must end with the label (#6999 F2 r3).
+                    outcome = self.needs_human_block.force_clear(
+                        action.issue_number, action.reason
+                    )
+                    if outcome is BlockOutcome.HELD_BY_ANOTHER_CAUSE:
+                        # A quarantine or tech-lead escalation still requires
+                        # the block and this command cannot settle it (#6999 F3
+                        # round 4). Shedding the REST is still correct and the
+                        # recovery still finalizes: one label legitimately held
+                        # by another owner is not a failure of the shed, and
+                        # failing here would wedge terminal recovery behind a
+                        # quarantine until a human intervened.
+                        self._record_label_stat(
+                            action.issue_number, "label_remove_noop"
+                        )
+                        continue
+                    if not outcome.committed:
+                        raise RuntimeError("shared block could not be cleared")
+                else:
+                    self.labels.remove_label(action.issue_number, label)
                 self._persist_label_remove(action.issue_number, label)
                 self._record_label_stat(action.issue_number, "label_remove_applied")
                 self._log_label_mutation(
@@ -1176,7 +1221,26 @@ class ActionApplier:
         # Add needs-human label
         self._record_label_stat(action.issue_number, "label_add_attempted")
         try:
-            self.labels.add_label(action.pr_number, action.needs_human_label)
+            # Through the owner, and against the PR - the number actually
+            # labelled (#6999 F2 round 3). Recording this cause against the
+            # issue would leave the PR's block with no discoverable owner at
+            # all. A composition without an owner still writes directly: the
+            # boundary must never turn a real mutation into a silent no-op.
+            acquired = self.needs_human_block.acquire(
+                HumanBlockRequest(
+                    target=action.pr_number,
+                    cause=NeedsHumanCause.MERGE_ESCALATION,
+                    reason=action.reason or "escalated-to-human",
+                )
+            )
+            if acquired is BlockOutcome.UNGOVERNED:
+                # No owner in this composition, so the boundary must not turn a
+                # real mutation into a silent no-op.
+                self.labels.add_label(  # shared-block: ungoverned fallback
+                    action.pr_number, action.needs_human_label
+                )
+            elif not acquired.committed:
+                raise RuntimeError("shared needs-human block did not apply")
             self._persist_label_add(action.pr_number, action.needs_human_label)
             self._record_label_stat(action.issue_number, "label_add_applied")
             added_labels.append(action.needs_human_label)
@@ -1207,22 +1271,12 @@ class ActionApplier:
         # comment_override, use that verbatim (post-publish-stuck path
         # provides its own copy that doesn't mention rework cycles).
         if self.repository_host:
-            if action.comment_override is not None:
-                comment = action.comment_override
-            else:
-                latest_review_section = self._get_latest_review_section(
+            comment = escalation_comment(
+                action,
+                self._get_latest_review_section(
                     action.pr_number, action.latest_review_body
-                )
-                comment = f"""## ⚠️ Escalated to Human Review
-
-This PR has gone through {action.rework_cycles - 1} rework cycles without passing review.
-Maximum rework cycles ({action.max_rework_cycles}) exceeded.
-{latest_review_section}
-**A human needs to review and either:**
-- Approve the PR manually
-- Provide specific guidance for the agent
-- Take over the implementation
-"""
+                ),
+            )
             try:
                 comment_url = self.repository_host.add_comment(action.pr_number, comment)
             except Exception as e:
@@ -1234,31 +1288,7 @@ Maximum rework cycles ({action.max_rework_cycles}) exceeded.
             action.pr_number, action.needs_human_label, action.rework_cycles,
         )
 
-        # Emit trace event
-        self.events.publish(
-            make_trace_event(
-                EventName.REVIEW_ESCALATED,
-                {
-                    "pr_number": action.pr_number,
-                    "issue_number": action.issue_number,
-                    "rework_count": action.rework_cycles - 1,
-                    "rework_cycle": action.rework_cycles,
-                    "max_rework_cycles": action.max_rework_cycles,
-                },
-            )
-        )
-        if comment_url:
-            self.events.publish(
-                make_trace_event(
-                    EventName.REVIEW_COMMENT_ADDED,
-                    {
-                        "issue_number": action.issue_number,
-                        "pr_number": action.pr_number,
-                        "comment_url": comment_url,
-                        "summary": "Posted escalation comment",
-                    },
-                )
-            )
+        publish_escalation_events(self.events, action, comment_url)
 
         if errors:
             return ActionResult.fail(action, "; ".join(errors))
@@ -1341,6 +1371,26 @@ Maximum rework cycles ({action.max_rework_cycles}) exceeded.
         # explicit guard that this command writes only to a still-claimed issue.
         self._verify_claim_before_write(action, action.issue_number)
 
+        close_applied = False
+        if action.close_issue:
+            # Close-on-merge fallback (porchpin #81): revalidation ordering
+            # and rationale live in run_close_on_merge_fallback — the module
+            # owns the destructive precondition; the planner's bit is advisory.
+            close_applied, close_error = run_close_on_merge_fallback(
+                repository_host=self.repository_host,
+                action=action,
+                close=self._apply_close_issue,
+            )
+            if close_error is not None:
+                # Fail without any further mutation (no shed, no history);
+                # the entry stays reconcilable for retry.
+                return ActionResult.fail(
+                    action,
+                    close_error,
+                    issue_number=action.issue_number,
+                    pr_number=action.pr_number,
+                )
+
         shed_result = self._apply_shed_recovered_workflow_labels(
             ShedRecoveredWorkflowLabelsAction(
                 issue_number=action.issue_number,
@@ -1382,6 +1432,7 @@ Maximum rework cycles ({action.max_rework_cycles}) exceeded.
             pr_number=action.pr_number,
             status=action.status,
             shed_removed=list(shed_result.details.get("removed", [])),
+            closed_issue=close_applied,
         )
 
     def _apply_queue_review(self, action: Action) -> ActionResult:
@@ -1433,12 +1484,28 @@ Maximum rework cycles ({action.max_rework_cycles}) exceeded.
         )
 
     def _apply_create_tech_lead_issue(self, action: Action) -> ActionResult:
-        """Delegate tech-lead-authored issue creation to its apply-time owner."""
+        """Create a tech-lead-authored issue under whole-run coordination.
+
+        The ORDER — reserve the global run, then create its anchor, then
+        compensate on failure — is policy, and it lives with the run owner
+        (#6994 round 2 F3/A3). This seam supplies only the GitHub create.
+        """
         assert isinstance(action, CreateTechLeadIssueAction)
+        from .tech_lead_run_wiring import create_owned_tech_lead_issue
+
         if not self.repository_host:
             return ActionResult.fail(
                 action, "No repository_host configured for issue creation"
             )
+        return create_owned_tech_lead_issue(
+            action, ownership=self.run_ownership, create=self._create_tech_lead_issue
+        )
+
+    def _create_tech_lead_issue(
+        self, action: CreateTechLeadIssueAction
+    ) -> ActionResult:
+        """The GitHub create itself, with no run-coordination policy of its own."""
+        assert self.repository_host is not None
         return apply_create_tech_lead_issue(
             action,
             repository_host=self.repository_host,
@@ -1483,9 +1550,14 @@ Maximum rework cycles ({action.max_rework_cycles}) exceeded.
         apply_fn: "Callable[[_TechLeadOpAction], ActionResult] | None",
         op_type: str,
     ) -> ActionResult:
-        # Reconciliation pause gate first (raises ReconciliationRequired) — a
-        # paused issue must never be mutated from an agent proposal.
-        self._require_expected(action, action.issue_number)
+        # NO reconciliation gate here. Every mutating tech-lead command now
+        # crosses it in exactly one place — the typed dispatch wrapper in
+        # ``tech_lead_applier_handlers`` — which reads this same subject
+        # (``ResetRetryIssueAction``/``KillHungSessionAction`` name
+        # ``issue_number``). Keeping the old call as well made an allowed
+        # reset/kill perform TWO cache-bypassing GitHub reads per dispatch and
+        # left mutation policy owned in two places (#6957 round-2 review F5/A5).
+        # This executor owns operation-specific preconditions and execution only.
         if apply_fn is None:
             return ActionResult.fail(
                 action,
@@ -1691,34 +1763,15 @@ Maximum rework cycles ({action.max_rework_cycles}) exceeded.
                      pr_number, payload.get("issue_key"), added, removed)
         self.events.publish(make_trace_event(EventName.PR_VIEW_CHANGED, payload))
 
-    @staticmethod
-    def _increment_label_stat(stats: _LabelMutationStats, field_name: LabelMutationStatField) -> None:
-        if field_name == "label_add_attempted":
-            stats.label_add_attempted += 1
-        elif field_name == "label_add_applied":
-            stats.label_add_applied += 1
-        elif field_name == "label_add_noop":
-            stats.label_add_noop += 1
-        elif field_name == "label_remove_attempted":
-            stats.label_remove_attempted += 1
-        elif field_name == "label_remove_applied":
-            stats.label_remove_applied += 1
-        elif field_name == "label_remove_noop":
-            stats.label_remove_noop += 1
-        else:
-            stats.label_mutation_failed += 1
-
     def _record_label_stat(self, issue_number: int, field_name: LabelMutationStatField) -> None:
         """Increment label mutation counters for current apply_all batch."""
         if self._active_label_mutation_stats is None:
             return
 
-        self._increment_label_stat(self._active_label_mutation_stats, field_name)
-
-        issue_stats = self._active_label_mutation_by_issue.setdefault(
-            issue_number, _LabelMutationStats()
-        )
-        self._increment_label_stat(issue_stats, field_name)
+        self._active_label_mutation_stats.increment(field_name)
+        self._active_label_mutation_by_issue.setdefault(
+            issue_number, LabelMutationStats()
+        ).increment(field_name)
 
     def _emit_label_mutation_summary(self) -> None:
         """Emit per-batch label mutation summary event and log line."""

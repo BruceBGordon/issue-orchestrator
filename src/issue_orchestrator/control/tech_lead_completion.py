@@ -609,7 +609,7 @@ def generate_tech_lead_completion_actions(
                 expected=expected,
                 op_ledger=build_op_ledger(tech_lead_authority.list_ops()),
                 pattern_ledger=build_pattern_ledger(
-                    tech_lead_authority.list_patterns()
+                    tech_lead_authority.list_pattern_evidence()
                 ),
                 source_run_id=session.run_assets.run_id,
                 source_session_name=session.run_assets.session_name,

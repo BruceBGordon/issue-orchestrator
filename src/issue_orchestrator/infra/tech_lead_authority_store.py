@@ -40,6 +40,15 @@ from pathlib import Path
 from typing import Iterator
 
 from ..domain.models import DiscoveredFailure
+from ..domain.tech_lead_findings import (
+    VALID_PROMOTION_STATES,
+    PatternEvidence,
+    PendingCaseFile,
+    PendingPromotion,
+    PromotedFinding,
+    PromotionState,
+    reconcile_pattern_classification,
+)
 from ..domain.tech_lead_session import (
     StoredTechLeadOp,
     TechLeadLaunchAuthority,
@@ -49,52 +58,60 @@ from ..ports.tech_lead_authority import (
     TechLeadAuthorityConflictError,
     TechLeadOpConflictError,
     TechLeadPatternConflictError,
+    TechLeadPromotionConflictError,
     TechLeadShippedFixConflictError,
     TechLeadStormCohortConflictError,
+    UnknownTechLeadPatternError,
 )
 from .repo_identity import state_dir
+from . import tech_lead_pending_intents as pending_intents
 from .sqlite_connection import open_sqlite
+from .tech_lead_authority_schema import initialize_tech_lead_authority_schema
 
 logger = logging.getLogger(__name__)
 
 
 def _cohort_from_payload(payload: str) -> tuple[DiscoveredFailure, ...]:
     """Rehydrate a stored cohort payload into typed failure facts."""
-    return tuple(
-        DiscoveredFailure.from_dict(item) for item in json.loads(payload)
+    return tuple(DiscoveredFailure.from_dict(item) for item in json.loads(payload))
+
+
+def _pattern_evidence_from_row(row: sqlite3.Row) -> PatternEvidence:
+    """Project one pattern row onto its typed domain value (#6781/#6957)."""
+    return PatternEvidence(
+        signature=str(row["signature"]),
+        case_file_issue_number=int(row["issue_number"]),
+        observation_count=int(row["observation_count"]),
+        fix_class=str(row["fix_class"]),
+        area=str(row["area"]),
+        diagnosis=str(row["diagnosis"]),
     )
 
-_SCHEMA = """
-CREATE TABLE IF NOT EXISTS tech_lead_launch_authority (
-    run_id TEXT NOT NULL,
-    session_name TEXT NOT NULL,
-    authority TEXT NOT NULL,
-    recorded_at TEXT NOT NULL,
-    PRIMARY KEY (run_id, session_name)
-);
-CREATE TABLE IF NOT EXISTS tech_lead_proposal_ops (
-    issue_number INTEGER PRIMARY KEY,
-    op TEXT NOT NULL,
-    recorded_at TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS tech_lead_patterns (
-    signature TEXT PRIMARY KEY,
-    issue_number INTEGER NOT NULL,
-    recorded_at TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS tech_lead_shipped_fixes (
-    issue_number INTEGER PRIMARY KEY,
-    title TEXT NOT NULL,
-    pr_url TEXT NOT NULL,
-    area TEXT NOT NULL,
-    merged_at TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS tech_lead_storm_cohorts (
-    anchor_issue_number INTEGER PRIMARY KEY,
-    cohort TEXT NOT NULL,
-    recorded_at TEXT NOT NULL
-);
-"""
+
+
+
+
+
+def _promotion_from_row(row: sqlite3.Row) -> PromotedFinding:
+    """Project one promoted-finding row onto its typed domain value (#6957)."""
+    state = str(row["state"])
+    if state not in VALID_PROMOTION_STATES:
+        raise ValueError(
+            f"tech_lead_promoted_findings row for signature"
+            f" {str(row['signature'])!r} has unknown state {state!r}"
+        )
+    return PromotedFinding(
+        signature=str(row["signature"]),
+        case_file_issue_number=int(row["case_file_issue_number"]),
+        target_repo=str(row["target_repo"]),
+        target_issue_number=int(row["target_issue_number"]),
+        state=state,  # type: ignore[arg-type]  # validated against the literal set
+        area=str(row["area"]),
+        title=str(row["title"]),
+        shipped_pr_url=str(row["shipped_pr_url"]),
+        recorded_at=str(row["recorded_at"]),
+        reported_observations=int(row["reported_observations"]),
+    )
 
 
 class SqliteTechLeadAuthorityStore:
@@ -117,8 +134,7 @@ class SqliteTechLeadAuthorityStore:
 
     def initialize(self) -> None:
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
-        conn = self._get_connection()
-        conn.executescript(_SCHEMA)
+        initialize_tech_lead_authority_schema(self._get_connection())
 
     def _get_connection(self) -> sqlite3.Connection:
         conn = getattr(self._local, "conn", None)
@@ -184,9 +200,7 @@ class SqliteTechLeadAuthorityStore:
             list(authority.problem_issue_numbers),
         )
 
-    def load(
-        self, *, run_id: str, session_name: str
-    ) -> TechLeadLaunchAuthority | None:
+    def load(self, *, run_id: str, session_name: str) -> TechLeadLaunchAuthority | None:
         """Load the launch authority for a session run, or None when absent.
 
         Malformed stored content raises ValueError loudly — the store is
@@ -290,19 +304,40 @@ class SqliteTechLeadAuthorityStore:
             "SELECT issue_number, op FROM tech_lead_proposal_ops ORDER BY issue_number",
         ).fetchall()
         return tuple(
-            (int(row["issue_number"]), StoredTechLeadOp.from_dict(json.loads(row["op"])))
+            (
+                int(row["issue_number"]),
+                StoredTechLeadOp.from_dict(json.loads(row["op"])),
+            )
             for row in rows
         )
 
     # -- Pattern case files (#6781) -----------------------------------------
 
-    def record_pattern(self, *, signature: str, issue_number: int) -> None:
+    def record_pattern(
+        self,
+        *,
+        signature: str,
+        issue_number: int,
+        observation_id: str,
+        fix_class: str = "",
+        area: str = "",
+        diagnosis: str = "",
+    ) -> None:
         """Persist a signature's case-file issue (create-once).
 
         Same issue for an existing signature: no-op. Different issue:
         :class:`TechLeadPatternConflictError` — a signature keys exactly one
-        evidence trail, which must never silently move.
+        evidence trail, which must never silently move. ``fix_class``/``area``
+        are the promotion facts (#6957), and ``observation_id`` is the identity
+        of the single observation the issue BODY records; the count starts at
+        one and every further observation advances it through
+        :meth:`note_pattern_observation`, create-once by identity.
         """
+        if not observation_id.strip():
+            raise ValueError(
+                "record_pattern requires the identity of the observation the"
+                " case-file body records"
+            )
         with self._transaction() as tx:
             row = tx.execute(
                 "SELECT issue_number FROM tech_lead_patterns WHERE signature = ?",
@@ -315,20 +350,103 @@ class SqliteTechLeadAuthorityStore:
                     f"pattern signature {signature!r} is already recorded for"
                     f" case-file issue #{int(row[0])}"
                 )
+            now = datetime.now(timezone.utc).isoformat()
             tx.execute(
                 "INSERT INTO tech_lead_patterns (signature, issue_number,"
-                " recorded_at) VALUES (?, ?, ?)",
-                (
-                    signature,
-                    issue_number,
-                    datetime.now(timezone.utc).isoformat(),
-                ),
+                " recorded_at, observation_count, fix_class, area, diagnosis)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (signature, issue_number, now, 1, fix_class, area, diagnosis),
+            )
+            tx.execute(
+                "INSERT INTO tech_lead_pattern_observations (signature,"
+                " observation_id, recorded_at) VALUES (?, ?, ?)",
+                (signature, observation_id, now),
             )
         logger.info(
-            "[tech_lead] Recorded pattern case file: signature=%r issue=#%d",
+            "[tech_lead] Recorded pattern case file: signature=%r issue=#%d"
+            " observation=%s fix_class=%r",
             signature,
             issue_number,
+            observation_id,
+            fix_class,
         )
+
+    def note_pattern_observation(
+        self,
+        *,
+        signature: str,
+        observation_id: str,
+        fix_class: str = "",
+        area: str = "",
+    ) -> bool:
+        """Record ONE observation create-once and advance the count (#6957).
+
+        The count is what ``min_evidence`` reads, so it is keyed by WHICH
+        observation produced it, never by how many times the orchestrator
+        replayed the write: the identity row and the increment land in ONE
+        transaction, so a replayed action finds its identity present and returns
+        False without touching the count (review F1).
+
+        Classification/area are merged by the shared reconcile rule, which
+        raises on a conflicting non-empty value rather than letting a later
+        observation silently reclassify or reroute the signature (review F3).
+        """
+        if not observation_id.strip():
+            raise ValueError(
+                "note_pattern_observation requires a stable observation identity"
+            )
+        with self._transaction() as tx:
+            row = tx.execute(
+                "SELECT observation_count, fix_class, area FROM tech_lead_patterns"
+                " WHERE signature = ?",
+                (signature,),
+            ).fetchone()
+            if row is None:
+                raise UnknownTechLeadPatternError(
+                    f"no pattern case file is recorded for signature {signature!r}"
+                )
+            # Reconciled before the create-once check so a conflict is reported
+            # identically on the first attempt and on a replay.
+            merged_fix_class = reconcile_pattern_classification(
+                field="fix_class",
+                signature=signature,
+                existing=str(row["fix_class"]),
+                incoming=fix_class,
+            )
+            merged_area = reconcile_pattern_classification(
+                field="area",
+                signature=signature,
+                existing=str(row["area"]),
+                incoming=area,
+            )
+            inserted = tx.execute(
+                "INSERT OR IGNORE INTO tech_lead_pattern_observations (signature,"
+                " observation_id, recorded_at) VALUES (?, ?, ?)",
+                (signature, observation_id, datetime.now(timezone.utc).isoformat()),
+            ).rowcount
+            if not inserted:
+                return False
+            tx.execute(
+                "UPDATE tech_lead_patterns SET observation_count = ?, fix_class = ?,"
+                " area = ? WHERE signature = ?",
+                (
+                    int(row["observation_count"]) + 1,
+                    merged_fix_class,
+                    merged_area,
+                    signature,
+                ),
+            )
+        return True
+
+    def has_pattern_observation(self, *, signature: str, observation_id: str) -> bool:
+        """True when this exact observation is already recorded (local read)."""
+        conn = self._get_connection()
+        row = conn.execute(
+            "SELECT 1 FROM tech_lead_pattern_observations WHERE signature = ?"
+            " AND observation_id = ?",
+            (signature, observation_id),
+        ).fetchone()
+        return row is not None
 
     def lookup_pattern(self, *, signature: str) -> int | None:
         """Return the case-file issue for a signature, or None when absent."""
@@ -339,14 +457,184 @@ class SqliteTechLeadAuthorityStore:
         ).fetchone()
         return int(row["issue_number"]) if row is not None else None
 
+    def load_pattern_evidence(self, *, signature: str) -> PatternEvidence | None:
+        """One signature's durable row, or None when it has no case file."""
+        conn = self._get_connection()
+        row = conn.execute(
+            "SELECT signature, issue_number, observation_count, fix_class, area,"
+            " diagnosis FROM tech_lead_patterns WHERE signature = ?",
+            (signature,),
+        ).fetchone()
+        return _pattern_evidence_from_row(row) if row is not None else None
+
+    # -- In-flight creations (#6957 round-3 review F10/F11) ------------------
+    #
+    # The crash-window outbox. Its SQL lives in ``tech_lead_pending_intents``
+    # (same shape, same lifetime, distinct from the durable ledgers); this store
+    # owns the connection and the transaction boundary those functions run in.
+
+    def record_pending_case_file(self, *, pending: PendingCaseFile) -> None:
+        """Persist an in-flight case-file creation (create-once)."""
+        with self._transaction() as tx:
+            pending_intents.insert_case_file(tx, pending)
+
+    def load_pending_case_file(self, *, signature: str) -> PendingCaseFile | None:
+        """Return a signature's in-flight creation, or None when absent."""
+        return pending_intents.select_case_file(self._get_connection(), signature)
+
+    def discard_pending_case_file(self, *, signature: str) -> None:
+        """Remove an in-flight creation row. No-op if absent."""
+        with self._transaction() as tx:
+            pending_intents.delete_case_file(tx, signature)
+
+    def record_pending_promotion(self, *, pending: PendingPromotion) -> None:
+        """Persist an in-flight promotion filing (create-once)."""
+        with self._transaction() as tx:
+            pending_intents.insert_promotion(tx, pending)
+
+    def load_pending_promotion(self, *, signature: str) -> PendingPromotion | None:
+        """Return a signature's in-flight filing, or None when absent."""
+        return pending_intents.select_promotion(self._get_connection(), signature)
+
+    def discard_pending_promotion(self, *, signature: str) -> None:
+        """Remove an in-flight filing row. No-op if absent."""
+        with self._transaction() as tx:
+            pending_intents.delete_promotion(tx, signature)
+
     def list_patterns(self) -> tuple[tuple[str, int], ...]:
         """All (signature, case_file_issue_number) rows — the pattern ledger."""
         conn = self._get_connection()
         rows = conn.execute(
             "SELECT signature, issue_number FROM tech_lead_patterns ORDER BY signature",
         ).fetchall()
-        return tuple(
-            (str(row["signature"]), int(row["issue_number"])) for row in rows
+        return tuple((str(row["signature"]), int(row["issue_number"])) for row in rows)
+
+    def list_pattern_evidence(self) -> tuple[PatternEvidence, ...]:
+        """All case-file rows with their promotion facts (#6957)."""
+        conn = self._get_connection()
+        rows = conn.execute(
+            "SELECT signature, issue_number, observation_count, fix_class, area,"
+            " diagnosis"
+            " FROM tech_lead_patterns ORDER BY signature",
+        ).fetchall()
+        return tuple(_pattern_evidence_from_row(row) for row in rows)
+
+    # -- Promoted findings (#6957) ------------------------------------------
+
+    def record_promotion(self, *, promotion: PromotedFinding) -> None:
+        """Persist a promoted finding (create-once by signature)."""
+        with self._transaction() as tx:
+            row = tx.execute(
+                "SELECT target_repo, target_issue_number FROM"
+                " tech_lead_promoted_findings WHERE signature = ?",
+                (promotion.signature,),
+            ).fetchone()
+            if row is not None:
+                if (
+                    str(row["target_repo"]) == promotion.target_repo
+                    and int(row["target_issue_number"]) == promotion.target_issue_number
+                ):
+                    return
+                raise TechLeadPromotionConflictError(
+                    f"pattern signature {promotion.signature!r} is already promoted"
+                    f" to {row['target_repo']}#{int(row['target_issue_number'])}"
+                )
+            tx.execute(
+                "INSERT INTO tech_lead_promoted_findings (signature,"
+                " case_file_issue_number, target_repo, target_issue_number, state,"
+                " area, title, shipped_pr_url, recorded_at, reported_observations)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    promotion.signature,
+                    promotion.case_file_issue_number,
+                    promotion.target_repo,
+                    promotion.target_issue_number,
+                    promotion.state,
+                    promotion.area,
+                    promotion.title,
+                    promotion.shipped_pr_url,
+                    promotion.recorded_at or datetime.now(timezone.utc).isoformat(),
+                    promotion.reported_observations,
+                ),
+            )
+        logger.info(
+            "[tech_lead] Recorded promoted finding: signature=%r -> %s#%d"
+            " (case file #%d)",
+            promotion.signature,
+            promotion.target_repo,
+            promotion.target_issue_number,
+            promotion.case_file_issue_number,
+        )
+
+    def note_promotion_reported(self, *, signature: str, observations: int) -> None:
+        """Advance a promotion's reported-observation high-water mark (#6957).
+
+        Written AFTER the evidence comment lands on the promoted issue, so a
+        crash between the two repeats one comment rather than silently dropping
+        evidence the promoted issue was never told about. ``max`` keeps the mark
+        monotonic against an out-of-order retry.
+        """
+        with self._transaction() as tx:
+            row = tx.execute(
+                "SELECT reported_observations FROM tech_lead_promoted_findings"
+                " WHERE signature = ?",
+                (signature,),
+            ).fetchone()
+            if row is None:
+                raise UnknownTechLeadPatternError(
+                    f"no promotion is recorded for signature {signature!r}"
+                )
+            tx.execute(
+                "UPDATE tech_lead_promoted_findings SET reported_observations = ?"
+                " WHERE signature = ?",
+                (max(int(row["reported_observations"]), observations), signature),
+            )
+
+    def load_promotion(self, *, signature: str) -> PromotedFinding | None:
+        """Return a signature's promotion row, or None when never promoted."""
+        conn = self._get_connection()
+        row = conn.execute(
+            "SELECT * FROM tech_lead_promoted_findings WHERE signature = ?",
+            (signature,),
+        ).fetchone()
+        return _promotion_from_row(row) if row is not None else None
+
+    def list_promotions(self) -> tuple[PromotedFinding, ...]:
+        """All promotion rows — the dedup, cap, and loop-closure ledger read."""
+        conn = self._get_connection()
+        rows = conn.execute(
+            "SELECT * FROM tech_lead_promoted_findings ORDER BY signature",
+        ).fetchall()
+        return tuple(_promotion_from_row(row) for row in rows)
+
+    def settle_promotion(
+        self,
+        *,
+        signature: str,
+        state: PromotionState,
+        shipped_pr_url: str = "",
+    ) -> None:
+        """Move a promotion to a terminal state (``declined``/``shipped``)."""
+        with self._transaction() as tx:
+            row = tx.execute(
+                "SELECT shipped_pr_url FROM tech_lead_promoted_findings"
+                " WHERE signature = ?",
+                (signature,),
+            ).fetchone()
+            if row is None:
+                raise UnknownTechLeadPatternError(
+                    f"no promotion is recorded for signature {signature!r}"
+                )
+            tx.execute(
+                "UPDATE tech_lead_promoted_findings SET state = ?, shipped_pr_url = ?"
+                " WHERE signature = ?",
+                (state, shipped_pr_url or str(row["shipped_pr_url"]), signature),
+            )
+        logger.info(
+            "[tech_lead] Promotion for signature=%r settled as %s%s",
+            signature,
+            state,
+            f" ({shipped_pr_url})" if shipped_pr_url else "",
         )
 
     # -- Problem-storm cohorts (#6780) ------------------------------------
@@ -361,9 +649,7 @@ class SqliteTechLeadAuthorityStore:
         review's act-level authority and the retention scope for the members'
         run artifacts, so it must never silently change after creation.
         """
-        payload = json.dumps(
-            [problem.to_dict() for problem in cohort], sort_keys=True
-        )
+        payload = json.dumps([problem.to_dict() for problem in cohort], sort_keys=True)
         with self._transaction() as tx:
             row = tx.execute(
                 "SELECT cohort FROM tech_lead_storm_cohorts"
@@ -440,10 +726,7 @@ class SqliteTechLeadAuthorityStore:
                 (issue_number,),
             ).fetchone()
             if row is not None:
-                if (
-                    str(row["pr_url"]) == pr_url
-                    and str(row["area"]) == area
-                ):
+                if str(row["pr_url"]) == pr_url and str(row["area"]) == area:
                     return
                 raise TechLeadShippedFixConflictError(
                     f"different shipped-fix evidence is already recorded for"
@@ -474,12 +757,16 @@ class SqliteTechLeadAuthorityStore:
         """Return the newest durable shipped-fix facts."""
         if limit <= 0:
             raise ValueError("shipped-fix limit must be positive")
-        rows = self._get_connection().execute(
-            "SELECT issue_number, title, pr_url, area, merged_at "
-            "FROM tech_lead_shipped_fixes "
-            "ORDER BY merged_at DESC, issue_number DESC LIMIT ?",
-            (limit,),
-        ).fetchall()
+        rows = (
+            self._get_connection()
+            .execute(
+                "SELECT issue_number, title, pr_url, area, merged_at "
+                "FROM tech_lead_shipped_fixes "
+                "ORDER BY merged_at DESC, issue_number DESC LIMIT ?",
+                (limit,),
+            )
+            .fetchall()
+        )
         return tuple(
             TechLeadShippedFixSummary(
                 issue_number=int(row["issue_number"]),

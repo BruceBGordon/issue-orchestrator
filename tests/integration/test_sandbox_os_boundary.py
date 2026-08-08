@@ -279,7 +279,25 @@ def _tool_events(stdout: str) -> list[_ToolEvent]:
             evt = json.loads(line)
         except ValueError:
             continue
-        content = (evt.get("message") or {}).get("content")
+        if not isinstance(evt, dict):
+            continue
+        if evt.get("type") == "system" and evt.get("subtype") == "permission_denied":
+            denied_tool_use_id = evt.get("tool_use_id")
+            if isinstance(denied_tool_use_id, str):
+                results[denied_tool_use_id] = (
+                    True,
+                    _result_text(evt.get("message")),
+                )
+            continue
+        # The CLI's stream carries non-assistant events too, and some of them
+        # (errors, system notices) put a plain string in ``message``. Skip them
+        # the way _codex_command_events skips non-dict ``item`` payloads —
+        # a missing tool event still fails the assertions below, but with the
+        # assertion's message instead of an AttributeError in the parser.
+        message = evt.get("message")
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
         if not isinstance(content, list):
             continue
         for block in content:
@@ -317,6 +335,44 @@ def _native_writes_to(events: list[_ToolEvent], target: Path) -> list[_ToolEvent
         for e in events
         if e.tool in _WRITE_TOOLS and e.file_path and str(Path(e.file_path)) == tp
     ]
+
+
+def test_tool_events_supports_system_permission_denial_message() -> None:
+    """Claude 2.1.224 emits permission denials with a string message."""
+    tool_use_id = "toolu_denied_write"
+    target = "/outside/native_escape.txt"
+    denial = "Permission to use Write has been denied in don't ask mode."
+    stream = "\n".join(
+        [
+            json.dumps({
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": tool_use_id,
+                            "name": "Write",
+                            "input": {"file_path": target, "content": "blocked"},
+                        }
+                    ]
+                },
+            }),
+            json.dumps({
+                "type": "system",
+                "subtype": "status",
+                "message": "non-tool status text",
+            }),
+            json.dumps({
+                "type": "system",
+                "subtype": "permission_denied",
+                "tool_name": "Write",
+                "tool_use_id": tool_use_id,
+                "message": denial,
+            }),
+        ]
+    )
+
+    assert _tool_events(stream) == [_ToolEvent("Write", target, True, denial)]
 
 
 def _is_permission_denial(text: str) -> bool:

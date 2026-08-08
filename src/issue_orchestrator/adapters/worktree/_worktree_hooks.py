@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+from dataclasses import dataclass
 from pathlib import Path
 
 from ...infra.repo_guardrails import (
@@ -20,6 +21,10 @@ logger = logging.getLogger(__name__)
 # Path to bundled hooks (in issue_orchestrator/hooks/, 3 levels up from this module)
 HOOKS_DIR = Path(__file__).parent.parent.parent / "hooks"
 PROJECT_COMMIT_MESSAGE_HOOKS = ("prepare-commit-msg", "applypatch-msg")
+
+# ``git config --get`` exits 1 for "no such key" and reserves other nonzero
+# exits for real failures (unreadable or invalid config file, not a repository).
+GIT_CONFIG_KEY_ABSENT = 1
 
 # Placeholder in the bundled pre-push template that we substitute with the
 # orchestrator's interpreter path at install time. See the comment in
@@ -64,7 +69,7 @@ def _install_orchestrator_pre_push(src: Path, dst: Path) -> None:
     dst.chmod(0o755)
 
 
-def install_hooks(worktree_path: Path, pre_push_hook: Path | None = None) -> None:
+def install_hooks(worktree_path: Path, pre_push_hook: Path | None = None) -> bool:
     """
     Install git hooks into a worktree.
 
@@ -74,6 +79,21 @@ def install_hooks(worktree_path: Path, pre_push_hook: Path | None = None) -> Non
     Args:
         worktree_path: Path to the worktree
         pre_push_hook: Custom pre-push hook path (uses bundled if None)
+
+    Returns:
+        True when the orchestrator's pre-push guardrail is one Git will
+        actually run: the worktree's effective ``core.hooksPath`` is the
+        worktree hooks directory, and the orchestrator hook is in it — either
+        standalone as ``pre-push`` or as ``pre-push.orchestrator`` behind the
+        chained wrapper. False when it is not, for any reason: no linked git
+        dir, unreadable repo hook configuration, a worktree Git configuration
+        that would not take, or a supplied ``pre_push_hook`` path that does not
+        exist. Every False path logs the specific cause.
+
+        Callers that asked for enforced guardrails must treat False as a
+        failure. The guardrail is the only thing stopping an agent from pushing
+        past validation, so "asked for it", "copied a file" and "Git will run
+        it" are three different facts and only the last one is success.
 
     Note:
         Worktrees have a .git file (not directory) that points to the main repo.
@@ -86,66 +106,27 @@ def install_hooks(worktree_path: Path, pre_push_hook: Path | None = None) -> Non
 
     git_file = worktree_path / ".git"
     if not git_file.exists():
-        return
+        logger.warning("No .git link in %s; cannot install worktree hooks", worktree_path)
+        return False
 
     content = git_file.read_text().strip()
     if not content.startswith("gitdir:"):
-        return
+        logger.warning(
+            "Malformed .git link in %s; cannot install worktree hooks", worktree_path
+        )
+        return False
 
     gitdir = Path(content.split(":", 1)[1].strip())
     hooks_dir = gitdir / "hooks"
     hooks_dir.mkdir(parents=True, exist_ok=True)
 
-    # Read from main repo config, not worktree config. Worktree config may have
-    # our override from a previous install.
-    main_git_dir = gitdir.parent.parent
-    hooks_path_result = _git_run(
-        main_git_dir,
-        ["config", "--local", "--get", "core.hooksPath"],
-        check=False,
-    )
-    custom_hooks_path = (
-        hooks_path_result.stdout.strip()
-        if hooks_path_result.returncode == 0
-        else None
-    )
+    repo_hooks_path = _read_main_repo_hooks_path(gitdir)
+    if not repo_hooks_path.readable:
+        return False
+    custom_hooks_path = repo_hooks_path.path
 
-    # Always set per-worktree hooksPath so hooks live with the worktree.
-    # Explicit GIT_DIR prevents symlink resolution from writing to another worktree config.
-    git_env = {
-        **os.environ,
-        "GIT_DIR": str(gitdir),
-        "GIT_WORK_TREE": str(worktree_path),
-    }
-    _git_run(
-        worktree_path,
-        ["config", "extensions.worktreeConfig", "true"],
-        check=False,
-        env=git_env,
-    )
-    _git_run(
-        worktree_path,
-        ["config", "--worktree", "core.hooksPath", str(hooks_dir)],
-        check=False,
-        env=git_env,
-    )
-    _git_run(
-        worktree_path,
-        ["config", "--worktree", "core.worktree", str(worktree_path)],
-        check=False,
-        env=git_env,
-    )
-    _git_run(
-        worktree_path,
-        ["config", "--worktree", "core.bare", "false"],
-        check=False,
-        env=git_env,
-    )
-    logger.info(
-        "Overriding core.hooksPath to %s for this worktree only (gitdir=%s)",
-        hooks_dir,
-        gitdir,
-    )
+    if not _point_worktree_at_hooks_dir(worktree_path, gitdir, hooks_dir):
+        return False
 
     _install_project_commit_message_hooks(gitdir, custom_hooks_path, hooks_dir)
 
@@ -159,10 +140,135 @@ def install_hooks(worktree_path: Path, pre_push_hook: Path | None = None) -> Non
     quarantine_managed_hook_file(hooks_dir / "pre-push.project")
 
     if project_hook is not None and project_hook.is_file():
-        _install_chained_hook(hooks_dir, dst_hook, project_hook, orchestrator_hook)
-    elif orchestrator_hook.exists():
+        return _install_chained_hook(
+            hooks_dir, dst_hook, project_hook, orchestrator_hook
+        )
+    if orchestrator_hook.exists():
         _install_orchestrator_pre_push(orchestrator_hook, dst_hook)
         logger.info("Installed orchestrator pre-push hook")
+        return True
+
+    logger.warning(
+        "No orchestrator pre-push hook to install (missing source %s)",
+        orchestrator_hook,
+    )
+    return False
+
+
+@dataclass(frozen=True)
+class _MainRepoHooksPath:
+    """What the main repo says about ``core.hooksPath``.
+
+    ``readable`` is separate from ``path`` because "the repo has no custom hooks
+    path" and "we could not read the repo's config" are different facts with
+    different consequences. Collapsing both into ``None`` — which the old code
+    did by keying only on ``returncode == 0`` — makes a config-read error look
+    like a plain repo, so the project's own pre-push gate is quietly dropped
+    from the worktree chain and the push runs with fewer checks than the repo
+    demands.
+    """
+
+    readable: bool
+    path: str | None
+
+
+def _read_main_repo_hooks_path(gitdir: Path) -> _MainRepoHooksPath:
+    """Read ``core.hooksPath`` from the main repo config, not the worktree's.
+
+    Worktree config may already carry our own override from a previous install,
+    which would resolve project hooks against the wrong directory.
+    """
+    main_git_dir = gitdir.parent.parent
+    result = _git_run(
+        main_git_dir,
+        ["config", "--local", "--get", "core.hooksPath"],
+        check=False,
+    )
+    if result.returncode == 0:
+        return _MainRepoHooksPath(readable=True, path=result.stdout.strip() or None)
+    if result.returncode == GIT_CONFIG_KEY_ABSENT:
+        return _MainRepoHooksPath(readable=True, path=None)
+
+    logger.error(
+        "Failed to read core.hooksPath from %s (git exit %s): %s",
+        main_git_dir,
+        result.returncode,
+        (result.stderr or "").strip(),
+    )
+    return _MainRepoHooksPath(readable=False, path=None)
+
+
+def _point_worktree_at_hooks_dir(
+    worktree_path: Path, gitdir: Path, hooks_dir: Path
+) -> bool:
+    """Make Git run this worktree's hooks from ``hooks_dir``, and prove it did.
+
+    Copying a hook file is not installing a guardrail. Git only runs it if the
+    worktree's effective ``core.hooksPath`` points at the directory holding it,
+    and that is what these config writes establish. A write that fails while
+    the hooks directory stays writable leaves Git on its previous hooks path:
+    the file lands, nothing ever executes it, and the push sails through — the
+    exact bypass an installed-looking hook is supposed to close.
+
+    So every write is checked, and the outcome is then read back out of Git
+    rather than inferred from the writes having returned zero.
+    """
+    # Explicit GIT_DIR prevents symlink resolution from writing to another
+    # worktree's config.
+    git_env = {
+        **os.environ,
+        "GIT_DIR": str(gitdir),
+        "GIT_WORK_TREE": str(worktree_path),
+    }
+    required_settings = (
+        ["config", "extensions.worktreeConfig", "true"],
+        ["config", "--worktree", "core.hooksPath", str(hooks_dir)],
+        ["config", "--worktree", "core.worktree", str(worktree_path)],
+        ["config", "--worktree", "core.bare", "false"],
+    )
+    for argv in required_settings:
+        result = _git_run(worktree_path, argv, check=False, env=git_env)
+        if result.returncode != 0:
+            logger.error(
+                "Failed to set worktree git config '%s' for %s (git exit %s): %s",
+                " ".join(argv[1:]),
+                worktree_path,
+                result.returncode,
+                (result.stderr or "").strip(),
+            )
+            return False
+
+    effective = _git_run(
+        worktree_path,
+        ["config", "--get", "core.hooksPath"],
+        check=False,
+        env=git_env,
+    )
+    if effective.returncode != 0:
+        logger.error(
+            "Could not read back core.hooksPath for %s (git exit %s): %s",
+            worktree_path,
+            effective.returncode,
+            (effective.stderr or "").strip(),
+        )
+        return False
+
+    effective_hooks_dir = Path(effective.stdout.strip())
+    if effective_hooks_dir != hooks_dir:
+        logger.error(
+            "Worktree hooks path did not take effect for %s: git uses %s, expected %s",
+            worktree_path,
+            effective_hooks_dir,
+            hooks_dir,
+        )
+        return False
+
+    logger.info(
+        "Overriding core.hooksPath to %s for this worktree only (gitdir=%s)",
+        hooks_dir,
+        gitdir,
+    )
+    return True
 
 
 def _project_hooks_base(gitdir: Path, custom_hooks_path: str | None) -> Path:
@@ -252,7 +358,14 @@ def _install_chained_hook(
     dst_hook: Path,
     project_hook: Path,
     orchestrator_hook: Path,
-) -> None:
+) -> bool:
+    """Install the project+orchestrator chain; report whether the guardrail landed.
+
+    Returns False when the wrapper and the project hook are installed but the
+    orchestrator hook source does not exist. The wrapper then runs only the
+    project's own gate, which is exactly the silent guardrail loss the caller
+    must be able to see.
+    """
     # Fail fast: reaching here with a managed source hook means
     # _resolve_project_pre_push_hook's filter was bypassed (e.g. a caller
     # supplied an explicit project_hook). Silently skipping the copy would
@@ -274,11 +387,19 @@ def _install_chained_hook(
     dst_hook.write_text(wrapper_content)
     dst_hook.chmod(0o755)
 
-    if orchestrator_hook.exists():
-        orch_hook_copy = hooks_dir / "pre-push.orchestrator"
-        _install_orchestrator_pre_push(orchestrator_hook, orch_hook_copy)
+    if not orchestrator_hook.exists():
+        logger.warning(
+            "Installed chained pre-push wrapper without the orchestrator hook "
+            "(missing source %s)",
+            orchestrator_hook,
+        )
+        return False
+
+    orch_hook_copy = hooks_dir / "pre-push.orchestrator"
+    _install_orchestrator_pre_push(orchestrator_hook, orch_hook_copy)
 
     logger.info("Installed chained pre-push hooks (project + orchestrator)")
+    return True
 
 
 def _chained_hook_script() -> str:

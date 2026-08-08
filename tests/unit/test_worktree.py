@@ -26,6 +26,11 @@ from issue_orchestrator.adapters.worktree.api import (
     WorktreeError,
 )
 from issue_orchestrator.ports.worktree_manager import WorktreeReuseOptions
+from tests.unit.worktree_git_helpers import (
+    block_worktree_config_writes,
+    effective_hooks_path,
+    make_git_worktree,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -158,8 +163,12 @@ class TestBranchSuffix:
 class TestCreateWorktree:
     """Test the create_worktree function."""
 
+    @patch(
+        "issue_orchestrator.adapters.worktree._worktree_runtime_setup.install_hooks",
+        return_value=True,
+    )
     @patch("issue_orchestrator.adapters.git.git_cli.subprocess.run")
-    def test_create_worktree_success(self, mock_run, tmp_path):
+    def test_create_worktree_success(self, mock_run, mock_install_hooks, tmp_path):
         """Test successful worktree creation."""
         # Setup
         repo_root = tmp_path / "repo"
@@ -213,8 +222,12 @@ class TestCreateWorktree:
         assert "123-add-user-auth" in worktree_cmd
         assert "origin/main" in worktree_cmd  # Should branch from origin/main
 
+    @patch(
+        "issue_orchestrator.adapters.worktree._worktree_runtime_setup.install_hooks",
+        return_value=True,
+    )
     @patch("issue_orchestrator.adapters.git.git_cli.subprocess.run")
-    def test_create_worktree_uses_seed_ref_override_for_fresh_branch(self, mock_run, tmp_path):
+    def test_create_worktree_uses_seed_ref_override_for_fresh_branch(self, mock_run, mock_install_hooks, tmp_path):
         """Fresh worktrees can be seeded from an explicit local ref without changing PR base."""
         repo_root = tmp_path / "repo"
         repo_root.mkdir()
@@ -257,8 +270,12 @@ class TestCreateWorktree:
         assert "origin/main" not in worktree_cmd
         assert not any(cmd[3:6] == ["fetch", "origin", "main"] for cmd in calls)
 
+    @patch(
+        "issue_orchestrator.adapters.worktree._worktree_runtime_setup.install_hooks",
+        return_value=True,
+    )
     @patch("issue_orchestrator.adapters.git.git_cli.subprocess.run")
-    def test_create_worktree_stack_successor_branches_from_predecessor(self, mock_run, tmp_path):
+    def test_create_worktree_stack_successor_branches_from_predecessor(self, mock_run, mock_install_hooks, tmp_path):
         """A stack successor's fresh branch is created from origin/<predecessor>.
 
         With no local/remote issue branch and no seed ref, passing the
@@ -298,8 +315,12 @@ class TestCreateWorktree:
         assert worktree_cmd[-3:] == ["-b", "123-test", "origin/20-base"]
         assert "origin/main" not in worktree_cmd
 
+    @patch(
+        "issue_orchestrator.adapters.worktree._worktree_runtime_setup.install_hooks",
+        return_value=True,
+    )
     @patch("issue_orchestrator.adapters.git.git_cli.subprocess.run")
-    def test_create_worktree_default_base(self, mock_run, tmp_path):
+    def test_create_worktree_default_base(self, mock_run, mock_install_hooks, tmp_path):
         """Test worktree creation with default base directory."""
         # Setup
         repo_root = tmp_path / "repo"
@@ -330,7 +351,7 @@ class TestCreateWorktree:
         # Git should not have been called
         mock_run.assert_not_called()
 
-    @patch("issue_orchestrator.adapters.worktree._worktree.install_hooks")
+    @patch("issue_orchestrator.adapters.worktree._worktree_runtime_setup.install_hooks")
     @patch("issue_orchestrator.adapters.git.git_cli.subprocess.run")
     def test_create_worktree_already_exists(self, mock_run, mock_install_hooks, tmp_path):
         """Test that existing worktree is reused when it passes validation."""
@@ -410,8 +431,12 @@ class TestCreateWorktree:
         with pytest.raises(WorktreeError, match="Failed to create worktree"):
             create_worktree(repo_root, 123, "Test")
 
+    @patch(
+        "issue_orchestrator.adapters.worktree._worktree_runtime_setup.install_hooks",
+        return_value=True,
+    )
     @patch("issue_orchestrator.adapters.git.git_cli.subprocess.run")
-    def test_create_worktree_recovers_from_stale_branch_registration(self, mock_run, tmp_path):
+    def test_create_worktree_recovers_from_stale_branch_registration(self, mock_run, mock_install_hooks, tmp_path):
         """Prune stale worktree metadata and retry when branch is bound to missing path."""
         repo_root = tmp_path / "repo"
         repo_root.mkdir()
@@ -469,8 +494,8 @@ class TestCreateWorktree:
         assert branch_name == "123-test"
         assert state["worktree_add_calls"] == 2
 
-    @patch("issue_orchestrator.adapters.worktree._worktree.install_claude_settings")
-    @patch("issue_orchestrator.adapters.worktree._worktree.install_hooks")
+    @patch("issue_orchestrator.adapters.worktree._worktree_runtime_setup.install_claude_settings")
+    @patch("issue_orchestrator.adapters.worktree._worktree_runtime_setup.install_hooks")
     @patch("issue_orchestrator.adapters.git.git_cli.subprocess.run")
     def test_create_worktree_detaches_when_branch_in_use(
         self,
@@ -526,8 +551,8 @@ class TestCreateWorktree:
         mock_install_hooks.assert_called_once()
         mock_install_claude_settings.assert_called_once()
 
-    @patch("issue_orchestrator.adapters.worktree._worktree.install_claude_settings")
-    @patch("issue_orchestrator.adapters.worktree._worktree.install_hooks")
+    @patch("issue_orchestrator.adapters.worktree._worktree_runtime_setup.install_claude_settings")
+    @patch("issue_orchestrator.adapters.worktree._worktree_runtime_setup.install_hooks")
     @patch("issue_orchestrator.adapters.git.git_cli.subprocess.run")
     def test_create_worktree_removes_existing_path_when_reuse_disabled(
         self,
@@ -593,9 +618,9 @@ class TestCreateWorktree:
         mock_install_hooks.assert_called_once()
         mock_install_claude_settings.assert_called_once()
 
-    @patch("issue_orchestrator.adapters.worktree._worktree.sync_cli_tools")
-    @patch("issue_orchestrator.adapters.worktree._worktree.install_claude_settings")
-    @patch("issue_orchestrator.adapters.worktree._worktree.install_hooks")
+    @patch("issue_orchestrator.adapters.worktree._worktree_runtime_setup.sync_cli_tools")
+    @patch("issue_orchestrator.adapters.worktree._worktree_runtime_setup.install_claude_settings")
+    @patch("issue_orchestrator.adapters.worktree._worktree_runtime_setup.install_hooks")
     @patch("issue_orchestrator.adapters.git.git_cli.subprocess.run")
     def test_create_worktree_does_not_create_setup_commit(
         self,
@@ -696,9 +721,9 @@ class TestCreateWorktree:
         assert ".issue-orchestrator/worktree-id" in exclude_text
         assert "src/issue_orchestrator/entrypoints/cli_tools/coding_done.py" in exclude_text
 
-    @patch("issue_orchestrator.adapters.worktree._worktree.sync_cli_tools")
-    @patch("issue_orchestrator.adapters.worktree._worktree.install_claude_settings")
-    @patch("issue_orchestrator.adapters.worktree._worktree.install_hooks")
+    @patch("issue_orchestrator.adapters.worktree._worktree_runtime_setup.sync_cli_tools")
+    @patch("issue_orchestrator.adapters.worktree._worktree_runtime_setup.install_claude_settings")
+    @patch("issue_orchestrator.adapters.worktree._worktree_runtime_setup.install_hooks")
     @patch("issue_orchestrator.adapters.git.git_cli.subprocess.run")
     def test_create_worktree_writes_excludes_to_common_git_dir_for_linked_worktree(
         self,
@@ -776,9 +801,9 @@ class TestCreateWorktree:
         assert synced_models.exists()
         assert "class ProposedFollowUpIssue" in synced_models.read_text()
 
-    @patch("issue_orchestrator.adapters.worktree._worktree.sync_cli_tools")
-    @patch("issue_orchestrator.adapters.worktree._worktree.install_claude_settings")
-    @patch("issue_orchestrator.adapters.worktree._worktree.install_hooks")
+    @patch("issue_orchestrator.adapters.worktree._worktree_runtime_setup.sync_cli_tools")
+    @patch("issue_orchestrator.adapters.worktree._worktree_runtime_setup.install_claude_settings")
+    @patch("issue_orchestrator.adapters.worktree._worktree_runtime_setup.install_hooks")
     @patch("issue_orchestrator.adapters.git.git_cli.subprocess.run")
     def test_create_worktree_links_repo_venv_into_issue_worktree(
         self,
@@ -837,8 +862,12 @@ class TestCreateWorktree:
         mock_install_hooks.assert_called_once()
         mock_install_claude_settings.assert_called_once()
 
+    @patch(
+        "issue_orchestrator.adapters.worktree._worktree_runtime_setup.install_hooks",
+        return_value=True,
+    )
     @patch("issue_orchestrator.adapters.git.git_cli.subprocess.run")
-    def test_create_worktree_creates_base_directory(self, mock_run, tmp_path):
+    def test_create_worktree_creates_base_directory(self, mock_run, mock_install_hooks, tmp_path):
         """Test that worktree base directory is created if it doesn't exist."""
         # Setup
         repo_root = tmp_path / "repo"
@@ -857,8 +886,12 @@ class TestCreateWorktree:
         assert worktree_base.exists()
         assert worktree_base.is_dir()
 
+    @patch(
+        "issue_orchestrator.adapters.worktree._worktree_runtime_setup.install_hooks",
+        return_value=True,
+    )
     @patch("issue_orchestrator.adapters.git.git_cli.subprocess.run")
-    def test_create_worktree_with_complex_title(self, mock_run, tmp_path):
+    def test_create_worktree_with_complex_title(self, mock_run, mock_install_hooks, tmp_path):
         """Test worktree creation with complex issue title."""
         # Setup
         repo_root = tmp_path / "repo"
@@ -1560,8 +1593,12 @@ class TestGetWorktreeBranch:
 class TestIntegrationScenarios:
     """Test integration scenarios with multiple operations."""
 
+    @patch(
+        "issue_orchestrator.adapters.worktree._worktree_runtime_setup.install_hooks",
+        return_value=True,
+    )
     @patch("issue_orchestrator.adapters.git.git_cli.subprocess.run")
-    def test_full_lifecycle(self, mock_run, tmp_path):
+    def test_full_lifecycle(self, mock_run, mock_install_hooks, tmp_path):
         """Test complete lifecycle: create, check, remove."""
         # Setup
         repo_root = tmp_path / "repo"
@@ -1607,8 +1644,12 @@ class TestIntegrationScenarios:
         # Remove worktree
         remove_worktree(worktree_path)
 
+    @patch(
+        "issue_orchestrator.adapters.worktree._worktree_runtime_setup.install_hooks",
+        return_value=True,
+    )
     @patch("issue_orchestrator.adapters.git.git_cli.subprocess.run")
-    def test_edge_case_titles(self, mock_run, tmp_path):
+    def test_edge_case_titles(self, mock_run, mock_install_hooks, tmp_path):
         """Test various edge case issue titles."""
         # Setup
         repo_root = tmp_path / "repo"
@@ -1643,18 +1684,18 @@ class TestInstallHooks:
         worktree_path = tmp_path / "worktree"
         worktree_path.mkdir()
         # No .git file
-        
-        # Should not raise, just return
-        install_hooks(worktree_path)
+
+        # Should not raise, and must report that nothing was installed so
+        # callers enforcing guardrails can fail instead of assuming success.
+        assert install_hooks(worktree_path) is False
 
     def test_install_hooks_invalid_git_file(self, tmp_path):
         """Test that install_hooks handles invalid .git file content."""
         worktree_path = tmp_path / "worktree"
         worktree_path.mkdir()
         (worktree_path / ".git").write_text("invalid content")
-        
-        # Should not raise, just return
-        install_hooks(worktree_path)
+
+        assert install_hooks(worktree_path) is False
 
     def test_install_hooks_no_project_hook(self, tmp_path, monkeypatch):
         """Test installing hooks when project has no pre-push hook."""
@@ -1662,31 +1703,20 @@ class TestInstallHooks:
         # sys.executable (not whatever the caller's shell has configured).
         monkeypatch.delenv("ISSUE_ORCHESTRATOR_PYTHON", raising=False)
 
-        # Setup fake git structure
-        main_repo = tmp_path / "main_repo"
-        main_repo.mkdir()
-        main_git = main_repo / ".git"
-        main_git.mkdir()
-        main_hooks = main_git / "hooks"
-        main_hooks.mkdir()
-        # No pre-push hook in main repo
+        # A real repo, because "installed" means git will run it — which only a
+        # real repo can be asked.
+        wt = make_git_worktree(tmp_path)
 
-        worktrees_dir = main_git / "worktrees" / "test-worktree"
-        worktrees_dir.mkdir(parents=True)
-        hooks_dir = worktrees_dir / "hooks"
-
-        worktree_path = tmp_path / "worktree"
-        worktree_path.mkdir()
-        (worktree_path / ".git").write_text(f"gitdir: {worktrees_dir}")
-
-        install_hooks(worktree_path)
+        assert install_hooks(wt.worktree_path) is True
 
         # Should have installed orchestrator's hook directly (no chaining)
-        pre_push = hooks_dir / "pre-push"
+        pre_push = wt.hooks_dir / "pre-push"
         assert pre_push.exists()
         # Should NOT have project or orchestrator suffixed hooks
-        assert not (hooks_dir / "pre-push.project").exists()
-        assert not (hooks_dir / "pre-push.orchestrator").exists()
+        assert not (wt.hooks_dir / "pre-push.project").exists()
+        assert not (wt.hooks_dir / "pre-push.orchestrator").exists()
+        # ...and git must actually be pointed at the directory holding it.
+        assert effective_hooks_path(wt.worktree_path) == str(wt.hooks_dir)
 
         # Regression: the bundled hook ships with an ``@@ORCHESTRATOR_PYTHON@@``
         # placeholder; install must substitute it with the orchestrator's
@@ -1704,44 +1734,31 @@ class TestInstallHooks:
     def test_install_hooks_chains_with_project_hook(self, tmp_path, monkeypatch):
         """Test that hooks are chained when project has a pre-push hook."""
         monkeypatch.delenv("ISSUE_ORCHESTRATOR_PYTHON", raising=False)
-        # Setup fake git structure
-        main_repo = tmp_path / "main_repo"
-        main_repo.mkdir()
-        main_git = main_repo / ".git"
-        main_git.mkdir()
-        main_hooks = main_git / "hooks"
-        main_hooks.mkdir()
-        
+        wt = make_git_worktree(tmp_path)
+
         # Create a project pre-push hook
-        project_hook = main_hooks / "pre-push"
+        project_hook = wt.main_repo / ".git" / "hooks" / "pre-push"
         project_hook.write_text("#!/bin/bash\necho 'Project hook'\nexit 0\n")
         project_hook.chmod(0o755)
-        
-        worktrees_dir = main_git / "worktrees" / "test-worktree"
-        worktrees_dir.mkdir(parents=True)
-        hooks_dir = worktrees_dir / "hooks"
-        
-        worktree_path = tmp_path / "worktree"
-        worktree_path.mkdir()
-        (worktree_path / ".git").write_text(f"gitdir: {worktrees_dir}")
-        
-        install_hooks(worktree_path)
-        
+
+        assert install_hooks(wt.worktree_path) is True
+
         # Verify chained hooks were created
-        pre_push = hooks_dir / "pre-push"
-        pre_push_project = hooks_dir / "pre-push.project"
-        pre_push_orchestrator = hooks_dir / "pre-push.orchestrator"
-        
+        pre_push = wt.hooks_dir / "pre-push"
+        pre_push_project = wt.hooks_dir / "pre-push.project"
+        pre_push_orchestrator = wt.hooks_dir / "pre-push.orchestrator"
+
         assert pre_push.exists(), "Wrapper hook should exist"
         assert pre_push_project.exists(), "Project hook copy should exist"
         assert pre_push_orchestrator.exists(), "Orchestrator hook copy should exist"
-        
+        assert effective_hooks_path(wt.worktree_path) == str(wt.hooks_dir)
+
         # Verify wrapper content chains both hooks
         wrapper_content = pre_push.read_text()
         assert "pre-push.project" in wrapper_content, "Wrapper should call project hook"
         assert "pre-push.orchestrator" in wrapper_content, "Wrapper should call orchestrator hook"
         assert "set -e" in wrapper_content, "Wrapper should fail on error"
-        
+
         # Verify project hook was copied correctly
         assert "Project hook" in pre_push_project.read_text()
 
@@ -1754,6 +1771,58 @@ class TestInstallHooks:
         installed = pre_push_orchestrator.read_text()
         assert "@@ORCHESTRATOR_PYTHON@@" not in installed
         assert sys.executable in installed
+
+    def test_install_hooks_reports_failure_when_supplied_hook_is_missing(
+        self, tmp_path, monkeypatch
+    ):
+        """A chained wrapper without the orchestrator hook is a guardrail loss.
+
+        The project's own gate still runs, so the push "works" and nothing looks
+        wrong — which is exactly why the return value has to say it didn't.
+        """
+        monkeypatch.delenv("ISSUE_ORCHESTRATOR_PYTHON", raising=False)
+        wt = make_git_worktree(tmp_path)
+        project_hook = wt.main_repo / ".git" / "hooks" / "pre-push"
+        project_hook.write_text("#!/bin/bash\nexit 0\n")
+        project_hook.chmod(0o755)
+
+        installed = install_hooks(wt.worktree_path, tmp_path / "nonexistent-pre-push")
+
+        assert installed is False
+        assert not (wt.hooks_dir / "pre-push.orchestrator").exists()
+
+    def test_install_hooks_reports_failure_when_worktree_config_cannot_be_written(
+        self, tmp_path
+    ):
+        """A copied hook in a directory git never consults is not a guardrail.
+
+        This is the bypass the return value exists to close: the hooks directory
+        stays perfectly writable, so the file lands and everything *looks*
+        installed, while git keeps using its previous hooks path and the
+        orchestrator's pre-push check never runs.
+        """
+        wt = make_git_worktree(tmp_path)
+        block_worktree_config_writes(wt.gitdir)
+
+        installed = install_hooks(wt.worktree_path)
+
+        assert installed is False
+        assert not (wt.hooks_dir / "pre-push").exists()
+        assert effective_hooks_path(wt.worktree_path) != str(wt.hooks_dir)
+
+    def test_install_hooks_reports_failure_when_repo_hooks_path_is_unreadable(
+        self, tmp_path
+    ):
+        """A config-read error must not be read as "this repo has no hooksPath".
+
+        Treating the two the same would resolve project hooks against the wrong
+        directory and silently drop the repo's own pre-push gate from the chain.
+        """
+        wt = make_git_worktree(tmp_path)
+        (wt.main_repo / ".git" / "config").write_text("[core\nthis is not valid\n")
+
+        assert install_hooks(wt.worktree_path) is False
+        assert not (wt.hooks_dir / "pre-push").exists()
 
     @patch("issue_orchestrator.adapters.git.git_cli.subprocess.run")
     def test_install_hooks_with_custom_hooks_path(self, mock_run, tmp_path):
@@ -1782,20 +1851,22 @@ class TestInstallHooks:
         project_hook.write_text("#!/bin/bash\necho 'Custom hooks path hook'\nexit 0\n")
         project_hook.chmod(0o755)
 
-        # Mock git config to return custom hooksPath
+        # Mock a coherent git: the main repo reports .githooks, the worktree
+        # config writes succeed, and reading core.hooksPath back afterwards
+        # returns the worktree hooks dir those writes just set.
         def mock_git_command(*args, **kwargs):
-            cmd = args[0]
-            if "config" in cmd and "--get" in cmd and "core.hooksPath" in cmd:
+            argv = args[0][3:]  # strip ["git", "-C", <repo>]
+            if argv[:4] == ["config", "--local", "--get", "core.hooksPath"]:
                 return MagicMock(returncode=0, stdout=".githooks\n", stderr="")
-            elif "config" in cmd and "extensions.worktreeConfig" in cmd:
-                return MagicMock(returncode=0, stdout="", stderr="")
-            elif "config" in cmd and "--worktree" in cmd and "core.hooksPath" in cmd:
+            if argv[:3] == ["config", "--get", "core.hooksPath"]:
+                return MagicMock(returncode=0, stdout=f"{hooks_dir}\n", stderr="")
+            if argv[:1] == ["config"]:
                 return MagicMock(returncode=0, stdout="", stderr="")
             return MagicMock(returncode=1, stdout="", stderr="")
 
         mock_run.side_effect = mock_git_command
 
-        install_hooks(worktree_path)
+        assert install_hooks(worktree_path) is True
 
         # Verify chained hooks were created in gitdir/hooks (not .githooks)
         pre_push = hooks_dir / "pre-push"
@@ -1986,10 +2057,10 @@ class TestCreateWorktreeReuse:
 
         with (
             patch("issue_orchestrator.adapters.git.git_cli.subprocess.run") as mock_run,
-            patch("issue_orchestrator.adapters.worktree._worktree.install_hooks"),
-            patch("issue_orchestrator.adapters.worktree._worktree.install_claude_settings"),
+            patch("issue_orchestrator.adapters.worktree._worktree_runtime_setup.install_hooks"),
+            patch("issue_orchestrator.adapters.worktree._worktree_runtime_setup.install_claude_settings"),
 
-            patch("issue_orchestrator.adapters.worktree._worktree.sync_cli_tools"),
+            patch("issue_orchestrator.adapters.worktree._worktree_runtime_setup.sync_cli_tools"),
         ):
             def run_side_effect(cmd, *args, **kwargs):
                 argv = cmd[3:]
@@ -2055,10 +2126,10 @@ class TestCreateWorktreeReuse:
 
         with (
             patch("issue_orchestrator.adapters.git.git_cli.subprocess.run") as mock_run,
-            patch("issue_orchestrator.adapters.worktree._worktree.install_hooks"),
-            patch("issue_orchestrator.adapters.worktree._worktree.install_claude_settings"),
+            patch("issue_orchestrator.adapters.worktree._worktree_runtime_setup.install_hooks"),
+            patch("issue_orchestrator.adapters.worktree._worktree_runtime_setup.install_claude_settings"),
 
-            patch("issue_orchestrator.adapters.worktree._worktree.sync_cli_tools"),
+            patch("issue_orchestrator.adapters.worktree._worktree_runtime_setup.sync_cli_tools"),
         ):
             def run_side_effect(cmd, *args, **kwargs):
                 argv = cmd[3:]
@@ -2120,10 +2191,10 @@ class TestCreateWorktreeReuse:
 
         with (
             patch("issue_orchestrator.adapters.git.git_cli.subprocess.run") as mock_run,
-            patch("issue_orchestrator.adapters.worktree._worktree.install_hooks"),
-            patch("issue_orchestrator.adapters.worktree._worktree.install_claude_settings"),
+            patch("issue_orchestrator.adapters.worktree._worktree_runtime_setup.install_hooks"),
+            patch("issue_orchestrator.adapters.worktree._worktree_runtime_setup.install_claude_settings"),
 
-            patch("issue_orchestrator.adapters.worktree._worktree.sync_cli_tools"),
+            patch("issue_orchestrator.adapters.worktree._worktree_runtime_setup.sync_cli_tools"),
         ):
             def run_side_effect(cmd, *args, **kwargs):
                 argv = cmd[3:]
@@ -2184,9 +2255,9 @@ class TestCreateWorktreeReuse:
 
         with (
             patch("issue_orchestrator.adapters.git.git_cli.subprocess.run") as mock_run,
-            patch("issue_orchestrator.adapters.worktree._worktree.install_hooks"),
-            patch("issue_orchestrator.adapters.worktree._worktree.install_claude_settings"),
-            patch("issue_orchestrator.adapters.worktree._worktree.sync_cli_tools"),
+            patch("issue_orchestrator.adapters.worktree._worktree_runtime_setup.install_hooks"),
+            patch("issue_orchestrator.adapters.worktree._worktree_runtime_setup.install_claude_settings"),
+            patch("issue_orchestrator.adapters.worktree._worktree_runtime_setup.sync_cli_tools"),
         ):
             def run_side_effect(cmd, *args, **kwargs):
                 argv = cmd[3:]
@@ -2262,9 +2333,9 @@ class TestCreateWorktreeReuse:
 
         with (
             patch("issue_orchestrator.adapters.git.git_cli.subprocess.run") as mock_run,
-            patch("issue_orchestrator.adapters.worktree._worktree.install_hooks"),
-            patch("issue_orchestrator.adapters.worktree._worktree.install_claude_settings"),
-            patch("issue_orchestrator.adapters.worktree._worktree.sync_cli_tools"),
+            patch("issue_orchestrator.adapters.worktree._worktree_runtime_setup.install_hooks"),
+            patch("issue_orchestrator.adapters.worktree._worktree_runtime_setup.install_claude_settings"),
+            patch("issue_orchestrator.adapters.worktree._worktree_runtime_setup.sync_cli_tools"),
         ):
             def run_side_effect(cmd, *args, **kwargs):
                 argv = cmd[3:]

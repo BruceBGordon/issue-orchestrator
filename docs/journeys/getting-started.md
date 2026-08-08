@@ -119,6 +119,7 @@ For the full walkthrough with examples, prompt templates, and multi-agent setup,
 | Understand all config options | [Configuration](../user/configuration.md) then [Configuration Reference](../user/configuration_reference.md) |
 | Set up code review | [Review Workflow](../development/REVIEW_WORKFLOW.md) |
 | Use the VS Code extension | [VS Code Integration](../user/vscode.md) |
+| Expose your repo's test results in the dashboard | [Client Test Integrations](../user/test-integrations.md) |
 | Run E2E tests automatically | [E2E Runner](../user/e2e.md) |
 | Common questions | [FAQ](../user/faq.md) |
 | Something broke | [Troubleshooting](../development/TROUBLESHOOTING.md) |

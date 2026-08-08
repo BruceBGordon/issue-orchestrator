@@ -17,11 +17,110 @@ class ProviderErrorType(str, Enum):
 
 @dataclass(frozen=True)
 class ProviderCircuitState:
+    """Persisted circuit state, with one deadline per independent cause.
+
+    A credential outage and a service outage are unrelated facts about a
+    provider, and each has its own validity window. Collapsing them into a
+    single ``open_until`` meant retiring one silently released the other: a
+    ``READY`` credential probe says nothing about a 429/5xx outage, but would
+    have re-opened launches into it (#6999 F3). Both dimensions are stored, and
+    "is the circuit open" is *derived* from them.
+    """
+
     provider: str
-    open_until: datetime | None
     consecutive_outages: int
     last_error_summary: str | None
     updated_at: datetime
+    # Deadline for the escalating transient ladder (429/5xx/transport).
+    transient_open_until: datetime | None = None
+    # Deadline for the human-fixable credential outage. Its own (long) window,
+    # cleared the moment the probe confirms re-authentication.
+    auth_open_until: datetime | None = None
+    # Auth failures are counted separately from transient outages: a credential
+    # outage is human-fixable and must trip the circuit on its own threshold,
+    # not be diluted by unrelated network blips (#6999).
+    consecutive_auth_failures: int = 0
+    # Identity of the last provider-readiness *sample* counted against this
+    # circuit. One physical credential probe gates many launches in a tick, and
+    # every one of them reports the same result; the circuit counts that sample
+    # exactly once so a configured threshold > 1 still means "more than one
+    # observation" (#6999 F2).
+    last_auth_sample_id: str = ""
+
+    @property
+    def open_until(self) -> datetime | None:
+        """The latest deadline across both causes, or ``None`` if neither is set.
+
+        The aggregate the circuit is judged on: a provider is unavailable while
+        *any* cause is still within its own window.
+        """
+        deadlines = [
+            deadline
+            for deadline in (self.transient_open_until, self.auth_open_until)
+            if deadline is not None
+        ]
+        return max(deadlines) if deadlines else None
+
+
+@dataclass(frozen=True)
+class ProviderCircuitStatus:
+    """Derived, point-in-time read model of a provider's circuit.
+
+    Unlike the persisted :class:`ProviderCircuitState`, this carries the
+    *interpreted* status the circuit owner computes against a clock:
+    whether the circuit is open right now and how much cooldown remains.
+    UI/observation layers consume this instead of re-deriving "is open"
+    from ``open_until`` (that policy lives once, on the manager).
+    """
+
+    provider: str
+    is_open: bool
+    open_until: datetime | None
+    cooldown_remaining_seconds: int
+    consecutive_outages: int
+    last_error_summary: str | None
+    updated_at: datetime
+
+
+class ProviderCircuitStatusReader(Protocol):
+    """Narrow read port: the interpreted status of every tracked circuit.
+
+    The only surface presentation code is allowed to depend on for provider
+    circuit state. Implemented by the circuit owner
+    (``control.provider_resilience.ProviderResilienceManager``), so the
+    dashboard projection depends on *behaviour* ("give me the interpreted
+    status") rather than on the orchestrator's dependency-container layout.
+    """
+
+    def snapshot(self, now: datetime | None = None) -> list[ProviderCircuitStatus]:
+        ...
+
+
+@dataclass(frozen=True)
+class StaticProviderCircuitStatusReader:
+    """A reader that returns a fixed, explicitly supplied status list.
+
+    Deliberately *not* a fallback: it exists so the two places that genuinely
+    have no circuit owner to read must name that fact in the type system —
+    the pre-boot dashboard page (no orchestrator is installed yet) and tests
+    that inject an explicit circuit state. A misconfigured production
+    orchestrator can never silently resolve to this, because the orchestrator
+    facade exposes its resilience owner as a required property.
+    """
+
+    statuses: tuple[ProviderCircuitStatus, ...] = ()
+
+    def snapshot(self, now: datetime | None = None) -> list[ProviderCircuitStatus]:
+        del now  # a fixed status list has no clock to interpret against
+        return list(self.statuses)
+
+
+# The explicit "there is no circuit owner to read" reader. Distinct from a
+# healthy-but-empty read only in intent; both render as "no outage", which is
+# correct when no orchestrator is running at all.
+NO_PROVIDER_CIRCUIT_STATUS: StaticProviderCircuitStatusReader = (
+    StaticProviderCircuitStatusReader()
+)
 
 
 class ProviderCircuitStore(Protocol):

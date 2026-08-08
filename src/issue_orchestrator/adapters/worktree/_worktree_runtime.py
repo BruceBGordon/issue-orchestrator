@@ -1,14 +1,22 @@
-"""Runtime setup helpers for issue worktrees."""
+"""Runtime setup step helpers for issue worktrees.
+
+Each function here is one step of worktree runtime setup. The order in which
+they run, and which of them run at all, is owned by
+``_worktree_runtime_setup.WorktreeRuntimeSetup`` — not by callers.
+"""
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import shutil
 import uuid
 from pathlib import Path
+from typing import Any
 
 from ...infra.runtime_artifacts import RUNTIME_IGNORE_FILE, load_runtime_ignore_patterns
+from ._worktree_errors import WorktreeError
 from ._worktree_git import _git_run
 
 logger = logging.getLogger(__name__)
@@ -18,7 +26,7 @@ WORKTREE_ID_MARKER = ".issue-orchestrator/worktree-id"
 
 # Claude Code settings to enforce completion command usage on exit.
 # The Stop hook checks for a marker file that coding-done/reviewer-done creates.
-CLAUDE_SETTINGS_FOR_AGENTS = {
+CLAUDE_SETTINGS_FOR_AGENTS: dict[str, Any] = {
     "hooks": {
         "Stop": [
             {
@@ -76,6 +84,13 @@ __all__ = [
 
 
 def _configure_no_verify_dry_run(worktree_path: Path, allow: bool) -> None:
+    """Enable or clear the ``--no-verify`` dry-run escape hatch for a worktree.
+
+    The flag file is what the block-no-verify guardrail hook reads, so neither
+    outcome of a dropped write is acceptable: a stale ``allow`` file leaves a
+    hook bypass open for the whole session, and a missing one breaks the reuse
+    push preflight. Fail the worktree setup instead of guessing.
+    """
     flag_path = worktree_path / ALLOW_NO_VERIFY_DRY_RUN_PATH
     try:
         if allow:
@@ -83,8 +98,11 @@ def _configure_no_verify_dry_run(worktree_path: Path, allow: bool) -> None:
             flag_path.write_text("allow\n")
         elif flag_path.exists():
             flag_path.unlink()
-    except OSError:
-        logger.debug("Failed to update dry-run allow flag: %s", flag_path)
+    except OSError as exc:
+        action = "set" if allow else "clear"
+        raise WorktreeError(
+            f"Failed to {action} no-verify dry-run flag at {flag_path}: {exc}"
+        ) from exc
 
 
 def _link_repo_venv_into_worktree(repo_root: Path, worktree_path: Path) -> None:
@@ -156,6 +174,45 @@ def sync_cli_tools(worktree_path: Path) -> list[Path]:
     return synced_paths
 
 
+def _read_worktree_identity(marker_path: Path) -> str | None:
+    """Return the persisted worktree identity, or None if it must be created.
+
+    Content policy and I/O policy are deliberately different here.
+
+    Content that cannot carry an identity — an empty marker, or bytes that are
+    not UTF-8 — is regenerated: there is nothing to preserve, so a fresh id
+    loses no information.
+
+    An I/O failure says nothing about the content. The marker may hold a
+    perfectly good identity this process simply could not read, and the caller's
+    next move is to write a new one. That would silently rebrand the worktree
+    and make every job holding the old id believe its worktree was replaced, so
+    a read error aborts setup instead and leaves the file alone.
+
+    Raises:
+        WorktreeError: If an existing marker cannot be read.
+    """
+    if not marker_path.exists():
+        return None
+    try:
+        existing_id = marker_path.read_text().strip()
+    except UnicodeDecodeError as exc:
+        logger.warning(
+            "Non-UTF-8 worktree identity marker, regenerating: path=%s error=%s",
+            marker_path,
+            exc,
+        )
+        return None
+    except OSError as exc:
+        raise WorktreeError(
+            f"Failed to read worktree identity marker at {marker_path}: {exc}"
+        ) from exc
+    if not existing_id:
+        logger.warning("Empty worktree identity marker, regenerating: %s", marker_path)
+        return None
+    return existing_id
+
+
 def _install_worktree_identity(worktree_path: Path) -> str:
     """
     Install a unique identity marker in the worktree.
@@ -171,26 +228,30 @@ def _install_worktree_identity(worktree_path: Path) -> str:
 
     Returns:
         The worktree identity (existing or newly created)
+
+    Raises:
+        WorktreeError: If an existing identity cannot be read, or a new one
+            cannot be persisted. Returning an unpersisted id would hand jobs a
+            value no later run can match, silently disabling path-reuse
+            detection; overwriting an unreadable one would change the identity
+            of a worktree that already had a valid id.
     """
     marker_path = worktree_path / WORKTREE_ID_MARKER
 
-    if marker_path.exists():
-        try:
-            existing_id = marker_path.read_text().strip()
-            if existing_id:
-                logger.debug("Worktree identity exists: %s", existing_id)
-                return existing_id
-        except Exception:
-            pass
+    existing_id = _read_worktree_identity(marker_path)
+    if existing_id:
+        logger.debug("Worktree identity exists: %s", existing_id)
+        return existing_id
 
     worktree_id = f"wt-{uuid.uuid4().hex[:12]}"
     try:
         marker_path.parent.mkdir(parents=True, exist_ok=True)
         marker_path.write_text(worktree_id)
-        logger.info("Installed worktree identity: %s", worktree_id)
-    except Exception as e:
-        logger.warning("Failed to install worktree identity: %s", e)
-
+    except OSError as exc:
+        raise WorktreeError(
+            f"Failed to install worktree identity at {marker_path}: {exc}"
+        ) from exc
+    logger.info("Installed worktree identity: %s", worktree_id)
     return worktree_id
 
 
@@ -300,6 +361,83 @@ def _hide_runtime_artifacts_from_git_status(
     )
 
 
+def _read_mergeable_claude_settings(settings_file: Path) -> dict[str, Any] | None:
+    """Return existing settings safe to merge into, or None to write a fresh file.
+
+    Content the merge cannot use — non-UTF-8 bytes, non-JSON text, a non-object
+    document, or a wrong-shaped ``hooks`` entry — resolves to "replace": the
+    Stop hook is a completion guardrail, so a broken file must never leave a
+    worktree without it. Replacement discards operator content, so it is logged
+    at WARNING rather than swallowed.
+
+    A read failure is *not* a content verdict. Replacing a file we merely failed
+    to open would throw away operator settings that are perfectly intact, so it
+    fails setup and leaves the file untouched.
+
+    A ``hooks`` key that is present but not an object (``null`` included) is
+    wrong-shaped, not absent — the merge would try to ``setdefault`` into a
+    non-mapping. Only a genuinely missing key is safe to merge into.
+
+    Raises:
+        WorktreeError: If an existing settings file cannot be read.
+    """
+    if not settings_file.exists():
+        return None
+
+    try:
+        raw_settings = settings_file.read_text()
+    except UnicodeDecodeError as exc:
+        logger.warning(
+            "Replacing non-UTF-8 Claude settings: path=%s error=%s", settings_file, exc
+        )
+        return None
+    except OSError as exc:
+        raise WorktreeError(
+            f"Failed to read existing Claude settings at {settings_file}: {exc}"
+        ) from exc
+
+    try:
+        existing = json.loads(raw_settings)
+    except json.JSONDecodeError as exc:
+        logger.warning(
+            "Replacing unreadable Claude settings: path=%s error=%s", settings_file, exc
+        )
+        return None
+
+    if not isinstance(existing, dict):
+        logger.warning("Replacing non-object Claude settings: %s", settings_file)
+        return None
+
+    if "hooks" in existing:
+        hooks = existing["hooks"]
+        if not isinstance(hooks, dict):
+            logger.warning(
+                "Replacing Claude settings with non-object 'hooks': %s", settings_file
+            )
+            return None
+        if not isinstance(hooks.get("Stop", []), list):
+            logger.warning(
+                "Replacing Claude settings with non-list 'hooks.Stop': %s", settings_file
+            )
+            return None
+
+    return existing
+
+
+def _merge_agent_stop_hook(existing: dict[str, Any] | None) -> dict[str, Any]:
+    """Return settings that contain the agent Stop hook exactly once."""
+    if existing is None:
+        return copy.deepcopy(CLAUDE_SETTINGS_FOR_AGENTS)
+
+    merged = copy.deepcopy(existing)
+    hooks = merged.setdefault("hooks", {})
+    stop_hooks = hooks.setdefault("Stop", [])
+    our_hook = CLAUDE_SETTINGS_FOR_AGENTS["hooks"]["Stop"][0]
+    if our_hook not in stop_hooks:
+        stop_hooks.append(copy.deepcopy(our_hook))
+    return merged
+
+
 def install_claude_settings(worktree_path: Path) -> None:
     """
     Install Claude Code settings to enforce completion command usage on exit.
@@ -309,27 +447,25 @@ def install_claude_settings(worktree_path: Path) -> None:
 
     Args:
         worktree_path: Path to the worktree
+
+    Raises:
+        WorktreeError: If an existing settings file cannot be read, or the
+            settings file cannot be written. The Stop hook is the only reminder
+            an agent gets to run a completion command, so a worktree without it
+            is not a runnable session — and an unreadable file is not a licence
+            to overwrite whatever the operator put there.
     """
     worktree_path = Path(worktree_path)
     claude_dir = worktree_path / ".claude"
     settings_file = claude_dir / "settings.json"
 
-    claude_dir.mkdir(parents=True, exist_ok=True)
-
-    if settings_file.exists():
-        try:
-            existing = json.loads(settings_file.read_text())
-            if "hooks" not in existing:
-                existing["hooks"] = {}
-            if "Stop" not in existing["hooks"]:
-                existing["hooks"]["Stop"] = []
-            our_hook = CLAUDE_SETTINGS_FOR_AGENTS["hooks"]["Stop"][0]
-            if our_hook not in existing["hooks"]["Stop"]:
-                existing["hooks"]["Stop"].append(our_hook)
-            settings_file.write_text(json.dumps(existing, indent=2))
-        except (json.JSONDecodeError, KeyError):
-            settings_file.write_text(json.dumps(CLAUDE_SETTINGS_FOR_AGENTS, indent=2))
-    else:
-        settings_file.write_text(json.dumps(CLAUDE_SETTINGS_FOR_AGENTS, indent=2))
+    settings = _merge_agent_stop_hook(_read_mergeable_claude_settings(settings_file))
+    try:
+        claude_dir.mkdir(parents=True, exist_ok=True)
+        settings_file.write_text(json.dumps(settings, indent=2))
+    except OSError as exc:
+        raise WorktreeError(
+            f"Failed to install Claude settings at {settings_file}: {exc}"
+        ) from exc
 
     logger.debug("Installed Claude settings at %s", settings_file)

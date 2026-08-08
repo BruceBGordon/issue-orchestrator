@@ -31,6 +31,7 @@ from .http_client import (
     build_github_auth,
     classify_github_http_failure,
 )
+from .marker_recovery import find_marker_issue, prove_marker_issue
 from .repo import get_repo_from_git, GitRepoError
 from .cache import GitHubCache
 from .adapter_cache import GitHubAdapterCacheSupport
@@ -545,6 +546,24 @@ class GitHubAdapter:
         """
         raw = self._client.search_issues_by_title(query_terms, limit=limit)
         return self._raw_issues_to_issues(raw)
+
+    def find_issue_by_marker(
+        self, *, title: str, marker: str, authoritative: bool = False
+    ) -> int | None:
+        """Recover an issue this orchestrator created, by its body marker.
+
+        The ``RepositoryHost`` half of the shared crash-window recovery the
+        promotion target adapter uses (``marker_recovery``). ``authoritative``
+        picks which lookup runs: the bounded best-effort scan, or the complete,
+        title-independent, fail-loud one whose miss is proof of absence (#6957
+        round-5 review F13).
+        """
+        found = (
+            prove_marker_issue(self._client, marker=marker)
+            if authoritative
+            else find_marker_issue(self._client, title=title, marker=marker)
+        )
+        return found.number if found is not None else None
 
     def get_default_branch(self) -> str:
         """The repository's real default branch (cached; GitHub is authoritative)."""
@@ -1595,6 +1614,7 @@ class GitHubAdapter:
             base_branch=(pr.get("base") or {}).get("ref")
             or pr.get("baseRefName")
             or None,
+            merged_at=pr.get("merged_at") or None,
         )
 
     def _fetch_pr_info_from_search(self, pr: dict[str, Any]) -> PRInfo | None:
@@ -1779,6 +1799,16 @@ class GitHubAdapter:
         orchestrator-authored marker comments before re-posting them.
         """
         return self._client.issue_comment_marker_present(issue_number, marker)
+
+    def issue_closed_on_or_after(self, issue_number: int, timestamp: str) -> bool:
+        """Return True if the issue has a ``closed`` event at/after ``timestamp``.
+
+        Typed transition evidence for the close-on-merge fallback: proves
+        whether an auto-close already fired for a given merge, so a deliberate
+        human reopen is never re-closed. Scans all event pages, fail-loud on
+        truncated or malformed reads.
+        """
+        return self._client.issue_closed_on_or_after(issue_number, timestamp)
 
     def get_pr_reviews(self, pr_number: int) -> list[dict[str, Any]]:
         """Get all reviews on a pull request.

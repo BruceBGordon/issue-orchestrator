@@ -55,6 +55,28 @@
             </span>
         </div>
         {% endif %}
+        <!-- Provider circuit-breaker outage banner + health panel (issue #5980).
+             Surgically updated by ``updateProviderCircuitBanner`` from
+             ``window.dashboardData.providerCircuit``; the whole banner is hidden
+             while all providers are healthy.
+             Accessibility: the assertive live region is the dedicated, visually
+             hidden ``#providerCircuitAnnouncer`` span -- written only when the
+             semantic outage state changes, so screen readers announce an outage
+             once rather than on every countdown tick. The interactive <details>
+             health panel lives OUTSIDE that alert region and is preserved across
+             refreshes (updates replace only its rows, so its open/focus state
+             survives live updates). -->
+        <div id="providerCircuitBanner" class="provider-circuit-banner" style="display:none;">
+            <span id="providerCircuitAnnouncer" class="pcircuit-announcer" role="alert" aria-live="assertive"></span>
+            <span class="pcircuit-icon" aria-hidden="true">&#x26A0;</span>
+            <div id="providerCircuitBody" class="pcircuit-body">
+                <span id="providerCircuitSummary" class="pcircuit-summary"></span>
+                <details id="providerCircuitDetails" class="pcircuit-details" hidden>
+                    <summary class="pcircuit-summary-toggle">Circuit details</summary>
+                    <ul id="providerCircuitList" class="pcircuit-list"></ul>
+                </details>
+            </div>
+        </div>
         <header>
             <div class="header-left">
                 <h1>Issue Orchestrator</h1>
@@ -182,13 +204,17 @@
             </button>
             <div class="tab-spacer"></div>
             <div class="tab-menu-wrap">
-                <button class="tab-menu-btn" onclick="toggleSettingsMenu(event)" aria-label="Dashboard actions" aria-haspopup="true">&#x2630;</button>
+                <button class="tab-menu-btn" id="settingsMenuBtn" onclick="toggleSettingsMenu(event)" aria-label="Dashboard actions" aria-haspopup="true" aria-expanded="false">&#x2630;</button>
                 <div class="settings-menu" id="settingsMenu" role="menu" aria-label="Dashboard actions">
                     <button class="settings-menu-item" id="pauseResumeItem" onclick="togglePause()" role="menuitem">
                         {% if paused %}<span aria-hidden="true">&#x25B6;</span> Resume{% else %}<span aria-hidden="true">&#x23F8;</span> Pause{% endif %}
                     </button>
                     <button class="settings-menu-item" onclick="refreshFromGitHub()" role="menuitem"><span aria-hidden="true">&#x1F504;</span> Refresh from GitHub</button>
                     <button class="settings-menu-item" onclick="openRetrospectiveReviewDialog()" role="menuitem"><span aria-hidden="true">&#x21BB;</span> Review Existing Implementation</button>
+                    <div class="settings-menu-row" role="presentation">
+                        <button class="settings-menu-item" id="techLeadHealthReviewItem" onclick="runBoardHealthReview()" role="menuitem"><span aria-hidden="true">&#x1F9ED;</span> Run board health review</button>
+                        <span class="settings-menu-status" id="techLeadHealthReviewStatus" role="status" aria-live="polite"></span>
+                    </div>
                     <button class="settings-menu-item" onclick="openFlowRefreshPrefs()" role="menuitem"><span aria-hidden="true">&#x26A1;</span> Flow refresh preferences</button>
                     <button class="settings-menu-item" onclick="showGitHubUsage()" role="menuitem"><span aria-hidden="true">&#x1F4CA;</span> Show GitHub usage</button>
                     <button class="settings-menu-item" onclick="goToSettings()" role="menuitem"><span aria-hidden="true">&#x2699;</span> Settings</button>
@@ -265,6 +291,9 @@
                                 {% if not card.queue_wait_reason %}
                                 <div class="card-line card-muted">{{ card.summary }}</div>
                                 {% endif %}
+                                {% endif %}
+                                {% if card.provider_badge %}
+                                <div class="card-line card-provider"><span class="provider-badge provider-badge--{{ card.provider_badge.tone }}" title="{{ card.provider_badge.title | e }}"><span class="provider-badge-icon" aria-hidden="true">&#x26A1;</span><span class="provider-badge-text">{{ card.provider_badge.label_text }}</span></span></div>
                                 {% endif %}
                                 {% if card.stack_chip %}
                                 <div class="card-line card-stack"><span class="stack-chip stack-chip--{{ card.stack_chip.tone }}" title="{{ card.stack_chip.title | e }}"><span class="stack-chip-icon" aria-hidden="true">&#x26D3;</span><span class="stack-chip-mode">{{ card.stack_chip.mode_label }}</span><span class="stack-chip-status">{{ card.stack_chip.status_text }}</span></span></div>
@@ -398,6 +427,8 @@
         <div class="issue-detail-actions" id="issueDetailActions" style="display:none;">
             <button class="issue-action-btn" id="issueDetailUnblockBtn" style="display:none;" onclick="unblockFromDrawer()">Unblock</button>
             <button class="issue-action-btn" id="issueDetailRetryPublishBtn" style="display:none;">Retry Publish</button>
+            <button class="issue-action-btn" id="issueDetailInvestigateTechLeadBtn" style="display:none;" onclick="investigateWithTechLeadFromDrawer()">Investigate with tech lead</button>
+            <span class="issue-action-status" id="issueDetailTechLeadStatus" role="status" aria-live="polite"></span>
         </div>
         <details class="issue-detail-section issue-detail-stack" id="issueDetailStack" style="display:none;">
             <summary id="issueDetailStackSummary">Stack dependencies &amp; gates</summary>
@@ -582,6 +613,10 @@
         <button id="menuCloseIssue" class="context-menu-item" role="menuitem" style="display:none;">Close Issue</button>
         <button id="menuResetRetry" class="context-menu-item" role="menuitem" style="display:none;">Reset &amp; Retry</button>
         <button id="menuResetRetryScratch" class="context-menu-item" role="menuitem" style="display:none;">Reset and Retry From Scratch</button>
+        <div class="context-menu-row" id="menuInvestigateTechLeadRow" role="presentation" style="display:none;">
+            <button id="menuInvestigateTechLead" class="context-menu-item" role="menuitem">Investigate with tech lead</button>
+            <span class="context-menu-status" id="menuInvestigateTechLeadStatus" role="status" aria-live="polite"></span>
+        </div>
     </div>
     <div id="toast" role="status" aria-live="polite"></div>
 

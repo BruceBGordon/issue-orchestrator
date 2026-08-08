@@ -2,6 +2,14 @@
 
 The Issue Orchestrator can run long-lived E2E suites in a background worker and surface the results in the dashboard without making the product pytest-shaped.
 
+This page covers the **async runner itself**: its execution model, run lifecycle, retry/resume semantics, quarantine, control API, and debugging.
+
+> **Setting up your repo's tests?** Start with
+> [Client Test Integrations](test-integrations.md). That is the canonical guide for
+> choosing between validation gates and the E2E runner, emitting JUnit XML,
+> capturing artifacts, per-framework recipes (pytest, Playwright, Vitest/Jest,
+> Cypress, wrapper scripts), and the path/worktree rules those paths must obey.
+
 The reporting model is:
 
 1. Raw run output is always captured.
@@ -61,78 +69,24 @@ E2E_AGENT_GUIDED_ONBOARDING_PROVIDERS=codex,claude-code make test-e2e-onboarding
 
 The live onboarding acceptance is collection-gated behind `E2E_AGENT_GUIDED_ONBOARDING=1` so normal `heavy_e2e` runs do not burn GitHub cleanup calls just to skip it.
 
-## Quick Start
+## Runner Modes
 
-### Pytest runner: issue-orchestrator style
+`e2e.runner_kind` selects the execution adapter. The two modes differ in what the runner can observe while the suite is running, not in how results are ingested.
 
-Use this when the suite is already pytest-based and you want the dashboard to ingest structured per-case results in addition to runtime events.
+| | `pytest` | `command` |
+|---|---|---|
+| Live per-test progress events | Yes | No |
+| `allow_retry_once` | Yes | Ignored; the original command result is reported |
+| `stop_on_first_failure` | Yes (adds `-x`) | Ignored |
+| Resume after interruption | Yes, by deselecting already-passing nodeids | No; interrupted runs restart fresh |
+| Suite definition | `e2e.pytest_args` | `e2e.command` |
+| Structured results | JUnit XML ingested after the run | JUnit XML ingested after the run |
 
-```yaml
-e2e:
-  enabled: true
-  role: "auto"
-  runner_kind: "pytest"
-  auto_run_interval_minutes: 30
-  pytest_args:
-    - "tests/e2e"
-    - "-v"
-    - "--junitxml=.issue-orchestrator/e2e-results/pytest-junit.xml"
-  junit_xml_paths:
-    - ".issue-orchestrator/e2e-results/pytest-junit.xml"
-  allow_retry_once: true
-  quarantine_file: "tests/e2e/quarantine.txt"
-  auto_quarantine: true
-  auto_create_issues: true
-  issue_agent_label: "agent:backend"
-  survive_restart: true
-```
+Both modes execute inside the E2E worktree, always capture raw output, and ingest `junit_xml_paths` / `artifact_paths` after the process exits. Ingestion is loud on this surface: the run fails when the configured JUnit list as a whole resolves to no fresh files, or when the artifact list as a whole resolves to nothing. Matching is per field rather than per entry, so one non-matching glob is tolerated while another entry in the same field matches — see [the surface matrix](test-integrations.md#path-and-glob-rules) for the exact contract.
 
-Notes:
+Pytest resume works best when long workflows are split into discrete test functions, so already-passing nodeids can be deselected after an interruption.
 
-- `pytest_args` still drive live pytest execution and retries.
-- `junit_xml_paths` point at the files to ingest after the run completes.
-- `Raw Output` is available even if the XML report is missing or incomplete.
-- Pytest resume works best when long workflows are split into discrete test functions so already-passing nodeids can be deselected after an interruption.
-
-### Command runner: framework-neutral mode
-
-Use this when the suite lives behind a command such as Playwright, Vitest, Cypress, Robot Framework, or a project-local wrapper script.
-
-```yaml
-e2e:
-  enabled: true
-  role: "auto"
-  runner_kind: "command"
-  auto_run_interval_minutes: 30
-  command:
-    - "./scripts/run-e2e-suite.sh"
-  junit_xml_paths:
-    - "test-results/junit.xml"
-  artifact_paths:
-    - "playwright-report/index.html"
-    - "test-results/**/*.zip"
-    - "test-results/**/*.png"
-  auto_create_issues: true
-  issue_agent_label: "agent:backend"
-```
-
-The command runs inside the E2E worktree. Missing configured JUnit or artifact paths fail the run loudly.
-
-## What To Configure For New Projects
-
-For any new repo, start with these invariants:
-
-1. The E2E command must produce a stable raw log. The orchestrator captures this automatically.
-2. The suite should emit JUnit XML whenever practical.
-3. Any native HTML report or trace output should be listed in `artifact_paths`.
-4. Agentic issue/session data is optional. The dashboard works without it.
-
-Recommended patterns:
-
-- `pytest`: add `--junitxml=...` to `pytest_args` and mirror the same path in `junit_xml_paths`
-- `Playwright`: emit JUnit XML plus `playwright-report/index.html`
-- `Vitest` / `Jest`: use a JUnit reporter plus any native HTML/JSON output as artifacts
-- project-local wrapper scripts: keep the command stable and have the script write JUnit + artifacts
+For the YAML for each mode, per-framework recipes, and the path rules those globs must obey, see [Client Test Integrations](test-integrations.md).
 
 ## Results, Artifacts, And Session Logs
 
@@ -176,6 +130,30 @@ This matters because many E2E suites will not create issues on every failing tes
 - ingests results after the command completes
 - does not attempt pytest-style resume semantics
 - interrupted runs restart fresh
+
+### Orchestrator restarts
+
+The E2E worker is a detached subprocess, so it can outlive an orchestrator restart.
+
+`e2e.survive_restart` (default `true`) leaves a running worker alone on shutdown: neither the worker nor its `running` row is touched, so the detached worker keeps going and finishes the run normally. A restart is not a run boundary. Set it to `false` to stop the worker on shutdown and mark the running row canceled instead.
+
+Orphan recovery is a separate, conditional path. If a surviving worker dies before finishing — machine reboot, OOM kill, manual `kill` — the row stays `running` with a PID that no longer exists. The next attempt to start a run detects that dead PID, marks the stale row `interrupted`, and proceeds. For `runner_kind=pytest`, an `interrupted` run is the one that can resume by deselecting already-passing nodeids. So a restart alone does not end and resume the in-flight run; only a worker that actually died does.
+
+## Quarantine
+
+`e2e.quarantine_file` names a plain-text file of test node IDs, one per line, with `#` comment lines allowed. It is read from the E2E worktree, so the path is a normal repository-relative path such as `tests/e2e/quarantine.txt`.
+
+Quarantined tests still run and still appear in the Results tab. What changes is how their failures are scored:
+
+- they are excluded from the retry-once pass
+- when *only* quarantined tests failed, the run completes as `warning` rather than `failed`, and a non-zero runner exit code is ignored with a note explaining why
+- a single non-quarantined failure still fails the run
+
+Matching is exact against the node ID, for both live pytest observation and JUnit-ingested cases. If your JUnit `classname`/`name` pair does not produce the nodeid you expect, the entry will not match.
+
+`e2e.auto_quarantine: true` appends every failing node ID to that file after a failed run, preserving any leading comment header. Because the E2E worktree is force-checked-out to the orchestrator's `HEAD` before each run, additions to a **tracked** quarantine file do not survive to the next run — commit the entries you want to keep.
+
+Doctor verifies the quarantine file exists when E2E is enabled.
 
 ## API Endpoints
 
@@ -279,11 +257,11 @@ tail -f .issue-orchestrator/logs/e2e/run_*.log
 | Symptom | Cause | Fix |
 |---------|-------|-----|
 | E2E not auto-triggering | `auto_run_interval_minutes: 0` | Set it to a positive value |
-| Results tab has only Raw Output | No JUnit XML configured or emitted | Add `--junitxml` / `junit_xml_paths` or configure your command runner to emit JUnit |
-| Run fails with configured-report error | `junit_xml_paths` or `artifact_paths` did not resolve | Fix the emitted file path or the config glob |
 | Command runner cannot resume | Resume is pytest-only | Restart the command run; use raw output and JUnit for debugging |
 | Linked issue lifecycle is missing | The suite did not create or exercise issues in-window | Debug from Results/Timeline instead; lifecycle/session controls are additive |
 | Session Recording button does nothing | The lifecycle command lacked valid run-scoped recording context | This is a bug; the dashboard should only emit phase-scoped session parameters when both `round_index` and `session_role` are available |
+
+For result-ingestion problems — only `Raw Output` in the Results tab, unresolved `junit_xml_paths` / `artifact_paths` globs, rejected JUnit reports, or artifacts that vanish between runs — see the troubleshooting table in [Client Test Integrations](test-integrations.md#troubleshooting).
 
 ## Auto-Trigger Logic
 

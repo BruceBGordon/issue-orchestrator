@@ -19,6 +19,7 @@ from fastapi.staticfiles import StaticFiles
 from sse_starlette.sse import EventSourceResponse
 
 from ..control.shutdown_manager import shutdown_manager
+from ..events.sse_envelope import apply_sse_envelope
 from ..execution.client_host import ClientHost, detect_client_host
 from ..execution.review_artifact_reader import ManifestReviewArtifactReader
 from ._auth_middleware import (
@@ -39,6 +40,7 @@ from .timeline_presentation import (
 )
 from .web_diagnostics_routes import install_web_diagnostics_dependencies, web_diagnostics_router
 from .web_retrospective_review_routes import web_retrospective_review_router
+from .web_tech_lead_routes import web_tech_lead_router
 from .web_issue_detail_routes import web_issue_detail_router
 from .web_log_routes import web_log_router
 from .web_operator_routes import install_web_operator_dependencies, web_operator_router
@@ -219,11 +221,20 @@ _main_loop: asyncio.AbstractEventLoop | None = None
 async def broadcast_event(event_type: str, data: dict | None = None) -> None:
     """Broadcast an event to all SSE subscribers.
 
+    This is the single serialization boundary for the SSE stream, so it is where
+    the public envelope is applied: ``apply_sse_envelope`` stamps the ``schema``
+    version onto every event regardless of which producer emitted it. Callers
+    must not add the field themselves — see
+    :mod:`issue_orchestrator.events.sse_envelope`.
+
     Args:
         event_type: Type of event (e.g., "session_started", "session_completed", "state_changed")
         data: Optional data to include with the event
     """
-    event = {"type": event_type, "data": data or {}}
+    enveloped = apply_sse_envelope(event_type, data)
+    # ``data`` is a read-only mapping; copy it into a plain dict so the
+    # transport can JSON-serialize it.
+    event = {"type": enveloped.type, "data": dict(enveloped.data)}
     dead_subscribers = []
 
     for queue in _event_subscribers:
@@ -337,6 +348,7 @@ app.include_router(web_operator_router)
 app.include_router(web_diagnostics_router)
 app.include_router(web_retry_history_router)
 app.include_router(web_retrospective_review_router)
+app.include_router(web_tech_lead_router)
 app.include_router(web_session_router)
 app.include_router(web_issue_detail_router)
 

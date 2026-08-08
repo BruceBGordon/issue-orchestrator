@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 import pytest
+
 from unittest.mock import MagicMock, call, patch
 
 from issue_orchestrator.control.session_launch_types import LaunchResult
@@ -1017,8 +1018,13 @@ class TestStartupManagerTechLeadRecovery:
         sample_state,
         mock_repository_host,
         mock_config,
+        tmp_path,
     ):
         """Startup-recovery -> launch boundary keeps the batch flavor (#6768 B5)."""
+        from issue_orchestrator.execution.pending_work_claim_store import (
+            SqlitePendingWorkClaimStore,
+        )
+
         mock_config.agents = {"agent:tech-lead": MagicMock()}
         mock_config.tech_lead_review_agent = "agent:tech-lead"
 
@@ -1039,7 +1045,10 @@ class TestStartupManagerTechLeadRecovery:
         launcher.session_manager.runner.discover_running_sessions.return_value = []
 
         orchestrator_launch_tech_lead_session(
-            recovered, sample_state, mock_config, launcher, MagicMock()
+            recovered, sample_state, mock_config, launcher, MagicMock(),
+            # The real orchestrator-owned ledger, because the launch settles a
+            # durable claim as well as the queue item (#6999 F4).
+            SqlitePendingWorkClaimStore.for_repo(tmp_path),
         )
 
         launch_call = launcher.launch_issue_session.call_args
@@ -1318,6 +1327,64 @@ class TestStartupManagerResumePartialWork:
         launch_session.assert_not_called()
         assert sample_state.active_sessions == []
         assert sample_state.priority_queue == [1]
+
+    @pytest.mark.asyncio
+    @patch("issue_orchestrator.control.startup_manager.analyze_issue")
+    async def test_reserved_tech_lead_does_not_block_partial_worker_resume(
+        self,
+        mock_analyze,
+        sample_state,
+        mock_config,
+        mock_events,
+        mock_runner,
+        mock_repository_host,
+        mock_action_applier,
+        mock_issue_branches_fn,
+        mock_label_store,
+    ):
+        """Startup recovery uses the worker lane, not total session count."""
+        from tests.unit.test_planner import make_session
+
+        mock_config.max_concurrent_sessions = 1
+        mock_config.tech_lead_review_agent = "agent:tech-lead"
+        mock_config.tech_lead.max_concurrent = 1
+        mock_config.agents = {"agent:web": MagicMock()}
+        mock_issue_branches_fn.return_value = {1: "1-feature"}
+
+        issue = Issue(number=1, title="Partial work", labels=["agent:web", "in-progress"])
+        mock_repository_host.list_issues.return_value = [issue]
+        mock_analyze.return_value = MagicMock(
+            has_session=False,
+            has_open_pr=False,
+            has_partial_work=True,
+            branch="1-feature",
+        )
+
+        tech_lead_session = make_session(
+            Issue(number=9, title="Tech lead", labels=["agent:tech-lead"])
+        )
+        tech_lead_session.agent_label = "agent:tech-lead"
+        sample_state.active_sessions = [tech_lead_session]
+        launch_session = MagicMock(return_value=MagicMock())
+        manager = StartupManager(
+            config=mock_config,
+            events=mock_events,
+            runner=mock_runner,
+            repository_host=mock_repository_host,
+            action_applier=mock_action_applier,
+            issue_branches_fn=mock_issue_branches_fn,
+            session_exists_fn=lambda name: False,
+            restore_sessions_fn=MagicMock(),
+            launch_session_fn=launch_session,
+            update_queue_cache_fn=lambda: None,
+            issue_fetch_resilience=IssueFetchResilience("owner/repo"),
+            label_store=mock_label_store,
+        )
+
+        await manager.run_startup(sample_state)
+
+        launch_session.assert_called_once_with(issue)
+        assert sample_state.priority_queue == []
 
 
 class TestStartupManagerValidationRetryRecovery:
@@ -1916,3 +1983,47 @@ class TestRetrospectiveRecoveryCallBudget:
         mock_repository_host.search_pr_refs_for_issue.assert_not_called()
         mock_repository_host.get_prs_for_issue.assert_not_called()
         mock_repository_host.get_pr.assert_not_called()
+
+
+class TestStartupSweepsThePendingWorkLedger:
+    """Startup restoration must run even when discovery finds nothing (#6999 F8).
+
+    The durable pending-work ledger holds requests that have already left their
+    in-memory queue. The rows it exists for belong to runs whose terminals are
+    already gone - so "no running sessions were discovered" is exactly the case
+    where that row is the only remaining record of the work. Guarding the
+    restoration call on a non-empty discovery is the bug this pins.
+    """
+
+    @pytest.mark.asyncio
+    async def test_restoration_runs_with_no_discovered_sessions(
+        self,
+        mock_config,
+        mock_events,
+        mock_runner,
+        mock_repository_host,
+        mock_action_applier,
+        mock_issue_branches_fn,
+        mock_label_store,
+        sample_state,
+    ):
+        mock_runner.discover_running_sessions = MagicMock(return_value=[])
+        restore_sessions_fn = MagicMock()
+        manager = StartupManager(
+            config=mock_config,
+            events=mock_events,
+            runner=mock_runner,
+            repository_host=mock_repository_host,
+            action_applier=mock_action_applier,
+            issue_branches_fn=mock_issue_branches_fn,
+            session_exists_fn=lambda name: False,
+            restore_sessions_fn=restore_sessions_fn,
+            launch_session_fn=lambda issue: None,
+            update_queue_cache_fn=lambda: None,
+            issue_fetch_resilience=IssueFetchResilience("owner/repo"),
+            label_store=mock_label_store,
+        )
+
+        await manager.run_startup(sample_state)
+
+        restore_sessions_fn.assert_called_once_with([])

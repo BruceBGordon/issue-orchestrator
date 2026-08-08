@@ -115,6 +115,116 @@ class TechLeadSessionFlavor(str, Enum):
     HEALTH_REVIEW = "health_review"
 
 
+class TechLeadCreationKind(str, Enum):
+    """Why a tech-lead-authored issue is being created.
+
+    The two kinds have OPPOSITE reconciliation duties, which is the whole reason
+    they are named rather than inferred:
+
+    * ``AUTHORS_ANCHOR`` — the planner's batch tracking issue and the
+      health-review anchor. These are the FIRST issue of their session; there is
+      no prior issue whose pause label could gate them, so they legitimately
+      have no reconciliation subject and no expectations.
+    * ``DERIVED_FROM_ANCHOR`` — a follow-up issue, a gated proposal, or a
+      pattern case file, all decided BY a tech-lead session working an anchor.
+      Each must reconcile against that anchor before it writes: an anchor paused
+      behind ``io:needs-reconcile`` must not spawn new issues.
+    """
+
+    AUTHORS_ANCHOR = "authors_anchor"
+    DERIVED_FROM_ANCHOR = "derived_from_anchor"
+
+
+@dataclass(frozen=True, slots=True)
+class TechLeadCreationOrigin:
+    """What a tech-lead issue creation was decided from (#6957 R2 review F6/A6).
+
+    Replaces a pair of defaulted fields — ``anchor_issue_number: int = 0`` plus
+    an inherited ``expected=None`` — whose simultaneous absence was being read as
+    authority. Composition that dropped both produced a follow-up creation that
+    looked exactly like legitimate anchor authoring and wrote UNGUARDED. Two
+    defaults cannot express intent; this can.
+
+    The valid states are exactly two, and ``__post_init__`` admits no others:
+
+    * ``(AUTHORS_ANCHOR, no subject)`` — nothing to reconcile against;
+    * ``(DERIVED_FROM_ANCHOR, positive subject)`` — reconcile against it.
+
+    "No others" is enforced at RUNTIME, not merely annotated. Branching on
+    ``kind is AUTHORS_ANCHOR`` and treating everything else as derived would let
+    an untyped caller or a ``cast`` construct a third family of states that
+    happens to be handled conservatively today and could be branched on
+    differently tomorrow — the abstraction's central promise would be false
+    (#6957 round-3 review F8/A7). Same reason ``StoredTechLeadOp`` re-checks its
+    own annotations below.
+
+    ``requires_expected_state`` carries the other half of the invariant to the
+    command that owns it: a derived creation without an ``ExpectedState`` would
+    cross the gate as a no-op, so the command rejects that combination too.
+    """
+
+    kind: TechLeadCreationKind
+    anchor_issue_number: int = 0
+
+    def __post_init__(self) -> None:
+        # Runtime re-checks: annotations carry no runtime guarantee, and this
+        # type's whole value is that its state space really is closed.
+        kind = cast(object, self.kind)
+        if not isinstance(kind, TechLeadCreationKind):
+            raise ValueError(
+                "a TechLeadCreationOrigin kind must be a TechLeadCreationKind"
+                f" ({[member.value for member in TechLeadCreationKind]}), got"
+                f" {kind!r}"
+            )
+        anchor = cast(object, self.anchor_issue_number)
+        if isinstance(anchor, bool) or not isinstance(anchor, int):
+            raise ValueError(
+                "a TechLeadCreationOrigin anchor_issue_number must be an int,"
+                f" got {anchor!r}"
+            )
+        if self.kind is TechLeadCreationKind.AUTHORS_ANCHOR:
+            if self.anchor_issue_number:
+                raise ValueError(
+                    "a tech-lead creation that AUTHORS its anchor has no prior"
+                    " issue to reconcile against; it must not name one, got"
+                    f" #{self.anchor_issue_number}"
+                )
+            return
+        if self.anchor_issue_number <= 0:
+            raise ValueError(
+                "a tech-lead creation derived from an anchor requires that"
+                " anchor's positive issue number — it is the issue whose pause"
+                f" label gates the creation, got {self.anchor_issue_number!r}"
+            )
+
+    @classmethod
+    def authors_anchor(cls) -> "TechLeadCreationOrigin":
+        """The batch/health-review anchor this session is being created FOR."""
+        return cls(kind=TechLeadCreationKind.AUTHORS_ANCHOR)
+
+    @classmethod
+    def derived_from_anchor(cls, anchor_issue_number: int) -> "TechLeadCreationOrigin":
+        """A creation decided BY a session working *anchor_issue_number*."""
+        return cls(
+            kind=TechLeadCreationKind.DERIVED_FROM_ANCHOR,
+            anchor_issue_number=anchor_issue_number,
+        )
+
+    @property
+    def authors_new_anchor(self) -> bool:
+        return self.kind is TechLeadCreationKind.AUTHORS_ANCHOR
+
+    @property
+    def reconciliation_subject(self) -> int:
+        """The managed-repo issue whose labels gate this creation (0 = none)."""
+        return self.anchor_issue_number
+
+    @property
+    def requires_expected_state(self) -> bool:
+        """True when the creation must carry expectations to check at the gate."""
+        return not self.authors_new_anchor
+
+
 @dataclass(frozen=True)
 class TechLeadAssignment:
     """Launch-time record of a tech_lead session's assignment.

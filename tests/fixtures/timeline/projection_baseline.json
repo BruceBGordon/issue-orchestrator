@@ -443,6 +443,24 @@
     "status": "completed",
     "step": "pr.view_changed"
   },
+  "provider.auth_failed": {
+    "level": "detail",
+    "phase": "system",
+    "status": "completed",
+    "step": "provider.auth_failed"
+  },
+  "provider.issue_blocked": {
+    "level": "phase",
+    "phase": "blocked",
+    "status": "failed",
+    "step": "provider_blocked"
+  },
+  "provider.issue_unblocked": {
+    "level": "phase",
+    "phase": "in_progress",
+    "status": "completed",
+    "step": "provider_unblocked"
+  },
   "provider.outage_entered": {
     "level": "detail",
     "phase": "system",
@@ -749,6 +767,12 @@
     "status": "failed",
     "step": "blocked"
   },
+  "session.claim_unreadable": {
+    "level": "detail",
+    "phase": "in_progress",
+    "status": "failed",
+    "step": "claim_unreadable"
+  },
   "session.cleanup": {
     "level": "detail",
     "phase": "in_progress",
@@ -772,6 +796,12 @@
     "phase": "in_progress",
     "status": "failed",
     "step": "invalid_completion_record"
+  },
+  "session.launch_blocked_provider": {
+    "level": "detail",
+    "phase": "in_progress",
+    "status": "failed",
+    "step": "launch_blocked_provider"
   },
   "session.launched": {
     "level": "detail",
@@ -809,6 +839,12 @@
     "status": "completed",
     "step": "processing_completed"
   },
+  "session.provider_auth_terminated": {
+    "level": "detail",
+    "phase": "in_progress",
+    "status": "failed",
+    "step": "provider_auth_terminated"
+  },
   "session.restored": {
     "level": "detail",
     "phase": "in_progress",
@@ -820,6 +856,18 @@
     "phase": "in_progress",
     "status": "completed",
     "step": "resumed"
+  },
+  "session.run_unrestorable": {
+    "level": "detail",
+    "phase": "in_progress",
+    "status": "failed",
+    "step": "run_unrestorable"
+  },
+  "session.run_unrestorable_claim_unreadable": {
+    "level": "detail",
+    "phase": "in_progress",
+    "status": "failed",
+    "step": "run_unrestorable_claim_unreadable"
   },
   "session.slow": {
     "level": "detail",
@@ -893,36 +941,6 @@
     "status": "completed",
     "step": "stale.persistent_detected"
   },
-  "tick.completed": {
-    "level": "detail",
-    "phase": "system",
-    "status": "completed",
-    "step": "tick.completed"
-  },
-  "tick.slow": {
-    "level": "detail",
-    "phase": "system",
-    "status": "completed",
-    "step": "tick.slow"
-  },
-  "tick.started": {
-    "level": "detail",
-    "phase": "system",
-    "status": "started",
-    "step": "tick.started"
-  },
-  "transition.applied": {
-    "level": "detail",
-    "phase": "system",
-    "status": "completed",
-    "step": "transition.applied"
-  },
-  "transition.rejected": {
-    "level": "detail",
-    "phase": "system",
-    "status": "completed",
-    "step": "transition.rejected"
-  },
   "tech_lead.action_executed": {
     "level": "detail",
     "phase": "system",
@@ -953,6 +971,30 @@
     "status": "started",
     "step": "tech_lead.launching"
   },
+  "tech_lead.run_held": {
+    "level": "detail",
+    "phase": "system",
+    "status": "completed",
+    "step": "tech_lead.run_held"
+  },
+  "tech_lead.run_ownership_changed": {
+    "level": "detail",
+    "phase": "system",
+    "status": "completed",
+    "step": "tech_lead.run_ownership_changed"
+  },
+  "tech_lead.run_requested": {
+    "level": "detail",
+    "phase": "system",
+    "status": "completed",
+    "step": "tech_lead.run_requested"
+  },
+  "tech_lead.run_withdrawn": {
+    "level": "detail",
+    "phase": "system",
+    "status": "completed",
+    "step": "tech_lead.run_withdrawn"
+  },
   "tech_lead.skipped": {
     "level": "detail",
     "phase": "system",
@@ -964,6 +1006,36 @@
     "phase": "system",
     "status": "completed",
     "step": "tech_lead.stuck_sweep"
+  },
+  "tick.completed": {
+    "level": "detail",
+    "phase": "system",
+    "status": "completed",
+    "step": "tick.completed"
+  },
+  "tick.slow": {
+    "level": "detail",
+    "phase": "system",
+    "status": "completed",
+    "step": "tick.slow"
+  },
+  "tick.started": {
+    "level": "detail",
+    "phase": "system",
+    "status": "started",
+    "step": "tick.started"
+  },
+  "transition.applied": {
+    "level": "detail",
+    "phase": "system",
+    "status": "completed",
+    "step": "transition.applied"
+  },
+  "transition.rejected": {
+    "level": "detail",
+    "phase": "system",
+    "status": "completed",
+    "step": "transition.rejected"
   },
   "validation.completed": {
     "level": "detail",

@@ -4,6 +4,7 @@ import pytest
 import yaml
 from pathlib import Path
 from issue_orchestrator.infra.config import Config
+from issue_orchestrator.infra.config_models import PromotionRouteTarget
 
 
 class TestConfig:
@@ -3045,6 +3046,262 @@ tech_lead:
 
         assert any("tech_lead.dedup.similarity_threshold" in error for error in errors)
 
+    def test_finding_promotion_defaults(self):
+        """#6957: the lane ships ON but gated, so promotion needs one approval."""
+        findings = Config().tech_lead.findings
+
+        assert findings.promote == "gated"
+        assert findings.min_evidence == 2
+        assert findings.max_open_promoted == 3
+        assert findings.route == {"default": PromotionRouteTarget(repo="self")}
+        assert findings.enabled is True
+        assert findings.gated is True
+
+    def test_finding_promotion_from_yaml(self, tmp_path):
+        config_file = tmp_path / ".issue-orchestrator.yaml"
+        config_file.write_text(
+            """
+tech_lead:
+  findings:
+    promote: auto
+    min_evidence: 4
+    max_open_promoted: 1
+    route:
+      completion-pipeline: issue-orchestrator/issue-orchestrator
+      default: self
+"""
+        )
+
+        findings = Config.load(config_file).tech_lead.findings
+
+        assert findings.promote == "auto"
+        assert findings.gated is False
+        assert findings.min_evidence == 4
+        assert findings.max_open_promoted == 1
+        assert findings.route_for("completion-pipeline").repo == (
+            "issue-orchestrator/issue-orchestrator"
+        )
+        assert findings.route_for("ui").repo == "self"
+        assert findings.target_repos() == ("issue-orchestrator/issue-orchestrator",)
+
+    def test_finding_promotion_route_defaults_to_self_when_omitted(self, tmp_path):
+        config_file = tmp_path / ".issue-orchestrator.yaml"
+        config_file.write_text(
+            """
+tech_lead:
+  findings:
+    route:
+      completion-pipeline: owner/repo
+"""
+        )
+
+        findings = Config.load(config_file).tech_lead.findings
+
+        assert findings.route_for("anything-else").repo == "self"
+
+    def test_finding_promotion_default_route_is_case_insensitive(self, tmp_path):
+        config_file = tmp_path / ".issue-orchestrator.yaml"
+        config_file.write_text(
+            """
+tech_lead:
+  findings:
+    route:
+      Default: owner/repo
+"""
+        )
+
+        findings = Config.load(config_file).tech_lead.findings
+
+        assert findings.route == {"default": PromotionRouteTarget(repo="owner/repo")}
+        assert findings.route_for("anything-else").repo == "owner/repo"
+
+    def test_finding_promotion_target_repos_fold_repository_case(self):
+        findings = Config().tech_lead.findings
+        findings.route = {
+            "one": PromotionRouteTarget(repo="Owner/Repo"),
+            "two": PromotionRouteTarget(repo="owner/repo"),
+        }
+
+        assert findings.target_repos() == ("Owner/Repo",)
+
+    def test_promote_off_disables_the_lane(self):
+        config = Config()
+        config.tech_lead.findings.promote = "off"
+
+        assert config.tech_lead.findings.enabled is False
+        assert config.validate() == [] or not any(
+            "tech_lead.findings" in error for error in config.validate()
+        )
+
+    @pytest.mark.parametrize(
+        "attr,value,fragment",
+        (
+            ("promote", "sometimes", "tech_lead.findings.promote"),
+            ("min_evidence", 0, "tech_lead.findings.min_evidence"),
+            ("max_open_promoted", 0, "tech_lead.findings.max_open_promoted"),
+        ),
+    )
+    def test_invalid_finding_promotion_settings_fail_startup(
+        self, attr: str, value, fragment: str
+    ):
+        """Fail-loud: a misconfigured lane must never silently never-promote."""
+        config = Config()
+        setattr(config.tech_lead.findings, attr, value)
+
+        assert any(fragment in error for error in config.validate())
+
+    def test_malformed_route_target_fails_startup(self):
+        config = Config()
+        config.tech_lead.findings.route = {
+            "default": PromotionRouteTarget(repo="not-a-repo")
+        }
+
+        errors = config.validate()
+
+        assert any("tech_lead.findings.route" in error for error in errors)
+
+    @pytest.mark.parametrize(
+        "route_yaml,fragment",
+        (
+            ("'': owner/repo", "keys must be non-empty"),
+            ("completion-pipeline: ''", "must not be empty"),
+            (
+                "Queue: owner/one\n      queue: owner/two",
+                "duplicate case-insensitive area",
+            ),
+            ("completion-pipeline: []", "must be 'self', 'owner/repo'"),
+            ("completion-pipeline: 3", "must be 'self', 'owner/repo'"),
+            ("completion-pipeline:\n        nope: x", "unknown key"),
+            ("completion-pipeline:\n        scope_label: x", "requires a non-empty"),
+            (
+                "completion-pipeline:\n        repo: owner/repo\n"
+                "        scope_label: [1]",
+                "must be a label string",
+            ),
+        ),
+    )
+    def test_blank_or_ambiguous_finding_routes_fail_load(
+        self, tmp_path, route_yaml: str, fragment: str
+    ):
+        config_file = tmp_path / ".issue-orchestrator.yaml"
+        config_file.write_text(
+            f"tech_lead:\n  findings:\n    route:\n      {route_yaml}\n"
+        )
+
+        with pytest.raises(ValueError, match=fragment):
+            Config.load(config_file)
+
+    @pytest.mark.parametrize("value", ("[]", "''", "false", "0", "3", "'gated'"))
+    def test_a_non_mapping_findings_block_is_rejected_not_defaulted(
+        self, tmp_path, value: str
+    ):
+        """#6957 round-5 review F14: the same truthiness bug, one level up.
+
+        ``tech_lead.findings`` defaults to ``promote: gated`` with
+        ``route.default: self``, so silently replacing an explicit value with
+        ``{}`` ENABLES issue creation — the opposite of what an operator writing
+        ``findings: false`` intends.
+        """
+        config_file = tmp_path / ".issue-orchestrator.yaml"
+        config_file.write_text(f"tech_lead:\n  findings: {value}\n")
+
+        with pytest.raises(ValueError, match="tech_lead.findings must be a mapping"):
+            Config.load(config_file)
+
+    @pytest.mark.parametrize("body", ("tech_lead:\n  priority: P1\n", "tech_lead:\n  findings: null\n"))
+    def test_omitted_or_null_findings_takes_the_defaults(self, tmp_path, body: str):
+        """Omission and an explicit null are the only ways to accept defaults."""
+        config_file = tmp_path / ".issue-orchestrator.yaml"
+        config_file.write_text(body)
+
+        findings = Config.load(config_file).tech_lead.findings
+
+        assert findings.promote == "gated"
+        assert findings.route == {"default": PromotionRouteTarget(repo="self")}
+
+    def test_promote_off_is_how_the_lane_is_disabled(self, tmp_path):
+        """The message points here, so it had better work."""
+        config_file = tmp_path / ".issue-orchestrator.yaml"
+        config_file.write_text("tech_lead:\n  findings:\n    promote: off\n")
+
+        assert Config.load(config_file).tech_lead.findings.enabled is False
+
+    @pytest.mark.parametrize("value", ("[]", "''", "false", "0"))
+    def test_falsy_non_mapping_route_is_rejected_not_defaulted(
+        self, tmp_path, value: str
+    ):
+        """#6957 review F6: an explicitly supplied non-mapping must fail loudly.
+
+        ``data.get("route") or {}`` accepted every falsy value and silently
+        replaced it with ``default: self`` — quietly redirecting a cross-repo
+        routing feature into the managed repo.
+        """
+        config_file = tmp_path / ".issue-orchestrator.yaml"
+        config_file.write_text(
+            f"tech_lead:\n  findings:\n    route: {value}\n"
+        )
+
+        with pytest.raises(ValueError, match="route must be a mapping"):
+            Config.load(config_file)
+
+    @pytest.mark.parametrize("value", ("", "null"))
+    def test_omitted_or_null_route_takes_the_default(self, tmp_path, value: str):
+        """Omission and an explicit null are the only accepted 'no route table'."""
+        config_file = tmp_path / ".issue-orchestrator.yaml"
+        config_file.write_text(
+            "tech_lead:\n  findings:\n    min_evidence: 3\n"
+            + (f"    route: {value}\n" if value else "")
+        )
+
+        findings = Config.load(config_file).tech_lead.findings
+
+        assert findings.route == {"default": PromotionRouteTarget(repo="self")}
+
+    def test_foreign_route_declares_the_targets_scheduling_labels(self, tmp_path):
+        """#6957 review F2: a route owns the target's whole queue contract."""
+        config_file = tmp_path / ".issue-orchestrator.yaml"
+        config_file.write_text(
+            """
+tech_lead:
+  findings:
+    route:
+      completion-pipeline:
+        repo: owner/repo
+        scope_label: upstream-scope
+        agent_label: agent:platform
+      default: self
+"""
+        )
+
+        findings = Config.load(config_file).tech_lead.findings
+
+        target = findings.route_for("completion-pipeline")
+        assert target.repo == "owner/repo"
+        assert target.scope_label == "upstream-scope"
+        assert target.agent_label == "agent:platform"
+        assert findings.target_repos() == ("owner/repo",)
+
+    def test_self_route_may_not_redeclare_the_managed_repos_contract(self):
+        """The managed repo's scheduling labels come from its own config."""
+        config = Config()
+        config.tech_lead.findings.route = {
+            "default": PromotionRouteTarget(repo="self", scope_label="something")
+        }
+
+        errors = config.validate()
+
+        assert any("routes to 'self'" in error for error in errors)
+
+    def test_foreign_route_with_a_blank_agent_label_fails_startup(self):
+        config = Config()
+        config.tech_lead.findings.route = {
+            "default": PromotionRouteTarget(repo="owner/repo", agent_label="")
+        }
+
+        errors = config.validate()
+
+        assert any("agent_label" in error for error in errors)
+
     def test_tech_lead_config_from_yaml(self, tmp_path):
         """Test loading tech_lead config from YAML."""
         config_content = """
@@ -3268,6 +3525,18 @@ tech_lead:
         assert result["tech_lead"]["dedup"] == {
             "enabled": True,
             "similarity_threshold": 0.72,
+        }
+        assert result["tech_lead"]["findings"] == {
+            "promote": "gated",
+            "min_evidence": 2,
+            "max_open_promoted": 3,
+            "route": {
+                "default": {
+                    "repo": "self",
+                    "scope_label": None,
+                    "agent_label": None,
+                }
+            },
         }
         assert (
             result["tech_lead"]["milestone_strategy"]["inherit_from_issues"] == "latest"

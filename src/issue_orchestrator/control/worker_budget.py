@@ -1,11 +1,13 @@
 """Worker-slot accounting — the single owner of "which active sessions count
 against the worker budget (``max_concurrent_sessions``)".
 
-Two seams must agree on this rule or they drift (cross-path rule drift):
+Every worker-capacity consumer must agree on this rule or they drift
+(cross-path rule drift):
 
-* the planner's ``_launch_budgets`` computes remaining worker capacity, and
-* the orchestrator's E2E start-gate asks "is a worker slot free?" before it
-  lets a first-class E2E run claim one.
+* the planner computes remaining capacity and explains capacity skips,
+* startup recovery decides whether partial worker sessions may resume, and
+* the orchestrator's E2E start-gate asks whether a first-class E2E run may
+  claim a worker slot.
 
 The rule: the tech lead draws from its own reserved additive budget
 when ``tech_lead.max_concurrent`` is set, so its active sessions are NOT charged
@@ -46,6 +48,30 @@ class TechLeadSlotAvailability:
                 "TechLeadSlotAvailability: reason must be set iff available == 0"
                 f" (available={self.available}, reason={self.reason!r})"
             )
+
+
+@dataclass(frozen=True)
+class WorkerSlotAvailability:
+    """Current worker-budget occupancy from the canonical counting rule.
+
+    Callers consume this value instead of reconstructing capacity from raw
+    ``len(active_sessions)`` or snapshot counts. ``remaining`` deliberately
+    stays negative when the system is over capacity so planner accounting
+    preserves the true occupancy rather than silently clamping it.
+    """
+
+    active: int
+    maximum: int
+
+    @property
+    def remaining(self) -> int:
+        """Worker slots remaining; negative when active workers exceed max."""
+        return self.maximum - self.active
+
+    @property
+    def is_free(self) -> bool:
+        """Whether at least one worker slot is currently unoccupied."""
+        return self.remaining > 0
 
 
 def tech_lead_slot_availability(
@@ -134,6 +160,16 @@ def active_worker_session_count(
     return len(active_sessions) - active_tech_lead_session_count(config, active_sessions)
 
 
+def worker_slot_availability(
+    config: "Config", active_sessions: "Sequence[Session]"
+) -> WorkerSlotAvailability:
+    """Return canonical worker occupancy and remaining capacity."""
+    return WorkerSlotAvailability(
+        active=active_worker_session_count(config, active_sessions),
+        maximum=config.max_concurrent_sessions,
+    )
+
+
 def worker_slot_free(
     config: "Config", active_sessions: "Sequence[Session]"
 ) -> bool:
@@ -142,7 +178,4 @@ def worker_slot_free(
     Uses the SAME accounting as the planner so the E2E start-gate competes for
     the worker budget, not the tech-lead's reserved slot.
     """
-    return (
-        active_worker_session_count(config, active_sessions)
-        < config.max_concurrent_sessions
-    )
+    return worker_slot_availability(config, active_sessions).is_free

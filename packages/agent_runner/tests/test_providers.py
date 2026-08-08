@@ -149,7 +149,7 @@ class TestCodexProvider:
         assert "Fix the bug" in cmd
 
     def test_build_command_default_full_auto(self) -> None:
-        """Test that full-auto is default approval mode."""
+        """Test that full-auto maps to supported explicit CLI policies."""
         provider = CodexProvider()
 
         cmd = provider.build_command(
@@ -157,7 +157,10 @@ class TestCodexProvider:
             model="gpt-5-codex",
         )
 
-        assert "--full-auto" in cmd
+        assert "--full-auto" not in cmd
+        assert cmd[cmd.index("--ask-for-approval") + 1] == "on-request"
+        assert cmd.index("--ask-for-approval") < cmd.index("exec")
+        assert cmd[cmd.index("--sandbox") + 1] == "workspace-write"
 
     def test_build_command_yolo_mode(self) -> None:
         """Test yolo approval mode."""
@@ -170,7 +173,11 @@ class TestCodexProvider:
         )
 
         assert "--dangerously-bypass-approvals-and-sandbox" in cmd
+        assert cmd.index("--dangerously-bypass-approvals-and-sandbox") < cmd.index(
+            "exec"
+        )
         assert "--full-auto" not in cmd
+        assert "--ask-for-approval" not in cmd
 
     def test_build_command_default_approval_mode(self) -> None:
         """Test default approval mode (no flag)."""
@@ -183,6 +190,7 @@ class TestCodexProvider:
         )
 
         assert "--full-auto" not in cmd
+        assert "--ask-for-approval" not in cmd
         assert "--dangerously-bypass-approvals-and-sandbox" not in cmd
 
     def test_build_command_json_output_default(self) -> None:

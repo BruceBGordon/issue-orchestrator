@@ -4,15 +4,18 @@ import json
 import os
 import subprocess
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
 from issue_orchestrator.execution.git_working_copy import GitWorkingCopy
+from issue_orchestrator.ports.command_runner import OutputNewlines
 from issue_orchestrator.ports.git import GitError, GitResult
 from issue_orchestrator.ports.working_copy import (
     BranchPathsResult,
     BranchStatus,
+    BranchTextFile,
+    BranchTextFilesResult,
     CommitInfo,
     PreflightResult,
     PushResult,
@@ -249,6 +252,7 @@ class TestListDirtyFiles:
             mock_run.assert_called_once_with(
                 worktree_path,
                 ["diff", "--name-only", "-z"],
+                newlines=OutputNewlines.PRESERVED,
             )
 
     def test_list_dirty_files_tracked_mode(self, git_wc, worktree_path):
@@ -1520,6 +1524,53 @@ def _run_git_cmd(cwd: Path, *args: str) -> str:
     return result.stdout.strip()
 
 
+class TestReadBranchTextFiles:
+    def test_reads_exact_head_objects_in_requested_order(
+        self, git_wc, worktree_path
+    ):
+        with patch.object(git_wc, "_run_git") as mock_run:
+            mock_run.side_effect = [
+                git_result(stdout="first\n"),
+                git_result(stdout="second\n"),
+            ]
+
+            result = git_wc.read_branch_text_files(
+                worktree_path, ("tests/test_first.py", "tests/test_second.py")
+            )
+
+        assert result == BranchTextFilesResult(
+            success=True,
+            files=(
+                BranchTextFile(path="tests/test_first.py", content="first\n"),
+                BranchTextFile(path="tests/test_second.py", content="second\n"),
+            ),
+        )
+        assert mock_run.call_args_list == [
+            call(
+                worktree_path,
+                ["show", "HEAD:tests/test_first.py"],
+                newlines=OutputNewlines.PRESERVED,
+            ),
+            call(
+                worktree_path,
+                ["show", "HEAD:tests/test_second.py"],
+                newlines=OutputNewlines.PRESERVED,
+            ),
+        ]
+
+    def test_git_error_fails_complete_request(self, git_wc, worktree_path):
+        with patch.object(git_wc, "_run_git") as mock_run:
+            mock_run.side_effect = git_error(stderr="fatal: path missing")
+
+            result = git_wc.read_branch_text_files(
+                worktree_path, ("tests/test_guard.py",)
+            )
+
+        assert result.success is False
+        assert result.files == ()
+        assert result.error == "fatal: path missing"
+
+
 class TestBranchPostImagePathsAgainstBase:
     """Path-oriented branch-tip query (#6659).
 
@@ -1603,6 +1654,7 @@ class TestBranchPostImagePathsAgainstBase:
                     "--diff-filter=ACMRT",
                     "origin/main...HEAD",
                 ],
+                newlines=OutputNewlines.PRESERVED,
             )
 
     def test_git_error_fails_closed(self, git_wc, worktree_path):

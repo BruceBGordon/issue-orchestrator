@@ -20,6 +20,7 @@ from issue_orchestrator.domain.models import (
 )
 from issue_orchestrator.domain.session_key import SessionKey, TaskKind
 from issue_orchestrator.infra.config import Config
+from issue_orchestrator.ports.provider_resilience import NO_PROVIDER_CIRCUIT_STATUS
 from issue_orchestrator.view_models.dashboard import build_dashboard_view_model
 from issue_orchestrator.view_models.dashboard_flow import compact_card
 from tests.unit.session_run_helpers import make_session_run_assets
@@ -113,6 +114,7 @@ def test_dashboard_view_model_active_card_carries_issue_label():
 
     view_model = build_dashboard_view_model(
         _Stub(),
+        provider_circuit=NO_PROVIDER_CIRCUIT_STATUS,
         queue_page=1,
         active_tab="flow",
         e2e_page=1,
@@ -152,6 +154,7 @@ def test_dashboard_view_model_history_card_carries_issue_label():
 
     view_model = build_dashboard_view_model(
         _Stub(),
+        provider_circuit=NO_PROVIDER_CIRCUIT_STATUS,
         queue_page=1,
         active_tab="awaiting-merge",
         e2e_page=1,

@@ -708,13 +708,13 @@ class TestSettingsEndpoints:
 
     def test_post_settings_concurrency_change_applies_to_running_engine(self):
         """The API update is visible to the live worker-capacity owner."""
+        from issue_orchestrator.control.worker_budget import worker_slot_free
         from issue_orchestrator.entrypoints import web
-        from issue_orchestrator.control.health_gate import HealthGate
 
         mock_orch = create_mock_orchestrator()
         mock_orch.config.max_concurrent_sessions = 2
-        health_gate = HealthGate(mock_orch.config)
-        assert health_gate.check(active_sessions=2).can_proceed is False
+        active_workers = [MagicMock(), MagicMock()]
+        assert worker_slot_free(mock_orch.config, active_workers) is False
 
         with (
             patch("issue_orchestrator.infra.doctor.run_doctor") as mock_doctor,
@@ -737,8 +737,7 @@ class TestSettingsEndpoints:
 
                 assert response.status_code == 200
                 assert response.json()["restart_required"] is False
-                assert health_gate.check(active_sessions=2).can_proceed is True
-                assert health_gate.available_capacity == 3
+                assert worker_slot_free(mock_orch.config, active_workers) is True
             finally:
                 web._orchestrator = None
 

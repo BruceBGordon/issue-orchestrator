@@ -888,6 +888,10 @@ class Config:
             circuit_dict["max_cooldowns"] = circuit.max_cooldowns
         if circuit.label != "blocked:provider-unavailable":
             circuit_dict["label"] = circuit.label
+        if circuit.auth_failure_threshold != 1:
+            circuit_dict["auth_failure_threshold"] = circuit.auth_failure_threshold
+        if circuit.auth_cooldown_seconds != 21600:
+            circuit_dict["auth_cooldown_seconds"] = circuit.auth_cooldown_seconds
         if circuit_dict:
             provider_dict["circuit_breaker"] = circuit_dict
 
@@ -1327,6 +1331,23 @@ class Config:
                 "tech_lead.max_concurrent must be >= 1 when set (a reserved tech_lead "
                 "budget of at least one slot); omit it to share the worker "
                 f"budget, got {self.tech_lead.max_concurrent}"
+            )
+        # Same ranges the settings schema advertises. Raw YAML bypasses that
+        # schema entirely, and the circuit owner no longer clamps: an
+        # out-of-range threshold or a zero/negative cooldown would silently
+        # produce an already-expired auth deadline and stop protecting the
+        # fleet, which is the burn this whole feature exists to prevent
+        # (#6999 F7).
+        circuit = self.provider_resilience.circuit_breaker
+        if not (1 <= circuit.auth_failure_threshold <= 10):
+            errors.append(
+                "provider_resilience.circuit_breaker.auth_failure_threshold must be "
+                f"between 1 and 10, got {circuit.auth_failure_threshold}"
+            )
+        if not (60 <= circuit.auth_cooldown_seconds <= 604800):
+            errors.append(
+                "provider_resilience.circuit_breaker.auth_cooldown_seconds must be "
+                f"between 60 and 604800, got {circuit.auth_cooldown_seconds}"
             )
         if self.validation.publish.dirty_check not in {"tracked", "unstaged", "all", "off"}:
             errors.append(

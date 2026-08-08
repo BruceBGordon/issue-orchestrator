@@ -7,7 +7,7 @@ import subprocess
 from pathlib import Path
 
 from ..infra.shutdown_signals import child_signal_reset_preexec
-from ..ports.command_runner import CommandResult
+from ..ports.command_runner import CommandResult, OutputNewlines
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +23,7 @@ class LocalCommandRunner:
         env: dict[str, str] | None = None,
         timeout_seconds: int | None = None,
         shell: bool = False,
+        newlines: OutputNewlines = OutputNewlines.TRANSLATED,
     ) -> CommandResult:
         logger.debug("Running command: %s", command)
         try:
@@ -30,7 +31,9 @@ class LocalCommandRunner:
                 command,
                 cwd=str(cwd) if cwd else None,
                 capture_output=True,
-                text=True,
+                # Text mode is where universal-newline translation happens, so
+                # a byte-exact capture has to decode the output itself.
+                text=not newlines.capture_bytes,
                 timeout=timeout_seconds,
                 env=env,
                 shell=shell,
@@ -41,17 +44,17 @@ class LocalCommandRunner:
             )
             return CommandResult(
                 returncode=result.returncode,
-                stdout=result.stdout or "",
-                stderr=result.stderr or "",
+                stdout=newlines.decode(result.stdout),
+                stderr=newlines.decode(result.stderr),
                 timed_out=False,
             )
         except subprocess.TimeoutExpired as exc:
-            stdout = exc.stdout if isinstance(exc.stdout, str) else (exc.stdout.decode() if exc.stdout else "")
-            stderr = exc.stderr if isinstance(exc.stderr, str) else (exc.stderr.decode() if exc.stderr else "")
+            # A timed-out capture can end mid-character, and its output is only
+            # ever diagnostic, so replace here instead of losing the result.
             return CommandResult(
                 returncode=-1,
-                stdout=stdout,
-                stderr=stderr,
+                stdout=newlines.decode(exc.stdout, errors="replace"),
+                stderr=newlines.decode(exc.stderr, errors="replace"),
                 timed_out=True,
             )
         except Exception as exc:

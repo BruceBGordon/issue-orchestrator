@@ -15,6 +15,7 @@ from ..history import latest_history_entries_by_issue
 from ..control.label_manager import LabelManager
 from ..infra.audit import get_issue_dependencies
 from ..infra import gh_audit
+from ..ports.provider_resilience import ProviderCircuitStatusReader
 from .dependency_gate import (
     stack_chip,
     stack_chip_payload,
@@ -22,10 +23,14 @@ from .dependency_gate import (
     stack_dependency_view,
     stack_signal,
 )
+from .issue_card_labels import blocked_summary, display_labels as _display_labels
+from .issue_card_labels import provider_badge, provider_badge_payload, provider_signal
+from .provider_circuit import ProviderCircuitStatusView, read_provider_circuit_status
+from .tech_lead_run_actions import TechLeadRunActionsView, read_tech_lead_run_actions
 from .dashboard_e2e import E2E_PAGE_SIZE
 from .dashboard_e2e import build_e2e_items
 from .dashboard_e2e import build_e2e_view_model
-from .dashboard_e2e import build_recent_e2e_runs
+from .dashboard_e2e import build_recent_e2e_runs_payload
 from .dashboard_e2e import get_e2e_status
 from .lifecycle_semantics import RecentE2ERunsPayload
 from .dashboard_assets import DASHBOARD_CSS_CHUNKS
@@ -34,7 +39,7 @@ from .dashboard_flow import apply_lane_precedence
 from .dashboard_flow import build_awaiting_merge_items
 from .dashboard_flow import build_flow_columns
 from .dashboard_flow import exclude_flow_overlaps
-from .dashboard_flow import select_issues_for_tab
+from .dashboard_flow import normalize_dashboard_tab, select_issues_for_tab
 from .dashboard_flow import stamp_issue_item_stale_badge_visibility
 from .rework_status import queued_rework_issue_numbers, resolve_queued_rework
 from .timestamp_values import dashboard_timestamp_source
@@ -94,6 +99,9 @@ class DashboardViewModel:
 
     agents: dict[str, Any]
     agent_names: list[str]
+
+    provider_circuit: ProviderCircuitStatusView
+    tech_lead_runs: TechLeadRunActionsView
 
     def template_context(self) -> dict[str, Any]:
         return {
@@ -159,6 +167,8 @@ class DashboardViewModel:
             "scope": self.scope_summary,
             "refresh": self.scope_summary.get("refresh", {}),
             "githubUsage": github_usage,
+            "providerCircuit": self.provider_circuit.model_dump(mode="json"),
+            "techLeadRuns": self.tech_lead_runs.model_dump(mode="json", by_alias=True),
             "fetchLayerVisibilityAwareEnabled": self.scope_summary.get("refresh", {}).get("visibilityAwareEnabled", False),
             "fetchLayerSelectiveSyncPlannerEnabled": self.scope_summary.get("refresh", {}).get("selectiveSyncPlannerEnabled", False),
         }
@@ -285,16 +295,6 @@ def flow_stage_label(steps: list[dict[str, str]], stage: str) -> str:
     return stage.replace("_", " ").title()
 
 
-def blocked_summary(labels: list[str], lm: LabelManager, dependency_summary: str | None = None) -> str | None:
-    reasons: list[str] = []
-    blocking = lm.get_blocking(labels)
-    if blocking:
-        reasons.append(lm.describe(blocking[0]))
-    if dependency_summary:
-        reasons.append(dependency_summary)
-    return " • ".join(reasons) if reasons else None
-
-
 def _queue_wait_reason(
     *,
     state,
@@ -323,16 +323,6 @@ def _queue_wait_reason(
     if queue_position <= 1:
         return "Waiting: next scheduler tick"
     return f"Waiting: {queue_position - 1} runnable queued ahead"
-
-
-def _display_labels(labels: list[str], lm: LabelManager) -> list[str]:
-    """Labels shown as pills in UI cards.
-
-    Include orchestrator-owned labels and agent routing labels.
-    """
-    visible = set(lm.get_ours(labels))
-    visible.update(label for label in labels if label.startswith("agent:"))
-    return sorted(visible)
 
 
 def _format_age_seconds(seconds: float | int | None) -> str:
@@ -431,14 +421,16 @@ def _attach_refresh_meta(items: list[dict[str, Any]], state, config, now_ts: flo
         item.update(_refresh_meta_for_issue(state, config, issue_number, now_ts))
 
 
-def _attach_stack_payload(items: list[Any], state) -> None:
-    """Finalization owner for the "every visible card carries the stack view" policy.
+def _attach_card_projections(items: list[Any], state, lm: LabelManager) -> None:
+    """Finalization owner for the "every visible card carries X" policies.
 
     Projects each card's producer ``stack_dependency`` / ``stack_signal`` from the
-    state snapshot. Runs over each assembled lane list — after all card builders,
-    before columns and awaiting-merge derive from them — so no individual builder
-    can omit the fields and a new lane cannot regress the chip by forgetting to
-    set them. This is the single enrichment boundary; builders never set them.
+    state snapshot, plus the provider-outage badge from the card's own
+    orchestrator labels. Runs over each assembled lane list — after all card
+    builders, before columns and awaiting-merge derive from them — so no
+    individual builder can omit the fields and a new lane cannot regress a chip
+    or badge by forgetting to set them. This is the single enrichment boundary;
+    builders never set them.
     """
     for item in items:
         issue_number = item.get("issue_number")
@@ -447,9 +439,12 @@ def _attach_stack_payload(items: list[Any], state) -> None:
         view = stack_dependency_view(state, issue_number)
         item["stack_dependency"] = stack_dependency_payload(view)
         item["stack_signal"] = stack_signal(view)
-        # Precomputed chip display so the server template and JS render an
-        # identical chip (the first-paint DOM must match what the client rebuilds).
+        # Precomputed chip/badge display so the server template and JS render
+        # identically (the first-paint DOM must match what the client rebuilds).
         item["stack_chip"] = stack_chip_payload(stack_chip(view))
+        badge = provider_badge(item.get("orchestrator_labels") or (), lm)
+        item["provider_badge"] = provider_badge_payload(badge)
+        item["provider_signal"] = provider_signal(badge)
 
 
 def _refresh_meta(state, config, issue_number: int) -> dict[str, Any]:
@@ -1177,28 +1172,22 @@ def _history_time_fields(entry) -> tuple[str, bool]:
     return (f"{runtime} min", False) if runtime else ("", False)
 
 
-def _normalize_tab(active_tab: str) -> str:
-    # Map legacy tab names to new kanban-based tabs
-    if active_tab in {"work", "active", "queue", "flow"}:
-        return "kanban"
-    if active_tab == "attention":
-        return "kanban"
-    if active_tab in {"history", "merged"}:
-        return "kanban"
-    if active_tab in {"kanban", "blocked", "awaiting-merge", "completed", "e2e"}:
-        return active_tab
-    return "kanban"
-
-
 def build_dashboard_view_model(
     orchestrator,
+    *,
+    provider_circuit: ProviderCircuitStatusReader,
     queue_page: int = 1,
     active_tab: str = "kanban",
     e2e_page: int = 1,
     e2e_status_provider: Callable[[Any], dict[str, Any]] | None = None,
 ) -> DashboardViewModel:
-    """Build dashboard view model for templates and APIs."""
-    active_tab = _normalize_tab(active_tab)
+    """Build dashboard view model for templates and APIs.
+
+    ``provider_circuit`` is a required behaviour-level port (#5980 F2/A1): the
+    projection never traverses the orchestrator's dependency container, and
+    omitting the wiring is a hard error rather than a silently healthy fleet.
+    """
+    active_tab = normalize_dashboard_tab(active_tab)
     queue_page = max(queue_page, 1)
     e2e_page = max(e2e_page, 1)
 
@@ -1265,8 +1254,9 @@ def build_dashboard_view_model(
         for items in (active_items, queue_items, blocked_items, history_items, backlog_items):
             _attach_refresh_meta(items, state, config, now_ts)
             # Single owner: every lane (incl. label-blocked / validation-retry /
-            # retrospective) gets the stack view; derived lanes inherit it.
-            _attach_stack_payload(items, state)
+            # retrospective) gets the stack view and provider badge; derived
+            # lanes inherit them.
+            _attach_card_projections(items, state, lm)
         stamp_issue_item_stale_badge_visibility(history_items, mode="when_stale_and_merge_pending")
 
         completed_items = history_projection.completed_items
@@ -1414,7 +1404,7 @@ def build_dashboard_view_model(
             "refresh": refresh_status,
         }
 
-    recent_e2e_runs = _build_recent_e2e_runs_payload(config)
+    recent_e2e_runs = build_recent_e2e_runs_payload(config)
 
     return DashboardViewModel(
         issues=issues,
@@ -1456,27 +1446,6 @@ def build_dashboard_view_model(
         recent_e2e_runs=recent_e2e_runs,
         agents=agents,
         agent_names=list(agents.keys()) if agents else [],
+        provider_circuit=read_provider_circuit_status(provider_circuit),
+        tech_lead_runs=read_tech_lead_run_actions(config, state),
     )
-
-
-def _build_recent_e2e_runs_payload(config: Any) -> RecentE2ERunsPayload:
-    """Build the typed runs-as-rows payload for the inline panel (issue #6334).
-
-    Tolerates a missing e2e DB (fresh repo / E2E disabled) by returning
-    an empty payload — the JS chunk renders the empty state and the
-    rest of the dashboard is unaffected.
-    """
-    if config is None or not getattr(config, "e2e", None) or not config.e2e.enabled:
-        return RecentE2ERunsPayload(runs=())
-    db_path = config.repo_root / ".issue-orchestrator" / "e2e.db" if config.repo_root else None
-    if db_path is None or not db_path.exists():
-        return RecentE2ERunsPayload(runs=())
-    try:
-        from ..infra.e2e_db import E2EDB
-
-        db = E2EDB(db_path)
-        return build_recent_e2e_runs(db, config, limit=100)
-    except Exception:
-        # Same defensive shape as ``_build_e2e_db_items`` — a broken
-        # e2e.db should not take the dashboard down with it.
-        return RecentE2ERunsPayload(runs=())

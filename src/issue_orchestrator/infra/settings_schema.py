@@ -16,6 +16,10 @@ from typing import Any, Literal, Optional, TYPE_CHECKING
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from ..domain.tech_lead_findings import (
+    FINDING_PROMOTION_GATED,
+    VALID_FINDING_PROMOTION_MODES,
+)
 from ..domain.tech_lead_naming import TECH_LEAD_DISPLAY_NAME
 from .config_models import (
     MERGE_QUEUE_PROVIDERS,
@@ -371,7 +375,7 @@ class E2ESettings(BaseModel):
                 ".issue-orchestrator/e2e-results/pytest-junit.xml",
                 "test-results/junit.xml",
             ],
-            "doc_notes": "Leave empty for log-only runs. Missing configured reports fail the run loudly. Use the same path you passed to pytest --junitxml or your external test runner.",
+            "doc_notes": "Leave empty for log-only runs. The run fails loudly when this list as a whole resolves to no fresh files; a single non-matching entry is tolerated when another entry here matched. Use the same path you passed to pytest --junitxml or your external test runner.",
             "config_attr": "e2e.junit_xml_paths",
             "yaml_path": "e2e.junit_xml_paths",
             "ui_transform": "newline_separated_list",
@@ -567,7 +571,7 @@ class ValidationSettings(BaseModel):
         description="Relative JUnit XML files or globs emitted by validation commands",
         json_schema_extra={
             "doc_examples": ["test-results.xml", "build/test-results/test/*.xml"],
-            "doc_notes": "When set, failed validations render a structured test-results view in the dashboard.",
+            "doc_notes": "When set, failed validations render a structured test-results view in the dashboard. Evidence only: reports that do not resolve or cannot be parsed leave the view empty without changing the validation command's own outcome.",
             "section": "Evidence",
             "config_attr": "validation.junit_xml_paths",
             "yaml_path": "validation.junit_xml_paths",
@@ -1245,6 +1249,82 @@ class ReviewSettings(BaseModel):
             "yaml_path": "tech_lead.authority.kill_hung_session",
         },
     )
+    tech_lead_findings_promote: str = Field(
+        FINDING_PROMOTION_GATED,
+        title=f"{TECH_LEAD_DISPLAY_NAME} Finding Promotion",
+        description="Promote accrued pattern case files to runnable issues",
+        json_schema_extra={
+            "enum": list(VALID_FINDING_PROMOTION_MODES),
+            "doc_examples": ["gated", "off", "auto"],
+            "doc_notes": (
+                "The finding-promotion lane (#6957) turns a pattern case file "
+                "that crossed its evidence threshold into a runnable issue in "
+                "the repo that owns the fix. gated (default) files it carrying "
+                "the proposed-tech-lead label, so operator approval is exactly "
+                "one action — removing the label; auto files it ungated, "
+                "immediately runnable in the target repo's own pipeline; off "
+                "disables the lane entirely (no promotion issues and no "
+                "loop-closure reads); the lane is also inert without "
+                "review.tech_lead_review_agent, since it actuates tech-lead "
+                "findings. Only findings the tech lead classified "
+                "fix:code are ever promoted. Routing is YAML-only: "
+                "tech_lead.findings.route maps an area label to 'self' or an "
+                "owner/repo target, with route.default as the catch-all. A "
+                "route entry may also be a mapping "
+                "({repo, scope_label, agent_label}) declaring the target's "
+                "scheduling labels; a 'self' route inherits filtering.label and "
+                "review.tech_lead_follow_up_agent and must not redeclare them. "
+                "Every foreign target is proven FILEABLE at startup, not at "
+                "promotion time: reachable, issues enabled, and able to apply "
+                "that route's labels plus create any it lacks (filing "
+                "provisions labels before it opens the issue, and GitHub's "
+                "triage role cannot create them). "
+                "Allowed values: off, gated, auto."
+            ),
+            "section": _TECH_LEAD_SECTION,
+            "config_attr": "tech_lead.findings.promote",
+            "yaml_path": "tech_lead.findings.promote",
+        },
+    )
+    tech_lead_findings_min_evidence: int = Field(
+        2,
+        title="Finding Promotion: Minimum Evidence",
+        description="Observations a pattern must accrue before it can be promoted",
+        ge=1,
+        json_schema_extra={
+            "doc_examples": ["2", "3"],
+            "doc_notes": (
+                "Counted from the orchestrator-owned pattern ledger, not from "
+                "case-file comments, so human comments on a case file can never "
+                "inflate it. A signature becomes promotable on the tick its "
+                "observation count reaches this value."
+            ),
+            "section": _TECH_LEAD_SECTION,
+            "config_attr": "tech_lead.findings.min_evidence",
+            "yaml_path": "tech_lead.findings.min_evidence",
+        },
+    )
+    tech_lead_findings_max_open_promoted: int = Field(
+        3,
+        title="Finding Promotion: Max Open Per Target",
+        description="Cap on in-flight promoted issues per target repository",
+        ge=1,
+        json_schema_extra={
+            "doc_examples": ["3", "1"],
+            "doc_notes": (
+                "Storm backpressure: excess eligible signatures wait behind "
+                "merges rather than flooding a repo. It also bounds the lane's "
+                "GitHub reads — loop closure polls at most this many issues per "
+                "target per tick, rotating across the durable ledger so lowering "
+                "the cap after a larger cohort was filed slows coverage instead "
+                "of exceeding the budget. Set tech_lead.findings.promote: off to "
+                "disable the lane instead of setting this to 0."
+            ),
+            "section": _TECH_LEAD_SECTION,
+            "config_attr": "tech_lead.findings.max_open_promoted",
+            "yaml_path": "tech_lead.findings.max_open_promoted",
+        },
+    )
     tech_lead_health_review_interval_minutes: int = Field(
         0,
         title="Health Review Interval (minutes)",
@@ -1429,6 +1509,24 @@ class ReviewSettings(BaseModel):
             raise ValueError(
                 f"tech lead authority mode must be one of"
                 f" {list(TECH_LEAD_AUTHORITY_MODES)}, got {value!r}"
+            )
+        return value
+
+    @field_validator("tech_lead_findings_promote")
+    @classmethod
+    def _validate_finding_promotion_mode(cls, value: str) -> str:
+        """Close the promotion mode at the SCHEMA boundary (#6957 R3 F9).
+
+        ``json_schema_extra={"enum": ...}`` only shapes the generated select; it
+        does not make Pydantic reject anything. Without this, a tampered POST
+        body was applied to live config and only rejected later by the doctor
+        pass — after the write, and as a whole-config error rather than a
+        field-scoped one the form can attach to the offending input.
+        """
+        if value not in VALID_FINDING_PROMOTION_MODES:
+            raise ValueError(
+                "tech_lead.findings.promote must be one of"
+                f" {list(VALID_FINDING_PROMOTION_MODES)}, got {value!r}"
             )
         return value
 
@@ -1820,6 +1918,44 @@ class AdvancedSettings(BaseModel):
             "section": "Provider Resilience",
             "config_attr": "provider_resilience.circuit_breaker.label",
             "yaml_path": "provider_resilience.circuit_breaker.label",
+        },
+    )
+    provider_auth_failure_threshold: int = Field(
+        1,
+        title="Provider Auth Failure Threshold",
+        description="Consecutive provider auth failures before the circuit opens",
+        ge=1,
+        le=10,
+        json_schema_extra={
+            "doc_examples": ["1", "2", "3"],
+            "doc_notes": (
+                "The credential probe reads local CLI state and is deterministic, "
+                "so one confirmed failure is normally enough. Raise it only if a "
+                "provider's probe proves flaky."
+            ),
+            "section": "Provider Resilience",
+            "config_attr": "provider_resilience.circuit_breaker.auth_failure_threshold",
+            "yaml_path": "provider_resilience.circuit_breaker.auth_failure_threshold",
+        },
+    )
+    provider_auth_cooldown_seconds: int = Field(
+        21600,
+        title="Provider Auth Cooldown (seconds)",
+        description="How long the circuit stays open after a provider auth failure",
+        ge=60,
+        le=604800,
+        json_schema_extra={
+            "doc_examples": ["3600", "21600", "86400"],
+            "doc_notes": (
+                "An expired login only a human can fix, so this is much longer "
+                "than the transient cooldown. Recovery does not wait it out, and "
+                "does not need a successful session: while the circuit is open "
+                "nothing launches, so the credential probe is what notices the "
+                "re-authentication and clears the circuit before the next launch."
+            ),
+            "section": "Provider Resilience",
+            "config_attr": "provider_resilience.circuit_breaker.auth_cooldown_seconds",
+            "yaml_path": "provider_resilience.circuit_breaker.auth_cooldown_seconds",
         },
     )
     session_interactions_enabled: bool = Field(

@@ -160,7 +160,28 @@ validation artifacts from runs before the scratch boundary.
 | `control/session_rework_launcher.py` | Rework session launch path |
 | `control/review_exchange_loop.py` | Local coder/reviewer exchange loop |
 | `control/planner.py::_plan_discovered_failures()` | Queue tech lead to investigate failures |
+| `control/tech_lead_ledger_planning.py` | One planning owner for everything the tech-lead durable ledgers drive |
+| `control/tech_lead_finding_promotion.py` | Case file → gated runnable issue → shipped fix (#6957) |
 | `infra/orchestrator.py` | Runtime facade that delegates to the review workflow helpers |
+
+## Finding Promotion (#6957)
+
+A pattern case file (`flag_pattern`, #6781) that firms up becomes real work
+instead of a dead end. On the tick a signature crosses `min_evidence`
+observations, is classified `fix:code`, has no promotion row, and fits its
+routed target's in-flight cap, the orchestrator files ONE gated issue in the
+repo its `area` routes to. Removing `proposed-tech-lead` is the operator's whole
+approval; closing it is a permanent decline. When the promoted issue closes with
+a merged PR, the source orchestrator records the shipped fix, comments the fix
+reference on the case file, and closes it.
+
+Invariants worth knowing before changing anything here:
+
+- `fix:human` and unclassified findings are NEVER promoted.
+- One promoted issue per signature, ever — the durable ledger (not the issue
+  body) is the authority, and `declined`/`shipped` are permanent.
+- Only READS cross repositories; every write lands in the repo that owns it.
+- Route targets are validated by doctor at startup, not at promotion time.
 
 ## Configuration
 
@@ -185,4 +206,13 @@ review:
   tech_lead_review_agent: "agent:tech-lead"
   tech_lead_review_threshold: 5        # Batch review after N PRs
   tech_lead_review_on_failure: true    # Investigate failures (default: true)
+
+tech_lead:
+  findings:                            # Finding promotion (#6957)
+    promote: "gated"                   # off | gated | auto
+    min_evidence: 2                    # observations before eligibility
+    max_open_promoted: 3               # in-flight cap per target repo
+    route:
+      completion-pipeline: "issue-orchestrator/issue-orchestrator"
+      default: "self"
 ```

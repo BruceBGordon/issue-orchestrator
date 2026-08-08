@@ -101,6 +101,7 @@ export interface DashboardDataPayload {
   githubOwner: string;
   githubRepo: string;
   paused: boolean;
+  providerCircuit: ProviderCircuitStatusPayload;
   queueRefreshSeconds: number;
   repo: string;
   repoRoot: string;
@@ -543,6 +544,8 @@ export interface IssueItemPayload {
   issue_number?: number | string | null;
   issue_url?: string | null;
   open_run_command?: OpenE2ERunCommandPayload | null;
+  provider_badge?: ProviderBadgeViewPayload | null;
+  provider_signal?: string | null;
   runtime_label?: string | null;
   show_stale_badge: boolean;
   stack_chip?: StackChipViewPayload | null;
@@ -741,6 +744,32 @@ export interface PhaseDialogPayload {
   phase: Record<string, any> | null;
   phases: Record<string, any>[];
   title: string;
+}
+
+export interface ProviderBadgeViewPayload {
+  label_text: string;
+  title: string;
+  tone: string;
+}
+
+export interface ProviderCircuitEntryPayload {
+  consecutive_outages: number;
+  cooldown_remaining_label: string | null;
+  is_open: boolean;
+  last_error_summary: string | null;
+  next_retry_at: string | null;
+  provider: string;
+  status_label: string;
+}
+
+export interface ProviderCircuitStatusPayload {
+  any_open: boolean;
+  entries: ProviderCircuitEntryPayload[];
+  next_retry_at: string | null;
+  open_count: number;
+  open_providers: string[];
+  status_unavailable: boolean;
+  summary_text: string;
 }
 
 export interface PublishFailedCodingAttemptPayload {
@@ -1142,6 +1171,30 @@ export interface SwitchE2ETimelineViewCommandPayload {
   view: TimelineView;
 }
 
+export interface TechLeadGlobalHealthReviewScopePayload {
+  kind: "global_health_review";
+}
+
+export interface TechLeadIssueScopePayload {
+  issue_number: number;
+  kind: "issue";
+}
+
+export interface TechLeadRunAdmissionPayload {
+  admitted: boolean;
+  behind_global_barrier: boolean;
+  detail: string;
+  issue_number: number | null;
+  outcome: "queued" | "already_queued" | "already_running" | "paused" | "not_running" | "not_configured" | "not_eligible" | "claim_conflict" | "failed";
+  reason: string;
+  run_key: string;
+  scope_kind: "global_health_review" | "global_batch_review" | "issue";
+}
+
+export interface TechLeadRunRequestPayload {
+  scope: TechLeadRunScopePayload;
+}
+
 export interface TestCaseHistoryPayload {
   outcome: string;
   run_id: number;
@@ -1271,6 +1324,8 @@ export type ReviewStagePayload = ReviewNotReachedPayload | ReviewSkippedPayload 
 export type ReviewTranscriptEvidencePayload = ReviewTranscriptAvailablePayload | ReviewTranscriptUnavailablePayload;
 
 export type SessionRecordingEvidencePayload = SessionRecordingAvailablePayload | SessionRecordingUnavailablePayload;
+
+export type TechLeadRunScopePayload = TechLeadGlobalHealthReviewScopePayload | TechLeadIssueScopePayload;
 
 export type TimelineCommandPayload = ShowEventDetailsCommandPayload | OpenCompletionRecordCommandPayload | OpenValidationDetailsCommandPayload | OpenSessionRecordingCommandPayload | OpenReviewFeedbackCommandPayload | OpenReviewArtifactCommandPayload | OpenIssueTimelineCommandPayload | OpenE2ERunCommandPayload | ExpandE2ERunCommandPayload | SwitchE2ETimelineViewCommandPayload | CreateE2EUntriagedIssuesCommandPayload | OpenInlineAgentAttemptsCommandPayload;
 

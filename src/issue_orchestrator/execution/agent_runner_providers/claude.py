@@ -5,12 +5,17 @@ Builds command-line invocations for Anthropic's Claude Code CLI.
 Previously in ``_vendor/agent_runner/providers/claude.py``.
 """
 
+import json
 from typing import TYPE_CHECKING
+
+from issue_orchestrator.ports.provider_readiness import ProviderReadiness
+from issue_orchestrator.ports.provider_resilience import ProviderErrorType
 
 from .base import CLIProvider
 
 if TYPE_CHECKING:
     from issue_orchestrator.domain.sandbox_scope import SandboxScope
+    from issue_orchestrator.ports.command_runner import CommandRunner
 
 
 class ClaudeCodeProvider(CLIProvider):
@@ -120,6 +125,79 @@ class ClaudeCodeProvider(CLIProvider):
             cmd.append(prompt)
 
         return cmd
+
+    # ``claude auth status --json`` is the cheapest reliable credential probe:
+    # it reads local credential state only (no API round-trip, no tokens spent)
+    # and answers in well under a second, which is what makes it affordable on
+    # every launch. Its ``loggedIn`` field is the authoritative signal — the
+    # expired-login TUI banner (#6999) is the *symptom* this probe predicts.
+    AUTH_STATUS_ARGV = ("auth", "status", "--json")
+
+    def check_readiness(self, runner: "CommandRunner") -> ProviderReadiness:
+        """Probe Claude Code's local credential state without spawning a TUI."""
+        if not self.is_available():
+            return ProviderReadiness.not_installed(
+                self.name, f"{self.executable} not found in PATH"
+            )
+        output, exit_code, timed_out = self._run_auth_probe(
+            runner, [self.executable, *self.AUTH_STATUS_ARGV]
+        )
+        if timed_out:
+            return ProviderReadiness.unknown(
+                self.name,
+                f"`{self.executable} auth status` timed out after "
+                f"{self.AUTH_PROBE_TIMEOUT_SECONDS}s",
+            )
+        return self._interpret_auth_status(output, exit_code)
+
+    def _interpret_auth_status(
+        self, output: str, exit_code: int | None
+    ) -> ProviderReadiness:
+        """Turn one ``auth status`` result into a typed readiness.
+
+        All raw interpretation of Claude's output lives here; token matching is
+        delegated to the shared classification table so no second table exists.
+        """
+        logged_in = self._logged_in_flag(output)
+        if logged_in is True:
+            return ProviderReadiness.ready(
+                self.name, f"{self.executable} auth status: logged in"
+            )
+        if logged_in is False:
+            return ProviderReadiness.auth_expired(
+                self.name,
+                f"{self.executable} auth status reports not logged in — "
+                "run `claude /login`",
+            )
+        if self.classify_output(output) is ProviderErrorType.AUTH:
+            return ProviderReadiness.auth_expired(
+                self.name,
+                f"{self.executable} auth status reported an auth failure — "
+                "run `claude /login`",
+            )
+        return ProviderReadiness.unknown(
+            self.name,
+            f"`{self.executable} auth status` gave no verdict (exit={exit_code})",
+        )
+
+    @staticmethod
+    def _logged_in_flag(output: str) -> bool | None:
+        """Read ``loggedIn`` out of the probe's JSON, or ``None`` if absent.
+
+        The CLI may prefix diagnostics before the JSON document, so the object
+        is extracted by brace span rather than assuming the whole stream parses.
+        """
+        start = output.find("{")
+        end = output.rfind("}")
+        if start == -1 or end <= start:
+            return None
+        try:
+            payload = json.loads(output[start : end + 1])
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(payload, dict) or "loggedIn" not in payload:
+            return None
+        return bool(payload["loggedIn"])
 
     def apply_scope(self, scope: "SandboxScope") -> list[str]:
         """Translate a :class:`SandboxScope` into claude-code sandbox argv.

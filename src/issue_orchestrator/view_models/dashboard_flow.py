@@ -51,6 +51,11 @@ def compute_compact_card_fingerprint(card: dict[str, Any]) -> str:
         _s(card.get("github_aria_label")),
         labels_str,
         _s(card.get("stack_signal")),
+        # `provider_signal` encodes the precomputed provider-outage badge. It
+        # deliberately excludes the cooldown/ETA so a counting-down outage does
+        # not re-fingerprint (and re-flash) every affected card each refresh;
+        # gaining or losing the badge does re-fingerprint.
+        _s(card.get("provider_signal")),
         # `run_dir` binds the reused card node to a specific run. A card whose
         # other fields are unchanged but whose run directory advanced (e.g. a
         # `rework-<issue>` slot replaced by a new run) must re-fingerprint so
@@ -125,6 +130,10 @@ def compact_card(item: dict[str, Any], state_label: str | None = None) -> dict[s
         # Precomputed chip display; carried so the server-rendered first paint and
         # the client rebuild render the identical chip.
         "stack_chip": item.get("stack_chip"),
+        # Precomputed provider-outage badge + its fingerprint signal (#5980),
+        # carried for the same reason as the stack chip above.
+        "provider_badge": item.get("provider_badge"),
+        "provider_signal": item.get("provider_signal") or "",
     }
     card["fingerprint"] = compute_compact_card_fingerprint(card)
     return card
@@ -375,3 +384,21 @@ def select_issues_for_tab(
     if active_tab == "e2e":
         return e2e_items
     return active_items
+
+
+def normalize_dashboard_tab(active_tab: str) -> str:
+    """Map a requested (possibly legacy) tab name onto a tab that exists.
+
+    Beside :func:`select_issues_for_tab`: which tab is being shown and what
+    belongs on it are one policy, and an unknown name must resolve to a real
+    tab here rather than reaching a projection that has no rows for it.
+    """
+    if active_tab in {"work", "active", "queue", "flow"}:
+        return "kanban"
+    if active_tab == "attention":
+        return "kanban"
+    if active_tab in {"history", "merged"}:
+        return "kanban"
+    if active_tab in {"kanban", "blocked", "awaiting-merge", "completed", "e2e"}:
+        return active_tab
+    return "kanban"

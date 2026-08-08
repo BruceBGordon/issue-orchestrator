@@ -29,6 +29,7 @@ from issue_orchestrator.control.tech_lead_completion import (
     tech_lead_decision_processing_error,
 )
 from issue_orchestrator.control.label_manager import LabelManager
+from tests.conftest import make_provider_availability
 from issue_orchestrator.domain.board_snapshot import BoardFailure, BoardSnapshot
 from issue_orchestrator.domain.issue_key import FakeIssueKey
 from issue_orchestrator.domain.models import AgentConfig, Issue, Session, SessionStatus
@@ -136,6 +137,7 @@ def make_planner(
         config, repository_host, LabelManager(config), tech_lead_authority,
         open_issue_corpus,
         lambda _n: None,  # no live target session in these unit fixtures (#6779 R1)
+        make_provider_availability(config),
     )
 
 
@@ -2110,3 +2112,56 @@ class TestMilestoneResolutionBoundary:
             action for action in actions if isinstance(action, CreateTechLeadIssueAction)
         ]
         assert create.milestone == TechLeadMilestoneIntent(explicit_name="M5")
+
+
+def test_provider_blocked_rework_restores_its_needs_rework_trigger(
+    tmp_path: Path,
+) -> None:
+    """The durable half of returning a provider-killed rework (#6999 F2).
+
+    The rework launcher strips ``needs-rework`` when the session starts. The
+    in-memory queue restore (``InFlightWorkLedger``) covers this process; the
+    label is what an orchestrator restarted during the outage would read, so a
+    credential outage must not leave a PR that asked for rework no longer
+    saying so.
+    """
+    from issue_orchestrator.ports.provider_resilience import ProviderErrorType
+
+    config = Config()
+    session = make_session(tmp_path, terminal_id="rework-1")
+    session.pr_number = 70
+
+    actions = make_planner(config).generate_completion_actions(
+        session,
+        SessionStatus.BLOCKED,
+        provider_error_type=ProviderErrorType.AUTH,
+    )
+
+    restored = [
+        action
+        for action in actions
+        if isinstance(action, AddLabelAction)
+        and action.label == LabelManager(config).needs_rework
+    ]
+    assert len(restored) == 1
+    # On the PR, which is where the launcher removed it from.
+    assert restored[0].issue_number == 70
+
+
+def test_provider_blocked_issue_session_adds_no_rework_trigger(
+    tmp_path: Path,
+) -> None:
+    """Restoring the trigger is scoped to rework sessions, nothing wider."""
+    from issue_orchestrator.ports.provider_resilience import ProviderErrorType
+
+    config = Config()
+
+    actions = make_planner(config).generate_completion_actions(
+        make_session(tmp_path, terminal_id="issue-1"),
+        SessionStatus.BLOCKED,
+        provider_error_type=ProviderErrorType.AUTH,
+    )
+
+    assert LabelManager(config).needs_rework not in added_labels(actions)
+    # The claim is still released, exactly as before.
+    assert "in-progress" in removed_labels(actions)

@@ -1,8 +1,16 @@
 """Shared fixtures and configuration for tests."""
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import os
 import pytest
+
+from issue_orchestrator.control.tech_lead_run_ownership import (
+    TechLeadRunOwnership,
+)
+from issue_orchestrator.ports.run_ledger_store import (
+    SingleInstanceRunLedgerStore,
+)
 from pathlib import Path
 from typing import Optional
 from unittest.mock import MagicMock, PropertyMock, patch
@@ -235,6 +243,14 @@ class MockGitHubAdapter:
         self.labels: dict[int, set[str]] = {}  # issue_number -> labels
         self.prs: dict[str, list[PRInfo]] = {}  # branch -> PRs
         self.comments: list[dict] = []
+        # (issue_number, ISO-8601Z timestamp) per close, mirroring GitHub's
+        # /issues/{n}/events "closed" entries for issue_closed_on_or_after.
+        # Timestamps are DETERMINISTIC (tests/AGENTS.md: never the real
+        # clock): a fixed far-future base plus a per-event counter, so any
+        # close recorded during a scenario sorts after any fixture merged_at.
+        # Tests needing precise ordering seed issue_close_events directly.
+        self.issue_close_events: list[tuple[int, str]] = []
+        self._close_event_seq = 0
         self.pr_reviews: dict[int, list[dict]] = {}  # pr_number -> reviews
         self.close_pr_calls: list[int] = []
         # pr_number -> current merge queue entry (None/absent = not enqueued)
@@ -523,6 +539,27 @@ class MockGitHubAdapter:
         issue = self.get_issue(issue_number)
         if issue is not None:
             issue.state = state
+            if state == "closed":
+                self._close_event_seq += 1
+                seq = self._close_event_seq
+                self.issue_close_events.append((
+                    issue_number,
+                    f"9999-01-01T00:{seq // 60:02d}:{seq % 60:02d}Z",
+                ))
+
+    def issue_closed_on_or_after(self, issue_number: int, timestamp: str) -> bool:
+        """Whether a recorded close event exists at/after ``timestamp`` (mock).
+
+        Mirrors the GitHub adapter's typed close-event evidence read. The mock
+        does not simulate GitHub's closing-keyword auto-close, so scenarios
+        that merge a PR without closing its issue genuinely have no close
+        event — the close-on-merge fallback then behaves exactly as it would
+        against real GitHub.
+        """
+        return any(
+            number == issue_number and closed_at >= timestamp
+            for number, closed_at in self.issue_close_events
+        )
 
 
 @pytest.fixture
@@ -791,6 +828,7 @@ def build_test_orchestrator_deps(
     lease_renewer=None,
     timeline_reader=None,
     timeline_writer=None,
+    provider_readiness_probe=None,
 ):
     """Factory function to create OrchestratorDeps for testing.
 
@@ -811,6 +849,10 @@ def build_test_orchestrator_deps(
         planner: Optional override for Planner (for testing)
         session_manager: Optional override for SessionManager (for testing)
         action_applier: Optional override for ActionApplier (for testing)
+        provider_readiness_probe: Optional ProviderReadinessProbe. Defaults to
+            the explicit "nothing to probe" reader, so a test that does not
+            care about provider credentials never spawns a CLI probe and never
+            silently claims a provider is authenticated (#6999).
 
     Returns:
         OrchestratorDeps with all components wired
@@ -832,6 +874,12 @@ def build_test_orchestrator_deps(
     from issue_orchestrator.control.label_sync import LabelSync
     from issue_orchestrator.control.board_snapshot_builder import BoardSnapshotBuilder
     from issue_orchestrator.control.orchestrator_deps import OrchestratorDeps
+    from issue_orchestrator.entrypoints.bootstrap_completion import (
+        build_completion_handler_factory,
+    )
+    from issue_orchestrator.entrypoints.bootstrap_operator_commands import (
+        build_operator_issue_command_factory,
+    )
     from issue_orchestrator.entrypoints.bootstrap_session_launcher import (
         build_session_launcher_factory,
     )
@@ -911,10 +959,7 @@ def build_test_orchestrator_deps(
         reconcile=False,
     )
 
-    health_gate = HealthGate(
-        max_concurrent_sessions=config.max_concurrent_sessions,
-        rate_limit_threshold=100,
-    )
+    health_gate = HealthGate(rate_limit_threshold=100)
 
     session_restorer = SessionRestorer(
         config=config,
@@ -995,11 +1040,18 @@ def build_test_orchestrator_deps(
     # for tests that consume deps directly instead of relying on runtime wiring.
     _action_applier.lease_id_lookup = lambda _issue_number: None
 
+    from issue_orchestrator.ports.provider_readiness import (
+        NO_PROVIDER_READINESS_PROBE,
+    )
+
+    readiness_probe = provider_readiness_probe or NO_PROVIDER_READINESS_PROBE
+
     infra_services = InfraServices(
         label_manager=label_manager,
         label_store=label_store,
         queue_cache_store=_build_null_queue_cache_store(),
         provider_resilience=provider_resilience,
+        provider_readiness_probe=readiness_probe,
         timeline_reader=timeline_reader,
         timeline_store=NullTimelineStore(),
         timeline_writer=timeline_writer,
@@ -1015,6 +1067,29 @@ def build_test_orchestrator_deps(
     from issue_orchestrator.execution.thread_background_job_runner import (
         ThreadBackgroundJobRunner,
     )
+    from issue_orchestrator.control.claim_quarantine import (
+        build_claim_quarantine_owner,
+    )
+    from issue_orchestrator.control.needs_human_block import NeedsHumanBlock
+    from issue_orchestrator.execution.pending_work_claim_store import (
+        SqlitePendingWorkClaimStore,
+    )
+
+    pending_work_claims = SqlitePendingWorkClaimStore.for_repo(config.repo_root)
+    # One owner for every durable cause of the shared needs-human label, wired
+    # exactly as bootstrap wires it (#6999 F4).
+    needs_human_block = NeedsHumanBlock(
+        needs_human_label=label_manager.needs_human,
+        tech_lead_marker=label_manager.tech_lead_needs_human,
+        # The RAW writer: the owner is the one holder that may write this label.
+        labels=repo_host,
+        read_labels=repo_host.get_issue_labels_fresh,
+        quarantined_issue_numbers=pending_work_claims.quarantined_issue_numbers,
+        causes=pending_work_claims,
+    )
+    # Same post-construction bind bootstrap does: the applier records causes
+    # into the very store this block reads (#6999 F2 round 2).
+    _action_applier.needs_human_block = needs_human_block
 
     publish_recovery = PublishRecoveryService(
         repository_host=repo_host,
@@ -1038,6 +1113,17 @@ def build_test_orchestrator_deps(
     return OrchestratorDeps(
         events=events,
         runner=runner,
+        # Orchestrator-owned, outside every worktree, exactly as bootstrap
+        # wires it (#6999 F7).
+        pending_work_claims=pending_work_claims,
+        claim_quarantine=build_claim_quarantine_owner(
+            store=pending_work_claims,
+            action_applier=_action_applier,
+            label_manager=label_manager,
+            events=events,
+            needs_human_block=needs_human_block,
+        ),
+        needs_human_block=needs_human_block,
         # The same endpoint the completion processor got, mirroring how
         # bootstrap shares one instance. Nothing binds a port in tests, so
         # it honestly resolves to "no endpoint yet".
@@ -1061,6 +1147,29 @@ def build_test_orchestrator_deps(
             state_machine_manager=state_machine_manager,
             label_manager=label_manager,
             agent_callback_endpoint=agent_callback_endpoint,
+            provider_readiness_probe=readiness_probe,
+            needs_human_block=needs_human_block,
+        ),
+        # Same shape again for the completion handler (#6999 A4).
+        completion_handler_factory=build_completion_handler_factory(
+            config,
+            events=events,
+            repository_host=repo_host,
+            session_output=session_output,
+            tech_lead_authority=tech_lead_authority,
+            open_issue_corpus=open_issue_corpus,
+            label_manager=label_manager,
+            provider_resilience=provider_resilience,
+        ),
+        # ...and for the operator retry/dismiss command, whose transition spans
+        # GitHub labels and the local retry/queue state (#6999 F5).
+        operator_issue_command_factory=build_operator_issue_command_factory(
+            config,
+            repository_host=repo_host,
+            label_manager=label_manager,
+            needs_human_block=needs_human_block,
+            fresh_issue_reader=fresh_reader,
+            queue_cache_store=infra_services.queue_cache_store,
         ),
         repository_host=repo_host,
         e2e_issue_tracker=e2e_issue_tracker,
@@ -1096,6 +1205,13 @@ def build_test_orchestrator_deps(
         claim_manager=claim_manager,
         claim_gate=claim_gate,
         lease_renewer=lease_renewer,
+        # Single-instance run ownership: the same "No Nulls" shape
+        # NullClaimManager gives issue claims (#6994).
+        run_ownership=TechLeadRunOwnership(
+            SingleInstanceRunLedgerStore(lease_seconds=900),
+            lease_seconds=900,
+            renew_before_expiry_seconds=300,
+        ),
         publish_recovery=publish_recovery,
         services=infra_services,
     )
@@ -1406,3 +1522,37 @@ repo:
     config_file = tmp_path / ".issue-orchestrator.yaml"
     config_file.write_text(config_content)
     return config_file
+
+
+# =============================================================================
+# Provider availability (#6999)
+# =============================================================================
+
+
+def make_provider_availability(config, provider_resilience=None):
+    """A real :class:`ProviderAvailabilityPolicy` over an in-memory circuit.
+
+    Completion planning asks this owner for the provider-blocked transition
+    instead of building a raw label mutation, so tests that construct a
+    completion planner/handler must supply a real one (#6999 F5/A2). Passing an
+    existing ``provider_resilience`` shares the circuit under test.
+    """
+    from issue_orchestrator.control.label_manager import LabelManager
+    from issue_orchestrator.control.provider_availability import (
+        ProviderAvailabilityPolicy,
+    )
+    from issue_orchestrator.control.provider_resilience import (
+        ProviderResilienceManager,
+    )
+    from issue_orchestrator.ports import InMemoryProviderCircuitStore
+    from issue_orchestrator.ports.event_sink import NullEventSink
+
+    if provider_resilience is None:
+        provider_resilience = ProviderResilienceManager(
+            config=config.provider_resilience,
+            store=InMemoryProviderCircuitStore(),
+            events=NullEventSink(),
+        )
+    return ProviderAvailabilityPolicy(
+        config, provider_resilience, LabelManager(config)
+    )

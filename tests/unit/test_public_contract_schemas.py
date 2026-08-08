@@ -46,6 +46,26 @@ def _dashboard_data_payload(**overrides: object) -> dict[str, object]:
         "githubRepo": "repo",
         "agents": ["agent:web"],
         "validationConfigured": False,
+        "providerCircuit": {
+            "any_open": False,
+            "open_count": 0,
+            "open_providers": [],
+            "summary_text": "",
+            "next_retry_at": None,
+            "entries": [],
+        },
+        "techLeadRuns": {
+            "configured": True,
+            "paused": False,
+            "globalStatus": "idle",
+            "globalStatusLabel": "",
+            "healthReviewStatus": "idle",
+            "healthReviewStatusLabel": "",
+            "globalBarrierNote": "",
+            "queuedIssueNumbers": [],
+            "runningIssueNumbers": [],
+            "globalBarrierActive": False,
+        },
     }
     payload.update(overrides)
     return payload

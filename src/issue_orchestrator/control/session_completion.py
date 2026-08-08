@@ -24,6 +24,8 @@ from ..events import EventName
 from ..infra.config import Config
 from ..ports import EventSink
 from ..ports.event_sink import make_trace_event
+from ..ports.provider_resilience import ProviderErrorType
+from ..ports.pending_work_claim_store import PendingWorkClaimStore
 from ..ports.session_output import SessionOutput
 from ..ports.worktree_manager import WorktreeManager
 from .active_sessions import has_active_terminal
@@ -238,6 +240,10 @@ def handle_session_completion(  # noqa: C901, PLR0912 - handles validation, acti
     kill_session_fn: Callable[[str], None],
     config: Config,
     session_output: SessionOutput,
+    # Required, not defaulted: settling the pending-work claim is part of what
+    # completing a session MEANS, and a default let one completion path drift
+    # from the other (#6999 F9/A4).
+    pending_work_claims: PendingWorkClaimStore,
     pr_url_hint: Optional[str] = None,
     processing_errors: Optional[list[str]] = None,
     diagnostic_path: Optional[str] = None,
@@ -251,6 +257,10 @@ def handle_session_completion(  # noqa: C901, PLR0912 - handles validation, acti
     claim_manager: Optional["ClaimManager"] = None,
     events: Optional[EventSink] = None,
     publish_recovery: Optional["PublishRecoveryService"] = None,
+    # The typed provider verdict this session ended on (#6999). Carried rather
+    # than re-derived so the reaction owner can decline to mint a substance
+    # investigation for a credential outage.
+    provider_error_type: ProviderErrorType | None = None,
 ) -> None:
     """Handle session completion - moved from Orchestrator per method table.
 
@@ -276,6 +286,20 @@ def handle_session_completion(  # noqa: C901, PLR0912 - handles validation, acti
 
     # Remove by session name, NOT issue number - multiple sessions can share an issue number
     state.active_sessions = [s for s in state.active_sessions if s.terminal_id != session.terminal_id]
+
+    # Settle the claim this session took off a pending queue at launch (#6999
+    # F2/A1). One typed outcome for every terminal path: a session stopped by
+    # its provider never got to attempt the work, so its request goes back to
+    # its own queue with its full context and its full retry budget instead of
+    # being spent. Every other status - including an agent-reported BLOCKED -
+    # consumes it exactly as before. Issue sessions hold no claim (they are
+    # claimed by label) and settle to a no-op.
+    from .in_flight_work import InFlightWorkLedger, SettlementOutcome
+
+    InFlightWorkLedger(state, pending_work_claims).settle(
+        session,
+        SettlementOutcome.for_provider_error(provider_error_type),
+    )
 
     # Handle validation retry - queue for re-launch instead of normal completion
     if status == SessionStatus.NEEDS_VALIDATION_RETRY:
@@ -324,6 +348,9 @@ def handle_session_completion(  # noqa: C901, PLR0912 - handles validation, acti
             blocked_reason=blocked_reason,
             completion_detail=completion_detail,
             finalize_terminal=False,
+            # Routes a provider-caused block to the provider-impact owner
+            # rather than generic blocked handling (#6999 F5).
+            provider_error_type=provider_error_type,
         )
     finally:
         # Completion state is orchestrator-authoritative. Runtime session
@@ -465,6 +492,7 @@ def handle_session_completion(  # noqa: C901, PLR0912 - handles validation, acti
             session.worktree_path, run_dir, diagnostic_path, claude_log_path
         ),
         record=state.record_discovered_failure,
+        provider_error_type=provider_error_type,
     )
     if effective_status in (SessionStatus.FAILED, SessionStatus.TIMED_OUT):
         # Track failed issues to prevent immediate retry (cleared on cache refresh)
@@ -521,6 +549,7 @@ def process_active_sessions(
     worktree_manager: Optional[WorktreeManager],
     kill_session_fn: Callable[[str], None],
     config: Config,
+    pending_work_claims: PendingWorkClaimStore,
     completion_dispatcher: "CompletionDispatcher | None" = None,
     provider_resilience: "ProviderResilienceManager | None" = None,
     publish_recovery: "PublishRecoveryService | None" = None,
@@ -562,6 +591,7 @@ def process_active_sessions(
             session_output=session_controller.session_output,
             provider_resilience=provider_resilience,
             publish_recovery=publish_recovery,
+            pending_work_claims=pending_work_claims,
         )
 
     # Apply decisions that finished on a prior tick (background dispatcher)
@@ -673,6 +703,7 @@ def _apply_completed_decision(
     kill_session_fn: Callable[[str], None],
     config: Config,
     session_output: SessionOutput,
+    pending_work_claims: PendingWorkClaimStore,
     provider_resilience: "ProviderResilienceManager | None" = None,
     publish_recovery: "PublishRecoveryService | None" = None,
 ) -> None:
@@ -727,6 +758,8 @@ def _apply_completed_decision(
         blocked_reason=decision.blocked_reason,
         completion_detail=decision.completion_detail,
         publish_recovery=publish_recovery,
+        provider_error_type=decision.provider_error_type,
+        pending_work_claims=pending_work_claims,
     )
     elapsed = time.monotonic() - started
     if elapsed > 5:
@@ -753,4 +786,14 @@ def _record_provider_resilience_effects(
             failure.provider,
             error_summary=failure.error_summary,
             attempts=failure.attempts,
+        )
+    if decision.provider_auth_failure:
+        auth_failure = decision.provider_auth_failure
+        provider_resilience.record_auth_failure(
+            auth_failure.provider,
+            error_summary=auth_failure.error_summary,
+            # The credential sample this verdict was confirmed against. Sharing
+            # it with the launch-side check means one physical observation is
+            # counted once, not once per consumer (#6999 F2).
+            sample_id=auth_failure.sample_id,
         )

@@ -6,6 +6,25 @@ import shutil
 from pathlib import Path
 
 from ...adapters.git.git_cli import GitCLI, SubprocessCommandRunner
+from ...execution.agent_runner_providers import get_provider
+from ...ports.provider_resilience import ProviderErrorType
+
+
+AI_GATE_MESSAGE_SUMMARY_LIMIT = 240
+"""Maximum length of the actionable first line shown in startup summaries."""
+
+AI_GATE_CONSOLE_DETAILS_LIMIT = 2_000
+"""Maximum detail length for command surfaces without expandable diagnostics."""
+
+CLAUDE_GATE_PROVIDER = "claude-code"
+"""The provider adapter that owns interpretation of this gate's CLI output.
+
+The gate spawns the ``claude`` CLI, so the Claude Code provider adapter is the
+one that knows what its auth banners look like (#6999). The gate used to keep
+its own four-marker table, which had already drifted from the provider's: each
+side recognised banners the other missed, so an expiry that the gate caught at
+startup could still run a session to its 90-minute timeout, and vice versa.
+"""
 
 
 def _test_ai_gate_env(project_root: Path) -> dict[str, str]:
@@ -112,10 +131,119 @@ def _detect_blocked_from_output(output: str) -> bool:
     return any(ind in output_lower for ind in blocked_indicators)
 
 
+def _is_claude_auth_failure(output: str) -> bool:
+    """Ask the provider adapter whether this CLI output is an auth failure.
+
+    The gate carries no banner text of its own: it hands the raw output to the
+    provider that produced it and reads back a typed
+    :class:`ProviderErrorType`. Same owner the readiness probe and live-session
+    diagnosis consult, so a banner learned for one is known to all three.
+    """
+    return get_provider(CLAUDE_GATE_PROVIDER).classify_output(output) is (
+        ProviderErrorType.AUTH
+    )
+
+
+def _claude_process_failure_message(
+    *, returncode: int, stdout: str, stderr: str, work_repo: Path
+) -> str:
+    """Describe a Claude process failure without mislabeling it as a hook failure."""
+    output = stdout + stderr
+    if _is_claude_auth_failure(output):
+        summary = "Claude is not authenticated; run 'claude auth login'"
+        remediation = "Verify with 'claude auth status', then retry startup."
+    else:
+        summary = f"Claude AI gate could not run (exit {returncode})"
+        remediation = "Resolve the Claude CLI error below, then retry startup."
+
+    return (
+        f"{summary}\n"
+        f"{remediation}\n"
+        "The AI gate did not reach a result, so startup remains blocked.\n"
+        f"Work repo: {work_repo}\n"
+        f"Hooks dir exists: {(work_repo / '.claude' / 'hooks').exists()}\n"
+        f"Stdout ({len(stdout)} chars): {stdout[:500]}\n"
+        f"Stderr ({len(stderr)} chars): {stderr[:500]}"
+    )
+
+
+def evaluate_claude_ai_gate_result(
+    *, returncode: int, stdout: str, stderr: str, work_repo: Path
+) -> tuple[bool, str]:
+    """Classify Claude execution, provider, and hook outcomes for the AI gate.
+
+    A clean exit that reports the hook block is checked before the provider
+    auth question. The provider's table is broader than the four markers this
+    module used to keep — it also knows generic auth words like "forbidden" —
+    and Claude describing a blocked push is free to use them. A gate run that
+    produced its own success evidence is not an auth failure, whatever words
+    the report happens to contain.
+    """
+    output = stdout + stderr
+    if returncode != 0:
+        return False, _claude_process_failure_message(
+            returncode=returncode,
+            stdout=stdout,
+            stderr=stderr,
+            work_repo=work_repo,
+        )
+    if _detect_blocked_from_output(output):
+        return (
+            True,
+            "AI gate test passed: Claude was blocked from running --no-verify\n"
+            f"Output: {output[:500]}",
+        )
+    if _is_claude_auth_failure(output):
+        return False, _claude_process_failure_message(
+            returncode=returncode,
+            stdout=stdout,
+            stderr=stderr,
+            work_repo=work_repo,
+        )
+    return (
+        False,
+        "AI gate test FAILED: Claude did not report a hook block\n"
+        f"Exit code: {returncode}\n"
+        f"Work repo: {work_repo}\n"
+        f"Hooks dir exists: {(work_repo / '.claude' / 'hooks').exists()}\n"
+        f"Stdout ({len(stdout)} chars): {stdout[:500]}\n"
+        f"Stderr ({len(stderr)} chars): {stderr[:500]}",
+    )
+
+
+def summarize_ai_gate_message(message: str) -> str:
+    """Return one bounded, actionable line for startup and setup output.
+
+    Full provider diagnostics remain available in the AI gate's expandable
+    result. The startup error needs the first meaningful line intact rather
+    than an arbitrary character slice that can end in the middle of a fix.
+    """
+    first_line = next(
+        (line.strip() for line in message.splitlines() if line.strip()),
+        "AI gate failed without diagnostic output",
+    )
+    if len(first_line) <= AI_GATE_MESSAGE_SUMMARY_LIMIT:
+        return first_line
+    return first_line[: AI_GATE_MESSAGE_SUMMARY_LIMIT - 3].rstrip() + "..."
+
+
+def format_ai_gate_console_details(message: str) -> str:
+    """Return bounded detail lines for command surfaces without drill-down UI."""
+    meaningful_lines = [line.strip() for line in message.splitlines() if line.strip()]
+    details = "\n".join(meaningful_lines[1:])
+    if len(details) <= AI_GATE_CONSOLE_DETAILS_LIMIT:
+        return details
+    return details[: AI_GATE_CONSOLE_DETAILS_LIMIT - 3].rstrip() + "..."
+
+
 __all__ = [
+    "CLAUDE_GATE_PROVIDER",
     "_copy_hook_dir",
     "_detect_blocked_from_output",
     "_init_test_ai_gate_repo",
     "_synthesize_gate_settings",
     "_test_ai_gate_env",
+    "evaluate_claude_ai_gate_result",
+    "format_ai_gate_console_details",
+    "summarize_ai_gate_message",
 ]

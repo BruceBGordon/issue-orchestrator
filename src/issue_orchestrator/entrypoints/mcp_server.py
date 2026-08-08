@@ -272,6 +272,45 @@ class OrchestratorHttpClient:
         return None
 
 
+# The public MCP tool surface, declared as data rather than as a sequence of
+# registration calls. This is the inventory the stability doc
+# (``docs/user/stability.md``) publishes and that
+# ``tests/unit/test_public_api_surface_docs.py`` drift-tests, so a tool cannot
+# be added or removed without the documented surface moving with it.
+#
+# The surface is **experimental** during 0.x: names, arguments, and return
+# shapes may change in any release. See docs/user/stability.md.
+MCP_TOOLS: tuple[tuple[str, str], ...] = (
+    ("orchestrator.status", "tool_status"),
+    ("orchestrator.start", "tool_start"),
+    ("orchestrator.stop", "tool_stop"),
+    ("orchestrator.pause", "tool_pause"),
+    ("orchestrator.resume", "tool_resume"),
+    ("orchestrator.refresh", "tool_refresh"),
+    ("orchestrator.shutdown", "tool_shutdown"),
+    ("orchestrator.snapshot", "tool_snapshot"),
+    ("orchestrator.session.worktree", "tool_session_worktree"),
+    ("orchestrator.session.manifest", "tool_session_manifest"),
+    ("orchestrator.session.phases", "tool_session_phases"),
+    ("orchestrator.session.claude_log", "tool_session_claude_log"),
+    ("orchestrator.session.orchestrator_log", "tool_session_orchestrator_log"),
+    # orchestrator.session.send intentionally omitted — see module docstring.
+    # Any MCP client holding the transport could inject arbitrary text into a
+    # running agent's prompt via that tool.
+    ("orchestrator.session.kill", "tool_session_kill"),
+    ("orchestrator.session.focus", "tool_session_focus"),
+    ("orchestrator.urls", "tool_urls"),
+    ("orchestrator.doctor", "tool_doctor"),
+    # Unified dashboard tools
+    ("orchestrator.state", "tool_state"),
+    ("orchestrator.repos", "tool_repos"),
+    ("orchestrator.repos.start", "tool_repos_start"),
+    ("orchestrator.repos.stop", "tool_repos_stop"),
+)
+
+MCP_TOOL_NAMES: tuple[str, ...] = tuple(name for name, _ in MCP_TOOLS)
+
+
 class McpApp:
     def __init__(self, settings: McpSettings) -> None:
         self._settings = settings
@@ -310,31 +349,10 @@ class McpApp:
             }
 
     def register(self, server: FastMCP) -> None:
-        server.tool(name="orchestrator.status")(self.tool_status)
-        server.tool(name="orchestrator.start")(self.tool_start)
-        server.tool(name="orchestrator.stop")(self.tool_stop)
-        server.tool(name="orchestrator.pause")(self.tool_pause)
-        server.tool(name="orchestrator.resume")(self.tool_resume)
-        server.tool(name="orchestrator.refresh")(self.tool_refresh)
-        server.tool(name="orchestrator.shutdown")(self.tool_shutdown)
-        server.tool(name="orchestrator.snapshot")(self.tool_snapshot)
-        server.tool(name="orchestrator.session.worktree")(self.tool_session_worktree)
-        server.tool(name="orchestrator.session.manifest")(self.tool_session_manifest)
-        server.tool(name="orchestrator.session.phases")(self.tool_session_phases)
-        server.tool(name="orchestrator.session.claude_log")(self.tool_session_claude_log)
-        server.tool(name="orchestrator.session.orchestrator_log")(self.tool_session_orchestrator_log)
-        # orchestrator.session.send intentionally omitted — see module
-        # docstring. Any MCP client holding the transport could inject
-        # arbitrary text into a running agent's prompt via that tool.
-        server.tool(name="orchestrator.session.kill")(self.tool_session_kill)
-        server.tool(name="orchestrator.session.focus")(self.tool_session_focus)
-        server.tool(name="orchestrator.urls")(self.tool_urls)
-        server.tool(name="orchestrator.doctor")(self.tool_doctor)
-        # Unified dashboard tools
-        server.tool(name="orchestrator.state")(self.tool_state)
-        server.tool(name="orchestrator.repos")(self.tool_repos)
-        server.tool(name="orchestrator.repos.start")(self.tool_repos_start)
-        server.tool(name="orchestrator.repos.stop")(self.tool_repos_stop)
+        for tool_name, handler_name in MCP_TOOLS:
+            # getattr fails loudly if the table names a handler that no longer
+            # exists, so the declared surface cannot drift from the code.
+            server.tool(name=tool_name)(getattr(self, handler_name))
 
     async def tool_status(self) -> dict[str, Any]:
         return await self._safe("orchestrator.status", self.status)

@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Optional, cast
 from unittest.mock import MagicMock, patch
 
+from issue_orchestrator.domain.tech_lead_session import TechLeadCreationOrigin
 from issue_orchestrator.control.session_completion import (
     _apply_completed_decisions,
     _record_provider_resilience_effects,
@@ -32,7 +33,10 @@ from issue_orchestrator.control.session_decision import (
     ProviderTransientFailureDecision,
     SessionDecision,
 )
-from issue_orchestrator.control.session_launch_types import LaunchResult
+from issue_orchestrator.control.session_launch_types import (
+    LaunchDisposition,
+    LaunchResult,
+)
 from tests.callback_endpoint_helpers import ready_callback_endpoint
 from issue_orchestrator.control.session_launcher import (
     SessionLauncher,
@@ -41,11 +45,13 @@ from issue_orchestrator.control.session_launcher import (
 )
 from issue_orchestrator.control.isolation import GRADLE_USER_HOME_ENV
 from issue_orchestrator.control.session_review_support import build_review_existing_work
-from issue_orchestrator.control.session_routing import (
+from issue_orchestrator.control.pending_session_queues import (
     TECH_LEAD_LAUNCH_RETRY_LIMIT,
     PendingSessionQueues,
     TechLeadQueueOutcome,
     TechLeadRetentionOutcome,
+)
+from issue_orchestrator.control.session_routing import (
     orchestrator_launch_session,
     orchestrator_launch_review_session,
     orchestrator_launch_rework_session,
@@ -115,6 +121,7 @@ from issue_orchestrator.ports import (
     NullBoardSnapshotProvider,
     NullManifestDownloader,
 )
+from issue_orchestrator.ports.command_runner import OutputNewlines
 from issue_orchestrator.ports.board_snapshot_provider import BoardSnapshotProvider
 from issue_orchestrator.control.board_snapshot_builder import (
     BoardSnapshotBuilder,
@@ -340,6 +347,7 @@ class MockCommandRunner:
         env: dict[str, str] | None = None,
         timeout_seconds: int | None = None,
         shell: bool = False,
+        newlines: OutputNewlines = OutputNewlines.TRANSLATED,
     ) -> CommandResult:
         self.run_calls.append({"command": command, "cwd": cwd, "env": env, "shell": shell})
         if self._result_index < len(self.results):
@@ -1071,7 +1079,7 @@ class TestLaunchIssueSession:
 
         assert result.success is False
         assert "Terminal session already running" in result.reason
-        assert result.keep_queued is True
+        assert result.disposition is LaunchDisposition.EXISTING_TERMINAL
 
     def test_adds_in_progress_label(self, launcher_bundle, sample_issue, mock_repo_host):
         """Verify in-progress label is added."""
@@ -1488,7 +1496,7 @@ class TestLaunchIssueSession:
 
         Round-2 F1 regression wired end-to-end through the real ``GitHubAdapter``
         cache and ``GitStackPredecessorFactsProvider``: the recheck re-runs
-        ``evaluate_work_gate`` (session_launcher ``_verify_dependencies_fresh``),
+        ``evaluate_work_gate`` (``LaunchDependencyGate.verify_fresh``),
         which gathers PR-scoped review labels and then issue labels. Before the
         cache-owner fix, the first evaluation's empty issue-label refresh
         corrupted the cached PR's ``code-reviewed``, so this second (recheck)
@@ -1572,7 +1580,7 @@ class TestLaunchIssueSession:
         # Just-before-launch recheck with NO PR-label change must still pass —
         # the issue-label refresh during gather must not corrupt the cached PR —
         # and it resolves the predecessor branch as the successor's stack base.
-        freshness = launcher_bundle.launcher._verify_dependencies_fresh(issue)  # noqa: SLF001
+        freshness = launcher_bundle.launcher._dependency_gate.verify_fresh(issue)  # noqa: SLF001
         assert freshness.failure is None
         assert freshness.stack_base_branch == "200-base"
 
@@ -1585,7 +1593,7 @@ class TestLaunchIssueSession:
             adapter.remove_label(201, "code-reviewed")
 
         # Now the recheck must block the stale stack work.
-        result = launcher_bundle.launcher._verify_dependencies_fresh(issue)  # noqa: SLF001
+        result = launcher_bundle.launcher._dependency_gate.verify_fresh(issue)  # noqa: SLF001
         assert result.failure is not None
         assert result.failure.success is False
         assert "Dependencies not satisfied" in result.failure.reason
@@ -1737,7 +1745,7 @@ class TestLaunchReviewSession:
         assert "No repo configured" in result.reason
 
     def test_skips_when_terminal_already_running(self, launcher_bundle):
-        """Verify keeps queued when terminal exists (keep_queued=True)."""
+        """Verify keeps queued when terminal exists (EXISTING_TERMINAL)."""
         launcher_bundle.session_exists_override[0] = lambda name: name == "review-456"
         review = PendingReview(
             issue_key=GitHubIssueKey(repo="test/repo", external_id="123"),
@@ -1750,7 +1758,7 @@ class TestLaunchReviewSession:
         result = launcher_bundle.launcher.launch_review_session(review, active_sessions=[])
 
         assert result.success is False
-        assert result.keep_queued is True
+        assert result.disposition is LaunchDisposition.EXISTING_TERMINAL
 
     def test_triggers_review_state_machine(self, launcher_bundle):
         """Verify review state machine is triggered."""
@@ -2090,7 +2098,7 @@ class TestLaunchRetrospectiveReviewSession:
         )
 
         assert result.success is False
-        assert result.keep_queued is True
+        assert result.disposition is LaunchDisposition.EXISTING_TERMINAL
 
 
 # =============================================================================
@@ -2224,7 +2232,7 @@ class TestLaunchReworkSession:
         result = launcher_bundle.launcher.launch_rework_session(rework, active_sessions=[])
 
         assert result.success is False
-        assert result.keep_queued is True
+        assert result.disposition is LaunchDisposition.EXISTING_TERMINAL
 
     def test_updates_rework_cycle_label(self, launcher_bundle, mock_repo_host):
         """Verify rework cycle label is updated (lines 820-839)."""
@@ -2745,13 +2753,14 @@ class TestOrchestratorLaunchValidationRetrySession:
             state,
             launcher_bundle.launcher,
             MagicMock(),
+            _claims_store(),
         )
 
         assert result is not None
         assert [r.issue_number for r in state.pending_validation_retries] == [456]
         assert [s.terminal_id for s in state.active_sessions] == ["issue-123"]
 
-    def test_restores_keep_queued_retry_and_removes_pending(
+    def test_restores_existing_terminal_and_removes_pending(
         self,
         launcher_bundle,
         sample_issue,
@@ -2802,6 +2811,7 @@ class TestOrchestratorLaunchValidationRetrySession:
             state,
             launcher_bundle.launcher,
             mock_restorer,
+            _claims_store(),
         )
 
         assert result is restored
@@ -2826,7 +2836,7 @@ class TestOrchestratorLaunchReviewSession:
 
         mock_restorer = MagicMock()
 
-        result = orchestrator_launch_review_session(review, state, session_launcher, mock_restorer)
+        result = orchestrator_launch_review_session(review, state, session_launcher, mock_restorer, _claims_store())
 
         assert result is not None
         assert len(state.pending_reviews) == 0
@@ -2857,7 +2867,7 @@ class TestOrchestratorLaunchReviewSession:
         mock_restorer = MagicMock()
         mock_restorer.restore_known_terminal.return_value = []
 
-        result = orchestrator_launch_review_session(review, state, launcher_bundle.launcher, mock_restorer)
+        result = orchestrator_launch_review_session(review, state, launcher_bundle.launcher, mock_restorer, _claims_store())
 
         assert result is None
         mock_restorer.restore_known_terminal.assert_not_called()
@@ -2909,6 +2919,7 @@ class TestOrchestratorLaunchReviewSession:
             state,
             launcher_bundle.launcher,
             mock_restorer,
+            _claims_store(),
         )
 
         assert result is restored
@@ -2946,7 +2957,7 @@ class TestOrchestratorLaunchReworkSession:
 
         mock_restorer = MagicMock()
 
-        result = orchestrator_launch_rework_session(rework, state, session_launcher, mock_restorer)
+        result = orchestrator_launch_rework_session(rework, state, session_launcher, mock_restorer, _claims_store())
 
         assert result is not None
         assert len(state.pending_reworks) == 0
@@ -3048,7 +3059,7 @@ class TestPendingSessionQueuesTechLeadIntake:
         (entry,) = state.pending_tech_lead_reviews
         assert entry.flavor is TechLeadSessionFlavor.BATCH_REVIEW
 
-    def test_retain_tech_lead_for_retry_is_bounded_by_the_owner(self):
+    def test_tech_lead_retry_is_bounded_by_the_owner(self):
         """Retryable launch failures retain the item; the owner bounds retries.
 
         The queued investigation is the only cross-tick record, so retention is
@@ -3070,20 +3081,28 @@ class TestPendingSessionQueuesTechLeadIntake:
         )
 
         for attempt in range(1, TECH_LEAD_LAUNCH_RETRY_LIMIT):
-            assert queues.retain_tech_lead_for_retry(8) is TechLeadRetentionOutcome.RETAINED
+            plan = queues.plan_tech_lead_retry(8)
+            assert plan.outcome is TechLeadRetentionOutcome.RETAINED
+            # Planning alone changes nothing: the spend is not real until it has
+            # been made durable and then projected back here (#6999 F2).
+            (entry,) = state.pending_tech_lead_reviews
+            assert entry.retryable_launch_failures == attempt - 1
+            queues.apply_tech_lead_retry(plan)
             (entry,) = state.pending_tech_lead_reviews
             assert entry.retryable_launch_failures == attempt
 
-        assert queues.retain_tech_lead_for_retry(8) is TechLeadRetentionOutcome.EXHAUSTED
+        final = queues.plan_tech_lead_retry(8)
+        assert final.outcome is TechLeadRetentionOutcome.EXHAUSTED
+        queues.apply_tech_lead_retry(final)
         assert len(state.pending_tech_lead_reviews) == 1, (
             "EXHAUSTED must retain the record; the caller commits the drop only "
             "after the durable needs-human transition succeeds"
         )
 
-    def test_retain_tech_lead_for_retry_for_unqueued_issue_fails_fast(self):
+    def test_tech_lead_retry_for_unqueued_issue_fails_fast(self):
         """Retaining an item that is not queued is an upstream invariant bug."""
         with pytest.raises(ValueError, match="no such item is queued"):
-            PendingSessionQueues(OrchestratorState()).retain_tech_lead_for_retry(999)
+            PendingSessionQueues(OrchestratorState()).plan_tech_lead_retry(999)
 
     def test_remove_tech_lead_removes_only_matching_issue(self):
         """remove_tech_lead completes the owner lifecycle (#6768 round 4)."""
@@ -3147,6 +3166,7 @@ class TestOrchestratorLaunchTechLeadSession:
                 sample_config,
                 MagicMock(),
                 MagicMock(),
+                _claims_store(),
             )
 
     def test_raises_when_tech_lead_agent_not_in_config(self, sample_config):
@@ -3160,6 +3180,7 @@ class TestOrchestratorLaunchTechLeadSession:
                 sample_config,
                 MagicMock(),
                 MagicMock(),
+                _claims_store(),
             )
 
     @pytest.mark.parametrize(
@@ -3182,6 +3203,7 @@ class TestOrchestratorLaunchTechLeadSession:
             sample_config,
             launcher,
             MagicMock(),
+            _claims_store(),
         )
 
         call = launcher.launch_issue_session.call_args
@@ -3207,28 +3229,35 @@ class TestOrchestratorLaunchTechLeadSession:
         launcher = _stub_tech_lead_launcher(LaunchResult(session=session, success=True))
 
         result = orchestrator_launch_tech_lead_session(
-            state.pending_tech_lead_reviews[0], state, sample_config, launcher, MagicMock()
+            state.pending_tech_lead_reviews[0], state, sample_config, launcher, MagicMock(),
+            _claims_store(),
         )
 
         assert result is session
         assert state.pending_tech_lead_reviews == []
         assert state.active_sessions == [session]
 
-    def test_keep_queued_launch_retains_item_for_retry(self, sample_config):
-        """keep_queued (existing terminal, not yet restorable) retains the item.
+    def test_existing_terminal_launch_retains_item_for_retry(self, sample_config):
+        """EXISTING_TERMINAL (not yet restorable) retains the item.
 
-        (The other retention case is ``retry_queued`` — a transient
-        required-input prep failure — covered by the bounded-retention tests.)
+        (The other retention cases are ``RETRYABLE_FAILURE`` — a transient
+        required-input prep failure, or a terminal that never came up — covered
+        by the bounded-retention tests.)
         """
         sample_config.tech_lead_review_agent = "agent:web"
         state = OrchestratorState()
         PendingSessionQueues(state).queue_batch_review(789, "Tech Lead batch")
         launcher = _stub_tech_lead_launcher(
-            LaunchResult(session=None, success=False, keep_queued=True)
+            LaunchResult(
+                session=None,
+                success=False,
+                disposition=LaunchDisposition.EXISTING_TERMINAL,
+            )
         )
 
         result = orchestrator_launch_tech_lead_session(
-            state.pending_tech_lead_reviews[0], state, sample_config, launcher, MagicMock()
+            state.pending_tech_lead_reviews[0], state, sample_config, launcher, MagicMock(),
+            _claims_store(),
         )
 
         assert result is None
@@ -3252,7 +3281,8 @@ class TestOrchestratorLaunchTechLeadSession:
         launcher = _stub_tech_lead_launcher(LaunchResult(session=None, success=False))
 
         result = orchestrator_launch_tech_lead_session(
-            state.pending_tech_lead_reviews[0], state, sample_config, launcher, MagicMock()
+            state.pending_tech_lead_reviews[0], state, sample_config, launcher, MagicMock(),
+            _claims_store(),
         )
 
         assert result is None
@@ -3546,6 +3576,7 @@ class TestLaunchTechLeadIssueSessionFlavors:
             launcher_bundle.launcher.config,
             launcher_bundle.launcher,
             MagicMock(),
+            _claims_store(),
         )
         assert session is not None
         return session
@@ -3852,6 +3883,7 @@ class TestLaunchTechLeadIssueSessionFlavors:
                     body="Walk the floor",
                     labels=("agent:tech-lead", HEALTH_REVIEW_MARKER_LABEL),
                     pr_count=0,
+                    origin=TechLeadCreationOrigin.authors_anchor(),
                 )
             ],
             issue_number=905,
@@ -3921,6 +3953,7 @@ class TestLaunchTechLeadIssueSessionFlavors:
                 config,
                 launcher_bundle.launcher,
                 MagicMock(),
+                _claims_store(),
             )
             assert session is None
             assert len(state.pending_tech_lead_reviews) == 1, (
@@ -3947,6 +3980,7 @@ class TestLaunchTechLeadIssueSessionFlavors:
             config,
             launcher_bundle.launcher,
             MagicMock(),
+            _claims_store(),
         )
         assert session is None
         assert state.pending_tech_lead_reviews == []
@@ -3999,6 +4033,7 @@ class TestLaunchTechLeadIssueSessionFlavors:
                 config,
                 launcher_bundle.launcher,
                 MagicMock(),
+                _claims_store(),
             )
 
     @staticmethod
@@ -4121,6 +4156,7 @@ class TestLaunchTechLeadIssueSessionFlavors:
             config,
             launcher_bundle.launcher,
             MagicMock(),
+            _claims_store(),
         )
         assert state.pending_tech_lead_reviews == [], (
             "the drop must commit only after the durable transition succeeds"
@@ -4214,6 +4250,7 @@ class TestLaunchTechLeadIssueSessionFlavors:
             config,
             launcher_bundle.launcher,
             MagicMock(),
+            _claims_store(),
         )
 
         assert session is not None
@@ -4518,6 +4555,7 @@ class TestTechLeadProducerToLaunchBoundary:
             launcher_bundle.launcher.config,
             launcher_bundle.launcher,
             MagicMock(),
+            _claims_store(),
         )
         assert session is not None
         return session
@@ -4541,6 +4579,7 @@ class TestTechLeadProducerToLaunchBoundary:
                     body="Review these PRs",
                     labels=("agent:tech-lead",),
                     pr_count=5,
+                    origin=TechLeadCreationOrigin.authors_anchor(),
                 )
             ],
             issue_number=903,
@@ -4818,6 +4857,7 @@ class TestTechLeadProducerToLaunchBoundary:
                 labels=("agent:tech-lead", HEALTH_REVIEW_MARKER_LABEL),
                 pr_count=0,
                 storm_problems=cohort,
+                origin=TechLeadCreationOrigin.authors_anchor(),
             ),
             905,
             pre_crash_state,
@@ -5082,6 +5122,72 @@ class TestParseSessionRef:
 # =============================================================================
 
 
+def _claims_store(base=None):
+    """The orchestrator-owned claim store, rooted outside any worktree.
+
+    Defaults to a throwaway root for the launch tests that only assert queue
+    state; pass a real base when a test needs launch and settlement to share
+    one store (#6999 F7).
+    """
+    import tempfile
+
+    from issue_orchestrator.execution.pending_work_claim_store import (
+        SqlitePendingWorkClaimStore,
+    )
+
+    return SqlitePendingWorkClaimStore.for_repo(
+        Path(base) if base is not None else Path(tempfile.mkdtemp())
+    )
+
+
+def _no_claims_store():
+    """A claim ledger holding nothing, for terminals that took no work.
+
+    Restoration must read and enumerate, and must not write (#6999 F4/F8).
+    """
+
+    class _Empty:
+        def hold_pending_work_claim(self, run, claim) -> None:
+            raise AssertionError("restoration must not hold claims")
+
+        def defer_pending_work_claim(self, run) -> None:
+            raise AssertionError("restoration must not defer claims")
+
+        def consume_pending_work_claim(self, run) -> None:
+            raise AssertionError("restoration must not consume claims")
+
+        def look_up_pending_work_claim(self, run):
+            from issue_orchestrator.ports.pending_work_claim_store import (
+                ClaimLookup,
+                ClaimState,
+            )
+
+            return ClaimLookup(ClaimState.ABSENT)
+
+        def list_unresolved_claims(self):
+            return ()
+
+        def list_unreadable_claims(self):
+            return ()
+
+        def mark_deferred_by_run_key(self, run_key) -> None:
+            raise AssertionError("nothing to defer")
+
+        def run_key_for(self, run) -> str:
+            return str(run.run_dir)
+
+    return _Empty()
+
+
+def _no_quarantine():
+    """These terminals hold no claim, so none may be quarantined (#6999 F6)."""
+    owner = MagicMock()
+    owner.quarantine.side_effect = AssertionError(
+        "no terminal here holds a claim, so none may be quarantined"
+    )
+    return owner
+
+
 class TestRestoreRunningSessions:
     """Tests for restore_running_sessions function (line 1085)."""
 
@@ -5092,10 +5198,13 @@ class TestRestoreRunningSessions:
         mock_session.terminal_id = "issue-123"
         mock_restorer.restore_sessions.return_value = [mock_session]
 
-        active_sessions = []
+        state = OrchestratorState()
+        active_sessions = state.active_sessions
         running = [{"tab_name": "issue-123", "issue_number": 123}]
 
-        added = restore_running_sessions(running, active_sessions, mock_restorer)
+        added = restore_running_sessions(
+            running, state, mock_restorer, _no_claims_store(), _no_quarantine()
+        )
 
         assert added == [mock_session]
         assert len(active_sessions) == 1
@@ -5143,12 +5252,16 @@ class TestRestoreRunningSessions:
         )
         mock_restorer = MagicMock()
         mock_restorer.restore_sessions.return_value = [duplicate, new_session]
-        active_sessions = [existing]
+        state = OrchestratorState()
+        state.active_sessions.append(existing)
+        active_sessions = state.active_sessions
 
         added = restore_running_sessions(
             [{"tab_name": "issue-123"}, {"tab_name": "issue-456"}],
-            active_sessions,
+            state,
             mock_restorer,
+            _no_claims_store(),
+            _no_quarantine(),
         )
 
         assert added == [new_session]
@@ -5263,6 +5376,7 @@ class TestProcessActiveSessions:
             worktree_manager=None,
             kill_session_fn=lambda x: None,
             config=config,
+            pending_work_claims=_test_claim_store(),
         )
 
         # Session should still be in active list
@@ -5310,6 +5424,7 @@ class TestProcessActiveSessions:
             worktree_manager=None,
             kill_session_fn=MagicMock(),
             config=MagicMock(),
+            pending_work_claims=_test_claim_store(),
         )
 
         assert state.active_sessions == [session]
@@ -5363,6 +5478,7 @@ class TestProcessActiveSessions:
             worktree_manager=None,
             kill_session_fn=MagicMock(),
             config=MagicMock(),
+            pending_work_claims=_test_claim_store(),
         )
 
         assert captured_phase["value"] == "active_sessions:#392"
@@ -5419,7 +5535,7 @@ class TestProcessActiveSessions:
         mock_session_runner.session_exists_by_name.return_value = True
         observer = SessionObserver(
             MagicMock(),
-            FileSystemSessionOutput(),
+            _claims_store(),
             events=events,
             session_runner=mock_session_runner,
             repository_host=MagicMock(),
@@ -5443,6 +5559,7 @@ class TestProcessActiveSessions:
                 worktree_manager=None,
                 kill_session_fn=MagicMock(),
                 config=MagicMock(),
+                pending_work_claims=_test_claim_store(),
             )
 
         # Session stayed active because the controller deferred…
@@ -5532,6 +5649,7 @@ class TestProcessActiveSessions:
             worktree_manager=None,
             kill_session_fn=kill_session_fn,
             config=MagicMock(),
+            pending_work_claims=_test_claim_store(),
         )
 
         assert state.active_sessions == []
@@ -5657,6 +5775,7 @@ class TestProcessActiveSessions:
                 kill_session_fn=kill_session_fn,
                 config=MagicMock(),
                 completion_dispatcher=dispatcher,
+                pending_work_claims=_test_claim_store(),
             )
 
         # Tick 1: the decision is offloaded to the runner, NOT run inline — the
@@ -5803,6 +5922,7 @@ class TestProcessActiveSessions:
                 kill_session_fn=kill_session_fn,
                 config=MagicMock(),
                 completion_dispatcher=dispatcher,
+                pending_work_claims=_test_claim_store(),
             )
 
         # Tick 1: dispatch the decision (submit #1); nothing is decided yet.
@@ -5954,6 +6074,7 @@ class TestHandleSessionCompletion:
             kill_session_fn=lambda x: None,
             config=config,
             session_output=MagicMock(spec=SessionOutput),
+            pending_work_claims=_test_claim_store(),
         )
 
         assert len(state.active_sessions) == 0
@@ -6022,6 +6143,7 @@ class TestHandleSessionCompletion:
             config=config,
             session_output=session_output,
             diagnostic_path=diagnostic_path,
+            pending_work_claims=_test_claim_store(),
         )
 
         assert len(state.discovered_failures) == 1
@@ -6153,6 +6275,7 @@ class TestHandleSessionCompletion:
             kill_session_fn=lambda _name: calls.append("kill"),
             config=MagicMock(),
             session_output=session_output,
+            pending_work_claims=_test_claim_store(),
         )
 
         assert calls == ["process_completion", "kill", "actions"]
@@ -6217,6 +6340,7 @@ class TestHandleSessionCompletion:
             kill_session_fn=lambda _name: None,
             config=MagicMock(),
             session_output=session_output,
+            pending_work_claims=_test_claim_store(),
         )
 
         session_output.find_run_dir.assert_not_called()
@@ -6282,6 +6406,7 @@ class TestHandleSessionCompletion:
             kill_session_fn=lambda _name: calls.append("kill"),
             config=MagicMock(),
             session_output=session_output,
+            pending_work_claims=_test_claim_store(),
         )
 
         assert calls == ["process_completion", "kill", "actions"]
@@ -6352,6 +6477,7 @@ class TestHandleSessionCompletion:
             config=MagicMock(),
             session_output=session_output,
             completion_detail=completion_detail,
+            pending_work_claims=_test_claim_store(),
         )
 
         assert len(state.pending_reworks) == 1
@@ -6436,6 +6562,7 @@ class TestHandleSessionCompletion:
                 kill_session_fn=kill_session,
                 config=MagicMock(),
                 session_output=MagicMock(spec=SessionOutput),
+                pending_work_claims=_test_claim_store(),
             )
 
         assert state.active_sessions == []
@@ -6498,6 +6625,7 @@ class TestHandleSessionCompletion:
             kill_session_fn=lambda x: None,
             config=config,
             session_output=MagicMock(spec=SessionOutput),
+            pending_work_claims=_test_claim_store(),
         )
 
         assert len(state.discovered_reviews) == 1
@@ -6558,6 +6686,7 @@ class TestHandleSessionCompletion:
             session_output=MagicMock(spec=SessionOutput),
             blocked_label="blocked-upstream",
             blocked_reason="Waiting for external API",
+            pending_work_claims=_test_claim_store(),
         )
 
         mock_completion_handler.process_completion.assert_called_once()
@@ -6976,3 +7105,17 @@ class TestStackRelaunchGate:
         assert result.success is False
         assert mock_worktree_manager.create_calls == []
         assert any(str(e.name) == "issue.dependency_blocked" for e in mock_events.events)
+
+
+def _test_claim_store(tmp_path=None):
+    """The orchestrator-owned claim store completion now requires (#6999 F9)."""
+    import tempfile
+    from pathlib import Path as _Path
+
+    from issue_orchestrator.execution.pending_work_claim_store import (
+        SqlitePendingWorkClaimStore,
+    )
+
+    return SqlitePendingWorkClaimStore.for_repo(
+        _Path(tmp_path) if tmp_path is not None else _Path(tempfile.mkdtemp())
+    )

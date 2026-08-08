@@ -1235,7 +1235,73 @@ class GitHubHttpClient:
                     issue_number=issue_number,
                 )
 
+    def issue_closed_on_or_after(self, issue_number: int, timestamp: str) -> bool:
+        """Return True if the issue has a ``closed`` event at/after ``timestamp``.
+
+        Paginates ``/issues/{n}/events`` with the same fail-loud contract as
+        ``issue_comment_marker_present``: a short/empty page is the only clean
+        "no such event" answer; a malformed body or a scan that exceeds the
+        page cap raises rather than reporting absence from a truncated read —
+        the caller decides a destructive write (close-on-merge fallback) on
+        this fact. Timestamps are GitHub's own ISO-8601 UTC strings on both
+        sides, so lexicographic comparison is chronological. Not ETag-cached:
+        transition evidence must not come from a stale page.
+        """
+        page = 1
+        while True:
+            payload = self._request_json(
+                "GET",
+                f"/repos/{self._config.repo}/issues/{issue_number}/events",
+                params={"per_page": 100, "page": page},
+                caller="issue_closed_on_or_after",
+                use_cache=False,
+            )
+            if not isinstance(payload, list):
+                raise GitHubHttpError(
+                    f"Event listing for #{issue_number} page {page} was not a "
+                    f"list ({type(payload).__name__}); cannot confirm close-"
+                    f"event absence",
+                    issue_number=issue_number,
+                )
+            if not payload:
+                return False
+            for event in payload:
+                if not isinstance(event, dict):
+                    continue
+                if event.get("event") != "closed":
+                    continue
+                created_at = event.get("created_at")
+                if isinstance(created_at, str) and created_at >= timestamp:
+                    return True
+            if len(payload) < 100:
+                return False
+            page += 1
+            if page > _MARKER_SCAN_PAGE_CAP:
+                raise GitHubHttpError(
+                    f"Issue event scan for #{issue_number} exceeded "
+                    f"{_MARKER_SCAN_PAGE_CAP} pages without reaching the final "
+                    f"page; cannot confirm close-event absence",
+                    issue_number=issue_number,
+                )
+
     # -------------------- Git refs / commits --------------------
+
+    def get_repository(self) -> dict[str, Any]:
+        """The repository payload (default branch, permissions, feature flags).
+
+        Used by finding promotion's startup writability check (#6957): the
+        ``permissions`` block reports what the token can actually do, so a
+        misrouted or unauthorized target fails at startup rather than on the
+        tick a pattern finally becomes promotable.
+        """
+        payload = self._request_json(
+            "GET",
+            f"/repos/{self._config.repo}",
+            caller="get_repository",
+        )
+        if not isinstance(payload, dict):
+            raise GitHubHttpError("GitHub repository payload was not an object")
+        return payload
 
     def get_default_branch(self) -> str:
         payload = self._request_json(
@@ -1869,6 +1935,72 @@ class GitHubHttpClient:
             remaining -= len(nodes)
 
         return all_prs
+
+    def get_closing_pull_request(self, issue_number: int) -> dict[str, Any] | None:
+        """The pull request GitHub records as having CLOSED *issue_number*.
+
+        Authoritative linkage, not text association: the issue's ``ClosedEvent``
+        names its ``closer``, which is a pull request only when GitHub itself
+        resolved a closing keyword (or an equivalent link). ``get_prs_for_issue``
+        cannot answer this — it is a search for PRs that merely MENTION the
+        number, so any merged PR quoting ``#501`` would look like the fix that
+        shipped it (#6957 review F4).
+
+        Returns ``{"url", "number", "merged"}`` for that PR, or None when the
+        issue is open, was closed by a human/commit/another issue, or the
+        closing event carries no pull request.
+
+        Only the NEWEST ``ClosedEvent`` is consulted — the one that produced the
+        issue's current closed state. An issue can be closed by a merged PR,
+        reopened, and later closed by hand; falling back to the older PR-backed
+        close would report that stale merge as the outcome and mark a manual
+        decline as shipped (#6957 round-2 review F4).
+        """
+        owner, repo = self._config.repo.split("/", 1)
+        query = """
+        query($owner: String!, $repo: String!, $number: Int!) {
+            repository(owner: $owner, name: $repo) {
+                issue(number: $number) {
+                    timelineItems(last: 1, itemTypes: [CLOSED_EVENT]) {
+                        nodes {
+                            ... on ClosedEvent {
+                                closer {
+                                    ... on PullRequest {
+                                        number
+                                        url
+                                        merged
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        """
+        result = self._graphql(
+            query,
+            {"owner": owner, "repo": repo, "number": issue_number},
+            caller="get_closing_pull_request",
+        )
+        issue = (
+            (result.get("data") or {}).get("repository", {}) or {}
+        ).get("issue") or {}
+        nodes = (issue.get("timelineItems") or {}).get("nodes") or []
+        if not nodes:
+            return None
+        # ``last: 1`` already asks GitHub for only the newest close; index
+        # defensively in case a caller/mock supplies more, and NEVER fall
+        # through to an older event when this one has no PR closer.
+        newest = nodes[-1]
+        closer = newest.get("closer") if isinstance(newest, dict) else None
+        if not isinstance(closer, dict) or not closer.get("number"):
+            return None
+        return {
+            "number": int(closer["number"]),
+            "url": str(closer.get("url") or ""),
+            "merged": bool(closer.get("merged")),
+        }
 
     def get_prs_for_issue(self, issue_number: int) -> list[dict[str, Any]]:
         # GitHub's search API rejects queries without an `is:` qualifier with

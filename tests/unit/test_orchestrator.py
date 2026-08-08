@@ -20,6 +20,11 @@ from issue_orchestrator.domain.models import (
     ORCHESTRATOR_PR_MARKER,
 )
 from issue_orchestrator.domain.issue_key import FakeIssueKey
+from issue_orchestrator.domain.tech_lead_run import IssueInvestigationScope
+from issue_orchestrator.domain.tech_lead_session import (
+    TechLeadLaunchScope,
+    TechLeadSessionFlavor,
+)
 from issue_orchestrator.domain.session_key import SessionKey, TaskKind
 from issue_orchestrator.infra.config import Config
 from issue_orchestrator.control.scheduler import Scheduler
@@ -220,16 +225,24 @@ def test_terminate_tech_lead_session_is_behavior_complete(sample_config, tmp_pat
     tech_lead = SimpleNamespace(
         terminal_id="tech-lead-77", issue=SimpleNamespace(number=77), lease_id="lease-1",
         scratch_worktree=True, worktree_path=scratch,
+        tech_lead_scope=TechLeadLaunchScope(
+            flavor=TechLeadSessionFlavor.FAILURE_INVESTIGATION
+        ),
     )
     other = SimpleNamespace(
         terminal_id="issue-88", issue=SimpleNamespace(number=88), lease_id=None,
-        scratch_worktree=False, worktree_path=None,
+        scratch_worktree=False, worktree_path=None, tech_lead_scope=None,
     )
     orchestrator.state.active_sessions = [tech_lead, other]
+    # The run this session holds across engines — termination owns BOTH
+    # coordination layers, so it must go back too (#6994 round 2 F10).
+    assert orchestrator.deps.run_ownership.claim(IssueInvestigationScope(77)).owned
 
     outcome = orchestrator.terminate_tech_lead_session(tech_lead)
 
     assert outcome.clean is True  # every effect succeeded
+    assert outcome.run_released is True
+    assert orchestrator.deps.run_ownership.owns("issue:77") is False
     # State machine terminalized (removed)...
     smm.remove_session_machine.assert_called_once_with("tech-lead-77")
     # ...terminal stopped through the real session-routing boundary...
@@ -309,6 +322,10 @@ def test_composed_one_shot_timeout_terminates_via_real_driver_and_facade(
     that separate unit tests with a fake host could not catch. No live GitHub."""
     from issue_orchestrator.control.tech_lead_trigger import run_targeted_investigations
 
+    # A tech lead agent must be configured: the one-shot CLI now shares the
+    # dashboard's admission owner, which refuses a repository without one
+    # (#6994 round 1 F2).
+    sample_config.tech_lead_review_agent = "agent:tech-lead"
     orchestrator = create_test_orchestrator(sample_config)
     session_manager = MagicMock()
     claim_manager = MagicMock()
@@ -343,7 +360,9 @@ def test_composed_one_shot_timeout_terminates_via_real_driver_and_facade(
     orchestrator.tick = lambda: True  # never drains the session -> forces timeout
     orchestrator.pause = lambda: None
 
-    clock = iter([0, 0, 0, 9_999])  # observed_at, deadline, check#1, check#2 (past)
+    # deadline, then the poll checks; the tail stays past the deadline so the
+    # drive loop terminates deterministically however often it samples.
+    clock = iter([0, 0] + [9_999] * 8)
     results = run_targeted_investigations(
         orchestrator, [77], now=lambda: next(clock), sleep=lambda _s: None, timeout_s=1
     )
@@ -1009,8 +1028,15 @@ class TestLaunchSession:
     ):
         """Review tab names resolve to review-PR ids when deciding if tracked."""
         orchestrator = create_test_orchestrator(sample_config, mock_repository_host)
+        from tests.unit.session_run_helpers import make_session_run_assets
+
         existing = MagicMock(spec=Session)
         existing.terminal_id = "review-456"
+        # An active session always carries typed run assets; the ledger sweep
+        # that now runs on every reconcile reads its run key (#6999 F8).
+        existing.run_assets = make_session_run_assets(
+            sample_config.repo_root, session_name="review-456"
+        )
         orchestrator.state.active_sessions = [existing]
         orchestrator.deps.runner.discover_running_sessions = MagicMock(return_value=[
             {"issue_number": 100, "tab_name": "#100 Review PR #456", "is_review": True}
@@ -3934,3 +3960,157 @@ def test_full_deps_publish_recovery_reconciles_through_shared_action_applier(sam
         and action.label == deps.label_manager.pr_pending
         for action in applied
     ), "publish recovery must apply labels through deps.action_applier"
+
+
+class TestPublicCompletionFacadeSettlesClaims:
+    """Both completion paths must settle the pending-work claim (#6999 F9).
+
+    The periodic processing path injected the claim store; the public facade
+    did not. A queued session completing through the facade therefore removed
+    itself from active_sessions and then failed while settling, leaving state
+    half-mutated and the two paths behaving differently. These tests drive the
+    facade itself, because the boundary tests pass the store explicitly to the
+    control function and cannot see the wiring.
+    """
+
+    def _claimed_session(self, orchestrator, tmp_path: Path):
+        from issue_orchestrator.control.in_flight_work import InFlightWorkLedger
+        from issue_orchestrator.domain.issue_key import FakeIssueKey
+        from issue_orchestrator.domain.models import PendingReview
+        from issue_orchestrator.domain.pending_work import (
+            PendingWorkClaim,
+            PendingWorkKind,
+        )
+
+        issue = create_issue(1)
+        session = create_session(issue)
+        from tests.unit.session_run_helpers import make_session_run_assets
+
+        session.run_assets = make_session_run_assets(
+            tmp_path / "wt", session_name=session.terminal_id
+        )
+        claim = PendingWorkClaim(
+            PendingWorkKind.REVIEW,
+            PendingReview(
+                issue_key=FakeIssueKey(name="1"),
+                pr_number=70,
+                pr_url="url",
+                branch_name="branch",
+                _issue_number=1,
+                agent_label="agent:backend",
+            ),
+        )
+        orchestrator.state.active_sessions.append(session)
+        InFlightWorkLedger(
+            orchestrator.state, orchestrator.deps.pending_work_claims
+        ).take(session, claim)
+        return session
+
+    def test_facade_returns_provider_deferred_work_to_its_queue(
+        self, sample_config, tmp_path: Path
+    ):
+        from issue_orchestrator.ports.provider_resilience import ProviderErrorType
+
+        orchestrator = create_test_orchestrator(sample_config)
+        session = self._claimed_session(orchestrator, tmp_path)
+
+        orchestrator.handle_session_completion(
+            session,
+            SessionStatus.BLOCKED,
+            provider_error_type=ProviderErrorType.AUTH,
+        )
+
+        assert [r.pr_number for r in orchestrator.state.pending_reviews] == [70]
+
+    def test_facade_consumes_the_claim_on_a_real_work_outcome(
+        self, sample_config, tmp_path: Path
+    ):
+        orchestrator = create_test_orchestrator(sample_config)
+        session = self._claimed_session(orchestrator, tmp_path)
+
+        orchestrator.handle_session_completion(session, SessionStatus.COMPLETED)
+
+        assert orchestrator.state.pending_reviews == []
+        assert orchestrator.deps.pending_work_claims.list_unresolved_claims() == ()
+
+
+class TestReconcileSweepsThePendingWorkLedger:
+    """The runtime reconcile must sweep even with nothing untracked (#6999 F8).
+
+    The two early returns in ``_reconcile_running_sessions`` used to skip
+    recovery entirely, and the ledger rows that recovery exists for belong to
+    runs whose terminals are already gone - so those are exactly the branches
+    where the row is the only remaining record of the work. Driven through the
+    real facade so either return regaining its short-circuit fails here.
+    """
+
+    def _seed_unresolved_claim(self, orchestrator, tmp_path: Path):
+        from issue_orchestrator.domain.models import (
+            DiscoveredFailure,
+            PendingTechLeadReview,
+        )
+        from issue_orchestrator.domain.pending_work import (
+            PendingWorkClaim,
+            PendingWorkKind,
+        )
+        from issue_orchestrator.domain.tech_lead_session import TechLeadSessionFlavor
+        from tests.unit.session_run_helpers import make_session_run_assets
+
+        claim = PendingWorkClaim(
+            PendingWorkKind.TECH_LEAD,
+            PendingTechLeadReview(
+                issue_number=7,
+                title="Investigate: session failed",
+                flavor=TechLeadSessionFlavor.FAILURE_INVESTIGATION,
+                failure=DiscoveredFailure(7, "Test", "failed", blocking_label="blocked-failed"),
+            ),
+        )
+        orchestrator.deps.pending_work_claims.hold_pending_work_claim(
+            make_session_run_assets(tmp_path / "gone-wt", session_name="issue-7"),
+            claim,
+            issue_number=7,
+        )
+
+    def _force_scan(self, orchestrator):
+        orchestrator._last_orphan_reconcile_scan_at = 0.0  # noqa: SLF001
+        orchestrator._last_orphan_reconcile_active_count = -1  # noqa: SLF001
+
+    def test_nothing_discovered_still_recovers_the_work(
+        self, sample_config, mock_repository_host, tmp_path: Path
+    ):
+        orchestrator = create_test_orchestrator(sample_config, mock_repository_host)
+        self._seed_unresolved_claim(orchestrator, tmp_path)
+        orchestrator.deps.runner.discover_running_sessions = MagicMock(return_value=[])
+        self._force_scan(orchestrator)
+
+        orchestrator._reconcile_running_sessions()  # noqa: SLF001
+
+        assert [
+            t.issue_number for t in orchestrator.state.pending_tech_lead_reviews
+        ] == [7]
+
+    def test_everything_already_tracked_still_recovers_the_work(
+        self, sample_config, mock_repository_host, tmp_path: Path
+    ):
+        """The other early return: discovery found only terminals we track."""
+        from tests.unit.session_run_helpers import make_session_run_assets
+
+        orchestrator = create_test_orchestrator(sample_config, mock_repository_host)
+        self._seed_unresolved_claim(orchestrator, tmp_path)
+        tracked = MagicMock(spec=Session)
+        tracked.terminal_id = "issue-99"
+        tracked.run_assets = make_session_run_assets(
+            tmp_path / "live-wt", session_name="issue-99"
+        )
+        orchestrator.state.active_sessions = [tracked]
+        orchestrator.deps.runner.discover_running_sessions = MagicMock(return_value=[
+            {"issue_number": 99, "tab_name": "issue-99", "is_review": False,
+             "session_name": "issue-99"}
+        ])
+        self._force_scan(orchestrator)
+
+        orchestrator._reconcile_running_sessions()  # noqa: SLF001
+
+        assert [
+            t.issue_number for t in orchestrator.state.pending_tech_lead_reviews
+        ] == [7]

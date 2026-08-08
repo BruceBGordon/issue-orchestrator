@@ -20,6 +20,12 @@ Canonical source: `src/issue_orchestrator/infra/sqlite_registry.py`
 - **Provider Circuit**: `.issue-orchestrator/state/provider_circuit.sqlite`
   - Code: `src/issue_orchestrator/execution/provider_circuit_store.py`
 
+- **Pending Work Claims**: `.issue-orchestrator/state/pending_work_claims.sqlite`
+  - Code: `src/issue_orchestrator/execution/pending_work_claim_store.py`
+  - Authoritative record of queued work that has left its in-memory pending
+    queue (held / deferred), plus the quarantine markers for runs whose claim
+    could not be read. Deliberately outside every agent-writable worktree.
+
 - **Queue Cache**: `.issue-orchestrator/state/queue_cache.sqlite`
   - Code: `src/issue_orchestrator/execution/queue_cache_store.py`
 

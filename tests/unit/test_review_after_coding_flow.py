@@ -45,6 +45,7 @@ from issue_orchestrator.control.scheduler import Scheduler
 from issue_orchestrator.ports.session_output import SessionOutput
 from issue_orchestrator.control.workflows.review_workflow import ReviewDecision
 from issue_orchestrator.ports import NullEventSink
+from tests.conftest import make_provider_availability
 from tests.unit.session_run_helpers import make_session_run_assets
 
 
@@ -92,6 +93,7 @@ def make_completion_handler(config: Config, repository_host) -> CompletionHandle
             is_enabled=lambda: config.tech_lead.dedup.enabled,
         ),
         active_session_run_id=lambda _n: None,
+        provider_availability=make_provider_availability(config),
     )
 
 
@@ -181,6 +183,7 @@ class TestReviewAfterCodingFlow:
             kill_session_fn=lambda x: None,
             config=config,
             session_output=MagicMock(spec=SessionOutput),
+            pending_work_claims=_test_claim_store(),
         )
 
         assert len(state.discovered_reviews) == 1, (
@@ -216,6 +219,7 @@ class TestReviewAfterCodingFlow:
             config=config,
             session_output=MagicMock(spec=SessionOutput),
             review_exchange_completed=False,
+            pending_work_claims=_test_claim_store(),
         )
 
         assert len(state.discovered_reviews) == 1
@@ -259,6 +263,7 @@ class TestReviewAfterCodingFlow:
             config=config,
             session_output=MagicMock(spec=SessionOutput),
             review_exchange_completed=True,
+            pending_work_claims=_test_claim_store(),
         )
 
         assert len(state.discovered_reviews) == 0
@@ -401,6 +406,7 @@ class TestReviewNotQueuedWhenConditionsNotMet:
             kill_session_fn=lambda x: None,
             config=config,
             session_output=MagicMock(spec=SessionOutput),
+            pending_work_claims=_test_claim_store(),
         )
 
         assert len(state.discovered_reviews) == 0, (
@@ -449,6 +455,7 @@ class TestReviewNotQueuedWhenConditionsNotMet:
             kill_session_fn=lambda x: None,
             config=config,
             session_output=MagicMock(spec=SessionOutput),
+            pending_work_claims=_test_claim_store(),
         )
 
         assert len(state.discovered_reviews) == 0, (
@@ -493,8 +500,23 @@ class TestReviewNotQueuedWhenConditionsNotMet:
             kill_session_fn=lambda x: None,
             config=config,
             session_output=MagicMock(spec=SessionOutput),
+            pending_work_claims=_test_claim_store(),
         )
 
         assert len(state.discovered_reviews) == 0, (
             "No review should be queued when code_review_agent not configured"
         )
+
+
+def _test_claim_store(tmp_path=None):
+    """The orchestrator-owned claim store completion now requires (#6999 F9)."""
+    import tempfile
+    from pathlib import Path as _Path
+
+    from issue_orchestrator.execution.pending_work_claim_store import (
+        SqlitePendingWorkClaimStore,
+    )
+
+    return SqlitePendingWorkClaimStore.for_repo(
+        _Path(tmp_path) if tmp_path is not None else _Path(tempfile.mkdtemp())
+    )

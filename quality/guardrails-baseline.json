@@ -56,6 +56,14 @@
       "rule_id": "control_policy_branch_sites",
       "value": 35
     },
+    "control_policy_branch_sites:src/issue_orchestrator/control/completion_history_status.py": {
+      "detail": "4 branch site(s) mention lifecycle/control terms",
+      "kind": "control_policy_branch_sites",
+      "metric_id": "src/issue_orchestrator/control/completion_history_status.py",
+      "path": "src/issue_orchestrator/control/completion_history_status.py",
+      "rule_id": "control_policy_branch_sites",
+      "value": 4
+    },
     "control_policy_branch_sites:src/issue_orchestrator/control/completion_pr_collision.py": {
       "detail": "1 branch site(s) mention lifecycle/control terms",
       "kind": "control_policy_branch_sites",
@@ -185,12 +193,12 @@
       "value": 5
     },
     "control_policy_branch_sites:src/issue_orchestrator/control/planner.py": {
-      "detail": "24 branch site(s) mention lifecycle/control terms",
+      "detail": "11 branch site(s) mention lifecycle/control terms",
       "kind": "control_policy_branch_sites",
       "metric_id": "src/issue_orchestrator/control/planner.py",
       "path": "src/issue_orchestrator/control/planner.py",
       "rule_id": "control_policy_branch_sites",
-      "value": 24
+      "value": 11
     },
     "control_policy_branch_sites:src/issue_orchestrator/control/pr_scanner.py": {
       "detail": "6 branch site(s) mention lifecycle/control terms",
@@ -201,12 +209,12 @@
       "value": 6
     },
     "control_policy_branch_sites:src/issue_orchestrator/control/provider_availability.py": {
-      "detail": "3 branch site(s) mention lifecycle/control terms",
+      "detail": "7 branch site(s) mention lifecycle/control terms",
       "kind": "control_policy_branch_sites",
       "metric_id": "src/issue_orchestrator/control/provider_availability.py",
       "path": "src/issue_orchestrator/control/provider_availability.py",
       "rule_id": "control_policy_branch_sites",
-      "value": 3
+      "value": 7
     },
     "control_policy_branch_sites:src/issue_orchestrator/control/provider_command_wrapper.py": {
       "detail": "1 branch site(s) mention lifecycle/control terms",
@@ -215,6 +223,14 @@
       "path": "src/issue_orchestrator/control/provider_command_wrapper.py",
       "rule_id": "control_policy_branch_sites",
       "value": 1
+    },
+    "control_policy_branch_sites:src/issue_orchestrator/control/provider_impact.py": {
+      "detail": "6 branch site(s) mention lifecycle/control terms",
+      "kind": "control_policy_branch_sites",
+      "metric_id": "src/issue_orchestrator/control/provider_impact.py",
+      "path": "src/issue_orchestrator/control/provider_impact.py",
+      "rule_id": "control_policy_branch_sites",
+      "value": 6
     },
     "control_policy_branch_sites:src/issue_orchestrator/control/publish_recovery.py": {
       "detail": "13 branch site(s) mention lifecycle/control terms",
@@ -1216,6 +1232,14 @@
       "rule_id": "control_policy_branch_sites",
       "value": 3
     },
+    "control_policy_branch_sites:src/issue_orchestrator/static/js/dashboard/provider_circuit.js": {
+      "detail": "4 branch site(s) mention lifecycle/control terms",
+      "kind": "control_policy_branch_sites",
+      "metric_id": "src/issue_orchestrator/static/js/dashboard/provider_circuit.js",
+      "path": "src/issue_orchestrator/static/js/dashboard/provider_circuit.js",
+      "rule_id": "control_policy_branch_sites",
+      "value": 4
+    },
     "control_policy_branch_sites:src/issue_orchestrator/static/js/dashboard/session_dialogs.js": {
       "detail": "7 branch site(s) mention lifecycle/control terms",
       "kind": "control_policy_branch_sites",
@@ -1312,6 +1336,14 @@
       "rule_id": "control_policy_branch_sites",
       "value": 5
     },
+    "control_policy_branch_sites:src/issue_orchestrator/view_models/provider_circuit.py": {
+      "detail": "5 branch site(s) mention lifecycle/control terms",
+      "kind": "control_policy_branch_sites",
+      "metric_id": "src/issue_orchestrator/view_models/provider_circuit.py",
+      "path": "src/issue_orchestrator/view_models/provider_circuit.py",
+      "rule_id": "control_policy_branch_sites",
+      "value": 5
+    },
     "oversized_control_hotspots:src/issue_orchestrator/control/action_applier.py": {
       "detail": "1802 lines exceeds budget 800",
       "kind": "file_line_budget",
@@ -1319,14 +1351,6 @@
       "path": "src/issue_orchestrator/control/action_applier.py",
       "rule_id": "oversized_control_hotspots",
       "value": 1802
-    },
-    "oversized_control_hotspots:src/issue_orchestrator/control/actions.py": {
-      "detail": "803 lines exceeds budget 800",
-      "kind": "file_line_budget",
-      "metric_id": "src/issue_orchestrator/control/actions.py",
-      "path": "src/issue_orchestrator/control/actions.py",
-      "rule_id": "oversized_control_hotspots",
-      "value": 803
     },
     "oversized_control_hotspots:src/issue_orchestrator/control/awaiting_merge_reconciler.py": {
       "detail": "963 lines exceeds budget 800",
@@ -1377,12 +1401,12 @@
       "value": 1474
     },
     "oversized_control_hotspots:src/issue_orchestrator/control/planner.py": {
-      "detail": "1805 lines exceeds budget 800",
+      "detail": "1770 lines exceeds budget 800",
       "kind": "file_line_budget",
       "metric_id": "src/issue_orchestrator/control/planner.py",
       "path": "src/issue_orchestrator/control/planner.py",
       "rule_id": "oversized_control_hotspots",
-      "value": 1805
+      "value": 1770
     },
     "oversized_control_hotspots:src/issue_orchestrator/control/session_controller.py": {
       "detail": "1910 lines exceeds budget 800",
@@ -1569,12 +1593,12 @@
       "value": 1274
     },
     "oversized_control_hotspots:src/issue_orchestrator/infra/orchestrator.py": {
-      "detail": "1145 lines exceeds budget 800",
+      "detail": "1136 lines exceeds budget 800",
       "kind": "file_line_budget",
       "metric_id": "src/issue_orchestrator/infra/orchestrator.py",
       "path": "src/issue_orchestrator/infra/orchestrator.py",
       "rule_id": "oversized_control_hotspots",
-      "value": 1145
+      "value": 1136
     },
     "oversized_control_hotspots:src/issue_orchestrator/infra/supervisor.py": {
       "detail": "984 lines exceeds budget 800",
@@ -1585,12 +1609,12 @@
       "value": 984
     },
     "oversized_control_hotspots:src/issue_orchestrator/view_models/dashboard.py": {
-      "detail": "1482 lines exceeds budget 800",
+      "detail": "1460 lines exceeds budget 800",
       "kind": "file_line_budget",
       "metric_id": "src/issue_orchestrator/view_models/dashboard.py",
       "path": "src/issue_orchestrator/view_models/dashboard.py",
       "rule_id": "oversized_control_hotspots",
-      "value": 1482
+      "value": 1460
     },
     "oversized_control_hotspots:src/issue_orchestrator/view_models/issue_detail.py": {
       "detail": "1099 lines exceeds budget 800",
@@ -2128,10 +2152,10 @@
       "rule_id": "ruff_noqa_suppressions",
       "value": 1
     },
-    "ruff_noqa_suppressions:src/issue_orchestrator/entrypoints/mcp_server.py:25d30ad79690:line-273": {
-      "detail": "line 273: # noqa: BLE001",
+    "ruff_noqa_suppressions:src/issue_orchestrator/entrypoints/mcp_server.py:25d30ad79690:line-291": {
+      "detail": "line 291: # noqa: BLE001",
       "kind": "ruff_noqa_suppression",
-      "metric_id": "src/issue_orchestrator/entrypoints/mcp_server.py:25d30ad79690:line-273",
+      "metric_id": "src/issue_orchestrator/entrypoints/mcp_server.py:25d30ad79690:line-291",
       "path": "src/issue_orchestrator/entrypoints/mcp_server.py",
       "rule_id": "ruff_noqa_suppressions",
       "value": 1
@@ -2565,6 +2589,14 @@
       "kind": "ruff_noqa_suppression",
       "metric_id": "src/issue_orchestrator/view_models/journey_projection.py:b01adb1c5d5d",
       "path": "src/issue_orchestrator/view_models/journey_projection.py",
+      "rule_id": "ruff_noqa_suppressions",
+      "value": 1
+    },
+    "ruff_noqa_suppressions:src/issue_orchestrator/view_models/provider_circuit.py:4492131310dc": {
+      "detail": "line 205: # noqa: BLE001 - failure is rendered as an explicit warning",
+      "kind": "ruff_noqa_suppression",
+      "metric_id": "src/issue_orchestrator/view_models/provider_circuit.py:4492131310dc",
+      "path": "src/issue_orchestrator/view_models/provider_circuit.py",
       "rule_id": "ruff_noqa_suppressions",
       "value": 1
     },

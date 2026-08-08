@@ -437,67 +437,74 @@ class TestReviewLaunchLoopPrevention:
         assert len(results2) == 0
 
 
-class TestLaunchResultKeepQueued:
-    """Tests for the keep_queued flag in LaunchResult.
+class TestLaunchDispositionRetainsPendingWork:
+    """The typed disposition decides whether a launch consumes its pending item.
 
-    When a session launcher returns keep_queued=True (e.g., "terminal already running"),
-    the pending item should NOT be removed from the queue. This prevents infinite loops
-    where the scanner keeps finding the same PR because it's removed from pending but
-    still has the label on GitHub.
+    A launch can fail without the work having failed: the terminal is already
+    running, or the provider refused. Both must leave the pending item alone,
+    otherwise the scanner keeps rediscovering work it has already dropped — and
+    for a tech-lead failure investigation, whose queue entry is the only record,
+    dropping it loses the investigation outright (#6999 F10).
     """
 
-    def test_launch_result_keep_queued_default_false(self):
-        """By default, keep_queued should be False."""
-        from issue_orchestrator.control.session_launch_types import LaunchResult
+    def test_an_unannotated_failure_is_permanent(self):
+        """The default is unchanged: a plain failure means the launcher gave up."""
+        from issue_orchestrator.control.session_launch_types import (
+            LaunchDisposition,
+            LaunchResult,
+        )
 
         result = LaunchResult(session=None, success=False, reason="Some error")
-        assert result.keep_queued is False
 
-    def test_launch_result_keep_queued_set_true(self):
-        """keep_queued should be settable to True."""
-        from issue_orchestrator.control.session_launch_types import LaunchResult
+        assert result.disposition is LaunchDisposition.PERMANENT_FAILURE
+        assert not result.defers_to_provider
 
-        result = LaunchResult(session=None, success=False, reason="Terminal already running", keep_queued=True)
-        assert result.keep_queued is True
+    def test_a_successful_launch_is_always_launched(self):
+        """Success has exactly one disposition; it cannot contradict itself."""
+        from issue_orchestrator.control.session_launch_types import (
+            LaunchDisposition,
+            LaunchResult,
+        )
 
-    def test_launch_result_usage_example(self):
-        """Example of how keep_queued is used to prevent infinite loops.
+        result = LaunchResult(
+            session=None,
+            success=True,
+            disposition=LaunchDisposition.PERMANENT_FAILURE,
+        )
 
-        When a session exists in the terminal but isn't tracked in active_sessions,
-        the launcher returns keep_queued=True. The orchestrator should then NOT
-        remove the review from pending_reviews, preventing the scanner from
-        re-discovering it on the next tick.
+        assert result.disposition is LaunchDisposition.LAUNCHED
+
+    @pytest.mark.parametrize(
+        "disposition,retained",
+        [
+            ("EXISTING_TERMINAL", True),
+            ("PROVIDER_DEFERRED", True),
+            ("RETRYABLE_FAILURE", True),
+            ("PERMANENT_FAILURE", False),
+        ],
+    )
+    def test_only_a_permanent_failure_consumes_the_pending_item(
+        self, disposition: str, retained: bool
+    ):
+        """The queue owner's contract, stated as a table.
+
+        Mirrors ``_PendingQueueOwner.settle``: exactly one disposition drops the
+        work, and a provider refusal is not it.
         """
-        from issue_orchestrator.control.session_launch_types import LaunchResult
+        from issue_orchestrator.control.session_launch_types import (
+            LaunchDisposition,
+            LaunchResult,
+        )
 
-        # Simulating what happens when terminal already running
         result = LaunchResult(
             session=None,
             success=False,
-            reason="Terminal session already running",
-            keep_queued=True
+            reason="launch did not start a session",
+            disposition=LaunchDisposition[disposition],
         )
 
-        # The orchestrator should check this flag
-        pending_reviews = ["review_42"]  # Simulated pending list
-
-        # Current implementation (after fix):
-        if not result.keep_queued:
+        pending_reviews = ["review_42"]
+        if result.disposition is LaunchDisposition.PERMANENT_FAILURE:
             pending_reviews = [r for r in pending_reviews if r != "review_42"]
 
-        # Since keep_queued is True, the review should STILL be in pending
-        assert "review_42" in pending_reviews
-
-        # Contrast with normal failure (keep_queued=False):
-        result_normal = LaunchResult(
-            session=None,
-            success=False,
-            reason="No agent config"
-        )
-
-        pending_reviews_2 = ["review_42"]
-        if not result_normal.keep_queued:
-            pending_reviews_2 = [r for r in pending_reviews_2 if r != "review_42"]
-
-        # Normal failure removes from pending
-        assert "review_42" not in pending_reviews_2
+        assert ("review_42" in pending_reviews) is retained

@@ -543,3 +543,27 @@ def build_e2e_view_model(
         },
         "agents": agents,
     }
+
+
+def build_recent_e2e_runs_payload(config: Any) -> RecentE2ERunsPayload:
+    """Build the typed runs-as-rows payload for the inline panel (issue #6334).
+
+    Owns opening the e2e DB for the dashboard so the dashboard builder does not
+    have to know where ``e2e.db`` lives. Tolerates a missing e2e DB (fresh repo
+    / E2E disabled) by returning an empty payload — the JS chunk renders the
+    empty state and the rest of the dashboard is unaffected.
+    """
+    if config is None or not getattr(config, "e2e", None) or not config.e2e.enabled:
+        return RecentE2ERunsPayload(runs=())
+    db_path = config.repo_root / ".issue-orchestrator" / "e2e.db" if config.repo_root else None
+    if db_path is None or not db_path.exists():
+        return RecentE2ERunsPayload(runs=())
+    try:
+        from ..infra.e2e_db import E2EDB
+
+        db = E2EDB(db_path)
+        return build_recent_e2e_runs(db, config, limit=100)
+    except Exception:
+        # Same defensive shape as ``_build_e2e_db_items`` — a broken
+        # e2e.db should not take the dashboard down with it.
+        return RecentE2ERunsPayload(runs=())

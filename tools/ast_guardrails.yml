@@ -91,13 +91,43 @@ deny_attr_calls:
     allow:
       - src/issue_orchestrator/control/action_applier.py
       - src/issue_orchestrator/control/completion_processor.py
+      # The completion processor's PR-labelling boundary, extracted for its
+      # line budget (#6999 F2 round 5). Same IO boundary as the file above -
+      # it runs ONLY from the create-PR completion action - and its governed
+      # label is refused there by the capability rather than written.
+      - src/issue_orchestrator/control/completion_pr_labels.py
       - src/issue_orchestrator/control/label_sync.py
+      # The shared needs-human block's one owner (#6999 F2 round 3). It is the
+      # only writer of that label BY DESIGN - every acquisition, cause release
+      # and operator force-clear routes through it - and the companion
+      # shared-needs-human-block-bypass check enforces the other direction.
+      - src/issue_orchestrator/control/needs_human_block.py
+      # ...and the capability wrapper it hands to everyone else. This file is a
+      # pass-through with one refusal in it: it makes direct label mutation of
+      # the governed label impossible for its holders, which is the opposite of
+      # bypassing the applier boundary.
+      - src/issue_orchestrator/control/governed_label_set.py
+      # The operator retry/dismiss command (#6999 A2 round 5). It is the label
+      # mutation boundary those two endpoints consume - the entrypoints used to
+      # spell the same writes out themselves, which is how they drifted apart -
+      # and its one governed label goes through NeedsHumanBlock, never here.
+      - src/issue_orchestrator/control/operator_unblock.py
       # tech_lead_proposals hosts ActionApplier execution boundaries extracted
       # for the applier line budget (#6778): apply_create_tech_lead_issue and
       # finalize_tech_lead_op_execution run ONLY inside applier handlers, so
       # their add_comment calls are the same applier IO boundary as
       # action_applier.py's own.
       - src/issue_orchestrator/control/tech_lead_proposals.py
+      # Same rationale for the two other tech-lead applier boundaries extracted
+      # for the applier line budget: apply_append_pattern_observation (#6781/
+      # #6957) and apply_promote_tech_lead_finding /
+      # apply_settle_tech_lead_promotion (#6957) run ONLY inside applier
+      # handlers, so their add_comment calls are the same applier IO boundary
+      # as action_applier.py's own. Both target orchestrator-owned case-file
+      # issues, never a claimed coding issue.
+      - src/issue_orchestrator/control/tech_lead_case_files.py
+      - src/issue_orchestrator/control/tech_lead_case_file_owner.py
+      - src/issue_orchestrator/control/tech_lead_promotion_appliers.py
   - name: entrypoints_no_direct_label_mutations
     description: "Entrypoint handlers must apply label/comment mutations via ActionApplier"
     deny_in:

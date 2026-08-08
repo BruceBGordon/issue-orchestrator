@@ -27,6 +27,13 @@ from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
 from ..domain.artifact_contracts import ValidationFailed
+from .needs_human_block import (
+    NO_OTHER_NEEDS_HUMAN_CAUSES,
+    BlockOutcome,
+    HumanBlockRequest,
+    NeedsHumanCause,
+    SharedNeedsHumanBlock,
+)
 from ..domain.completion_finalization import (
     CompletionFinalizationCommand,
     CompletionFinalizationPlan,
@@ -89,6 +96,7 @@ from .completion_result_artifacts import (
 )
 from .completion_review_exchange import CompletionReviewExchange
 from .completion_ports import GitAdapter, LabelAdapter, PRAdapter
+from .completion_pr_labels import apply_pr_labels, reserved_pr_label_error
 from .completion_types import (
     ERROR_PREFIX_CREATE_PR,
     ERROR_PREFIX_PUBLISH_BLOCKED,
@@ -103,7 +111,7 @@ from .review_exchange_pr_comment import (
     GITHUB_COMMENT_BODY_LIMIT,
     build_review_exchange_pr_comment_body,
 )
-from .test_skip_guard import scan_added_test_skip_guards
+from .test_skip_guard import added_test_paths, scan_added_test_skip_guards
 from .tech_lead_approval_gate import build_tech_lead_decision_approval_gate
 from .tech_lead_completion import tech_lead_decision_processing_error
 from .tech_lead_session_policy import is_benign_tech_lead_no_commits, is_tech_lead_session, shape_requested_actions_for_tech_lead
@@ -162,6 +170,15 @@ from .validation_record_containment import (
     open_contained_validation_record as _open_contained_validation_record,
 )
 
+# Completion actions that assert the shared needs-human block, and the cause
+# each one carries (#6999 F2 round 3). A table rather than a branch: a
+# completion action added later either appears here with a cause or does not
+# touch the block at all.
+_AGENT_BLOCK_CAUSES = {
+    RequestedAction.ADD_NEEDS_HUMAN_LABEL: NeedsHumanCause.AGENT_COMPLETION,
+}
+
+
 
 class CompletionProcessor:
     """Process agent completion records and execute requested actions.
@@ -196,6 +213,10 @@ class CompletionProcessor:
         review_artifact_reader: ReviewArtifactReader | None = None,
         runtime_identity: RuntimeIdentity | None = None,
         tech_lead_authority: "TechLeadAuthorityStore | None" = None,
+        # The one owner of the shared needs-human block (#6999 F2 round 3).
+        # An explicit null object rather than an optional: it governs no label,
+        # so a composition path without one behaves as it always did.
+        needs_human_block: "SharedNeedsHumanBlock" = NO_OTHER_NEEDS_HUMAN_CAUSES,
     ):
         """Initialize the processor with required adapters.
 
@@ -224,6 +245,7 @@ class CompletionProcessor:
                 processed; the fail-fast default raises on first use.
         """
         self.label_adapter = label_adapter
+        self.needs_human_block = needs_human_block
         self.pr_adapter = pr_adapter
         self.git_adapter = git_adapter
         self.session_output = session_output
@@ -1043,6 +1065,18 @@ class CompletionProcessor:
                 message="No completion record found",
                 errors=["Completion record not found or invalid"],
             )
+        # Rejected at the door, BEFORE any side effect (#6999 F2 round 5).
+        # ``pr_labels`` is whatever the agent wrote, and the shared human-block
+        # label is not among the things it may hand itself: applied, it would
+        # create a block with no cause recorded, which a later typed release
+        # then takes away from whoever did record one. The agent has the typed
+        # needs_human outcome for that, which goes through the block owner.
+        # The completion FAILS rather than dropping the entry quietly - a
+        # silently ignored request is one nothing downstream can see.
+        if reserved := reserved_pr_label_error(record, self.needs_human_block):
+            return None, None, ProcessingResult(
+                success=False, message=reserved, errors=[reserved]
+            )
 
         session_name = self.session_output.session_name_from_path(completion_path) or record.session_id
         if record.validation_record_path and session_name:
@@ -1125,7 +1159,50 @@ class CompletionProcessor:
                 run_assets=run_assets,
             )
 
-        scan = scan_added_test_skip_guards(diff_result.diff_text)
+        try:
+            test_paths = added_test_paths(diff_result.diff_text)
+        except ValueError as exc:
+            return self._handle_gate_failure(
+                worktree,
+                record,
+                session_name,
+                issue_number,
+                f"Could not parse branch diff for banned test skips: {exc}",
+                gate_record=None,
+                run_assets=run_assets,
+            )
+        if not test_paths:
+            return None
+        branch_files_result = self.git_adapter.read_branch_text_files(
+            worktree, test_paths
+        )
+        if not branch_files_result.success:
+            return self._handle_gate_failure(
+                worktree,
+                record,
+                session_name,
+                issue_number,
+                (
+                    "Could not read branch-tip test files for banned test-skip "
+                    f"scan: {branch_files_result.error or 'unknown git error'}"
+                ),
+                gate_record=None,
+                run_assets=run_assets,
+            )
+        try:
+            scan = scan_added_test_skip_guards(
+                diff_result.diff_text, branch_files_result.files
+            )
+        except ValueError as exc:
+            return self._handle_gate_failure(
+                worktree,
+                record,
+                session_name,
+                issue_number,
+                f"Could not scan branch-tip test files for banned test skips: {exc}",
+                gate_record=None,
+                run_assets=run_assets,
+            )
         if scan.ok:
             return None
         return self._handle_gate_failure(
@@ -1906,6 +1983,8 @@ class CompletionProcessor:
 
         label_key, target_number, operation = config
         label = self._get_label(label_key)
+        if owned := self._shared_block_request(action, issue_number, actions_taken):
+            return owned
         if is_timeline_trace_enabled():
             logger.info(
                 "[TIMELINE] completion.label_mutation issue=%s action=%s operation=%s label_key=%s label=%s target=%s",
@@ -1926,6 +2005,49 @@ class CompletionProcessor:
             self.label_adapter.remove_label(target_number, label)
             actions_taken.append(f"Removed '{label}' label from #{target_number}")
 
+        return self._ActionResult()
+
+    def _shared_block_request(
+        self,
+        action: RequestedAction,
+        issue_number: int,
+        actions_taken: list[str],
+    ) -> "_ActionResult | None":
+        """Route an agent-requested ``needs_human`` through the block owner.
+
+        The agent asked for the shared block by name, and that assertion needs
+        provenance exactly as the orchestrator's own do (#6999 F2 round 3).
+        Applying it straight through the label adapter was the MAIN completion
+        path bypassing the owner: a quarantine holding the same label could
+        resolve and take away a block the session had just asked for, because
+        nothing recorded that the session needed it.
+
+        ``None`` means "not mine" - a different action, or a composition with
+        no owner wired - and the caller's ordinary table handles it.
+        """
+        cause = _AGENT_BLOCK_CAUSES.get(action)
+        if cause is None:
+            return None
+        outcome = self.needs_human_block.acquire(
+            HumanBlockRequest(
+                target=issue_number,
+                cause=cause,
+                reason="agent requested needs_human on completion",
+            )
+        )
+        if outcome is BlockOutcome.UNGOVERNED:
+            # No owner in this composition; the ordinary adapter path applies.
+            return None
+        if not outcome.committed:
+            logger.error(
+                "[COMPLETION] Could not apply the shared needs-human block to "
+                "issue #%d; the next tick retries",
+                issue_number,
+            )
+            # Nothing recorded and nothing labelled, so the completion must
+            # not report a block it does not have.
+            return self._ActionResult(halt=True)
+        actions_taken.append(f"Added '{self._get_label('needs_human')}' label")
         return self._ActionResult()
 
     def _execute_push_action(
@@ -2205,22 +2327,18 @@ class CompletionProcessor:
         )
 
         if pr:
-            # ``create_pr`` is idempotent by head branch, so it can return an
-            # existing PR targeting the wrong base even when the issue-scoped
-            # reuse preflight missed it. Enforce the stack base invariant on the
-            # returned PR too — retarget through the owned op or fail closed —
-            # before it inherits labels/review finalization (#6596 F2).
-            base_failure = self._enforce_created_pr_base(
+            settle_failure = self._settle_created_pr(
                 pr=pr,
+                record=record,
                 stack_decision=stack_decision,
                 expected_base=expected_base,
                 issue_number=issue_number,
+                branch=branch,
                 actions_taken=actions_taken,
                 errors=errors,
             )
-            if base_failure is not None:
-                return base_failure
-            self._apply_pr_labels(pr, record, actions_taken)
+            if settle_failure is not None:
+                return settle_failure
             review_exchange_completed = False
             if exchange_mode in {"via-mcp", "via-local-loop"} and exchange_result:
                 review_exchange_completed = True
@@ -2464,25 +2582,49 @@ class CompletionProcessor:
             event_context=self._event_context,
         )
 
-    def _apply_pr_labels(
+    def _settle_created_pr(
         self,
+        *,
         pr: PRInfo,
         record: CompletionRecord,
+        stack_decision: Any,
+        expected_base: str,
+        issue_number: int,
+        branch: str | None,
         actions_taken: list[str],
-    ) -> None:
-        """Apply extra labels to PR if specified."""
-        actions_taken.append(f"Created PR #{pr.number}")
-        logger.info("Created PR #%d: %s", pr.number, pr.url)
+        errors: list[str],
+    ) -> "_ActionResult | None":
+        """Everything a freshly returned PR must satisfy before it is used.
 
-        # Skip for fake/dry-run PRs (numbers 90000-99999)
-        is_dry_run_pr = 90000 <= pr.number <= 99999
-        if record.pr_labels and not is_dry_run_pr:
-            for label in record.pr_labels:
-                self.label_adapter.add_label(pr.number, label)
-                logger.info("Added label '%s' to PR #%d", label, pr.number)
-            actions_taken.append(f"Added labels to PR: {record.pr_labels}")
-        elif record.pr_labels and is_dry_run_pr:
-            logger.info("[E2E_DRY_RUN] Skipping PR label addition for fake PR #%d", pr.number)
+        One guard rather than two, because both answer the same question - is
+        this PR fit to inherit review finalization? - and both halt when it is
+        not:
+
+        * its BASE, because ``create_pr`` is idempotent by head branch and can
+          return an existing PR targeting the wrong one even when the
+          issue-scoped reuse preflight missed it (#6596 F2);
+        * its LABELS, because the record that produced it is agent-authored and
+          may have asked for the shared human block (#6999 F2).
+        """
+        base_failure = self._enforce_created_pr_base(
+            pr=pr,
+            stack_decision=stack_decision,
+            expected_base=expected_base,
+            issue_number=issue_number,
+            actions_taken=actions_taken,
+            errors=errors,
+        )
+        if base_failure is not None:
+            return base_failure
+        if not apply_pr_labels(
+            pr=pr,
+            record=record,
+            labels=self.label_adapter,
+            actions_taken=actions_taken,
+            errors=errors,
+        ):
+            return self._ActionResult(branch=branch, pr_url=pr.url, halt=True)
+        return None
 
     def _cleanup_completion_record(
         self,

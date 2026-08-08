@@ -61,6 +61,11 @@ EVENT_SPEC: dict[PublicEventName, EventSpec] = {
     PublicEventName.SESSION_FAILED: EventSpec(phase='in_progress', step='failed', status='failed', level='detail'),
     PublicEventName.SESSION_TIMEOUT: EventSpec(phase='in_progress', step='timeout', status='failed', level='detail'),
     PublicEventName.SESSION_BLOCKED: EventSpec(phase='in_progress', step='blocked', status='failed', level='detail'),
+    PublicEventName.SESSION_LAUNCH_BLOCKED_PROVIDER: EventSpec(phase='in_progress', step='launch_blocked_provider', status='failed', level='detail'),
+    PublicEventName.SESSION_PROVIDER_AUTH_TERMINATED: EventSpec(phase='in_progress', step='provider_auth_terminated', status='failed', level='detail'),
+    PublicEventName.SESSION_CLAIM_UNREADABLE: EventSpec(phase='in_progress', step='claim_unreadable', status='failed', level='detail'),
+    PublicEventName.SESSION_RUN_UNRESTORABLE: EventSpec(phase='in_progress', step='run_unrestorable', status='failed', level='detail'),
+    PublicEventName.SESSION_RUN_UNRESTORABLE_CLAIM_UNREADABLE: EventSpec(phase='in_progress', step='run_unrestorable_claim_unreadable', status='failed', level='detail'),
     PublicEventName.SESSION_NO_COMPLETION_RECORD: EventSpec(phase='in_progress', step='no_completion_record', status='completed', level='detail'),
     PublicEventName.SESSION_INVALID_COMPLETION_RECORD: EventSpec(phase='in_progress', step='invalid_completion_record', status='failed', level='detail'),
     PublicEventName.SESSION_PROCESSING_COMPLETED: EventSpec(phase='in_progress', step='processing_completed', status='completed', level='detail'),
@@ -111,6 +116,10 @@ EVENT_SPEC: dict[PublicEventName, EventSpec] = {
     PublicEventName.ISSUE_COMPLETED: EventSpec(phase='completed', step='completed', status='completed', level='phase'),
     PublicEventName.ISSUE_UNBLOCKED: EventSpec(phase='in_progress', step='unblocked', status='completed', level='phase'),
     PublicEventName.ISSUE_PR_CREATED: EventSpec(phase='orchestrator', step='pr_created', status='completed', level='phase'),
+
+    # ----- Provider outage impact on this issue (issue #5980) -----
+    PublicEventName.PROVIDER_ISSUE_BLOCKED: EventSpec(phase='blocked', step='provider_blocked', status='failed', level='phase'),
+    PublicEventName.PROVIDER_ISSUE_UNBLOCKED: EventSpec(phase='in_progress', step='provider_unblocked', status='completed', level='phase'),
 
     # ----- Publish failure -----
     PublicEventName.PUBLISH_FAILED: EventSpec(phase='orchestrator', step='publish.failed', status='failed', level='detail'),

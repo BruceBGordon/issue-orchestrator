@@ -166,6 +166,23 @@ function renderStackChipHtml(card) {
         + `</span></div>`;
 }
 
+// Provider-outage badge. Rendered from the server-precomputed
+// card.provider_badge (view_models/issue_card_labels.py::provider_badge) so the
+// first-paint DOM (Jinja), the compact card, and the expanded row all render
+// the same markup from the same projection — the label semantics live once, in
+// Python, and are prefix/config aware. Status is text ("Provider unavailable"),
+// never colour alone; the icon is decorative and the visible text is the
+// accessible name.
+function renderProviderBadgeHtml(card) {
+    const badge = card && card.provider_badge;
+    if (!badge) return '';
+    return `<div class="card-line card-provider">`
+        + `<span class="provider-badge provider-badge--${badge.tone}" title="${escapeAttr(String(badge.title || ''))}">`
+        + `<span class="provider-badge-icon" aria-hidden="true">⚡</span>`
+        + `<span class="provider-badge-text">${escapeHtml(String(badge.label_text || ''))}</span>`
+        + `</span></div>`;
+}
+
 function renderCompactCardHtml(card) {
     const n = card.issue_number;
     const cardId = String(card.card_id || `issue-${n}`);
@@ -229,6 +246,7 @@ function renderCompactCardHtml(card) {
         <div class="card-line">${phaseLineHtml}</div>
         ${queueWaitLine}
         ${detailLine}
+        ${renderProviderBadgeHtml(card)}
         ${renderStackChipHtml(card)}
         ${badgesDiv}
     </div>`;
@@ -391,6 +409,63 @@ function toggleColumnExpand(columnId) {
     updateEmbeddedBackButtonVisibility();
 }
 
+// One expanded (list-view) row. Extracted from loadExpandedColumn so the
+// compact and expanded row forms can both be asserted directly, and so the
+// provider badge cannot be added to one form and forgotten in the other.
+function renderExpandedCardHtml(item, columnId, isViewed) {
+    const n = item.issue_number;
+    const isPrClosedBlock = columnId === 'blocked' && hasPrClosedBlock(item);
+    const orchLabels = item.orchestrator_labels || [];
+    const orchPills = orchLabels.map((label) => `<span class="badge badge-orch">${label}</span>`).join('');
+    const badgesDiv = orchPills
+        ? `<div class="card-badges">${orchPills}</div>`
+        : '';
+    const queueWaitReason = item.queue_wait_reason || '';
+    const detailText = queueWaitReason || item.detail_label || item.status || '';
+    const detailClass = queueWaitReason ? 'card-line card-wait' : 'card-line card-muted';
+    const detailDiv = detailText
+        ? `<div class="${detailClass}">${escapeHtml(String(detailText))}</div>`
+        : '';
+    const issueLink = item.issue_url
+        ? `<a class="card-gh card-issue-link" href="${escapeAttr(String(item.issue_url))}" target="_blank" rel="noopener noreferrer" title="Open issue #${n} on GitHub" aria-label="Open issue #${n} on GitHub">↗</a>`
+        : '';
+    const prLink = item.pr_url
+        ? `<a class="card-action-btn card-pr-link" href="${escapeAttr(String(item.pr_url))}" target="_blank" rel="noopener noreferrer" onclick="event.stopPropagation();" title="Open PR for issue #${n} on GitHub" aria-label="Open PR for issue #${n} on GitHub">PR ↗</a>`
+        : '';
+    const itemLabel = item.issue_label || `#${n}`;
+    const itemLabelHtml = escapeHtml(String(itemLabel));
+    const itemLabelAttr = escapeAttr(String(itemLabel));
+    return `
+                <div class="expanded-card${isViewed ? ' viewed' : ''}" data-issue="${n}" data-viewed="${isViewed}">
+                    <input type="checkbox" class="card-checkbox" onchange="updateBulkBar('${columnId}')">
+                    <div class="card-content">
+                        <button class="card-focus" onclick="openIssueDetail(${n}, this);event.stopPropagation();"
+                                title="Focus issue ${itemLabelAttr}">
+                            ${itemLabelHtml} ${escapeHtml(String(item.title || ''))}
+                        </button>
+                        ${detailDiv}
+                        ${renderProviderBadgeHtml(item)}
+                        ${badgesDiv}
+                    </div>
+                    <div class="card-actions">
+                        ${columnId === 'blocked' && isPrClosedBlock ? `<button class="card-action-btn card-action-unblock" onclick="retryPrClosedSingle(${n}, this);event.stopPropagation();" title="Remove stale PR labels and requeue issue #${n}">Retry</button>` : ''}
+                        ${columnId === 'blocked' && isPrClosedBlock ? `<button class="card-action-btn card-action-reset" onclick="closePrClosedIssue(${n}, this);event.stopPropagation();" title="Close issue #${n}">Close Issue</button>` : ''}
+                        ${columnId === 'blocked' && !isPrClosedBlock ? `<button class="card-action-btn card-action-unblock" onclick="unblockSingle(${n}, this);event.stopPropagation();" title="Unblock issue #${n}">Unblock</button>` : ''}
+                        ${columnId === 'blocked' && !isPrClosedBlock ? `<button class="card-action-btn card-action-reset" onclick="resetRetrySingle(${n}, this);event.stopPropagation();" title="Full reset and requeue issue #${n}">Reset & Retry</button>` : ''}
+                        ${columnId === 'blocked' && !isPrClosedBlock ? `<button class="card-action-btn card-action-reset" onclick="resetRetrySingleFromScratch(${n}, this);event.stopPropagation();" title="Full reset and requeue issue #${n} from a fresh branch based on main">Reset & Retry From Scratch</button>` : ''}
+                        ${columnId === 'running' ? `<button class="card-action-btn card-action-reset" onclick="killExpandedSingle(${n}, this);event.stopPropagation();" title="Terminate issue #${n} and place on hold">Cancel</button>` : ''}
+                        ${columnId === 'queued' ? `<button class="card-action-btn card-action-reset" onclick="cancelQueuedSingle(${n}, this);event.stopPropagation();" title="Place queued issue #${n} on hold">Cancel</button>` : ''}
+                        ${columnId === 'awaiting-merge' ? `<button class="card-action-btn card-action-unblock" onclick="retryExpandedSingle(${n}, 'awaiting-merge', this);event.stopPropagation();" title="Remove pr-pending and requeue issue #${n}">Retry</button>` : ''}
+                        ${columnId === 'awaiting-merge' ? `<button class="card-action-btn card-action-reset" onclick="resetRetrySingle(${n}, this);event.stopPropagation();" title="Full reset and requeue issue #${n}">Reset & Retry</button>` : ''}
+                        ${columnId === 'awaiting-merge' ? `<button class="card-action-btn card-action-reset" onclick="resetRetrySingleFromScratch(${n}, this);event.stopPropagation();" title="Full reset and requeue issue #${n} from a fresh branch based on main">Reset & Retry From Scratch</button>` : ''}
+                        ${columnId === 'completed' ? `<button class="card-action-btn card-action-unblock" onclick="retryExpandedSingle(${n}, 'completed', this);event.stopPropagation();" title="Requeue issue #${n} for another run">Retry</button>` : ''}
+                        ${issueLink}
+                        ${prLink}
+                        <button class="card-timeline-btn" onclick="openIssueTimeline(${n}, this);event.stopPropagation();" title="Open timeline for issue #${n}" aria-label="Open timeline for issue #${n}">&#x1F9ED;</button>
+                    </div>
+                </div>`;
+}
+
 async function loadExpandedColumn(columnId, options = {}) {
     const forceRebuild = Boolean(options.forceRebuild);
     let vm = options.viewModel || null;
@@ -416,59 +491,9 @@ async function loadExpandedColumn(columnId, options = {}) {
 
         if (shouldRebuild) {
             const viewed = columnId === 'blocked' ? getViewedIssues() : new Set();
-            expandedList.innerHTML = items.map(item => {
-                const isViewed = viewed.has(item.issue_number);
-                const n = item.issue_number;
-                const isPrClosedBlock = columnId === 'blocked' && hasPrClosedBlock(item);
-                const orchLabels = item.orchestrator_labels || [];
-                const orchPills = orchLabels.map((label) => `<span class="badge badge-orch">${label}</span>`).join('');
-                const badgesDiv = orchPills
-                    ? `<div class="card-badges">${orchPills}</div>`
-                    : '';
-                const queueWaitReason = item.queue_wait_reason || '';
-                const detailText = queueWaitReason || item.detail_label || item.status || '';
-                const detailClass = queueWaitReason ? 'card-line card-wait' : 'card-line card-muted';
-                const detailDiv = detailText
-                    ? `<div class="${detailClass}">${escapeHtml(String(detailText))}</div>`
-                    : '';
-                const issueLink = item.issue_url
-                    ? `<a class="card-gh card-issue-link" href="${escapeAttr(String(item.issue_url))}" target="_blank" rel="noopener noreferrer" title="Open issue #${n} on GitHub" aria-label="Open issue #${n} on GitHub">↗</a>`
-                    : '';
-                const prLink = item.pr_url
-                    ? `<a class="card-action-btn card-pr-link" href="${escapeAttr(String(item.pr_url))}" target="_blank" rel="noopener noreferrer" onclick="event.stopPropagation();" title="Open PR for issue #${n} on GitHub" aria-label="Open PR for issue #${n} on GitHub">PR ↗</a>`
-                    : '';
-                const itemLabel = item.issue_label || `#${n}`;
-                const itemLabelHtml = escapeHtml(String(itemLabel));
-                const itemLabelAttr = escapeAttr(String(itemLabel));
-                return `
-                <div class="expanded-card${isViewed ? ' viewed' : ''}" data-issue="${n}" data-viewed="${isViewed}">
-                    <input type="checkbox" class="card-checkbox" onchange="updateBulkBar('${columnId}')">
-                    <div class="card-content">
-                        <button class="card-focus" onclick="openIssueDetail(${n}, this);event.stopPropagation();"
-                                title="Focus issue ${itemLabelAttr}">
-                            ${itemLabelHtml} ${escapeHtml(String(item.title || ''))}
-                        </button>
-                        ${detailDiv}
-                        ${badgesDiv}
-                    </div>
-                    <div class="card-actions">
-                        ${columnId === 'blocked' && isPrClosedBlock ? `<button class="card-action-btn card-action-unblock" onclick="retryPrClosedSingle(${n}, this);event.stopPropagation();" title="Remove stale PR labels and requeue issue #${n}">Retry</button>` : ''}
-                        ${columnId === 'blocked' && isPrClosedBlock ? `<button class="card-action-btn card-action-reset" onclick="closePrClosedIssue(${n}, this);event.stopPropagation();" title="Close issue #${n}">Close Issue</button>` : ''}
-                        ${columnId === 'blocked' && !isPrClosedBlock ? `<button class="card-action-btn card-action-unblock" onclick="unblockSingle(${n}, this);event.stopPropagation();" title="Unblock issue #${n}">Unblock</button>` : ''}
-                        ${columnId === 'blocked' && !isPrClosedBlock ? `<button class="card-action-btn card-action-reset" onclick="resetRetrySingle(${n}, this);event.stopPropagation();" title="Full reset and requeue issue #${n}">Reset & Retry</button>` : ''}
-                        ${columnId === 'blocked' && !isPrClosedBlock ? `<button class="card-action-btn card-action-reset" onclick="resetRetrySingleFromScratch(${n}, this);event.stopPropagation();" title="Full reset and requeue issue #${n} from a fresh branch based on main">Reset & Retry From Scratch</button>` : ''}
-                        ${columnId === 'running' ? `<button class="card-action-btn card-action-reset" onclick="killExpandedSingle(${n}, this);event.stopPropagation();" title="Terminate issue #${n} and place on hold">Cancel</button>` : ''}
-                        ${columnId === 'queued' ? `<button class="card-action-btn card-action-reset" onclick="cancelQueuedSingle(${n}, this);event.stopPropagation();" title="Place queued issue #${n} on hold">Cancel</button>` : ''}
-                        ${columnId === 'awaiting-merge' ? `<button class="card-action-btn card-action-unblock" onclick="retryExpandedSingle(${n}, 'awaiting-merge', this);event.stopPropagation();" title="Remove pr-pending and requeue issue #${n}">Retry</button>` : ''}
-                        ${columnId === 'awaiting-merge' ? `<button class="card-action-btn card-action-reset" onclick="resetRetrySingle(${n}, this);event.stopPropagation();" title="Full reset and requeue issue #${n}">Reset & Retry</button>` : ''}
-                        ${columnId === 'awaiting-merge' ? `<button class="card-action-btn card-action-reset" onclick="resetRetrySingleFromScratch(${n}, this);event.stopPropagation();" title="Full reset and requeue issue #${n} from a fresh branch based on main">Reset & Retry From Scratch</button>` : ''}
-                        ${columnId === 'completed' ? `<button class="card-action-btn card-action-unblock" onclick="retryExpandedSingle(${n}, 'completed', this);event.stopPropagation();" title="Requeue issue #${n} for another run">Retry</button>` : ''}
-                        ${issueLink}
-                        ${prLink}
-                        <button class="card-timeline-btn" onclick="openIssueTimeline(${n}, this);event.stopPropagation();" title="Open timeline for issue #${n}" aria-label="Open timeline for issue #${n}">&#x1F9ED;</button>
-                    </div>
-                </div>`;
-            }).join('');
+            expandedList.innerHTML = items
+                .map(item => renderExpandedCardHtml(item, columnId, viewed.has(item.issue_number)))
+                .join('');
             expandedColumnFingerprints.set(columnId, nextFingerprint);
             const reconciledSelection = new Set(
                 expandedColumnState.reconcileSelectedIssues([...previousSelection], items),
