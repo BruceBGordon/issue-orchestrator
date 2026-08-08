@@ -203,7 +203,7 @@ Four concrete mechanisms in today's code destroy or strand the work:
 
    | Layer | Owner | Needs orchestrator state |
    |---|---|---|
-   | Remote execution | `ValidatedHeadExecutor` — exact-object/exact-lease branch write, then ensure exactly one PR, as two separately callable steps | no |
+   | Remote execution | `ValidatedHeadExecutor` — exact-object/exact-lease branch write, then ensure exactly one PR, as two separately callable steps with **stage-specific result types** composed by one named composer | no |
    | Fenced publication | `FencedValidatedHeadPublisher` — the disposition owner's claim re-checked before and between those steps | no |
    | Finalization | `PublishedWorkFinalizer` — staged review routing, then recovery-block clearing, composing the existing `RetryReviewRouting` policy | yes, on the request |
    | Admission | `PublishRecoveryService` (manual) and `ValidatedWorkDispositionService` (validated work), as **siblings** | yes |
@@ -214,7 +214,18 @@ Four concrete mechanisms in today's code destroy or strand the work:
    its two allowed callers. Authority lives one layer up instead: the disposition
    owner wraps the executor in a fenced publisher that holds its claim, and the
    manual owner calls the executor under its existing locator/background-job
-   authority. Neither forges the other's.
+   authority. Neither forges the other's, and both end in the same composer — so
+   the combined and two-step paths produce identical results by construction rather
+   than by convention.
+
+   The disposition owner reaches the *other* runtime owners the same way it reaches
+   the remote: through one narrow seam. "Is another issue-runtime owner active?" is
+   answered by an `IssueRuntimeActivityPort` implemented by the lifecycle boundary
+   that already owns teardown and the freshness predicate, constructed once in
+   bootstrap and shared by all three. Without it the disposition service would have
+   had to gather the session manager, pair registry, job supervisor and publish-retry
+   owner itself — reaching into four siblings, one of which this ADR forbids it to
+   depend on at all.
 
    **Publication is fenced, synchronous, and its durability lives in numbered
    attempt rows.** A lease expiring proves only that time passed, never that the
@@ -230,9 +241,25 @@ Four concrete mechanisms in today's code destroy or strand the work:
    (head, base) rule for the create. Ownership is **record-scoped and spans
    finalization**, not attempt-scoped: routing, history and the staged label
    sequence happen after the push outcome is durable and are exactly as
-   single-owner as the push. Acquiring the claim is what bumps the fence, so a
-   rival cannot obtain one by reading the column — and a takeover invalidates the
-   previous owner in the same act that authorizes the new one. Process-liveness evidence gates *reclamation*
+   single-owner as the push.
+
+   The claim is a **capability, not a struct**: `acquire_claim()` mints a random
+   secret and stores only its hash, so no reader of the row can construct a value
+   the store's predicates accept, and every call additionally checks that the
+   presenting process *is* the recorded owner. A fence bump alone could not do
+   this — the bumped value is as readable as the old one.
+
+   **Takeover requires positive proof the previous owner is dead, and there is no
+   grace timer.** `holds_claim()` and the mutation it guards are not atomic, so a
+   fence cannot by itself stop a former owner from performing one more effect —
+   and while remote writes converge and label writes are idempotent, the staged
+   finalizer also mutates process-local `OrchestratorState`, which no durable fence
+   reaches. The proof already exists in this system: `infra/repo_lock.py` admits one
+   orchestrator per repository via `flock`, and the kernel releases that lock when
+   the holder dies. Takeover is therefore permitted only when the recorded owner is
+   no longer the live lock holder; a live-but-wedged owner is displaced only by an
+   explicit, audited operator command. Waiting costs visibility, never data, because
+   the record stays unresolved throughout. Process-liveness evidence gates *reclamation*
    so a healthy slow publisher is not displaced needlessly, but it is never the
    safety argument; the fence holds even when the liveness probe is wrong. The port makes one call and returns what happened; there is no
    "submitted, poll later" state, because nothing in this design owns a job runner
