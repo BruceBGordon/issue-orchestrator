@@ -65,9 +65,18 @@ Four concrete mechanisms in today's code destroy or strand the work:
    worktree, and run directory still exist. A failure to record fails closed and
    raises; teardown does not proceed.
 
-2. `IssueRuntimeTermination` gains a required `validated_work: ValidatedWorkDisposition`
-   field with **seven** states, partitioned into two sets that the contract keeps
-   distinct because conflating them is how work gets destroyed:
+2. `IssueRuntimeTermination` gains a required
+   `validated_work: ValidatedWorkDispositionBatch` field — **every** disposition the
+   capture produced, one per distinct unit of work. Singular was itself a data-loss
+   path: an issue whose durable ledger holds two runs validated at different commits
+   has two units of work, and a result that can hold one forces capture to pick a
+   winner and tear the loser's worktree down un-escrowed. Lineage cannot protect a
+   record admission never created. Recency selects *within* a unit of work; the
+   choice *between* units is the lineage decision, made durably after all of them
+   are admitted.
+
+   Each member carries one of **seven** states, partitioned into two sets that the
+   contract keeps distinct because conflating them is how work gets destroyed:
 
    | Set | States | Meaning |
    |---|---|---|
@@ -196,8 +205,20 @@ Four concrete mechanisms in today's code destroy or strand the work:
    | Finalization | `PublishedWorkFinalizer` — staged review routing, then recovery-block clearing, composing the existing `RetryReviewRouting` policy | yes, on the request |
    | Admission | `PublishRecoveryService` (manual) and `ValidatedWorkDispositionService` (validated work), as **siblings** | yes |
 
-   **Publication is synchronous, and its durability lives in numbered attempt
-   rows.** The port makes one call and returns what happened; there is no
+   **Publication is fenced, synchronous, and its durability lives in numbered
+   attempt rows.** A lease expiring proves only that time passed, never that the
+   previous caller is dead, so an expired timestamp cannot by itself authorize a
+   second attempt: a slow publisher can still return and record a late outcome over
+   the winner's, and the Git ref lease bounds only the branch write, not PR
+   creation, label routing, history mutation, or outcome recording. Correctness
+   therefore rests on a **monotonic fence** per record, bumped by every claim and
+   every reclamation. Every durable write compare-and-sets on it (so a stale claim's
+   write is discarded, not merged), the fence is re-checked immediately before each
+   external mutation, and the two remote writes are each independently fenced by the
+   remote itself — the exact ref lease for the push, and GitHub's one-open-PR-per
+   (head, base) rule for the create. Process-liveness evidence gates *reclamation*
+   so a healthy slow publisher is not displaced needlessly, but it is never the
+   safety argument; the fence holds even when the liveness probe is wrong. The port makes one call and returns what happened; there is no
    "submitted, poll later" state, because nothing in this design owns a job runner
    or a submission store to make such a state durable. What *is* durable is the
    attempt: the operation is identified by record and target commit and never
@@ -218,7 +239,23 @@ Four concrete mechanisms in today's code destroy or strand the work:
    never inferred from labels looking correct, because cleanup labels do not prove
    the routing mutation happened.
 
-9. **This owner writes exactly one label of its own.** A failed disposition keeps
+9. **An approved operation binds the facts it was approved against.** The evidence
+   id binds the immutable half — repo, issue, branch, validated head, run identity,
+   artifact hashes — and deliberately excludes the mutable observations, which is
+   what makes it crash-stable. That exclusion means the id alone cannot authorize:
+   the PR and the expected remote baseline are refreshed under the same id while a
+   record is unresolved, so an operation approved against one PR and one remote
+   state could execute against another with the immutable approval unchanged.
+   Revalidation cannot close this — it proves the current facts are internally safe,
+   not that they are the facts a human authorized. The immutable
+   `StoredTechLeadOp` (and the operator command) therefore carries a
+   `ValidatedWorkAuthoritySnapshot`, checked for exact equality against the durable
+   record before anything else runs; a changed observation stale-downgrades the
+   approval with zero writes and asks for a fresh one. The snapshot is
+   authorization input, never a competing source of truth: every stale check still
+   runs against freshly read state after it matches.
+
+10. **This owner writes exactly one label of its own.** A failed disposition keeps
    `recovery-pending` and registers its escalation through the needs-human owner's
    behavior API as its own enumerated cause. It does not write
    `tech-lead-needs-human`, which ADR-0013 defines as provenance for a *different*
@@ -246,7 +283,8 @@ Four concrete mechanisms in today's code destroy or strand the work:
   shutdown races all route through one contract instead of four policies.
 - Teardown gains a failure mode it did not have: escrow failure blocks teardown.
   That is deliberate and fail-closed — losing validated work is the worse outcome.
-- A new registered SQLite store and an escrow directory join the orchestrator-owned
+- Two new registered SQLite stores — the validated-work store and the issue run
+  ledger — and an escrow directory join the orchestrator-owned
   state dir, with their own retention boundary that `session_output_retention_days`
   and worktree cleanup must not cross. That boundary is driven by a new top-level
   config section, `Config.validated_work`, which brings the full set of surfaces a
