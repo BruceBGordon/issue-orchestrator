@@ -194,13 +194,7 @@ class OperatorIssueCommandRunner:
         state = self.state()
         RetryHistoryState(state).make_retryable(issue_number)
 
-        cached = next(
-            (
-                issue for issue in state.cached_scope_issues
-                if issue.number == issue_number
-            ),
-            None,
-        )
+        cached = self._cached_issue(state, issue_number)
         if cached is None or not is_dataclass(cached) or isinstance(cached, type):
             return
         settled = tuple(label for label in observed if label not in removed)
@@ -214,6 +208,29 @@ class OperatorIssueCommandRunner:
             list(removed),
             list(settled),
         )
+
+    def _cached_issue(self, state: "OrchestratorState", issue_number: int):
+        """The cached copy, from EITHER supported cache shape (#6999 F8 r9).
+
+        ``cached_scope_issues`` is the usual home, and the queue copy is
+        normally a subset of it. But a COLD scope cache over a populated queue
+        cache is a shape this system explicitly supports:
+        ``QueueProjection.update_and_emit`` falls back the same way, the
+        dashboard projection does too, and a test pins it.
+
+        Looking only in scope meant that in exactly that shape the
+        reconciliation quietly did nothing - after the retry gates had already
+        been cleared. The stale queue copy survived with its blocking labels,
+        the planner went on refusing it, and the operator was told the issue was
+        queued for retry. Reconciling whichever copy exists and pushing it back
+        through ``upsert_refreshed_issue`` also repopulates the scope cache, so
+        the two shapes converge instead of one of them being a dead end.
+        """
+        for cache in (state.cached_scope_issues, state.cached_queue_issues):
+            for issue in cache:
+                if issue.number == issue_number:
+                    return issue
+        return None
 
     def _remove_from_board(self, issue_number: int) -> None:
         state = self.state()

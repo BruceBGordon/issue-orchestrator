@@ -504,3 +504,59 @@ class TestARecoveredRetrySettlesTheCachedCopy:
             issue for issue in state.cached_scope_issues if issue.number == ISSUE
         )
         assert set(settled.labels) == {"agent:web"}
+
+    def test_a_recovered_retry_settles_a_queue_only_cold_cache_too(
+        self, sample_config, state
+    ):
+        """The same recovery, in the supported COLD-SCOPE shape (#6999 F8 r9).
+
+        An empty ``cached_scope_issues`` over a populated ``cached_queue_issues``
+        is a state this system supports and pins - the queue projection and the
+        dashboard both fall back that way. Reconciling only the scope copy meant
+        that here the settle did nothing at all, silently, AFTER the retry gates
+        had been cleared: the stale queue copy kept its blocking labels, the
+        planner kept refusing it, and the operator was told it was queued.
+        """
+        from unittest.mock import MagicMock
+
+        from issue_orchestrator.control.scheduler import Scheduler
+
+        labels = LabelManager(sample_config)
+        live = {ISSUE: {"agent:web", labels.blocked, labels.blocked_failed}}
+        cached = self._cached(labels)
+        state.cached_scope_issues = []
+        state.cached_queue_issues = [cached]
+        store = MagicMock()
+        host = _RepositoryHost(live, refuse=frozenset({labels.blocked_failed}))
+        _labels, runner = _runner(
+            sample_config, state, live, store=store, host=host
+        )
+
+        assert runner.retry(ISSUE).status is OperatorCommandStatus.INCOMPLETE
+        assert state.cached_queue_issues == [cached], "nothing settled yet"
+
+        host.refuse = frozenset()
+        second = runner.retry(ISSUE)
+
+        assert second.status is OperatorCommandStatus.COMMITTED
+        queued = next(
+            issue for issue in state.cached_queue_issues if issue.number == ISSUE
+        )
+        assert labels.blocked not in queued.labels
+        assert labels.blocked_failed not in queued.labels
+        assert "agent:web" in queued.labels
+        # ...and the cold scope cache is repopulated rather than left behind.
+        settled = next(
+            issue for issue in state.cached_scope_issues if issue.number == ISSUE
+        )
+        assert labels.blocked not in settled.labels
+        persisted = next(
+            issue
+            for issue in store.save_snapshot.call_args.args[0]
+            if issue.number == ISSUE
+        )
+        assert labels.blocked not in persisted.labels
+        decision = Scheduler(sample_config, label_manager=labels).evaluate_issues(
+            [queued], check_dependencies=False
+        )[0]
+        assert decision.available, decision.reason
