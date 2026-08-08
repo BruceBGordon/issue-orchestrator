@@ -1069,10 +1069,15 @@ def build_test_orchestrator_deps(
     # One owner for every durable cause of the shared needs-human label, wired
     # exactly as bootstrap wires it (#6999 F4).
     needs_human_block = NeedsHumanBlock(
+        needs_human_label=label_manager.needs_human,
         tech_lead_marker=label_manager.tech_lead_needs_human,
         read_labels=repo_host.get_issue_labels_fresh,
         quarantined_issue_numbers=pending_work_claims.quarantined_issue_numbers,
+        causes=pending_work_claims,
     )
+    # Same post-construction bind bootstrap does: the applier records causes
+    # into the very store this block reads (#6999 F2 round 2).
+    _action_applier.needs_human_block = needs_human_block
 
     publish_recovery = PublishRecoveryService(
         repository_host=repo_host,

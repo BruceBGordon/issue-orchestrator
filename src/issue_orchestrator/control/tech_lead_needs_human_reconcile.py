@@ -200,6 +200,7 @@ class TechLeadNeedsHumanLifecycle:
                 issue_number=issue_number,
                 label=self._labels.needs_human,
                 reason=reason,
+                needs_human_cause=NeedsHumanCause.TECH_LEAD_ESCALATION,
                 expected=self._expected(
                     required={self._labels.tech_lead_needs_human},
                     forbidden={self._labels.needs_human},
@@ -304,6 +305,7 @@ class TechLeadNeedsHumanLifecycle:
                         "recover interrupted tech_lead needs-human escalation "
                         "from durable marker"
                     ),
+                    needs_human_cause=NeedsHumanCause.TECH_LEAD_ESCALATION,
                     expected=self._expected(
                         required={self._labels.tech_lead_needs_human},
                         forbidden={self._labels.needs_human},
@@ -368,6 +370,7 @@ class TechLeadNeedsHumanLifecycle:
                             "running tech_lead investigation supersedes "
                             "orchestrator-owned needs-human escalation"
                         ),
+                        needs_human_cause=NeedsHumanCause.TECH_LEAD_ESCALATION,
                         expected=self._expected(
                             required={
                                 self._labels.tech_lead_needs_human,

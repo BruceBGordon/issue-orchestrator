@@ -96,6 +96,19 @@ CREATE TABLE IF NOT EXISTS pending_work_claim_quarantine (
     cause TEXT,
     work_kind TEXT
 );
+-- Durable provenance for every OTHER cause of the shared needs-human block
+-- (#6999 F2 round 2). The tech-lead marker label and the quarantine table
+-- above already record their own. A session or planner escalation recorded
+-- nothing, so a remover saw an owner-less label and took it off. Rows are
+-- meaningful only while the label is present and are dropped with it, so a
+-- stale one can never strand an issue in needs-human.
+-- NOTE: no semicolons in this comment - the schema is split on them.
+CREATE TABLE IF NOT EXISTS needs_human_cause (
+    issue_number INTEGER NOT NULL,
+    cause TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    PRIMARY KEY (issue_number, cause)
+);
 """
 
 # Additive columns the quarantine table gained after it shipped. ``CREATE TABLE
@@ -442,15 +455,22 @@ class SqlitePendingWorkClaimStore:
 
     def refresh_deferred_claim(
         self, work_key: str, claim: PendingWorkClaim
-    ) -> None:
-        """Rewrite the deferred row's payload from the current request."""
+    ) -> bool:
+        """Rewrite the deferred row's payload; report whether one existed.
+
+        ``rowcount`` is the whole point (#6999 F1 round 2): an UPDATE that
+        matches nothing is a successful statement and a failed commitment, and
+        the caller spending a bounded retry budget has to be able to tell them
+        apart.
+        """
         payload = json.dumps(encode_claim(claim), sort_keys=True)
         with self._write_lock, self._transaction() as conn:
-            conn.execute(
+            cursor = conn.execute(
                 "UPDATE pending_work_claim SET payload = ? "
                 "WHERE work_key = ? AND deferred = 1",
                 (payload, work_key),
             )
+            return cursor.rowcount > 0
 
     def mark_deferred_by_run_key(self, run_key: str) -> None:
         """Keep the row; only a relaunch of the same work may retire it."""
@@ -502,6 +522,44 @@ class SqlitePendingWorkClaimStore:
         allocated and the terminal registry recorded.
         """
         return self.run_key_for_path(run.run_dir)
+
+    # -- shared needs-human provenance -------------------------------------
+
+    def record_needs_human_cause(
+        self, issue_number: int, cause: str, *, reason: str
+    ) -> None:
+        with self._write_lock, self._transaction() as conn:
+            conn.execute(
+                "INSERT INTO needs_human_cause (issue_number, cause, reason) "
+                "VALUES (?, ?, ?) "
+                "ON CONFLICT(issue_number, cause) DO UPDATE SET "
+                "reason = excluded.reason",
+                (issue_number, cause, reason),
+            )
+
+    def needs_human_causes(self, issue_number: int) -> frozenset[str]:
+        return frozenset(
+            str(row["cause"])
+            for row in self._get_connection().execute(
+                "SELECT cause FROM needs_human_cause WHERE issue_number = ?",
+                (issue_number,),
+            )
+        )
+
+    def withdraw_needs_human_cause(self, issue_number: int, cause: str) -> None:
+        with self._write_lock, self._transaction() as conn:
+            conn.execute(
+                "DELETE FROM needs_human_cause "
+                "WHERE issue_number = ? AND cause = ?",
+                (issue_number, cause),
+            )
+
+    def clear_needs_human_causes(self, issue_number: int) -> None:
+        with self._write_lock, self._transaction() as conn:
+            conn.execute(
+                "DELETE FROM needs_human_cause WHERE issue_number = ?",
+                (issue_number,),
+            )
 
     # -- quarantine --------------------------------------------------------
 

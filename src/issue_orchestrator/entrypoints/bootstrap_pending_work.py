@@ -23,7 +23,7 @@ from ..control.needs_human_block import NeedsHumanBlock
 from ..execution.pending_work_claim_store import SqlitePendingWorkClaimStore
 
 if TYPE_CHECKING:
-    from ..control.actions import SupportsApplyAction
+    from ..control.action_applier import ActionApplier
     from ..control.label_manager import LabelManager
     from ..ports import EventSink
     from ..ports.repository_host import RepositoryHost
@@ -42,17 +42,27 @@ def build_pending_work_wiring(
     *,
     repo_root: Path,
     repository_host: "RepositoryHost",
-    action_applier: "SupportsApplyAction",
+    action_applier: "ActionApplier",
     label_manager: "LabelManager",
     events: "EventSink",
 ) -> PendingWorkWiring:
     """Assemble the ledger, its quarantine owner, and the shared-block reader."""
     claims = SqlitePendingWorkClaimStore.for_repo(repo_root)
     needs_human_block = NeedsHumanBlock(
+        needs_human_label=label_manager.needs_human,
         tech_lead_marker=label_manager.tech_lead_needs_human,
         read_labels=repository_host.get_issue_labels_fresh,
         quarantined_issue_numbers=claims.quarantined_issue_numbers,
+        causes=claims,
     )
+    # The applier is the single seam every label mutation passes through, so it
+    # is where an acquisition records its cause and a removal withdraws one
+    # (#6999 F2 round 2). Bound here, post-construction, because the applier is
+    # also what the quarantine owner applies THROUGH - and because the binding
+    # is a correctness contract, not a convenience: the applier must write into
+    # the very store this block reads, or a recorded cause is invisible to the
+    # remover it exists to stop.
+    action_applier.needs_human_block = needs_human_block
     return PendingWorkWiring(
         claims=claims,
         quarantine=build_claim_quarantine_owner(

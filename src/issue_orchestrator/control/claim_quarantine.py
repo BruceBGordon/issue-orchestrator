@@ -534,6 +534,7 @@ def build_claim_quarantine_owner(
                     issue_number=issue_number,
                     label=label_manager.needs_human,
                     reason="pending-work claim unreadable",
+                    needs_human_cause=NeedsHumanCause.CLAIM_QUARANTINE,
                 )
             )
             if not result.success:
@@ -550,6 +551,7 @@ def build_claim_quarantine_owner(
                     issue_number=issue_number,
                     label=label_manager.needs_human,
                     reason="pending-work claim quarantine resolved",
+                    needs_human_cause=NeedsHumanCause.CLAIM_QUARANTINE,
                 )
             ).success
 

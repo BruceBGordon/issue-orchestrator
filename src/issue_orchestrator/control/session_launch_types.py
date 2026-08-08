@@ -39,6 +39,17 @@ class LaunchDisposition(Enum):
     #: failed input read, and calling it an input failure would have made
     #: routing it here a lie.
     RETRYABLE_FAILURE = "retryable_failure"
+    #: The durable pending-work claim could not be recorded, so the launch
+    #: never happened AND nothing about this request exists in the ledger
+    #: (#6999 F1 round 2). Deliberately distinct from ``RETRYABLE_FAILURE``,
+    #: which it used to borrow: that disposition spends a unit of the queue's
+    #: bounded budget, and the settlement makes that spend durable by rewriting
+    #: the deferred row - a row that, in this case, was never created. The
+    #: rewrite silently matched zero rows, so the budget was spent in memory
+    #: against nothing, and a process death then lost the request outright.
+    #: Nothing failed about the WORK here; the ledger did. The item is retained
+    #: with its budget untouched, exactly as a provider refusal leaves it.
+    CLAIM_UNRECORDED = "claim_unrecorded"
     #: The launcher gave up. The queue drops the item.
     PERMANENT_FAILURE = "permanent_failure"
 

@@ -60,6 +60,14 @@ class WorkDisposal(Enum):
     #: a human after exhausting its budget. The deferred row must go with it,
     #: or startup recovery re-admits work that was deliberately abandoned.
     DROPPED = "dropped"
+    #: There is no durable row for this request at all, and none should be
+    #: written (#6999 F1 round 2). A launch can end before the claim is ever
+    #: held - the provider refuses, or the ledger write itself fails - and the
+    #: item then sits on its queue exactly as it arrived. Naming that state
+    #: instead of settling it as RETAINED is what stops a settlement believing
+    #: it committed something: the RETAINED write is an UPDATE of the deferred
+    #: row, which matches zero rows here and reports nothing.
+    UNRECORDED = "unrecorded"
 
 
 class LaunchWorkClaim(Protocol):
@@ -81,8 +89,8 @@ class LaunchWorkClaim(Protocol):
         """Bring the durable row into line with what the queue decided."""
         ...
 
-    def spend_budget(self, claim: PendingWorkClaim) -> None:
-        """Persist a request whose bounded retry budget has just been spent."""
+    def spend_budget(self, claim: PendingWorkClaim) -> bool:
+        """Persist a spent retry budget; report whether it actually committed."""
         ...
 
 
@@ -151,7 +159,13 @@ class PendingWorkLaunchClaim:
                 None,
                 False,
                 f"Could not record the pending-work claim: {exc}",
-                disposition=LaunchDisposition.RETRYABLE_FAILURE,
+                # NOT a retryable failure (#6999 F1 round 2). That disposition
+                # spends a unit of the queue's bounded budget and makes the
+                # spend durable by rewriting this request's deferred row - the
+                # very row this write just failed to create. The rewrite would
+                # match zero rows and say so to nobody, leaving the budget spent
+                # in memory against nothing durable at all.
+                disposition=LaunchDisposition.CLAIM_UNRECORDED,
             )
         return None
 
@@ -182,6 +196,10 @@ class PendingWorkLaunchClaim:
         copy so the durable payload can be written before the in-memory queue is
         touched (#6999 F2).
         """
+        if disposal is WorkDisposal.UNRECORDED:
+            # Nothing was ever written for this request, so there is nothing to
+            # bring into line and no write that could report otherwise.
+            return
         settled = claim or self.claim
         work_key = settled.work_key()
         if disposal is WorkDisposal.DROPPED:
@@ -198,7 +216,7 @@ class PendingWorkLaunchClaim:
         # would refund it.
         self.claims.refresh_deferred_claim(work_key, settled)
 
-    def spend_budget(self, claim: PendingWorkClaim) -> None:
+    def spend_budget(self, claim: PendingWorkClaim) -> bool:
         """Make one spent unit of a bounded retry budget durable, first (#6999 F2).
 
         The budget lives in the queued request, and the in-memory queue does not
@@ -207,8 +225,14 @@ class PendingWorkLaunchClaim:
         fail (an escalation that does not commit, a process that dies): none of
         it may be able to refund the attempt, so this write goes first, before
         the in-memory queue is touched and before anything irreversible runs.
+
+        Reports whether it COMMITTED (#6999 F1 round 2). The write is an UPDATE
+        of this work's deferred row, and a launch that ended before the claim
+        was ever held has no such row: the statement then matches nothing and
+        succeeds. Returning that fact is what lets the settlement refuse to
+        spend a budget in memory that nothing durable will remember.
         """
-        self.claims.refresh_deferred_claim(claim.work_key(), claim)
+        return self.claims.refresh_deferred_claim(claim.work_key(), claim)
 
 
 @dataclass(frozen=True, slots=True)
@@ -232,8 +256,13 @@ class _ClaimlessLaunch:
     ) -> None:
         return None
 
-    def spend_budget(self, claim: PendingWorkClaim) -> None:
-        return None
+    def spend_budget(self, claim: PendingWorkClaim) -> bool:
+        # A claimless launch has no budget to spend and no row to spend it in,
+        # so nothing was committed. Reported honestly rather than as a success:
+        # this null object never reaches a settlement, and if one is ever built
+        # over it, refusing to project an uncommitted spend is the safe answer.
+        del claim
+        return False
 
 
 NO_LAUNCH_WORK_CLAIM: LaunchWorkClaim = _ClaimlessLaunch()
@@ -432,6 +461,21 @@ class LaunchSettlement:
             # exists, so dropping it here would lose it permanently.
             logger.info("[PROVIDER] Launch deferred, work retained: %s", result.reason)
             return SettlementDecision(WorkDisposal.RETAINED, claim, _no_projection)
+        if result.disposition is LaunchDisposition.CLAIM_UNRECORDED:
+            # The ledger refused the claim, so this request has no durable row
+            # and the launch never happened (#6999 F1 round 2). Nothing about
+            # the WORK failed, so no budget is spent - the item waits on its
+            # queue exactly as it arrived, for a tick when the store is
+            # writable. Settling it as a retryable failure was the bug: the
+            # spend was projected onto the queue while the write that was meant
+            # to make it durable matched no rows at all.
+            logger.error(
+                "[WORK] %s work could not be claimed durably, so no launch was "
+                "attempted and no retry was spent: %s",
+                claim.kind.value,
+                result.reason,
+            )
+            return SettlementDecision(WorkDisposal.UNRECORDED, claim, _no_projection)
         if result.disposition is LaunchDisposition.RETRYABLE_FAILURE:
             return self._spend_retry_budget(claim)
         if result.disposition is LaunchDisposition.PERMANENT_FAILURE:
@@ -471,7 +515,21 @@ class LaunchSettlement:
         investigation is not.
         """
         plan = self.plan_retry(claim)
-        self.work.spend_budget(plan.spent)
+        if not self.work.spend_budget(plan.spent):
+            # The ledger has no row for this work, so the spend committed
+            # nowhere (#6999 F1 round 2). Projecting it anyway is the failure
+            # this ordering exists to prevent, only worse: the budget would be
+            # spent solely in memory, so a death loses the request outright and
+            # repeated store faults would burn the bound and escalate work that
+            # never actually failed. No durable spend, no spend.
+            logger.error(
+                "[WORK] Refusing to spend a retry against %s work: the ledger "
+                "holds no deferred row for it, so the spend would exist only in "
+                "memory. The request keeps its full budget and the next tick "
+                "retries.",
+                claim.kind.value,
+            )
+            return SettlementDecision(WorkDisposal.UNRECORDED, claim, _no_projection)
         plan.apply()
         if not plan.exhausted or not plan.commit_exhaustion():
             return SettlementDecision(

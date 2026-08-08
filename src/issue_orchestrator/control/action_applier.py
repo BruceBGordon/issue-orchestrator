@@ -28,7 +28,7 @@ Usage:
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Literal, Optional, Sequence, TypeVar
+from typing import TYPE_CHECKING, Callable, Optional, Sequence, TypeVar
 
 from ..events import EventName
 from ..infra.logging_config import issue_log
@@ -55,7 +55,13 @@ if TYPE_CHECKING:
     from .session_history import SessionHistoryOwner
     from .tech_lead_kill_session import TechLeadKillSessionExecutor
     from .tech_lead_reset_retry import TechLeadResetRetryExecutor
+from .label_mutation_stats import LabelMutationStatField, LabelMutationStats
 from .mutation_gate import ReconciliationGate
+from .needs_human_block import (
+    NO_OTHER_NEEDS_HUMAN_CAUSES,
+    BlockMutation,
+    SharedNeedsHumanBlock,
+)
 from .reconciliation import ReconciliationRequired
 from .claim_gate import ClaimGate, ClaimLostError
 from .review_exchange_lifecycle import (
@@ -111,56 +117,6 @@ ValidationRetryLauncherCallback = Callable[[int], Optional[Session]]
 LeaseIdLookup = Callable[[int], str | None]
 # Act-level tech_lead op actions share one dispatch shape (#6764/#6778).
 _TechLeadOpAction = TypeVar("_TechLeadOpAction", ResetRetryIssueAction, KillHungSessionAction)
-LabelMutationStatField = Literal[
-    "label_add_attempted",
-    "label_add_applied",
-    "label_add_noop",
-    "label_remove_attempted",
-    "label_remove_applied",
-    "label_remove_noop",
-    "label_mutation_failed",
-]
-
-
-@dataclass
-class _LabelMutationStats:
-    """Per-batch label mutation counters for churn observability."""
-
-    label_add_attempted: int = 0
-    label_add_applied: int = 0
-    label_add_noop: int = 0
-    label_remove_attempted: int = 0
-    label_remove_applied: int = 0
-    label_remove_noop: int = 0
-    label_mutation_failed: int = 0
-
-    @property
-    def attempted(self) -> int:
-        return self.label_add_attempted + self.label_remove_attempted
-
-    @property
-    def applied(self) -> int:
-        return self.label_add_applied + self.label_remove_applied
-
-    @property
-    def noop(self) -> int:
-        return self.label_add_noop + self.label_remove_noop
-
-    def to_payload(self) -> dict[str, int]:
-        return {
-            "label_add_attempted": self.label_add_attempted,
-            "label_add_applied": self.label_add_applied,
-            "label_add_noop": self.label_add_noop,
-            "label_remove_attempted": self.label_remove_attempted,
-            "label_remove_applied": self.label_remove_applied,
-            "label_remove_noop": self.label_remove_noop,
-            "label_mutation_attempted": self.attempted,
-            "label_mutation_applied": self.applied,
-            "label_mutation_noop": self.noop,
-            "label_mutation_failed": self.label_mutation_failed,
-        }
-
-
 @dataclass
 class ActionApplier:
     """Applies actions via ports/adapters.
@@ -196,6 +152,12 @@ class ActionApplier:
     # which decides the labels to remove from the issue's live labels at apply
     # time. Optional so unrelated tests need not wire it.
     label_manager: Optional["LabelManager"] = None
+    # The one owner of the shared needs-human block's provenance (#6999 F2
+    # round 2). Every add of that label records the asserting cause and every
+    # remove withdraws one, so a remover can tell whether it is the last cause
+    # standing. An explicit null object rather than an optional: it governs no
+    # label, so an applier holding it behaves exactly as it did before.
+    needs_human_block: SharedNeedsHumanBlock = NO_OTHER_NEEDS_HUMAN_CAUSES
     # Issue-scoped persistent coder/reviewer subprocess pair registry.
     # Used with the background supervisor to terminate hidden review-exchange
     # runtime work at issue lifecycle boundaries. ADR 0026 / B2.
@@ -226,10 +188,10 @@ class ActionApplier:
     promotion_target: Optional["PromotionTargetHost"] = None
     # Expedite-lane owner seam (#6870), wired post-construction; unwired = no-op.
     expedite_lane: Optional["ExpediteLane"] = None
-    _active_label_mutation_stats: _LabelMutationStats | None = field(
+    _active_label_mutation_stats: LabelMutationStats | None = field(
         default=None, init=False, repr=False
     )
-    _active_label_mutation_by_issue: dict[int, _LabelMutationStats] = field(
+    _active_label_mutation_by_issue: dict[int, LabelMutationStats] = field(
         default_factory=dict, init=False, repr=False
     )
 
@@ -268,7 +230,7 @@ class ActionApplier:
         Returns:
             List of ActionResults
         """
-        self._active_label_mutation_stats = _LabelMutationStats()
+        self._active_label_mutation_stats = LabelMutationStats()
         self._active_label_mutation_by_issue = {}
         try:
             return [self.apply(action) for action in actions]
@@ -348,6 +310,9 @@ class ActionApplier:
             self._record_label_stat(action.issue_number, "label_add_attempted")
             has_label = self._has_label_safely(action.issue_number, action.label)
             if has_label is True:
+                # Already present, but THIS lifecycle now requires it too, and
+                # that is exactly the fact a later remover needs (#6999 F2 r2).
+                self._on_label_added(action)
                 self._record_label_stat(action.issue_number, "label_add_noop")
                 self._log_label_mutation(
                     level=logging.INFO,
@@ -366,6 +331,7 @@ class ActionApplier:
                 )
             self.labels.add_label(action.issue_number, action.label)
             self._persist_label_add(action.issue_number, action.label)
+            self._on_label_added(action)
             self._record_label_stat(action.issue_number, "label_add_applied")
             self._log_label_mutation(
                 level=logging.INFO,
@@ -400,6 +366,50 @@ class ActionApplier:
             )
             return ActionResult.fail(action, str(e))
 
+    def _on_label_added(self, action: AddLabelAction) -> None:
+        self.needs_human_block.blocks_mutation(
+            action.issue_number,
+            action.label,
+            BlockMutation.ACQUIRED,
+            cause=action.needs_human_cause,
+            reason=action.reason,
+        )
+
+    def _withdraw_needs_human_cause(
+        self, action: RemoveLabelAction
+    ) -> Optional[ActionResult]:
+        """Withdraw this remover's cause; stop if another still holds the block.
+
+        A refusal is reported as a successful no-op, not a failure (#6999 F2
+        round 2). Nothing went wrong: this cause IS withdrawn, its obligation is
+        discharged, and the label correctly stays for someone else. Reporting
+        failure would make an owner retry forever against a block it no longer
+        has any claim on.
+        """
+        if not self.needs_human_block.blocks_mutation(
+            action.issue_number,
+            action.label,
+            BlockMutation.RELEASING,
+            cause=action.needs_human_cause,
+        ):
+            return None
+        self._log_label_mutation(
+            level=logging.INFO,
+            issue_number=action.issue_number,
+            operation="remove",
+            outcome="noop",
+            label=action.label,
+            reason=action.reason,
+            detail="another lifecycle still requires the shared block",
+        )
+        return ActionResult.ok(
+            action,
+            issue_number=action.issue_number,
+            label=action.label,
+            no_op=True,
+            blocked_by_other_cause=True,
+        )
+
     def _apply_remove_label(self, action: Action) -> ActionResult:
         """Remove a label from an issue."""
         assert isinstance(action, RemoveLabelAction)
@@ -408,6 +418,9 @@ class ActionApplier:
         self._require_expected(action, action.issue_number)
         # Verify claim ownership before write (raises ClaimLostError)
         self._verify_claim_before_write(action, action.issue_number)
+
+        if blocked := self._withdraw_needs_human_cause(action):
+            return blocked
 
         try:
             self._record_label_stat(action.issue_number, "label_remove_attempted")
@@ -440,6 +453,12 @@ class ActionApplier:
                 )
             self.labels.remove_label(action.issue_number, action.label)
             self._persist_label_remove(action.issue_number, action.label)
+            self.needs_human_block.blocks_mutation(
+                action.issue_number,
+                action.label,
+                BlockMutation.RELEASED,
+                cause=action.needs_human_cause,
+            )
             self._record_label_stat(action.issue_number, "label_remove_applied")
             self._log_label_mutation(
                 level=logging.INFO,
@@ -1721,34 +1740,15 @@ Maximum rework cycles ({action.max_rework_cycles}) exceeded.
                      pr_number, payload.get("issue_key"), added, removed)
         self.events.publish(make_trace_event(EventName.PR_VIEW_CHANGED, payload))
 
-    @staticmethod
-    def _increment_label_stat(stats: _LabelMutationStats, field_name: LabelMutationStatField) -> None:
-        if field_name == "label_add_attempted":
-            stats.label_add_attempted += 1
-        elif field_name == "label_add_applied":
-            stats.label_add_applied += 1
-        elif field_name == "label_add_noop":
-            stats.label_add_noop += 1
-        elif field_name == "label_remove_attempted":
-            stats.label_remove_attempted += 1
-        elif field_name == "label_remove_applied":
-            stats.label_remove_applied += 1
-        elif field_name == "label_remove_noop":
-            stats.label_remove_noop += 1
-        else:
-            stats.label_mutation_failed += 1
-
     def _record_label_stat(self, issue_number: int, field_name: LabelMutationStatField) -> None:
         """Increment label mutation counters for current apply_all batch."""
         if self._active_label_mutation_stats is None:
             return
 
-        self._increment_label_stat(self._active_label_mutation_stats, field_name)
-
-        issue_stats = self._active_label_mutation_by_issue.setdefault(
-            issue_number, _LabelMutationStats()
-        )
-        self._increment_label_stat(issue_stats, field_name)
+        self._active_label_mutation_stats.increment(field_name)
+        self._active_label_mutation_by_issue.setdefault(
+            issue_number, LabelMutationStats()
+        ).increment(field_name)
 
     def _emit_label_mutation_summary(self) -> None:
         """Emit per-batch label mutation summary event and log line."""

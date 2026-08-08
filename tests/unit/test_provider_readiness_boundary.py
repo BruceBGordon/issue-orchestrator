@@ -6429,7 +6429,10 @@ def test_a_claim_store_that_cannot_record_stops_the_launch(tmp_path: Path) -> No
     )
 
     assert not result.success
-    assert result.disposition is LaunchDisposition.RETRYABLE_FAILURE
+    # Not a retryable failure: that disposition spends a unit of the queue's
+    # bounded budget and makes the spend durable by rewriting a deferred row
+    # this very write failed to create (#6999 F1 round 2).
+    assert result.disposition is LaunchDisposition.CLAIM_UNRECORDED
     assert harness.created == []  # no terminal was spawned
     assert store.deferred == []  # nothing was held, so nothing to hand back
     assert len(state.pending_tech_lead_reviews) == 1
@@ -6666,3 +6669,117 @@ def test_an_escalation_that_commits_is_never_refunded_by_the_restart(
     assert _route("tech_lead", restarted, harness) is None
     assert restarted.pending_tech_lead_reviews == []
     assert harness.claims.list_unresolved_claims() == ()
+
+
+def test_an_unwritable_ledger_never_spends_a_budget_it_cannot_record(
+    tmp_path: Path,
+) -> None:
+    """The whole production router, against a store that refuses every hold.
+
+    The launcher's own contract has always been that a failed hold costs the
+    request nothing: no terminal, no queue mutation, full budget, retry next
+    tick. But the launcher does not settle - the router does - and settlement
+    read a failed hold as an ordinary retryable failure. That spent a unit of
+    the bounded budget on the queue object and "made it durable" by rewriting
+    this work's deferred row, which the failed hold had never created. The
+    UPDATE matched zero rows and said so to nobody.
+
+    Two losses followed, and only the production path shows either: a death
+    after that projection lost freshly queued work outright, because the ledger
+    held nothing; and TECH_LEAD_LAUNCH_RETRY_LIMIT store faults in a row
+    exhausted the bound and escalated an investigation that had never actually
+    failed to launch.
+    """
+    from issue_orchestrator.control.pending_session_queues import (
+        TECH_LEAD_LAUNCH_RETRY_LIMIT,
+    )
+
+    class _RefusingHoldStore:
+        """Every durable hold fails; everything else is the real store."""
+
+        def __init__(self, real):
+            self._real = real
+            self.refusals = 0
+
+        def hold_pending_work_claim(self, run, claim, *, issue_number):
+            self.refusals += 1
+            raise RuntimeError("ledger is unwritable")
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+    harness = _ready_harness(tmp_path)
+    real_claims = harness.claims
+    harness.claims = _RefusingHoldStore(real_claims)
+    state = _pending_state("tech_lead")
+
+    # More attempts than the bound, so an over-spent budget would have
+    # escalated and dropped the investigation by now.
+    for _ in range(TECH_LEAD_LAUNCH_RETRY_LIMIT + 1):
+        assert _route("tech_lead", state, harness) is None
+
+    assert harness.claims.refusals == TECH_LEAD_LAUNCH_RETRY_LIMIT + 1
+    assert harness.created == []  # nothing was ever spawned
+    (queued,) = state.pending_tech_lead_reviews
+    assert queued.retryable_launch_failures == 0, (
+        "a ledger fault is not the work failing; the budget must be untouched"
+    )
+    assert EventName.ISSUE_NEEDS_HUMAN.value not in harness.event_names()
+
+    # Nothing half-written: the ledger has no row for work it never accepted,
+    # so a restart cannot resurrect a phantom claim either. The request itself
+    # is not recoverable from the ledger and must not pretend to be - it was
+    # never taken off anything durable, and the queue that holds it is
+    # rebuilt by discovery.
+    harness.claims = real_claims
+    assert harness.claims.list_unresolved_claims() == ()
+    assert harness.claims.list_unreadable_claims() == ()
+    restarted = _recover_with_no_terminals(state, harness)
+    assert restarted.pending_tech_lead_reviews == []
+
+    # ...and once the store is writable again the very next launch proceeds
+    # with the full budget the fault never spent.
+    assert _route("tech_lead", state, harness) is not None
+    assert harness.created == ["issue-7"]
+
+
+def test_a_settlement_will_not_project_a_spend_the_ledger_did_not_take(
+    tmp_path: Path,
+) -> None:
+    """The backstop, independent of which disposition got us here.
+
+    ``refresh_deferred_claim`` is an UPDATE of this work's deferred row, so it
+    reports whether one existed. Any settlement that spends a bounded budget
+    has to consult that: a spend the ledger did not take is a spend that lives
+    only in memory, and the ordering this transaction is built on says the
+    queue may never move ahead of the ledger.
+    """
+    from issue_orchestrator.control.launch_transaction import RetryPlan
+
+    harness = _failing_spawn_harness(tmp_path)
+    state = _pending_state("tech_lead")
+    (queued,) = state.pending_tech_lead_reviews
+    projected: list[str] = []
+
+    # No deferred row exists: nothing was ever held for this work.
+    assert harness.claims.list_unresolved_claims() == ()
+
+    settlement = _settlement_over(
+        "tech_lead",
+        state,
+        harness,
+        remove=lambda: pytest.fail("nothing may be dropped here"),
+        plan_retry=lambda claim: RetryPlan(
+            spent=claim,
+            exhausted=True,
+            apply=lambda: projected.append("apply"),
+            commit_exhaustion=lambda: pytest.fail(
+                "an uncommitted spend must never reach the escalation"
+            ),
+        ),
+    )
+    settlement.settle(_unspawned("RETRYABLE_FAILURE"), state)
+
+    assert projected == []
+    assert queued.retryable_launch_failures == 0
+    assert _pending_count(state, "tech_lead") == 1

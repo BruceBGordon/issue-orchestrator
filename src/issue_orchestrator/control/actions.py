@@ -28,6 +28,7 @@ from ..domain.models import (
     AwaitingMergeTerminalStatus,
     DiscoveredFailure,
 )
+from .needs_human_block import NeedsHumanCause
 from .action_base import Action as Action, ActionType as ActionType
 # Action result types are the Apply/report half of this boundary. They live in
 # `action_results.py` and remain re-exported here for existing importers.
@@ -77,6 +78,14 @@ class AddLabelAction(Action):
     issue_number: int = 0
     label: str = ""
     issue_key: str = ""  # stable_id for SSE events; falls back to str(issue_number) when empty
+    # Which lifecycle is asserting the shared needs-human block, when that is
+    # the label being added (#6999 F2 round 2). Ignored for every other label.
+    # It defaults to SESSION_LIFECYCLE - the catch-all for planner escalations -
+    # so a call site that adds the shared label without thinking about ownership
+    # still records provenance rather than creating an unowned block. The two
+    # lifecycles that keep their own durable provenance name themselves, which
+    # is what stops a re-assertion by one of them reading as a second cause.
+    needs_human_cause: NeedsHumanCause = NeedsHumanCause.SESSION_LIFECYCLE
     action_type: ActionType = field(default=ActionType.ADD_LABEL, init=False)
 
 
@@ -87,6 +96,10 @@ class RemoveLabelAction(Action):
     issue_number: int = 0
     label: str = ""
     issue_key: str = ""  # stable_id for SSE events; falls back to str(issue_number) when empty
+    # Which lifecycle is WITHDRAWING its claim on the shared needs-human block
+    # (#6999 F2 round 2). The withdrawal always happens; the label only comes
+    # off if no other cause still requires it.
+    needs_human_cause: NeedsHumanCause = NeedsHumanCause.SESSION_LIFECYCLE
     action_type: ActionType = field(default=ActionType.REMOVE_LABEL, init=False)
 
 

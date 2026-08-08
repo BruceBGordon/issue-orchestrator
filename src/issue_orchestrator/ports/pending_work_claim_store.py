@@ -330,7 +330,7 @@ class PendingWorkClaimStore(Protocol):
         """
         ...
 
-    def refresh_deferred_claim(self, work_key: str, claim: PendingWorkClaim) -> None:
+    def refresh_deferred_claim(self, work_key: str, claim: PendingWorkClaim) -> bool:
         """Re-persist a deferred row's payload from the current request (#6999 F4).
 
         The payload is written when the claim is HELD, before the launch fails,
@@ -339,8 +339,16 @@ class PendingWorkClaimStore(Protocol):
         restart re-admits the request with a refunded budget and relaunches an
         investigation whose retries are already exhausted.
 
-        A no-op when no deferred row exists: a launch that never held the claim
-        has nothing to refresh.
+        Returns whether a deferred row was actually rewritten (#6999 F1 round
+        2). A launch that never held the claim — the provider refused before the
+        hold, or the hold itself failed — has no row here, and the write then
+        matches nothing. That is a legitimate outcome, but it is NOT a commit,
+        and a caller that treats it as one spends a retry budget nothing
+        durable will remember. Unlike :meth:`retire_deferred_claim`, whose
+        postcondition ("no deferred row for this work") holds either way, this
+        method's postcondition ("the deferred row now says THIS") cannot be
+        satisfied by an absent row, so the difference is reported rather than
+        swallowed.
         """
         ...
 
@@ -375,6 +383,53 @@ class PendingWorkClaimStore(Protocol):
         generation would otherwise suppress the new one's comment and event
         (#6999 F12).
         """
+        ...
+
+
+class NeedsHumanCauseStore(Protocol):
+    """Durable provenance for the shared ``needs-human`` block (#6999 F2 r2).
+
+    Two of the block's causes already record themselves durably and elsewhere:
+    a tech-lead escalation owns a marker label, and a quarantine owns a row in
+    :class:`ClaimQuarantineStore`. Every OTHER orchestrator cause — a session
+    that ended without a completion record, publish failures past their bound,
+    an invalid completion record, a stuck sweep — simply added the shared label
+    and left no trace of having needed it. A remover could then see a label with
+    no discoverable owner and conclude it was its own to take off.
+
+    These rows are that missing trace. They are deliberately NOT authoritative
+    over the label: the label is, and a human who removes it ends every cause at
+    once. A row therefore only ever means "while this label is present, THIS
+    lifecycle is one of the reasons for it", and rows are dropped as soon as the
+    label goes — by the remover that took it off, or by the first reader that
+    finds it already gone. That is what stops a stale row stranding an issue in
+    ``needs-human`` forever.
+
+    Kept in the orchestrator-owned database for the same reason the quarantine
+    is: it shares that trust boundary and its lifetime, and it must not live
+    anywhere an agent can write.
+    """
+
+    def record_needs_human_cause(
+        self, issue_number: int, cause: str, *, reason: str
+    ) -> None:
+        """Record that ``cause`` requires the shared block on ``issue_number``.
+
+        Idempotent: a lifecycle that re-asserts the same cause on every tick
+        must not accumulate rows.
+        """
+        ...
+
+    def needs_human_causes(self, issue_number: int) -> frozenset[str]:
+        """Every cause currently recorded against ``issue_number``."""
+        ...
+
+    def withdraw_needs_human_cause(self, issue_number: int, cause: str) -> None:
+        """Drop one cause's row, leaving any others in place."""
+        ...
+
+    def clear_needs_human_causes(self, issue_number: int) -> None:
+        """Drop every cause for an issue whose shared label is gone."""
         ...
 
 
@@ -463,6 +518,7 @@ __all__ = [
     "QuarantineLabelState",
     "QuarantineRecord",
     "ConflictingPendingWorkClaimError",
+    "NeedsHumanCauseStore",
     "PendingWorkClaimStore",
     "UnreadableClaim",
     "UnresolvedClaim",

@@ -22,6 +22,9 @@ from issue_orchestrator.control.actions import (
 from issue_orchestrator.control.claim_quarantine import QuarantineSubject
 from issue_orchestrator.control.label_manager import LabelManager
 from issue_orchestrator.control.needs_human_block import NeedsHumanBlock
+from issue_orchestrator.execution.pending_work_claim_store import (
+    SqlitePendingWorkClaimStore,
+)
 from issue_orchestrator.control.reconciliation import (
     ExternalSnapshot,
     ReconciliationRequired,
@@ -547,9 +550,11 @@ class TestQuarantineProvenanceIsRespected:
             discover_marked_issue_numbers=lambda: (903,),
             apply_actions=applier,
             needs_human_block=NeedsHumanBlock(
+                needs_human_label=labels.needs_human,
                 tech_lead_marker=labels.tech_lead_needs_human,
                 read_labels=lambda issue_number: list(live[issue_number]),
                 quarantined_issue_numbers=lambda: frozenset({903}),
+                causes=SqlitePendingWorkClaimStore.for_repo(tmp_path),
             ),
         )
 
@@ -573,9 +578,11 @@ class TestQuarantineProvenanceIsRespected:
             discover_marked_issue_numbers=lambda: (903,),
             apply_actions=applier,
             needs_human_block=NeedsHumanBlock(
+                needs_human_label=labels.needs_human,
                 tech_lead_marker=labels.tech_lead_needs_human,
                 read_labels=lambda issue_number: list(live[issue_number]),
                 quarantined_issue_numbers=frozenset,
+                causes=SqlitePendingWorkClaimStore.for_repo(tmp_path),
             ),
         )
 
@@ -657,9 +664,11 @@ class TestTheSharedBlockIsNotOneOwnersToRetract:
         applier = _RecordingApplier(live=live)
         claims = SqlitePendingWorkClaimStore.for_repo(tmp_path)
         block = NeedsHumanBlock(
+            needs_human_label=labels.needs_human,
             tech_lead_marker=labels.tech_lead_needs_human,
             read_labels=lambda issue_number: list(live.get(issue_number, set())),
             quarantined_issue_numbers=claims.quarantined_issue_numbers,
+            causes=claims,
         )
         quarantine = build_claim_quarantine_owner(
             store=claims,
@@ -775,3 +784,207 @@ class TestTheSharedBlockIsNotOneOwnersToRetract:
             for action in applier.applied
             if isinstance(action, AddLabelAction)
         ] == []
+
+
+class TestEveryOrchestratorCauseOwnsTheSharedBlock:
+    """The other causes, through the seam every label mutation passes (#6999 F2 r2).
+
+    Naming only the tech-lead escalation and the quarantine left the same loss
+    open for every OTHER orchestrator cause. Several controllers add the shared
+    label directly - a session that ended without a completion record, publish
+    failures past their bound, an invalid completion record, a stuck sweep - and
+    none of them recorded that they needed it. So: quarantine acquires the
+    label, a planner escalation later needs the very same label and finds it
+    already present, the quarantine resolves, and the remover sees no cause it
+    recognises and takes the block off underneath a lifecycle that still
+    requires it.
+
+    These exercise the REAL ``ActionApplier``, because that is the single seam
+    every acquisition and release passes through and therefore the only place
+    the rule can be made to hold for call sites nobody has converted - the ten
+    that exist today and the eleventh someone adds tomorrow.
+    """
+
+    def _wiring(self, sample_config, tmp_path, live):
+        from unittest.mock import MagicMock
+
+        from issue_orchestrator.control.action_applier import ActionApplier
+        from issue_orchestrator.control.claim_quarantine import (
+            build_claim_quarantine_owner,
+        )
+
+        labels = LabelManager(sample_config)
+
+        class _LabelSet:
+            """Live labels, with the production add/remove/has semantics."""
+
+            def add_label(self, number: int, label: str) -> None:
+                live.setdefault(number, set()).add(label)
+
+            def remove_label(self, number: int, label: str) -> None:
+                live.setdefault(number, set()).discard(label)
+
+            def has_label(self, number: int, label: str) -> bool:
+                return label in live.get(number, set())
+
+        claims = SqlitePendingWorkClaimStore.for_repo(tmp_path)
+        block = NeedsHumanBlock(
+            needs_human_label=labels.needs_human,
+            tech_lead_marker=labels.tech_lead_needs_human,
+            read_labels=lambda number: list(live.get(number, set())),
+            quarantined_issue_numbers=claims.quarantined_issue_numbers,
+            causes=claims,
+        )
+        applier = ActionApplier(
+            labels=_LabelSet(),
+            sessions=MagicMock(),
+            events=MagicMock(),
+            label_manager=labels,
+            needs_human_block=block,
+        )
+        quarantine = build_claim_quarantine_owner(
+            store=claims,
+            action_applier=applier,
+            label_manager=labels,
+            events=MagicMock(),
+            needs_human_block=block,
+        )
+        return labels, applier, quarantine, block
+
+    def _quarantine_run(self, quarantine, tmp_path, issue_number=903):
+        from issue_orchestrator.control.in_flight_work import QuarantinedSession
+
+        quarantine.quarantine(
+            QuarantineSubject.live_run_with_unreadable_claim(
+                QuarantinedSession(
+                    _session(issue_number, tmp_path),
+                    "payload unreadable",
+                    f"/runs/{issue_number}",
+                    f"/runs/{issue_number}@t1",
+                )
+            )
+        )
+
+    def _session_escalation(self, labels, issue_number=903):
+        """Exactly what the completion planner emits - a plain label add."""
+        return AddLabelAction(
+            issue_number=issue_number,
+            label=labels.needs_human,
+            reason="Session terminated without calling completion command (mandatory)",
+        )
+
+    def test_a_resolving_quarantine_leaves_a_planner_escalation_blocked(
+        self, sample_config, tmp_path
+    ):
+        """The reviewer's scenario, end to end, with no tech-lead marker in sight."""
+        live: dict[int, set[str]] = {903: set()}
+        labels, applier, quarantine, _block = self._wiring(
+            sample_config, tmp_path, live
+        )
+
+        self._quarantine_run(quarantine, tmp_path)
+        assert labels.needs_human in live[903]
+
+        # A session for the same issue dies without a completion record while
+        # the quarantine's block is standing. The planner's add is a no-op on
+        # the label - and that no-op is exactly the moment the cause has to be
+        # recorded, because it is the only trace this lifecycle ever leaves.
+        result = applier.apply(self._session_escalation(labels))
+        assert result.success
+        assert result.details.get("no_op") is True
+
+        quarantine.reconcile_released(frozenset())
+
+        assert labels.needs_human in live[903], (
+            "the planner escalation still requires the block"
+        )
+        assert labels.tech_lead_needs_human not in live[903]
+        assert quarantine.store.list_quarantines() == ()
+
+    def test_the_last_cause_out_still_clears_the_block(
+        self, sample_config, tmp_path
+    ):
+        """Provenance must not become a one-way ratchet.
+
+        A cause ledger that can only accumulate strands issues in needs-human
+        forever, which is a worse failure than the one it fixes. The planner
+        cause withdraws through the same seam, and once it is the last one the
+        label comes off.
+        """
+        live: dict[int, set[str]] = {903: set()}
+        labels, applier, quarantine, _block = self._wiring(
+            sample_config, tmp_path, live
+        )
+
+        self._quarantine_run(quarantine, tmp_path)
+        applier.apply(self._session_escalation(labels))
+        quarantine.reconcile_released(frozenset())
+        assert labels.needs_human in live[903]
+
+        # The planner's own clear - the last cause standing.
+        cleared = applier.apply(
+            RemoveLabelAction(
+                issue_number=903,
+                label=labels.needs_human,
+                reason="post-publish state now reworkable; clearing needs-human",
+            )
+        )
+
+        assert cleared.success
+        assert not cleared.details.get("blocked_by_other_cause")
+        assert labels.needs_human not in live[903]
+
+    def test_a_withdrawal_that_is_not_the_last_cause_keeps_the_label(
+        self, sample_config, tmp_path
+    ):
+        """The backstop fires even for a remover that never asked."""
+        live: dict[int, set[str]] = {903: set()}
+        labels, applier, quarantine, _block = self._wiring(
+            sample_config, tmp_path, live
+        )
+
+        self._quarantine_run(quarantine, tmp_path)
+        applier.apply(self._session_escalation(labels))
+
+        # A planner clear while the quarantine is still live. The withdrawal is
+        # real - this cause is discharged - but the label is not this remover's
+        # to take.
+        cleared = applier.apply(
+            RemoveLabelAction(
+                issue_number=903,
+                label=labels.needs_human,
+                reason="post-publish state now reworkable; clearing needs-human",
+            )
+        )
+
+        assert cleared.success, "a discharged obligation is not a failure"
+        assert cleared.details.get("blocked_by_other_cause") is True
+        assert labels.needs_human in live[903]
+
+    def test_a_human_clearing_the_label_ends_every_recorded_cause(
+        self, sample_config, tmp_path
+    ):
+        """The label stays authoritative over the rows, never the reverse.
+
+        A human who removes ``needs-human`` ends every cause at once and tells
+        nobody. A row found standing over an absent label is stale by
+        definition; leaving it would hold the block open for a cause that no
+        longer exists and strand the issue the next time anything asked.
+        """
+        from issue_orchestrator.control.needs_human_block import NeedsHumanCause
+
+        live: dict[int, set[str]] = {903: set()}
+        labels, applier, _quarantine, block = self._wiring(
+            sample_config, tmp_path, live
+        )
+
+        applier.apply(self._session_escalation(labels))
+        assert block.held_by_another_cause(
+            903, excluding=NeedsHumanCause.CLAIM_QUARANTINE
+        )
+
+        live[903].discard(labels.needs_human)  # a human, out of band
+
+        assert not block.held_by_another_cause(
+            903, excluding=NeedsHumanCause.CLAIM_QUARANTINE
+        )
