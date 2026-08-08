@@ -3059,7 +3059,7 @@ class TestPendingSessionQueuesTechLeadIntake:
         (entry,) = state.pending_tech_lead_reviews
         assert entry.flavor is TechLeadSessionFlavor.BATCH_REVIEW
 
-    def test_retain_tech_lead_for_retry_is_bounded_by_the_owner(self):
+    def test_tech_lead_retry_is_bounded_by_the_owner(self):
         """Retryable launch failures retain the item; the owner bounds retries.
 
         The queued investigation is the only cross-tick record, so retention is
@@ -3081,20 +3081,28 @@ class TestPendingSessionQueuesTechLeadIntake:
         )
 
         for attempt in range(1, TECH_LEAD_LAUNCH_RETRY_LIMIT):
-            assert queues.retain_tech_lead_for_retry(8) is TechLeadRetentionOutcome.RETAINED
+            plan = queues.plan_tech_lead_retry(8)
+            assert plan.outcome is TechLeadRetentionOutcome.RETAINED
+            # Planning alone changes nothing: the spend is not real until it has
+            # been made durable and then projected back here (#6999 F2).
+            (entry,) = state.pending_tech_lead_reviews
+            assert entry.retryable_launch_failures == attempt - 1
+            queues.apply_tech_lead_retry(plan)
             (entry,) = state.pending_tech_lead_reviews
             assert entry.retryable_launch_failures == attempt
 
-        assert queues.retain_tech_lead_for_retry(8) is TechLeadRetentionOutcome.EXHAUSTED
+        final = queues.plan_tech_lead_retry(8)
+        assert final.outcome is TechLeadRetentionOutcome.EXHAUSTED
+        queues.apply_tech_lead_retry(final)
         assert len(state.pending_tech_lead_reviews) == 1, (
             "EXHAUSTED must retain the record; the caller commits the drop only "
             "after the durable needs-human transition succeeds"
         )
 
-    def test_retain_tech_lead_for_retry_for_unqueued_issue_fails_fast(self):
+    def test_tech_lead_retry_for_unqueued_issue_fails_fast(self):
         """Retaining an item that is not queued is an upstream invariant bug."""
         with pytest.raises(ValueError, match="no such item is queued"):
-            PendingSessionQueues(OrchestratorState()).retain_tech_lead_for_retry(999)
+            PendingSessionQueues(OrchestratorState()).plan_tech_lead_retry(999)
 
     def test_remove_tech_lead_removes_only_matching_issue(self):
         """remove_tech_lead completes the owner lifecycle (#6768 round 4)."""

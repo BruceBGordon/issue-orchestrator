@@ -298,21 +298,74 @@ class ProviderResilienceManager:
             ))
         return updated
 
-    def record_success(self, provider: str | None, now: datetime | None = None) -> None:
+    def record_success(
+        self, provider: str | None, now: datetime | None = None
+    ) -> ProviderCircuitState | None:
+        """Retire the *transient* outage after an ordinary call came back clean.
+
+        Cause-specific, for the same reason :meth:`clear_auth_failures` is
+        (#6999 F3). A completed provider call proves the service answered; it
+        does not prove the credential is valid, and it is not the typed READY
+        readiness probe the recovery contract requires. Deleting the whole row
+        here erased the auth deadline, the auth counter and the sample identity
+        that had been recorded by a *different* concurrent session, so:
+
+        * an in-flight success landing after an auth outage opened re-admitted
+          the whole fleet to a provider that would refuse every launch — the
+          90-minute burn this boundary exists to end;
+        * ``auth_failure_threshold > 1`` could never accumulate, because any
+          successful call in between reset the count to zero;
+        * ``provider.outage_exited`` was announced while the provider was still
+          demonstrably closed.
+
+        So the auth dimension survives untouched and only
+        :meth:`clear_auth_failures` — driven by a confirmed READY probe — may
+        retire it. The row is deleted only when NO cause is left, which keeps
+        "a healthy circuit has no row" true. ``provider.outage_exited`` is
+        emitted on the aggregate transition alone.
+
+        Returns the updated state, or ``None`` when the row was deleted or
+        there was nothing tracked to update.
+        """
         if not provider:
-            return
+            return None
         now = now or _now()
         state = self.store.get(provider)
         if state is None:
-            return
-        self.store.delete(provider)
-        self.events.publish(make_trace_event(
-            EventName.PROVIDER_OUTAGE_EXITED,
-            {
-                "provider": provider,
-                "at": now.isoformat(),
-            },
-        ))
+            return None
+
+        was_open = self._is_open_state(state, now)
+        updated: ProviderCircuitState | None = ProviderCircuitState(
+            provider=provider,
+            transient_open_until=None,
+            # Untouched: a service call that succeeded says nothing about the
+            # credential, and the auth cause is retired by a READY probe only.
+            auth_open_until=state.auth_open_until,
+            consecutive_outages=0,
+            last_error_summary=state.last_error_summary,
+            updated_at=now,
+            consecutive_auth_failures=state.consecutive_auth_failures,
+            last_auth_sample_id=state.last_auth_sample_id,
+        )
+        auth_cause_remains = (
+            state.auth_open_until is not None or state.consecutive_auth_failures > 0
+        )
+        if auth_cause_remains:
+            self.store.save(updated)
+        else:
+            # Nothing is left to remember, and a healthy circuit has no row.
+            self.store.delete(provider)
+            updated = None
+
+        if was_open and not self._is_open_state(updated, now):
+            self.events.publish(make_trace_event(
+                EventName.PROVIDER_OUTAGE_EXITED,
+                {
+                    "provider": provider,
+                    "at": now.isoformat(),
+                },
+            ))
+        return updated
 
     def close_expired(self, now: datetime | None = None) -> list[ProviderCircuitState]:
         """Retire circuits whose causes have *all* elapsed.

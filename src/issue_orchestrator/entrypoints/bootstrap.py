@@ -30,6 +30,7 @@ from .bootstrap_provider import (
     build_provider_readiness_probe,
     build_provider_resilience,
 )
+from .bootstrap_pending_work import build_pending_work_wiring
 from .bootstrap_session_launcher import build_session_launcher_factory
 from .bootstrap_completion import (
     _validation_attempt_key_factory,
@@ -84,8 +85,6 @@ from ..ports.provider_readiness import (
     NO_PROVIDER_READINESS_PROBE,
     ProviderReadinessProbe,
 )
-from ..control.claim_quarantine import build_claim_quarantine_owner
-from ..execution.pending_work_claim_store import SqlitePendingWorkClaimStore
 from ..execution.session_output_adapter import FileSystemSessionOutput
 from ..execution.review_artifact_reader import ManifestReviewArtifactReader
 from ..execution.thread_background_job_runner import ThreadBackgroundJobRunner
@@ -841,10 +840,9 @@ def build_orchestrator(
     # Bundle all dependencies into OrchestratorDeps (no nulls, no optionals)
     # Assembly of the session launcher lives here, at the composition
     # root, rather than in the facade or the control layer (#6924 A3-R2).
-    pending_work_claims = SqlitePendingWorkClaimStore.for_repo(config.repo_root)
-    claim_quarantine = build_claim_quarantine_owner(
-        store=pending_work_claims, action_applier=action_applier,
-        label_manager=label_manager, events=events)
+    pending_work = build_pending_work_wiring(
+        repo_root=config.repo_root, repository_host=github,
+        action_applier=action_applier, label_manager=label_manager, events=events)
     session_launcher_factory = build_session_launcher_factory(
         config=config,
         events=events,
@@ -863,7 +861,7 @@ def build_orchestrator(
         label_manager=label_manager,
         agent_callback_endpoint=agent_callback_endpoint,
         provider_readiness_probe=provider_readiness_probe,
-        quarantined_issue_numbers=pending_work_claims.quarantined_issue_numbers,
+        needs_human_block=pending_work.needs_human_block,
     )
     deps = OrchestratorDeps(
         events=events,
@@ -884,8 +882,8 @@ def build_orchestrator(
         command_runner=command_runner,
         session_output=session_output,
         manifest_downloader=manifest_downloader,
-        pending_work_claims=pending_work_claims,
-        claim_quarantine=claim_quarantine,
+        pending_work_claims=pending_work.claims,
+        claim_quarantine=pending_work.quarantine,
         state_machine_manager=state_machine_manager,
         completion_processor=completion_processor,
         session_controller=session_controller_instance,
@@ -1238,10 +1236,9 @@ def build_orchestrator_for_testing(
     # Bundle all dependencies into OrchestratorDeps (no nulls, no optionals)
     # Assembly of the session launcher lives here, at the composition
     # root, rather than in the facade or the control layer (#6924 A3-R2).
-    pending_work_claims = SqlitePendingWorkClaimStore.for_repo(config.repo_root)
-    claim_quarantine = build_claim_quarantine_owner(
-        store=pending_work_claims, action_applier=action_applier,
-        label_manager=label_manager, events=events)
+    pending_work = build_pending_work_wiring(
+        repo_root=config.repo_root, repository_host=github,
+        action_applier=action_applier, label_manager=label_manager, events=events)
     session_launcher_factory = build_session_launcher_factory(
         config=config,
         events=events,
@@ -1260,7 +1257,7 @@ def build_orchestrator_for_testing(
         label_manager=label_manager,
         agent_callback_endpoint=agent_callback_endpoint,
         provider_readiness_probe=provider_readiness_probe,
-        quarantined_issue_numbers=pending_work_claims.quarantined_issue_numbers,
+        needs_human_block=pending_work.needs_human_block,
     )
     completion_handler_factory = build_completion_handler_factory(
         config,
@@ -1291,8 +1288,8 @@ def build_orchestrator_for_testing(
         command_runner=command_runner,
         session_output=session_output,
         manifest_downloader=manifest_downloader,
-        pending_work_claims=pending_work_claims,
-        claim_quarantine=claim_quarantine,
+        pending_work_claims=pending_work.claims,
+        claim_quarantine=pending_work.quarantine,
         state_machine_manager=state_machine_manager,
         completion_processor=completion_processor,
         session_controller=session_controller,

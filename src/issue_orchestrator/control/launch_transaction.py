@@ -75,8 +75,14 @@ class LaunchWorkClaim(Protocol):
         """Hand the work back because no terminal ever started."""
         ...
 
-    def settle_unspawned(self, disposal: WorkDisposal) -> None:
+    def settle_unspawned(
+        self, disposal: WorkDisposal, claim: PendingWorkClaim | None = None
+    ) -> None:
         """Bring the durable row into line with what the queue decided."""
+        ...
+
+    def spend_budget(self, claim: PendingWorkClaim) -> None:
+        """Persist a request whose bounded retry budget has just been spent."""
         ...
 
 
@@ -157,7 +163,9 @@ class PendingWorkLaunchClaim:
             self.claim.kind.value,
         )
 
-    def settle_unspawned(self, disposal: WorkDisposal) -> None:
+    def settle_unspawned(
+        self, disposal: WorkDisposal, claim: PendingWorkClaim | None = None
+    ) -> None:
         """Finish the transaction :meth:`abandon_unspawned` left half-done.
 
         Deferring is the right FIRST move for every unspawned exit - it is
@@ -168,21 +176,39 @@ class PendingWorkLaunchClaim:
         a dropped item left a recoverable row, so the startup sweep resurrected
         work a permanent failure or an exhausted, escalated retry budget had
         deliberately ended.
+
+        ``claim`` is the request as the DECISION leaves it, which is not always
+        the object the launch held: a spent retry budget produces an advanced
+        copy so the durable payload can be written before the in-memory queue is
+        touched (#6999 F2).
         """
-        work_key = self.claim.work_key()
+        settled = claim or self.claim
+        work_key = settled.work_key()
         if disposal is WorkDisposal.DROPPED:
             self.claims.retire_deferred_claim(work_key)
             logger.info(
                 "[WORK] %s work was dropped by its queue; retiring its claim "
                 "so recovery cannot re-admit it",
-                self.claim.kind.value,
+                settled.kind.value,
             )
             return
         # Still owned by a queue. The payload is rewritten from the request as
-        # it stands NOW, because the settlement may have spent part of its
-        # bounded retry budget - a restart that read the pre-launch payload
+        # the decision leaves it, because the settlement may have spent part of
+        # its bounded retry budget - a restart that read the pre-launch payload
         # would refund it.
-        self.claims.refresh_deferred_claim(work_key, self.claim)
+        self.claims.refresh_deferred_claim(work_key, settled)
+
+    def spend_budget(self, claim: PendingWorkClaim) -> None:
+        """Make one spent unit of a bounded retry budget durable, first (#6999 F2).
+
+        The budget lives in the queued request, and the in-memory queue does not
+        survive a crash - so until the advanced request is in the ledger, the
+        unit is not spent at all. Everything the settlement does afterwards can
+        fail (an escalation that does not commit, a process that dies): none of
+        it may be able to refund the attempt, so this write goes first, before
+        the in-memory queue is touched and before anything irreversible runs.
+        """
+        self.claims.refresh_deferred_claim(claim.work_key(), claim)
 
 
 @dataclass(frozen=True, slots=True)
@@ -201,7 +227,12 @@ class _ClaimlessLaunch:
     def abandon_unspawned(self, run: SessionRunAssets) -> None:
         return None
 
-    def settle_unspawned(self, disposal: WorkDisposal) -> None:
+    def settle_unspawned(
+        self, disposal: WorkDisposal, claim: PendingWorkClaim | None = None
+    ) -> None:
+        return None
+
+    def spend_budget(self, claim: PendingWorkClaim) -> None:
         return None
 
 
@@ -238,6 +269,66 @@ def abandon_claim_unless_spawned(
             work.abandon_unspawned(run)
 
 
+@dataclass(frozen=True, slots=True)
+class SettlementDecision:
+    """A settled launch outcome, and the queue projection still owed (#6999 F2).
+
+    The decision and its projection are separated because they are not equally
+    durable. The ledger row survives a restart; the in-memory queue does not. So
+    the decision is committed to the ledger FIRST and the queue is then brought
+    into line with it — never the other way round, which is how a permanently
+    dropped item kept a recoverable row for the startup sweep to re-admit.
+    """
+
+    disposal: WorkDisposal
+    #: The request as the decision leaves it, which is what the ledger stores.
+    claim: PendingWorkClaim
+    #: The in-memory queue mutation this decision implies. Run only after the
+    #: durable side has committed.
+    project: Callable[[], None]
+
+
+def _no_projection() -> None:
+    """The queue has nothing to do: the item is already where it belongs."""
+
+
+@dataclass(frozen=True, slots=True)
+class RetryPlan:
+    """What spending one unit of a bounded launch budget WOULD do (#6999 F2).
+
+    Planned rather than done, because the spend has to reach the ledger before
+    it reaches anything else. ``spent`` is an advanced COPY of the request, so
+    the durable payload can be written while the queue still holds the original;
+    ``apply`` then projects the same spend onto that queue.
+
+    ``commit_exhaustion`` is the only irreversible act in the whole settlement:
+    the external needs-human transition that ends a bounded budget. It runs with
+    the spend already durable, so a failure or a crash inside it can never
+    refund the attempt, and it reports whether it committed — an escalation that
+    did not commit leaves the work queued to try again.
+    """
+
+    spent: PendingWorkClaim
+    exhausted: bool
+    apply: Callable[[], None]
+    commit_exhaustion: Callable[[], bool]
+
+
+def unbounded_retry(claim: PendingWorkClaim) -> RetryPlan:
+    """The plan for a queue with no launch budget: retain, spend nothing.
+
+    An explicit default rather than an optional every settlement would have to
+    re-check. Validation retries, reviews and reworks are re-derived from
+    durable state, so a retryable launch failure simply leaves them queued.
+    """
+    return RetryPlan(
+        spent=claim,
+        exhausted=False,
+        apply=_no_projection,
+        commit_exhaustion=lambda: False,
+    )
+
+
 @dataclass(frozen=True)
 class LaunchSettlement:
     """One launch's whole transaction: terminal outcome, queue, and ledger.
@@ -261,21 +352,25 @@ class LaunchSettlement:
       a permanent failure or an escalated, exhausted budget that leaves a
       recoverable row is not permanent at all.
 
+    Each of those reaches the LEDGER before it reaches the queue (#6999 F2).
+    The two are not equally durable, so they are not peers: the ledger row is
+    the decision and the queue is its projection. See :meth:`_commit`.
+
     ``work`` is the SAME object the launch held its claim with, so the durable
     record spans the whole launch rather than starting after it.
     """
 
     work: PendingWorkLaunchClaim
     remove: Callable[[], None]
-    # Adopting an already-running terminal, and spending one unit of the
-    # bounded retryable-failure budget. Both default to doing nothing, for the
-    # queues that have no such behaviour — an explicit no-op rather than an
-    # optional every caller of `settle` would have to re-check. The retry
-    # callback reports what it decided, because whether the item survived its
-    # own budget is exactly what the durable half has to match.
+    # Adopting an already-running terminal, and PLANNING the spend of one unit
+    # of the bounded retryable-failure budget. Both default to doing nothing,
+    # for the queues that have no such behaviour — an explicit no-op rather than
+    # an optional every caller of `settle` would have to re-check. The retry
+    # callback PLANS rather than acts, because the spend has to reach the ledger
+    # before it reaches the queue (#6999 F2).
     restore_existing: Callable[[], Optional[Session]] = field(default=lambda: None)
-    retain_for_retry: Callable[[], WorkDisposal] = field(
-        default=lambda: WorkDisposal.RETAINED
+    plan_retry: Callable[[PendingWorkClaim], RetryPlan] = field(
+        default=unbounded_retry
     )
     # Validation retries own their own durable queue and are re-derived from
     # it, so a plain failure leaves the item alone. Every other queue drops.
@@ -296,18 +391,39 @@ class LaunchSettlement:
                 self._consume_into_flight(restored, state)
                 return restored
             # Nothing was adopted, so the item is still queued and waiting.
-            self.work.settle_unspawned(WorkDisposal.RETAINED)
+            self._commit(
+                SettlementDecision(
+                    WorkDisposal.RETAINED, self.work.claim, _no_projection
+                )
+            )
             return None
-        self.work.settle_unspawned(self._dispose(result))
+        self._commit(self._decide(result))
         return None
 
-    def _dispose(self, result: LaunchResult) -> WorkDisposal:
+    def _commit(self, decision: SettlementDecision) -> None:
+        """Durable side first, in-memory queue second (#6999 F2).
+
+        The one ordering rule of the whole transaction. A ledger row outlives
+        the process; a pending queue does not. Mutating the queue first left a
+        window in which a crash - or a store fault - kept a deferred row for
+        work the launcher had already dropped, and the startup sweep exists
+        precisely to re-admit deferred rows. Committing the decision first makes
+        the queue a PROJECTION of durable truth rather than a second, rival copy
+        of it: a crash before the projection loses only state that a restart
+        rebuilds from the ledger anyway.
+        """
+        self.work.settle_unspawned(decision.disposal, decision.claim)
+        decision.project()
+
+    def _decide(self, result: LaunchResult) -> SettlementDecision:
         """What this launch outcome means for the request, as one typed answer.
 
-        Deliberately returns the disposal instead of acting on the ledger
-        itself: the queue decision and the durable one are the same decision,
-        and splitting them is how a dropped item kept a recoverable row.
+        Deliberately returns the decision - disposal, durable payload, and the
+        queue projection it implies - instead of acting on either side itself:
+        the queue decision and the durable one are the same decision, and
+        splitting them is how a dropped item kept a recoverable row.
         """
+        claim = self.work.claim
         if result.disposition is LaunchDisposition.PROVIDER_DEFERRED:
             # The provider refused before the work was touched. Keep the item
             # exactly as it is: no restoration attempt (there is no terminal to
@@ -315,21 +431,53 @@ class LaunchSettlement:
             # For a failure investigation the queue is the only record that
             # exists, so dropping it here would lose it permanently.
             logger.info("[PROVIDER] Launch deferred, work retained: %s", result.reason)
-            return WorkDisposal.RETAINED
+            return SettlementDecision(WorkDisposal.RETAINED, claim, _no_projection)
         if result.disposition is LaunchDisposition.RETRYABLE_FAILURE:
-            # The queue owner spends the budget and says whether the item
-            # survived it. An exhausted budget is a committed drop, not a
-            # retention, and the ledger has to hear about it.
-            return self.retain_for_retry()
+            return self._spend_retry_budget(claim)
         if result.disposition is LaunchDisposition.PERMANENT_FAILURE:
             if self.drop_on_permanent_failure:
-                self.remove()
-                return WorkDisposal.DROPPED
-            return WorkDisposal.RETAINED
+                return SettlementDecision(WorkDisposal.DROPPED, claim, self.remove)
+            return SettlementDecision(WorkDisposal.RETAINED, claim, _no_projection)
         # Named explicitly rather than left as a fall-through: dropping the
         # work is the destructive branch, and a disposition added later without
         # a decision here must not silently land in it (#6999 A1).
         raise ValueError(f"unhandled launch disposition: {result.disposition}")
+
+    def _spend_retry_budget(self, claim: PendingWorkClaim) -> SettlementDecision:
+        """Spend one unit of a bounded launch budget, durably, then act on it.
+
+        Three steps in a fixed order, and the order is the correctness (#6999
+        F2):
+
+        1. the spend reaches the LEDGER, before the queue and before anything
+           irreversible - so nothing that follows can refund the attempt;
+        2. the queue is brought into line with it;
+        3. only then does an exhausted budget run its external needs-human
+           transition, and only a committed one drops the work.
+
+        An escalation that does not commit leaves the request queued with its
+        budget spent, so the next tick re-attempts the escalation rather than
+        starting the budget again.
+
+        The escalation in step 3 and the ledger retire that follows it straddle
+        two stores - GitHub and SQLite - so they cannot be made one atomic act,
+        and their ordering is a deliberate choice
+        of which way to fail. Retiring the row first would mean a death in that
+        window loses the work with nobody told about it. Escalating first means
+        a death in that window leaves a recoverable row whose budget is already
+        at its bound: the work comes back, the human has already been told, and
+        the next settlement re-asserts the same idempotent escalation and drops
+        it again. One redundant attempt is recoverable; a silently discarded
+        investigation is not.
+        """
+        plan = self.plan_retry(claim)
+        self.work.spend_budget(plan.spent)
+        plan.apply()
+        if not plan.exhausted or not plan.commit_exhaustion():
+            return SettlementDecision(
+                WorkDisposal.RETAINED, plan.spent, _no_projection
+            )
+        return SettlementDecision(WorkDisposal.DROPPED, plan.spent, self.remove)
 
     def _consume_into_flight(
         self, session: Session, state: "OrchestratorState"
@@ -349,7 +497,10 @@ __all__ = [
     "LaunchSettlement",
     "LaunchWorkClaim",
     "PendingWorkLaunchClaim",
+    "RetryPlan",
+    "SettlementDecision",
     "SpawnGuard",
     "WorkDisposal",
     "abandon_claim_unless_spawned",
+    "unbounded_retry",
 ]

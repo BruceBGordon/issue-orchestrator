@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from enum import Enum
 from typing import Protocol
 
 from ..domain.pending_work import PendingWorkKind
@@ -40,6 +41,7 @@ from ..ports.pending_work_claim_store import (
     ClaimQuarantineStore,
     QuarantineCause,
     QuarantineLabelState,
+    QuarantineRecord,
     UnreadableClaim,
     UnresolvedClaim,
 )
@@ -51,6 +53,11 @@ from .actions import (
 )
 from .in_flight_work import QuarantinedSession
 from .label_manager import LabelManager
+from .needs_human_block import (
+    NO_OTHER_NEEDS_HUMAN_CAUSES,
+    NeedsHumanCause,
+    SharedNeedsHumanBlock,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -148,6 +155,18 @@ class QuarantineSubject:
         )
 
 
+class _BlockExit(Enum):
+    """What a resolving quarantine owes the shared block on its way out."""
+
+    #: Ours, and nothing else is standing on it - take it off, then delete.
+    CLEAR = "clear"
+    #: Not ours, or another lifecycle now needs it - delete only our record.
+    LEAVE = "leave"
+    #: A sibling quarantine on the same issue still holds it. Stay ``releasing``
+    #: and retry next sweep, so the last one out is the one that clears it.
+    WAIT = "wait"
+
+
 class QuarantineLabelOps(Protocol):
     """The blocking-label operations a quarantine needs, with typed outcomes.
 
@@ -194,6 +213,11 @@ class ClaimQuarantineOwner:
     store: ClaimQuarantineStore
     labels: QuarantineLabelOps
     events: EventSink
+    #: Every OTHER durable cause of the shared ``needs-human`` label (#6999 F4).
+    #: A quarantine's own row proves it applied the block; it does not prove it
+    #: is still the only reason for it, and removing a block another lifecycle
+    #: now requires is how a live escalation silently disappears.
+    block: SharedNeedsHumanBlock = NO_OTHER_NEEDS_HUMAN_CAUSES
 
     def quarantine(self, subject: QuarantineSubject) -> None:
         """Escalate one run under its own typed cause (#6999 A1).
@@ -243,35 +267,69 @@ class ClaimQuarantineOwner:
         same issue; a ``needs-human`` applied by a human or another owner keeps
         its own provenance. Only after cleanup commits is the row deleted.
         """
-        # Every early return below either deletes the row or leaves it
-        # ``releasing``, which the sweep retries. There is no path that ends
-        # with the obligation dropped and the label still on the issue.
+        # Every branch below either deletes the row or leaves it ``releasing``,
+        # which the sweep retries. There is no path that ends with the
+        # obligation dropped and the label still on the issue.
         record = self.store.read_quarantine(quarantine_key)
         if record is None:
             return
         if not record.releasing:
             self.store.mark_quarantine_releasing(quarantine_key)
+        owed = self._exit_owes(record)
+        if owed is _BlockExit.WAIT:
+            return
+        if owed is _BlockExit.CLEAR and not self._clear_block(record.issue_number):
+            return
+        self.store.release_quarantine(quarantine_key)
+
+    def _exit_owes(self, record: QuarantineRecord) -> "_BlockExit":
+        """What this quarantine's exit owes the SHARED block, as one answer.
+
+        Three separate questions used to be three inline guards on the way out,
+        which is exactly the shape that let one of them be forgotten (#6999 F4).
+        They are one decision: this quarantine may take the shared label off
+        only if it demonstrably put it there, no sibling quarantine is still
+        standing on it, and no other lifecycle has since come to need it.
+        """
         if not record.block_is_ours:
             # Nothing of ours on the issue; the row is all there is to remove.
-            self.store.release_quarantine(quarantine_key)
-            return
+            return _BlockExit.LEAVE
         if record.issue_number in self.store.quarantined_issue_numbers():
             # Another quarantine on the same issue is still live, and it is
             # very likely standing on OUR label: the second one to escalate
             # found the label already present and recorded itself PREEXISTING,
             # so it will never take it off. Deleting our row here would strand
             # the block forever. The row stays in ``releasing`` - excluded from
-            # the live set above, so it holds nothing open - and the next sweep
-            # retries it until we are the last one out.
-            return
-        if not self.labels.release_block(record.issue_number):
+            # the live set - and the next sweep retries it until we are last out.
+            return _BlockExit.WAIT
+        if self.block.held_by_another_cause(
+            record.issue_number, excluding=NeedsHumanCause.CLAIM_QUARANTINE
+        ):
+            # OUR cause is gone, but the shared label is not ours alone to take
+            # off (#6999 F4). A tech-lead escalation that became required while
+            # this quarantine held the block recorded its own marker and is now
+            # relying on the same label; removing it would leave that escalation
+            # with neither the block nor anything to recover it from. Withdraw
+            # our cause - the row - and leave the label to the owner that still
+            # needs it, which will clear it on its own terms.
+            logger.info(
+                "[WORK] Quarantine on issue #%d resolved, but another lifecycle "
+                "still requires needs-human; leaving the label and dropping only "
+                "the quarantine record",
+                record.issue_number,
+            )
+            return _BlockExit.LEAVE
+        return _BlockExit.CLEAR
+
+    def _clear_block(self, issue_number: int) -> bool:
+        cleared = self.labels.release_block(issue_number)
+        if not cleared:
             logger.error(
                 "[WORK] Could not clear the quarantine block on issue #%d; "
                 "keeping the record so the next sweep retries",
-                record.issue_number,
+                issue_number,
             )
-            return
-        self.store.release_quarantine(quarantine_key)
+        return cleared
 
     def _escalate(self, subject: QuarantineSubject) -> None:
         quarantine_key = subject.quarantine_key
@@ -459,6 +517,7 @@ def build_claim_quarantine_owner(
     action_applier: SupportsApplyAction,
     label_manager: LabelManager,
     events: EventSink,
+    needs_human_block: SharedNeedsHumanBlock = NO_OTHER_NEEDS_HUMAN_CAUSES,
 ) -> ClaimQuarantineOwner:
     """Assemble the owner from composition-root collaborators.
 
@@ -503,7 +562,12 @@ def build_claim_quarantine_owner(
                 )
             ).success
 
-    return ClaimQuarantineOwner(store=store, labels=_Labels(), events=events)
+    return ClaimQuarantineOwner(
+        store=store,
+        labels=_Labels(),
+        events=events,
+        block=needs_human_block,
+    )
 
 
 __all__ = [

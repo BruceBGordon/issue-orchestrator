@@ -1759,7 +1759,7 @@ class PendingTechLeadReview:
     # snapshot. Interval/batch reviews keep this empty.
     problem_cohort: tuple[DiscoveredFailure, ...] = ()
     # Retryable launch failures consumed so far (owner-tracked by
-    # PendingSessionQueues.retain_tech_lead_for_retry; bounded — see
+    # PendingSessionQueues.plan_tech_lead_retry; bounded — see
     # TECH_LEAD_LAUNCH_RETRY_LIMIT). For failure investigations this queue item
     # is the ONLY durable record of the investigation, so transient prep
     # failures retain it instead of dropping it.

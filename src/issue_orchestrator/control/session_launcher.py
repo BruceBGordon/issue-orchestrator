@@ -76,6 +76,10 @@ from .provider_availability import ProviderAvailabilityPolicy
 from .provider_launch_gate import ProviderLaunchGate
 from .action_applier import ActionApplier
 from .actions import Action, AddLabelAction, RemoveLabelAction
+from .needs_human_block import (
+    NO_OTHER_NEEDS_HUMAN_CAUSES,
+    SharedNeedsHumanBlock,
+)
 from .tech_lead_needs_human_reconcile import TechLeadNeedsHumanLifecycle, discover_tech_lead_needs_human_issue_numbers
 from .session_manager import SessionManager, SessionRef
 from .launch_transaction import (
@@ -255,7 +259,8 @@ class SessionLauncher:
         # provider adapter names that fact instead of silently claiming the
         # provider is authenticated.
         provider_readiness_probe: ProviderReadinessProbe = NO_PROVIDER_READINESS_PROBE,
-        quarantined_issue_numbers: Callable[[], frozenset[int]] = frozenset,
+        # Every OTHER durable cause of the shared needs-human label (#6999 F4).
+        needs_human_block: SharedNeedsHumanBlock = NO_OTHER_NEEDS_HUMAN_CAUSES,
     ):
         self.config = config
         self.events = events
@@ -309,7 +314,7 @@ class SessionLauncher:
             apply_actions=lambda actions, context: self._apply_actions(
                 actions, context=context
             ),
-            quarantined_issue_numbers=quarantined_issue_numbers,
+            needs_human_block=needs_human_block,
         )
 
     @property

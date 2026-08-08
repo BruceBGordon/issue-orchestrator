@@ -1633,6 +1633,119 @@ class TestIndependentOutageCauses:
 
         assert events.names().count(EventName.PROVIDER_OUTAGE_EXITED.value) == 1
 
+    def test_a_provider_success_cannot_erase_a_live_auth_outage(self) -> None:
+        """An ordinary completed call is not the READY probe recovery requires.
+
+        ``record_success`` used to delete the whole provider row. With
+        concurrent sessions an older, in-flight success lands AFTER another
+        session (or a readiness sample) has opened ``auth_open_until``, and
+        deleting the row took the auth deadline, the auth counter and the sample
+        identity with it - re-admitting the entire fleet to a provider that
+        refuses every launch. That is the 90-minute burn this boundary exists to
+        end, and a successful old call is no evidence at all about the
+        credential (#6999 F3).
+        """
+        events = RecordingEvents()
+        manager = _manager(events)
+        start = datetime(2026, 8, 4, 22, 0, tzinfo=timezone.utc)
+        manager.record_auth_failure(
+            "claude-code", error_summary="not logged in", sample_id="s1", now=start
+        )
+        opened = manager.get_state("claude-code")
+        assert opened is not None
+        auth_deadline = opened.auth_open_until
+        assert auth_deadline is not None
+
+        manager.record_success("claude-code", now=start + timedelta(seconds=1))
+
+        state = manager.get_state("claude-code")
+        assert state is not None, "the auth outage must survive a service success"
+        assert state.auth_open_until == auth_deadline
+        assert state.consecutive_auth_failures == 1
+        assert state.last_auth_sample_id == "s1"
+        assert manager.is_open("claude-code", start + timedelta(seconds=2))
+        # ...and nothing announced a recovery that has not happened.
+        assert EventName.PROVIDER_OUTAGE_EXITED.value not in events.names()
+
+    def test_a_success_retires_the_transient_cause_and_only_that(self) -> None:
+        """Both causes coexisting: the success clears its own half, exactly."""
+        events = RecordingEvents()
+        manager = _manager(events)
+        start = datetime(2026, 8, 4, 22, 0, tzinfo=timezone.utc)
+        manager.record_transient_failure(
+            "claude-code", error_summary="503", now=start
+        )
+        manager.record_auth_failure(
+            "claude-code",
+            error_summary="not logged in",
+            sample_id="s1",
+            now=start + timedelta(seconds=1),
+        )
+
+        manager.record_success("claude-code", now=start + timedelta(seconds=2))
+
+        state = manager.get_state("claude-code")
+        assert state is not None
+        assert state.transient_open_until is None
+        assert state.consecutive_outages == 0
+        assert state.auth_open_until is not None
+        assert manager.is_open("claude-code", start + timedelta(seconds=3))
+        assert EventName.PROVIDER_OUTAGE_EXITED.value not in events.names()
+
+        # Only the confirmed READY probe ends it, and then the aggregate
+        # transition is announced exactly once.
+        manager.clear_auth_failures("claude-code", now=start + timedelta(seconds=4))
+        assert not manager.is_open("claude-code", start + timedelta(seconds=5))
+        assert events.names().count(EventName.PROVIDER_OUTAGE_EXITED.value) == 1
+
+    def test_a_success_between_auth_failures_does_not_reset_the_threshold(
+        self,
+    ) -> None:
+        """``auth_failure_threshold > 1`` has to be able to accumulate.
+
+        Zeroing ``consecutive_auth_failures`` on any successful call meant a
+        configured threshold above one could never be reached: every unrelated
+        call in between refunded the count, so the circuit never tripped and the
+        fleet kept launching into an expired credential.
+        """
+        events = RecordingEvents()
+        manager = _manager(events, threshold=2)
+        start = datetime(2026, 8, 4, 22, 0, tzinfo=timezone.utc)
+
+        manager.record_auth_failure(
+            "claude-code", error_summary="not logged in", sample_id="s1", now=start
+        )
+        assert not manager.is_open("claude-code", start + timedelta(seconds=1))
+
+        manager.record_success("claude-code", now=start + timedelta(seconds=1))
+        manager.record_auth_failure(
+            "claude-code",
+            error_summary="not logged in",
+            sample_id="s2",
+            now=start + timedelta(seconds=2),
+        )
+
+        state = manager.get_state("claude-code")
+        assert state is not None
+        assert state.consecutive_auth_failures == 2
+        assert manager.is_open("claude-code", start + timedelta(seconds=3))
+
+    def test_a_success_on_a_healthy_transient_circuit_still_removes_the_row(
+        self,
+    ) -> None:
+        """With no auth cause left, "a healthy circuit has no row" still holds."""
+        events = RecordingEvents()
+        manager = _manager(events)
+        start = datetime(2026, 8, 4, 22, 0, tzinfo=timezone.utc)
+        manager.record_transient_failure(
+            "claude-code", error_summary="503", now=start
+        )
+
+        manager.record_success("claude-code", now=start + timedelta(seconds=1))
+
+        assert manager.get_state("claude-code") is None
+        assert events.names().count(EventName.PROVIDER_OUTAGE_EXITED.value) == 1
+
     def test_a_ready_probe_cannot_launch_work_into_a_transient_outage(self) -> None:
         """End to end through the assessment: healthy credentials are not enough."""
         manager = _manager(RecordingEvents())
@@ -2876,7 +2989,9 @@ def test_a_refused_tech_lead_launch_keeps_its_full_retry_budget(
     # And the allowance is genuinely intact rather than merely unread: the first
     # REAL input failure is the first one counted, and it is retained.
     queues = PendingSessionQueues(state)
-    assert queues.retain_tech_lead_for_retry(7) is TechLeadRetentionOutcome.RETAINED
+    spend = queues.plan_tech_lead_retry(7)
+    assert spend.outcome is TechLeadRetentionOutcome.RETAINED
+    queues.apply_tech_lead_retry(spend)
     assert state.pending_tech_lead_reviews[0].retryable_launch_failures == 1
 
 
@@ -2893,7 +3008,7 @@ def test_a_provider_deferral_touches_neither_restoration_nor_the_retry_budget(
     """
     from issue_orchestrator.control.launch_transaction import (
         LaunchSettlement,
-        WorkDisposal,
+        RetryPlan,
     )
     from issue_orchestrator.control.session_launch_types import (
         LaunchDisposition,
@@ -2907,15 +3022,20 @@ def test_a_provider_deferral_touches_neither_restoration_nor_the_retry_budget(
         calls.append("restore_existing")
         return None
 
-    def _spy_retain_for_retry():
-        calls.append("retain_for_retry")
-        return WorkDisposal.RETAINED
+    def _spy_plan_retry(claim):
+        calls.append("plan_retry")
+        return RetryPlan(
+            spent=claim,
+            exhausted=False,
+            apply=lambda: calls.append("apply_retry"),
+            commit_exhaustion=lambda: False,
+        )
 
     owner = LaunchSettlement(
         work=_launch_work("tech_lead", _pending_state("tech_lead"), tmp_path),
         remove=lambda: calls.append("remove"),
         restore_existing=_spy_restore_existing,
-        retain_for_retry=_spy_retain_for_retry,
+        plan_retry=_spy_plan_retry,
     )
 
     settled = owner.settle(
@@ -6313,3 +6433,236 @@ def test_a_claim_store_that_cannot_record_stops_the_launch(tmp_path: Path) -> No
     assert harness.created == []  # no terminal was spawned
     assert store.deferred == []  # nothing was held, so nothing to hand back
     assert len(state.pending_tech_lead_reviews) == 1
+
+
+# ---------------------------------------------------------------------------
+# The durable decision lands BEFORE the queue projection (#6999 F2)
+# ---------------------------------------------------------------------------
+#
+# The queue and the ledger are not equally durable: a ledger row survives a
+# restart, an in-memory queue does not. So the settlement commits its decision
+# to the ledger first and then brings the queue into line with it. These tests
+# interrupt the transaction in exactly that gap - the queue projection dies -
+# and then restart, because a restart is what turns "the queue never heard" into
+# either a resurrection or a refund.
+
+
+class _Interrupted(RuntimeError):
+    """The process died between the durable decision and its projection."""
+
+
+def _die() -> None:
+    raise _Interrupted("process died")
+
+
+def _settlement_over(queue: str, state, harness, *, remove, plan_retry=None,
+                     drop_on_permanent_failure: bool = True):
+    """A settlement over the harness's own store, so the ledger is the real one."""
+    from issue_orchestrator.control.launch_transaction import (
+        LaunchSettlement,
+        PendingWorkLaunchClaim,
+        unbounded_retry,
+    )
+
+    return LaunchSettlement(
+        work=PendingWorkLaunchClaim(
+            claim=_claim(queue, state), claims=harness.claims
+        ),
+        remove=remove,
+        plan_retry=plan_retry or unbounded_retry,
+        drop_on_permanent_failure=drop_on_permanent_failure,
+    )
+
+
+def _unspawned(disposition: str):
+    """An unspawned launch outcome, named by its disposition."""
+    from issue_orchestrator.control.session_launch_types import (
+        LaunchDisposition,
+        LaunchResult,
+    )
+
+    return LaunchResult(
+        session=None,
+        success=False,
+        reason="nothing started",
+        disposition=LaunchDisposition[disposition],
+    )
+
+
+def test_a_drop_interrupted_before_the_queue_hears_is_still_permanent(
+    tmp_path: Path,
+) -> None:
+    """Permanent drop, interrupted in the gap, then restarted.
+
+    The queue removal used to run FIRST and the ledger second, so a death in
+    between left the deferred row the startup sweep is built to re-admit - and
+    the queue mutation it was protecting had evaporated with the process
+    anyway. Committing the drop durably first inverts that: the only thing lost
+    to the interruption is state a restart rebuilds from the ledger.
+    """
+    harness = _failing_spawn_harness(tmp_path)
+    state = _pending_state("review")
+
+    # A transient spawn failure first, so a real deferred row exists.
+    assert _route("review", state, harness) is None
+    assert len(harness.claims.list_unresolved_claims()) == 1
+
+    settlement = _settlement_over("review", state, harness, remove=_die)
+    with pytest.raises(_Interrupted):
+        settlement.settle(_unspawned("PERMANENT_FAILURE"), state)
+
+    # The projection never ran, so this process still shows the item queued...
+    assert _pending_count(state, "review") == 1
+    # ...but the durable decision had already committed, and the restart that
+    # rebuilds every queue from the ledger re-admits nothing.
+    assert harness.claims.list_unresolved_claims() == ()
+    restarted = _recover_with_no_terminals(state, harness)
+    assert _pending_count(restarted, "review") == 0
+
+
+def test_a_store_that_cannot_retire_a_dropped_claim_leaves_the_item_queued(
+    tmp_path: Path,
+) -> None:
+    """The store fault case: no durable decision, so no projection either.
+
+    The ordering has to hold under a store that refuses, not only under a crash.
+    A drop whose ledger write fails must not remove the queue item, or the work
+    is gone from the only two places that hold it.
+    """
+    harness = _failing_spawn_harness(tmp_path)
+    state = _pending_state("review")
+    assert _route("review", state, harness) is None
+
+    class _RefusingRetire:
+        def __init__(self, real):
+            self._real = real
+
+        def retire_deferred_claim(self, work_key):
+            raise RuntimeError("ledger is unwritable")
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+    removed: list[str] = []
+    harness.claims = _RefusingRetire(harness.claims)
+    settlement = _settlement_over(
+        "review", state, harness, remove=lambda: removed.append("remove")
+    )
+    with pytest.raises(RuntimeError, match="ledger is unwritable"):
+        settlement.settle(_unspawned("PERMANENT_FAILURE"), state)
+
+    assert removed == []  # the queue was never told
+    assert _pending_count(state, "review") == 1
+
+
+def test_a_spent_retry_interrupted_before_the_queue_hears_is_not_refunded(
+    tmp_path: Path,
+) -> None:
+    """Retained retry-budget advancement, interrupted in the gap.
+
+    The budget lives in the queued request, so until the advanced request is in
+    the ledger the attempt is not spent at all. It used to be spent on the queue
+    object first and serialised afterwards, which meant an interruption anywhere
+    in between refunded it: the restart read the pre-launch payload and gave the
+    investigation its attempts back, so a permanently broken input could
+    relaunch forever without ever reaching the escalation that tells a human.
+    """
+    from dataclasses import replace
+
+    from issue_orchestrator.control.launch_transaction import RetryPlan
+    from issue_orchestrator.domain.pending_work import (
+        PendingWorkClaim,
+        PendingWorkKind,
+    )
+
+    harness = _failing_spawn_harness(tmp_path)
+    state = _pending_state("tech_lead")
+    assert _route("tech_lead", state, harness) is None
+    (queued,) = state.pending_tech_lead_reviews
+    assert queued.retryable_launch_failures == 1
+
+    spent = PendingWorkClaim(
+        PendingWorkKind.TECH_LEAD,
+        replace(queued, retryable_launch_failures=2),
+    )
+    settlement = _settlement_over(
+        "tech_lead",
+        state,
+        harness,
+        remove=lambda: pytest.fail("a retained item must never be dropped"),
+        plan_retry=lambda claim: RetryPlan(
+            spent=spent, exhausted=False, apply=_die, commit_exhaustion=lambda: False
+        ),
+    )
+    with pytest.raises(_Interrupted):
+        settlement.settle(_unspawned("RETRYABLE_FAILURE"), state)
+
+    # This process never projected the spend onto its queue...
+    assert queued.retryable_launch_failures == 1
+    # ...but the ledger already had it, so the restart does not hand it back.
+    restarted = _recover_with_no_terminals(state, harness)
+    (recovered,) = restarted.pending_tech_lead_reviews
+    assert recovered.retryable_launch_failures == 2
+    # ...and the typed trigger context came back with it.
+    assert recovered.failure is not None
+
+
+def test_an_escalation_that_commits_is_never_refunded_by_the_restart(
+    tmp_path: Path,
+) -> None:
+    """Committed exhausted escalation, interrupted before the ledger retire.
+
+    The escalation is a GitHub transition and the retire is a SQLite write, so
+    the two cannot be one atomic act; the ordering is a choice of which way to
+    fail. Retiring first would let a death in the window discard an
+    investigation with nobody told. Escalating first means the work comes back
+    - but at its BOUND, never with a fresh budget, so the very next settlement
+    re-asserts the same idempotent escalation and drops it rather than starting
+    three more launches. One redundant attempt is recoverable; a silently
+    discarded investigation is not.
+    """
+    from issue_orchestrator.control.pending_session_queues import (
+        TECH_LEAD_LAUNCH_RETRY_LIMIT,
+    )
+
+    harness = _failing_spawn_harness(tmp_path)
+    state = _pending_state("tech_lead")
+
+    retired: list[str] = []
+
+    class _DyingRetire:
+        def __init__(self, real):
+            self._real = real
+
+        def retire_deferred_claim(self, work_key):
+            retired.append(work_key)
+            raise _Interrupted("process died")
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+    real_claims = harness.claims
+    for _ in range(TECH_LEAD_LAUNCH_RETRY_LIMIT - 1):
+        assert _route("tech_lead", state, harness) is None
+
+    harness.claims = _DyingRetire(real_claims)
+    with pytest.raises(_Interrupted):
+        _route("tech_lead", state, harness)
+
+    # The escalation DID commit - the human has been told - and the retire is
+    # what died.
+    assert retired == ["tech_lead:7"]
+    assert EventName.ISSUE_NEEDS_HUMAN.value in harness.event_names()
+
+    harness.claims = real_claims
+    restarted = _recover_with_no_terminals(state, harness)
+    (recovered,) = restarted.pending_tech_lead_reviews
+    assert recovered.retryable_launch_failures == TECH_LEAD_LAUNCH_RETRY_LIMIT, (
+        "the budget must come back spent; a refund would restart the whole bound"
+    )
+
+    # And the next settlement finishes what the interruption left: no third
+    # bound to work through, just the same escalation and the drop.
+    assert _route("tech_lead", restarted, harness) is None
+    assert restarted.pending_tech_lead_reviews == []
+    assert harness.claims.list_unresolved_claims() == ()

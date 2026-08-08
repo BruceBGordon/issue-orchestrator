@@ -15,7 +15,7 @@ the item arrives from discovery or from a provider-deferred relaunch.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from typing import TYPE_CHECKING, Callable
 
@@ -59,6 +59,24 @@ class TechLeadRetentionOutcome(Enum):
 
     RETAINED = "retained"
     EXHAUSTED = "exhausted"
+
+
+@dataclass(frozen=True, slots=True)
+class TechLeadRetryPlan:
+    """One planned spend of a queued tech_lead item's bounded launch budget.
+
+    Carries the ADVANCED request rather than mutating the queued one, so the
+    launch transaction can make the spend durable before it is real anywhere
+    else (#6999 F2). The queued object is brought into line afterwards by
+    :meth:`PendingSessionQueues.apply_tech_lead_retry`.
+    """
+
+    item: PendingTechLeadReview
+    outcome: TechLeadRetentionOutcome
+
+    @property
+    def exhausted(self) -> bool:
+        return self.outcome is TechLeadRetentionOutcome.EXHAUSTED
 
 
 @dataclass(frozen=True, slots=True)
@@ -172,25 +190,57 @@ class PendingSessionQueues:
             )
         )
 
-    def retain_tech_lead_for_retry(self, issue_number: int) -> TechLeadRetentionOutcome:
-        """Bounded retention of a queued tech_lead item after a retryable launch failure.
+    def plan_tech_lead_retry(self, issue_number: int) -> TechLeadRetryPlan:
+        """What spending one unit of this item's launch budget WOULD produce.
 
-        Before escalation starts, failure investigations have no labels-as-
-        truth recovery: the queued item is the only record (the per-tick
-        ``discovered_failures`` buffer is cleared after planning), so a
-        transient required-input prep failure must retain it for retry, not
-        delete it. Retention is bounded by ``TECH_LEAD_LAUNCH_RETRY_LIMIT``:
-        once exhausted ``EXHAUSTED`` is returned, but the item is NOT removed
-        here (#6771 round 4). Destructive queue removal must not precede the
-        lifecycle's committed needs-human transition, so the launch caller
-        commits the drop via
-        ``remove_tech_lead`` only after ``escalate_issue_needs_human`` succeeds;
-        on escalation failure the item is retained and re-attempted.
+        Bounded retention of a queued tech_lead item after a retryable launch
+        failure - PLANNED, not applied (#6999 F2). Before escalation starts,
+        failure investigations have no labels-as-truth recovery: the queued item
+        is the only record (the per-tick ``discovered_failures`` buffer is
+        cleared after planning), so a transient required-input prep failure must
+        retain it for retry, not delete it. Retention is bounded by
+        ``TECH_LEAD_LAUNCH_RETRY_LIMIT``; once exhausted the item is still NOT
+        removed here (#6771 round 4), because destructive queue removal must not
+        precede the lifecycle's committed needs-human transition.
 
-        Asking to retain an item that is not queued is an invariant violation
+        Planning it is what lets the launch transaction make the spend durable
+        before it is real anywhere else. The advanced request is returned as a
+        COPY, so the ledger payload can be written while this queue still holds
+        the original; :meth:`apply_tech_lead_retry` then projects the same spend
+        onto the queue once the durable side has committed.
+
+        Asking about an item that is not queued is an invariant violation
         upstream (the launch path holds the item it just failed to launch);
         fail fast rather than silently absorbing it.
         """
+        item = self._queued_tech_lead(issue_number)
+        spent = replace(
+            item, retryable_launch_failures=item.retryable_launch_failures + 1
+        )
+        return TechLeadRetryPlan(
+            item=spent,
+            outcome=(
+                TechLeadRetentionOutcome.EXHAUSTED
+                if spent.retryable_launch_failures >= TECH_LEAD_LAUNCH_RETRY_LIMIT
+                else TechLeadRetentionOutcome.RETAINED
+            ),
+        )
+
+    def apply_tech_lead_retry(self, plan: TechLeadRetryPlan) -> None:
+        """Project a planned spend onto the queued item (#6999 F2)."""
+        item = self._queued_tech_lead(plan.item.issue_number)
+        item.retryable_launch_failures = plan.item.retryable_launch_failures
+        if plan.outcome is TechLeadRetentionOutcome.RETAINED:
+            logger.warning(
+                "[TECH_LEAD] Retaining %s for issue #%d after retryable launch "
+                "failure %d/%d",
+                item.flavor.value,
+                item.issue_number,
+                item.retryable_launch_failures,
+                TECH_LEAD_LAUNCH_RETRY_LIMIT,
+            )
+
+    def _queued_tech_lead(self, issue_number: int) -> PendingTechLeadReview:
         item = next(
             (
                 t
@@ -204,18 +254,7 @@ class PendingSessionQueues:
                 f"Cannot retain tech_lead item for issue #{issue_number} after a "
                 "retryable launch failure: no such item is queued"
             )
-        item.retryable_launch_failures += 1
-        if item.retryable_launch_failures >= TECH_LEAD_LAUNCH_RETRY_LIMIT:
-            return TechLeadRetentionOutcome.EXHAUSTED
-        logger.warning(
-            "[TECH_LEAD] Retaining %s for issue #%d after retryable launch failure "
-            "%d/%d",
-            item.flavor.value,
-            issue_number,
-            item.retryable_launch_failures,
-            TECH_LEAD_LAUNCH_RETRY_LIMIT,
-        )
-        return TechLeadRetentionOutcome.RETAINED
+        return item
 
     def restore_deferred(self, claim: PendingWorkClaim) -> bool:
         """Return a launched-but-provider-deferred request to its own queue.
@@ -325,4 +364,5 @@ __all__ = [
     "PendingSessionQueues",
     "TechLeadQueueOutcome",
     "TechLeadRetentionOutcome",
+    "TechLeadRetryPlan",
 ]

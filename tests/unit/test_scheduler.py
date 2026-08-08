@@ -3,6 +3,9 @@
 from pathlib import Path
 import pytest
 from unittest.mock import MagicMock, patch
+from issue_orchestrator.control.needs_human_block import (
+    NO_OTHER_NEEDS_HUMAN_CAUSES,
+)
 from issue_orchestrator.control.scheduler import (
     Scheduler, SchedulerResult, DueDateStrategy, MilestoneNumberStrategy,
     PatternStrategy, NameStrategy, get_milestone_strategy, load_strategy_class,
@@ -1457,7 +1460,7 @@ class TestLaunchSessionDependencyCAS:
                 label_manager=orch.deps.label_manager,
                 agent_callback_endpoint=ready_callback_endpoint(),
                 provider_readiness_probe=orch.deps.provider_readiness_probe,
-                quarantined_issue_numbers=frozenset,
+                needs_human_block=NO_OTHER_NEEDS_HUMAN_CAUSES,
             )
 
         # Original issue had no dependencies
@@ -1550,7 +1553,7 @@ class TestLaunchSessionDependencyCAS:
                 label_manager=orch.deps.label_manager,
                 agent_callback_endpoint=ready_callback_endpoint(),
                 provider_readiness_probe=orch.deps.provider_readiness_probe,
-                quarantined_issue_numbers=frozenset,
+                needs_human_block=NO_OTHER_NEEDS_HUMAN_CAUSES,
             )
 
         issue = Issue(

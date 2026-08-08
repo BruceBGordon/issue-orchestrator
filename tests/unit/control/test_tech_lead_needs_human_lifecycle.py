@@ -21,6 +21,7 @@ from issue_orchestrator.control.actions import (
 )
 from issue_orchestrator.control.claim_quarantine import QuarantineSubject
 from issue_orchestrator.control.label_manager import LabelManager
+from issue_orchestrator.control.needs_human_block import NeedsHumanBlock
 from issue_orchestrator.control.reconciliation import (
     ExternalSnapshot,
     ReconciliationRequired,
@@ -545,7 +546,11 @@ class TestQuarantineProvenanceIsRespected:
             read_labels=lambda issue_number: list(live[issue_number]),
             discover_marked_issue_numbers=lambda: (903,),
             apply_actions=applier,
-            quarantined_issue_numbers=lambda: frozenset({903}),
+            needs_human_block=NeedsHumanBlock(
+                tech_lead_marker=labels.tech_lead_needs_human,
+                read_labels=lambda issue_number: list(live[issue_number]),
+                quarantined_issue_numbers=lambda: frozenset({903}),
+            ),
         )
 
         # A perfectly healthy session for the same issue is running.
@@ -567,7 +572,11 @@ class TestQuarantineProvenanceIsRespected:
             read_labels=lambda issue_number: list(live[issue_number]),
             discover_marked_issue_numbers=lambda: (903,),
             apply_actions=applier,
-            quarantined_issue_numbers=frozenset,
+            needs_human_block=NeedsHumanBlock(
+                tech_lead_marker=labels.tech_lead_needs_human,
+                read_labels=lambda issue_number: list(live[issue_number]),
+                quarantined_issue_numbers=frozenset,
+            ),
         )
 
         lifecycle.reconcile([_session(903, tmp_path)])
@@ -618,3 +627,151 @@ class TestQuarantineProvenanceIsRespected:
         assert labels.needs_human in applier.live[903]
         # ...and the operator is not re-told about a quarantine already reported.
         assert not [a for a in applier.applied if isinstance(a, AddCommentAction)]
+
+
+class TestTheSharedBlockIsNotOneOwnersToRetract:
+    """Two independent causes, one label, and no way to lose either (#6999 F4).
+
+    ``needs-human`` is a single label with several independent causes. Each
+    owner used to reason about it from its OWN provenance alone, which is not
+    enough to decide a removal - and the gap was not theoretical. A quarantine
+    acquired the label; a tech-lead escalation then became required, saw a bare
+    label it had not applied, and deliberately declined to claim it by recording
+    no marker; the quarantine later resolved and took "its" label off. The
+    escalation was left with neither the block nor the marker its own recovery
+    reads, so an issue a human had been told to look at went quietly back on the
+    board.
+    """
+
+    def _owners(self, sample_config, tmp_path, live):
+        from unittest.mock import MagicMock
+
+        from issue_orchestrator.control.claim_quarantine import (
+            build_claim_quarantine_owner,
+        )
+        from issue_orchestrator.execution.pending_work_claim_store import (
+            SqlitePendingWorkClaimStore,
+        )
+
+        labels = LabelManager(sample_config)
+        applier = _RecordingApplier(live=live)
+        claims = SqlitePendingWorkClaimStore.for_repo(tmp_path)
+        block = NeedsHumanBlock(
+            tech_lead_marker=labels.tech_lead_needs_human,
+            read_labels=lambda issue_number: list(live.get(issue_number, set())),
+            quarantined_issue_numbers=claims.quarantined_issue_numbers,
+        )
+        quarantine = build_claim_quarantine_owner(
+            store=claims,
+            action_applier=applier,
+            label_manager=labels,
+            events=MagicMock(),
+            needs_human_block=block,
+        )
+        lifecycle = TechLeadNeedsHumanLifecycle(
+            labels=labels,
+            events=MagicMock(),
+            read_labels=lambda issue_number: list(live.get(issue_number, set())),
+            discover_marked_issue_numbers=lambda: (),
+            apply_actions=lambda actions, context: all(
+                applier.apply(action).success for action in actions
+            ),
+            needs_human_block=block,
+        )
+        return labels, applier, quarantine, lifecycle
+
+    def _quarantine_run(self, quarantine, tmp_path, issue_number=903):
+        from issue_orchestrator.control.in_flight_work import QuarantinedSession
+
+        quarantined = QuarantinedSession(
+            _session(issue_number, tmp_path),
+            "payload unreadable",
+            f"/runs/{issue_number}",
+            f"/runs/{issue_number}@t1",
+        )
+        quarantine.quarantine(
+            QuarantineSubject.live_run_with_unreadable_claim(quarantined)
+        )
+        return quarantined
+
+    def test_a_resolving_quarantine_leaves_a_live_tech_lead_block_standing(
+        self, sample_config, tmp_path
+    ):
+        """The whole cross-owner sequence, end to end."""
+        live: dict[int, set[str]] = {903: set()}
+        labels, _applier, quarantine, lifecycle = self._owners(
+            sample_config, tmp_path, live
+        )
+
+        quarantined = self._quarantine_run(quarantine, tmp_path)
+        assert labels.needs_human in live[903]
+
+        # A tech-lead investigation exhausts its launch budget while the
+        # quarantine's block is standing. The label is present but it is not a
+        # human's, so this escalation still records its own provenance.
+        assert lifecycle.escalate(
+            issue_number=903,
+            reason="tech_lead launch retries exhausted",
+            comment="dropped after 3 launch failures",
+            context="tech_lead_launch_retry_exhausted",
+            event_data={"issue_number": 903},
+        ) is True
+        assert labels.tech_lead_needs_human in live[903]
+
+        # The quarantine's own cause is repaired and it releases.
+        quarantine.reconcile_released(frozenset())
+
+        # The issue stays durably blocked for the cause that is still live, with
+        # no repair tick required, and the quarantine keeps nothing of its own.
+        assert labels.needs_human in live[903]
+        assert labels.tech_lead_needs_human in live[903]
+        assert quarantine.store.list_quarantines() == ()
+        assert quarantine.store.quarantined_issue_numbers() == frozenset()
+        del quarantined
+
+    def test_a_resolving_quarantine_still_clears_a_block_nobody_else_wants(
+        self, sample_config, tmp_path
+    ):
+        """The guard is scoped: with no second cause, release behaves as before."""
+        live: dict[int, set[str]] = {903: set()}
+        labels, _applier, quarantine, _lifecycle_ = self._owners(
+            sample_config, tmp_path, live
+        )
+
+        self._quarantine_run(quarantine, tmp_path)
+        assert labels.needs_human in live[903]
+
+        quarantine.reconcile_released(frozenset())
+
+        assert labels.needs_human not in live[903]
+        assert quarantine.store.list_quarantines() == ()
+
+    def test_a_human_applied_block_is_still_never_claimed(
+        self, sample_config, tmp_path
+    ):
+        """Only ANOTHER ORCHESTRATOR cause defeats the human-intent rule.
+
+        A bare needs-human that nothing else accounts for is a human's, and this
+        lifecycle must keep refusing to stamp its marker on it - otherwise its
+        own supersede path would later remove a label it never applied.
+        """
+        labels = LabelManager(sample_config)
+        live: dict[int, set[str]] = {903: {labels.needs_human}}
+        _labels, applier, _quarantine, lifecycle = self._owners(
+            sample_config, tmp_path, live
+        )
+
+        assert lifecycle.escalate(
+            issue_number=903,
+            reason="tech_lead launch retries exhausted",
+            comment="dropped after 3 launch failures",
+            context="tech_lead_launch_retry_exhausted",
+            event_data={"issue_number": 903},
+        ) is True
+
+        assert labels.tech_lead_needs_human not in live[903]
+        assert [
+            action.label
+            for action in applier.applied
+            if isinstance(action, AddLabelAction)
+        ] == []

@@ -12,6 +12,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Optional
 
+from ..control.needs_human_block import SharedNeedsHumanBlock
 from ..control.session_launcher import SessionLauncher
 from ..ports.provider_readiness import ProviderReadinessProbe
 
@@ -46,7 +47,7 @@ def build_session_launcher_factory(
     label_manager,
     agent_callback_endpoint: "AgentCallbackEndpoint",
     provider_readiness_probe: ProviderReadinessProbe,
-    quarantined_issue_numbers: Callable[[], frozenset[int]],
+    needs_human_block: SharedNeedsHumanBlock,
 ) -> "SessionLauncherFactory":
     """Bind the application dependencies; return the facade-facing factory."""
 
@@ -82,7 +83,7 @@ def build_session_launcher_factory(
             board_snapshot_provider=board_snapshot_provider,
             agent_callback_endpoint=agent_callback_endpoint,
             provider_readiness_probe=provider_readiness_probe,
-            quarantined_issue_numbers=quarantined_issue_numbers,
+            needs_human_block=needs_human_block,
         )
 
     return _factory

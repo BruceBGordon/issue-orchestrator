@@ -16,6 +16,11 @@ from typing import TYPE_CHECKING
 from ..events import EventName
 from ..ports.event_sink import EventSink, make_trace_event
 from .actions import Action, AddCommentAction, AddLabelAction, RemoveLabelAction
+from .needs_human_block import (
+    NO_OTHER_NEEDS_HUMAN_CAUSES,
+    NeedsHumanCause,
+    SharedNeedsHumanBlock,
+)
 from .reconciliation import ExpectedState, ReconciliationRequired
 
 if TYPE_CHECKING:
@@ -58,19 +63,21 @@ class TechLeadNeedsHumanLifecycle:
         read_labels: ReadLabels,
         discover_marked_issue_numbers: DiscoverMarkedIssueNumbers,
         apply_actions: ApplyActions,
-        quarantined_issue_numbers: Callable[[], frozenset[int]] = frozenset,
+        needs_human_block: SharedNeedsHumanBlock = NO_OTHER_NEEDS_HUMAN_CAUSES,
     ) -> None:
         self._labels = labels
         self._events = events
         self._read_labels = read_labels
         self._discover_marked_issue_numbers = discover_marked_issue_numbers
         self._apply_actions = apply_actions
-        # #6999 F12: issues held open by an unreadable-claim quarantine. That
-        # owner keeps a terminal OUT of active_sessions on purpose, so "a
-        # session for this issue is active" is not evidence its block can be
-        # lifted - and lifting it would retract a warning about a live agent
-        # nobody can account for.
-        self._quarantined_issue_numbers = quarantined_issue_numbers
+        # Every OTHER durable cause of the shared needs-human label (#6999
+        # F12/F4). It answers two questions this lifecycle cannot answer from
+        # its own marker: whether a bare label it did not apply is human intent
+        # or another owner's block, and whether clearing its own escalation may
+        # take the shared label with it. An unreadable-claim quarantine keeps
+        # its terminal OUT of active_sessions on purpose, so "a session for this
+        # issue is active" is not evidence its block can be lifted.
+        self._block = needs_human_block
 
     def _expected(
         self,
@@ -131,8 +138,19 @@ class TechLeadNeedsHumanLifecycle:
         The marker commits first.  Therefore a needs-human label created by this
         workflow can never exist without durable ownership provenance.  A
         marker-only crash is recovered by :meth:`reconcile`, independently of
-        the in-memory tech_lead queue.  A pre-existing bare needs-human label is
-        respected as human/session-owned and is never retroactively claimed.
+        the in-memory tech_lead queue.  A bare needs-human label that belongs to
+        nobody else is respected as human/session-owned and is never
+        retroactively claimed.
+
+        "Nobody else's" is asked of the shared-block owner rather than inferred
+        from the label alone (#6999 F4).  A label another ORCHESTRATOR cause
+        applied — a quarantined pending-work claim — is not human intent, and
+        reading it as such left this escalation with no provenance at all: when
+        the quarantine resolved it took the shared label with it, and an issue a
+        human had been told to look at went quietly back on the board with
+        neither the block nor the marker :meth:`reconcile` recovers from.  So
+        the marker is recorded in that case too; only genuine human/session
+        intent suppresses it.
 
         Each step also carries an expected-state guard so a concurrent human or
         orchestrator path that clears or pauses the escalation between our steps
@@ -154,18 +172,24 @@ class TechLeadNeedsHumanLifecycle:
 
         marker_present = self._labels.tech_lead_needs_human in current
         needs_human_present = self._labels.needs_human in current
+        # Only a block nobody else accounts for is human intent (#6999 F4).
+        human_owned_block = needs_human_present and not self._block.held_by_another_cause(
+            issue_number, excluding=NeedsHumanCause.TECH_LEAD_ESCALATION
+        )
 
-        if not marker_present and not needs_human_present:
+        if not marker_present and not human_owned_block:
+            # The label is forbidden only when this escalation is also the one
+            # putting it there. When another orchestrator cause already holds
+            # it, requiring its absence would refuse the very marker that keeps
+            # this escalation recoverable after that cause resolves.
+            forbidden = {self._labels.tech_lead_needs_human}
+            if not needs_human_present:
+                forbidden.add(self._labels.needs_human)
             marker = AddLabelAction(
                 issue_number=issue_number,
                 label=self._labels.tech_lead_needs_human,
                 reason=reason,
-                expected=self._expected(
-                    forbidden={
-                        self._labels.tech_lead_needs_human,
-                        self._labels.needs_human,
-                    }
-                ),
+                expected=self._expected(forbidden=forbidden),
             )
             if not self._apply_guarded([marker], context):
                 return False
@@ -251,10 +275,12 @@ class TechLeadNeedsHumanLifecycle:
                 self._recover_interrupted_escalation(issue_number, current)
                 continue
 
-            if issue_number in self._quarantined_issue_numbers():
+            if self._block.held_by_another_cause(
+                issue_number, excluding=NeedsHumanCause.TECH_LEAD_ESCALATION
+            ):
                 logger.info(
-                    "[TECH_LEAD] Leaving needs-human on issue #%d: an unreadable "
-                    "pending-work claim is quarantined against it",
+                    "[TECH_LEAD] Leaving needs-human on issue #%d: another "
+                    "durable cause still requires the shared block",
                     issue_number,
                 )
                 continue

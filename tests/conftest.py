@@ -1060,11 +1060,19 @@ def build_test_orchestrator_deps(
     from issue_orchestrator.control.claim_quarantine import (
         build_claim_quarantine_owner,
     )
+    from issue_orchestrator.control.needs_human_block import NeedsHumanBlock
     from issue_orchestrator.execution.pending_work_claim_store import (
         SqlitePendingWorkClaimStore,
     )
 
     pending_work_claims = SqlitePendingWorkClaimStore.for_repo(config.repo_root)
+    # One owner for every durable cause of the shared needs-human label, wired
+    # exactly as bootstrap wires it (#6999 F4).
+    needs_human_block = NeedsHumanBlock(
+        tech_lead_marker=label_manager.tech_lead_needs_human,
+        read_labels=repo_host.get_issue_labels_fresh,
+        quarantined_issue_numbers=pending_work_claims.quarantined_issue_numbers,
+    )
 
     publish_recovery = PublishRecoveryService(
         repository_host=repo_host,
@@ -1096,6 +1104,7 @@ def build_test_orchestrator_deps(
             action_applier=_action_applier,
             label_manager=label_manager,
             events=events,
+            needs_human_block=needs_human_block,
         ),
         # The same endpoint the completion processor got, mirroring how
         # bootstrap shares one instance. Nothing binds a port in tests, so
@@ -1121,7 +1130,7 @@ def build_test_orchestrator_deps(
             label_manager=label_manager,
             agent_callback_endpoint=agent_callback_endpoint,
             provider_readiness_probe=readiness_probe,
-            quarantined_issue_numbers=pending_work_claims.quarantined_issue_numbers,
+            needs_human_block=needs_human_block,
         ),
         # Same shape again for the completion handler (#6999 A4).
         completion_handler_factory=build_completion_handler_factory(
