@@ -17,7 +17,11 @@ from issue_orchestrator.control.operator_issue_command_runner import (
     OperatorIssueCommandRunner,
 )
 from issue_orchestrator.control.operator_unblock import OperatorUnblocker
-from issue_orchestrator.domain.models import OrchestratorState, SessionHistoryEntry
+from issue_orchestrator.domain.models import (
+    Issue,
+    OrchestratorState,
+    SessionHistoryEntry,
+)
 from issue_orchestrator.ports.operator_issue_commands import (
     OperatorCommandIntent,
     OperatorCommandStatus,
@@ -93,11 +97,12 @@ def state() -> OrchestratorState:
     return state
 
 
-def _runner(sample_config, state, live, *, block=None, refuse=frozenset(), store=None):
+def _runner(sample_config, state, live, *, block=None, refuse=frozenset(), store=None,
+            host=None):
     from unittest.mock import MagicMock
 
     labels = LabelManager(sample_config)
-    host = _RepositoryHost(live, refuse=refuse)
+    host = host if host is not None else _RepositoryHost(live, refuse=refuse)
     return labels, OperatorIssueCommandRunner(
         unblocker=OperatorUnblocker(
             repository_host=host,
@@ -384,3 +389,118 @@ class TestTheOutcomeSaysWhatHappened:
 
         assert not hasattr(outcome, "payload")
         assert not hasattr(outcome, "message")
+
+
+class TestARecoveredRetrySettlesTheCachedCopy:
+    """The second attempt, after a partial failure (#6999 F7 round 8).
+
+    Partial failure only became reachable in round 7, and it brought a second
+    attempt with it. That attempt sees a DIFFERENT GitHub state from the first,
+    so patching the cached copy with just its own removals is not the same as
+    reconciling it - and the difference is a label the planner still gates on.
+    """
+
+    def _cached(self, labels, *extra):
+        return Issue(
+            number=ISSUE,
+            title="Timed out issue",
+            labels=("agent:web", labels.blocked, labels.blocked_failed, *extra),
+        )
+
+    def test_a_recovered_retry_leaves_no_stale_blocking_label_behind(
+        self, sample_config, state
+    ):
+        """Remove one label, fail the other, recover - and the cache settles.
+
+        Subtracting only the second attempt's removals from the first
+        attempt's cache leaves ``blocked`` on the cached copy: gone from
+        GitHub, still gating the planner, while the operator is told the issue
+        was queued for retry.
+        """
+        from unittest.mock import MagicMock
+
+        from issue_orchestrator.control.scheduler import Scheduler
+
+        labels = LabelManager(sample_config)
+        live = {ISSUE: {"agent:web", labels.blocked, labels.blocked_failed}}
+        cached = self._cached(labels)
+        state.cached_scope_issues = [cached]
+        state.cached_queue_issues = []
+        store = MagicMock()
+        host = _RepositoryHost(live, refuse=frozenset({labels.blocked_failed}))
+        _labels, runner = _runner(
+            sample_config, state, live, store=store, host=host
+        )
+
+        # Attempt 1: one label comes off, GitHub refuses the other.
+        first = runner.retry(ISSUE)
+
+        assert first.status is OperatorCommandStatus.INCOMPLETE
+        assert labels.blocked in first.removed
+        assert labels.blocked_failed in first.failed
+        assert live[ISSUE] == {"agent:web", labels.blocked_failed}
+        assert state.cached_scope_issues == [cached], "nothing settled yet"
+
+        # Attempt 2: GitHub recovers. The fresh read no longer mentions the
+        # label attempt 1 already removed, so this attempt removes only one.
+        host.refuse = frozenset()
+        second = runner.retry(ISSUE)
+
+        assert second.status is OperatorCommandStatus.COMMITTED
+        assert second.removed == (labels.blocked_failed,)
+
+        settled = next(
+            issue for issue in state.cached_scope_issues if issue.number == ISSUE
+        )
+        assert labels.blocked not in settled.labels, (
+            "removed from GitHub by the FIRST attempt, so it must not survive "
+            "in the cache the planner reads"
+        )
+        assert labels.blocked_failed not in settled.labels
+        assert "agent:web" in settled.labels, "non-gating labels are preserved"
+
+        # The queue copy is the one the planner actually pulls from.
+        queued = next(
+            issue for issue in state.cached_queue_issues if issue.number == ISSUE
+        )
+        assert labels.blocked not in queued.labels
+
+        # ...and so is the snapshot a warm restart would come back to.
+        persisted = next(
+            issue
+            for issue in store.save_snapshot.call_args.args[0]
+            if issue.number == ISSUE
+        )
+        assert labels.blocked not in persisted.labels
+
+        # Finally the real arbiter: the scheduler must now let it through.
+        decision = Scheduler(sample_config, label_manager=labels).evaluate_issues(
+            [settled], check_dependencies=False
+        )[0]
+        assert decision.available, decision.reason
+
+    def test_a_single_successful_retry_still_settles_the_same_way(
+        self, sample_config, state
+    ):
+        """The one-attempt path, so the reconciliation is not just two-attempt.
+
+        ``observed`` is authoritative for EVERY label, which also means a cache
+        carrying a label GitHub no longer has is corrected rather than trusted.
+        """
+        from unittest.mock import MagicMock
+
+        labels = LabelManager(sample_config)
+        live = {ISSUE: {"agent:web", labels.blocked}}
+        # The cache is stale: it still carries a label GitHub has already lost.
+        state.cached_scope_issues = [self._cached(labels)]
+        state.cached_queue_issues = []
+        store = MagicMock()
+        _labels, runner = _runner(sample_config, state, live, store=store)
+
+        outcome = runner.retry(ISSUE)
+
+        assert outcome.status is OperatorCommandStatus.COMMITTED
+        settled = next(
+            issue for issue in state.cached_scope_issues if issue.number == ISSUE
+        )
+        assert set(settled.labels) == {"agent:web"}

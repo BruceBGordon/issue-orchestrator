@@ -66,12 +66,12 @@ class OperatorIssueCommandRunner:
 
     def retry(self, issue_number: int) -> OperatorCommandOutcome:
         """Clear the retry-gating labels, then make the issue eligible again."""
-        current = self.fresh_labels.read_issue_labels(issue_number)
+        observed = tuple(self.fresh_labels.read_issue_labels(issue_number))
         return self._settle(
             issue_number,
             OperatorCommandIntent.RETRY,
-            self.unblocker.retry(issue_number, current),
-            self._make_retryable,
+            self.unblocker.retry(issue_number, observed),
+            lambda removed: self._make_retryable(issue_number, observed, removed),
         )
 
     def dismiss(self, issue_number: int) -> OperatorCommandOutcome:
@@ -80,7 +80,7 @@ class OperatorIssueCommandRunner:
             issue_number,
             OperatorCommandIntent.DISMISS,
             self.unblocker.dismiss(issue_number),
-            lambda number, removed: self._remove_from_board(number),
+            lambda removed: self._remove_from_board(issue_number),
         )
 
     # -- internals ---------------------------------------------------------
@@ -90,7 +90,7 @@ class OperatorIssueCommandRunner:
         issue_number: int,
         intent: OperatorCommandIntent,
         labels: OperatorUnblockOutcome,
-        commit: Callable[[int, tuple[str, ...]], None],
+        commit: Callable[[tuple[str, ...]], None],
     ) -> OperatorCommandOutcome:
         """Apply the ordering invariant, for whichever command asked.
 
@@ -130,7 +130,7 @@ class OperatorIssueCommandRunner:
             return self._outcome(
                 issue_number, intent, OperatorCommandStatus.INCOMPLETE, labels
             )
-        self.run_locked(lambda: commit(issue_number, labels.removed))
+        self.run_locked(lambda: commit(labels.removed))
         logger.info(
             "[%s] Issue #%d settled, removed labels: %s",
             intent.value,
@@ -158,20 +158,42 @@ class OperatorIssueCommandRunner:
             held_by=labels.held_by,
         )
 
-    def _make_retryable(self, issue_number: int, removed: tuple[str, ...]) -> None:
-        """Clear the retry gates, then refresh the cached copy behind them.
+    def _make_retryable(
+        self,
+        issue_number: int,
+        observed: tuple[str, ...],
+        removed: tuple[str, ...],
+    ) -> None:
+        """Clear the retry gates, then reconcile the cached copy behind them.
 
         Removing the GitHub label is not enough: ``QueueCache.evaluate_issue``
         rejects any issue whose number is in ``session_history`` (or
         ``failed_this_cycle``), so the planner keeps skipping it on every
-        refresh until the orchestrator restarts.
+        refresh until the orchestrator restarts. And clearing those gates is not
+        enough either, because ``Scheduler`` re-reads the cached issue's LABELS
+        and refuses anything still wearing a blocking one.
+
+        So the cached copy is reconciled against what GitHub actually had, not
+        patched with this attempt's removals (#6999 F7 round 8). The difference
+        only shows up across two attempts, which is exactly what the new partial
+        failure path made reachable:
+
+        1. the cache and GitHub both carry ``blocked`` and ``blocked-failed``;
+        2. a first retry removes ``blocked``, fails on ``blocked-failed``, and
+           correctly leaves the cache alone;
+        3. the operator retries. The fresh read now shows only
+           ``blocked-failed``, so that is all this attempt removes.
+
+        Subtracting only step 3's removals from the step-1 cache leaves
+        ``blocked`` on the cached copy - already gone from GitHub, still gating
+        the planner - and the operator is told the issue was queued. Starting
+        from ``observed``, the pre-write snapshot this attempt actually acted
+        on, cannot drift that way: it is authoritative for every label,
+        including the non-gating ones the cache would otherwise be trusted for.
         """
         state = self.state()
         RetryHistoryState(state).make_retryable(issue_number)
 
-        # The cached scope copy still carries the labels just removed; the queue
-        # copy will have been rejected after the timeout, so re-evaluate the
-        # scope copy against the freshly pruned state.
         cached = next(
             (
                 issue for issue in state.cached_scope_issues
@@ -181,19 +203,16 @@ class OperatorIssueCommandRunner:
         )
         if cached is None or not is_dataclass(cached) or isinstance(cached, type):
             return
-        updated = replace(
-            cached,
-            labels=tuple(
-                label for label in cached.labels if label not in removed
-            ),
-        )
+        settled = tuple(label for label in observed if label not in removed)
+        updated = replace(cached, labels=settled)
         queue_cache = QueueCache(self.config, state, self.queue_cache_store)
         queue_cache.upsert_refreshed_issue(updated)
         queue_cache.save_snapshot()
         logger.debug(
-            "[cache] Reset issue #%d for retry: removed labels=%s",
+            "[cache] Reset issue #%d for retry: removed=%s, settled labels=%s",
             issue_number,
             list(removed),
+            list(settled),
         )
 
     def _remove_from_board(self, issue_number: int) -> None:
