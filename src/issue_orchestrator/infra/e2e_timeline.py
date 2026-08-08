@@ -6,6 +6,11 @@ import json
 import logging
 import sqlite3
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ..ports.timeline_store import TimelineStore
+    from .e2e_db import E2ERun
 
 logger = logging.getLogger(__name__)
 
@@ -96,3 +101,64 @@ def read_orchestrator_events_by_window(
     # Restore chronological order across issues
     all_events.sort(key=lambda e: e.get("timestamp", ""))
     return all_events
+
+
+def snapshot_agent_events(
+    run: "E2ERun",
+    *,
+    repo_root: Path,
+    timeline_store: "TimelineStore",
+) -> None:
+    """Copy agent timeline events from the E2E worktree into the base repo.
+
+    Agent sessions run in the E2E worktree, so their timeline events live in
+    that worktree's ``timeline.sqlite`` — which is wiped on refresh. They are
+    snapshotted into the base repo's timeline under the same E2E run key (a
+    negative int) so the nesting endpoints can split them from the pytest
+    events by event-name prefix (``e2e.*`` vs ``session.*``).
+
+    Lives beside :func:`read_orchestrator_events_by_window` rather than on the
+    orchestrator facade: it is the write half of the same worktree-timeline
+    concern, and needs nothing from the facade but a repo root and the store.
+    """
+    from ..domain.timeline_key import TimelineKey
+    from ..ports.timeline_store import TimelineRecord
+    from .e2e_worktree import get_e2e_worktree_path
+
+    try:
+        wt_timeline = (
+            get_e2e_worktree_path(repo_root)
+            / ".issue-orchestrator" / "state" / "timeline.sqlite"
+        )
+        if not wt_timeline.exists():
+            return
+
+        agent_events = read_orchestrator_events_by_window(
+            wt_timeline, started_at=run.started_at, finished_at=run.finished_at
+        )
+        if not agent_events:
+            return
+
+        store_key = TimelineKey.for_e2e_run(run.id).to_store_key()
+        for evt in agent_events:
+            # Stored as ``e2e.agent_snapshot`` to avoid the run-scoped CHECK
+            # constraint. The data blob carries the complete pre-rendered event
+            # dict; the read path returns it directly rather than re-deriving
+            # it through TimelineStream.
+            timeline_store.append(
+                store_key,
+                TimelineRecord(
+                    event_id=f"snap-{evt.get('event_id', '')}",
+                    timestamp=evt.get("timestamp", ""),
+                    event="e2e.agent_snapshot",
+                    data=evt,
+                    source_event="e2e.agent_snapshot",
+                ),
+            )
+        logger.info(
+            "Snapshot %d agent events for E2E run %d", len(agent_events), run.id
+        )
+    except Exception:
+        logger.debug(
+            "Could not snapshot E2E agent events for run %d", run.id, exc_info=True
+        )

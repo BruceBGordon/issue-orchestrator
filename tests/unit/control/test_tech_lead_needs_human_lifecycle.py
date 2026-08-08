@@ -12,6 +12,7 @@ complete against state that no longer holds.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -1017,6 +1018,31 @@ class TestEveryOrchestratorCauseOwnsTheSharedBlock:
         )
 
 
+@dataclass(frozen=True)
+class _CompletionRun:
+    """One real ``CompletionProcessor.process()`` run and everything it touched.
+
+    Named so a rejection can be asserted as the ABSENCE of external effects
+    rather than the absence of one label call: the record is rejected at the
+    door, so no PR is created, no branch is pushed, and nothing on the git side
+    is asked to do anything at all (#6999 F2 round 6).
+    """
+
+    result: object
+    labels: object
+    pr: object
+    git: object
+
+    def external_calls(self) -> list[str]:
+        """Every PR/git method the completion actually invoked."""
+        return [
+            f"{surface}.{call[0]}"
+            for surface, spy in (("pr", self.pr), ("git", self.git))
+            for call in spy.mock_calls
+            if call[0]
+        ]
+
+
 class TestTheBlockOwnerIsNotBypassableInProduction:
     """The four paths that reached around the owner (#6999 F2 round 3).
 
@@ -1099,7 +1125,15 @@ class TestTheBlockOwnerIsNotBypassableInProduction:
 
     def _process_completion(self, tmp_path, block, labels, record_actions, *,
                             issue_number=903, pr_labels=(), outcome="needs_human"):
-        """Drive the REAL public completion path with a real record on disk."""
+        """Drive the REAL public completion path with a real record on disk.
+
+        Returns every external surface the completion can reach - the label
+        adapter, the PR adapter and the git adapter - so a test can assert what
+        did NOT happen. Returning only the label spy is what let a "rejected
+        before any side effect" claim rest on one absent label call, which a
+        rejection moved after push or PR creation would still satisfy
+        (#6999 F2 round 6).
+        """
         import json
         from unittest.mock import MagicMock
 
@@ -1171,7 +1205,9 @@ class TestTheBlockOwnerIsNotBypassableInProduction:
             ),
             agent_label="agent:test",
         )
-        return result, adapter
+        return _CompletionRun(
+            result=result, labels=adapter, pr=pr_adapter, git=git_adapter
+        )
 
     def test_an_agent_requested_needs_human_survives_a_quarantine_release(
         self, sample_config, tmp_path
@@ -1191,15 +1227,15 @@ class TestTheBlockOwnerIsNotBypassableInProduction:
         self._quarantine_run(quarantine, tmp_path)
         assert labels.needs_human in live[903]
 
-        result, adapter = self._process_completion(
+        run = self._process_completion(
             tmp_path, block, labels, ["add_needs_human_label"]
         )
 
-        assert result.success, result.errors
+        assert run.result.success, run.result.errors
         # The raw adapter was never asked for this label: the owner is the only
         # writer, and the capability would have refused it anyway.
         assert [
-            call for call in adapter.add_label.call_args_list
+            call for call in run.labels.add_label.call_args_list
             if call.args[1] == labels.needs_human
         ] == []
 
@@ -1230,7 +1266,7 @@ class TestTheBlockOwnerIsNotBypassableInProduction:
             sample_config, tmp_path, live
         )
 
-        result, adapter = self._process_completion(
+        run = self._process_completion(
             tmp_path,
             block,
             labels,
@@ -1239,12 +1275,16 @@ class TestTheBlockOwnerIsNotBypassableInProduction:
             outcome="completed",
         )
 
-        # The whole completion is refused, at the door, before any side effect.
-        assert not result.success
-        assert any("reserved shared block" in error for error in result.errors)
-        # No PR, and NOTHING was labelled - not even the ordinary label beside
-        # the reserved one, because the record itself was rejected.
-        assert adapter.add_label.call_args_list == []
+        # The whole completion is refused, at the door.
+        assert not run.result.success
+        assert any("reserved shared block" in error for error in run.result.errors)
+        # "Before any side effect" asserted as the ABSENCE of every external
+        # effect, not just of one label call: nothing was labelled - not even
+        # the ordinary label beside the reserved one - and the PR and git
+        # surfaces were never touched at all, so no branch was pushed and no
+        # PR created or reused.
+        assert run.labels.add_label.call_args_list == []
+        assert run.external_calls() == []
         assert claims.needs_human_causes(77) == frozenset()
         assert claims.needs_human_causes(903) == frozenset()
 
@@ -1262,7 +1302,7 @@ class TestTheBlockOwnerIsNotBypassableInProduction:
             sample_config, tmp_path, live
         )
 
-        result, adapter = self._process_completion(
+        run = self._process_completion(
             tmp_path,
             block,
             labels,
@@ -1271,10 +1311,15 @@ class TestTheBlockOwnerIsNotBypassableInProduction:
             outcome="completed",
         )
 
-        assert result.success, result.errors
+        assert run.result.success, run.result.errors
         assert (77, "size:small") in [
-            (call.args[0], call.args[1]) for call in adapter.add_label.call_args_list
+            (call.args[0], call.args[1])
+            for call in run.labels.add_label.call_args_list
         ]
+        # ...and this is the run that PROVES the assertion above is meaningful:
+        # the same record really does reach PR creation when nothing reserved
+        # is in it, so a rejected one reaching none of it is a real difference.
+        assert "pr.create_pr" in run.external_calls()
 
     def test_a_refusal_at_the_capability_fails_the_completion(
         self, sample_config, tmp_path
@@ -1297,7 +1342,7 @@ class TestTheBlockOwnerIsNotBypassableInProduction:
             sample_config, tmp_path, live
         )
 
-        result, adapter = self._process_completion(
+        run = self._process_completion(
             tmp_path,
             NO_OTHER_NEEDS_HUMAN_CAUSES,
             labels,
@@ -1306,11 +1351,11 @@ class TestTheBlockOwnerIsNotBypassableInProduction:
             outcome="completed",
         )
 
-        assert not result.success
-        assert any("governed_label" in error for error in result.errors)
+        assert not run.result.success
+        assert any("governed_label" in error for error in run.result.errors)
         # ...and the reserved label never reached the raw adapter.
         assert [
-            call for call in adapter.add_label.call_args_list
+            call for call in run.labels.add_label.call_args_list
             if call.args[1] == labels.needs_human
         ] == []
 
@@ -1524,15 +1569,16 @@ class TestTheOwnerSurvivesAHalfWrittenTransition:
     """
 
     def _block(self, sample_config, tmp_path, live, *, labels_writer=None,
-               causes=None):
+               causes=None, quarantined=None, read_labels=None):
         labels = LabelManager(sample_config)
         claims = causes or SqlitePendingWorkClaimStore.for_repo(tmp_path)
+        held = quarantined if quarantined is not None else set()
         return labels, NeedsHumanBlock(
             needs_human_label=labels.needs_human,
             tech_lead_marker=labels.tech_lead_needs_human,
             labels=labels_writer or _LiveLabelWriter(live),
-            read_labels=lambda number: list(live.get(number, set())),
-            quarantined_issue_numbers=frozenset,
+            read_labels=read_labels or (lambda number: list(live.get(number, set()))),
+            quarantined_issue_numbers=lambda: frozenset(held),
             causes=claims,
         ), claims
 
@@ -1745,3 +1791,128 @@ class TestTheOwnerSurvivesAHalfWrittenTransition:
         )
         assert block.release(merge) is BlockOutcome.CLEARED
         assert labels.needs_human not in live[903]
+
+    def _ghost_after_a_failed_clear(self, sample_config, tmp_path, live, **kw):
+        """Leave the exact half-written state: label gone, ordinary row alive.
+
+        A release whose label removal COMMITS and whose cause clear then fails.
+        Returns the owner rebuilt without the fault, so the next acquisition
+        runs against a real store holding a row nothing is asserting.
+        """
+        real = SqlitePendingWorkClaimStore.for_repo(tmp_path)
+
+        class _RefusingClear:
+            def record_needs_human_cause(self, issue_number, cause, *, reason):
+                real.record_needs_human_cause(issue_number, cause, reason=reason)
+
+            def restart_needs_human_causes(self, issue_number, cause, *, reason):
+                real.restart_needs_human_causes(issue_number, cause, reason=reason)
+
+            def needs_human_causes(self, issue_number):
+                return real.needs_human_causes(issue_number)
+
+            def withdraw_needs_human_cause(self, issue_number, cause):
+                real.withdraw_needs_human_cause(issue_number, cause)
+
+            def clear_needs_human_causes(self, issue_number):
+                raise RuntimeError("sqlite write failed")
+
+        labels, block, _ = self._block(
+            sample_config, tmp_path, live, causes=_RefusingClear()
+        )
+        assert block.acquire(self._request(labels)) is BlockOutcome.HELD
+        with pytest.raises(RuntimeError):
+            block.release(self._request(labels))
+        assert labels.needs_human not in live[903]
+        assert real.needs_human_causes(903) != frozenset(), "the ghost survived"
+
+        labels, healthy, _ = self._block(
+            sample_config, tmp_path, live, causes=real, **kw
+        )
+        return labels, healthy, real
+
+    def test_a_quarantine_acquiring_next_does_not_inherit_the_ghost(
+        self, sample_config, tmp_path
+    ):
+        """A SELF-RECORDING cause opens a generation too (#6999 F4 round 6).
+
+        Quarantine keeps its provenance in its own ledger, so it records
+        nothing here - but it still RE-ADDS the shared label, and the stale
+        ordinary row underneath would then be read as part of the new
+        generation. Releasing the quarantine would find that ghost, conclude
+        another lifecycle still needs the block, and strand the issue in
+        needs-human with nothing able to clear it.
+        """
+        live: dict[int, set[str]] = {903: set()}
+        quarantined: set[int] = set()
+        labels, block, real = self._ghost_after_a_failed_clear(
+            sample_config, tmp_path, live, quarantined=quarantined
+        )
+
+        # The quarantine acquires: its own ledger row, and the shared label.
+        quarantined.add(903)
+        quarantine = self._request(labels, NeedsHumanCause.CLAIM_QUARANTINE)
+        assert block.acquire(quarantine) is BlockOutcome.HELD
+        assert labels.needs_human in live[903]
+        assert real.needs_human_causes(903) == frozenset(), (
+            "a new generation inherits nothing, even when its cause records "
+            "its provenance somewhere else"
+        )
+
+        # ...and when it resolves, the block goes with it.
+        quarantined.discard(903)
+        assert block.release(quarantine) is BlockOutcome.CLEARED
+        assert labels.needs_human not in live[903]
+
+    def test_a_tech_lead_escalation_acquiring_next_does_not_inherit_it_either(
+        self, sample_config, tmp_path
+    ):
+        """The other self-recording cause, whose provenance is its marker."""
+        live: dict[int, set[str]] = {903: set()}
+        labels, block, real = self._ghost_after_a_failed_clear(
+            sample_config, tmp_path, live
+        )
+
+        live[903].add(labels.tech_lead_needs_human)
+        tech_lead = self._request(labels, NeedsHumanCause.TECH_LEAD_ESCALATION)
+        assert block.acquire(tech_lead) is BlockOutcome.HELD
+        assert labels.needs_human in live[903]
+        assert real.needs_human_causes(903) == frozenset()
+
+        # The tech-lead lifecycle drops its marker, then gives the block back.
+        live[903].discard(labels.tech_lead_needs_human)
+        assert block.release(tech_lead) is BlockOutcome.CLEARED
+        assert labels.needs_human not in live[903]
+
+    def test_an_unreadable_label_aborts_the_acquisition_before_it_writes(
+        self, sample_config, tmp_path
+    ):
+        """Unknown generation is not "existing generation" (#6999 F4 round 6).
+
+        The retention read fails CLOSED - "every cause still holds" - because
+        wrongly keeping a block costs a tick and wrongly dropping one loses a
+        human's only signal. Reused during acquisition that same fallback says
+        "the label is present", so the incoming cause appends to provenance
+        that may already be stale and the label goes on regardless.
+
+        So acquisition asks its own question and refuses to answer it wrongly:
+        no cause recorded, no label written, and a FAILED outcome the caller
+        retries.
+        """
+        live: dict[int, set[str]] = {903: set()}
+
+        def _unreadable(issue_number: int):
+            raise RuntimeError("github read failed")
+
+        labels, block, real = self._ghost_after_a_failed_clear(
+            sample_config, tmp_path, live, read_labels=_unreadable
+        )
+        ghost = real.needs_human_causes(903)
+
+        assert block.acquire(self._request(labels)) is BlockOutcome.FAILED
+        assert labels.needs_human not in live[903], (
+            "no label may go on over provenance that could not be checked"
+        )
+        assert real.needs_human_causes(903) == ghost, (
+            "and nothing was appended to the stale row it could not evaluate"
+        )

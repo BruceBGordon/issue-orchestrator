@@ -242,6 +242,11 @@ class NeedsHumanBlock:
         ALREADY PRESENT label matters just as much as applying a fresh one - a
         cause arriving second is exactly the case that used to leave no trace
         and lose its block.
+
+        FAILS without touching the label when the provenance cannot be settled
+        first: when the cause store refuses the write, and when the target's
+        current labels cannot be read at all, since that leaves which
+        GENERATION of the block this joins unknown (#6999 F4 round 6).
         """
         # Provenance FIRST, then the label (#6999 F4 round 4). Labelling first
         # left a window where the external write had committed and the cause
@@ -250,8 +255,8 @@ class NeedsHumanBlock:
         # the opposite - a recorded cause with no label - which the read path
         # prunes on sight.
         #
-        # Which write records it depends on whether this is a NEW GENERATION of
-        # the label (#6999 F4 round 5). Rows only ever mean "while this label is
+        # What that write IS depends on whether this is a new generation of the
+        # label (#6999 F4 round 5/6). Rows only ever mean "while this label is
         # present, X requires it", so an absent label makes every existing row
         # stale - and a clear that failed after a committed removal leaves
         # exactly that. Inheriting one would give the incoming cause a companion
@@ -383,22 +388,33 @@ class NeedsHumanBlock:
     def _recorded(self, request: HumanBlockRequest) -> bool:
         """Record this cause against the CURRENT generation of the label.
 
-        When the label is absent the incoming cause opens a new generation, so
-        every earlier row is replaced in ONE transaction rather than cleared and
-        then written: a clear-then-record can die in between and leave the new
-        cause recorded beside the stale one, which is precisely the state being
-        prevented.
+        When the label is absent the incoming cause opens a NEW generation, and
+        every row from the previous one is stale by definition. Ending them is
+        the acquisition's job whatever the incoming cause is (#6999 F4 round 6):
+        a self-recording cause keeps its own provenance elsewhere, but it still
+        re-adds the shared label, and a stale ordinary row left underneath it
+        would be read as part of the new generation - so releasing the real
+        owner would find a ghost and strand the block. It therefore CLEARS the
+        old rows without inserting one of its own; an ordinary cause replaces
+        them with itself in ONE transaction, because a clear-then-record can die
+        in between and leave the new cause beside the stale one.
 
         A failure here aborts the acquisition rather than proceeding, because
         the alternative is applying a live block whose provenance is wrong.
         """
-        if request.cause in _SELF_RECORDING_CAUSES:
-            return True
+        present = self._label_present_now(request.target)
+        if present is None:
+            return False
+        self_recording = request.cause in _SELF_RECORDING_CAUSES
+        if present and self_recording:
+            return True  # existing generation, provenance kept by its lifecycle
         try:
-            if self.needs_human_label in self._live_labels(request.target):
+            if present:
                 self.causes.record_needs_human_cause(
                     request.target, request.cause.value, reason=request.reason
                 )
+            elif self_recording:
+                self.causes.clear_needs_human_causes(request.target)
             else:
                 self.causes.restart_needs_human_causes(
                     request.target, request.cause.value, reason=request.reason
@@ -412,6 +428,32 @@ class NeedsHumanBlock:
             )
             return False
         return True
+
+    def _label_present_now(self, issue_number: int) -> bool | None:
+        """Is the shared label on ``issue_number`` right now - or UNKNOWN?
+
+        Deliberately NOT :meth:`_live_labels` (#6999 F4 round 6). That read
+        fails closed to "every cause still holds", which is right when the
+        question is whether to RETRACT a block: keeping one costs a tick of
+        attention, dropping one loses a human's only signal.
+
+        It is the wrong answer here. Acquisition is asking which GENERATION of
+        the label it is joining, and a fallback that says "present" makes an
+        unreadable issue look like an existing generation - so the incoming
+        cause appends to provenance that may already be stale, and the label
+        goes on anyway. Unknown must therefore abort the acquisition before any
+        label write, which the caller turns into ``FAILED`` for its own retry.
+        """
+        try:
+            return self.needs_human_label in frozenset(self.read_labels(issue_number))
+        except Exception:
+            logger.exception(
+                "[BLOCK] Could not read labels for #%d, so which generation of "
+                "the shared needs-human block this acquisition joins is unknown;"
+                " refusing to apply it rather than inheriting stale provenance",
+                issue_number,
+            )
+            return None
 
     def _withdraw(self, request: HumanBlockRequest) -> None:
         if request.cause not in _SELF_RECORDING_CAUSES:

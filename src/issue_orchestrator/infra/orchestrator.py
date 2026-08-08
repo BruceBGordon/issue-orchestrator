@@ -12,8 +12,8 @@ if TYPE_CHECKING:
     from ..control.session_manager import SessionRef, SessionType
     from ..control.tech_lead_trigger import TechLeadTerminationOutcome
     from ..domain.tech_lead_session import TechLeadLaunchScope
+    from ..ports.operator_issue_commands import OperatorIssueCommands
     from ..ports.session_runner import DiscoveredSession
-    from .e2e_db import E2ERun
 
 from ..events import EventName, EventContext, EventHub
 from ..control.orchestrator_support import (
@@ -92,6 +92,7 @@ from .startup_errors import StartupError, write_startup_failure
 from ..control.health_gate import HealthDecision
 from ..control.orchestrator_deps import OrchestratorDeps
 from .e2e_runner import maybe_trigger_e2e, get_e2e_runner_manager
+from .e2e_timeline import snapshot_agent_events
 from .sqlite_maintenance import run_backups_if_due
 
 
@@ -179,6 +180,24 @@ class Orchestrator:
     @property
     def state_lock(self) -> threading.RLock:
         return self._state_lock
+
+    @cached_property
+    def operator_issue_commands(self) -> "OperatorIssueCommands":
+        """Operator "retry"/"dismiss", bound to this facade's state and lock.
+
+        The Control API asks for the COMMAND rather than assembling one: the
+        transition it performs spans GitHub labels and the local retry/queue
+        state and must settle them in that order, which is not a rule a
+        transport can be trusted to re-derive twice (#6999 F5).
+        """
+        return self.deps.operator_issue_command_factory(
+            state=lambda: self.state,
+            run_locked=self._run_locked,
+        )
+
+    def _run_locked(self, fn):
+        with self._state_lock:
+            return fn()
 
     def kill_session(self, name: str) -> None:
         """Kill a session by terminal ID (public wrapper)."""
@@ -543,7 +562,11 @@ class Orchestrator:
             # Snapshot agent events from the E2E worktree timeline into the
             # base repo timeline so they persist across worktree refreshes.
             if last_run is not None:
-                self._snapshot_e2e_agent_events(last_run)
+                snapshot_agent_events(
+                    last_run,
+                    repo_root=self.config.repo_root,
+                    timeline_store=self.deps.timeline_store,
+                )
 
             event_name = EventName.E2E_COMPLETED if status == "passed" else EventName.E2E_FAILED
             self.deps.events.publish(TraceEvent(
@@ -553,59 +576,6 @@ class Orchestrator:
                     "status": status,
                 }),
             ))
-
-    def _snapshot_e2e_agent_events(self, run: "E2ERun") -> None:
-        """Copy agent timeline events from the E2E worktree to the base repo.
-
-        Agent sessions run in the E2E worktree, so their timeline events
-        are in that worktree's timeline.sqlite which gets wiped on refresh.
-        We snapshot them into the base repo's timeline under the same E2E
-        run key (negative int) so the nesting endpoints can split them
-        from the pytest events by event name prefix (e2e.* vs session.*/etc).
-        """
-        try:
-            from .e2e_worktree import get_e2e_worktree_path
-            from ..domain.timeline_key import TimelineKey
-            from .e2e_timeline import read_orchestrator_events_by_window
-
-            wt_timeline = get_e2e_worktree_path(self.config.repo_root) / ".issue-orchestrator" / "state" / "timeline.sqlite"
-            if not wt_timeline.exists():
-                return
-
-            agent_events = read_orchestrator_events_by_window(
-                wt_timeline,
-                started_at=run.started_at,
-                finished_at=run.finished_at,
-            )
-            if not agent_events:
-                return
-
-            # Write agent events to the base repo's timeline under the E2E run's key.
-            # Use a distinct event name prefix so they're identifiable as snapshots.
-            from ..ports.timeline_store import TimelineRecord
-            store = self.deps.timeline_store
-            store_key = TimelineKey.for_e2e_run(run.id).to_store_key()
-
-            for evt in agent_events:
-                # Store as e2e.agent_snapshot to avoid the run-scoped
-                # CHECK constraint.  The data blob contains the complete
-                # pre-rendered event dict; the read path returns it directly
-                # rather than re-deriving through TimelineStream.
-                record = TimelineRecord(
-                    event_id=f"snap-{evt.get('event_id', '')}",
-                    timestamp=evt.get("timestamp", ""),
-                    event="e2e.agent_snapshot",
-                    data=evt,
-                    source_event="e2e.agent_snapshot",
-                )
-                store.append(store_key, record)
-
-            logger.info(
-                "Snapshot %d agent events for E2E run %d",
-                len(agent_events), run.id,
-            )
-        except Exception:
-            logger.debug("Could not snapshot E2E agent events for run %d", run.id, exc_info=True)
 
     def _maybe_run_sqlite_backups(self) -> None:
         if not self.config.sqlite_backup.enabled:

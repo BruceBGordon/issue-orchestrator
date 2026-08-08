@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     from ..events import EventHub
     from ..ports.agent_callback_endpoint import AgentCallbackEndpoint
     from ..ports.completion_handler_factory import CompletionHandlerFactory
+    from ..ports.operator_issue_commands import OperatorIssueCommandFactory
     from ..ports.session_launcher_factory import SessionLauncherFactory
     from ..ports.label_store import LabelStore
     from ..ports.pending_work_claim_store import PendingWorkClaimStore
@@ -122,6 +123,11 @@ class OrchestratorDeps:
     # Same split for the completion handler: the facade supplies only its own
     # runtime state, never the dependency-container layout (#6999 A4).
     completion_handler_factory: "CompletionHandlerFactory"
+    # Operator "retry"/"dismiss": one settled transition across GitHub labels
+    # and the local retry/queue state, in that order (#6999 F5). A factory for
+    # the same reason as the two above - the live state and its lock belong to
+    # the facade, everything else to this container.
+    operator_issue_command_factory: "OperatorIssueCommandFactory"
 
     # IO adapters
     worktree_manager: "WorktreeManager"

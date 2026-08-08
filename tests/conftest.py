@@ -870,6 +870,9 @@ def build_test_orchestrator_deps(
     from issue_orchestrator.entrypoints.bootstrap_completion import (
         build_completion_handler_factory,
     )
+    from issue_orchestrator.entrypoints.bootstrap_operator_commands import (
+        build_operator_issue_command_factory,
+    )
     from issue_orchestrator.entrypoints.bootstrap_session_launcher import (
         build_session_launcher_factory,
     )
@@ -1150,6 +1153,16 @@ def build_test_orchestrator_deps(
             open_issue_corpus=open_issue_corpus,
             label_manager=label_manager,
             provider_resilience=provider_resilience,
+        ),
+        # ...and for the operator retry/dismiss command, whose transition spans
+        # GitHub labels and the local retry/queue state (#6999 F5).
+        operator_issue_command_factory=build_operator_issue_command_factory(
+            config,
+            repository_host=repo_host,
+            label_manager=label_manager,
+            needs_human_block=needs_human_block,
+            fresh_issue_reader=fresh_reader,
+            queue_cache_store=infra_services.queue_cache_store,
         ),
         repository_host=repo_host,
         e2e_issue_tracker=e2e_issue_tracker,

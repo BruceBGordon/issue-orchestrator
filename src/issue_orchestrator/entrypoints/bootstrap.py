@@ -36,6 +36,7 @@ from .bootstrap_pending_work import (
     require_repository_host,
 )
 from .bootstrap_session_launcher import build_session_launcher_factory
+from .bootstrap_operator_commands import build_operator_issue_command_factory
 from .bootstrap_completion import (
     _validation_attempt_key_factory,
     build_completion_handler_factory,
@@ -864,6 +865,14 @@ def build_orchestrator(
         agent_callback_endpoint=agent_callback_endpoint,
         session_launcher_factory=session_launcher_factory,
         completion_handler_factory=completion_handler_factory,
+        operator_issue_command_factory=build_operator_issue_command_factory(
+            config,
+            repository_host=github,
+            label_manager=label_manager,
+            needs_human_block=pending_work.needs_human_block,
+            fresh_issue_reader=fresh_issue_reader,
+            queue_cache_store=queue_cache_store,
+        ),
         board_snapshot_builder=create_board_snapshot_builder(
             config, timeline_store, tech_lead_board_publisher, working_copy
         ),
@@ -1277,6 +1286,14 @@ def build_orchestrator_for_testing(
         agent_callback_endpoint=agent_callback_endpoint,
         session_launcher_factory=session_launcher_factory,
         completion_handler_factory=completion_handler_factory,
+        operator_issue_command_factory=build_operator_issue_command_factory(
+            config,
+            repository_host=github,
+            label_manager=label_manager,
+            needs_human_block=pending_work.needs_human_block,
+            fresh_issue_reader=fresh_issue_reader,
+            queue_cache_store=queue_cache_store,
+        ),
         board_snapshot_builder=create_board_snapshot_builder(
             config, timeline_store, tech_lead_board_publisher_for_testing, working_copy
         ),
