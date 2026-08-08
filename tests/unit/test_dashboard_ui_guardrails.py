@@ -484,6 +484,26 @@ def test_tech_lead_context_menu_item_is_keyboard_reachable() -> None:
     assert "addKeyboardSupport" in js
 
 
+def test_keyboard_activation_is_wired_at_most_once_per_element() -> None:
+    """One keypress must not become two activations (#6994 round 4 F15).
+
+    ``addKeyboardSupport`` synthesises a click, so an element registered by two
+    independently loaded chunks turns one Enter/Space into two POSTs while a
+    pointer user gets one. Structural backstop for the behavioural proof in
+    ``tests/js/tech_lead_menu_keyboard.test.js``; "exactly once" is enforced by
+    the helper rather than by convention across chunks.
+    """
+    helper = _read(DASHBOARD_JS_DIR / "issue_metadata.js")
+    tech_lead = _read(DASHBOARD_JS_DIR / "tech_lead_runs.js")
+
+    assert "keyboardActivationWired" in helper
+    assert "keyboardActivationWired.has(element)" in helper
+    # The context menu owns its own items' keyboard wiring; the tech-lead chunk
+    # only wires the Settings remedy it creates itself.
+    assert "addKeyboardSupport(menuItem)" not in tech_lead
+    assert "addKeyboardSupport(link)" in tech_lead
+
+
 def test_tech_lead_actions_go_through_the_ui_action_contract_builders() -> None:
     contract = _read(UI_ACTION_CONTRACT_JS)
     js = _read(DASHBOARD_JS)

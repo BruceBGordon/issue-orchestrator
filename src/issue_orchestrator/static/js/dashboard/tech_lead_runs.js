@@ -361,6 +361,10 @@ document.addEventListener('DOMContentLoaded', () => {
             if (contextMenu) contextMenu.classList.remove('visible');
             investigateWithTechLead(menuItem.dataset.issue);
         });
-        if (typeof addKeyboardSupport === 'function') addKeyboardSupport(menuItem);
+        // Keyboard activation for this item belongs to the context menu's own
+        // owner (`issue_menus.js` wires every menu item uniformly). Registering
+        // it here as well would be a second owner for one element (#6994 round
+        // 4 F15); the Settings remedy above has no such owner, so it keeps its
+        // own registration.
     }
 });

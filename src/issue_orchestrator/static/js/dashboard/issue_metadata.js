@@ -391,10 +391,21 @@ async function toggleExcluded() {
 })();
 
 // Helper to add keyboard support to menu items
+// Elements already wired for keyboard activation. The helper synthesises a
+// click, so wiring one element twice turns ONE keypress into TWO activations —
+// two POSTs, two toasts — while pointer users get one. That is a silent
+// behavioural split between input methods, and it cannot be prevented by
+// convention across independently loaded chunks, so the helper enforces
+// "exactly once" itself (#6994 round 4 F15).
+const keyboardActivationWired = new WeakSet();
+
 function addKeyboardSupport(element) {
-    if (!element) return;
+    if (!element || keyboardActivationWired.has(element)) return;
+    keyboardActivationWired.add(element);
     element.addEventListener('keydown', (e) => {
         if (e.key === 'Enter' || e.key === ' ') {
+            // Suppress the browser's own activation as well, so a native
+            // <button> is activated exactly once by this handler.
             e.preventDefault();
             element.click();
         }
