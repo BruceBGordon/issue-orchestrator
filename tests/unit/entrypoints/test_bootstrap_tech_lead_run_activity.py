@@ -29,6 +29,7 @@ from issue_orchestrator.entrypoints.bootstrap_tech_lead import (
 )
 from issue_orchestrator.infra.config import Config
 from issue_orchestrator.infra.repo_identity import state_dir
+from tests.unit.session_run_helpers import make_session_run_assets
 
 STARTED = datetime(2026, 8, 9, 9, 0, 0)
 
@@ -39,22 +40,30 @@ def _config(repo_root: Path) -> Config:
     return config
 
 
-def _session(run_dir: Path) -> SimpleNamespace:
-    run_dir.mkdir(parents=True, exist_ok=True)
+def _session(worktree: Path) -> SimpleNamespace:
+    """A stamped tech-lead session with REAL typed run assets.
+
+    The archive is handed the run's trust relationship (its engine-created
+    worktree plus the components below it), so a session carrying loose values
+    would not exercise the composed seam at all.
+    """
+    assets = make_session_run_assets(
+        worktree, session_name="tech-lead-900", run_id="run-900"
+    )
     return SimpleNamespace(
         issue=SimpleNamespace(number=900, title="Board anchor", agent_type="agent:tl"),
         terminal_id="tech-lead-900",
         started_at=STARTED,
-        run_dir=run_dir,
-        run_assets=SimpleNamespace(run_id="run-900", session_name="tech-lead-900"),
+        run_dir=assets.run_dir,
+        run_assets=assets,
         tech_lead_scope=TechLeadLaunchScope(
             flavor=TechLeadSessionFlavor.HEALTH_REVIEW
         ),
     )
 
 
-def _records_a_run(activity, run_dir: Path) -> TechLeadRunPhase:
-    session = _session(run_dir)
+def _records_a_run(activity, worktree: Path) -> TechLeadRunPhase:
+    session = _session(worktree)
     activity.note_started(session)
     activity.note_concluded(session, SessionStatus.COMPLETED)
     (record,) = activity.recent(limit=5)
@@ -64,7 +73,7 @@ def _records_a_run(activity, run_dir: Path) -> TechLeadRunPhase:
 def test_a_healthy_state_directory_yields_a_durable_history(tmp_path):
     activity = create_tech_lead_run_activity(_config(tmp_path))
 
-    assert _records_a_run(activity, tmp_path / "run") is TechLeadRunPhase.COMPLETED
+    assert _records_a_run(activity, tmp_path / "worktree") is TechLeadRunPhase.COMPLETED
     assert (state_dir(tmp_path) / "tech_lead_runs.sqlite").exists()
 
 
@@ -78,7 +87,7 @@ def test_an_unwritable_state_directory_still_composes_an_engine(tmp_path):
 
     # The engine composes, and runs are still recorded — in memory, for the life
     # of this process, which is what the warning in the log says.
-    assert _records_a_run(activity, tmp_path / "run") is TechLeadRunPhase.COMPLETED
+    assert _records_a_run(activity, tmp_path / "worktree") is TechLeadRunPhase.COMPLETED
 
 
 def test_a_corrupt_history_database_still_composes_an_engine(tmp_path):
@@ -89,4 +98,4 @@ def test_a_corrupt_history_database_still_composes_an_engine(tmp_path):
 
     activity = create_tech_lead_run_activity(_config(tmp_path))
 
-    assert _records_a_run(activity, tmp_path / "run") is TechLeadRunPhase.COMPLETED
+    assert _records_a_run(activity, tmp_path / "worktree") is TechLeadRunPhase.COMPLETED

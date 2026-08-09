@@ -117,9 +117,17 @@ coordination requires a *shared* (i.e. GitHub) point.
   the browser consumes instead of receiving it as an untyped extra.
   The archive is a BOUNDED owner, because its source is agent-authored and its
   destination is the operator's state volume:
-  - the walk is anchored on an open descriptor for the run directory and opens
-    every component `O_NOFOLLOW` relative to its parent, streaming from the
-    descriptor it validated — the same discipline
+  - the archive is handed a typed `TechLeadRunSource` (run identity + the
+    engine-created worktree it is trusted relative to), never a naked path, and it
+    reaches the run directory by descending that run's own component NAMES from
+    the worktree with `O_DIRECTORY | O_NOFOLLOW` — so a renamed run directory with
+    a symlink left in its place, or a swapped `.issue-orchestrator`/`sessions`,
+    cannot redirect the copy at another run or out of the worktree;
+  - below the anchor it opens every component `O_NOFOLLOW | O_NONBLOCK` relative
+    to its parent (the non-blocking open is what keeps a FIFO from parking a
+    completing run's terminal seam), streaming from the descriptor it validated
+    against both the per-file cap and the aggregate bytes still unspent — the same
+    discipline
     `control/validation_record_containment.py` applies to a single agent-supplied
     file, extracted for trees as `infra/contained_artifact_copy.py`. Nothing is
     reopened by pathname, so a file or ancestor swapped under the walk cannot

@@ -35,7 +35,7 @@ import logging
 from pathlib import Path
 from typing import Optional, Protocol
 
-from ..domain.tech_lead_run_artifacts import TechLeadRunArtifacts
+from ..domain.tech_lead_run_artifacts import TechLeadRunArtifacts, TechLeadRunSource
 
 logger = logging.getLogger(__name__)
 
@@ -44,13 +44,15 @@ class TechLeadRunArtifactArchive(Protocol):
     """Durable home for the artifacts of runs this engine has finished."""
 
     def preserve(
-        self,
-        *,
-        run_id: str,
-        session_name: str,
-        run_dir: Path,
+        self, *, run: TechLeadRunSource
     ) -> Optional[TechLeadRunArtifacts]:
-        """Copy ``run_dir``'s inspectable artifacts somewhere nothing deletes.
+        """Copy a run's inspectable artifacts somewhere nothing deletes.
+
+        Takes the typed source rather than a run id, a session name and a naked
+        path: safe admission cannot be promised by an implementation that is only
+        told WHERE to read, because the trust boundary is the relationship between
+        the engine-created worktree and the agent-writable components below it
+        (#6858 round 5 F16/A5).
 
         Returns the typed locator for what was preserved, or ``None`` when there
         was nothing to preserve (the run wrote no artifacts) or preserving it
@@ -85,18 +87,14 @@ class DiscardedTechLeadRunArtifacts:
     """
 
     def preserve(
-        self,
-        *,
-        run_id: str,
-        session_name: str,
-        run_dir: Path,
+        self, *, run: TechLeadRunSource
     ) -> Optional[TechLeadRunArtifacts]:
         logger.debug(
             "[TECH_LEAD_RUN] No artifact archive is wired; %s/%s keeps no"
             " inspectable evidence of %s",
-            run_id,
-            session_name,
-            run_dir,
+            run.run_id,
+            run.session_name,
+            run.run_dir,
         )
         return None
 

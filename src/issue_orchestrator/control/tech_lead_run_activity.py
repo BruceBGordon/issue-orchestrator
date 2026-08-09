@@ -245,10 +245,16 @@ class TechLeadRunActivity:
         immediately stops the matching rows advertising them (#6858 round 2 F6).
         A pruned run keeps its verdict and loses only its drill-down.
         """
+        from ..domain.tech_lead_run_artifacts import TechLeadRunSource
+
+        # The typed run source, straight from the session's own run assets: the
+        # archive is told the trusted root AND the run's identity, not three loose
+        # values it would have to trust blindly (#6858 F16/A5). Unguarded on
+        # purpose — ``SessionRunAssets`` already proves the run directory lives
+        # under its worktree's session artifacts, so an incoherent source is a
+        # composition bug that should surface, not a receipt to skip silently.
         artifacts = self._archive.preserve(
-            run_id=session.run_assets.run_id,
-            session_name=session.run_assets.session_name,
-            run_dir=session.run_dir,
+            run=TechLeadRunSource.from_run_assets(session.run_assets)
         )
         self._store.forget_artifacts(self._archive.prune())
         return artifacts

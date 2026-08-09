@@ -44,7 +44,7 @@ import os
 import stat as stat_module
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator, Optional
+from typing import Iterator, Optional, Sequence
 
 logger = logging.getLogger(__name__)
 
@@ -134,7 +134,15 @@ class CopyBudget:
 
 
 def open_anchor(root: Path) -> Optional[int]:
-    """Open ``root`` as the descriptor the whole walk is anchored on."""
+    """Open a TRUSTED root as the descriptor a walk is anchored on.
+
+    Deliberately without ``O_NOFOLLOW``: the caller's root is engine-created and
+    may legitimately be reached through a symlinked prefix (macOS ``/tmp`` vs
+    ``/private/tmp``). Everything BELOW it is agent-writable and must be opened
+    with :func:`open_contained_directory` instead — see
+    :func:`open_contained_anchor`, which is what callers with an untrusted
+    subpath should use.
+    """
     try:
         return os.open(str(root), os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
     except OSError:
@@ -142,6 +150,42 @@ def open_anchor(root: Path) -> Optional[int]:
             "[ARTIFACT_COPY] Could not open %s to copy from it", root, exc_info=True
         )
         return None
+
+
+def open_contained_anchor(
+    root: Path, parts: "Sequence[str]"
+) -> Optional[int]:
+    """Descend ``parts`` from a trusted ``root``, following no link on the way.
+
+    The descriptor a walk is anchored on has to be reached as safely as the files
+    below it. Opening ``root/parts`` as one absolute pathname follows whatever the
+    components point at, so an agent that renames its run directory and leaves a
+    symlink behind — or swaps an intermediate directory — redirects the whole copy
+    at another run, or out of the worktree entirely (#6858 round 5 F16). Each
+    component is therefore opened ``O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC``
+    relative to its parent, exactly as the file walk does.
+
+    Returns the final directory's descriptor (the caller owns it), or ``None``
+    when any component is missing or is not a real directory.
+    """
+    current = open_anchor(root)
+    if current is None:
+        return None
+    for segment in parts:
+        following = open_contained_directory(current, segment)
+        close_fd(current)
+        if following is None:
+            logger.warning(
+                "[ARTIFACT_COPY] Refusing to copy from %s: component %r under %s"
+                " is missing or is not a real directory (a symlink here would"
+                " redirect the whole copy)",
+                Path(*parts) if parts else root,
+                segment,
+                root,
+            )
+            return None
+        current = following
+    return current
 
 
 def close_fd(fd: int) -> None:
@@ -183,6 +227,11 @@ def admit_contained_file(
 ) -> Optional[AdmittedFile]:
     """Open and validate one file relative to ``parent_fd``, or refuse it.
 
+    This is the WHOLE admission: the per-file cap, the regular-file and non-empty
+    checks, and the budget's own predicate (file count, aggregate bytes). One
+    predicate, in one place, so nothing that reaches :func:`stream_admitted` can
+    have skipped part of it (#6858 round 5 F15).
+
     ``O_NOFOLLOW`` refuses a symlink; ``O_NONBLOCK`` is what makes the open itself
     safe on an agent-authored entry that is neither a symlink nor a directory. A
     FIFO opened read-only and blocking waits for a writer that may never come —
@@ -200,7 +249,7 @@ def admit_contained_file(
         _log_refused_open(name, exc)
         return None
     size = _admissible_size(fd, name, cap)
-    if size is None:
+    if size is None or not budget.admits(size):
         close_fd(fd)
         return None
     return AdmittedFile(
@@ -235,8 +284,6 @@ def copy_contained_file(
     if admitted is None:
         return 0
     try:
-        if not budget.admits(admitted.size):
-            return 0
         written = stream_admitted(admitted, target)
         if written is None:
             return 0
@@ -505,6 +552,7 @@ __all__ = [
     "copy_contained_file",
     "copy_contained_tree",
     "open_anchor",
+    "open_contained_anchor",
     "open_contained_directory",
     "stream_admitted",
     "unlink",

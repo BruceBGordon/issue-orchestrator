@@ -35,6 +35,7 @@ from issue_orchestrator.domain.tech_lead_run_record import (
     TechLeadRunRecord,
     TechLeadRunSubjectKind,
 )
+from issue_orchestrator.domain.session_run import SessionRunAssets
 from issue_orchestrator.domain.tech_lead_session import (
     TechLeadLaunchScope,
     TechLeadSessionFlavor,
@@ -55,6 +56,7 @@ from issue_orchestrator.ports.tech_lead_run_artifact_archive import (
 from issue_orchestrator.ports.tech_lead_run_record_store import (
     InMemoryTechLeadRunRecordStore,
 )
+from tests.unit.session_run_helpers import make_session_run_assets
 
 TECH_LEAD_AGENT = "agent:tech-lead"
 STARTED = datetime(2026, 8, 9, 9, 0, 0)
@@ -69,23 +71,25 @@ class FakeIssue:
 
 
 class FakeSession:
-    """The session surface the activity owner reads."""
+    """The session surface the activity owner reads.
+
+    Real ``SessionRunAssets``, not a loose namespace: the archive is handed the
+    run's TRUST RELATIONSHIP (its engine-created worktree and the components below
+    it), so a fake that cannot state one would not exercise the real seam.
+    """
 
     def __init__(
         self,
         issue_number: int,
         flavor: TechLeadSessionFlavor | None,
         *,
-        run_dir: Path,
+        run_assets: SessionRunAssets,
     ) -> None:
         self.issue = FakeIssue(issue_number)
         self.terminal_id = f"tech-lead-{issue_number}"
         self.started_at = STARTED
-        self.run_dir = run_dir
-        self.run_assets = SimpleNamespace(
-            run_id=f"run-{issue_number}",
-            session_name=f"tech-lead-{issue_number}",
-        )
+        self.run_assets = run_assets
+        self.run_dir = run_assets.run_dir
         self.tech_lead_scope = (
             TechLeadLaunchScope(flavor=flavor) if flavor is not None else None
         )
@@ -99,10 +103,17 @@ def _activity(store, archive=None) -> TechLeadRunActivity:
     )
 
 
+def _assets(tmp_path: Path, number: int) -> SessionRunAssets:
+    """Typed run assets laid out the way a launched session's are."""
+    return make_session_run_assets(
+        tmp_path / f"wt-{number}",
+        session_name=f"tech-lead-{number}",
+        run_id=f"run-{number}",
+    )
+
+
 def _session(tmp_path: Path, number: int, flavor) -> FakeSession:
-    run_dir = tmp_path / f"run-{number}"
-    run_dir.mkdir(parents=True, exist_ok=True)
-    return FakeSession(number, flavor, run_dir=run_dir)
+    return FakeSession(number, flavor, run_assets=_assets(tmp_path, number))
 
 
 # A valid decision artifact pair: one finding, one proposal, and a report that
@@ -441,7 +452,6 @@ class TestTheRunsEvidenceOutlivesItsWorktree:
         (Path(session.run_dir) / "terminal-recording.jsonl").write_text(
             '{"event_type": "output", "data_b64": "aGk="}\n', encoding="utf-8"
         )
-        (Path(session.run_dir) / "manifest.json").write_text("{}", encoding="utf-8")
         return session
 
     def test_a_concluded_run_keeps_its_artifacts_after_the_worktree_is_gone(
@@ -556,16 +566,15 @@ class TestRetentionAndTheRowsThatAdvertiseIt:
         return TechLeadRunActivity(store, archive, now=lambda: ENDED)
 
     def _finish_run(self, activity, tmp_path, index: int) -> None:
-        run_dir = tmp_path / f"run-{index}"
-        data_dir = run_dir / "tech-lead-data"
-        data_dir.mkdir(parents=True, exist_ok=True)
-        (run_dir / "terminal-recording.jsonl").write_text(
+        assets = _assets(tmp_path, index)
+        (assets.run_dir / "tech-lead-data").mkdir(parents=True, exist_ok=True)
+        (assets.run_dir / "terminal-recording.jsonl").write_text(
             '{"event_type": "output", "data_b64": "aGk="}\n', encoding="utf-8"
         )
         session = FakeSession(
             index,
             TechLeadSessionFlavor.FAILURE_INVESTIGATION,
-            run_dir=run_dir,
+            run_assets=assets,
         )
         activity.note_started(session)
         activity.note_concluded(session, SessionStatus.COMPLETED)
@@ -611,3 +620,4 @@ class TestRetentionAndTheRowsThatAdvertiseIt:
         assert by_key["issue:1"].artifacts is None
         assert by_key["issue:1"].phase is TechLeadRunPhase.COMPLETED
         assert by_key["issue:2"].artifacts is not None
+

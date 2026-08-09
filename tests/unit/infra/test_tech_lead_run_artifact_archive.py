@@ -31,7 +31,10 @@ from issue_orchestrator.domain.tech_lead_artifacts import (
     TECH_LEAD_DECISION_FILENAME,
     TECH_LEAD_REPORT_FILENAME,
 )
-from issue_orchestrator.domain.tech_lead_run_artifacts import TechLeadRunArtifactKind
+from issue_orchestrator.domain.tech_lead_run_artifacts import (
+    TechLeadRunArtifactKind,
+    TechLeadRunSource,
+)
 from issue_orchestrator.infra.contained_artifact_copy import (
     CopyBounds,
     CopyBudget,
@@ -45,6 +48,7 @@ from issue_orchestrator.infra.tech_lead_run_artifact_archive import (
     ArchiveLimits,
     FileSystemTechLeadRunArtifactArchive,
 )
+from tests.unit.session_run_helpers import make_session_run_assets
 
 RECORDING = '{"event_type": "output", "data_b64": "aGk="}\n'
 DECISION = '{"summary": "ok"}'
@@ -52,8 +56,14 @@ REPORT = "# Health review\n"
 
 
 def _run_dir(tmp_path: Path, name: str = "run") -> Path:
-    """A finished tech-lead run directory with all three inspectable kinds."""
-    run_dir = tmp_path / name
+    """A finished tech-lead run directory with all three inspectable kinds.
+
+    Laid out exactly as production does — under an engine-created worktree, at
+    ``.issue-orchestrator/sessions/<run>`` — because the components between the
+    trusted root and the run directory are agent-writable and the archive has to
+    descend them one at a time (#6858 round 5 F16).
+    """
+    run_dir = tmp_path / f"wt-{name}" / ".issue-orchestrator" / "sessions" / name
     data_dir = run_dir / "tech-lead-data"
     data_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "terminal-recording.jsonl").write_text(RECORDING, encoding="utf-8")
@@ -70,8 +80,23 @@ def _archive(tmp_path: Path, **limits) -> FileSystemTechLeadRunArtifactArchive:
     )
 
 
+def _source(run_dir: Path, *, run: str, session: str) -> TechLeadRunSource:
+    """The typed run source for a ``_run_dir`` layout.
+
+    The worktree is three components up — ``<worktree>/.issue-orchestrator/
+    sessions/<run>`` — and is NOT resolved, so a link planted anywhere below it is
+    still there for the archive to refuse.
+    """
+    return TechLeadRunSource(
+        run_id=run,
+        session_name=session,
+        worktree_path=run_dir.parent.parent.parent,
+        run_dir=run_dir,
+    )
+
+
 def _preserve(archive, run_dir: Path, *, run="run-900", session="tech-lead-900"):
-    return archive.preserve(run_id=run, session_name=session, run_dir=run_dir)
+    return archive.preserve(run=_source(run_dir, run=run, session=session))
 
 
 def _open_descriptor_count() -> int:
@@ -189,9 +214,9 @@ class TestAdmission:
         assert TechLeadRunArtifactKind.DECISION not in artifacts.kinds
 
     def test_a_run_with_nothing_inspectable_keeps_no_archive_directory(self, tmp_path):
-        run_dir = tmp_path / "empty-run"
-        run_dir.mkdir()
-        (run_dir / "manifest.json").write_text("{}", encoding="utf-8")
+        run_dir = _run_dir(tmp_path, name="empty-run")
+        (run_dir / "terminal-recording.jsonl").unlink()
+        shutil.rmtree(run_dir / "tech-lead-data")
         archive = _archive(tmp_path)
 
         assert _preserve(archive, run_dir) is None
@@ -577,13 +602,15 @@ class TestTheAggregateBoundHoldsUnderGrowth:
     def test_a_file_grown_after_admission_cannot_outspend_the_budget(self, tmp_path):
         run_dir = _run_dir(tmp_path)
         source = run_dir / "manifest.json"
-        source.write_text("x" * 100, encoding="utf-8")
+        # 20 bytes: comfortably INSIDE the 30 that will be left, so admission
+        # accepts it on the same predicate production uses — this is the state the
+        # race actually starts from, not one the budget would already refuse.
+        source.write_text("x" * 20, encoding="utf-8")
         budget = CopyBudget(
             CopyBounds(files=10, total_bytes=150, entries=50, directories=5, depth=3)
         )
-        # 120 of the 150 aggregate bytes are already gone, so this file's real
-        # allowance is 30 even though its own cap is 4096.
         budget.spend(120)
+        assert budget.remaining_bytes == 30
         anchor = open_anchor(run_dir)
         assert anchor is not None
         target = tmp_path / "landed.json"
@@ -591,13 +618,16 @@ class TestTheAggregateBoundHoldsUnderGrowth:
             admitted = admit_contained_file(
                 anchor, "manifest.json", cap=4096, budget=budget
             )
+            # Admission is the WHOLE predicate, budget included, so reaching this
+            # line proves production would have admitted this file too.
             assert admitted is not None
-            assert admitted.size == 100
-            # Admission GRANTED the smaller of the two ceilings, not the file cap.
+            assert admitted.size == 20
+            # ...and it granted the smaller of the two ceilings, not the file cap.
             assert admitted.allowance == 30
-            # THE window: it grows past that allowance but stays under its cap.
+            # THE window: the same inode grows past its allowance while staying
+            # far below the 4096-byte per-file cap.
             with source.open("a", encoding="utf-8") as handle:
-                handle.write("y" * 500)
+                handle.write("y" * 100)
 
             written = stream_admitted(admitted, target)
         finally:
@@ -609,9 +639,9 @@ class TestTheAggregateBoundHoldsUnderGrowth:
         assert not target.exists(), "no partial artifact may be left behind"
         assert budget.remaining_bytes == 30
 
-    def test_the_copier_spends_only_what_it_was_granted(self, tmp_path):
-        """End to end through the public copy step: whatever lands, the aggregate
-        bound holds."""
+    def test_the_copier_refuses_a_file_bigger_than_what_is_left(self, tmp_path):
+        """The other half: a file already over the remaining aggregate is refused
+        at admission, before a byte is read."""
         run_dir = _run_dir(tmp_path)
         (run_dir / "manifest.json").write_text("x" * 100, encoding="utf-8")
         budget = CopyBudget(
@@ -764,3 +794,151 @@ class TestCrashReconciliation:
         entries = {path.name for path in (tmp_path / "archive").iterdir()}
         assert entries == {"run-7__tech-lead-7"}
         assert removed == ()
+
+
+class TestTheSourceAnchorIsReachedSafely:
+    """#6858 round 5 F16: the anchor must be as safe as the files below it.
+
+    The adapter used to open the absolute ``run_dir`` pathname with
+    ``O_DIRECTORY`` alone. Descendant opens were descriptor-relative and safe —
+    but relative to whatever that FIRST open followed. An agent working inside its
+    own worktree can rename its run directory and leave a symlink in its place, or
+    swap ``.issue-orchestrator`` / ``sessions``, and the unsandboxed engine would
+    then archive another run's (or another tree's) ``manifest.json``,
+    ``terminal-recording.jsonl`` or ``tech-lead-data`` as if it were this run's.
+
+    The anchor is now reached by descending the run's own component NAMES from its
+    engine-created worktree with ``O_DIRECTORY | O_NOFOLLOW``, so each of these is
+    refused rather than followed.
+    """
+
+    OTHER_RUN_REPORT = "# A DIFFERENT run's findings\n"
+
+    def _decoy(self, tmp_path) -> Path:
+        """Another run whose artifacts must never be mistaken for ours."""
+        decoy = _run_dir(tmp_path, name="decoy")
+        (decoy / "tech-lead-data" / TECH_LEAD_REPORT_FILENAME).write_text(
+            self.OTHER_RUN_REPORT, encoding="utf-8"
+        )
+        return decoy
+
+    def test_a_symlink_replacing_the_run_directory_is_refused(self, tmp_path):
+        archive = _archive(tmp_path)
+        run_dir = _run_dir(tmp_path)
+        first = _preserve(archive, run_dir)
+        assert first is not None
+        decoy = self._decoy(tmp_path)
+        # The agent renames its run directory and leaves a link to another run.
+        shutil.rmtree(run_dir)
+        run_dir.symlink_to(decoy, target_is_directory=True)
+
+        assert _preserve(archive, run_dir) is None
+
+        # The previous complete receipt is untouched, and no other run's bytes
+        # reached the archive at all.
+        assert (first.location / "tech-lead-data" / TECH_LEAD_REPORT_FILENAME).read_text(
+            encoding="utf-8"
+        ) == REPORT
+        assert not any(
+            self.OTHER_RUN_REPORT in path.read_text(encoding="utf-8", errors="replace")
+            for path in (tmp_path / "archive").rglob("*")
+            if path.is_file()
+        )
+
+    def test_a_symlink_replacing_an_ancestor_below_the_worktree_is_refused(
+        self, tmp_path
+    ):
+        archive = _archive(tmp_path)
+        run_dir = _run_dir(tmp_path)
+        decoy = self._decoy(tmp_path)
+        # ``sessions`` is inside the agent's worktree. Swapping it for a link to a
+        # tree that happens to contain a same-named run directory is the ancestor
+        # form of the same attack.
+        sessions = run_dir.parent
+        elsewhere = tmp_path / "elsewhere"
+        (elsewhere / run_dir.name).mkdir(parents=True)
+        shutil.copytree(decoy, elsewhere / run_dir.name, dirs_exist_ok=True)
+        shutil.rmtree(sessions)
+        sessions.symlink_to(elsewhere, target_is_directory=True)
+
+        assert _preserve(archive, run_dir) is None
+        assert list((tmp_path / "archive").iterdir()) == []
+
+    def test_the_legitimate_nested_layout_is_still_preserved(self, tmp_path):
+        """The guard must not cost the normal case: a real worktree-nested run
+        directory still preserves all three kinds."""
+        run_dir = _run_dir(tmp_path)
+
+        artifacts = _preserve(_archive(tmp_path), run_dir)
+
+        assert artifacts is not None
+        assert set(artifacts.kinds) == {
+            TechLeadRunArtifactKind.SESSION_REPLAY,
+            TechLeadRunArtifactKind.REPORT,
+            TechLeadRunArtifactKind.DECISION,
+        }
+
+
+class TestTheTypedRunSource:
+    """The archive is told the trust RELATIONSHIP, not three loose values (A5)."""
+
+    def test_a_run_directory_outside_the_trusted_root_is_refused(self, tmp_path):
+        with pytest.raises(ValueError, match="does not live under the trusted root"):
+            TechLeadRunSource(
+                run_id="run-1",
+                session_name="tech-lead-1",
+                worktree_path=tmp_path / "worktree",
+                run_dir=tmp_path / "elsewhere" / "run",
+            )
+
+    def test_the_relative_components_are_the_unresolved_names(self, tmp_path):
+        """They must be NAMES, not a resolved path: resolving is what would follow
+        the link the adapter exists to refuse."""
+        source = _source(_run_dir(tmp_path), run="run-900", session="tech-lead-900")
+
+        assert source.relative_run_parts == (
+            ".issue-orchestrator",
+            "sessions",
+            "run",
+        )
+
+    def test_real_run_assets_can_always_describe_their_trust_relationship(
+        self, tmp_path
+    ):
+        """``SessionRunAssets`` already proves run_dir lives under its worktree's
+        session artifacts, so the conversion cannot fail for a real session — which
+        is why the activity owner calls it unguarded rather than carrying a
+        fallback that could never be exercised."""
+        for name in ("worktree", "wt with spaces", "deep/nested/tree"):
+            assets = make_session_run_assets(
+                tmp_path / name, session_name="tech-lead-1", run_id="run-1"
+            )
+
+            source = TechLeadRunSource.from_run_assets(assets)
+
+            assert source.relative_run_parts[:2] == (".issue-orchestrator", "sessions")
+
+    def test_it_is_built_from_the_sessions_own_typed_run_assets(self, tmp_path):
+        assets = make_session_run_assets(
+            tmp_path / "worktree", session_name="tech-lead-900", run_id="run-900"
+        )
+
+        source = TechLeadRunSource.from_run_assets(assets)
+
+        assert (source.run_id, source.session_name) == ("run-900", "tech-lead-900")
+        assert source.run_dir == assets.run_dir
+        assert source.worktree_path == assets.worktree_path
+        assert source.relative_run_parts[:2] == (".issue-orchestrator", "sessions")
+
+    @pytest.mark.parametrize("field", ["run_id", "session_name"])
+    def test_it_refuses_a_source_with_no_run_identity(self, tmp_path, field):
+        fields = {
+            "run_id": "run-1",
+            "session_name": "tech-lead-1",
+            "worktree_path": tmp_path / "worktree",
+            "run_dir": tmp_path / "worktree" / ".issue-orchestrator" / "sessions" / "r",
+        }
+        fields[field] = ""
+
+        with pytest.raises(ValueError, match="session run identity"):
+            TechLeadRunSource(**fields)

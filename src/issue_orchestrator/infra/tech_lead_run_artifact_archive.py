@@ -59,6 +59,7 @@ from ..domain.tech_lead_run_artifacts import (
     TERMINAL_RECORDING_FILENAME,
     TechLeadRunArtifactKind,
     TechLeadRunArtifacts,
+    TechLeadRunSource,
 )
 from .contained_artifact_copy import (
     CopyBounds,
@@ -66,7 +67,7 @@ from .contained_artifact_copy import (
     close_fd,
     copy_contained_file,
     copy_contained_tree,
-    open_anchor,
+    open_contained_anchor,
     unlink,
 )
 from .repo_identity import state_dir
@@ -191,11 +192,7 @@ class FileSystemTechLeadRunArtifactArchive:
         return cls(state_dir(repo_root) / ARCHIVE_DIRNAME)
 
     def preserve(
-        self,
-        *,
-        run_id: str,
-        session_name: str,
-        run_dir: Path,
+        self, *, run: TechLeadRunSource
     ) -> Optional[TechLeadRunArtifacts]:
         """Copy one run's inspectable artifacts into the archive.
 
@@ -207,16 +204,16 @@ class FileSystemTechLeadRunArtifactArchive:
         artifacts preserved", because a lost receipt must never fail the run that
         earned it.
         """
-        name = _archive_name(run_id, session_name)
+        name = _archive_name(run.run_id, run.session_name)
         destination = self._root / name
         staging = self._root / f"{_STAGING_PREFIX}{name}.{os.getpid()}"
-        label = f"{run_id}/{session_name}"
+        label = f"{run.run_id}/{run.session_name}"
         try:
             self._root.mkdir(parents=True, exist_ok=True)
             self.reconcile()
             _discard(staging)
             staging.mkdir(parents=True)
-            copied = self._copy_admitted(run_dir, staging, label)
+            copied = self._copy_admitted(run, staging, label)
             kinds = _preserved_kinds(staging)
             if not kinds:
                 _discard(staging)
@@ -233,7 +230,7 @@ class FileSystemTechLeadRunArtifactArchive:
             logger.warning(
                 "[TECH_LEAD_RUN] Could not preserve the artifacts of %s from %s",
                 label,
-                run_dir,
+                run.run_dir,
                 exc_info=True,
             )
             return None
@@ -347,18 +344,25 @@ class FileSystemTechLeadRunArtifactArchive:
         except OSError:
             return ()
 
-    def _copy_admitted(self, run_dir: Path, staging: Path, label: str) -> int:
-        """Copy every admitted member of ``run_dir`` into ``staging``.
+    def _copy_admitted(
+        self, run: TechLeadRunSource, staging: Path, label: str
+    ) -> int:
+        """Copy every admitted member of the run directory into ``staging``.
 
-        Delegates the walk to :mod:`.contained_artifact_copy`, which owns the
-        symlink-safe descriptor discipline and the traversal bounds; this method
-        owns only WHICH members are preserved and which cap each one takes.
+        The anchor is reached by descending the run's own component NAMES from its
+        engine-created worktree, refusing any that is not a real directory — so a
+        renamed run directory with a symlink left in its place cannot redirect the
+        copy at another run or out of the worktree (#6858 round 5 F16). The walk
+        below it is delegated to :mod:`.contained_artifact_copy`, which owns the
+        descriptor discipline and the traversal bounds; this method owns only
+        WHICH members are preserved and which cap each one takes.
         """
-        root_fd = open_anchor(run_dir)
+        root_fd = open_contained_anchor(run.worktree_path, run.relative_run_parts)
         if root_fd is None:
             logger.warning(
-                "[TECH_LEAD_RUN] Could not open the run directory %s to preserve %s",
-                run_dir,
+                "[TECH_LEAD_RUN] Could not safely open the run directory %s to"
+                " preserve %s",
+                run.run_dir,
                 label,
             )
             return 0

@@ -25,11 +25,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path, PurePosixPath
+from typing import TYPE_CHECKING
 
 from .tech_lead_artifacts import (
     TECH_LEAD_DECISION_FILENAME,
     TECH_LEAD_REPORT_FILENAME,
 )
+
+if TYPE_CHECKING:
+    from .session_run import SessionRunAssets
 
 # The run-relative directory the tech-lead agent writes its artifacts into.
 TECH_LEAD_DATA_DIRNAME = "tech-lead-data"
@@ -74,6 +78,83 @@ ARTIFACT_KIND_ORDER: tuple[TechLeadRunArtifactKind, ...] = (
     TechLeadRunArtifactKind.REPORT,
     TechLeadRunArtifactKind.DECISION,
 )
+
+
+@dataclass(frozen=True, slots=True)
+class TechLeadRunSource:
+    """Where one finished run's artifacts are, and the ROOT they may be read from.
+
+    The archive used to be handed a run id, a session name and a naked
+    ``run_dir``: three loose values that had already travelled together as the
+    session's typed run assets, and no statement of what the path was trusted
+    relative to. That is what let the adapter open the run directory by absolute
+    pathname — following whatever the final component pointed at — before its
+    ``O_NOFOLLOW`` walk began (#6858 round 5 F16/A5).
+
+    So this type carries the RELATIONSHIP, not just the paths:
+
+    * ``worktree_path`` is engine-created. Its own prefix is outside anything an
+      agent can write, which is what makes it usable as a trust anchor.
+    * ``run_dir`` must live under it, and the components BETWEEN them
+      (``.issue-orchestrator/sessions/<run>``) are agent-writable — so they are
+      exposed as plain NAMES for the adapter to open one at a time, refusing any
+      that has become a symlink. Deriving them without resolving is the point: a
+      resolved path has already followed the link we mean to catch.
+    """
+
+    run_id: str
+    session_name: str
+    worktree_path: Path
+    run_dir: Path
+
+    def __post_init__(self) -> None:
+        if not self.run_id or not self.session_name:
+            raise ValueError(
+                "a tech-lead run source needs its session run identity"
+                f" (run_id={self.run_id!r}, session_name={self.session_name!r})"
+            )
+        for label, path in (
+            ("worktree_path", self.worktree_path),
+            ("run_dir", self.run_dir),
+        ):
+            if not path.is_absolute():
+                raise ValueError(f"TechLeadRunSource.{label} must be absolute: {path}")
+        # Raises when the run directory is not under the trusted root at all.
+        self.relative_run_parts
+
+    @property
+    def relative_run_parts(self) -> tuple[str, ...]:
+        """The component names between the trusted root and the run directory.
+
+        Compared against the root both as recorded and as resolved, because a
+        worktree reached through a symlinked prefix (macOS ``/tmp`` vs
+        ``/private/tmp``) is a normal setup — while the components BELOW the root
+        are never resolved, since resolving them is exactly what would hide an
+        agent-planted link.
+        """
+        for base in (self.worktree_path, self.worktree_path.resolve()):
+            try:
+                return self.run_dir.relative_to(base).parts
+            except ValueError:
+                continue
+        raise ValueError(
+            f"run_dir {self.run_dir} does not live under the trusted root"
+            f" {self.worktree_path}"
+        )
+
+    @classmethod
+    def from_run_assets(cls, assets: "SessionRunAssets") -> "TechLeadRunSource":
+        """The archive's view of an active session's typed run assets.
+
+        One conversion, at the seam that already holds the assets, so no caller
+        re-derives a run's identity or its root from loose values.
+        """
+        return cls(
+            run_id=assets.identity.run_id,
+            session_name=assets.identity.session_name,
+            worktree_path=assets.worktree_path,
+            run_dir=assets.run_dir,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -149,5 +230,6 @@ __all__ = [
     "TERMINAL_RECORDING_FILENAME",
     "TechLeadRunArtifactKind",
     "TechLeadRunArtifacts",
+    "TechLeadRunSource",
     "kinds_from_values",
 ]
