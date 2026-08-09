@@ -320,3 +320,161 @@ test('the published Commands dispatch to the existing artifact openers', () => {
         'markdown',
     ]);
 });
+
+// --- Refresh must not cost the operator their place (#6858 F11) --------------
+//
+// The panel used to assign ``list.innerHTML`` on every view-model refresh, so a
+// focused Session replay / Report / Decision button was destroyed and recreated
+// underneath a keyboard user mid-tab. These prove the two halves of the fix:
+// unchanged rows are never rewritten, and a row that IS rewritten hands focus
+// back to the same action.
+
+function activityWithActions(overrides = {}) {
+    return {
+        entries: [entry({ artifacts: [REPLAY_COMMAND, REPORT_COMMAND], ...overrides })],
+        emptyMessage: 'No tech-lead runs recorded yet.',
+    };
+}
+
+// A hand-rolled list node with only the surface the updater touches: children
+// with a row key and a SETTABLE outerHTML that rebuilds that row's action slots
+// (as a real DOM does when a node is replaced), plus a querySelector resolving
+// the [data-tla-row][data-tla-action] slot the focus restore looks for. Rebuilding
+// on assignment is what makes the focus assertion meaningful: the button focus
+// lands on afterwards is a NEW object, not the one that was focused before.
+function fakeList(rowsHtml) {
+    const list = { children: [] };
+
+    function buildSlots(row, html) {
+        row.slots = {};
+        const count = (html.match(/data-tla-action="/g) || []).length;
+        for (let index = 0; index < count; index += 1) {
+            const slot = {
+                dataset: { tlaRow: row.dataset.tlaRow, tlaAction: String(index) },
+            };
+            const button = {
+                dataset: {},
+                parentElement: slot,
+                focused: false,
+                focus() { this.focused = true; },
+            };
+            slot.button = button;
+            slot.querySelector = () => button;
+            row.slots[String(index)] = slot;
+        }
+    }
+
+    function makeRow(html) {
+        const key = (/data-tla-row="([^"]*)"/.exec(html) || ['', ''])[1];
+        const row = { dataset: { tlaRow: key }, slots: {}, rewrites: 0 };
+        let current = '';
+        Object.defineProperty(row, 'outerHTML', {
+            get: () => current,
+            set: (value) => {
+                current = value;
+                row.rewrites += 1;
+                buildSlots(row, value);
+            },
+        });
+        row.outerHTML = html;
+        row.rewrites = 0;
+        return row;
+    }
+
+    let innerHTML = '';
+    Object.defineProperty(list, 'innerHTML', {
+        get: () => innerHTML,
+        set: (value) => {
+            innerHTML = value;
+            list.children = (value.match(/<li[\s\S]*?<\/li>/g) || []).map(makeRow);
+        },
+    });
+    list.querySelector = (selector) => {
+        const match = /\[data-tla-row="([^"]*)"\]\[data-tla-action="([^"]*)"\]/.exec(selector);
+        if (!match) return null;
+        const [, rowKey, actionIndex] = match;
+        const row = list.children.find(child => child.dataset.tlaRow === rowKey);
+        return row ? (row.slots[actionIndex] || null) : null;
+    };
+    list.innerHTML = rowsHtml;
+    return list;
+}
+
+function panelWith(list, activeElement = null) {
+    const elements = {
+        techLeadActivityPanel: { open: true },
+        techLeadActivityList: list,
+        techLeadActivityCount: { textContent: '' },
+    };
+    return loadModule(elements, {
+        document: {
+            getElementById: (id) => elements[id] || null,
+            activeElement,
+        },
+    });
+}
+
+test('an unchanged refresh rewrites no row markup at all', () => {
+    const activity = activityWithActions();
+    const list = fakeList(loadModule().techLeadActivityRowsHtml(activity));
+    const nodes = list.children;
+
+    panelWith(list).updateTechLeadActivityPanel(activity);
+
+    // Same nodes, never rewritten: the rows the operator is tabbing through are
+    // untouched, so nothing inside them could have lost focus.
+    assert.equal(list.children, nodes);
+    assert.deepEqual(list.children.map(row => row.rewrites), [0]);
+});
+
+test('a changed row hands keyboard focus back to the same action', () => {
+    const activity = activityWithActions();
+    const list = fakeList(loadModule().techLeadActivityRowsHtml(activity));
+    // The operator is on the Report button (action slot 1) when a refresh lands...
+    const focused = list.children[0].slots['1'].button;
+    const panel = panelWith(list, focused);
+    // ...and this run has since concluded differently, so its row DOES change.
+    const changed = activityWithActions({
+        phase: 'failed', phaseLabel: 'Failed', tone: 'bad',
+    });
+
+    panel.updateTechLeadActivityPanel(changed);
+
+    assert.equal(list.children[0].rewrites, 1, 'the changed row is rewritten');
+    const restored = list.children[0].slots['1'].button;
+    assert.notEqual(restored, focused, 'the rewritten row has a new control');
+    assert.equal(restored.focused, true, 'focus returns to the equivalent action');
+});
+
+test('the focused action is identified from the button inside its slot', () => {
+    const context = loadModule();
+    const slot = { dataset: { tlaRow: 'run-900::tech-lead-900', tlaAction: '2' } };
+    const button = { dataset: {}, parentElement: slot };
+
+    // Field-by-field: a vm-realm object fails strict deep equality even when
+    // shape-equal (tests/js/AGENTS.md).
+    const found = context.techLeadActivityFocusedAction(button);
+    assert.equal(found.row, 'run-900::tech-lead-900');
+    assert.equal(found.action, '2');
+    assert.equal(context.techLeadActivityFocusedAction(null), null);
+    assert.equal(context.techLeadActivityFocusedAction({ dataset: {} }), null);
+});
+
+test('a refresh that changes the row SET rebuilds, and rows keep their identity', () => {
+    const context = loadModule();
+    const one = activityWithActions();
+    const two = {
+        entries: [
+            entry({ runId: 'run-901', sessionName: 'tech-lead-901', artifacts: [] }),
+            ...one.entries,
+        ],
+        emptyMessage: 'No tech-lead runs recorded yet.',
+    };
+
+    const stable = context.techLeadActivityRowPlan(one, ['run-900::tech-lead-900']);
+    const grown = context.techLeadActivityRowPlan(two, ['run-900::tech-lead-900']);
+
+    assert.equal(stable.rebuild, false);
+    assert.equal(grown.rebuild, true);
+    assert.match(grown.html, /data-tla-row="run-901::tech-lead-901"/);
+});

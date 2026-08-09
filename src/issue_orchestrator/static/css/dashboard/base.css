@@ -1009,6 +1009,12 @@ html[data-embedded="true"] .embedded-sep {
     flex-wrap: wrap;
     gap: 6px;
 }
+/* One slot per action, carrying the run + action identity a refresh uses to put
+   keyboard focus back where it was (#6858 F11). Inline-flex so the slot adds no
+   layout of its own and the focus ring on the button inside is never clipped. */
+.tla-action-slot {
+    display: inline-flex;
+}
 .tla-action {
     font-size: 11px;
     padding: 2px 8px;

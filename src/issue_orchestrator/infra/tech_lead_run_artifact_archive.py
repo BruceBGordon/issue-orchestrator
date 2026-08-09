@@ -1,4 +1,4 @@
-"""Engine-owned durable home for finished tech-lead run artifacts (#6858 F4/F6).
+"""Engine-owned durable home for finished tech-lead run artifacts (#6858 F4/F6/F8-F10).
 
 ``.issue-orchestrator/state/tech-lead-runs/<run>/`` — beside the databases, and
 deliberately NOT inside any worktree. A tech-lead investigation runs in
@@ -13,31 +13,45 @@ Copies, never moves: completion is still reading the same directory (the audit
 writer, the analysis pass), and a move would pull the ground out from under
 them. The originals die with their worktree anyway.
 
-Three things make this a BOUNDED owner rather than a copy loop (#6858 round 2
-F6/A3), because the source is agent-authored and the destination is the
-operator's state volume:
+The source is AGENT-AUTHORED and the destination is the operator's state volume,
+so this is a bounded owner rather than a copy loop. Four properties, each of
+which was a real hole in an earlier round:
 
-* **Admission.** Only regular files are admitted, never symlinks or devices, and
-  never a path that resolves outside the run directory. ``shutil.copytree``
-  follows links by default, which would let a run's evidence tree pull arbitrary
-  files into a durable engine-owned directory.
-* **Bounds.** A per-member size cap (the same 2 MiB the decision loader applies
-  before parsing an agent artifact), an aggregate byte cap, and a file-count cap.
-  Everything dropped is logged: a silent cap reads as "we preserved it all".
-* **Atomic publication + retention.** The copy is staged in a sibling directory
-  and swapped in only once it is complete, so a failed retry cannot destroy the
-  receipt that was already there. Retention keeps the newest
-  ``ARCHIVE_RETENTION`` runs and REPORTS what it removed, so the caller can
-  retire the matching record locators in the same breath.
+* **Race-free admission (#6858 round 3 F9).** The walk is anchored on an open
+  descriptor for the run directory and every component is opened with
+  ``O_NOFOLLOW`` relative to its parent's descriptor, exactly as
+  :mod:`...control.validation_record_containment` does for agent-supplied
+  validation records. Nothing is ever reopened by pathname, so a descendant that
+  swaps a file — or an ancestor directory — between the check and the copy cannot
+  make the archive read from outside the run. Bytes are streamed from that
+  descriptor under a hard ceiling, so a file that GROWS after its ``fstat``
+  cannot spend more budget than it was admitted for.
+* **Bounded discovery (#6858 round 3 F8).** Walking is iterative (no recursion to
+  exhaust), lazy (an unbounded directory is never materialised into a list), and
+  capped on entries visited, directories entered, and depth. A per-entry failure
+  refuses that entry only; it never costs the artifacts already admitted.
+* **Bounds on what lands.** A per-file cap — 2 MiB for agent-authored artifacts,
+  the same gate the decision loader applies before parsing one, and a separate
+  larger cap for the orchestrator-written PTY capture — plus aggregate byte and
+  file-count budgets. Everything dropped is logged: a silent cap reads as "we
+  preserved it all".
+* **Crash-safe publication + bounded retention (#6858 round 3 F10).** A copy is
+  staged in a PID-owned sibling directory and swapped in only once complete.
+  ``reconcile()`` restores a receipt that a crash left renamed aside, and
+  reclaims scratch belonging to processes that are gone — never a live engine's
+  active stage. ``prune()`` then keeps the newest ``ARCHIVE_RETENTION`` runs and
+  REPORTS what it removed, so the caller can retire the matching record locators
+  in the same breath.
 """
 
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator, Optional
+from typing import Optional
 
 from ..domain.tech_lead_run_artifacts import (
     ARTIFACT_KIND_ORDER,
@@ -46,16 +60,27 @@ from ..domain.tech_lead_run_artifacts import (
     TechLeadRunArtifactKind,
     TechLeadRunArtifacts,
 )
+from .contained_artifact_copy import (
+    CopyBounds,
+    CopyBudget,
+    close_fd,
+    copy_contained_file,
+    copy_contained_tree,
+    open_anchor,
+    unlink,
+)
 from .repo_identity import state_dir
+from .shutdown_timing import process_is_alive
 
 logger = logging.getLogger(__name__)
 
 # The archive's directory name under the state directory.
 ARCHIVE_DIRNAME = "tech-lead-runs"
 
-# Staging and retirement prefixes. Dot-prefixed so a half-written or
-# being-deleted directory is never mistaken for a preserved run by retention or
-# by anything listing the archive.
+# Scratch prefixes. Dot-prefixed so a half-written or being-swapped directory is
+# never mistaken for a preserved run by retention or by anything listing the
+# archive. A staging name also carries the OWNING PID, so reconciliation can tell
+# an abandoned stage from another live engine's work in progress.
 _STAGING_PREFIX = ".incoming-"
 _RETIRED_PREFIX = ".retired-"
 
@@ -71,11 +96,20 @@ MAX_RECORDING_BYTES = 64 * 1024 * 1024
 # has stopped being evidence.
 MAX_ARCHIVE_BYTES = 96 * 1024 * 1024
 MAX_ARCHIVE_FILES = 200
+# Discovery bounds, which apply BEFORE anything is copied. Without them the
+# copy budget bounds only the bytes that land, not the traversal that finds
+# them — and a tree of a million empty files or dangling links would exhaust the
+# engine before the copy budget refused anything.
+MAX_SCAN_ENTRIES = 5_000
+MAX_SCAN_DIRECTORIES = 250
+MAX_SCAN_DEPTH = 8
 # How many runs' archives are kept. The history ROWS are unbounded (they are
 # tiny and their whole value is that nothing deletes them); the artifact bytes
 # are not, so the newest N runs keep their evidence and older rows keep their
 # verdict without a drill-down.
 ARCHIVE_RETENTION = 50
+
+_READ_CHUNK_BYTES = 64 * 1024
 
 
 @dataclass(frozen=True)
@@ -94,38 +128,49 @@ class ArchiveLimits:
     recording_bytes: int = MAX_RECORDING_BYTES
     total_bytes: int = MAX_ARCHIVE_BYTES
     files: int = MAX_ARCHIVE_FILES
+    # Discovery bounds, spent while walking rather than while copying.
+    scan_entries: int = MAX_SCAN_ENTRIES
+    scan_directories: int = MAX_SCAN_DIRECTORIES
+    scan_depth: int = MAX_SCAN_DEPTH
     retention: int = ARCHIVE_RETENTION
 
     def cap_for(self, member: "_PreservedMember") -> int:
         return self.recording_bytes if member.is_recording else self.artifact_bytes
 
+    def copy_bounds(self) -> CopyBounds:
+        """The subset the contained-copy owner enforces on its walk."""
+        return CopyBounds(
+            files=self.files,
+            total_bytes=self.total_bytes,
+            entries=self.scan_entries,
+            directories=self.scan_directories,
+            depth=self.scan_depth,
+        )
 
-class _ArchiveBudget:
-    """The aggregate bounds one preservation may spend.
 
-    A tiny object rather than two counters threaded through the walk, so the
-    stop condition is asked in one place and the reason it stopped is reportable.
-    """
+class _PreservedMember:
+    """One run-relative member of the preserved set, and which cap it takes."""
 
-    def __init__(self, *, max_bytes: int, max_files: int) -> None:
-        self._max_bytes = max_bytes
-        self._max_files = max_files
-        self.bytes_spent = 0
-        self.files_spent = 0
-        self.exhausted_by = ""
+    def __init__(
+        self, name: str, *, recursive: bool, is_recording: bool = False
+    ) -> None:
+        self.name = name
+        self.recursive = recursive
+        self.is_recording = is_recording
 
-    def admits(self, size: int) -> bool:
-        if self.files_spent + 1 > self._max_files:
-            self.exhausted_by = f"file count cap {self._max_files}"
-            return False
-        if self.bytes_spent + size > self._max_bytes:
-            self.exhausted_by = f"aggregate size cap {self._max_bytes} bytes"
-            return False
-        return True
 
-    def spend(self, size: int) -> None:
-        self.bytes_spent += size
-        self.files_spent += 1
+# What is copied out of a run directory, as run-relative members. The three
+# drill-down KINDS live in here, and so does the context that makes them
+# readable: the manifest a run-scoped reader resolves against, the prompt the
+# run was launched with, and the whole evidence directory (evidence map, board
+# snapshot, proposals) the report cites. Preserving the citations alongside the
+# report is the difference between evidence and an assertion.
+_PRESERVED_MEMBERS: tuple[_PreservedMember, ...] = (
+    _PreservedMember("manifest.json", recursive=False),
+    _PreservedMember(TERMINAL_RECORDING_FILENAME, recursive=False, is_recording=True),
+    _PreservedMember("session-prompt.txt", recursive=False),
+    _PreservedMember(TECH_LEAD_DATA_DIRNAME, recursive=True),
+)
 
 
 class FileSystemTechLeadRunArtifactArchive:
@@ -158,26 +203,27 @@ class FileSystemTechLeadRunArtifactArchive:
         preserved for this run untouched, because the live destination is not
         opened until a complete copy exists beside it.
 
-        Best-effort by contract: every filesystem failure is logged and reported
-        as "no artifacts preserved", because a lost receipt must never fail the
-        run that earned it.
+        Best-effort by contract: every failure is logged and reported as "no
+        artifacts preserved", because a lost receipt must never fail the run that
+        earned it.
         """
         name = _archive_name(run_id, session_name)
         destination = self._root / name
-        staging = self._root / f"{_STAGING_PREFIX}{name}"
+        staging = self._root / f"{_STAGING_PREFIX}{name}.{os.getpid()}"
+        label = f"{run_id}/{session_name}"
         try:
             self._root.mkdir(parents=True, exist_ok=True)
+            self.reconcile()
             _discard(staging)
             staging.mkdir(parents=True)
-            copied = self._copy_admitted(run_dir, staging, run_id, session_name)
+            copied = self._copy_admitted(run_dir, staging, label)
             kinds = _preserved_kinds(staging)
             if not kinds:
                 _discard(staging)
                 logger.info(
-                    "[TECH_LEAD_RUN] Run %s/%s preserved %d support file(s) and no"
+                    "[TECH_LEAD_RUN] Run %s preserved %d support file(s) and no"
                     " inspectable artifact; keeping no archive",
-                    run_id,
-                    session_name,
+                    label,
                     copied,
                 )
                 return None
@@ -185,31 +231,78 @@ class FileSystemTechLeadRunArtifactArchive:
         except OSError:
             _discard(staging)
             logger.warning(
-                "[TECH_LEAD_RUN] Could not preserve the artifacts of %s/%s from %s",
-                run_id,
-                session_name,
+                "[TECH_LEAD_RUN] Could not preserve the artifacts of %s from %s",
+                label,
                 run_dir,
                 exc_info=True,
             )
             return None
         logger.info(
-            "[TECH_LEAD_RUN] Preserved %s for %s/%s at %s",
+            "[TECH_LEAD_RUN] Preserved %s for %s at %s",
             ", ".join(kind.value for kind in kinds),
-            run_id,
-            session_name,
+            label,
             destination,
         )
         return TechLeadRunArtifacts(location=destination.resolve(), kinds=kinds)
+
+    def reconcile(self) -> None:
+        """Repair scratch state a crash left behind.
+
+        Two cases, and neither may touch a live engine's work:
+
+        * ``.retired-<name>`` with no live ``<name>`` — a publish was interrupted
+          between renaming the old receipt aside and swapping the new one in. The
+          record still points at ``<name>``, so the retired receipt is RESTORED
+          rather than deleted. With a live ``<name>`` it is simply leftover.
+        * ``.incoming-<name>.<pid>`` — an interrupted stage. Reclaimed only when
+          that PID is gone: deleting a live engine's active stage would corrupt a
+          preservation that is still running.
+
+        Never raises: unreconciled scratch is a bigger archive, not a failed run.
+        """
+        for path in self._scratch(_RETIRED_PREFIX):
+            live = self._root / path.name[len(_RETIRED_PREFIX) :]
+            if live.exists():
+                _discard(path)
+                continue
+            try:
+                path.rename(live)
+            except OSError:
+                logger.warning(
+                    "[TECH_LEAD_RUN] Could not restore the interrupted archive"
+                    " %s to %s",
+                    path,
+                    live,
+                    exc_info=True,
+                )
+                continue
+            logger.info(
+                "[TECH_LEAD_RUN] Restored %s from an interrupted publication",
+                live,
+            )
+        for path in self._scratch(_STAGING_PREFIX):
+            owner = _staging_owner_pid(path.name)
+            if owner is None or owner == os.getpid() or process_is_alive(owner):
+                continue
+            if _discard(path):
+                logger.info(
+                    "[TECH_LEAD_RUN] Reclaimed abandoned archive scratch %s"
+                    " (owner pid %d is gone)",
+                    path,
+                    owner,
+                )
 
     def prune(self) -> tuple[Path, ...]:
         """Drop all but the newest ``retention`` archives; report what went.
 
         The caller retires the matching record locators, so a pruned run's row
         stops advertising a drill-down instead of pointing at a deleted
-        directory. Never raises: a retention pass that cannot run is a bigger
-        archive, not a failed run.
+        directory. Reconciles first, so an interrupted publication is restored
+        and counted rather than silently accumulating outside retention. Never
+        raises.
         """
         try:
+            self.reconcile()
             preserved = sorted(
                 (path for path in self._root.iterdir() if _is_preserved_dir(path)),
                 key=_newest_first,
@@ -243,137 +336,59 @@ class FileSystemTechLeadRunArtifactArchive:
     # Internals
     # ------------------------------------------------------------------
 
-    def _copy_admitted(
-        self, run_dir: Path, staging: Path, run_id: str, session_name: str
-    ) -> int:
+    def _scratch(self, prefix: str) -> tuple[Path, ...]:
+        """Scratch directories with ``prefix``, or none when unreadable."""
+        try:
+            return tuple(
+                path
+                for path in self._root.iterdir()
+                if path.name.startswith(prefix) and not path.is_symlink()
+            )
+        except OSError:
+            return ()
+
+    def _copy_admitted(self, run_dir: Path, staging: Path, label: str) -> int:
         """Copy every admitted member of ``run_dir`` into ``staging``.
 
-        Returns how many files landed. Refusals and bound exhaustion are logged
-        rather than raised: one hostile or oversized file must not cost the run
-        the rest of its receipt.
+        Delegates the walk to :mod:`.contained_artifact_copy`, which owns the
+        symlink-safe descriptor discipline and the traversal bounds; this method
+        owns only WHICH members are preserved and which cap each one takes.
         """
-        run_root = run_dir.resolve()
-        budget = _ArchiveBudget(
-            max_bytes=self._limits.total_bytes, max_files=self._limits.files
-        )
-        copied = 0
-        for member in _PRESERVED_MEMBERS:
-            for source, relative in member.sources(run_dir):
-                size = _admissible_size(
-                    source, run_root, self._limits.cap_for(member)
-                )
-                if size is None:
-                    continue
-                if not budget.admits(size):
-                    logger.warning(
-                        "[TECH_LEAD_RUN] Stopped preserving %s/%s at %s: %s",
-                        run_id,
-                        session_name,
-                        relative,
-                        budget.exhausted_by,
-                    )
-                    return copied
-                target = staging / relative
-                target.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copyfile(source, target)
-                budget.spend(size)
-                copied += 1
-        return copied
-
-
-class _PreservedMember:
-    """One run-relative member of the preserved set, and which cap it takes."""
-
-    def __init__(self, name: str, *, recursive: bool, is_recording: bool = False) -> None:
-        self._name = name
-        self._recursive = recursive
-        self.is_recording = is_recording
-
-    def sources(self, run_dir: Path) -> Iterator[tuple[Path, Path]]:
-        """``(source, run-relative target)`` for each candidate file.
-
-        Directory members are walked WITHOUT following links, and only real
-        subdirectories are descended: a symlinked directory inside an
-        agent-authored evidence tree is not a directory this archive walks.
-        """
-        root = run_dir / self._name
-        if not self._recursive:
-            yield (root, Path(self._name))
-            return
-        if root.is_symlink() or not root.is_dir():
-            return
-        for source in sorted(_iter_regular_files(root)):
-            yield (source, Path(self._name) / source.relative_to(root))
-
-
-def _iter_regular_files(root: Path) -> Iterator[Path]:
-    """Every non-symlink file under ``root``, depth-first, links never followed."""
-    for entry in sorted(root.iterdir()):
-        if entry.is_symlink():
-            continue
-        if entry.is_dir():
-            yield from _iter_regular_files(entry)
-        elif entry.is_file():
-            yield entry
-
-
-# What is copied out of a run directory, as run-relative members. The three
-# drill-down KINDS live in here, and so does the context that makes them
-# readable: the manifest a run-scoped reader resolves against, the prompt the
-# run was launched with, and the whole evidence directory (evidence map, board
-# snapshot, proposals) the report cites. Preserving the citations alongside the
-# report is the difference between evidence and an assertion.
-_PRESERVED_MEMBERS: tuple[_PreservedMember, ...] = (
-    _PreservedMember("manifest.json", recursive=False),
-    _PreservedMember(TERMINAL_RECORDING_FILENAME, recursive=False, is_recording=True),
-    _PreservedMember("session-prompt.txt", recursive=False),
-    _PreservedMember(TECH_LEAD_DATA_DIRNAME, recursive=True),
-)
-
-
-def _admissible_size(source: Path, run_root: Path, max_bytes: int) -> Optional[int]:
-    """The file's size, or ``None`` when it must not be preserved.
-
-    Refuses anything that is not a real, non-empty, contained regular file.
-    Empty is treated as absent throughout the run-artifact surfaces: an empty
-    recording or a zero-byte decision is a capture gap, and offering a
-    drill-down into one only teaches an operator to distrust the buttons.
-    """
-    try:
-        if source.is_symlink():
+        root_fd = open_anchor(run_dir)
+        if root_fd is None:
             logger.warning(
-                "[TECH_LEAD_RUN] Refusing to preserve %s: symlinks are not"
-                " artifacts, and following one would copy from outside the run",
-                source,
+                "[TECH_LEAD_RUN] Could not open the run directory %s to preserve %s",
+                run_dir,
+                label,
             )
-            return None
-        if not source.is_file():
-            return None
-        # Containment: raises ValueError when the real file lives outside the run
-        # directory, which is the only way a non-symlink candidate can escape.
-        source.resolve().relative_to(run_root)
-        size = source.stat().st_size
-    except ValueError:
-        logger.warning(
-            "[TECH_LEAD_RUN] Refusing to preserve %s: it resolves outside the run"
-            " directory",
-            source,
-        )
-        return None
-    except OSError:
-        return None
-    if size <= 0:
-        return None
-    if size > max_bytes:
-        logger.warning(
-            "[TECH_LEAD_RUN] Refusing to preserve %s: %d bytes exceeds the %d"
-            " byte cap for this artifact",
-            source,
-            size,
-            max_bytes,
-        )
-        return None
-    return size
+            return 0
+        budget = CopyBudget(self._limits.copy_bounds())
+        copied = 0
+        try:
+            for member in _PRESERVED_MEMBERS:
+                if budget.exhausted:
+                    break
+                cap = self._limits.cap_for(member)
+                if member.recursive:
+                    copied += copy_contained_tree(
+                        root_fd, member.name, staging, cap=cap, budget=budget,
+                        label=label,
+                    )
+                    continue
+                copied += copy_contained_file(
+                    root_fd, member.name, staging / member.name, cap=cap,
+                    budget=budget,
+                )
+        finally:
+            close_fd(root_fd)
+        if budget.exhausted:
+            logger.warning(
+                "[TECH_LEAD_RUN] Stopped preserving %s after %d file(s): %s",
+                label,
+                copied,
+                budget.exhausted_by,
+            )
+        return copied
 
 
 def _preserved_kinds(location: Path) -> tuple[TechLeadRunArtifactKind, ...]:
@@ -398,7 +413,9 @@ def _publish(staging: Path, destination: Path) -> None:
 
     The previous archive is renamed aside FIRST and deleted only once the new one
     is live, so an interrupted publish leaves either the old complete receipt or
-    the new one — never a half-copied directory the record already points at.
+    the new one — never a half-copied directory the record already points at. A
+    crash between the two renames is repaired by :meth:`reconcile`, which finds
+    the retired receipt with no live version and restores it.
     """
     retired = destination.parent / f"{_RETIRED_PREFIX}{destination.name}"
     _discard(retired)
@@ -420,6 +437,9 @@ def _discard(path: Path) -> bool:
         return True
     except FileNotFoundError:
         return True
+    except NotADirectoryError:
+        unlink(path)
+        return not path.exists()
     except OSError:
         logger.warning(
             "[TECH_LEAD_RUN] Could not remove %s from the artifact archive",
@@ -434,6 +454,17 @@ def _is_preserved_dir(path: Path) -> bool:
     if path.name.startswith((_STAGING_PREFIX, _RETIRED_PREFIX)):
         return False
     return path.is_dir() and not path.is_symlink()
+
+
+def _staging_owner_pid(name: str) -> Optional[int]:
+    """The PID that owns a staging directory, or ``None`` when unnamed.
+
+    An unowned name is left alone: it was written by a build that did not stamp
+    ownership, and guessing that nothing is using it is how a live preservation
+    gets deleted underneath itself.
+    """
+    suffix = name.rpartition(".")[2]
+    return int(suffix) if suffix.isdigit() else None
 
 
 def _newest_first(path: Path) -> tuple[float, str]:
@@ -456,18 +487,21 @@ def _archive_name(run_id: str, session_name: str) -> str:
 
 def _safe_component(value: str) -> str:
     safe = "".join(
-        char if char.isalnum() or char in "-_." else "-" for char in value.strip()
+        char if char.isalnum() or char in "-_" else "-" for char in value.strip()
     )
-    return safe.strip(".-") or "unnamed"
+    return safe.strip("-") or "unnamed"
 
 
 __all__ = [
     "ARCHIVE_DIRNAME",
-    "ArchiveLimits",
     "ARCHIVE_RETENTION",
     "MAX_ARCHIVE_BYTES",
     "MAX_ARCHIVE_FILES",
     "MAX_ARTIFACT_BYTES",
     "MAX_RECORDING_BYTES",
+    "MAX_SCAN_DEPTH",
+    "MAX_SCAN_DIRECTORIES",
+    "MAX_SCAN_ENTRIES",
+    "ArchiveLimits",
     "FileSystemTechLeadRunArtifactArchive",
 ]

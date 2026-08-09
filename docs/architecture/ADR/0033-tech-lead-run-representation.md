@@ -116,12 +116,26 @@ coordination requires a *shared* (i.e. GitHub) point.
   OpenAPI boundary, so the generated Python and TypeScript clients can name what
   the browser consumes instead of receiving it as an untyped extra.
   The archive is a BOUNDED owner, because its source is agent-authored and its
-  destination is the operator's state volume: symlinks and escaping paths are
-  refused, per-file/aggregate/count caps apply (and log what they drop), the copy
-  is staged and swapped so a failed retry cannot destroy a complete receipt, and
-  retention keeps the newest runs while REPORTING what it removed — the activity
-  owner retires the matching record locators in the same breath, so no row
-  advertises a drill-down into a directory that is gone.
+  destination is the operator's state volume:
+  - the walk is anchored on an open descriptor for the run directory and opens
+    every component `O_NOFOLLOW` relative to its parent, streaming from the
+    descriptor it validated — the same discipline
+    `control/validation_record_containment.py` applies to a single agent-supplied
+    file, extracted for trees as `infra/contained_artifact_copy.py`. Nothing is
+    reopened by pathname, so a file or ancestor swapped under the walk cannot
+    redirect a read outside the run, and the byte ceiling is enforced on bytes
+    READ so an appender cannot outgrow its admission;
+  - discovery is iterative, lazy, and capped on entries, directories and depth, so
+    a pathological tree costs a refused branch rather than the engine; one
+    unreadable child never costs the artifacts already admitted;
+  - per-file/aggregate/count caps apply and log what they drop;
+  - a copy is staged in a PID-owned sibling directory and swapped in only when
+    complete, so a failed retry cannot destroy a complete receipt.
+    `reconcile()` restores a receipt a crash left renamed aside and reclaims
+    scratch owned by processes that are gone — never a live engine's active stage;
+  - retention keeps the newest runs while REPORTING what it removed, and the
+    activity owner retires the matching record locators in the same breath, so no
+    row advertises a drill-down into a directory that is gone.
 - Writes on both are best-effort by contract: the run's product is its proposals,
   and losing the receipt must never lose the run. Because the *store* cannot know
   whether losing durability is acceptable, it fails loudly on an unusable

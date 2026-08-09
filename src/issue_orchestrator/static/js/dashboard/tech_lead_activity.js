@@ -22,8 +22,10 @@
 // * Drill-downs are native <button> elements with real text labels, rendered by
 //   the shared lifecycle-Command owner, so they are keyboard reachable and carry
 //   the same visible focus ring as every other dashboard action.
-// * Updates replace only the list's rows, so an operator's open panel and
-//   keyboard focus survive live SSE-driven refreshes.
+// * Refreshes RECONCILE keyed rows: unchanged rows are never rewritten, so an
+//   operator tabbing through the panel keeps their place. When a row's markup
+//   does change, focus is returned to the same action in the rebuilt row. The
+//   <details>/<summary> nodes are never replaced at all.
 
 function techLeadActivityState() {
     return (window.dashboardData && window.dashboardData.techLeadActivity) || null;
@@ -68,12 +70,26 @@ function techLeadActivityActionsHtml(entry) {
             ? `<span class="tla-artifacts-note">${escapeHtml(note)}</span>`
             : '';
     }
+    // Each control sits in a slot carrying the run + action identity. That is
+    // what lets a refresh put keyboard focus back on the SAME action after a row
+    // is re-rendered, instead of dropping it to the document (#6858 F11).
+    const key = techLeadActivityRowKey(entry);
     const buttons = commands
-        .map(command => _renderLifecycleCommandButton(
-            command, null, 'issue-action-btn tla-action',
+        .map((command, index) => (
+            `<span class="tla-action-slot" data-tla-row="${escapeAttr(key)}"`
+            + ` data-tla-action="${index}">`
+            + _renderLifecycleCommandButton(command, null, 'issue-action-btn tla-action')
+            + '</span>'
         ))
         .join('');
     return `<span class="tla-actions">${buttons}</span>`;
+}
+
+// Pure: the identity of one recorded run's row. The session run pair is the
+// record's own primary key, so a row keeps its identity across refreshes even as
+// its phase, counts and drill-downs change.
+function techLeadActivityRowKey(entry) {
+    return `${entry.runId || ''}::${entry.sessionName || ''}`;
 }
 
 // Pure: "2 findings · 1 proposal", or '' when the run produced neither.
@@ -126,17 +142,62 @@ function renderTechLeadActivityRow(entry) {
     if (actions) {
         cells.push(actions);
     }
-    return `<li class="tla-row">${cells.join('')}</li>`;
+    const key = escapeAttr(techLeadActivityRowKey(entry));
+    return `<li class="tla-row" data-tla-row="${key}">${cells.join('')}</li>`;
+}
+
+// Pure: the keyed rows to render, newest first. The empty state is a row too, so
+// the reconciler below has one shape to compare against.
+function techLeadActivityRowModels(activity) {
+    const entries = techLeadActivityEntries(activity);
+    if (!entries.length) {
+        const message = (activity && activity.emptyMessage) || '';
+        return [{
+            key: '',
+            html: `<li class="tla-row tla-row--empty" data-tla-row="">`
+                + `${escapeHtml(message)}</li>`,
+        }];
+    }
+    return entries.map(entry => ({
+        key: techLeadActivityRowKey(entry),
+        html: renderTechLeadActivityRow(entry),
+    }));
 }
 
 // Pure: the whole list body — rows, or the server's empty-state sentence.
 function techLeadActivityRowsHtml(activity) {
-    const entries = techLeadActivityEntries(activity);
-    if (!entries.length) {
-        const message = (activity && activity.emptyMessage) || '';
-        return `<li class="tla-row tla-row--empty">${escapeHtml(message)}</li>`;
+    return techLeadActivityRowModels(activity).map(row => row.html).join('');
+}
+
+// Pure: how to get from the rows currently in the DOM to the ones the payload
+// asks for. ``rebuild`` means the row SET changed (a run started, one aged out
+// of the window) and the list is written wholesale; otherwise only the rows whose
+// markup actually differs are replaced, so unchanged rows — and any focus inside
+// them — are never touched (#6858 F11).
+function techLeadActivityRowPlan(activity, existingKeys) {
+    const rows = techLeadActivityRowModels(activity);
+    const current = Array.isArray(existingKeys) ? existingKeys : [];
+    const aligned = current.length === rows.length
+        && rows.every((row, index) => current[index] === row.key);
+    if (!aligned) {
+        return { rebuild: true, html: rows.map(row => row.html).join(''), replace: [] };
     }
-    return entries.map(renderTechLeadActivityRow).join('');
+    return { rebuild: false, html: '', replace: rows };
+}
+
+// Pure: which artifact action holds keyboard focus, as {row, action} — or null
+// when focus is elsewhere. Walks up from the focused control to its slot, so it
+// works whether the browser focused the button or something inside it.
+function techLeadActivityFocusedAction(active) {
+    let node = active;
+    for (let depth = 0; node && depth < 4; depth += 1) {
+        const data = node.dataset;
+        if (data && data.tlaAction !== undefined && data.tlaRow !== undefined) {
+            return { row: data.tlaRow, action: data.tlaAction };
+        }
+        node = node.parentElement;
+    }
+    return null;
 }
 
 // Pure: the count shown beside the panel's name.
@@ -145,9 +206,11 @@ function techLeadActivityCountText(activity) {
     return count ? String(count) : '';
 }
 
-// Surgically update the panel. The <details>/<summary> nodes are never
-// replaced, so an operator's expanded panel and keyboard focus survive every
-// live refresh; only the <ul> rows and the count change.
+// Surgically update the panel. The <details>/<summary> nodes are never replaced,
+// unchanged rows are never rewritten, and a focused drill-down is returned to
+// the same action when its row IS rewritten — so an operator tabbing through an
+// expanded panel keeps both the panel and their place in it across every live
+// SSE-driven refresh.
 function updateTechLeadActivityPanel(activity) {
     const panel = document.getElementById('techLeadActivityPanel');
     // No payload yet is NOT an empty history: before the first view-model
@@ -158,11 +221,63 @@ function updateTechLeadActivityPanel(activity) {
     }
     const list = document.getElementById('techLeadActivityList');
     if (list) {
-        list.innerHTML = techLeadActivityRowsHtml(activity);
+        const focused = techLeadActivityFocusedAction(document.activeElement || null);
+        if (applyTechLeadActivityRows(list, activity)) {
+            restoreTechLeadActivityFocus(list, focused);
+        }
     }
     const count = document.getElementById('techLeadActivityCount');
     if (count) {
         count.textContent = techLeadActivityCountText(activity);
+    }
+}
+
+// Write the planned rows into ``list``. Returns whether any markup was replaced,
+// which is exactly when focus may have been destroyed and needs restoring.
+function applyTechLeadActivityRows(list, activity) {
+    const existing = list.children ? Array.from(list.children) : [];
+    const plan = techLeadActivityRowPlan(activity, existing.map(techLeadActivityNodeKey));
+    if (plan.rebuild) {
+        list.innerHTML = plan.html;
+        return true;
+    }
+    let replaced = false;
+    plan.replace.forEach((row, index) => {
+        const node = existing[index];
+        if (node && node.outerHTML !== row.html) {
+            node.outerHTML = row.html;
+            replaced = true;
+        }
+    });
+    return replaced;
+}
+
+function techLeadActivityNodeKey(node) {
+    return (node && node.dataset && node.dataset.tlaRow) || '';
+}
+
+// Put keyboard focus back on the equivalent action after its row was rewritten.
+// A run whose row vanished loses focus to the document, which is the honest
+// outcome — the control the operator was on no longer exists.
+function restoreTechLeadActivityFocus(list, focused) {
+    if (!focused || !list || typeof list.querySelector !== 'function') {
+        return;
+    }
+    let slot = null;
+    try {
+        slot = list.querySelector(
+            `[data-tla-row="${focused.row}"][data-tla-action="${focused.action}"]`,
+        );
+    } catch (_err) {
+        // A run identity that cannot be expressed as a selector costs the focus
+        // restore, never the refresh itself.
+        return;
+    }
+    const control = slot && typeof slot.querySelector === 'function'
+        ? slot.querySelector('button')
+        : null;
+    if (control && typeof control.focus === 'function') {
+        control.focus();
     }
 }
 
