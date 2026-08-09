@@ -23,14 +23,24 @@ from __future__ import annotations
 
 import os
 import shutil
-import threading
 from pathlib import Path
+
+import pytest
 
 from issue_orchestrator.domain.tech_lead_artifacts import (
     TECH_LEAD_DECISION_FILENAME,
     TECH_LEAD_REPORT_FILENAME,
 )
 from issue_orchestrator.domain.tech_lead_run_artifacts import TechLeadRunArtifactKind
+from issue_orchestrator.infra.contained_artifact_copy import (
+    CopyBounds,
+    CopyBudget,
+    admit_contained_file,
+    close_fd,
+    copy_contained_file,
+    open_anchor,
+    stream_admitted,
+)
 from issue_orchestrator.infra.tech_lead_run_artifact_archive import (
     ArchiveLimits,
     FileSystemTechLeadRunArtifactArchive,
@@ -62,6 +72,17 @@ def _archive(tmp_path: Path, **limits) -> FileSystemTechLeadRunArtifactArchive:
 
 def _preserve(archive, run_dir: Path, *, run="run-900", session="tech-lead-900"):
     return archive.preserve(run_id=run, session_name=session, run_dir=run_dir)
+
+
+def _open_descriptor_count() -> int:
+    """How many descriptors this process holds open.
+
+    ``/dev/fd`` is the portable-enough window into that on both platforms this
+    repo supports (on Linux it is a symlink to ``/proc/self/fd``). Counting it is
+    what makes "every opened descriptor is closed" an OBSERVABLE fact rather than
+    an assertion about private state.
+    """
+    return len(os.listdir("/dev/fd"))
 
 
 def _names(location: Path) -> set[str]:
@@ -390,57 +411,85 @@ class TestBoundedDiscovery:
 
 
 class TestTheCopyIsAnchoredOnDescriptors:
-    """#6858 round 3 F9: admission and copy must observe the SAME inode.
+    """#6858 round 3 F9 / round 4 F15: admission and copy observe the SAME inode.
 
     Checking a pathname and then reopening it is a TOCTOU window: a concurrent
     writer can swap the file — or an ancestor directory — for a link and make the
     copy read from outside the run. The walk therefore opens every component
     ``O_NOFOLLOW`` relative to its parent's descriptor and streams from that
-    descriptor, exactly as ``validation_record_containment`` does.
+    descriptor, as ``validation_record_containment`` does for a single file.
+
+    These drive the copier's own two steps — admit, then stream — so the mutation
+    lands EXACTLY in the window that used to be exploitable, with no threads and
+    no scheduler luck. A pathname-reopening implementation fails every one of
+    them; the round-3 spinning-thread versions could pass without ever entering
+    the window, which is why they are gone.
     """
 
     SECRET = "PRIVATE KEY MATERIAL"
 
-    def test_a_file_swapped_for_a_link_mid_copy_never_lands(self, tmp_path):
-        """The assertion holds for EVERY interleaving, so it cannot flake: no
-        matter when the swap lands, outside bytes must never reach the archive.
-        """
+    def _anchored(self, run_dir: Path):
+        anchor = open_anchor(run_dir)
+        assert anchor is not None
+        return anchor
+
+    def _budget(self, *, total_bytes: int = 1_000_000) -> CopyBudget:
+        return CopyBudget(
+            CopyBounds(
+                files=10, total_bytes=total_bytes, entries=50, directories=5, depth=3
+            )
+        )
+
+    def test_a_file_swapped_for_a_link_after_admission_is_never_read(self, tmp_path):
         secret = tmp_path / "outside" / "id_rsa"
         secret.parent.mkdir(parents=True)
         secret.write_text(self.SECRET, encoding="utf-8")
         run_dir = _run_dir(tmp_path)
-        data_dir = run_dir / "tech-lead-data"
-        targets = [data_dir / f"swap-{index}.json" for index in range(40)]
-        for target in targets:
-            target.write_text('{"ours": true}', encoding="utf-8")
-
-        stop = threading.Event()
-
-        def swap() -> None:
-            while not stop.is_set():
-                for target in targets:
-                    try:
-                        target.unlink()
-                        target.symlink_to(secret)
-                        target.unlink()
-                        target.write_text('{"ours": true}', encoding="utf-8")
-                    except OSError:
-                        continue
-
-        swapper = threading.Thread(target=swap, daemon=True)
-        swapper.start()
+        source = run_dir / "manifest.json"
+        source.write_text('{"ours": true}', encoding="utf-8")
+        anchor = self._anchored(run_dir)
         try:
-            artifacts = _preserve(_archive(tmp_path), run_dir)
-        finally:
-            stop.set()
-            swapper.join(timeout=5)
-
-        assert artifacts is not None
-        for name in _names(artifacts.location):
-            content = (artifacts.location / name).read_text(
-                encoding="utf-8", errors="replace"
+            admitted = admit_contained_file(
+                anchor, "manifest.json", cap=4096, budget=self._budget()
             )
-            assert self.SECRET not in content
+            assert admitted is not None
+            # THE window: the name now points at a secret outside the run.
+            source.unlink()
+            source.symlink_to(secret)
+
+            written = stream_admitted(admitted, tmp_path / "landed.json")
+        finally:
+            if admitted is not None:
+                admitted.close()
+            close_fd(anchor)
+
+        assert written == len('{"ours": true}')
+        assert (tmp_path / "landed.json").read_text(encoding="utf-8") == '{"ours": true}'
+
+    def test_a_file_replaced_by_other_content_after_admission_is_never_read(
+        self, tmp_path
+    ):
+        """Not just links: the admitted INODE is what gets copied, so a rewrite
+        through the same name cannot substitute content either."""
+        run_dir = _run_dir(tmp_path)
+        source = run_dir / "manifest.json"
+        source.write_text("original", encoding="utf-8")
+        anchor = self._anchored(run_dir)
+        try:
+            admitted = admit_contained_file(
+                anchor, "manifest.json", cap=4096, budget=self._budget()
+            )
+            assert admitted is not None
+            source.unlink()
+            source.write_text(self.SECRET, encoding="utf-8")
+
+            stream_admitted(admitted, tmp_path / "landed.json")
+        finally:
+            if admitted is not None:
+                admitted.close()
+            close_fd(anchor)
+
+        assert (tmp_path / "landed.json").read_text(encoding="utf-8") == "original"
 
     def test_an_ancestor_swapped_for_a_link_is_refused(self, tmp_path):
         """A symlinked ancestor trips ``O_NOFOLLOW`` on the directory open, so the
@@ -449,48 +498,184 @@ class TestTheCopyIsAnchoredOnDescriptors:
         elsewhere.mkdir()
         (elsewhere / "id_rsa").write_text(self.SECRET, encoding="utf-8")
         run_dir = _run_dir(tmp_path)
-        data_dir = run_dir / "tech-lead-data"
-        (data_dir / "nested").symlink_to(elsewhere, target_is_directory=True)
+        (run_dir / "tech-lead-data" / "nested").symlink_to(
+            elsewhere, target_is_directory=True
+        )
 
         artifacts = _preserve(_archive(tmp_path), run_dir)
 
         assert artifacts is not None
         assert not any("nested" in name for name in _names(artifacts.location))
 
-    def test_an_artifact_growing_during_the_copy_never_exceeds_its_cap(self, tmp_path):
-        """The ceiling is enforced on the bytes READ, not on the earlier ``fstat``.
-
-        A file admitted at one size and copied at another would spend budget it
-        was never granted. Invariant under every interleaving: either the artifact
-        is refused, or what landed is within the cap — never a bigger file.
-        """
-        cap = 4096
+    def test_a_symlink_planted_before_admission_is_refused_at_the_open(self, tmp_path):
+        secret = tmp_path / "outside" / "id_rsa"
+        secret.parent.mkdir(parents=True)
+        secret.write_text(self.SECRET, encoding="utf-8")
         run_dir = _run_dir(tmp_path)
-        grower = run_dir / "tech-lead-data" / "grower.json"
-        grower.write_text("x" * 512, encoding="utf-8")
-
-        stop = threading.Event()
-
-        def append() -> None:
-            while not stop.is_set():
-                try:
-                    with grower.open("a", encoding="utf-8") as handle:
-                        handle.write("y" * 1024)
-                except OSError:
-                    return
-
-        appender = threading.Thread(target=append, daemon=True)
-        appender.start()
+        source = run_dir / "manifest.json"
+        source.unlink()
+        source.symlink_to(secret)
+        anchor = self._anchored(run_dir)
         try:
-            artifacts = _preserve(_archive(tmp_path, artifact_bytes=cap), run_dir)
+            assert admit_contained_file(
+                anchor, "manifest.json", cap=4096, budget=self._budget()
+            ) is None
         finally:
-            stop.set()
-            appender.join(timeout=5)
+            close_fd(anchor)
+
+
+class TestBlockingSpecialFilesAreRefused:
+    """#6858 round 4 F13: a FIFO must not be able to hang the terminal seam.
+
+    A FIFO is neither a symlink nor a directory, so the scan offers it as a file.
+    Opened read-only and BLOCKING it waits for a writer that may never come — and
+    that wait happens at a completing run's terminal seam, before the
+    regular-file check can reject it. ``O_NONBLOCK`` on the open is what makes the
+    rejection reachable. Without the fix these tests hang rather than fail, so
+    each carries a timeout.
+    """
+
+    @pytest.mark.timeout(30)
+    def test_admission_refuses_a_fifo_without_waiting_for_a_writer(self, tmp_path):
+        run_dir = _run_dir(tmp_path)
+        (run_dir / "manifest.json").unlink()
+        os.mkfifo(run_dir / "manifest.json")
+        anchor = open_anchor(run_dir)
+        assert anchor is not None
+        budget = CopyBudget(
+            CopyBounds(files=5, total_bytes=4096, entries=20, directories=3, depth=2)
+        )
+        try:
+            assert admit_contained_file(
+                anchor, "manifest.json", cap=4096, budget=budget
+            ) is None
+        finally:
+            close_fd(anchor)
+
+    @pytest.mark.timeout(30)
+    def test_preserving_a_run_with_a_fifo_completes_and_refuses_it(self, tmp_path):
+        run_dir = _run_dir(tmp_path)
+        os.mkfifo(run_dir / "tech-lead-data" / "pipe.json")
+
+        artifacts = _preserve(_archive(tmp_path), run_dir)
 
         assert artifacts is not None
-        landed = artifacts.location / "tech-lead-data" / "grower.json"
-        if landed.exists():
-            assert landed.stat().st_size <= cap
+        assert not any("pipe.json" in name for name in _names(artifacts.location))
+        # The real artifacts are unaffected by the refused special file.
+        assert TechLeadRunArtifactKind.REPORT in artifacts.kinds
+
+
+class TestTheAggregateBoundHoldsUnderGrowth:
+    """#6858 round 4 F14: admission is granted on the size ``fstat`` reported.
+
+    A file an agent is still appending to can stay under its per-file cap and
+    still push the archive past its AGGREGATE bound, because the budget was
+    debited with the streamed size. The stream is therefore capped by whichever
+    ceiling is smaller — this file's cap, or the bytes still unspent.
+    """
+
+    def test_a_file_grown_after_admission_cannot_outspend_the_budget(self, tmp_path):
+        run_dir = _run_dir(tmp_path)
+        source = run_dir / "manifest.json"
+        source.write_text("x" * 100, encoding="utf-8")
+        budget = CopyBudget(
+            CopyBounds(files=10, total_bytes=150, entries=50, directories=5, depth=3)
+        )
+        # 120 of the 150 aggregate bytes are already gone, so this file's real
+        # allowance is 30 even though its own cap is 4096.
+        budget.spend(120)
+        anchor = open_anchor(run_dir)
+        assert anchor is not None
+        target = tmp_path / "landed.json"
+        try:
+            admitted = admit_contained_file(
+                anchor, "manifest.json", cap=4096, budget=budget
+            )
+            assert admitted is not None
+            assert admitted.size == 100
+            # Admission GRANTED the smaller of the two ceilings, not the file cap.
+            assert admitted.allowance == 30
+            # THE window: it grows past that allowance but stays under its cap.
+            with source.open("a", encoding="utf-8") as handle:
+                handle.write("y" * 500)
+
+            written = stream_admitted(admitted, target)
+        finally:
+            if admitted is not None:
+                admitted.close()
+            close_fd(anchor)
+
+        assert written is None, "a file over its allowance must be refused"
+        assert not target.exists(), "no partial artifact may be left behind"
+        assert budget.remaining_bytes == 30
+
+    def test_the_copier_spends_only_what_it_was_granted(self, tmp_path):
+        """End to end through the public copy step: whatever lands, the aggregate
+        bound holds."""
+        run_dir = _run_dir(tmp_path)
+        (run_dir / "manifest.json").write_text("x" * 100, encoding="utf-8")
+        budget = CopyBudget(
+            CopyBounds(files=10, total_bytes=150, entries=50, directories=5, depth=3)
+        )
+        budget.spend(120)
+        anchor = open_anchor(run_dir)
+        assert anchor is not None
+        try:
+            landed = copy_contained_file(
+                anchor,
+                "manifest.json",
+                tmp_path / "landed.json",
+                cap=4096,
+                budget=budget,
+            )
+        finally:
+            close_fd(anchor)
+
+        # 100 bytes do not fit in the 30 that are left, so nothing is spent.
+        assert landed == 0
+        assert budget.remaining_bytes == 30
+        assert not (tmp_path / "landed.json").exists()
+
+
+class TestEveryOpenedDescriptorIsClosed:
+    """#6858 round 4 F12: a processed directory's descriptor must be released.
+
+    The walk queues an open descriptor per admitted subdirectory. Closing only the
+    ones still queued leaked one per VISITED directory — up to the directory cap
+    per run — and repeated tech-lead runs then exhaust the engine's descriptor
+    limit, at which point unrelated SQLite, GitHub and terminal work starts
+    failing. Counting the process's open descriptors is the observable proof.
+    """
+
+    def _nested_run(self, tmp_path, name: str) -> Path:
+        run_dir = _run_dir(tmp_path, name=name)
+        branch = run_dir / "tech-lead-data"
+        for level in range(4):
+            branch = branch / f"level-{level}"
+            branch.mkdir()
+            (branch / "note.json").write_text('{"n": 1}', encoding="utf-8")
+            for sibling in range(3):
+                twig = branch / f"twig-{sibling}"
+                twig.mkdir()
+                (twig / "leaf.json").write_text('{"leaf": 1}', encoding="utf-8")
+        return run_dir
+
+    def test_repeated_preservation_returns_descriptors_to_the_baseline(self, tmp_path):
+        archive = _archive(tmp_path)
+        # One warm-up run so lazily-opened loggers/handles are not counted.
+        assert _preserve(
+            archive, self._nested_run(tmp_path, "warmup"), run="warm", session="warm"
+        ) is not None
+        baseline = _open_descriptor_count()
+
+        for index in range(3):
+            run_dir = self._nested_run(tmp_path, f"run-{index}")
+            assert _preserve(
+                archive, run_dir, run=f"run-{index}", session=f"tech-lead-{index}"
+            ) is not None
+
+        # 3 runs x 16 directories: a per-directory leak would be unmistakable.
+        assert _open_descriptor_count() <= baseline
 
 
 class TestCrashReconciliation:

@@ -10,12 +10,21 @@ durable state volume.
 Two properties, each of which was a real hole before it was written down:
 
 * **Race-free admission.** Every component is opened relative to its parent's
-  descriptor with ``O_NOFOLLOW``, and bytes are streamed from the descriptor that
-  was validated. A descendant that swaps a file — or an ancestor directory — for a
-  symlink between the scan and the copy therefore loses: the open trips ``ELOOP``,
-  and nothing outside the anchored root can be read. The byte ceiling is enforced
-  on the bytes READ, so a file another process is appending to cannot spend more
-  budget than it was admitted for.
+  descriptor with ``O_NOFOLLOW | O_NONBLOCK``, and bytes are streamed from the
+  descriptor that was validated. A descendant that swaps a file — or an ancestor
+  directory — for a symlink between the scan and the copy therefore loses: the open
+  trips ``ELOOP``, and nothing outside the anchored root can be read. Admission and
+  transfer are two public steps (:func:`admit_contained_file`,
+  :func:`stream_admitted`) precisely so that invariant is inspectable rather than
+  asserted. ``O_NONBLOCK`` is what makes the OPEN safe: a FIFO is neither symlink
+  nor directory, and opening one read-only and blocking would wait for a writer
+  that may never come. The byte ceiling is enforced on the bytes READ, against
+  both the per-file cap and the aggregate bytes still unspent, so a file another
+  process is appending to cannot spend budget it was not granted.
+* **Owned descriptors.** Every descriptor this walk opens is closed by it — the
+  directory being scanned as soon as it is done, anything still queued on the way
+  out. A leak here is a leak per visited directory, which ends as an engine-wide
+  descriptor exhaustion that breaks SQLite, GitHub and terminal work alike.
 * **Bounded discovery.** The walk is iterative (a pathological depth costs a
   refused branch, not a ``RecursionError`` through a never-raise contract), lazy
   (an unbounded directory is never materialised into a list), and capped on
@@ -103,6 +112,17 @@ class CopyBudget:
             )
         return True
 
+    @property
+    def remaining_bytes(self) -> int:
+        """Aggregate bytes still unspent — the OTHER ceiling a stream must respect.
+
+        Admission is granted on the size ``fstat`` reported, so a file an agent is
+        still appending to could otherwise stay under its per-file cap and still
+        push the archive past its aggregate bound (#6858 round 4 F14). The stream
+        is therefore capped by whichever of the two is smaller.
+        """
+        return max(0, self._bounds.total_bytes - self._bytes_spent)
+
     def spend(self, size: int) -> None:
         self._bytes_spent += size
         self._files_spent += 1
@@ -131,34 +151,99 @@ def close_fd(fd: int) -> None:
         pass
 
 
-def copy_contained_file(
-    parent_fd: int, name: str, target: Path, *, cap: int, budget: CopyBudget
-) -> int:
-    """Copy one file opened relative to ``parent_fd``. Returns 1 when it landed.
+@dataclass(frozen=True)
+class AdmittedFile:
+    """A file that passed admission, HELD OPEN at the inode that passed.
 
-    The file is opened ``O_NOFOLLOW``, validated through ``fstat`` on that
-    descriptor, and streamed FROM the descriptor — the pathname is never reopened,
-    so nothing that changes on disk between admission and copy can redirect the
-    read.
+    Admission and transfer are two steps on purpose. The invariant this module
+    exists to keep — "the bytes copied are the bytes that were checked" — is only
+    meaningful if the descriptor outlives the check, and splitting the steps is
+    what makes that inspectable: a caller (or a test) can mutate the pathname
+    between them and prove the transfer is unaffected.
+
+    The owner closes it with :meth:`close`.
+    """
+
+    fd: int
+    name: str
+    size: int
+    # The most this file may WRITE: its own cap, or the aggregate bytes still
+    # unspent, whichever is smaller. Part of what admission GRANTS rather than a
+    # decision each call site makes, so a file that grows after admission cannot
+    # slip past the aggregate bound through a caller that passed the wrong
+    # ceiling (#6858 round 4 F14).
+    allowance: int
+
+    def close(self) -> None:
+        close_fd(self.fd)
+
+
+def admit_contained_file(
+    parent_fd: int, name: str, *, cap: int, budget: CopyBudget
+) -> Optional[AdmittedFile]:
+    """Open and validate one file relative to ``parent_fd``, or refuse it.
+
+    ``O_NOFOLLOW`` refuses a symlink; ``O_NONBLOCK`` is what makes the open itself
+    safe on an agent-authored entry that is neither a symlink nor a directory. A
+    FIFO opened read-only and blocking waits for a writer that may never come —
+    which would hang the terminal seam of a completing run before the
+    regular-file check could reject it (#6858 round 4 F13). With ``O_NONBLOCK``
+    the open returns immediately and ``fstat`` refuses it as a non-regular file.
     """
     try:
         fd = os.open(
-            name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent_fd
+            name,
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+            dir_fd=parent_fd,
         )
     except OSError as exc:
         _log_refused_open(name, exc)
+        return None
+    size = _admissible_size(fd, name, cap)
+    if size is None:
+        close_fd(fd)
+        return None
+    return AdmittedFile(
+        fd=fd,
+        name=name,
+        size=size,
+        allowance=min(cap, budget.remaining_bytes),
+    )
+
+
+def stream_admitted(admitted: AdmittedFile, target: Path) -> Optional[int]:
+    """Write an admitted file's bytes to ``target``, or refuse it.
+
+    Reads exclusively from the admitted descriptor — never from ``admitted.name``
+    — so anything the pathname points at by now is irrelevant, and writes at most
+    the allowance admission granted.
+    """
+    return _stream_capped(admitted.fd, target, admitted.allowance)
+
+
+def copy_contained_file(
+    parent_fd: int, name: str, target: Path, *, cap: int, budget: CopyBudget
+) -> int:
+    """Admit and copy one file relative to ``parent_fd``. 1 when it landed.
+
+    Nothing here chooses a ceiling: the allowance admission granted is the only
+    one, and it already accounts for both this file's cap and the aggregate bytes
+    still unspent — so a file that grows after admission can never push the
+    archive past either bound (#6858 round 4 F14).
+    """
+    admitted = admit_contained_file(parent_fd, name, cap=cap, budget=budget)
+    if admitted is None:
         return 0
     try:
-        size = _admissible_size(fd, name, cap)
-        if size is None or not budget.admits(size):
+        if not budget.admits(admitted.size):
             return 0
-        written = _stream_capped(fd, target, cap)
+        written = stream_admitted(admitted, target)
         if written is None:
             return 0
         budget.spend(written)
         return 1
     finally:
-        close_fd(fd)
+        admitted.close()
 
 
 def copy_contained_tree(
@@ -179,24 +264,31 @@ def copy_contained_tree(
     if root is None:
         return 0
     copied = 0
+    # Every descriptor in ``pending`` is OWNED by this walk: the one being scanned
+    # is closed the moment its directory is done, and anything still queued is
+    # closed on the way out. A processed directory left open would leak one
+    # descriptor per visited directory — up to the directory cap per run, and
+    # eventually the engine's whole descriptor budget (#6858 round 4 F12).
     pending: list[tuple[int, Path, int]] = [(root, Path(name), 1)]
     try:
         while pending and not budget.exhausted:
             dir_fd, relative, depth = pending.pop()
-            copied += _copy_directory(
-                dir_fd,
-                relative,
-                depth,
-                destination,
-                cap=cap,
-                budget=budget,
-                label=label,
-                pending=pending,
-            )
+            try:
+                copied += _copy_directory(
+                    dir_fd,
+                    relative,
+                    depth,
+                    destination,
+                    cap=cap,
+                    budget=budget,
+                    label=label,
+                    pending=pending,
+                )
+            finally:
+                close_fd(dir_fd)
     finally:
-        for open_fd, _relative, _depth in pending:
-            close_fd(open_fd)
-        close_fd(root)
+        for queued_fd, _relative, _depth in pending:
+            close_fd(queued_fd)
     return copied
 
 
@@ -371,8 +463,8 @@ def _stream_capped(fd: int, target: Path, cap: int) -> Optional[int]:
                     sink.write(chunk)
     except _ArtifactTooLarge as exc:
         logger.warning(
-            "[ARTIFACT_COPY] Refusing %s: it grew past the %d byte cap while being"
-            " copied",
+            "[ARTIFACT_COPY] Refusing %s: it grew past its %d byte allowance while"
+            " being copied",
             exc.target.name,
             exc.cap,
         )
@@ -405,12 +497,15 @@ def unlink(target: Path) -> None:
 
 
 __all__ = [
+    "AdmittedFile",
     "CopyBounds",
     "CopyBudget",
+    "admit_contained_file",
     "close_fd",
     "copy_contained_file",
     "copy_contained_tree",
     "open_anchor",
     "open_contained_directory",
+    "stream_admitted",
     "unlink",
 ]
