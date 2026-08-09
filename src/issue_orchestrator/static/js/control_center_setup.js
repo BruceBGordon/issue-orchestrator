@@ -251,7 +251,8 @@
                 ? Boolean(existingConfig.review?.enabled && reviewerAgentLabel)
                 : true;
             const configureTechLead = data.existing_config
-                ? Boolean(existingConfig.review?.tech_lead_review_agent)
+                ? existingConfig.tech_lead?.enabled
+                    ?? Boolean(existingConfig.review?.tech_lead_review_agent)
                 : true;
             const techLeadReviewThreshold = Number.isInteger(
                 existingConfig.review?.tech_lead_review_threshold,

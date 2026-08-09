@@ -664,11 +664,24 @@ class TechLeadActivationOwner:
     tech_lead_review_agent: Optional[str]
 
     @property
+    def tech_lead_explicitly_disabled(self) -> bool:
+        """Whether the operator persisted the authoritative off choice."""
+        return self.tech_lead.enabled is False
+
+    @property
     def tech_lead_enabled(self) -> bool:
         """Admit new work only when enabled and backed by an agent."""
-        return bool(self.tech_lead_review_agent) and self.tech_lead.enabled is not False
+        return (
+            bool(self.tech_lead_review_agent) and not self.tech_lead_explicitly_disabled
+        )
 
     @tech_lead_enabled.setter
     def tech_lead_enabled(self, enabled: bool) -> None:
         """Persist the operator's explicit master-switch choice."""
         self.tech_lead.enabled = enabled
+
+    def explicit_tech_lead_section(self) -> dict[str, dict[str, bool]]:
+        """Serialize only an explicit choice, preserving legacy omission."""
+        if self.tech_lead.enabled is None:
+            return {}
+        return {"tech_lead": {"enabled": self.tech_lead.enabled}}

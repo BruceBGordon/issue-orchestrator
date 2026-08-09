@@ -37,6 +37,7 @@ from issue_orchestrator.domain.tech_lead_run import (
     REASON_NO_TECH_LEAD_AGENT,
     REASON_ORCHESTRATOR_PAUSED,
     REASON_RUN_CLAIM_UNAVAILABLE,
+    REASON_TECH_LEAD_DISABLED,
     GlobalBatchReviewScope,
     GlobalHealthReviewScope,
     IssueInvestigationScope,
@@ -411,9 +412,7 @@ def test_global_request_deduplicates_against_a_running_health_review():
     anchor's marker label (#6994 round 1 F3) rather than losing.
     """
     state = _state(
-        active_sessions=[
-            FakeSession(900, flavor=TechLeadSessionFlavor.HEALTH_REVIEW)
-        ]
+        active_sessions=[FakeSession(900, flavor=TechLeadSessionFlavor.HEALTH_REVIEW)]
     )
     anchor_host = FakeAnchorHost(state)
     admission = _coordinator(state, anchor_host=anchor_host).admit(_global_request())
@@ -506,7 +505,7 @@ def test_master_switch_refuses_new_work_without_touching_external_owners():
     ).admit(_issue_request(42))
 
     assert admission.outcome is TechLeadRunOutcome.NOT_CONFIGURED
-    assert admission.reason == REASON_NO_TECH_LEAD_AGENT
+    assert admission.reason == REASON_TECH_LEAD_DISABLED
     assert state.pending_tech_lead_reviews == []
     assert repository_host.get_issue_calls == []
     assert anchor_host.calls == 0

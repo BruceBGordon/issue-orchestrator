@@ -1158,7 +1158,7 @@ class Config(TechLeadActivationOwner):
             hooks_dict.setdefault("ai_gate", {})["dangerous_allow_failure"] = True
         if hooks_dict:
             result["hooks"] = hooks_dict
-
+        result.update(self.explicit_tech_lead_section())
         return result
 
     def save(self, path: Optional[Path] = None) -> Path:

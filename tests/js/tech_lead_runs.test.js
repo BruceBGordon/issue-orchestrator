@@ -180,6 +180,12 @@ const UNCONFIGURED = {
     unavailableReason: 'No tech lead agent is configured for this repository.',
     needsSettings: true,
 };
+const DISABLED = {
+    unavailableReason: (
+        'Tech lead is disabled for this repository. Enable it in Settings to run tech-lead work.'
+    ),
+    needsSettings: true,
+};
 const PAUSED = {
     unavailableReason: 'The Repository Engine is paused. Resume it to run tech-lead work.',
 };
@@ -376,6 +382,22 @@ test('an unconfigured engine offers a keyboard-reachable Settings control', () =
         null,
     );
     void elements;
+});
+
+test('an explicitly disabled engine shows the disabled reason and Settings remedy', () => {
+    const { context, elements } = loadModule();
+    context.window.dashboardData.techLeadRuns = ready(DISABLED);
+
+    context.refreshTechLeadRunControls();
+
+    const item = elements.get('techLeadHealthReviewItem');
+    const status = elements.get('techLeadHealthReviewStatus');
+    const link = context.document.getElementById('techLeadHealthReviewItemSettingsLink');
+    assert.equal(item.attributes['aria-disabled'], 'true');
+    assert.match(status.textContent, /disabled for this repository/);
+    assert.doesNotMatch(status.textContent, /No tech lead agent/);
+    assert.ok(link, 'Settings must be offered when tech lead is disabled');
+    assert.equal(link.textContent, 'Open Settings');
 });
 
 test('a stopped engine says so instead of blaming configuration', () => {

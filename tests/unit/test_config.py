@@ -3040,6 +3040,26 @@ class TestTechLeadConfig:
         config.tech_lead.enabled = True
         assert config.tech_lead_enabled is True
 
+    def test_explicit_disable_survives_save_and_reload(self, tmp_path):
+        config = Config()
+        config.tech_lead_review_agent = "agent:tech-lead"
+        config.tech_lead.enabled = False
+        saved = tmp_path / "saved.yaml"
+
+        assert config.to_dict()["tech_lead"] == {"enabled": False}
+        config.save(saved)
+        reloaded = Config.load(saved)
+
+        assert reloaded.tech_lead_review_agent == "agent:tech-lead"
+        assert reloaded.tech_lead.enabled is False
+        assert reloaded.tech_lead_enabled is False
+
+    def test_legacy_omission_stays_omitted_when_serialized(self):
+        config = Config()
+        config.tech_lead_review_agent = "agent:tech-lead"
+
+        assert "tech_lead" not in config.to_dict()
+
     @pytest.mark.parametrize(("raw", "expected"), (("false", False), ("true", True)))
     def test_tech_lead_enabled_from_yaml(self, tmp_path, raw: str, expected: bool):
         config_file = tmp_path / ".issue-orchestrator.yaml"
@@ -3263,7 +3283,9 @@ tech_lead:
         with pytest.raises(ValueError, match="tech_lead.findings must be a mapping"):
             Config.load(config_file)
 
-    @pytest.mark.parametrize("body", ("tech_lead:\n  priority: P1\n", "tech_lead:\n  findings: null\n"))
+    @pytest.mark.parametrize(
+        "body", ("tech_lead:\n  priority: P1\n", "tech_lead:\n  findings: null\n")
+    )
     def test_omitted_or_null_findings_takes_the_defaults(self, tmp_path, body: str):
         """Omission and an explicit null are the only ways to accept defaults."""
         config_file = tmp_path / ".issue-orchestrator.yaml"
@@ -3292,9 +3314,7 @@ tech_lead:
         routing feature into the managed repo.
         """
         config_file = tmp_path / ".issue-orchestrator.yaml"
-        config_file.write_text(
-            f"tech_lead:\n  findings:\n    route: {value}\n"
-        )
+        config_file.write_text(f"tech_lead:\n  findings:\n    route: {value}\n")
 
         with pytest.raises(ValueError, match="route must be a mapping"):
             Config.load(config_file)
