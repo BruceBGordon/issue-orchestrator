@@ -332,30 +332,43 @@ Four concrete mechanisms in today's code destroy or strand the work:
    owns pause/resume/refresh and friends but no stop command, and the stop routes
    call `SupervisorOps` directly, one of them with the default `instance_id=None`,
    which cannot target the named instance holding a claim. So this ADR defines
-   `RepositoryEngineLifecycle` over `SupervisorOps` and routes the **existing** stop
-   surfaces through it, giving engine lifecycle one boundary instead of three call
-   sites.
+   `RepositoryEngineLifecycle` over `SupervisorOps` as a **new boundary with one new
+   caller**, owning exactly one behaviour: the targeted stop of one named or
+   single-instance engine. It does **not** migrate the existing stop surfaces, and
+   an earlier draft claiming it would was a scoping error — those routes also carry
+   bulk, force, graceful-timeout, port-fallback and shutdown-operation semantics,
+   and the tree has stop consumers in MCP, CLI, repository removal, restart and
+   reconciliation. They are pre-existing and untouched here, so nothing about them
+   is being deferred; the guardrail is scoped to the surfaces this design
+   introduces.
+
+   **Its stop policy is stated, not inherited.** `SupervisorOps.stop()` defaults
+   `force_if_graceful_fails=True` and a graceful timeout, so a call that named
+   neither would silently own "graceful, then SIGKILL after an unstated timeout"
+   while the prose claimed force was out of scope. The command carries both
+   explicitly, and force-on-timeout is deliberately enabled: the case being solved
+   is an engine that has stopped responding, so a graceful-only stop would leave the
+   only recovery path a no-op. Forcing is safe on this contract's terms — the
+   record, evidence and escrow are durable, the fence refuses the dying process's
+   late writes, and a killed process has its gate released by the kernel, which is
+   what makes death provable.
 
    The recovery-specific guard is a *separate*, smaller owner. A plain
    `StopEngineCommand` carries no record binding — engine lifecycle has no business
    knowing about validated work — so "stop this engine only if it still owns this
-   exact record" becomes a bounded control-layer coordinator that re-reads the owner
-   through an exact `snapshot_record(record_id)`, refuses on any mismatch or a
-   non-local target with zero effect, and delegates a plain stop only on an exact
-   match. Without that command, the guard could only be scattered between a UI
-   route, the disposition store, and `SupervisorOps`. The record context reaches the
-   engine surface through the issue-detail link, so the engine control stays where
-   engine controls belong while still being record-bound.
+   exact record" becomes a bounded coordinator that re-reads the owner by exact
+   `record_id`, refuses on any mismatch or a non-local target with zero effect, and
+   delegates a plain stop only on an exact match.
 
-   **The new boundary owns the targeted stop only, and the consolidation is
-   deferred with a tracked follow-up.** The existing stop routes also carry bulk,
-   force, graceful-timeout, port-fallback and shutdown-operation semantics, and the
-   tree has stop consumers in MCP, CLI, repository removal, restart and
-   reconciliation. Migrating all of that is a project of its own and does not belong
-   inside a validated-work design; asserting it in passing was a scoping error. The
-   guardrail is therefore narrowed to the surfaces this design introduces, with the
-   repo-wide version as the follow-up's exit criterion, and the recovery path
-   depends on none of it.
+   **Both live in the Control Center, because the Repository Engine is the thing
+   that is stuck.** Hosting the coordinator or its endpoint in the engine that owns
+   the claim would make the escape hatch unavailable in exactly the failure it
+   exists for. The Control Center composes the write half over `SupervisorOps` and
+   the read half over an out-of-process reader that opens the target repository's
+   own `validated_work.sqlite` read-only — which is why that state is a file in the
+   repository's state directory rather than engine memory. Neither half requires the
+   target engine to be responsive. The issue detail, served by that engine, only
+   reports the owner and links to the Control Center.
 
    The disposition owner stays read-only with respect to engine lifecycle: it
    publishes the claim holder as a fact, with **stop availability computed by the
