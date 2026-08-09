@@ -15,6 +15,7 @@ from issue_orchestrator.control.claim_gate import ClaimLostError
 from issue_orchestrator.control.completion_handler import CompletionHandler
 from issue_orchestrator.control.label_manager import LabelManager
 from issue_orchestrator.control.open_issue_corpus import OpenIssueCorpusManager
+from issue_orchestrator.control.tech_lead_run_activity import in_memory_run_activity
 from issue_orchestrator.control.reconciliation import (
     ExternalSnapshot,
     ReconciliationRequired,
@@ -622,6 +623,7 @@ class TestEffectiveTerminalOutcomeEvents:
             ),
             active_session_run_id=lambda _issue_number: None,
             provider_availability=make_provider_availability(config),
+            tech_lead_run_activity=in_memory_run_activity(),
             mandated_action=mandated_action,
         )
 

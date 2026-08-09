@@ -39,6 +39,7 @@ if TYPE_CHECKING:
     from ..ports.goal_pilot_store import GoalPilotStore
     from ..ports.attempt_store import AttemptStore
     from ..ports.tech_lead_authority import TechLeadAuthorityStore
+    from .tech_lead_run_activity import TechLeadRunActivity
     from .open_issue_corpus import OpenIssueCorpusManager
     from ..ports.fresh_issue_reader import FreshIssueReader
     from ..ports.worktree_manager import WorktreeManager
@@ -186,6 +187,10 @@ class OrchestratorDeps:
     @property
     def tech_lead_authority(self) -> "TechLeadAuthorityStore":
         return self.services.tech_lead_authority
+
+    @property
+    def tech_lead_run_activity(self) -> "TechLeadRunActivity":
+        return self.services.tech_lead_run_activity
 
     @property
     def open_issue_corpus(self) -> "OpenIssueCorpusManager":

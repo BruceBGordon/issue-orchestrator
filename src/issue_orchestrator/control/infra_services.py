@@ -35,10 +35,23 @@ if TYPE_CHECKING:
     from .label_manager import LabelManager
     from .provider_launch_readiness import ProviderLaunchReadinessSampler
     from .provider_resilience import ProviderResilienceManager
+    from .tech_lead_run_activity import TechLeadRunActivity
 
 
 def _noop_health_check() -> None:
     """Default no-op health check for tests and disabled configurations."""
+
+
+def _in_memory_run_activity() -> "TechLeadRunActivity":
+    """Tech-lead run history with no durable home (ADR-0033 / #6858).
+
+    Never ``None``, for the same reason ``run_ownership`` never is: the launch
+    and completion seams that record a run must not carry an "if history is
+    wired" branch, or the branch becomes the place recording silently stops.
+    """
+    from .tech_lead_run_activity import in_memory_run_activity
+
+    return in_memory_run_activity()
 
 
 @dataclass(frozen=True)
@@ -77,5 +90,12 @@ class InfraServices:
     pair_registry: "PersistentExchangePairRegistry | None" = None
     turn_mailbox: "TurnMailbox | None" = None
     background_job_supervisor: "BackgroundJobSupervisor | None" = None
+    # The LOCAL half of ADR-0033: what tech-lead runs this engine executed and
+    # what they concluded. Paired with ``tech_lead_authority`` (the trust
+    # boundary) but deliberately a different owner — this one decides nothing
+    # and is never read by a peer engine (#6858).
+    tech_lead_run_activity: "TechLeadRunActivity" = field(
+        default_factory=_in_memory_run_activity
+    )
     instance_id: str = ""
     state_health_check: Callable[[], None] = field(default=_noop_health_check)

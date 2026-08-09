@@ -910,3 +910,88 @@ html[data-embedded="true"] .embedded-sep {
     .kanban-column { flex: none; }
     .e2e-board { grid-template-columns: 1fr; }
 }
+
+/* Tech-lead activity panel — ADR-0033's local visibility surface (#6858).
+   A native <details> disclosure, so the open/closed state is real semantics
+   rather than a class we maintain. Phase tone is a tint on text that is ALSO
+   spelled out, so colour is never the only status signal in either theme. */
+.tech-lead-activity {
+    margin: 12px 0 0;
+    padding: 8px 12px;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: var(--bg-panel);
+    color: var(--text);
+    font-size: 13px;
+    line-height: 1.4;
+}
+.tech-lead-activity > summary.tla-summary {
+    cursor: pointer;
+    font-weight: 600;
+    color: var(--accent);
+    width: fit-content;
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+}
+.tech-lead-activity > summary.tla-summary:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+    border-radius: 3px;
+}
+.tla-count {
+    color: var(--text-muted);
+    font-weight: 400;
+}
+.tla-list {
+    list-style: none;
+    margin: 8px 0 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+.tla-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 8px;
+    padding-bottom: 6px;
+    border-bottom: 1px solid var(--border);
+}
+.tla-row:last-child {
+    border-bottom: none;
+    padding-bottom: 0;
+}
+.tla-row--empty {
+    color: var(--text-muted);
+}
+.tla-flavor {
+    font-weight: 700;
+}
+.tla-phase {
+    font-size: 11px;
+    font-weight: 700;
+    padding: 1px 6px;
+    border-radius: 999px;
+    border: 1px solid currentColor;
+    background: color-mix(in srgb, currentColor 14%, transparent);
+}
+.tla-phase--active { color: var(--accent); }
+.tla-phase--good { color: var(--ok); }
+.tla-phase--warn { color: var(--warn); }
+.tla-phase--bad { color: var(--danger); }
+.tla-phase--muted { color: var(--text-muted); }
+.tla-subject,
+.tla-started,
+.tla-produced {
+    color: var(--text-muted);
+}
+.tla-detail {
+    color: var(--text-muted);
+    font-style: italic;
+    /* Never clipped: a long decision summary wraps rather than truncating
+       text the operator cannot then reach. */
+    flex: 1 1 100%;
+    overflow-wrap: anywhere;
+}

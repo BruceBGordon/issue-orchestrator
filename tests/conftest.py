@@ -1157,6 +1157,7 @@ def build_test_orchestrator_deps(
             repository_host=repo_host,
             session_output=session_output,
             tech_lead_authority=tech_lead_authority,
+            tech_lead_run_activity=infra_services.tech_lead_run_activity,
             open_issue_corpus=open_issue_corpus,
             label_manager=label_manager,
             provider_resilience=provider_resilience,

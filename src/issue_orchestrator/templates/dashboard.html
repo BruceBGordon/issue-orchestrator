@@ -359,6 +359,25 @@
                 </article>
                 {% endfor %}
             </section>
+            <!-- Tech-lead activity: ADR-0033's LOCAL visibility surface (#6858).
+                 A run's existence and detail live here, on the tool's own
+                 dashboard; only the run's output (its proposals) reaches the
+                 client's GitHub board. Rows are written by
+                 ``updateTechLeadActivityPanel`` from
+                 ``window.dashboardData.techLeadActivity``.
+                 Accessibility: a native <details>/<summary> disclosure (keyboard
+                 reachable, accessible name, expanded state reported without
+                 ARIA) wrapping a real list. Phase is always rendered as text
+                 beside its tone class, so colour is never the only signal, and
+                 refreshes replace only the <ul> rows so an open panel keeps its
+                 state and focus. -->
+            <details class="tech-lead-activity" id="techLeadActivityPanel">
+                <summary class="tla-summary">
+                    Tech lead activity
+                    <span class="tla-count" id="techLeadActivityCount"></span>
+                </summary>
+                <ul class="tla-list" id="techLeadActivityList"></ul>
+            </details>
             {% else %}
             <section class="dashboard-e2e" id="panel-e2e" role="tabpanel" aria-labelledby="tab-e2e" aria-label="E2E dashboard">
                 {% set e2e_vm = e2e_status.view_model if e2e_status and e2e_status.view_model else {} %}

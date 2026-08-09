@@ -13,10 +13,14 @@ about a mock. The clock and the drive loop are injected, so nothing sleeps.
 
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Optional
 
+from issue_orchestrator.control.tech_lead_run_activity import (
+    in_memory_run_activity,
+)
 from issue_orchestrator.control.tech_lead_launch_authority import (
     TechLeadLaunchAuthority,
 )
@@ -74,6 +78,15 @@ class FakeSession:
         self.scratch_worktree = True
         self.worktree_path = Path(f"/tmp/scratch-{issue_number}")
         self.tech_lead_scope = TechLeadLaunchScope(flavor=flavor)
+        # The launch authority opens the run's LOCAL record from these
+        # (ADR-0033 / #6858), so the fake carries the same identity a real
+        # session hands it.
+        self.started_at = datetime(2026, 8, 9, 12, 0, 0)
+        self.run_dir = Path(f"/tmp/scratch-{issue_number}/run")
+        self.run_assets = SimpleNamespace(
+            run_id=f"run-{issue_number}",
+            session_name=f"tech-lead-{issue_number}",
+        )
 
 
 class _State:
@@ -156,6 +169,7 @@ class _Host:
             ),
             events=SimpleNamespace(publish=lambda _e: None),  # type: ignore[arg-type]
             launch=self._start_session,
+            activity=in_memory_run_activity(),
         ).launch(tech_lead)
 
     def _start_session(self, tech_lead: PendingTechLeadReview):

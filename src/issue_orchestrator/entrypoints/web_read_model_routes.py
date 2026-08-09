@@ -20,6 +20,10 @@ from ..ports.provider_resilience import (
     NO_PROVIDER_CIRCUIT_STATUS,
     ProviderCircuitStatusReader,
 )
+from ..ports.tech_lead_run_record_store import (
+    NO_TECH_LEAD_RUN_HISTORY,
+    TechLeadRunHistoryReader,
+)
 from ..view_models.dashboard import build_dashboard_view_model
 from .web_session_context import WebOrchestratorDependency
 from .web_templates import get_templates
@@ -67,10 +71,25 @@ def _provider_circuit_reader(orchestrator: Any) -> ProviderCircuitStatusReader:
     return orchestrator.provider_circuit
 
 
+def _tech_lead_history_reader(orchestrator: Any) -> TechLeadRunHistoryReader:
+    """Resolve the dashboard's local tech-lead run history (ADR-0033 / #6858).
+
+    The same "there is no orchestrator to read" decision the provider-circuit
+    reader makes, made once, in the same place. With no engine there is no
+    local history — and a PRESENT engine always goes through its required
+    facade property, so broken wiring fails loudly instead of rendering an
+    empty panel that looks like a tech lead which has simply never run.
+    """
+    if orchestrator is None:
+        return NO_TECH_LEAD_RUN_HISTORY
+    return orchestrator.tech_lead_run_history
+
+
 def _build_dashboard_vm_sync(orchestrator: Any, queue_page: int, active_tab: str, e2e_page: int):
     return build_dashboard_view_model(
         orchestrator,
         provider_circuit=_provider_circuit_reader(orchestrator),
+        tech_lead_history=_tech_lead_history_reader(orchestrator),
         queue_page=queue_page,
         active_tab=active_tab,
         e2e_page=e2e_page,

@@ -19,6 +19,9 @@ from issue_orchestrator.contracts.public import DashboardDataContract
 from issue_orchestrator.control.provider_resilience import ProviderResilienceManager
 from issue_orchestrator.domain.models import OrchestratorState
 from issue_orchestrator.infra.config import Config, ProviderResilienceConfig
+from issue_orchestrator.ports.tech_lead_run_record_store import (
+    NO_TECH_LEAD_RUN_HISTORY,
+)
 from issue_orchestrator.ports.provider_resilience import (
     NO_PROVIDER_CIRCUIT_STATUS,
     InMemoryProviderCircuitStore,
@@ -209,6 +212,7 @@ def test_dashboard_data_surfaces_open_circuit():
     view_model = build_dashboard_view_model(
         _orchestrator_stub(),
         provider_circuit=_fixed_reader(_open("anthropic", 300, error="overloaded")),
+        tech_lead_history=NO_TECH_LEAD_RUN_HISTORY,
         e2e_status_provider=lambda _: {"enabled": False, "running": False},
     )
 
@@ -241,6 +245,7 @@ def test_dashboard_data_circuit_hidden_for_an_explicitly_empty_reader():
     view_model = build_dashboard_view_model(
         _orchestrator_stub(),
         provider_circuit=NO_PROVIDER_CIRCUIT_STATUS,
+        tech_lead_history=NO_TECH_LEAD_RUN_HISTORY,
         e2e_status_provider=lambda _: {"enabled": False, "running": False},
     )
 
@@ -304,6 +309,7 @@ def test_dashboard_data_circuit_read_failure_surfaces_as_unavailable_not_healthy
     view_model = build_dashboard_view_model(
         _orchestrator_stub(),
         provider_circuit=broken,
+        tech_lead_history=NO_TECH_LEAD_RUN_HISTORY,
         e2e_status_provider=lambda _: {"enabled": False, "running": False},
     )
 

@@ -95,6 +95,44 @@ class TechLeadRunActionsContract(ContractBase):
     needsSettings: bool = False
 
 
+class TechLeadRunActivityEntryContract(ContractBase):
+    """One recorded tech-lead run on the activity panel (ADR-0033 / #6858)."""
+
+    runKey: str
+    # "Health review" | "Batch review" | "Failure investigation".
+    flavorLabel: str
+    # "running" | "completed" | "needs_human" | "failed" | "withdrawn".
+    phase: str
+    # Colour-independent phase text — never colour alone.
+    phaseLabel: str
+    # Semantic styling bucket: "active" | "good" | "warn" | "bad" | "muted".
+    tone: str
+    startedAt: str
+    # "" while the run is still going.
+    endedAt: str = ""
+    # 0 when the run referenced no GitHub object.
+    subjectIssueNumber: int = 0
+    subjectTitle: str = ""
+    detail: str = ""
+    findings: int = 0
+    proposals: int = 0
+    # Drill-down identity for the session-replay surface.
+    runId: str
+    sessionName: str
+
+
+class TechLeadActivityContract(ContractBase):
+    """The local tech-lead run history the dashboard shows (ADR-0033 / #6858).
+
+    Local by design: the run's existence and detail belong on the tool's own
+    dashboard, while only the run's OUTPUT (its proposals) reaches the client's
+    GitHub board.
+    """
+
+    entries: list[TechLeadRunActivityEntryContract] = Field(default_factory=list)
+    emptyMessage: str
+
+
 class DashboardDataContract(ContractBase):
     startupComplete: bool
     paused: bool
@@ -121,6 +159,10 @@ class DashboardDataContract(ContractBase):
     # loudly rather than silently reading as "no tech lead configured" and
     # hiding both dashboard actions.
     techLeadRuns: TechLeadRunActionsContract
+    # ADR-0033's local visibility surface (#6858). Required (no default): the
+    # producer always emits it, and a dropped value must fail the contract
+    # loudly rather than silently reading as "the tech lead has never run".
+    techLeadActivity: TechLeadActivityContract
 
 
 class DashboardViewModelContract(ContractBase):

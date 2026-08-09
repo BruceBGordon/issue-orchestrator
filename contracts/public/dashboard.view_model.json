@@ -86,6 +86,9 @@
           "title": "Startupcomplete",
           "type": "boolean"
         },
+        "techLeadActivity": {
+          "$ref": "#/$defs/TechLeadActivityContract"
+        },
         "techLeadRuns": {
           "$ref": "#/$defs/TechLeadRunActionsContract"
         },
@@ -106,7 +109,8 @@
         "agents",
         "validationConfigured",
         "providerCircuit",
-        "techLeadRuns"
+        "techLeadRuns",
+        "techLeadActivity"
       ],
       "title": "DashboardDataContract",
       "type": "object"
@@ -233,6 +237,28 @@
       "title": "ProviderCircuitStatusContract",
       "type": "object"
     },
+    "TechLeadActivityContract": {
+      "additionalProperties": true,
+      "description": "The local tech-lead run history the dashboard shows (ADR-0033 / #6858).\n\nLocal by design: the run's existence and detail belong on the tool's own\ndashboard, while only the run's OUTPUT (its proposals) reaches the client's\nGitHub board.",
+      "properties": {
+        "emptyMessage": {
+          "title": "Emptymessage",
+          "type": "string"
+        },
+        "entries": {
+          "items": {
+            "$ref": "#/$defs/TechLeadRunActivityEntryContract"
+          },
+          "title": "Entries",
+          "type": "array"
+        }
+      },
+      "required": [
+        "emptyMessage"
+      ],
+      "title": "TechLeadActivityContract",
+      "type": "object"
+    },
     "TechLeadRunActionsContract": {
       "additionalProperties": true,
       "description": "State powering the two scoped tech-lead dashboard actions (#6994).\n\nAdvisory affordance data only. ``POST /api/tech-lead/runs`` re-decides\nadmission server-side on every click, so these flags shape what the operator\nSEES, never what the engine allows.",
@@ -310,6 +336,86 @@
         "globalBarrierActive"
       ],
       "title": "TechLeadRunActionsContract",
+      "type": "object"
+    },
+    "TechLeadRunActivityEntryContract": {
+      "additionalProperties": true,
+      "description": "One recorded tech-lead run on the activity panel (ADR-0033 / #6858).",
+      "properties": {
+        "detail": {
+          "default": "",
+          "title": "Detail",
+          "type": "string"
+        },
+        "endedAt": {
+          "default": "",
+          "title": "Endedat",
+          "type": "string"
+        },
+        "findings": {
+          "default": 0,
+          "title": "Findings",
+          "type": "integer"
+        },
+        "flavorLabel": {
+          "title": "Flavorlabel",
+          "type": "string"
+        },
+        "phase": {
+          "title": "Phase",
+          "type": "string"
+        },
+        "phaseLabel": {
+          "title": "Phaselabel",
+          "type": "string"
+        },
+        "proposals": {
+          "default": 0,
+          "title": "Proposals",
+          "type": "integer"
+        },
+        "runId": {
+          "title": "Runid",
+          "type": "string"
+        },
+        "runKey": {
+          "title": "Runkey",
+          "type": "string"
+        },
+        "sessionName": {
+          "title": "Sessionname",
+          "type": "string"
+        },
+        "startedAt": {
+          "title": "Startedat",
+          "type": "string"
+        },
+        "subjectIssueNumber": {
+          "default": 0,
+          "title": "Subjectissuenumber",
+          "type": "integer"
+        },
+        "subjectTitle": {
+          "default": "",
+          "title": "Subjecttitle",
+          "type": "string"
+        },
+        "tone": {
+          "title": "Tone",
+          "type": "string"
+        }
+      },
+      "required": [
+        "runKey",
+        "flavorLabel",
+        "phase",
+        "phaseLabel",
+        "tone",
+        "startedAt",
+        "runId",
+        "sessionName"
+      ],
+      "title": "TechLeadRunActivityEntryContract",
       "type": "object"
     }
   },

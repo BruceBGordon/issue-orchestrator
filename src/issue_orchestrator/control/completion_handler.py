@@ -19,6 +19,7 @@ if TYPE_CHECKING:
     from ..domain.state_machines.review_machine import ReviewStateMachine
     from ..domain.models import PendingReview, PendingRework, PendingTechLeadReview
     from ..ports.tech_lead_authority import TechLeadAuthorityStore
+    from .tech_lead_run_activity import TechLeadRunActivity
     from ..ports.provider_resilience import ProviderErrorType
     from .open_issue_corpus import OpenIssueCorpusManager
     from .provider_availability import ProviderAvailabilityPolicy
@@ -107,6 +108,7 @@ class CompletionHandler:
         open_issue_corpus: "OpenIssueCorpusManager",
         active_session_run_id: Callable[[int], str | None],
         provider_availability: "ProviderAvailabilityPolicy",
+        tech_lead_run_activity: "TechLeadRunActivity",
         remove_session_machine_fn: Callable[[str], None] | None = None,
         label_manager: "LabelManager | None" = None,
     ):
@@ -118,6 +120,7 @@ class CompletionHandler:
         self._get_review_machine = get_review_machine_fn
         self._session_output = session_output
         self._tech_lead_authority = tech_lead_authority
+        self._tech_lead_run_activity = tech_lead_run_activity
         self._remove_session_machine = remove_session_machine_fn
         if label_manager is None:
             from .label_manager import LabelManager
@@ -301,6 +304,13 @@ class CompletionHandler:
         discard_tech_lead_authority_after_completion(
             self.config, self._tech_lead_authority, session,
             processing_errors=processing_errors,
+        )
+        # ADR-0033 (#6858): the same terminal seam closes the run's LOCAL
+        # record. Beside the retention owner deliberately — the row that stops
+        # being authority and the row that becomes history are the same event,
+        # so a status that reaches one always reaches the other.
+        self._tech_lead_run_activity.note_concluded(
+            self.config, session, status, processing_errors=processing_errors,
         )
 
         result = CompletionResult(

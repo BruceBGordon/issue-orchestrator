@@ -16,6 +16,7 @@ from ..control.label_manager import LabelManager
 from ..infra.audit import get_issue_dependencies
 from ..infra import gh_audit
 from ..ports.provider_resilience import ProviderCircuitStatusReader
+from ..ports.tech_lead_run_record_store import TechLeadRunHistoryReader
 from .dependency_gate import (
     stack_chip,
     stack_chip_payload,
@@ -26,6 +27,7 @@ from .dependency_gate import (
 from .issue_card_labels import blocked_summary, display_labels as _display_labels
 from .issue_card_labels import provider_badge, provider_badge_payload, provider_signal
 from .provider_circuit import ProviderCircuitStatusView, read_provider_circuit_status
+from .tech_lead_activity import TechLeadActivityView, read_tech_lead_activity
 from .tech_lead_run_actions import TechLeadRunActionsView, read_tech_lead_run_actions
 from .dashboard_e2e import E2E_PAGE_SIZE
 from .dashboard_e2e import build_e2e_items
@@ -102,6 +104,9 @@ class DashboardViewModel:
 
     provider_circuit: ProviderCircuitStatusView
     tech_lead_runs: TechLeadRunActionsView
+    # ADR-0033 (#6858): what the tech lead has already DONE, local to this
+    # engine — the counterpart to ``tech_lead_runs``, which is what it can do.
+    tech_lead_activity: TechLeadActivityView
 
     def template_context(self) -> dict[str, Any]:
         return {
@@ -169,6 +174,7 @@ class DashboardViewModel:
             "githubUsage": github_usage,
             "providerCircuit": self.provider_circuit.model_dump(mode="json"),
             "techLeadRuns": self.tech_lead_runs.model_dump(mode="json", by_alias=True),
+            "techLeadActivity": self.tech_lead_activity.model_dump(mode="json", by_alias=True),
             "fetchLayerVisibilityAwareEnabled": self.scope_summary.get("refresh", {}).get("visibilityAwareEnabled", False),
             "fetchLayerSelectiveSyncPlannerEnabled": self.scope_summary.get("refresh", {}).get("selectiveSyncPlannerEnabled", False),
         }
@@ -1176,6 +1182,7 @@ def build_dashboard_view_model(
     orchestrator,
     *,
     provider_circuit: ProviderCircuitStatusReader,
+    tech_lead_history: TechLeadRunHistoryReader,
     queue_page: int = 1,
     active_tab: str = "kanban",
     e2e_page: int = 1,
@@ -1448,4 +1455,5 @@ def build_dashboard_view_model(
         agent_names=list(agents.keys()) if agents else [],
         provider_circuit=read_provider_circuit_status(provider_circuit),
         tech_lead_runs=read_tech_lead_run_actions(config, state),
+        tech_lead_activity=read_tech_lead_activity(tech_lead_history),
     )

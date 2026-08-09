@@ -560,6 +560,7 @@ def orchestrator_launch_tech_lead_run(
         is_blocking_any=LabelManager(orchestrator.config).is_blocking_any,
         events=deps.events,  # type: ignore[attr-defined]
         launch=orchestrator.launch_queued_tech_lead_session,
+        activity=deps.tech_lead_run_activity,  # type: ignore[attr-defined]
     ).launch(tech_lead)
 
 

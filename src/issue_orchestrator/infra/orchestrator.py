@@ -85,6 +85,7 @@ from ..control.issue_fetch_resilience import (
 )
 from ..ports import TraceEvent, RepositoryHost, SessionRunner
 from ..ports.provider_resilience import ProviderCircuitStatusReader
+from ..ports.tech_lead_run_record_store import TechLeadRunHistoryReader
 from ..ports.repository_host import RepositoryHostError
 from .startup_errors import StartupError, write_startup_failure
 from ..control.health_gate import HealthDecision
@@ -161,6 +162,17 @@ class Orchestrator:
         ``deps``, and a composition error cannot degrade into "no outage".
         """
         return self.deps.provider_resilience
+
+    @property
+    def tech_lead_run_history(self) -> "TechLeadRunHistoryReader":
+        """Access the LOCAL tech-lead run history (ADR-0033 / #6858).
+
+        Required for the same reason ``provider_circuit`` is: the dashboard's
+        activity projection depends on the read-only port, never on ``deps``,
+        so a composition error surfaces as a hard failure rather than as an
+        engine that looks like it has simply never run the tech lead.
+        """
+        return self.deps.tech_lead_run_activity
 
     @property
     def shutdown_requested(self) -> bool:

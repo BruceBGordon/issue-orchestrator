@@ -78,13 +78,32 @@ coordination requires a *shared* (i.e. GitHub) point.
   folding failure-investigation into the unified run model; a footprint config
   knob.
 
+## Implementation status
+
+- **Shared coordination — done (#6994).** `TechLeadRunLedgerStore` is the
+  minimal shared mechanism: one compare-and-swap ledger cell, not an issue per
+  run. `TechLeadRunOwnership` applies claim + lease + stale detection, and
+  `TechLeadLaunchAuthority` is the single gate a session may start behind. The
+  three flavors are unified under one run model whose scopes
+  (`GlobalHealthReviewScope`, `GlobalBatchReviewScope`,
+  `IssueInvestigationScope`) *reference* their subject.
+- **Local visibility — done (#6858).** `TechLeadRunRecord` is the run as the
+  winning engine remembers it: scope, phase, what it produced, and the session
+  run identity a replay drill-down needs. It is opened by the launch authority,
+  concluded at completion finalization beside the launch-authority retention
+  owner, and stored in its own SQLite file (`tech_lead_runs.sqlite`) —
+  deliberately not in the authority store, whose rows are load-bearing and
+  deleted at each run's terminal. `TechLeadActivityView` projects it onto the
+  dashboard's "Tech lead activity" panel. Writes are best-effort by contract:
+  the run's product is its proposals, and losing the receipt must never lose
+  the run.
+
 ## Open questions
 
-- **Minimal coordination mechanism**: one long-lived reused "tech-lead
-  coordination" object, a claim label, or a lock — whichever coordinates across
-  instances with the least board footprint.
-- Where the local run-record lives (a local store + dashboard multi-source
-  rendering).
+- **Footprint config knob.** The whole-repository anchor issue is still a real
+  GitHub object. Now that the run record exists, the anchor's remaining job is
+  coordination — which the ledger already does — so retiring it (or making it
+  config-opt-in, per the decision above) is the next step. Tracked separately.
 
 ## Alternatives considered
 

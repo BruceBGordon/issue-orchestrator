@@ -19,9 +19,14 @@ a tick that is a function call rather than a thread.
 
 from __future__ import annotations
 
+from datetime import datetime
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Optional
 
+from issue_orchestrator.control.tech_lead_run_activity import (
+    in_memory_run_activity,
+)
 from issue_orchestrator.control.tech_lead_launch_authority import (
     TechLeadLaunchAuthority,
 )
@@ -73,6 +78,14 @@ class FakeSession:
         self.agent_label = TECH_LEAD_AGENT
         self.terminal_id = f"tech-lead-{issue_number}"
         self.tech_lead_scope = TechLeadLaunchScope(flavor=flavor)
+        # The launch authority opens the run's LOCAL record from these
+        # (ADR-0033 / #6858).
+        self.started_at = datetime(2026, 8, 9, 12, 0, 0)
+        self.run_dir = Path(f"/tmp/run-{issue_number}")
+        self.run_assets = SimpleNamespace(
+            run_id=f"run-{issue_number}",
+            session_name=f"tech-lead-{issue_number}",
+        )
 
 
 def _anchor(number: int, flavor: TechLeadSessionFlavor) -> PendingTechLeadReview:
@@ -173,6 +186,7 @@ class _Engine:
             ),
             events=SimpleNamespace(publish=lambda _e: None),  # type: ignore[arg-type]
             launch=self._start,
+            activity=in_memory_run_activity(),
         )
 
     def _start(self, tech_lead: PendingTechLeadReview):

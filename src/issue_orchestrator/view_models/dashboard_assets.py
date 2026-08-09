@@ -60,6 +60,11 @@ DASHBOARD_JS_CHUNKS: tuple[str, ...] = (
     # "Run board health review" and the blocked-item "Investigate with tech
     # lead". Loaded after ``issue_menus.js`` so the context-menu wiring exists.
     "tech_lead_runs.js",
+    # ``tech_lead_activity.js`` renders the local tech-lead run history panel
+    # (ADR-0033 / #6858) from ``window.dashboardData.techLeadActivity``. Loaded
+    # after ``core.js`` (``escapeHtml`` / ``escapeAttr``) and after
+    # ``timestamp_formatting.js`` (``formatTimestamp``).
+    "tech_lead_activity.js",
     "e2e_runtime.js",
     "e2e_triage.js",
     # ``e2e_canonical_payload.js`` provides the pure translator from

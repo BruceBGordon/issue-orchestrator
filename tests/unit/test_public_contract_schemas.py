@@ -66,6 +66,10 @@ def _dashboard_data_payload(**overrides: object) -> dict[str, object]:
             "runningIssueNumbers": [],
             "globalBarrierActive": False,
         },
+        "techLeadActivity": {
+            "entries": [],
+            "emptyMessage": "No tech-lead runs recorded yet.",
+        },
     }
     payload.update(overrides)
     return payload

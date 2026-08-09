@@ -16,6 +16,7 @@ from ..execution.review_artifact_reader import ManifestReviewArtifactReader
 from ..execution.session_output_adapter import FileSystemSessionOutput
 from ..infra import runtime_identity
 from ..control.completion_ports import LabelAdapter, PRAdapter
+from ..control.tech_lead_run_activity import optional_run_activity
 from ..infra.config import Config
 from ..ports import EventSink
 
@@ -39,6 +40,7 @@ if TYPE_CHECKING:
     from ..execution.persistent_exchange_pair_registry_inmemory import (
         InMemoryPersistentExchangePairRegistry,
     )
+    from ..control.tech_lead_run_activity import TechLeadRunActivity
     from ..ports.tech_lead_authority import TechLeadAuthorityStore
 
 
@@ -93,6 +95,9 @@ def create_completion_components(
     attempt_store: "AttemptStore | None" = None,
     turn_mailbox: "TurnMailbox | None" = None,
     tech_lead_authority: "TechLeadAuthorityStore | None" = None,
+    # ADR-0033's local run history (#6858). Optional at this seam only because
+    # every collaborator here is: the composition root always supplies one.
+    tech_lead_run_activity: "TechLeadRunActivity | None" = None,
     open_issue_corpus: "OpenIssueCorpusManager | None" = None,
     # The completion handler needs a full repository host; ``github`` above is
     # only guaranteed to satisfy the narrower label/PR completion port, so the
@@ -205,6 +210,7 @@ def create_completion_components(
             repository_host=repository_host,
             session_output=session_output,
             tech_lead_authority=tech_lead_authority,
+            tech_lead_run_activity=optional_run_activity(tech_lead_run_activity),
             open_issue_corpus=open_issue_corpus,
             label_manager=label_manager,
             provider_resilience=provider_resilience,
@@ -229,6 +235,7 @@ def build_completion_handler_factory(
     repository_host: "RepositoryHost",
     session_output: "SessionOutput",
     tech_lead_authority: "TechLeadAuthorityStore",
+    tech_lead_run_activity: "TechLeadRunActivity",
     open_issue_corpus: "OpenIssueCorpusManager",
     label_manager: "LabelManager",
     provider_resilience: ProviderResilienceManager,
@@ -263,6 +270,7 @@ def build_completion_handler_factory(
             open_issue_corpus,
             lambda n: active_session_run_id(active_sessions(), n),
             provider_availability,
+            tech_lead_run_activity,
             remove_session_machine_fn=state_machines.remove_session_machine,
             label_manager=label_manager,
         )
