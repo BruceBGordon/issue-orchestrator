@@ -550,7 +550,11 @@ case that made clamping look necessary — an operator abandoning work while new
 evidence sat attached — is closed at the other end instead.
 
 **`abandon()` refuses while unresolved attached evidence exists.** It returns
-`ATTACHED_EVIDENCE_PENDING` with zero effect and names the waiting evidence ids. The
+`AbandonValidatedWorkOutcome(status=ATTACHED_EVIDENCE_PENDING, ...)` with zero
+effect, naming the waiting evidence ids in `pending_evidence_ids` — and the same
+condition makes `can_abandon` false on the snapshot, with
+`abandon_unavailable = ATTACHED_EVIDENCE_PENDING`, so the UI never offers an action
+the owner is specified to refuse. The
 reason is that abandonment is an operator accepting a loss, and accepting a loss
 requires seeing what is being lost: attached evidence may be a *better* capture of
 the same work — one that would have published — and it has not yet been considered
@@ -919,6 +923,30 @@ class ValidatedWorkDisposition:
             raise ValueError("only ABANDONED carries an OperatorResolution")
 
 
+class AbandonStatus(StrEnum):
+    """Total. Every abandon() call ends on exactly one of these."""
+    ABANDONED                 = "abandoned"
+    NO_SUCH_RECORD            = "no_such_record"
+    ALREADY_RESOLVED          = "already_resolved"       # RECOVERED or ABANDONED
+    REFUSED_STATE             = "refused_state"          # QUEUED / PUBLISHING: stop it first
+    ATTACHED_EVIDENCE_PENDING = "attached_evidence_pending"
+
+
+@dataclass(frozen=True, slots=True)
+class AbandonValidatedWorkOutcome:
+    """Typed result, because a refusal has to carry its reason to the UI.
+
+    Returning a bare `ValidatedWorkDisposition` gave callers no way to tell
+    success from refusal except by re-reading state or parsing an exception,
+    and no carrier at all for the evidence ids an
+    `ATTACHED_EVIDENCE_PENDING` refusal must name.
+    """
+    status: AbandonStatus
+    disposition: ValidatedWorkDisposition | None   # set iff ABANDONED
+    pending_evidence_ids: tuple[str, ...]          # non-empty iff ATTACHED_EVIDENCE_PENDING
+    message: str
+
+
 @dataclass(frozen=True, slots=True)
 class ValidatedWorkDispositionBatch:
     """EVERY disposition one termination produced. One per distinct ValidatedWorkKey.
@@ -993,7 +1021,8 @@ class ValidatedWorkSnapshot:
     finalization_phase: FinalizationPhase      # §4.5b; where a resumed finalize restarts
     updated_at: str
     can_recover: bool                 # PARKED, or FAILED after the condition is fixed
-    can_abandon: bool                 # PARKED/FAILED only — never QUEUED/PUBLISHING
+    can_abandon: bool                 # PARKED/FAILED **and** no unresolved attached evidence
+    abandon_unavailable: AbandonStatus | None   # why not, when can_abandon is false
 ```
 
 ### 2.3 Ports
@@ -1033,7 +1062,7 @@ class ValidatedWorkDispositionOwner(Protocol):
 
     def abandon(
         self, issue_number: int, evidence_id: str, resolution: OperatorResolution
-    ) -> ValidatedWorkDisposition: ...
+    ) -> AbandonValidatedWorkOutcome: ...
     """Operator explicitly accepts the loss: UNRESOLVED -> ABANDONED.
 
     The single modeled route out of FAILED/PARKED without a recovery.
@@ -1514,6 +1543,9 @@ CREATE TABLE IF NOT EXISTS validated_work_records (
     owner_claim_hash      TEXT NOT NULL DEFAULT '',   -- sha256 of the claim secret
     owner_instance_id     TEXT NOT NULL DEFAULT '',   -- repo-lock instance, for the death proof
     owner_claimed_at      TEXT NOT NULL DEFAULT '',   -- diagnostics/UI only, never authority
+    stop_reserved_fence   INTEGER NOT NULL DEFAULT -1, -- §8.4; -1 = no reservation
+    stop_reserved_engine  TEXT NOT NULL DEFAULT '',    -- the engine the stop targets
+    stop_reserved_at      TEXT NOT NULL DEFAULT '',
     state                 TEXT NOT NULL,              -- ValidatedWorkState
     failure               TEXT NOT NULL DEFAULT '',   -- ValidatedWorkFailure
     reason                TEXT NOT NULL DEFAULT '',
@@ -1547,7 +1579,11 @@ CREATE TABLE IF NOT EXISTS validated_work_evidence (
     -- The disposition THIS evidence was admitted with (§5). Durable because an
     -- attached row may be promoted long after capture, and promoting it as QUEUED
     -- when it was captured PARKED would auto-publish approval-required work.
-    initial_state         TEXT NOT NULL,              -- ValidatedWorkState: QUEUED or PARKED
+    -- QUEUED, PARKED **or FAILED**: §5 admits evidence FAILED for
+    -- VALIDATION_SHA_MISMATCH and ARTIFACT_*, and that verdict is as durable as
+    -- the others. Restricting the column to two states would force a promotion
+    -- to invent a third answer.
+    initial_state         TEXT NOT NULL,              -- ValidatedWorkState (any admitted state)
     initial_failure       TEXT NOT NULL DEFAULT '',   -- ValidatedWorkFailure, e.g. WORKTREE_AHEAD_OF_VALIDATION
     initial_reason        TEXT NOT NULL DEFAULT '',
     admitted_at           TEXT NOT NULL,
@@ -2482,7 +2518,12 @@ def relinquish_claim(self, claim: ValidatedWorkClaim) -> bool: ...
     """Called BY THE OWNER at a stage boundary — graceful shutdown, or a drain
     that finished a tick — so nothing can be in flight. Clears the owner and
     bumps the fence, letting the next drain proceed without waiting for a death
-    proof. There is no counterpart that takes a claim from someone else."""
+    proof. There is no counterpart that takes a claim from someone else.
+
+    Returns False (`STOP_RESERVED`) while a §8.4 stop reservation is live for
+    this fence: an operator is stopping this engine *because* it owns this
+    record, and letting it hand the claim off mid-flight would make that stop
+    hit an engine that no longer owns it."""
 
 def begin_publish_attempt(
     self,
@@ -3427,8 +3468,9 @@ per the `schema-updates` skill.
   whose items carry `state`, `unresolved`, `worktree_head_sha`, `failure`,
   `escrow_retained`, `lineage_role` (so an ancestor parked behind a descendant reads
   as *waiting*, not *stuck*), `publish_attempts`, `finalization_phase`, the
-  available operator actions (`recover`, and `abandon` for a `PARKED`/`FAILED`
-  record), **and a nested `authority` object carrying every field of
+  available operator actions (`recover`, and `abandon` **only when `can_abandon`**,
+  with `abandon_unavailable` carrying the typed reason otherwise), **and a nested
+  `authority` object carrying every field of
   `ValidatedWorkAuthoritySnapshot` verbatim**: `record_id`, `evidence_id`,
   `observation_revision`, `validated_head_sha`, `branch_name`, `repo_slug`,
   `issue_number`, `pr_number`, `expected_remote_head_sha`.
@@ -3542,11 +3584,26 @@ class StopEngineCommand:
 
 
 class StopEngineStatus(StrEnum):
-    STOPPED_GRACEFULLY = "stopped_gracefully"   # it honoured the shutdown request
-    STOPPED_FORCIBLY   = "stopped_forcibly"     # graceful timed out; force applied
-    NOT_RUNNING        = "not_running"          # nothing to stop; gate already free
-    REMOTE_HOST        = "remote_host"          # refused: not ours to stop
-    FAILED             = "failed"
+    """Only distinctions the underlying port can actually prove.
+
+    An earlier draft promised STOPPED_GRACEFULLY / STOPPED_FORCIBLY /
+    NOT_RUNNING as separate outcomes. `SupervisorOps.stop()` returns a bare
+    `bool` (`infra/supervisor.py:824-835`), and `InterruptibleStopController`
+    returns the same `True` for a graceful exit and a successful force
+    (`infra/shutdown_timing.py:148-168`) — as it does for a missing lock file
+    and for a stale lock it cleaned up. Those four facts are collapsed before
+    any adapter can see them, so a lifecycle owner claiming to distinguish
+    them would be inventing knowledge its port does not have.
+
+    Enriching `SupervisorOps` to preserve them is a change to a shipped port
+    with many callers, and is out of scope here for the same reason the stop
+    consolidation is. The distinction this contract actually needs is the one
+    `bool` does prove: is the engine still running? If it is not, its gate is
+    released and the claim is takeable, which is the entire point.
+    """
+    STOPPED     = "stopped"      # no longer running: gracefully, forcibly, or already gone
+    REMOTE_HOST = "remote_host"  # refused before calling: not ours to stop
+    FAILED      = "failed"       # the supervisor could not stop it; still running
 
 
 @dataclass(frozen=True, slots=True)
@@ -3557,7 +3614,8 @@ class StopEngineOutcome:
 
 
 class RepositoryEngineLifecycle(Protocol):
-    """The named boundary every engine stop goes through, new and existing."""
+    """The targeted-stop boundary this design adds. Not a universal one:
+    the pre-existing stop surfaces are untouched (see the scope note below)."""
     def stop_engine(self, command: StopEngineCommand) -> StopEngineOutcome: ...
     def engines(self) -> tuple[EngineIdentity, ...]: ...
 ```
@@ -3584,10 +3642,12 @@ its `flock` released by the kernel, which is what makes death provable (§4.4e).
 `ENGINE_STOP_GRACEFUL_TIMEOUT_SECONDS` is a module constant, not a setting, for the
 same reason `PUBLISH_ATTEMPT_LIMIT` is.
 
-Outcome mapping is total: the graceful request succeeding is `STOPPED_GRACEFULLY`,
-the force path completing after the timeout is `STOPPED_FORCIBLY`, a missing or
-already-dead holder is `NOT_RUNNING` (the claim is takeable either way), and
-anything else is `FAILED` with the message preserved.
+Outcome mapping is total over what the port returns: `True` ⇒ `STOPPED` (the engine
+is not running, whether it exited gracefully, was forced, or was already gone — in
+every case its gate is released and the claim is takeable), `False` ⇒ `FAILED` with
+the supervisor's message preserved, and a non-local target is refused as
+`REMOTE_HOST` before any call. `StopOwnerStatus` drops `ALREADY_STOPPED` for the
+same reason: it was a distinction this stack cannot make.
 
 The operator confirmation must say what will happen in those words: that the engine
 will be asked to shut down, that it will be **forcibly terminated** if it has not
@@ -3640,8 +3700,7 @@ class StopValidatedWorkOwnerCommand:
 
 class StopOwnerStatus(StrEnum):
     """Total. Every dispatch ends on exactly one of these."""
-    STOPPED           = "stopped"          # the owning engine was stopped
-    ALREADY_STOPPED   = "already_stopped"  # it was not running; claim is now takeable
+    STOPPED           = "stopped"          # the engine is no longer running
     NO_SUCH_RECORD    = "no_such_record"   # record_id resolves to nothing
     NOT_OWNED         = "not_owned"        # the record has no claim holder now
     OWNER_CHANGED     = "owner_changed"    # someone else holds it; re-render
@@ -3663,12 +3722,76 @@ class ValidatedWorkOwnerStopCoordinator(Protocol):
     ) -> StopOwnerOutcome: ...
 ```
 
-The coordinator re-reads the record's current owner, refuses on **any** mismatch or
-a non-local target with zero effect, and only on an exact match delegates a plain
+The coordinator matches the record's current owner, refuses on **any** mismatch or a
+non-local target with zero effect, and only on an exact match delegates a plain
 `StopEngineCommand` to `RepositoryEngineLifecycle`. Three boundaries stay intact:
 the disposition owner remains read-only with respect to engine lifecycle, the engine
 owner remains ignorant of validated work, and the route dispatches a typed command
 instead of implementing policy.
+
+#### A read-then-stop is not a guard: the reservation interlock
+
+Matching a snapshot and *then* calling the supervisor does not make the promise
+true, it only narrows the window. This execution is legal under the rest of this
+contract:
+
+1. the coordinator reads record `R`, owned by engine `A`, and matches the rendered `A`;
+2. `A` reaches a stage boundary and calls `relinquish_claim()` (§4.4e) — it stays
+   alive and keeps doing unrelated work;
+3. engine `B` acquires `R`;
+4. the coordinator stops `A`, halting all of `A`'s work although `A` no longer owns `R`.
+
+Zero-effect-on-mismatch has to hold at the **effect point**, not at the read. So the
+guard is a durable, store-owned reservation, and it is owned by the disposition
+store because the claim is:
+
+```python
+def reserve_owner_stop(
+    self, record_id: str, expected_engine: EngineIdentity
+) -> StopReservation | StopReservationRefusal: ...
+    """CAS: the record's owner must BE `expected_engine` at this instant.
+
+    One transaction: compare the recorded owner (host, instance_id, repo_root)
+    and `owner_fence`; on a match, record a reservation bound to that fence and
+    return it. Refuses `NOT_OWNED` / `OWNER_CHANGED` with no writes.
+    """
+
+def release_owner_stop(self, reservation: StopReservation) -> None: ...
+    """Always called, in a `finally`. Clears the reservation."""
+```
+
+**What the reservation blocks is exactly one thing: `relinquish_claim()`.** While a
+reservation is live for the current fence, relinquish returns `STOP_RESERVED` and
+the owner keeps its claim. That closes the race completely, because relinquish is
+the *only* way a live engine loses a claim — the other way is death, and stopping an
+already-dead engine is the harmless `STOPPED` outcome the operator asked for.
+Acquisition needs no separate block: `B` can only acquire when the record is
+unowned or `A` is provably dead, and neither can happen while `A` is alive and
+holding.
+
+So the coordinator's sequence is reserve → stop → release, and every refusal path
+happens before any external call:
+
+```python
+reservation = store.reserve_owner_stop(record_id, expected_engine)   # CAS
+if isinstance(reservation, StopReservationRefusal):
+    return StopOwnerOutcome(...)              # zero supervisor calls
+try:
+    outcome = lifecycle.stop_engine(StopEngineCommand(...))
+finally:
+    store.release_owner_stop(reservation)
+```
+
+**A leaked reservation costs a graceful hand-back, never correctness or data.** If
+the Control Center dies between reserve and release, `A` cannot relinquish — so it
+keeps the claim until it dies, which is precisely the behaviour of any record whose
+owner never relinquishes. Ownership still transfers on death, escrow is still
+retained, the record is still unresolved and still blocks reset. Nothing new can
+wedge, and no timer is introduced to "expire" the reservation. The one cleanup is
+free and provable: a reservation is bound to the `owner_fence` it was taken at, so
+any fence change (the owner died and a successor took over) invalidates it, and
+`reserve_owner_stop` refuses while a reservation exists for a different engine or
+fence.
 
 **The re-read needs an exact record lookup.** `snapshot(issue_number)` is the wrong
 shape here: `record_id` is a canonical hash (§2.1.1), so a coordinator holding only
@@ -3740,7 +3863,7 @@ it already resolves per-instance status — and that row is addressable:
 
 | Step | Surface | What it carries |
 |---|---|---|
-| 1 | Issue detail (served by the engine) | renders the `ClaimOwnerFact` as text — "Owned by engine `<label>` (`Running`)" — and a **link**, never a control, to the Control Center: `{control_center_origin}/?repo={repo_key}&engine={instance_key}&stop_owner_of={record_id}` |
+| 1 | Issue detail (served by the engine) | renders the `ClaimOwnerFact` as text — "Owned by engine `<label>` (`Running`)" — and a **link**, never a control, to the Control Center: `{cc_origin}/?repo={repo_key}&engine={instance_key}&stop_owner_of={record_id}`, where `cc_origin` is the embed-context parameter below — rendered as plain text with no anchor when it is absent |
 | 2 | Control Center repository card | with that context, expands the named engine row and renders the native **`Stop engine`** button (accessible name includes the engine label) beside a summary of the record it would unblock. Without the context the card is unchanged |
 | 3 | POST | `POST /api/control-center/repositories/{repo_key}/engines/{instance_key}/stop-validated-work-owner`, body `{record_id, engine: {repo_root, instance_id, host, label}, reason}` — the engine object echoed **verbatim** from what step 2 rendered, exactly as §4.3 check 0's authority snapshot is echoed |
 | 4 | Handler | builds `StopValidatedWorkOwnerCommand` from the body **and the route**, checks they agree (below), and dispatches to the coordinator; it re-derives nothing and decides nothing |
@@ -3763,14 +3886,29 @@ Any disagreement is a typed refusal with zero effect: `REPO_MISMATCH` for 1–3,
 `OWNER_CHANGED` for 4. A duplicated path value that contradicts the body is
 therefore a refusal, not an ignored field.
 
-**Navigation works from both places the issue detail is rendered.** Embedded in the
-Control Center shell, the link resolves against the shell's own origin and the card
-is already in the DOM. Opened standalone against the Repository Engine, the engine
-does not guess: the Control Center origin is a **configured value** the engine
-already needs for its shell integration, and when it is absent the issue detail
-renders the owner fact and the record id as text with an explicit "open the Control
-Center for this repository to stop engine `<label>`" instruction rather than a dead
-link. A link that cannot be built is never rendered as one.
+**The origin is supplied by the shell and preserved by embedded navigation.** There
+is no `control_center_origin` setting today and this design does not add one: a new
+top-level config surface for a value the shell already knows would be a worse
+answer than passing it, and the engine has no way to discover it on its own.
+Instead it rides the mechanism that already exists for exactly this purpose.
+
+The Control Center shell builds repository dashboard URLs and stamps its embed
+context onto them — today `embedded` and `theme`
+(`static/js/control_center.js:901-906`) — and `embedded_nav.js` preserves that
+context across in-dashboard navigation from a single frozen list,
+`EMBEDDED_CONTEXT_PARAMS` (`static/js/embedded_nav.js:31-43`). This design adds one
+member, `cc_origin`, to **both** places: the shell stamps its own origin, and
+embedded navigation carries it just like `theme`. One list, one rule, no new
+configuration surface, and the link builder reads it from the same place every other
+embed-context consumer does.
+
+Three cases, all specified:
+
+| Context | Behaviour |
+|---|---|
+| Embedded in the shell | `cc_origin` is present; the link is built against it, and the target card is already in the shell |
+| Standalone **with** `cc_origin` (navigated from an embedded session, or supplied explicitly) | same link, opened against that origin |
+| Standalone **without** `cc_origin` | the issue detail renders the owner fact and the record id as **text**, with an explicit "open the Control Center for this repository to stop engine `<label>`" instruction. A link that cannot be built is never rendered as one — no dead href, no guessed origin |
 
 The endpoint is registered in the UI OpenAPI contract per the `ui-openapi` skill
 with a required request body and the typed `StopOwnerOutcome` as its response, and
@@ -3926,14 +4064,16 @@ sweeps above:
 | §4.4e liveness matrix | One deterministic case per row, driven against real gate files: (1) self ⇒ False; (2) different host ⇒ False, with no filesystem access to that host attempted; (3) **same-instance restart** ⇒ True with **no probe issued** — asserted by a gate double that fails the test if the held gate is reopened, since probing it would self-conflict and strand the record forever; (4) single-instance current vs any other owner ⇒ True; (5) named current vs a former single-instance owner ⇒ True; (6) named current vs a *different* live named instance ⇒ False by non-blocking probe, and ⇒ True once that instance's gate is released, with the probe asserted not to disturb the live holder. |
 | §4.4e relinquish | `relinquish_claim()` is callable only by the owner at a stage boundary, clears ownership and bumps the fence, and lets the next drain proceed with no death proof. There is **no** operation that takes a claim from a live owner — asserted by the absence of such a method on the port and by a guardrail. |
 | §8.4 stop engine (producer) | Snapshot → rendered context → guarded request, both hops: the issue detail renders the `ClaimOwnerFact` as text plus a **link carrying `stop_owner_of={record_id}`** and asserts **no engine control in the issue view**; the engine surface with that context renders the native `Stop engine` button and posts a body whose `engine` object is byte-for-field what it rendered. Without the context, the engine surface's ordinary controls are unchanged. |
-| §8.4 stop engine (handler) | Guarded request → coordinator → lifecycle: an exact match reaches `Supervisor.stop(repo_root=<that repo>, instance_id=<that instance>, force=False, graceful_timeout_seconds=…, force_if_graceful_fails=True)` — asserted for a **named** instance in a multi-instance repository (where the repository-scoped route would stop the wrong engine) **and** for the single-instance engine addressed as `default`. One case per `StopOwnerStatus` member, derived from the enum: `NO_SUCH_RECORD`, `NOT_OWNED`, `OWNER_CHANGED`, `REPO_MISMATCH`, `REMOTE_HOST`, `ALREADY_STOPPED`, `STOP_FAILED` — every refusal with **zero** supervisor calls. |
-| §8.4 stop policy | One case per `StopEngineStatus`: a graceful stop honoured within the timeout ⇒ `STOPPED_GRACEFULLY`; an engine that ignores the graceful request ⇒ force applied **after** the stated timeout ⇒ `STOPPED_FORCIBLY`; no live holder ⇒ `NOT_RUNNING`; supervisor failure ⇒ `FAILED`. The timeout and force flag are asserted to be the command's values, **not** `SupervisorOps` defaults — a call that omitted them would silently force-kill on an unstated timeout. The confirmation text is asserted to state graceful-then-force and the engine-wide scope. |
+| §8.4 stop engine (handler) | Guarded request → coordinator → lifecycle: an exact match reaches `Supervisor.stop(repo_root=<that repo>, instance_id=<that instance>, force=False, graceful_timeout_seconds=…, force_if_graceful_fails=True)` — asserted for a **named** instance in a multi-instance repository (where the repository-scoped route would stop the wrong engine) **and** for the single-instance engine addressed as `default`. One case per `StopOwnerStatus` member, derived from the enum: `NO_SUCH_RECORD`, `NOT_OWNED`, `OWNER_CHANGED`, `REPO_MISMATCH`, `REMOTE_HOST`, `STOP_FAILED` — every refusal with **zero** supervisor calls. |
+| §8.4 reservation | **The race is closed at the effect point, not the read.** Pause the coordinator after `reserve_owner_stop()` succeeds and attempt to move the claim: the owner's `relinquish_claim()` returns `STOP_RESERVED` and keeps the claim, no successor can acquire, and the subsequent stop therefore targets an engine that still owns the record. Then run the mirror case — pause **before** the reservation, move the claim, and assert `reserve_owner_stop()` refuses `OWNER_CHANGED` with **zero** supervisor calls. |
+| §8.4 reservation | Cleanup on every path: `release_owner_stop()` runs in a `finally` for `STOPPED`, `FAILED` and every refusal, and a reservation left behind by a killed coordinator is invalidated by the next `owner_fence` change. Assert a leaked reservation never blocks acquisition after the owner dies, and that `reserve_owner_stop()` refuses while a reservation exists for a different engine or fence. |
+| §8.4 stop policy | One case per `StopEngineStatus` at the port boundary: the supervisor reporting the engine stopped ⇒ `STOPPED` (driven for a graceful exit, a force-after-timeout, and an already-gone holder, all of which the port collapses to `True` — the test asserts they map to one status rather than pretending to tell them apart); the supervisor failing ⇒ `FAILED`; a non-local target ⇒ `REMOTE_HOST` with no call. The timeout and force flag are asserted to be the **command's** values, not `SupervisorOps` defaults — a call that omitted them would silently force-kill on an unstated timeout. The confirmation text is asserted to state graceful-then-force and the engine-wide scope. |
 | §8.4 stop engine (wedged) | **The Control Center command succeeds while the owning Repository Engine is unresponsive.** The engine process is modelled as alive but not serving HTTP; the coordinator still reads the record through `SqliteValidatedWorkRecordReader` against the repository's own state file, the lifecycle owner still stops it via the supervisor, and the record becomes takeable. This is the regression for hosting the escape hatch inside the process it must escape. |
 | §8.4 stop engine (identity) | All four identities must agree: route (`repo_key`/`instance_key`), rendered body engine, record repository, and current claim owner. A body whose engine contradicts the path is `REPO_MISMATCH` with zero effect — the duplicated path value is checked, not ignored — and `instance_key` round-trips `default` ↔ `None` through the one shared encoder used by both the link builder and the route parser. |
-| §8.4 stop engine (navigation) | Embedded and standalone issue detail both produce a working path: embedded resolves against the shell origin; standalone uses the configured Control Center origin; with that origin unset, the issue detail renders the owner fact and record id as **text with instructions and no link**, asserted never to emit a dead href. |
+| §8.4 stop engine (navigation) | All three context cases: embedded (with `cc_origin` stamped by the shell), standalone carrying `cc_origin`, and standalone without it — the last asserted to render **text with instructions and no anchor at all**, never a dead href. Plus the transport itself: `cc_origin` is in `EMBEDDED_CONTEXT_PARAMS` and is stamped by the shell's URL builder, asserted by navigating two hops inside the dashboard and finding it preserved alongside `theme`. |
 | §8.4 stop engine (transport) | The endpoint is registered in the UI OpenAPI contract with its required body and typed response; it uses the shared browser-session auth helper (CSRF/SSE token) rather than a bespoke path; `actor` comes from the session and a body-supplied `actor` is ignored. `snapshot_record()` is the only read the coordinator makes — a store double fails the test if the coordinator touches it directly. |
 | §8.4 stop engine | `EngineIdentity` has no `targetable_here` property and consults no process-global host state; availability arrives as owner-computed data, asserted by constructing the identity in a process whose local host differs from the snapshot's and checking the rendered availability is unchanged. |
-| §8.4 stop engine | `RepositoryEngineLifecycle` owns the targeted graceful stop and **only** that: the guardrail rejects direct `SupervisorOps.stop`/`stop_all_instances` calls from validated-work, disposition and issue-detail modules, and a companion assertion records that the existing bulk/force/port routes are deliberately unmigrated (the tracked follow-up), so a later repo-wide widening is a visible change rather than a silent one. The disposition owner exposes no stop method and reads no supervisor state; the issue-detail handler builds no stop call from pid fields. |
+| §8.4 stop engine | `RepositoryEngineLifecycle` owns the targeted graceful stop and **only** that: the guardrail rejects direct `SupervisorOps.stop`/`stop_all_instances` calls from validated-work, disposition and issue-detail modules, and a companion assertion records that the existing bulk/force/port routes are deliberately unmigrated and unclaimed, so a later repo-wide widening is a visible change rather than a silent one. The disposition owner exposes no stop method and reads no supervisor state; the issue-detail handler builds no stop call from pid fields. |
 | §8.4 stop engine | `EngineIdentity` carries `repo_root`, and the adapter's `Supervisor.stop` call uses it rather than any ambient repository — asserted with two repositories present. |
 | §4.4e takeover | There is **no** operation that displaces a live owner: the store port exposes none, and a guardrail asserts none is added. A wedged live owner leaves the record `PUBLISHING` — asserted unresolved, escrow retained, reset blocked — and the UI surfaces the owning engine. Stopping that engine (releasing its gate) is what lets the next drain acquire. |
 | §4.4e attempts | Restart at **every** attempt boundary: after the claim/before the call, after the call/before `record_attempt_outcome`, and after the outcome. Each resumes without a duplicate remote write. |
@@ -3948,10 +4088,12 @@ sweeps above:
 | §2.1.3 attached | A capture arriving while the row is `PUBLISHING` durably records role `attached` and returns `ATTACHED` without disturbing the submission. **In the same process, without a restart**, the drain that resolves the submission then queries `attached_evidence()` and converges or supersedes. A second case restarts between the two and reaches the same end state. |
 | §2.1.3 attached | Attached evidence resolved after the current submission **fails**: `resolve_attached_evidence()` promotes the oldest attached row to `CURRENT`, supersedes the failed current, and the record leaves `FAILED` rather than staying blocked behind it. Multiple attached rows are processed oldest-first, deterministically. |
 | §2.1.3 attached | **Approval-required attached evidence stays approval-required.** Attach a single row admitted `PARKED(WORKTREE_AHEAD_OF_VALIDATION)`, fail the current publication, and assert the record re-opens `PARKED` with that row's original failure and reason and is **not** drained. |
+| §2.1.3 attached | Initially **`FAILED`** attached evidence, as its own case: a row admitted `FAILED(VALIDATION_SHA_MISMATCH)` promotes to `FAILED` with that exact failure and reason — "copy verbatim" holds for **every** admitted state, not just the two that read as recoverable, and the promoted record stays unresolved. |
 | §2.1.3 attached | The auto-eligible counterpart, as its own case: a single attached row admitted `QUEUED` (worktree head == validated head, branch binding verified) promotes to `QUEUED` and drains. Both this and the case above are then repeated **across a restart**, with the worktree deleted and no escrow envelope readable, so the values can only have come from the evidence relation. A store that defaults or re-derives publishes work a human was meant to approve. |
 | §2.1.3 attached | **Multiple attached rows drain one per pass.** Attach a `QUEUED` row and a `PARKED` row, fail the current: the oldest promotes and the other stays attached; a second failure/resolution pass promotes the second. Assert the parked one never drains automatically whichever order it arrives in, and that the record is never observed with two `CURRENT` rows. |
 | §2.1.3 attached | `resolve_attached_evidence()` runs on **every** drain for a non-`PUBLISHING` record, not only on the leaving edge: a record that failed, promoted one row and still holds another has the second promoted on a later drain — the regression for rows stranded until retention. |
-| §2.1.3 attached | `abandon()` on a record with unresolved attached evidence returns `ATTACHED_EVIDENCE_PENDING` with **zero** effect and names the waiting ids; after the drain promotes them and none remain, the same call succeeds. Retention is asserted to release **no** attached row while the owning record is unresolved. |
+| §2.1.3 attached | `abandon()` on a record with unresolved attached evidence returns `AbandonValidatedWorkOutcome(ATTACHED_EVIDENCE_PENDING)` with **zero** effect and the waiting ids in `pending_evidence_ids`; after the drain promotes them and none remain, the same call returns `ABANDONED` with its disposition. Retention is asserted to release **no** attached row while the owning record is unresolved. |
+| §8.4 abandon contract | Both sides of the command boundary, one case per `AbandonStatus` member derived from the enum: the owner returns each status, the endpoint maps each to its response, and the **public contract** carries `can_abandon` plus `abandon_unavailable`. A record with unresolved attached evidence renders with the abandon action **absent** and the typed reason shown — the regression for a UI offering an action the owner refuses, with no response shape for why. |
 | §2.1.3 attached | Every admission branch that inserts evidence writes `initial_state`/`initial_failure`/`initial_reason`: driven once per branch — new record, attached-during-publishing, retained-on-`RECOVERED`, reopened-from-`ABANDONED`, and ordinary supersede — with the `NOT NULL` constraint asserted to reject a branch that omits them. |
 | §2.1.3 attached | Resolution after the current submission **succeeds**: every attached row becomes `SUPERSEDED` and the record stays `RECOVERED`. The regression is the row that stayed `attached` forever — assert it is not re-selected on the next drain, or on any drain after that. |
 | §2.1.3 replay | **Repeating the same attached capture while the record is still `PUBLISHING`** returns `ATTACHED` with no insert and no integrity error. Repeating a `CURRENT` id converges; repeating a `SUPERSEDED` id returns `RETAINED` and changes nothing. Every role is replayed twice in a row. |
@@ -4210,12 +4352,14 @@ Ordered so each slice is independently shippable and leaves the tree green.
    the dashboard actions (with the §8.4 accessibility requirements). **Also the
    wedged-owner recovery path**, which is its own body of work: the
    `RepositoryEngineLifecycle` boundary and its `SupervisorOps` adapter, the
-   `ValidatedWorkOwnerStopCoordinator`, `snapshot_record()` on the owner port, the
-   `stop-validated-work-owner` endpoint with its OpenAPI/auth wiring, the engine-surface
-   control and the issue-detail link that carries `stop_owner_of`, and the narrowed
-   guardrail. The repo-wide stop consolidation is **deferred** with a tracked
-   follow-up (§8.4) and is explicitly *not* in this slice; slice 7 links it and
-   states the two-path risk it leaves open until then. `abandon()` is
+   `ValidatedWorkOwnerStopCoordinator` with its `reserve_owner_stop` interlock,
+   `snapshot_record()` on the owner port, the Control Center-side
+   `ValidatedWorkRecordReader` and composition root, the
+   `stop-validated-work-owner` endpoint with its OpenAPI/auth wiring, the
+   `cc_origin` embed-context parameter, the engine-row control and the issue-detail
+   link that carries `stop_owner_of`, and the scoped guardrail. This slice claims
+   **no** consolidation of the pre-existing stop surfaces: they are untouched, so
+   nothing here is deferred and nothing waits on a follow-up. `abandon()` is
    the last piece, deliberately: until it exists, unresolved work has no exit at all,
    which is the safe direction to be incomplete in.
 8. **Backfill the stranded cohort.** #6327/#6335/#6337 (#6914) and #5204/#5561

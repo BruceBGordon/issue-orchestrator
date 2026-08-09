@@ -356,9 +356,19 @@ Four concrete mechanisms in today's code destroy or strand the work:
    The recovery-specific guard is a *separate*, smaller owner. A plain
    `StopEngineCommand` carries no record binding — engine lifecycle has no business
    knowing about validated work — so "stop this engine only if it still owns this
-   exact record" becomes a bounded coordinator that re-reads the owner by exact
-   `record_id`, refuses on any mismatch or a non-local target with zero effect, and
-   delegates a plain stop only on an exact match.
+   exact record" becomes a bounded coordinator.
+
+   **That guard must hold at the effect point, not at a read.** Matching a snapshot
+   and then calling the supervisor only narrows the window: the owner may relinquish
+   at a stage boundary and a successor may acquire before the stop lands, so the
+   operator's stop would halt an engine that no longer owns the record. The
+   disposition store therefore owns a conditional **stop reservation** — a
+   compare-and-set on the current owner and fence — and while it is held,
+   `relinquish_claim()` is refused. That is sufficient because relinquish is the
+   only way a *live* engine loses a claim, and stopping an engine that has already
+   died is the harmless outcome the operator asked for. A reservation leaked by a
+   dead Control Center costs a graceful hand-back and nothing else: ownership still
+   transfers on death, and no timer is introduced to expire it.
 
    **Both live in the Control Center, because the Repository Engine is the thing
    that is stuck.** Hosting the coordinator or its endpoint in the engine that owns
