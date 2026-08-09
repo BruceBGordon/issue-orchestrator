@@ -96,6 +96,7 @@ class SessionRunAssets:
         _require_absolute_path(self.worktree_path, "worktree_path")
         _require_absolute_path(self.run_dir, "run_dir")
         _require_run_dir_under_worktree(self.run_dir, self.worktree_path)
+        _require_run_dir_names_this_run(self.run_dir, self.identity)
         if self.manifest.run_dir != self.run_dir:
             raise ValueError("SessionRunAssets.manifest must belong to run_dir")
         if self.terminal_recording.run_dir != self.run_dir:
@@ -242,6 +243,20 @@ def _require_non_empty(value: object, field_name: str) -> None:
 # spellings of the same relationship (#6858 round 6 F16).
 SESSION_ARTIFACT_PARTS: tuple[str, ...] = (".issue-orchestrator", "sessions")
 
+_RUN_DIR_NAME_SEPARATOR = "__"
+
+
+def canonical_run_dir_name(run_id: str, session_name: str) -> str:
+    """The ONE directory name a session run's artifacts live in.
+
+    The allocator that creates the directory and every boundary that later has to
+    decide "is this identity the identity of that directory?" call this, so the
+    relationship has one spelling. Without it, a value object can carry a run's
+    identity while pointing at a different run's directory — which is how one
+    run's bytes get filed under another run's name (#6858 round 7 F17).
+    """
+    return f"{run_id}{_RUN_DIR_NAME_SEPARATOR}{session_name}"
+
 
 def _require_absolute_path(value: object, field_name: str) -> None:
     require_absolute_path(value, field_name)
@@ -254,6 +269,26 @@ def _require_contained_file(path: Path, run_dir: Path, field_name: str) -> None:
 
 def _require_under_run_dir(path: Path, run_dir: Path, field_name: str) -> None:
     require_path_under(path, run_dir, field_name)
+
+
+def _require_run_dir_names_this_run(
+    run_dir: Path, identity: "SessionRunIdentity"
+) -> None:
+    """The directory must be the one this identity names, not a sibling.
+
+    The identity comes from a worktree manifest an agent can write, and downstream
+    owners trust the two halves for DIFFERENT things — the archive names its
+    durable destination from the identity while reading bytes from the directory.
+    Letting those disagree files one run's evidence under another run's name and
+    can replace that run's receipt, so they are bound here, once, where the pair
+    is first assembled (#6858 round 7 F17/A6).
+    """
+    expected = canonical_run_dir_name(identity.run_id, identity.session_name)
+    if run_dir.name != expected:
+        raise ValueError(
+            f"session run directory {run_dir.name!r} does not name run"
+            f" {identity.run_id}/{identity.session_name} (expected {expected!r})"
+        )
 
 
 def _require_run_dir_under_worktree(run_dir: Path, worktree_path: Path) -> None:

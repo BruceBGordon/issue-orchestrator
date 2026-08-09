@@ -122,7 +122,15 @@ coordination requires a *shared* (i.e. GitHub) point.
     reaches the run directory by descending that run's own component NAMES from
     the worktree with `O_DIRECTORY | O_NOFOLLOW` — so a renamed run directory with
     a symlink left in its place, or a swapped `.issue-orchestrator`/`sessions`,
-    cannot redirect the copy at another run or out of the worktree;
+    cannot redirect the copy at another run or out of the worktree. Those names
+    are validated and frozen at construction: no `..`/`.`/empty component, and
+    exactly this run's own artifact directory, because the archive names its
+    durable destination from the identity while reading bytes from the directory
+    and a source allowed to disagree would file one run's evidence under another
+    run's receipt. `canonical_run_dir_name` in `domain/session_run.py` owns that
+    one relationship, and `SessionRunAssets` binds it too — so a restart whose
+    worktree manifest was rewritten is skipped rather than crossed with another
+    run;
   - below the anchor it opens every component `O_NOFOLLOW | O_NONBLOCK` relative
     to its parent (the non-blocking open is what keeps a FIFO from parking a
     completing run's terminal seam), streaming from the descriptor it validated

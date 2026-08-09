@@ -1216,7 +1216,14 @@ Timestamp: {self._now_iso()}
 
     @staticmethod
     def _run_dir_name(session_name: str, run_id: str) -> str:
-        return f"{run_id}__{session_name}"
+        """The run's directory name, from the domain's one owner of that name.
+
+        The allocator and every boundary that has to recognise a run's own
+        directory must agree, so neither spells it locally (#6858 round 7 F17).
+        """
+        from ..domain.session_run import canonical_run_dir_name
+
+        return canonical_run_dir_name(run_id, session_name)
 
     @staticmethod
     def _session_name_from_run_dir(name: str) -> str | None:

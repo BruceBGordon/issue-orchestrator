@@ -31,6 +31,7 @@ from issue_orchestrator.domain.tech_lead_artifacts import (
     TECH_LEAD_DECISION_FILENAME,
     TECH_LEAD_REPORT_FILENAME,
 )
+from issue_orchestrator.domain.session_run import canonical_run_dir_name
 from issue_orchestrator.domain.tech_lead_run_artifacts import (
     TechLeadRunArtifactKind,
     TechLeadRunSource,
@@ -56,15 +57,29 @@ DECISION = '{"summary": "ok"}'
 REPORT = "# Health review\n"
 
 
-def _run_dir(tmp_path: Path, name: str = "run") -> Path:
+RUN = "run-900"
+SESSION = "tech-lead-900"
+
+
+def _run_dir(
+    tmp_path: Path, name: str = "run", *, run: str = RUN, session: str = SESSION
+) -> Path:
     """A finished tech-lead run directory with all three inspectable kinds.
 
     Laid out exactly as production does — under an engine-created worktree, at
-    ``.issue-orchestrator/sessions/<run>`` — because the components between the
-    trusted root and the run directory are agent-writable and the archive has to
-    descend them one at a time (#6858 round 5 F16).
+    ``.issue-orchestrator/sessions/<run_id>__<session_name>`` — because the
+    components between the trusted root and the run directory are agent-writable
+    and the archive has to descend them one at a time (#6858 round 5 F16), and
+    because the directory has to NAME the run whose identity is claimed for it
+    (#6858 round 7 F17). ``name`` only isolates the worktree.
     """
-    run_dir = tmp_path / f"wt-{name}" / ".issue-orchestrator" / "sessions" / name
+    run_dir = (
+        tmp_path
+        / f"wt-{name}"
+        / ".issue-orchestrator"
+        / "sessions"
+        / canonical_run_dir_name(run, session)
+    )
     data_dir = run_dir / "tech-lead-data"
     data_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "terminal-recording.jsonl").write_text(RECORDING, encoding="utf-8")
@@ -81,7 +96,9 @@ def _archive(tmp_path: Path, **limits) -> FileSystemTechLeadRunArtifactArchive:
     )
 
 
-def _source(run_dir: Path, *, run: str, session: str) -> TechLeadRunSource:
+def _source(
+    run_dir: Path, *, run: str = RUN, session: str = SESSION
+) -> TechLeadRunSource:
     """The typed run source for a ``_run_dir`` layout.
 
     The worktree is three components up — ``<worktree>/.issue-orchestrator/
@@ -96,7 +113,7 @@ def _source(run_dir: Path, *, run: str, session: str) -> TechLeadRunSource:
     )
 
 
-def _preserve(archive, run_dir: Path, *, run="run-900", session="tech-lead-900"):
+def _preserve(archive, run_dir: Path, *, run: str = RUN, session: str = SESSION):
     return archive.preserve(run=_source(run_dir, run=run, session=session))
 
 
@@ -308,7 +325,12 @@ class TestAtomicPublication:
 
 class TestRetention:
     def _preserve_dated(self, archive, tmp_path, index: int) -> Path:
-        run_dir = _run_dir(tmp_path, name=f"run-{index}")
+        run_dir = _run_dir(
+            tmp_path,
+            name=f"run-{index}",
+            run=f"run-{index}",
+            session=f"tech-lead-{index}",
+        )
         artifacts = _preserve(
             archive, run_dir, run=f"run-{index}", session=f"tech-lead-{index}"
         )
@@ -678,8 +700,8 @@ class TestEveryOpenedDescriptorIsClosed:
     failing. Counting the process's open descriptors is the observable proof.
     """
 
-    def _nested_run(self, tmp_path, name: str) -> Path:
-        run_dir = _run_dir(tmp_path, name=name)
+    def _nested_run(self, tmp_path, name: str, *, run=RUN, session=SESSION) -> Path:
+        run_dir = _run_dir(tmp_path, name=name, run=run, session=session)
         branch = run_dir / "tech-lead-data"
         for level in range(4):
             branch = branch / f"level-{level}"
@@ -695,12 +717,20 @@ class TestEveryOpenedDescriptorIsClosed:
         archive = _archive(tmp_path)
         # One warm-up run so lazily-opened loggers/handles are not counted.
         assert _preserve(
-            archive, self._nested_run(tmp_path, "warmup"), run="warm", session="warm"
+            archive,
+            self._nested_run(tmp_path, "warmup", run="warm", session="warm"),
+            run="warm",
+            session="warm",
         ) is not None
         baseline = _open_descriptor_count()
 
         for index in range(3):
-            run_dir = self._nested_run(tmp_path, f"run-{index}")
+            run_dir = self._nested_run(
+                tmp_path,
+                f"run-{index}",
+                run=f"run-{index}",
+                session=f"tech-lead-{index}",
+            )
             assert _preserve(
                 archive, run_dir, run=f"run-{index}", session=f"tech-lead-{index}"
             ) is not None
@@ -918,20 +948,45 @@ class TestTheTypedRunSource:
 
     def test_the_worktree_itself_is_not_a_run_directory(self, tmp_path):
         """An empty component sequence would make the whole worktree the anchor."""
-        with pytest.raises(ValueError, match="not a session run directory"):
+        with pytest.raises(ValueError, match="is not the artifact directory of run"):
             self._source(tmp_path, tmp_path / "worktree")
 
     def test_a_directory_outside_the_session_namespace_is_refused(self, tmp_path):
         """The relationship this type promises is a SESSION RUN under the
         worktree's artifact namespace, not any directory inside the worktree."""
-        with pytest.raises(ValueError, match="not a session run directory"):
+        with pytest.raises(ValueError, match="is not the artifact directory of run"):
             self._source(tmp_path, tmp_path / "worktree" / "src" / "secrets")
 
     def test_the_sessions_root_alone_is_not_a_run_directory(self, tmp_path):
-        with pytest.raises(ValueError, match="not a session run directory"):
+        with pytest.raises(ValueError, match="is not the artifact directory of run"):
             self._source(
                 tmp_path, tmp_path / "worktree" / ".issue-orchestrator" / "sessions"
             )
+
+    def test_a_directory_naming_another_run_is_refused(self, tmp_path):
+        """#6858 round 7 F17: the archive NAMES its durable destination from the
+        identity and READS bytes from the directory, so a source allowed to
+        disagree files one run's evidence under another run's receipt."""
+        sessions = tmp_path / "worktree" / ".issue-orchestrator" / "sessions"
+
+        with pytest.raises(ValueError, match="is not the artifact directory of run"):
+            self._source(tmp_path, sessions / canonical_run_dir_name("run-2", "tl-2"))
+
+    def test_a_directory_nested_below_another_run_is_refused(self, tmp_path):
+        sessions = tmp_path / "worktree" / ".issue-orchestrator" / "sessions"
+        other = sessions / canonical_run_dir_name("run-2", "tl-2")
+
+        with pytest.raises(ValueError, match="is not the artifact directory of run"):
+            self._source(tmp_path, other / "tech-lead-data")
+
+    def test_a_directory_nested_below_its_own_run_is_refused(self, tmp_path):
+        """Only the run directory itself is the source; a subdirectory of it would
+        archive a fragment under the whole run's name."""
+        sessions = tmp_path / "worktree" / ".issue-orchestrator" / "sessions"
+        own = sessions / canonical_run_dir_name("run-1", "tech-lead-1")
+
+        with pytest.raises(ValueError, match="is not the artifact directory of run"):
+            self._source(tmp_path, own / "tech-lead-data")
 
     def test_the_validated_components_are_frozen_at_construction(self, tmp_path):
         """Frozen, not recomputed: a property would answer from whatever the
@@ -949,7 +1004,7 @@ class TestTheTypedRunSource:
         assert source.relative_run_parts == (
             ".issue-orchestrator",
             "sessions",
-            "run",
+            canonical_run_dir_name(RUN, SESSION),
         )
 
     def test_real_run_assets_can_always_describe_their_trust_relationship(
@@ -992,6 +1047,69 @@ class TestTheTypedRunSource:
 
         with pytest.raises(ValueError, match="session run identity"):
             TechLeadRunSource(**fields)
+
+
+class TestOneRunsEvidenceIsNeverFiledUnderAnother:
+    """#6858 round 7 F17: the archive names its destination from the claimed
+    identity and reads bytes from the directory, so those two must be one run.
+
+    The mismatch is now unrepresentable, which is what makes the attempt safe:
+    it fails where the source is built, before the archive can read a byte or
+    replace a receipt.
+    """
+
+    def test_claiming_one_identity_for_another_runs_directory_is_impossible(
+        self, tmp_path
+    ):
+        archive = _archive(tmp_path)
+        victim_dir = _run_dir(tmp_path, name="victim", run="run-victim", session="tl-victim")
+        victim = _preserve(archive, victim_dir, run="run-victim", session="tl-victim")
+        assert victim is not None
+        other_dir = _run_dir(tmp_path, name="other", run="run-other", session="tl-other")
+        (other_dir / "tech-lead-data" / TECH_LEAD_REPORT_FILENAME).write_text(
+            "# The OTHER run's findings\n", encoding="utf-8"
+        )
+
+        # The attempt: claim the victim's identity while pointing at the other run.
+        with pytest.raises(ValueError, match="is not the artifact directory of run"):
+            TechLeadRunSource(
+                run_id="run-victim",
+                session_name="tl-victim",
+                worktree_path=other_dir.parent.parent.parent,
+                run_dir=other_dir,
+            )
+
+        # The victim's receipt is byte-for-byte what its own run wrote, and the
+        # other run's bytes are nowhere in the archive.
+        assert (victim.location / "tech-lead-data" / TECH_LEAD_REPORT_FILENAME).read_text(
+            encoding="utf-8"
+        ) == REPORT
+        assert not any(
+            "OTHER run" in path.read_text(encoding="utf-8", errors="replace")
+            for path in (tmp_path / "archive").rglob("*")
+            if path.is_file()
+        )
+
+    def test_each_run_files_under_its_own_identity(self, tmp_path):
+        """The control: two runs preserved side by side keep separate receipts."""
+        archive = _archive(tmp_path)
+        first = _preserve(
+            archive,
+            _run_dir(tmp_path, name="a", run="run-a", session="tl-a"),
+            run="run-a",
+            session="tl-a",
+        )
+        second = _preserve(
+            archive,
+            _run_dir(tmp_path, name="b", run="run-b", session="tl-b"),
+            run="run-b",
+            session="tl-b",
+        )
+
+        assert first is not None and second is not None
+        assert first.location.name == "run-a__tl-a"
+        assert second.location.name == "run-b__tl-b"
+        assert first.location != second.location
 
 
 class TestTheWalkRefusesEscapingComponents:

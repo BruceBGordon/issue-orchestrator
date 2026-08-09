@@ -27,7 +27,7 @@ from enum import Enum
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING
 
-from .session_run import SESSION_ARTIFACT_PARTS
+from .session_run import SESSION_ARTIFACT_PARTS, canonical_run_dir_name
 from .tech_lead_artifacts import (
     TECH_LEAD_DECISION_FILENAME,
     TECH_LEAD_REPORT_FILENAME,
@@ -102,9 +102,12 @@ class TechLeadRunSource:
       that has become a symlink. Deriving them without resolving is the point: a
       resolved path has already followed the link we mean to catch.
     * Those names are validated and frozen HERE, at construction, so a source that
-      would walk out of its own root — or that does not identify a session run at
-      all — cannot be represented. The archive's safety must not rest on one
-      upstream caller happening to enforce more than this type does.
+      would walk out of its own root — or that names a DIFFERENT run than its own
+      identity claims — cannot be represented. The archive's safety must not rest
+      on one upstream caller happening to enforce more than this type does: it
+      trusts ``run_id``/``session_name`` for naming its durable destination and
+      ``run_dir`` for reading bytes, so the one-to-one relationship between them
+      is this type's to prove.
     """
 
     run_id: str
@@ -169,11 +172,21 @@ class TechLeadRunSource:
                 f" {unsafe} — a descriptor walk given those names would leave"
                 f" {self.worktree_path} without following a single symlink"
             )
-        namespace = SESSION_ARTIFACT_PARTS
-        if parts[: len(namespace)] != namespace or len(parts) <= len(namespace):
+        # Exactly the namespace plus THIS run's own directory — no other run's,
+        # and nothing nested below one. The archive names its durable destination
+        # from ``run_id``/``session_name`` while reading bytes from these
+        # components; a source allowed to disagree files one run's evidence under
+        # another run's identity and atomically replaces that run's receipt
+        # (#6858 round 7 F17/A6).
+        expected = SESSION_ARTIFACT_PARTS + (
+            canonical_run_dir_name(self.run_id, self.session_name),
+        )
+        if parts != expected:
             raise ValueError(
-                f"run_dir {self.run_dir} is not a session run directory under"
-                f" {'/'.join(namespace)} of {self.worktree_path}"
+                f"run_dir {self.run_dir} is not the artifact directory of run"
+                f" {self.run_id}/{self.session_name}: expected"
+                f" {'/'.join(expected)} under {self.worktree_path}, got"
+                f" {'/'.join(parts)}"
             )
         return parts
 
