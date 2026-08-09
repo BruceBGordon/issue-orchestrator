@@ -239,12 +239,19 @@ class TechLeadRunActivity:
         Called at the terminal seam, which is the last moment the run's own
         directory is guaranteed to exist: the cleanup of a disposable
         investigation worktree is planned from this same completion.
+
+        Retention runs here too, because this owner is the only one holding BOTH
+        halves: the archive says which locations it retired, and the store
+        immediately stops the matching rows advertising them (#6858 round 2 F6).
+        A pruned run keeps its verdict and loses only its drill-down.
         """
-        return self._archive.preserve(
+        artifacts = self._archive.preserve(
             run_id=session.run_assets.run_id,
             session_name=session.run_assets.session_name,
             run_dir=session.run_dir,
         )
+        self._store.forget_artifacts(self._archive.prune())
+        return artifacts
 
     def _read_decision_outcome(self, session: "Session") -> "_DecisionOutcome":
         """What the run's own decision artifact says it produced.

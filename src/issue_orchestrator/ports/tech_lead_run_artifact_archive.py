@@ -12,6 +12,18 @@ The archive is a port for the same reason the record store is: preserving files
 is filesystem work, the owner that decides WHEN to preserve them is control-layer
 policy, and a test wants the second without the first.
 
+The archive owns more than the copy, because the source is agent-authored and the
+destination is the operator's state volume (#6858 round 2 F6/A3). One owner is
+responsible for all three of:
+
+* **safe admission** — only real, contained, bounded regular files are preserved;
+* **atomic publication** — a run's archive is replaced only by a COMPLETE new
+  one, so a failed retry cannot destroy the receipt that was already there;
+* **bounded retention** — :meth:`TechLeadRunArtifactArchive.prune` reports what it
+  removed so the caller can retire the matching record locators in the same
+  breath. Splitting retention from the locator update is what leaves live rows
+  advertising directories that are gone.
+
 Exception contract, mirroring the record store's: implementations MUST NOT raise.
 A run whose receipt cannot be filed is still a run that happened; the archive
 therefore returns ``None`` and logs, and the record simply carries no drill-down.
@@ -46,7 +58,19 @@ class TechLeadRunArtifactArchive(Protocol):
 
         Idempotent on the session run identity — re-preserving one run replaces
         its archive rather than accumulating copies, so a publish retry that
-        re-enters completion does not multiply the run's evidence.
+        re-enters completion does not multiply the run's evidence. The
+        replacement is atomic: a failed attempt leaves the previously preserved
+        archive exactly as it was.
+        """
+        ...
+
+    def prune(self) -> tuple[Path, ...]:
+        """Apply retention and return the locations that no longer exist.
+
+        Called by the activity owner right after a conclusion, which then retires
+        the record locators pointing at those locations — so retention and the
+        rows that advertise it move together. Never raises: a retention pass that
+        cannot run leaves a bigger archive, not a failed run.
         """
         ...
 
@@ -75,6 +99,10 @@ class DiscardedTechLeadRunArtifacts:
             run_dir,
         )
         return None
+
+    def prune(self) -> tuple[Path, ...]:
+        """Nothing was ever kept, so nothing is ever retired."""
+        return ()
 
 
 __all__ = [

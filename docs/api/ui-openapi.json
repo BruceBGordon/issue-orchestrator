@@ -812,6 +812,74 @@
           "status_unavailable": {"type": "boolean"}
         }
       },
+      "TechLeadRunArtifactCommandPayload": {
+        "oneOf": [
+          {"$ref": "#/components/schemas/OpenSessionRecordingCommandPayload"},
+          {"$ref": "#/components/schemas/OpenReviewArtifactCommandPayload"}
+        ],
+        "discriminator": {"propertyName": "kind"}
+      },
+      "TechLeadRunActivityEntryPayload": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "runKey",
+          "flavorLabel",
+          "phase",
+          "phaseLabel",
+          "tone",
+          "startedAt",
+          "endedAt",
+          "subjectKind",
+          "subjectLabel",
+          "subjectIssueNumber",
+          "subjectTitle",
+          "anchorIssueNumber",
+          "detail",
+          "findings",
+          "proposals",
+          "runId",
+          "sessionName",
+          "artifacts",
+          "artifactsNote"
+        ],
+        "properties": {
+          "runKey": {"type": "string"},
+          "flavorLabel": {"type": "string"},
+          "phase": {"enum": ["running", "completed", "needs_human", "failed", "withdrawn"]},
+          "phaseLabel": {"type": "string"},
+          "tone": {"enum": ["active", "good", "warn", "bad", "muted"]},
+          "startedAt": {"type": "string"},
+          "endedAt": {"type": "string"},
+          "subjectKind": {"enum": ["issue", "board", "pr_manifest"]},
+          "subjectLabel": {"type": "string"},
+          "subjectIssueNumber": {"type": "integer"},
+          "subjectTitle": {"type": "string"},
+          "anchorIssueNumber": {"type": "integer"},
+          "detail": {"type": "string"},
+          "findings": {"type": "integer"},
+          "proposals": {"type": "integer"},
+          "runId": {"type": "string"},
+          "sessionName": {"type": "string"},
+          "artifacts": {
+            "type": "array",
+            "items": {"$ref": "#/components/schemas/TechLeadRunArtifactCommandPayload"}
+          },
+          "artifactsNote": {"type": "string"}
+        }
+      },
+      "TechLeadActivityPayload": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["entries", "emptyMessage"],
+        "properties": {
+          "entries": {
+            "type": "array",
+            "items": {"$ref": "#/components/schemas/TechLeadRunActivityEntryPayload"}
+          },
+          "emptyMessage": {"type": "string"}
+        }
+      },
       "DashboardDataPayload": {
         "type": "object",
         "additionalProperties": true,
@@ -826,7 +894,8 @@
           "githubRepo",
           "agents",
           "validationConfigured",
-          "providerCircuit"
+          "providerCircuit",
+          "techLeadActivity"
         ],
         "properties": {
           "startupComplete": {"type": "boolean"},
@@ -840,7 +909,8 @@
           "e2eLastRun": {"type": ["object", "null"], "additionalProperties": true},
           "agents": {"type": "array", "items": {"type": "string"}},
           "validationConfigured": {"type": "boolean"},
-          "providerCircuit": {"$ref": "#/components/schemas/ProviderCircuitStatusPayload"}
+          "providerCircuit": {"$ref": "#/components/schemas/ProviderCircuitStatusPayload"},
+          "techLeadActivity": {"$ref": "#/components/schemas/TechLeadActivityPayload"}
         }
       },
       "DashboardViewModelPayload": {

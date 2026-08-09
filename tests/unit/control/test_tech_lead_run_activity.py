@@ -14,6 +14,7 @@ mock. The clock is injected; nothing sleeps.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 from datetime import datetime
 from pathlib import Path
@@ -42,6 +43,7 @@ from issue_orchestrator.domain.tech_lead_run_artifacts import (
     TechLeadRunArtifactKind,
 )
 from issue_orchestrator.infra.tech_lead_run_artifact_archive import (
+    ArchiveLimits,
     FileSystemTechLeadRunArtifactArchive,
 )
 from issue_orchestrator.infra.tech_lead_run_record_store import (
@@ -536,3 +538,76 @@ class TestTheRunsEvidenceOutlivesItsWorktree:
 
         assert record.artifacts is not None
         assert record.artifacts.has(TechLeadRunArtifactKind.REPORT)
+
+
+class TestRetentionAndTheRowsThatAdvertiseIt:
+    """#6858 round 2 F6: the bytes and the claim about them retire together.
+
+    Retention is applied by the archive, but the RECORD is what tells an operator
+    a drill-down exists. This owner holds both, so pruning an archive and
+    retiring the locator that points at it is one event — otherwise the history
+    keeps offering buttons into directories that are gone.
+    """
+
+    def _activity(self, tmp_path, store, *, retention: int):
+        archive = FileSystemTechLeadRunArtifactArchive(
+            tmp_path / "archive", limits=ArchiveLimits(retention=retention)
+        )
+        return TechLeadRunActivity(store, archive, now=lambda: ENDED)
+
+    def _finish_run(self, activity, tmp_path, index: int) -> None:
+        run_dir = tmp_path / f"run-{index}"
+        data_dir = run_dir / "tech-lead-data"
+        data_dir.mkdir(parents=True, exist_ok=True)
+        (run_dir / "terminal-recording.jsonl").write_text(
+            '{"event_type": "output", "data_b64": "aGk="}\n', encoding="utf-8"
+        )
+        session = FakeSession(
+            index,
+            TechLeadSessionFlavor.FAILURE_INVESTIGATION,
+            run_dir=run_dir,
+        )
+        activity.note_started(session)
+        activity.note_concluded(session, SessionStatus.COMPLETED)
+        # Explicit mtime so "newest" is a fact rather than a race. Deliberately
+        # in the past: the run being concluded next is the newest one, and each
+        # finished run is stamped older than the one after it.
+        stamp = 1_700_000_000 + index
+        location = tmp_path / "archive" / f"run-{index}__tech-lead-{index}"
+        if location.is_dir():
+            os.utime(location, (stamp, stamp))
+
+    def test_a_pruned_run_keeps_its_verdict_and_loses_its_drill_down(self, tmp_path):
+        store = InMemoryTechLeadRunRecordStore()
+        activity = self._activity(tmp_path, store, retention=2)
+
+        for index in range(1, 5):
+            self._finish_run(activity, tmp_path, index)
+
+        records = {record.run_key: record for record in store.recent(limit=10)}
+        assert len(records) == 4
+        # Every run still reports what it concluded...
+        assert all(
+            record.phase is TechLeadRunPhase.COMPLETED for record in records.values()
+        )
+        # ...but only the runs whose archives survived still offer an inspection.
+        with_artifacts = {
+            key for key, record in records.items() if record.artifacts is not None
+        }
+        assert with_artifacts == {"issue:3", "issue:4"}
+        for record in records.values():
+            if record.artifacts is not None:
+                assert record.artifacts.location.is_dir()
+
+    def test_the_durable_store_retires_pruned_locators_too(self, tmp_path):
+        store = SqliteTechLeadRunRecordStore(tmp_path / "runs.sqlite")
+        activity = self._activity(tmp_path, store, retention=1)
+
+        self._finish_run(activity, tmp_path, 1)
+        self._finish_run(activity, tmp_path, 2)
+
+        reopened = SqliteTechLeadRunRecordStore(tmp_path / "runs.sqlite")
+        by_key = {record.run_key: record for record in reopened.recent(limit=10)}
+        assert by_key["issue:1"].artifacts is None
+        assert by_key["issue:1"].phase is TechLeadRunPhase.COMPLETED
+        assert by_key["issue:2"].artifacts is not None

@@ -111,7 +111,17 @@ coordination requires a *shared* (i.e. GitHub) point.
   `TechLeadRunArtifacts` locator. `TechLeadActivityView` publishes that as the
   dashboard's existing typed inspection commands (`open_session_recording`,
   `open_review_artifact`), so the panel's buttons route through the one lifecycle
-  dispatcher and the browser never reconstructs a path.
+  dispatcher and the browser never reconstructs a path. The whole activity
+  payload — container, entry, and the command union — is declared on the UI
+  OpenAPI boundary, so the generated Python and TypeScript clients can name what
+  the browser consumes instead of receiving it as an untyped extra.
+  The archive is a BOUNDED owner, because its source is agent-authored and its
+  destination is the operator's state volume: symlinks and escaping paths are
+  refused, per-file/aggregate/count caps apply (and log what they drop), the copy
+  is staged and swapped so a failed retry cannot destroy a complete receipt, and
+  retention keeps the newest runs while REPORTING what it removed — the activity
+  owner retires the matching record locators in the same breath, so no row
+  advertises a drill-down into a directory that is gone.
 - Writes on both are best-effort by contract: the run's product is its proposals,
   and losing the receipt must never lose the run. Because the *store* cannot know
   whether losing durability is acceptable, it fails loudly on an unusable

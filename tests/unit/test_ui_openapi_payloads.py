@@ -510,6 +510,58 @@ def _provider_circuit_payload(**overrides: object) -> dict[str, object]:
     return payload
 
 
+def _tech_lead_activity_entry_payload(**overrides: object) -> dict[str, object]:
+    """A complete recorded-run entry for the activity panel (ADR-0033 / #6858)."""
+    entry: dict[str, object] = {
+        "runKey": "global:health_review",
+        "flavorLabel": "Health review",
+        "phase": "completed",
+        "phaseLabel": "Completed",
+        "tone": "good",
+        "startedAt": "2026-08-09T09:00:00",
+        "endedAt": "2026-08-09T09:30:00",
+        "subjectKind": "board",
+        "subjectLabel": "Whole board",
+        "subjectIssueNumber": 0,
+        "subjectTitle": "",
+        "anchorIssueNumber": 900,
+        "detail": "Two hotspots are past budget",
+        "findings": 2,
+        "proposals": 1,
+        "runId": "run-900",
+        "sessionName": "tech-lead-900",
+        "artifacts": [
+            {
+                "kind": "open_session_recording",
+                "label": "Session replay",
+                "issue_number": 900,
+                "run_dir": "/repo/.issue-orchestrator/state/tech-lead-runs/run-900",
+            },
+            {
+                "kind": "open_review_artifact",
+                "label": "Report",
+                "issue_number": 900,
+                "run_dir": "/repo/.issue-orchestrator/state/tech-lead-runs/run-900",
+                "artifact_path": "tech-lead-data/tech-lead-report.md",
+                "artifact_type": "tech_lead_report",
+                "render_mode": "markdown",
+            },
+        ],
+        "artifactsNote": "",
+    }
+    entry.update(overrides)
+    return entry
+
+
+def _tech_lead_activity_payload(**overrides: object) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "entries": [_tech_lead_activity_entry_payload()],
+        "emptyMessage": "No tech-lead runs recorded yet.",
+    }
+    payload.update(overrides)
+    return payload
+
+
 def _dashboard_data_payload(**overrides: object) -> dict[str, object]:
     """A minimal complete ``DashboardDataPayload`` for contract validation."""
     payload: dict[str, object] = {
@@ -524,6 +576,7 @@ def _dashboard_data_payload(**overrides: object) -> dict[str, object]:
         "agents": ["agent:web"],
         "validationConfigured": False,
         "providerCircuit": _provider_circuit_payload(),
+        "techLeadActivity": _tech_lead_activity_payload(),
     }
     payload.update(overrides)
     return payload
@@ -609,6 +662,151 @@ def test_dashboard_data_payload_requires_provider_circuit() -> None:
     with pytest.raises(JsonSchemaValidationError):
         circuit_validator.validate(extra_key)
 
+
+def test_dashboard_data_payload_requires_tech_lead_activity() -> None:
+    """#6858 F7: ADR-0033's local visibility surface is a *typed* field on the
+    canonical UI boundary, not an untyped extra that ``additionalProperties``
+    lets slip through.
+
+    The browser reads ``window.dashboardData.techLeadActivity`` directly, so a
+    dropped or malformed payload must fail here rather than render an empty
+    "the tech lead has never run" panel — and the generated Python/TypeScript
+    clients must be able to NAME the shape they consume.
+    """
+    from issue_orchestrator.contracts.ui_openapi_models import (
+        DashboardDataPayload,
+        TechLeadActivityPayload,
+    )
+    from pydantic import ValidationError
+
+    data_validator = _validator("DashboardDataPayload")
+    activity_validator = _validator("TechLeadActivityPayload")
+
+    valid = _dashboard_data_payload()
+    data_validator.validate(valid)  # must not raise
+    DashboardDataPayload.model_validate(valid)
+    TechLeadActivityPayload.model_validate(_tech_lead_activity_payload())
+
+    # Missing entirely → rejected on both layers.
+    incomplete = _dashboard_data_payload()
+    del incomplete["techLeadActivity"]
+    with pytest.raises(JsonSchemaValidationError):
+        data_validator.validate(incomplete)
+    with pytest.raises(ValidationError):
+        DashboardDataPayload.model_validate(incomplete)
+
+    # Missing the published empty-state sentence → rejected: the browser must
+    # never have to invent words for a state the engine did not report.
+    without_message = _tech_lead_activity_payload()
+    del without_message["emptyMessage"]
+    with pytest.raises(JsonSchemaValidationError):
+        activity_validator.validate(without_message)
+    with pytest.raises(ValidationError):
+        TechLeadActivityPayload.model_validate(without_message)
+
+    # Unknown extra key inside the strict container → rejected.
+    with pytest.raises(JsonSchemaValidationError):
+        activity_validator.validate(_tech_lead_activity_payload(unexpected=True))
+
+
+def test_tech_lead_activity_entry_payload_rejects_malformed_rows() -> None:
+    """Every field the panel renders is required and vocabulary-constrained.
+
+    A dropped ``phaseLabel`` or an out-of-vocabulary ``tone`` would leave the
+    row's status signalled by colour alone, which is exactly what the published
+    phase text exists to prevent.
+    """
+    from issue_orchestrator.contracts.ui_openapi_models import (
+        TechLeadRunActivityEntryPayload,
+    )
+    from pydantic import ValidationError
+
+    validator = _validator("TechLeadRunActivityEntryPayload")
+
+    valid = _tech_lead_activity_entry_payload()
+    validator.validate(valid)
+    TechLeadRunActivityEntryPayload.model_validate(valid)
+
+    for field in ("phaseLabel", "subjectLabel", "anchorIssueNumber", "artifacts"):
+        incomplete = _tech_lead_activity_entry_payload()
+        del incomplete[field]
+        with pytest.raises(JsonSchemaValidationError):
+            validator.validate(incomplete)
+        with pytest.raises(ValidationError):
+            TechLeadRunActivityEntryPayload.model_validate(incomplete)
+
+    # Out-of-vocabulary phase / tone / subject kind → rejected.
+    for field, value in (
+        ("phase", "in_progress"),
+        ("tone", "chartreuse"),
+        ("subjectKind", "epic"),
+    ):
+        with pytest.raises(JsonSchemaValidationError):
+            validator.validate(_tech_lead_activity_entry_payload(**{field: value}))
+
+
+def test_tech_lead_activity_artifacts_are_the_shared_lifecycle_commands() -> None:
+    """#6858 A4: the drill-down is the dashboard's EXISTING typed command, so a
+    malformed variant must fail at the same boundary the timeline's commands do
+    — the panel and the one dispatcher cannot drift apart."""
+    from issue_orchestrator.contracts.ui_openapi_models import (
+        TechLeadRunActivityEntryPayload,
+    )
+    from pydantic import ValidationError
+
+    validator = _validator("TechLeadRunActivityEntryPayload")
+
+    # An artifact command with an unknown kind is not dispatchable.
+    unknown_kind = _tech_lead_activity_entry_payload(
+        artifacts=[
+            {
+                "kind": "open_tech_lead_thing",
+                "label": "Report",
+                "issue_number": 900,
+                "run_dir": "/repo/run",
+            }
+        ]
+    )
+    with pytest.raises(JsonSchemaValidationError):
+        validator.validate(unknown_kind)
+    with pytest.raises(ValidationError):
+        TechLeadRunActivityEntryPayload.model_validate(unknown_kind)
+
+    # An artifact-read command missing the fields the reader needs.
+    incomplete_read = _tech_lead_activity_entry_payload(
+        artifacts=[
+            {
+                "kind": "open_review_artifact",
+                "label": "Report",
+                "issue_number": 900,
+                "run_dir": "/repo/run",
+                "artifact_type": "tech_lead_report",
+            }
+        ]
+    )
+    with pytest.raises(JsonSchemaValidationError):
+        validator.validate(incomplete_read)
+    with pytest.raises(ValidationError):
+        TechLeadRunActivityEntryPayload.model_validate(incomplete_read)
+
+    # An artifact type outside the reader's vocabulary.
+    unknown_type = _tech_lead_activity_entry_payload(
+        artifacts=[
+            {
+                "kind": "open_review_artifact",
+                "label": "Secrets",
+                "issue_number": 900,
+                "run_dir": "/repo/run",
+                "artifact_path": "../../etc/passwd",
+                "artifact_type": "host_file",
+                "render_mode": "markdown",
+            }
+        ]
+    )
+    with pytest.raises(JsonSchemaValidationError):
+        validator.validate(unknown_type)
+    with pytest.raises(ValidationError):
+        TechLeadRunActivityEntryPayload.model_validate(unknown_type)
 
 def test_view_model_snapshot_payload_matches_ui_openapi() -> None:
     config = _make_config()

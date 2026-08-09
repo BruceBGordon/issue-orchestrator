@@ -21,7 +21,7 @@ import threading
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Iterator, Optional
+from typing import Iterator, Optional, Sequence
 
 from ..domain.tech_lead_run import TechLeadRunScopeKind
 from ..domain.tech_lead_run_artifacts import TechLeadRunArtifacts, kinds_from_values
@@ -184,6 +184,25 @@ class SqliteTechLeadRunRecordStore:
             ),
             what=f"conclude run {run_id}/{session_name}",
         )
+
+    def forget_artifacts(self, locations: Sequence[Path]) -> None:
+        """Clear the locator on every row pointing at a retired archive.
+
+        Retention removed the bytes; this removes the claim that they are there
+        (#6858 round 2 F6). The verdict, the counts and the timing stay: a run
+        whose evidence aged out still happened.
+        """
+        # One fixed statement per location rather than a generated ``IN (?,?,…)``
+        # list: a retention pass retires a handful of rows at most, and a SQL
+        # string assembled from a variable-length list is the shape this codebase
+        # does not write. Each is independent, so one failure loses one locator.
+        for location in locations:
+            self._write(
+                "UPDATE tech_lead_run_records SET artifact_dir = '',"
+                " artifact_kinds = '' WHERE artifact_dir = ?",
+                (str(location),),
+                what=f"retire the artifact locator at {location}",
+            )
 
     # ------------------------------------------------------------------
     # Reads

@@ -48,7 +48,10 @@ Canonical source: `src/issue_orchestrator/infra/sqlite_registry.py`
   - Preserved run artifacts sit beside it at
     `.issue-orchestrator/state/tech-lead-runs/<run>/`
     (`src/issue_orchestrator/infra/tech_lead_run_artifact_archive.py`) — copied
-    out of the run's disposable worktree at its terminal seam.
+    out of the run's disposable worktree at its terminal seam. Unlike the rows,
+    those BYTES are bounded: symlinks/oversized files are refused, each archive
+    is staged then swapped in atomically, and retention keeps the newest
+    `ARCHIVE_RETENTION` runs, retiring the matching record locators as it prunes.
 
 ## Registry and maintenance
 

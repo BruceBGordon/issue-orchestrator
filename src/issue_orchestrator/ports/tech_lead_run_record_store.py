@@ -19,8 +19,10 @@ by the implementation rather than silently swallowed by callers.
 from __future__ import annotations
 
 import threading
+from dataclasses import replace
 from datetime import datetime
-from typing import Optional, Protocol
+from pathlib import Path
+from typing import Optional, Protocol, Sequence
 
 from ..domain.tech_lead_run_artifacts import TechLeadRunArtifacts
 from ..domain.tech_lead_run_record import TechLeadRunPhase, TechLeadRunRecord
@@ -84,6 +86,17 @@ class TechLeadRunRecordStore(Protocol):
         the SAME write as the verdict: the two are one fact ("it ended, and this
         is the evidence"), and splitting them would let a crash between the two
         leave a concluded run advertising a drill-down that was never filed.
+        """
+        ...
+
+    def forget_artifacts(self, locations: "Sequence[Path]") -> None:
+        """Drop the artifact locator from every row pointing at ``locations``.
+
+        The other half of the archive's retention pass (#6858 round 2 F6): the
+        bytes and the row that advertises them are retired together, so a
+        recorded run never offers a drill-down into a directory that is gone. The
+        VERDICT is untouched — a run whose evidence aged out still happened, and
+        still concluded what it concluded.
         """
         ...
 
@@ -155,6 +168,19 @@ class InMemoryTechLeadRunRecordStore:
                         artifacts=artifacts,
                     )
                     return
+
+    def forget_artifacts(self, locations: "Sequence[Path]") -> None:
+        retired = {Path(location) for location in locations}
+        if not retired:
+            return
+        with self._lock:
+            self._records = [
+                replace(record, artifacts=None)
+                if record.artifacts is not None
+                and record.artifacts.location in retired
+                else record
+                for record in self._records
+            ]
 
     def recent(self, *, limit: int) -> tuple[TechLeadRunRecord, ...]:
         with self._lock:

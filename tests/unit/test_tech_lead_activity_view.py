@@ -325,3 +325,32 @@ class TestTheDrillDownIsAPublishedCommand:
         ]
         assert commands[1].artifact_type == "tech_lead_report"
         assert all(command.run_dir for command in commands)
+
+
+def test_the_real_projection_satisfies_the_ui_openapi_boundary(tmp_path):
+    """Producer to CANONICAL boundary, with a populated row (#6858 F7).
+
+    The dashboard contract test above proves the public JSON blob; this proves
+    the same payload against the UI OpenAPI schema the generated Python and
+    TypeScript clients are built from — including a real drill-down command,
+    which an empty history never exercises.
+    """
+    from issue_orchestrator.contracts.ui_openapi_models import TechLeadActivityPayload
+
+    view = _view(
+        _concluded(
+            tmp_path,
+            TechLeadRunArtifactKind.SESSION_REPLAY,
+            TechLeadRunArtifactKind.REPORT,
+            TechLeadRunArtifactKind.DECISION,
+        )
+    )
+
+    payload = view.model_dump(mode="json", by_alias=True)
+    typed = TechLeadActivityPayload.model_validate(payload)
+
+    assert [command.kind for command in typed.entries[0].artifacts] == [
+        "open_session_recording",
+        "open_review_artifact",
+        "open_review_artifact",
+    ]
