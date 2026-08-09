@@ -16,7 +16,6 @@ from ..execution.review_artifact_reader import ManifestReviewArtifactReader
 from ..execution.session_output_adapter import FileSystemSessionOutput
 from ..infra import runtime_identity
 from ..control.completion_ports import LabelAdapter, PRAdapter
-from ..control.tech_lead_run_activity import optional_run_activity
 from ..infra.config import Config
 from ..ports import EventSink
 
@@ -95,9 +94,6 @@ def create_completion_components(
     attempt_store: "AttemptStore | None" = None,
     turn_mailbox: "TurnMailbox | None" = None,
     tech_lead_authority: "TechLeadAuthorityStore | None" = None,
-    # ADR-0033's local run history (#6858). Optional at this seam only because
-    # every collaborator here is: the composition root always supplies one.
-    tech_lead_run_activity: "TechLeadRunActivity | None" = None,
     open_issue_corpus: "OpenIssueCorpusManager | None" = None,
     # The completion handler needs a full repository host; ``github`` above is
     # only guaranteed to satisfy the narrower label/PR completion port, so the
@@ -110,6 +106,11 @@ def create_completion_components(
     # NEEDS_HUMAN completion outcome routes through it, and the label adapter
     # below refuses that label by value, so the two halves cannot disagree.
     needs_human_block: "SharedNeedsHumanBlock",
+    # ADR-0033's local run history (#6858). REQUIRED: this seam manufactured its
+    # own fallback owner, which could silently split launch and completion across
+    # two different in-memory histories while the facade claimed broken wiring
+    # fails loudly (#6858 round 1 A2). The caller passes the ONE owner it built.
+    tech_lead_run_activity: "TechLeadRunActivity",
 ) -> tuple[
     "CompletionProcessor | None",
     "SessionController | None",
@@ -210,7 +211,7 @@ def create_completion_components(
             repository_host=repository_host,
             session_output=session_output,
             tech_lead_authority=tech_lead_authority,
-            tech_lead_run_activity=optional_run_activity(tech_lead_run_activity),
+            tech_lead_run_activity=tech_lead_run_activity,
             open_issue_corpus=open_issue_corpus,
             label_manager=label_manager,
             provider_resilience=provider_resilience,

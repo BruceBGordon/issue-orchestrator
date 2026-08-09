@@ -89,14 +89,35 @@ coordination requires a *shared* (i.e. GitHub) point.
   `IssueInvestigationScope`) *reference* their subject.
 - **Local visibility — done (#6858).** `TechLeadRunRecord` is the run as the
   winning engine remembers it: scope, phase, what it produced, and the session
-  run identity a replay drill-down needs. It is opened by the launch authority,
-  concluded at completion finalization beside the launch-authority retention
-  owner, and stored in its own SQLite file (`tech_lead_runs.sqlite`) —
-  deliberately not in the authority store, whose rows are load-bearing and
-  deleted at each run's terminal. `TechLeadActivityView` projects it onto the
-  dashboard's "Tech lead activity" panel. Writes are best-effort by contract:
-  the run's product is its proposals, and losing the receipt must never lose
-  the run.
+  run identity a replay drill-down needs. It is opened by the launch authority
+  and concluded from the **post-apply effective terminal status** — the same
+  value the terminal trace event, the cached state machine and the session
+  history are finalized from — so a run whose mandated action failed is never
+  recorded as completed. Its subject comes from the canonical run **scope**, and
+  the bookkeeping anchor a whole-repository run was coordinated *through* is
+  recorded separately as an anchor: the shared coordination half must not
+  masquerade as the local subject.
+  It is stored in its own SQLite file (`tech_lead_runs.sqlite`) — deliberately
+  not in the authority store, whose rows are load-bearing and deleted at each
+  run's terminal — registered in the repository SQLite registry for startup
+  integrity checks, pragma enforcement and backups.
+- **The artifacts, not just the summary — done (#6858).** A run writes its
+  evidence map, decision, report and terminal recording inside its worktree, and
+  a failure investigation's worktree is disposable scratch that completion always
+  removes. `TechLeadRunArtifactArchive` therefore copies the run's inspectable set
+  into an engine-owned directory
+  (`.issue-orchestrator/state/tech-lead-runs/<run>/`) at the terminal seam,
+  preserving the run-relative layout, and the record carries a typed
+  `TechLeadRunArtifacts` locator. `TechLeadActivityView` publishes that as the
+  dashboard's existing typed inspection commands (`open_session_recording`,
+  `open_review_artifact`), so the panel's buttons route through the one lifecycle
+  dispatcher and the browser never reconstructs a path.
+- Writes on both are best-effort by contract: the run's product is its proposals,
+  and losing the receipt must never lose the run. Because the *store* cannot know
+  whether losing durability is acceptable, it fails loudly on an unusable
+  database and the composition root makes the call — logging the loss and
+  selecting the in-memory implementation, so a read-only state directory can
+  never stop the Repository Engine from starting.
 
 ## Open questions
 

@@ -1720,7 +1720,12 @@
           "issue_number": {"type": "integer"},
           "run_dir": {"type": "string"},
           "artifact_path": {"type": "string"},
-          "artifact_type": {"enum": ["review_report", "review_decision"]},
+          "artifact_type": {
+            "enum": [
+              "review_report", "review_decision",
+              "tech_lead_report", "tech_lead_decision"
+            ]
+          },
           "render_mode": {"enum": ["markdown", "json"]}
         }
       },

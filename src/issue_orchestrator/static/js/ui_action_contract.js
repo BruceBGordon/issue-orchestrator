@@ -26,6 +26,17 @@
         ISSUE_RESUME: (issueNumber) => `/api/issues/${issueNumber}/resume`,
     };
 
+    // The run-scoped artifact types the read endpoint serves: the reviewer's
+    // report/decision pair and the tech lead's (#6858 F4). One set, so the
+    // browser and the server-side artifact policy cannot disagree about which
+    // artifacts are addressable.
+    const REVIEW_ARTIFACT_TYPES = new Set([
+        'review_report',
+        'review_decision',
+        'tech_lead_report',
+        'tech_lead_decision',
+    ]);
+
     function normalizeIssueNumbers(issueNumbers) {
         if (!Array.isArray(issueNumbers)) return [];
         return issueNumbers
@@ -252,7 +263,7 @@
         if (!artifactPath) {
             throw new Error('artifactPath is required for review artifact action');
         }
-        if (artifactType !== 'review_report' && artifactType !== 'review_decision') {
+        if (!REVIEW_ARTIFACT_TYPES.has(artifactType)) {
             throw new Error(`Unsupported review artifact type: ${artifactType}`);
         }
         const params = new URLSearchParams();
@@ -267,6 +278,7 @@
 
     return {
         ENDPOINTS,
+        REVIEW_ARTIFACT_TYPES,
         normalizeIssueNumbers,
         buildUnblockRequest,
         buildResetRetryRequest,

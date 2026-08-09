@@ -305,13 +305,10 @@ class CompletionHandler:
             self.config, self._tech_lead_authority, session,
             processing_errors=processing_errors,
         )
-        # ADR-0033 (#6858): the same terminal seam closes the run's LOCAL
-        # record. Beside the retention owner deliberately — the row that stops
-        # being authority and the row that becomes history are the same event,
-        # so a status that reaches one always reaches the other.
-        self._tech_lead_run_activity.note_concluded(
-            self.config, session, status, processing_errors=processing_errors,
-        )
+        # ADR-0033's run record is NOT closed here: the authoritative terminal
+        # status does not exist until required tech-lead actions have applied, so
+        # it closes in ``finalize_terminal_outcome`` beside the other post-apply
+        # terminal commits (#6858 round 1 F3).
 
         result = CompletionResult(
             history_entry=history_entry,
@@ -604,21 +601,26 @@ class CompletionHandler:
         *,
         blocked_reason: Optional[str] = None,
         completion_detail: Optional[dict[str, Any]] = None,
+        processing_errors: Optional[list[str]] = None,
     ) -> None:
-        """Commit BOTH terminal consumers from the ONE effective status post-apply.
+        """Commit EVERY terminal consumer from the ONE effective status post-apply.
 
-        The terminal trace event and the cached ``SessionStateMachine`` transition
-        are the two terminal-outcome commits. ``handle_session_completion`` defers
-        both out of ``process_completion`` (``finalize_terminal=False``) and calls
-        this once with ``effective_terminal_status(history_status, outcome)`` so a
-        failed mandated reset ends the machine FAILED and emits one SESSION_FAILED —
-        never a false COMPLETED neither consumer can retract (#6777).
+        The terminal trace event, the cached ``SessionStateMachine`` transition and
+        ADR-0033's local run record are the terminal-outcome commits.
+        ``handle_session_completion`` defers them out of ``process_completion``
+        (``finalize_terminal=False``) and calls this once with
+        ``effective_terminal_status(history_status, outcome)`` so a failed mandated
+        reset ends the machine FAILED, emits one SESSION_FAILED, and records the run
+        as FAILED — never a false COMPLETED no consumer can retract (#6777, #6858).
         """
         self.emit_trace_events(
             session, effective_status, pr_url, pr_number,
             blocked_reason=blocked_reason, completion_detail=completion_detail,
         )
         self._update_state_machines(session, effective_status, pr_url)
+        self._tech_lead_run_activity.note_concluded(
+            session, effective_status, processing_errors=processing_errors,
+        )
 
     def emit_trace_events(
         self,

@@ -18,6 +18,10 @@ from issue_orchestrator.contracts.public import (
     TechLeadActivityContract,
 )
 from issue_orchestrator.domain.tech_lead_run import TechLeadRunScopeKind
+from issue_orchestrator.domain.tech_lead_run_artifacts import (
+    TechLeadRunArtifactKind,
+    TechLeadRunArtifacts,
+)
 from issue_orchestrator.domain.tech_lead_run_record import (
     TechLeadRunPhase,
     TechLeadRunRecord,
@@ -28,6 +32,8 @@ from issue_orchestrator.ports.tech_lead_run_record_store import (
     InMemoryTechLeadRunRecordStore,
 )
 from issue_orchestrator.view_models.tech_lead_activity import (
+    ARTIFACTS_ABSENT_NOTE,
+    ARTIFACTS_PENDING_NOTE,
     EMPTY_MESSAGE,
     read_tech_lead_activity,
 )
@@ -45,6 +51,7 @@ def _record(**overrides) -> TechLeadRunRecord:
         "started_at": STARTED,
         "run_id": "run-900",
         "session_name": "tech-lead-900",
+        "anchor_issue_number": 900,
     }
     fields.update(overrides)
     return TechLeadRunRecord(**fields)
@@ -94,12 +101,30 @@ def test_every_phase_carries_text_as_well_as_a_tone(phase, label, tone):
     assert entry.phase_label
 
 
-def test_a_whole_board_run_advertises_no_subject_issue():
-    """A health review's subject is the board. Claiming an issue number it does
-    not have would point the operator at the wrong thing."""
+def test_a_whole_board_run_advertises_the_board_as_its_subject():
+    """A health review's subject is the board, and the anchor it was coordinated
+    through is published separately AS an anchor (#6858 F5). Claiming the anchor
+    is the subject points the operator at the wrong thing."""
     view = _view(_record())
 
     (entry,) = view.entries
+    assert entry.subject_kind == "board"
+    assert entry.subject_label == "Whole board"
+    assert entry.subject_issue_number == 0
+    assert entry.anchor_issue_number == 900
+
+
+def test_a_batch_review_advertises_the_pr_manifest_as_its_subject():
+    view = _view(
+        _record(
+            run_key="global:batch_review",
+            scope_kind=TechLeadRunScopeKind.GLOBAL_BATCH_REVIEW,
+            flavor=TechLeadSessionFlavor.BATCH_REVIEW,
+        )
+    )
+
+    (entry,) = view.entries
+    assert (entry.subject_kind, entry.subject_label) == ("pr_manifest", "PR manifest")
     assert entry.subject_issue_number == 0
 
 
@@ -113,11 +138,14 @@ def test_a_focused_investigation_references_its_subject_issue():
             session_name="tech-lead-42",
             subject_issue_number=42,
             subject_title="Flaky merge queue",
+            anchor_issue_number=42,
         )
     )
 
     (entry,) = view.entries
     assert entry.flavor_label == "Failure investigation"
+    assert entry.subject_kind == "issue"
+    assert entry.subject_label == "#42 Flaky merge queue"
     assert entry.subject_issue_number == 42
     assert entry.subject_title == "Flaky merge queue"
 
@@ -191,3 +219,109 @@ def test_the_dashboard_contract_requires_the_activity_payload():
                 },
             }
         )
+
+
+def _preserved(tmp_path, *kinds) -> TechLeadRunArtifacts:
+    location = tmp_path / "archive" / "run-900__tech-lead-900"
+    location.mkdir(parents=True, exist_ok=True)
+    return TechLeadRunArtifacts(location=location, kinds=kinds)
+
+
+def _concluded(tmp_path, *kinds):
+    return _record(
+        phase=TechLeadRunPhase.COMPLETED,
+        ended_at=ENDED,
+        artifacts=_preserved(tmp_path, *kinds),
+    )
+
+
+class TestTheDrillDownIsAPublishedCommand:
+    """#6858 F4/A1: local visibility means the ARTIFACTS are reachable.
+
+    The panel publishes the dashboard's EXISTING typed lifecycle commands, built
+    from the PRESERVED location the archive owner recorded. The browser therefore
+    never reconstructs a path, and never derives one from runId/sessionName —
+    which it could not do anyway, since the run's own directory was deleted with
+    its worktree.
+    """
+
+    def test_a_preserved_replay_publishes_the_session_recording_command(
+        self, tmp_path
+    ):
+        view = _view(
+            _concluded(tmp_path, TechLeadRunArtifactKind.SESSION_REPLAY)
+        )
+
+        (entry,) = view.entries
+        (command,) = entry.artifacts
+        assert command.kind == "open_session_recording"
+        assert command.label == "Session replay"
+        # Keyed by the run's anchor, and pointed at the PRESERVED directory.
+        assert command.issue_number == 900
+        assert command.run_dir.endswith("run-900__tech-lead-900")
+
+    def test_a_preserved_pair_publishes_report_and_decision_commands(self, tmp_path):
+        view = _view(
+            _concluded(
+                tmp_path,
+                TechLeadRunArtifactKind.REPORT,
+                TechLeadRunArtifactKind.DECISION,
+            )
+        )
+
+        (entry,) = view.entries
+        report, decision = entry.artifacts
+        assert (report.kind, report.label) == ("open_review_artifact", "Report")
+        assert report.artifact_type == "tech_lead_report"
+        assert report.artifact_path == "tech-lead-data/tech-lead-report.md"
+        assert report.render_mode == "markdown"
+        assert decision.artifact_type == "tech_lead_decision"
+        assert decision.artifact_path == "tech-lead-data/tech-lead-decision.json"
+        assert decision.render_mode == "json"
+
+    def test_only_preserved_kinds_are_offered(self, tmp_path):
+        """A run that died before writing a decision must not offer a button
+        that 404s."""
+        view = _view(_concluded(tmp_path, TechLeadRunArtifactKind.SESSION_REPLAY))
+
+        (entry,) = view.entries
+        assert [command.kind for command in entry.artifacts] == [
+            "open_session_recording"
+        ]
+        assert entry.artifacts_note == ""
+
+    def test_a_running_run_says_artifacts_are_not_preserved_yet(self):
+        view = _view(_record())
+
+        (entry,) = view.entries
+        assert entry.artifacts == ()
+        assert entry.artifacts_note == ARTIFACTS_PENDING_NOTE
+
+    def test_a_finished_run_with_nothing_preserved_says_so(self):
+        """"Not yet" and "never" are different facts, so they are two sentences."""
+        view = _view(_record(phase=TechLeadRunPhase.FAILED, ended_at=ENDED))
+
+        (entry,) = view.entries
+        assert entry.artifacts == ()
+        assert entry.artifacts_note == ARTIFACTS_ABSENT_NOTE
+
+    def test_the_serialized_commands_satisfy_the_public_contract(self, tmp_path):
+        """Producer→payload for the drill-down itself, not just the summary."""
+        view = _view(
+            _concluded(
+                tmp_path,
+                TechLeadRunArtifactKind.SESSION_REPLAY,
+                TechLeadRunArtifactKind.REPORT,
+            )
+        )
+
+        payload = view.model_dump(mode="json", by_alias=True)
+        contract = TechLeadActivityContract.model_validate(payload)
+
+        commands = contract.entries[0].artifacts
+        assert [command.kind for command in commands] == [
+            "open_session_recording",
+            "open_review_artifact",
+        ]
+        assert commands[1].artifact_type == "tech_lead_report"
+        assert all(command.run_dir for command in commands)

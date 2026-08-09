@@ -189,6 +189,74 @@ def test_get_review_artifact_rejects_wrong_filename_for_type(tmp_path: Path) -> 
         )
 
 
+def test_get_review_artifact_serves_the_tech_lead_pair(tmp_path: Path) -> None:
+    """The tech lead's report/decision pair reads through the SAME run-scoped
+    policy the reviewer's pair does (#6858 F4), so the dashboard needs no second
+    artifact endpoint and no second containment rule."""
+    accessor, _worktree, run_dir = _build_accessor(tmp_path)
+    data_dir = run_dir / "tech-lead-data"
+    data_dir.mkdir(parents=True)
+    (data_dir / "tech-lead-report.md").write_text("# Health review\n", encoding="utf-8")
+    (data_dir / "tech-lead-decision.json").write_text('{"summary": "ok"}', encoding="utf-8")
+
+    report = accessor.get_review_artifact(
+        artifact_path="tech-lead-data/tech-lead-report.md",
+        artifact_type="tech_lead_report",
+    )
+    decision = accessor.get_review_artifact(
+        artifact_path="tech-lead-data/tech-lead-decision.json",
+        artifact_type="tech_lead_decision",
+    )
+
+    assert report.descriptor.content_type == "text/markdown"
+    assert decision.descriptor.content_type == "application/json"
+
+
+def test_get_review_artifact_rejects_a_tech_lead_path_outside_its_directory(
+    tmp_path: Path,
+) -> None:
+    """A caller-supplied path is checked against the type's declared home."""
+    accessor, _worktree, run_dir = _build_accessor(tmp_path)
+    stray = run_dir / "tech-lead-report.md"
+    stray.write_text("# Not where the run writes it\n", encoding="utf-8")
+
+    with pytest.raises(ArtifactNotFoundError, match="not a persisted tech-lead artifact"):
+        accessor.get_review_artifact(
+            artifact_path=str(stray),
+            artifact_type="tech_lead_report",
+        )
+
+
+def test_get_review_artifact_rejects_a_tech_lead_path_escaping_the_run(
+    tmp_path: Path,
+) -> None:
+    accessor, _worktree, _run_dir = _build_accessor(tmp_path)
+    outside = tmp_path / "elsewhere" / "tech-lead-report.md"
+    outside.parent.mkdir(parents=True, exist_ok=True)
+    outside.write_text("# Someone else's run\n", encoding="utf-8")
+
+    with pytest.raises(ArtifactNotFoundError, match="escapes run_dir"):
+        accessor.get_review_artifact(
+            artifact_path=str(outside),
+            artifact_type="tech_lead_report",
+        )
+
+
+def test_get_review_artifact_rejects_a_tech_lead_decision_that_is_not_json(
+    tmp_path: Path,
+) -> None:
+    accessor, _worktree, run_dir = _build_accessor(tmp_path)
+    data_dir = run_dir / "tech-lead-data"
+    data_dir.mkdir(parents=True)
+    (data_dir / "tech-lead-decision.json").write_text("not json", encoding="utf-8")
+
+    with pytest.raises(ArtifactNotFoundError):
+        accessor.get_review_artifact(
+            artifact_path="tech-lead-data/tech-lead-decision.json",
+            artifact_type="tech_lead_decision",
+        )
+
+
 def test_get_agent_log_uses_terminal_recording_even_when_claude_log_exists(tmp_path: Path) -> None:
     accessor, _worktree, run_dir = _build_accessor(tmp_path)
     recording = run_dir / "terminal-recording.jsonl"

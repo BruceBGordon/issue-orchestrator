@@ -155,14 +155,19 @@ def _release_run_hold(deps: object, session: "Session") -> bool:
 def _close_run_record(deps: object, session: "Session") -> None:
     """Mark the terminated session's local run record withdrawn.
 
-    Unlike the run HOLD, a missing activity owner is not a composition error:
-    the record is a receipt, and a deployment without one still terminates
-    correctly. It is skipped rather than raised so a missing receipt cannot
-    fail a cleanup that otherwise succeeded.
+    The activity owner is a REQUIRED composition dependency (#6858 round 1 A2),
+    so a missing one is a wiring error and fails loudly here — the same rule the
+    run hold above follows. Reporting a clean withdrawal when nothing recorded it
+    is how the activity surface ends up claiming stopped work is still running.
+    The effect runner around this call already isolates the failure so one broken
+    receipt cannot abort the rest of the cleanup.
     """
     activity = getattr(deps, "tech_lead_run_activity", None)
     if activity is None:
-        return
+        raise RuntimeError(
+            "no tech-lead run activity owner is wired, so the terminated run's"
+            " local record cannot be closed"
+        )
     activity.note_withdrawn(session)
 
 

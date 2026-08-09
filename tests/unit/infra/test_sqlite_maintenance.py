@@ -207,3 +207,47 @@ def test_the_real_claim_store_writes_where_the_registry_says(tmp_path):
 
     registered = {db.key: db for db in list_sqlite_databases(config)}
     assert registered["pending_work_claims"].path_fn(config).is_file()
+
+
+def test_sqlite_registry_includes_the_tech_lead_run_history(tmp_path):
+    """ADR-0033's local run history is a first-class state DB (#6858 F1).
+
+    It holds the ONLY durable record that a tech-lead run happened and what it
+    concluded, and nothing rebuilds it — the runs it describes executed in
+    worktrees that no longer exist. So it gets the same startup integrity check,
+    pragma enforcement, and backups as every other authoritative store.
+    """
+    config = Config()
+    config.repo_root = tmp_path
+
+    entry = next(
+        db for db in list_sqlite_databases(config) if db.key == "tech_lead_runs"
+    )
+
+    assert entry.label == "Tech Lead Runs"
+    assert entry.path_fn(config) == state_dir(tmp_path) / "tech_lead_runs.sqlite"
+    assert entry.enabled_fn(config) is True
+    assert entry.backup is True
+    assert entry.enforce_pragmas is True
+
+
+def test_tech_lead_run_history_db_is_backed_up_when_due(tmp_path):
+    """The registered policy actually drives a backup for the real file."""
+    config = Config()
+    config.repo_root = tmp_path
+
+    from issue_orchestrator.infra.tech_lead_run_record_store import (
+        SqliteTechLeadRunRecordStore,
+    )
+
+    SqliteTechLeadRunRecordStore.for_repo(tmp_path)  # creates the DB file
+
+    results = run_backups_if_due(config)
+
+    assert any(r.db.key == "tech_lead_runs" and r.performed for r in results)
+    date_str = datetime.now(timezone.utc).date().isoformat()
+    backup = (
+        tmp_path / ".issue-orchestrator" / "backups" / "sqlite"
+        / "tech_lead_runs" / "daily" / f"{date_str}.db"
+    )
+    assert backup.exists()

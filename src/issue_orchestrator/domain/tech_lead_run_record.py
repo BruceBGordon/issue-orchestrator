@@ -30,7 +30,34 @@ from enum import Enum
 from typing import Optional
 
 from .tech_lead_run import TechLeadRunScopeKind, scope_kind_of_run_key
+from .tech_lead_run_artifacts import TechLeadRunArtifacts
 from .tech_lead_session import TechLeadSessionFlavor
+
+
+class TechLeadRunSubjectKind(str, Enum):
+    """What a run is ABOUT — never what it was coordinated through (#6858 F5).
+
+    The canonical scopes already say this: both global flavors report
+    ``subject_issue_number is None`` because their subject is the board or the
+    accumulated PR manifest. Recording ``session.issue`` for every flavor made a
+    health review look like an investigation of its own bookkeeping anchor,
+    which is precisely the coordination/visibility confusion ADR-0033 splits.
+    So the subject is derived from the scope, and the anchor is recorded
+    separately, as an anchor.
+    """
+
+    ISSUE = "issue"
+    BOARD = "board"
+    PR_MANIFEST = "pr_manifest"
+
+
+# One scope → one subject. A table rather than a branch chain, so a new scope
+# cannot be classified differently by two surfaces.
+_SUBJECT_KIND_BY_SCOPE: dict[TechLeadRunScopeKind, TechLeadRunSubjectKind] = {
+    TechLeadRunScopeKind.ISSUE: TechLeadRunSubjectKind.ISSUE,
+    TechLeadRunScopeKind.GLOBAL_HEALTH_REVIEW: TechLeadRunSubjectKind.BOARD,
+    TechLeadRunScopeKind.GLOBAL_BATCH_REVIEW: TechLeadRunSubjectKind.PR_MANIFEST,
+}
 
 
 class TechLeadRunPhase(str, Enum):
@@ -76,12 +103,15 @@ class TechLeadRunRecord:
     run is its session run — ``(run_id, session_name)`` — which is also exactly
     what the replay surface needs to find its artifacts.
 
-    ``subject_issue_number`` is a REFERENCE, never ownership: for a focused
-    investigation it is the issue under investigation, and for a whole-board
-    review it is the anchor the run was coordinated through. Recording it as a
-    reference is the identity-layer half of decoupled-scratch — investigate the
-    subject without being it — and it is what lets the anchor become optional
-    later without the record losing its subject.
+    ``subject_issue_number`` is a REFERENCE, never ownership, and it belongs to
+    the run's SCOPE rather than to the session that executed it: a focused
+    investigation references the issue under investigation, and a whole-board
+    review references no issue at all, because its subject is the board. The
+    bookkeeping anchor a global run was coordinated THROUGH is recorded
+    separately as ``anchor_issue_number`` — naming it as an anchor is what stops
+    the shared coordination half masquerading as the local subject (#6858 F5),
+    and it is what lets the anchor become optional later without the record
+    losing its subject.
     """
 
     run_key: str
@@ -94,9 +124,14 @@ class TechLeadRunRecord:
     # about a run with no way to check it.
     run_id: str
     session_name: str
-    # The GitHub object this run REFERENCED (0 when it referenced none).
+    # The issue this run is ABOUT: the focus issue of an investigation, and 0
+    # for every whole-repository run, whose subject is not an issue.
     subject_issue_number: int = 0
     subject_title: str = ""
+    # The GitHub object the run was COORDINATED through (0 when none). For a
+    # focused investigation this is the same issue as the subject; for a global
+    # run it is the bookkeeping anchor, which is not its subject.
+    anchor_issue_number: int = 0
     ended_at: Optional[datetime] = None
     # Operator-facing sentence for the phase. Free prose, deliberately: it is
     # never branched on, only rendered.
@@ -104,6 +139,11 @@ class TechLeadRunRecord:
     # What the run produced, as counted from its own decision artifact.
     findings: int = 0
     proposals: int = 0
+    # Where the run's PRESERVED artifacts are, once it has ended. ``None`` while
+    # a run is still going, and also for a run whose artifacts could not be
+    # preserved — the record then truthfully offers no drill-down rather than a
+    # button pointing into a deleted scratch worktree (#6858 F4).
+    artifacts: Optional[TechLeadRunArtifacts] = None
 
     def __post_init__(self) -> None:
         if not self.run_id or not self.session_name:
@@ -118,10 +158,25 @@ class TechLeadRunRecord:
                 f"run key {self.run_key!r} does not name a"
                 f" {self.scope_kind.value} run"
             )
-        if self.subject_issue_number < 0:
+        if self.subject_issue_number < 0 or self.anchor_issue_number < 0:
             raise ValueError(
-                "subject_issue_number is a reference or 0, never negative;"
-                f" got {self.subject_issue_number}"
+                "issue references are positive numbers or 0, never negative;"
+                f" got subject={self.subject_issue_number}"
+                f" anchor={self.anchor_issue_number}"
+            )
+        # The scope decides what a subject may be. Without this a global run can
+        # still be stored as if the anchor were its subject, which is the exact
+        # confusion the anchor field exists to remove (#6858 F5).
+        if self.subject_kind is TechLeadRunSubjectKind.ISSUE:
+            if self.subject_issue_number <= 0:
+                raise ValueError(
+                    "a focused tech-lead investigation references the issue it"
+                    " investigates; got no subject issue number"
+                )
+        elif self.subject_issue_number or self.subject_title:
+            raise ValueError(
+                f"a {self.subject_kind.value} run has no subject issue — its"
+                " coordination anchor belongs in anchor_issue_number"
             )
         if self.phase.is_terminal and self.ended_at is None:
             raise ValueError(
@@ -129,6 +184,15 @@ class TechLeadRunRecord:
             )
         if not self.phase.is_terminal and self.ended_at is not None:
             raise ValueError("a running tech-lead run has not ended yet")
+
+    @property
+    def subject_kind(self) -> TechLeadRunSubjectKind:
+        """What this run is about, as its scope declares it.
+
+        Derived rather than stored so a record can never carry a subject kind
+        that disagrees with its own scope.
+        """
+        return _SUBJECT_KIND_BY_SCOPE[self.scope_kind]
 
     def concluded(
         self,
@@ -138,6 +202,7 @@ class TechLeadRunRecord:
         detail: str = "",
         findings: int = 0,
         proposals: int = 0,
+        artifacts: Optional[TechLeadRunArtifacts] = None,
     ) -> "TechLeadRunRecord":
         """This run, as it looks once it has stopped.
 
@@ -157,6 +222,7 @@ class TechLeadRunRecord:
             detail=detail,
             findings=findings,
             proposals=proposals,
+            artifacts=artifacts,
         )
 
     @property

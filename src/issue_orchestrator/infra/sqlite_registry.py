@@ -107,6 +107,23 @@ def list_sqlite_databases(config: Config) -> list[SQLiteDatabase]:
             backup=True,
             enforce_pragmas=True,
         ),
+        SQLiteDatabase(
+            # ADR-0033's LOCAL half (#6858): the only durable record that a
+            # tech-lead run happened, what it concluded, and where its preserved
+            # artifacts are. Unlike the authority store beside it, nothing
+            # deletes these rows — which is exactly why they need the same
+            # startup integrity check, pragma enforcement and backups as every
+            # other authoritative store. Losing this file is losing the
+            # operator's whole history, and there is nowhere to rebuild it from:
+            # the runs it describes ran in worktrees that no longer exist
+            # (#6858 round 1 F1).
+            key="tech_lead_runs",
+            label="Tech Lead Runs",
+            path_fn=lambda cfg: _state_db(cfg, "tech_lead_runs.sqlite"),
+            enabled_fn=lambda cfg: True,
+            backup=True,
+            enforce_pragmas=True,
+        ),
         # Rebuildable GitHub open-issue fingerprint cache used by the tech-lead
         # create_issue dedup gate (#6881).
         SQLiteDatabase(

@@ -693,7 +693,7 @@ export interface OpenIssueTimelineCommandPayload {
 
 export interface OpenReviewArtifactCommandPayload {
   artifact_path: string;
-  artifact_type: "review_report" | "review_decision";
+  artifact_type: "review_report" | "review_decision" | "tech_lead_report" | "tech_lead_decision";
   issue_number: number;
   kind: "open_review_artifact";
   label: string;

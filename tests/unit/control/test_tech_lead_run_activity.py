@@ -14,6 +14,7 @@ mock. The clock is injected; nothing sleeps.
 from __future__ import annotations
 
 import json
+import shutil
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -31,14 +32,23 @@ from issue_orchestrator.domain.tech_lead_run import TechLeadRunScopeKind
 from issue_orchestrator.domain.tech_lead_run_record import (
     TechLeadRunPhase,
     TechLeadRunRecord,
+    TechLeadRunSubjectKind,
 )
 from issue_orchestrator.domain.tech_lead_session import (
     TechLeadLaunchScope,
     TechLeadSessionFlavor,
 )
-from issue_orchestrator.infra.config import Config
+from issue_orchestrator.domain.tech_lead_run_artifacts import (
+    TechLeadRunArtifactKind,
+)
+from issue_orchestrator.infra.tech_lead_run_artifact_archive import (
+    FileSystemTechLeadRunArtifactArchive,
+)
 from issue_orchestrator.infra.tech_lead_run_record_store import (
     SqliteTechLeadRunRecordStore,
+)
+from issue_orchestrator.ports.tech_lead_run_artifact_archive import (
+    DiscardedTechLeadRunArtifacts,
 )
 from issue_orchestrator.ports.tech_lead_run_record_store import (
     InMemoryTechLeadRunRecordStore,
@@ -79,14 +89,12 @@ class FakeSession:
         )
 
 
-def _config() -> Config:
-    config = Config()
-    config.tech_lead_review_agent = TECH_LEAD_AGENT
-    return config
-
-
-def _activity(store) -> TechLeadRunActivity:
-    return TechLeadRunActivity(store, now=lambda: ENDED)
+def _activity(store, archive=None) -> TechLeadRunActivity:
+    return TechLeadRunActivity(
+        store,
+        archive if archive is not None else DiscardedTechLeadRunArtifacts(),
+        now=lambda: ENDED,
+    )
 
 
 def _session(tmp_path: Path, number: int, flavor) -> FakeSession:
@@ -158,6 +166,36 @@ class TestARunIsRemembered:
         assert record.run_key == "issue:42"
         assert record.subject_issue_number == 42
         assert record.subject_title == "Issue #42"
+        # For a focused investigation the anchor IS the subject.
+        assert record.anchor_issue_number == 42
+
+    @pytest.mark.parametrize(
+        "flavor,subject_kind",
+        [
+            (TechLeadSessionFlavor.HEALTH_REVIEW, TechLeadRunSubjectKind.BOARD),
+            (TechLeadSessionFlavor.BATCH_REVIEW, TechLeadRunSubjectKind.PR_MANIFEST),
+        ],
+    )
+    def test_a_global_run_records_its_anchor_as_an_anchor_not_a_subject(
+        self, tmp_path, flavor, subject_kind
+    ):
+        """Through the REAL owner seam, not a hand-built record (#6858 F5).
+
+        A whole-repository run executes as a session on a bookkeeping anchor
+        issue. Recording that anchor as the run's subject made every health and
+        batch review read as an investigation OF its own bookkeeping — the exact
+        coordination/visibility confusion ADR-0033 splits by owner.
+        """
+        store = InMemoryTechLeadRunRecordStore()
+        session = _session(tmp_path, 900, flavor)
+
+        _activity(store).note_started(session)
+
+        (record,) = store.recent(limit=10)
+        assert record.subject_kind is subject_kind
+        assert record.subject_issue_number == 0
+        assert record.subject_title == ""
+        assert record.anchor_issue_number == 900
 
     def test_a_session_with_no_launch_stamp_is_not_recorded(self, tmp_path):
         """A run that cannot name itself is noise, not evidence."""
@@ -188,7 +226,7 @@ class TestARunIsConcluded:
         activity = _activity(store)
         activity.note_started(session)
 
-        activity.note_concluded(_config(), session, SessionStatus.COMPLETED)
+        activity.note_concluded(session, SessionStatus.COMPLETED)
 
         (record,) = store.recent(limit=10)
         assert record.phase is TechLeadRunPhase.COMPLETED
@@ -208,7 +246,6 @@ class TestARunIsConcluded:
         activity.note_started(session)
 
         activity.note_concluded(
-            _config(),
             session,
             SessionStatus.COMPLETED,
             processing_errors=["tech_lead decision contract violation"],
@@ -234,7 +271,7 @@ class TestARunIsConcluded:
         activity = _activity(store)
         activity.note_started(session)
 
-        activity.note_concluded(_config(), session, status)
+        activity.note_concluded(session, status)
 
         (record,) = store.recent(limit=10)
         assert record.phase is phase
@@ -245,22 +282,35 @@ class TestARunIsConcluded:
         activity = _activity(store)
         activity.note_started(session)
 
-        activity.note_concluded(
-            _config(), session, SessionStatus.NEEDS_VALIDATION_RETRY
-        )
+        activity.note_concluded(session, SessionStatus.NEEDS_VALIDATION_RETRY)
 
         (record,) = store.recent(limit=10)
         assert record.phase is TechLeadRunPhase.RUNNING
 
-    def test_a_non_tech_lead_session_is_never_recorded(self, tmp_path):
-        """Completion finalization runs for EVERY session; only ours are runs."""
+    def test_a_session_with_no_launch_stamp_is_never_concluded(self, tmp_path):
+        """Completion finalization runs for EVERY session; only ours are runs,
+        and the session's own launch stamp is what says so."""
         store = InMemoryTechLeadRunRecordStore()
-        session = _session(tmp_path, 42, TechLeadSessionFlavor.FAILURE_INVESTIGATION)
-        session.issue.agent_type = "agent:developer"
+        session = _session(tmp_path, 42, None)
 
-        _activity(store).note_concluded(_config(), session, SessionStatus.COMPLETED)
+        _activity(store).note_concluded(session, SessionStatus.COMPLETED)
 
         assert store.recent(limit=10) == ()
+
+    def test_a_renamed_tech_lead_agent_still_concludes_an_open_run(self, tmp_path):
+        """The gate is the run's IMMUTABLE launch stamp, not the current agent
+        configuration: a repository that renames its tech lead agent mid-run must
+        not strand the open record at RUNNING forever."""
+        store = InMemoryTechLeadRunRecordStore()
+        session = _session(tmp_path, 42, TechLeadSessionFlavor.FAILURE_INVESTIGATION)
+        activity = _activity(store)
+        activity.note_started(session)
+        session.issue.agent_type = "agent:some-other-lead"
+
+        activity.note_concluded(session, SessionStatus.COMPLETED)
+
+        (record,) = store.recent(limit=10)
+        assert record.phase is TechLeadRunPhase.COMPLETED
 
     def test_a_terminated_run_is_withdrawn_rather_than_left_running(self, tmp_path):
         """The one-shot timeout path runs no further tick, so a record left at
@@ -284,7 +334,7 @@ class TestTheHistorySurvivesRestart:
         session = _session(tmp_path, 900, TechLeadSessionFlavor.HEALTH_REVIEW)
         first = _activity(SqliteTechLeadRunRecordStore(db))
         first.note_started(session)
-        first.note_concluded(_config(), session, SessionStatus.COMPLETED)
+        first.note_concluded(session, SessionStatus.COMPLETED)
 
         reopened = SqliteTechLeadRunRecordStore(db)
 
@@ -298,9 +348,9 @@ class TestTheHistorySurvivesRestart:
         session = _session(tmp_path, 42, TechLeadSessionFlavor.FAILURE_INVESTIGATION)
         activity = _activity(store)
         activity.note_started(session)
-        activity.note_concluded(_config(), session, SessionStatus.COMPLETED)
+        activity.note_concluded(session, SessionStatus.COMPLETED)
 
-        activity.note_concluded(_config(), session, SessionStatus.FAILED)
+        activity.note_concluded(session, SessionStatus.FAILED)
 
         (record,) = store.recent(limit=10)
         assert record.phase is TechLeadRunPhase.COMPLETED
@@ -365,7 +415,6 @@ class TestPublishFailuresAreNotConclusions:
         activity.note_started(session)
 
         activity.note_concluded(
-            _config(),
             session,
             SessionStatus.FAILED,
             processing_errors=[f"{ERROR_PREFIX_PUSH}: remote rejected"],
@@ -373,3 +422,117 @@ class TestPublishFailuresAreNotConclusions:
 
         (record,) = store.recent(limit=10)
         assert record.phase is TechLeadRunPhase.RUNNING
+
+
+class TestTheRunsEvidenceOutlivesItsWorktree:
+    """#6858 F4: the promise of local visibility is the ARTIFACTS, not a summary.
+
+    A failure investigation writes its evidence map, decision, report and
+    terminal recording inside a DISPOSABLE scratch worktree, and completion
+    always removes that worktree. Before the archive, a record kept counts and a
+    sentence while the evidence they described was deleted minutes later.
+    """
+
+    def _run_dir_with_artifacts(self, tmp_path) -> "FakeSession":
+        session = _session(tmp_path, 42, TechLeadSessionFlavor.FAILURE_INVESTIGATION)
+        _write_decision(session)
+        (Path(session.run_dir) / "terminal-recording.jsonl").write_text(
+            '{"event_type": "output", "data_b64": "aGk="}\n', encoding="utf-8"
+        )
+        (Path(session.run_dir) / "manifest.json").write_text("{}", encoding="utf-8")
+        return session
+
+    def test_a_concluded_run_keeps_its_artifacts_after_the_worktree_is_gone(
+        self, tmp_path
+    ):
+        store = InMemoryTechLeadRunRecordStore()
+        archive = FileSystemTechLeadRunArtifactArchive(tmp_path / "archive")
+        session = self._run_dir_with_artifacts(tmp_path)
+        activity = _activity(store, archive)
+        activity.note_started(session)
+
+        activity.note_concluded(session, SessionStatus.COMPLETED)
+        # The scratch worktree is removed by the cleanup this same completion
+        # plans. Everything the operator was promised must survive it.
+        shutil.rmtree(session.run_dir)
+
+        (record,) = store.recent(limit=10)
+        assert record.artifacts is not None
+        assert set(record.artifacts.kinds) == {
+            TechLeadRunArtifactKind.SESSION_REPLAY,
+            TechLeadRunArtifactKind.REPORT,
+            TechLeadRunArtifactKind.DECISION,
+        }
+        for kind in record.artifacts.kinds:
+            assert record.artifacts.path_for(kind).is_file()
+
+    def test_the_preserved_location_is_outside_the_runs_own_directory(self, tmp_path):
+        """Otherwise "preserved" means "deleted with everything else"."""
+        store = InMemoryTechLeadRunRecordStore()
+        archive = FileSystemTechLeadRunArtifactArchive(tmp_path / "archive")
+        session = self._run_dir_with_artifacts(tmp_path)
+        activity = _activity(store, archive)
+        activity.note_started(session)
+
+        activity.note_concluded(session, SessionStatus.COMPLETED)
+
+        (record,) = store.recent(limit=10)
+        assert record.artifacts is not None
+        with pytest.raises(ValueError):
+            record.artifacts.location.relative_to(Path(session.run_dir))
+
+    def test_a_run_that_wrote_nothing_advertises_no_drill_down(self, tmp_path):
+        """Truthful emptiness beats a button that 404s."""
+        store = InMemoryTechLeadRunRecordStore()
+        archive = FileSystemTechLeadRunArtifactArchive(tmp_path / "archive")
+        session = _session(tmp_path, 900, TechLeadSessionFlavor.HEALTH_REVIEW)
+        activity = _activity(store, archive)
+        activity.note_started(session)
+
+        activity.note_concluded(session, SessionStatus.FAILED)
+
+        (record,) = store.recent(limit=10)
+        assert record.artifacts is None
+
+    def test_an_unwritable_archive_does_not_fail_the_conclusion(self, tmp_path):
+        """A lost receipt must never lose the run: the port forbids raising."""
+        store = InMemoryTechLeadRunRecordStore()
+        blocked = tmp_path / "blocked"
+        blocked.write_text("not a directory", encoding="utf-8")
+        archive = FileSystemTechLeadRunArtifactArchive(blocked / "archive")
+        session = self._run_dir_with_artifacts(tmp_path)
+        activity = _activity(store, archive)
+        activity.note_started(session)
+
+        activity.note_concluded(session, SessionStatus.COMPLETED)
+
+        (record,) = store.recent(limit=10)
+        assert record.phase is TechLeadRunPhase.COMPLETED
+        assert record.artifacts is None
+
+    def test_a_withdrawn_runs_evidence_is_preserved_too(self, tmp_path):
+        """A run stopped mid-audit is exactly the one an operator wants to read."""
+        store = InMemoryTechLeadRunRecordStore()
+        archive = FileSystemTechLeadRunArtifactArchive(tmp_path / "archive")
+        session = self._run_dir_with_artifacts(tmp_path)
+        activity = _activity(store, archive)
+        activity.note_started(session)
+
+        activity.note_withdrawn(session)
+
+        (record,) = store.recent(limit=10)
+        assert record.phase is TechLeadRunPhase.WITHDRAWN
+        assert record.artifacts is not None
+
+    def test_the_locator_survives_a_restart(self, tmp_path):
+        db = tmp_path / "runs.sqlite"
+        archive = FileSystemTechLeadRunArtifactArchive(tmp_path / "archive")
+        session = self._run_dir_with_artifacts(tmp_path)
+        first = _activity(SqliteTechLeadRunRecordStore(db), archive)
+        first.note_started(session)
+        first.note_concluded(session, SessionStatus.COMPLETED)
+
+        (record,) = SqliteTechLeadRunRecordStore(db).recent(limit=10)
+
+        assert record.artifacts is not None
+        assert record.artifacts.has(TechLeadRunArtifactKind.REPORT)

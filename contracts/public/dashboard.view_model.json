@@ -342,6 +342,23 @@
       "additionalProperties": true,
       "description": "One recorded tech-lead run on the activity panel (ADR-0033 / #6858).",
       "properties": {
+        "anchorIssueNumber": {
+          "default": 0,
+          "title": "Anchorissuenumber",
+          "type": "integer"
+        },
+        "artifacts": {
+          "items": {
+            "$ref": "#/$defs/TechLeadRunArtifactCommandContract"
+          },
+          "title": "Artifacts",
+          "type": "array"
+        },
+        "artifactsNote": {
+          "default": "",
+          "title": "Artifactsnote",
+          "type": "string"
+        },
         "detail": {
           "default": "",
           "title": "Detail",
@@ -395,6 +412,14 @@
           "title": "Subjectissuenumber",
           "type": "integer"
         },
+        "subjectKind": {
+          "title": "Subjectkind",
+          "type": "string"
+        },
+        "subjectLabel": {
+          "title": "Subjectlabel",
+          "type": "string"
+        },
         "subjectTitle": {
           "default": "",
           "title": "Subjecttitle",
@@ -412,10 +437,78 @@
         "phaseLabel",
         "tone",
         "startedAt",
+        "subjectKind",
+        "subjectLabel",
         "runId",
         "sessionName"
       ],
       "title": "TechLeadRunActivityEntryContract",
+      "type": "object"
+    },
+    "TechLeadRunArtifactCommandContract": {
+      "additionalProperties": true,
+      "description": "One inspection of a recorded run's PRESERVED artifacts (#6858 F4).\n\nThe dashboard's EXISTING lifecycle inspection command, reused rather than\ncopied: ``open_session_recording`` for the replay and\n``open_review_artifact`` for the tech-lead report/decision pair, both\ndispatched by ``runLifecycleCommand``. Snake_case because that is the\nlifecycle command wire shape the one dispatcher already reads.\n\nThe preserved ``run_dir`` is published by the archive owner because only it\nknows where a finished run's evidence was filed \u2014 the UI must never\nreconstruct a path or derive one from ``runId``/``sessionName``.",
+      "properties": {
+        "artifact_path": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Artifact Path"
+        },
+        "artifact_type": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Artifact Type"
+        },
+        "issue_number": {
+          "title": "Issue Number",
+          "type": "integer"
+        },
+        "kind": {
+          "title": "Kind",
+          "type": "string"
+        },
+        "label": {
+          "title": "Label",
+          "type": "string"
+        },
+        "render_mode": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Render Mode"
+        },
+        "run_dir": {
+          "title": "Run Dir",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "label",
+        "issue_number",
+        "run_dir"
+      ],
+      "title": "TechLeadRunArtifactCommandContract",
       "type": "object"
     }
   },

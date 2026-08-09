@@ -95,6 +95,34 @@ class TechLeadRunActionsContract(ContractBase):
     needsSettings: bool = False
 
 
+class TechLeadRunArtifactCommandContract(ContractBase):
+    """One inspection of a recorded run's PRESERVED artifacts (#6858 F4).
+
+    The dashboard's EXISTING lifecycle inspection command, reused rather than
+    copied: ``open_session_recording`` for the replay and
+    ``open_review_artifact`` for the tech-lead report/decision pair, both
+    dispatched by ``runLifecycleCommand``. Snake_case because that is the
+    lifecycle command wire shape the one dispatcher already reads.
+
+    The preserved ``run_dir`` is published by the archive owner because only it
+    knows where a finished run's evidence was filed — the UI must never
+    reconstruct a path or derive one from ``runId``/``sessionName``.
+    """
+
+    # "open_session_recording" | "open_review_artifact".
+    kind: str
+    # Operator-facing button text.
+    label: str
+    # The issue number the run-scoped endpoints are keyed by.
+    issue_number: int
+    # The engine-owned preserved run directory, which outlives the run's worktree.
+    run_dir: str
+    # Present for ``open_review_artifact`` only.
+    artifact_path: Optional[str] = None
+    artifact_type: Optional[str] = None
+    render_mode: Optional[str] = None
+
+
 class TechLeadRunActivityEntryContract(ContractBase):
     """One recorded tech-lead run on the activity panel (ADR-0033 / #6858)."""
 
@@ -110,15 +138,26 @@ class TechLeadRunActivityEntryContract(ContractBase):
     startedAt: str
     # "" while the run is still going.
     endedAt: str = ""
-    # 0 when the run referenced no GitHub object.
+    # What the run is ABOUT: "issue" | "board" | "pr_manifest".
+    subjectKind: str
+    # Rendered subject — "#42 Flaky merge queue" | "Whole board" | "PR manifest".
+    subjectLabel: str
+    # 0 for every whole-repository run: its subject is the board or the manifest,
+    # not an issue (#6858 F5).
     subjectIssueNumber: int = 0
     subjectTitle: str = ""
+    # The bookkeeping issue the run was COORDINATED through (0 when none).
+    anchorIssueNumber: int = 0
     detail: str = ""
     findings: int = 0
     proposals: int = 0
     # Drill-down identity for the session-replay surface.
     runId: str
     sessionName: str
+    # Inspections available for this run's preserved artifacts.
+    artifacts: list[TechLeadRunArtifactCommandContract] = Field(default_factory=list)
+    # Why there are none ("" when there are some).
+    artifactsNote: str = ""
 
 
 class TechLeadActivityContract(ContractBase):

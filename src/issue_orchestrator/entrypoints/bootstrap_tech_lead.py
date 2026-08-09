@@ -77,11 +77,36 @@ def create_tech_lead_run_activity(config: "Config") -> "TechLeadRunActivity":
     module also builds: that one is a trust boundary whose rows are deleted at
     each run's terminal, this one is the operator-facing history that only has
     value once a run is over (#6858).
+
+    The composition root is where the port's best-effort contract is HONOURED
+    rather than merely declared. The store itself fails loudly on an unusable
+    database — it cannot know whether losing durability is acceptable — so this
+    factory catches that failure, says plainly in the log that the engine is
+    running without a durable history, and selects the in-memory implementation.
+    A read-only state directory or a corrupt file must not stop the Repository
+    Engine from starting: history is a receipt, and no receipt is a reason to
+    refuse the work (#6858 round 1 F2).
     """
-    from ..control.tech_lead_run_activity import TechLeadRunActivity
+    from ..control.tech_lead_run_activity import TechLeadRunActivity, in_memory_run_activity
+    from ..infra.tech_lead_run_artifact_archive import (
+        FileSystemTechLeadRunArtifactArchive,
+    )
     from ..infra.tech_lead_run_record_store import SqliteTechLeadRunRecordStore
 
-    return TechLeadRunActivity(SqliteTechLeadRunRecordStore.for_repo(config.repo_root))
+    try:
+        store = SqliteTechLeadRunRecordStore.for_repo(config.repo_root)
+    except (OSError, sqlite3.Error):
+        logger.warning(
+            "[TECH_LEAD_RUN] The durable tech-lead run history at %s could not be"
+            " opened; this engine will record runs in memory only and forget them"
+            " when it exits",
+            config.repo_root,
+            exc_info=True,
+        )
+        return in_memory_run_activity()
+    return TechLeadRunActivity(
+        store, FileSystemTechLeadRunArtifactArchive.for_repo(config.repo_root)
+    )
 
 
 def create_open_issue_corpus_store(config: "Config") -> "OpenIssueCorpusStore":

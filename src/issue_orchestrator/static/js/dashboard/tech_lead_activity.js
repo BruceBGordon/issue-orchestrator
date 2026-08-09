@@ -19,6 +19,9 @@
 //   are and where it is in them.
 // * Phase is ALWAYS rendered as text (``phaseLabel``) next to its tone class —
 //   colour is never the only signal.
+// * Drill-downs are native <button> elements with real text labels, rendered by
+//   the shared lifecycle-Command owner, so they are keyboard reachable and carry
+//   the same visible focus ring as every other dashboard action.
 // * Updates replace only the list's rows, so an operator's open panel and
 //   keyboard focus survive live SSE-driven refreshes.
 
@@ -31,16 +34,46 @@ function techLeadActivityEntries(activity) {
     return (activity && Array.isArray(activity.entries)) ? activity.entries : [];
 }
 
-// Pure: "#123 Some title", or '' when the run referenced no GitHub object.
-// A whole-board review's subject is the board, and claiming an issue number it
-// does not have would point the operator at the wrong thing.
+// Pure: the run's subject, as the server named it — "#123 Some title" for a
+// focused investigation, "Whole board" / "PR manifest" for a global run. The
+// browser never derives this: a whole-board review's subject is NOT the anchor
+// it was coordinated through, and deciding that here is how the two halves of
+// ADR-0033 got confused in the first place.
 function techLeadActivitySubjectText(entry) {
-    const number = Number(entry.subjectIssueNumber) || 0;
-    if (!number) {
+    return entry.subjectLabel ? String(entry.subjectLabel) : '';
+}
+
+// Pure: "via #900", or '' when the anchor IS the subject (or there is none).
+// Shown so an operator can still reach a global run's bookkeeping issue without
+// the panel claiming the run was about it.
+function techLeadActivityAnchorText(entry) {
+    const anchor = Number(entry.anchorIssueNumber) || 0;
+    const subject = Number(entry.subjectIssueNumber) || 0;
+    if (!anchor || anchor === subject) {
         return '';
     }
-    const title = entry.subjectTitle ? ` ${entry.subjectTitle}` : '';
-    return `#${number}${title}`;
+    return `via #${anchor}`;
+}
+
+// Pure: the run's drill-down buttons, or the server's sentence explaining why
+// there are none. Every button is a typed lifecycle Command the server built
+// from the PRESERVED artifact location, rendered and dispatched by the shared
+// command owner — so this panel never assembles an endpoint, a path, or a
+// fallback guess from runId/sessionName.
+function techLeadActivityActionsHtml(entry) {
+    const commands = Array.isArray(entry.artifacts) ? entry.artifacts : [];
+    if (!commands.length) {
+        const note = entry.artifactsNote ? String(entry.artifactsNote) : '';
+        return note
+            ? `<span class="tla-artifacts-note">${escapeHtml(note)}</span>`
+            : '';
+    }
+    const buttons = commands
+        .map(command => _renderLifecycleCommandButton(
+            command, null, 'issue-action-btn tla-action',
+        ))
+        .join('');
+    return `<span class="tla-actions">${buttons}</span>`;
 }
 
 // Pure: "2 findings · 1 proposal", or '' when the run produced neither.
@@ -71,6 +104,10 @@ function renderTechLeadActivityRow(entry) {
     if (subject) {
         cells.push(`<span class="tla-subject">${escapeHtml(subject)}</span>`);
     }
+    const anchor = techLeadActivityAnchorText(entry);
+    if (anchor) {
+        cells.push(`<span class="tla-anchor">${escapeHtml(anchor)}</span>`);
+    }
     const started = formatTimestamp(entry.startedAt, '');
     if (started) {
         cells.push(`<span class="tla-started">${escapeHtml(started)}</span>`);
@@ -84,6 +121,10 @@ function renderTechLeadActivityRow(entry) {
             `<span class="tla-detail" title="${escapeAttr(entry.detail)}">`
             + `${escapeHtml(entry.detail)}</span>`,
         );
+    }
+    const actions = techLeadActivityActionsHtml(entry);
+    if (actions) {
+        cells.push(actions);
     }
     return `<li class="tla-row">${cells.join('')}</li>`;
 }

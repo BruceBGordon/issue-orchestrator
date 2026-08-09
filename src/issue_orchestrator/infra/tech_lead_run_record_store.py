@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Iterator, Optional
 
 from ..domain.tech_lead_run import TechLeadRunScopeKind
+from ..domain.tech_lead_run_artifacts import TechLeadRunArtifacts, kinds_from_values
 from ..domain.tech_lead_run_record import TechLeadRunPhase, TechLeadRunRecord
 from ..domain.tech_lead_session import TechLeadSessionFlavor
 from .repo_identity import state_dir
@@ -52,6 +53,20 @@ CREATE INDEX IF NOT EXISTS idx_tech_lead_run_records_started
     ON tech_lead_run_records (started_at DESC);
 """
 
+# Columns added after the table's first shape, with the value an existing row
+# gets. Applied idempotently at initialization because every write here is
+# best-effort: a column this build expects and an older file lacks would turn
+# "history is a receipt" into "history silently stopped being written".
+_ADDED_COLUMNS: tuple[tuple[str, str], ...] = (
+    # The coordination anchor, recorded as an anchor rather than as the run's
+    # subject (#6858 F5).
+    ("anchor_issue_number", "INTEGER NOT NULL DEFAULT 0"),
+    # Where the run's preserved artifacts live, and which kinds are there
+    # (#6858 F4). Empty for a run whose artifacts were not preserved.
+    ("artifact_dir", "TEXT NOT NULL DEFAULT ''"),
+    ("artifact_kinds", "TEXT NOT NULL DEFAULT ''"),
+)
+
 
 class SqliteTechLeadRunRecordStore:
     """Durable, append-mostly history of this engine's tech-lead runs."""
@@ -72,10 +87,30 @@ class SqliteTechLeadRunRecordStore:
         return cls(state_dir(repo_root) / "tech_lead_runs.sqlite")
 
     def initialize(self) -> None:
+        """Create or migrate the history table.
+
+        Raises on an unusable database rather than degrading here: the STORE
+        cannot know whether losing durability is acceptable. That choice belongs
+        to the composition root, which selects the in-memory implementation
+        instead when this fails (#6858 round 1 F2).
+        """
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         conn = self._get_connection()
         conn.executescript(SCHEMA)
+        self._add_missing_columns(conn)
         conn.commit()
+
+    def _add_missing_columns(self, conn: sqlite3.Connection) -> None:
+        existing = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(tech_lead_run_records)")
+        }
+        for column, declaration in _ADDED_COLUMNS:
+            if column not in existing:
+                conn.execute(
+                    "ALTER TABLE tech_lead_run_records"
+                    f" ADD COLUMN {column} {declaration}"
+                )
 
     # ------------------------------------------------------------------
     # Writes
@@ -87,8 +122,9 @@ class SqliteTechLeadRunRecordStore:
             "INSERT OR REPLACE INTO tech_lead_run_records ("
             " run_id, session_name, run_key, scope_kind, flavor, phase,"
             " started_at, ended_at, subject_issue_number, subject_title,"
-            " detail, findings, proposals"
-            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " anchor_issue_number, detail, findings, proposals,"
+            " artifact_dir, artifact_kinds"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 record.run_id,
                 record.session_name,
@@ -100,9 +136,11 @@ class SqliteTechLeadRunRecordStore:
                 record.ended_at.isoformat() if record.ended_at else "",
                 record.subject_issue_number,
                 record.subject_title,
+                record.anchor_issue_number,
                 record.detail,
                 record.findings,
                 record.proposals,
+                *_artifact_columns(record.artifacts),
             ),
             what=f"open run {record.run_key}",
         )
@@ -117,6 +155,7 @@ class SqliteTechLeadRunRecordStore:
         detail: str = "",
         findings: int = 0,
         proposals: int = 0,
+        artifacts: Optional[TechLeadRunArtifacts] = None,
     ) -> None:
         """Close an open row. Silently no-ops when this engine opened none.
 
@@ -125,9 +164,11 @@ class SqliteTechLeadRunRecordStore:
         conclusion would overwrite the first verdict with whatever the retry
         happened to see.
         """
+        artifact_dir, artifact_kinds = _artifact_columns(artifacts)
         self._write(
             "UPDATE tech_lead_run_records SET phase = ?, ended_at = ?,"
-            " detail = ?, findings = ?, proposals = ?"
+            " detail = ?, findings = ?, proposals = ?,"
+            " artifact_dir = ?, artifact_kinds = ?"
             " WHERE run_id = ? AND session_name = ? AND phase = ?",
             (
                 phase.value,
@@ -135,6 +176,8 @@ class SqliteTechLeadRunRecordStore:
                 detail,
                 findings,
                 proposals,
+                artifact_dir,
+                artifact_kinds,
                 run_id,
                 session_name,
                 TechLeadRunPhase.RUNNING.value,
@@ -198,6 +241,37 @@ class SqliteTechLeadRunRecordStore:
                 raise
 
 
+def _artifact_columns(
+    artifacts: Optional[TechLeadRunArtifacts],
+) -> tuple[str, str]:
+    """The two stored columns for an artifact locator, or empty for none."""
+    if artifacts is None:
+        return ("", "")
+    return (
+        str(artifacts.location),
+        ",".join(kind.value for kind in artifacts.kinds),
+    )
+
+
+def _artifacts_from_row(row: sqlite3.Row) -> Optional[TechLeadRunArtifacts]:
+    """Rehydrate an artifact locator, or ``None`` when the row has none.
+
+    A stored location that is no longer on disk yields ``None``: the archive is
+    engine-owned and nothing prunes it, but an operator who moved or wiped their
+    state directory should see "no drill-down" rather than a button that 404s.
+    """
+    location = str(row["artifact_dir"]).strip()
+    kinds = kinds_from_values(
+        tuple(part for part in str(row["artifact_kinds"]).split(",") if part)
+    )
+    if not location or not kinds:
+        return None
+    path = Path(location)
+    if not path.is_absolute() or not path.is_dir():
+        return None
+    return TechLeadRunArtifacts(location=path, kinds=kinds)
+
+
 def _record_from_row(row: sqlite3.Row) -> Optional[TechLeadRunRecord]:
     """Rehydrate one row, or ``None`` when it no longer parses.
 
@@ -218,10 +292,12 @@ def _record_from_row(row: sqlite3.Row) -> Optional[TechLeadRunRecord]:
             session_name=str(row["session_name"]),
             subject_issue_number=int(row["subject_issue_number"]),
             subject_title=str(row["subject_title"]),
+            anchor_issue_number=int(row["anchor_issue_number"]),
             ended_at=datetime.fromisoformat(ended) if ended else None,
             detail=str(row["detail"]),
             findings=int(row["findings"]),
             proposals=int(row["proposals"]),
+            artifacts=_artifacts_from_row(row),
         )
     except (ValueError, TypeError, KeyError):
         logger.warning(

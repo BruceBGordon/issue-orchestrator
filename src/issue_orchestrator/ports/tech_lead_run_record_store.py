@@ -22,6 +22,7 @@ import threading
 from datetime import datetime
 from typing import Optional, Protocol
 
+from ..domain.tech_lead_run_artifacts import TechLeadRunArtifacts
 from ..domain.tech_lead_run_record import TechLeadRunPhase, TechLeadRunRecord
 
 
@@ -71,12 +72,18 @@ class TechLeadRunRecordStore(Protocol):
         detail: str = "",
         findings: int = 0,
         proposals: int = 0,
+        artifacts: Optional[TechLeadRunArtifacts] = None,
     ) -> None:
         """Close the open record for one session run.
 
         A no-op when no record was opened — a run this engine never recorded
         (an older engine's, or one whose open write failed) must not resurrect
         as a phantom conclusion with no start.
+
+        ``artifacts`` is the locator for what the run left behind, recorded at
+        the SAME write as the verdict: the two are one fact ("it ended, and this
+        is the evidence"), and splitting them would let a crash between the two
+        leave a concluded run advertising a drill-down that was never filed.
         """
         ...
 
@@ -128,16 +135,24 @@ class InMemoryTechLeadRunRecordStore:
         detail: str = "",
         findings: int = 0,
         proposals: int = 0,
+        artifacts: Optional[TechLeadRunArtifacts] = None,
     ) -> None:
         with self._lock:
             for index, existing in enumerate(self._records):
                 if _is_run(existing, run_id, session_name):
+                    if existing.phase.is_terminal:
+                        # The once-only guard the SQLite predicate applies, here
+                        # too: a publish retry re-enters completion for the same
+                        # session run, and a second conclusion would overwrite
+                        # the first verdict with whatever the retry saw.
+                        return
                     self._records[index] = existing.concluded(
                         phase=phase,
                         ended_at=ended_at,
                         detail=detail,
                         findings=findings,
                         proposals=proposals,
+                        artifacts=artifacts,
                     )
                     return
 
@@ -153,17 +168,9 @@ def _is_run(record: TechLeadRunRecord, run_id: str, session_name: str) -> bool:
     return record.run_id == run_id and record.session_name == session_name
 
 
-def optional_run_record_store(
-    store: Optional[TechLeadRunRecordStore],
-) -> TechLeadRunRecordStore:
-    """``store``, or an in-memory one when a composition wired none."""
-    return store if store is not None else InMemoryTechLeadRunRecordStore()
-
-
 __all__ = [
     "NO_TECH_LEAD_RUN_HISTORY",
     "InMemoryTechLeadRunRecordStore",
     "TechLeadRunHistoryReader",
     "TechLeadRunRecordStore",
-    "optional_run_record_store",
 ]

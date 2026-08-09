@@ -705,7 +705,7 @@ class OpenIssueTimelineCommandPayload(BaseModel):
 class OpenReviewArtifactCommandPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
     artifact_path: str
-    artifact_type: Literal['review_report', 'review_decision']
+    artifact_type: Literal['review_report', 'review_decision', 'tech_lead_report', 'tech_lead_decision']
     issue_number: int
     kind: Literal['open_review_artifact']
     label: str

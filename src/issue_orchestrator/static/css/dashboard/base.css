@@ -984,8 +984,12 @@ html[data-embedded="true"] .embedded-sep {
 .tla-phase--muted { color: var(--text-muted); }
 .tla-subject,
 .tla-started,
-.tla-produced {
+.tla-produced,
+.tla-anchor {
     color: var(--text-muted);
+}
+.tla-anchor {
+    font-size: 11px;
 }
 .tla-detail {
     color: var(--text-muted);
@@ -994,4 +998,23 @@ html[data-embedded="true"] .embedded-sep {
        text the operator cannot then reach. */
     flex: 1 1 100%;
     overflow-wrap: anywhere;
+}
+/* Drill-downs into the run's PRESERVED artifacts (#6858). Their own row inside
+   the entry so a run with three actions wraps instead of squeezing the phase
+   and subject, and so the focus ring on a button is never clipped by a
+   neighbouring cell. */
+.tla-actions {
+    flex: 1 1 100%;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+}
+.tla-action {
+    font-size: 11px;
+    padding: 2px 8px;
+}
+.tla-artifacts-note {
+    flex: 1 1 100%;
+    color: var(--text-muted);
+    font-size: 11px;
 }
