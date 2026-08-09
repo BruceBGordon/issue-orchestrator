@@ -36,6 +36,7 @@ from .config_models import (
     SessionInteractionsConfig,
     SqliteBackupConfig,
     TimelineConfig,
+    TechLeadActivationOwner,
     TechLeadConfig,
     ValidationConfig,
 )
@@ -93,7 +94,7 @@ def _put_if_truthy(target: dict, key: str, value: object) -> None:
 
 
 @dataclass
-class Config:
+class Config(TechLeadActivationOwner):
     """Orchestrator configuration."""
 
     # Agent configurations keyed by label (e.g., "agent:web")
@@ -271,7 +272,6 @@ class Config:
     tech_lead_failed_label: str = "tech-lead-failed"  # Label when tech_lead fails (matches load_review_section default)
     tech_lead_review_threshold: int = 0  # Trigger tech_lead review after N PRs (0 = manual only)
     tech_lead_review_on_failure: bool = True  # Trigger tech_lead to investigate when sessions fail
-    # Validated worker a tech_lead create_issue follow-up routes to (#6779 R9).
     tech_lead_follow_up_agent: Optional[str] = None
 
     @property
@@ -707,7 +707,7 @@ class Config:
                 "fetch_limit": self.filtering.fetch_limit,
                 "max_to_start": self.filtering.max_to_start,
             },
-            "tech_lead": self.tech_lead.to_event_dict(),
+            "tech_lead": self.tech_lead.to_event_dict(enabled=self.tech_lead_enabled),
             "scheduling": {
                 "default_priority_tier": self.scheduling.default_priority_tier,
             },
@@ -1158,7 +1158,7 @@ class Config:
             hooks_dict.setdefault("ai_gate", {})["dangerous_allow_failure"] = True
         if hooks_dict:
             result["hooks"] = hooks_dict
-
+        result.update(self.explicit_tech_lead_section())
         return result
 
     def save(self, path: Optional[Path] = None) -> Path:

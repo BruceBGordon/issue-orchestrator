@@ -12,14 +12,12 @@ a normal tick (#6957 round-2 review F9/A4):
 This module is the single owner. Everything else consumes
 :func:`promotion_lane_readiness` and never re-derives the predicate.
 
-**Activation.** The lane is ACTIVE only when the promotion mode is not ``off``,
-a repository is configured, AND a tech-lead agent is configured. The last
-condition is the one the boundaries disagreed about, and it is deliberate: the
-lane exists to actuate what a tech lead diagnosed, so removing the tech lead
-turns the whole ADR-0031 machinery off — including the cross-repo loop-closure
-reads. Leaving them running for a feature the operator switched off is exactly
-the "fails only after startup, or late and cross-repo" behavior the review
-rejected. Durable promotion rows are never discarded, so re-enabling the agent
+**Activation.** The lane is ACTIVE only when the master tech-lead workflow is
+enabled, the promotion mode is not ``off``, and a repository is configured.
+The master predicate includes the configured-agent dependency and preserves the
+legacy agent-presence rule when ``tech_lead.enabled`` is omitted. Turning the
+master switch off stops the whole ADR-0031 machinery — including cross-repo
+loop-closure reads. Durable promotion rows are never discarded, so re-enabling
 resumes settlement exactly where it stopped.
 
 **Readiness.** An ACTIVE lane's remaining dependencies are startup errors, not
@@ -68,20 +66,20 @@ class PromotionLaneReadiness:
 def promotion_lane_readiness(config: "Config") -> PromotionLaneReadiness:
     """The one activation/readiness decision for the finding-promotion lane."""
     findings = config.tech_lead.findings
+    if not config.tech_lead_enabled:
+        inactive_reason = (
+            "tech_lead.enabled is false"
+            if config.tech_lead.enabled is False
+            else "no tech lead agent is configured (review.tech_lead_review_agent)"
+        )
+        return PromotionLaneReadiness(
+            active=False,
+            inactive_reason=inactive_reason,
+        )
     if not findings.enabled:
         return PromotionLaneReadiness(
             active=False,
             inactive_reason="tech_lead.findings.promote is 'off'",
-        )
-    if not config.tech_lead_review_agent:
-        return PromotionLaneReadiness(
-            active=False,
-            inactive_reason=(
-                "no tech lead agent is configured (review.tech_lead_review_agent);"
-                " finding promotion actuates tech-lead findings, so it is inert"
-                " without one. Durable promotion rows are kept, so configuring an"
-                " agent again resumes the lane where it stopped"
-            ),
         )
     if not config.repo:
         return PromotionLaneReadiness(

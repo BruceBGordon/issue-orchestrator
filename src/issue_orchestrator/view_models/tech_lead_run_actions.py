@@ -52,6 +52,10 @@ REASON_ENGINE_STOPPED = (
     "The Repository Engine is not running. Start it to run tech-lead work."
 )
 REASON_NO_AGENT = "No tech lead agent is configured for this repository."
+REASON_DISABLED = (
+    "Tech lead is disabled for this repository. Enable it in Settings to run"
+    " tech-lead work."
+)
 REASON_ENGINE_PAUSED = (
     "The Repository Engine is paused. Resume it to run tech-lead work."
 )
@@ -191,6 +195,8 @@ def read_tech_lead_run_actions(
     health_status = _health_review_status(config, state)
     global_run_numbers = _global_run_issue_numbers(config, state)
     configured = bool(config.tech_lead_review_agent)
+    enabled = config.tech_lead_enabled
+    explicitly_disabled = config.tech_lead_explicitly_disabled
     paused = bool(state.paused)
     return TechLeadRunActionsView(
         configured=configured,
@@ -202,9 +208,7 @@ def read_tech_lead_run_actions(
         health_review_status_label=_STATUS_LABELS[health_status],
         global_barrier_note=_barrier_note(global_status, health_status),
         queued_issue_numbers=tuple(
-            sorted(
-                item.issue_number for item in pending if not is_global_pending(item)
-            )
+            sorted(item.issue_number for item in pending if not is_global_pending(item))
         ),
         running_issue_numbers=tuple(
             sorted(
@@ -214,8 +218,8 @@ def read_tech_lead_run_actions(
             )
         ),
         global_barrier_active=global_running or global_queued,
-        unavailable_reason=_unavailable_reason(configured, paused),
-        needs_settings=not configured,
+        unavailable_reason=_unavailable_reason(configured, explicitly_disabled, paused),
+        needs_settings=not enabled,
     )
 
 
@@ -258,8 +262,12 @@ def _is_health_review_scope(scope: "TechLeadLaunchScope | None") -> bool:
     return scope is not None and scope.flavor is TechLeadSessionFlavor.HEALTH_REVIEW
 
 
-def _unavailable_reason(configured: bool, paused: bool) -> str:
+def _unavailable_reason(
+    configured: bool, explicitly_disabled: bool, paused: bool
+) -> str:
     """Why neither action can run, in the admission owner's own order."""
+    if explicitly_disabled:
+        return REASON_DISABLED
     if not configured:
         return REASON_NO_AGENT
     if paused:
@@ -267,9 +275,7 @@ def _unavailable_reason(configured: bool, paused: bool) -> str:
     return ""
 
 
-def _global_run_issue_numbers(
-    config: "Config", state: "OrchestratorState"
-) -> set[int]:
+def _global_run_issue_numbers(config: "Config", state: "OrchestratorState") -> set[int]:
     """Anchor issue numbers currently carrying a whole-board tech-lead run.
 
     Excluded from the per-issue affordances: a health-review anchor is not a

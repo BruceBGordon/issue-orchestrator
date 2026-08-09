@@ -1099,6 +1099,38 @@ test('pending save cannot complete after close and reopen for another repository
     assert.equal(loadReposCalls, 0);
 });
 
+test('existing explicit tech-lead disable wins over retained agent configuration', async () => {
+    const document = fakeDocument();
+    const responses = [
+        jsonResponse({
+            all_ok: true,
+            checks: { git: { ok: true, detail: 'git version 2' } },
+        }),
+        jsonResponse(repositoryDetection({
+            existing_config: {
+                agents: { 'agent:tech-lead': { model: 'sonnet' } },
+                review: { tech_lead_review_agent: 'agent:tech-lead' },
+                tech_lead: { enabled: false },
+            },
+        })),
+    ];
+    const wizard = createSetupWizard({
+        document,
+        fetch: async () => responses.shift(),
+        escapeHtml: (value) => String(value),
+        loadRepos: async () => {},
+        setupCommands,
+    });
+    wizard.bind();
+    await wizard.open('/repos/porchpin');
+
+    await document.elements.get('setupWizardNext').emit('click');
+
+    const configureHtml = document.elements.get('setupContent').innerHTML;
+    assert.match(configureHtml, /id="setupConfigureTechLead"\s*>/);
+    assert.doesNotMatch(configureHtml, /id="setupConfigureTechLead" checked/);
+});
+
 test('existing config preview requires explicit replacement confirmation before save', async () => {
     const document = fakeDocument();
     const fetchCalls = [];
@@ -1159,6 +1191,7 @@ test('existing config preview requires explicit replacement confirmation before 
     const configureHtml = document.elements.get('setupContent').innerHTML;
     assert.match(configureHtml, /value="agent:backend"/);
     assert.match(configureHtml, /value="opus" selected/);
+    assert.match(configureHtml, /id="setupConfigureTechLead" checked/);
 
     document.elements.set(
         'setupRepoName',

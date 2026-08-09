@@ -42,7 +42,9 @@ from ..domain.tech_lead_run import (
     REASON_ANCHOR_CLOSED,
     REASON_ANCHOR_UNREADABLE,
     REASON_CLAIMED_BY_PEER,
+    REASON_NO_TECH_LEAD_AGENT,
     REASON_RUN_CLAIM_UNAVAILABLE,
+    REASON_TECH_LEAD_DISABLED,
     TechLeadRunScope,
 )
 from ..events import EventName
@@ -133,6 +135,18 @@ class TechLeadLaunchAuthority:
     def _refusal_for(
         self, tech_lead: PendingTechLeadReview, scope: TechLeadRunScope
     ) -> Optional[TechLeadLaunchRefusal]:
+        if not self._config.tech_lead_enabled:
+            explicitly_disabled = self._config.tech_lead_explicitly_disabled
+            return TechLeadLaunchRefusal(
+                scope.run_key,
+                tech_lead.issue_number,
+                REASON_TECH_LEAD_DISABLED
+                if explicitly_disabled
+                else REASON_NO_TECH_LEAD_AGENT,
+                "Tech lead is disabled for this repository."
+                if explicitly_disabled
+                else "No tech lead agent is configured for this repository.",
+            )
         withdrawal = self._revalidate_subject(tech_lead, scope)
         if withdrawal is not None:
             return withdrawal
@@ -226,9 +240,7 @@ class TechLeadLaunchAuthority:
             )
         return None
 
-    def _local_scope_barrier(
-        self, tech_lead: PendingTechLeadReview
-    ) -> Optional[str]:
+    def _local_scope_barrier(self, tech_lead: PendingTechLeadReview) -> Optional[str]:
         """The scope gate, re-applied to state as it is at THIS instant.
 
         The planner asks the same question of a plan-time snapshot. Asking again

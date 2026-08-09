@@ -46,6 +46,23 @@ def _required_mapping(data: dict, key: str) -> dict:
     return value
 
 
+def _optional_bool(data: dict, key: str) -> bool | None:
+    """Read an optional boolean without truthiness coercion.
+
+    The master switch must not turn a quoted ``"false"`` into ``True`` via
+    ``bool(value)``. Omission/null retains the legacy activation rule; every
+    explicit non-boolean value is a configuration error.
+    """
+    value = data.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, bool):
+        raise ValueError(
+            f"tech_lead.{key} must be a boolean, got {type(value).__name__} ({value!r})"
+        )
+    return value
+
+
 def parse_tech_lead_config(data: dict) -> TechLeadConfig:
     """Parse tech_lead section from YAML data."""
     # Parse lists (support comma-separated strings)
@@ -67,6 +84,7 @@ def parse_tech_lead_config(data: dict) -> TechLeadConfig:
     max_concurrent = int(mc) if (mc := data.get("max_concurrent")) is not None else None
 
     return TechLeadConfig(
+        enabled=_optional_bool(data, "enabled"),
         inherit_labels=list(inherit_labels),
         explicit_labels=list(explicit_labels),
         milestone_strategy=milestone_strategy,

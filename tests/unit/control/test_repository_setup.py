@@ -93,6 +93,7 @@ def test_setup_command_defaults_to_complete_review_pipeline(
     assert config["review"]["tech_lead_follow_up_agent"] == "agent:dev"
     assert config["review"]["tech_lead_review_label"] == "needs-tech-lead-review"
     assert config["review"]["tech_lead_review_threshold"] == 1
+    assert config["tech_lead"]["enabled"] is True
 
 
 def test_setup_command_can_explicitly_disable_tech_lead(tmp_path: Path) -> None:

@@ -41,6 +41,7 @@ from issue_orchestrator.infra.settings_schema import (
     get_summary_fields,
 )
 from issue_orchestrator.infra.settings_schema_support import (
+    FORM_CONTROL_BOOLEAN,
     FORM_CONTROL_INTEGER,
     FORM_CONTROL_OPTIONAL_INTEGER,
 )
@@ -97,6 +98,7 @@ class TestModelDefaults:
     def test_review_defaults(self):
         m = ReviewSettings()
         assert m.enabled is False
+        assert m.tech_lead_enabled is False
         assert m.default_reviewer is None
         assert m.max_rework_cycles == 5
         # Reserved tech_lead concurrency defaults to unset (share worker budget).
@@ -236,6 +238,20 @@ class TestValidation:
         with pytest.raises(ValidationError):
             MergeQueueSettings(failure_action="explode")
 
+    def test_enabled_tech_lead_requires_agent(self):
+        with pytest.raises(ValidationError, match="tech_lead.enabled is true"):
+            ReviewSettings(tech_lead_enabled=True)
+
+    def test_disabled_tech_lead_preserves_dormant_subordinate_settings(self):
+        settings = ReviewSettings(
+            tech_lead_enabled=False,
+            tech_lead_health_review_interval_minutes=240,
+            tech_lead_stuck_sweep_enabled=True,
+        )
+
+        assert settings.tech_lead_health_review_interval_minutes == 240
+        assert settings.tech_lead_stuck_sweep_enabled is True
+
     def test_merge_queue_enqueue_after_enum(self):
         with pytest.raises(ValidationError):
             MergeQueueSettings(enqueue_after="whenever")
@@ -317,6 +333,7 @@ class TestValidation:
         )
         assert (
             ReviewSettings(
+                tech_lead_enabled=True,
                 tech_lead_health_review_interval_minutes=240,
                 tech_lead_agent="agent:tech-lead",
             ).tech_lead_health_review_interval_minutes
@@ -328,9 +345,13 @@ class TestValidation:
         agent must be rejected at the settings/POST boundary, never silently
         disabled at runtime."""
         with pytest.raises(ValidationError, match="no tech lead agent is configured"):
-            ReviewSettings(tech_lead_health_review_interval_minutes=60)
+            ReviewSettings(
+                tech_lead_enabled=True,
+                tech_lead_health_review_interval_minutes=60,
+            )
         with pytest.raises(ValidationError, match="no tech lead agent is configured"):
             ReviewSettings(
+                tech_lead_enabled=True,
                 tech_lead_health_review_interval_minutes=60, tech_lead_agent=""
             )
 
@@ -504,6 +525,7 @@ class TestFromConfig:
         rev = tabs["review"]
         assert isinstance(rev, ReviewSettings)
         assert rev.enabled is True
+        assert rev.tech_lead_enabled is True
         assert rev.default_reviewer == "agent:reviewer"
         assert rev.max_rework_cycles == 3
         assert rev.tech_lead_agent == "agent:tech-lead"
@@ -528,6 +550,19 @@ class TestFromConfig:
         tabs["review"].tech_lead_max_concurrent = None
         apply_to(tabs, back)
         assert back.tech_lead.max_concurrent is None
+
+    def test_tech_lead_master_switch_round_trips_and_requires_restart(self):
+        cfg = Config()
+        cfg.tech_lead_review_agent = "agent:tech-lead"
+        tabs = from_config(cfg)
+        assert tabs["review"].tech_lead_enabled is True
+
+        tabs["review"] = tabs["review"].model_copy(update={"tech_lead_enabled": False})
+        restart = apply_to(tabs, cfg)
+
+        assert restart is True
+        assert cfg.tech_lead.enabled is False
+        assert cfg.tech_lead_enabled is False
 
     def test_advanced_tab(self):
         tabs = from_config(self._make_config())
@@ -591,6 +626,14 @@ class TestFormControlClassification:
         control = schemas["merge_queue"]["properties"]["provider"]["x_control"]
         assert control["kind"] == FORM_CONTROL_ENUM
         assert control["options"] == list(MERGE_QUEUE_PROVIDERS)
+
+    def test_tech_lead_master_switch_is_an_accessible_native_boolean(self):
+        prop = get_settings_json_schema()["review"]["properties"]["tech_lead_enabled"]
+
+        assert prop["x_control"]["kind"] == FORM_CONTROL_BOOLEAN
+        assert prop["title"] == "Enable Tech Lead"
+        assert prop["yaml_path"] == "tech_lead.enabled"
+        assert prop["restart_required"] is True
 
     def test_nits_by_agent_is_dict_enum_with_policy_options(self):
         schemas = get_settings_json_schema()

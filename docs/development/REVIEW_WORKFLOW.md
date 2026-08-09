@@ -206,11 +206,19 @@ review:
   tech_lead_review_on_failure: true       # React to failed/timed-out/unexplained blocked sessions
 
 tech_lead:
+  enabled: true                         # One master switch for all new tech-lead work
   health_review:
     interval_minutes: 240              # Periodic floor; 0 disables interval
     storm_threshold: 3                 # K recent problems -> one health review; 0 disables
     storm_window_minutes: 5            # Settle window for the problem cohort
 ```
+
+Set only `tech_lead.enabled: false` to stop all new batch reviews, failure
+investigations, periodic/storm health reviews, stuck sweeps, manual runs,
+proposal reconciliation, and finding promotion. The detailed settings remain
+configured for a one-line re-enable. Already-running sessions may finish. For
+backward compatibility, omitting the key retains the historical behavior:
+configuring `review.tech_lead_review_agent` enables the workflow.
 
 ## Key Design Decisions
 

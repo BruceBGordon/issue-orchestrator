@@ -322,6 +322,26 @@ class TestFactGathererTechLeadFacts:
 
         assert result is None
 
+    def test_master_switch_returns_none_without_repository_reads(
+        self,
+        fact_gatherer,
+        sample_state,
+        mock_config,
+        mock_repository_host,
+    ):
+        """Dormant sub-settings cannot leak scans past the single master gate."""
+        mock_config.tech_lead_review_agent = "agent:tech-lead"
+        mock_config.tech_lead.enabled = False
+        mock_config.tech_lead_review_threshold = 2
+        mock_config.tech_lead.health_review.interval_minutes = 60
+        mock_config.tech_lead.stuck_sweep.enabled = True
+
+        result = fact_gatherer.gather_tech_lead_facts(sample_state)
+
+        assert result is None
+        mock_repository_host.get_prs_with_label.assert_not_called()
+        mock_repository_host.list_issues.assert_not_called()
+
     def test_tech_lead_facts_returns_none_when_threshold_zero(
         self, fact_gatherer, sample_state, mock_config
     ):

@@ -26,7 +26,7 @@ if TYPE_CHECKING:
 
 
 def check_tech_lead_labels(config: "Config | None" = None) -> list[Check]:
-    if config is None or not config.tech_lead_review_agent or not config.repo:
+    if config is None or not config.tech_lead_enabled or not config.repo:
         return []  # tech_lead/repo not configured -> nothing to verify
 
     from ....domain.tech_lead_session import PROPOSED_TECH_LEAD_LABEL

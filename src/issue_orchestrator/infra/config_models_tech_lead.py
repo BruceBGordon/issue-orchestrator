@@ -545,11 +545,18 @@ TECH_LEAD_MAX_EXPEDITED_LIMIT = 20
 class TechLeadConfig:
     """Tech Lead issue configuration.
 
-    Controls how labels and milestones are assigned to orchestrator-created
-    tech_lead issues, which tech_lead decision proposals the orchestrator
-    executes versus surfaces (ADR-0031), and the periodic health-review
-    trigger (ADR-0031 §4).
+    Controls whether new tech-lead work is admitted, how labels and milestones
+    are assigned to orchestrator-created tech_lead issues, which tech_lead
+    decision proposals the orchestrator executes versus surfaces (ADR-0031),
+    and the periodic health-review trigger (ADR-0031 §4).
+
+    ``enabled`` is optional only for backwards compatibility. ``None`` means
+    the YAML key was omitted, so :attr:`Config.tech_lead_enabled` preserves the
+    legacy rule (configured agent => enabled). A persisted true/false value is
+    the authoritative master switch.
     """
+
+    enabled: Optional[bool] = None
 
     # Labels to inherit from source issues (if any source issue has the label)
     inherit_labels: list[str] = field(default_factory=list)
@@ -598,9 +605,10 @@ class TechLeadConfig:
     # Finding-promotion lane: pattern case file -> gated runnable issue (#6957)
     findings: TechLeadFindingsConfig = field(default_factory=TechLeadFindingsConfig)
 
-    def to_event_dict(self) -> dict:
+    def to_event_dict(self, *, enabled: Optional[bool] = None) -> dict:
         """Serialized ``tech_lead`` section for config event payloads."""
         return {
+            "enabled": self.enabled if enabled is None else enabled,
             "inherit_labels": list(self.inherit_labels),
             "explicit_labels": list(self.explicit_labels),
             "milestone_strategy": {
@@ -647,3 +655,33 @@ class TechLeadConfig:
         errors.extend(self.dedup.startup_errors())
         errors.extend(self.findings.startup_errors())
         return errors
+
+
+class TechLeadActivationOwner:
+    """Own the effective master-switch rule while retaining legacy configs."""
+
+    tech_lead: TechLeadConfig
+    tech_lead_review_agent: Optional[str]
+
+    @property
+    def tech_lead_explicitly_disabled(self) -> bool:
+        """Whether the operator persisted the authoritative off choice."""
+        return self.tech_lead.enabled is False
+
+    @property
+    def tech_lead_enabled(self) -> bool:
+        """Admit new work only when enabled and backed by an agent."""
+        return (
+            bool(self.tech_lead_review_agent) and not self.tech_lead_explicitly_disabled
+        )
+
+    @tech_lead_enabled.setter
+    def tech_lead_enabled(self, enabled: bool) -> None:
+        """Persist the operator's explicit master-switch choice."""
+        self.tech_lead.enabled = enabled
+
+    def explicit_tech_lead_section(self) -> dict[str, dict[str, bool]]:
+        """Serialize only an explicit choice, preserving legacy omission."""
+        if self.tech_lead.enabled is None:
+            return {}
+        return {"tech_lead": {"enabled": self.tech_lead.enabled}}
