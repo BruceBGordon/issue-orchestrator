@@ -620,4 +620,3 @@ class TestRetentionAndTheRowsThatAdvertiseIt:
         assert by_key["issue:1"].artifacts is None
         assert by_key["issue:1"].phase is TechLeadRunPhase.COMPLETED
         assert by_key["issue:2"].artifacts is not None
-

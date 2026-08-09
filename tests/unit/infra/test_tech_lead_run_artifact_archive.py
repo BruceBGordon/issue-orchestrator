@@ -42,6 +42,7 @@ from issue_orchestrator.infra.contained_artifact_copy import (
     close_fd,
     copy_contained_file,
     open_anchor,
+    open_contained_anchor,
     stream_admitted,
 )
 from issue_orchestrator.infra.tech_lead_run_artifact_archive import (
@@ -882,14 +883,63 @@ class TestTheSourceAnchorIsReachedSafely:
 class TestTheTypedRunSource:
     """The archive is told the trust RELATIONSHIP, not three loose values (A5)."""
 
+    def _source(self, tmp_path, run_dir: Path) -> TechLeadRunSource:
+        return TechLeadRunSource(
+            run_id="run-1",
+            session_name="tech-lead-1",
+            worktree_path=tmp_path / "worktree",
+            run_dir=run_dir,
+        )
+
     def test_a_run_directory_outside_the_trusted_root_is_refused(self, tmp_path):
         with pytest.raises(ValueError, match="does not live under the trusted root"):
-            TechLeadRunSource(
-                run_id="run-1",
-                session_name="tech-lead-1",
-                worktree_path=tmp_path / "worktree",
-                run_dir=tmp_path / "elsewhere" / "run",
+            self._source(tmp_path, tmp_path / "elsewhere" / "run")
+
+    def test_a_run_directory_that_climbs_out_of_the_root_is_refused(self, tmp_path):
+        """``Path.relative_to`` is LEXICAL: it answers ``("..", …)`` rather than
+        refusing, and ``O_NOFOLLOW`` does not help because ``..`` is a real
+        directory entry, not a symlink. A walk handed those names would leave the
+        trusted root without following anything (#6858 round 6 F16)."""
+        escaping = tmp_path / "worktree" / ".." / "outside" / "run"
+
+        with pytest.raises(ValueError, match="reaches its trusted root through"):
+            self._source(tmp_path, escaping)
+
+    def test_a_parent_traversal_anywhere_in_the_path_is_refused(self, tmp_path):
+        """Not only at the front: a climb from inside the session namespace and
+        back is the same escape."""
+        sneaky = (
+            tmp_path / "worktree" / ".issue-orchestrator" / "sessions" / ".." / ".."
+            / ".." / "outside"
+        )
+
+        with pytest.raises(ValueError, match="reaches its trusted root through"):
+            self._source(tmp_path, sneaky)
+
+    def test_the_worktree_itself_is_not_a_run_directory(self, tmp_path):
+        """An empty component sequence would make the whole worktree the anchor."""
+        with pytest.raises(ValueError, match="not a session run directory"):
+            self._source(tmp_path, tmp_path / "worktree")
+
+    def test_a_directory_outside_the_session_namespace_is_refused(self, tmp_path):
+        """The relationship this type promises is a SESSION RUN under the
+        worktree's artifact namespace, not any directory inside the worktree."""
+        with pytest.raises(ValueError, match="not a session run directory"):
+            self._source(tmp_path, tmp_path / "worktree" / "src" / "secrets")
+
+    def test_the_sessions_root_alone_is_not_a_run_directory(self, tmp_path):
+        with pytest.raises(ValueError, match="not a session run directory"):
+            self._source(
+                tmp_path, tmp_path / "worktree" / ".issue-orchestrator" / "sessions"
             )
+
+    def test_the_validated_components_are_frozen_at_construction(self, tmp_path):
+        """Frozen, not recomputed: a property would answer from whatever the
+        prefix resolves to at call time, which is not what was validated."""
+        source = _source(_run_dir(tmp_path), run="run-900", session="tech-lead-900")
+
+        with pytest.raises((AttributeError, TypeError)):
+            source.relative_run_parts = ("anything",)  # type: ignore[misc]
 
     def test_the_relative_components_are_the_unresolved_names(self, tmp_path):
         """They must be NAMES, not a resolved path: resolving is what would follow
@@ -942,3 +992,33 @@ class TestTheTypedRunSource:
 
         with pytest.raises(ValueError, match="session run identity"):
             TechLeadRunSource(**fields)
+
+
+class TestTheWalkRefusesEscapingComponents:
+    """The second lock on the same door (#6858 round 6 F16).
+
+    ``TechLeadRunSource`` makes an escaping source unrepresentable, but the layer
+    that would PERFORM the escape refuses it too: ``O_NOFOLLOW`` says nothing
+    about ``..``, which is a real directory entry rather than a symlink.
+    """
+
+    @pytest.mark.parametrize(
+        "parts",
+        [("..",), ("..", "outside"), (".issue-orchestrator", "..", ".."), ("",), (".",)],
+    )
+    def test_a_walk_never_descends_a_traversal_component(self, tmp_path, parts):
+        (tmp_path / "worktree").mkdir()
+        (tmp_path / "outside").mkdir()
+
+        assert open_contained_anchor(tmp_path / "worktree", parts) is None
+
+    def test_a_legitimate_sequence_still_resolves(self, tmp_path):
+        nested = tmp_path / "worktree" / ".issue-orchestrator" / "sessions" / "run-1"
+        nested.mkdir(parents=True)
+
+        fd = open_contained_anchor(
+            tmp_path / "worktree", (".issue-orchestrator", "sessions", "run-1")
+        )
+
+        assert fd is not None
+        close_fd(fd)

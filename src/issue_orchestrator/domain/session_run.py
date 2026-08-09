@@ -237,6 +237,12 @@ def _require_non_empty(value: object, field_name: str) -> None:
         raise ValueError(f"{field_name} must be a non-empty string")
 
 
+# The worktree-relative namespace one session run's artifacts live in. Named once
+# so the assets contract and the archive's trust anchor cannot drift into two
+# spellings of the same relationship (#6858 round 6 F16).
+SESSION_ARTIFACT_PARTS: tuple[str, ...] = (".issue-orchestrator", "sessions")
+
+
 def _require_absolute_path(value: object, field_name: str) -> None:
     require_absolute_path(value, field_name)
 
@@ -251,7 +257,7 @@ def _require_under_run_dir(path: Path, run_dir: Path, field_name: str) -> None:
 
 
 def _require_run_dir_under_worktree(run_dir: Path, worktree_path: Path) -> None:
-    sessions_root = worktree_path / ".issue-orchestrator" / "sessions"
+    sessions_root = worktree_path.joinpath(*SESSION_ARTIFACT_PARTS)
     try:
         run_dir.resolve().relative_to(sessions_root.resolve())
     except ValueError as exc:

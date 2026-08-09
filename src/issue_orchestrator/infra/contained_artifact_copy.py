@@ -165,9 +165,27 @@ def open_contained_anchor(
     component is therefore opened ``O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC``
     relative to its parent, exactly as the file walk does.
 
+    Segments are checked before they are used. ``O_NOFOLLOW`` refuses a symlink
+    but says nothing about ``..``, which is a real directory entry: a walk handed
+    that name climbs out of the trusted root without following anything. Callers
+    are expected to pass an already-validated sequence (see
+    ``TechLeadRunSource``); this is the second lock on the same door, because the
+    layer that performs the escape is the right place to refuse it too.
+
     Returns the final directory's descriptor (the caller owns it), or ``None``
-    when any component is missing or is not a real directory.
+    when the sequence is unusable or any component is missing or is not a real
+    directory.
     """
+    unsafe = [segment for segment in parts if segment in ("", ".", "..")]
+    if unsafe:
+        logger.warning(
+            "[ARTIFACT_COPY] Refusing to descend %s from %s: %s would leave the"
+            " trusted root",
+            list(parts),
+            root,
+            unsafe,
+        )
+        return None
     current = open_anchor(root)
     if current is None:
         return None

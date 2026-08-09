@@ -22,11 +22,12 @@ but are not separate buttons — they are read through the report that cites the
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING
 
+from .session_run import SESSION_ARTIFACT_PARTS
 from .tech_lead_artifacts import (
     TECH_LEAD_DECISION_FILENAME,
     TECH_LEAD_REPORT_FILENAME,
@@ -100,12 +101,23 @@ class TechLeadRunSource:
       exposed as plain NAMES for the adapter to open one at a time, refusing any
       that has become a symlink. Deriving them without resolving is the point: a
       resolved path has already followed the link we mean to catch.
+    * Those names are validated and frozen HERE, at construction, so a source that
+      would walk out of its own root — or that does not identify a session run at
+      all — cannot be represented. The archive's safety must not rest on one
+      upstream caller happening to enforce more than this type does.
     """
 
     run_id: str
     session_name: str
     worktree_path: Path
     run_dir: Path
+    # The validated component names between the trusted root and the run
+    # directory, derived and FROZEN at construction. Not a caller argument and not
+    # a property: a property would recompute the relationship every time it was
+    # asked, so a symlinked prefix that changed under a long-lived source could
+    # answer differently on the second call than the constructor validated on the
+    # first (#6858 round 6 F16).
+    relative_run_parts: tuple[str, ...] = field(init=False, default=())
 
     def __post_init__(self) -> None:
         if not self.run_id or not self.session_name:
@@ -119,28 +131,51 @@ class TechLeadRunSource:
         ):
             if not path.is_absolute():
                 raise ValueError(f"TechLeadRunSource.{label} must be absolute: {path}")
-        # Raises when the run directory is not under the trusted root at all.
-        self.relative_run_parts
+        object.__setattr__(self, "relative_run_parts", self._derive_parts())
 
-    @property
-    def relative_run_parts(self) -> tuple[str, ...]:
-        """The component names between the trusted root and the run directory.
+    def _derive_parts(self) -> tuple[str, ...]:
+        """The component names to descend, or a refusal.
 
-        Compared against the root both as recorded and as resolved, because a
-        worktree reached through a symlinked prefix (macOS ``/tmp`` vs
-        ``/private/tmp``) is a normal setup — while the components BELOW the root
-        are never resolved, since resolving them is exactly what would hide an
-        agent-planted link.
+        The root is compared both as recorded and as resolved, because a worktree
+        reached through a symlinked prefix (macOS ``/tmp`` vs ``/private/tmp``) is
+        a normal setup — while the components BELOW it are never resolved, since
+        resolving them is exactly what would hide an agent-planted link.
+
+        ``Path.relative_to`` is LEXICAL, so it happily answers ``("..", …)`` for a
+        run directory that climbs back out of the root. ``O_NOFOLLOW`` does not
+        help there: ``..`` is a real directory entry, not a symlink, so a walk
+        handed those names would leave the trusted root without following
+        anything. Each name is therefore checked here, in the type whose whole
+        job is to prove the relationship — the archive must not depend on one
+        upstream construction path remembering a stronger invariant than this
+        value object enforces (#6858 round 6 F16/A5).
         """
+        parts: tuple[str, ...] | None = None
         for base in (self.worktree_path, self.worktree_path.resolve()):
             try:
-                return self.run_dir.relative_to(base).parts
+                parts = self.run_dir.relative_to(base).parts
+                break
             except ValueError:
                 continue
-        raise ValueError(
-            f"run_dir {self.run_dir} does not live under the trusted root"
-            f" {self.worktree_path}"
-        )
+        if parts is None:
+            raise ValueError(
+                f"run_dir {self.run_dir} does not live under the trusted root"
+                f" {self.worktree_path}"
+            )
+        unsafe = [part for part in parts if part in ("", ".", "..")]
+        if unsafe:
+            raise ValueError(
+                f"run_dir {self.run_dir} reaches its trusted root through"
+                f" {unsafe} — a descriptor walk given those names would leave"
+                f" {self.worktree_path} without following a single symlink"
+            )
+        namespace = SESSION_ARTIFACT_PARTS
+        if parts[: len(namespace)] != namespace or len(parts) <= len(namespace):
+            raise ValueError(
+                f"run_dir {self.run_dir} is not a session run directory under"
+                f" {'/'.join(namespace)} of {self.worktree_path}"
+            )
+        return parts
 
     @classmethod
     def from_run_assets(cls, assets: "SessionRunAssets") -> "TechLeadRunSource":
