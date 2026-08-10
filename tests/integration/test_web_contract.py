@@ -37,6 +37,11 @@ class TestOrchestratorWebContract:
         assert callable(getattr(sample_orchestrator, "resume", None))
         assert callable(getattr(sample_orchestrator, "request_shutdown", None))
         assert callable(getattr(sample_orchestrator, "request_refresh", None))
+        # Read-model facades the dashboard route resolves before rendering.
+        assert callable(getattr(sample_orchestrator.provider_circuit, "snapshot", None))
+        assert callable(
+            getattr(sample_orchestrator.tech_lead_run_history, "recent", None)
+        )
 
     def test_protocol_attributes_exist_on_mock(self):
         """Verify required attributes exist on mock orchestrator."""
@@ -48,3 +53,7 @@ class TestOrchestratorWebContract:
         assert callable(getattr(mock, "resume", None))
         assert callable(getattr(mock, "request_shutdown", None))
         assert callable(getattr(mock, "request_refresh", None))
+        # A double without these makes every dashboard page render raise, so the
+        # gap belongs here rather than in a browser suite (#6858 rework 1).
+        assert callable(getattr(mock.provider_circuit, "snapshot", None))
+        assert callable(getattr(mock.tech_lead_run_history, "recent", None))
