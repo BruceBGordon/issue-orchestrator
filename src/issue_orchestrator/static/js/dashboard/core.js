@@ -605,6 +605,7 @@ async function _refreshViewModelImpl({ reloadOnListChange = true } = {}) {
                         Number.isFinite(serverCount) ? serverCount : visibleItems.length,
                     );
                 }
+                syncColumnOverflowFooter(colEl, col);
 
                 // Rebuild compact cards (skip if column is expanded — it has its own refresh)
                 if (colEl.dataset.expanded !== 'true') {

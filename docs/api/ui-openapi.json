@@ -758,11 +758,12 @@
       "FlowColumnPayload": {
         "type": "object",
         "additionalProperties": true,
-        "required": ["id", "title", "count", "items"],
+        "required": ["id", "title", "count", "hidden_count", "items"],
         "properties": {
           "id": {"type": "string"},
           "title": {"type": "string"},
           "count": {"type": "integer"},
+          "hidden_count": {"type": "integer", "minimum": 0},
           "items": {"type": "array", "items": {"$ref": "#/components/schemas/IssueItemPayload"}},
           "expandable": {"type": "boolean"},
           "session_scoped": {"type": "boolean"}

@@ -8,6 +8,7 @@ from typing import Any, Literal
 from ..domain.issue_key import format_issue_label
 
 StaleBadgeVisibilityMode = Literal["when_stale", "when_stale_and_merge_pending", "never"]
+COMPACT_COLUMN_PREVIEW_LIMIT = 12
 
 
 def compute_compact_card_fingerprint(card: dict[str, Any]) -> str:
@@ -324,40 +325,66 @@ def build_flow_columns(
         for item in queue_preview_items
         if item.get("issue_number") not in awaiting_numbers
     ]
+    queued_cards = [
+        compact_card(item, "queued")
+        for item in queued_preview_only[:COMPACT_COLUMN_PREVIEW_LIMIT]
+    ]
+    running_cards = [
+        compact_card(item, "running")
+        for item in active_items[:COMPACT_COLUMN_PREVIEW_LIMIT]
+    ]
+    blocked_cards = [
+        compact_card(item, "blocked")
+        for item in blocked_items[:COMPACT_COLUMN_PREVIEW_LIMIT]
+    ]
+    awaiting_merge_cards = [
+        compact_card(item, "awaiting merge")
+        for item in awaiting_merge_items[:COMPACT_COLUMN_PREVIEW_LIMIT]
+    ]
+    completed_cards = [
+        compact_card(item, "completed")
+        for item in completed_items[:COMPACT_COLUMN_PREVIEW_LIMIT]
+    ]
+
     return [
         {
             "id": "queued",
             "title": "Queued",
             "count": len(queued_only),
-            "items": [compact_card(item, "queued") for item in queued_preview_only[:12]],
+            "items": queued_cards,
+            "hidden_count": max(len(queued_only) - len(queued_cards), 0),
             "expandable": True,
         },
         {
             "id": "running",
             "title": "Running",
             "count": len(active_items),
-            "items": [compact_card(item, "running") for item in active_items[:12]],
+            "items": running_cards,
+            "hidden_count": max(len(active_items) - len(running_cards), 0),
             "expandable": True,
         },
         {
             "id": "blocked",
             "title": "Blocked",
             "count": len(blocked_items),
-            "items": [compact_card(item, "blocked") for item in blocked_items[:12]],
+            "items": blocked_cards,
+            "hidden_count": max(len(blocked_items) - len(blocked_cards), 0),
             "expandable": True,
         },
         {
             "id": "awaiting-merge",
             "title": "Awaiting Merge",
             "count": len(awaiting_merge_items),
-            "items": [compact_card(item, "awaiting merge") for item in awaiting_merge_items[:12]],
+            "items": awaiting_merge_cards,
+            "hidden_count": max(len(awaiting_merge_items) - len(awaiting_merge_cards), 0),
             "expandable": True,
         },
         {
             "id": "completed",
             "title": "Completed",
             "count": len(completed_items),
-            "items": [compact_card(item, "completed") for item in completed_items[:12]],
+            "items": completed_cards,
+            "hidden_count": max(len(completed_items) - len(completed_cards), 0),
             "expandable": True,
             "session_scoped": True,
         },
