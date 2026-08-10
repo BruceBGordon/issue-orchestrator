@@ -5,7 +5,9 @@ satisfy the OrchestratorForWeb protocol, catching drift between them.
 """
 
 import pytest
+from fastapi.testclient import TestClient
 
+from issue_orchestrator.entrypoints import web as web_module
 from issue_orchestrator.ports.web_contract import OrchestratorForWeb
 from tests.fixtures.web_contract_mocks import MockOrchestratorForWeb
 
@@ -57,3 +59,35 @@ class TestOrchestratorWebContract:
         # gap belongs here rather than in a browser suite (#6858 rework 1).
         assert callable(getattr(mock.provider_circuit, "snapshot", None))
         assert callable(getattr(mock.tech_lead_run_history, "recent", None))
+
+
+@pytest.fixture
+def dashboard_client():
+    """The dashboard app with the shared web double installed.
+
+    Restores whatever orchestrator was there, so this cannot leak into the
+    module-scoped browser fixtures that share ``set_orchestrator``.
+    """
+    original = web_module.get_orchestrator()
+    web_module.configure_dashboard_admin_token(None)
+    web_module.set_orchestrator(MockOrchestratorForWeb())
+    try:
+        yield TestClient(web_module.app)
+    finally:
+        web_module.set_orchestrator(original)
+
+
+def test_dashboard_page_renders_against_the_shared_double(dashboard_client):
+    """``GET /`` must RENDER for the double, not just type-check against it.
+
+    The protocol above says which members exist; this says the page actually
+    builds from them. It is the cheap half of a guarantee that used to be held
+    only by the Playwright suite: when the route started resolving a read-model
+    facade the double did not carry, every dashboard render raised, and the
+    first thing to notice was a browser test several suites and ~12 CI-minutes
+    later (#6858 rework 1). A 500 here costs a second.
+    """
+    response = dashboard_client.get("/")
+
+    assert response.status_code == 200, response.text
+    assert "text/html" in response.headers["content-type"]
