@@ -12,6 +12,7 @@ import yaml
 from ..infra.config_value_rules import resolve_tech_lead_watch_label
 from .setup_wizard_prompts import (
     build_code_review_prompt_text,
+    build_internal_review_instructions_text,
     build_starter_prompt_text,
     build_tech_lead_review_prompt_text,
 )
@@ -47,6 +48,52 @@ class PlannedSetupPrompt:
     path: Path
     content: str
     agent: str
+
+
+def _plan_internal_review_prompt(
+    review_config: Mapping[str, Any],
+    repo_root: Path,
+    planned_paths: set[Path],
+) -> PlannedSetupPrompt | None:
+    """Plan the optional internal-review artifact within the repository."""
+    internal_review = review_config.get("internal", {}) or {}
+    if not isinstance(internal_review, Mapping):
+        raise ValueError("review.internal must be a mapping")
+    if internal_review.get("enabled") is not True:
+        return None
+
+    instructions_rel = internal_review.get(
+        "instructions",
+        ".io/internal-review.md",
+    )
+    if not isinstance(instructions_rel, str) or not instructions_rel.strip():
+        raise ValueError("review.internal.instructions must be non-empty")
+    instructions_rel = instructions_rel.strip()
+    configured_path = Path(instructions_rel)
+    if configured_path.is_absolute():
+        raise ValueError("review.internal.instructions must be repository-relative")
+    repo_root_resolved = repo_root.resolve()
+    instructions_path = (repo_root_resolved / configured_path).resolve()
+    try:
+        instructions_path.relative_to(repo_root_resolved)
+    except ValueError as exc:
+        raise ValueError(
+            "review.internal.instructions must stay inside the repository"
+        ) from exc
+    if instructions_path.exists():
+        if not instructions_path.is_file():
+            raise ValueError(
+                "review.internal.instructions must reference a file: "
+                f"{instructions_path}"
+            )
+        return None
+    if instructions_path in planned_paths:
+        return None
+    return PlannedSetupPrompt(
+        path=instructions_path,
+        content=build_internal_review_instructions_text(),
+        agent="internal-review",
+    )
 
 
 def render_setup_config_yaml(
@@ -127,6 +174,14 @@ def plan_missing_setup_prompts(
             )
         )
         planned_paths.add(prompt_path)
+
+    internal_review_prompt = _plan_internal_review_prompt(
+        review_config,
+        repo_root,
+        planned_paths,
+    )
+    if internal_review_prompt is not None:
+        planned.append(internal_review_prompt)
 
     return tuple(planned)
 

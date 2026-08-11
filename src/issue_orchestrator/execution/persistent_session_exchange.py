@@ -413,6 +413,7 @@ def run_persistent_session_exchange(  # noqa: PLR0913
     before_reviewer_round: Callable[[int], None] | None = None,
     turn_mailbox: "TurnMailbox | None" = None,
     response_channels: ReviewExchangeResponseChannels | None = None,
+    coder_prompt_addendum: str | None = None,
 ) -> ReviewExchangeOutcome:
     """Run the coder↔reviewer exchange against a registry-owned persistent pair.
 
@@ -784,6 +785,7 @@ def run_persistent_session_exchange(  # noqa: PLR0913
                 reviewer_mirror=reviewer_mirror,
                 turn_mailbox=turn_mailbox,
                 response_channels=effective_response_channels,
+                coder_prompt_addendum=coder_prompt_addendum,
             ),
         )
     except Exception as exc:
@@ -1664,6 +1666,7 @@ class _DriveRoundsCommand:
     emit: Callable[[EventName, dict[str, Any]], None]
     coder_mirror: _RoleSliceMirror
     reviewer_mirror: _RoleSliceMirror
+    coder_prompt_addendum: str | None = None
     turn_mailbox: "TurnMailbox | None" = None
     response_channels: ReviewExchangeResponseChannels = field(
         default_factory=ReviewExchangeResponseChannels
@@ -1928,6 +1931,7 @@ def _drive_rounds(command: _DriveRoundsCommand) -> ReviewExchangeOutcome:
             require_validation=require_validation,
             run_dir=run_dir,
             reviewer_feedback=_coder_reviewer_feedback(decision_result),
+            coder_prompt_addendum=command.coder_prompt_addendum,
         )
         _persist_turn_packet(exchange_dir, coder_packet)
         coder_response_channel = response_channels.for_role(Role.CODER)

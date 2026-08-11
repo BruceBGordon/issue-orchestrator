@@ -214,3 +214,72 @@ def test_setup_file_adapter_plans_shared_prompt_target_once(
     assert prompt_files[0].path == (tmp_path / ".io" / "shared.md").resolve()
     assert prompt_files[0].agent == "agent:frontend"
     assert "# Frontend Agent Prompt" in prompt_files[0].content
+
+
+def test_setup_file_adapter_plans_enabled_internal_review_instructions(
+    tmp_path: Path,
+) -> None:
+    config = _command(tmp_path).build_config(
+        repository_setup_github_authorization_codec
+    )
+    config["review"]["internal"] = {
+        "enabled": True,
+        "max_rounds": 5,
+        "instructions": ".io/internal-review.md",
+    }
+
+    plan = RepositorySetupFileSystemAdapter().plan(
+        repo_root=tmp_path,
+        config_target=RepositorySetupNamedConfig(RepositoryConfigName("default")),
+        config=config,
+        include_prompts=True,
+    )
+
+    internal = [file for file in plan.files if file.agent == "internal-review"]
+    assert len(internal) == 1
+    assert internal[0].path == (tmp_path / ".io" / "internal-review.md").resolve()
+    assert "Spawn exactly one internal reviewer" in internal[0].content
+    assert "Return exactly one conversational verdict" in internal[0].content
+
+
+@pytest.mark.parametrize("instructions", ["../outside.md", "/tmp/outside.md"])
+def test_setup_file_adapter_rejects_internal_review_prompt_outside_repository(
+    tmp_path: Path,
+    instructions: str,
+) -> None:
+    config = _command(tmp_path).build_config(
+        repository_setup_github_authorization_codec
+    )
+    config["review"]["internal"] = {
+        "enabled": True,
+        "instructions": instructions,
+    }
+
+    with pytest.raises(ValueError, match="repository-relative|inside"):
+        RepositorySetupFileSystemAdapter().plan(
+            repo_root=tmp_path,
+            config_target=RepositorySetupNamedConfig(RepositoryConfigName("default")),
+            config=config,
+            include_prompts=True,
+        )
+
+
+def test_setup_file_adapter_rejects_internal_review_prompt_directory(
+    tmp_path: Path,
+) -> None:
+    config = _command(tmp_path).build_config(
+        repository_setup_github_authorization_codec
+    )
+    (tmp_path / ".io").mkdir()
+    config["review"]["internal"] = {
+        "enabled": True,
+        "instructions": " .io ",
+    }
+
+    with pytest.raises(ValueError, match="must reference a file"):
+        RepositorySetupFileSystemAdapter().plan(
+            repo_root=tmp_path,
+            config_target=RepositorySetupNamedConfig(RepositoryConfigName("default")),
+            config=config,
+            include_prompts=True,
+        )

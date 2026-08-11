@@ -79,6 +79,12 @@ from .config_sections import (
     parse_milestone_order,
 )
 from .config_value_rules import resolve_tech_lead_watch_label
+from .config_review_projection import (
+    internal_review_dict,
+    runtime_exchange_dict,
+    runtime_run_audit_dict,
+    serialized_internal_review_dict,
+)
 from .validation_config_loader import (
     load_validation_config as load_validation_config,
     load_validation_config_from_file as load_validation_config_from_file,
@@ -306,6 +312,11 @@ class Config:
     retrospective_reviewed_label: str = "retrospective-reviewed"
     retrospective_changes_requested_label: str = "retrospective-changes-requested"
 
+    # Fast coder-owned review loop that runs before any successful coder handoff.
+    internal_review_enabled: bool = False
+    internal_review_max_rounds: int = 5
+    internal_review_instructions: str = ".io/internal-review.md"
+
     # Review exchange mode (via-mcp, via-local-loop, or via-draft-pr review)
     review_exchange_mode: str = "via-local-loop"
     review_exchange_probe_schedule: str = "daily"  # startup, daily, interval, manual
@@ -488,25 +499,6 @@ class Config:
             }
         return exchange_dict
 
-    def _runtime_exchange_dict(self) -> dict[str, object]:
-        exchange_dict: dict[str, object] = {"mode": self.review_exchange_mode}
-        exchange_dict["probe"] = {
-            "schedule": self.review_exchange_probe_schedule,
-            "interval_days": self.review_exchange_probe_interval_days,
-        }
-        exchange_dict["loop"] = {
-            "max_rounds": self.review_exchange_max_rounds,
-            "max_no_progress": self.review_exchange_max_no_progress,
-            "require_validation": self.review_exchange_require_validation,
-        }
-        return exchange_dict
-
-    def _runtime_run_audit_dict(self) -> dict[str, object]:
-        return {
-            "min_runtime_minutes": self.review_run_audit_min_runtime_minutes,
-            "on_timeout": self.review_run_audit_on_timeout,
-        }
-
     def get_label_review_keep_current_approach(self) -> str:
         """Get the reviewer keep-current-approach label with prefix if configured."""
         return self.prefixed_label(self.review_keep_current_approach_label)
@@ -656,14 +648,15 @@ class Config:
                 "default": self.code_review_agent,
                 "code_review_label": self.code_review_label,
                 "code_reviewed_label": self.code_reviewed_label,
-                "run_audit": self._runtime_run_audit_dict(),
+                "run_audit": runtime_run_audit_dict(self),
                 "retrospective": {
                     "enabled": self.retrospective_review_enabled,
                     "trigger_label": self.retrospective_review_trigger_label,
                     "reviewed_label": self.retrospective_reviewed_label,
                     "changes_requested_label": self.retrospective_changes_requested_label,
                 },
-                "exchange": self._runtime_exchange_dict(),
+                "internal": internal_review_dict(self),
+                "exchange": runtime_exchange_dict(self),
                 "nits": {
                     "default_policy": self.review_nits_default_policy,
                     "by_agent": dict(self.review_nits_by_agent),
@@ -1006,6 +999,8 @@ class Config:
                 "reviewed_label": self.retrospective_reviewed_label,
                 "changes_requested_label": self.retrospective_changes_requested_label,
             }
+        if internal_review := serialized_internal_review_dict(self):
+            review_dict["internal"] = internal_review
         if self.review_nits_default_policy != "surface" or self.review_nits_by_agent:
             nits_dict: dict[str, object] = {
                 "default_policy": self.review_nits_default_policy,

@@ -18,6 +18,10 @@ from ..infra import runtime_identity
 from ..control.completion_ports import LabelAdapter, PRAdapter
 from ..infra.config import Config
 from ..ports import EventSink
+from ..ports.coder_prompt import (
+    CoderPromptAddendumProvider,
+    NO_CODER_PROMPT_ADDENDUM,
+)
 
 if TYPE_CHECKING:
     from ..control.needs_human_block import SharedNeedsHumanBlock
@@ -105,6 +109,7 @@ def create_completion_components(
     # NEEDS_HUMAN completion outcome routes through it, and the label adapter
     # below refuses that label by value, so the two halves cannot disagree.
     needs_human_block: "SharedNeedsHumanBlock",
+    coder_prompt_addendum: CoderPromptAddendumProvider = NO_CODER_PROMPT_ADDENDUM,
 ) -> tuple[
     "CompletionProcessor | None",
     "SessionController | None",
@@ -167,7 +172,10 @@ def create_completion_components(
         # mailbox: agents run `exchange-respond`, the Control API delivers into
         # the open turn slot, and send_round polls the mailbox (#6549).
         review_exchange_runner=PersistentReviewExchangeRunner(
-            session_output, pair_registry, turn_mailbox=turn_mailbox,
+            session_output,
+            pair_registry,
+            turn_mailbox=turn_mailbox,
+            coder_prompt_addendum=coder_prompt_addendum,
         ),
         event_bus=None,
         label_config=label_manager.to_label_config_dict(),

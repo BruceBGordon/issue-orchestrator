@@ -6,6 +6,7 @@ doctor code.
 
 Check types:
 - path_exists: field value is a repo-relative path that should exist
+- path_is_file: field value is a repo-relative path to a regular file
 - first_arg_path_exists: first space-separated arg in a list field is a path
 - references_agent: field value must be a key in config.agents (or None)
 
@@ -22,6 +23,7 @@ from ...config import Config
 from ...settings_schema import (
     DOCTOR_CHECK_FIRST_ARG_PATH_EXISTS,
     DOCTOR_CHECK_PATH_EXISTS,
+    DOCTOR_CHECK_PATH_IS_FILE,
     DOCTOR_CHECK_REFERENCES_AGENT,
     SUMMARY_BOOLEAN_FLAG,
     SUMMARY_ENABLED_FLAG,
@@ -78,6 +80,37 @@ def _check_path_exists(
     )]
 
 
+def _check_path_is_file(
+    field: dict[str, Any], value: Any, repo_root: Path,
+) -> list[Check]:
+    """Check that a contained repo-relative path identifies a regular file."""
+    if not value:
+        return []
+    repo_root_resolved = repo_root.resolve()
+    path = (repo_root_resolved / str(value)).resolve()
+    try:
+        path.relative_to(repo_root_resolved)
+    except ValueError:
+        return [Check(
+            name=field["title"],
+            status=field["doctor_severity"],
+            detail=(
+                f"File path '{value}' resolves outside the repository "
+                f"(field: {field['name']})"
+            ),
+        )]
+    if path.is_file():
+        return []
+    return [Check(
+        name=field["title"],
+        status=field["doctor_severity"],
+        detail=(
+            f"File '{value}' is missing or not a regular file "
+            f"(field: {field['name']})"
+        ),
+    )]
+
+
 def _check_first_arg_path(
     field: dict[str, Any], value: Any, repo_root: Path,
 ) -> list[Check]:
@@ -120,6 +153,7 @@ def _check_references_agent(
 # Dispatch table: doctor_check string -> handler function
 _CHECK_HANDLERS = {
     DOCTOR_CHECK_PATH_EXISTS: _check_path_exists,
+    DOCTOR_CHECK_PATH_IS_FILE: _check_path_is_file,
     DOCTOR_CHECK_FIRST_ARG_PATH_EXISTS: _check_first_arg_path,
     DOCTOR_CHECK_REFERENCES_AGENT: _check_references_agent,
 }

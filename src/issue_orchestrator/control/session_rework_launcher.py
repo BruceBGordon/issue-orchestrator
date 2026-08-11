@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
 from ..domain.issue_key import IssueKey
+from ..domain.coder_prompt import append_coder_prompt_addendum
 from ..domain.models import (
     AgentConfig,
     Issue,
@@ -25,6 +26,7 @@ from ..infra.logging_config import issue_log, log_context
 from ..ports import EventSink, RepositoryHost
 from ..ports.event_sink import make_run_scoped_event, make_trace_event
 from ..ports.session_output import SessionOutput
+from ..ports.coder_prompt import CoderPromptAddendumProvider
 from ..ports.worktree_manager import WorktreeManager, WorktreeReuseOptions
 from .actions import Action, AddCommentAction, AddLabelAction, RemoveLabelAction
 from .launch_transaction import (
@@ -146,6 +148,7 @@ class ReworkLaunchDependencies:
     build_session_env: SessionEnvBuilder
     check_provider_ready: ProviderReadinessChecker
     resolve_stack_decision: StackDecisionResolverFn
+    coder_prompt_addendum: CoderPromptAddendumProvider
 
 
 def _rework_preflight(
@@ -419,13 +422,17 @@ def launch_rework_session(
             pr_number=pr_number,
             existing_work=existing_work,
         )
+        rendered_prompt = append_coder_prompt_addendum(
+            rendered_prompt,
+            deps.coder_prompt_addendum.for_worktree(worktree_path),
+        )
         prompt_path = deps.persist_session_prompt(run.run_dir, rendered_prompt)
-        base_command = agent_config.get_command(
+        base_command = agent_config.get_command_for_prompt(
+            rendered_prompt,
             issue_number=issue_number,
             issue_title=issue_title,
             worktree=worktree_path,
             pr_number=pr_number,
-            existing_work=existing_work,
             task_kind=TaskKind.REWORK.value,
         )
         base_command = deps.wrap_provider_command(base_command, agent_config, run.run_dir)

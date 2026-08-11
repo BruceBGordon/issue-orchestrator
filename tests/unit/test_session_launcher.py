@@ -121,6 +121,7 @@ from issue_orchestrator.ports import (
     NullBoardSnapshotProvider,
     NullManifestDownloader,
 )
+from issue_orchestrator.ports.coder_prompt import CoderPromptAddendumProvider
 from issue_orchestrator.ports.command_runner import OutputNewlines
 from issue_orchestrator.ports.board_snapshot_provider import BoardSnapshotProvider
 from issue_orchestrator.control.board_snapshot_builder import (
@@ -526,6 +527,7 @@ def _build_launcher_bundle(
     mock_command_runner,
     *,
     board_snapshot_provider: BoardSnapshotProvider | None = None,
+    coder_prompt_addendum: CoderPromptAddendumProvider | None = None,
 ) -> LauncherTestBundle:
     """Create a SessionLauncher with mock dependencies and tracking.
 
@@ -576,6 +578,9 @@ def _build_launcher_bundle(
         return review_machines[pr_number]
 
     mock_action_applier = MagicMock()
+    launcher_kwargs = {}
+    if coder_prompt_addendum is not None:
+        launcher_kwargs["coder_prompt_addendum"] = coder_prompt_addendum
     launcher = SessionLauncher(
         config=sample_config,
         events=mock_events,
@@ -596,6 +601,7 @@ def _build_launcher_bundle(
         remove_session_machine=remove_session_machine,
         board_snapshot_provider=board_snapshot_provider,
         agent_callback_endpoint=ready_callback_endpoint(),
+        **launcher_kwargs,
     )
 
     bundle = LauncherTestBundle(
@@ -631,6 +637,30 @@ def launcher_bundle(
         mock_working_copy,
         mock_command_runner,
     )
+
+
+@pytest.fixture
+def internal_review_launcher_bundle(
+    sample_config,
+    mock_events,
+    mock_repo_host,
+    mock_worktree_manager,
+    mock_working_copy,
+    mock_command_runner,
+) -> tuple[LauncherTestBundle, MagicMock]:
+    """Build a launcher with a recording coder-only prompt provider."""
+    provider = MagicMock(name="coder_prompt_addendum")
+    provider.for_worktree.return_value = "INTERNAL-REVIEW-MARKER"
+    bundle = _build_launcher_bundle(
+        sample_config,
+        mock_events,
+        mock_repo_host,
+        mock_worktree_manager,
+        mock_working_copy,
+        mock_command_runner,
+        coder_prompt_addendum=provider,
+    )
+    return bundle, provider
 
 
 @pytest.fixture
@@ -750,6 +780,19 @@ class TestLaunchIssueSession:
         assert result.session.key.task == TaskKind.CODE
         assert result.session.run_dir is not None
         assert result.session.run_dir.name.endswith("__coding-1")
+
+    def test_internal_review_instructions_reach_initial_coder_command(
+        self,
+        internal_review_launcher_bundle,
+        sample_issue,
+    ):
+        bundle, provider = internal_review_launcher_bundle
+
+        result = bundle.launcher.launch_issue_session(sample_issue, active_sessions=[])
+
+        assert result.success is True
+        assert "INTERNAL-REVIEW-MARKER" in bundle.create_session_calls[0]["cmd"]
+        provider.for_worktree.assert_called_once_with(result.session.worktree_path)
 
     def test_tech_lead_session_creates_tech_lead_data_dir_without_manifest(
         self, session_launcher, sample_config, tmp_path
@@ -1639,6 +1682,34 @@ class TestLaunchValidationRetrySession:
         assert "Validation Retry" in command
         assert "dirty worktree" in command
 
+    def test_internal_review_instructions_reach_validation_retry_command(
+        self,
+        internal_review_launcher_bundle,
+    ):
+        bundle, provider = internal_review_launcher_bundle
+        retry = PendingValidationRetry(
+            issue_number=123,
+            issue_title="Fix checkout",
+            agent_label="agent:web",
+            worktree_path="/tmp/worktree-123",
+            branch_name="123-fix-checkout",
+            original_prompt="Work on issue #123",
+            validation_error="dirty worktree",
+            validation_error_file=None,
+            retry_count=1,
+            source_task=TaskKind.CODE,
+            validation_cmd="make test",
+        )
+
+        result = bundle.launcher.launch_validation_retry_session(
+            retry,
+            active_sessions=[],
+        )
+
+        assert result.success is True
+        assert "INTERNAL-REVIEW-MARKER" in bundle.create_session_calls[0]["cmd"]
+        provider.for_worktree.assert_called_once_with(result.session.worktree_path)
+
 
 class TestLaunchIssueSessionPerSessionWorktree:
     """Tests for per-session worktree mode (lines 264-266)."""
@@ -1677,6 +1748,25 @@ class TestLaunchReviewSession:
         assert result.session.key.task == TaskKind.REVIEW
         assert result.session.run_dir is not None
         assert result.session.run_dir.name.endswith("__review-1")
+
+    def test_internal_coder_instructions_do_not_change_reviewer_command(
+        self,
+        internal_review_launcher_bundle,
+    ):
+        bundle, provider = internal_review_launcher_bundle
+        review = PendingReview(
+            issue_key=GitHubIssueKey(repo="test/repo", external_id="123"),
+            pr_number=456,
+            pr_url="https://github.com/test/repo/pull/456",
+            branch_name="123-feature",
+            _issue_number=123,
+        )
+
+        result = bundle.launcher.launch_review_session(review, active_sessions=[])
+
+        assert result.success is True
+        assert "INTERNAL-REVIEW-MARKER" not in bundle.create_session_calls[0]["cmd"]
+        provider.for_worktree.assert_not_called()
 
     def test_review_launch_threads_issue_label_provider_args(self, launcher_bundle):
         """Label-derived provider args should reach review command and wrapper."""
@@ -2146,6 +2236,23 @@ class TestLaunchReworkSession:
         started = next(e for e in mock_events.events if str(e.name) == "rework.started")
         assert started.data["agent"] == "agent:web"
         assert started.data["task"] == "rework"
+
+    def test_internal_review_instructions_reach_rework_command(
+        self,
+        internal_review_launcher_bundle,
+    ):
+        bundle, provider = internal_review_launcher_bundle
+        rework = PendingRework(
+            issue_key=GitHubIssueKey(repo="test/repo", external_id="123"),
+            agent_type="agent:web",
+            rework_cycle=1,
+        )
+
+        result = bundle.launcher.launch_rework_session(rework, active_sessions=[])
+
+        assert result.success is True
+        assert "INTERNAL-REVIEW-MARKER" in bundle.create_session_calls[0]["cmd"]
+        provider.for_worktree.assert_called_once_with(result.session.worktree_path)
 
     def test_successful_launch_without_pr(self, session_launcher):
         """Verify launch when no PR exists (lines 597-599)."""

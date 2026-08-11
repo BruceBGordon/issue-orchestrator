@@ -167,6 +167,30 @@ agents:
     model: "sonnet"
 ```
 
+### Enable the Coder's Internal Review Loop
+
+The optional internal loop asks every coder turn—including validation retries,
+rework turns, and coder turns inside `via-local-loop`—to spawn one lightweight
+reviewer and iterate with it before reporting success. This improves the change
+presented to the independent review workflow; it does not replace that workflow
+or change `review.exchange.mode`.
+
+```yaml
+review:
+  internal:
+    enabled: true
+    max_rounds: 5
+    instructions: ".io/internal-review.md"
+```
+
+`instructions` is a repository-relative, coder-facing Markdown file. Its
+contents are appended to each coder prompt inside a fixed contract requiring
+approval from the same internally spawned reviewer. If the reviewer cannot be
+spawned, approval cannot be reached, or the round limit is exhausted, the coder
+must report blocked (or needs-human when a human decision is required), not
+successful completion. Repository setup creates the canonical instructions
+file when internal review is enabled and the configured file is missing.
+
 ### Declare Repo-Scoped GitHub Auth
 
 ```yaml

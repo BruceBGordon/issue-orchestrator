@@ -47,9 +47,10 @@ from ..domain.models import (
     TaskKind,
     get_completion_path,
 )
+from ..domain.coder_prompt import append_coder_prompt_addendum
 from ..domain.session_run import SessionRunAssets
 from .worktree_context import WorktreeContext
-from ..infra.validation_state import DEFAULT_RETRY_TEMPLATE
+from ..infra.validation_state import DEFAULT_RETRY_TEMPLATE, _truncate_with_tail
 from ..domain.tech_lead_session import TechLeadLaunchScope
 from .tech_lead_session_policy import (
     failure_investigation_scratch_identity,
@@ -67,6 +68,10 @@ from ..ports import (
 from ..ports.provider_readiness import (
     NO_PROVIDER_READINESS_PROBE,
     ProviderReadinessProbe,
+)
+from ..ports.coder_prompt import (
+    CoderPromptAddendumProvider,
+    NO_CODER_PROMPT_ADDENDUM,
 )
 from ..ports.session_output import SessionOutput
 from ..ports.event_sink import SessionStartedEventPayload, make_session_started_event
@@ -118,94 +123,12 @@ from .launch_guards import (
 )
 from .session_env import build_session_env_exports
 from .provider_command_wrapper import ProviderCommandWrapper
-
-logger = logging.getLogger(__name__)
-_TRUNCATION_MARKER_BUDGET = 30
-_MIN_USEFUL_TRUNCATED_HEAD = 100
-
-
-def detect_existing_work(
-    worktree_path: Path,
-    working_copy: WorkingCopy,
-    *,
-    seed_ref: str | None = None,
-) -> Optional[str]:
-    """Check if worktree has commits ahead of main and return context for agent."""
-    try:
-        if seed_ref:
-            head_sha = working_copy.get_head_sha(worktree_path)
-            if head_sha and head_sha == seed_ref:
-                return None
-
-        commits = working_copy.get_commits_ahead_of_main(worktree_path)
-        if not commits:
-            return None
-
-        branch = working_copy.get_current_branch(worktree_path) or "unknown"
-        commit_list = "\n".join(
-            f"  - {c.short_sha} {c.message}" for c in commits[:10]
-        )
-        if len(commits) > 10:
-            commit_list += f"\n  ... and {len(commits) - 10} more"
-
-        return (
-            f"This worktree has {len(commits)} existing commit(s) from a previous session. "
-            f"Branch: {branch}. Commits: {commit_list}. "
-            f"EVALUATE this existing work BEFORE starting fresh."
-        )
-    except Exception as e:
-        logger.warning("Failed to detect existing work: %s", e)
-        return None
-
-
-_REBASE_CONFLICT_WARNING = (
-    "WARNING: This branch could not be rebased onto main due to merge conflicts. "
-    "The code is out of date. You should resolve the conflicts by running: "
-    "git fetch origin main && git rebase origin/main. "
-    "If conflicts occur, resolve them and continue with: git rebase --continue. "
-    "This is critical to ensure tests pass with the latest code."
+from .session_worktree_briefing import (
+    describe_worktree_state,
+    detect_existing_work as detect_existing_work,
 )
 
-
-def describe_worktree_state(
-    worktree_path: Path,
-    working_copy: WorkingCopy,
-    *,
-    seed_ref: str | None = None,
-    rebase_failed: bool = False,
-) -> Optional[str]:
-    """What the agent needs to know about the worktree it is being handed.
-
-    Prior commits and an unresolved rebase are two facts about the same
-    workspace and reach the agent as one briefing, so they are decided together
-    rather than stitched at the call site.
-    """
-    existing_work = detect_existing_work(
-        worktree_path, working_copy, seed_ref=seed_ref
-    )
-    if existing_work:
-        logger.info(
-            "[launch] Found existing work - agent will evaluate before starting fresh"
-        )
-    if not rebase_failed:
-        return existing_work
-    logger.warning(
-        "[launch] Rebase failed - agent will need to resolve merge conflicts"
-    )
-    if existing_work:
-        return f"{existing_work}\n\n{_REBASE_CONFLICT_WARNING}"
-    return _REBASE_CONFLICT_WARNING
-
-
-def _truncate_with_tail(text: str, max_length: int = 4000, tail_length: int = 2000) -> str:
-    """Truncate long validation output while preserving the summary tail."""
-    if len(text) <= max_length:
-        return text
-    head_length = max_length - tail_length - _TRUNCATION_MARKER_BUDGET
-    if head_length < _MIN_USEFUL_TRUNCATED_HEAD:
-        return f"[...truncated {len(text) - tail_length} chars...]\n\n{text[-tail_length:]}"
-    omitted = len(text) - head_length - tail_length
-    return f"{text[:head_length]}\n\n[...truncated {omitted} chars...]\n\n{text[-tail_length:]}"
+logger = logging.getLogger(__name__)
 
 
 class SessionLauncher:
@@ -261,6 +184,7 @@ class SessionLauncher:
         provider_readiness_probe: ProviderReadinessProbe = NO_PROVIDER_READINESS_PROBE,
         # Every OTHER durable cause of the shared needs-human label (#6999 F4).
         needs_human_block: SharedNeedsHumanBlock = NO_OTHER_NEEDS_HUMAN_CAUSES,
+        coder_prompt_addendum: CoderPromptAddendumProvider = NO_CODER_PROMPT_ADDENDUM,
     ):
         self.config = config
         self.events = events
@@ -284,6 +208,7 @@ class SessionLauncher:
         self._dependency_evaluator = dependency_evaluator
         self._claim_manager = claim_manager
         self._provider_resilience = provider_resilience
+        self._coder_prompt_addendum = coder_prompt_addendum
         self._provider_gate = (
             ProviderLaunchGate(
                 policy=ProviderAvailabilityPolicy(
@@ -1038,6 +963,10 @@ class SessionLauncher:
                 worktree=worktree_path,
                 existing_work=existing_work,
             )
+            rendered_prompt = self._with_coder_prompt_addendum(
+                rendered_prompt,
+                worktree_path,
+            )
             prompt_path = self._persist_session_prompt(run.run_dir, rendered_prompt)
             base_command = agent_config.get_command_for_prompt(
                 rendered_prompt,
@@ -1290,6 +1219,10 @@ class SessionLauncher:
                 issue=issue,
                 agent_config=agent_config,
                 retry_count=retry_count,
+            )
+            retry_prompt = self._with_coder_prompt_addendum(
+                retry_prompt,
+                worktree_path,
             )
 
             ctx.write_worktree_note()
@@ -2171,9 +2104,17 @@ class SessionLauncher:
             build_session_env=self._build_session_env,
             check_provider_ready=self._check_provider_ready,
             resolve_stack_decision=self._dependency_gate.stack_base_decision_for_issue,
+            coder_prompt_addendum=self._coder_prompt_addendum,
         )
         return launch_rework_flow(
             rework, active_sessions, deps, work_claim=work_claim
+        )
+
+    def _with_coder_prompt_addendum(self, prompt: str, worktree: Path) -> str:
+        """Compose one coder prompt through the shared addendum owner."""
+        return append_coder_prompt_addendum(
+            prompt,
+            self._coder_prompt_addendum.for_worktree(worktree),
         )
 
     def _run_setup_commands(self, worktree_path: Path) -> None:
