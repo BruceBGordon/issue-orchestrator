@@ -179,6 +179,13 @@ review:
   tech_lead_review_on_failure: true
   max_rework_cycles: 5
   reviewer_feedback_cache_minutes: 5
+  # Optional fast review loop owned by each coder turn. The configured file is
+  # appended to coder prompts; it tells the coder how to spawn and iterate with
+  # one internal reviewer before the normal independent review begins.
+  internal:
+    enabled: false
+    max_rounds: 5
+    instructions: ".io/internal-review.md"
   nits:
     default_policy: "surface"     # ignore, surface, address
     by_agent: {}                  # e.g. agent:frontend: address

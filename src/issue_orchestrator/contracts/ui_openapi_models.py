@@ -821,12 +821,15 @@ class RecentE2ERunsPayload(BaseModel):
 class RepositorySetupCommandPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
     config_name: str | None = Field(default=None, min_length=1)
+    configure_internal_reviewer: bool
     configure_reviewer: bool
     configure_tech_lead: bool
     create_labels: bool | None = None
     create_prompts: bool | None = None
     effort: Literal['low', 'medium', 'high', 'xhigh', 'max']
     github_authorization: RepositorySetupGitHubAuthorizationPayload
+    internal_review_instructions: str = Field(..., min_length=1)
+    internal_review_max_rounds: int = Field(..., ge=1, le=50, strict=True)
     model: Literal['haiku', 'sonnet', 'opus']
     replace_existing: bool | None = None
     repo_name: str = Field(..., min_length=1)

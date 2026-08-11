@@ -1,5 +1,7 @@
 """Review workflow configuration validator."""
 
+from pathlib import Path
+
 from typing import TYPE_CHECKING
 
 from .base import ConfigValidator
@@ -65,10 +67,36 @@ class ReviewWorkflowValidator(ConfigValidator):
                 config.review_nits_default_policy, config.review_nits_by_agent
             )
         )
+        self._validate_internal_review(config, errors)
         self._validate_retrospective_review(config, errors)
         # Pair validation is deferred to runtime when the actual coder agent is known.
 
         return errors
+
+    @staticmethod
+    def _validate_internal_review(config: "Config", errors: list[str]) -> None:
+        """Validate the bounded, repository-relative internal-review policy."""
+        if not isinstance(config.internal_review_enabled, bool):
+            errors.append("review.internal.enabled must be a boolean.")
+        max_rounds = config.internal_review_max_rounds
+        if not isinstance(max_rounds, int) or isinstance(max_rounds, bool):
+            errors.append("review.internal.max_rounds must be an integer.")
+        elif not 1 <= max_rounds <= 50:
+            errors.append("review.internal.max_rounds must be between 1 and 50.")
+        raw_instructions = config.internal_review_instructions
+        if not isinstance(raw_instructions, str):
+            errors.append("review.internal.instructions must be a string.")
+            return
+        instructions = raw_instructions.strip()
+        if not instructions:
+            errors.append("review.internal.instructions must be non-empty.")
+            return
+        configured_path = Path(instructions)
+        if configured_path.is_absolute() or ".." in configured_path.parts:
+            errors.append(
+                "review.internal.instructions must be a repository-relative path "
+                "that stays inside the repository root."
+            )
 
     def _validate_retrospective_review(self, config: "Config", errors: list[str]) -> None:
         """Validate review-first existing-implementation rerun settings."""

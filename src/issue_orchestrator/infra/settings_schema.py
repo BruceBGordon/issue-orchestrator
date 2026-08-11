@@ -12,6 +12,7 @@ via Field() + json_schema_extra. This single source of truth drives:
 from __future__ import annotations
 
 import functools
+from pathlib import Path
 from typing import Any, Literal, Optional, TYPE_CHECKING
 
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -33,6 +34,7 @@ from .settings_schema_support import (
     CONFIG_VALUE_TYPE_PATH,
     DOCTOR_CHECK_FIRST_ARG_PATH_EXISTS,  # pyright: ignore[reportUnusedImport] -- re-exported for doctor schema checks
     DOCTOR_CHECK_PATH_EXISTS,
+    DOCTOR_CHECK_PATH_IS_FILE,
     DOCTOR_CHECK_REFERENCES_AGENT,
     DOCTOR_SEVERITY_ERROR,
     DOCTOR_SEVERITY_WARNING,
@@ -734,6 +736,80 @@ class ReviewSettings(BaseModel):
             "yaml_path": "review.max_rework_cycles",
         },
     )
+    internal_enabled: bool = Field(
+        False,
+        title="Enable Internal Reviewer",
+        description=(
+            "Require each coder turn to iterate with an internally spawned "
+            "reviewer before reporting successful completion"
+        ),
+        json_schema_extra={
+            "doc_examples": ["true", "false"],
+            "doc_notes": (
+                "This lightweight coder-owned loop runs before the independent "
+                "review exchange and does not replace it."
+            ),
+            "section": "Internal Review",
+            "config_attr": "internal_review_enabled",
+            "yaml_path": "review.internal.enabled",
+            "restart_required": True,
+        },
+    )
+    internal_max_rounds: int = Field(
+        5,
+        title="Internal Review Max Rounds",
+        description=(
+            "Maximum internal reviewer verdicts before the coder must report blocked"
+        ),
+        ge=1,
+        le=50,
+        json_schema_extra={
+            "doc_examples": ["3", "5", "10"],
+            "doc_notes": (
+                "Reaching the limit never permits successful completion; the "
+                "coder reports the turn as blocked."
+            ),
+            "section": "Internal Review",
+            "config_attr": "internal_review_max_rounds",
+            "yaml_path": "review.internal.max_rounds",
+            "restart_required": True,
+        },
+    )
+    internal_instructions: str = Field(
+        ".io/internal-review.md",
+        title="Internal Review Instructions",
+        description="Repo-relative coder instructions for the internal review loop",
+        min_length=1,
+        json_schema_extra={
+            "doc_examples": [".io/internal-review.md"],
+            "doc_notes": (
+                "The file is appended to coder prompts when internal review is enabled. "
+                "Doctor verifies that it exists."
+            ),
+            "section": "Internal Review",
+            "config_attr": "internal_review_instructions",
+            "yaml_path": "review.internal.instructions",
+            "doctor_check": DOCTOR_CHECK_PATH_IS_FILE,
+            "doctor_check_condition": "internal_review_enabled",
+            "doctor_severity": DOCTOR_SEVERITY_ERROR,
+            "restart_required": True,
+        },
+    )
+
+    @field_validator("internal_instructions")
+    @classmethod
+    def _validate_internal_instructions(cls, value: str) -> str:
+        instructions = value.strip()
+        if not instructions:
+            raise ValueError("review.internal.instructions must be non-empty")
+        configured_path = Path(instructions)
+        if configured_path.is_absolute() or ".." in configured_path.parts:
+            raise ValueError(
+                "review.internal.instructions must be a repository-relative "
+                "path that stays inside the repository root"
+            )
+        return instructions
+
     max_consecutive_publish_failures: int = Field(
         3,
         title="Max Consecutive Publish Failures",

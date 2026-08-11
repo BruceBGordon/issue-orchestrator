@@ -447,6 +447,36 @@ class TestSettingsEndpoints:
         finally:
             web._orchestrator = None
 
+    def test_settings_page_renders_accessible_internal_review_controls(self):
+        """Internal-review schema fields keep native labelled form controls."""
+        from issue_orchestrator.entrypoints import web
+
+        mock_orch = create_mock_orchestrator()
+        web._orchestrator = mock_orch
+        try:
+            response = TestClient(app).get("/settings")
+
+            html = response.text
+            assert response.status_code == 200
+            assert 'for="review__internal_enabled">Enable Internal Reviewer</label>' in html
+            assert (
+                'id="review__internal_enabled"\n'
+                '                           data-tab="review" '
+                'data-field="internal_enabled" data-type="boolean"'
+            ) in html
+            assert (
+                'for="review__internal_max_rounds">Internal Review Max Rounds</label>'
+                in html
+            )
+            assert 'data-field="internal_max_rounds" data-type="integer"' in html
+            assert (
+                'for="review__internal_instructions">Internal Review Instructions</label>'
+                in html
+            )
+            assert 'data-field="internal_instructions" data-type="string"' in html
+        finally:
+            web._orchestrator = None
+
     def test_settings_page_renders_accessible_tech_lead_master_switch(self):
         """The one-place switch is a labelled native checkbox in Review settings."""
         from issue_orchestrator.entrypoints import web

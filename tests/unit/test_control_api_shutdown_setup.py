@@ -20,6 +20,9 @@ def _complete_setup_payload(repo_root, **overrides):
         "configure_reviewer": True,
         "reviewer_model": "sonnet",
         "reviewer_effort": "high",
+        "configure_internal_reviewer": False,
+        "internal_review_max_rounds": 5,
+        "internal_review_instructions": ".io/internal-review.md",
         "validation_quick_command": "make test-quick",
         "validation_publish_command": "make validate",
         "github_authorization": {

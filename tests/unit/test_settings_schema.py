@@ -14,6 +14,7 @@ from issue_orchestrator.infra.settings_schema import (
     CONFIG_VALUE_TYPE_PATH,
     DOCTOR_CHECK_FIRST_ARG_PATH_EXISTS,
     DOCTOR_CHECK_PATH_EXISTS,
+    DOCTOR_CHECK_PATH_IS_FILE,
     DOCTOR_CHECK_REFERENCES_AGENT,
     FORM_CONTROL_DICT_ENUM,
     FORM_CONTROL_ENUM,
@@ -101,6 +102,9 @@ class TestModelDefaults:
         assert m.tech_lead_enabled is False
         assert m.default_reviewer is None
         assert m.max_rework_cycles == 5
+        assert m.internal_enabled is False
+        assert m.internal_max_rounds == 5
+        assert m.internal_instructions == ".io/internal-review.md"
         # Reserved tech_lead concurrency defaults to unset (share worker budget).
         assert m.tech_lead_max_concurrent is None
 
@@ -268,6 +272,22 @@ class TestValidation:
     def test_review_max_rework_max(self):
         with pytest.raises(ValidationError):
             ReviewSettings(max_rework_cycles=11)
+
+    @pytest.mark.parametrize("rounds", [0, 51])
+    def test_internal_review_max_rounds_bounds(self, rounds):
+        with pytest.raises(ValidationError):
+            ReviewSettings(internal_max_rounds=rounds)
+
+    @pytest.mark.parametrize(
+        "instructions",
+        ["", "   ", "../outside.md", "/tmp/outside.md"],
+    )
+    def test_internal_review_instructions_must_stay_inside_repository(
+        self,
+        instructions,
+    ):
+        with pytest.raises(ValidationError):
+            ReviewSettings(internal_instructions=instructions)
 
     def test_finding_promotion_mode_rejects_unsupported(self):
         """#6957 R3 F9: `enum` in json_schema_extra shapes the select, it does
@@ -441,6 +461,9 @@ class TestFromConfig:
         cfg.review_enabled = True
         cfg.code_review_agent = "agent:reviewer"
         cfg.max_rework_cycles = 3
+        cfg.internal_review_enabled = True
+        cfg.internal_review_max_rounds = 4
+        cfg.internal_review_instructions = ".io/custom-internal-review.md"
         cfg.tech_lead_review_agent = "agent:tech-lead"
         cfg.tech_lead_review_threshold = 5
         cfg.tech_lead.max_concurrent = 2
@@ -528,6 +551,9 @@ class TestFromConfig:
         assert rev.tech_lead_enabled is True
         assert rev.default_reviewer == "agent:reviewer"
         assert rev.max_rework_cycles == 3
+        assert rev.internal_enabled is True
+        assert rev.internal_max_rounds == 4
+        assert rev.internal_instructions == ".io/custom-internal-review.md"
         assert rev.tech_lead_agent == "agent:tech-lead"
         assert rev.tech_lead_threshold == 5
         assert rev.tech_lead_max_concurrent == 2
@@ -969,6 +995,13 @@ class TestJsonSchema:
             for prop_name, prop in schema["properties"].items():
                 assert "title" in prop, f"{key}.{prop_name} missing title"
 
+    def test_internal_review_fields_use_native_supported_controls(self):
+        properties = get_settings_json_schema()["review"]["properties"]
+
+        assert properties["internal_enabled"]["x_control"]["kind"] == "boolean"
+        assert properties["internal_max_rounds"]["x_control"]["kind"] == "integer"
+        assert properties["internal_instructions"]["x_control"]["kind"] == "string"
+
     def test_schema_is_cached(self):
         """Calling get_settings_json_schema twice should return the same object."""
         s1 = get_settings_json_schema()
@@ -1120,6 +1153,7 @@ class TestTabDefinitions:
         """doctor_check values must be known check type constants."""
         valid_types = {
             DOCTOR_CHECK_PATH_EXISTS,
+            DOCTOR_CHECK_PATH_IS_FILE,
             DOCTOR_CHECK_FIRST_ARG_PATH_EXISTS,
             DOCTOR_CHECK_REFERENCES_AGENT,
         }
@@ -1212,6 +1246,9 @@ class TestDoctorCheckFields:
         path_fields = [f for f in get_doctor_check_fields()
                        if f["doctor_check"] == DOCTOR_CHECK_PATH_EXISTS]
         assert any(f["name"] == "quarantine_file" for f in path_fields)
+        file_fields = [f for f in get_doctor_check_fields()
+                       if f["doctor_check"] == DOCTOR_CHECK_PATH_IS_FILE]
+        assert any(f["name"] == "internal_instructions" for f in file_fields)
 
     def test_agent_ref_fields(self):
         ref_fields = [f for f in get_doctor_check_fields()

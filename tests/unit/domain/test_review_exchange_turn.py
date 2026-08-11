@@ -47,6 +47,7 @@ class TestReviewExchangeTurnPacketRoundTrip:
             last_coder_text="Applied the fix.",
             last_reviewer_text="Still failing on edge case.",
             reviewer_feedback=None,
+            coder_prompt_addendum="Internal coder instructions",
         )
         recovered = ReviewExchangeTurnPacket.from_manifest(
             original.to_manifest_fields(),
@@ -86,6 +87,7 @@ class TestReviewExchangeTurnPacketRoundTrip:
         assert "last_coder_text" not in fields
         assert "last_reviewer_text" not in fields
         assert "reviewer_feedback" not in fields
+        assert "coder_prompt_addendum" not in fields
         assert "prompt_files" not in fields
 
     @pytest.mark.parametrize("missing_key", [
@@ -181,6 +183,21 @@ class TestReviewExchangeTurnPacketRoundTrip:
 
 
 class TestBuildReviewerPrompt:
+    def test_coder_addendum_never_changes_reviewer_prompt(self) -> None:
+        packet = ReviewExchangeTurnPacket(
+            issue_number=42,
+            issue_title="Make it right",
+            round_index=1,
+            role=Role.REVIEWER,
+            require_validation=False,
+            run_dir=Path("/wt/.issue-orchestrator/sessions/review-exchange-run"),
+            coder_prompt_addendum="INTERNAL-CODER-ONLY",
+        )
+
+        prompt = build_reviewer_prompt(packet)
+
+        assert "INTERNAL-CODER-ONLY" not in prompt
+
     def test_validation_note_uses_injected_validation_record_path(self) -> None:
         run_dir = Path("/wt/.issue-orchestrator/sessions/review-exchange-run")
         validation_record = Path("/explicit/artifacts/validation-record.json")
@@ -223,6 +240,24 @@ class TestBuildReviewerPrompt:
 
 
 class TestBuildCoderPrompt:
+    def test_internal_review_addendum_is_appended_after_outer_feedback(self) -> None:
+        packet = ReviewExchangeTurnPacket(
+            issue_number=42,
+            issue_title="Make it right",
+            round_index=2,
+            role=Role.CODER,
+            require_validation=False,
+            run_dir=Path("/wt/.issue-orchestrator/sessions/review-exchange-run"),
+            reviewer_feedback="External reviewer finding.",
+            coder_prompt_addendum="MANDATORY-INTERNAL-REVIEW",
+        )
+
+        prompt = build_coder_prompt(packet)
+
+        assert prompt.index("External reviewer finding.") < prompt.index(
+            "MANDATORY-INTERNAL-REVIEW"
+        )
+
     def test_dirty_worktree_prevalidation_instruction_is_explicit(self) -> None:
         packet = ReviewExchangeTurnPacket(
             issue_number=42,

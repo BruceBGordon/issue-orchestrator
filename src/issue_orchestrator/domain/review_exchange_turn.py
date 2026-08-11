@@ -148,6 +148,8 @@ class ReviewExchangeTurnPacket:
     distinct from ``last_reviewer_text`` because that remains the
     reviewer's one-line JSON summary for reviewer-to-reviewer context.
     """
+    coder_prompt_addendum: str | None = None
+    """Coder-only instructions composed outside the pure exchange builder."""
 
     def to_manifest_fields(self) -> dict[str, Any]:
         """Render to a JSON-safe dict for artifact persistence.
@@ -173,6 +175,8 @@ class ReviewExchangeTurnPacket:
             manifest["last_reviewer_text"] = self.last_reviewer_text
         if self.reviewer_feedback is not None:
             manifest["reviewer_feedback"] = self.reviewer_feedback
+        if self.coder_prompt_addendum is not None:
+            manifest["coder_prompt_addendum"] = self.coder_prompt_addendum
         return manifest
 
     @classmethod
@@ -216,6 +220,7 @@ class ReviewExchangeTurnPacket:
         last_coder_text = manifest.get("last_coder_text")
         last_reviewer_text = manifest.get("last_reviewer_text")
         reviewer_feedback = manifest.get("reviewer_feedback")
+        coder_prompt_addendum = manifest.get("coder_prompt_addendum")
         prompt_files = ReviewExchangePromptFiles.from_manifest(
             manifest.get("prompt_files"),
         )
@@ -232,6 +237,11 @@ class ReviewExchangeTurnPacket:
             last_coder_text=last_coder_text if isinstance(last_coder_text, str) else None,
             last_reviewer_text=last_reviewer_text if isinstance(last_reviewer_text, str) else None,
             reviewer_feedback=reviewer_feedback if isinstance(reviewer_feedback, str) else None,
+            coder_prompt_addendum=(
+                coder_prompt_addendum
+                if isinstance(coder_prompt_addendum, str)
+                else None
+            ),
         )
 
 

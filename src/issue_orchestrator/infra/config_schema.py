@@ -225,6 +225,7 @@ def allowed_config_shape() -> dict[str, ConfigShape]:
         "max_consecutive_review_exchange_failures": LEAF,
         "reviewer_feedback_cache_minutes": LEAF,
         "keep_current_approach_label": LEAF,
+        "internal": _leaf_keys("enabled", "max_rounds", "instructions"),
         "retrospective": _leaf_keys(
             "enabled",
             "trigger_label",

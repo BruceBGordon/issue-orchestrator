@@ -3,7 +3,7 @@
 import pytest
 import yaml
 from pathlib import Path
-from issue_orchestrator.infra.config import Config
+from issue_orchestrator.infra.config import Config, ConfigSectionError
 from issue_orchestrator.infra.config_models import PromotionRouteTarget
 
 
@@ -1514,6 +1514,9 @@ agents:
             config.retrospective_changes_requested_label
             == "retrospective-changes-requested"
         )
+        assert config.internal_review_enabled is False
+        assert config.internal_review_max_rounds == 5
+        assert config.internal_review_instructions == ".io/internal-review.md"
         # tech_lead review defaults
         assert config.tech_lead_review_agent is None
         assert config.tech_lead_review_label is None
@@ -1640,6 +1643,10 @@ review:
     trigger_label: lack-of-review-redo
     reviewed_label: lack-of-review-reviewed
     changes_requested_label: lack-of-review-needs-work
+  internal:
+    enabled: true
+    max_rounds: 3
+    instructions: .io/fast-internal-review.md
   keep_current_approach_label: reviewer-keep-current-approach
   tech_lead_review_agent: agent:tech-lead
   tech_lead_reviewed_label: tech-lead-reviewed
@@ -1669,6 +1676,9 @@ review:
         assert (
             config.retrospective_changes_requested_label == "lack-of-review-needs-work"
         )
+        assert config.internal_review_enabled is True
+        assert config.internal_review_max_rounds == 3
+        assert config.internal_review_instructions == ".io/fast-internal-review.md"
         assert (
             config.review_keep_current_approach_label
             == "reviewer-keep-current-approach"
@@ -1700,6 +1710,61 @@ review:
         assert any(
             "review.retrospective.enabled requires review.default" in e for e in errors
         )
+
+    @pytest.mark.parametrize(
+        ("internal_yaml", "error_fragment"),
+        [
+            ('enabled: "yes"', "review.internal.enabled"),
+            ("max_rounds: nope", "review.internal.max_rounds"),
+            ("max_rounds: true", "review.internal.max_rounds"),
+            ("max_rounds: 0", "review.internal.max_rounds"),
+            ("max_rounds: 51", "review.internal.max_rounds"),
+            ("instructions: 123", "review.internal.instructions"),
+            ('instructions: ""', "review.internal.instructions"),
+            ("instructions: ../outside.md", "review.internal.instructions"),
+            ("instructions: /tmp/outside.md", "review.internal.instructions"),
+        ],
+    )
+    def test_internal_review_rejects_invalid_bounded_configuration(
+        self,
+        tmp_path,
+        internal_yaml,
+        error_fragment,
+    ):
+        config_file = tmp_path / ".issue-orchestrator.yaml"
+        config_file.write_text(
+            "worktrees:\n"
+            "  base: /tmp\n"
+            "review:\n"
+            "  internal:\n"
+            f"    {internal_yaml}\n",
+            encoding="utf-8",
+        )
+
+        errors = Config.load(config_file).validate()
+
+        assert any(error_fragment in error for error in errors)
+
+    def test_internal_review_section_must_be_a_mapping(self, tmp_path):
+        config_file = tmp_path / ".issue-orchestrator.yaml"
+        config_file.write_text("review:\n  internal: enabled\n", encoding="utf-8")
+
+        with pytest.raises(ConfigSectionError, match="internal"):
+            Config.load(config_file)
+
+    def test_internal_review_instruction_path_is_normalized_at_load(self, tmp_path):
+        config_file = tmp_path / ".issue-orchestrator.yaml"
+        config_file.write_text(
+            'review:\n  internal:\n    instructions: " .io/internal-review.md "\n',
+            encoding="utf-8",
+        )
+
+        config = Config.load(config_file)
+
+        assert not any(
+            "review.internal" in error for error in config.validate()
+        )
+        assert config.internal_review_instructions == ".io/internal-review.md"
 
     def test_retrospective_review_validates_non_empty_labels(self, tmp_path):
         """Retrospective labels are source-of-truth state and must be explicit."""
@@ -4425,6 +4490,28 @@ agents:
         result = config.to_dict()
 
         assert "review" not in result or "max_rework_cycles" not in result["review"]
+
+    def test_to_dict_round_trips_non_default_internal_review_settings(
+        self,
+        tmp_path,
+    ):
+        config_file = tmp_path / ".issue-orchestrator.yaml"
+        config_file.write_text(
+            "review:\n"
+            "  internal:\n"
+            "    enabled: true\n"
+            "    max_rounds: 4\n"
+            "    instructions: .io/custom-internal-review.md\n",
+            encoding="utf-8",
+        )
+
+        result = Config.load(config_file).to_dict()
+
+        assert result["review"]["internal"] == {
+            "enabled": True,
+            "max_rounds": 4,
+            "instructions": ".io/custom-internal-review.md",
+        }
 
     def test_to_dict_includes_retrospective_review_settings(self, tmp_path):
         """Retrospective review labels round-trip through saved config."""

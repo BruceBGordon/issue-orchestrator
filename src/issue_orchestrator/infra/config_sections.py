@@ -436,6 +436,22 @@ def load_review_section(config: "Config", review_section: dict) -> None:
             "on_timeout",
             True,
         )
+    internal_section = get_section(
+        review_section,
+        "internal",
+        config.config_path or Path("<config>"),
+    )
+    config.internal_review_enabled = internal_section.get("enabled", False)
+    config.internal_review_max_rounds = internal_section.get("max_rounds", 5)
+    internal_instructions = internal_section.get(
+        "instructions",
+        ".io/internal-review.md",
+    )
+    config.internal_review_instructions = (
+        internal_instructions.strip()
+        if isinstance(internal_instructions, str)
+        else internal_instructions
+    )
     nits_section = review_section.get("nits", {})
     if isinstance(nits_section, dict):
         config.review_nits_default_policy = nits_section.get(

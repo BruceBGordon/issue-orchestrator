@@ -144,6 +144,9 @@ class TestReviewWorkflowValidator:
         config.review_nits_default_policy = "address"
         config.review_nits_by_agent = {}
         config.retrospective_review_enabled = False
+        config.internal_review_enabled = False
+        config.internal_review_max_rounds = 5
+        config.internal_review_instructions = ".io/internal-review.md"
         # Concrete False so the stuck-sweep cross-field invariant (#6823) is off
         # by default here (a bare MagicMock attribute is truthy).
         config.tech_lead.stuck_sweep.enabled = False

@@ -13,6 +13,7 @@ from .config_paths import resolve_relative_path
 
 # Doctor check type constants - used in json_schema_extra["doctor_check"]
 DOCTOR_CHECK_PATH_EXISTS = "path_exists"
+DOCTOR_CHECK_PATH_IS_FILE = "path_is_file"
 DOCTOR_CHECK_FIRST_ARG_PATH_EXISTS = "first_arg_path_exists"
 DOCTOR_CHECK_REFERENCES_AGENT = "references_agent"
 

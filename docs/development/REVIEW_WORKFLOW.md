@@ -2,14 +2,19 @@
 
 ## The Review Loop
 
-The core concept: an agent codes, a reviewer checks, and they iterate until the code is approved or the orchestrator escalates.
+The core concept: an agent codes, a reviewer checks, and they iterate until the code is approved or the orchestrator escalates. An optional coder-owned internal review loop can run within each coder turn before that independent review.
 
-This flow begins after validation passes. When an agent completes work, the orchestrator processes the completion record — which includes running the validation gate (tests, linting, architecture checks). Only after validation succeeds does the review loop start.
+The independent review flow begins after validation passes. When an agent completes work, the orchestrator processes the completion record — which includes running the validation gate (tests, linting, architecture checks). The optional internal review happens inside the coder turn before that completion; only after completion and validation does the external review loop start.
 
 ```mermaid
 flowchart TD
-  DONE["Agent completes work"] --> VAL{"Validation gate"}
-  VAL -->|fails| BLOCKED["Blocked — validation failed"]
+  CODE["Coder implements and tests"] --> INTERNAL{"Internal review enabled?"}
+  INTERNAL -->|yes| IREVIEW["Coder iterates with one spawned reviewer"]
+  IREVIEW -->|approved| DONE["Agent completes work"]
+  IREVIEW -->|limit / stuck| INTERNAL_BLOCK["Blocked or needs human"]
+  INTERNAL -->|no| DONE
+  DONE --> VAL{"Validation gate"}
+  VAL -->|fails| VAL_BLOCK["Blocked — validation failed"]
   VAL -->|passes| REVIEW["Reviewer checks code"]
   REVIEW --> ARTIFACTS["Review report + decision JSON"]
   ARTIFACTS -->|approved| PR["PR created / marked reviewed"]
@@ -19,6 +24,21 @@ flowchart TD
 ```
 
 **Cycle limits prevent infinite loops.** The orchestrator tracks rework iterations (`rework-cycle-N` labels on GitHub). After `max_rework_cycles` (default: 5), it stops the loop and escalates to a human. For in-process exchange modes, `max_rounds` and `max_no_progress` provide additional stopping conditions — if the reviewer reports no progress for consecutive rounds, the loop stops early.
+
+### Internal Review Within a Coder Turn
+
+When `review.internal.enabled` is true, the orchestrator appends the configured
+coder-facing instructions to every coder prompt: initial coding, validation
+retry, draft-PR rework, and the coder side of an in-process review exchange.
+The coder spawns exactly one lightweight internal reviewer and iterates with the
+same reviewer until it returns `APPROVED`. A successful coder completion is not
+allowed before that approval; an unavailable reviewer, unresolved finding, or
+exhausted `max_rounds` requires a blocked or needs-human result.
+
+This is intentionally a prompt-level, high-speed loop. It creates no review
+artifacts, labels, completion protocol, or orchestrator-managed round state.
+The ordinary external reviewer remains independent and receives the improved
+implementation through the unchanged outer workflow.
 
 ## Exchange Mechanisms
 
@@ -184,6 +204,12 @@ stateDiagram-v2
 review:
   enabled: true
   default: "agent:reviewer"            # Default reviewer agent
+
+  # Coder-owned loop inside every coder turn (independent review still follows)
+  internal:
+    enabled: false
+    max_rounds: 5                      # Reviewer verdicts before coder blocks
+    instructions: ".io/internal-review.md" # Relative to the configured repository root
 
   # Exchange mechanism
   exchange:

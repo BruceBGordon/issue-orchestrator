@@ -26,6 +26,12 @@ from ..domain.runtime_config import RuntimeConfigReference
 from ..events import EventContext
 from ..ports.event_sink import EventSink
 from ..ports.review_exchange_approval_gate import ReviewExchangeApprovalGate
+from ..ports.coder_prompt import (
+    CoderPromptAddendumProvider,
+    NO_CODER_PROMPT_ADDENDUM,
+)
+from ..domain.coder_prompt import CoderPromptAddendumUnavailable
+from ..domain.session_key import TaskKind
 from .persistent_exchange_pair_registry_inmemory import (
     InMemoryPersistentExchangePairRegistry,
 )
@@ -98,10 +104,12 @@ class PersistentReviewExchangeRunner:
         pair_registry: InMemoryPersistentExchangePairRegistry,
         *,
         turn_mailbox: "TurnMailbox | None" = None,
+        coder_prompt_addendum: CoderPromptAddendumProvider = NO_CODER_PROMPT_ADDENDUM,
     ) -> None:
         self._session_output = session_output
         self._pair_registry = pair_registry
         self._turn_mailbox = turn_mailbox
+        self._coder_prompt_addendum = coder_prompt_addendum
 
     def job_timeout_seconds(
         self,
@@ -164,6 +172,16 @@ class PersistentReviewExchangeRunner:
             )
             return wt.path
 
+        prepared_coder_prompt = self._coder_prompt_addendum.prepare(
+            task=TaskKind.REWORK,
+            agent_label=coder_label,
+        )
+        if isinstance(prepared_coder_prompt, CoderPromptAddendumUnavailable):
+            raise RuntimeError(
+                "Required coder prompt addendum unavailable: "
+                f"{prepared_coder_prompt.reason}"
+            )
+
         return run_persistent_session_exchange(
             exchange_run=exchange_run,
             session_output=self._session_output,
@@ -190,4 +208,5 @@ class PersistentReviewExchangeRunner:
             event_context=event_context,
             turn_mailbox=self._turn_mailbox,
             response_channels=response_channels,
+            coder_prompt_addendum=prepared_coder_prompt.addendum,
         )
