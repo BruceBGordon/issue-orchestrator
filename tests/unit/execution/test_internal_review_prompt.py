@@ -28,6 +28,7 @@ def _provider(
         enabled=enabled,
         max_rounds=max_rounds,
         instructions_path=instructions_path,
+        tech_lead_agent_label_supplier=lambda: None,
     )
 
 
@@ -87,6 +88,36 @@ def test_loaded_config_normalizes_instruction_path_before_runtime_read(
     addendum = preparation.addendum
     assert addendum is not None
     assert "Review the coder's work." in addendum
+
+
+def test_built_provider_reads_live_tech_lead_agent_label(tmp_path: Path) -> None:
+    instructions = tmp_path / ".io" / "internal-review.md"
+    instructions.parent.mkdir()
+    instructions.write_text("Review the coder's work.", encoding="utf-8")
+    config_path = tmp_path / ".issue-orchestrator.yaml"
+    config_path.write_text(
+        "review:\n"
+        "  tech_lead_review_agent: agent:old-tech-lead\n"
+        "  internal:\n"
+        "    enabled: true\n",
+        encoding="utf-8",
+    )
+    config = Config.load(config_path)
+    config.repo_root = tmp_path
+    provider = build_coder_prompt_addendum_provider(config)
+
+    config.tech_lead_review_agent = "agent:new-tech-lead"
+
+    assert provider.prepare(
+        task=TaskKind.CODE,
+        agent_label="agent:new-tech-lead",
+    ) == PreparedCoderPromptAddendum(None)
+    old_label_preparation = provider.prepare(
+        task=TaskKind.CODE,
+        agent_label="agent:old-tech-lead",
+    )
+    assert isinstance(old_label_preparation, PreparedCoderPromptAddendum)
+    assert old_label_preparation.addendum is not None
 
 
 def test_enabled_provider_fails_when_instruction_file_is_missing(
@@ -160,7 +191,7 @@ def test_non_coder_roles_do_not_read_instruction_file(
             enabled=True,
             max_rounds=5,
             instructions_path=".io/internal-review.md",
-            tech_lead_agent_label="agent:architecture",
+            tech_lead_agent_label_supplier=lambda: "agent:architecture",
         )
 
     assert _prepare(

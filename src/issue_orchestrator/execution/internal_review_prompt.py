@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 from ..domain.coder_prompt import (
     CoderPromptAddendumPreparation,
@@ -27,7 +27,7 @@ class FileInternalReviewPromptAddendum:
     enabled: bool
     max_rounds: int
     instructions_path: str
-    tech_lead_agent_label: str | None = None
+    tech_lead_agent_label_supplier: Callable[[], str | None]
 
     def prepare(
         self,
@@ -60,8 +60,9 @@ class FileInternalReviewPromptAddendum:
         if not self.enabled or task not in {TaskKind.CODE, TaskKind.REWORK}:
             return False
         tech_lead_labels = {"agent:tech-lead"}
-        if self.tech_lead_agent_label is not None:
-            tech_lead_labels.add(self.tech_lead_agent_label)
+        configured_tech_lead_label = self.tech_lead_agent_label_supplier()
+        if configured_tech_lead_label is not None:
+            tech_lead_labels.add(configured_tech_lead_label)
         return agent_label not in tech_lead_labels
 
     def _contained_instructions_path(self) -> Path:
@@ -94,5 +95,5 @@ def build_coder_prompt_addendum_provider(
         enabled=config.internal_review_enabled,
         max_rounds=config.internal_review_max_rounds,
         instructions_path=config.internal_review_instructions,
-        tech_lead_agent_label=config.tech_lead_review_agent,
+        tech_lead_agent_label_supplier=lambda: config.tech_lead_review_agent,
     )
