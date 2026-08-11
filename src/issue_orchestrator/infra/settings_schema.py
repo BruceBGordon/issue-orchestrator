@@ -1087,10 +1087,32 @@ class ReviewSettings(BaseModel):
             "yaml_path": "review.post_publish.checks_pending_timeout_seconds",
         },
     )
+    tech_lead_enabled: bool = Field(
+        False,
+        title=f"Enable {TECH_LEAD_DISPLAY_NAME}",
+        description="Master switch for all new tech-lead work",
+        json_schema_extra={
+            "doc_examples": ["true", "false"],
+            "doc_notes": (
+                "When false, the Repository Engine admits and plans no new "
+                "tech-lead batch reviews, failure investigations, health "
+                "reviews, stuck sweeps, manual runs, proposal reconciliation, "
+                "or finding promotion. Detailed tech-lead settings remain "
+                "configured so changing only this value back to true restores "
+                "them. Already-running sessions may finish. If omitted from "
+                "YAML, legacy configurations remain enabled when "
+                "review.tech_lead_review_agent is configured."
+            ),
+            "section": _TECH_LEAD_SECTION,
+            "config_attr": "tech_lead_enabled",
+            "yaml_path": "tech_lead.enabled",
+            "restart_required": True,
+        },
+    )
     tech_lead_agent: Optional[str] = Field(
         None,
-        title=f"{TECH_LEAD_DISPLAY_NAME} Review Agent",
-        description="Agent for batch reviews (optional)",
+        title=f"{TECH_LEAD_DISPLAY_NAME} Agent",
+        description="Agent for batch, health, and failure-investigation runs",
         json_schema_extra={
             "doc_examples": ["agent:tech-lead"],
             "doc_notes": "Must match a label defined under agents.",
@@ -1098,7 +1120,7 @@ class ReviewSettings(BaseModel):
             "config_attr": "tech_lead_review_agent",
             "yaml_path": "review.tech_lead_review_agent",
             "doctor_check": DOCTOR_CHECK_REFERENCES_AGENT,
-            "doctor_check_condition": "review_enabled",
+            "doctor_check_condition": "tech_lead_enabled",
             "doctor_severity": DOCTOR_SEVERITY_ERROR,
         },
     )
@@ -1112,8 +1134,8 @@ class ReviewSettings(BaseModel):
                 "When a tech lead decision proposes a new follow-up issue, the "
                 "orchestrator attaches this worker's agent label so normal "
                 "discovery picks it up. Must match a worker label under agents. "
-                "REQUIRED whenever review.tech_lead_review_agent is set: a "
-                "configured tech lead agent makes create_issue proposals reachable, "
+                "REQUIRED whenever tech_lead.enabled is true: an active tech "
+                "lead can make create_issue proposals reachable, "
                 "so leaving this unset fails startup validation instead of "
                 "guessing by config order later."
             ),
@@ -1341,7 +1363,7 @@ class ReviewSettings(BaseModel):
                 "immediately runnable in the target repo's own pipeline; off "
                 "disables the lane entirely (no promotion issues and no "
                 "loop-closure reads); the lane is also inert without "
-                "review.tech_lead_review_agent, since it actuates tech-lead "
+                "tech_lead.enabled, since it actuates tech-lead "
                 "findings. Only findings the tech lead classified "
                 "fix:code are ever promoted. Routing is YAML-only: "
                 "tech_lead.findings.route maps an area label to 'self' or an "
@@ -1607,6 +1629,15 @@ class ReviewSettings(BaseModel):
         return value
 
     @model_validator(mode="after")
+    def _enabled_tech_lead_requires_agent(self) -> "ReviewSettings":
+        if self.tech_lead_enabled and not self.tech_lead_agent:
+            raise ValueError(
+                "tech_lead.enabled is true but no tech lead agent is configured; "
+                "set review.tech_lead_review_agent, or set tech_lead.enabled to false."
+            )
+        return self
+
+    @model_validator(mode="after")
     def _health_review_interval_requires_tech_lead_agent(self) -> "ReviewSettings":
         # Cross-field invariant (#6763/#6776): a positive health-review
         # interval without a configured tech lead agent would be silently
@@ -1614,7 +1645,8 @@ class ReviewSettings(BaseModel):
         # loud instead of degrading (0 disables; a positive interval needs
         # an agent to walk the board).
         if (
-            self.tech_lead_health_review_interval_minutes > 0
+            self.tech_lead_enabled
+            and self.tech_lead_health_review_interval_minutes > 0
             and not self.tech_lead_agent
         ):
             raise ValueError(
@@ -1630,7 +1662,11 @@ class ReviewSettings(BaseModel):
         # Cross-field invariant (#6823): the sweep re-injects stuck issues into
         # the reactive-tech-lead pipeline, so an enabled sweep with no tech lead agent
         # is silently inert at runtime. Reject the pair so it fails loudly.
-        if self.tech_lead_stuck_sweep_enabled and not self.tech_lead_agent:
+        if (
+            self.tech_lead_enabled
+            and self.tech_lead_stuck_sweep_enabled
+            and not self.tech_lead_agent
+        ):
             raise ValueError(
                 "tech_lead.stuck_sweep.enabled is true but no tech lead agent is "
                 "configured; set review.tech_lead_review_agent, or disable the "

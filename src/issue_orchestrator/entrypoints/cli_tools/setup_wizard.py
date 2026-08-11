@@ -2,7 +2,7 @@
 
 import sys
 from pathlib import Path
-from collections.abc import Iterable
+from collections.abc import Iterable, MutableMapping
 from typing import Any, Optional, cast
 
 import yaml
@@ -515,7 +515,7 @@ def _print_claude_code_next_steps(
 
 def _collect_stage2_tech_lead(
     prompter: Prompter,
-    review: dict,
+    config: MutableMapping[str, Any],
     code_reviewed_label: str,
     agent_labels: Iterable[str],
 ) -> None:
@@ -529,6 +529,11 @@ def _collect_stage2_tech_lead(
     prompter.print("")
     if not prompter.yes_no("Enable Stage 2: Tech Lead batch review?", default=False):
         return
+    review = cast(dict[str, Any], config["review"])
+    config["tech_lead"] = {
+        **cast(dict[str, Any], config.get("tech_lead", {})),
+        "enabled": True,
+    }
     prompter.print("\n  --- Stage 2: Tech Lead Batch Review ---")
     review_agent = prompter.input("  tech_lead review agent label", "agent:tech-lead")
     reviewed_label = prompter.input(
@@ -829,7 +834,7 @@ def wizard_new_project(prompter: Prompter) -> dict[str, Any]:  # noqa: C901, PLR
         # Stage 2: Tech Lead Batch Review (advanced only)
         if advanced:
             _collect_stage2_tech_lead(
-                prompter, config["review"], code_reviewed_label, config["agents"]
+                prompter, config, code_reviewed_label, config["agents"]
             )
 
     return config
@@ -1161,7 +1166,7 @@ def wizard_existing_project(  # noqa: C901, PLR0912 - interactive wizard with br
 
             # Stage 2: Tech Lead Batch Review (only if Stage 1 enabled)
             _collect_stage2_tech_lead(
-                prompter, config["review"], code_reviewed_label, config["agents"]
+                prompter, config, code_reviewed_label, config["agents"]
             )
 
     return config, updating_existing_path

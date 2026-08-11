@@ -13,6 +13,7 @@ from .config_models_tech_lead import (
     MilestoneStrategyConfig as MilestoneStrategyConfig,
     PromotionRouteTarget as PromotionRouteTarget,
     StuckSweepConfig as StuckSweepConfig,
+    TechLeadActivationOwner as TechLeadActivationOwner,
     TechLeadAuthorityConfig as TechLeadAuthorityConfig,
     TechLeadConfig as TechLeadConfig,
     TechLeadDedupConfig as TechLeadDedupConfig,

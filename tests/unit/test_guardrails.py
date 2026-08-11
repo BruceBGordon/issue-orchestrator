@@ -10,8 +10,30 @@ from pathlib import Path
 
 import pytest
 
+from tests.git_push_authorization import (
+    GH_AUTH_ENV_VAR,
+    GH_AUTH_TOKEN,
+    authorized_local_fixture_git_env,
+    unauthorized_git_env,
+)
+
 # Path to the wrapper scripts
 SCRIPTS_DIR = Path(__file__).parent.parent.parent / "src" / "issue_orchestrator" / "scripts"
+
+
+@pytest.mark.parametrize("wrapper", ["git", "gh"])
+def test_wrapper_scripts_accept_the_shared_authorization_token(wrapper: str) -> None:
+    """The shared test helper must authorize against what the wrappers check.
+
+    ``tests/git_push_authorization`` is the single owner of the privileged
+    fixture bypass. If its constants drifted from the wrapper sources, every
+    fixture would silently lose its authorization and the failure would show
+    up as an unrelated "BLOCKED" push somewhere far away.
+    """
+    source = (SCRIPTS_DIR / wrapper).read_text(encoding="utf-8")
+
+    assert GH_AUTH_ENV_VAR in source
+    assert GH_AUTH_TOKEN in source
 
 
 class TestGhWrapper:
@@ -23,18 +45,15 @@ class TestGhWrapper:
         fake_gh = tmp_path / "gh"
         fake_gh.write_text("#!/bin/sh\nexit 0\n")
         fake_gh.chmod(0o755)
-        env = os.environ.copy()
+        env = unauthorized_git_env()  # Ensure not authorized
         env["PATH"] = f"{SCRIPTS_DIR}:{env.get('PATH', '')}"
         env["ORCHESTRATOR_REAL_GH"] = str(fake_gh)
-        env.pop("ORCHESTRATOR_GH_AUTH", None)  # Ensure not authorized
         return env
 
     @pytest.fixture
     def authorized_env(self, wrapper_env):
         """Environment with authorization token set."""
-        env = wrapper_env.copy()
-        env["ORCHESTRATOR_GH_AUTH"] = "agent-done-authorized"
-        return env
+        return authorized_local_fixture_git_env(wrapper_env)
 
     def test_blocks_pr_create(self, wrapper_env):
         """gh pr create should be blocked without authorization."""
@@ -185,17 +204,14 @@ class TestGitWrapper:
     @pytest.fixture
     def wrapper_env(self):
         """Environment with wrapper directory prepended to PATH."""
-        env = os.environ.copy()
+        env = unauthorized_git_env()
         env["PATH"] = f"{SCRIPTS_DIR}:{env.get('PATH', '')}"
-        env.pop("ORCHESTRATOR_GH_AUTH", None)
         return env
 
     @pytest.fixture
     def authorized_env(self, wrapper_env):
         """Environment with authorization token set."""
-        env = wrapper_env.copy()
-        env["ORCHESTRATOR_GH_AUTH"] = "agent-done-authorized"
-        return env
+        return authorized_local_fixture_git_env(wrapper_env)
 
     def test_blocks_push(self, wrapper_env, tmp_path):
         """git push should be blocked without authorization."""

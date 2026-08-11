@@ -32,6 +32,7 @@ class ReviewWorkflowValidator(ConfigValidator):
         errors: list[str] = []
 
         self._validate_review_defaults(config, errors)
+        self._validate_tech_lead_switch(config, errors)
         self._validate_tech_lead_agent(config, errors)
         self._validate_tech_lead_follow_up_agent(config, errors)
         # Graduated tech_lead authority (ADR-0031): act-level 'execute' is a
@@ -137,6 +138,8 @@ class ReviewWorkflowValidator(ConfigValidator):
             )
 
     def _validate_tech_lead_agent(self, config: "Config", errors: list[str]) -> None:
+        if config.tech_lead.enabled is False:
+            return
         if not config.tech_lead_review_agent:
             return
         if config.tech_lead_review_agent not in config.agents:
@@ -159,6 +162,8 @@ class ReviewWorkflowValidator(ConfigValidator):
         # (#6779 R14), and when set it MUST name a real agent so routing can
         # never fall back to dict order and hand new work to a
         # reviewer/tech_lead/goal-pilot agent (#6779 R9).
+        if config.tech_lead.enabled is False:
+            return
         if not config.tech_lead_follow_up_agent:
             if config.tech_lead_review_agent:
                 errors.append(
@@ -183,6 +188,8 @@ class ReviewWorkflowValidator(ConfigValidator):
         # (health_review_interval_minutes() returns 0). Reject the pair so the
         # misconfiguration fails loudly rather than degrading; 0/absent is the
         # documented disable value and a positive interval needs an agent.
+        if config.tech_lead.enabled is False:
+            return
         interval = config.tech_lead.health_review.interval_minutes
         if interval > 0 and not config.tech_lead_review_agent:
             errors.append(
@@ -198,7 +205,10 @@ class ReviewWorkflowValidator(ConfigValidator):
         # the reactive-tech-lead pipeline, so an enabled sweep with no tech lead agent
         # (or tech-lead-on-failure off) is silently inert at runtime. Reject the
         # pair so the misconfiguration fails loudly instead of degrading.
-        if not config.tech_lead.stuck_sweep.enabled:
+        if (
+            config.tech_lead.enabled is False
+            or not config.tech_lead.stuck_sweep.enabled
+        ):
             return
         if not config.tech_lead_review_agent:
             errors.append(
@@ -212,6 +222,20 @@ class ReviewWorkflowValidator(ConfigValidator):
                 "review.tech_lead_review_on_failure is false; the sweep feeds the "
                 "reactive tech-lead-on-failure pipeline and would be inert. Enable "
                 "tech_lead_review_on_failure, or disable the stuck sweep."
+            )
+
+    @staticmethod
+    def _validate_tech_lead_switch(config: "Config", errors: list[str]) -> None:
+        """An explicitly enabled workflow must declare its agent dependency.
+
+        Omission is the backwards-compatible legacy mode, where no agent means
+        disabled. Explicit ``false`` is always an escape hatch from dormant
+        cross-field dependencies without deleting their configured values.
+        """
+        if config.tech_lead.enabled is True and not config.tech_lead_review_agent:
+            errors.append(
+                "tech_lead.enabled is true but review.tech_lead_review_agent is "
+                "not configured. Configure the agent, or set tech_lead.enabled: false."
             )
 
     def _validate_exchange_mode(

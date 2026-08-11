@@ -104,7 +104,7 @@ def storm_possible(state: "OrchestratorState", config: "Config") -> bool:
     tick that already has problems on the board; failing to arm one mints a
     duplicate anchor.
     """
-    if not (config.tech_lead_review_on_failure and config.tech_lead_review_agent):
+    if not (config.tech_lead_enabled and config.tech_lead_review_on_failure):
         return False
     threshold = config.tech_lead.health_review.storm_threshold
     if threshold <= 0:
@@ -230,7 +230,7 @@ class TechLeadReactionPolicy:
         """
         if (
             not self._config.tech_lead_review_on_failure
-            or not self._config.tech_lead_review_agent
+            or not self._config.tech_lead_enabled
         ):
             return TechLeadReaction()
 

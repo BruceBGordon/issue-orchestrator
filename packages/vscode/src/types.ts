@@ -125,8 +125,35 @@ export interface McpError {
   type?: string;
 }
 
+/**
+ * Mirrors `LaunchStatus` in `src/issue_orchestrator/infra/launcher.py`. The
+ * server rejects any status outside this set rather than reporting it as a
+ * success, so the union is closed on the wire too.
+ */
+export type LaunchStatus =
+  | "ok"
+  | "doctor_warning"
+  | "already_running"
+  | "doctor_error"
+  | "launch_error";
+
+export interface LaunchResult {
+  status: LaunchStatus;
+  launched: boolean;
+  doctor?: DoctorReport;
+  error?: string;
+  supervisor?: Record<string, unknown>;
+}
+
 export interface StartResponse {
   supervisor?: SupervisorStatus;
+  /**
+   * Present when this call ran the launcher. Operator detail only — do NOT
+   * decide success from `launch.status`. The server normalises every failure
+   * (thrown or returned) onto the top-level `error` below; reading the nested
+   * status here would duplicate that mapping on the client.
+   */
+  launch?: LaunchResult;
   error?: McpError;
   ui_hint?: UiHint;
 }

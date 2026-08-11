@@ -119,12 +119,19 @@ class TestReviewWorkflowValidator:
         agents=None,
         health_review_interval_minutes=0,
         tech_lead_follow_up_agent=None,
+        tech_lead_enabled=None,
     ):
         """Create a mock config with review settings."""
         config = MagicMock()
         config.review_enabled = review_enabled
         config.code_review_agent = code_review_agent
         config.tech_lead_review_agent = tech_lead_review_agent
+        config.tech_lead.enabled = tech_lead_enabled
+        config.tech_lead_enabled = (
+            bool(tech_lead_review_agent)
+            if tech_lead_enabled is None
+            else bool(tech_lead_enabled and tech_lead_review_agent)
+        )
         # Explicit None default so the typed follow-up-agent invariant (#6779 R9)
         # is exercised deterministically (a bare MagicMock is truthy).
         config.tech_lead_follow_up_agent = tech_lead_follow_up_agent
@@ -269,6 +276,33 @@ class TestReviewWorkflowValidator:
         )
         errors = ReviewWorkflowValidator().validate(config)
         assert not any("tech_lead_follow_up_agent" in e for e in errors), errors
+
+    def test_explicitly_enabled_tech_lead_requires_agent(self):
+        """The master switch fails fast when its runtime dependency is absent."""
+        config = self._make_config(tech_lead_enabled=True)
+
+        errors = ReviewWorkflowValidator().validate(config)
+
+        assert any("tech_lead.enabled is true" in error for error in errors), errors
+
+    def test_explicitly_disabled_tech_lead_preserves_dormant_settings(self):
+        """Turning off the master switch does not require deleting sub-settings."""
+        config = self._make_config(
+            tech_lead_enabled=False,
+            tech_lead_review_agent="agent:tech-lead",
+            tech_lead_follow_up_agent=None,
+            health_review_interval_minutes=60,
+            agents={},
+        )
+        config.tech_lead.stuck_sweep.enabled = True
+        config.tech_lead_review_on_failure = False
+
+        errors = ReviewWorkflowValidator().validate(config)
+
+        assert not any("tech_lead_review_agent" in error for error in errors), errors
+        assert not any("tech_lead_follow_up_agent" in error for error in errors), errors
+        assert not any("no tech lead agent" in error for error in errors), errors
+        assert not any("stuck_sweep.enabled" in error for error in errors), errors
 
     def test_negative_health_review_interval_error(self):
         """The validator surfaces the health-review interval invariant so a

@@ -127,7 +127,7 @@ def stuck_sweep_due(config: "Config", state: "OrchestratorState", now: float) ->
     sweep = config.tech_lead.stuck_sweep
     if not sweep.enabled:
         return False
-    if not (config.tech_lead_review_agent and config.tech_lead_review_on_failure):
+    if not (config.tech_lead_enabled and config.tech_lead_review_on_failure):
         return False
     interval_seconds = sweep.interval_minutes * 60
     if interval_seconds <= 0:

@@ -192,6 +192,7 @@ class RepositorySetupCommand:
             review["default"] = REVIEWER_AGENT_LABEL
 
         if self.configure_tech_lead:
+            config["tech_lead"] = {"enabled": True}
             agents[TECH_LEAD_AGENT_LABEL] = self._agent_config(
                 prompt=TECH_LEAD_PROMPT_PATH,
                 model=self.tech_lead_model,

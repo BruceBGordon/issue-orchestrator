@@ -104,7 +104,7 @@ class CleanupManager:
 
     def _get_cleanup_label(self) -> str | None:
         """Get the label that indicates review is complete."""
-        if self.config.tech_lead_review_agent:
+        if self.config.tech_lead_enabled:
             label = self.config.tech_lead_reviewed_label
         elif self.config.code_review_agent:
             label = self.config.code_reviewed_label
@@ -131,7 +131,7 @@ class CleanupManager:
 
     def _get_cleanup_settings(self) -> tuple[bool, bool]:
         """Get cleanup settings (close_tabs, remove_worktrees) based on workflow."""
-        if self.config.tech_lead_review_agent:
+        if self.config.tech_lead_enabled:
             return (
                 self.config.cleanup.with_tech_lead.close_ai_session_tabs,
                 self.config.cleanup.with_tech_lead.remove_worktrees,

@@ -918,6 +918,29 @@ class TestCleanupStrategy:
 
         assert result.should_defer_cleanup is True
 
+    def test_disabled_tech_lead_uses_code_review_cleanup_without_erasing_agent(
+        self, config: Config, agent_config: AgentConfig, tmp_worktree: Path
+    ) -> None:
+        config.tech_lead_review_agent = "agent:tech-lead"
+        config.tech_lead.enabled = False
+        config.code_review_agent = "agent:reviewer"
+        config.cleanup.without_tech_lead.wait_for_code_review = True
+        config.cleanup.without_tech_lead.close_ai_session_tabs = True
+        issue = make_issue()
+        session = create_test_session(
+            issue, agent_config, tmp_worktree, terminal_id="issue-1"
+        )
+        repository_host = make_repository_host(
+            prs=[SimpleNamespace(url="http://pr", number=42, labels=[])]
+        )
+
+        result = make_handler(
+            config, repository_host=repository_host
+        ).process_completion(session, SessionStatus.COMPLETED)
+
+        assert result.should_defer_cleanup is True
+        assert result.pending_cleanup is not None
+
     def test_review_session_does_not_defer_cleanup(
         self, config: Config, agent_config: AgentConfig, tmp_worktree: Path
     ) -> None:

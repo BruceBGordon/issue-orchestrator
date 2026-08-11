@@ -35,6 +35,7 @@ def _payload(view: TechLeadRunActionsView) -> dict:
     """The exact serialization ``dashboard_data`` publishes."""
     return view.model_dump(mode="json", by_alias=True)
 
+
 TECH_LEAD_AGENT = "agent:tech-lead"
 
 
@@ -171,7 +172,7 @@ def test_non_tech_lead_sessions_are_not_reported_as_tech_lead_runs():
 
 
 def test_a_missing_engine_projects_not_running_rather_than_unconfigured():
-    """"Start the engine" and "add a tech lead agent" are different remedies.
+    """Starting the engine and adding a tech lead agent are different remedies.
 
     With no engine we cannot know whether an agent is configured, so claiming it
     is missing would send the operator to Settings for a problem they may not
@@ -218,9 +219,12 @@ def test_the_dashboard_data_payload_carries_the_projection():
     assert "tech_lead_runs" in fields
 
     view = read_tech_lead_run_actions(
-        _config(), _state(active_sessions=[
-            FakeSession(900, flavor=TechLeadSessionFlavor.HEALTH_REVIEW)
-        ])
+        _config(),
+        _state(
+            active_sessions=[
+                FakeSession(900, flavor=TechLeadSessionFlavor.HEALTH_REVIEW)
+            ]
+        ),
     )
     payload = _payload(view)
     assert payload["globalStatus"] == STATUS_RUNNING
@@ -248,6 +252,19 @@ def test_a_missing_tech_lead_agent_names_settings_as_the_remedy():
 
     assert "No tech lead agent is configured" in view.unavailable_reason
     assert view.needs_settings is True
+
+
+def test_an_explicit_disable_is_not_reported_as_a_missing_agent():
+    config = _config()
+    config.tech_lead.enabled = False
+
+    view = read_tech_lead_run_actions(config, _state(active_sessions=[FakeSession(42)]))
+
+    assert view.configured is True
+    assert "disabled for this repository" in view.unavailable_reason
+    assert "No tech lead agent" not in view.unavailable_reason
+    assert view.needs_settings is True
+    assert view.running_issue_numbers == (42,)
 
 
 def test_a_paused_engine_says_resume_not_configure():
@@ -301,7 +318,7 @@ def test_a_queued_BATCH_review_leaves_the_health_action_available():
 
 
 def test_a_queued_batch_review_SAYS_the_health_review_would_wait():
-    """"It will queue" is a different message from "it is already queued"."""
+    """Queuing a run differs from reporting that it is already queued."""
     view = read_tech_lead_run_actions(
         _config(), _state(pending_tech_lead_reviews=[_batch_review()])
     )

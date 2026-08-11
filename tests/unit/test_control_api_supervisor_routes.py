@@ -722,7 +722,7 @@ class TestSupervisorStart:
         from issue_orchestrator.entrypoints import control_api_orchestrator_routes
         from issue_orchestrator.infra import launcher
         from issue_orchestrator.infra.doctor.types import DoctorResult
-        from issue_orchestrator.infra.launcher import LaunchResult
+        from issue_orchestrator.infra.launcher import LaunchResult, LaunchStatus
 
         config_dir = tmp_path / ".issue-orchestrator" / "config"
         config_dir.mkdir(parents=True)
@@ -744,7 +744,7 @@ class TestSupervisorStart:
             lambda **kwargs: LaunchResult(
                 doctor=DoctorResult(checks=[]),
                 launched=True,
-                status="ok",
+                status=LaunchStatus.OK,
                 supervisor={"pid": 123, "port": 19080},
             ),
         )
@@ -890,7 +890,7 @@ class TestSupervisorStart:
         from issue_orchestrator.entrypoints import control_api_orchestrator_routes
         from issue_orchestrator.infra import launcher
         from issue_orchestrator.infra.doctor.types import DoctorResult
-        from issue_orchestrator.infra.launcher import LaunchResult
+        from issue_orchestrator.infra.launcher import LaunchResult, LaunchStatus
 
         config_dir = tmp_path / ".issue-orchestrator" / "config"
         config_dir.mkdir(parents=True)
@@ -909,7 +909,7 @@ class TestSupervisorStart:
             return LaunchResult(
                 doctor=DoctorResult(checks=[]),
                 launched=True,
-                status="ok",
+                status=LaunchStatus.OK,
                 supervisor={"pid": 123, "port": 19080},
             )
 
@@ -934,7 +934,7 @@ class TestSupervisorStart:
         """Return 422 with doctor_failed when preflight checks fail."""
         from issue_orchestrator.infra import launcher
         from issue_orchestrator.infra.doctor.types import Check, DoctorResult
-        from issue_orchestrator.infra.launcher import LaunchResult
+        from issue_orchestrator.infra.launcher import LaunchResult, LaunchStatus
 
         # Create config file
         config_dir = tmp_path / ".issue-orchestrator" / "config"
@@ -950,7 +950,7 @@ class TestSupervisorStart:
                     checks=[Check(name="Hooks", status="error", detail="not installed")]
                 ),
                 launched=False,
-                status="doctor_error",
+                status=LaunchStatus.DOCTOR_ERROR,
             ),
         )
 

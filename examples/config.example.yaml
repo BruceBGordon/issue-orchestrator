@@ -387,6 +387,11 @@ milestones:
   foundation: "M0"
 
 tech_lead:
+  # Master switch for every new tech-lead run and supporting lane. Keep the
+  # detailed settings below configured; changing only this value disables or
+  # restores batch reviews, failure investigations, health/stuck triggers,
+  # manual runs, proposal reconciliation, and finding promotion.
+  enabled: true
   inherit_labels: []
   explicit_labels: []
   milestone_strategy:
@@ -419,7 +424,7 @@ tech_lead:
   # Unwired act-level actions (kill_hung_session) must stay "propose"
   # until their executors land (#6764) - "execute" fails at startup.
   # A create_issue follow-up routes its new issue to review.tech_lead_follow_up_agent
-  # (set above; REQUIRED whenever review.tech_lead_review_agent is configured, #6779).
+  # (set above; REQUIRED whenever tech_lead.enabled is true, #6779).
   # authority:
   #   post_comment: "execute"       # execute | propose
   #   create_issue: "execute"       # execute | propose (propose = gated issue)
@@ -430,8 +435,9 @@ tech_lead:
   # the periodic floor. A storm of K recent blocked/failed problem issues
   # creates one immediate health review instead of K investigations. The
   # anchor closes automatically when the review lands with a valid decision.
-  # Requires review.tech_lead_review_agent. interval_minutes=0 disables only the
-  # periodic trigger; storm_threshold=0 disables only storm escalation.
+  # Requires tech_lead.enabled and review.tech_lead_review_agent.
+  # interval_minutes=0 disables only the periodic trigger; storm_threshold=0
+  # disables only storm escalation.
   # health_review:
   #   interval_minutes: 240
   #   storm_threshold: 3
@@ -447,9 +453,8 @@ tech_lead:
   #       the issue while gated declines it permanently (never re-filed).
   #     auto files it ungated - immediately runnable in the target's pipeline.
   #     off disables the lane entirely (no issues filed, no follow-up reads).
-  #     The lane is also inert without review.tech_lead_review_agent - it
-  #     actuates tech-lead findings, so removing the tech lead turns it off
-  #     completely. Durable rows are kept, so re-adding the agent resumes it.
+  #     The lane is also inert while tech_lead.enabled is false. Durable rows
+  #     are kept, so re-enabling resumes it where it stopped.
   #   min_evidence: observations a signature must accrue before it is eligible.
   #     Counted in the orchestrator-owned pattern ledger, so comments on the
   #     case file cannot inflate it.

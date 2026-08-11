@@ -55,8 +55,8 @@ class TechLeadWorkflow:
         self.events = events
 
     def is_configured(self) -> bool:
-        """Check if tech_lead review is configured."""
-        return self.config.tech_lead_review_agent is not None
+        """Check whether new tech-lead work is enabled and startable."""
+        return self.config.tech_lead_enabled
 
     def should_launch_tech_lead(
         self,
@@ -75,7 +75,9 @@ class TechLeadWorkflow:
         event can never disagree with the actual planned launches.
         """
         if not self.is_configured():
-            return TechLeadDecision.skip("No tech_lead_review_agent configured")
+            return TechLeadDecision.skip(
+                "Tech lead is disabled or has no configured agent"
+            )
 
         if not pending_tech_lead:
             return TechLeadDecision.skip("No pending tech_lead reviews")
