@@ -60,6 +60,33 @@ def test_setup_file_adapter_plans_and_writes_runnable_contained_artifacts(
     assert Config.load(config_file.path).validate() == []
 
 
+def test_setup_command_choice_plans_internal_reviewer_instructions(
+    tmp_path: Path,
+) -> None:
+    command = RepositorySetupCommand(
+        repo_root=tmp_path,
+        repo_name="owner/repo",
+        worker_agent_label="agent:dev",
+        model="sonnet",
+        validation_quick_command="make test-quick",
+        validation_publish_command="make validate",
+        configure_internal_reviewer=True,
+    )
+
+    plan = RepositorySetupFileSystemAdapter().plan(
+        repo_root=tmp_path,
+        config_target=RepositorySetupNamedConfig(command.config_name),
+        config=command.build_config(repository_setup_github_authorization_codec),
+        include_prompts=True,
+    )
+
+    internal_prompt = next(
+        file for file in plan.files if file.agent == "internal-review"
+    )
+    assert internal_prompt.path == tmp_path / ".io" / "internal-review.md"
+    assert "Return exactly one conversational verdict" in internal_prompt.content
+
+
 def test_setup_file_adapter_revalidates_forged_config_name(
     tmp_path: Path,
 ) -> None:

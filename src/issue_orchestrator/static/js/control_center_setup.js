@@ -250,6 +250,17 @@
             const configureReviewer = data.existing_config
                 ? Boolean(existingConfig.review?.enabled && reviewerAgentLabel)
                 : true;
+            const configureInternalReviewer = Boolean(
+                existingConfig.review?.internal?.enabled,
+            );
+            const internalReviewMaxRounds = Number.isInteger(
+                existingConfig.review?.internal?.max_rounds,
+            )
+                ? existingConfig.review.internal.max_rounds
+                : 5;
+            const internalReviewInstructions =
+                existingConfig.review?.internal?.instructions
+                || '.io/internal-review.md';
             const configureTechLead = data.existing_config
                 ? existingConfig.tech_lead?.enabled
                     ?? Boolean(existingConfig.review?.tech_lead_review_agent)
@@ -342,6 +353,55 @@
                         toggleId: 'setupConfigureReviewer',
                         enabled: configureReviewer,
                     })}
+                    <fieldset class="setup-role-card">
+                        <legend>Coder-owned internal review</legend>
+                        <p id="setupInternalReviewerHelp" class="setup-field-help">
+                            Makes each coder iterate with one fast internal reviewer before
+                            the independent code reviewer sees the work.
+                        </p>
+                        <label class="setup-role-toggle">
+                            <input
+                                type="checkbox"
+                                id="setupConfigureInternalReviewer"
+                                ${configureInternalReviewer ? 'checked' : ''}
+                                aria-describedby="setupInternalReviewerHelp"
+                                aria-controls="setupInternalReviewerFields"
+                                aria-expanded="${configureInternalReviewer}"
+                            >
+                            <span>Enable internal reviewer loop</span>
+                        </label>
+                        <div id="setupInternalReviewerFields" class="setup-role-fields">
+                            <div class="form-group">
+                                <label class="form-label" for="setupInternalReviewMaxRounds">
+                                    Maximum review rounds
+                                </label>
+                                <input
+                                    type="number"
+                                    id="setupInternalReviewMaxRounds"
+                                    class="form-input"
+                                    min="1"
+                                    max="50"
+                                    value="${escapeHtml(internalReviewMaxRounds)}"
+                                >
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label" for="setupInternalReviewInstructions">
+                                    Reviewer instructions file
+                                </label>
+                                <input
+                                    type="text"
+                                    id="setupInternalReviewInstructions"
+                                    class="form-input"
+                                    value="${escapeHtml(internalReviewInstructions)}"
+                                    aria-describedby="setupInternalReviewInstructionsHelp"
+                                >
+                                <div id="setupInternalReviewInstructionsHelp" class="setup-field-help">
+                                    Repository-relative Markdown file. Setup creates the starter
+                                    file when the loop is enabled and the file is missing.
+                                </div>
+                            </div>
+                        </div>
+                    </fieldset>
                     ${renderAgentRoleFields({
                         role: 'Tech lead',
                         idPrefix: 'setupTechLead',
@@ -386,6 +446,14 @@
                 'input',
                 updateValidationReadiness,
             );
+            const internalReviewToggle = element('setupConfigureInternalReviewer');
+            const updateInternalReviewFields = () => {
+                const enabled = internalReviewToggle.checked;
+                internalReviewToggle.setAttribute('aria-expanded', String(enabled));
+                element('setupInternalReviewerFields').hidden = !enabled;
+            };
+            internalReviewToggle.addEventListener('change', updateInternalReviewFields);
+            updateInternalReviewFields();
             updateValidationReadiness();
         } catch (error) {
             if (!isCurrentOperation(operation)) return;
@@ -455,6 +523,9 @@
             configureReviewer: element('setupConfigureReviewer').checked,
             reviewerModel: element('setupReviewerModel').value,
             reviewerEffort: element('setupReviewerEffort').value,
+            configureInternalReviewer: element('setupConfigureInternalReviewer').checked,
+            internalReviewMaxRounds: element('setupInternalReviewMaxRounds').value,
+            internalReviewInstructions: element('setupInternalReviewInstructions').value,
             validationQuickCommand: element('setupValidationQuickCommand').value,
             validationPublishCommand: element('setupValidationPublishCommand').value,
             configureTechLead: element('setupConfigureTechLead').checked,
@@ -936,12 +1007,18 @@
             html += '<p style="margin-top: 16px;">You can now start the repository engine for this repository.</p>';
             const configuredRoles = ['worker'];
             if (state.options?.configureReviewer) configuredRoles.push('reviewer/rework');
+            if (state.options?.configureInternalReviewer) {
+                configuredRoles.splice(1, 0, 'coder-owned internal review');
+            }
             if (state.options?.configureTechLead) configuredRoles.push('tech lead');
             html += `<p><strong>Configured pipeline:</strong> ${configuredRoles.join(' → ')}</p>`;
             const omittedDefaultRoles = [
                 state.options?.configureReviewer
                     ? ''
                     : '<li><strong>Code reviewer:</strong> enable the bounded review/rework gate.</li>',
+                state.options?.configureInternalReviewer
+                    ? ''
+                    : '<li><strong>Internal reviewer:</strong> add a fast coder-owned review loop before external review.</li>',
                 state.options?.configureTechLead
                     ? ''
                     : '<li><strong>Tech lead:</strong> enable architectural and failure review.</li>',

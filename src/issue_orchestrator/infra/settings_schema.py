@@ -806,7 +806,7 @@ class ReviewSettings(BaseModel):
         if configured_path.is_absolute() or ".." in configured_path.parts:
             raise ValueError(
                 "review.internal.instructions must be a repository-relative "
-                "path that stays inside the coder worktree"
+                "path that stays inside the repository root"
             )
         return instructions
 

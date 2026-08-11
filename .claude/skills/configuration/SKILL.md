@@ -91,12 +91,13 @@ Add these to make the doctor automatically validate the field:
 
 | Key | Purpose | Values |
 |-----|---------|--------|
-| `doctor_check` | Check type to run | `"path_exists"`, `"first_arg_path_exists"`, `"references_agent"` |
+| `doctor_check` | Check type to run | `"path_exists"`, `"path_is_file"`, `"first_arg_path_exists"`, `"references_agent"` |
 | `doctor_check_condition` | Only run check when this config attr is truthy | `"e2e.enabled"`, `"review_enabled"` |
 | `doctor_severity` | Severity if check fails | `"error"` (default), `"warning"` |
 
 **Check types:**
 - `path_exists` — field value is a repo-relative path that should exist
+- `path_is_file` — field value is a repo-relative path that must be a regular file
 - `first_arg_path_exists` — first space-separated arg in a list is a path
 - `references_agent` — field value must be a key in `config.agents`
 

@@ -95,7 +95,7 @@ class ReviewWorkflowValidator(ConfigValidator):
         if configured_path.is_absolute() or ".." in configured_path.parts:
             errors.append(
                 "review.internal.instructions must be a repository-relative path "
-                "that stays inside the coder worktree."
+                "that stays inside the repository root."
             )
 
     def _validate_retrospective_review(self, config: "Config", errors: list[str]) -> None:

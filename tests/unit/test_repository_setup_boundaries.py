@@ -110,6 +110,9 @@ def test_cli_and_http_produce_equivalent_owner_request_and_preview(
         configure_reviewer=True,
         reviewer_model="opus",
         reviewer_effort="max",
+        configure_internal_reviewer=True,
+        internal_review_max_rounds=4,
+        internal_review_instructions=".io/internal-review.md",
         validation_quick_command="make test-quick",
         validation_publish_command="make validate",
         worktree_base="../worktrees/repo",
@@ -138,6 +141,10 @@ def test_cli_and_http_produce_equivalent_owner_request_and_preview(
 
     assert cli_request == http_request
     assert owner.preview(cli_request) == owner.preview(http_request)
+    assert any(
+        planned.agent == "internal-review"
+        for planned in owner.preview(http_request).files
+    )
     assert "priority:high" in {
         name for name, _color, _description in owner.preview(cli_request).labels
     }

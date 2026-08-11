@@ -183,8 +183,9 @@ review:
     instructions: ".io/internal-review.md"
 ```
 
-`instructions` is a repository-relative, coder-facing Markdown file. Its
-contents are appended to each coder prompt inside a fixed contract requiring
+`instructions` is a coder-facing Markdown file relative to the orchestrator's
+configured repository root. Its trusted contents are read before launch claims
+or worktree mutation and appended to each coder prompt inside a fixed contract requiring
 approval from the same internally spawned reviewer. If the reviewer cannot be
 spawned, approval cannot be reached, or the round limit is exhausted, the coder
 must report blocked (or needs-human when a human decision is required), not

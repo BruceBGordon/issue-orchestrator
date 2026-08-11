@@ -44,6 +44,8 @@ from issue_orchestrator.domain.review_exchange_run import (
 from issue_orchestrator.domain.review_exchange_summary import ReviewExchangeSummaryV1
 from issue_orchestrator.domain.runtime_config import RuntimeConfigReference
 from issue_orchestrator.execution import persistent_review_exchange_runner as prer
+from issue_orchestrator.domain.coder_prompt import PreparedCoderPromptAddendum
+from issue_orchestrator.domain.session_key import TaskKind
 
 
 @pytest.fixture
@@ -326,7 +328,9 @@ def test_run_resolves_coder_addendum_for_coder_worktree_only(
 
     monkeypatch.setattr(prer, "run_persistent_session_exchange", _fake_inner)
     provider = MagicMock(name="coder_prompt_addendum")
-    provider.for_worktree.return_value = "INTERNAL-CODER-ONLY"
+    provider.prepare.return_value = PreparedCoderPromptAddendum(
+        "INTERNAL-CODER-ONLY"
+    )
     runner = prer.PersistentReviewExchangeRunner(
         MagicMock(name="session_output"),
         MagicMock(name="pair_registry"),
@@ -335,7 +339,10 @@ def test_run_resolves_coder_addendum_for_coder_worktree_only(
 
     _run(runner, tmp_path)
 
-    provider.for_worktree.assert_called_once_with(tmp_path / "coder")
+    provider.prepare.assert_called_once_with(
+        task=TaskKind.REWORK,
+        agent_label="agent:coder",
+    )
     assert captured["coder_prompt_addendum"] == "INTERNAL-CODER-ONLY"
 
 

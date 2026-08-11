@@ -2,12 +2,37 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 
 def append_coder_prompt_addendum(prompt: str, addendum: str | None) -> str:
     """Append one owned coder addendum without changing disabled prompts."""
     if addendum is None:
         return prompt
     return f"{prompt.rstrip()}\n\n---\n\n{addendum.strip()}\n"
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedCoderPromptAddendum:
+    """A resolved coder addendum whose composition cannot perform I/O."""
+
+    addendum: str | None
+
+    def compose(self, prompt: str) -> str:
+        """Append this prepared addendum to ``prompt`` when one is enabled."""
+        return append_coder_prompt_addendum(prompt, self.addendum)
+
+
+@dataclass(frozen=True, slots=True)
+class CoderPromptAddendumUnavailable:
+    """A required coder addendum could not be prepared for this launch."""
+
+    reason: str
+
+
+CoderPromptAddendumPreparation = (
+    PreparedCoderPromptAddendum | CoderPromptAddendumUnavailable
+)
 
 
 def build_internal_review_addendum(

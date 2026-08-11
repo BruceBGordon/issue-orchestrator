@@ -100,6 +100,10 @@ function fakeDocument() {
         'setupConfigureReviewer',
         'setupReviewerModel',
         'setupReviewerEffort',
+        'setupConfigureInternalReviewer',
+        'setupInternalReviewerFields',
+        'setupInternalReviewMaxRounds',
+        'setupInternalReviewInstructions',
         'setupValidationQuickCommand',
         'setupValidationPublishCommand',
         'setupWorktreeBase',
@@ -291,6 +295,9 @@ test('setup request contract defaults the complete review pipeline on', () => {
         validationPublishCommand: 'make validate',
         worktreeBase: '../worktrees/porchpin',
         configureReviewer: false,
+        configureInternalReviewer: true,
+        internalReviewMaxRounds: 3,
+        internalReviewInstructions: '.io/fast-review.md',
         configureTechLead: false,
     }, {
         createLabels: false,
@@ -301,6 +308,12 @@ test('setup request contract defaults the complete review pipeline on', () => {
     assert.equal(enabled.body.configure_reviewer, true);
     assert.equal(enabled.body.reviewer_model, 'sonnet');
     assert.equal(enabled.body.reviewer_effort, 'high');
+    assert.equal(enabled.body.configure_internal_reviewer, false);
+    assert.equal(enabled.body.internal_review_max_rounds, 5);
+    assert.equal(
+        enabled.body.internal_review_instructions,
+        '.io/internal-review.md',
+    );
     assert.equal(enabled.body.validation_quick_command, 'make test-quick');
     assert.equal(enabled.body.validation_publish_command, 'make validate');
     assert.equal(enabled.body.configure_tech_lead, true);
@@ -310,6 +323,9 @@ test('setup request contract defaults the complete review pipeline on', () => {
     assert.equal(enabled.body.worktree_base, '../worktrees/porchpin');
     assert.equal(disabled.endpoint, '/control/setup/save');
     assert.equal(disabled.body.configure_reviewer, false);
+    assert.equal(disabled.body.configure_internal_reviewer, true);
+    assert.equal(disabled.body.internal_review_max_rounds, 3);
+    assert.equal(disabled.body.internal_review_instructions, '.io/fast-review.md');
     assert.equal(disabled.body.configure_tech_lead, false);
     assert.equal(disabled.body.create_prompts, true);
     assert.equal(disabled.body.create_labels, false);
@@ -353,6 +369,13 @@ test('setup request contract rejects invalid role and validation choices', () =>
             techLeadReviewThreshold: 51,
         }),
         /techLeadReviewThreshold must be an integer/,
+    );
+    assert.throws(
+        () => setupCommands.buildSetupPreviewRequest('/repos/porchpin', {
+            ...valid,
+            internalReviewMaxRounds: 0,
+        }),
+        /internalReviewMaxRounds must be an integer/,
     );
     assert.throws(
         () => setupCommands.buildSetupPreviewRequest('/repos/porchpin', {
@@ -450,6 +473,35 @@ test('setup modal completes the default-on preview and save round trip', async (
     assert.match(configureHtml, /<legend>Worker<\/legend>/);
     assert.match(configureHtml, /<legend>Code reviewer<\/legend>/);
     assert.match(configureHtml, /id="setupConfigureReviewer" checked/);
+    assert.match(configureHtml, /<legend>Coder-owned internal review<\/legend>/);
+    assert.match(configureHtml, /id="setupConfigureInternalReviewer"/);
+    assert.doesNotMatch(
+        configureHtml,
+        /id="setupConfigureInternalReviewer"[^>]*checked/,
+    );
+    assert.match(configureHtml, /aria-controls="setupInternalReviewerFields"/);
+    assert.match(configureHtml, /id="setupInternalReviewMaxRounds"/);
+    assert.match(configureHtml, /min="1"/);
+    assert.match(configureHtml, /max="50"/);
+    assert.match(configureHtml, /id="setupInternalReviewInstructions"/);
+    assert.match(
+        configureHtml,
+        /aria-describedby="setupInternalReviewInstructionsHelp"/,
+    );
+    const internalReviewToggle = document.elements.get(
+        'setupConfigureInternalReviewer',
+    );
+    const internalReviewFields = document.elements.get(
+        'setupInternalReviewerFields',
+    );
+    assert.equal(internalReviewFields.hidden, true);
+    assert.equal(internalReviewToggle.getAttribute('aria-expanded'), 'false');
+    internalReviewToggle.checked = true;
+    await internalReviewToggle.emit('change');
+    assert.equal(internalReviewFields.hidden, false);
+    assert.equal(internalReviewToggle.getAttribute('aria-expanded'), 'true');
+    internalReviewToggle.checked = false;
+    await internalReviewToggle.emit('change');
     assert.match(configureHtml, /id="setupConfigureTechLead" checked/);
     assert.match(configureHtml, /id="setupWorkerEffort"/);
     assert.match(configureHtml, /id="setupReviewerEffort"/);
@@ -515,6 +567,10 @@ test('setup modal completes the default-on preview and save round trip', async (
     const previewRequest = fetchCalls[3];
     assert.equal(previewRequest[0], '/control/setup/preview');
     assert.equal(JSON.parse(previewRequest[1].body).configure_reviewer, true);
+    assert.equal(
+        JSON.parse(previewRequest[1].body).configure_internal_reviewer,
+        false,
+    );
     assert.equal(JSON.parse(previewRequest[1].body).configure_tech_lead, true);
     assert.equal(JSON.parse(previewRequest[1].body).effort, 'high');
     assert.equal(JSON.parse(previewRequest[1].body).reviewer_effort, 'high');

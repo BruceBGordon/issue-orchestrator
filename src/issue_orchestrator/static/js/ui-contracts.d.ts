@@ -809,12 +809,15 @@ export interface RecentE2ERunsPayload {
 
 export interface RepositorySetupCommandPayload {
   config_name?: string;
+  configure_internal_reviewer: boolean;
   configure_reviewer: boolean;
   configure_tech_lead: boolean;
   create_labels?: boolean;
   create_prompts?: boolean;
   effort: "low" | "medium" | "high" | "xhigh" | "max";
   github_authorization: RepositorySetupGitHubAuthorizationPayload;
+  internal_review_instructions: string;
+  internal_review_max_rounds: number;
   model: "haiku" | "sonnet" | "opus";
   replace_existing?: boolean;
   repo_name: string;

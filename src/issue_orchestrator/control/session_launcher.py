@@ -47,7 +47,10 @@ from ..domain.models import (
     TaskKind,
     get_completion_path,
 )
-from ..domain.coder_prompt import append_coder_prompt_addendum
+from ..domain.coder_prompt import (
+    CoderPromptAddendumUnavailable,
+    PreparedCoderPromptAddendum,
+)
 from ..domain.session_run import SessionRunAssets
 from .worktree_context import WorktreeContext
 from ..infra.validation_state import DEFAULT_RETRY_TEMPLATE, _truncate_with_tail
@@ -714,7 +717,18 @@ class SessionLauncher:
             issue.number, session_name, session_key.stable_id(), extra=_identity_log_extra,
         )
 
-        # Phase 2: Verify dependencies haven't changed (CAS check)
+        # Phase 2: Resolve required prompt input before any gate that may park
+        # the issue by writing a shared label or durable provider record.
+        prepared_coder_prompt = self._coder_prompt_addendum.prepare(
+            task=TaskKind.CODE,
+            agent_label=issue.agent_type,
+        )
+        if isinstance(prepared_coder_prompt, CoderPromptAddendumUnavailable):
+            return LaunchResult.required_input_unavailable(
+                prepared_coder_prompt.reason
+            )
+
+        # Phase 3: Verify dependencies and provider readiness.
         freshness = self._dependency_gate.verify_fresh(issue)
         if freshness.failure:
             return freshness.failure
@@ -725,12 +739,12 @@ class SessionLauncher:
 
         log_transition("issue", issue.number, "AVAILABLE", "LAUNCHING", "no conflicts")
 
-        # Phase 3: Acquire distributed claim
+        # Phase 4: Acquire the distributed claim before worktree creation/reset.
         claim = self._acquire_issue_claim(issue)
         if not claim.success:
             return claim.as_launch_failure()
 
-        # Phase 4: Prepare worktree
+        # Phase 5: Prepare worktree.
         step_start = time.time()
         logger.info(issue_log(issue.number, "Creating worktree..."))
         from_scratch_pending = self._lm.reset_retry_scratch_pending in issue.labels
@@ -963,10 +977,7 @@ class SessionLauncher:
                 worktree=worktree_path,
                 existing_work=existing_work,
             )
-            rendered_prompt = self._with_coder_prompt_addendum(
-                rendered_prompt,
-                worktree_path,
-            )
+            rendered_prompt = prepared_coder_prompt.compose(rendered_prompt)
             prompt_path = self._persist_session_prompt(run.run_dir, rendered_prompt)
             base_command = agent_config.get_command_for_prompt(
                 rendered_prompt,
@@ -1103,12 +1114,14 @@ class SessionLauncher:
 
     def _admit_validation_retry(
         self, retry: PendingValidationRetry, active_sessions: list[Session]
-    ) -> "LaunchResult | tuple[Issue, AgentConfig, str]":
+    ) -> "LaunchResult | tuple[Issue, AgentConfig, str, PreparedCoderPromptAddendum]":
         """Resolve who a validation retry runs as, and whether it may run now.
 
         The retry's whole admission phase in one place: which issue and agent it
-        belongs to, the ordinary session-conflict preconditions, and whether that
-        agent's provider is usable at all.
+        belongs to, the ordinary session-conflict preconditions, its required
+        prompt input, and whether that agent's provider is usable at all. Prompt
+        preparation deliberately precedes the provider gate because that gate
+        may park the issue with a shared label and durable record.
         """
         resolved = self._resolve_validation_retry_issue(retry)
         if resolved is None:
@@ -1121,9 +1134,17 @@ class SessionLauncher:
         session_name = f"issue-{issue.number}"
         if result := self._check_launch_preconditions(issue, active_sessions, session_name):
             return result
+        prepared_coder_prompt = self._coder_prompt_addendum.prepare(
+            task=TaskKind.CODE,
+            agent_label=agent_label,
+        )
+        if isinstance(prepared_coder_prompt, CoderPromptAddendumUnavailable):
+            return LaunchResult.required_input_unavailable(
+                prepared_coder_prompt.reason
+            )
         if result := self._check_provider_ready(agent_config.provider, issue.number):
             return result
-        return issue, agent_config, agent_label
+        return issue, agent_config, agent_label, prepared_coder_prompt
 
     def launch_validation_retry_session(
         self,
@@ -1136,7 +1157,7 @@ class SessionLauncher:
         admitted = self._admit_validation_retry(retry, active_sessions)
         if isinstance(admitted, LaunchResult):
             return admitted
-        issue, agent_config, agent_label = admitted
+        issue, agent_config, agent_label, prepared_coder_prompt = admitted
         session_name = f"issue-{issue.number}"
 
         retry_count = max(1, retry.retry_count)
@@ -1220,10 +1241,7 @@ class SessionLauncher:
                 agent_config=agent_config,
                 retry_count=retry_count,
             )
-            retry_prompt = self._with_coder_prompt_addendum(
-                retry_prompt,
-                worktree_path,
-            )
+            retry_prompt = prepared_coder_prompt.compose(retry_prompt)
 
             ctx.write_worktree_note()
             ctx.write_session_identity({
@@ -2108,13 +2126,6 @@ class SessionLauncher:
         )
         return launch_rework_flow(
             rework, active_sessions, deps, work_claim=work_claim
-        )
-
-    def _with_coder_prompt_addendum(self, prompt: str, worktree: Path) -> str:
-        """Compose one coder prompt through the shared addendum owner."""
-        return append_coder_prompt_addendum(
-            prompt,
-            self._coder_prompt_addendum.for_worktree(worktree),
         )
 
     def _run_setup_commands(self, worktree_path: Path) -> None:

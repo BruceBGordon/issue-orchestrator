@@ -209,7 +209,7 @@ review:
   internal:
     enabled: false
     max_rounds: 5                      # Reviewer verdicts before coder blocks
-    instructions: ".io/internal-review.md" # Repo-relative coder instructions
+    instructions: ".io/internal-review.md" # Relative to the configured repository root
 
   # Exchange mechanism
   exchange:

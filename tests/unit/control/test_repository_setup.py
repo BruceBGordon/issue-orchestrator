@@ -78,6 +78,11 @@ def test_setup_command_defaults_to_complete_review_pipeline(
             "require_validation": True,
         },
     }
+    assert config["review"]["internal"] == {
+        "enabled": False,
+        "max_rounds": 5,
+        "instructions": ".io/internal-review.md",
+    }
     assert config["validation"] == {
         "quick": {
             "cmd": "make test-quick",
@@ -94,6 +99,27 @@ def test_setup_command_defaults_to_complete_review_pipeline(
     assert config["review"]["tech_lead_review_label"] == "needs-tech-lead-review"
     assert config["review"]["tech_lead_review_threshold"] == 1
     assert config["tech_lead"]["enabled"] is True
+
+
+def test_setup_command_enables_internal_reviewer_with_owned_artifact(
+    tmp_path: Path,
+) -> None:
+    config = RepositorySetupCommand(
+        repo_root=tmp_path,
+        repo_name="owner/repo",
+        worker_agent_label="agent:dev",
+        model="sonnet",
+        **_VALIDATION_COMMANDS,
+        configure_internal_reviewer=True,
+        internal_review_max_rounds=3,
+        internal_review_instructions=" .io/fast-review.md ",
+    ).build_config(repository_setup_github_authorization_codec)
+
+    assert config["review"]["internal"] == {
+        "enabled": True,
+        "max_rounds": 3,
+        "instructions": ".io/fast-review.md",
+    }
 
 
 def test_setup_command_can_explicitly_disable_tech_lead(tmp_path: Path) -> None:
@@ -295,6 +321,21 @@ def test_setup_request_detaches_nested_config_from_surface_mutation(
             "tech_lead_review_threshold",
             51,
             "tech_lead_review_threshold must be between",
+        ),
+        (
+            "internal_review_max_rounds",
+            0,
+            "internal_review_max_rounds must be between",
+        ),
+        (
+            "internal_review_max_rounds",
+            51,
+            "internal_review_max_rounds must be between",
+        ),
+        (
+            "internal_review_instructions",
+            "../outside.md",
+            "internal_review_instructions must be a contained",
         ),
         ("worktree_base", "", "worktree_base is required"),
     ],

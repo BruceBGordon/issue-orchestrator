@@ -34,6 +34,7 @@ TECH_LEAD_PROMPT_PATH = ".io/tech-lead.md"
 REVIEWER_AGENT_LABEL = "agent:reviewer"
 REVIEWER_PROMPT_PATH = ".io/reviewer.md"
 WORKER_PROMPT_PATH = ".io/dev.md"
+INTERNAL_REVIEW_PROMPT_PATH = ".io/internal-review.md"
 
 _SUPPORTED_MODELS = frozenset({"haiku", "sonnet", "opus"})
 _SUPPORTED_EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
@@ -60,6 +61,9 @@ class RepositorySetupCommand:
     configure_reviewer: bool = True
     reviewer_model: str = "sonnet"
     reviewer_effort: str = "high"
+    configure_internal_reviewer: bool = False
+    internal_review_max_rounds: int = 5
+    internal_review_instructions: str = INTERNAL_REVIEW_PROMPT_PATH
     worktree_base: str | None = None
     github_authorization: RepositorySetupGitHubAuthorization = (
         RepositorySetupGitHubAuthorization(kind="detected")
@@ -119,6 +123,19 @@ class RepositorySetupCommand:
         """Validate review cadence and its required validation gates."""
         if not 0 <= self.tech_lead_review_threshold <= 50:
             raise ValueError("tech_lead_review_threshold must be between 0 and 50")
+        if not 1 <= self.internal_review_max_rounds <= 50:
+            raise ValueError("internal_review_max_rounds must be between 1 and 50")
+        instructions = self.internal_review_instructions.strip()
+        configured_path = Path(instructions)
+        if (
+            not instructions
+            or configured_path.is_absolute()
+            or ".." in configured_path.parts
+            or configured_path == Path(".")
+        ):
+            raise ValueError(
+                "internal_review_instructions must be a contained repository-relative path"
+            )
         for field, command in (
             ("validation_quick_command", self.validation_quick_command),
             ("validation_publish_command", self.validation_publish_command),
@@ -179,6 +196,11 @@ class RepositorySetupCommand:
                     "max_no_progress": 2,
                     "require_validation": True,
                 },
+            },
+            "internal": {
+                "enabled": self.configure_internal_reviewer,
+                "max_rounds": self.internal_review_max_rounds,
+                "instructions": self.internal_review_instructions.strip(),
             },
         }
         config["review"] = review
