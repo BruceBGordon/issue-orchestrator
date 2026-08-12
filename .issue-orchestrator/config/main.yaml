@@ -60,7 +60,7 @@ agents:
     prompt: repo-specific/prompts/tech-lead.md
     provider: "claude-code"
     ai_system: "claude-code"
-    model: "fable"
+    model: "opus"
     timeout_minutes: 90
     reviewer: "agent:reviewer"
     provider_args:
@@ -88,6 +88,11 @@ review:
   code_review_label: needs-code-review
   code_reviewed_label: code-reviewed
   max_rework_cycles: 10
+  # Fast coder-owned review before the independent external review.
+  internal:
+    enabled: true
+    max_rounds: 10
+    instructions: "repo-specific/prompts/internal-review.md"
   nits:
     default_policy: "address"
     by_agent: {}
