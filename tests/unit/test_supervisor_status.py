@@ -511,14 +511,16 @@ class TestMultiInstanceSupport:
             mode: str = "default",
             expected_config_fingerprint: str | None = None,
         ) -> LockInfo:
-            calls.append({
-                "instance_id": instance_id,
-                "port": port,
-                "start_paused": start_paused,
-                "log_level": log_level,
-                "mode": mode,
-                "expected_config_fingerprint": expected_config_fingerprint,
-            })
+            calls.append(
+                {
+                    "instance_id": instance_id,
+                    "port": port,
+                    "start_paused": start_paused,
+                    "log_level": log_level,
+                    "mode": mode,
+                    "expected_config_fingerprint": expected_config_fingerprint,
+                }
+            )
             return LockInfo(
                 repo_root=str(repo_root),
                 pid=1000 + len(calls),
@@ -537,7 +539,10 @@ class TestMultiInstanceSupport:
 
         infos = start_instances(tmp_path, count=2, start_paused=True)
 
-        assert [info.instance_id for info in infos] == ["orchestrator-1", "orchestrator-2"]
+        assert [info.instance_id for info in infos] == [
+            "orchestrator-1",
+            "orchestrator-2",
+        ]
         assert [call["start_paused"] for call in calls] == [True, True]
 
     def test_start_instances_forwards_log_level(
@@ -562,13 +567,15 @@ class TestMultiInstanceSupport:
             mode: str = "default",
             expected_config_fingerprint: str | None = None,
         ) -> LockInfo:
-            calls.append({
-                "instance_id": instance_id,
-                "port": port,
-                "log_level": log_level,
-                "mode": mode,
-                "expected_config_fingerprint": expected_config_fingerprint,
-            })
+            calls.append(
+                {
+                    "instance_id": instance_id,
+                    "port": port,
+                    "log_level": log_level,
+                    "mode": mode,
+                    "expected_config_fingerprint": expected_config_fingerprint,
+                }
+            )
             return LockInfo(
                 repo_root=str(repo_root),
                 pid=1000 + len(calls),
@@ -587,8 +594,153 @@ class TestMultiInstanceSupport:
 
         infos = start_instances(tmp_path, count=2, log_level="DEBUG")
 
-        assert [info.instance_id for info in infos] == ["orchestrator-1", "orchestrator-2"]
+        assert [info.instance_id for info in infos] == [
+            "orchestrator-1",
+            "orchestrator-2",
+        ]
         assert [call["log_level"] for call in calls] == ["DEBUG", "DEBUG"]
+
+    def test_start_instances_rolls_back_prior_children_when_later_start_fails(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        config_path = tmp_path / ".issue-orchestrator/config/default.yaml"
+        config_path.parent.mkdir(parents=True)
+        config_path.write_text("instances: 2\nagents: {}\n", encoding="utf-8")
+        first = LockInfo(
+            repo_root=str(tmp_path),
+            pid=1001,
+            started_at="",
+            http_port=27101,
+            state_dir=str(tmp_path / ".issue-orchestrator/state"),
+            instance_id="orchestrator-1",
+        )
+        starts = MagicMock(side_effect=[first, RuntimeError("second failed")])
+        rollback = MagicMock(return_value=True)
+        monkeypatch.setattr(
+            "issue_orchestrator.infra.supervisor.find_free_port",
+            MagicMock(side_effect=[27101, 27102]),
+        )
+        monkeypatch.setattr("issue_orchestrator.infra.supervisor.start", starts)
+        monkeypatch.setattr("issue_orchestrator.infra.supervisor.stop", rollback)
+        monkeypatch.setattr(
+            "issue_orchestrator.infra.supervisor.shutdown_timing.process_is_alive",
+            lambda _pid: False,
+        )
+
+        with pytest.raises(RuntimeError, match="second failed"):
+            start_instances(tmp_path, count=2)
+
+        rollback.assert_called_once_with(
+            tmp_path.resolve(),
+            force=True,
+            instance_id="orchestrator-1",
+            reason="rollback partial multi-instance start",
+            actor="supervisor.start_instances.rollback",
+        )
+
+    def test_start_instances_rolls_back_when_later_port_allocation_fails(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        config_path = tmp_path / ".issue-orchestrator/config/default.yaml"
+        config_path.parent.mkdir(parents=True)
+        config_path.write_text("instances: 2\nagents: {}\n", encoding="utf-8")
+        first = LockInfo(
+            repo_root=str(tmp_path),
+            pid=1001,
+            started_at="",
+            http_port=27201,
+            state_dir=str(tmp_path / ".issue-orchestrator/state"),
+            instance_id="orchestrator-1",
+        )
+        starts = MagicMock(return_value=first)
+        rollback = MagicMock(return_value=True)
+        monkeypatch.setattr(
+            "issue_orchestrator.infra.supervisor.find_free_port",
+            MagicMock(side_effect=[27201, OSError("no ports available")]),
+        )
+        monkeypatch.setattr("issue_orchestrator.infra.supervisor.start", starts)
+        monkeypatch.setattr("issue_orchestrator.infra.supervisor.stop", rollback)
+        monkeypatch.setattr(
+            "issue_orchestrator.infra.supervisor.shutdown_timing.process_is_alive",
+            lambda _pid: False,
+        )
+
+        with pytest.raises(OSError, match="no ports available"):
+            start_instances(tmp_path, count=2)
+
+        starts.assert_called_once()
+        rollback.assert_called_once_with(
+            tmp_path.resolve(),
+            force=True,
+            instance_id="orchestrator-1",
+            reason="rollback partial multi-instance start",
+            actor="supervisor.start_instances.rollback",
+        )
+
+    def test_start_instances_kills_attempt_pid_when_lock_is_not_published(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        config_path = tmp_path / ".issue-orchestrator/config/default.yaml"
+        config_path.parent.mkdir(parents=True)
+        config_path.write_text("instances: 2\nagents: {}\n", encoding="utf-8")
+        synthetic = LockInfo(
+            repo_root=str(tmp_path),
+            pid=27301,
+            started_at="",
+            http_port=27351,
+            state_dir=str(tmp_path / ".issue-orchestrator/state"),
+            instance_id="orchestrator-1",
+        )
+        monkeypatch.setattr(
+            "issue_orchestrator.infra.supervisor.find_free_port",
+            MagicMock(side_effect=[27351, OSError("no ports available")]),
+        )
+        monkeypatch.setattr(
+            "issue_orchestrator.infra.supervisor.start",
+            MagicMock(return_value=synthetic),
+        )
+        normal_stop = MagicMock(return_value=True)
+        monkeypatch.setattr("issue_orchestrator.infra.supervisor.stop", normal_stop)
+        monkeypatch.setattr(
+            "issue_orchestrator.infra.supervisor.shutdown_timing.process_is_alive",
+            lambda pid: pid == synthetic.pid,
+        )
+        published_lock = MagicMock(side_effect=[None, synthetic])
+        monkeypatch.setattr(
+            "issue_orchestrator.infra.supervisor.read_lock",
+            published_lock,
+        )
+        exact_kill = MagicMock()
+        monkeypatch.setattr(
+            "issue_orchestrator.infra.supervisor._send_kill_signal",
+            exact_kill,
+        )
+        verified_exit = MagicMock(return_value=True)
+        monkeypatch.setattr(
+            "issue_orchestrator.infra.supervisor._wait_for_process_exit_after_force",
+            verified_exit,
+        )
+        released = MagicMock()
+        monkeypatch.setattr(
+            "issue_orchestrator.infra.supervisor.release_lock",
+            released,
+        )
+
+        with pytest.raises(OSError, match="no ports available"):
+            start_instances(tmp_path, count=2)
+
+        normal_stop.assert_called_once()
+        exact_kill.assert_called_once_with(synthetic.pid, force=True)
+        verified_exit.assert_called_once_with(
+            synthetic.pid,
+            timeout_iterations=20,
+        )
+        assert published_lock.call_count == 2
+        released.assert_called_once_with(
+            tmp_path.resolve(),
+            synthetic.pid,
+            synthetic.instance_id,
+        )
 
 
 class TestMultiInstanceStatus:

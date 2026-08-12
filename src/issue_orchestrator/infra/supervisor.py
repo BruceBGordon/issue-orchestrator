@@ -28,7 +28,6 @@ from .config_identity import (
 from .repo_identity import normalize_repo_root, serialize_repo_identity, state_dir
 from .repo_lock import (
     AlreadyRunning,
-    ConfigurationIdentityConflict,
     LockInfo,
     assert_repository_configuration_identity,
     is_locked,
@@ -39,7 +38,9 @@ from .repo_lock import (
 from .supervisor_models import MultiInstanceStatus, SupervisorStatus
 from . import shutdown_timing
 
-DEFAULT_ENGINE_GRACEFUL_TIMEOUT_SECONDS = shutdown_timing.DEFAULT_ENGINE_GRACEFUL_TIMEOUT_SECONDS
+DEFAULT_ENGINE_GRACEFUL_TIMEOUT_SECONDS = (
+    shutdown_timing.DEFAULT_ENGINE_GRACEFUL_TIMEOUT_SECONDS
+)
 
 logger = logging.getLogger(__name__)
 _EXPECTED_IDENTITY_ENV = "ISSUE_ORCHESTRATOR_EXPECTED_IDENTITY"
@@ -85,13 +86,17 @@ def _check_and_cleanup_stale_lock(repo_root: Path, instance_id: str | None) -> N
     try:
         os.kill(info.pid, 0)
         raise AlreadyRunning(
-            pid=info.pid, repo_root=repo_root,
-            port=info.http_port, instance_id=instance_id,
+            pid=info.pid,
+            repo_root=repo_root,
+            port=info.http_port,
+            instance_id=instance_id,
         )
     except OSError:
         logger.info(
             "Cleaning up stale lock for %s instance=%s (pid %d not running)",
-            repo_root, instance_id or "default", info.pid,
+            repo_root,
+            instance_id or "default",
+            info.pid,
         )
         release_lock(repo_root, info.pid, instance_id)
 
@@ -102,7 +107,9 @@ def _extract_error_from_log(log_file: Path) -> str:
         return ""
     try:
         lines = log_file.read_text().splitlines()
-        error_lines = [l for l in lines if "ERROR" in l or "Traceback" in l or "ValueError" in l]
+        error_lines = [
+            l for l in lines if "ERROR" in l or "Traceback" in l or "ValueError" in l
+        ]
         if error_lines:
             return f"\n\nError from log:\n  {error_lines[-1]}"
         for line in reversed(lines):
@@ -208,7 +215,9 @@ def start(
         cmd.extend(["--instance-id", instance_id])
 
     instance_str = f" instance={instance_id}" if instance_id else ""
-    logger.info("Starting orchestrator for %s%s on port %d", repo_root, instance_str, port)
+    logger.info(
+        "Starting orchestrator for %s%s on port %d", repo_root, instance_str, port
+    )
     logger.debug("Command: %s", " ".join(cmd))
 
     _spawn = spawn_process or subprocess.Popen
@@ -230,6 +239,7 @@ def start(
 
     # Wait for the process to create its lock file
     import time
+
     for _ in range(50):  # Wait up to 5 seconds
         info = read_lock(repo_root, instance_id)
         if info is not None and info.pid == process.pid:
@@ -285,8 +295,13 @@ def _kill_by_port(port: int, use_sigkill: bool = False) -> bool:
                 try:
                     pid = int(pid_str)
                     os.kill(pid, sig)
-                    logger.warning("port-based kill: %s pid=%d port=%d (cross-repo "
-                                   "if another orchestrator)", sig.name, pid, port)
+                    logger.warning(
+                        "port-based kill: %s pid=%d port=%d (cross-repo "
+                        "if another orchestrator)",
+                        sig.name,
+                        pid,
+                        port,
+                    )
                     killed = True
                 except (ProcessLookupError, ValueError):
                     pass
@@ -335,7 +350,9 @@ def _request_graceful_shutdown(
     try:
         logger.info(
             "Requesting graceful shutdown via HTTP on port %d (reason=%r actor=%r)",
-            port, reason, actor,
+            port,
+            reason,
+            actor,
         )
         req = urllib.request.Request(
             f"http://127.0.0.1:{port}/api/shutdown",
@@ -393,6 +410,7 @@ def stop_by_port(
             logger.debug("HTTP shutdown failed on port %d: %s", port, e)
 
         import time
+
         time.sleep(0.5)
         if not _is_port_in_use(port):
             return True
@@ -400,6 +418,7 @@ def stop_by_port(
     killed = _kill_by_port(port, use_sigkill=force)
     if killed:
         import time
+
         time.sleep(0.5)
         return not _is_port_in_use(port)
     return False
@@ -423,7 +442,9 @@ def _send_kill_signal(pid: int, force: bool) -> None:
     try:
         os.killpg(pid, sig)
     except OSError as e:
-        logger.warning("Failed to kill process group %d: %s, trying single process", pid, e)
+        logger.warning(
+            "Failed to kill process group %d: %s, trying single process", pid, e
+        )
         try:
             os.kill(pid, sig)
         except OSError as e2:
@@ -472,8 +493,7 @@ def stop(
         force_requested=force,
         force_on_timeout=force_if_graceful_fails,
         request_graceful=lambda: bool(
-            port
-            and _request_graceful_shutdown(port, reason=reason, actor=actor)
+            port and _request_graceful_shutdown(port, reason=reason, actor=actor)
         ),
         terminate=lambda: _send_kill_signal(pid, force=False),
         force_stop=lambda: _force_stop(repo_root, pid, port, instance_id),
@@ -557,6 +577,7 @@ def _force_kill_by_port_last_resort(
         return False
 
     import time
+
     logger.warning("Force killing by port %d", port)
     _kill_by_port(port, use_sigkill=True)
     time.sleep(0.5)
@@ -680,8 +701,8 @@ def start_instances(
     results = []
     for i in range(1, count + 1):
         instance_id = f"orchestrator-{i}"
-        port = find_free_port()
         try:
+            port = find_free_port()
             info = start(
                 repo_root,
                 config_name,
@@ -697,13 +718,64 @@ def start_instances(
             logger.info("Started instance %s on port %d", instance_id, port)
         except AlreadyRunning:
             logger.warning("Instance %s already running, skipping", instance_id)
-        except ConfigurationIdentityConflict:
-            raise
         except Exception as e:
             logger.error("Failed to start instance %s: %s", instance_id, e)
+            _rollback_started_instances(repo_root, results, cause=e)
             raise
 
     return results
+
+
+def _rollback_started_instances(
+    repo_root: Path,
+    started: list[LockInfo],
+    *,
+    cause: Exception,
+) -> None:
+    """Stop every child published by a failed multi-instance start attempt."""
+    failed: list[str] = []
+    for info in reversed(started):
+        if not _rollback_started_instance(repo_root, info):
+            failed.append(f"{info.instance_id}: process {info.pid} survived rollback")
+    if failed:
+        raise RuntimeError(
+            "Multi-instance start failed and rollback was incomplete: "
+            + "; ".join(failed)
+        ) from cause
+
+
+def _rollback_started_instance(repo_root: Path, info: LockInfo) -> bool:
+    """Stop and verify one exact process created by the current start attempt."""
+    try:
+        stop(
+            repo_root,
+            force=True,
+            instance_id=info.instance_id,
+            reason="rollback partial multi-instance start",
+            actor="supervisor.start_instances.rollback",
+        )
+    except Exception:
+        logger.exception("Normal rollback failed for instance %s", info.instance_id)
+    if not shutdown_timing.process_is_alive(info.pid):
+        return True
+
+    published = read_lock(repo_root, info.instance_id)
+    if published is not None and published.pid != info.pid:
+        logger.error(
+            "Refusing to terminate replacement instance %s pid=%d while rolling back pid=%d",
+            info.instance_id,
+            published.pid,
+            info.pid,
+        )
+        return False
+
+    _send_kill_signal(info.pid, force=True)
+    if not _wait_for_process_exit_after_force(info.pid, timeout_iterations=20):
+        return False
+    published_after_exit = read_lock(repo_root, info.instance_id)
+    if published_after_exit is not None and published_after_exit.pid == info.pid:
+        release_lock(repo_root, info.pid, info.instance_id)
+    return True
 
 
 def stop_all_instances(

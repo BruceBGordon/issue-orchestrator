@@ -2,8 +2,6 @@
 
 from pathlib import Path
 
-import pytest
-
 from issue_orchestrator.domain.repository_launch_selection import (
     RepositoryLaunchSelection,
 )
@@ -52,18 +50,3 @@ def test_runtime_reference_rejects_path_selection_name_drift(tmp_path: Path) -> 
         assert "must match" in str(exc)
     else:
         raise AssertionError("path/selection drift must fail")
-
-
-def test_runtime_reference_rejects_path_selection_mode_drift(tmp_path: Path) -> None:
-    config_path = tmp_path / ".issue-orchestrator/config/modes/default/main.yaml"
-    config_path.parent.mkdir(parents=True)
-    config_path.write_text("agents: {}\n")
-
-    with pytest.raises(ValueError, match="selection mode"):
-        RuntimeConfigReference(
-            config_path=config_path.resolve(),
-            selection=RepositoryLaunchSelection.parse(
-                mode="codex",
-                config_name="main.yaml",
-            ),
-        )

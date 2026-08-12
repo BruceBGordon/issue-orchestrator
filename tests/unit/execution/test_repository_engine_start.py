@@ -24,10 +24,21 @@ from issue_orchestrator.execution.repository_engine_start import (
     RepositoryEngineStartRequest,
     StartRepositoryEngineCommand,
 )
+from issue_orchestrator.ports.repository_engine_supervisor import (
+    MultiInstanceStatus,
+    SupervisorStatus,
+)
 
 
 def _selection(mode: str = "codex") -> RepositoryLaunchSelection:
     return RepositoryLaunchSelection.parse(mode=mode, config_name="main.yaml")
+
+
+def _stopped_supervisor() -> MagicMock:
+    supervisor = MagicMock()
+    supervisor.status_all_instances.return_value = MultiInstanceStatus(repo_root="")
+    supervisor.status.return_value = SupervisorStatus(state="stopped")
+    return supervisor
 
 
 def _prepare_successful_start(
@@ -35,6 +46,11 @@ def _prepare_successful_start(
     selection: RepositoryLaunchSelection,
     launch: Mock,
 ) -> Mock:
+    monkeypatch.setattr(
+        "issue_orchestrator.execution.repository_engine_start."
+        "inspect_orchestrator_at_port",
+        lambda _repo, _port, *, expected_identity: None,
+    )
     monkeypatch.setattr(
         "issue_orchestrator.execution.repository_engine_start."
         "inspect_repository_orchestrator_ownership",
@@ -79,7 +95,7 @@ def test_start_owner_persists_the_exact_launched_selection(
     )
     persisted = _prepare_successful_start(monkeypatch, selection, launch)
 
-    result = StartRepositoryEngineCommand(MagicMock()).execute(
+    result = StartRepositoryEngineCommand(_stopped_supervisor()).execute(
         RepositoryEngineStartRequest(repo_root=tmp_path, selection=selection)
     )
 
@@ -90,6 +106,357 @@ def test_start_owner_persists_the_exact_launched_selection(
     assert launch.call_args.kwargs["mode"] == "codex"
     assert launch.call_args.kwargs["config_name"] == "main.yaml"
     persisted.assert_called_once_with(tmp_path, selection)
+
+
+def test_start_owner_reports_matching_dynamic_multi_instance_locks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selection = _selection()
+    launch = Mock()
+    supervisor = MagicMock()
+    supervisor.status_all_instances.return_value = MultiInstanceStatus(
+        repo_root=str(tmp_path),
+        expected_count=2,
+        instances=[
+            SupervisorStatus(
+                state="running",
+                port=23101,
+                instance_id="orchestrator-1",
+                configuration_mode="codex",
+                config_name="main.yaml",
+                config_fingerprint="fingerprint",
+            ),
+            SupervisorStatus(
+                state="running",
+                port=23102,
+                instance_id="orchestrator-2",
+                configuration_mode="codex",
+                config_name="main.yaml",
+                config_fingerprint="fingerprint",
+            ),
+        ],
+    )
+    _prepare_successful_start(monkeypatch, selection, launch)
+
+    result = StartRepositoryEngineCommand(supervisor).execute(
+        RepositoryEngineStartRequest(repo_root=tmp_path, selection=selection)
+    )
+
+    assert result.status_code == 409
+    assert result.payload["error"] == "already_running"
+    assert result.payload["ports"] == [23101, 23102]
+    assert len(result.payload["instances"]) == 2
+    launch.assert_not_called()
+
+
+def test_start_owner_rejects_conflicting_dynamic_lock_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selection = _selection()
+    launch = Mock()
+    supervisor = MagicMock()
+    supervisor.status_all_instances.return_value = MultiInstanceStatus(
+        repo_root=str(tmp_path),
+        instances=[
+            SupervisorStatus(
+                state="running",
+                port=24101,
+                instance_id="orchestrator-1",
+                configuration_mode="claude",
+                config_name="main.yaml",
+                config_fingerprint="other-fingerprint",
+            )
+        ],
+    )
+    _prepare_successful_start(monkeypatch, selection, launch)
+
+    result = StartRepositoryEngineCommand(supervisor).execute(
+        RepositoryEngineStartRequest(repo_root=tmp_path, selection=selection)
+    )
+
+    assert result.status_code == 409
+    assert result.payload["error"] == "configuration_conflict"
+    assert result.payload["ports"] == [24101]
+    assert result.payload["active"] == [
+        {
+            "mode": "claude",
+            "config_name": "main.yaml",
+            "config_fingerprint": "other-fingerprint",
+        }
+    ]
+    launch.assert_not_called()
+
+
+def test_start_owner_restarts_tracked_engine_with_repo_identity_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selection = _selection()
+    doctor = SimpleNamespace(to_dict=lambda: {"ok": True})
+    launch = Mock(
+        return_value=SimpleNamespace(
+            status="ok",
+            launched=True,
+            supervisor={"pid": 123, "port": 24601},
+            doctor=doctor,
+            error=None,
+            conflict=None,
+        )
+    )
+    supervisor = MagicMock()
+    supervisor.status_all_instances.return_value = MultiInstanceStatus(
+        repo_root=str(tmp_path),
+        instances=[
+            SupervisorStatus(
+                state="running",
+                port=24601,
+                instance_id="orchestrator-1",
+                configuration_mode="codex",
+                config_name="main.yaml",
+                config_fingerprint="fingerprint",
+            )
+        ],
+    )
+    supervisor.stop.return_value = True
+    _prepare_successful_start(monkeypatch, selection, launch)
+    inspect = Mock(return_value={"port": 24601, "identity_mismatch": {"branch": {}}})
+    monkeypatch.setattr(
+        "issue_orchestrator.execution.repository_engine_start."
+        "inspect_orchestrator_at_port",
+        inspect,
+    )
+
+    result = StartRepositoryEngineCommand(supervisor).execute(
+        RepositoryEngineStartRequest(repo_root=tmp_path, selection=selection)
+    )
+
+    assert result.status_code == 200
+    inspect.assert_called_once()
+    supervisor.stop.assert_called_once_with(
+        tmp_path,
+        force=True,
+        instance_id="orchestrator-1",
+        reason="engine identity mismatch detected on repository start",
+        actor="control-center",
+    )
+    launch.assert_called_once()
+
+
+def test_start_owner_rejects_tracked_repo_identity_drift_when_stop_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selection = _selection()
+    launch = Mock()
+    supervisor = MagicMock()
+    supervisor.status_all_instances.return_value = MultiInstanceStatus(
+        repo_root=str(tmp_path),
+        instances=[
+            SupervisorStatus(
+                state="running",
+                port=24701,
+                configuration_mode="codex",
+                config_name="main.yaml",
+                config_fingerprint="fingerprint",
+            )
+        ],
+    )
+    supervisor.stop.return_value = False
+    _prepare_successful_start(monkeypatch, selection, launch)
+    monkeypatch.setattr(
+        "issue_orchestrator.execution.repository_engine_start."
+        "inspect_orchestrator_at_port",
+        Mock(return_value={"port": 24701, "identity_mismatch": {"branch": {}}}),
+    )
+
+    result = StartRepositoryEngineCommand(supervisor).execute(
+        RepositoryEngineStartRequest(repo_root=tmp_path, selection=selection)
+    )
+
+    assert result.status_code == 409
+    assert result.payload["error"] == "engine_identity_mismatch"
+    assert result.payload["port"] == 24701
+    launch.assert_not_called()
+
+
+def test_start_owner_reuses_config_probe_for_a_tracked_port(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selection = _selection()
+    launch = Mock()
+    supervisor = MagicMock()
+    supervisor.status_all_instances.return_value = MultiInstanceStatus(
+        repo_root=str(tmp_path),
+        instances=[
+            SupervisorStatus(
+                state="running",
+                port=24801,
+                configuration_mode="codex",
+                config_name="main.yaml",
+                config_fingerprint="fingerprint",
+            )
+        ],
+    )
+    _prepare_successful_start(monkeypatch, selection, launch)
+    direct_inspect = Mock()
+    monkeypatch.setattr(
+        "issue_orchestrator.execution.repository_engine_start."
+        "inspect_orchestrator_at_port",
+        direct_inspect,
+    )
+    monkeypatch.setattr(
+        "issue_orchestrator.execution.repository_engine_start."
+        "inspect_repository_orchestrator_ownership",
+        lambda *_: RepositoryOrchestratorOwnership(
+            requested=selection,
+            matching=(
+                {
+                    "port": 24801,
+                    "info": {"config_fingerprint": "fingerprint"},
+                    "active_selection": selection.to_dict(),
+                },
+            ),
+            conflicting=(),
+        ),
+    )
+
+    result = StartRepositoryEngineCommand(supervisor).execute(
+        RepositoryEngineStartRequest(repo_root=tmp_path, selection=selection)
+    )
+
+    assert result.status_code == 409
+    assert result.payload["error"] == "already_running"
+    direct_inspect.assert_not_called()
+    launch.assert_not_called()
+
+
+def test_start_owner_replenishes_after_stopping_one_stale_tracked_instance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selection = _selection()
+    doctor = SimpleNamespace(to_dict=lambda: {"ok": True})
+    launch = Mock(
+        return_value=SimpleNamespace(
+            status="ok",
+            launched=True,
+            supervisor={"instances": []},
+            doctor=doctor,
+            error=None,
+            conflict=None,
+        )
+    )
+    supervisor = MagicMock()
+    supervisor.status_all_instances.return_value = MultiInstanceStatus(
+        repo_root=str(tmp_path),
+        instances=[
+            SupervisorStatus(
+                state="running",
+                port=24901,
+                instance_id="orchestrator-1",
+                configuration_mode="codex",
+                config_name="main.yaml",
+                config_fingerprint="fingerprint",
+            ),
+            SupervisorStatus(
+                state="running",
+                port=24902,
+                instance_id="orchestrator-2",
+                configuration_mode="codex",
+                config_name="main.yaml",
+                config_fingerprint="fingerprint",
+            ),
+        ],
+    )
+    supervisor.stop.return_value = True
+    _prepare_successful_start(monkeypatch, selection, launch)
+    monkeypatch.setattr(
+        "issue_orchestrator.execution.repository_engine_start."
+        "inspect_orchestrator_at_port",
+        Mock(
+            side_effect=[
+                {"port": 24901},
+                {"port": 24902, "identity_mismatch": {"branch": {}}},
+            ]
+        ),
+    )
+
+    result = StartRepositoryEngineCommand(supervisor).execute(
+        RepositoryEngineStartRequest(repo_root=tmp_path, selection=selection)
+    )
+
+    assert result.status_code == 200
+    supervisor.stop.assert_called_once_with(
+        tmp_path,
+        force=True,
+        instance_id="orchestrator-2",
+        reason="engine identity mismatch detected on repository start",
+        actor="control-center",
+    )
+    launch.assert_called_once()
+
+
+def test_force_restart_stops_tracked_dynamic_ports_through_supervisor_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selection = _selection()
+    doctor = SimpleNamespace(to_dict=lambda: {"ok": True})
+    launch = Mock(
+        return_value=SimpleNamespace(
+            status="ok",
+            launched=True,
+            supervisor={"pid": 123, "port": 25101},
+            doctor=doctor,
+            error=None,
+            conflict=None,
+        )
+    )
+    supervisor = MagicMock()
+    supervisor.status_all_instances.return_value = MultiInstanceStatus(
+        repo_root=str(tmp_path),
+        instances=[
+            SupervisorStatus(
+                state="running",
+                port=25101,
+                instance_id="orchestrator-1",
+                configuration_mode="codex",
+                config_name="main.yaml",
+                config_fingerprint="fingerprint",
+            ),
+            SupervisorStatus(
+                state="running",
+                port=25102,
+                instance_id="orchestrator-2",
+                configuration_mode="codex",
+                config_name="main.yaml",
+                config_fingerprint="fingerprint",
+            ),
+        ],
+    )
+    supervisor.stop_all_instances.return_value = 2
+    _prepare_successful_start(monkeypatch, selection, launch)
+
+    result = StartRepositoryEngineCommand(supervisor).execute(
+        RepositoryEngineStartRequest(
+            repo_root=tmp_path,
+            selection=selection,
+            force_restart=True,
+        )
+    )
+
+    assert result.status_code == 200
+    supervisor.stop_all_instances.assert_called_once_with(
+        tmp_path,
+        force=True,
+        reason="force_restart=true on repository engine start",
+        actor="control-center",
+    )
+    supervisor.stop_by_port.assert_not_called()
+    launch.assert_called_once()
 
 
 def test_start_owner_rejects_maintenance_config_as_engine_config(
@@ -112,7 +479,7 @@ def test_start_owner_rejects_maintenance_config_as_engine_config(
         ),
     )
 
-    result = StartRepositoryEngineCommand(MagicMock()).execute(
+    result = StartRepositoryEngineCommand(_stopped_supervisor()).execute(
         RepositoryEngineStartRequest(
             repo_root=tmp_path,
             selection=selection,
@@ -146,7 +513,7 @@ def test_start_owner_rejects_maintenance_symlink_as_external_config(
         ),
     )
 
-    result = StartRepositoryEngineCommand(MagicMock()).execute(
+    result = StartRepositoryEngineCommand(_stopped_supervisor()).execute(
         RepositoryEngineStartRequest(
             repo_root=tmp_path,
             selection=selection,
@@ -164,13 +531,11 @@ def test_start_owner_rejects_config_owned_by_another_repository(
     requested_repo = tmp_path / "requested"
     other_repo = tmp_path / "other"
     selection = _selection()
-    other_config = (
-        other_repo / ".issue-orchestrator/config/modes/codex/main.yaml"
-    )
+    other_config = other_repo / ".issue-orchestrator/config/modes/codex/main.yaml"
     other_config.parent.mkdir(parents=True)
     other_config.write_text("agents: {}\n", encoding="utf-8")
 
-    result = StartRepositoryEngineCommand(MagicMock()).execute(
+    result = StartRepositoryEngineCommand(_stopped_supervisor()).execute(
         RepositoryEngineStartRequest(
             repo_root=requested_repo,
             selection=selection,
@@ -211,7 +576,7 @@ async def test_start_and_selection_change_share_one_mutation_gate(
     )
     start_task = asyncio.create_task(
         asyncio.to_thread(
-            StartRepositoryEngineCommand(MagicMock()).execute,
+            StartRepositoryEngineCommand(_stopped_supervisor()).execute,
             RepositoryEngineStartRequest(repo_root=tmp_path, selection=selection),
         )
     )

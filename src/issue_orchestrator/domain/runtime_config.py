@@ -8,7 +8,6 @@ from pathlib import Path
 from .repository_launch_selection import (
     ConfigurationModeName,
     RepositoryLaunchSelection,
-    selection_from_config_path,
 )
 
 
@@ -28,8 +27,6 @@ class RuntimeConfigReference:
             )
         if self.config_path.name != self.selection.config.value:
             raise ValueError("config_path and selection config_name must match")
-        if selection_from_config_path(self.config_path) != self.selection:
-            raise ValueError("config_path and selection mode must match")
 
     @property
     def config_name(self) -> str:

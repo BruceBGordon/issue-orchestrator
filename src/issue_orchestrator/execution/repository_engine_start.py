@@ -16,14 +16,17 @@ from ..ports.repository_engine_supervisor import (
 from .control_center_runtime import (
     annotate_identity_mismatch,
     build_repo_identity,
+    inspect_orchestrator_at_port,
     inspect_repository_orchestrator_ownership,
     is_shutdown_complete,
+    live_repository_engine_statuses,
 )
 
 if TYPE_CHECKING:
     from ..infra.config import Config
     from ..infra.launcher import LaunchResult
     from ..infra.repo_identity import RepoIdentity
+    from ..ports.repository_engine_supervisor import SupervisorStatus
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,7 +52,24 @@ class RepositoryEngineStartResult:
 
     @property
     def orphaned_running(self) -> bool:
-        return self.status_code == 409 and self.payload.get("error") == "orphaned_running"
+        return (
+            self.status_code == 409 and self.payload.get("error") == "orphaned_running"
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ExistingRepositoryEngineOwnership:
+    """One coherent snapshot of tracked and port-probed runtime ownership."""
+
+    tracked: tuple[SupervisorStatus, ...]
+    tracked_ports: frozenset[int]
+    tracked_details: dict[int, dict[str, Any] | None]
+    orphan_matching: tuple[dict[str, Any], ...]
+    orphan_conflicting: tuple[dict[str, Any], ...]
+    matching: tuple[dict[str, Any], ...]
+    conflicting_orphans: tuple[dict[str, Any], ...]
+    tracked_matching: tuple[SupervisorStatus, ...]
+    tracked_conflicting: tuple[SupervisorStatus, ...]
 
 
 def record_repository_engine_launch(
@@ -200,6 +220,7 @@ class StartRepositoryEngineCommand:
         launch_result: LaunchResult,
     ) -> RepositoryEngineStartResult:
         from ..infra.launcher import launch_subprocess
+
         restarted = False
         outcome = launch_result.status
         if (
@@ -247,7 +268,9 @@ class StartRepositoryEngineCommand:
             supervisor_data = launch_result.supervisor
             if isinstance(supervisor_data.get("pid"), int):
                 payload["pid"] = supervisor_data["pid"]
-            if isinstance(supervisor_data.get("port"), (int, type(None))):
+            if "port" in supervisor_data and isinstance(
+                supervisor_data["port"], (int, type(None))
+            ):
                 payload["port"] = supervisor_data["port"]
             if isinstance(supervisor_data.get("instances"), list):
                 payload["instances"] = supervisor_data["instances"]
@@ -258,71 +281,294 @@ class StartRepositoryEngineCommand:
         request: RepositoryEngineStartRequest,
         expected_config_fingerprint: str,
     ) -> RepositoryEngineStartResult | None:
-        ownership = inspect_repository_orchestrator_ownership(
+        ownership = self._observe_existing_ownership(
+            request,
+            expected_config_fingerprint,
+        )
+        conflict = self._configuration_conflict_result(
+            request,
+            expected_config_fingerprint,
+            ownership,
+        )
+        if conflict is not None:
+            return conflict
+        if request.force_restart:
+            return self._force_restart_existing(request, ownership)
+        (
+            tracked_matching,
+            mismatch_result,
+            stopped_mismatch,
+        ) = self._remove_tracked_identity_mismatches(
+            request,
+            ownership.tracked_matching,
+            ownership.tracked_details,
+        )
+        if mismatch_result is not None:
+            return mismatch_result
+        orphan_result = self._resolve_matching_ownership(
+            request,
+            ownership.matching,
+            expected_config_fingerprint,
+        )
+        if orphan_result is not None:
+            return orphan_result
+        if stopped_mismatch:
+            return None
+        return self._resolve_tracked_ownership(
+            request,
+            tracked_matching,
+            expected_config_fingerprint,
+        )
+
+    def _observe_existing_ownership(
+        self,
+        request: RepositoryEngineStartRequest,
+        expected_config_fingerprint: str,
+    ) -> ExistingRepositoryEngineOwnership:
+        tracked = self._tracked_live_statuses(request)
+        tracked_ports = frozenset(
+            status.port for status in tracked if isinstance(status.port, int)
+        )
+        expected_identity = build_repo_identity(request.repo_root)
+        probed = inspect_repository_orchestrator_ownership(
             request.repo_root,
             request.selection,
         )
-        expected_identity = build_repo_identity(request.repo_root)
-        for detected in ownership.all:
+        for detected in probed.all:
             annotate_identity_mismatch(
                 detected,
                 detected.get("info", {}),
                 expected_identity,
             )
+        probed_by_port = {detected["port"]: detected for detected in probed.all}
+        tracked_details: dict[int, dict[str, Any] | None] = {}
+        for status in tracked:
+            port = status.port
+            if not isinstance(port, int):
+                continue
+            tracked_details[port] = probed_by_port.get(port)
+            if tracked_details[port] is None:
+                tracked_details[port] = inspect_orchestrator_at_port(
+                    request.repo_root,
+                    port,
+                    expected_identity=expected_identity,
+                )
+        orphan_matching = tuple(
+            item for item in probed.matching if item.get("port") not in tracked_ports
+        )
+        orphan_conflicting = tuple(
+            item for item in probed.conflicting if item.get("port") not in tracked_ports
+        )
         matching = tuple(
             detected
-            for detected in ownership.matching
+            for detected in orphan_matching
             if detected.get("info", {}).get("config_fingerprint")
             == expected_config_fingerprint
         )
-        conflicting = ownership.conflicting + tuple(
-            detected for detected in ownership.matching if detected not in matching
+        conflicting_orphans = orphan_conflicting + tuple(
+            detected for detected in orphan_matching if detected not in matching
         )
-        if conflicting and not request.force_restart:
-            return RepositoryEngineStartResult(
-                {
-                    "error": "configuration_conflict",
-                    "detail": "A live Repository Engine owns a different configuration identity.",
-                    "requested": {
-                        **request.selection.to_dict(),
-                        "config_fingerprint": expected_config_fingerprint,
-                    },
-                    "active": [
-                        {
-                            **detected["active_selection"],
-                            "config_fingerprint": detected.get("info", {}).get(
-                                "config_fingerprint", ""
-                            ),
-                        }
-                        for detected in conflicting
-                    ],
-                    "ports": [detected["port"] for detected in conflicting],
-                },
-                409,
+        tracked_matching = tuple(
+            status
+            for status in tracked
+            if self._status_matches(
+                status,
+                request.selection,
+                expected_config_fingerprint,
             )
-        if request.force_restart:
-            for detected in ownership.all:
-                stopped = self._supervisor.stop_by_port(
-                    detected["port"],
-                    force=True,
-                    reason="force_restart=true on repository engine start",
-                    actor=request.actor,
-                )
-                if not stopped:
-                    return RepositoryEngineStartResult(
-                        {
-                            "error": "stop_failed",
-                            "detail": "Unable to stop existing orchestrator process.",
-                            "port": detected["port"],
-                        },
-                        500,
-                    )
-            return None
-        return self._resolve_matching_ownership(
-            request,
-            matching,
-            expected_config_fingerprint,
         )
+        tracked_conflicting = tuple(
+            status for status in tracked if status not in tracked_matching
+        )
+        return ExistingRepositoryEngineOwnership(
+            tracked=tracked,
+            tracked_ports=tracked_ports,
+            tracked_details=tracked_details,
+            orphan_matching=orphan_matching,
+            orphan_conflicting=orphan_conflicting,
+            matching=matching,
+            conflicting_orphans=conflicting_orphans,
+            tracked_matching=tracked_matching,
+            tracked_conflicting=tracked_conflicting,
+        )
+
+    @staticmethod
+    def _configuration_conflict_result(
+        request: RepositoryEngineStartRequest,
+        expected_config_fingerprint: str,
+        ownership: ExistingRepositoryEngineOwnership,
+    ) -> RepositoryEngineStartResult | None:
+        if request.force_restart or not (
+            ownership.tracked_conflicting or ownership.conflicting_orphans
+        ):
+            return None
+        return RepositoryEngineStartResult(
+            {
+                "error": "configuration_conflict",
+                "detail": "A live Repository Engine owns a different configuration identity.",
+                "requested": {
+                    **request.selection.to_dict(),
+                    "config_fingerprint": expected_config_fingerprint,
+                },
+                "active": [
+                    {
+                        "mode": status.configuration_mode,
+                        "config_name": status.config_name,
+                        "config_fingerprint": status.config_fingerprint,
+                    }
+                    for status in ownership.tracked_conflicting
+                ]
+                + [
+                    {
+                        **detected["active_selection"],
+                        "config_fingerprint": detected.get("info", {}).get(
+                            "config_fingerprint", ""
+                        ),
+                    }
+                    for detected in ownership.conflicting_orphans
+                ],
+                "ports": [
+                    status.port
+                    for status in ownership.tracked_conflicting
+                    if isinstance(status.port, int)
+                ]
+                + [detected["port"] for detected in ownership.conflicting_orphans],
+            },
+            409,
+        )
+
+    def _force_restart_existing(
+        self,
+        request: RepositoryEngineStartRequest,
+        ownership: ExistingRepositoryEngineOwnership,
+    ) -> RepositoryEngineStartResult | None:
+        if ownership.tracked:
+            stopped_count = self._supervisor.stop_all_instances(
+                request.repo_root,
+                force=True,
+                reason="force_restart=true on repository engine start",
+                actor=request.actor,
+            )
+            if stopped_count < len(ownership.tracked):
+                return RepositoryEngineStartResult(
+                    {
+                        "error": "stop_failed",
+                        "detail": "Unable to stop every tracked orchestrator process.",
+                        "ports": sorted(ownership.tracked_ports),
+                    },
+                    500,
+                )
+        for detected in ownership.orphan_matching + ownership.orphan_conflicting:
+            stopped = self._supervisor.stop_by_port(
+                detected["port"],
+                force=True,
+                reason="force_restart=true on repository engine start",
+                actor=request.actor,
+            )
+            if not stopped:
+                return RepositoryEngineStartResult(
+                    {
+                        "error": "stop_failed",
+                        "detail": "Unable to stop existing orchestrator process.",
+                        "port": detected["port"],
+                    },
+                    500,
+                )
+        return None
+
+    def _remove_tracked_identity_mismatches(
+        self,
+        request: RepositoryEngineStartRequest,
+        matching: tuple[SupervisorStatus, ...],
+        details_by_port: dict[int, dict[str, Any] | None],
+    ) -> tuple[
+        tuple[SupervisorStatus, ...],
+        RepositoryEngineStartResult | None,
+        bool,
+    ]:
+        healthy: list[SupervisorStatus] = []
+        stopped_mismatch = False
+        for status in matching:
+            port = status.port
+            details = details_by_port.get(port) if isinstance(port, int) else None
+            if details is None or not details.get("identity_mismatch"):
+                healthy.append(status)
+                continue
+            stopped = self._supervisor.stop(
+                request.repo_root,
+                force=True,
+                instance_id=status.instance_id,
+                reason="engine identity mismatch detected on repository start",
+                actor=request.actor,
+            )
+            if not stopped:
+                return (
+                    (),
+                    RepositoryEngineStartResult(
+                        {
+                            "error": "engine_identity_mismatch",
+                            "detail": "Mismatched engine detected and could not be stopped",
+                            "port": port,
+                        },
+                        409,
+                    ),
+                    False,
+                )
+            stopped_mismatch = True
+        return tuple(healthy), None, stopped_mismatch
+
+    def _tracked_live_statuses(
+        self,
+        request: RepositoryEngineStartRequest,
+    ) -> tuple[SupervisorStatus, ...]:
+        return live_repository_engine_statuses(
+            request.repo_root,
+            self._supervisor,
+            request.selection,
+        )
+
+    @staticmethod
+    def _status_matches(
+        status: SupervisorStatus,
+        selection: RepositoryLaunchSelection,
+        fingerprint: str,
+    ) -> bool:
+        return (
+            status.configuration_mode == selection.mode.value
+            and status.config_name == selection.config.value
+            and status.config_fingerprint == fingerprint
+        )
+
+    def _resolve_tracked_ownership(
+        self,
+        request: RepositoryEngineStartRequest,
+        matching: tuple[SupervisorStatus, ...],
+        expected_config_fingerprint: str,
+    ) -> RepositoryEngineStartResult | None:
+        if request.instance_id is not None:
+            matching = tuple(
+                status
+                for status in matching
+                if status.instance_id == request.instance_id
+            )
+        if not matching:
+            return None
+        ports = sorted(
+            status.port for status in matching if isinstance(status.port, int)
+        )
+        payload: RepositoryEngineStartPayload = {
+            "error": "already_running",
+            "status": RUNNING_SUPERVISOR_STATE,
+            "repo_root": str(request.repo_root),
+            "mode": request.selection.mode.value,
+            "config_name": request.selection.config.value,
+            "config_fingerprint": expected_config_fingerprint,
+            "ports": ports,
+            "instances": [status.to_dict() for status in matching],
+        }
+        if len(ports) == 1:
+            payload["port"] = ports[0]
+        return RepositoryEngineStartResult(payload, 409)
 
     def _resolve_matching_ownership(
         self,

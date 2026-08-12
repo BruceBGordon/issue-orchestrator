@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Self
 
 from .repository_config_name import RepositoryConfigName
@@ -126,25 +125,8 @@ class RepositoryConfigurationIdentity:
             )
 
 
-def selection_from_config_path(config_path: Path) -> RepositoryLaunchSelection:
-    """Derive the typed identity encoded by a conventional config path."""
-    resolved = config_path.expanduser().resolve()
-    parent = resolved.parent
-    is_mode_path = (
-        parent.parent.name == "modes"
-        and parent.parent.parent.name == "config"
-        and parent.parent.parent.parent.name == ".issue-orchestrator"
-    )
-    mode = ConfigurationModeName(parent.name) if is_mode_path else None
-    return RepositoryLaunchSelection.parse(
-        mode=mode,
-        config_name=resolved.name,
-    )
-
-
 __all__ = [
     "ConfigurationModeName",
     "RepositoryLaunchSelection",
     "RepositoryConfigurationIdentity",
-    "selection_from_config_path",
 ]

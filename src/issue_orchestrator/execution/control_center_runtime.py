@@ -107,20 +107,7 @@ def _get_live_configuration_identity(
 ) -> RepositoryConfigurationIdentity | None:
     """Return the exact active identity without interpreting stopped config files."""
     desired = get_selected_launch_selection(repo_root)
-    aggregate = supervisor.status_all_instances(
-        repo_root,
-        desired.config.value,
-        mode=desired.mode.value,
-    )
-    live = [
-        instance
-        for instance in aggregate.instances
-        if instance.state not in {"stopped", "failed"}
-    ]
-    if not live:
-        single = supervisor.status(repo_root)
-        if single.state not in {"stopped", "failed"}:
-            live.append(single)
+    live = list(live_repository_engine_statuses(repo_root, supervisor, desired))
     if live:
         selection = _selection_from_live_statuses(live)
         fingerprints = {status.config_fingerprint for status in live}
@@ -145,8 +132,7 @@ def _get_live_configuration_identity(
         raise RuntimeError("Conflicting live repository configuration identities")
     mode, config_name = identities.pop()
     fingerprints = {
-        str(item.get("info", {}).get("config_fingerprint", ""))
-        for item in detected
+        str(item.get("info", {}).get("config_fingerprint", "")) for item in detected
     }
     if len(fingerprints) != 1:
         raise RuntimeError("Conflicting live repository config fingerprints")
@@ -157,6 +143,28 @@ def _get_live_configuration_identity(
         ),
         fingerprint=fingerprints.pop(),
     )
+
+
+def live_repository_engine_statuses(
+    repo_root: Path,
+    supervisor: SupervisorOps,
+    selection: RepositoryLaunchSelection,
+) -> tuple[SupervisorStatus, ...]:
+    """Return authoritative live lock statuses before any port discovery."""
+    aggregate = supervisor.status_all_instances(
+        repo_root,
+        selection.config.value,
+        mode=selection.mode.value,
+    )
+    live = tuple(
+        instance
+        for instance in aggregate.instances
+        if instance.state not in {"stopped", "failed"}
+    )
+    if live:
+        return live
+    single = supervisor.status(repo_root)
+    return (single,) if single.state not in {"stopped", "failed"} else ()
 
 
 def _selection_from_live_statuses(
@@ -240,12 +248,38 @@ def detect_orchestrator_by_port(
     if not port:
         return None
 
+    details = inspect_orchestrator_at_port(
+        repo_root,
+        port,
+        expected_identity=expected_identity,
+    )
+    if details is None or details["info"].get("repo_root") != str(repo_root):
+        return None
+    return details
+
+
+def inspect_orchestrator_at_port(
+    repo_root: Path,
+    port: int,
+    *,
+    expected_identity: RepoIdentity | None = None,
+) -> dict[str, Any] | None:
+    """Inspect one known runtime port without inferring lifecycle ownership."""
+
     base_url = f"http://127.0.0.1:{port}"
     info = _read_json(f"{base_url}/api/info", timeout=0.6)
-    if info is None or info.get("repo_root") != str(repo_root):
+    if info is None:
         return None
 
     details: dict[str, Any] = {"port": port, "info": info}
+    observed_root = info.get("repo_root")
+    if observed_root != str(repo_root):
+        details["identity_mismatch"] = {
+            "repo_root": {
+                "expected": str(repo_root),
+                "observed": observed_root,
+            }
+        }
     annotate_identity_mismatch(details, info, expected_identity)
     _annotate_orchestrator_health(details, base_url)
     return details
@@ -459,6 +493,8 @@ __all__ = [
     "get_selected_config",
     "heartbeat_age_seconds",
     "is_shutdown_complete",
+    "inspect_orchestrator_at_port",
     "inspect_repository_orchestrator_ownership",
+    "live_repository_engine_statuses",
     "RepositoryOrchestratorOwnership",
 ]

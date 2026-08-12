@@ -8,7 +8,6 @@ from typing import Any
 from ..domain.repository_launch_selection import (
     ConfigurationModeName,
     RepositoryLaunchSelection,
-    selection_from_config_path,
 )
 from ..domain.worktree_paths import (
     WORKTREE_COLLECTION_DIR as WORKTREE_COLLECTION_DIR,
@@ -33,6 +32,22 @@ class ConfigEnvVarError(Exception):
 
 class ConfigSectionError(ValueError):
     """Raised when a config section has an invalid type."""
+
+
+def selection_from_config_path(config_path: Path) -> RepositoryLaunchSelection:
+    """Derive the typed launch selection encoded by config storage layout."""
+    resolved = config_path.expanduser().resolve()
+    parent = resolved.parent
+    is_mode_path = (
+        parent.parent.name == MODES_DIR
+        and parent.parent.parent.name == "config"
+        and parent.parent.parent.parent.name == ".issue-orchestrator"
+    )
+    mode = ConfigurationModeName(parent.name) if is_mode_path else None
+    return RepositoryLaunchSelection.parse(
+        mode=mode,
+        config_name=resolved.name,
+    )
 
 
 def expand_env_vars(value: Any, path: str = "") -> Any:

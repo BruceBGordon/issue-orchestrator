@@ -14,6 +14,8 @@ from issue_orchestrator.execution.control_center_actions import (
     AuditIssuesCommand,
     ConfiguredRepoActionRequest,
     ControlCenterActions,
+    DoctorActionRequest,
+    DoctorCommand,
     InitializeLabelsCommand,
     ListStaleWorktreesCommand,
     PauseOrchestratorCommand,
@@ -198,6 +200,45 @@ def test_effective_selection_prefers_active_cli_lock(tmp_path: Path) -> None:
         "mode": "codex",
         "config_name": "main.yaml",
     }
+
+
+@pytest.mark.asyncio
+async def test_doctor_missing_target_config_never_falls_back_to_cwd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cwd_repo = tmp_path / "control-center-cwd"
+    cwd_config = cwd_repo / ".issue-orchestrator/config/modes/default/default.yaml"
+    cwd_config.parent.mkdir(parents=True)
+    cwd_config.write_text(
+        "repo:\n  github:\n    app:\n      private_key_path: /secret/key.pem\n",
+        encoding="utf-8",
+    )
+    target_repo = tmp_path / "target"
+    target_repo.mkdir()
+    expected_path = (
+        target_repo / ".issue-orchestrator/config/modes/default/default.yaml"
+    )
+    captured: dict[str, object] = {}
+
+    def fake_doctor(**kwargs: object) -> SimpleNamespace:
+        captured.update(kwargs)
+        return SimpleNamespace(to_dict=lambda: {"overall": "warning"})
+
+    monkeypatch.chdir(cwd_repo)
+    monkeypatch.setattr("issue_orchestrator.infra.doctor.run_doctor", fake_doctor)
+
+    result = await DoctorCommand().execute(
+        DoctorActionRequest(
+            repo_root=target_repo,
+            selection=RepositoryLaunchSelection.default(),
+        )
+    )
+
+    assert result.status_code == 200
+    assert captured["config"] is None
+    assert captured["config_path"] == expected_path
+    assert captured["config_path"] != cwd_config
 
 
 @pytest.mark.asyncio

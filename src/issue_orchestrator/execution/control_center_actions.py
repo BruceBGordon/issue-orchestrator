@@ -280,14 +280,13 @@ class DoctorCommand:
         from ..execution.command_runner import LocalCommandRunner
 
         config = None
-        config_path = None
+        config_path = get_config_path(
+            request.repo_root,
+            request.selection.config.value,
+            request.selection.mode,
+        )
         available = list_configs(request.repo_root, request.selection.mode)
         if request.selection.config.value in available:
-            config_path = get_config_path(
-                request.repo_root,
-                request.selection.config.value,
-                request.selection.mode,
-            )
             try:
                 config = Config.load(config_path)
             except Exception:

@@ -853,6 +853,67 @@ class TestSupervisorStart:
         assert captured["config_name"] == "main.yaml"
         assert captured["config"].config_path == config_path.resolve()
 
+    def test_start_returns_successful_multi_instance_payload_without_single_port(
+        self,
+        supervisor_client: TestClient,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from issue_orchestrator.infra import launcher
+        from issue_orchestrator.infra.doctor.types import DoctorResult
+        from issue_orchestrator.infra.launcher import LaunchResult, LaunchStatus
+
+        config_path = (
+            tmp_path / ".issue-orchestrator/config/modes/codex/main.yaml"
+        )
+        config_path.parent.mkdir(parents=True)
+        config_path.write_text("instances: 2\nagents: {}\n", encoding="utf-8")
+        monkeypatch.setattr(
+            "issue_orchestrator.execution.control_center_runtime."
+            "detect_repository_orchestrators",
+            lambda *_: [],
+        )
+        monkeypatch.setattr(
+            launcher,
+            "launch_subprocess",
+            lambda **_kwargs: LaunchResult(
+                doctor=DoctorResult(checks=[]),
+                launched=True,
+                status=LaunchStatus.OK,
+                supervisor={
+                    "configuration_mode": "codex",
+                    "config_name": "main.yaml",
+                    "config_fingerprint": "fingerprint",
+                    "instances": [
+                        {
+                            "pid": 101,
+                            "port": 26101,
+                            "instance_id": "orchestrator-1",
+                        },
+                        {
+                            "pid": 102,
+                            "port": 26102,
+                            "instance_id": "orchestrator-2",
+                        },
+                    ],
+                },
+            ),
+        )
+
+        response = supervisor_client.post(
+            "/control/orchestrator/start",
+            json={
+                "repo_root": str(tmp_path),
+                "mode": "codex",
+                "config_name": "main.yaml",
+            },
+        )
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert "port" not in payload
+        assert [item["port"] for item in payload["instances"]] == [26101, 26102]
+
     def test_start_returns_conflict_for_multi_instance_mode_owner(
         self,
         supervisor_client: TestClient,

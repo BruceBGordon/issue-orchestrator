@@ -48,6 +48,23 @@ def test_detect_ignores_orchestrator_belonging_to_a_different_repo(monkeypatch) 
     assert result is None
 
 
+def test_known_tracked_port_reports_a_different_repository_as_identity_drift(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        ccr, "_read_json", lambda url, **_: {"repo_root": "/some/OTHER/repo"}
+    )
+    monkeypatch.setattr(ccr, "_annotate_orchestrator_health", lambda *_: None)
+
+    result = ccr.inspect_orchestrator_at_port(Path("/my/repo"), 64999)
+
+    assert result is not None
+    assert result["identity_mismatch"]["repo_root"] == {
+        "expected": "/my/repo",
+        "observed": "/some/OTHER/repo",
+    }
+
+
 def test_detect_returns_none_when_nothing_answers_on_port(monkeypatch) -> None:
     monkeypatch.setattr(ccr, "_load_config_port", lambda repo, cfg, mode: 64999)
     monkeypatch.setattr(ccr, "_read_json", lambda url, **_: None)
@@ -70,11 +87,11 @@ def test_detect_returns_none_when_no_configured_port(monkeypatch) -> None:
 def test_detect_matches_orchestrator_for_the_same_repo(monkeypatch) -> None:
     """Same-repo orchestrator IS detected (so the guard is meaningful, not vacuous)."""
     monkeypatch.setattr(ccr, "_load_config_port", lambda repo, cfg, mode: 64999)
-    monkeypatch.setattr(
-        ccr, "_read_json", lambda url, **_: {"repo_root": "/my/repo"}
-    )
+    monkeypatch.setattr(ccr, "_read_json", lambda url, **_: {"repo_root": "/my/repo"})
     # Avoid the real health probe (would hit the network).
-    monkeypatch.setattr(ccr, "_annotate_orchestrator_health", lambda details, base_url: None)
+    monkeypatch.setattr(
+        ccr, "_annotate_orchestrator_health", lambda details, base_url: None
+    )
 
     result = ccr.detect_orchestrator_by_port(Path("/my/repo"), "test.yaml")
 
