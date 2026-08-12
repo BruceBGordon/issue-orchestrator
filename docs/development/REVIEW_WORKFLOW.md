@@ -280,13 +280,25 @@ Control when AI session tabs close and worktrees are removed:
 cleanup:
   with_tech_lead:                    # When tech lead review is enabled
     close_ai_session_tabs: true   # Close tabs after tech lead review
-    remove_worktrees: false       # Keep worktrees for reference
+    remove_worktrees: true        # Remove owned worktrees after tech lead review
 
   without_tech_lead:                 # When tech lead review is NOT enabled
     wait_for_code_review: true    # true = after code review, false = on completion
     close_ai_session_tabs: true
-    remove_worktrees: false
+    remove_worktrees: true
 ```
+
+Worktree removal defaults to `true` for new and omitted configurations. It
+still waits for the applicable review gate. Set it to `false` to retain issue
+worktrees for inspection. Review-gated cleanup removes only the checkout and
+preserves its local branch, including local-only commits. Branch deletion is
+reserved for explicitly disposable scratch/reset lifecycle owners. On startup,
+the orchestrator also reconciles proven inactive reviewer and tech-lead scratch
+worktrees. Manual, active, activity-unknown, initializing-engine, ambiguous,
+and reviewer worktrees whose detached HEAD differs from the exact tip recorded
+by the reviewer lifecycle are retained. Reviewer worktrees created before that
+tip marker existed use the stricter legacy proof that HEAD still equals the
+registered parent worktree tip.
 
 ## UI Phase Detection
 

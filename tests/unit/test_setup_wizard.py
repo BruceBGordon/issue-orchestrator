@@ -41,6 +41,24 @@ from issue_orchestrator.ports.repository_setup import (
 )
 
 
+@pytest.mark.parametrize(
+    ("review", "section", "wait_for_review"),
+    [
+        ({"tech_lead_review_agent": "agent:lead"}, "with_tech_lead", None),
+        ({"enabled": True}, "without_tech_lead", True),
+        ({}, "without_tech_lead", False),
+    ],
+)
+def test_generated_configs_default_to_review_gated_worktree_cleanup(
+    review: dict, section: str, wait_for_review: bool | None,
+) -> None:
+    cleanup = setup_wizard_module.default_cleanup_config({"review": review})
+
+    assert cleanup[section]["remove_worktrees"] is True
+    if wait_for_review is not None:
+        assert cleanup[section]["wait_for_code_review"] is wait_for_review
+
+
 @pytest.fixture(autouse=True)
 def _verified_setup_github_authorization(
     monkeypatch: pytest.MonkeyPatch,

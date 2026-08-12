@@ -684,7 +684,7 @@ class TestToolEndpoints:
 
         response = client.post(
             "/control/tools/worktrees/cleanup",
-            json={"repo_root": str(tmp_path), "dry_run": True},
+            json={"repo_root": str(tmp_path)},
         )
 
         assert response.status_code == 200

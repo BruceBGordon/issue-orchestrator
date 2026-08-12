@@ -18,6 +18,7 @@ from ..domain.repository_launch_selection import (
 from ..ports.repository_engine_supervisor import SupervisorOps
 from .orchestrator_http_api import OrchestratorAsyncHttpApi
 from .repository_engine_start import StartRepositoryEngineCommand
+from .control_center_worktree_audit import ControlCenterWorktreeAuditOwner
 from ..ports.repository_host import (
     RepositoryHostError,
     repository_host_failure_payload,
@@ -408,64 +409,16 @@ class TraceIssueCommand:
             return ActionResult({"error": str(exc)}, status_code=500)
 
 
-def _find_stale_worktrees(
-    repo_root: Path, worktree_base: Path, active: set[Path]
-) -> list[dict[str, str]]:
-    stale: list[dict[str, str]] = []
-    if not worktree_base.exists():
-        return stale
-
-    repo_name = repo_root.name
-    worktree_pattern = re.compile(rf"^{re.escape(repo_name)}-(\d+)$")
-    for entry in worktree_base.iterdir():
-        if not entry.is_dir():
-            continue
-        if not worktree_pattern.match(entry.name):
-            continue
-        git_path = entry / ".git"
-        if not git_path.exists() or git_path.is_dir():
-            continue
-        if entry in active:
-            continue
-        stale.append({"path": str(entry), "name": entry.name})
-    return stale
-
-
 class ListStaleWorktreesCommand:
-    """List stale orchestrator worktrees (read-only)."""
+    """Audit registered worktrees with the startup cleanup policy (read-only)."""
+
+    def __init__(self, audit_owner: ControlCenterWorktreeAuditOwner) -> None:
+        self._audit_owner = audit_owner
 
     async def execute(self, request: ConfiguredRepoActionRequest) -> ActionResult:
-        from ..execution.git_working_copy import GitWorkingCopy
-        from .control_center_runtime import load_config_for_selection
-
-        fallback_mode = False
         try:
-            config = load_config_for_selection(request.repo_root, request.selection)
-            worktree_base = config.worktree_base
-        except FileNotFoundError:
-            fallback_mode = True
-            worktree_base = request.repo_root.parent
-
-        if not worktree_base.exists():
-            return ActionResult(
-                {"stale_worktrees": [], "message": "No worktree directory found"}
-            )
-
-        try:
-            working_copy = GitWorkingCopy()
-            active = working_copy.list_active_worktrees(request.repo_root)
-            stale = _find_stale_worktrees(request.repo_root, worktree_base, active)
-            payload: dict[str, Any] = {
-                "stale_worktrees": stale,
-                "cleanup_command": f"cd {request.repo_root} && git worktree prune",
-                "message": "Run the cleanup_command in terminal to remove stale worktrees safely.",
-            }
-            if fallback_mode:
-                payload["scope"] = "repo-parent-fallback"
-                payload["note"] = (
-                    "No config found; scanned repo parent using worktree naming convention."
-                )
-            return ActionResult(payload)
+            report = self._audit_owner.audit(request.repo_root, request.selection)
+            return ActionResult(report.to_payload())
         except Exception as exc:
             return ActionResult({"error": str(exc)}, status_code=500)
 
@@ -549,9 +502,25 @@ class ControlCenterActions:
         self.labels_cmd: InitializeLabelsCommand = (
             labels_cmd or InitializeLabelsCommand()
         )
-        self.stale_worktrees_cmd: ListStaleWorktreesCommand = (
-            stale_worktrees_cmd or ListStaleWorktreesCommand()
-        )
+        if stale_worktrees_cmd is None:
+            from ..control.worktree_reconciliation import WorktreeAuditOwner
+            from .control_center_worktree_audit import (
+                HttpRepositoryEngineStatusReader,
+                RepositoryEngineWorktreeActivityReader,
+            )
+            from .worktree_adapter import GitWorktreeManager
+
+            worktrees = GitWorktreeManager()
+            stale_worktrees_cmd = ListStaleWorktreesCommand(
+                ControlCenterWorktreeAuditOwner(
+                    WorktreeAuditOwner(worktrees),
+                    RepositoryEngineWorktreeActivityReader(
+                        supervisor,
+                        HttpRepositoryEngineStatusReader(),
+                    ),
+                )
+            )
+        self.stale_worktrees_cmd = stale_worktrees_cmd
         self.select_launch_config_cmd: SelectLaunchConfigurationCommand = (
             select_launch_config_cmd or SelectLaunchConfigurationCommand(supervisor)
         )

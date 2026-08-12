@@ -91,7 +91,7 @@ class _State:
 class FailingWorktrees:
     """A worktree manager whose removal always fails, to prove independence."""
 
-    def remove(self, path, force: bool = False) -> None:
+    def remove_checkout_and_branch(self, path, force: bool = False) -> None:
         raise RuntimeError(f"cannot remove {path} (force={force})")
 
 

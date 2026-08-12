@@ -37,6 +37,7 @@ if TYPE_CHECKING:
     from ..ports.tech_lead_authority import TechLeadAuthorityStore
     from .label_manager import LabelManager
     from .label_store_reconciler import FreshLabelSnapshot
+    from .worktree_reconciliation import StartupWorktreeReconciler
 from ..domain.models import (
     OrchestratorState,
     PendingRetrospectiveReview,
@@ -94,6 +95,7 @@ class StartupManager:
         launch_session_fn: Callable[[Issue], Optional[Session]],
         update_queue_cache_fn: Callable[[], None],
         issue_fetch_resilience: IssueFetchResilience,
+        startup_worktree_reconciler: "StartupWorktreeReconciler",
         queue_cache_store: "QueueCacheStore | None" = None,
         label_manager: "LabelManager | None" = None,
         label_store: "LabelStore | None" = None,
@@ -116,6 +118,7 @@ class StartupManager:
                 transient repository blip degrades-and-continues while a
                 persistent repo-not-found/auth failure fails fast; downstream
                 recovery phases keep their own error handling.
+            startup_worktree_reconciler: Owner of crash-safe worktree recovery.
             queue_cache_store: Persistent store for queue cache (enables warm restarts)
             label_manager: Label registry for prefix-aware queries.
         """
@@ -130,6 +133,7 @@ class StartupManager:
         self._launch_session = launch_session_fn
         self._update_queue_cache = update_queue_cache_fn
         self._issue_fetch_resilience = issue_fetch_resilience
+        self._startup_worktree_reconciler = startup_worktree_reconciler
         self._queue_cache_store = queue_cache_store
         if label_manager is None:
             from .label_manager import LabelManager
@@ -810,12 +814,8 @@ class StartupManager:
             print(f"\n🔄 Recovered {recovered} pending validation retry(ies)")
 
     def _recover_orphaned_cleanups(self, state: OrchestratorState) -> None:
-        """Recover orphaned cleanups from before restart.
-
-        This is a simplified version - the full logic is in CleanupManager.
-        """
-        # Delegate to CleanupManager if needed
-        pass
+        """Recover review-gated issue trees and owned disposable orphans."""
+        self._startup_worktree_reconciler.recover(state)
 
     def _restore_and_sync_queue(self, state: OrchestratorState) -> None:
         """Restore queue cache from SQLite and delta-sync from GitHub.

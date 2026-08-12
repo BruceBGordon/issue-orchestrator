@@ -80,6 +80,7 @@ CLEANUP_SAFE_UNTRACKED_EXACT: frozenset[str] = frozenset(
         ".issue-orchestrator/review-exchange-turn-prompt.md",
         ".issue-orchestrator/review-report.md",
         ".issue-orchestrator/review-response.json",
+        ".issue-orchestrator/reviewer-owned-head",
         ".issue-orchestrator/validation-errors.txt",
         ".issue-orchestrator/validation-state.json",
         ".issue-orchestrator/worktree-id",

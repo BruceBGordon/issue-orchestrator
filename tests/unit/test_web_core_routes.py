@@ -229,6 +229,9 @@ class TestApiStatusEndpoint:
         assert data["active_sessions"][0]["issue_number"] == 1
         assert data["active_sessions"][0]["title"] == "Test Issue"
         assert data["active_sessions"][0]["branch"] == "feature/issue-1"
+        assert data["active_sessions"][0]["worktree_path"] == str(
+            session.worktree_path
+        )
         set_orchestrator(None)
 
     def test_status_when_orchestrator_not_running(self):

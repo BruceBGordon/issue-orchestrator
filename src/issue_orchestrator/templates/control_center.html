@@ -297,8 +297,8 @@
                                 </svg>
                             </div>
                             <div class="tool-card-content">
-                                <div class="tool-card-title">List Stale Worktrees</div>
-                                <div class="tool-card-desc">Find orphaned worktree directories (read-only)</div>
+                                <div class="tool-card-title">Audit Worktrees</div>
+                                <div class="tool-card-desc">Classify registered worktrees with startup cleanup policy (read-only)</div>
                             </div>
                         </button>
                     </div>
@@ -892,11 +892,11 @@
         </div>
     </div>
 
-    <!-- Worktrees Cleanup Modal -->
+    <!-- Worktree Audit Modal -->
     <div class="modal-backdrop" id="worktreesModal" role="dialog" aria-labelledby="worktreesModalTitle" aria-modal="true">
         <div class="modal" style="max-width: 560px;">
             <div class="modal-header">
-                <h2 class="modal-title" id="worktreesModalTitle">Stale Worktrees</h2>
+                <h2 class="modal-title" id="worktreesModalTitle">Worktree Audit</h2>
                 <button class="modal-close" id="closeWorktreesModal" aria-label="Close dialog">
                     <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true">
                         <path fill="currentColor" fill-rule="evenodd" d="M3.72 3.72a.75.75 0 011.06 0L8 6.94l3.22-3.22a.75.75 0 111.06 1.06L9.06 8l3.22 3.22a.75.75 0 11-1.06 1.06L8 9.06l-3.22 3.22a.75.75 0 01-1.06-1.06L6.94 8 3.72 4.78a.75.75 0 010-1.06z"/>
@@ -904,7 +904,7 @@
                 </button>
             </div>
             <div class="modal-body">
-                <div id="worktreesContent">Scanning for stale worktrees...</div>
+                <div id="worktreesContent" aria-live="polite">Auditing registered worktrees...</div>
             </div>
             <div class="modal-footer">
                 <button class="btn" id="cancelWorktrees">Close</button>

@@ -13,7 +13,7 @@ from ...infra.runtime_artifacts import is_cleanup_safe_untracked_path
 from ...infra.logging_config import issue_log
 from ...ports.git import GitResult
 from ...ports.worktree_policy import WorktreePolicy
-from ...ports.worktree_manager import WorktreeReuseOptions
+from ...ports.worktree_manager import RegisteredWorktree, WorktreeReuseOptions
 from ...infra.worktree_base import resolve_base_branch
 from ._worktree_errors import WorktreeError as WorktreeError
 from ._worktree_git import _git, _git_env_no_prompt, _git_run
@@ -1258,14 +1258,22 @@ def _delete_worktree_branch(repo_root: Path, branch_name: str | None) -> None:
     )
 
 
-def remove_worktree(worktree_path: Path, *, force: bool = False) -> None:
+def remove_worktree(
+    worktree_path: Path,
+    *,
+    force: bool = False,
+    delete_branch: bool = True,
+) -> None:
     """
-    Remove a git worktree and its associated branch.
+    Remove a git worktree and optionally its associated branch.
 
     Args:
         worktree_path: Path to the worktree to remove
         force: If true, use ``git worktree remove --force`` and fallback to
             deleting the directory when git cannot remove it cleanly.
+        delete_branch: Whether to delete the associated local branch after the
+            checkout is removed. Retention cleanup passes false; disposable
+            scratch/reset owners pass true.
 
     Raises:
         WorktreeError: If removal fails
@@ -1309,7 +1317,8 @@ def remove_worktree(worktree_path: Path, *, force: bool = False) -> None:
                 f"Failed to remove worktree path after git/rmtree cleanup: {worktree_path}"
             )
 
-        _delete_worktree_branch(repo_root, branch_name)
+        if delete_branch:
+            _delete_worktree_branch(repo_root, branch_name)
         logger.info(
             "Worktree removed: path=%s branch=%s",
             worktree_path,
@@ -1357,6 +1366,55 @@ def list_worktrees(repo_root: Path) -> list[Path]:
         if isinstance(e, WorktreeError):
             raise
         raise WorktreeError(f"Error listing worktrees: {e}")
+
+
+def _parse_registered_worktree(record: str) -> RegisteredWorktree | None:
+    """Parse one blank-line-delimited porcelain record."""
+    fields: dict[str, object] = {}
+    for line in record.splitlines():
+        if line.startswith("worktree "):
+            fields["path"] = Path(line.removeprefix("worktree "))
+        elif line.startswith("HEAD "):
+            fields["head"] = line.removeprefix("HEAD ")
+        elif line.startswith("branch refs/heads/"):
+            fields["branch"] = line.removeprefix("branch refs/heads/")
+        elif line == "detached":
+            fields["branch"] = None
+        elif line == "locked" or line.startswith("locked "):
+            fields["locked"] = True
+        elif line == "prunable" or line.startswith("prunable "):
+            fields["prunable"] = True
+
+    path = fields.get("path")
+    head = fields.get("head")
+    if not isinstance(path, Path) or not isinstance(head, str):
+        return None
+    branch = fields.get("branch")
+    return RegisteredWorktree(
+        path=path,
+        head=head,
+        branch=branch if isinstance(branch, str) else None,
+        locked=bool(fields.get("locked", False)),
+        prunable=bool(fields.get("prunable", False)),
+    )
+
+
+def parse_registered_worktrees(output: str) -> tuple[RegisteredWorktree, ...]:
+    """Parse ``git worktree list --porcelain`` without guessing from folders."""
+    parsed = (
+        _parse_registered_worktree(record)
+        for record in output.strip().split("\n\n")
+        if record.strip()
+    )
+    return tuple(item for item in parsed if item is not None)
+
+
+def list_registered_worktrees(repo_root: Path) -> tuple[RegisteredWorktree, ...]:
+    """List registered worktrees with branch and safety metadata."""
+    result = _git_run(repo_root, ["worktree", "list", "--porcelain"], check=False)
+    if result.returncode != 0:
+        raise WorktreeError(f"Failed to list worktrees: {result.stderr}")
+    return parse_registered_worktrees(result.stdout)
 
 
 def worktree_exists(worktree_path: Path, repo_root: Path) -> bool:

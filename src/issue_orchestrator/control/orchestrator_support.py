@@ -192,7 +192,11 @@ class OrchestratorSupport:
             self.config.cleanup.without_tech_lead.close_ai_session_tabs or not self.config.code_review_agent
         ):
             try:
-                self.worktree_manager.remove(session.worktree_path) if self.worktree_manager else None
+                (
+                    self.worktree_manager.remove_checkout(session.worktree_path)
+                    if self.worktree_manager
+                    else None
+                )
             except Exception:
                 pass
         try:

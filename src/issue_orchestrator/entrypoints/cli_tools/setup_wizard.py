@@ -1227,6 +1227,27 @@ def wizard_existing_project(  # noqa: C901, PLR0912 - interactive wizard with br
     return config, updating_existing_path
 
 
+def default_cleanup_config(config: dict) -> dict:
+    """Build safe automatic cleanup defaults for a newly generated config."""
+    review_cfg = config.get("review", {})
+    has_tech_lead = review_cfg.get("tech_lead_review_agent")
+    has_code_review = review_cfg.get("enabled") or review_cfg.get("default")
+    if has_tech_lead:
+        return {
+            "with_tech_lead": {
+                "close_ai_session_tabs": True,
+                "remove_worktrees": True,
+            }
+        }
+    return {
+        "without_tech_lead": {
+            "wait_for_code_review": bool(has_code_review),
+            "close_ai_session_tabs": True,
+            "remove_worktrees": True,
+        }
+    }
+
+
 def run_wizard(  # noqa: C901, PLR0912 - main wizard entry point with prerequisite checks, mode selection, and confirmation flow
     target_path: Path | None = None,
     prompter: Prompter | None = None,
@@ -1342,37 +1363,7 @@ def run_wizard(  # noqa: C901, PLR0912 - main wizard entry point with prerequisi
 
     # Add cleanup config with defaults (don't prompt - users can edit later)
     if "cleanup" not in config:
-        review_cfg = config.get("review", {})
-        has_tech_lead = review_cfg.get("tech_lead_review_agent")
-        has_code_review = review_cfg.get("enabled") or review_cfg.get("default")
-
-        # Include section based on their review workflow
-        if has_tech_lead:
-            # Tech Lead workflow - cleanup happens after tech_lead review
-            config["cleanup"] = {
-                "with_tech_lead": {
-                    "close_ai_session_tabs": True,
-                    "remove_worktrees": False,
-                }
-            }
-        elif has_code_review:
-            # Code review only - cleanup after code review
-            config["cleanup"] = {
-                "without_tech_lead": {
-                    "wait_for_code_review": True,
-                    "close_ai_session_tabs": True,
-                    "remove_worktrees": False,
-                }
-            }
-        else:
-            # No review workflow - cleanup on completion
-            config["cleanup"] = {
-                "without_tech_lead": {
-                    "wait_for_code_review": False,
-                    "close_ai_session_tabs": True,
-                    "remove_worktrees": False,
-                }
-            }
+        config["cleanup"] = default_cleanup_config(config)
 
     # Review config
     prompter.print("\n" + "=" * 50)

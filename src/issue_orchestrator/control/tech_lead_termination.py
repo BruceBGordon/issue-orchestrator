@@ -97,7 +97,10 @@ def terminate_tech_lead_session(
     )
     worktree_removed = attempt(
         _void(
-            lambda: worktrees.remove(session.worktree_path, force=True)
+            lambda: worktrees.remove_checkout_and_branch(
+                session.worktree_path,
+                force=True,
+            )
             if (disposable and worktrees)
             else None
         ),

@@ -94,9 +94,9 @@ def _remove_local_worktree(
 
     try:
         if from_scratch:
-            worktree_manager.remove(worktree_path, force=True)
+            worktree_manager.remove_checkout_and_branch(worktree_path, force=True)
         else:
-            worktree_manager.remove(worktree_path)
+            worktree_manager.remove_checkout(worktree_path)
         if worktree_path.exists():
             message = f"Worktree still exists after removal: {worktree_path}"
             if from_scratch:

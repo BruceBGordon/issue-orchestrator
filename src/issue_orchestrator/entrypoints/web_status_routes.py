@@ -34,6 +34,10 @@ async def get_status(orchestrator: WebOrchestratorDependency) -> JSONResponse:
             "agent_type": session.issue.agent_type,
             "status": "running" if session.runtime_minutes < session.agent_config.timeout_minutes else "slow",
             "branch": session.branch_name,
+            # Control Center worktree audits consume this server-to-server as
+            # authoritative activity evidence. Older engines omit it, which
+            # deliberately makes the audit fail closed and retain disposables.
+            "worktree_path": str(session.worktree_path),
         })
 
     # Serialize pending reviews

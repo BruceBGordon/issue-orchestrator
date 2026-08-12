@@ -30,7 +30,11 @@ from issue_orchestrator.infra.config import Config
 from issue_orchestrator.control.scheduler import Scheduler
 from issue_orchestrator.observation.observer import SessionObserver
 from issue_orchestrator.ports.pull_request_tracker import PRInfo
-from issue_orchestrator.ports.worktree_manager import WorktreeInfo, WorktreeReuseOptions
+from issue_orchestrator.ports.worktree_manager import (
+    RegisteredWorktree,
+    WorktreeInfo,
+    WorktreeReuseOptions,
+)
 from issue_orchestrator.execution.worktree_adapter import GitWorktreeManager
 from issue_orchestrator.events import EventName
 from issue_orchestrator.contracts.public import OrchestratorPausedPayload, OrchestratorResumedPayload
@@ -75,8 +79,15 @@ class MockWorktreeManager:
         })
         return WorktreeInfo(path=self.worktree_path, branch_name=self.branch_name)
 
-    def remove(self, worktree_path: Path, *, force: bool = False) -> None:
+    def remove_checkout(self, worktree_path: Path, *, force: bool = False) -> None:
         """Track remove calls."""
+        del force
+        self.remove_calls.append(worktree_path)
+
+    def remove_checkout_and_branch(
+        self, worktree_path: Path, *, force: bool = False
+    ) -> None:
+        """Track destructive remove calls."""
         del force
         self.remove_calls.append(worktree_path)
 
@@ -84,6 +95,11 @@ class MockWorktreeManager:
         """Test fakes do not opt into forced cleanup unless a test configures it."""
         del worktree_path
         return False
+
+    def list_registered(self, repo_root: Path) -> tuple[RegisteredWorktree, ...]:
+        """No registered worktrees are relevant to this test fake."""
+        del repo_root
+        return ()
 
     def extract_issue_number(self, branch_name: str) -> int | None:
         """Extract issue number from branch name."""
@@ -253,7 +269,9 @@ def test_terminate_tech_lead_session_is_behavior_complete(sample_config, tmp_pat
     # ...claim released...
     claim_manager.release_claim.assert_called_once_with(77, "lease-1")
     # ...and the disposable scratch worktree force-removed (no leak).
-    worktree_manager.remove.assert_called_once_with(scratch, force=True)
+    worktree_manager.remove_checkout_and_branch.assert_called_once_with(
+        scratch, force=True
+    )
 
 
 def _terminate_fixture(sample_config, tmp_path):
@@ -282,7 +300,9 @@ def test_terminate_tech_lead_worktree_failure_reports_unclean_with_leaked_path(
     # names the EXACT leaked path (the sole cleanup-failure owner — no dead
     # engine-tick ImmediateCleanup retry). Never a silent leak reported as success.
     orchestrator, tech_lead, sm, cm, wtm, scratch = _terminate_fixture(sample_config, tmp_path)
-    wtm.remove.side_effect = RuntimeError("git worktree remove failed")
+    wtm.remove_checkout_and_branch.side_effect = RuntimeError(
+        "git worktree remove failed"
+    )
 
     outcome = orchestrator.terminate_tech_lead_session(tech_lead)
 
@@ -309,7 +329,7 @@ def test_terminate_tech_lead_terminal_failure_does_not_abort_other_effects(
     assert outcome.terminal_stopped is False
     # ...yet claim + worktree still handled, and the session reconciled.
     cm.release_claim.assert_called_once_with(77, "lease-1")
-    wtm.remove.assert_called_once_with(scratch, force=True)
+    wtm.remove_checkout_and_branch.assert_called_once_with(scratch, force=True)
     assert orchestrator.state.active_sessions == []
 
 
@@ -372,7 +392,9 @@ def test_composed_one_shot_timeout_terminates_via_real_driver_and_facade(
     # Behavior-complete cleanup applied by the REAL facade terminate:
     smm.remove_session_machine.assert_called_once_with("tech-lead-77")
     claim_manager.release_claim.assert_called_once_with(77, "lease-1")
-    worktree_manager.remove.assert_called_once_with(scratch, force=True)
+    worktree_manager.remove_checkout_and_branch.assert_called_once_with(
+        scratch, force=True
+    )
     assert orchestrator.state.active_sessions == []
 
 
@@ -1263,7 +1285,9 @@ class TestHandleSessionCompletion:
         mock_worktree_manager,
     ):
         """Legacy test - worktree removal is now deferred to planner/applier."""
-        mock_worktree_manager.remove.side_effect = Exception("Failed to remove worktree")
+        mock_worktree_manager.remove_checkout.side_effect = Exception(
+            "Failed to remove worktree"
+        )
 
         issue = create_issue(1)
         session = create_session(issue)
@@ -3292,7 +3316,7 @@ class TestDeferredCleanup:
         orchestrator.handle_session_completion(session, SessionStatus.COMPLETED)
 
         # Worktree should NOT be removed (deferred)
-        mock_worktree_manager.remove.assert_not_called()
+        mock_worktree_manager.remove_checkout.assert_not_called()
 
         # Should have pending cleanup
         assert len(orchestrator.state.pending_cleanups) == 1
@@ -3336,7 +3360,7 @@ class TestDeferredCleanup:
         orchestrator.handle_session_completion(session, SessionStatus.COMPLETED)
 
         # Worktree should NOT be removed (deferred)
-        mock_worktree_manager.remove.assert_not_called()
+        mock_worktree_manager.remove_checkout.assert_not_called()
 
         # Should have pending cleanup
         assert len(orchestrator.state.pending_cleanups) == 1

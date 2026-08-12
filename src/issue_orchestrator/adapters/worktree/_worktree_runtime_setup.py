@@ -19,7 +19,7 @@ from ._worktree_hooks import install_hooks
 from ._worktree_runtime import (
     _configure_no_verify_dry_run,
     _hide_runtime_artifacts_from_git_status,
-    _install_worktree_identity,
+    install_worktree_identity,
     _link_repo_venv_into_worktree,
     install_claude_settings,
     sync_cli_tools,
@@ -129,7 +129,7 @@ class WorktreeRuntimeSetup:
         )
         _link_repo_venv_into_worktree(self.repo_root, worktree_path)
         synced_cli_tool_paths = list(sync_cli_tools(worktree_path))
-        worktree_id = _install_worktree_identity(worktree_path)
+        worktree_id = install_worktree_identity(worktree_path)
         _hide_runtime_artifacts_from_git_status(worktree_path, synced_cli_tool_paths)
 
         logger.debug(

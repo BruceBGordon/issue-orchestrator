@@ -2477,12 +2477,12 @@ class TestCleanupConfig:
 
         # with_tech_lead defaults
         assert config.cleanup.with_tech_lead.close_ai_session_tabs is True
-        assert config.cleanup.with_tech_lead.remove_worktrees is False
+        assert config.cleanup.with_tech_lead.remove_worktrees is True
 
         # without_tech_lead defaults
         assert config.cleanup.without_tech_lead.wait_for_code_review is True
         assert config.cleanup.without_tech_lead.close_ai_session_tabs is True
-        assert config.cleanup.without_tech_lead.remove_worktrees is False
+        assert config.cleanup.without_tech_lead.remove_worktrees is True
 
     def test_cleanup_config_from_yaml_with_tech_lead(self, tmp_path):
         """Test loading cleanup config for CTO workflow."""
@@ -2536,7 +2536,7 @@ cleanup:
         assert config.cleanup.without_tech_lead.remove_worktrees is True
         # with_tech_lead should have defaults
         assert config.cleanup.with_tech_lead.close_ai_session_tabs is True
-        assert config.cleanup.with_tech_lead.remove_worktrees is False
+        assert config.cleanup.with_tech_lead.remove_worktrees is True
 
     def test_cleanup_config_from_yaml_both_sections(self, tmp_path):
         """Test loading cleanup config with both sections specified."""
@@ -2614,10 +2614,10 @@ cleanup: {}
 
         # All defaults
         assert config.cleanup.with_tech_lead.close_ai_session_tabs is True
-        assert config.cleanup.with_tech_lead.remove_worktrees is False
+        assert config.cleanup.with_tech_lead.remove_worktrees is True
         assert config.cleanup.without_tech_lead.wait_for_code_review is True
         assert config.cleanup.without_tech_lead.close_ai_session_tabs is True
-        assert config.cleanup.without_tech_lead.remove_worktrees is False
+        assert config.cleanup.without_tech_lead.remove_worktrees is True
 
     def test_cleanup_config_missing_section_uses_defaults(self, tmp_path):
         """Test that missing cleanup section uses all defaults."""
@@ -2636,7 +2636,7 @@ agents:
 
         # All defaults when section is missing
         assert config.cleanup.with_tech_lead.close_ai_session_tabs is True
-        assert config.cleanup.with_tech_lead.remove_worktrees is False
+        assert config.cleanup.with_tech_lead.remove_worktrees is True
         assert config.cleanup.without_tech_lead.wait_for_code_review is True
 
 

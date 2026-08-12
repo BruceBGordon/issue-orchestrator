@@ -382,7 +382,17 @@ def mock_control_actions():
     )
     actions.stale_worktrees_cmd = MagicMock()
     actions.stale_worktrees_cmd.execute = AsyncMock(
-        return_value=ActionResult({"stale_worktrees": [], "message": "ok"})
+        return_value=ActionResult({
+            "worktrees": [],
+            "cleanup_candidates": [],
+            "stale_worktrees": [],
+            "message": "ok",
+            "issue_cleanup_enabled": True,
+            "activity_evidence": "known",
+            "audit_unavailable": False,
+            "scope": "configured",
+            "note": None,
+        })
     )
     actions.effective_launch_selection = MagicMock(
         return_value=RepositoryLaunchSelection.default()
