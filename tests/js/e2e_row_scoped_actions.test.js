@@ -64,6 +64,7 @@ function _baseStubs() {
         }),
         REPO_ROOT: '/tmp/repo',
         CONFIG_NAME: 'default.yaml',
+        CONFIG_MODE: 'default',
     };
 }
 

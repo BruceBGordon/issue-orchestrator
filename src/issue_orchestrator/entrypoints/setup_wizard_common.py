@@ -153,6 +153,8 @@ def find_existing_config(
         start_path = Path.cwd()
 
     candidates = [
+        f"{CONFIG_DIR}/modes/default/{DEFAULT_CONFIG_NAME}",
+        f"{CONFIG_DIR}/modes/default/*.yaml",
         f"{CONFIG_DIR}/{DEFAULT_CONFIG_NAME}",
         f"{CONFIG_DIR}/*.yaml",
     ]

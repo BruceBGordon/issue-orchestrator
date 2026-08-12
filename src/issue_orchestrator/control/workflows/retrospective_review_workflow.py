@@ -87,4 +87,3 @@ class RetrospectiveReviewWorkflow:
             deferred,
         )
         return RetrospectiveReviewDecision.launch(to_launch, available)
-

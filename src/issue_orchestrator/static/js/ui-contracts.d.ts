@@ -96,6 +96,8 @@ export interface CycleValidationBadgePayload {
 
 export interface DashboardDataPayload {
   agents: string[];
+  configMode: string;
+  configName: string;
   e2eLastRun?: Record<string, any> | null;
   e2eRunning: boolean;
   githubOwner: string;

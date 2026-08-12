@@ -103,6 +103,8 @@ class DashboardDataContract(ContractBase):
     queueRefreshSeconds: int
     repo: Optional[str]
     repoRoot: Optional[str]
+    configName: str
+    configMode: str
     githubOwner: Optional[str]
     githubRepo: Optional[str]
     e2eLastRun: Optional[dict[str, Any]] = None

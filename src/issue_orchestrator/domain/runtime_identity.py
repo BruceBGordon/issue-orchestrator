@@ -18,4 +18,3 @@ class RuntimeIdentity:
         if self.source_commit_sha is None:
             return None
         return self.source_commit_sha[:7]
-

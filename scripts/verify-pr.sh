@@ -2,11 +2,22 @@
 set -euo pipefail
 
 # Managed by issue-orchestrator setup-guardrails: verify-pr
+# issue-orchestrator-selection: modes/default/main.yaml
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
-export ISSUE_ORCHESTRATOR_CONFIG_NAME=main.yaml
+# Preserve the engine's complete runtime selection. A human push has no
+# selection, so use the mode that generated this managed fallback. A partial
+# environment is never combined with baked values from another mode.
+if [ -z "${ISSUE_ORCHESTRATOR_MODE:-}" ] ||
+   [ -z "${ISSUE_ORCHESTRATOR_CONFIG_NAME:-}" ] ||
+   [ -z "${ISSUE_ORCHESTRATOR_CONFIG_PATH:-}" ]; then
+  selected_config_rel=modes/default/main.yaml
+  export ISSUE_ORCHESTRATOR_CONFIG_NAME=main.yaml
+  export ISSUE_ORCHESTRATOR_CONFIG_PATH="$repo_root/.issue-orchestrator/config/$selected_config_rel"
+  export ISSUE_ORCHESTRATOR_MODE=default
+fi
 PYTHON_ENV_NAME=ISSUE_ORCHESTRATOR_PYTHON
 PYTHON_BIN=""
 

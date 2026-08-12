@@ -14,9 +14,9 @@ class TestConfig:
         "config_path",
         [
             "examples/config.example.yaml",
-            ".issue-orchestrator/config/hooks-validate.yaml",
-            ".issue-orchestrator/config/main.yaml",
-            ".issue-orchestrator/config/z-codespaces.yaml",
+            ".issue-orchestrator/config/maintenance/hooks-validate.yaml",
+            ".issue-orchestrator/config/modes/default/main.yaml",
+            ".issue-orchestrator/config/modes/default/z-codespaces.yaml",
         ],
     )
     def test_shipped_configs_validate_clean(self, tmp_path, config_path):
@@ -461,6 +461,8 @@ worktrees:
             Path(__file__).resolve().parents[2]
             / ".issue-orchestrator"
             / "config"
+            / "modes"
+            / "default"
             / "z-codespaces.yaml"
         )
         data = yaml.safe_load(codespaces_path.read_text(encoding="utf-8"))

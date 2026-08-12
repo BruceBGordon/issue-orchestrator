@@ -40,6 +40,7 @@ from .config_models import (
     TechLeadConfig,
     ValidationConfig,
 )
+from .config_identity import ConfigLaunchIdentity, RuntimeConfigReferenceOwner
 from .config_paths import (
     CONFIG_DIR as CONFIG_DIR,
     DEFAULT_CONFIG_NAME as DEFAULT_CONFIG_NAME,
@@ -51,8 +52,10 @@ from .config_paths import (
     get_config_dir as get_config_dir,
     get_config_path as get_config_path,
     list_configs as list_configs,
+    list_modes as list_modes,
     repo_root_from_config_path as repo_root_from_config_path,
     resolve_relative_path as resolve_relative_path,
+    selection_from_config_path as selection_from_config_path,
 )
 from . import github_config as _github_config
 from .config_sections import (
@@ -100,7 +103,7 @@ def _put_if_truthy(target: dict, key: str, value: object) -> None:
 
 
 @dataclass
-class Config(TechLeadActivationOwner):
+class Config(ConfigLaunchIdentity, RuntimeConfigReferenceOwner, TechLeadActivationOwner):
     """Orchestrator configuration."""
 
     # Agent configurations keyed by label (e.g., "agent:web")
@@ -510,6 +513,7 @@ class Config(TechLeadActivationOwner):
         (YAML + command line overrides) for debugging.
         """
         result = {
+            "launch_selection": self.launch_identity_dict(),
             "repo": {
                 "name": self.repo,
                 "root": str(self.repo_root),
@@ -1204,6 +1208,7 @@ class Config(TechLeadActivationOwner):
 
         config = cls()
         config.config_path = config_path.resolve()
+        config.launch_selection = selection_from_config_path(config.config_path)
 
         # Extract all sections with validation
         sections = extract_config_sections(data, config_path)
@@ -1251,10 +1256,9 @@ class Config(TechLeadActivationOwner):
         config.ai_systems_allowed = parse_ai_systems_allowed(
             sections["ai_systems"].get("allowed", [])
         )
-
-
         # Parse complex optional configs
         apply_optional_sections(config, sections)
+        config.refresh_config_fingerprint()
         return config
 
     @classmethod
@@ -1262,6 +1266,7 @@ class Config(TechLeadActivationOwner):
         cls,
         start_path: Optional[Path] = None,
         config_name: str = DEFAULT_CONFIG_NAME,
+        mode: str = "default",
         overrides: Optional[list[str]] = None,
     ) -> "Config":
         """Find config file in current or parent directories and load it.
@@ -1271,7 +1276,7 @@ class Config(TechLeadActivationOwner):
             config_name: Name of config file to load (default: default.yaml)
             overrides: CLI overrides in path=value format
         """
-        config_file = find_config_file(start_path, config_name)
+        config_file = find_config_file(start_path, config_name, mode)
         if not config_file:
             raise FileNotFoundError(
                 f"No config found in {CONFIG_DIR}/ directory. "

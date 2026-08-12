@@ -44,6 +44,7 @@ function loadE2ERuntime(overrides = {}) {
             dashboardData: {
                 repoRoot: '/tmp/repo',
                 configName: 'default.yaml',
+                configMode: 'default',
                 e2eRunning: false,
                 e2eLastRun: null,
                 e2eNeedsAttention: false,
@@ -64,6 +65,37 @@ function loadE2ERuntime(overrides = {}) {
     Object.assign(context, overrides);
     return context;
 }
+
+test('start request carries the dashboard mode and config identity', async () => {
+    const fetchCalls = [];
+    const ctx = loadE2ERuntime({
+        fetch: async (url, options = {}) => {
+            fetchCalls.push([url, options]);
+            return { ok: true, json: async () => ({}) };
+        },
+        window: {
+            location: { search: '' },
+            dashboardData: {
+                repoRoot: '/tmp/repo',
+                configName: 'main.yaml',
+                configMode: 'codex',
+                e2eRunning: false,
+                e2eLastRun: null,
+                e2eNeedsAttention: false,
+                e2eFailedTests: [],
+            },
+        },
+    });
+
+    await ctx.startE2E();
+
+    assert.equal(fetchCalls[0][0], '/control/e2e/start');
+    assert.deepEqual(JSON.parse(fetchCalls[0][1].body), {
+        repo_root: '/tmp/repo',
+        config_name: 'main.yaml',
+        mode: 'codex',
+    });
+});
 
 function makeActionEvent(dataset) {
     const event = {

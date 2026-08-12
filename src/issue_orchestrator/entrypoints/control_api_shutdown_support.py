@@ -10,7 +10,7 @@ from fastapi import Depends, FastAPI, Request
 _SHUTDOWN_DEPENDENCIES_STATE_KEY = "control_api_shutdown_dependencies"
 
 if TYPE_CHECKING:
-    from ..infra.supervisor import SupervisorOps
+    from ..ports.repository_engine_supervisor import SupervisorOps
 
 
 @dataclass(frozen=True)

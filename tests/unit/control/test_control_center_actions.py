@@ -12,16 +12,26 @@ from issue_orchestrator.adapters.github.http_client import GitHubHttpError
 from issue_orchestrator.execution.control_center_actions import (
     AuditActionRequest,
     AuditIssuesCommand,
+    ConfiguredRepoActionRequest,
+    ControlCenterActions,
+    DoctorActionRequest,
+    DoctorCommand,
     InitializeLabelsCommand,
     ListStaleWorktreesCommand,
     PauseOrchestratorCommand,
     RefreshActionRequest,
     RefreshOrchestratorCommand,
     RepoActionRequest,
+    SelectLaunchConfigurationCommand,
+    SelectLaunchConfigurationRequest,
     TraceActionRequest,
     TraceIssueCommand,
 )
-from issue_orchestrator.infra.supervisor import SupervisorStatus
+from issue_orchestrator.domain.repository_launch_selection import (
+    RepositoryLaunchSelection,
+)
+from issue_orchestrator.infra.repo_lock import acquire_lock, release_lock
+from issue_orchestrator.infra.supervisor import MultiInstanceStatus, SupervisorStatus
 
 
 @pytest.mark.asyncio
@@ -35,6 +45,200 @@ async def test_pause_command_returns_not_running() -> None:
     assert result.status_code == 400
     assert result.payload["error"] == "not_running"
     assert result.payload["state"] == "stopped"
+
+
+@pytest.mark.asyncio
+async def test_select_launch_configuration_rejects_live_owner(
+    tmp_path: Path,
+) -> None:
+    supervisor = MagicMock()
+    supervisor.status_all_instances.return_value = MultiInstanceStatus(
+        repo_root=str(tmp_path),
+        instances=[SupervisorStatus(state="unknown")],
+    )
+
+    result = await SelectLaunchConfigurationCommand(supervisor).execute(
+        SelectLaunchConfigurationRequest(
+            repo_root=tmp_path,
+            selection=RepositoryLaunchSelection.parse(
+                mode="codex",
+                config_name="main.yaml",
+            ),
+        )
+    )
+
+    assert result.status_code == 409
+    assert result.payload["error"] == "engine_running"
+    assert result.payload["states"] == ["unknown"]
+
+
+@pytest.mark.asyncio
+async def test_select_launch_configuration_allows_failed_stale_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    supervisor = MagicMock()
+    supervisor.status_all_instances.return_value = MultiInstanceStatus(
+        repo_root=str(tmp_path),
+        instances=[SupervisorStatus(state="failed")],
+    )
+    monkeypatch.setattr(
+        "issue_orchestrator.execution.control_center_runtime.detect_repository_orchestrators",
+        lambda _repo: [],
+    )
+    monkeypatch.setattr(
+        "issue_orchestrator.infra.config.list_configs",
+        lambda _repo, _mode: ["main.yaml"],
+    )
+    persisted: list[RepositoryLaunchSelection] = []
+    monkeypatch.setattr(
+        "issue_orchestrator.infra.repo_registry.set_selected_launch_selection",
+        lambda _repo, selection: persisted.append(selection) or True,
+    )
+    selection = RepositoryLaunchSelection.parse(
+        mode="codex",
+        config_name="main.yaml",
+    )
+
+    result = await SelectLaunchConfigurationCommand(supervisor).execute(
+        SelectLaunchConfigurationRequest(repo_root=tmp_path, selection=selection)
+    )
+
+    assert result.status_code == 200
+    assert persisted == [selection]
+
+
+@pytest.mark.asyncio
+async def test_select_launch_configuration_rejects_nonselected_orphan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    supervisor = MagicMock()
+    supervisor.status_all_instances.return_value = MultiInstanceStatus(
+        repo_root=str(tmp_path)
+    )
+    monkeypatch.setattr(
+        "issue_orchestrator.execution.control_center_runtime.detect_repository_orchestrators",
+        lambda _repo: [
+            {
+                "port": 19090,
+                "probed_selection": {
+                    "mode": "claude",
+                    "config_name": "other.yaml",
+                },
+            }
+        ],
+    )
+
+    result = await SelectLaunchConfigurationCommand(supervisor).execute(
+        SelectLaunchConfigurationRequest(
+            repo_root=tmp_path,
+            selection=RepositoryLaunchSelection.parse(
+                mode="codex",
+                config_name="main.yaml",
+            ),
+        )
+    )
+
+    assert result.status_code == 409
+    assert result.payload["ports"] == [19090]
+
+
+@pytest.mark.asyncio
+async def test_select_launch_configuration_is_atomic_with_engine_start(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    supervisor = MagicMock()
+    persisted = Mock(return_value=True)
+    monkeypatch.setattr(
+        "issue_orchestrator.infra.repo_registry.set_selected_launch_selection",
+        persisted,
+    )
+    info = acquire_lock(
+        tmp_path,
+        configuration_mode="default",
+        config_name="main.yaml",
+        config_fingerprint="fingerprint",
+    )
+    try:
+        result = await SelectLaunchConfigurationCommand(supervisor).execute(
+            SelectLaunchConfigurationRequest(
+                repo_root=tmp_path,
+                selection=RepositoryLaunchSelection.parse(
+                    mode="codex",
+                    config_name="main.yaml",
+                ),
+            )
+        )
+    finally:
+        release_lock(tmp_path, pid=info.pid)
+
+    assert result.status_code == 409
+    assert result.payload["error"] == "engine_running"
+    persisted.assert_not_called()
+    supervisor.status_all_instances.assert_not_called()
+
+
+def test_effective_selection_prefers_active_cli_lock(tmp_path: Path) -> None:
+    supervisor = MagicMock()
+    supervisor.status_all_instances.return_value = MultiInstanceStatus(
+        repo_root=str(tmp_path),
+        instances=[
+            SupervisorStatus(
+                state="running",
+                configuration_mode="codex",
+                config_name="main.yaml",
+                config_fingerprint="fingerprint",
+            )
+        ],
+    )
+
+    selection = ControlCenterActions(supervisor).effective_launch_selection(tmp_path)
+
+    assert selection.to_dict() == {
+        "mode": "codex",
+        "config_name": "main.yaml",
+    }
+
+
+@pytest.mark.asyncio
+async def test_doctor_missing_target_config_never_falls_back_to_cwd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cwd_repo = tmp_path / "control-center-cwd"
+    cwd_config = cwd_repo / ".issue-orchestrator/config/modes/default/default.yaml"
+    cwd_config.parent.mkdir(parents=True)
+    cwd_config.write_text(
+        "repo:\n  github:\n    app:\n      private_key_path: /secret/key.pem\n",
+        encoding="utf-8",
+    )
+    target_repo = tmp_path / "target"
+    target_repo.mkdir()
+    expected_path = (
+        target_repo / ".issue-orchestrator/config/modes/default/default.yaml"
+    )
+    captured: dict[str, object] = {}
+
+    def fake_doctor(**kwargs: object) -> SimpleNamespace:
+        captured.update(kwargs)
+        return SimpleNamespace(to_dict=lambda: {"overall": "warning"})
+
+    monkeypatch.chdir(cwd_repo)
+    monkeypatch.setattr("issue_orchestrator.infra.doctor.run_doctor", fake_doctor)
+
+    result = await DoctorCommand().execute(
+        DoctorActionRequest(
+            repo_root=target_repo,
+            selection=RepositoryLaunchSelection.default(),
+        )
+    )
+
+    assert result.status_code == 200
+    assert captured["config"] is None
+    assert captured["config_path"] == expected_path
+    assert captured["config_path"] != cwd_config
 
 
 @pytest.mark.asyncio
@@ -134,8 +338,8 @@ async def test_stale_worktrees_fallback_without_config(monkeypatch: pytest.Monke
 
     # Force fallback mode (no config available).
     monkeypatch.setattr(
-        "issue_orchestrator.infra.config.Config.find_and_load",
-        staticmethod(lambda start_path: (_ for _ in ()).throw(FileNotFoundError())),
+        "issue_orchestrator.execution.control_center_runtime.load_config_for_selection",
+        lambda repo_root, selection: (_ for _ in ()).throw(FileNotFoundError()),
     )
 
     fake_git = SimpleNamespace(list_active_worktrees=lambda _repo: set())
@@ -145,7 +349,12 @@ async def test_stale_worktrees_fallback_without_config(monkeypatch: pytest.Monke
     )
 
     cmd = ListStaleWorktreesCommand()
-    result = await cmd.execute(RepoActionRequest(repo_root=repo_root))
+    result = await cmd.execute(
+        ConfiguredRepoActionRequest(
+            repo_root=repo_root,
+            selection=RepositoryLaunchSelection.default(),
+        )
+    )
 
     assert result.status_code == 200
     assert result.payload["scope"] == "repo-parent-fallback"
@@ -179,14 +388,20 @@ async def test_initialize_labels_uses_loaded_config_for_repository_host() -> Non
         "agent:backend",
     ]
 
-    with patch("issue_orchestrator.infra.config.Config.find_and_load", return_value=config):
+    with patch(
+        "issue_orchestrator.execution.control_center_runtime.load_config_for_selection",
+        return_value=config,
+    ):
         with patch("issue_orchestrator.control.label_manager.LabelManager", return_value=label_manager):
             with patch(
                 "issue_orchestrator.execution.providers.create_repository_host",
                 return_value=client,
             ) as mock_create_host:
                 result = await InitializeLabelsCommand().execute(
-                    RepoActionRequest(repo_root=Path("/tmp/repo")),
+                    ConfiguredRepoActionRequest(
+                        repo_root=Path("/tmp/repo"),
+                        selection=RepositoryLaunchSelection.default(),
+                    ),
                 )
 
     assert result.status_code == 200
@@ -205,7 +420,10 @@ async def test_audit_command_reports_repository_host_error(tmp_path: Path) -> No
         response_text='{"message":"GitHub search is degraded"}',
     )
 
-    with patch("issue_orchestrator.infra.config.Config.find_and_load", return_value=config):
+    with patch(
+        "issue_orchestrator.execution.control_center_runtime.load_config_for_selection",
+        return_value=config,
+    ):
         with patch(
             "issue_orchestrator.execution.providers.create_repository_host",
             return_value=Mock(),
@@ -223,7 +441,10 @@ async def test_audit_command_reports_repository_host_error(tmp_path: Path) -> No
                         side_effect=upstream_error,
                     ):
                         result = await AuditIssuesCommand().execute(
-                            AuditActionRequest(repo_root=tmp_path),
+                            AuditActionRequest(
+                                repo_root=tmp_path,
+                                selection=RepositoryLaunchSelection.default(),
+                            ),
                         )
 
     assert result.status_code == 502

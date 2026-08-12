@@ -175,5 +175,15 @@ def load_config(args: argparse.Namespace) -> "Config":
     if hasattr(args, "config") and args.config:
         config_path = Path(args.config)
         # Config.load() handles repo_root calculation properly
-        return Config.load(config_path, overrides=overrides)
-    return Config.find_and_load(overrides=overrides)
+        config = Config.load(config_path, overrides=overrides)
+        explicit_mode = getattr(args, "mode", None)
+        if explicit_mode and config.configuration_mode != explicit_mode:
+            raise ValueError(
+                "Explicit --mode does not match --config path: "
+                f"mode={explicit_mode!r} path_mode={config.configuration_mode!r}"
+            )
+        return config
+    return Config.find_and_load(
+        overrides=overrides,
+        mode=getattr(args, "mode", None) or "default",
+    )

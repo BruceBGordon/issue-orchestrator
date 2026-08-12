@@ -30,7 +30,7 @@ async function showE2ETriage() {
     document.getElementById('e2eTriageModal').classList.add('visible');
 
     try {
-        const res = await fetch(`/control/e2e/triage/${e2eLastRun.id}?repo_root=${encodeURIComponent(REPO_ROOT)}&config_name=${encodeURIComponent(CONFIG_NAME)}`);
+        const res = await fetch(`/control/e2e/triage/${e2eLastRun.id}?repo_root=${encodeURIComponent(REPO_ROOT)}&config_name=${encodeURIComponent(CONFIG_NAME)}&mode=${encodeURIComponent(CONFIG_MODE)}`);
         const data = await res.json();
 
         if (!res.ok) {
@@ -264,7 +264,7 @@ async function createE2EIssues() {
     btn.textContent = 'Creating...';
 
     try {
-        const res = await fetch(`/control/e2e/create-issues/${e2eLastRun.id}?repo_root=${encodeURIComponent(REPO_ROOT)}&config_name=${encodeURIComponent(CONFIG_NAME)}`, {
+        const res = await fetch(`/control/e2e/create-issues/${e2eLastRun.id}?repo_root=${encodeURIComponent(REPO_ROOT)}&config_name=${encodeURIComponent(CONFIG_NAME)}&mode=${encodeURIComponent(CONFIG_MODE)}`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ nodeids: selectedNodeids, agent: agent }),
@@ -302,7 +302,7 @@ async function syncE2EIssues() {
     btn.textContent = 'Syncing...';
 
     try {
-        const res = await fetch(`/control/e2e/sync-issues/${e2eLastRun.id}?repo_root=${encodeURIComponent(REPO_ROOT)}&config_name=${encodeURIComponent(CONFIG_NAME)}`, {
+        const res = await fetch(`/control/e2e/sync-issues/${e2eLastRun.id}?repo_root=${encodeURIComponent(REPO_ROOT)}&config_name=${encodeURIComponent(CONFIG_NAME)}&mode=${encodeURIComponent(CONFIG_MODE)}`, {
             method: 'POST',
         });
         const data = await res.json();
@@ -350,8 +350,8 @@ async function showQuarantineViewer() {
     try {
         // Fetch current quarantine list and flaky tests in parallel
         const [quarantineRes, flakyRes] = await Promise.all([
-            fetch(`/control/e2e/quarantine?repo_root=${encodeURIComponent(REPO_ROOT)}&config_name=${encodeURIComponent(CONFIG_NAME)}`),
-            fetch(`/control/e2e/flaky-tests?repo_root=${encodeURIComponent(REPO_ROOT)}&config_name=${encodeURIComponent(CONFIG_NAME)}&threshold=3&window=10`)
+            fetch(`/control/e2e/quarantine?repo_root=${encodeURIComponent(REPO_ROOT)}&config_name=${encodeURIComponent(CONFIG_NAME)}&mode=${encodeURIComponent(CONFIG_MODE)}`),
+            fetch(`/control/e2e/flaky-tests?repo_root=${encodeURIComponent(REPO_ROOT)}&config_name=${encodeURIComponent(CONFIG_NAME)}&mode=${encodeURIComponent(CONFIG_MODE)}&threshold=3&window=10`)
         ]);
 
         const quarantine = await quarantineRes.json();
@@ -453,7 +453,7 @@ async function saveQuarantineChanges() {
     try {
         // Process additions
         if (quarantineData.toAdd.size > 0) {
-            const addRes = await fetch(`/control/e2e/quarantine?repo_root=${encodeURIComponent(REPO_ROOT)}&config_name=${encodeURIComponent(CONFIG_NAME)}`, {
+            const addRes = await fetch(`/control/e2e/quarantine?repo_root=${encodeURIComponent(REPO_ROOT)}&config_name=${encodeURIComponent(CONFIG_NAME)}&mode=${encodeURIComponent(CONFIG_MODE)}`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ action: 'add', nodeids: Array.from(quarantineData.toAdd) })
@@ -466,7 +466,7 @@ async function saveQuarantineChanges() {
 
         // Process removals
         if (quarantineData.toRemove.size > 0) {
-            const removeRes = await fetch(`/control/e2e/quarantine?repo_root=${encodeURIComponent(REPO_ROOT)}&config_name=${encodeURIComponent(CONFIG_NAME)}`, {
+            const removeRes = await fetch(`/control/e2e/quarantine?repo_root=${encodeURIComponent(REPO_ROOT)}&config_name=${encodeURIComponent(CONFIG_NAME)}&mode=${encodeURIComponent(CONFIG_MODE)}`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ action: 'remove', nodeids: Array.from(quarantineData.toRemove) })

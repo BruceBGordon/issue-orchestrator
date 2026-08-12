@@ -217,7 +217,14 @@ def test_local_onboarding_smoke_journey(tmp_path: Path, monkeypatch: pytest.Monk
     ):
         run_wizard(target_path=repo, prompter=prompter)
 
-    config_path = repo / ".issue-orchestrator" / "config" / "default.yaml"
+    config_path = (
+        repo
+        / ".issue-orchestrator"
+        / "config"
+        / "modes"
+        / "default"
+        / "default.yaml"
+    )
     assert config_path.exists()
     assert (repo / ".prompts" / "dev.md").exists()
     assert (repo / ".githooks" / "pre-push").exists()

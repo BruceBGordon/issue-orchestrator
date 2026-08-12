@@ -111,6 +111,8 @@ class CycleValidationBadgePayload(BaseModel):
 class DashboardDataPayload(BaseModel):
     model_config = ConfigDict(extra="allow")
     agents: list[str]
+    configMode: str
+    configName: str
     e2eLastRun: dict[str, Any] | None = None
     e2eRunning: bool
     githubOwner: str

@@ -43,6 +43,9 @@ from issue_orchestrator.domain.review_exchange_run import (
 )
 from issue_orchestrator.domain.review_exchange_summary import ReviewExchangeSummaryV1
 from issue_orchestrator.domain.runtime_config import RuntimeConfigReference
+from issue_orchestrator.domain.repository_launch_selection import (
+    RepositoryLaunchSelection,
+)
 from issue_orchestrator.execution import persistent_review_exchange_runner as prer
 from issue_orchestrator.domain.coder_prompt import PreparedCoderPromptAddendum
 from issue_orchestrator.domain.session_key import TaskKind
@@ -118,7 +121,10 @@ def _runtime_config(tmp_path: Path) -> RuntimeConfigReference:
         config_path.write_text(
             "validation:\n  quick:\n    cmd: 'true'\n", encoding="utf-8"
         )
-    return RuntimeConfigReference.from_path(config_path)
+    return RuntimeConfigReference(
+        config_path=config_path.resolve(),
+        selection=RepositoryLaunchSelection.parse(config_name=config_path.name),
+    )
 
 
 def _canned_outcome(exchange_run: ReviewExchangeRun) -> ReviewExchangeOutcome:

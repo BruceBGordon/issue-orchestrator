@@ -58,7 +58,7 @@ class TestControlCenterShutdownEndpoint:
             mock_supervisor.stop.assert_not_called()
             mock_thread.assert_called_once()
         finally:
-            set_supervisor(DefaultSupervisorOps())
+            set_supervisor(build_default_supervisor_ops())
 
     def test_shutdown_force_stops_running_engines_when_requested(self):
         from issue_orchestrator.entrypoints import control_api
@@ -103,7 +103,7 @@ class TestControlCenterShutdownEndpoint:
             assert stop_kwargs["graceful_timeout_seconds"] == 120
             mock_thread.assert_called_once()
         finally:
-            set_supervisor(DefaultSupervisorOps())
+            set_supervisor(build_default_supervisor_ops())
 
     def test_shutdown_marks_failed_when_running_engine_cannot_be_stopped(self):
         from issue_orchestrator.entrypoints import control_api
@@ -143,7 +143,7 @@ class TestControlCenterShutdownEndpoint:
             schedule_exit.assert_not_called()
         finally:
             control_api_shutdown_state.reset_shutdown_operations_for_testing()
-            set_supervisor(DefaultSupervisorOps())
+            set_supervisor(build_default_supervisor_ops())
 
     def test_force_and_timeout_updates_reach_current_stop_controller(self, tmp_path):
         from threading import Event
@@ -277,7 +277,7 @@ class TestControlCenterShutdownEndpoint:
             mock_thread.assert_called_once()
         finally:
             control_api_shutdown_state.reset_shutdown_operations_for_testing()
-            set_supervisor(DefaultSupervisorOps())
+            set_supervisor(build_default_supervisor_ops())
 
     def test_shutdown_state_endpoint_returns_global_operation(self):
         try:
@@ -408,7 +408,14 @@ class TestControlCenterSetupRoutes:
     def test_setup_preview_marks_existing_config_for_overwrite(self, tmp_path):
         """Preview must make replacement of an existing config explicit."""
         repo_root = tmp_path / "repo"
-        config_path = repo_root / ".issue-orchestrator" / "config" / "default.yaml"
+        config_path = (
+            repo_root
+            / ".issue-orchestrator"
+            / "config"
+            / "modes"
+            / "default"
+            / "default.yaml"
+        )
         config_path.parent.mkdir(parents=True)
         config_path.write_text("repo:\n  name: old/repo\n")
         client = TestClient(control_app)
@@ -759,7 +766,14 @@ class TestControlCenterSetupRoutes:
         assert "needs-tech-lead-review" in data["created_labels"]
         assert "tech-lead-reviewed" in data["created_labels"]
 
-        config_path = repo_root / ".issue-orchestrator" / "config" / "default.yaml"
+        config_path = (
+            repo_root
+            / ".issue-orchestrator"
+            / "config"
+            / "modes"
+            / "default"
+            / "default.yaml"
+        )
         config_text = config_path.read_text()
         assert "Issue Orchestrator Configuration" in config_text
         assert "repo:\n  name: owner/repo\n" in config_text

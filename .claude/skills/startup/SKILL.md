@@ -214,7 +214,7 @@ After the orchestrator process starts (either in-process or via supervisor),
 | "Hooks not installed" | AI hook installation check | Run `issue-orchestrator setup-hooks` |
 | "Repo guardrails not installed" | Repo Guardrails check | Run `issue-orchestrator setup-guardrails` |
 | "Hook verification failed" | Hook Verification check | Run `issue-orchestrator verify` |
-| "Config not found" | Config File check | Create `.issue-orchestrator/config/default.yaml` |
+| "Config not found" | Config File check | Create `.issue-orchestrator/config/modes/default/default.yaml` |
 | "Repository not configured" | Repository check | Set `repo.name` in config or run from git repo |
 | "Already running" (409) | Lock file | Stop existing instance or use `force_restart` |
 | "Config validation errors" | Config Validation check | Fix config per error messages |

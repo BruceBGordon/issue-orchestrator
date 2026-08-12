@@ -79,6 +79,7 @@ class DashboardViewModel:
     repo: str
     repo_root: str
     config_name: str
+    config_mode: str
     github_owner: str
     github_repo: str
     validation_configured: bool
@@ -157,6 +158,7 @@ class DashboardViewModel:
             "repo": self.repo,
             "repoRoot": self.repo_root,
             "configName": self.config_name,
+            "configMode": self.config_mode,
             "githubOwner": self.github_owner,
             "githubRepo": self.github_repo,
             "validationConfigured": self.validation_configured,
@@ -1330,6 +1332,7 @@ def build_dashboard_view_model(
     repo = config.repo if config else ""
     repo_root = str(config.repo_root) if config and config.repo_root else ""
     config_name = config.config_path.name if config and config.config_path else ""
+    config_mode = config.configuration_mode if config else "default"
     github_owner = repo.split("/")[0] if repo and "/" in repo else ""
     github_repo = repo.split("/")[1] if repo and "/" in repo else ""
     # When there is no config at all (pre-bootstrap render) we cannot know
@@ -1432,6 +1435,7 @@ def build_dashboard_view_model(
         repo=repo,
         repo_root=repo_root,
         config_name=config_name,
+        config_mode=config_mode,
         github_owner=github_owner,
         github_repo=github_repo,
         validation_configured=validation_configured,

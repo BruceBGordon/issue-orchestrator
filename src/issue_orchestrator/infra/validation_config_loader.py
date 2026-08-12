@@ -6,7 +6,15 @@ from pathlib import Path
 
 import yaml
 
-from .config_paths import DEFAULT_CONFIG_NAME, find_config_file
+from ..domain.repository_launch_selection import (
+    ConfigurationModeName,
+    RepositoryLaunchSelection,
+)
+from .config_paths import (
+    DEFAULT_CONFIG_NAME,
+    find_config_file,
+    selection_from_config_path,
+)
 from .config_models import ValidationConfig
 from .env import get_env
 from .validation_junit_paths import configured_validation_junit_xml_paths_from_mapping
@@ -59,6 +67,7 @@ def extract_validation_config(config: dict) -> dict:
 def load_validation_config(
     start_path: Path | None = None,
     config_name: str | None = None,
+    mode: str | ConfigurationModeName = "default",
 ) -> dict:
     """Load validation configuration from the config file.
 
@@ -69,13 +78,20 @@ def load_validation_config(
     if selected_config_name and not selected_config_name.endswith(".yaml"):
         selected_config_name = f"{selected_config_name}.yaml"
 
-    config_path = find_config_file(start_path, selected_config_name)
+    selected_mode = (
+        mode if isinstance(mode, ConfigurationModeName) else ConfigurationModeName(mode)
+    )
+    config_path = find_config_file(
+        start_path,
+        selected_config_name,
+        selected_mode,
+    )
     if not config_path:
         if config_name:
             start_from = start_path or Path.cwd()
             raise FileNotFoundError(
                 f"Configured file '{selected_config_name}' not found under "
-                f"{start_from}/.issue-orchestrator/config"
+                f"{start_from}/.issue-orchestrator/config/modes/{selected_mode.value}"
             )
         return default_validation_config()
 
@@ -112,8 +128,27 @@ def load_runtime_validation_config(
     3. repo-local ``default.yaml`` search
     """
     config_path_env = get_env("CONFIG_PATH") or os.environ.get("ORCHESTRATOR_CONFIG_PATH")
-    if config_path_env:
-        return load_validation_config_from_file(Path(config_path_env))
-
     config_name = get_env("CONFIG_NAME") or os.environ.get("ORCHESTRATOR_CONFIG_NAME")
-    return load_validation_config(start_path, config_name=config_name)
+    mode_raw = get_env("MODE") or os.environ.get("ORCHESTRATOR_MODE")
+    runtime_selection = RepositoryLaunchSelection.parse(
+        mode=mode_raw,
+        config_name=config_name,
+    )
+    if config_path_env:
+        config_path = Path(config_path_env)
+        path_selection = selection_from_config_path(config_path)
+        if mode_raw is not None and path_selection.mode != runtime_selection.mode:
+            raise ValueError(
+                "Runtime config path mode does not match ISSUE_ORCHESTRATOR_MODE"
+            )
+        if config_name is not None and path_selection.config != runtime_selection.config:
+            raise ValueError(
+                "Runtime config path name does not match ISSUE_ORCHESTRATOR_CONFIG_NAME"
+            )
+        return load_validation_config_from_file(config_path)
+
+    return load_validation_config(
+        start_path,
+        config_name=config_name,
+        mode=runtime_selection.mode,
+    )

@@ -8,7 +8,7 @@ This repo can run in GitHub Codespaces without changing the normal local
 The repo now includes:
 
 - `.devcontainer/devcontainer.json`
-- `.issue-orchestrator/config/z-codespaces.yaml`
+- `.issue-orchestrator/config/modes/default/z-codespaces.yaml`
 
 The `z-` prefix is intentional so the Codespaces config sorts after the normal
 local configs in Control Center lists.
@@ -100,12 +100,12 @@ If you want to skip Control Center:
 
 ```bash
 source .venv/bin/activate
-issue-orchestrator start --config .issue-orchestrator/config/z-codespaces.yaml --port 8080
+issue-orchestrator --config .issue-orchestrator/config/modes/default/z-codespaces.yaml start --port 8080
 ```
 
 ## Local development
 
 Nothing changes for local Mac development. Keep using:
 
-- `.issue-orchestrator/config/main.yaml`
+- `.issue-orchestrator/config/modes/default/main.yaml`
 - your existing local startup flow

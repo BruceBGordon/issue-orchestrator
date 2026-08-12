@@ -91,7 +91,7 @@ cd /path/to/your/project
 issue-orchestrator setup
 ```
 
-This creates `.issue-orchestrator/config/default.yaml` interactively. Or create it manually — a minimal config:
+This creates `.issue-orchestrator/config/modes/default/default.yaml` interactively. Or create it manually — a minimal config:
 
 ```yaml
 agents:

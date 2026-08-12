@@ -1183,6 +1183,15 @@ def detect_agents_from_config(config) -> dict[str, AiAgentType]:
                 logger.warning(
                     "Unknown AI agent override for %s: %s", label, meta_agent
                 )
+        provider = agent_config.resolve_launch_provider()
+        if provider:
+            try:
+                result[label] = AiAgentType(provider)
+                continue
+            except ValueError:
+                logger.warning(
+                    "Unknown launch provider for hook detection %s: %s", label, provider
+                )
         command = getattr(agent_config, "command", None) or ""
         result[label] = detect_ai_agent(command)
     return result

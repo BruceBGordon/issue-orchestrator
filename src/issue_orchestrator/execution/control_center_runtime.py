@@ -3,10 +3,15 @@
 from __future__ import annotations
 
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
+from ..domain.repository_launch_selection import (
+    RepositoryConfigurationIdentity,
+    RepositoryLaunchSelection,
+)
 from ..execution.git_working_copy import GitWorkingCopy
 from ..execution.orchestrator_http_api import probe_orchestrator_json
 from ..infra.repo_identity import (
@@ -16,6 +21,22 @@ from ..infra.repo_identity import (
 )
 
 LOCK_HEARTBEAT_UNRESPONSIVE_SECONDS = 45
+
+if TYPE_CHECKING:
+    from ..ports.repository_engine_supervisor import SupervisorOps, SupervisorStatus
+
+
+@dataclass(frozen=True, slots=True)
+class RepositoryOrchestratorOwnership:
+    """Live port probes partitioned against one requested selection."""
+
+    requested: RepositoryLaunchSelection
+    matching: tuple[dict[str, Any], ...]
+    conflicting: tuple[dict[str, Any], ...]
+
+    @property
+    def all(self) -> tuple[dict[str, Any], ...]:
+        return self.matching + self.conflicting
 
 
 def build_repo_identity(repo_root: Path) -> RepoIdentity:
@@ -31,26 +52,171 @@ def build_repo_identity(repo_root: Path) -> RepoIdentity:
         dirty_lines = git.get_status_porcelain_lines(root)
         return branch, dirty_lines
 
-    return build_repo_identity_with_status(repo_root, status_resolver=_resolve_repo_status)
+    return build_repo_identity_with_status(
+        repo_root, status_resolver=_resolve_repo_status
+    )
 
 
-def get_selected_config(repo_root: Path) -> str:
-    """Return the selected config name for a repo, defaulting to default.yaml."""
+def get_selected_launch_selection(repo_root: Path) -> RepositoryLaunchSelection:
+    """Return the complete desired launch selection for a repository."""
     from ..infra.repo_registry import load_registry
 
     registry = load_registry()
     normalized = str(repo_root.resolve())
     for repo in registry.repos:
         if repo.path == normalized:
-            return repo.selected_config or "default.yaml"
-    return "default.yaml"
+            return repo.launch_selection
+    return RepositoryLaunchSelection.default()
 
 
-def _load_config_port(repo_root: Path, config_name: str | None) -> int | None:
+def get_selected_config(repo_root: Path) -> str:
+    """Return the selected config name for compatibility call sites."""
+    return get_selected_launch_selection(repo_root).config.value
+
+
+def get_effective_launch_selection(
+    repo_root: Path,
+    supervisor: SupervisorOps,
+) -> RepositoryLaunchSelection:
+    """Resolve the live engine selection, or desired selection when stopped."""
+    live = _get_live_configuration_identity(repo_root, supervisor)
+    if live is not None:
+        return live.selection
+    return get_selected_launch_selection(repo_root)
+
+
+def get_effective_configuration_identity(
+    repo_root: Path,
+    supervisor: SupervisorOps,
+) -> RepositoryConfigurationIdentity:
+    """Resolve one active mode/config/fingerprint, or desired file identity."""
+    live = _get_live_configuration_identity(repo_root, supervisor)
+    if live is not None:
+        return live
+    desired = get_selected_launch_selection(repo_root)
+    config = load_config_for_selection(repo_root, desired)
+    return RepositoryConfigurationIdentity(
+        selection=desired,
+        fingerprint=config.config_fingerprint,
+    )
+
+
+def _get_live_configuration_identity(
+    repo_root: Path,
+    supervisor: SupervisorOps,
+) -> RepositoryConfigurationIdentity | None:
+    """Return the exact active identity without interpreting stopped config files."""
+    desired = get_selected_launch_selection(repo_root)
+    live = list(live_repository_engine_statuses(repo_root, supervisor, desired))
+    if live:
+        selection = _selection_from_live_statuses(live)
+        fingerprints = {status.config_fingerprint for status in live}
+        if len(fingerprints) != 1:
+            raise RuntimeError("Conflicting live repository config fingerprints")
+        return RepositoryConfigurationIdentity(
+            selection=selection,
+            fingerprint=fingerprints.pop(),
+        )
+
+    detected = detect_repository_orchestrators(repo_root)
+    if not detected:
+        return None
+    identities = {
+        (
+            str(item.get("info", {}).get("configuration_mode", "")),
+            str(item.get("info", {}).get("config_name", "")),
+        )
+        for item in detected
+    }
+    if len(identities) != 1:
+        raise RuntimeError("Conflicting live repository configuration identities")
+    mode, config_name = identities.pop()
+    fingerprints = {
+        str(item.get("info", {}).get("config_fingerprint", "")) for item in detected
+    }
+    if len(fingerprints) != 1:
+        raise RuntimeError("Conflicting live repository config fingerprints")
+    return RepositoryConfigurationIdentity(
+        selection=RepositoryLaunchSelection.parse(
+            mode=mode,
+            config_name=config_name,
+        ),
+        fingerprint=fingerprints.pop(),
+    )
+
+
+def live_repository_engine_statuses(
+    repo_root: Path,
+    supervisor: SupervisorOps,
+    selection: RepositoryLaunchSelection,
+) -> tuple[SupervisorStatus, ...]:
+    """Return authoritative live lock statuses before any port discovery."""
+    aggregate = supervisor.status_all_instances(
+        repo_root,
+        selection.config.value,
+        mode=selection.mode.value,
+    )
+    live = tuple(
+        instance
+        for instance in aggregate.instances
+        if instance.state not in {"stopped", "failed"}
+    )
+    if live:
+        return live
+    single = supervisor.status(repo_root)
+    return (single,) if single.state not in {"stopped", "failed"} else ()
+
+
+def _selection_from_live_statuses(
+    statuses: list[SupervisorStatus],
+) -> RepositoryLaunchSelection:
+    identities = {
+        (status.configuration_mode, status.config_name) for status in statuses
+    }
+    if len(identities) != 1:
+        raise RuntimeError("Conflicting live repository configuration identities")
+    mode, config_name = identities.pop()
+    return RepositoryLaunchSelection.parse(mode=mode, config_name=config_name)
+
+
+def load_config_for_selection(
+    repo_root: Path,
+    selection: RepositoryLaunchSelection,
+):
+    """Load exactly one typed repository mode/config selection."""
+    from ..infra.config import Config, get_config_path
+
+    return Config.load(
+        get_config_path(
+            repo_root,
+            selection.config.value,
+            selection.mode,
+        )
+    )
+
+
+def load_selected_config(repo_root: Path):
+    """Load the registry-owned desired configuration for a repository."""
+    return load_config_for_selection(
+        repo_root,
+        get_selected_launch_selection(repo_root),
+    )
+
+
+def _load_config_port(
+    repo_root: Path,
+    config_name: str | None,
+    mode: str | None,
+) -> int | None:
     """Load the web port from a repo config."""
     from ..infra.config import Config, get_config_path
 
-    config_path = get_config_path(repo_root, config_name or "default.yaml")
+    selection = RepositoryLaunchSelection.parse(mode=mode, config_name=config_name)
+    config_path = get_config_path(
+        repo_root,
+        selection.config.value,
+        selection.mode,
+    )
     if not config_path.exists():
         return None
     try:
@@ -74,22 +240,103 @@ def detect_orchestrator_by_port(
     repo_root: Path,
     config_name: str | None,
     *,
+    mode: str | None = None,
     expected_identity: RepoIdentity | None = None,
 ) -> dict[str, Any] | None:
     """Detect an orchestrator by probing the configured port."""
-    port = _load_config_port(repo_root, config_name)
+    port = _load_config_port(repo_root, config_name, mode)
     if not port:
         return None
 
+    details = inspect_orchestrator_at_port(
+        repo_root,
+        port,
+        expected_identity=expected_identity,
+    )
+    if details is None or details["info"].get("repo_root") != str(repo_root):
+        return None
+    return details
+
+
+def inspect_orchestrator_at_port(
+    repo_root: Path,
+    port: int,
+    *,
+    expected_identity: RepoIdentity | None = None,
+) -> dict[str, Any] | None:
+    """Inspect one known runtime port without inferring lifecycle ownership."""
+
     base_url = f"http://127.0.0.1:{port}"
     info = _read_json(f"{base_url}/api/info", timeout=0.6)
-    if info is None or info.get("repo_root") != str(repo_root):
+    if info is None:
         return None
 
     details: dict[str, Any] = {"port": port, "info": info}
+    observed_root = info.get("repo_root")
+    if observed_root != str(repo_root):
+        details["identity_mismatch"] = {
+            "repo_root": {
+                "expected": str(repo_root),
+                "observed": observed_root,
+            }
+        }
     annotate_identity_mismatch(details, info, expected_identity)
     _annotate_orchestrator_health(details, base_url)
     return details
+
+
+def detect_repository_orchestrators(repo_root: Path) -> list[dict[str, Any]]:
+    """Probe every launchable repo config and return distinct live engines.
+
+    Registry selection is desired state, not runtime ownership.  A lifecycle
+    guard therefore has to inspect every configured port rather than only the
+    currently selected mode/config pair.
+    """
+    from ..infra.config import list_configs, list_modes
+
+    detected_by_port: dict[int, dict[str, Any]] = {}
+    for mode in list_modes(repo_root):
+        for config_name in list_configs(repo_root, mode):
+            detected = detect_orchestrator_by_port(
+                repo_root,
+                config_name,
+                mode=mode,
+            )
+            if detected is None:
+                continue
+            port = detected["port"]
+            detected.setdefault(
+                "probed_selection",
+                RepositoryLaunchSelection.parse(
+                    mode=mode,
+                    config_name=config_name,
+                ).to_dict(),
+            )
+            detected_by_port.setdefault(port, detected)
+    return [detected_by_port[port] for port in sorted(detected_by_port)]
+
+
+def inspect_repository_orchestrator_ownership(
+    repo_root: Path,
+    requested: RepositoryLaunchSelection,
+) -> RepositoryOrchestratorOwnership:
+    """Classify every live engine as matching or conflicting ownership."""
+    matching: list[dict[str, Any]] = []
+    conflicting: list[dict[str, Any]] = []
+    for detected in detect_repository_orchestrators(repo_root):
+        info = detected.get("info", {})
+        probed = detected.get("probed_selection", {})
+        active = RepositoryLaunchSelection.parse(
+            mode=info.get("configuration_mode") or probed.get("mode"),
+            config_name=info.get("config_name") or probed.get("config_name"),
+        )
+        detected["active_selection"] = active.to_dict()
+        (matching if active == requested else conflicting).append(detected)
+    return RepositoryOrchestratorOwnership(
+        requested=requested,
+        matching=tuple(matching),
+        conflicting=tuple(conflicting),
+    )
 
 
 def annotate_identity_mismatch(
@@ -115,7 +362,9 @@ def annotate_identity_mismatch(
             if observed_identity_payload.get("branch")
             else None
         ),
-        working_tree_dirty=bool(observed_identity_payload.get("working_tree_dirty", False)),
+        working_tree_dirty=bool(
+            observed_identity_payload.get("working_tree_dirty", False)
+        ),
         dirty_fingerprint=(
             str(observed_identity_payload["dirty_fingerprint"])
             if observed_identity_payload.get("dirty_fingerprint")
@@ -237,8 +486,15 @@ __all__ = [
     "client_dashboard_url",
     "confirm_orchestrator_at_port",
     "detect_orchestrator_by_port",
+    "detect_repository_orchestrators",
     "enrich_runtime_health",
+    "get_effective_launch_selection",
+    "get_effective_configuration_identity",
     "get_selected_config",
     "heartbeat_age_seconds",
     "is_shutdown_complete",
+    "inspect_orchestrator_at_port",
+    "inspect_repository_orchestrator_ownership",
+    "live_repository_engine_statuses",
+    "RepositoryOrchestratorOwnership",
 ]

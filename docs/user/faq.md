@@ -2,8 +2,8 @@
 
 ## Getting Started
 
-**Q1: Where does the config live, and how do I pick a named config?**
-A: By default, config lives at `.issue-orchestrator/config/default.yaml`. You can also create a named config like `.issue-orchestrator/config/main.yaml` and select it in the Control Center: pick the repo, then use the `Config` dropdown (it appears when multiple configs exist) and optionally set a default. In VS Code, set `issueOrchestrator.configPath` in settings.
+**Q1: Where does the config live, and how do I pick a mode or named config?**
+A: By default, config lives at `.issue-orchestrator/config/modes/default/default.yaml`. Add sibling directories such as `modes/codex/` or `modes/claude/` for alternate complete config sets. In Control Center, pick the repo, then choose `Mode` and `Config` before starting the Repository Engine. These selectors are locked while the engine is running. In VS Code, set `issueOrchestrator.configPath` to the complete mode config path.
 
 **Q2: What is the minimum config to run anything?**
 A: You need at least one agent definition and a validation command. See the minimal example in [Configuration](configuration.md) under "TL;DR - Starter Config to Get Running."

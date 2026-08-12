@@ -2,24 +2,93 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
+import multiprocessing
+import os
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
+from issue_orchestrator.domain.repository_launch_selection import (
+    RepositoryLaunchSelection,
+)
 from issue_orchestrator.infra.repo_registry import (
     RegisteredRepo,
     RepoRegistry,
+    RepoRegistryTransactionOwner,
     add_repo,
     cleanup_stale_repos,
     list_repos,
     load_registry,
     remove_repo,
+    record_launched_selection,
     save_registry,
     _config_dir,
     _repos_file,
 )
+
+
+def _hold_registry_transaction(
+    config_dir: str,
+    repo_path: str,
+    entered: multiprocessing.synchronize.Event,
+    release: multiprocessing.synchronize.Event,
+) -> None:
+    os.environ["ISSUE_ORCHESTRATOR_CONFIG_DIR"] = config_dir
+    selection = RepositoryLaunchSelection.parse(
+        mode="codex",
+        config_name="main.yaml",
+    )
+
+    def hold(registry: RepoRegistry) -> None:
+        repo = registry.add(repo_path)
+        repo.select_launch_configuration(selection)
+        entered.set()
+        if not release.wait(timeout=5):
+            raise RuntimeError("registry transaction was not released")
+
+    RepoRegistryTransactionOwner().mutate(hold)
+
+
+def _record_registry_selection(
+    config_dir: str,
+    repo_path: str,
+    started: multiprocessing.synchronize.Event,
+) -> None:
+    os.environ["ISSUE_ORCHESTRATOR_CONFIG_DIR"] = config_dir
+    started.set()
+    record_launched_selection(
+        repo_path,
+        RepositoryLaunchSelection.parse(
+            mode="claude",
+            config_name="main.yaml",
+        ),
+    )
+
+
+def test_record_launched_selection_updates_an_existing_registration(
+    tmp_path: Path,
+) -> None:
+    repos_file = tmp_path / "repos.json"
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    selection = RepositoryLaunchSelection.parse(
+        mode="codex",
+        config_name="main.yaml",
+    )
+    with patch(
+        "issue_orchestrator.infra.repo_registry._repos_file",
+        return_value=repos_file,
+    ):
+        add_repo(repo_root)
+        record_launched_selection(repo_root, selection)
+
+        registered = list_repos()
+
+    assert len(registered) == 1
+    assert registered[0].launch_selection == selection
 
 
 class TestConfigDir:
@@ -78,6 +147,7 @@ class TestRegisteredRepo:
             "name": "My Repo",
             "added_at": "2024-01-01T00:00:00+00:00",
             "selected_config": "default.yaml",  # Default config file name
+            "selected_mode": "default",
         }
 
     def test_from_dict(self) -> None:
@@ -93,6 +163,7 @@ class TestRegisteredRepo:
         assert repo.path == "/home/user/projects/my-repo"
         assert repo.name == "My Repo"
         assert repo.added_at == "2024-01-01T00:00:00+00:00"
+        assert repo.selected_mode == "default"
 
     def test_from_dict_with_minimal_data(self) -> None:
         """Creates from dict with only required fields."""
@@ -274,8 +345,30 @@ class TestLoadSaveRegistry:
         assert loaded.repos[0].path == "/home/user/repo"
         assert loaded.repos[0].name == "Test Repo"
 
-    def test_load_handles_corrupt_json(self, tmp_path: Path) -> None:
-        """Returns empty registry for corrupt JSON."""
+    def test_serialization_failure_preserves_existing_registry(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        repos_file = tmp_path / "repos.json"
+        existing = '{"repos": [{"path": "/kept"}]}\n'
+        repos_file.write_text(existing, encoding="utf-8")
+        registry = RepoRegistry(
+            repos=[RegisteredRepo(path="/replacement", selected_config="main.yaml")]
+        )
+        registry.repos[0].selected_config = object()  # type: ignore[assignment]
+
+        with patch(
+            "issue_orchestrator.infra.repo_registry._repos_file",
+            return_value=repos_file,
+        ):
+            with pytest.raises(TypeError):
+                save_registry(registry)
+
+        assert repos_file.read_text(encoding="utf-8") == existing
+        assert list(tmp_path.glob(".repos.json.*.tmp")) == []
+
+    def test_load_rejects_corrupt_json(self, tmp_path: Path) -> None:
+        """A corrupt registry fails fast instead of masquerading as empty."""
         repos_file = tmp_path / "repos.json"
         repos_file.write_text("not valid json{{{")
 
@@ -283,9 +376,56 @@ class TestLoadSaveRegistry:
             "issue_orchestrator.infra.repo_registry._repos_file",
             return_value=repos_file,
         ):
-            registry = load_registry()
+            with pytest.raises(json.JSONDecodeError):
+                load_registry()
 
-        assert len(registry.repos) == 0
+    def test_transactions_serialize_concurrent_different_repo_updates(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        context = multiprocessing.get_context("spawn")
+        entered = context.Event()
+        release = context.Event()
+        second_started = context.Event()
+        first_repo = tmp_path / "first"
+        second_repo = tmp_path / "second"
+        first_repo.mkdir()
+        second_repo.mkdir()
+        holder = context.Process(
+            target=_hold_registry_transaction,
+            args=(str(tmp_path), str(first_repo), entered, release),
+        )
+        contender = context.Process(
+            target=_record_registry_selection,
+            args=(str(tmp_path), str(second_repo), second_started),
+        )
+
+        holder.start()
+        assert entered.wait(timeout=5), "first registry transaction did not start"
+        gate_fd = os.open(tmp_path / ".repos.json.lock", os.O_RDWR)
+        try:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(gate_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            os.close(gate_fd)
+
+        contender.start()
+        assert second_started.wait(timeout=5), "second registry mutation did not start"
+        release.set()
+        holder.join(timeout=5)
+        contender.join(timeout=5)
+
+        assert holder.exitcode == 0
+        assert contender.exitcode == 0
+        with patch.dict(
+            "os.environ",
+            {"ISSUE_ORCHESTRATOR_CONFIG_DIR": str(tmp_path)},
+        ):
+            registry = load_registry()
+        assert {repo.path for repo in registry.repos} == {
+            str(first_repo.resolve()),
+            str(second_repo.resolve()),
+        }
 
 
 class TestConvenienceFunctions:

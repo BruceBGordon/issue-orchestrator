@@ -1327,6 +1327,19 @@ class TestDetectAgentsFromConfig:
 
         assert result["agent:test"] == AiAgentType.UNKNOWN
 
+    def test_provider_is_authoritative_over_legacy_command(self):
+        """Mode/provider changes install hooks for the effective launcher."""
+        mock_config = Mock()
+        mock_agent = Mock()
+        mock_agent.meta_agent = None
+        mock_agent.command = "claude --dangerously-skip-permissions"
+        mock_agent.resolve_launch_provider.return_value = "codex"
+        mock_config.agents = {"agent:test": mock_agent}
+
+        result = detect_agents_from_config(mock_config)
+
+        assert result["agent:test"] == AiAgentType.CODEX
+
 
 class TestParseHookInput:
     """Tests for parse_hook_input.py (extract_command function)."""

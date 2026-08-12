@@ -33,118 +33,33 @@ import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Awaitable
+from typing import Any, Awaitable, Callable, cast
 import inspect
 from mcp.server.fastmcp import FastMCP
 
-if TYPE_CHECKING:
-    from ..infra.launcher import LaunchResult
-
-from ..contracts.mcp import McpErrorPayload, McpUiHintPayload
+from ..contracts.mcp import McpUiHintPayload
+from ..contracts.repository_engine import RepositoryEngineStartPayload
 from ..infra import supervisor
+from ..domain.repository_launch_selection import RepositoryLaunchSelection
+from ..execution.mcp_repository_engine_runtime import (
+    mcp_launch_payload,
+    repository_start_failure_error,
+    require_identity_if_running,
+    require_status_identity,
+    resolve_start_result,
+)
+from ..execution.repository_engine_start import (
+    RepositoryEngineStartRequest,
+    StartRepositoryEngineCommand,
+)
+from ..execution.repository_engine_supervisor import build_default_supervisor_ops
 from ..infra.config import Config, get_config_path
 from ..infra.client_urls import resolve_client_base_url
-from ..infra.launcher import LaunchStatus
 from ..execution.orchestrator_http_api import OrchestratorAsyncHttpApi
 
 logger = logging.getLogger(__name__)
 
 _REPOS_ALLOWLIST_ENV = "ISSUE_ORCHESTRATOR_MCP_REPOS_ALLOWLIST"
-
-# The ``error.type`` each failing launcher status maps to. Keyed by the shared
-# ``LaunchStatus`` vocabulary rather than raw strings, and asserted in
-# ``tests/unit/test_mcp_server.py`` to cover exactly
-# ``LaunchStatus.failure_statuses()`` — which the launcher in turn proves is a
-# partition of the enum, so a new failure status cannot slip through as a
-# success by being omitted from both sets.
-#
-# ``LAUNCH_ERROR`` carries the exception text in ``LaunchResult.error``;
-# ``DOCTOR_ERROR`` carries none, so the message is built from the failing
-# checks. Both must surface as the top-level structured error that
-# ``docs/user/mcp.md`` documents and the VS Code start command consumes —
-# otherwise an ordinary failed launch reads as success to every client.
-LAUNCH_FAILURE_ERROR_TYPES: dict[LaunchStatus, str] = {
-    LaunchStatus.DOCTOR_ERROR: "DoctorError",
-    LaunchStatus.LAUNCH_ERROR: "LaunchError",
-}
-
-
-def _doctor_error_message(launch_result: "LaunchResult") -> str:
-    failing = [
-        check for check in launch_result.doctor.checks if check.status == "error"
-    ]
-    if not failing:
-        return "Doctor checks failed"
-    detail = "; ".join(
-        f"{check.name}: {check.detail}" if check.detail else check.name
-        for check in failing
-    )
-    return f"Doctor checks failed — {detail}"
-
-
-def _launcher_error_message(launch_result: "LaunchResult") -> str:
-    """Return a non-empty description of a launcher process failure.
-
-    Emptiness matters: clients test the presence of a message to decide a start
-    failed, so an empty one would read as success and silently drop the
-    operator back into a "started" UI.
-    """
-    launcher_message = (launch_result.error or "").strip()
-    return launcher_message or "Orchestrator failed to start (launch_error)"
-
-
-_LAUNCH_FAILURE_MESSAGE_BUILDERS: dict[
-    LaunchStatus, Callable[["LaunchResult"], str]
-] = {
-    LaunchStatus.DOCTOR_ERROR: _doctor_error_message,
-    LaunchStatus.LAUNCH_ERROR: _launcher_error_message,
-}
-
-
-def _build_launch_failure_error(
-    launch_result: "LaunchResult", status: LaunchStatus
-) -> McpErrorPayload:
-    return {
-        "message": _LAUNCH_FAILURE_MESSAGE_BUILDERS[status](launch_result),
-        "type": LAUNCH_FAILURE_ERROR_TYPES[status],
-    }
-
-
-def _no_launch_failure_error(
-    _launch_result: "LaunchResult", _status: LaunchStatus
-) -> None:
-    return None
-
-
-_LAUNCH_ERROR_BY_FAILURE_DISPOSITION: dict[
-    bool,
-    Callable[["LaunchResult", LaunchStatus], McpErrorPayload | None],
-] = {
-    False: _no_launch_failure_error,
-    True: _build_launch_failure_error,
-}
-
-
-def launch_failure_error(
-    launch_result: "LaunchResult",
-) -> McpErrorPayload | None:
-    """Map a launcher outcome onto the MCP error object, or ``None`` on success.
-
-    This is the single owner of the ``LaunchResult`` → ``orchestrator.start``
-    mapping. Callers must not re-derive failure from ``status`` or ``launched``
-    themselves; the VS Code consumer likewise keys off the returned top-level
-    ``error`` rather than reinterpreting the nested launch payload.
-
-    The classification is total, with no default-to-success branch anywhere: a
-    status outside the enum raises ``UnknownLaunchStatusError``, and an enum
-    member with no declared disposition raises ``UnclassifiedLaunchStatusError``.
-    ``orchestrator.start`` runs inside ``_safe``, so either way the caller
-    receives a structured error — never a silent "started".
-    """
-    status = LaunchStatus.parse(launch_result.status)
-    return _LAUNCH_ERROR_BY_FAILURE_DISPOSITION[status.is_failure](
-        launch_result, status
-    )
 
 
 def _mcp_repos_allowlist() -> list[Path] | None:
@@ -206,39 +121,53 @@ class McpSettings:
     auto_start: bool
 
 
+class RepoStartPayload(RepositoryEngineStartPayload, total=False):
+    """Typed public result for the repository-start MCP operation."""
+
+
 class OrchestratorHttpClient:
-    def __init__(self, settings: McpSettings) -> None:
+    def __init__(
+        self,
+        settings: McpSettings,
+        repo_start_command: StartRepositoryEngineCommand | None = None,
+    ) -> None:
         self._settings = settings
         self._cached_port: int | None = None
+        self._port_override = False
+        self._repo_start_command = repo_start_command or StartRepositoryEngineCommand(
+            build_default_supervisor_ops()
+        )
 
     def status(self) -> supervisor.SupervisorStatus:
-        return supervisor.status(self._settings.repo_root, instance_id=self._settings.instance_id)
+        return supervisor.status(
+            self._settings.repo_root, instance_id=self._settings.instance_id
+        )
 
     def start(self) -> supervisor.SupervisorStatus:
-        from ..infra.launcher import launch_subprocess
-
         config = Config.load(self._settings.config_path)
-        result = launch_subprocess(
-            repo_root=self._settings.repo_root,
-            config=config,
-            config_name=self._settings.config_path.name,
-            instance_id=self._settings.instance_id,
-        )
-        if LaunchStatus.parse(result.status) is LaunchStatus.ALREADY_RUNNING:
-            if result.supervisor and "port" in result.supervisor:
-                self._cached_port = result.supervisor["port"]
-            return supervisor.status(self._settings.repo_root, instance_id=self._settings.instance_id)
-        if not result.launched:
-            raise RuntimeError(
-                f"Failed to start orchestrator: {result.status}"
-                + (f" — {result.error}" if result.error else "")
+        result = self._repo_start_command.execute(
+            RepositoryEngineStartRequest(
+                repo_root=self._settings.repo_root,
+                selection=config.launch_selection,
+                config_path=self._settings.config_path,
+                instance_id=self._settings.instance_id,
+                actor="mcp-auto-start",
             )
-        if result.supervisor and "port" in result.supervisor:
-            self._cached_port = result.supervisor["port"]
-        return supervisor.status(self._settings.repo_root, instance_id=self._settings.instance_id)
+        )
+        status = resolve_start_result(
+            result,
+            config,
+            lambda: supervisor.status(
+                self._settings.repo_root,
+                instance_id=self._settings.instance_id,
+            ),
+        )
+        self._cached_port = status.port
+        return status
 
     def _ensure_running(self) -> supervisor.SupervisorStatus:
         status = self.status()
+        config = Config.load(self._settings.config_path)
         if status.state != "running":
             if not self._settings.auto_start:
                 raise RuntimeError("Orchestrator not running")
@@ -247,6 +176,7 @@ class OrchestratorHttpClient:
             raise RuntimeError(f"Orchestrator not running (state={status.state})")
         if status.port is None:
             raise RuntimeError("Orchestrator running but no port available")
+        require_status_identity(status, config)
         return status
 
     def _api_base_url_for_port(self, port: int) -> str:
@@ -260,7 +190,7 @@ class OrchestratorHttpClient:
 
     def _resolve_port(self) -> int:
         cached_port = self._cached_port
-        if cached_port is not None:
+        if self._port_override and cached_port is not None:
             return cached_port
         status = self._ensure_running()
         port = status.port
@@ -273,11 +203,8 @@ class OrchestratorHttpClient:
         return self._api_base_url_for_port(self._resolve_port())
 
     def refresh_api_base_url(self) -> str:
-        status = self.status()
-        if status.state != "running":
-            raise RuntimeError(f"Orchestrator not running (state={status.state})")
-        if status.port is None:
-            raise RuntimeError("Orchestrator running but no port available")
+        status = self._ensure_running()
+        assert status.port is not None
         self._cached_port = status.port
         return self._api_base_url_for_port(status.port)
 
@@ -285,16 +212,18 @@ class OrchestratorHttpClient:
         return self._client_base_url_for_port(self._resolve_port())
 
     def doctor_url(self) -> str | None:
-        if self._cached_port:
+        if self._port_override and self._cached_port:
             return self._client_url_for_path(self._cached_port, "/api/doctor")
         status = self.status()
         if status.state == "running" and status.port:
+            require_status_identity(status, Config.load(self._settings.config_path))
             return self._client_url_for_path(status.port, "/api/doctor")
         return None
 
     def update_port(self, port: int) -> None:
-        """Update the cached port after an external launch."""
+        """Install an explicit operator override that bypasses lock discovery."""
         self._cached_port = port
+        self._port_override = True
 
     def close(self) -> None:
         return None
@@ -342,7 +271,10 @@ MCP_TOOL_NAMES: tuple[str, ...] = tuple(name for name, _ in MCP_TOOLS)
 class McpApp:
     def __init__(self, settings: McpSettings) -> None:
         self._settings = settings
-        self._client = OrchestratorHttpClient(settings)
+        self._repo_start_command = StartRepositoryEngineCommand(
+            build_default_supervisor_ops()
+        )
+        self._client = OrchestratorHttpClient(settings, self._repo_start_command)
         self._api = OrchestratorAsyncHttpApi(
             self._client.api_base_url,
             refresh_base_url=self._client.refresh_api_base_url,
@@ -390,10 +322,8 @@ class McpApp:
 
         Both failure routes land on a top-level ``error`` before they get
         here: ``_safe`` converts exceptions, and ``start`` normalises a failed
-        ``LaunchResult`` via ``launch_failure_error``. So the hint is attached
-        by inspecting the result rather than by catching — an outer ``except``
-        here would never fire, and a returned doctor/launch failure would
-        never reach one anyway.
+        repository-start command result. So the hint is attached by inspecting
+        the result rather than by catching.
 
         Attaching the hint must not be able to undo that. It runs after
         ``_safe`` has already produced the structured error, so anything raised
@@ -527,11 +457,19 @@ class McpApp:
         """List all repos with status."""
         return await self._safe("orchestrator.repos", self.list_repos)
 
-    async def tool_repos_start(self, repo_path: str, config_name: str = "default.yaml") -> dict[str, Any]:
+    async def tool_repos_start(
+        self,
+        repo_path: str,
+        config_name: str = "default.yaml",
+        mode: str = "default",
+    ) -> RepoStartPayload:
         """Start orchestrator for a specific repo."""
-        return await self._safe(
-            "orchestrator.repos.start",
-            lambda: self.start_repo(repo_path, config_name),
+        return cast(
+            RepoStartPayload,
+            await self._safe(
+                "orchestrator.repos.start",
+                lambda: dict(self.start_repo(repo_path, config_name, mode)),
+            ),
         )
 
     async def tool_repos_stop(self, repo_path: str, force: bool = False) -> dict[str, Any]:
@@ -555,7 +493,12 @@ class McpApp:
         state = detect_system_state()
         return {"repos": [r.to_dict() for r in state.repos]}
 
-    def start_repo(self, repo_path: str, config_name: str = "default.yaml") -> dict[str, Any]:
+    def start_repo(
+        self,
+        repo_path: str,
+        config_name: str = "default.yaml",
+        mode: str = "default",
+    ) -> RepoStartPayload:
         """Start orchestrator for a specific repo.
 
         The ``repo_path`` is caller-supplied and therefore untrusted —
@@ -568,12 +511,18 @@ class McpApp:
         path = Path(repo_path).expanduser().resolve(strict=False)
 
         try:
-            info = supervisor.start(path, config_name)
-            return {
-                "status": "started",
-                "pid": info.pid,
-                "port": info.http_port,
-            }
+            selection = RepositoryLaunchSelection.parse(
+                mode=mode,
+                config_name=config_name,
+            )
+            result = self._repo_start_command.execute(
+                RepositoryEngineStartRequest(
+                    repo_root=path,
+                    selection=selection,
+                    actor="mcp",
+                )
+            )
+            return cast(RepoStartPayload, dict(result.payload))
         except Exception as e:
             logger.exception("Failed to start orchestrator for %s", repo_path)
             return {"error": str(e)}
@@ -606,29 +555,24 @@ class McpApp:
 
     def start(self) -> dict[str, Any]:
         status = self._client.status()
-        if status.state == "running":
-            return {"supervisor": status.to_dict()}
-
-        from ..infra.launcher import launch_subprocess
-
         config = Config.load(self._settings.config_path)
-        launch_result = launch_subprocess(
-            repo_root=self._settings.repo_root,
-            config=config,
-            config_name=self._settings.config_path.name,
-            instance_id=self._settings.instance_id,
-        )
-        # Update cached port from supervisor data
-        if launch_result.supervisor and "port" in launch_result.supervisor:
-            self._client.update_port(launch_result.supervisor["port"])
-        result: dict[str, Any] = {"launch": launch_result.to_dict()}
-        # A doctor/launch failure is an ordinary return value, not an
-        # exception, so normalise it onto the documented top-level error here.
-        # ``tool_start`` then attaches the doctor ui_hint uniformly.
-        error = launch_failure_error(launch_result)
-        if error is not None:
-            result["error"] = error
-        return result
+        if status.state != "running":
+            command_result = self._repo_start_command.execute(
+                RepositoryEngineStartRequest(
+                    repo_root=self._settings.repo_root,
+                    selection=config.launch_selection,
+                    config_path=self._settings.config_path,
+                    instance_id=self._settings.instance_id,
+                    actor="mcp",
+                )
+            )
+            result: dict[str, Any] = {"launch": mcp_launch_payload(command_result)}
+            error = repository_start_failure_error(command_result)
+            if error is not None:
+                result["error"] = error
+            return result
+        require_status_identity(status, config)
+        return {"supervisor": status.to_dict()}
 
     def stop(
         self,
@@ -636,6 +580,8 @@ class McpApp:
         *,
         reason: str = "mcp_server.stop",
     ) -> dict[str, Any]:
+        status = self._client.status()
+        require_identity_if_running(status, Config.load(self._settings.config_path))
         stopped = supervisor.stop(
             self._settings.repo_root,
             instance_id=self._settings.instance_id,
@@ -712,7 +658,11 @@ class McpApp:
             config = Config.load(self._settings.config_path)
         except Exception:
             config = None
-        result = run_doctor(config=config, config_path=self._settings.config_path, runner=LocalCommandRunner())
+        result = run_doctor(
+            config=config,
+            config_path=self._settings.config_path,
+            runner=LocalCommandRunner(),
+        )
         return result.to_dict()
 
 
@@ -720,12 +670,14 @@ mcp = FastMCP("Issue Orchestrator", json_response=True)
 
 
 def _resolve_settings(args: argparse.Namespace) -> McpSettings:
-    repo_root = Path(args.repo_root or os.environ.get("IO_E2E_REPO_ROOT", "") or Path.cwd())
+    repo_root = Path(
+        args.repo_root or os.environ.get("IO_E2E_REPO_ROOT", "") or Path.cwd()
+    )
     config_path_str = args.config_path or os.environ.get("IO_E2E_CONFIG_PATH", "")
     if config_path_str:
         config_path = Path(config_path_str)
     else:
-        config_path = get_config_path(repo_root, args.config_name)
+        config_path = get_config_path(repo_root, args.config_name, args.mode)
     if not config_path.exists():
         raise FileNotFoundError(f"Config file not found: {config_path}")
     return McpSettings(
@@ -748,11 +700,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Issue Orchestrator MCP server")
     parser.add_argument("--repo-root", help="Repository root path")
     parser.add_argument("--config", dest="config_path", help="Path to config file")
-    parser.add_argument("--config-name", default="default.yaml", help="Config filename (default.yaml)")
-    parser.add_argument("--instance-id", help="Instance ID for multi-orchestrator setups")
+    parser.add_argument(
+        "--config-name", default="default.yaml", help="Config filename (default.yaml)"
+    )
+    parser.add_argument(
+        "--mode", default="default", help="Directory-backed configuration mode"
+    )
+    parser.add_argument(
+        "--instance-id", help="Instance ID for multi-orchestrator setups"
+    )
     parser.add_argument("--host", default="127.0.0.1", help="Host for web API calls")
-    parser.add_argument("--auto-start", action="store_true", help="Start orchestrator if not running")
-    parser.add_argument("--api-port", type=int, help="Control API port (bypasses supervisor detection)")
+    parser.add_argument(
+        "--auto-start", action="store_true", help="Start orchestrator if not running"
+    )
+    parser.add_argument(
+        "--api-port", type=int, help="Control API port (bypasses supervisor detection)"
+    )
     return parser
 
 

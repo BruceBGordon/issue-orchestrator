@@ -7,6 +7,7 @@ from issue_orchestrator.observation.instance_detector import (
     DashboardStatus,
     RepoStatus,
     SystemState,
+    discover_repos,
     detect_system_state,
     get_best_entry_point,
     write_dashboard_pid,
@@ -14,13 +15,17 @@ from issue_orchestrator.observation.instance_detector import (
     _is_orchestrator_codebase,
     _get_config_status,
 )
+from issue_orchestrator.infra.repo_registry import RegisteredRepo
+from issue_orchestrator.infra.supervisor import MultiInstanceStatus, SupervisorStatus
 
 
 class TestDashboardStatus:
     """Tests for DashboardStatus dataclass."""
 
     def test_to_dict_running(self):
-        status = DashboardStatus(running=True, pid=1234, port=19080, started_at="2024-01-01T00:00:00Z")
+        status = DashboardStatus(
+            running=True, pid=1234, port=19080, started_at="2024-01-01T00:00:00Z"
+        )
         result = status.to_dict()
         assert result == {
             "running": True,
@@ -124,24 +129,36 @@ class TestGetConfigStatus:
         config_dir.mkdir(parents=True)
         (config_dir / "default.yaml").write_text("repo: test")
 
-        with patch("issue_orchestrator.observation.instance_detector.list_configs", return_value=["default.yaml"]):
-            status, configs = _get_config_status(tmp_path)
+        with patch(
+            "issue_orchestrator.observation.instance_detector.list_configs",
+            return_value=["default.yaml"],
+        ):
+            status, modes, mode_configs = _get_config_status(tmp_path)
         assert status == "ready"
-        assert configs == ["default.yaml"]
+        assert modes == ["default"]
+        assert mode_configs == {"default": ["default.yaml"]}
 
     def test_legacy_config(self, tmp_path):
         (tmp_path / ".issue-orchestrator.yaml").write_text("repo: test")
 
-        with patch("issue_orchestrator.observation.instance_detector.list_configs", return_value=[]):
-            status, configs = _get_config_status(tmp_path)
+        with patch(
+            "issue_orchestrator.observation.instance_detector.list_configs",
+            return_value=[],
+        ):
+            status, modes, mode_configs = _get_config_status(tmp_path)
         assert status == "legacy"
-        assert configs == []
+        assert modes == []
+        assert mode_configs == {}
 
     def test_needs_setup(self, tmp_path):
-        with patch("issue_orchestrator.observation.instance_detector.list_configs", return_value=[]):
-            status, configs = _get_config_status(tmp_path)
+        with patch(
+            "issue_orchestrator.observation.instance_detector.list_configs",
+            return_value=[],
+        ):
+            status, modes, mode_configs = _get_config_status(tmp_path)
         assert status == "needs_setup"
-        assert configs == []
+        assert modes == []
+        assert mode_configs == {}
 
 
 class TestGetBestEntryPoint:
@@ -288,12 +305,21 @@ class TestDetectSystemState:
     def test_detects_current_directory(self, tmp_path):
         (tmp_path / ".git").mkdir()
 
-        with patch("issue_orchestrator.observation.instance_detector.load_registry") as mock_registry:
+        with patch(
+            "issue_orchestrator.observation.instance_detector.load_registry"
+        ) as mock_registry:
             mock_registry.return_value.repos = []
-            with patch("issue_orchestrator.observation.instance_detector._read_dashboard_pid") as mock_dash:
+            with patch(
+                "issue_orchestrator.observation.instance_detector._read_dashboard_pid"
+            ) as mock_dash:
                 mock_dash.return_value = DashboardStatus(running=False)
-                with patch("issue_orchestrator.observation.instance_detector.list_configs", return_value=[]):
-                    with patch("issue_orchestrator.observation.instance_detector.supervisor") as mock_sup:
+                with patch(
+                    "issue_orchestrator.observation.instance_detector.list_configs",
+                    return_value=[],
+                ):
+                    with patch(
+                        "issue_orchestrator.observation.instance_detector.supervisor"
+                    ) as mock_sup:
                         mock_sup.status.return_value = MagicMock(state="stopped")
                         state = detect_system_state(tmp_path)
 
@@ -302,14 +328,100 @@ class TestDetectSystemState:
 
     def test_detects_orchestrator_codebase(self, tmp_path):
         (tmp_path / ".git").mkdir()
-        (tmp_path / "pyproject.toml").write_text('[project]\nname = "issue-orchestrator"\n')
+        (tmp_path / "pyproject.toml").write_text(
+            '[project]\nname = "issue-orchestrator"\n'
+        )
 
-        with patch("issue_orchestrator.observation.instance_detector.load_registry") as mock_registry:
+        with patch(
+            "issue_orchestrator.observation.instance_detector.load_registry"
+        ) as mock_registry:
             mock_registry.return_value.repos = []
-            with patch("issue_orchestrator.observation.instance_detector._read_dashboard_pid") as mock_dash:
+            with patch(
+                "issue_orchestrator.observation.instance_detector._read_dashboard_pid"
+            ) as mock_dash:
                 mock_dash.return_value = DashboardStatus(running=False)
                 state = detect_system_state(tmp_path)
 
         assert state.is_orchestrator_codebase is True
         # Orchestrator codebase should not be added as a repo
         assert len(state.repos) == 0
+
+    def test_reports_active_identity_separately_from_registry_selection(
+        self,
+        tmp_path,
+    ) -> None:
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        registered = RegisteredRepo(
+            path=str(repo),
+            selected_mode="default",
+            selected_config="main.yaml",
+        )
+        active = SupervisorStatus(
+            state="running",
+            pid=42,
+            port=19090,
+            instance_id="orchestrator-1",
+            configuration_mode="codex",
+            config_name="other.yaml",
+            config_fingerprint="codex-fingerprint",
+        )
+
+        with (
+            patch(
+                "issue_orchestrator.observation.instance_detector.load_registry"
+            ) as registry,
+            patch(
+                "issue_orchestrator.observation.instance_detector._read_dashboard_pid",
+                return_value=DashboardStatus(running=False),
+            ),
+            patch(
+                "issue_orchestrator.observation.instance_detector.supervisor.status_all_instances",
+                return_value=MultiInstanceStatus(
+                    repo_root=str(repo),
+                    instances=[active],
+                ),
+            ),
+            patch(
+                "issue_orchestrator.observation.instance_detector._check_if_paused",
+                return_value=False,
+            ),
+        ):
+            registry.return_value.repos = [registered]
+            payload = detect_system_state(tmp_path).repos[0].to_dict()
+
+        assert payload["selected_mode"] == "default"
+        assert payload["selected_config"] == "main.yaml"
+        assert payload["active_mode"] == "codex"
+        assert payload["active_config"] == "other.yaml"
+        assert payload["active_config_fingerprint"] == "codex-fingerprint"
+        assert payload["active_instances"] == [active.to_dict()]
+
+
+class TestDiscoverRepos:
+    def test_discovery_reports_directory_backed_modes(
+        self,
+        tmp_path,
+    ) -> None:
+        repo = tmp_path / "project"
+        (repo / ".git").mkdir(parents=True)
+        config = repo / ".issue-orchestrator/config/modes/codex/main.yaml"
+        config.parent.mkdir(parents=True)
+        config.write_text("agents: {}\n", encoding="utf-8")
+
+        with patch(
+            "issue_orchestrator.observation.instance_detector.load_registry"
+        ) as registry:
+            registry.return_value.repos = []
+            discovered = discover_repos([tmp_path], max_depth=1)
+
+        assert discovered == [
+            {
+                "path": str(repo.resolve()),
+                "name": "project",
+                "configs": [],
+                "modes": ["codex"],
+                "mode_configs": {"codex": ["main.yaml"]},
+                "status": "ready",
+            }
+        ]

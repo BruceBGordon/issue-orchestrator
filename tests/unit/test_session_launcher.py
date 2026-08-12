@@ -23,6 +23,9 @@ from unittest.mock import MagicMock, patch
 from issue_orchestrator.domain.tech_lead_session import TechLeadCreationOrigin
 from issue_orchestrator.domain.claim import ClaimResult
 from issue_orchestrator.control.provider_resilience import ProviderResilienceManager
+from issue_orchestrator.domain.repository_launch_selection import (
+    RepositoryLaunchSelection,
+)
 from issue_orchestrator.control.session_completion import (
     _apply_completed_decisions,
     _record_provider_resilience_effects,
@@ -1521,13 +1524,26 @@ class TestLaunchIssueSession:
         cmd = launcher_bundle.create_session_calls[0]["cmd"]
         assert "IMPORTANT:" in cmd or "existing commit" in cmd.lower() or result.session is not None
 
-    def test_writes_session_identity_file(self, session_launcher, sample_issue, mock_worktree_manager, tmp_path):
-        """Verify session identity file is written (lines 174-175 on error)."""
+    def test_writes_session_identity_file(self, session_launcher, sample_issue):
+        """The session producer records the complete launch configuration identity."""
+        session_launcher.config.launch_selection = RepositoryLaunchSelection.parse(
+            mode="codex",
+            config_name="main.yaml",
+        )
+        session_launcher.config.config_fingerprint = "effective-config-fingerprint"
+
         result = session_launcher.launch_issue_session(sample_issue, active_sessions=[])
 
         assert result.success is True
-        # Check that worktree was created
-        assert len(mock_worktree_manager.create_calls) == 1
+        assert result.session is not None
+        identity = json.loads(
+            (result.session.run_dir / "session-identity.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        assert identity["configuration_mode"] == "codex"
+        assert identity["config_name"] == "main.yaml"
+        assert identity["config_fingerprint"] == "effective-config-fingerprint"
 
     def test_sets_e2e_pr_labels_env(self, launcher_bundle, sample_issue):
         """Verify E2E_PR_LABELS env var is set (lines 349-350)."""

@@ -14,7 +14,7 @@ import json
 import logging
 import re
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, cast
 
 if TYPE_CHECKING:
     from ..infra.config import Config
@@ -39,6 +39,18 @@ _CANONICAL_SESSION_PREFIXES = (
 )
 _REVIEW_SESSION_RE = re.compile(r"^review-(\d+)$")
 _REVIEW_TITLE_RE = re.compile(r"\bReview PR #(\d+)\b")
+
+
+class SessionConfigurationIdentityError(RuntimeError):
+    """A surviving session cannot be safely restored under this configuration."""
+
+
+class SessionConfigurationModeMismatchError(SessionConfigurationIdentityError):
+    """A surviving session belongs to another effective launch configuration."""
+
+
+class SessionConfigurationIdentityVerificationError(SessionConfigurationIdentityError):
+    """A surviving session's effective launch configuration cannot be verified."""
 
 
 class SessionRestorer:
@@ -92,12 +104,19 @@ class SessionRestorer:
                 )
                 if session:
                     restored.append(session)
-                    logger.info("Restored tracking for session %s (issue #%d)",
-                               session.terminal_id, issue_number)
+                    logger.info(
+                        "Restored tracking for session %s (issue #%d)",
+                        session.terminal_id,
+                        issue_number,
+                    )
                     print(f"  Restored: {session.terminal_id} (#{issue_number})")
 
+            except SessionConfigurationIdentityError:
+                raise
             except Exception as e:
-                logger.exception("Failed to restore session for issue #%d: %s", issue_number, e)
+                logger.exception(
+                    "Failed to restore session for issue #%d: %s", issue_number, e
+                )
                 print(f"  Warning: Failed to restore session for #{issue_number}: {e}")
 
         return restored
@@ -150,6 +169,57 @@ class SessionRestorer:
         )
         return self.restore_sessions([discovered], already_tracked)
 
+    def _assert_restored_session_mode(
+        self,
+        run_assets: SessionRunAssets,
+        session_name: str,
+    ) -> None:
+        """Reject a relaunch that would reinterpret a live session under another mode."""
+        identity_path = run_assets.run_dir / "session-identity.json"
+        identity: dict[str, object] = {}
+        if identity_path.is_file():
+            try:
+                loaded = json.loads(identity_path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError) as exc:
+                raise SessionConfigurationIdentityVerificationError(
+                    f"Cannot verify configuration identity for live session {session_name}: "
+                    f"{identity_path} is unreadable"
+                ) from exc
+            if not isinstance(loaded, dict):
+                raise SessionConfigurationIdentityVerificationError(
+                    f"Cannot verify configuration identity for live session {session_name}: "
+                    f"{identity_path} must contain a JSON object"
+                )
+            identity = loaded
+
+        identity_keys = (
+            "configuration_mode",
+            "config_name",
+            "config_fingerprint",
+        )
+        recorded_values = tuple(identity.get(key) for key in identity_keys)
+        current_values = (
+            self.config.configuration_mode,
+            self.config.config_name,
+            self.config.config_fingerprint,
+        )
+        if not all(isinstance(value, str) for value in recorded_values):
+            raise SessionConfigurationIdentityVerificationError(
+                f"Cannot verify configuration identity for live session {session_name}: "
+                f"{identity_path} lacks mode, config name, or effective fingerprint"
+            )
+        recorded_identity = cast(tuple[str, str, str], recorded_values)
+        if recorded_identity != current_values:
+            recorded_mode, recorded_config, recorded_fingerprint = recorded_identity
+            raise SessionConfigurationModeMismatchError(
+                "Cannot start Repository Engine with configuration "
+                f"{self.config.configuration_mode!r}/{self.config.config_name!r} "
+                f"({self.config.config_fingerprint[:12]}): live session {session_name!r} "
+                f"was launched with {recorded_mode!r}/{recorded_config!r} "
+                f"({recorded_fingerprint[:12]}). Drain or terminate live sessions before "
+                "switching or editing configuration."
+            )
+
     def _restore_single_session(
         self,
         session_info: DiscoveredSession,
@@ -171,12 +241,13 @@ class SessionRestorer:
             return None
 
         run_assets = self._required_run_assets(session_info, session_name)
-        if run_assets is None:
-            return None
+        self._assert_restored_session_mode(run_assets, session_name)
 
         # Determine session type and session_name
         restored_pr_number: int | None = None
-        if is_review and not session_name.startswith(RETROSPECTIVE_REVIEW_TERMINAL_PREFIX):
+        if is_review and not session_name.startswith(
+            RETROSPECTIVE_REVIEW_TERMINAL_PREFIX
+        ):
             match = _REVIEW_SESSION_RE.match(session_name)
             restored_pr_number = int(match.group(1)) if match else issue_number
 
@@ -203,7 +274,9 @@ class SessionRestorer:
             agent_config = next(iter(self.config.agents.values()), None)
 
         if not agent_config:
-            logger.warning("No agent config available for session %s - skipping", session_name)
+            logger.warning(
+                "No agent config available for session %s - skipping", session_name
+            )
             return None
 
         if not self.config.repo:
@@ -218,7 +291,9 @@ class SessionRestorer:
             task_kind = TaskKind.REVIEW if is_review else TaskKind.CODE
         session_key = SessionKey(issue=issue_key, task=task_kind)
         # Use the agent type from issue labels, or the first available agent as fallback
-        agent_label_val = issue_obj.agent_type or next(iter(self.config.agents.keys()), "unknown")
+        agent_label_val = issue_obj.agent_type or next(
+            iter(self.config.agents.keys()), "unknown"
+        )
         return Session(
             key=session_key,
             issue=issue_obj,
@@ -237,27 +312,26 @@ class SessionRestorer:
             ),
         )
 
-    @staticmethod
     def _required_run_assets(
+        self,
         session_info: DiscoveredSession,
         session_name: str,
-    ) -> SessionRunAssets | None:
+    ) -> SessionRunAssets:
         raw: object = session_info.get("run_dir")
         if type(raw) is not str or not raw:
-            logger.warning(
-                "Discovered active session %s has no recorded run_dir - skipping",
-                session_name,
+            message = (
+                f"Discovered active session {session_name} has no recorded run_dir"
             )
-            return None
+            raise SessionConfigurationIdentityVerificationError(
+                f"Cannot verify configuration identity: {message}"
+            )
         run_dir = Path(raw)
         manifest_path = run_dir / "manifest.json"
         if not run_dir.exists() or not manifest_path.exists():
-            logger.warning(
-                "Discovered active session %s run assets are missing: %s - skipping",
-                session_name,
-                run_dir,
+            message = f"Discovered active session {session_name} run assets are missing: {run_dir}"
+            raise SessionConfigurationIdentityVerificationError(
+                f"Cannot verify configuration identity: {message}"
             )
-            return None
         try:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             if not isinstance(manifest, dict):
@@ -267,13 +341,13 @@ class SessionRestorer:
                 manifest=manifest,
             )
         except (OSError, json.JSONDecodeError, ValueError, TypeError) as exc:
-            logger.warning(
-                "Discovered active session %s has invalid run assets at %s: %s - skipping",
-                session_name,
-                run_dir,
-                exc,
+            message = (
+                f"Discovered active session {session_name} has invalid run assets at "
+                f"{run_dir}: {exc}"
             )
-            return None
+            raise SessionConfigurationIdentityVerificationError(
+                f"Cannot verify configuration identity: {message}"
+            ) from exc
 
     def _get_branch_name(self, worktree_path: Path) -> str:
         """Get the current branch name for a worktree.

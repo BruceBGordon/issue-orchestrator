@@ -40,7 +40,7 @@ their focus issue and use it for board context.
 
 | Source | Access | What It Tells You |
 |--------|--------|-------------------|
-| Config file | `cat .issue-orchestrator/config/*.yaml` | Agent definitions, timeouts, label names, review workflow |
+| Config file | `cat .issue-orchestrator/config/modes/<mode>/*.yaml` | Agent definitions, timeouts, label names, review workflow |
 | Agent prompts | `cat .prompts/<agent>.md` or path from config | What agents are instructed to do |
 
 ### Local Logs and Session Artifacts (Advisory)

@@ -57,7 +57,7 @@ both lifecycle gates.
 
 When you install repo guardrails with `issue-orchestrator setup-guardrails`, the
 generated `scripts/verify-pr.sh` captures the selected config filename. If you
-switch the repo to a different `.issue-orchestrator/config/*.yaml`, rerun
+switch the repo to a different `.issue-orchestrator/config/modes/<mode>/*.yaml`, rerun
 `setup-guardrails` so pre-push validation and cache lookups continue to use the
 same config.
 

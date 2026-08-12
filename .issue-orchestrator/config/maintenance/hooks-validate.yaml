@@ -1,4 +1,4 @@
-# Hook validation config: exercises AI gate tests for supported CLIs.
+# Maintenance-only hook validation config: exercises supported CLIs.
 # Not intended for issue execution.
 # Codex is excluded because live verification is not yet supported.
 

@@ -51,6 +51,11 @@ def parse_args() -> argparse.Namespace:
         help="Path to config file (optional, will search if not provided)",
     )
     parser.add_argument(
+        "--mode",
+        default="default",
+        help="Directory-backed configuration mode (default: default)",
+    )
+    parser.add_argument(
         "--log-level",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         default="INFO",
@@ -128,13 +133,33 @@ def _assert_expected_identity(repo_root: Path) -> None:
         )
 
 
-def _load_config_for_instance(repo_root: Path, config_path: Path | None, instance_id: str | None):
+def _load_config_for_instance(
+    repo_root: Path,
+    config_path: Path | None,
+    instance_id: str | None,
+    mode: str = "default",
+):
     from ..infra.config import Config
+    from ..infra.config_identity import (
+        EXPECTED_CONFIG_FINGERPRINT_ENV,
+        assert_expected_config_fingerprint,
+    )
+    from ..infra.config_paths import require_engine_launch_config_path
 
     if config_path:
+        config_path = require_engine_launch_config_path(config_path)
         config = Config.load(config_path)
     else:
-        config = Config.find_and_load(repo_root)
+        config = Config.find_and_load(repo_root, mode=mode)
+    if config.configuration_mode != mode:
+        raise ValueError(
+            "Selected mode does not match config path: "
+            f"mode={mode!r} path_mode={config.configuration_mode!r}"
+        )
+    assert_expected_config_fingerprint(
+        config.config_fingerprint,
+        os.environ.get(EXPECTED_CONFIG_FINGERPRINT_ENV),
+    )
     config.repo_root = repo_root
     if not instance_id:
         return config
@@ -189,6 +214,7 @@ async def run(
     instance_id: str | None = None,
     start_paused: bool = False,
     dev_no_auth: bool = False,
+    mode: str = "default",
 ) -> None:
     """Run the orchestrator with web dashboard.
 
@@ -208,10 +234,19 @@ async def run(
 
     _assert_expected_identity(repo_root)
 
+    config = _load_config_for_instance(repo_root, config_path, instance_id, mode)
+
     # Acquire the repository lock (instance-specific if multi-instance)
     instance_str = f" instance={instance_id}" if instance_id else ""
     logger.info("Acquiring lock for %s%s", repo_root, instance_str)
-    lock_info = acquire_lock(repo_root, port, instance_id)
+    lock_info = acquire_lock(
+        repo_root,
+        port,
+        instance_id,
+        configuration_mode=config.configuration_mode,
+        config_name=config.config_name,
+        config_fingerprint=config.config_fingerprint,
+    )
     logger.info("Lock acquired: pid=%d, port=%s", lock_info.pid, lock_info.http_port)
 
     # Register cleanup on exit
@@ -225,8 +260,6 @@ async def run(
         while True:
             touch_lock(repo_root, instance_id=instance_id)
             await asyncio.sleep(5.0)
-
-    config = _load_config_for_instance(repo_root, config_path, instance_id)
 
     # Build the orchestrator before startup publishes anything, so auth
     # and the bound port land on the same agent-callback endpoint the
@@ -294,23 +327,29 @@ def main() -> int:
     # is attributed and forces exit; run() later attaches graceful shutdown.
     # See infra.shutdown_signals.
     from ..infra.shutdown_signals import begin_shutdown_watch, block_shutdown_signals
+
     if block_shutdown_signals():
         begin_shutdown_watch()
-        logger.debug("Shutdown signals blocked; early sender-attributed watcher started")
+        logger.debug(
+            "Shutdown signals blocked; early sender-attributed watcher started"
+        )
 
     # Change to repo root
     os.chdir(args.repo_root)
 
     try:
-        asyncio.run(run(
-            args.repo_root,
-            args.port,
-            args.config,
-            args.no_browser,
-            args.instance_id,
-            args.start_paused,
-            args.dev_no_auth,
-        ))
+        asyncio.run(
+            run(
+                args.repo_root,
+                args.port,
+                args.config,
+                args.no_browser,
+                args.instance_id,
+                args.start_paused,
+                args.dev_no_auth,
+                args.mode,
+            )
+        )
         return 0
     except Exception as e:
         logger.exception("Orchestrator failed: %s", e)

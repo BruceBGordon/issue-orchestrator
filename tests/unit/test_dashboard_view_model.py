@@ -129,6 +129,8 @@ def test_view_model_active_session_and_dashboard_data():
     assert dashboard_data["paused"] is False
     assert dashboard_data["queueRefreshSeconds"] == 600
     assert dashboard_data["agents"] == ["agent:web"]
+    assert dashboard_data["configName"] == ""
+    assert dashboard_data["configMode"] == "default"
     assert "scope" in dashboard_data
     assert dashboard_data["refresh"]["fetchLayerEnabled"] is True
 

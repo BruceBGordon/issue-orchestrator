@@ -3,6 +3,7 @@ import { createRequire } from "module";
 import { normalizeClientCapabilities, sessionActionMode } from "../../src/clientCapabilities.js";
 import { decideStartOutcome, runStartCommand } from "../../src/startCommand.js";
 import type { StartResponse } from "../../src/types.js";
+import { defaultConfigPath } from "../../src/configPaths.js";
 
 const require = createRequire(import.meta.url);
 const vscode = require("vscode") as typeof import("vscode");
@@ -50,6 +51,13 @@ suite("Issue Orchestrator Extension", () => {
   test("sessionActionMode falls back to console when focus unsupported", () => {
     assert.strictEqual(sessionActionMode({ focus_session: false }), "console");
     assert.strictEqual(sessionActionMode({ focus_session: true }), "focus");
+  });
+
+  test("default config path uses the default mode directory", () => {
+    assert.strictEqual(
+      defaultConfigPath("/work/repo"),
+      "/work/repo/.issue-orchestrator/config/modes/default/default.yaml"
+    );
   });
 });
 

@@ -839,6 +839,18 @@ body {
     min-width: 140px;
 }
 
+.repo-card-config label {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+}
+
+.repo-card-config select:disabled {
+    cursor: not-allowed;
+    opacity: 0.7;
+}
+
 .repo-card-stat {
     display: flex;
     align-items: center;

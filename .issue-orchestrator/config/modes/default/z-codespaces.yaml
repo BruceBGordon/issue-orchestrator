@@ -1,4 +1,4 @@
-# Codespaces-specific orchestrator config.
+# Codespaces-specific config in the default mode.
 #
 # This keeps the local `main.yaml` workflow unchanged while giving Codespaces a
 # stable dashboard/control API port pair that matches forwarded ports in

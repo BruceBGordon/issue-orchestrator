@@ -135,7 +135,8 @@ export type LaunchStatus =
   | "doctor_warning"
   | "already_running"
   | "doctor_error"
-  | "launch_error";
+  | "launch_error"
+  | "configuration_conflict";
 
 export interface LaunchResult {
   status: LaunchStatus;

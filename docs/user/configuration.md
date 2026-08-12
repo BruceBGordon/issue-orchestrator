@@ -1,6 +1,43 @@
 # Configuration
 
-Configuration lives in `.issue-orchestrator/config/default.yaml` (or a named config like `main.yaml`).
+Launchable configuration lives in
+`.issue-orchestrator/config/modes/<mode>/default.yaml` (or a named config such
+as `main.yaml`). The Control Center selects a typed `(mode, config)` pair when
+it starts a Repository Engine.
+
+## Configuration modes
+
+Each mode is a directory containing complete, coherent configuration files:
+
+```text
+.issue-orchestrator/config/
+  modes/
+    default/
+      main.yaml
+    codex/
+      main.yaml
+    claude/
+      main.yaml
+  maintenance/
+    hooks-validate.yaml
+```
+
+Use modes to switch provider/model budgets or compare agent configurations.
+The common case remains `default`; Control Center hides the mode selector when
+no alternative exists. Mode and config controls are disabled while the
+Repository Engine is Running or Paused. Stop the engine and drain any surviving
+agent sessions before switching. A missing mode/config pair fails startup;
+there is no cross-mode fallback.
+
+From the CLI, global selection options precede the command:
+
+```bash
+issue-orchestrator --mode codex start
+issue-orchestrator --config .issue-orchestrator/config/modes/codex/main.yaml start
+```
+
+Files under `maintenance/` are not launch modes. They support repository
+maintenance such as exercising every hook adapter.
 
 ---
 

@@ -171,8 +171,8 @@ class GitHubAuth:
         timeout_seconds: float = 10.0,
     ) -> TokenValidationResult:
         base_url = self.api_url.rstrip("/")
-        headers = self.authorization_headers()
         try:
+            headers = self.authorization_headers()
             if self.auth_kind == "github_app":
                 return self._validate_installation_token(
                     base_url=base_url,

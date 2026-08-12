@@ -227,7 +227,7 @@ To exercise AI gate tests for all supported CLIs without changing your main conf
 make verify-hooks-all
 ```
 
-This runs `issue-orchestrator setup-hooks` with `.issue-orchestrator/config/hooks-validate.yaml`,
+This runs `issue-orchestrator setup-hooks` with `.issue-orchestrator/config/maintenance/hooks-validate.yaml`,
 which installs hooks and executes AI gate tests for the configured agents.
 Codex is intentionally excluded because AI gate tests are not yet supported.
 
@@ -259,7 +259,7 @@ signature: sha256(verified_at + hooks_hash + secret)
 ## Configuration
 
 ```yaml
-# .issue-orchestrator/config/default.yaml
+# .issue-orchestrator/config/modes/default/default.yaml
 
 # Verification config (optional)
 verify:

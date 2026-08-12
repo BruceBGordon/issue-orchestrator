@@ -5,28 +5,32 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+from .repository_launch_selection import (
+    ConfigurationModeName,
+    RepositoryLaunchSelection,
+)
+
 
 @dataclass(frozen=True, slots=True)
 class RuntimeConfigReference:
     """The selected orchestrator config file for a managed runtime action."""
 
     config_path: Path
-    config_name: str
+    selection: RepositoryLaunchSelection
 
     def __post_init__(self) -> None:
         if not self.config_path.is_absolute():
             raise ValueError("config_path must be absolute")
-        if not self.config_path.is_file():
-            raise ValueError(
-                f"config_path must point to an existing file: {self.config_path}"
-            )
-        if type(self.config_name) is not str or not self.config_name.strip():
-            raise ValueError("config_name must be a non-empty string")
+        if self.config_path.name != self.selection.config.value:
+            raise ValueError("config_path and selection config_name must match")
 
-    @classmethod
-    def from_path(cls, config_path: Path) -> "RuntimeConfigReference":
-        resolved = config_path.expanduser().resolve()
-        return cls(config_path=resolved, config_name=resolved.name)
+    @property
+    def config_name(self) -> str:
+        return self.selection.config.value
+
+    @property
+    def mode(self) -> ConfigurationModeName:
+        return self.selection.mode
 
     def to_env(self) -> dict[str, str]:
         return {
@@ -34,4 +38,6 @@ class RuntimeConfigReference:
             "ISSUE_ORCHESTRATOR_CONFIG_PATH": str(self.config_path),
             "ORCHESTRATOR_CONFIG_NAME": self.config_name,
             "ORCHESTRATOR_CONFIG_PATH": str(self.config_path),
+            "ISSUE_ORCHESTRATOR_MODE": self.mode.value,
+            "ORCHESTRATOR_MODE": self.mode.value,
         }
