@@ -485,6 +485,27 @@ def test_github_auth_validates_app_installation_repo_access(
     assert result.username == "GitHub App installation 145305179"
 
 
+def test_github_auth_validation_reports_token_provider_failure() -> None:
+    class _Provider:
+        auth_kind = "github_app"
+
+        def get_token(self) -> str:
+            raise GitHubAuthError("GitHub App private key is unavailable")
+
+    auth = GitHubAuth(
+        token_provider=_Provider(),
+        source_descriptions=("GitHub App installation 145305179",),
+        repo="owner/repo",
+    )
+
+    result = auth.validate(repo="owner/repo")
+
+    assert result == TokenValidationResult(
+        valid=False,
+        error="GitHub App private key is unavailable",
+    )
+
+
 def test_read_gh_cli_token_from_hosts_oauth_token(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
