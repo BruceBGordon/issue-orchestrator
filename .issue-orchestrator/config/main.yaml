@@ -92,7 +92,7 @@ review:
   internal:
     enabled: true
     max_rounds: 10
-    instructions: ".io/internal-review.md"
+    instructions: "repo-specific/prompts/internal-review.md"
   nits:
     default_policy: "address"
     by_agent: {}
