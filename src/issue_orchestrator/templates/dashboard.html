@@ -238,7 +238,7 @@
                          data-column="{{ column.id }}"
                          data-column-title="{{ column.title }}"
                          data-expanded="false">
-                    <h2 id="column-{{ column.id }}-heading" ondblclick="toggleColumnExpand('{{ column.id }}')">
+                    <h2 ondblclick="toggleColumnExpand('{{ column.id }}')">
                         {% if column.expandable %}
                         <button type="button" class="column-expand-btn" onclick="toggleColumnExpand('{{ column.id }}');event.stopPropagation();" aria-label="Expand {{ column.title }}" aria-controls="column-{{ column.id }}-expanded" aria-expanded="false">
                             <span class="expand-chevron">&#x25B8;</span>
@@ -335,7 +335,7 @@
                     <div class="column-expanded"
                          id="column-{{ column.id }}-expanded"
                          role="region"
-                         aria-labelledby="column-{{ column.id }}-heading"
+                         aria-label="{{ column.title }} full list"
                          aria-hidden="true"
                          style="display:none;">
                         {% if column.id == 'blocked' %}

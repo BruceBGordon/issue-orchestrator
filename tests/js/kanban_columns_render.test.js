@@ -108,6 +108,59 @@ test('live refresh hides the compact-column footer when the full list is visible
     assert.equal(label.textContent, '0 more');
 });
 
+test('live refresh preserves focus before hiding a footer that no longer has overflow', () => {
+    const context = loadModule();
+    const transitions = [];
+    let isHidden = true;
+    const label = { textContent: '' };
+    const expandButton = {
+        focus: () => {
+            transitions.push('focus-expand');
+            context.document.activeElement = expandButton;
+        },
+    };
+    const footer = {
+        querySelector: (selector) => selector === '.column-overflow-label' ? label : null,
+        setAttribute: () => {},
+    };
+    Object.defineProperty(footer, 'hidden', {
+        get: () => isHidden,
+        set: (value) => {
+            isHidden = value;
+            transitions.push(`hidden-${value}`);
+        },
+    });
+    const column = {
+        querySelector: (selector) => {
+            if (selector === '.column-overflow-footer') return footer;
+            if (selector === '.column-expand-btn') return expandButton;
+            return null;
+        },
+    };
+
+    context.syncColumnOverflowFooter(column, {
+        id: 'blocked',
+        title: 'Blocked',
+        count: 13,
+        hidden_count: 1,
+    });
+    assert.equal(isHidden, false);
+    assert.equal(label.textContent, '1 more');
+
+    context.document.activeElement = footer;
+    transitions.length = 0;
+
+    context.syncColumnOverflowFooter(column, {
+        id: 'blocked',
+        title: 'Blocked',
+        count: 12,
+        hidden_count: 0,
+    });
+
+    assert.deepEqual(transitions, ['focus-expand', 'hidden-true']);
+    assert.equal(context.document.activeElement, expandButton);
+});
+
 test('compact-column footer dispatches to the existing full-list expansion', () => {
     const context = loadModule();
     const calls = [];

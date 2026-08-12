@@ -296,7 +296,8 @@ def test_truncated_blocked_column_renders_full_list_footer(jinja_env):
     expanded = blocked_col.select_one("#column-blocked-expanded")
     assert expanded is not None
     assert expanded.get("role") == "region"
-    assert expanded.get("aria-labelledby") == "column-blocked-heading"
+    assert expanded.get("aria-label") == "Blocked full list"
+    assert expanded.get("aria-labelledby") is None
 
 
 def test_complete_compact_column_keeps_full_list_footer_hidden(jinja_env):

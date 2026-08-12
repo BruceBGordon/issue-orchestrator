@@ -355,6 +355,9 @@ function syncColumnOverflowFooter(columnElement, column) {
     }
 
     footer.querySelector('.column-overflow-label').textContent = `${hiddenCount} more`;
+    if (hiddenCount === 0 && document.activeElement === footer) {
+        columnElement.querySelector('.column-expand-btn').focus();
+    }
     footer.hidden = hiddenCount === 0;
 
     const title = String(column?.title || column?.id || 'column');
