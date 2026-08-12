@@ -5,9 +5,15 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import Any
 
 from ..domain.repository_launch_selection import RepositoryLaunchSelection
+from ..domain.runtime_config import RuntimeConfigReference
+from .config_paths import (
+    require_engine_launch_config_path,
+    selection_from_config_path,
+)
 
 EXPECTED_CONFIG_FINGERPRINT_ENV = "ISSUE_ORCHESTRATOR_EXPECTED_CONFIG_FINGERPRINT"
 
@@ -75,10 +81,35 @@ class ConfigLaunchIdentity:
         return self.config_fingerprint
 
 
+class RuntimeConfigReferenceOwner:
+    """Construct a verified runtime reference from loaded configuration state."""
+
+    config_path: Path | None
+    launch_selection: RepositoryLaunchSelection
+
+    def runtime_config_reference(self) -> RuntimeConfigReference:
+        """Validate file existence and storage-derived mode at the infra boundary."""
+        if self.config_path is None:
+            raise ValueError("Runtime config reference requires config_path")
+        config_path = require_engine_launch_config_path(self.config_path)
+        if not config_path.is_file():
+            raise ValueError(
+                f"config_path must point to an existing file: {config_path}"
+            )
+        path_selection = selection_from_config_path(config_path)
+        if path_selection != self.launch_selection:
+            raise ValueError("config_path and launch selection must match")
+        return RuntimeConfigReference(
+            config_path=config_path,
+            selection=self.launch_selection,
+        )
+
+
 __all__ = [
     "ConfigurationFingerprintMismatch",
     "ConfigLaunchIdentity",
     "EXPECTED_CONFIG_FINGERPRINT_ENV",
+    "RuntimeConfigReferenceOwner",
     "assert_expected_config_fingerprint",
     "effective_config_fingerprint",
 ]

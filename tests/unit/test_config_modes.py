@@ -6,6 +6,9 @@ from pathlib import Path
 
 import pytest
 
+from issue_orchestrator.domain.repository_launch_selection import (
+    RepositoryLaunchSelection,
+)
 from issue_orchestrator.infra.config import Config
 from issue_orchestrator.infra.config_paths import (
     get_config_path,
@@ -58,6 +61,34 @@ def test_config_load_records_mode_and_effective_fingerprint(tmp_path: Path) -> N
 
     assert config.configuration_mode == "codex"
     assert config.config_name == "main.yaml"
+
+
+def test_runtime_config_reference_rejects_path_selection_mode_drift(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / ".issue-orchestrator/config/modes/codex/main.yaml"
+    _write_config(config_path)
+    config = Config.load(config_path)
+    config.launch_selection = RepositoryLaunchSelection.parse(
+        mode="claude",
+        config_name="main.yaml",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="config_path and launch selection must match",
+    ):
+        config.runtime_config_reference()
+
+
+def test_runtime_config_reference_requires_the_loaded_file(tmp_path: Path) -> None:
+    config_path = tmp_path / ".issue-orchestrator/config/modes/codex/main.yaml"
+    _write_config(config_path)
+    config = Config.load(config_path)
+    config_path.unlink()
+
+    with pytest.raises(ValueError, match="must point to an existing file"):
+        config.runtime_config_reference()
 
 
 def test_effective_fingerprint_refresh_is_stable_and_override_sensitive(

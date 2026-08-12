@@ -21,10 +21,6 @@ class RuntimeConfigReference:
     def __post_init__(self) -> None:
         if not self.config_path.is_absolute():
             raise ValueError("config_path must be absolute")
-        if not self.config_path.is_file():
-            raise ValueError(
-                f"config_path must point to an existing file: {self.config_path}"
-            )
         if self.config_path.name != self.selection.config.value:
             raise ValueError("config_path and selection config_name must match")
 

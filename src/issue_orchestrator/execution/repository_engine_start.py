@@ -442,18 +442,18 @@ class StartRepositoryEngineCommand:
         request: RepositoryEngineStartRequest,
         ownership: ExistingRepositoryEngineOwnership,
     ) -> RepositoryEngineStartResult | None:
-        if ownership.tracked:
-            stopped_count = self._supervisor.stop_all_instances(
+        for tracked in ownership.tracked:
+            stopped = self._supervisor.stop_tracked_instance(
                 request.repo_root,
-                force=True,
+                tracked,
                 reason="force_restart=true on repository engine start",
                 actor=request.actor,
             )
-            if stopped_count < len(ownership.tracked):
+            if not stopped:
                 return RepositoryEngineStartResult(
                     {
                         "error": "stop_failed",
-                        "detail": "Unable to stop every tracked orchestrator process.",
+                        "detail": "Unable to stop a tracked orchestrator process.",
                         "ports": sorted(ownership.tracked_ports),
                     },
                     500,

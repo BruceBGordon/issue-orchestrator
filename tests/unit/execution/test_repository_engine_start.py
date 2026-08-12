@@ -421,6 +421,7 @@ def test_force_restart_stops_tracked_dynamic_ports_through_supervisor_owner(
         instances=[
             SupervisorStatus(
                 state="running",
+                pid=201,
                 port=25101,
                 instance_id="orchestrator-1",
                 configuration_mode="codex",
@@ -429,6 +430,7 @@ def test_force_restart_stops_tracked_dynamic_ports_through_supervisor_owner(
             ),
             SupervisorStatus(
                 state="running",
+                pid=202,
                 port=25102,
                 instance_id="orchestrator-2",
                 configuration_mode="codex",
@@ -437,7 +439,7 @@ def test_force_restart_stops_tracked_dynamic_ports_through_supervisor_owner(
             ),
         ],
     )
-    supervisor.stop_all_instances.return_value = 2
+    supervisor.stop_tracked_instance.return_value = True
     _prepare_successful_start(monkeypatch, selection, launch)
 
     result = StartRepositoryEngineCommand(supervisor).execute(
@@ -449,14 +451,60 @@ def test_force_restart_stops_tracked_dynamic_ports_through_supervisor_owner(
     )
 
     assert result.status_code == 200
-    supervisor.stop_all_instances.assert_called_once_with(
-        tmp_path,
-        force=True,
-        reason="force_restart=true on repository engine start",
-        actor="control-center",
-    )
+    assert supervisor.stop_tracked_instance.call_count == 2
     supervisor.stop_by_port.assert_not_called()
     launch.assert_called_once()
+
+
+def test_force_restart_does_not_hide_a_named_instance_stop_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selection = _selection()
+    launch = Mock()
+    tracked = [
+        SupervisorStatus(
+            state="running",
+            pid=301,
+            port=25201,
+            instance_id="orchestrator-1",
+            configuration_mode="codex",
+            config_name="main.yaml",
+            config_fingerprint="fingerprint",
+        ),
+        SupervisorStatus(
+            state="running",
+            pid=302,
+            port=25202,
+            instance_id="orchestrator-2",
+            configuration_mode="codex",
+            config_name="main.yaml",
+            config_fingerprint="fingerprint",
+        ),
+    ]
+    supervisor = MagicMock()
+    supervisor.status_all_instances.return_value = MultiInstanceStatus(
+        repo_root=str(tmp_path),
+        instances=tracked,
+    )
+    supervisor.stop_tracked_instance.side_effect = [True, False]
+    _prepare_successful_start(monkeypatch, selection, launch)
+
+    result = StartRepositoryEngineCommand(supervisor).execute(
+        RepositoryEngineStartRequest(
+            repo_root=tmp_path,
+            selection=selection,
+            force_restart=True,
+        )
+    )
+
+    assert result.status_code == 500
+    assert result.payload["error"] == "stop_failed"
+    assert [
+        call.args[1] for call in supervisor.stop_tracked_instance.call_args_list
+    ] == tracked
+    supervisor.stop_all_instances.assert_not_called()
+    launch.assert_not_called()
 
 
 def test_start_owner_rejects_maintenance_config_as_engine_config(

@@ -40,7 +40,7 @@ from .config_models import (
     TechLeadConfig,
     ValidationConfig,
 )
-from .config_identity import ConfigLaunchIdentity
+from .config_identity import ConfigLaunchIdentity, RuntimeConfigReferenceOwner
 from .config_paths import (
     CONFIG_DIR as CONFIG_DIR,
     DEFAULT_CONFIG_NAME as DEFAULT_CONFIG_NAME,
@@ -103,7 +103,7 @@ def _put_if_truthy(target: dict, key: str, value: object) -> None:
 
 
 @dataclass
-class Config(ConfigLaunchIdentity, TechLeadActivationOwner):
+class Config(ConfigLaunchIdentity, RuntimeConfigReferenceOwner, TechLeadActivationOwner):
     """Orchestrator configuration."""
 
     # Agent configurations keyed by label (e.g., "agent:web")

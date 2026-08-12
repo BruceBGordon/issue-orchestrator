@@ -461,6 +461,7 @@ def stop(
     graceful_timeout_seconds: float = DEFAULT_ENGINE_GRACEFUL_TIMEOUT_SECONDS,
     force_if_graceful_fails: bool = True,
     stop_policy: shutdown_timing.StopPolicy | None = None,
+    expected_pid: int | None = None,
 ) -> bool:
     """Stop the orchestrator; ``reason`` records the caller's intent."""
     if not reason or not reason.strip():
@@ -475,6 +476,15 @@ def stop(
     if info is None:
         logger.debug("No lock file found for %s (already stopped)", repo_root)
         return True
+
+    if expected_pid is not None and info.pid != expected_pid:
+        logger.warning(
+            "Refusing to stop replacement instance %s pid=%d; expected pid=%d",
+            instance_id or "default",
+            info.pid,
+            expected_pid,
+        )
+        return False
 
     pid, port = info.pid, info.http_port
 
@@ -502,6 +512,27 @@ def stop(
     stopped = controller.stop()
     logger.info("Orchestrator stop attempt completed pid=%d stopped=%s", pid, stopped)
     return stopped
+
+
+def stop_tracked_instance(
+    repo_root: Path | str,
+    tracked: SupervisorStatus,
+    *,
+    reason: str,
+    actor: str,
+) -> bool:
+    """Stop and verify only the exact process represented by ``tracked``."""
+    if tracked.pid is None:
+        return False
+    stopped = stop(
+        repo_root,
+        force=True,
+        instance_id=tracked.instance_id,
+        reason=reason,
+        actor=actor,
+        expected_pid=tracked.pid,
+    )
+    return stopped and not shutdown_timing.process_is_alive(tracked.pid)
 
 
 def _force_stop(

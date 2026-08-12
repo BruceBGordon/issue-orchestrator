@@ -110,6 +110,17 @@ class SupervisorOps(Protocol):
         stop_policy: RepositoryEngineStopPolicy | None = None,
     ) -> bool: ...
 
+    def stop_tracked_instance(
+        self,
+        repo_root: Path | str,
+        tracked: SupervisorStatus,
+        *,
+        reason: str,
+        actor: str,
+    ) -> bool:
+        """Stop only the exact PID/instance represented by ``tracked``."""
+        ...
+
     def stop_by_port(
         self,
         port: int,

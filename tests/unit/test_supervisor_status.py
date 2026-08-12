@@ -17,6 +17,7 @@ from issue_orchestrator.infra.supervisor import (
     status,
     start,
     start_instances,
+    stop_tracked_instance,
     find_free_port,
     status_all_instances,
 )
@@ -24,6 +25,47 @@ from issue_orchestrator.infra.supervisor import (
 
 def test_graceful_shutdown_default_allows_agent_runtime_cleanup() -> None:
     assert DEFAULT_ENGINE_GRACEFUL_TIMEOUT_SECONDS == 120
+
+
+def test_stop_rejects_a_replacement_process_for_exact_tracked_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    replacement_pid = os.getpid()
+    lock_dir = tmp_path / ".issue-orchestrator/locks"
+    lock_dir.mkdir(parents=True)
+    (lock_dir / "orchestrator-1.json").write_text(
+        json.dumps(
+            {
+                "repo_root": str(tmp_path),
+                "pid": replacement_pid,
+                "started_at": "2026-08-12T00:00:00Z",
+                "http_port": 19090,
+                "state_dir": str(tmp_path / ".issue-orchestrator/state"),
+                "instance_id": "orchestrator-1",
+            }
+        ),
+        encoding="utf-8",
+    )
+    kill = MagicMock()
+    monkeypatch.setattr(
+        "issue_orchestrator.infra.supervisor._send_kill_signal",
+        kill,
+    )
+
+    stopped = stop_tracked_instance(
+        tmp_path,
+        SupervisorStatus(
+            state="running",
+            pid=replacement_pid + 1,
+            instance_id="orchestrator-1",
+        ),
+        reason="test exact ownership",
+        actor="test",
+    )
+
+    assert stopped is False
+    kill.assert_not_called()
 
 
 def test_start_rejects_config_changed_after_preflight_before_spawn(

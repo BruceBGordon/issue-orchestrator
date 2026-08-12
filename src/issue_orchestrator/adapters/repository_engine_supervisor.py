@@ -24,6 +24,23 @@ class DefaultSupervisorOps:
 
         return supervisor.stop(*args, **kwargs)
 
+    def stop_tracked_instance(
+        self,
+        repo_root: Any,
+        tracked: SupervisorStatus,
+        *,
+        reason: str,
+        actor: str,
+    ) -> bool:
+        from ..infra import supervisor
+
+        return supervisor.stop_tracked_instance(
+            repo_root,
+            tracked,
+            reason=reason,
+            actor=actor,
+        )
+
     def stop_by_port(self, *args: Any, **kwargs: Any) -> bool:
         from ..infra import supervisor
 
