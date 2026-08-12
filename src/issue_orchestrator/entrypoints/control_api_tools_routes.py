@@ -12,7 +12,7 @@ from fastapi.responses import JSONResponse
 
 from ..execution.control_center_actions import (
     AuditActionRequest,
-    RepoActionRequest,
+    ConfiguredRepoActionRequest,
     TraceActionRequest,
 )
 from .control_api_tools_support import ControlApiToolsDependency
@@ -39,8 +39,13 @@ async def tools_audit(
     if repo_path is None:
         return JSONResponse({"error": "Invalid repo_root"}, status_code=400)
     actions = deps.get_control_actions()
+    selection = actions.effective_launch_selection(repo_path)
     result = await actions.audit_cmd.execute(
-        AuditActionRequest(repo_root=repo_path, issue_number=issue_number),
+        AuditActionRequest(
+            repo_root=repo_path,
+            selection=selection,
+            issue_number=issue_number,
+        ),
     )
     return JSONResponse(result.payload, status_code=result.status_code)
 
@@ -95,7 +100,12 @@ async def tools_labels_init(
         return JSONResponse({"error": "Invalid repo_root"}, status_code=400)
 
     actions = deps.get_control_actions()
-    result = await actions.labels_cmd.execute(RepoActionRequest(repo_root=repo_path))
+    result = await actions.labels_cmd.execute(
+        ConfiguredRepoActionRequest(
+            repo_root=repo_path,
+            selection=actions.effective_launch_selection(repo_path),
+        )
+    )
     return JSONResponse(result.payload, status_code=result.status_code)
 
 
@@ -126,6 +136,9 @@ async def tools_worktrees_cleanup(
 
     actions = deps.get_control_actions()
     result = await actions.stale_worktrees_cmd.execute(
-        RepoActionRequest(repo_root=repo_path),
+        ConfiguredRepoActionRequest(
+            repo_root=repo_path,
+            selection=actions.effective_launch_selection(repo_path),
+        ),
     )
     return JSONResponse(result.payload, status_code=result.status_code)

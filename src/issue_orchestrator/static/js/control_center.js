@@ -6,7 +6,7 @@ const state = {
     discoveredRepos: [],
     discoveredLoadedAt: 0,
     currentView: 'repositories',
-    activeRepo: null,  // { path, config, source: 'registered'|'discovered' }
+    activeRepo: null,  // { path, config, mode, source: 'registered'|'discovered' }
     theme: localStorage.getItem('theme') || 'system',
     dashboardStatus: null
 };
@@ -17,7 +17,7 @@ const REPO_START_POLL_INTERVAL_MS = 250;
 const REPO_START_TIMEOUT_MS = 15000;
 let shutdownExpectClose = false;
 let shutdownCloseAttempted = false;
-let doctorModalContext = { repoRoot: null, configName: null, title: null, data: null };
+let doctorModalContext = { repoRoot: null, configName: null, mode: null, title: null, data: null };
 let setupWizardController = null;
 
 const DISCOVERED_STALE_MS = 5 * 60 * 1000;
@@ -31,77 +31,153 @@ function loadRecentRepo() {
     return null;
 }
 
-function saveRecentRepo(path, config) {
-    localStorage.setItem('recentRepo', JSON.stringify({ path, config }));
+function saveRecentRepo(path, config, mode = 'default') {
+    localStorage.setItem('recentRepo', JSON.stringify({ path, config, mode }));
 }
 
-// Load default config for a repo from localStorage
-function getDefaultConfig(repoPath) {
+function getDefaultMode(repoPath) {
     try {
-        const defaults = JSON.parse(localStorage.getItem('repoDefaultConfigs') || '{}');
+        const defaults = JSON.parse(localStorage.getItem('repoDefaultModes') || '{}');
         return defaults[repoPath];
     } catch (e) {}
     return null;
 }
 
-function setDefaultConfigForRepo(repoPath, configName) {
+function setDefaultModeForRepo(repoPath, mode) {
+    try {
+        const defaults = JSON.parse(localStorage.getItem('repoDefaultModes') || '{}');
+        defaults[repoPath] = mode;
+        localStorage.setItem('repoDefaultModes', JSON.stringify(defaults));
+    } catch (e) {}
+}
+
+function getRepoModes(repo) {
+    if (repo?.modes?.length) return repo.modes;
+    return repo?.configs?.length ? ['default'] : [];
+}
+
+function getSelectedRepoMode(repo, preferredMode = null) {
+    const modes = getRepoModes(repo);
+    if (getRepoState(repo) !== 'not running' && repo?.active_mode) return repo.active_mode;
+    if (!modes.length) return preferredMode || 'default';
+    if (repo.selected_mode && modes.includes(repo.selected_mode)) return repo.selected_mode;
+    if (preferredMode && modes.includes(preferredMode)) return preferredMode;
+    const savedMode = getDefaultMode(repo.path);
+    if (savedMode && modes.includes(savedMode)) return savedMode;
+    return modes[0];
+}
+
+function getRepoConfigs(repo, mode = null) {
+    const selectedMode = mode && getRepoModes(repo).includes(mode)
+        ? mode
+        : getSelectedRepoMode(repo);
+    const configured = repo?.mode_configs?.[selectedMode]
+        || (selectedMode === 'default' ? (repo?.configs || []) : []);
+    if (
+        getRepoState(repo) !== 'not running'
+        && repo?.active_mode === selectedMode
+        && repo?.active_config
+        && !configured.includes(repo.active_config)
+    ) {
+        return [repo.active_config, ...configured];
+    }
+    return configured;
+}
+
+// Load default config for a repo from localStorage
+function getDefaultConfig(repoPath, mode = 'default') {
     try {
         const defaults = JSON.parse(localStorage.getItem('repoDefaultConfigs') || '{}');
-        defaults[repoPath] = configName;
+        return defaults[repoPath]?.[mode] || null;
+    } catch (e) {}
+    return null;
+}
+
+function setDefaultConfigForRepo(repoPath, configName, mode = 'default') {
+    try {
+        const defaults = JSON.parse(localStorage.getItem('repoDefaultConfigs') || '{}');
+        defaults[repoPath] = defaults[repoPath] || {};
+        defaults[repoPath][mode] = configName;
         localStorage.setItem('repoDefaultConfigs', JSON.stringify(defaults));
     } catch (e) {}
 }
 
-function clearDefaultConfigForRepo(repoPath) {
+function clearDefaultConfigForRepo(repoPath, mode = 'default') {
     try {
         const defaults = JSON.parse(localStorage.getItem('repoDefaultConfigs') || '{}');
-        delete defaults[repoPath];
+        if (defaults[repoPath]) {
+            delete defaults[repoPath][mode];
+            if (Object.keys(defaults[repoPath]).length === 0) delete defaults[repoPath];
+        }
         localStorage.setItem('repoDefaultConfigs', JSON.stringify(defaults));
     } catch (e) {}
 }
 
-function isRepoConfigAvailable(repo, configName) {
+function isRepoConfigAvailable(repo, configName, mode = null) {
     return Boolean(
         configName
-        && repo?.configs
-        && repo.configs.includes(configName)
+        && getRepoConfigs(repo, mode).includes(configName)
     );
 }
 
-function getSelectedRepoConfig(repo, preferredConfig = null) {
-    if (!repo?.configs || repo.configs.length === 0) {
+function getSelectedRepoConfig(repo, preferredConfig = null, mode = null) {
+    const configs = getRepoConfigs(repo, mode);
+    const selectedMode = mode && getRepoModes(repo).includes(mode)
+        ? mode
+        : getSelectedRepoMode(repo);
+    if (
+        getRepoState(repo) !== 'not running'
+        && repo?.active_mode === selectedMode
+        && repo?.active_config
+    ) return repo.active_config;
+    if (configs.length === 0) {
         return preferredConfig;
     }
+    if (
+        repo.selected_mode === selectedMode
+        && repo.selected_config
+        && configs.includes(repo.selected_config)
+    ) return repo.selected_config;
     if (preferredConfig !== null && preferredConfig !== undefined) {
-        return isRepoConfigAvailable(repo, preferredConfig) ? preferredConfig : null;
+        return configs.includes(preferredConfig) ? preferredConfig : null;
     }
-    const savedDefault = getDefaultConfig(repo.path);
+    const savedDefault = getDefaultConfig(repo.path, selectedMode);
     if (savedDefault !== null && savedDefault !== undefined) {
-        return isRepoConfigAvailable(repo, savedDefault) ? savedDefault : null;
+        return configs.includes(savedDefault) ? savedDefault : null;
     }
-    return repo.configs[0];
+    return configs[0];
 }
 
-function getRepoConfigIssue(repo, preferredConfig = null) {
-    if (!repo?.configs || repo.configs.length === 0) {
+function getRepoConfigIssue(repo, preferredConfig = null, mode = null) {
+    const configs = getRepoConfigs(repo, mode);
+    const selectedMode = mode && getRepoModes(repo).includes(mode)
+        ? mode
+        : getSelectedRepoMode(repo);
+    if (configs.length === 0) {
         return null;
     }
-    if (preferredConfig && !repo.configs.includes(preferredConfig)) {
+    if (
+        repo.selected_mode === selectedMode
+        && repo.selected_config
+        && configs.includes(repo.selected_config)
+    ) return null;
+    if (preferredConfig && !configs.includes(preferredConfig)) {
         return `Selected config is unavailable: ${preferredConfig}`;
     }
-    const savedDefault = getDefaultConfig(repo.path);
-    if (savedDefault && !repo.configs.includes(savedDefault)) {
+    const savedDefault = getDefaultConfig(repo.path, selectedMode);
+    if (savedDefault && !configs.includes(savedDefault)) {
         return `Saved config is unavailable: ${savedDefault}`;
     }
     return null;
 }
 
-function buildRepoConfigOptions(repo, currentConfig) {
+function buildRepoConfigOptions(repo, currentConfig, mode = null) {
     const options = [];
-    if (repo.configs?.length && !currentConfig) {
+    const configs = getRepoConfigs(repo, mode);
+    if (configs.length && !currentConfig) {
         options.push('<option value="" selected>Choose config...</option>');
     }
-    for (const configName of (repo.configs || [])) {
+    for (const configName of configs) {
         options.push(
             `<option value="${escapeHtml(configName)}" ${configName === currentConfig ? 'selected' : ''}>${escapeHtml(configName)}</option>`
         );
@@ -109,16 +185,29 @@ function buildRepoConfigOptions(repo, currentConfig) {
     return options.join('');
 }
 
-function getValidRepoConfig(repo, preferredConfig = null) {
-    if (!repo?.configs || repo.configs.length === 0) {
-        return preferredConfig;
-    }
-    const selected = getSelectedRepoConfig(repo, preferredConfig);
-    return selected && repo.configs.includes(selected) ? selected : null;
+function buildRepoModeOptions(repo, currentMode) {
+    const modes = [...getRepoModes(repo)];
+    if (currentMode && !modes.includes(currentMode)) modes.unshift(currentMode);
+    return modes.map(mode => (
+        `<option value="${escapeHtml(mode)}" ${mode === currentMode ? 'selected' : ''}>${escapeHtml(mode)}</option>`
+    )).join('');
 }
 
-function requiresExplicitRepoConfigSelection(repo, selectedConfig) {
-    return Boolean(repo?.configs?.length && !selectedConfig && getRepoConfigIssue(repo, selectedConfig));
+function getValidRepoConfig(repo, preferredConfig = null, mode = null) {
+    const configs = getRepoConfigs(repo, mode);
+    if (configs.length === 0) {
+        return preferredConfig;
+    }
+    const selected = getSelectedRepoConfig(repo, preferredConfig, mode);
+    return selected && configs.includes(selected) ? selected : null;
+}
+
+function requiresExplicitRepoConfigSelection(repo, selectedConfig, mode = null) {
+    return Boolean(
+        getRepoConfigs(repo, mode).length
+        && !selectedConfig
+        && getRepoConfigIssue(repo, selectedConfig, mode)
+    );
 }
 
 // ============================================
@@ -193,7 +282,7 @@ function getRepoStateText(repo, isDiscovered = false) {
     return 'not running';
 }
 
-function selectRepo(path, config = null, source = 'registered') {
+function selectRepo(path, config = null, source = 'registered', mode = null) {
     const repo = source === 'discovered'
         ? state.discoveredRepos.find(r => r.path === path)
         : state.repos.find(r => r.path === path);
@@ -201,10 +290,11 @@ function selectRepo(path, config = null, source = 'registered') {
     if (!repo) return;
 
     // Determine config to use
-    const selectedConfig = getSelectedRepoConfig(repo, config);
+    const selectedMode = getSelectedRepoMode(repo, mode);
+    const selectedConfig = getSelectedRepoConfig(repo, config, selectedMode);
 
-    state.activeRepo = { path, config: selectedConfig, source };
-    saveRecentRepo(path, selectedConfig);
+    state.activeRepo = { path, config: selectedConfig, mode: selectedMode, source };
+    saveRecentRepo(path, selectedConfig, selectedMode);
 
     updateDropdownDisplay();
     updateConfigSelector(repo);
@@ -251,17 +341,19 @@ function updateConfigSelector(repo) {
     const setDefaultCheckbox = document.getElementById('setDefaultConfig');
     if (!selector || !select || !setDefaultCheckbox) return;
 
-    const currentConfig = getSelectedRepoConfig(repo, state.activeRepo?.config);
-    if (!repo || !repo.configs || (repo.configs.length <= 1 && currentConfig)) {
+    const currentMode = getSelectedRepoMode(repo, state.activeRepo?.mode);
+    const configs = getRepoConfigs(repo, currentMode);
+    const currentConfig = getSelectedRepoConfig(repo, state.activeRepo?.config, currentMode);
+    if (!repo || (configs.length <= 1 && currentConfig)) {
         selector.style.display = 'none';
         return;
     }
 
     // Populate config options
-    select.innerHTML = buildRepoConfigOptions(repo, currentConfig);
+    select.innerHTML = buildRepoConfigOptions(repo, currentConfig, currentMode);
 
     // Check if current is the default
-    const savedDefault = getDefaultConfig(repo.path);
+    const savedDefault = getDefaultConfig(repo.path, currentMode);
     setDefaultCheckbox.checked = savedDefault === currentConfig;
 
     selector.style.display = 'flex';
@@ -418,10 +510,10 @@ function initializeActiveRepo() {
         const inRegistered = state.repos.find(r => r.path === recent.path);
         const inDiscovered = state.discoveredRepos.find(r => r.path === recent.path);
         if (inRegistered) {
-            selectRepo(recent.path, recent.config, 'registered');
+            selectRepo(recent.path, recent.config, 'registered', recent.mode || null);
             return;
         } else if (inDiscovered) {
-            selectRepo(recent.path, recent.config, 'discovered');
+            selectRepo(recent.path, recent.config, 'discovered', recent.mode || null);
             return;
         }
     }
@@ -545,7 +637,9 @@ function closeConsolidatedDropdowns() {
     if (popover) popover.classList.remove('visible');
     if (menu) menu.classList.remove('visible');
     document.getElementById('scopeInfoBtn')?.classList.remove('active');
-    document.getElementById('actionMenuBtn')?.classList.remove('active');
+    const actionMenuButton = document.getElementById('actionMenuBtn');
+    actionMenuButton?.classList.remove('active');
+    actionMenuButton?.setAttribute('aria-expanded', 'false');
 }
 
 function closeSidebarAppMenu() {
@@ -911,7 +1005,142 @@ function getRepoDashboardUrl(repo, options = {}) {
 }
 
 function needsSetup(repo) {
-    return !repo.configs || repo.configs.length === 0;
+    return !getRepoModes(repo).some(mode => getRepoConfigs(repo, mode).length > 0);
+}
+
+async function persistRepoLaunchSelection(path, mode, configName) {
+    const response = await fetch('/control/repos/select-config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            repo_root: path,
+            mode,
+            config_name: configName,
+        }),
+    });
+    if (!response.ok) {
+        const error = await response.json();
+        throw new Error(error.detail || error.error || 'Failed to select configuration');
+    }
+}
+
+async function applyRepoModeSelection(repo, mode) {
+    if (!repo || !getRepoModes(repo).includes(mode)) return null;
+    const config = getSelectedRepoConfig(repo, null, mode);
+    if (!config) return null;
+    await persistRepoLaunchSelection(repo.path, mode, config);
+    repo.selected_mode = mode;
+    repo.selected_config = config;
+    setDefaultModeForRepo(repo.path, mode);
+    setDefaultConfigForRepo(repo.path, config, mode);
+    if (state.activeRepo?.path === repo.path) {
+        state.activeRepo.mode = mode;
+        state.activeRepo.config = config;
+        saveRecentRepo(repo.path, config, mode);
+    }
+    return config;
+}
+
+async function applyRepoConfigSelection(repo, mode, config) {
+    if (!repo) return false;
+    if (config) {
+        await persistRepoLaunchSelection(repo.path, mode, config);
+        repo.selected_mode = mode;
+        repo.selected_config = config;
+        setDefaultConfigForRepo(repo.path, config, mode);
+    } else {
+        clearDefaultConfigForRepo(repo.path, mode);
+    }
+    if (state.activeRepo?.path === repo.path) {
+        state.activeRepo.config = config || null;
+        state.activeRepo.mode = mode;
+        saveRecentRepo(repo.path, config, mode);
+    }
+    return true;
+}
+
+async function handleRepoCardModeChange(event) {
+    const path = event.currentTarget.dataset.path;
+    const mode = event.currentTarget.value;
+    const repo = state.repos.find(item => item.path === path);
+    const previous = getSelectedRepoMode(repo, getDefaultMode(path));
+    try {
+        const config = await applyRepoModeSelection(repo, mode);
+        if (!config) return;
+        showToast(`Mode for ${path.split('/').pop()} set to ${mode}`, 'success');
+        if (state.currentView === 'activity' && state.activeRepo?.path === path) {
+            loadActivityView(path);
+        } else {
+            renderRepos();
+        }
+    } catch (error) {
+        event.currentTarget.value = previous;
+        showToast(error.message, 'error');
+        if (state.currentView === 'activity' && state.activeRepo?.path === path) {
+            loadActivityView(path);
+        } else if (state.currentView === 'repositories') {
+            renderRepos();
+        }
+    }
+}
+
+async function handleMenuModeChange(event) {
+    if (!state.activeRepo?.path) return;
+    const repo = state.repos.find(item => item.path === state.activeRepo.path);
+    const previous = state.activeRepo.mode;
+    try {
+        const config = await applyRepoModeSelection(repo, event.target.value);
+        if (!config) return;
+        loadActivityView(state.activeRepo.path);
+    } catch (error) {
+        event.target.value = previous;
+        showToast(error.message, 'error');
+        loadActivityView(state.activeRepo.path);
+    }
+}
+
+async function handleRepoCardConfigChange(event) {
+    const path = event.currentTarget.dataset.path;
+    if (!path) return;
+    const repo = state.repos.find(item => item.path === path);
+    const mode = getSelectedRepoMode(repo, getDefaultMode(path));
+    const previous = getSelectedRepoConfig(repo, null, mode) || '';
+    const config = event.currentTarget.value;
+    try {
+        await applyRepoConfigSelection(repo, mode, config);
+        showToast(
+            config
+                ? `Default config for ${path.split('/').pop()} set to ${config}`
+                : `Config selection cleared for ${path.split('/').pop()}`,
+            'success',
+        );
+    } catch (error) {
+        event.currentTarget.value = previous;
+        showToast(error.message, 'error');
+    }
+    if (state.currentView === 'activity' && state.activeRepo?.path === path) {
+        loadActivityView(path);
+    } else if (state.currentView === 'repositories') {
+        renderRepos();
+    }
+}
+
+async function handleMenuConfigChange(event) {
+    if (!state.activeRepo?.path) return;
+    const path = state.activeRepo.path;
+    const mode = state.activeRepo.mode;
+    const previous = state.activeRepo.config || '';
+    try {
+        await applyRepoConfigSelection(
+            state.repos.find(item => item.path === path),
+            mode,
+            event.target.value,
+        );
+    } catch (error) {
+        event.target.value = previous;
+        showToast(error.message, 'error');
+    }
+    loadActivityView(path);
 }
 
 function isRepoStartPending(path) {
@@ -959,32 +1188,11 @@ function renderRepos() {
     container.querySelectorAll('[data-action]').forEach(btn => {
         btn.addEventListener('click', handleRepoAction);
     });
+    container.querySelectorAll('select[data-action="select-mode"]').forEach(select => {
+        select.addEventListener('change', handleRepoCardModeChange);
+    });
     container.querySelectorAll('select[data-action="select-config"]').forEach(select => {
-        select.addEventListener('change', (event) => {
-            const path = event.currentTarget.dataset.path;
-            const config = event.currentTarget.value;
-            if (!path) return;
-            if (config) {
-                setDefaultConfigForRepo(path, config);
-            } else {
-                clearDefaultConfigForRepo(path);
-            }
-            if (state.activeRepo?.path === path) {
-                state.activeRepo.config = config || null;
-                saveRecentRepo(path, config);
-            }
-            showToast(
-                config
-                    ? `Default config for ${path.split('/').pop()} set to ${config}`
-                    : `Config selection cleared for ${path.split('/').pop()}`,
-                'success',
-            );
-            if (state.currentView === 'activity' && state.activeRepo?.path === path) {
-                loadActivityView(path);
-            } else if (state.currentView === 'repositories') {
-                renderRepos();
-            }
-        });
+        select.addEventListener('change', handleRepoCardConfigChange);
     });
 }
 
@@ -1056,15 +1264,31 @@ function renderRepoCard(repo) {
         </div>
     ` : '';
 
-    const selectedConfig = getSelectedRepoConfig(repo);
-    const configIssue = getRepoConfigIssue(repo, selectedConfig);
-    const requiresConfigSelection = requiresExplicitRepoConfigSelection(repo, selectedConfig);
-    const configMarkup = repo.configs?.length ? `
+    const selectedMode = getSelectedRepoMode(repo);
+    const selectedConfig = getSelectedRepoConfig(repo, null, selectedMode);
+    const configIssue = getRepoConfigIssue(repo, selectedConfig, selectedMode);
+    const requiresConfigSelection = requiresExplicitRepoConfigSelection(
+        repo,
+        selectedConfig,
+        selectedMode,
+    );
+    const selectionDisabled = isNotRunning ? '' : 'disabled';
+    const modeMarkup = getRepoModes(repo).length > 1 ? `
         <div class="repo-card-config">
-            <span>Config:</span>
-            <select data-action="select-config" data-path="${escapeHtml(repo.path)}">
-                ${buildRepoConfigOptions(repo, selectedConfig)}
-            </select>
+            <label>Mode:
+                <select data-action="select-mode" data-path="${escapeHtml(repo.path)}" aria-label="Configuration mode for ${escapeHtml(repo.name)}" ${selectionDisabled}>
+                    ${buildRepoModeOptions(repo, selectedMode)}
+                </select>
+            </label>
+        </div>
+    ` : '';
+    const configMarkup = getRepoConfigs(repo, selectedMode).length ? `
+        <div class="repo-card-config">
+            <label>Config:
+                <select data-action="select-config" data-path="${escapeHtml(repo.path)}" aria-label="Configuration file for ${escapeHtml(repo.name)}" ${selectionDisabled}>
+                    ${buildRepoConfigOptions(repo, selectedConfig, selectedMode)}
+                </select>
+            </label>
             ${configIssue ? `<div class="repo-card-config-warning">${escapeHtml(configIssue)}</div>` : ''}
         </div>
     ` : '';
@@ -1107,6 +1331,7 @@ function renderRepoCard(repo) {
                 </div>
                 <span class="repo-card-badge ${badgeClass}">${badgeText}</span>
             </div>
+            ${modeMarkup}
             ${configMarkup}
             ${stats}
             <div class="repo-card-actions">
@@ -1210,6 +1435,17 @@ async function cleanRecoveryState() {
 // ============================================
 // Activity View
 // ============================================
+function resolveRepoActivitySelection(repo) {
+    const previousSelection = state.activeRepo?.path === repo.path
+        ? state.activeRepo
+        : null;
+    const mode = getSelectedRepoMode(repo, previousSelection?.mode);
+    return {
+        mode,
+        config: getSelectedRepoConfig(repo, previousSelection?.config, mode),
+    };
+}
+
 function loadActivityView(repoPath) {
     const repo = state.repos.find(r => r.path === repoPath);
     if (!repo) {
@@ -1218,9 +1454,11 @@ function loadActivityView(repoPath) {
         return;
     }
 
+    const selection = resolveRepoActivitySelection(repo);
     state.activeRepo = {
         path: repo.path,
-        config: getSelectedRepoConfig(repo),
+        config: selection.config,
+        mode: selection.mode,
         source: 'registered'
     };
     const repoState = getRepoState(repo);
@@ -1256,12 +1494,29 @@ function loadActivityView(repoPath) {
     }
 
     // Update config selector in menu
+    const modeSelect = document.getElementById('menuModeSelect');
+    const modeWrap = document.getElementById('menuModeWrap');
+    if (modeSelect && modeWrap) {
+        const modes = getRepoModes(repo);
+        if (modes.length > 1) {
+            modeSelect.innerHTML = buildRepoModeOptions(repo, state.activeRepo.mode);
+            modeSelect.disabled = repoState !== 'not running';
+            modeWrap.style.display = '';
+        } else {
+            modeWrap.style.display = 'none';
+        }
+    }
     const configSelect = document.getElementById('menuConfigSelect');
     const configWrap = document.getElementById('menuConfigWrap');
     if (configSelect && configWrap) {
-        const configs = repo.configs || [];
+        const configs = getRepoConfigs(repo, state.activeRepo.mode);
         if (configs.length > 1 || !state.activeRepo.config) {
-            configSelect.innerHTML = buildRepoConfigOptions(repo, state.activeRepo.config);
+            configSelect.innerHTML = buildRepoConfigOptions(
+                repo,
+                state.activeRepo.config,
+                state.activeRepo.mode,
+            );
+            configSelect.disabled = repoState !== 'not running';
             configWrap.style.display = '';
         } else {
             configWrap.style.display = 'none';
@@ -1277,8 +1532,16 @@ function loadActivityView(repoPath) {
 
     // Set iframe source to orchestrator dashboard
     const port = getRepoPort(repo);
-    const configIssue = getRepoConfigIssue(repo, state.activeRepo.config);
-    const requiresConfigSelection = requiresExplicitRepoConfigSelection(repo, state.activeRepo.config);
+    const configIssue = getRepoConfigIssue(
+        repo,
+        state.activeRepo.config,
+        state.activeRepo.mode,
+    );
+    const requiresConfigSelection = requiresExplicitRepoConfigSelection(
+        repo,
+        state.activeRepo.config,
+        state.activeRepo.mode,
+    );
     if (pendingRepoStarts.has(repo.path)) {
         loading.innerHTML = '<div class="spinner"></div><p>Starting repository engine...</p><p>Waiting for engine to become ready.</p>';
         loading.style.display = 'block';
@@ -1428,7 +1691,7 @@ async function registerDiscoveredRepo(path) {
     }
 }
 
-async function startRepo(path, configName = null, startPaused = false) {
+async function startRepo(path, configName = null, startPaused = false, modeName = null) {
     if (pendingRepoStarts.has(path)) {
         return;
     }
@@ -1446,12 +1709,17 @@ async function startRepo(path, configName = null, startPaused = false) {
         // 4. First available config from repo
         // 5. Fallback to 'default.yaml'
         let config = configName;
+        let mode = modeName;
         if (!config && state.activeRepo?.path === path) {
             config = state.activeRepo.config;
         }
+        if (!mode && state.activeRepo?.path === path) {
+            mode = state.activeRepo.mode;
+        }
         const repo = state.repos.find(r => r.path === path);
         if (repo) {
-            config = getValidRepoConfig(repo, config);
+            mode = getSelectedRepoMode(repo, mode || getDefaultMode(path));
+            config = getValidRepoConfig(repo, config, mode);
         }
         if (!config) {
             throw new Error('Select a valid config before starting this repository engine');
@@ -1460,7 +1728,7 @@ async function startRepo(path, configName = null, startPaused = false) {
         const response = await fetch('/control/orchestrator/start', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ repo_root: path, config_name: config, start_paused: startPaused })
+            body: JSON.stringify({ repo_root: path, config_name: config, mode, start_paused: startPaused })
         });
 
         if (!response.ok) {
@@ -1472,7 +1740,7 @@ async function startRepo(path, configName = null, startPaused = false) {
                     error.doctor,
                     error.detail || 'Pre-flight checks failed',
                     'fail',
-                    { repoRoot: path, configName: config },
+                    { repoRoot: path, configName: config, mode },
                 );
                 throw new Error((error.detail || 'Pre-flight checks failed') + '. See Doctor Results.');
             }
@@ -1480,7 +1748,7 @@ async function startRepo(path, configName = null, startPaused = false) {
         }
 
         // Select this repo as active
-        selectRepo(path, config, 'registered');
+        selectRepo(path, config, 'registered', mode);
 
         await waitForRepoToBeReady(path);
         await loadRepos();
@@ -1781,6 +2049,7 @@ function showDoctorResultsModal(title, data, prefixMessage = null, prefixClass =
     doctorModalContext = {
         repoRoot: context.repoRoot || null,
         configName: context.configName || null,
+        mode: context.mode || 'default',
         title,
         data,
     };
@@ -1802,9 +2071,12 @@ async function runDoctor() {
     const repo = state.repos.find(r => r.path === targetPath)
         || state.discoveredRepos.find(r => r.path === targetPath);
     const configName = repo
-        ? getValidRepoConfig(repo, state.activeRepo?.config)
+        ? getValidRepoConfig(repo, state.activeRepo?.config, state.activeRepo?.mode)
         : state.activeRepo?.config;
-    const context = { repoRoot: targetPath, configName };
+    const mode = repo
+        ? getSelectedRepoMode(repo, state.activeRepo?.mode)
+        : (state.activeRepo?.mode || 'default');
+    const context = { repoRoot: targetPath, configName, mode };
     const results = document.getElementById('doctorResults');
     showDoctorResultsModal(
         `Doctor — ${targetPath.split('/').pop()}`,
@@ -1814,7 +2086,7 @@ async function runDoctor() {
         context,
     );
     try {
-        const response = await fetch(`/control/orchestrator/doctor?repo_root=${encodeURIComponent(targetPath)}`);
+        const response = await fetch(`/control/orchestrator/doctor?repo_root=${encodeURIComponent(targetPath)}&config_name=${encodeURIComponent(configName)}&mode=${encodeURIComponent(mode)}`);
         showDoctorResultsModal(`Doctor — ${targetPath.split('/').pop()}`, await response.json(), null, 'info', context);
     } catch (error) {
         results.innerHTML = `<div class="doctor-check fail">✗ Failed to run diagnostics: ${escapeHtml(error.message)}</div>`;
@@ -1841,6 +2113,7 @@ async function repairGuardrails() {
     const context = {
         repoRoot: targetPath,
         configName: doctorModalContext.configName,
+        mode: doctorModalContext.mode,
     };
     if (button) {
         button.disabled = true;
@@ -1854,14 +2127,14 @@ async function repairGuardrails() {
         const response = await fetch('/control/orchestrator/guardrails/repair', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ repo_root: targetPath, config_name: doctorModalContext.configName })
+            body: JSON.stringify({ repo_root: targetPath, config_name: doctorModalContext.configName, mode: doctorModalContext.mode })
         });
         const repairResult = await response.json();
         if (!response.ok) {
             throw new Error(repairResult.detail || repairResult.error || 'Failed to repair guardrails');
         }
 
-        const doctorResponse = await fetch(`/control/orchestrator/doctor?repo_root=${encodeURIComponent(targetPath)}`);
+        const doctorResponse = await fetch(`/control/orchestrator/doctor?repo_root=${encodeURIComponent(targetPath)}&config_name=${encodeURIComponent(doctorModalContext.configName)}&mode=${encodeURIComponent(doctorModalContext.mode)}`);
         const doctorResult = await doctorResponse.json();
         const fileCount = (repairResult.installed_files || []).length;
         showDoctorResultsModal(
@@ -1888,7 +2161,7 @@ async function runSystemCheck() {
     const modal = document.getElementById('doctorModal');
     const modalTitle = document.getElementById('doctorModalTitle');
     const results = document.getElementById('doctorResults');
-    doctorModalContext = { repoRoot: null, configName: null, title: 'System Check', data: null };
+    doctorModalContext = { repoRoot: null, configName: null, mode: null, title: 'System Check', data: null };
     updateDoctorRepairAction(null);
     modal.classList.add('active');
     modalTitle.textContent = 'System Check';
@@ -3391,6 +3664,7 @@ document.addEventListener('DOMContentLoaded', () => {
         if (!wasVisible) {
             menu.classList.add('visible');
             btn.classList.add('active');
+            btn.setAttribute('aria-expanded', 'true');
         }
     });
 
@@ -3405,17 +3679,8 @@ document.addEventListener('DOMContentLoaded', () => {
     document.getElementById('maximizeExitBtn').addEventListener('click', toggleMaximize);
 
     // Config selector in action menu
-    document.getElementById('menuConfigSelect').addEventListener('change', async (e) => {
-        if (!state.activeRepo?.path) return;
-        state.activeRepo.config = e.target.value || null;
-        if (e.target.value) {
-            setDefaultConfigForRepo(state.activeRepo.path, e.target.value);
-        } else {
-            clearDefaultConfigForRepo(state.activeRepo.path);
-        }
-        saveRecentRepo(state.activeRepo.path, state.activeRepo.config);
-        loadActivityView(state.activeRepo.path);
-    });
+    document.getElementById('menuConfigSelect').addEventListener('change', handleMenuConfigChange);
+    document.getElementById('menuModeSelect').addEventListener('change', handleMenuModeChange);
 
     // Close modals on backdrop click
     document.querySelectorAll('.modal-backdrop').forEach(backdrop => {

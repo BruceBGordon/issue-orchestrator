@@ -2,6 +2,7 @@
 
 import argparse
 from collections.abc import Callable
+from contextlib import nullcontext
 from dataclasses import fields
 import inspect
 import os
@@ -29,11 +30,14 @@ from issue_orchestrator.entrypoints.cli import (
 from issue_orchestrator.entrypoints import cli, cli_parser
 from issue_orchestrator.entrypoints.cli_parser import CLICommandHandlers, build_parser
 from issue_orchestrator.domain.models import AgentConfig
+from issue_orchestrator.domain.repository_launch_selection import (
+    RepositoryLaunchSelection,
+)
 from issue_orchestrator.infra.config import Config
 
 
 @pytest.fixture(autouse=True)
-def mock_run_doctor(monkeypatch):
+def mock_run_doctor(monkeypatch, tmp_path: Path):
     """Auto-patch run_doctor for all tests to return OK result."""
     from issue_orchestrator.infra import doctor, launcher
     from issue_orchestrator.infra.doctor.types import DoctorResult
@@ -41,12 +45,50 @@ def mock_run_doctor(monkeypatch):
     mock_doctor = lambda **_kw: DoctorResult(checks=[])
     monkeypatch.setattr(doctor, "run_doctor", mock_doctor)
     monkeypatch.setattr(launcher, "run_doctor", mock_doctor)
+    monkeypatch.setenv(
+        "ISSUE_ORCHESTRATOR_CONFIG_DIR",
+        str(tmp_path / "issue-orchestrator-config"),
+    )
+    monkeypatch.setattr(
+        "issue_orchestrator.infra.config_paths.require_engine_launch_config_path",
+        lambda path: path,
+    )
+    from issue_orchestrator.execution.control_center_runtime import (
+        RepositoryOrchestratorOwnership,
+    )
+
+    monkeypatch.setattr(
+        "issue_orchestrator.execution.control_center_runtime."
+        "inspect_repository_orchestrator_ownership",
+        lambda _repo, selection: RepositoryOrchestratorOwnership(
+            requested=selection,
+            matching=(),
+            conflicting=(),
+        ),
+    )
+    monkeypatch.setattr("issue_orchestrator.infra.repo_lock.is_locked", lambda _repo: False)
+    monkeypatch.setattr("issue_orchestrator.infra.repo_lock.acquire_lock", Mock())
+    monkeypatch.setattr("issue_orchestrator.infra.repo_lock.release_lock", Mock())
+    monkeypatch.setattr(
+        "issue_orchestrator.infra.repo_lock.repository_lifecycle_mutation",
+        lambda _repo: nullcontext(),
+    )
 
 
 def _run_and_close(coro):
     if inspect.iscoroutine(coro):
         coro.close()
     return None
+
+
+def _mock_start_config() -> Mock:
+    """Return a CLI config double with a real persisted launch identity."""
+    config = Mock()
+    config.configuration_mode = "default"
+    config.config_name = "default.yaml"
+    config.config_fingerprint = "test-fingerprint"
+    config.launch_selection = RepositoryLaunchSelection.default()
+    return config
 
 
 class TestCmdStart:
@@ -80,10 +122,10 @@ class TestCmdStart:
                     "issue_orchestrator.entrypoints.dashboard.run_with_dashboard"
                 ) as mock_dashboard:
                     with patch(
-                        "issue_orchestrator.entrypoints.cli.asyncio"
+                        "issue_orchestrator.entrypoints.cli_run_modes.asyncio"
                     ) as mock_asyncio:
                         # Setup config
-                        mock_config = Mock()
+                        mock_config = _mock_start_config()
                         mock_config.agents = {"agent:test": Mock()}
                         mock_config.max_concurrent_sessions = 2
                         mock_config.ui_mode = "tmux"
@@ -123,9 +165,9 @@ class TestCmdStart:
                 "issue_orchestrator.entrypoints.bootstrap.build_orchestrator"
             ) as mock_build:
                 with patch(
-                    "issue_orchestrator.entrypoints.cli.asyncio"
+                        "issue_orchestrator.entrypoints.cli_run_modes.asyncio"
                 ) as mock_asyncio:
-                    mock_config = Mock()
+                    mock_config = _mock_start_config()
                     mock_config.agents = {"agent:test": Mock()}
                     mock_config.max_concurrent_sessions = 2
                     mock_config.ui_mode = "tmux"
@@ -1012,9 +1054,9 @@ class TestCmdStartAdvanced:
                         "issue_orchestrator.entrypoints.dashboard.run_with_dashboard"
                     ) as mock_dashboard:
                         with patch(
-                            "issue_orchestrator.entrypoints.cli.asyncio"
+                        "issue_orchestrator.entrypoints.cli_run_modes.asyncio"
                         ) as mock_asyncio:
-                            mock_config = Mock()
+                            mock_config = _mock_start_config()
                             mock_config.repo = "test/repo"
                             mock_config.agents = {"agent:test": Mock()}
                             mock_config.max_concurrent_sessions = 2
@@ -1054,9 +1096,9 @@ class TestCmdStartAdvanced:
                     "issue_orchestrator.entrypoints.dashboard.run_with_dashboard"
                 ) as mock_dashboard:
                     with patch(
-                        "issue_orchestrator.entrypoints.cli.asyncio"
+                        "issue_orchestrator.entrypoints.cli_run_modes.asyncio"
                     ) as mock_asyncio:
-                        mock_config = Mock()
+                        mock_config = _mock_start_config()
                         mock_config.agents = {"agent:test": Mock()}
                         mock_config.max_concurrent_sessions = 2
                         mock_config.ui_mode = "tmux"
@@ -1093,9 +1135,9 @@ class TestCmdStartAdvanced:
                     "issue_orchestrator.entrypoints.dashboard.run_with_dashboard"
                 ) as mock_dashboard:
                     with patch(
-                        "issue_orchestrator.entrypoints.cli.asyncio"
+                        "issue_orchestrator.entrypoints.cli_run_modes.asyncio"
                     ) as mock_asyncio:
-                        mock_config = Mock()
+                        mock_config = _mock_start_config()
                         mock_config.agents = {"agent:test": Mock()}
                         mock_config.max_concurrent_sessions = 2
                         mock_config.ui_mode = "tmux"
@@ -1134,9 +1176,9 @@ class TestCmdStartAdvanced:
                     "issue_orchestrator.entrypoints.dashboard.run_with_dashboard"
                 ) as mock_dashboard:
                     with patch(
-                        "issue_orchestrator.entrypoints.cli.asyncio"
+                        "issue_orchestrator.entrypoints.cli_run_modes.asyncio"
                     ) as mock_asyncio:
-                        mock_config = Mock()
+                        mock_config = _mock_start_config()
                         mock_config.agents = {"agent:test": Mock()}
                         mock_config.max_concurrent_sessions = 2
                         mock_config.ui_mode = "tmux"
@@ -1174,9 +1216,9 @@ class TestCmdStartAdvanced:
                     "issue_orchestrator.entrypoints.dashboard.run_with_dashboard"
                 ) as mock_dashboard:
                     with patch(
-                        "issue_orchestrator.entrypoints.cli.asyncio"
+                        "issue_orchestrator.entrypoints.cli_run_modes.asyncio"
                     ) as mock_asyncio:
-                        mock_config = Mock()
+                        mock_config = _mock_start_config()
                         mock_config.agents = {"agent:test": Mock()}
                         mock_config.max_concurrent_sessions = 2
                         mock_config.ui_mode = "tmux"
@@ -1213,9 +1255,9 @@ class TestCmdStartAdvanced:
                     "issue_orchestrator.entrypoints.dashboard.run_with_dashboard"
                 ) as mock_dashboard:
                     with patch(
-                        "issue_orchestrator.entrypoints.cli.asyncio"
+                        "issue_orchestrator.entrypoints.cli_run_modes.asyncio"
                     ) as mock_asyncio:
-                        mock_config = Mock()
+                        mock_config = _mock_start_config()
                         mock_config.agents = {"agent:test": Mock()}
                         mock_config.max_concurrent_sessions = 2
                         mock_config.ui_mode = "tmux"
@@ -1252,9 +1294,9 @@ class TestCmdStartAdvanced:
                     "issue_orchestrator.entrypoints.web.run_with_web_dashboard"
                 ) as mock_web:
                     with patch(
-                        "issue_orchestrator.entrypoints.cli.asyncio"
+                        "issue_orchestrator.entrypoints.cli_run_modes.asyncio"
                     ) as mock_asyncio:
-                        mock_config = Mock()
+                        mock_config = _mock_start_config()
                         mock_config.agents = {"agent:test": Mock()}
                         mock_config.max_concurrent_sessions = 2
                         mock_config.ui_mode = "web"
@@ -1292,9 +1334,9 @@ class TestCmdStartAdvanced:
                     "issue_orchestrator.entrypoints.web.run_with_web_dashboard"
                 ) as mock_web:
                     with patch(
-                        "issue_orchestrator.entrypoints.cli.asyncio"
+                        "issue_orchestrator.entrypoints.cli_run_modes.asyncio"
                     ) as mock_asyncio:
-                        mock_config = Mock()
+                        mock_config = _mock_start_config()
                         mock_config.agents = {"agent:test": Mock()}
                         mock_config.max_concurrent_sessions = 2
                         mock_config.ui_mode = "web"
@@ -1332,9 +1374,9 @@ class TestCmdStartAdvanced:
                     "issue_orchestrator.entrypoints.dashboard.run_with_dashboard"
                 ) as mock_dashboard:
                     with patch(
-                        "issue_orchestrator.entrypoints.cli.asyncio"
+                        "issue_orchestrator.entrypoints.cli_run_modes.asyncio"
                     ) as mock_asyncio:
-                        mock_config = Mock()
+                        mock_config = _mock_start_config()
                         mock_config.agents = {"agent:test": Mock()}
                         mock_config.max_concurrent_sessions = 2
                         mock_config.ui_mode = "tmux"
@@ -1497,6 +1539,17 @@ agents:
             # Verify Config.load returns the config with repo_root set
             assert result.repo_root == tmp_path
 
+    def test_load_config_rejects_explicit_mode_path_mismatch(self, tmp_path):
+        config_file = (
+            tmp_path / ".issue-orchestrator/config/modes/codex/main.yaml"
+        )
+        config_file.parent.mkdir(parents=True)
+        config_file.write_text("agents: {}\n", encoding="utf-8")
+        args = argparse.Namespace(config=str(config_file), mode="claude", set=[])
+
+        with pytest.raises(ValueError, match="does not match --config path"):
+            _load_config(args)
+
     def test_load_config_explicit_path_not_found(self, tmp_path):
         """Verify _load_config raises FileNotFoundError for missing config."""
         nonexistent = tmp_path / "does-not-exist.yaml"
@@ -1625,7 +1678,7 @@ agents:
 
                 with patch("issue_orchestrator.infra.orchestrator.Orchestrator"):
                     with patch(
-                        "issue_orchestrator.entrypoints.cli.asyncio"
+                        "issue_orchestrator.entrypoints.cli_run_modes.asyncio"
                     ) as mock_asyncio:
                         mock_asyncio.run.side_effect = _run_and_close
                         result = cmd_start(args)
@@ -1808,6 +1861,30 @@ class TestCmdRefresh:
 
 class TestCmdRestart:
     """Tests for the restart command."""
+
+    def test_start_fresh_places_global_selection_before_subcommand(self):
+        """Argparse global mode/config flags must appear before ``start``."""
+        from issue_orchestrator.entrypoints.cli import _start_fresh
+
+        args = argparse.Namespace(
+            config="/repo/config.yaml",
+            mode="codex",
+            port=8080,
+            debug=False,
+            ui_mode=None,
+        )
+        with patch("os.execvp") as execvp:
+            assert _start_fresh(args) == 1
+
+        argv = execvp.call_args.args[1]
+        assert argv[3:8] == [
+            "--config",
+            "/repo/config.yaml",
+            "--mode",
+            "codex",
+            "start",
+        ]
+        assert argv[8:] == ["--port", "8080"]
 
     def test_cmd_restart_orchestrator_running(self):
         """Verify restart command shuts down and starts new orchestrator."""

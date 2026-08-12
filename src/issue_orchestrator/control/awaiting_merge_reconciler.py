@@ -959,4 +959,3 @@ def _recent_label_drift_scan(
     last_scanned_at = state.awaiting_merge_drift_scan_timestamps.get(issue_number, 0.0)
     return last_scanned_at > 0 and (now - last_scanned_at) < interval_seconds
 
-

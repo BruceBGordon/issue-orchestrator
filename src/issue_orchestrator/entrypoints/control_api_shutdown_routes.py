@@ -18,7 +18,8 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
 from ..infra.shutdown_timing import StopAborted
-from ..infra.supervisor import DEFAULT_ENGINE_GRACEFUL_TIMEOUT_SECONDS, SupervisorOps
+from ..infra.supervisor import DEFAULT_ENGINE_GRACEFUL_TIMEOUT_SECONDS
+from ..ports.repository_engine_supervisor import SupervisorOps
 from . import control_api_shutdown_state as shutdown_state
 from .control_api_shutdown_support import ControlApiShutdownDependency
 

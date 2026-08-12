@@ -1273,7 +1273,10 @@ class CompletionReviewExchange:
             raise ValueError("Review exchange requires config")
         if self._config.config_path is None:
             raise ValueError("Review exchange requires config_path")
-        return RuntimeConfigReference.from_path(self._config.config_path)
+        return RuntimeConfigReference(
+            config_path=self._config.config_path.resolve(),
+            selection=self._config.launch_selection,
+        )
 
     def run_review_exchange_loop(
         self,

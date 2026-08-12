@@ -8,10 +8,17 @@ from __future__ import annotations
 
 import json
 import os
+import fcntl
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from threading import Lock
+from typing import Any, Callable, TypeVar
+
+from ..domain.repository_launch_selection import RepositoryLaunchSelection
+from .atomic_json import atomic_write_json
+
+_T = TypeVar("_T")
 
 
 def _config_dir() -> Path:
@@ -78,13 +85,31 @@ class RegisteredRepo:
     added_at: str = ""
     health: RepoHealth | None = None  # Cached health status
     selected_config: str = "default.yaml"  # Last used config file
+    selected_mode: str = "default"  # Last used directory-backed mode
 
     def __post_init__(self) -> None:
+        self.select_launch_configuration(self.launch_selection)
         if not self.added_at:
             self.added_at = datetime.now(timezone.utc).isoformat()
         if not self.name:
             # Default name is the directory name
             self.name = Path(self.path).name
+
+    @property
+    def launch_selection(self) -> RepositoryLaunchSelection:
+        """Return the complete desired mode/config pair as one typed value."""
+        return RepositoryLaunchSelection.parse(
+            mode=self.selected_mode,
+            config_name=self.selected_config,
+        )
+
+    def select_launch_configuration(
+        self,
+        selection: RepositoryLaunchSelection,
+    ) -> None:
+        """Replace the complete desired launch selection atomically."""
+        self.selected_mode = selection.mode.value
+        self.selected_config = selection.config.value
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dict for JSON serialization."""
@@ -93,6 +118,7 @@ class RegisteredRepo:
             "name": self.name,
             "added_at": self.added_at,
             "selected_config": self.selected_config,
+            "selected_mode": self.selected_mode,
         }
         if self.health:
             result["health"] = self.health.to_dict()
@@ -110,6 +136,7 @@ class RegisteredRepo:
             added_at=data.get("added_at", ""),
             health=health,
             selected_config=data.get("selected_config", "default.yaml"),
+            selected_mode=data.get("selected_mode", "default"),
         )
 
 
@@ -197,22 +224,20 @@ class RepoRegistry:
         return cls(repos=repos)
 
 
+def _load_registry_file(path: Path) -> RepoRegistry:
+    if not path.exists():
+        return RepoRegistry()
+    with open(path, encoding="utf-8") as registry_file:
+        return RepoRegistry.from_dict(json.load(registry_file))
+
+
 def load_registry() -> RepoRegistry:
     """Load the repo registry from disk.
 
     Returns:
         The repo registry (empty if file doesn't exist)
     """
-    path = _repos_file()
-    if not path.exists():
-        return RepoRegistry()
-
-    try:
-        with open(path) as f:
-            data = json.load(f)
-        return RepoRegistry.from_dict(data)
-    except (json.JSONDecodeError, OSError):
-        return RepoRegistry()
+    return _load_registry_file(_repos_file())
 
 
 def save_registry(registry: RepoRegistry) -> None:
@@ -221,11 +246,33 @@ def save_registry(registry: RepoRegistry) -> None:
     Args:
         registry: The registry to save
     """
-    path = _repos_file()
-    path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(_repos_file(), registry.to_dict())
 
-    with open(path, "w") as f:
-        json.dump(registry.to_dict(), f, indent=2)
+
+class RepoRegistryTransactionOwner:
+    """Serialize each registry read-modify-write transaction."""
+
+    def __init__(self) -> None:
+        self._thread_gate = Lock()
+
+    def mutate(self, mutation: Callable[[RepoRegistry], _T]) -> _T:
+        path = _repos_file()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        gate_path = path.with_name(f".{path.name}.lock")
+        with self._thread_gate:
+            gate_fd = os.open(gate_path, os.O_RDWR | os.O_CREAT, 0o600)
+            try:
+                fcntl.flock(gate_fd, fcntl.LOCK_EX)
+                registry = _load_registry_file(path)
+                result = mutation(registry)
+                atomic_write_json(path, registry.to_dict())
+                return result
+            finally:
+                fcntl.flock(gate_fd, fcntl.LOCK_UN)
+                os.close(gate_fd)
+
+
+_REGISTRY_TRANSACTIONS = RepoRegistryTransactionOwner()
 
 
 def add_repo(
@@ -243,10 +290,9 @@ def add_repo(
     Returns:
         The registered repo entry
     """
-    registry = load_registry()
-    repo = registry.add(repo_path, name=name)
-    save_registry(registry)
-    return repo
+    return _REGISTRY_TRANSACTIONS.mutate(
+        lambda registry: registry.add(repo_path, name=name)
+    )
 
 
 def remove_repo(repo_path: str | Path) -> bool:
@@ -260,11 +306,7 @@ def remove_repo(repo_path: str | Path) -> bool:
     Returns:
         True if removed, False if not found
     """
-    registry = load_registry()
-    removed = registry.remove(repo_path)
-    if removed:
-        save_registry(registry)
-    return removed
+    return _REGISTRY_TRANSACTIONS.mutate(lambda registry: registry.remove(repo_path))
 
 
 def list_repos() -> list[RegisteredRepo]:
@@ -285,24 +327,22 @@ def cleanup_stale_repos() -> int:
     Returns:
         Number of repos removed
     """
-    registry = load_registry()
-    stale_paths = []
+    def remove_stale(registry: RepoRegistry) -> int:
+        stale_paths = [
+            repo.path for repo in registry.repos if not Path(repo.path).exists()
+        ]
+        for path in stale_paths:
+            registry.remove(path)
+        return len(stale_paths)
 
-    for repo in registry.repos:
-        if not Path(repo.path).exists():
-            stale_paths.append(repo.path)
-
-    if not stale_paths:
-        return 0
-
-    for path in stale_paths:
-        registry.remove(path)
-
-    save_registry(registry)
-    return len(stale_paths)
+    return _REGISTRY_TRANSACTIONS.mutate(remove_stale)
 
 
-def check_repo_health(repo_path: str | Path, config_name: str = "default.yaml") -> RepoHealth:
+def check_repo_health(
+    repo_path: str | Path,
+    config_name: str = "default.yaml",
+    mode: str = "default",
+) -> RepoHealth:
     """Run doctor checks for a repository and return health status.
 
     Args:
@@ -319,7 +359,8 @@ def check_repo_health(repo_path: str | Path, config_name: str = "default.yaml") 
     repo_path = Path(repo_path)
 
     # Check if any configs exist
-    available_configs = list_configs(repo_path)
+    selection = RepositoryLaunchSelection.parse(mode=mode, config_name=config_name)
+    available_configs = list_configs(repo_path, selection.mode)
     if not available_configs:
         return RepoHealth(
             status="invalid",
@@ -328,7 +369,11 @@ def check_repo_health(repo_path: str | Path, config_name: str = "default.yaml") 
 
     # Try to load the specified config
     config = None
-    config_path = get_config_path(repo_path, config_name)
+    config_path = get_config_path(
+        repo_path,
+        selection.config.value,
+        selection.mode,
+    )
 
     if config_path.exists():
         try:
@@ -346,10 +391,13 @@ def check_repo_health(repo_path: str | Path, config_name: str = "default.yaml") 
 
     # Run doctor (change to repo directory for worktree checks)
     import os
+
     original_cwd = os.getcwd()
     try:
         os.chdir(repo_path)
-        result = run_doctor(config=config, config_path=config_path, runner=LocalCommandRunner())
+        result = run_doctor(
+            config=config, config_path=config_path, runner=LocalCommandRunner()
+        )
     finally:
         os.chdir(original_cwd)
 
@@ -367,7 +415,11 @@ def check_repo_health(repo_path: str | Path, config_name: str = "default.yaml") 
     return RepoHealth(status=status, errors=errors, warnings=warnings)
 
 
-def update_repo_health(repo_path: str | Path, config_name: str | None = None) -> RepoHealth:
+def update_repo_health(
+    repo_path: str | Path,
+    config_name: str | None = None,
+    mode: str | None = None,
+) -> RepoHealth:
     """Run doctor checks and persist the health status.
 
     Args:
@@ -377,22 +429,54 @@ def update_repo_health(repo_path: str | Path, config_name: str | None = None) ->
     Returns:
         The updated RepoHealth
     """
-    normalized = str(Path(repo_path).resolve())
-    registry = load_registry()
+    registered = load_registry().get(repo_path)
+    selection = registered.launch_selection if registered is not None else None
+    health = check_repo_health(
+        repo_path,
+        config_name or (
+            selection.config.value if selection is not None else "default.yaml"
+        ),
+        mode or (selection.mode.value if selection is not None else "default"),
+    )
+    if registered is None:
+        return health
 
-    # Find the repo
-    for repo in registry.repos:
-        if repo.path == normalized:
-            # Use provided config_name or fall back to selected_config
-            cfg_name = config_name or repo.selected_config
-            # Run health check
-            health = check_repo_health(repo_path, cfg_name)
-            repo.health = health
-            save_registry(registry)
-            return health
+    def persist_health(registry: RepoRegistry) -> RepoHealth:
+        current = registry.get(repo_path)
+        if current is not None:
+            current.health = health
+        return health
 
-    # Repo not found - run check anyway but don't persist
-    return check_repo_health(repo_path, config_name or "default.yaml")
+    return _REGISTRY_TRANSACTIONS.mutate(persist_health)
+
+
+def set_selected_launch_selection(
+    repo_path: str | Path,
+    selection: RepositoryLaunchSelection,
+) -> bool:
+    """Persist one complete desired launch selection for a repository."""
+    def select(registry: RepoRegistry) -> bool:
+        repo = registry.get(repo_path)
+        if repo is None:
+            return False
+        repo.select_launch_configuration(selection)
+        return True
+
+    return _REGISTRY_TRANSACTIONS.mutate(select)
+
+
+def record_launched_selection(
+    repo_path: str | Path,
+    selection: RepositoryLaunchSelection,
+) -> None:
+    """Register a launched repository and persist its effective selection."""
+    def record(registry: RepoRegistry) -> None:
+        repo = registry.get(repo_path)
+        if repo is None:
+            repo = registry.add(repo_path)
+        repo.select_launch_configuration(selection)
+
+    _REGISTRY_TRANSACTIONS.mutate(record)
 
 
 def set_selected_config(repo_path: str | Path, config_name: str) -> bool:
@@ -405,12 +489,16 @@ def set_selected_config(repo_path: str | Path, config_name: str) -> bool:
     Returns:
         True if updated, False if repo not found
     """
-    normalized = str(Path(repo_path).resolve())
-    registry = load_registry()
+    def select_config(registry: RepoRegistry) -> bool:
+        repo = registry.get(repo_path)
+        if repo is None:
+            return False
+        repo.select_launch_configuration(
+            RepositoryLaunchSelection.parse(
+                mode=repo.launch_selection.mode,
+                config_name=config_name,
+            )
+        )
+        return True
 
-    for repo in registry.repos:
-        if repo.path == normalized:
-            repo.selected_config = config_name
-            save_registry(registry)
-            return True
-    return False
+    return _REGISTRY_TRANSACTIONS.mutate(select_config)

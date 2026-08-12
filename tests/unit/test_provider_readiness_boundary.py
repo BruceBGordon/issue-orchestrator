@@ -5987,16 +5987,13 @@ def _restore_with_raw_discovery(harness, discovered):
     ["missing", "malformed", "identity_mismatch"],
     ids=["missing", "malformed", "identity-mismatch"],
 )
-def test_a_live_run_that_cannot_be_rebuilt_keeps_its_work(
+def test_an_unverifiable_live_run_aborts_restore_and_keeps_its_claim(
     break_manifest, tmp_path: Path
 ) -> None:
-    """SessionRestorer answers None for these, and the terminal is still alive.
-
-    Its run key would then be missing from the observed set, the sweep would
-    call the row orphaned, and the request would be requeued beside a process
-    still running it - launching the same review, rework, retry or
-    investigation twice (#6999 F14).
-    """
+    """Startup fails before unverifiable live work can be reinterpreted."""
+    from issue_orchestrator.control.session_restorer import (
+        SessionConfigurationIdentityVerificationError,
+    )
     from issue_orchestrator.ports.session_runner import DiscoveredSession
 
     harness = _ready_harness(tmp_path)
@@ -6013,34 +6010,34 @@ def test_a_live_run_that_cannot_be_rebuilt_keeps_its_work(
         payload["run_dir"] = str(manifest.parent.parent / "somewhere-else")
         manifest.write_text(json.dumps(payload), encoding="utf-8")
 
-    restarted, added = _restore_with_raw_discovery(
-        harness,
-        [
-            DiscoveredSession(
-                issue_number=7,
-                tab_name="",
-                is_review=False,
-                session_name=session.terminal_id,
-                run_dir=str(session.run_assets.run_dir),
-            )
-        ],
-    )
+    with pytest.raises(
+        SessionConfigurationIdentityVerificationError,
+        match="Cannot verify configuration identity",
+    ):
+        _restore_with_raw_discovery(
+            harness,
+            [
+                DiscoveredSession(
+                    issue_number=7,
+                    tab_name="",
+                    is_review=False,
+                    session_name=session.terminal_id,
+                    run_dir=str(session.run_assets.run_dir),
+                )
+            ],
+        )
 
-    assert added == []  # not admitted, since it could not be rebuilt
-    # ...and crucially its work was NOT requeued beside the live terminal.
-    assert restarted.pending_tech_lead_reviews == []
+    # The durable work remains claimed while startup stops for operator repair.
     assert len(harness.claims.list_unresolved_claims()) == 1
-    # A human is told, because a live terminal nobody can track is not routine -
-    # and told the TRUTH: the claim reads cleanly here, so this is the
-    # unrestorable-run story, not the unreadable-claim one (#6999 A1).
-    assert EventName.SESSION_RUN_UNRESTORABLE.value in harness.event_names()
-    assert EventName.SESSION_CLAIM_UNREADABLE.value not in harness.event_names()
 
 
-def test_an_unrestorable_run_is_not_requeued_on_repeated_scans(
+def test_an_unverifiable_run_fails_every_restore_without_requeueing(
     tmp_path: Path,
 ) -> None:
-    """The orphan scan runs every 30 seconds; none of them may requeue it."""
+    """Repeated restore attempts fail fast and preserve the durable claim."""
+    from issue_orchestrator.control.session_restorer import (
+        SessionConfigurationIdentityVerificationError,
+    )
     from issue_orchestrator.ports.session_runner import DiscoveredSession
 
     harness = _ready_harness(tmp_path)
@@ -6059,9 +6056,11 @@ def test_an_unrestorable_run_is_not_requeued_on_repeated_scans(
     ]
 
     for _ in range(3):
-        restarted, added = _restore_with_raw_discovery(harness, discovered)
-        assert added == []
-        assert restarted.pending_reviews == []
+        with pytest.raises(
+            SessionConfigurationIdentityVerificationError,
+            match="Cannot verify configuration identity",
+        ):
+            _restore_with_raw_discovery(harness, discovered)
         assert len(harness.claims.list_unresolved_claims()) == 1
 
 
@@ -6235,18 +6234,14 @@ def _discovered(session, *, is_review: bool):
     )
 
 
-def test_a_live_run_that_is_neither_rebuildable_nor_readable_is_escalated(
+def test_an_unverifiable_live_run_with_an_unreadable_claim_fails_fast(
     tmp_path: Path,
 ) -> None:
-    """Both halves of the record failed at once, and nobody was told (#6999 F2).
+    """Configuration identity is verified before an unreadable claim is handled."""
+    from issue_orchestrator.control.session_restorer import (
+        SessionConfigurationIdentityVerificationError,
+    )
 
-    The protection was there - the run was kept out of recovery so its work was
-    never requeued beside a live terminal - but the escalation was not: the
-    unreadable-claim branch of the discovery sweep only recorded a key, and the
-    ledger sweep then skipped the row for being live. The result was a running
-    agent the orchestrator does not track, carrying work nobody can name, with
-    no durable quarantine, no ``needs-human`` label, no comment and no event.
-    """
     harness = _ready_harness(tmp_path)
     state = _pending_state("tech_lead")
     session = _route("tech_lead", state, harness)
@@ -6254,39 +6249,26 @@ def test_a_live_run_that_is_neither_rebuildable_nor_readable_is_escalated(
     session.run_assets.manifest.path.unlink()  # cannot be rebuilt...
     _corrupt_stored_claim(tmp_path, session.run_assets)  # ...and cannot be read
 
-    restarted, added = _restore_with_raw_discovery(
-        harness, [_discovered(session, is_review=False)]
-    )
+    with pytest.raises(
+        SessionConfigurationIdentityVerificationError,
+        match="Cannot verify configuration identity",
+    ):
+        _restore_with_raw_discovery(
+            harness, [_discovered(session, is_review=False)]
+        )
 
-    assert added == []  # not admitted: nothing could be rebuilt
-    assert restarted.pending_tech_lead_reviews == []  # and NOT requeued
-    # The durable half: a quarantine row survives, so a restart still knows.
-    quarantines = harness.claims.list_quarantines()
-    assert [q.issue_number for q in quarantines] == [7]
-    assert quarantines[0].announced
-    assert quarantines[0].block_is_ours  # the needs-human block is held
-    labels = [a for a in harness.quarantine_actions if isinstance(a, AddLabelAction)]
-    comments = [
-        a for a in harness.quarantine_actions if isinstance(a, AddCommentAction)
-    ]
-    assert [a.issue_number for a in labels] == [7]
-    assert [a.number for a in comments] == [7]
-    # ...and the operator is told BOTH facts, not just one of them.
-    assert "could not be rebuilt" in comments[0].comment
-    assert "unreadable" in comments[0].comment
-    # The machine-readable half says both too (#6999 F6). It must not borrow
-    # either neighbour: ``run_unrestorable`` contracts that the work IS
-    # identified, and ``claim_unreadable`` that the run was rebuilt.
-    names = harness.event_names()
-    assert EventName.SESSION_RUN_UNRESTORABLE_CLAIM_UNREADABLE.value in names
-    assert EventName.SESSION_RUN_UNRESTORABLE.value not in names
-    assert EventName.SESSION_CLAIM_UNREADABLE.value not in names
+    assert harness.quarantine_actions == []
+    assert not harness.claims.list_quarantines()
 
 
-def test_the_combined_state_is_escalated_once_across_repeated_scans(
+def test_the_unverifiable_combined_state_fails_every_repeated_scan(
     tmp_path: Path,
 ) -> None:
-    """The orphan scan runs every 30 seconds; the human hears about it once."""
+    """Every scan refuses to reinterpret a run whose identity is unverifiable."""
+    from issue_orchestrator.control.session_restorer import (
+        SessionConfigurationIdentityVerificationError,
+    )
+
     harness = _ready_harness(tmp_path)
     state = _pending_state("review")
     session = _route("review", state, harness)
@@ -6296,15 +6278,14 @@ def test_the_combined_state_is_escalated_once_across_repeated_scans(
     discovered = [_discovered(session, is_review=True)]
 
     for _ in range(3):
-        restarted, added = _restore_with_raw_discovery(harness, discovered)
-        assert added == []
-        assert restarted.pending_reviews == []  # never a duplicate launch
+        with pytest.raises(
+            SessionConfigurationIdentityVerificationError,
+            match="Cannot verify configuration identity",
+        ):
+            _restore_with_raw_discovery(harness, discovered)
 
-    comments = [
-        a for a in harness.quarantine_actions if isinstance(a, AddCommentAction)
-    ]
-    assert len(comments) == 1
-    assert len(harness.claims.list_quarantines()) == 1
+    assert harness.quarantine_actions == []
+    assert not harness.claims.list_quarantines()
 
 
 def _quarantine_narratives(harness) -> list[str]:
@@ -6359,20 +6340,13 @@ def _break_both_halves(harness, tmp_path: Path, queue: str):
     return session
 
 
-def test_a_quarantine_rewrites_its_story_when_the_run_turns_out_to_be_live(
+def test_an_unverifiable_live_run_does_not_rewrite_an_existing_quarantine(
     tmp_path: Path,
 ) -> None:
-    """ended-unreadable -> live-combined: the false instruction must be replaced.
-
-    One discovery pass can miss a terminal that is very much alive - the run
-    directory is there but the manifest will not rebuild, so nothing reports it
-    - and the ledger sweep then announces the run as ENDED, telling an operator
-    to re-queue its work by hand if necessary. When the next pass DOES see the
-    terminal, the announced flag alone suppressed everything: no new comment, no
-    new event, and the instruction to re-queue still standing over a session
-    that is still doing the work. That is the duplicate execution the whole
-    quarantine exists to prevent (#6999 F6).
-    """
+    """A live run without configuration identity stops before quarantine mutation."""
+    from issue_orchestrator.control.session_restorer import (
+        SessionConfigurationIdentityVerificationError,
+    )
     from issue_orchestrator.ports.pending_work_claim_store import QuarantineCause
 
     harness = _ready_harness(tmp_path)
@@ -6383,63 +6357,54 @@ def test_a_quarantine_rewrites_its_story_when_the_run_turns_out_to_be_live(
     assert "already ended" in _comment_texts(harness)[0]
     assert EventName.SESSION_CLAIM_UNREADABLE.value in harness.event_names()
 
-    # Pass 2: the terminal is discovered alive, and neither half of its record
-    # can be read.
-    _restore_with_raw_discovery(harness, [_discovered(session, is_review=False)])
+    # Pass 2: the terminal is discovered alive, but restoration cannot verify
+    # which configuration owns it. Startup stops without reinterpreting the
+    # existing quarantine or telling the operator a contradictory story.
+    for _ in range(2):
+        with pytest.raises(
+            SessionConfigurationIdentityVerificationError,
+            match="Cannot verify configuration identity",
+        ):
+            _restore_with_raw_discovery(
+                harness, [_discovered(session, is_review=False)]
+            )
 
-    comments = _comment_texts(harness)
-    assert len(comments) == 2, "a changed cause must reach the operator again"
-    assert "still running" in comments[1]
-    assert "could not be rebuilt" in comments[1]
-    assert "already ended" not in comments[1]
-    assert (
-        EventName.SESSION_RUN_UNRESTORABLE_CLAIM_UNREADABLE.value
-        in harness.event_names()
-    )
-    # The durable row carries the cause it last announced, which is what makes
-    # the NEXT unchanged scan silent rather than a third comment.
+    assert len(_comment_texts(harness)) == 1
     (record,) = harness.claims.list_quarantines()
-    assert record.cause is QuarantineCause.RUN_UNRESTORABLE_CLAIM_UNREADABLE
+    assert record.cause is QuarantineCause.CLAIM_UNREADABLE_ENDED_RUN
     assert record.announced
-    _restore_with_raw_discovery(harness, [_discovered(session, is_review=False)])
-    assert len(_comment_texts(harness)) == 2
-
-    # ...and the timeline a human reads says two different things, in order.
-    first, second = _quarantine_narratives(harness)
-    assert first != second
-    assert "could not be identified" in first
-    assert "could not be rebuilt" in second
+    assert len(_quarantine_narratives(harness)) == 1
 
 
-def test_a_quarantine_rewrites_its_story_when_the_live_run_ends(
+def test_an_unverifiable_live_run_can_be_reconciled_after_the_terminal_ends(
     tmp_path: Path,
 ) -> None:
-    """live-combined -> ended-unreadable: the same rule in the other direction.
-
-    The operator was told a terminal is still working and must be stopped by
-    hand before anything is re-queued. Once it is gone that instruction is stale
-    in the opposite way: there is nothing left to stop, and the work can be
-    dealt with. A durable cause is what lets the sweep notice (#6999 F6).
-    """
+    """Once the unverifiable terminal ends, the unreadable claim is quarantined."""
+    from issue_orchestrator.control.session_restorer import (
+        SessionConfigurationIdentityVerificationError,
+    )
     from issue_orchestrator.ports.pending_work_claim_store import QuarantineCause
 
     harness = _ready_harness(tmp_path)
     session = _break_both_halves(harness, tmp_path, "review")
 
-    _restore_with_raw_discovery(harness, [_discovered(session, is_review=True)])
-    assert "still running" in _comment_texts(harness)[0]
+    with pytest.raises(
+        SessionConfigurationIdentityVerificationError,
+        match="Cannot verify configuration identity",
+    ):
+        _restore_with_raw_discovery(harness, [_discovered(session, is_review=True)])
+    assert _comment_texts(harness) == []
 
     # The terminal is gone: discovery returns nothing at all.
     _recover_with_no_terminals(None, harness)
 
     comments = _comment_texts(harness)
-    assert len(comments) == 2
-    assert "already ended" in comments[1]
-    assert "still running" not in comments[1]
+    assert len(comments) == 1
+    assert "already ended" in comments[0]
+    assert "still running" not in comments[0]
     (record,) = harness.claims.list_quarantines()
     assert record.cause is QuarantineCause.CLAIM_UNREADABLE_ENDED_RUN
-    first, second = _quarantine_narratives(harness)
-    assert first != second
+    assert len(_quarantine_narratives(harness)) == 1
 
 
 def test_the_two_quarantine_causes_do_not_borrow_each_others_story(

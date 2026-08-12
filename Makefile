@@ -683,7 +683,7 @@ _validate-full-impl:
 	@$(GMAKE) -j$(VALIDATE_E2E_JOBS) --output-sync=target test-e2e
 
 verify-hooks-all:
-	@.venv/bin/issue-orchestrator setup-hooks --config .issue-orchestrator/config/hooks-validate.yaml
+	@.venv/bin/issue-orchestrator setup-hooks --config .issue-orchestrator/config/maintenance/hooks-validate.yaml
 
 # Demo - show orchestrator features with mock data
 demo:

@@ -186,7 +186,7 @@ All labels are managed by the orchestrator:
 
 ## Configuration
 
-Agents are configured in `.issue-orchestrator/config/<name>.yaml`:
+Agents are configured in `.issue-orchestrator/config/modes/<mode>/<name>.yaml`:
 
 ```yaml
 agents:

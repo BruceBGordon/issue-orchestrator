@@ -255,7 +255,14 @@ def _make_config(
 
 
 def _write_test_config(tmp_path: Path) -> Path:
-    config_path = tmp_path / ".issue-orchestrator" / "config" / "default.yaml"
+    config_path = (
+        tmp_path
+        / ".issue-orchestrator"
+        / "config"
+        / "modes"
+        / "default"
+        / "default.yaml"
+    )
     config_path.parent.mkdir(parents=True, exist_ok=True)
     config_path.write_text(
         json.dumps({"validation": {"quick": {}, "publish": {}}}, indent=2),

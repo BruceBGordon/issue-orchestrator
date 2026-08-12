@@ -9,6 +9,80 @@ globals().update(
     {name: value for name, value in vars(_support).items() if not name.startswith("__")}
 )
 
+
+def test_e2e_dependency_forwards_typed_mode_selection(tmp_path: Path) -> None:
+    from issue_orchestrator.entrypoints.control_api_e2e_support import (
+        ControlApiE2EDependencies,
+    )
+
+    captured: list[object] = []
+    expected = MagicMock(spec=Config)
+    deps = ControlApiE2EDependencies(
+        get_orchestrator=lambda: None,
+        load_config_selection=lambda _repo, selection: (
+            captured.append(selection) or expected
+        ),
+        validate_repo_root=lambda value: Path(value) if value else None,
+    )
+
+    loaded = deps.load_config(tmp_path, "main.yaml", "codex")
+
+    assert loaded is expected
+    assert captured[0].to_dict() == {
+        "mode": "codex",
+        "config_name": "main.yaml",
+    }
+
+
+def test_e2e_routes_reject_invalid_mode_as_bad_request(tmp_path: Path) -> None:
+    from fastapi import FastAPI
+
+    from issue_orchestrator.entrypoints.control_api_e2e_runs import (
+        control_e2e_runs_router,
+    )
+    from issue_orchestrator.entrypoints.control_api_e2e_triage import (
+        control_e2e_triage_router,
+    )
+    from issue_orchestrator.entrypoints.control_api_e2e_support import (
+        ControlApiE2EDependencies,
+        install_control_api_e2e_dependencies,
+    )
+
+    app = FastAPI()
+    install_control_api_e2e_dependencies(
+        app,
+        ControlApiE2EDependencies(
+            get_orchestrator=lambda: None,
+            load_config_selection=lambda _repo, _selection: MagicMock(spec=Config),
+            validate_repo_root=lambda _value: tmp_path,
+        ),
+    )
+    app.include_router(control_e2e_runs_router)
+    app.include_router(control_e2e_triage_router)
+    (tmp_path / ".issue-orchestrator").mkdir()
+    (tmp_path / ".issue-orchestrator/e2e.db").touch()
+
+    client = TestClient(app)
+    requests = [
+        ("/control/e2e/status", {}),
+        ("/control/e2e/triage/1", {}),
+        ("/control/e2e/test/1", {"nodeid": "test_example"}),
+        ("/control/e2e/run/1", {"enhanced": "true"}),
+    ]
+    for endpoint, extras in requests:
+        response = client.get(
+            endpoint,
+            params={
+            "repo_root": str(tmp_path),
+            "config_name": "main.yaml",
+            "mode": "../codex",
+            **extras,
+            },
+        )
+
+        assert response.status_code == 400
+        assert response.json()["error"] == "invalid_configuration_selection"
+
 class TestE2ELogsEndpoint:
     """Test the /control/e2e/logs/{run_id} endpoint."""
 

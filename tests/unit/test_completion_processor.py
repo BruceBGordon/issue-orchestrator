@@ -2280,8 +2280,9 @@ class TestReviewExchangeExecution:
         assert captured["coder_label"] == "agent:coder"
         assert captured["reviewer_label"] == "agent:reviewer"
         assert config.config_path is not None
-        assert captured["runtime_config"] == RuntimeConfigReference.from_path(
-            config.config_path
+        assert captured["runtime_config"] == RuntimeConfigReference(
+            config_path=config.config_path.resolve(),
+            selection=config.launch_selection,
         )
 
     def test_resolve_agent_label_from_completion_path(self, tmp_path):

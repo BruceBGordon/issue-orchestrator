@@ -798,7 +798,14 @@ def build_config(
 
 
 def _write_runtime_config(repo_root: Path, validation_cmd: str | None) -> Path:
-    config_path = repo_root / ".issue-orchestrator" / "config" / "default.yaml"
+    config_path = (
+        repo_root
+        / ".issue-orchestrator"
+        / "config"
+        / "modes"
+        / "default"
+        / "default.yaml"
+    )
     config_path.parent.mkdir(parents=True, exist_ok=True)
     quick = {"cmd": validation_cmd, "timeout_seconds": 5} if validation_cmd else {}
     config_path.write_text(

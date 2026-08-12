@@ -20,7 +20,7 @@ Async E2E test runner that executes tests locally with dashboard visibility and 
 E2E settings are defined in `src/issue_orchestrator/infra/settings_schema.py` (`E2ESettings` model) and drive the web settings dialog, API, and wizard defaults. The schema is the single source of truth.
 
 ```yaml
-# .issue-orchestrator/config/*.yaml
+# .issue-orchestrator/config/modes/<mode>/*.yaml
 e2e:
   enabled: true
   role: "auto"                     # auto | executor | reader | disabled

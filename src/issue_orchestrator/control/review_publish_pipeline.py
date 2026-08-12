@@ -55,4 +55,3 @@ def resolve_review_publish_pipeline(exchange_mode: str | None) -> ReviewPublishP
     if exchange_mode in {"via-local-loop", "via-mcp"}:
         return LocalLoopPublishPipeline()
     return DraftPrPublishPipeline()
-

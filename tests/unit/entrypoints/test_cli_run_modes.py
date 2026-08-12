@@ -16,6 +16,8 @@ could die immediately after and stay green (F12).
 from __future__ import annotations
 
 import asyncio
+from contextlib import nullcontext
+import inspect
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -23,11 +25,22 @@ import pytest
 
 from issue_orchestrator.entrypoints import cli_run_modes
 from issue_orchestrator.entrypoints.cli_run_modes import declare_no_control_api
+from issue_orchestrator.domain.repository_launch_selection import (
+    RepositoryLaunchSelection,
+)
+from issue_orchestrator.execution.control_center_runtime import (
+    RepositoryOrchestratorOwnership,
+)
 from issue_orchestrator.infra.agent_callback_endpoint import (
     RuntimeAgentCallbackEndpoint,
 )
 
 BOUND_PORT = 54321
+
+
+def _close_coroutine(coro: object) -> None:
+    if inspect.iscoroutine(coro):
+        coro.close()
 
 
 class _FakeControlAPIServer:
@@ -98,6 +111,70 @@ class TestDeclareNoControlApi:
         """A port was asked for, so the server still owes a publication."""
         declare_no_control_api(orchestrator, 0)
         assert orchestrator.deps.agent_callback_endpoint.is_ready() is False
+
+
+def test_locked_cli_start_persists_exact_selection_after_lock_publication(
+    tmp_path: Path,
+    orchestrator,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selection = RepositoryLaunchSelection.parse(
+        mode="codex",
+        config_name="main.yaml",
+    )
+    config = MagicMock(
+        repo_root=tmp_path,
+        launch_selection=selection,
+        configuration_mode="codex",
+        config_name="main.yaml",
+        config_fingerprint="effective-fingerprint",
+        control_api_port=None,
+        web_port=8080,
+        ui_mode="web",
+    )
+    args = MagicMock(no_dashboard=True, api_port=None, port=8080)
+    acquire = MagicMock()
+    release = MagicMock()
+    record = MagicMock()
+    monkeypatch.setattr(
+        "issue_orchestrator.execution.control_center_runtime."
+        "inspect_repository_orchestrator_ownership",
+        lambda _repo, requested: RepositoryOrchestratorOwnership(
+            requested=requested,
+            matching=(),
+            conflicting=(),
+        ),
+    )
+    monkeypatch.setattr("issue_orchestrator.infra.repo_lock.is_locked", lambda _: False)
+    monkeypatch.setattr("issue_orchestrator.infra.repo_lock.acquire_lock", acquire)
+    monkeypatch.setattr("issue_orchestrator.infra.repo_lock.release_lock", release)
+    monkeypatch.setattr(
+        "issue_orchestrator.infra.repo_lock.repository_lifecycle_mutation",
+        lambda _repo: nullcontext(),
+    )
+    monkeypatch.setattr(
+        "issue_orchestrator.execution.repository_engine_start."
+        "record_repository_engine_launch",
+        record,
+    )
+    monkeypatch.setattr(cli_run_modes.asyncio, "run", _close_coroutine)
+
+    result = cli_run_modes.run_locked_cli_engine(
+        args,
+        config,
+        MagicMock(return_value=orchestrator),
+    )
+
+    assert result == 0
+    acquire.assert_called_once_with(
+        tmp_path,
+        None,
+        configuration_mode="codex",
+        config_name="main.yaml",
+        config_fingerprint="effective-fingerprint",
+    )
+    record.assert_called_once_with(tmp_path, selection)
+    release.assert_called_once_with(tmp_path)
 
 
 class TestNoDashboardMode:

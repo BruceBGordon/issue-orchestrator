@@ -161,7 +161,7 @@ pytest tests/e2e/ -v           # Live e2e tests (requires gh auth)
 
 The orchestrator includes an async E2E test runner. See [docs/user/e2e.md](docs/user/e2e.md) for details.
 
-**Configuration:** `.issue-orchestrator/config/<name>.yaml` - see `examples/config.example.yaml`
+**Configuration:** `.issue-orchestrator/config/modes/<mode>/<name>.yaml` - see `examples/config.example.yaml`
 
 ## Events vs Logs (Key Patterns)
 

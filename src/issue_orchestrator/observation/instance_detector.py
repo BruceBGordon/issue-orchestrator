@@ -17,7 +17,7 @@ from typing import Any, Literal
 
 from ..infra import supervisor
 from ..infra.repo_registry import load_registry
-from ..infra.config import list_configs
+from ..infra.config import list_configs, list_modes
 from ..infra.client_urls import resolve_client_dashboard_url, with_client_query_params
 
 logger = logging.getLogger(__name__)
@@ -37,7 +37,9 @@ def _is_port_available(port: int) -> bool:
     return True
 
 
-def _find_available_dashboard_port(default_port: int = 19080, max_offset: int = 20) -> int:
+def _find_available_dashboard_port(
+    default_port: int = 19080, max_offset: int = 20
+) -> int:
     """Pick the first available dashboard port, preferring default_port."""
     for candidate in range(default_port, default_port + max_offset + 1):
         if _is_port_available(candidate):
@@ -76,7 +78,14 @@ class RepoStatus:
     orchestrator_pid: int | None = None
     orchestrator_port: int | None = None
     configs: list[str] = field(default_factory=list)
+    modes: list[str] = field(default_factory=list)
+    mode_configs: dict[str, list[str]] = field(default_factory=dict)
+    selected_mode: str = "default"
     selected_config: str = "default.yaml"
+    active_mode: str | None = None
+    active_config: str | None = None
+    active_config_fingerprint: str | None = None
+    active_instances: list[dict[str, Any]] = field(default_factory=list)
     is_current_dir: bool = False
 
     def to_dict(self) -> dict[str, Any]:
@@ -89,7 +98,14 @@ class RepoStatus:
             "orchestrator_pid": self.orchestrator_pid,
             "orchestrator_port": self.orchestrator_port,
             "configs": self.configs,
+            "modes": self.modes,
+            "mode_configs": self.mode_configs,
+            "selected_mode": self.selected_mode,
             "selected_config": self.selected_config,
+            "active_mode": self.active_mode,
+            "active_config": self.active_config,
+            "active_config_fingerprint": self.active_config_fingerprint,
+            "active_instances": self.active_instances,
             "is_current_dir": self.is_current_dir,
         }
 
@@ -206,35 +222,84 @@ def _check_if_paused(port: int) -> bool:
         return False
 
 
-def _get_orchestrator_state(repo_path: Path) -> tuple[Literal["running", "stopped", "failed", "paused"], int | None, int | None]:
-    """Get orchestrator state for a repo.
+def get_orchestrator_details(
+    repo_path: Path,
+    *,
+    selected_mode: str,
+    selected_config: str,
+) -> dict[str, Any]:
+    """Return state plus actual lock identity/topology for one repository."""
+    aggregate = supervisor.status_all_instances(
+        repo_path,
+        selected_config,
+        mode=selected_mode,
+    )
+    instances = list(aggregate.instances)
+    if not instances:
+        single = supervisor.status(repo_path)
+        if single.state != "stopped":
+            instances.append(single)
+    active = sorted(
+        (instance for instance in instances if instance.state != "stopped"),
+        key=lambda instance: (
+            0 if instance.state == "running" else 1,
+            instance.configuration_mode,
+            instance.config_name,
+            instance.instance_id or "",
+        ),
+    )
+    if not active:
+        return {
+            "state": "stopped",
+            "pid": None,
+            "port": None,
+            "active_mode": None,
+            "active_config": None,
+            "active_config_fingerprint": None,
+            "active_instances": [],
+        }
 
-    Returns (state, pid, port).
-    """
-    status = supervisor.status(repo_path)
-    if status.state == "running":
-        if status.port and _check_if_paused(status.port):
-            return "paused", status.pid, status.port
-        return "running", status.pid, status.port
-    elif status.state == "failed":
-        return "failed", status.pid, status.port
-    return "stopped", None, None
+    primary = active[0]
+    running = [instance for instance in active if instance.state == "running"]
+    state: Literal["running", "stopped", "failed", "paused"] = "failed"
+    if running:
+        state = (
+            "paused"
+            if primary.port and _check_if_paused(primary.port)
+            else "running"
+        )
+    return {
+        "state": state,
+        "pid": primary.pid,
+        "port": primary.port,
+        "active_mode": primary.configuration_mode,
+        "active_config": primary.config_name,
+        "active_config_fingerprint": primary.config_fingerprint,
+        "active_instances": [instance.to_dict() for instance in active],
+    }
 
 
-def _get_config_status(repo_path: Path) -> tuple[Literal["ready", "needs_setup", "legacy"], list[str]]:
+def _get_config_status(
+    repo_path: Path,
+) -> tuple[
+    Literal["ready", "needs_setup", "legacy"],
+    list[str],
+    dict[str, list[str]],
+]:
     """Get config status for a repo.
 
     Returns (status, list_of_configs).
     """
-    configs = list_configs(repo_path)
-    if configs:
-        return "ready", configs
+    modes = list_modes(repo_path)
+    mode_configs = {mode: list_configs(repo_path, mode) for mode in modes}
+    if any(mode_configs.values()):
+        return "ready", modes, mode_configs
 
     legacy_config = (repo_path / ".issue-orchestrator.yaml").exists()
     if legacy_config:
-        return "legacy", []
+        return "legacy", [], {}
 
-    return "needs_setup", []
+    return "needs_setup", [], {}
 
 
 def detect_system_state(cwd: Path | None = None) -> SystemState:
@@ -269,38 +334,66 @@ def detect_system_state(cwd: Path | None = None) -> SystemState:
         if not repo_path.exists():
             continue
 
-        config_status, configs = _get_config_status(repo_path)
-        orch_state, orch_pid, orch_port = _get_orchestrator_state(repo_path)
+        selection = reg_repo.launch_selection
+        config_status, modes, mode_configs = _get_config_status(repo_path)
+        runtime = get_orchestrator_details(
+            repo_path,
+            selected_mode=selection.mode.value,
+            selected_config=selection.config.value,
+        )
 
-        repos.append(RepoStatus(
-            path=reg_repo.path,
-            name=reg_repo.name,
-            config_status=config_status,
-            orchestrator_state=orch_state,
-            orchestrator_pid=orch_pid,
-            orchestrator_port=orch_port,
-            configs=configs,
-            selected_config=reg_repo.selected_config,
-            is_current_dir=(repo_path == cwd),
-        ))
+        repos.append(
+            RepoStatus(
+                path=reg_repo.path,
+                name=reg_repo.name,
+                config_status=config_status,
+                orchestrator_state=runtime["state"],
+                orchestrator_pid=runtime["pid"],
+                orchestrator_port=runtime["port"],
+                configs=mode_configs.get(selection.mode.value, []),
+                modes=modes,
+                mode_configs=mode_configs,
+                selected_mode=selection.mode.value,
+                selected_config=selection.config.value,
+                active_mode=runtime["active_mode"],
+                active_config=runtime["active_config"],
+                active_config_fingerprint=runtime["active_config_fingerprint"],
+                active_instances=runtime["active_instances"],
+                is_current_dir=(repo_path == cwd),
+            )
+        )
 
     # If cwd is a git repo but not registered, add it
     if cwd_is_git and not is_orch_codebase:
         cwd_str = str(cwd)
         if not any(r.path == cwd_str for r in repos):
-            config_status, configs = _get_config_status(cwd)
-            orch_state, orch_pid, orch_port = _get_orchestrator_state(cwd)
-            repos.insert(0, RepoStatus(
-                path=cwd_str,
-                name=cwd.name,
-                config_status=config_status,
-                orchestrator_state=orch_state,
-                orchestrator_pid=orch_pid,
-                orchestrator_port=orch_port,
-                configs=configs,
+            config_status, modes, mode_configs = _get_config_status(cwd)
+            runtime = get_orchestrator_details(
+                cwd,
+                selected_mode="default",
                 selected_config="default.yaml",
-                is_current_dir=True,
-            ))
+            )
+            repos.insert(
+                0,
+                RepoStatus(
+                    path=cwd_str,
+                    name=cwd.name,
+                    config_status=config_status,
+                    orchestrator_state=runtime["state"],
+                    orchestrator_pid=runtime["pid"],
+                    orchestrator_port=runtime["port"],
+                    configs=mode_configs.get("default", []),
+                    modes=modes,
+                    mode_configs=mode_configs,
+                    selected_mode="default",
+                    selected_config="default.yaml",
+                    active_mode=runtime["active_mode"],
+                    active_config=runtime["active_config"],
+                    active_config_fingerprint=runtime["active_config_fingerprint"],
+                    active_instances=runtime["active_instances"],
+                    is_current_dir=True,
+                ),
+            )
 
     return SystemState(
         dashboard=dashboard,
@@ -377,7 +470,9 @@ def _default_search_paths() -> list[Path]:
     return default_repo_search_paths()
 
 
-def _dedupe_discovered_repos(discovered: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+def _dedupe_discovered_repos(
+    discovered: Iterable[dict[str, Any]],
+) -> list[dict[str, Any]]:
     """Deduplicate discovered repos by canonical repository path."""
     by_path: dict[str, dict[str, Any]] = {}
     for repo in discovered:
@@ -418,13 +513,17 @@ def _try_add_discovered_repo(
     if _is_orchestrator_codebase(entry_path):
         return True
 
-    config_status, configs = _get_config_status(entry_path)
-    discovered.append({
-        "path": resolved,
-        "name": entry_path.name,
-        "configs": configs,
-        "status": config_status,
-    })
+    config_status, modes, mode_configs = _get_config_status(entry_path)
+    discovered.append(
+        {
+            "path": resolved,
+            "name": entry_path.name,
+            "configs": mode_configs.get("default", []),
+            "modes": modes,
+            "mode_configs": mode_configs,
+            "status": config_status,
+        }
+    )
     return True
 
 
@@ -465,7 +564,9 @@ def discover_repos(
                 if not entry.is_dir() or entry.name.startswith("."):
                     continue
                 entry_path = Path(entry.path)
-                if not _try_add_discovered_repo(entry_path, registered_paths, discovered):
+                if not _try_add_discovered_repo(
+                    entry_path, registered_paths, discovered
+                ):
                     scan_directory(entry_path, depth + 1)
         except PermissionError:
             pass

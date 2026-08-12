@@ -11,6 +11,7 @@ import type {
 } from "./types.js";
 import type { OrchestratorClient } from "./orchestratorClient.js";
 import { normalizeClientCapabilities, sessionActionMode } from "./clientCapabilities.js";
+import { defaultConfigPath } from "./configPaths.js";
 import { showDoctorPanel, updateDoctorPanel } from "./doctorView.js";
 import type { DoctorAction } from "./doctorView.js";
 import { runStartCommand } from "./startCommand.js";
@@ -831,7 +832,7 @@ function buildFixActions(report: DoctorReport): DoctorAction[] {
       if (configPath) {
         addAction(`openFile:${configPath}`, "Fix: Config File");
       } else {
-        addAction("openFile:.issue-orchestrator/config/default.yaml", "Fix: Config File");
+        addAction("openFile:.issue-orchestrator/config/modes/default/default.yaml", "Fix: Config File");
         addAction("openFile:examples/config.example.yaml", "Open Example Config");
       }
     }
@@ -1075,7 +1076,7 @@ async function warnIfConfigMissing(): Promise<void> {
   if (!repoRoot) {
     return;
   }
-  const expected = path.join(repoRoot, ".issue-orchestrator", "config", "default.yaml");
+  const expected = defaultConfigPath(repoRoot);
   try {
     await (vscode.workspace as typeof vscode.workspace & { fs: { stat(uri: vscode.Uri): Promise<void> } }).fs.stat(
       vscode.Uri.file(expected)

@@ -56,7 +56,8 @@ from fastapi.staticfiles import StaticFiles
 from sse_starlette.sse import EventSourceResponse
 
 from ..infra import gh_audit
-from ..infra.supervisor import DefaultSupervisorOps, SupervisorOps
+from ..execution.repository_engine_supervisor import build_default_supervisor_ops
+from ..ports.repository_engine_supervisor import SupervisorOps
 from ..ports import RepositoryHost
 from ..control.goal_pilot import GoalPilot
 from ..execution.control_center_actions import ControlCenterActions
@@ -133,6 +134,7 @@ from .timeline_presentation import (
 _TEMPLATES_DIR = Path(__file__).parent.parent / "templates"
 
 if TYPE_CHECKING:
+    from ..domain.repository_launch_selection import RepositoryLaunchSelection
     from ..domain.repository_setup_auth import RepositorySetupGitHubAuthorization
     from ..infra.orchestrator import Orchestrator
     from ..infra.config import Config
@@ -141,13 +143,18 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 _PREFERRED_REPO_ROOT_ENV = "ISSUE_ORCHESTRATOR_CC_REPO_ROOT"
 
-def _load_config_by_name(repo_root: Path, config_name: str) -> "Config":
-    """Load orchestrator config by repo root and config file name.
+
+def _load_config_selection(
+    repo_root: Path,
+    selection: "RepositoryLaunchSelection",
+) -> "Config":
+    """Load exactly one typed E2E mode/config selection.
 
     Raises FileNotFoundError if the config file does not exist.
     """
-    from ..infra.config import Config
-    return Config.find_and_load(repo_root, config_name=config_name)
+    from ..execution.control_center_runtime import load_config_for_selection
+
+    return load_config_for_selection(repo_root, selection)
 
 
 def _create_repository_setup_host(
@@ -218,11 +225,13 @@ _agent_callback_token: str | None = None
 # admin bearer token. See security #6017 re-review-2 P1 — earlier
 # versions minted a session cookie for any anonymous GET of ``/``,
 # which defeated bearer-token auth entirely.
-_UNAUTHENTICATED_PATHS: frozenset[str] = frozenset({
-    "/",
-    "/login",
-    "/favicon.ico",
-})
+_UNAUTHENTICATED_PATHS: frozenset[str] = frozenset(
+    {
+        "/",
+        "/login",
+        "/favicon.ico",
+    }
+)
 _UNAUTHENTICATED_PREFIXES: tuple[str, ...] = ("/static/",)
 
 # The agent-callback route allowlist lives in ``_auth_middleware`` so
@@ -289,7 +298,7 @@ def get_configured_agent_callback_token() -> str | None:
 _orchestrator: "Orchestrator | None" = None
 
 # Supervisor operations (injectable for testing)
-_supervisor: SupervisorOps = DefaultSupervisorOps()
+_supervisor: SupervisorOps = build_default_supervisor_ops()
 _control_actions = ControlCenterActions(supervisor=_supervisor)
 
 
@@ -312,6 +321,7 @@ def _with_state_lock(fn):
         return fn()
     with lock:
         return fn()
+
 
 def _get_goal_pilot() -> GoalPilot:
     """Create a GoalPilot instance from the running orchestrator."""
@@ -464,7 +474,7 @@ async def get_repos() -> JSONResponse:
     return JSONResponse({"repos": [r.to_dict() for r in state.repos]})
 
 
-@control_app.post("/api/repos/{repo_id}/start")
+@control_app.post("/api/repos/{repo_id:path}/start")
 async def start_repo_orchestrator(repo_id: str, request: Request) -> JSONResponse:
     """Start orchestrator for a specific repo.
 
@@ -479,32 +489,48 @@ async def start_repo_orchestrator(repo_id: str, request: Request) -> JSONRespons
     path = Path(repo_path)
 
     if not path.exists():
-        return JSONResponse({"error": f"Repository not found: {repo_path}"}, status_code=404)
+        return JSONResponse(
+            {"error": f"Repository not found: {repo_path}"}, status_code=404
+        )
 
-    # Parse optional config_name from body
+    # Parse optional launch selection from body.
     config_name = "default.yaml"
+    mode = "default"
     try:
         body = await request.json()
         if isinstance(body, dict) and "config_name" in body:
             config_name = body["config_name"]
+        if isinstance(body, dict) and "mode" in body:
+            mode = body["mode"]
     except Exception:
         pass
 
-    # Use supervisor to start
     try:
-        info = _supervisor.start(path, config_name)
-        _track_launched_pids({"pid": info.pid})
-        return JSONResponse({
-            "status": "started",
-            "pid": info.pid,
-            "port": info.http_port,
-        })
+        from ..domain.repository_launch_selection import RepositoryLaunchSelection
+        from ..execution.repository_engine_start import RepositoryEngineStartRequest
+
+        selection = RepositoryLaunchSelection.parse(
+            mode=mode,
+            config_name=config_name,
+        )
+        result = get_control_actions().start_repo_engine_cmd.execute(
+            RepositoryEngineStartRequest(
+                repo_root=path,
+                selection=selection,
+                actor="legacy-control-api",
+            )
+        )
+        if result.succeeded:
+            _track_launched_pids(result.payload)
+        return JSONResponse(dict(result.payload), status_code=result.status_code)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
     except Exception as e:
         logger.exception("Failed to start orchestrator for %s", repo_path)
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
-@control_app.post("/api/repos/{repo_id}/stop")
+@control_app.post("/api/repos/{repo_id:path}/stop")
 async def stop_repo_orchestrator(repo_id: str, request: Request) -> JSONResponse:
     """Stop orchestrator for a specific repo.
 
@@ -537,37 +563,60 @@ async def stop_repo_orchestrator(repo_id: str, request: Request) -> JSONResponse
 
     force = bool(body.get("force", False)) if isinstance(body, dict) else False
 
-    stopped = _supervisor.stop(path, force=force, reason=parsed.reason, actor=parsed.actor)
+    stopped = _supervisor.stop(
+        path, force=force, reason=parsed.reason, actor=parsed.actor
+    )
     return JSONResponse({"status": "stopped" if stopped else "failed"})
 
 
-@control_app.get("/api/repos/{repo_id}/status")
+@control_app.get("/api/repos/{repo_id:path}/status")
 async def get_repo_status(repo_id: str) -> JSONResponse:
     """Get detailed status for a specific repo.
 
     The repo_id is the URL-encoded absolute path to the repo.
     """
     from urllib.parse import unquote
-    from ..observation.instance_detector import _get_config_status, _get_orchestrator_state
+    from ..observation.instance_detector import (
+        _get_config_status,
+        get_orchestrator_details,
+    )
+    from ..execution.control_center_runtime import get_selected_launch_selection
 
     repo_path = unquote(repo_id)
     path = Path(repo_path)
 
     if not path.exists():
-        return JSONResponse({"error": f"Repository not found: {repo_path}"}, status_code=404)
+        return JSONResponse(
+            {"error": f"Repository not found: {repo_path}"}, status_code=404
+        )
 
-    config_status, configs = _get_config_status(path)
-    orch_state, orch_pid, orch_port = _get_orchestrator_state(path)
+    config_status, modes, mode_configs = _get_config_status(path)
+    selection = get_selected_launch_selection(path)
+    runtime = get_orchestrator_details(
+        path,
+        selected_mode=selection.mode.value,
+        selected_config=selection.config.value,
+    )
 
-    return JSONResponse({
-        "path": repo_path,
-        "name": path.name,
-        "config_status": config_status,
-        "configs": configs,
-        "orchestrator_state": orch_state,
-        "orchestrator_pid": orch_pid,
-        "orchestrator_port": orch_port,
-    })
+    return JSONResponse(
+        {
+            "path": repo_path,
+            "name": path.name,
+            "config_status": config_status,
+            "configs": mode_configs.get("default", []),
+            "modes": modes,
+            "mode_configs": mode_configs,
+            "orchestrator_state": runtime["state"],
+            "orchestrator_pid": runtime["pid"],
+            "orchestrator_port": runtime["port"],
+            "selected_mode": selection.mode.value,
+            "selected_config": selection.config.value,
+            "active_mode": runtime["active_mode"],
+            "active_config": runtime["active_config"],
+            "active_config_fingerprint": runtime["active_config_fingerprint"],
+            "active_instances": runtime["active_instances"],
+        }
+    )
 
 
 @control_app.get("/api/discover")
@@ -667,19 +716,20 @@ async def status() -> JSONResponse:
 
     state = _orchestrator.state
     sessions = [
-        _active_session_status_payload(session)
-        for session in state.active_sessions
+        _active_session_status_payload(session) for session in state.active_sessions
     ]
-    return JSONResponse({
-        "paused": state.paused,
-        "active_sessions": len(state.active_sessions),
-        "sessions": sessions,
-        "pending_reviews": len(state.pending_reviews),
-        "pending_reworks": len(state.pending_reworks),
-        "completed_today": len(state.completed_today),
-        "issues_in_queue": len(state.cached_queue_issues),
-        "instance_id": _orchestrator.deps.services.instance_id,
-    })
+    return JSONResponse(
+        {
+            "paused": state.paused,
+            "active_sessions": len(state.active_sessions),
+            "sessions": sessions,
+            "pending_reviews": len(state.pending_reviews),
+            "pending_reworks": len(state.pending_reworks),
+            "completed_today": len(state.completed_today),
+            "issues_in_queue": len(state.cached_queue_issues),
+            "instance_id": _orchestrator.deps.services.instance_id,
+        }
+    )
 
 
 @control_app.get("/api/events")
@@ -689,9 +739,11 @@ async def events(request: Request):
         return JSONResponse({"error": "Event hub not initialized"}, status_code=503)
 
     event_hub = _orchestrator.event_hub
-    logger.info("[SSE] Client connected (subscribers=%d, last_event_id=%s)",
-                event_hub.stats().get("subscribers"),
-                event_hub.last_event_id)
+    logger.info(
+        "[SSE] Client connected (subscribers=%d, last_event_id=%s)",
+        event_hub.stats().get("subscribers"),
+        event_hub.last_event_id,
+    )
 
     async def event_generator():
         subscription = event_hub.subscribe()
@@ -700,21 +752,28 @@ async def events(request: Request):
                 if await request.is_disconnected():
                     break
                 try:
-                    event = await asyncio.wait_for(subscription.queue.get(), timeout=30.0)
+                    event = await asyncio.wait_for(
+                        subscription.queue.get(), timeout=30.0
+                    )
                     yield {
                         "event": event.type,
-                        "data": json.dumps({
-                            "event_id": event.event_id,
-                            "type": event.type,
-                            "issue_key": event.issue_key,
-                            "payload": event.payload,
-                        }),
+                        "data": json.dumps(
+                            {
+                                "event_id": event.event_id,
+                                "type": event.type,
+                                "issue_key": event.issue_key,
+                                "payload": event.payload,
+                            }
+                        ),
                     }
                 except asyncio.TimeoutError:
                     yield {"comment": "keepalive"}
         finally:
             event_hub.unsubscribe(subscription)
-            logger.info("[SSE] Client disconnected (subscribers=%d)", event_hub.stats().get("subscribers"))
+            logger.info(
+                "[SSE] Client disconnected (subscribers=%d)",
+                event_hub.stats().get("subscribers"),
+            )
 
     return EventSourceResponse(event_generator())
 
@@ -744,11 +803,13 @@ async def events_since(after: int = Query(0, alias="after")) -> JSONResponse:
         }
         for event in events
     ]
-    return JSONResponse({
-        "events": payload,
-        "last_event_id": event_hub.last_event_id,
-        "stats": stats,
-    })
+    return JSONResponse(
+        {
+            "events": payload,
+            "last_event_id": event_hub.last_event_id,
+            "stats": stats,
+        }
+    )
 
 
 @control_app.get("/api/events_stats")
@@ -780,7 +841,9 @@ async def snapshot() -> JSONResponse:
 
     from ..control.snapshot_builder import SnapshotBuilder
 
-    builder = SnapshotBuilder(config=_orchestrator.config, repository_host=_orchestrator.deps.repository_host)
+    builder = SnapshotBuilder(
+        config=_orchestrator.config, repository_host=_orchestrator.deps.repository_host
+    )
     snapshot_id = _orchestrator.event_hub.last_event_id
     last_tick_id = _orchestrator.event_context.tick_id
 
@@ -794,7 +857,9 @@ async def snapshot() -> JSONResponse:
         return JSONResponse(data)
     except Exception as exc:
         logger.exception("Control API snapshot failed: %s", exc)
-        return JSONResponse({"error": "snapshot_failed", "detail": str(exc)}, status_code=500)
+        return JSONResponse(
+            {"error": "snapshot_failed", "detail": str(exc)}, status_code=500
+        )
 
 
 @control_app.get("/api/health")
@@ -869,7 +934,9 @@ _DEV_NO_AUTH_BANNER_HTML = (
 )
 
 
-def _control_center_html_response(content: str, *, status_code: int = 200) -> HTMLResponse:
+def _control_center_html_response(
+    content: str, *, status_code: int = 200
+) -> HTMLResponse:
     """Return Control Center shell HTML that browsers must revalidate on reopen."""
     response = HTMLResponse(content=content, status_code=status_code)
     response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
@@ -926,7 +993,9 @@ async def control_center_ui(request: Request) -> HTMLResponse:
     # automatically instead of the operator hard-reloading. See
     # PR #6263 for the incident this prevents.
     content = content.replace("{{ static_version }}", STATIC_VERSION_TOKEN)
-    content = content.replace("{{ browser_auth_required }}", page_auth.browser_auth_required)
+    content = content.replace(
+        "{{ browser_auth_required }}", page_auth.browser_auth_required
+    )
     content = content.replace("{{ csrf_token }}", page_auth.csrf_token)
     # Render the dev-mode banner only when the operator has
     # explicitly disabled auth (``--dev-no-auth`` /
@@ -1028,9 +1097,7 @@ def _validate_repo_root(repo_root: object | None) -> Path | None:
             )
             return None
     except OSError as exc:
-        logger.debug(
-            "validate_repo_root stat failed for %s: %s", path, exc
-        )
+        logger.debug("validate_repo_root stat failed for %s: %s", path, exc)
         return None
 
     return path
@@ -1040,7 +1107,7 @@ install_control_api_e2e_dependencies(
     control_app,
     ControlApiE2EDependencies(
         get_orchestrator=get_orchestrator,
-        load_config_by_name=_load_config_by_name,
+        load_config_selection=_load_config_selection,
         validate_repo_root=_validate_repo_root,
     ),
 )
@@ -1089,12 +1156,16 @@ install_control_api_repo_dependencies(
     control_app,
     ControlApiRepoDependencies(
         get_supervisor=get_supervisor,
+        get_control_actions=get_control_actions,
         validate_repo_root=_validate_repo_root,
         get_preferred_repo_root=_preferred_repo_root,
-        get_expected_engine_identity_raw=lambda: os.environ.get(
-            "ISSUE_ORCHESTRATOR_EXPECTED_IDENTITY",
-            "",
-        ).strip() or None,
+        get_expected_engine_identity_raw=lambda: (
+            os.environ.get(
+                "ISSUE_ORCHESTRATOR_EXPECTED_IDENTITY",
+                "",
+            ).strip()
+            or None
+        ),
     ),
 )
 install_control_api_setup_dependencies(
@@ -1131,8 +1202,14 @@ async def control_terminal_recording(
 ) -> JSONResponse:
     """Terminal recording endpoint on control center — delegates to shared implementation."""
     from ..entrypoints.web import serve_terminal_recording
+
     return serve_terminal_recording(
-        issue_number, run_dir, offset, limit, round_index, session_role,
+        issue_number,
+        run_dir,
+        offset,
+        limit,
+        round_index,
+        session_role,
     )
 
 
@@ -1165,7 +1242,10 @@ async def control_issue_detail(
     # Try base repo timeline first, then E2E worktree timeline
     candidates = [
         validated_root / ".issue-orchestrator" / "state" / "timeline.sqlite",
-        get_e2e_worktree_path(validated_root) / ".issue-orchestrator" / "state" / "timeline.sqlite",
+        get_e2e_worktree_path(validated_root)
+        / ".issue-orchestrator"
+        / "state"
+        / "timeline.sqlite",
     ]
     records: list = []
     for db_path in candidates:
@@ -1181,7 +1261,10 @@ async def control_issue_detail(
 
     if not records:
         return JSONResponse(
-            {"error": "not_found", "detail": f"No timeline events for issue {issue_number}"},
+            {
+                "error": "not_found",
+                "detail": f"No timeline events for issue {issue_number}",
+            },
             status_code=404,
         )
 

@@ -7,6 +7,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from issue_orchestrator.infra.config import Config
+from issue_orchestrator.infra.config_identity import ConfigurationFingerprintMismatch
 from issue_orchestrator.infra.supervisor import (
     DEFAULT_ENGINE_GRACEFUL_TIMEOUT_SECONDS,
     LockInfo,
@@ -22,6 +24,28 @@ from issue_orchestrator.infra.supervisor import (
 
 def test_graceful_shutdown_default_allows_agent_runtime_cleanup() -> None:
     assert DEFAULT_ENGINE_GRACEFUL_TIMEOUT_SECONDS == 120
+
+
+def test_start_rejects_config_changed_after_preflight_before_spawn(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / ".issue-orchestrator/config/modes/codex/main.yaml"
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text("agents: {}\n", encoding="utf-8")
+    preflight_fingerprint = Config.load(config_path).config_fingerprint
+    config_path.write_text("agents: {}\nweb_port: 19090\n", encoding="utf-8")
+    spawn = MagicMock()
+
+    with pytest.raises(ConfigurationFingerprintMismatch):
+        start(
+            tmp_path,
+            config_name="main.yaml",
+            mode="codex",
+            expected_config_fingerprint=preflight_fingerprint,
+            spawn_process=spawn,
+        )
+
+    spawn.assert_not_called()
 
 
 def test_stop_controller_consumes_one_budget_across_request_and_signal() -> None:
@@ -483,12 +507,17 @@ class TestMultiInstanceSupport:
             expected_identity: dict[str, object] | None = None,
             start_paused: bool = False,
             log_level: str | None = None,
+            *,
+            mode: str = "default",
+            expected_config_fingerprint: str | None = None,
         ) -> LockInfo:
             calls.append({
                 "instance_id": instance_id,
                 "port": port,
                 "start_paused": start_paused,
                 "log_level": log_level,
+                "mode": mode,
+                "expected_config_fingerprint": expected_config_fingerprint,
             })
             return LockInfo(
                 repo_root=str(repo_root),
@@ -529,11 +558,16 @@ class TestMultiInstanceSupport:
             expected_identity: dict[str, object] | None = None,
             start_paused: bool = False,
             log_level: str | None = None,
+            *,
+            mode: str = "default",
+            expected_config_fingerprint: str | None = None,
         ) -> LockInfo:
             calls.append({
                 "instance_id": instance_id,
                 "port": port,
                 "log_level": log_level,
+                "mode": mode,
+                "expected_config_fingerprint": expected_config_fingerprint,
             })
             return LockInfo(
                 repo_root=str(repo_root),

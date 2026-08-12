@@ -289,9 +289,8 @@ class SessionLauncher:
         if "verbose" in labels:
             args["verbose"] = "true"
         return args or None
-
-    @staticmethod
     def _session_identity_launch_metadata(
+        self,
         agent_config: "AgentConfig",
         *,
         extra_provider_args: dict[str, str] | None,
@@ -302,8 +301,10 @@ class SessionLauncher:
             "permission_mode": agent_config.effective_permission_mode,
             "timeout_minutes": int(agent_config.timeout_minutes),
             "extra_provider_args": dict(extra_provider_args or {}),
+            "configuration_mode": self.config.configuration_mode,
+            "config_name": self.config.config_name,
+            "config_fingerprint": self.config.config_fingerprint,
         }
-
     def _apply_actions(self, actions: list[Action], *, context: str) -> bool:
         """Apply mutations through the ActionApplier."""
         all_ok = True

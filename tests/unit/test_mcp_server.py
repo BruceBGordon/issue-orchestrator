@@ -2,38 +2,59 @@ from __future__ import annotations
 
 from pathlib import Path
 import re
+from unittest.mock import MagicMock
 
 import pytest
 
 import asyncio
 
 from issue_orchestrator.entrypoints.mcp_server import (
-    LAUNCH_FAILURE_ERROR_TYPES,
     McpApp,
     McpSettings,
     OrchestratorHttpClient,
-    launch_failure_error,
     _mcp_repos_allowlist,
     _validate_repo_start_path,
 )
-from issue_orchestrator.infra import supervisor
-from issue_orchestrator.infra.doctor.types import Check, DoctorResult
-from issue_orchestrator.infra.launcher import (
-    LaunchResult,
-    LaunchStatus,
-    UnclassifiedLaunchStatusError,
-    UnknownLaunchStatusError,
+from issue_orchestrator.execution.repository_engine_start import (
+    RepositoryEngineStartResult,
 )
+from issue_orchestrator.infra import supervisor
+from issue_orchestrator.infra.config import Config
+from issue_orchestrator.infra.doctor.types import DoctorResult
+from issue_orchestrator.infra.launcher import LaunchResult, LaunchStatus
 
 
 def _settings(*, host: str = "127.0.0.1") -> McpSettings:
     return McpSettings(
         repo_root=Path("/tmp/repo"),
-        config_path=Path("/tmp/repo/.issue-orchestrator/config/default.yaml"),
+        config_path=Path(
+            "/tmp/repo/.issue-orchestrator/config/modes/default/default.yaml"
+        ),
         instance_id=None,
         host=host,
         auto_start=False,
     )
+
+
+def _repo_settings(
+    tmp_path: Path,
+    *,
+    mode: str = "codex",
+    auto_start: bool = False,
+) -> tuple[McpSettings, Config]:
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    config_path = repo / f".issue-orchestrator/config/modes/{mode}/main.yaml"
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text("agents: {}\n", encoding="utf-8")
+    settings = McpSettings(
+        repo_root=repo,
+        config_path=config_path,
+        instance_id=None,
+        host="127.0.0.1",
+        auto_start=auto_start,
+    )
+    return settings, Config.load(config_path)
 
 
 def test_http_client_keeps_internal_api_base_url_local() -> None:
@@ -43,7 +64,9 @@ def test_http_client_keeps_internal_api_base_url_local() -> None:
     assert client.api_base_url() == "http://0.0.0.0:55543"
 
 
-def test_http_client_resolves_client_base_url_for_codespaces(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_http_client_resolves_client_base_url_for_codespaces(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setenv("CODESPACE_NAME", "octo-space")
     monkeypatch.setenv("GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN", "app.github.dev")
     client = OrchestratorHttpClient(_settings())
@@ -67,14 +90,22 @@ def test_mcp_urls_use_client_facing_base_url(monkeypatch: pytest.MonkeyPatch) ->
     }
 
 
-def test_client_base_url_uses_supervisor_status_when_port_not_cached(monkeypatch: pytest.MonkeyPatch) -> None:
-    client = OrchestratorHttpClient(_settings(host="0.0.0.0"))
+def test_client_base_url_uses_supervisor_status_when_port_not_cached(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings, config = _repo_settings(tmp_path, mode="default")
+    settings = McpSettings(**{**settings.__dict__, "host": "0.0.0.0"})
+    client = OrchestratorHttpClient(settings)
     running = supervisor.SupervisorStatus(
         state="running",
         pid=123,
         port=19080,
         started_at=None,
         instance_id=None,
+        configuration_mode=config.configuration_mode,
+        config_name=config.config_name,
+        config_fingerprint=config.config_fingerprint,
     )
     monkeypatch.setattr(
         "issue_orchestrator.entrypoints.mcp_server.supervisor.status",
@@ -82,6 +113,131 @@ def test_client_base_url_uses_supervisor_status_when_port_not_cached(monkeypatch
     )
 
     assert client.client_base_url() == "http://localhost:19080"
+
+
+def test_auto_start_rejects_identity_mismatch_even_when_conflict_has_port(
+    tmp_path: Path,
+) -> None:
+    settings, _config = _repo_settings(tmp_path, auto_start=True)
+
+    class ConflictCommand:
+        def execute(self, _request: object) -> RepositoryEngineStartResult:
+            return RepositoryEngineStartResult(
+                {
+                    "error": "engine_identity_mismatch",
+                    "detail": "active engine differs",
+                    "port": 19080,
+                },
+                409,
+            )
+
+    client = OrchestratorHttpClient(settings, ConflictCommand())  # type: ignore[arg-type]
+
+    with pytest.raises(RuntimeError, match="active engine differs"):
+        client.start()
+
+
+def test_client_rejects_running_engine_with_different_configuration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings, config = _repo_settings(tmp_path)
+    client = OrchestratorHttpClient(settings)
+    monkeypatch.setattr(
+        client,
+        "status",
+        lambda: supervisor.SupervisorStatus(
+            state="running",
+            port=19080,
+            configuration_mode="default",
+            config_name=config.config_name,
+            config_fingerprint=config.config_fingerprint,
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="configuration identity mismatch"):
+        client.api_base_url()
+
+
+def test_cached_port_is_revalidated_after_engine_identity_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings, config = _repo_settings(tmp_path)
+    client = OrchestratorHttpClient(settings)
+    statuses = iter(
+        [
+            supervisor.SupervisorStatus(
+                state="running",
+                port=19080,
+                configuration_mode=config.configuration_mode,
+                config_name=config.config_name,
+                config_fingerprint=config.config_fingerprint,
+            ),
+            supervisor.SupervisorStatus(
+                state="running",
+                port=19080,
+                configuration_mode=config.configuration_mode,
+                config_name=config.config_name,
+                config_fingerprint="different-bytes",
+            ),
+        ]
+    )
+    monkeypatch.setattr(client, "status", lambda: next(statuses))
+
+    assert client.api_base_url() == "http://127.0.0.1:19080"
+    with pytest.raises(RuntimeError, match="configuration identity mismatch"):
+        client.api_base_url()
+
+
+def test_mcp_start_rejects_existing_engine_with_different_fingerprint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings, config = _repo_settings(tmp_path)
+    app = McpApp(settings)
+    monkeypatch.setattr(
+        app._client,
+        "status",
+        lambda: supervisor.SupervisorStatus(
+            state="running",
+            port=19080,
+            configuration_mode=config.configuration_mode,
+            config_name=config.config_name,
+            config_fingerprint="different-bytes",
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="configuration identity mismatch"):
+        app.start()
+
+
+def test_mcp_stop_rejects_existing_engine_with_different_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings, config = _repo_settings(tmp_path)
+    app = McpApp(settings)
+    monkeypatch.setattr(
+        app._client,
+        "status",
+        lambda: supervisor.SupervisorStatus(
+            state="running",
+            port=19080,
+            configuration_mode="default",
+            config_name=config.config_name,
+            config_fingerprint=config.config_fingerprint,
+        ),
+    )
+    stop = MagicMock()
+    monkeypatch.setattr(
+        "issue_orchestrator.entrypoints.mcp_server.supervisor.stop",
+        stop,
+    )
+
+    with pytest.raises(RuntimeError, match="configuration identity mismatch"):
+        app.stop()
+    stop.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -123,7 +279,9 @@ def test_shutdown_force_requires_confirm() -> None:
     assert result["error"]["type"] == "ConfirmationRequired"
 
 
-def test_shutdown_graceful_does_not_require_confirm(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_shutdown_graceful_does_not_require_confirm(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A non-forced shutdown runs without the confirm gate."""
     app = McpApp(_settings())
 
@@ -179,206 +337,65 @@ def test_start_success_carries_no_ui_hint(monkeypatch: pytest.MonkeyPatch) -> No
     assert "ui_hint" not in result
 
 
-# --- LaunchResult mapping ---------------------------------------------------
-#
-# A doctor/launch failure is an ordinary return value, not an exception, so it
-# never reaches ``_safe``. These pin the full status mapping against real
-# ``LaunchResult`` values.
-
-
-def _launch_result(
-    status: LaunchStatus | str,
-    *,
-    launched: bool,
-    error: str | None = None,
-    checks: list[Check] | None = None,
-    supervisor: dict | None = None,
-) -> LaunchResult:
-    return LaunchResult(
-        doctor=DoctorResult(checks=checks or []),
-        launched=launched,
-        status=status,  # type: ignore[arg-type]  # raw strings exercise the guard
-        error=error,
-        supervisor=supervisor,
-    )
-
-
-@pytest.mark.parametrize(
-    ("status", "launched"),
-    [
-        (LaunchStatus.OK, True),
-        (LaunchStatus.DOCTOR_WARNING, True),
-        (LaunchStatus.ALREADY_RUNNING, False),
-    ],
-)
-def test_launch_failure_error_is_none_for_successful_outcomes(
-    status: LaunchStatus, launched: bool
-) -> None:
-    """Warnings and a lost start race mean the orchestrator is running."""
-    result = _launch_result(
-        status,
-        launched=launched,
-        error=(
-            "Orchestrator already running"
-            if status is LaunchStatus.ALREADY_RUNNING
-            else None
-        ),
-        supervisor={"pid": 1, "port": 19080},
-    )
-
-    assert launch_failure_error(result) is None
-
-
-def test_launch_failure_error_builds_a_message_from_failing_doctor_checks() -> None:
-    """``doctor_error`` carries no ``error`` string, so the checks supply it."""
-    result = _launch_result(
-        LaunchStatus.DOCTOR_ERROR,
-        launched=False,
-        checks=[
-            Check(name="github_auth", status="error", detail="token expired"),
-            Check(name="worktrees", status="ok", detail="fine"),
-            Check(name="hooks", status="error", detail=""),
-        ],
-    )
-
-    error = launch_failure_error(result)
-
-    assert error == {
-        "message": "Doctor checks failed — github_auth: token expired; hooks",
-        "type": "DoctorError",
-    }
-
-
-def test_launch_failure_error_uses_the_launcher_message_for_launch_error() -> None:
-    result = _launch_result(
-        LaunchStatus.LAUNCH_ERROR, launched=False, error="port already bound"
-    )
-
-    assert launch_failure_error(result) == {
-        "message": "port already bound",
-        "type": "LaunchError",
-    }
-
-
-@pytest.mark.parametrize("blank", [None, "", "   "])
-def test_launch_failure_error_never_produces_a_blank_message(blank: str | None) -> None:
-    """A blank message would read as success to clients that test for one."""
-    result = _launch_result(LaunchStatus.LAUNCH_ERROR, launched=False, error=blank)
-
-    error = launch_failure_error(result)
-
-    assert error is not None
-    assert error["message"] == "Orchestrator failed to start (launch_error)"
-
-
-def test_the_failure_type_map_covers_exactly_the_failure_statuses() -> None:
-    """A new failure status must not silently fall through as a success.
-
-    Grounded in ``failure_statuses()`` rather than in a scan over ``is_failure``:
-    the launcher separately proves the two disposition sets partition the enum,
-    so a member omitted from both cannot satisfy this assertion by being
-    invisible to it.
-    """
-    assert set(LAUNCH_FAILURE_ERROR_TYPES) == LaunchStatus.failure_statuses()
-
-
-def test_every_launch_status_is_explicitly_classified_by_the_mapping() -> None:
-    """Walk the whole enum: each member is a mapped failure or a real success."""
-    for status in LaunchStatus:
-        error = launch_failure_error(_launch_result(status, launched=False))
-        if status in LaunchStatus.failure_statuses():
-            assert error is not None, f"{status.value} produced no MCP error"
-            assert error["type"] == LAUNCH_FAILURE_ERROR_TYPES[status]
-            assert error["message"].strip()
-        else:
-            assert status in LaunchStatus.success_statuses()
-            assert error is None
-
-
-def test_an_unclassified_enum_member_fails_loudly(
+def _tool_start_for_command_result(
     monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A future status added without a disposition must not read as success."""
-    monkeypatch.setattr(
-        LaunchStatus, "failure_statuses", classmethod(lambda cls: frozenset())
-    )
-    monkeypatch.setattr(
-        LaunchStatus, "success_statuses", classmethod(lambda cls: frozenset())
-    )
-
-    with pytest.raises(UnclassifiedLaunchStatusError):
-        launch_failure_error(_launch_result(LaunchStatus.DOCTOR_ERROR, launched=False))
-
-
-def test_tool_start_reports_an_unclassified_status_as_an_error_not_success(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """End to end: the client sees a failure, never a silent "started"."""
+    result: RepositoryEngineStartResult,
+) -> dict:
+    """Run the public MCP tool against one exact shared-command outcome."""
     app = McpApp(_settings())
     app.override_port(19080)
-    _patch_launch(
-        monkeypatch, _launch_result(LaunchStatus.LAUNCH_ERROR, launched=False)
-    )
-    monkeypatch.setattr(
-        LaunchStatus, "failure_statuses", classmethod(lambda cls: frozenset())
-    )
-    monkeypatch.setattr(
-        LaunchStatus, "success_statuses", classmethod(lambda cls: frozenset())
-    )
-
-    result = asyncio.run(app.tool_start())
-
-    assert result["error"]["type"] == "UnclassifiedLaunchStatusError"
-    assert "launch_error" in result["error"]["message"]
-
-
-@pytest.mark.parametrize("unknown", ["doctor_eror", "supervisor_error", "", "OK"])
-def test_an_unknown_status_fails_loudly_instead_of_reading_as_success(
-    unknown: str,
-) -> None:
-    """The classification is exhaustive: no default-to-success branch exists.
-
-    ``LaunchResult`` is a plain dataclass, so a misspelled or newly added
-    status can reach this mapping at runtime even though the enum types it.
-    """
-    result = _launch_result(unknown, launched=False)
-
-    with pytest.raises(UnknownLaunchStatusError) as excinfo:
-        launch_failure_error(result)
-
-    assert repr(unknown) in str(excinfo.value)
-
-
-def test_tool_start_reports_an_unknown_status_as_an_error_not_success(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """End to end: an unrecognised status reaches the client as a failure."""
-    app = McpApp(_settings())
-    app.override_port(19080)
-    _patch_launch(monkeypatch, _launch_result("supervisor_error", launched=False))
-
-    result = asyncio.run(app.tool_start())
-
-    assert result["error"]["type"] == "UnknownLaunchStatusError"
-    assert "supervisor_error" in result["error"]["message"]
-    assert result["ui_hint"]["kind"] == "doctor"
-
-
-def _patch_launch(monkeypatch: pytest.MonkeyPatch, result: LaunchResult) -> None:
-    """Make ``McpApp.start`` observe ``result`` from the real launcher seam."""
     monkeypatch.setattr(
         "issue_orchestrator.entrypoints.mcp_server.supervisor.status",
         lambda repo_root, instance_id=None: supervisor.SupervisorStatus(
             state="stopped", pid=None, port=None, started_at=None, instance_id=None
         ),
     )
+    config = Config()
     monkeypatch.setattr(
-        "issue_orchestrator.infra.config.Config.load", staticmethod(lambda path: None)
+        "issue_orchestrator.infra.config.Config.load",
+        staticmethod(lambda path: config),
     )
-    monkeypatch.setattr(
-        "issue_orchestrator.infra.launcher.launch_subprocess",
-        lambda **kwargs: result,
+    monkeypatch.setattr(app._repo_start_command, "execute", lambda _request: result)
+    return asyncio.run(app.tool_start())
+
+
+@pytest.mark.parametrize("launch_status", ["ok", "doctor_warning"])
+def test_tool_start_preserves_successful_command_status(
+    monkeypatch: pytest.MonkeyPatch,
+    launch_status: str,
+) -> None:
+    result = _tool_start_for_command_result(
+        monkeypatch,
+        RepositoryEngineStartResult(
+            {"status": "started", "launch_status": launch_status}
+        ),
     )
+
+    assert result["launch"]["status"] == launch_status
+    assert result["launch"]["launched"] is True
+    assert "error" not in result
+    assert "ui_hint" not in result
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"status": "started", "launch_status": "future_success"},
+        {"status": "started"},
+    ],
+)
+def test_tool_start_reports_invalid_success_status_as_error(
+    monkeypatch: pytest.MonkeyPatch,
+    payload: dict[str, str],
+) -> None:
+    result = _tool_start_for_command_result(
+        monkeypatch,
+        RepositoryEngineStartResult(payload),
+    )
+
+    assert result["error"]["type"] == "UnknownLaunchStatusError"
+    assert str(payload.get("launch_status")) in result["error"]["message"]
+    assert result["ui_hint"]["kind"] == "doctor"
 
 
 def test_tool_start_survives_a_doctor_url_lookup_that_also_fails(
@@ -415,19 +432,17 @@ def test_tool_start_survives_a_doctor_url_lookup_that_also_fails(
 def test_tool_start_surfaces_doctor_error_with_a_ui_hint(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The failure path a client actually hits: a returned LaunchResult."""
-    app = McpApp(_settings())
-    app.override_port(19080)
-    _patch_launch(
+    """The failure path a client actually hits: a returned start-command result."""
+    result = _tool_start_for_command_result(
         monkeypatch,
-        _launch_result(
-            LaunchStatus.DOCTOR_ERROR,
-            launched=False,
-            checks=[Check(name="github_auth", status="error", detail="token expired")],
+        RepositoryEngineStartResult(
+            {
+                "error": "doctor_failed",
+                "detail": "Doctor checks failed — github_auth: token expired",
+            },
+            422,
         ),
     )
-
-    result = asyncio.run(app.tool_start())
 
     assert result["error"] == {
         "message": "Doctor checks failed — github_auth: token expired",
@@ -437,24 +452,24 @@ def test_tool_start_surfaces_doctor_error_with_a_ui_hint(
         "kind": "doctor",
         "url": "http://127.0.0.1:19080/api/doctor",
     }
-    # The nested launch payload is still returned for detail.
+    # The nested command payload is still returned for detail.
+    assert result["launch"]["error_code"] == "doctor_failed"
+    assert result["launch"]["error"] == (
+        "Doctor checks failed — github_auth: token expired"
+    )
     assert result["launch"]["status"] == "doctor_error"
-    assert result["launch"]["launched"] is False
 
 
 def test_tool_start_surfaces_launch_error_with_a_ui_hint(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    app = McpApp(_settings())
-    app.override_port(19080)
-    _patch_launch(
+    result = _tool_start_for_command_result(
         monkeypatch,
-        _launch_result(
-        LaunchStatus.LAUNCH_ERROR, launched=False, error="port already bound"
-    ),
+        RepositoryEngineStartResult(
+            {"error": "launch_failed", "detail": "port already bound"},
+            500,
+        ),
     )
-
-    result = asyncio.run(app.tool_start())
 
     assert result["error"] == {
         "message": "port already bound",
@@ -463,33 +478,44 @@ def test_tool_start_surfaces_launch_error_with_a_ui_hint(
     assert result["ui_hint"]["kind"] == "doctor"
 
 
-@pytest.mark.parametrize(
-    "status",
-    [LaunchStatus.OK, LaunchStatus.DOCTOR_WARNING, LaunchStatus.ALREADY_RUNNING],
-)
-def test_tool_start_reports_no_error_for_successful_launches(
-    monkeypatch: pytest.MonkeyPatch, status: LaunchStatus
+def test_tool_start_treats_already_running_command_result_as_success(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    app = McpApp(_settings())
-    _patch_launch(
+    result = _tool_start_for_command_result(
         monkeypatch,
-        _launch_result(
-            status,
-            launched=status is not LaunchStatus.ALREADY_RUNNING,
-            error=(
-                "Orchestrator already running"
-                if status is LaunchStatus.ALREADY_RUNNING
-                else None
-            ),
-            supervisor={"pid": 4242, "port": 19081},
+        RepositoryEngineStartResult(
+            {"error": "already_running", "detail": "Orchestrator already running"},
+            409,
         ),
     )
 
-    result = asyncio.run(app.tool_start())
-
     assert "error" not in result
     assert "ui_hint" not in result
-    assert result["launch"]["status"] == status.value
+    assert result["launch"]["status"] == "already_running"
+    assert result["launch"]["launched"] is False
+
+
+def test_tool_start_surfaces_configuration_conflict_with_identity_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result = _tool_start_for_command_result(
+        monkeypatch,
+        RepositoryEngineStartResult(
+            {
+                "error": "configuration_conflict",
+                "detail": "codex/main is already running",
+            },
+            409,
+        ),
+    )
+
+    assert result["error"] == {
+        "message": "codex/main is already running",
+        "type": "ConfigurationConflict",
+    }
+    assert result["launch"]["status"] == "configuration_conflict"
+    assert result["launch"]["launched"] is False
+    assert result["ui_hint"]["kind"] == "doctor"
 
 
 def test_repos_start_returns_plain_string_error_for_invalid_path(
@@ -509,21 +535,23 @@ def test_repos_start_returns_plain_string_error_for_invalid_path(
 def test_repos_start_returns_plain_string_error_for_launch_failure(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A failed launch is a plain string too, not the structured error object."""
+    """A command failure preserves the typed repository-start payload."""
     app = McpApp(_settings())
     repo = tmp_path / "repo"
     (repo / ".git").mkdir(parents=True)
 
-    def boom(path, config_name):
-        raise RuntimeError("port already bound")
-
     monkeypatch.setattr(
-        "issue_orchestrator.entrypoints.mcp_server.supervisor.start", boom
+        app._repo_start_command,
+        "execute",
+        lambda _request: RepositoryEngineStartResult(
+            {"error": "launch_failed", "detail": "port already bound"},
+            500,
+        ),
     )
 
     result = asyncio.run(app.tool_repos_start(str(repo)))
 
-    assert result == {"error": "port already bound"}
+    assert result == {"error": "launch_failed", "detail": "port already bound"}
 
 
 def test_repos_stop_reports_status_not_a_plain_string_error(
@@ -596,9 +624,7 @@ def test_validate_repo_start_path_rejects_outside_allowlist(
     other = tmp_path / "other"
     other.mkdir()
     (other / ".git").mkdir()
-    monkeypatch.setenv(
-        "ISSUE_ORCHESTRATOR_MCP_REPOS_ALLOWLIST", str(allowed_root)
-    )
+    monkeypatch.setenv("ISSUE_ORCHESTRATOR_MCP_REPOS_ALLOWLIST", str(allowed_root))
 
     error = _validate_repo_start_path(str(other))
 
@@ -614,9 +640,7 @@ def test_validate_repo_start_path_accepts_under_allowlist(
     repo = allowed_root / "child" / "repo"
     repo.mkdir(parents=True)
     (repo / ".git").mkdir()
-    monkeypatch.setenv(
-        "ISSUE_ORCHESTRATOR_MCP_REPOS_ALLOWLIST", str(allowed_root)
-    )
+    monkeypatch.setenv("ISSUE_ORCHESTRATOR_MCP_REPOS_ALLOWLIST", str(allowed_root))
 
     assert _validate_repo_start_path(str(repo)) is None
 
@@ -627,8 +651,6 @@ def test_mcp_repos_allowlist_empty_forbids_everything(
     monkeypatch.setenv("ISSUE_ORCHESTRATOR_MCP_REPOS_ALLOWLIST", "   ")
 
     assert _mcp_repos_allowlist() == []
-
-
 # ---------------------------------------------------------------------------
 # Documentation drift guard — see #6463.
 #
@@ -906,3 +928,66 @@ def test_doc_records_why_session_send_is_absent() -> None:
     assert "prompt-injection" in text
     # ...and it must be explained in prose, never handed a reference row.
     assert "orchestrator.session.send" not in _tool_reference_rows(text)
+
+
+def test_repo_start_uses_shared_preflight_and_returns_effective_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    config_path = repo / ".issue-orchestrator/config/modes/codex/main.yaml"
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text("agents: {}\n", encoding="utf-8")
+    captured: dict[str, object] = {}
+
+    def fake_launch_subprocess(**kwargs: object) -> LaunchResult:
+        captured.update(kwargs)
+        return LaunchResult(
+            doctor=DoctorResult(checks=[]),
+            launched=True,
+            status=LaunchStatus.OK,
+            supervisor={
+                "pid": 42,
+                "port": 19080,
+                "configuration_mode": "codex",
+                "config_name": "main.yaml",
+                "config_fingerprint": "abc123",
+            },
+        )
+
+    selections: list[object] = []
+    monkeypatch.delenv("ISSUE_ORCHESTRATOR_MCP_REPOS_ALLOWLIST", raising=False)
+    monkeypatch.setattr(
+        "issue_orchestrator.infra.launcher.launch_subprocess",
+        fake_launch_subprocess,
+    )
+    monkeypatch.setattr(
+        "issue_orchestrator.infra.repo_registry.record_launched_selection",
+        lambda _repo, selection: selections.append(selection),
+    )
+    app = McpApp(
+        McpSettings(
+            repo_root=repo,
+            config_path=config_path,
+            instance_id=None,
+            host="127.0.0.1",
+            auto_start=False,
+        )
+    )
+
+    result = app.start_repo(str(repo), "main", "codex")
+
+    assert result["status"] == "started"
+    assert result["pid"] == 42
+    assert result["port"] == 19080
+    assert result["mode"] == "codex"
+    assert result["config_name"] == "main.yaml"
+    assert result["config_fingerprint"] == captured["config"].config_fingerprint
+    assert captured["mode"] == "codex"
+    assert captured["config_name"] == "main.yaml"
+    assert captured["config"].configuration_mode == "codex"
+    assert selections[0].to_dict() == {
+        "mode": "codex",
+        "config_name": "main.yaml",
+    }

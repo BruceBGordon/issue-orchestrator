@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -55,8 +56,15 @@ def _make_config(repo: Path) -> Config:
     return config
 
 
-def _make_loaded_config(repo: Path, *, config_name: str = "main.yaml") -> Config:
+def _make_loaded_config(
+    repo: Path,
+    *,
+    config_name: str = "main.yaml",
+    mode: str | None = None,
+) -> Config:
     config_dir = repo / ".issue-orchestrator" / "config"
+    if mode is not None:
+        config_dir = config_dir / "modes" / mode
     config_dir.mkdir(parents=True, exist_ok=True)
     config_path = config_dir / config_name
     config_path.write_text(
@@ -292,7 +300,7 @@ def test_checked_in_verify_pr_matches_portable_generated_output() -> None:
 
     assert verify_path.read_text() == _render_verify_pr_script(
         "make validate-pr-raw",
-        selected_config_name="main.yaml",
+        selected_config_name="modes/default/main.yaml",
     )
 
 
@@ -323,6 +331,103 @@ def test_render_verify_pr_script_exports_selected_config_name() -> None:
     assert "export ISSUE_ORCHESTRATOR_CONFIG_NAME=main.yaml" in rendered
 
 
+def test_render_verify_pr_script_exports_complete_mode_selection() -> None:
+    rendered = _render_verify_pr_script(
+        "make validate-pr",
+        selected_config_name="modes/codex/main.yaml",
+    )
+
+    assert "export ISSUE_ORCHESTRATOR_CONFIG_NAME=main.yaml" in rendered
+    assert "export ISSUE_ORCHESTRATOR_MODE=codex" in rendered
+    assert "modes/codex/main.yaml" in rendered
+
+
+def test_verify_script_preserves_complete_runtime_mode_selection(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    scripts = repo / "scripts"
+    scripts.mkdir()
+    verify_script = scripts / "verify-pr.sh"
+    verify_script.write_text(
+        _render_verify_pr_script(
+            "make validate-pr",
+            selected_config_name="modes/default/main.yaml",
+        )
+    )
+    verify_script.chmod(0o755)
+    capture = tmp_path / "selection.txt"
+    fake_python = tmp_path / "python"
+    fake_python.write_text(
+        "#!/usr/bin/env bash\n"
+        "printf '%s|%s|%s\\n' \"$ISSUE_ORCHESTRATOR_MODE\" "
+        "\"$ISSUE_ORCHESTRATOR_CONFIG_NAME\" "
+        "\"$ISSUE_ORCHESTRATOR_CONFIG_PATH\" > \"$CAPTURE_PATH\"\n"
+    )
+    fake_python.chmod(0o755)
+    runtime_path = repo / ".issue-orchestrator/config/modes/codex/codex.yaml"
+    env = {
+        **os.environ,
+        "CAPTURE_PATH": str(capture),
+        "ISSUE_ORCHESTRATOR_PYTHON": str(fake_python),
+        "ISSUE_ORCHESTRATOR_MODE": "codex",
+        "ISSUE_ORCHESTRATOR_CONFIG_NAME": "codex.yaml",
+        "ISSUE_ORCHESTRATOR_CONFIG_PATH": str(runtime_path),
+    }
+
+    subprocess.run([str(verify_script)], cwd=repo, env=env, check=True)
+
+    assert capture.read_text().strip() == f"codex|codex.yaml|{runtime_path}"
+
+
+def test_verify_script_supplies_baked_selection_for_human_push(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    scripts = repo / "scripts"
+    scripts.mkdir()
+    verify_script = scripts / "verify-pr.sh"
+    verify_script.write_text(
+        _render_verify_pr_script(
+            "make validate-pr",
+            selected_config_name="modes/default/main.yaml",
+        )
+    )
+    verify_script.chmod(0o755)
+    capture = tmp_path / "selection.txt"
+    fake_python = tmp_path / "python"
+    fake_python.write_text(
+        "#!/usr/bin/env bash\n"
+        "printf '%s|%s|%s\\n' \"$ISSUE_ORCHESTRATOR_MODE\" "
+        "\"$ISSUE_ORCHESTRATOR_CONFIG_NAME\" "
+        "\"$ISSUE_ORCHESTRATOR_CONFIG_PATH\" > \"$CAPTURE_PATH\"\n"
+    )
+    fake_python.chmod(0o755)
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key
+        not in {
+            "ISSUE_ORCHESTRATOR_MODE",
+            "ISSUE_ORCHESTRATOR_CONFIG_NAME",
+            "ISSUE_ORCHESTRATOR_CONFIG_PATH",
+        }
+    }
+    env.update(
+        {
+            "CAPTURE_PATH": str(capture),
+            "ISSUE_ORCHESTRATOR_PYTHON": str(fake_python),
+        }
+    )
+
+    subprocess.run([str(verify_script)], cwd=repo, env=env, check=True)
+
+    expected_path = repo / ".issue-orchestrator/config/modes/default/main.yaml"
+    assert capture.read_text().strip() == f"default|main.yaml|{expected_path}"
+
+
 def test_setup_repo_guardrails_uses_portable_verify_script_for_issue_orchestrator_shape(
     tmp_path: Path,
 ) -> None:
@@ -340,6 +445,24 @@ def test_setup_repo_guardrails_uses_portable_verify_script_for_issue_orchestrato
     assert sys.executable not in rendered
     assert '.venv/bin/python' in rendered
     assert "export ISSUE_ORCHESTRATOR_CONFIG_NAME=main.yaml" in rendered
+
+
+def test_setup_repo_guardrails_preserves_mode_in_portable_verify_script(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    (repo / "src" / "issue_orchestrator" / "entrypoints").mkdir(parents=True)
+    (repo / "src" / "issue_orchestrator" / "entrypoints" / "cli.py").write_text("")
+    (repo / "hooks").mkdir()
+    (repo / "hooks" / "pre-push").write_text("#!/usr/bin/env bash\n")
+
+    result = setup_repo_guardrails(_make_loaded_config(repo, mode="codex"))
+
+    rendered = result.verify_script.read_text()
+    assert "export ISSUE_ORCHESTRATOR_MODE=codex" in rendered
+    assert "modes/codex/main.yaml" in rendered
 
 
 def test_render_verify_pr_script_uses_cache_aware_prepush_check() -> None:

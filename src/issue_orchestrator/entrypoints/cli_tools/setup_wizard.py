@@ -1384,9 +1384,7 @@ def run_wizard(  # noqa: C901, PLR0912 - main wizard entry point with prerequisi
     # Use absolute paths to avoid issues with cwd
     from ...infra.config import CONFIG_DIR, DEFAULT_CONFIG_NAME
 
-    default_config_path = (
-        f"{CONFIG_DIR}/{DEFAULT_CONFIG_NAME}"  # .issue-orchestrator/config/default.yaml
-    )
+    default_config_path = f"{CONFIG_DIR}/modes/default/{DEFAULT_CONFIG_NAME}"
 
     if existing_config_path:
         output_path = (

@@ -15,13 +15,18 @@ from .hooks._python_path import (
     ORCHESTRATOR_PYTHON_ENV,
     shell_quote_issue_orchestrator_python,
 )
-from .hooks.hooks import detect_agents_from_config, get_adapter, install_hooks_for_config
+from .hooks.hooks import (
+    detect_agents_from_config,
+    get_adapter,
+    install_hooks_for_config,
+)
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_HOOKS_PATH = ".githooks"
 MANAGED_PRE_PUSH_MARKER = "Managed by issue-orchestrator setup-guardrails: pre-push"
 MANAGED_VERIFY_MARKER = "Managed by issue-orchestrator setup-guardrails: verify-pr"
+MANAGED_VERIFY_SELECTION_PREFIX = "# issue-orchestrator-selection: "
 MANAGED_HELPER_MARKER = (
     "Managed by issue-orchestrator setup-guardrails: block-no-verify helper"
 )
@@ -55,6 +60,7 @@ class RepoGuardrailsStatus:
     verify_exists: bool
     verify_executable: bool
     verify_managed: bool
+    verify_selected_config: str | None
     helper_exists: bool
     helper_executable: bool
     helper_managed: bool
@@ -134,14 +140,11 @@ def inspect_repo_guardrails(
         pre_push_calls_verify="scripts/verify-pr.sh" in pre_push_content,
         verify_exists=verify_script.exists(),
         verify_executable=_is_executable(verify_script),
-        verify_managed=_contains_managed_marker(
-            verify_content, MANAGED_VERIFY_MARKERS
-        ),
+        verify_managed=_contains_managed_marker(verify_content, MANAGED_VERIFY_MARKERS),
+        verify_selected_config=_managed_verify_selection(verify_content),
         helper_exists=helper_script.exists(),
         helper_executable=_is_executable(helper_script),
-        helper_managed=_contains_managed_marker(
-            helper_content, MANAGED_HELPER_MARKERS
-        ),
+        helper_managed=_contains_managed_marker(helper_content, MANAGED_HELPER_MARKERS),
         agent_hooks=agent_hooks,
     )
 
@@ -157,7 +160,9 @@ def setup_repo_guardrails(
     repo_root = (target_root or config.repo_root).resolve()
     git = _new_git_cli()
     local_hooks_path = _get_local_hooks_path(repo_root, git)
-    resolved_validation_cmd = (validation_cmd or config.validation.publish.cmd or "").strip()
+    resolved_validation_cmd = (
+        validation_cmd or config.validation.publish.cmd or ""
+    ).strip()
     if not resolved_validation_cmd:
         raise RepoGuardrailsError(
             "validation.publish.cmd is not configured. Set it in YAML or pass --validation-cmd."
@@ -220,7 +225,9 @@ def _resolve_repo_hooks_dir(
     return _resolve_hooks_dir_value(repo_root, DEFAULT_HOOKS_PATH)
 
 
-def _resolve_hooks_dir_value(repo_root: Path, hooks_path_value: str) -> tuple[str, Path]:
+def _resolve_hooks_dir_value(
+    repo_root: Path, hooks_path_value: str
+) -> tuple[str, Path]:
     hooks_dir = Path(hooks_path_value)
     if hooks_dir.is_absolute():
         resolved = hooks_dir.resolve()
@@ -329,7 +336,9 @@ def _install_verify_script(
     rendered = _render_verify_pr_script(
         validation_cmd,
         selected_config_name=selected_config_name,
-        baked_python=None if _should_render_portable_verify_script(result.repo_root) else shell_quote_issue_orchestrator_python(),
+        baked_python=None
+        if _should_render_portable_verify_script(result.repo_root)
+        else shell_quote_issue_orchestrator_python(),
     )
     _write_executable_file(verify_script, rendered, result)
 
@@ -416,9 +425,8 @@ def _should_render_portable_verify_script(repo_root: Path) -> bool:
     contains the ``issue_orchestrator`` package.
     """
     return (
-        (repo_root / "src" / "issue_orchestrator" / "entrypoints" / "cli.py").exists()
-        and (repo_root / "hooks" / "pre-push").exists()
-    )
+        repo_root / "src" / "issue_orchestrator" / "entrypoints" / "cli.py"
+    ).exists() and (repo_root / "hooks" / "pre-push").exists()
 
 
 def _render_verify_pr_script(
@@ -431,9 +439,28 @@ def _render_verify_pr_script(
     # wrapper lets prepush_check print the command resolved from config.
     _ = validation_cmd
     config_name_export = ""
+    selection_marker = ""
     if selected_config_name:
-        config_name_export = (
-            f"export ISSUE_ORCHESTRATOR_CONFIG_NAME={shlex.quote(selected_config_name)}\n"
+        relative_config = Path(selected_config_name)
+        mode = (
+            relative_config.parts[1]
+            if len(relative_config.parts) == 3 and relative_config.parts[0] == "modes"
+            else "default"
+        )
+        config_name_export = f"""# Preserve the engine's complete runtime selection. A human push has no
+# selection, so use the mode that generated this managed fallback. A partial
+# environment is never combined with baked values from another mode.
+if [ -z "${{ISSUE_ORCHESTRATOR_MODE:-}}" ] ||
+   [ -z "${{ISSUE_ORCHESTRATOR_CONFIG_NAME:-}}" ] ||
+   [ -z "${{ISSUE_ORCHESTRATOR_CONFIG_PATH:-}}" ]; then
+  selected_config_rel={shlex.quote(relative_config.as_posix())}
+  export ISSUE_ORCHESTRATOR_CONFIG_NAME={shlex.quote(relative_config.name)}
+  export ISSUE_ORCHESTRATOR_CONFIG_PATH="$repo_root/.issue-orchestrator/config/$selected_config_rel"
+  export ISSUE_ORCHESTRATOR_MODE={shlex.quote(mode)}
+fi
+"""
+        selection_marker = (
+            f"{MANAGED_VERIFY_SELECTION_PREFIX}{relative_config.as_posix()}"
         )
     baked_python_branch = ""
     if baked_python:
@@ -444,6 +471,7 @@ def _render_verify_pr_script(
 set -euo pipefail
 
 # {MANAGED_VERIFY_MARKER}
+{selection_marker}
 
 repo_root="$(cd "$(dirname "${{BASH_SOURCE[0]}}")/.." && pwd)"
 cd "$repo_root"
@@ -468,6 +496,15 @@ fi
 echo "verify-pr: running cache-aware pre-push validation"
 "$PYTHON_BIN" -m issue_orchestrator.entrypoints.cli_tools.prepush_check -v
 """
+
+
+def _managed_verify_selection(content: str) -> str | None:
+    """Read the baked human-push selection from a managed verify script."""
+    for line in content.splitlines():
+        if line.startswith(MANAGED_VERIFY_SELECTION_PREFIX):
+            value = line.removeprefix(MANAGED_VERIFY_SELECTION_PREFIX).strip()
+            return value or None
+    return None
 
 
 def _selected_config_name(config: Config, repo_root: Path) -> str | None:
@@ -497,9 +534,7 @@ def _render_repo_pre_push_hook(verify_script: Path, repo_root: Path) -> str:
     post_verify_function = ""
     post_verify_call = ""
     if post_verify_hook_exists:
-        post_verify_variable = (
-            f'POST_VERIFY_HOOK="$REPO_ROOT/{POST_VERIFY_HOOK_RELATIVE_PATH.as_posix()}"\n'
-        )
+        post_verify_variable = f'POST_VERIFY_HOOK="$REPO_ROOT/{POST_VERIFY_HOOK_RELATIVE_PATH.as_posix()}"\n'
         post_verify_function = """
 run_post_verify_hook() {
   if [ ! -f "$POST_VERIFY_HOOK" ]; then

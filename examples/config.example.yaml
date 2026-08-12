@@ -1,5 +1,5 @@
 # Example issue-orchestrator configuration
-# Copy to your repo as .issue-orchestrator/config/default.yaml
+# Copy to your repo as .issue-orchestrator/config/modes/default/default.yaml
 
 repo:
   # name: "owner/repo-name"      # Optional override; defaults to git remote

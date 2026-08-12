@@ -9,6 +9,7 @@ These tests verify the behavior of restoring session tracking after restart:
 Tests use mock adapters at port boundaries, not internal patches.
 """
 
+import json
 import logging
 import re
 from pathlib import Path
@@ -17,8 +18,15 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from issue_orchestrator.control.session_restorer import SessionRestorer
+from issue_orchestrator.control.session_restorer import (
+    SessionConfigurationIdentityVerificationError,
+    SessionConfigurationModeMismatchError,
+    SessionRestorer,
+)
 from issue_orchestrator.domain.models import AgentConfig, Issue, Session
+from issue_orchestrator.domain.repository_launch_selection import (
+    RepositoryLaunchSelection,
+)
 from issue_orchestrator.domain.session_key import TaskKind
 from issue_orchestrator.infra.config import Config
 from issue_orchestrator.ports.session_runner import DiscoveredSession
@@ -82,6 +90,16 @@ def make_discovered_session(
             is_review,
         )
         run_assets = make_session_run_assets(worktree, session_name=asset_session_name)
+        (run_assets.run_dir / "session-identity.json").write_text(
+            json.dumps(
+                {
+                    "configuration_mode": "default",
+                    "config_name": "default.yaml",
+                    "config_fingerprint": "",
+                }
+            ),
+            encoding="utf-8",
+        )
         discovered["run_dir"] = str(run_assets.run_dir)
     return discovered
 
@@ -138,7 +156,9 @@ class TestRestoreSessionsBasic:
         """Legacy discovered review records still derive review-N from tab text."""
         config = make_config(agents={"agent:web": make_agent_config(tmp_path)})
         restorer = SessionRestorer(config, MockRepositoryHost(), MockWorkingCopy())
-        discovered = make_discovered_session(100, tab_name="#100 Review PR #456", is_review=True)
+        discovered = make_discovered_session(
+            100, tab_name="#100 Review PR #456", is_review=True
+        )
 
         assert restorer.canonical_terminal_id(discovered) == "review-456"
 
@@ -150,7 +170,9 @@ class TestRestoreSessionsBasic:
         """A malformed review discovery record is visible in logs before fallback."""
         config = make_config(agents={"agent:web": make_agent_config(tmp_path)})
         restorer = SessionRestorer(config, MockRepositoryHost(), MockWorkingCopy())
-        discovered = make_discovered_session(100, tab_name="review title without pr", is_review=True)
+        discovered = make_discovered_session(
+            100, tab_name="review title without pr", is_review=True
+        )
 
         with caplog.at_level(logging.WARNING):
             assert restorer.canonical_terminal_id(discovered) == "review-100"
@@ -290,7 +312,9 @@ class TestRestoreSessionsBasic:
         existing_session.terminal_id = "issue-123"
 
         discovered = [make_discovered_session(123)]
-        restored = restorer.restore_sessions(discovered, already_tracked=[existing_session])
+        restored = restorer.restore_sessions(
+            discovered, already_tracked=[existing_session]
+        )
 
         # Session is already tracked, so nothing restored
         assert len(restored) == 0
@@ -332,8 +356,8 @@ class TestRestoreSessionsBasic:
 class TestOrphanedSessionHandling:
     """Tests for handling sessions without recorded run assets."""
 
-    def test_skips_discovered_session_without_run_assets(self, tmp_path, caplog):
-        """Sessions without recorded run assets are skipped and logged."""
+    def test_rejects_discovered_session_without_run_assets(self, tmp_path):
+        """An active terminal without identity assets blocks safe relaunch."""
         repo_root = tmp_path / "repo"
         repo_root.mkdir()
 
@@ -347,21 +371,18 @@ class TestOrphanedSessionHandling:
         restorer = SessionRestorer(config, repo_host, working_copy)
 
         discovered = [make_discovered_session(123)]
-        with caplog.at_level(logging.WARNING):
-            restored = restorer.restore_sessions(discovered, already_tracked=[])
-
-        # Session not restored
-        assert len(restored) == 0
-
-        # Warning logged
-        assert "has no recorded run_dir" in caplog.text
+        with pytest.raises(
+            SessionConfigurationIdentityVerificationError,
+            match="has no recorded run_dir",
+        ):
+            restorer.restore_sessions(discovered, already_tracked=[])
 
 
 class TestErrorRecovery:
     """Tests for error handling during session restoration."""
 
-    def test_continues_after_exception_restoring_single_session(self, tmp_path, caplog):
-        """If one session fails to restore, continue with others."""
+    def test_identity_verification_failure_aborts_restore_batch(self, tmp_path):
+        """Unverifiable live work blocks the relaunch before later sessions restore."""
         repo_root = tmp_path / "repo"
         repo_root.mkdir()
         worktree_200 = tmp_path / "repo-200"
@@ -373,7 +394,9 @@ class TestErrorRecovery:
 
         repo_host = MockRepositoryHost()
         # Only issue 200 exists; issue 100 will trigger cleanup path
-        repo_host.issues[200] = Issue(number=200, title="Good issue", labels=["agent:web"])
+        repo_host.issues[200] = Issue(
+            number=200, title="Good issue", labels=["agent:web"]
+        )
 
         working_copy = MockWorkingCopy()
         working_copy.branches[worktree_200] = "200-branch"
@@ -385,12 +408,11 @@ class TestErrorRecovery:
             make_discovered_session(200, worktree=worktree_200),  # Will succeed
         ]
 
-        with caplog.at_level(logging.WARNING):
-            restored = restorer.restore_sessions(discovered, already_tracked=[])
-
-        # Only the successful session restored
-        assert len(restored) == 1
-        assert restored[0].issue.number == 200
+        with pytest.raises(
+            SessionConfigurationIdentityVerificationError,
+            match="issue-100.*no recorded run_dir",
+        ):
+            restorer.restore_sessions(discovered, already_tracked=[])
 
     def test_exception_during_restore_is_logged(self, tmp_path, caplog):
         """Exceptions during single session restore are logged and continue."""
@@ -423,6 +445,202 @@ class TestErrorRecovery:
 
         # Exception logged
         assert "Failed to restore session for issue #123" in caplog.text
+
+    def test_rejects_live_session_launched_under_another_mode(self, tmp_path):
+        """A relaunch cannot reinterpret surviving work under new policy."""
+        worktree = tmp_path / "repo-123"
+        worktree.mkdir()
+        agent_config = make_agent_config(tmp_path)
+        config = make_config(agents={"agent:web": agent_config})
+        config.repo_root = tmp_path / "repo"
+        config.repo_root.mkdir()
+        config.launch_selection = RepositoryLaunchSelection.parse(
+            mode="codex",
+            config_name="main.yaml",
+        )
+        config.config_fingerprint = "current-fingerprint"
+        run_assets = make_session_run_assets(worktree, session_name="issue-123")
+        (run_assets.run_dir / "session-identity.json").write_text(
+            json.dumps(
+                {
+                    "configuration_mode": "claude",
+                    "config_name": "main.yaml",
+                    "config_fingerprint": "current-fingerprint",
+                }
+            ),
+            encoding="utf-8",
+        )
+        discovered = [
+            DiscoveredSession(
+                issue_number=123,
+                tab_name="#123 Some task",
+                is_review=False,
+                session_name="issue-123",
+                run_dir=str(run_assets.run_dir),
+            )
+        ]
+
+        with pytest.raises(
+            SessionConfigurationModeMismatchError,
+            match="was launched with 'claude'/'main.yaml'",
+        ):
+            SessionRestorer(
+                config, MockRepositoryHost(), MockWorkingCopy()
+            ).restore_sessions(discovered, already_tracked=[])
+
+    def test_allows_live_session_launched_under_current_mode(self, tmp_path):
+        """Surviving sessions remain restorable after a same-mode relaunch."""
+        worktree = tmp_path / "repo-123"
+        worktree.mkdir()
+        agent_config = make_agent_config(tmp_path)
+        config = make_config(agents={"agent:web": agent_config})
+        config.repo_root = tmp_path / "repo"
+        config.repo_root.mkdir()
+        config.launch_selection = RepositoryLaunchSelection.parse(
+            mode="codex",
+            config_name="main.yaml",
+        )
+        config.config_fingerprint = "current-fingerprint"
+        repo_host = MockRepositoryHost()
+        repo_host.issues[123] = Issue(
+            number=123,
+            title="Some task",
+            labels=["agent:web"],
+        )
+        working_copy = MockWorkingCopy()
+        working_copy.branches[worktree] = "123-some-task"
+        run_assets = make_session_run_assets(worktree, session_name="issue-123")
+        (run_assets.run_dir / "session-identity.json").write_text(
+            json.dumps(
+                {
+                    "configuration_mode": "codex",
+                    "config_name": "main.yaml",
+                    "config_fingerprint": "current-fingerprint",
+                }
+            ),
+            encoding="utf-8",
+        )
+        discovered = [
+            DiscoveredSession(
+                issue_number=123,
+                tab_name="#123 Some task",
+                is_review=False,
+                session_name="issue-123",
+                run_dir=str(run_assets.run_dir),
+            )
+        ]
+
+        restored = SessionRestorer(config, repo_host, working_copy).restore_sessions(
+            discovered, already_tracked=[]
+        )
+
+        assert [session.terminal_id for session in restored] == ["issue-123"]
+
+    @pytest.mark.parametrize(
+        ("recorded_config", "recorded_fingerprint"),
+        [
+            ("other.yaml", "current-fingerprint"),
+            ("main.yaml", "previous-fingerprint"),
+        ],
+    )
+    def test_rejects_same_mode_with_different_effective_config(
+        self,
+        tmp_path: Path,
+        recorded_config: str,
+        recorded_fingerprint: str,
+    ) -> None:
+        worktree = tmp_path / "repo-123"
+        worktree.mkdir()
+        config = make_config(agents={"agent:web": make_agent_config(tmp_path)})
+        config.launch_selection = RepositoryLaunchSelection.parse(
+            mode="codex",
+            config_name="main.yaml",
+        )
+        config.config_fingerprint = "current-fingerprint"
+        run_assets = make_session_run_assets(worktree, session_name="issue-123")
+        (run_assets.run_dir / "session-identity.json").write_text(
+            json.dumps(
+                {
+                    "configuration_mode": "codex",
+                    "config_name": recorded_config,
+                    "config_fingerprint": recorded_fingerprint,
+                }
+            ),
+            encoding="utf-8",
+        )
+        discovered = [
+            DiscoveredSession(
+                issue_number=123,
+                tab_name="#123 Some task",
+                is_review=False,
+                session_name="issue-123",
+                run_dir=str(run_assets.run_dir),
+            )
+        ]
+
+        with pytest.raises(SessionConfigurationModeMismatchError):
+            SessionRestorer(
+                config,
+                MockRepositoryHost(),
+                MockWorkingCopy(),
+            ).restore_sessions(discovered, already_tracked=[])
+
+    def test_non_default_mode_fails_when_live_session_identity_is_unverifiable(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        config = make_config(agents={"agent:web": make_agent_config(tmp_path)})
+        config.launch_selection = RepositoryLaunchSelection.parse(
+            mode="codex",
+            config_name="main.yaml",
+        )
+
+        with pytest.raises(
+            SessionConfigurationIdentityVerificationError,
+            match="no recorded run_dir",
+        ):
+            SessionRestorer(
+                config,
+                MockRepositoryHost(),
+                MockWorkingCopy(),
+            ).restore_sessions(
+                [make_discovered_session(123)],
+                already_tracked=[],
+            )
+
+    def test_unreadable_identity_fails_startup_instead_of_being_skipped(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        worktree = tmp_path / "repo-123"
+        worktree.mkdir()
+        config = make_config(agents={"agent:web": make_agent_config(tmp_path)})
+        run_assets = make_session_run_assets(worktree, session_name="issue-123")
+        (run_assets.run_dir / "session-identity.json").write_text(
+            "{not-json",
+            encoding="utf-8",
+        )
+
+        with pytest.raises(
+            SessionConfigurationIdentityVerificationError,
+            match="is unreadable",
+        ):
+            SessionRestorer(
+                config,
+                MockRepositoryHost(),
+                MockWorkingCopy(),
+            ).restore_sessions(
+                [
+                    DiscoveredSession(
+                        issue_number=123,
+                        tab_name="#123 Some task",
+                        is_review=False,
+                        session_name="issue-123",
+                        run_dir=str(run_assets.run_dir),
+                    )
+                ],
+                already_tracked=[],
+            )
 
 
 class TestStateValidation:
@@ -599,6 +817,7 @@ class TestWorktreeFromRunAssets:
         assert len(restored) == 1
         assert restored[0].worktree_path == worktree
 
+
 class TestReviewSessionSpecifics:
     """Tests specific to review session restoration."""
 
@@ -614,7 +833,9 @@ class TestReviewSessionSpecifics:
         config.repo_root = repo_root
 
         repo_host = MockRepositoryHost()
-        repo_host.issues[100] = Issue(number=100, title="Test", labels=["agent:reviewer"])
+        repo_host.issues[100] = Issue(
+            number=100, title="Test", labels=["agent:reviewer"]
+        )
 
         working_copy = MockWorkingCopy()
         working_copy.branches[worktree] = "100-branch"
@@ -648,7 +869,9 @@ class TestReviewSessionSpecifics:
         config.repo_root = repo_root
 
         repo_host = MockRepositoryHost()
-        repo_host.issues[100] = Issue(number=100, title="Test", labels=["agent:reviewer"])
+        repo_host.issues[100] = Issue(
+            number=100, title="Test", labels=["agent:reviewer"]
+        )
 
         working_copy = MockWorkingCopy()
         working_copy.branches[worktree] = "100-branch"

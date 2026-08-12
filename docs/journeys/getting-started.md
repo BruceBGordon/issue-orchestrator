@@ -49,7 +49,7 @@ If you're using an AI assistant to drive setup, tell it which repo-state path to
 
 If you choose `codex`, leave the wizard's Codex model prompt blank for the safest first run. That lets the installed Codex CLI choose the correct default for your account instead of pinning a stale model name.
 
-The wizard creates `.issue-orchestrator/config/default.yaml`. You can also write this by hand — see [Configuration](../user/configuration.md) for a minimal starter config.
+The wizard creates `.issue-orchestrator/config/modes/default/default.yaml`. You can also write this by hand — see [Configuration](../user/configuration.md) for a minimal starter config.
 
 ## 3. Set Up Repo Guardrails
 

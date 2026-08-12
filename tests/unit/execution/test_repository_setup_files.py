@@ -17,6 +17,7 @@ from issue_orchestrator.execution.repository_setup_github_authorization import (
     repository_setup_github_authorization_codec,
 )
 from issue_orchestrator.infra.config import Config, get_config_dir
+from issue_orchestrator.infra.config_paths import get_mode_dir
 from issue_orchestrator.ports.repository_setup import RepositorySetupFileSystemError
 from issue_orchestrator.ports.repository_setup import RepositorySetupNamedConfig
 
@@ -46,7 +47,9 @@ def test_setup_file_adapter_plans_and_writes_runnable_contained_artifacts(
     )
 
     config_file = next(file for file in plan.files if file.kind == "config")
-    assert config_file.path.parent.resolve() == get_config_dir(tmp_path).resolve()
+    assert config_file.path.parent.resolve() == get_mode_dir(
+        tmp_path, "default"
+    ).resolve()
     assert config_file.path.name == "default.yaml"
     assert {file.agent for file in plan.files if file.kind == "prompt"} == {
         "agent:dev",

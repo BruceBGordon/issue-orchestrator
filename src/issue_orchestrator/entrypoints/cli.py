@@ -1,8 +1,6 @@
 import argparse
-import asyncio
 import logging
 import os
-import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -18,9 +16,7 @@ from .cli_hook_commands import cmd_setup_guardrails, cmd_setup_hooks, cmd_verify
 from .cli_parser import CLICommandHandlers, build_parser
 from .cli_queue_commands import cmd_audit
 from .cli_run_modes import (
-    run_no_dashboard,
-    run_tui_dashboard,
-    run_web_dashboard_mode,
+    run_locked_cli_engine,
 )
 from .cli_support import (
     client_dashboard_link as _client_dashboard_link,
@@ -34,8 +30,6 @@ from .cli_utility_commands import cmd_demo, cmd_doctor, cmd_trace
 
 console = Console()
 logger = logging.getLogger(__name__)
-
-
 def _control_api_headers() -> dict[str, str]:
     """Return request headers for the Control API, with bearer token if set.
 
@@ -132,11 +126,16 @@ def cmd_start(args: argparse.Namespace) -> int:  # noqa: C901, PLR0912 - CLI ent
 
     try:
         from .bootstrap import build_orchestrator
-        from ..infra.repo_lock import is_locked, read_lock
-        from ..infra import supervisor
-
         # Load config first - repo_root is derived from config file location
         config = _load_config(args)
+        from ..infra.config_paths import require_engine_launch_config_path
+
+        if config.config_path is not None:
+            require_engine_launch_config_path(config.config_path)
+        loaded_effective_config = config.to_dict()
+        _apply_cli_overrides(args, config)
+        if config.to_dict() != loaded_effective_config:
+            config.refresh_config_fingerprint()
 
         # Set up logging to repo-scoped log file
         log_file = setup_logging(
@@ -247,12 +246,12 @@ def cmd_start(args: argparse.Namespace) -> int:  # noqa: C901, PLR0912 - CLI ent
         if not config.repo:
             console.print("[red]Error: repo must be set in config for test mode[/red]")
             return 1
+        before_test_mode = config.to_dict()
         _run_test_setup(config)
         config.filtering.label = "test-data"
+        if config.to_dict() != before_test_mode:
+            config.refresh_config_fingerprint()
         console.print("[cyan]Test mode: filtering.label set to 'test-data'[/cyan]")
-
-    # Apply CLI argument overrides to config
-    _apply_cli_overrides(args, config)
 
     console.print(f"[dim]Loaded config with {len(config.agents)} agent types[/dim]")
     console.print(
@@ -263,63 +262,7 @@ def cmd_start(args: argparse.Namespace) -> int:  # noqa: C901, PLR0912 - CLI ent
     if hasattr(args, "dry_run") and args.dry_run:
         return _run_dry_run(args, config)
 
-    if is_locked(config.repo_root):
-        info = read_lock(config.repo_root)
-        if info:
-            console.print(
-                f"[yellow]Orchestrator already running (pid={info.pid}, port={info.http_port}).[/yellow]"
-            )
-        if sys.stdin.isatty():
-            choice = console.input("Abort start? [Y/n]: ").strip().lower() or "y"
-            if choice in {"y", "yes"}:
-                return 1
-            console.print("[yellow]Stopping existing orchestrator...[/yellow]")
-            stopped = supervisor.stop(
-                config.repo_root,
-                force=True,
-                reason="cli start: replacing existing orchestrator at user prompt",
-                actor="cli.start",
-            )
-            if not stopped:
-                console.print("[red]Failed to stop existing orchestrator.[/red]")
-                return 1
-        else:
-            console.print(
-                "[red]Non-interactive start aborted (orchestrator already running).[/red]"
-            )
-            return 1
-
-    orchestrator = build_orchestrator(config=config)
-
-    # Get control API port (CLI --api-port overrides config; 0 = auto-assign)
-    cli_api_port = getattr(args, "api_port", None)
-    api_port = cli_api_port if cli_api_port is not None else config.control_api_port
-
-    try:
-        if args.no_dashboard:
-            # Run orchestrator without dashboard (useful for CI/debugging)
-            console.print("[dim]Running without dashboard UI[/dim]")
-            if api_port and api_port != 0:
-                console.print(f"[dim]Control API on http://127.0.0.1:{api_port}[/dim]")
-            asyncio.run(run_no_dashboard(orchestrator, api_port))
-        elif config.ui_mode == "web":
-            # Run with web dashboard in browser
-            port = args.port if args.port != 8080 else config.web_port
-            console.print("[dim]Starting web dashboard...[/dim]")
-            if port != 0:
-                console.print(
-                    f"[green]Dashboard will open at {_client_dashboard_link(port)}[/green]"
-                )
-            asyncio.run(run_web_dashboard_mode(orchestrator, config, args, api_port))
-        else:
-            # Run with interactive TUI dashboard (tmux mode)
-            if api_port and api_port != 0:
-                console.print(f"[dim]Control API on http://127.0.0.1:{api_port}[/dim]")
-            asyncio.run(run_tui_dashboard(orchestrator, config, api_port))
-    except KeyboardInterrupt:
-        console.print("\n[yellow]Shutting down...[/yellow]")
-
-    return 0
+    return run_locked_cli_engine(args, config, build_orchestrator)
 
 
 def cmd_status(args: argparse.Namespace) -> int:
@@ -434,7 +377,9 @@ def cmd_resume(args: argparse.Namespace) -> int:
             f"{base_url}/api/resume", timeout=5.0, headers=_control_api_headers()
         )
         if response.status_code == 200:
-            console.print("[green]Orchestrator resumed - new sessions may launch[/green]")
+            console.print(
+                "[green]Orchestrator resumed - new sessions may launch[/green]"
+            )
             return 0
         console.print(f"[red]Failed to resume: {response.text}[/red]")
         return 1
@@ -559,11 +504,16 @@ def _start_fresh(args: argparse.Namespace) -> int:
     import sys
 
     # Build command to run start
-    cmd = [sys.executable, "-m", "issue_orchestrator.entrypoints.cli", "start"]
+    cmd = [sys.executable, "-m", "issue_orchestrator.entrypoints.cli"]
 
-    # Pass through relevant flags
+    # Global flags must precede the subcommand for argparse to accept them.
     if hasattr(args, "config") and args.config:
         cmd.extend(["--config", args.config])
+    if hasattr(args, "mode") and args.mode:
+        cmd.extend(["--mode", args.mode])
+    cmd.append("start")
+
+    # Pass through start-command flags.
     if hasattr(args, "port") and args.port:
         cmd.extend(["--port", str(args.port)])
     if hasattr(args, "debug") and args.debug:

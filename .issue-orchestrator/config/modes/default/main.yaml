@@ -1,4 +1,5 @@
-# Migrated to sectioned format
+# Default mixed-provider mode. Copy this file into another mode directory and
+# change agent provider/model settings to create an alternate launch mode.
 
 repo:
   name: issue-orchestrator/issue-orchestrator

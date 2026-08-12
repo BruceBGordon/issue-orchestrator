@@ -257,7 +257,13 @@ class TestPhase7MultiRepoFromControlCenter:
         test_repo = tmp_path / "test-repo"
         test_repo.mkdir()
         (test_repo / ".git").mkdir()  # Discover endpoint only finds git repos
-        config_dir = test_repo / ".issue-orchestrator" / "config"
+        config_dir = (
+            test_repo
+            / ".issue-orchestrator"
+            / "config"
+            / "modes"
+            / "default"
+        )
         config_dir.mkdir(parents=True)
         (config_dir / "default.yaml").write_text("repo:\n  name: test/repo\n")
 
@@ -374,7 +380,9 @@ class TestSetupWizardEndpoints:
         client = TestClient(control_app)
 
         # Create a repo with config
-        config_dir = tmp_path / ".issue-orchestrator" / "config"
+        config_dir = (
+            tmp_path / ".issue-orchestrator" / "config" / "modes" / "default"
+        )
         config_dir.mkdir(parents=True)
         (config_dir / "default.yaml").write_text(
             "repo:\n  name: test/repo\nagents:\n  agent:dev:\n    prompt: dev.md\n"
@@ -438,7 +446,14 @@ class TestSetupWizardEndpoints:
         assert "config_path" in data
 
         # Config file should exist at new location
-        config_path = tmp_path / ".issue-orchestrator" / "config" / "default.yaml"
+        config_path = (
+            tmp_path
+            / ".issue-orchestrator"
+            / "config"
+            / "modes"
+            / "default"
+            / "default.yaml"
+        )
         assert config_path.exists()
         content = config_path.read_text()
         assert "name: test/repo" in content
@@ -455,7 +470,9 @@ agents:
     prompt: backend.md
     model: opus
 """
-        config_dir = tmp_path / ".issue-orchestrator" / "config"
+        config_dir = (
+            tmp_path / ".issue-orchestrator" / "config" / "modes" / "default"
+        )
         config_dir.mkdir(parents=True)
         (config_dir / "default.yaml").write_text(config_content)
 
@@ -478,7 +495,9 @@ agents:
         client = TestClient(control_app)
 
         # Create initial config at new location
-        config_dir = tmp_path / ".issue-orchestrator" / "config"
+        config_dir = (
+            tmp_path / ".issue-orchestrator" / "config" / "modes" / "default"
+        )
         config_dir.mkdir(parents=True)
         initial_config = "repo:\n  name: old/repo\nagents:\n  agent:old: {}\n"
         (config_dir / "default.yaml").write_text(initial_config)
@@ -594,7 +613,9 @@ class TestToolEndpoints:
     def test_audit_endpoint_with_config(self, tmp_path: Path) -> None:
         """GET /control/tools/audit returns audit entries when config exists."""
         # Create a minimal config
-        config_dir = tmp_path / ".issue-orchestrator" / "config"
+        config_dir = (
+            tmp_path / ".issue-orchestrator" / "config" / "modes" / "default"
+        )
         config_dir.mkdir(parents=True)
         (config_dir / "default.yaml").write_text(
             "repo:\n  name: test/repo\nagents:\n  agent:dev:\n    prompt: dev.md\n"
@@ -651,7 +672,9 @@ class TestToolEndpoints:
     def test_worktrees_cleanup_endpoint_exists(self, tmp_path: Path) -> None:
         """POST /control/tools/worktrees/cleanup endpoint exists."""
         # Create minimal config
-        config_dir = tmp_path / ".issue-orchestrator" / "config"
+        config_dir = (
+            tmp_path / ".issue-orchestrator" / "config" / "modes" / "default"
+        )
         config_dir.mkdir(parents=True)
         (config_dir / "default.yaml").write_text(
             "repo:\n  name: test/repo\nagents:\n  agent:dev:\n    prompt: dev.md\n"

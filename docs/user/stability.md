@@ -54,7 +54,7 @@ artifact but served without a version field.
 
 ### Config YAML schema — supported
 
-`.issue-orchestrator/config/<name>.yaml` is the primary way you configure the
+`.issue-orchestrator/config/modes/<mode>/<name>.yaml` is the primary way you configure the
 orchestrator, and it is a supported surface. The schema is generated from
 [`infra/settings_schema.py`](../../src/issue_orchestrator/infra/settings_schema.py)
 into the [Configuration Reference](configuration_reference.md), and a drift test

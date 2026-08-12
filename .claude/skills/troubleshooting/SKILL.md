@@ -352,7 +352,7 @@ cat $RUN_DIR/manifest.json | jq -r '.claude_log_path'
 | `.issue-orchestrator/state/session_registry.sqlite` | Current subprocess session registry |
 | `.issue-orchestrator/state/subprocess_sessions.json` | Legacy subprocess registry, migration fallback only |
 | `.issue-orchestrator/locks/` | Lock files (per instance) |
-| `.issue-orchestrator/config/*.yaml` | Configuration files |
+| `.issue-orchestrator/config/modes/*/*.yaml` | Launch configuration files |
 | `.issue-orchestrator/sessions/latest.json` | Pointer to most recent session run |
 | `.issue-orchestrator/sessions/index.json` | List of all session runs |
 | `.issue-orchestrator/sessions/<run>/manifest.json` | Session metadata |

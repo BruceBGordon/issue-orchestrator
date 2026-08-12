@@ -39,11 +39,13 @@ from issue_orchestrator.domain.models import OrchestratorState
 from issue_orchestrator.infra.config import Config
 from issue_orchestrator.infra.repo_guardrails import RepoGuardrailsError
 from issue_orchestrator.infra.supervisor import (
-    DefaultSupervisorOps,
     MultiInstanceStatus,
-    SupervisorOps,
     SupervisorStatus,
 )
+from issue_orchestrator.execution.repository_engine_supervisor import (
+    build_default_supervisor_ops,
+)
+from issue_orchestrator.ports.repository_engine_supervisor import SupervisorOps
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -217,7 +219,7 @@ def mock_supervisor():
     mock.stop_by_port.return_value = True
     set_supervisor(mock)
     yield mock
-    set_supervisor(DefaultSupervisorOps())
+    set_supervisor(build_default_supervisor_ops())
 
 
 class TestStopRepoOrchestratorEndpoint:

@@ -20,6 +20,7 @@ AI_GATE_STATE_FILE = ".issue-orchestrator/ai-gate-state.json"
 @dataclass
 class AiGateResult:
     """Result of a single agent's AI gate test."""
+
     success: bool
     message: str
     timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
@@ -32,10 +33,23 @@ class AiGateState:
     Tracks when the last AI gate test was performed and results
     for each agent type that was tested.
     """
+
     last_check: datetime | None = None
     last_results: dict[str, AiGateResult] = field(default_factory=dict)
+    required_agent_types: tuple[str, ...] = ()
 
-    def is_stale(self, interval_days: int) -> bool:
+    @property
+    def recorded_agent_types(self) -> tuple[str, ...]:
+        """Return the provider set, including caches written before it was explicit."""
+        if self.required_agent_types:
+            return self.required_agent_types
+        return tuple(sorted(self.last_results))
+
+    def is_stale(
+        self,
+        interval_days: int,
+        required_agent_types: set[str] | None = None,
+    ) -> bool:
         """Check if AI gate test needs to be run.
 
         Args:
@@ -46,6 +60,12 @@ class AiGateState:
         """
         if interval_days <= 0:
             return False  # Disabled
+        recorded_types = self.recorded_agent_types
+        if (
+            required_agent_types is not None
+            and recorded_types != tuple(sorted(required_agent_types))
+        ):
+            return True
         if self.last_check is None:
             return True  # First run
         elapsed = datetime.now(timezone.utc) - self.last_check
@@ -54,6 +74,7 @@ class AiGateState:
     def mark_checked(
         self,
         results: dict[str, tuple[bool, str]],
+        required_agent_types: set[str] | None = None,
     ) -> None:
         """Update state after running AI gate tests.
 
@@ -62,6 +83,7 @@ class AiGateState:
         """
         now = datetime.now(timezone.utc)
         self.last_check = now
+        self.required_agent_types = tuple(sorted(required_agent_types or results))
         self.last_results = {
             agent_type: AiGateResult(
                 success=success,
@@ -83,6 +105,7 @@ class AiGateState:
                 }
                 for agent_type, result in self.last_results.items()
             },
+            "required_agent_types": list(self.required_agent_types),
         }
 
     @classmethod
@@ -100,7 +123,9 @@ class AiGateState:
         for agent_type, result_data in data.get("last_results", {}).items():
             # Validate result_data is a dict with required keys
             if not isinstance(result_data, dict):
-                raise TypeError(f"Expected dict for result_data, got {type(result_data)}")
+                raise TypeError(
+                    f"Expected dict for result_data, got {type(result_data)}"
+                )
             timestamp = datetime.fromisoformat(result_data["timestamp"])
             last_results[agent_type] = AiGateResult(
                 success=result_data["success"],
@@ -108,7 +133,17 @@ class AiGateState:
                 timestamp=timestamp,
             )
 
-        return cls(last_check=last_check, last_results=last_results)
+        raw_required = data.get("required_agent_types", [])
+        if not isinstance(raw_required, list) or not all(
+            isinstance(item, str) for item in raw_required
+        ):
+            raise TypeError("required_agent_types must be a list of strings")
+
+        return cls(
+            last_check=last_check,
+            last_results=last_results,
+            required_agent_types=tuple(sorted(raw_required)),
+        )
 
 
 def get_ai_gate_state_path(repo_root: Path) -> Path:

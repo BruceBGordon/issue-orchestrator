@@ -671,7 +671,7 @@ async function createIssuesForUntriaged(runId, triggerEl) {
 
     try {
         const res = await fetch(
-            `/control/e2e/create-issues/${ctx.runId}?repo_root=${encodeURIComponent(REPO_ROOT)}&config_name=${encodeURIComponent(CONFIG_NAME)}`,
+            `/control/e2e/create-issues/${ctx.runId}?repo_root=${encodeURIComponent(REPO_ROOT)}&config_name=${encodeURIComponent(CONFIG_NAME)}&mode=${encodeURIComponent(CONFIG_MODE)}`,
             {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },

@@ -4,6 +4,9 @@ const REPO_ROOT = window.dashboardData?.repoRoot
 const CONFIG_NAME = window.dashboardData?.configName
     || new URLSearchParams(window.location.search).get('config_name')
     || '';
+const CONFIG_MODE = window.dashboardData?.configMode
+    || new URLSearchParams(window.location.search).get('mode')
+    || 'default';
 
 // Mutable state for E2E - updated by polling
 let e2eLastRun = window.dashboardData.e2eLastRun;
@@ -192,7 +195,7 @@ document.addEventListener('change', function(e) {
 
 async function updateE2EProgress() {
     try {
-        const res = await fetch(`/control/e2e/status?repo_root=${encodeURIComponent(REPO_ROOT)}&config_name=${encodeURIComponent(CONFIG_NAME)}`);
+        const res = await fetch(`/control/e2e/status?repo_root=${encodeURIComponent(REPO_ROOT)}&config_name=${encodeURIComponent(CONFIG_NAME)}&mode=${encodeURIComponent(CONFIG_MODE)}`);
         const data = await res.json();
 
         // Update mutable last run state
@@ -234,7 +237,7 @@ async function startE2E(forceRestart = false) {
             const stopRes = await fetch('/control/e2e/stop', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ repo_root: REPO_ROOT, config_name: CONFIG_NAME })
+                body: JSON.stringify({ repo_root: REPO_ROOT, config_name: CONFIG_NAME, mode: CONFIG_MODE })
             });
             if (!stopRes.ok) {
                 showToast('Failed to stop running E2E', 'error');
@@ -247,7 +250,7 @@ async function startE2E(forceRestart = false) {
         const res = await fetch('/control/e2e/start', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ repo_root: REPO_ROOT, config_name: CONFIG_NAME })
+            body: JSON.stringify({ repo_root: REPO_ROOT, config_name: CONFIG_NAME, mode: CONFIG_MODE })
         });
         const data = await res.json();
         if (res.ok) {
@@ -286,7 +289,7 @@ async function stopE2E() {
         const res = await fetch('/control/e2e/stop', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ repo_root: REPO_ROOT, config_name: CONFIG_NAME })
+            body: JSON.stringify({ repo_root: REPO_ROOT, config_name: CONFIG_NAME, mode: CONFIG_MODE })
         });
         const data = await res.json();
         if (res.ok) {
@@ -332,7 +335,7 @@ async function showE2ELogs() {
     }
 
     try {
-        const res = await fetch(`/control/e2e/logs/${e2eLastRun.id}?repo_root=${encodeURIComponent(REPO_ROOT)}&config_name=${encodeURIComponent(CONFIG_NAME)}&tail=200`);
+        const res = await fetch(`/control/e2e/logs/${e2eLastRun.id}?repo_root=${encodeURIComponent(REPO_ROOT)}&config_name=${encodeURIComponent(CONFIG_NAME)}&mode=${encodeURIComponent(CONFIG_MODE)}&tail=200`);
         const data = await res.json();
         if (res.ok) {
             const content = data.content || 'No logs available';
@@ -348,7 +351,7 @@ async function showE2ELogs() {
 
 async function showQuarantineList() {
     try {
-        const res = await fetch(`/control/e2e/quarantine?repo_root=${encodeURIComponent(REPO_ROOT)}&config_name=${encodeURIComponent(CONFIG_NAME)}`);
+        const res = await fetch(`/control/e2e/quarantine?repo_root=${encodeURIComponent(REPO_ROOT)}&config_name=${encodeURIComponent(CONFIG_NAME)}&mode=${encodeURIComponent(CONFIG_MODE)}`);
         const data = await res.json();
 
         if (!res.ok) {
@@ -387,7 +390,7 @@ async function showE2EFailures() {
     }
 
     try {
-        const res = await fetch(`/control/e2e/summary/${e2eLastRun.id}?repo_root=${encodeURIComponent(REPO_ROOT)}&config_name=${encodeURIComponent(CONFIG_NAME)}`);
+        const res = await fetch(`/control/e2e/summary/${e2eLastRun.id}?repo_root=${encodeURIComponent(REPO_ROOT)}&config_name=${encodeURIComponent(CONFIG_NAME)}&mode=${encodeURIComponent(CONFIG_MODE)}`);
         const summary = await res.json();
 
         if (!res.ok) {
@@ -470,7 +473,7 @@ async function showE2EStats() {
     modal.classList.add('visible');
 
     try {
-        const res = await fetch(`/control/e2e/stats?repo_root=${encodeURIComponent(REPO_ROOT)}&config_name=${encodeURIComponent(CONFIG_NAME)}`);
+        const res = await fetch(`/control/e2e/stats?repo_root=${encodeURIComponent(REPO_ROOT)}&config_name=${encodeURIComponent(CONFIG_NAME)}&mode=${encodeURIComponent(CONFIG_MODE)}`);
         const data = await res.json();
 
         if (!res.ok) {
@@ -541,7 +544,7 @@ async function showFlakyTestsList() {
     }
 
     try {
-        const url = `/control/e2e/flaky-tests?repo_root=${encodeURIComponent(REPO_ROOT)}&config_name=${encodeURIComponent(CONFIG_NAME)}`;
+        const url = `/control/e2e/flaky-tests?repo_root=${encodeURIComponent(REPO_ROOT)}&config_name=${encodeURIComponent(CONFIG_NAME)}&mode=${encodeURIComponent(CONFIG_MODE)}`;
         console.log('[Flaky Analysis] Fetching:', url);
         const res = await fetch(url);
         const text = await res.text();
@@ -599,7 +602,7 @@ async function openTestFailureDetail(nodeid) {
 
     try {
         // Use the dedicated test detail endpoint
-        const res = await fetch(`/control/e2e/test/${e2eLastRun.id}?nodeid=${encodeURIComponent(nodeid)}&repo_root=${encodeURIComponent(REPO_ROOT)}&config_name=${encodeURIComponent(CONFIG_NAME)}`);
+        const res = await fetch(`/control/e2e/test/${e2eLastRun.id}?nodeid=${encodeURIComponent(nodeid)}&repo_root=${encodeURIComponent(REPO_ROOT)}&config_name=${encodeURIComponent(CONFIG_NAME)}&mode=${encodeURIComponent(CONFIG_MODE)}`);
         const data = await res.json();
 
         if (!res.ok) {
@@ -845,7 +848,7 @@ async function createSingleIssue(nodeid) {
     }
 
     try {
-        const res = await fetch(`/control/e2e/create-issues/${e2eLastRun.id}?repo_root=${encodeURIComponent(REPO_ROOT)}&config_name=${encodeURIComponent(CONFIG_NAME)}`, {
+        const res = await fetch(`/control/e2e/create-issues/${e2eLastRun.id}?repo_root=${encodeURIComponent(REPO_ROOT)}&config_name=${encodeURIComponent(CONFIG_NAME)}&mode=${encodeURIComponent(CONFIG_MODE)}`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -885,7 +888,7 @@ async function quarantineSingleTest(nodeid) {
     }
 
     try {
-        const res = await fetch(`/control/e2e/quarantine?repo_root=${encodeURIComponent(REPO_ROOT)}&config_name=${encodeURIComponent(CONFIG_NAME)}`, {
+        const res = await fetch(`/control/e2e/quarantine?repo_root=${encodeURIComponent(REPO_ROOT)}&config_name=${encodeURIComponent(CONFIG_NAME)}&mode=${encodeURIComponent(CONFIG_MODE)}`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ action: 'add', nodeids: [nodeid] }),

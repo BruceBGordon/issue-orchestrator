@@ -386,8 +386,15 @@ class TestE2ETestDetailEndpoint:
         """Test not found should return 404."""
         from issue_orchestrator.infra.e2e_db import E2EDB
 
+        config_dir = (
+            tmp_path / ".issue-orchestrator" / "config" / "modes" / "default"
+        )
+        config_dir.mkdir(parents=True)
+        (config_dir / "default.yaml").write_text(
+            "repo:\n  name: test/repo\ne2e:\n  enabled: true\n"
+            "  pytest_paths: ['tests/e2e']\n"
+        )
         db_dir = tmp_path / ".issue-orchestrator"
-        db_dir.mkdir(exist_ok=True)
         db_path = db_dir / "e2e.db"
         db = E2EDB(db_path)
 
@@ -410,7 +417,9 @@ class TestE2ETestDetailEndpoint:
         from issue_orchestrator.infra.e2e_db import E2EDB
 
         # Create config file for _load_config_by_name
-        config_dir = tmp_path / ".issue-orchestrator" / "config"
+        config_dir = (
+            tmp_path / ".issue-orchestrator" / "config" / "modes" / "default"
+        )
         config_dir.mkdir(parents=True, exist_ok=True)
         (config_dir / "default.yaml").write_text("repo:\n  name: test/repo\ne2e:\n  enabled: true\n  pytest_paths: ['tests/e2e']\n")
 
