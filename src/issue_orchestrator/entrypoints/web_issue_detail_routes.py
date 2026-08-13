@@ -26,6 +26,10 @@ from ..view_models.dashboard import (
 from ..view_models.issue_detail import IssueStoryContext, build_issue_detail_view_model
 from ..view_models.rework_status import resolve_queued_rework
 from ..view_models.timeline_view import normalize_timeline_view
+from ..view_models.timeline_evidence_presentation import (
+    TimelineEventBatch,
+    attach_timeline_evidence,
+)
 from ..view_models.lifecycle_projection import (
     project_dashboard_lifecycle_container,
     project_e2e_suite_lifecycle_container_for_run,
@@ -48,10 +52,12 @@ from .web_session_context import (
     issue_title_for,
     resolve_issue_session_context,
 )
+from .web_timeline_evidence_routes import web_timeline_evidence_router
 
 logger = logging.getLogger(__name__)
 
 web_issue_detail_router = APIRouter()
+web_issue_detail_router.include_router(web_timeline_evidence_router)
 
 
 class E2ERunDatabaseNotFoundError(FileNotFoundError):
@@ -522,6 +528,11 @@ async def get_issue_detail(
         filtered_events
     )
     events = _decorate_timeline_events(events, issue_number)
+    events = attach_timeline_evidence(
+        TimelineEventBatch(events),
+        issue_number,
+        orchestrator.deps.timeline_evidence,
+    ).events
     phase_toc = _build_phase_toc(events)
     cycles = _build_timeline_cycles(events)
     payload = build_issue_detail_view_model(

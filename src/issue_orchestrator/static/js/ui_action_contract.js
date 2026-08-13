@@ -24,6 +24,7 @@
         RETRY_PUBLISH: (issueNumber) => `/api/issues/${issueNumber}/retry-publish`,
         CLOSE_ISSUE: (issueNumber) => `/api/issues/${issueNumber}/close`,
         ISSUE_RESUME: (issueNumber) => `/api/issues/${issueNumber}/resume`,
+        TIMELINE_EVIDENCE_PIN: (issueNumber) => `/api/issues/${issueNumber}/timeline-evidence/pin`,
     };
 
     function normalizeIssueNumbers(issueNumbers) {
@@ -118,6 +119,21 @@
             endpoint: ENDPOINTS.ISSUE_RESUME(normalized[0]),
             method: 'POST',
             body: { run_dir: String(runDir) },
+        };
+    }
+
+    function buildTimelineEvidencePinRequest(issueNumber, runDir, pinned) {
+        const normalized = normalizeIssueNumbers([issueNumber]);
+        if (normalized.length !== 1) {
+            throw new Error(`Invalid issue number for Timeline evidence pin: ${issueNumber}`);
+        }
+        if (!runDir) {
+            throw new Error('runDir is required for Timeline evidence pin');
+        }
+        return {
+            endpoint: ENDPOINTS.TIMELINE_EVIDENCE_PIN(normalized[0]),
+            method: 'PUT',
+            body: { run_dir: String(runDir), pinned: Boolean(pinned) },
         };
     }
 
@@ -277,6 +293,7 @@
         buildBulkCancelQueuedRequest,
         buildIssueRetryRequest,
         buildIssueResumeRequest,
+        buildTimelineEvidencePinRequest,
         buildRetryPublishRequest,
         buildCloseIssueRequest,
         buildGlobalHealthReviewRunRequest,

@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     from ..ports.timeline_reader import TimelineReader
     from ..ports.timeline_store import TimelineStore
     from ..ports.timeline_writer import TimelineWriter
+    from ..ports.timeline_evidence import TimelineEvidence
     from ..ports.promotion_target import PromotionTargetHost
     from ..ports.tech_lead_authority import TechLeadAuthorityStore
     from .open_issue_corpus import OpenIssueCorpusManager
@@ -57,6 +58,7 @@ class InfraServices:
     timeline_reader: "TimelineReader"
     timeline_store: "TimelineStore"
     timeline_writer: "TimelineWriter"
+    timeline_evidence: "TimelineEvidence"
     goal_pilot_store: "GoalPilotStore"
     attempt_store: "AttemptStore"
     # Orchestrator-owned tech_lead launch authority port (ADR-0031 / #6769 F2).

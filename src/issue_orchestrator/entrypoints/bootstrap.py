@@ -19,7 +19,6 @@ import logging
 import os
 import time
 from typing import TYPE_CHECKING, cast
-from uuid import uuid4
 
 from ..control.background_job_supervisor import BackgroundJobSupervisor
 from ..infra.agent_callback_endpoint import RuntimeAgentCallbackEndpoint
@@ -40,6 +39,7 @@ from .bootstrap_pending_work import (
     require_repository_host,
 )
 from .bootstrap_session_launcher import build_session_launcher_factory
+from .bootstrap_timeline import create_timeline_composition
 from .bootstrap_operator_commands import build_operator_issue_command_factory
 from .bootstrap_completion import (
     _validation_attempt_key_factory,
@@ -55,6 +55,7 @@ from ..ports.session_runner import SessionRunner, NullSessionRunner
 from ..ports.timeline_reader import NullTimelineReader
 from ..ports.timeline_store import NullTimelineStore, TimelineStore
 from ..ports.timeline_writer import NullTimelineWriter
+from ..ports.timeline_evidence import NULL_TIMELINE_EVIDENCE
 from ..control.orchestrator_deps import OrchestratorDeps
 from ..control.provider_resilience import ProviderResilienceManager
 from ..execution import (
@@ -66,11 +67,6 @@ from ..execution import (
     CompositeEventSink,
     SqliteGoalPilotStore,
     QueueCacheStore,
-    TimelineEventSink,
-    DefaultTimelineReader,
-    SqliteTimelineStore,
-    TimelineStoreConfig,
-    DefaultTimelineWriter,
 )
 from ..execution.gh_guard import install_gh_guard
 from ..events import EventHub, SequencedEventSink
@@ -531,19 +527,13 @@ def build_orchestrator(
     base_events = PluggyEventSink(pm)
     runner = PluggySessionRunner(pm)
 
-    # Timeline store + reader/writer + event sink
-    # instance_id uniquely identifies this orchestrator process lifetime.
-    # Used to scope timeline queries (e.g. E2E run detail views).
-    instance_id = str(uuid4())
-    logger.info("Orchestrator instance_id=%s", instance_id)
-    timeline_store = SqliteTimelineStore(
-        state_dir(config.repo_root) / "timeline.sqlite",
-        TimelineStoreConfig(max_records=config.timeline.max_records),
-        instance_id=instance_id,
-    )
-    timeline_reader = DefaultTimelineReader(timeline_store)
-    timeline_writer = DefaultTimelineWriter(timeline_store)
-    timeline_sink = TimelineEventSink(timeline_writer)
+    timeline = create_timeline_composition(config)
+    instance_id = timeline.instance_id
+    timeline_store = timeline.store
+    timeline_reader = timeline.reader
+    timeline_writer = timeline.writer
+    timeline_evidence = timeline.evidence
+    timeline_sink = timeline.sink
 
     # Resolve repo and create GitHub adapter
     repo = _resolve_repo(config)
@@ -734,6 +724,7 @@ def build_orchestrator(
     assert label_sync is not None
     assert action_applier is not None
     assert fact_gatherer is not None
+    fact_gatherer.timeline_evidence = timeline_evidence
     assert pr_scanner is not None
     assert session_restorer is not None
     assert completion_processor is not None
@@ -769,6 +760,7 @@ def build_orchestrator(
         action_applier.background_job_supervisor = background_job_supervisor
         action_applier.label_store = label_store
         action_applier.publish_recovery = publish_recovery
+        action_applier.timeline_evidence = timeline_evidence
 
     infra_services = InfraServices(
         label_manager=label_manager,
@@ -780,6 +772,7 @@ def build_orchestrator(
         timeline_reader=timeline_reader,
         timeline_store=timeline_store,
         timeline_writer=timeline_writer,
+        timeline_evidence=timeline_evidence,
         goal_pilot_store=goal_pilot_store,
         attempt_store=attempt_store,
         tech_lead_authority=tech_lead_authority,
@@ -1155,6 +1148,8 @@ def build_orchestrator_for_testing(
     timeline_reader = NullTimelineReader()
     timeline_writer = NullTimelineWriter()
     timeline_store: TimelineStore = NullTimelineStore()
+    timeline_evidence = NULL_TIMELINE_EVIDENCE
+    fact_gatherer.timeline_evidence = timeline_evidence
 
     # Create claim components for testing (NullClaimManager by default).
     lease_config = LeaseConfig()
@@ -1195,6 +1190,7 @@ def build_orchestrator_for_testing(
         action_applier.label_store = label_store
         action_applier.publish_recovery = publish_recovery
         action_applier.run_ownership = run_ownership
+        action_applier.timeline_evidence = timeline_evidence
 
     infra_services = InfraServices(
         label_manager=label_manager,
@@ -1206,6 +1202,7 @@ def build_orchestrator_for_testing(
         timeline_reader=timeline_reader,
         timeline_store=timeline_store,
         timeline_writer=timeline_writer,
+        timeline_evidence=timeline_evidence,
         goal_pilot_store=goal_pilot_store,
         attempt_store=attempt_store,
         tech_lead_authority=tech_lead_authority_for_testing,

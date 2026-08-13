@@ -2170,6 +2170,24 @@ def test_timeline_event_actions_use_primary_plus_overflow_menu() -> None:
     assert "_timelineActionShortLabel" in js
 
 
+def test_timeline_evidence_pin_is_visible_typed_and_keyboard_accessible() -> None:
+    body = _read(DASHBOARD_JS_DIR / "timeline.js")
+    journey = _read(DASHBOARD_JS_DIR / "plugins" / "agent_context.js")
+    contract = _read(UI_ACTION_CONTRACT_JS)
+    css = _read_dashboard_css_bundle()
+
+    assert "renderTimelineEvidence(evt.evidence)" in body
+    assert "renderTimelineEvidence(step && step.evidence)" in journey
+    assert "timeline-evidence-badge" in body
+    assert 'aria-label="${escapeAttr(helpText)}"' in body
+    assert "set_timeline_evidence_pin" in body
+    assert "window.confirm(confirmation)" in body
+    assert "uiActionContract.buildTimelineEvidencePinRequest" in body
+    assert "type=\"button\"" in body
+    assert "buildTimelineEvidencePinRequest" in contract
+    assert ".timeline-evidence-pinned" in css
+
+
 def test_timeline_events_pass_detail_context_to_action_menu() -> None:
     js = _read(DASHBOARD_JS)
     body = _function_body(js, "renderTimeline")

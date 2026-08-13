@@ -24,6 +24,7 @@ from issue_orchestrator.control.actions import (
     CreateTechLeadIssueAction,
     SurfaceTechLeadProposalAction,
     CleanupSessionAction,
+    PruneTimelineEvidenceAction,
     RemoveWorktreeAction,
     ReconcileHistoryEntryAction,
     RecoverTerminalIssueAction,
@@ -1686,6 +1687,8 @@ class TestCleanupSessionAction:
     def test_cleanup_full(self, applier, mock_sessions, mock_worktree_manager, tmp_path):
         """Test full cleanup - close tab and remove worktree."""
         mock_sessions.exists.return_value = True
+        evidence = Mock()
+        applier.timeline_evidence = evidence
 
         action = CleanupSessionAction(
             issue_number=123,
@@ -1699,8 +1702,41 @@ class TestCleanupSessionAction:
         result = applier.apply(action)
 
         assert result.success
+        evidence.archive_worktree.assert_called_once_with(123, Path(str(tmp_path)))
         mock_sessions.stop.assert_called_once()
         mock_worktree_manager.remove_checkout.assert_called_once()
+
+    def test_periodic_prune_routes_through_evidence_owner(self, applier):
+        evidence = Mock()
+        evidence.prune_expired.return_value = 3
+        applier.timeline_evidence = evidence
+
+        result = applier.apply(PruneTimelineEvidenceAction(reason="due"))
+
+        assert result.success
+        assert result.details["expired_runs"] == 3
+        evidence.prune_expired.assert_called_once_with()
+
+    def test_cleanup_keeps_worktree_when_evidence_archive_fails(
+        self, applier, mock_worktree_manager, tmp_path
+    ):
+        evidence = Mock()
+        evidence.archive_worktree.side_effect = RuntimeError("archive failed")
+        applier.timeline_evidence = evidence
+        action = CleanupSessionAction(
+            issue_number=123,
+            pr_number=456,
+            terminal_id="issue-123",
+            worktree_path=str(tmp_path),
+            close_tabs=False,
+            remove_worktrees=True,
+        )
+
+        result = applier.apply(action)
+
+        assert not result.success
+        assert "archive failed" in result.error
+        mock_worktree_manager.remove_checkout.assert_not_called()
 
     def test_cleanup_tabs_only(self, applier, mock_sessions, mock_worktree_manager, tmp_path):
         """Test cleanup with only tab closing."""
@@ -1746,6 +1782,8 @@ class TestCleanupSessionAction:
         """F8: a disposable scratch worktree is FORCE-removed (untracked agent
         artifacts must not fail its cleanup and leak it)."""
         mock_sessions.exists.return_value = True
+        evidence = Mock()
+        applier.timeline_evidence = evidence
 
         action = CleanupSessionAction(
             issue_number=123,
@@ -1760,6 +1798,7 @@ class TestCleanupSessionAction:
         result = applier.apply(action)
 
         assert result.success
+        evidence.archive_worktree.assert_not_called()
         mock_worktree_manager.remove_checkout_and_branch.assert_called_once_with(
             Path(str(tmp_path)), force=True
         )
@@ -3018,6 +3057,7 @@ class TestClaimGateAudit:
     #   (#6957); like APPEND_PATTERN_OBSERVATION the only GitHub target is a
     #   case file, which is never claimed.
     # - CLEANUP_SESSION: post-completion cleanup
+    # - PRUNE_TIMELINE_EVIDENCE: local archived-evidence retention only
     # - RECONCILE_HISTORY_ENTRY: local session history mutation + event only
     # - CREATE_PR: not implemented in action_applier
     EXEMPT_ACTIONS = {
@@ -3045,6 +3085,7 @@ class TestClaimGateAudit:
         ActionType.KILL_HUNG_SESSION,
         ActionType.DISCARD_TERMINAL_TECH_LEAD_PROPOSAL_OPS,
         ActionType.CLEANUP_SESSION,
+        ActionType.PRUNE_TIMELINE_EVIDENCE,
         ActionType.RECONCILE_HISTORY_ENTRY,
         ActionType.CREATE_PR,
     }

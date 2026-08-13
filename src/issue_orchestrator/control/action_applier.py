@@ -37,6 +37,7 @@ from ..ports.label_set import LabelSet
 from ..ports.fresh_issue_reader import FreshIssueReader
 from ..ports.repository_host import RepositoryHost
 from ..ports.worktree_manager import WorktreeManager
+from ..ports.timeline_evidence import NULL_TIMELINE_EVIDENCE, TimelineEvidence
 from ..domain.models import RETROSPECTIVE_REVIEW_TERMINAL_PREFIX, Session
 
 if TYPE_CHECKING:
@@ -98,6 +99,7 @@ from .actions import (
     KillHungSessionAction,
     SurfaceTechLeadProposalAction,
     CleanupSessionAction,
+    PruneTimelineEvidenceAction,
     RemoveWorktreeAction,
     ReconcileHistoryEntryAction,
     RecoverTerminalIssueAction,
@@ -108,6 +110,7 @@ from .session_manager import SessionManager, SessionRef, SessionType, SessionCon
 from .tech_lead_applier_handlers import tech_lead_action_handlers
 from .tech_lead_issue_creation import apply_create_tech_lead_issue
 from .history_reconciliation import apply_history_reconciliation
+from .session_worktree_cleanup import cleanup_session_worktree
 from .tech_lead_proposals import execute_approved_tech_lead_op
 from .tech_lead_reset_retry import apply_surface_tech_lead_proposal
 
@@ -198,6 +201,7 @@ class ActionApplier:
     # Cross-engine tech-lead run ownership (#6994 R2 F3). Unwired means anchor
     # creation fails loudly rather than racing a peer.
     run_ownership: Optional["TechLeadRunOwnership"] = None
+    timeline_evidence: TimelineEvidence = NULL_TIMELINE_EVIDENCE
     _active_label_mutation_stats: LabelMutationStats | None = field(
         default=None, init=False, repr=False
     )
@@ -288,6 +292,7 @@ class ActionApplier:
             ),
             # Cleanup operations
             ActionType.CLEANUP_SESSION: self._apply_cleanup_session,
+            ActionType.PRUNE_TIMELINE_EVIDENCE: self._apply_prune_timeline_evidence,
             ActionType.REMOVE_WORKTREE: self._apply_remove_worktree,
             # Comments
             ActionType.ADD_COMMENT: self._apply_add_comment,
@@ -1578,7 +1583,13 @@ class ActionApplier:
         errors = []
         cancellation = self._cancel_review_exchange_for_cleanup(action)
         self._cleanup_terminal_session(action, errors)
-        self._cleanup_worktree(action, errors)
+        cleanup_session_worktree(
+            action,
+            errors,
+            worktree_manager=self.worktree_manager,
+            timeline_evidence=self.timeline_evidence,
+            on_worktree_removed=self.on_worktree_removed,
+        )
 
         self.events.publish(make_trace_event(EventName.CLEANUP_COMPLETED, {"issue_number": action.issue_number, "pr_number": action.pr_number}))
 
@@ -1650,42 +1661,11 @@ class ActionApplier:
             return SessionType.TECH_LEAD
         return SessionType.ISSUE
 
-    def _cleanup_worktree(self, action: "CleanupSessionAction", errors: list[str]) -> None:
-        """Remove worktree if configured."""
-        if not (action.remove_worktrees and action.worktree_path):
-            return
-
-        if not self.worktree_manager:
-            errors.append("no worktree_manager configured")
-            return
-
-        try:
-            # Force removal ONLY for a disposable scratch worktree: it holds
-            # throwaway agent artifacts, so a leftover untracked file must not
-            # make ``git worktree remove`` fail (exit 128) and leak it. A normal
-            # coding worktree stays non-forced so user work is never discarded
-            # (#6824 F8).
-            remove_worktree = self.worktree_manager.remove_checkout
-            if action.disposable_worktree:
-                remove_worktree = self.worktree_manager.remove_checkout_and_branch
-            remove_worktree(Path(action.worktree_path), force=action.disposable_worktree)
-            logger.info(issue_log(action.issue_number, "Removed worktree: %s"), action.worktree_path)
-        except Exception as e:
-            errors.append(f"remove worktree: {e}")
-            logger.warning(issue_log(action.issue_number, "Failed to remove worktree: %s"), e)
-            return
-        # Removal SUCCEEDED (or the path was already gone). The "worktree is gone"
-        # notification is a distinct concern: a callback failure must NOT re-fail
-        # an already-completed removal, or the disposable cleanup would be retained
-        # and retried forever against a now-absent path (#6824 R3).
-        if self.on_worktree_removed:
-            try:
-                self.on_worktree_removed(action.worktree_path)
-            except Exception as e:
-                logger.warning(
-                    issue_log(action.issue_number, "worktree-removed callback failed (worktree already gone): %s"),
-                    e,
-                )
+    def _apply_prune_timeline_evidence(self, action: Action) -> ActionResult:
+        """Apply the periodic Timeline evidence retention mutation."""
+        assert isinstance(action, PruneTimelineEvidenceAction)
+        expired_runs = self.timeline_evidence.prune_expired()
+        return ActionResult.ok(action, expired_runs=expired_runs)
 
     def _apply_remove_worktree(self, action: Action) -> ActionResult:
         """Remove a git worktree."""

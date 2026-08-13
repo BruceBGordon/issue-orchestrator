@@ -627,6 +627,7 @@ export interface JourneyStepPayload {
   day: string;
   detail?: string | null;
   event: string;
+  evidence?: TimelineEvidenceStatePayload | null;
   in_round_progress?: boolean;
   narrative: string;
   status: string;
@@ -1255,6 +1256,23 @@ export interface TimelineDiagnosticPayload {
   evidence_ref?: string | null;
   message: string;
   severity: "info" | "warning" | "error";
+}
+
+export interface TimelineEvidencePinRequestPayload {
+  pinned: boolean;
+  run_dir: string;
+}
+
+export interface TimelineEvidenceStatePayload {
+  archived: boolean;
+  available: boolean;
+  expires_at: string | null;
+  help_text: string;
+  label: string;
+  pinned: boolean;
+  run_dir: string;
+  status: "active" | "retained" | "pinned" | "expired" | "missing";
+  unpin_expires_immediately: boolean;
 }
 
 export interface TimelineSubjectPayload {

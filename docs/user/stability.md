@@ -347,6 +347,7 @@ contracted route goes missing or stops using its generated response model.
 | `/api/e2e-runs/recent` | Repository Engine |
 | `/api/issue-detail/{issue_number}` | Repository Engine |
 | `/api/issue-rows` | Repository Engine |
+| `/api/issues/{issue_number}/timeline-evidence/pin` | Repository Engine |
 | `/api/retrospective-review` | Repository Engine |
 | `/api/retrospective-review/preflight` | Repository Engine |
 | `/api/tech-lead/runs` | Repository Engine |

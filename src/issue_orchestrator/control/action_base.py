@@ -95,6 +95,7 @@ class ActionType(Enum):
 
     # Cleanup operations
     CLEANUP_SESSION = "cleanup_session"
+    PRUNE_TIMELINE_EVIDENCE = "prune_timeline_evidence"
 
     # History operations
     RECONCILE_HISTORY_ENTRY = "reconcile_history_entry"

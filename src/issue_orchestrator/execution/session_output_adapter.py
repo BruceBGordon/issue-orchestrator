@@ -12,7 +12,7 @@ import json
 import logging
 import threading
 from dataclasses import asdict
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from unittest.mock import Mock
@@ -33,6 +33,7 @@ from ..domain.review_exchange_manifest import ReviewExchangeManifestHeader
 from ..domain.review_exchange_resume import is_no_completion_reason
 from ..domain.review_exchange_run import ReviewExchangeRun, ReviewExchangeRunAssets
 from ..domain.review_exchange_summary import ReviewExchangeSummaryV1
+from ..domain.run_manifest import RunManifest
 from ..domain.exchange_chapter import (
     CHAPTER_SCHEMA_VERSION,
     ChapterSidecarIdentityMismatch,
@@ -154,9 +155,6 @@ class FileSystemSessionOutput(RunDirectoryArtifacts):
             manifest_path = run_dir / MANIFEST_NAME
             started_at = datetime.now(timezone.utc).isoformat()
             retention_window_days = max(0, retention_days)
-            retention_expires_at = (
-                datetime.now(timezone.utc) + timedelta(days=retention_window_days)
-            ).isoformat()
 
             manifest = {
                 "session_name": session_name,
@@ -174,7 +172,6 @@ class FileSystemSessionOutput(RunDirectoryArtifacts):
                 "diagnostic_path": None,
                 "retention_tier": retention_tier,
                 "retention_days": retention_window_days,
-                "retention_expires_at": retention_expires_at,
                 "retention_pinned": retention_pinned,
                 "artifacts": {
                     "terminal_recording": {
@@ -299,7 +296,10 @@ class FileSystemSessionOutput(RunDirectoryArtifacts):
         ]
 
         removed: list[Path] = []
+        now = datetime.now(timezone.utc)
         for run_dir in runs[keep:]:
+            if RunManifest.has_retained_timeline_evidence(run_dir, now=now):
+                continue
             try:
                 self._delete_tree(run_dir)
                 removed.append(run_dir)

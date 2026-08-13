@@ -361,6 +361,15 @@ class CleanupSessionAction(Action):
 
 
 @dataclass(frozen=True)
+class PruneTimelineEvidenceAction(Action):
+    """Expire archived Timeline evidence whose retention window has elapsed."""
+
+    action_type: ActionType = field(
+        default=ActionType.PRUNE_TIMELINE_EVIDENCE, init=False
+    )
+
+
+@dataclass(frozen=True)
 class ReconcileHistoryEntryAction(Action):
     """Reconcile a completed history entry into a terminal PR/issue status.
 

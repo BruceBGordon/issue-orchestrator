@@ -35,6 +35,7 @@ class TestTimelineActionWiring:
         "open_orchestrator_log": "/api/session/orchestrator-log/{issue_number}",
         "open_session_diagnostics": "/api/dialog/session-diagnostics/{issue_number}",
         "show_event_details": None,  # client-side modal for row payload inspection
+        "set_timeline_evidence_pin": "/api/issues/{issue_number}/timeline-evidence/pin",
     }
     _REQUIRED_FIELDS_BY_ACTION: dict[str, tuple[str, ...]] = {
         "open_validation_failure": ("issue_number", "run_dir"),
@@ -44,6 +45,7 @@ class TestTimelineActionWiring:
         "view_claude_log": ("issue_number", "run_dir"),
         "open_orchestrator_log": ("issue_number", "run_dir"),
         "open_session_diagnostics": ("issue_number", "run_dir"),
+        "set_timeline_evidence_pin": ("issue_number", "run_dir", "pinned"),
     }
 
     def _write_review_phase_recording(
@@ -141,6 +143,41 @@ class TestTimelineActionWiring:
                 f"Action type '{action_type}' expects endpoint '{endpoint}' "
                 f"but no matching route found in the FastAPI app."
             )
+
+    def test_pin_endpoint_sends_typed_exact_run_command(self, tmp_path: Path) -> None:
+        from issue_orchestrator.domain.timeline_evidence import (
+            TimelineEvidenceIdentity,
+            TimelineEvidenceState,
+            TimelineEvidenceStatus,
+        )
+
+        mock_orch = create_mock_orchestrator()
+        run_dir = tmp_path / "run-4057"
+        mock_orch.deps.timeline_evidence.set_pinned.return_value = TimelineEvidenceState(
+            identity=TimelineEvidenceIdentity(4057, run_dir),
+            status=TimelineEvidenceStatus.PINNED,
+            label="Pinned",
+            available=True,
+            pinned=True,
+            archived=True,
+            help_text="Retained until unpinned.",
+        )
+
+        set_orchestrator(mock_orch)
+        try:
+            response = TestClient(app).put(
+                "/api/issues/4057/timeline-evidence/pin",
+                json={"run_dir": str(run_dir), "pinned": True},
+            )
+        finally:
+            set_orchestrator(None)
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "pinned"
+        command = mock_orch.deps.timeline_evidence.set_pinned.call_args.args[0]
+        assert command.identity.issue_number == 4057
+        assert command.identity.run_dir == run_dir
+        assert command.pinned is True
 
     def test_issue_detail_run_steps_carry_actions(self, tmp_path: Path) -> None:
         """Run cycle steps must pass through event actions for ⋯ menus."""

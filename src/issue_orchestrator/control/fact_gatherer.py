@@ -31,6 +31,7 @@ from ..infra.config import Config
 from ..events import EventName
 from ..ports.repository_host import RepositoryHost, RepositoryHostError
 from ..ports import EventSink,  make_trace_event
+from ..ports.timeline_evidence import NULL_TIMELINE_EVIDENCE, TimelineEvidence
 from .provider_launch_readiness import ProviderLaunchReadiness
 from .health_review_trigger import (
     classify_tech_lead_anchor_issues,
@@ -129,6 +130,7 @@ class FactGatherer:
     promotion_read_budget: PromotionReadBudget = field(
         default_factory=PromotionReadBudget
     )
+    timeline_evidence: TimelineEvidence = NULL_TIMELINE_EVIDENCE
 
     def fetch_issues(
         self,
@@ -270,6 +272,7 @@ class FactGatherer:
             session_history_issue_numbers=frozenset(e.issue_number for e in state.session_history),
             e2e_occupies_slot=e2e_occupies_slot,
             e2e_due=e2e_due,
+            timeline_evidence_prune_due=self.timeline_evidence.prune_due(),
             provider_launch=provider_launch or ProviderLaunchReadiness.empty(),
         )
 

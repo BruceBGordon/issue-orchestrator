@@ -148,3 +148,28 @@ def test_journey_step_carries_in_round_progress_as_a_typed_field() -> None:
         today="2026-03-22",
     )
     assert ordinary.in_round_progress is False
+
+
+def test_journey_step_carries_visible_timeline_evidence_state() -> None:
+    step = build_journey_step(
+        {
+            "event": "session.failed",
+            "status": "failed",
+            "timestamp": "2026-03-22T13:50:04Z",
+            "evidence": {
+                "run_dir": "/runs/failed-42",
+                "status": "pinned",
+                "label": "Pinned",
+                "available": True,
+                "pinned": True,
+                "archived": True,
+                "expires_at": None,
+                "help_text": "Retained until unpinned.",
+                "unpin_expires_immediately": False,
+            },
+        },
+        today="2026-03-22",
+    )
+
+    assert step.evidence is not None
+    assert step.evidence.status == "pinned"

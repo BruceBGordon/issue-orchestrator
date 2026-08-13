@@ -5,8 +5,10 @@ Tests for list_runs() and related functionality.
 
 import base64
 import json
+import os
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -22,6 +24,7 @@ from issue_orchestrator.execution.session_output_adapter import (
     VALIDATION_RECORD_NAME,
 )
 from issue_orchestrator.domain.review_exchange_summary import ReviewExchangeSummaryV1
+from issue_orchestrator.domain.run_manifest import RunManifest
 
 
 def _review_exchange_summary(
@@ -554,7 +557,27 @@ class TestRunRetentionMetadata:
         assert manifest["retention_tier"] == "cold"
         assert manifest["retention_days"] == 14
         assert manifest["retention_pinned"] is True
-        assert "retention_expires_at" in manifest
+        assert "retention_expires_at" not in manifest
+
+    def test_count_pruning_keeps_unexpired_timeline_evidence(self, tmp_path):
+        session_output = FileSystemSessionOutput()
+        oldest = session_output.start_run(tmp_path, "issue-1", issue_number=1)
+        protected = session_output.start_run(tmp_path, "review-1", issue_number=1)
+        newest = session_output.start_run(tmp_path, "rework-1", issue_number=1)
+        for position, run in enumerate((oldest, protected, newest), start=1):
+            os.utime(run.run_dir, (position, position))
+
+        manifest = RunManifest.load(protected.run_dir)
+        manifest.retention_expires_at = (
+            datetime.now(timezone.utc) + timedelta(days=7)
+        ).isoformat()
+        manifest.save()
+
+        removed = session_output.prune_runs(tmp_path, keep=1)
+
+        assert removed == [oldest.run_dir]
+        assert protected.run_dir.is_dir()
+        assert newest.run_dir.is_dir()
 
 
 class TestSessionLogCleaning:

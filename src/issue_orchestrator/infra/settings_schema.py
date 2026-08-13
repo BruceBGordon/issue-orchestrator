@@ -2114,13 +2114,18 @@ class AdvancedSettings(BaseModel):
     )
     session_output_retention_days: int = Field(
         7,
-        title="Session Output Retention (days)",
-        description="Retention window in days for session run artifacts",
+        title="Timeline Evidence Retention (days)",
+        description="Minimum retention window for terminal run evidence shown in Timeline",
         ge=0,
         le=365,
         json_schema_extra={
             "doc_examples": ["0", "7", "30"],
-            "doc_notes": "Set to 0 to expire immediately; cleanup policy may still defer deletion.",
+            "doc_notes": (
+                "The window starts when a run becomes terminal. Worktree cleanup archives "
+                "the evidence first; pinning an exact run retains it until unpinned. Set to "
+                "0 to make unpinned evidence immediately eligible for deletion. Disabling "
+                "worktree cleanup may keep files longer than this minimum."
+            ),
             "section": "Observability",
             "config_attr": "session_output_retention_days",
             "yaml_path": "observability.session_output_retention_days",

@@ -288,6 +288,22 @@ The orchestrator always ignores its built-in runtime artifacts, including
 runtime. Do not list source files, generated artifacts that should be reviewed,
 or anything the agent is expected to commit.
 
+### Timeline evidence retention
+
+`observability.session_output_retention_days` defaults to 7 for new and
+existing configurations. The clock starts when each run reaches a terminal
+outcome, including failed, timed-out, blocked, and needs-human runs. When normal
+worktree cleanup becomes eligible, the orchestrator first archives that run's
+Timeline evidence outside the worktree and rewrites the Timeline to the archived
+copy. If archiving fails, it keeps the worktree.
+
+Each exact run displays its retention state in Timeline. Use the row's actions
+menu to pin evidence you need for a longer investigation, and unpin it when the
+investigation is done. A pinned run is retained until unpinned; the UI warns when
+unpinning would make already-expired evidence disappear immediately. The setting
+is a minimum retention window: disabling worktree cleanup can leave the original
+files in place longer.
+
 ---
 
 ## What To Read Next

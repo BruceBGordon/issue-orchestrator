@@ -69,7 +69,7 @@ class TestLoadSave:
         })
         m = RunManifest.load(run_dir)
         assert m._extra["some_future_field"] == "hello"
-        assert m._extra["retention_pinned"] is True
+        assert m.retention_pinned is True
 
         m.save()
         raw = json.loads((run_dir / MANIFEST_FILENAME).read_text())

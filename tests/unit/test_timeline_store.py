@@ -200,6 +200,35 @@ def test_sqlite_timeline_store_preserves_run_dir_payload(tmp_path: Path) -> None
     assert records[0].data["task"] == "code"
 
 
+def test_sqlite_timeline_store_relocates_exact_run_references(tmp_path: Path) -> None:
+    store = SqliteTimelineStore(tmp_path / "timeline.sqlite")
+    old = tmp_path / "worktree" / ".issue-orchestrator" / "sessions" / "run"
+    new = tmp_path / "state" / "timeline-evidence" / "42" / "run"
+    store.append(
+        42,
+        TimelineRecord(
+            event_id="one",
+            timestamp="t1",
+            event="session.completed",
+            source_event="session.completed",
+            data={
+                "run_dir": str(old),
+                "artifact": str(old / "completion.json"),
+                "unrelated": str(tmp_path / "other"),
+            },
+        ),
+    )
+
+    assert store.relocate_run(42, old, new) == 1
+    record = store.read(42)[0]
+    assert record.data["run_dir"] == str(new)
+    assert record.data["artifact"] == str(new / "completion.json")
+    assert record.data["unrelated"] == str(tmp_path / "other")
+    assert store.references_run(42, new) is True
+    assert store.references_run(42, old) is False
+    assert store.references_run(7, new) is False
+
+
 def test_issue_timeline_preserves_explicit_event_artifacts() -> None:
     payload = build_issue_timeline(
         4057,

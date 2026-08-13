@@ -15,6 +15,7 @@ from typing import Annotated, Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from ..contracts.ui_openapi_models import TimelineView
+from .timeline_evidence_view import TimelineEvidenceView
 
 Severity = Literal["info", "warning", "error"]
 Timestamp = str
@@ -704,8 +705,6 @@ class JourneyStep(LifecycleBase):
     ``{"type": "open_agent_log", "value": "/path"}``) that the drawer reads
     by ``type``.  The shapes vary across event sources and are not part of
     the typed contract yet — they are pass-through from the event stream.
-    PR 2 introduces typed Command dispatch for the per-cycle validation
-    badge; broader step-action typing is a later follow-up.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True, arbitrary_types_allowed=True)
@@ -718,6 +717,7 @@ class JourneyStep(LifecycleBase):
     event: str
     detail: str | None = None
     actions: tuple[dict[str, Any], ...] = ()
+    evidence: TimelineEvidenceView | None = None
     # Marks a transient "live progress" row surfaced while a review round is
     # still open (issue #6428) so the UI can render an in-progress affordance
     # distinct from completed steps. Default ``False`` for ordinary steps.

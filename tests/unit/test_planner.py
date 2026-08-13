@@ -2904,6 +2904,19 @@ class TestPlanCleanups:
         assert action.close_tabs is True
         assert action.remove_worktrees is True
 
+    def test_plans_periodic_timeline_evidence_prune(self):
+        config = make_config()
+        planner = Planner(config=config, scheduler=Scheduler(config))
+
+        plan = planner.plan(make_snapshot(timeline_evidence_prune_due=True))
+
+        prune_actions = [
+            action
+            for action in plan.actions
+            if action.action_type == ActionType.PRUNE_TIMELINE_EVIDENCE
+        ]
+        assert len(prune_actions) == 1
+
     def test_no_cleanup_when_pr_not_reviewed(self):
         """Planner produces no CleanupSessionAction when PR is not reviewed."""
         from issue_orchestrator.domain.models import CleanupFacts

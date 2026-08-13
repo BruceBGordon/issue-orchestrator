@@ -35,6 +35,7 @@ if TYPE_CHECKING:
     from ..ports.timeline_reader import TimelineReader
     from ..ports.timeline_store import TimelineStore
     from ..ports.timeline_writer import TimelineWriter
+    from ..ports.timeline_evidence import TimelineEvidence
     from ..ports.e2e_issue_tracker import E2EIssueTracker
     from ..ports.goal_pilot_store import GoalPilotStore
     from ..ports.attempt_store import AttemptStore
@@ -214,6 +215,10 @@ class OrchestratorDeps:
     @property
     def timeline_writer(self) -> "TimelineWriter":
         return self.services.timeline_writer
+
+    @property
+    def timeline_evidence(self) -> "TimelineEvidence":
+        return self.services.timeline_evidence
 
     @property
     def pair_registry(self):  # noqa: ANN201 — return type is the protocol

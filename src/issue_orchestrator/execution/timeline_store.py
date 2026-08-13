@@ -49,6 +49,9 @@ CREATE INDEX IF NOT EXISTS idx_timeline_issue_sequence
 CREATE INDEX IF NOT EXISTS idx_timeline_issue_event_run_dir
     ON timeline_events(issue_number, event, run_dir);
 
+CREATE INDEX IF NOT EXISTS idx_timeline_issue_run_dir
+    ON timeline_events(issue_number, run_dir);
+
 CREATE INDEX IF NOT EXISTS idx_timeline_issue_source_event
     ON timeline_events(issue_number, source_event);
 
@@ -289,6 +292,85 @@ class SqliteTimelineStore(TimelineStore):
             deleted = tx.execute("SELECT changes()").fetchone()[0]
         logger.info("[TIMELINE] delete db=%s issue=%s deleted=%s", self._db_path, issue_number, deleted)
         return int(deleted)
+
+    def references_run(self, issue_number: int, run_dir: Path) -> bool:
+        """Return whether the durable Timeline owns this exact issue/run pair."""
+        with self._connection_lock:
+            row = (
+                self._get_connection()
+                .execute(
+                    """
+                SELECT 1
+                FROM timeline_events
+                WHERE issue_number = ? AND run_dir = ?
+                LIMIT 1
+                """,
+                    (issue_number, str(run_dir)),
+                )
+                .fetchone()
+            )
+        return row is not None
+
+    def relocate_run(
+        self,
+        issue_number: int,
+        old_run_dir: Path,
+        new_run_dir: Path,
+    ) -> int:
+        """Atomically rewrite every reference to one archived run directory."""
+        old = str(old_run_dir)
+        new = str(new_run_dir)
+        if not old or not new or old == new:
+            raise ValueError("Timeline run relocation requires two distinct paths")
+
+        def rewrite(value: object) -> object:
+            if isinstance(value, str):
+                if value == old:
+                    return new
+                prefix = old + os.sep
+                if value.startswith(prefix):
+                    return new + value[len(old) :]
+                return value
+            if isinstance(value, list):
+                return [rewrite(item) for item in value]
+            if isinstance(value, dict):
+                return {key: rewrite(item) for key, item in value.items()}
+            return value
+
+        relocated = 0
+        with self._transaction() as tx:
+            rows = tx.execute(
+                """
+                SELECT sequence, data_json
+                FROM timeline_events
+                WHERE issue_number = ? AND run_dir = ?
+                """,
+                (issue_number, old),
+            ).fetchall()
+            for row in rows:
+                payload = json.loads(row["data_json"] or "{}")
+                rewritten = rewrite(payload)
+                tx.execute(
+                    """
+                    UPDATE timeline_events
+                    SET run_dir = ?, data_json = ?
+                    WHERE sequence = ?
+                    """,
+                    (
+                        new,
+                        json.dumps(rewritten, sort_keys=True, default=str),
+                        int(row["sequence"]),
+                    ),
+                )
+                relocated += 1
+        logger.info(
+            "[TIMELINE] relocate_run issue=%s old=%s new=%s records=%s",
+            issue_number,
+            old,
+            new,
+            relocated,
+        )
+        return relocated
 
     def _trim_if_needed(self, conn: sqlite3.Connection, issue_number: int) -> None:
         max_records = self._config.max_records

@@ -65,6 +65,7 @@ from .actions import (
     EnqueueToMergeQueueAction,
     EscalateToHumanAction,
     CleanupSessionAction,
+    PruneTimelineEvidenceAction,
     ReconcileHistoryEntryAction,
     RecoverTerminalIssueAction,
     SessionType,
@@ -307,6 +308,11 @@ class Planner:
         # 1g. Process cleanups for reviewed PRs
         cleanup_actions = self._plan_cleanups(snapshot)
         actions.extend(cleanup_actions)
+
+        if snapshot.timeline_evidence_prune_due:
+            actions.append(
+                PruneTimelineEvidenceAction(reason="Timeline evidence pruning is due")
+            )
 
         # 1h. Reconcile recovered awaiting-merge history entries
         history_reconciliation_actions = self._plan_awaiting_merge_reconciliations(snapshot)

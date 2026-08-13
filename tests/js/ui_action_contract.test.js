@@ -64,6 +64,22 @@ test('buildIssueResumeRequest rejects missing runDir', () => {
     );
 });
 
+test('buildTimelineEvidencePinRequest returns exact-run typed command', () => {
+    const req = uiActionContract.buildTimelineEvidencePinRequest(
+        '4057', '/runs/failed-4057', true,
+    );
+    assert.equal(req.endpoint, '/api/issues/4057/timeline-evidence/pin');
+    assert.equal(req.method, 'PUT');
+    assert.deepEqual(req.body, { run_dir: '/runs/failed-4057', pinned: true });
+});
+
+test('buildTimelineEvidencePinRequest rejects missing runDir', () => {
+    assert.throws(
+        () => uiActionContract.buildTimelineEvidencePinRequest(4057, '', true),
+        /runDir is required/,
+    );
+});
+
 test('buildRetryPublishRequest returns issue-specific endpoint', () => {
     const req = uiActionContract.buildRetryPublishRequest('4057');
     assert.equal(req.endpoint, '/api/issues/4057/retry-publish');

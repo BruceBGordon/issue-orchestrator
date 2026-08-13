@@ -179,6 +179,39 @@
         }
       }
     },
+    "/api/issues/{issue_number}/timeline-evidence/pin": {
+      "put": {
+        "summary": "Set the pin state for one exact Timeline run",
+        "parameters": [
+          {
+            "name": "issue_number",
+            "in": "path",
+            "required": true,
+            "schema": {"type": "integer", "minimum": 1}
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {"$ref": "#/components/schemas/TimelineEvidencePinRequestPayload"}
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The resulting exact-run evidence state",
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "#/components/schemas/TimelineEvidenceStatePayload"}
+              }
+            }
+          },
+          "404": {"description": "The exact run or its evidence is unavailable"},
+          "409": {"description": "The exact issue/run pair is not eligible for pinning"}
+        }
+      }
+    },
     "/api/tech-lead/runs": {
       "post": {
         "summary": "Request a tech-lead run with an explicit scope",
@@ -1202,6 +1235,41 @@
             ]
           },
           "view": {"$ref": "#/components/schemas/TimelineView", "default": "user"}
+        }
+      },
+      "TimelineEvidencePinRequestPayload": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["run_dir", "pinned"],
+        "properties": {
+          "run_dir": {"type": "string", "minLength": 1},
+          "pinned": {"type": "boolean"}
+        }
+      },
+      "TimelineEvidenceStatePayload": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "run_dir",
+          "status",
+          "label",
+          "available",
+          "pinned",
+          "archived",
+          "expires_at",
+          "help_text",
+          "unpin_expires_immediately"
+        ],
+        "properties": {
+          "run_dir": {"type": "string"},
+          "status": {"type": "string", "enum": ["active", "retained", "pinned", "expired", "missing"]},
+          "label": {"type": "string"},
+          "available": {"type": "boolean"},
+          "pinned": {"type": "boolean"},
+          "archived": {"type": "boolean"},
+          "expires_at": {"type": ["string", "null"]},
+          "help_text": {"type": "string"},
+          "unpin_expires_immediately": {"type": "boolean"}
         }
       },
       "E2ERunDetailPayload": {
@@ -2305,6 +2373,12 @@
           "event": {"type": "string"},
           "detail": {"type": ["string", "null"]},
           "actions": {"type": "array", "items": {"type": "object", "additionalProperties": true}},
+          "evidence": {
+            "oneOf": [
+              {"$ref": "#/components/schemas/TimelineEvidenceStatePayload"},
+              {"type": "null"}
+            ]
+          },
           "in_round_progress": {"type": "boolean", "default": false}
         }
       },

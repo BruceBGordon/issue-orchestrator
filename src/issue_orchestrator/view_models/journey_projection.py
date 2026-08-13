@@ -51,6 +51,8 @@ from .lifecycle_semantics import (
     OpenValidationDetailsCommand,
     OutcomeBadge,
 )
+from .projection_values import optional_string
+from .timeline_evidence_view import parse_timeline_evidence
 
 EventDict = Mapping[str, Any]
 
@@ -457,8 +459,9 @@ def build_journey_step(evt: EventDict, today: str) -> JourneyStep:
         narrative=event_to_narrative(evt),
         status=str(evt.get("status") or ""),
         event=str(evt.get("event") or ""),
-        detail=_optional_str_strict(evt.get("detail")),
+        detail=optional_string(evt.get("detail")),
         actions=actions,
+        evidence=parse_timeline_evidence(evt.get("evidence")),
         in_round_progress=evt.get("in_round_progress") is True,
     )
 
@@ -1036,14 +1039,6 @@ def _has_logical_semantics(events: Sequence[EventDict]) -> bool:
 
 def _journey_event_name(event: EventDict) -> str:
     return str(event.get("source_event") or event.get("event") or "")
-
-
-def _optional_str_strict(value: Any) -> str | None:
-    if value is None:
-        return None
-    text = str(value)
-    return text or None
-
 
 
 __all__ = [

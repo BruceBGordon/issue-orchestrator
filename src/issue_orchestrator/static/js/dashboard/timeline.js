@@ -42,6 +42,7 @@ function renderTimeline(container, events, phaseToc = [], cycles = []) {
             const time = evt.timestamp ? `<div class="timeline-time">${formatTimestamp(evt.timestamp)}</div>` : '';
             const artifacts = renderTimelineArtifacts(evt.artifacts || []);
             const actions = renderTimelineEventActions(evt.actions || [], evt, detailIds);
+            const evidence = renderTimelineEvidence(evt.evidence);
             // E2E test events carry issue_affordances — render as clickable links
             // that open the issue detail drawer routed to the explicit
             // /api/e2e-run/{run_id}/issue-detail/{N} endpoint (no base-repo
@@ -87,6 +88,7 @@ function renderTimeline(container, events, phaseToc = [], cycles = []) {
                         <span class="timeline-step">${escapeHtml(stepLabel)}</span>
                         <span class="timeline-status">${formatStatus(evt.status)}</span>
                     </div>
+                    ${evidence}
                     ${actions}
                     ${time}
                     ${summary}
@@ -201,12 +203,14 @@ function renderTimelineChildren(children, detailIds = null) {
             const time = evt.timestamp ? `<div class="timeline-time">${formatTimestamp(evt.timestamp)}</div>` : '';
             const artifacts = renderTimelineArtifacts(evt.artifacts || []);
             const actions = renderTimelineEventActions(evt.actions || [], evt, detailIds);
+            const evidence = renderTimelineEvidence(evt.evidence);
             return `
                 <div class="timeline-event ${evt.status || ''}">
                     <div class="timeline-event-header">
                         <span class="timeline-step">${escapeHtml(stepLabel)}</span>
                         <span class="timeline-status">${formatStatus(evt.status)}</span>
                     </div>
+                    ${evidence}
                     ${actions}
                     ${time}
                     ${summary}
@@ -293,6 +297,16 @@ function renderTimelineEventActions(actions, eventDetail = null, detailIds = nul
     return html;
 }
 
+function renderTimelineEvidence(evidence) {
+    if (!evidence || typeof evidence !== 'object') return '';
+    const status = String(evidence.status || 'missing');
+    const label = String(evidence.label || 'Evidence unavailable');
+    const helpText = String(evidence.help_text || label);
+    return `<span class="timeline-evidence">
+        <span class="timeline-evidence-badge timeline-evidence-${escapeAttr(status)}" title="${escapeAttr(helpText)}" aria-label="${escapeAttr(helpText)}">${escapeHtml(label)}</span>
+    </span>`;
+}
+
 function _timelineEventDetailsPayload(evt) {
     if (!evt || typeof evt !== 'object') return {};
     const payload = {};
@@ -342,6 +356,9 @@ function _timelineActionShortLabel(action) {
     if (type === 'open_orchestrator_log') return 'Issue-Scoped Orchestrator Log';
     if (type === 'open_session_diagnostics') return label || 'Diagnostics';
     if (type === 'show_actions_error') return label || 'What is missing?';
+    if (type === 'set_timeline_evidence_pin') {
+        return action.pinned ? 'Pin Evidence' : 'Unpin Evidence';
+    }
     if (type === 'open_path') {
         const normalized = label.replace(/^Open\s+/i, '').replace(/\s+↗$/, '').trim();
         if (/^completion$/i.test(normalized)) return 'Completion Record';
@@ -467,6 +484,10 @@ function runTimelineEventAction(action) {
         openSessionManifest(action.issue_number, action.run_dir || null);
         return;
     }
+    if (action.type === 'set_timeline_evidence_pin' && action.issue_number) {
+        setTimelineEvidencePinned(action);
+        return;
+    }
     if (action.type === 'show_event_details') {
         const detailId = String(action.detail_id || '');
         const details = timelineEventDetailsById.get(detailId);
@@ -494,6 +515,33 @@ function runTimelineEventAction(action) {
         return;
     }
     showToast(`Unsupported timeline action: ${action.type}`, 'error');
+}
+
+async function setTimelineEvidencePinned(action) {
+    const confirmation = String(action.confirm_message || '').trim();
+    if (confirmation && !window.confirm(confirmation)) return;
+    try {
+        const request = uiActionContract.buildTimelineEvidencePinRequest(
+            action.issue_number,
+            action.run_dir,
+            action.pinned,
+        );
+        const response = await fetch(request.endpoint, {
+            method: request.method,
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(request.body),
+        });
+        const data = await response.json();
+        if (!response.ok) {
+            throw new Error(data.error || data.detail || `Request failed (${response.status})`);
+        }
+        showToast(data.pinned ? 'Timeline evidence pinned' : 'Timeline evidence unpinned');
+        if (issueDetailData && issueDetailData.issue_number === Number(action.issue_number)) {
+            await openIssueDetail(action.issue_number, null, { focus: 'timeline' });
+        }
+    } catch (err) {
+        showToast(`Could not update Timeline evidence: ${err.message || err}`, 'error');
+    }
 }
 
 function openTimelineEventDetails(details) {

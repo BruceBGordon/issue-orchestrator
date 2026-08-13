@@ -1723,6 +1723,7 @@ class TestLabelActionGeneration:
         self, config: Config, agent_config: AgentConfig, tmp_worktree: Path
     ) -> None:
         issue = make_issue(number=123, labels=["agent:test"])
+        config.session_output_retention_days = 3
         agent_config.timeout_minutes = 90
         session_output = FileSystemSessionOutput()
         run = session_output.start_run(tmp_worktree, "coding-1", issue_number=123)
@@ -1756,6 +1757,10 @@ class TestLabelActionGeneration:
         assert manifest["runtime_minutes"] >= 90
         assert manifest["timeout_minutes"] == 90
         assert "ended_at" in manifest
+        ended_at = datetime.fromisoformat(manifest["ended_at"])
+        expires_at = datetime.fromisoformat(manifest["retention_expires_at"])
+        assert expires_at - ended_at == timedelta(days=3)
+        assert manifest["evidence_available"] is True
         audit_payload = Path(manifest["run_audit_path"]).read_text()
         assert "\"outcome\": \"timed_out\"" in audit_payload
 

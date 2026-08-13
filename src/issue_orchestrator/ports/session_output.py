@@ -186,7 +186,7 @@ class SessionOutput(Protocol):
             orchestrator_log: Path to orchestrator log
             completion_path: Path where completion.json will be written
             retention_tier: Retention tier label persisted in manifest
-            retention_days: Retention window in days (0 = expires immediately)
+            retention_days: Retention window recorded now and started at terminal outcome
             retention_pinned: Whether this run is pinned from retention cleanup
 
         Returns:

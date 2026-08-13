@@ -95,6 +95,22 @@ class TestFactGathererE2ESlotFacts:
         assert snapshot.e2e_due is False
         reader.assert_not_called()
 
+    def test_snapshot_observes_timeline_evidence_prune_cadence(
+        self, mock_config, mock_repository_host, sample_state, sample_issues
+    ):
+        evidence = MagicMock()
+        evidence.prune_due.return_value = True
+        gatherer = FactGatherer(
+            config=mock_config,
+            repository_host=mock_repository_host,
+            timeline_evidence=evidence,
+        )
+
+        snapshot = gatherer.create_snapshot(sample_state, sample_issues)
+
+        assert snapshot.timeline_evidence_prune_due is True
+        evidence.prune_due.assert_called_once_with()
+
     def test_running_signal_sets_occupies_slot(
         self, mock_config, mock_repository_host, sample_state, sample_issues
     ):

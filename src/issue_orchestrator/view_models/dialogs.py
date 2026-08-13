@@ -251,6 +251,15 @@ def _join_worktree_path(worktree: str, rel_path: Any) -> str:
 
 
 def _build_session_diagnostics_rows(ctx: SessionDiagnosticsContext) -> list[DialogRow]:
+    if ctx.retention_pinned == "True":
+        evidence_retention = "Pinned — retained until unpinned"
+        evidence_value_kind = None
+    elif ctx.retention_expires_at:
+        evidence_retention = ctx.retention_expires_at
+        evidence_value_kind = "timestamp"
+    else:
+        evidence_retention = "Starts when the run ends"
+        evidence_value_kind = None
     rows = [
         DialogRow("Session", ctx.session_name or "-"),
         DialogRow("Started", ctx.started_at or "-", value_kind="timestamp"),
@@ -268,8 +277,11 @@ def _build_session_diagnostics_rows(ctx: SessionDiagnosticsContext) -> list[Dial
         DialogRow("Prompt Mode", ctx.claude_prompt_mode or "-"),
         DialogRow("Claude Session", ctx.claude_session_id or "-"),
         DialogRow("Retention Tier", ctx.retention_tier or "-"),
-        DialogRow("Retention Expires", ctx.retention_expires_at or "-", value_kind="timestamp"),
-        DialogRow("Retention Pinned", ctx.retention_pinned or "-"),
+        DialogRow(
+            "Timeline Evidence",
+            evidence_retention,
+            value_kind=evidence_value_kind,
+        ),
         DialogRow("Worktree", ctx.worktree or "-"),
     ]
     # Project the typed outcome into Status + Reason rows. The union

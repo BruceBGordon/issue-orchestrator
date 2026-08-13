@@ -1043,6 +1043,7 @@ def build_test_orchestrator_deps(
     from issue_orchestrator.ports.provider_readiness import (
         NO_PROVIDER_READINESS_PROBE,
     )
+    from issue_orchestrator.ports.timeline_evidence import NULL_TIMELINE_EVIDENCE
 
     readiness_probe = provider_readiness_probe or NO_PROVIDER_READINESS_PROBE
 
@@ -1055,6 +1056,7 @@ def build_test_orchestrator_deps(
         timeline_reader=timeline_reader,
         timeline_store=NullTimelineStore(),
         timeline_writer=timeline_writer,
+        timeline_evidence=NULL_TIMELINE_EVIDENCE,
         goal_pilot_store=goal_pilot_store,
         attempt_store=attempt_store,
         tech_lead_authority=tech_lead_authority,

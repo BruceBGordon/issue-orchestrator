@@ -228,12 +228,16 @@ function renderIssueRawTimelineEvents(data, selectedRuns) {
             const status = evt.status ? formatStatus(evt.status) : '';
             const timestamp = formatTimestamp(evt.timestamp || '');
             const summary = evt.summary || evt.detail || '';
+            const evidence = typeof renderTimelineEvidence === 'function'
+                ? renderTimelineEvidence(evt.evidence)
+                : '';
             return `<div class="journey-raw-event ${escapeAttr(evt.status || '')}" role="listitem">
                 <div class="journey-raw-event-header">
                     <span>${escapeHtml(eventName)}</span>
                     <span>${escapeHtml(status)}</span>
                 </div>
                 ${timestamp ? `<div class="journey-raw-event-meta">${escapeHtml(timestamp)}</div>` : ''}
+                ${evidence}
                 ${summary ? `<div class="journey-raw-event-summary">${escapeHtml(summary)}</div>` : ''}
             </div>`;
         }).join('')

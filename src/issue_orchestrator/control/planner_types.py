@@ -118,6 +118,9 @@ class OrchestratorSnapshot:
     #     letting a due suite beat new issues without preempting reviews/reworks.
     e2e_occupies_slot: bool = False
     e2e_due: bool = False
+    # Read-only maintenance cadence observation. The mutation is planned and
+    # applied through PruneTimelineEvidenceAction.
+    timeline_evidence_prune_due: bool = False
     # Provider launch eligibility, sampled once per tick BEFORE planning
     # (#6999 A3). Planning reads it; planning never takes the sample,
     # because sampling probes a CLI and writes circuit state.

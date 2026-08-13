@@ -346,6 +346,8 @@ observability:
   session_no_output_max_bytes: 10000
   session_no_output_repeat_seconds: 120
   session_output_retention_runs: 7
+  # Minimum days after a run ends that Timeline replay/evidence remains available.
+  # Exact runs can be pinned in Timeline; pinned evidence is retained until unpinned.
   session_output_retention_days: 7
   session_output_retention_tier: "hot"  # hot | cold
   stale_escalation_ticks: 0

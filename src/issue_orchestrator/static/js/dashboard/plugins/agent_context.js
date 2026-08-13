@@ -196,6 +196,9 @@
             : '';
         const detail = step && step.detail ? `<div class="journey-detail">${escapeHtml(step.detail)}</div>` : '';
         const actions = _defaultIssueLifecycleStepActions(step, options);
+        const evidence = typeof renderTimelineEvidence === 'function'
+            ? renderTimelineEvidence(step && step.evidence)
+            : '';
         const narrative = escapeHtml((step && (step.narrative || step.event)) || '');
         const timestamp = escapeHtml(_formatIssueLifecycleStepTimestamp(
             (step && step.timestamp) || '',
@@ -219,6 +222,7 @@
                     <span class="journey-main">
                         <span class="journey-summary-row">
                             <span class="journey-narrative">${narrative}</span>
+                            ${evidence}
                         </span>
                         ${validationDetail}
                     </span>
@@ -235,6 +239,7 @@
             <div class="journey-summary-row">
                 <span class="journey-narrative">${narrative}</span>
                 ${progressBadge}
+                ${evidence}
                 ${actions}
             </div>
             ${detail}

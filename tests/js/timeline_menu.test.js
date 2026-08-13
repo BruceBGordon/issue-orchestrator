@@ -55,7 +55,7 @@ class FakeElement {
     }
 }
 
-function loadTimeline() {
+function loadTimeline(overrides = {}) {
     const body = new FakeElement();
     const documentElement = new FakeElement();
     const openMenus = [];
@@ -92,6 +92,7 @@ function loadTimeline() {
         openModal: () => {},
         modalOverlay: { classList: { add: () => {} } },
         formatTimestamp: (value, fallback = '') => value ? `local:${String(value).slice(0, 10)}` : fallback,
+        ...overrides,
     };
     vm.createContext(context);
     const source = fs.readFileSync(
@@ -287,4 +288,111 @@ test('handleTimelineEventActionsClick accepts a text-node target from the summar
     assert.deepEqual(calls, ['preventDefault', 'stopPropagation']);
     assert.equal(menu.hasAttribute('open'), true);
     assert.equal(items.style.left, '304px');
+});
+
+test('timeline evidence action dispatches the exact-run pin command', () => {
+    const context = loadTimeline();
+    const calls = [];
+    context.setTimelineEvidencePinned = action => calls.push(action);
+    const action = {
+        type: 'set_timeline_evidence_pin',
+        issue_number: 42,
+        run_dir: '/runs/failed-42',
+        pinned: true,
+    };
+
+    context.runTimelineEventAction(action);
+
+    assert.deepEqual(calls, [action]);
+});
+
+test('pinning timeline evidence posts through the typed request and refreshes its drawer', async () => {
+    const calls = [];
+    const context = loadTimeline({
+        window: { confirm: () => true },
+        issueDetailData: { issue_number: 42 },
+        uiActionContract: {
+            buildTimelineEvidencePinRequest: (...args) => {
+                calls.push(['request', ...args]);
+                return {
+                    endpoint: '/api/issues/42/timeline-evidence/pin',
+                    method: 'PUT',
+                    body: { run_dir: '/runs/failed-42', pinned: true },
+                };
+            },
+        },
+        fetch: async (endpoint, options) => {
+            calls.push(['fetch', endpoint, options]);
+            return {
+                ok: true,
+                json: async () => ({ pinned: true }),
+            };
+        },
+        showToast: message => calls.push(['toast', message]),
+        openIssueDetail: async (...args) => calls.push(['refresh', ...args]),
+    });
+
+    await context.setTimelineEvidencePinned({
+        issue_number: 42,
+        run_dir: '/runs/failed-42',
+        pinned: true,
+        confirm_message: '',
+    });
+
+    assert.deepEqual(calls[0], ['request', 42, '/runs/failed-42', true]);
+    const fetchCall = calls.find(call => call[0] === 'fetch');
+    assert.equal(fetchCall[1], '/api/issues/42/timeline-evidence/pin');
+    assert.equal(fetchCall[2].method, 'PUT');
+    assert.deepEqual(JSON.parse(fetchCall[2].body), {
+        run_dir: '/runs/failed-42',
+        pinned: true,
+    });
+    const refreshCall = calls.at(-1);
+    assert.equal(refreshCall[0], 'refresh');
+    assert.equal(refreshCall[1], 42);
+    assert.equal(refreshCall[2], null);
+    assert.equal(refreshCall[3].focus, 'timeline');
+});
+
+test('expired evidence unpin confirmation can cancel before mutation', async () => {
+    const calls = [];
+    const context = loadTimeline({
+        window: {
+            confirm: message => {
+                calls.push(['confirm', message]);
+                return false;
+            },
+        },
+        uiActionContract: {
+            buildTimelineEvidencePinRequest: () => calls.push(['request']),
+        },
+        fetch: async () => calls.push(['fetch']),
+    });
+
+    await context.setTimelineEvidencePinned({
+        issue_number: 42,
+        run_dir: '/runs/failed-42',
+        pinned: false,
+        confirm_message: 'Unpinning removes this evidence now.',
+    });
+
+    assert.deepEqual(calls, [[
+        'confirm',
+        'Unpinning removes this evidence now.',
+    ]]);
+});
+
+test('timeline evidence badge exposes visible text and status-independent help', () => {
+    const context = loadTimeline();
+
+    const html = context.renderTimelineEvidence({
+        status: 'pinned',
+        label: 'Pinned',
+        help_text: 'Pinned evidence is retained until unpinned.',
+    });
+
+    assert.match(html, /timeline-evidence-pinned/);
+    assert.match(html, />Pinned<\/span>/);
+    assert.match(html, /title="Pinned evidence is retained until unpinned\."/);
+    assert.match(html, /aria-label="Pinned evidence is retained until unpinned\."/);
 });

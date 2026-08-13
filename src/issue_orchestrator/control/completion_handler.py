@@ -49,6 +49,7 @@ from .completion_action_planner import (
     CompletionActionPlanner,
     has_review_exchange_errors,
 )
+from .completion_manifest import enrich_terminal_run_manifest
 from .tech_lead_completion import discard_tech_lead_authority_after_completion
 from .invalid_record_actions import (
     failure_event_reason,
@@ -320,7 +321,13 @@ class CompletionHandler:
             )
 
         # Enrich manifest with runtime context + log tail
-        self._enrich_manifest_runtime(session, status)
+        enrich_terminal_run_manifest(
+            session=session,
+            status=status,
+            run_dir=self._resolve_session_run_dir(session),
+            session_output=self._session_output,
+            retention_days=self.config.session_output_retention_days,
+        )
 
         audit_actions = self._create_run_audit_and_actions(
             session,
@@ -1143,50 +1150,6 @@ class CompletionHandler:
                 expected=build_expected_for_mutation(),
             ),
         )
-
-    def _enrich_manifest_runtime(
-        self,
-        session: Session,
-        status: SessionStatus,
-    ) -> None:
-        """Write runtime context and log tail into the run manifest.
-
-        Best-effort — failures are logged but never block completion.
-        """
-        from ..domain.run_manifest import RunManifest
-
-        run_dir = self._resolve_session_run_dir(session)
-
-        try:
-            manifest = RunManifest.load(run_dir)
-        except Exception as exc:
-            logger.warning(
-                "[MANIFEST] Failed to load manifest for runtime enrichment: %s", exc,
-            )
-            return
-
-        manifest.runtime_minutes = session.runtime_minutes
-        if session.agent_config:
-            manifest.timeout_minutes = session.agent_config.timeout_minutes
-        if manifest.outcome is None:
-            manifest.outcome = status.value
-        if manifest.ended_at is None:
-            manifest.ended_at = datetime.now(timezone.utc).isoformat()
-
-        # Capture log tail for all outcomes
-        log_path = self._session_output.get_log_path_for_run_dir(run_dir)
-        if isinstance(log_path, Path) and log_path.exists():
-            try:
-                content = log_path.read_text()
-                lines = content.strip().split("\n")
-                manifest.log_tail = "\n".join(lines[-20:])
-            except Exception as exc:
-                logger.debug("[MANIFEST] Could not read log tail: %s", exc)
-
-        try:
-            manifest.save()
-        except Exception as exc:
-            logger.warning("[MANIFEST] Failed to save runtime enrichment: %s", exc)
 
     def _resolve_session_run_dir(self, session: Session) -> Path:
         """Resolve run_dir for events/diagnostics."""

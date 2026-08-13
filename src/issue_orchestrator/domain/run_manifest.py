@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass, field, fields
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +28,7 @@ from .artifact_contracts import (
     ValidationOutcome,
     validation_outcome_from_manifest_fields,
 )
+from .timeline_evidence import manifest_is_retention_protected
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +58,17 @@ class RunManifest:
     ended_at: str | None = None
     runtime_minutes: float | None = None
     timeout_minutes: int | None = None
+
+    # ------------------------------------------------------------------
+    # Timeline evidence retention (window finalized at terminal outcome)
+    # ------------------------------------------------------------------
+    retention_tier: str | None = None
+    retention_days: int | None = None
+    retention_expires_at: str | None = None
+    retention_pinned: bool = False
+    evidence_archived_at: str | None = None
+    evidence_expired_at: str | None = None
+    evidence_available: bool | None = None
 
     # ------------------------------------------------------------------
     # Outcome (set at completion)
@@ -178,6 +191,24 @@ class RunManifest:
         known_kwargs["run_dir"] = run_dir
 
         return cls(**known_kwargs, _extra=extra)
+
+    @classmethod
+    def has_retained_timeline_evidence(
+        cls,
+        run_dir: Path,
+        *,
+        now: datetime,
+    ) -> bool:
+        """Return whether count-based cleanup must preserve an exact run."""
+        try:
+            manifest = cls.load(run_dir)
+        except (FileNotFoundError, json.JSONDecodeError, ValueError):
+            return False
+        return manifest_is_retention_protected(
+            expires_at=manifest.retention_expires_at,
+            pinned=bool(manifest.retention_pinned),
+            now=now,
+        )
 
     def save(self) -> None:
         """Write the manifest to disk."""

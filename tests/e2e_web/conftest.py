@@ -22,6 +22,10 @@ from issue_orchestrator.execution.timeline_reader import DefaultTimelineReader
 from issue_orchestrator.execution.timeline_store import SqliteTimelineStore
 import issue_orchestrator.entrypoints.web as web_module
 from issue_orchestrator.entrypoints.web import app
+from issue_orchestrator.ports.timeline_evidence import (
+    NULL_TIMELINE_EVIDENCE,
+    TimelineEvidence,
+)
 from issue_orchestrator.ports.timeline_store import TimelineRecord
 from tests.fixtures.web_contract_mocks import MockOrchestratorForWeb
 
@@ -32,6 +36,7 @@ class FlowWebDeps:
 
     timeline_store: SqliteTimelineStore
     timeline_reader: DefaultTimelineReader
+    timeline_evidence: TimelineEvidence
     publish_recovery: MagicMock
 
 
@@ -337,6 +342,7 @@ def _configure_flow_deps(orchestrator: FlowWebMockOrchestrator, repo_root: Path)
     orchestrator.deps = FlowWebDeps(
         timeline_store=store,
         timeline_reader=DefaultTimelineReader(store),
+        timeline_evidence=NULL_TIMELINE_EVIDENCE,
         publish_recovery=publish_recovery,
     )
     orchestrator.config.repo_root = repo_root

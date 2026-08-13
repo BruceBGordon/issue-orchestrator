@@ -639,6 +639,7 @@ class JourneyStepPayload(BaseModel):
     day: str
     detail: str | None = None
     event: str
+    evidence: TimelineEvidenceStatePayload | None = None
     in_round_progress: bool | None = None
     narrative: str
     status: str
@@ -1280,6 +1281,23 @@ class TimelineDiagnosticPayload(BaseModel):
     evidence_ref: str | None = None
     message: str
     severity: Literal['info', 'warning', 'error']
+
+class TimelineEvidencePinRequestPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    pinned: bool
+    run_dir: str = Field(..., min_length=1)
+
+class TimelineEvidenceStatePayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    archived: bool
+    available: bool
+    expires_at: str | None
+    help_text: str
+    label: str
+    pinned: bool
+    run_dir: str
+    status: Literal['active', 'retained', 'pinned', 'expired', 'missing']
+    unpin_expires_immediately: bool
 
 class TimelineSubjectPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
