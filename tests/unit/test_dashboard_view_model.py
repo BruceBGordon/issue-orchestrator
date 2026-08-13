@@ -1561,6 +1561,40 @@ def test_publish_failed_scope_issue_survives_blocked_lane_without_queue_entry():
     assert blocked_item["blocked_summary"]
 
 
+def test_blocked_column_reports_items_omitted_from_compact_preview():
+    config = _make_config()
+    issues = [
+        Issue(
+            number=issue_number,
+            title=f"Blocked issue {issue_number}",
+            labels=["agent:web", "blocked-failed"],
+        )
+        for issue_number in range(1, 14)
+    ]
+    state = OrchestratorState(
+        startup_status="complete",
+        cached_scope_issues=issues,
+        cached_queue_issues=[],
+    )
+    orchestrator = _OrchestratorStub(state=state, config=config)
+
+    view_model = build_dashboard_view_model(
+        orchestrator,
+        provider_circuit=NO_PROVIDER_CIRCUIT_STATUS,
+        queue_page=1,
+        active_tab="flow",
+        e2e_page=1,
+        e2e_status_provider=lambda _: {"enabled": False, "running": False},
+    )
+
+    blocked_column = next(
+        column for column in view_model.flow_columns if column["id"] == "blocked"
+    )
+    assert blocked_column["count"] == 13
+    assert len(blocked_column["items"]) == 12
+    assert blocked_column["hidden_count"] == 1
+
+
 def test_review_stage_queue_item_does_not_get_queue_wait_reason():
     config = _make_config()
     issue = Issue(number=4057, title="Queued", labels=["agent:web"])

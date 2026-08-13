@@ -864,6 +864,31 @@ html[data-embedded="true"] .embedded-sep {
     max-height: none;
     overflow: auto;
 }
+.column-overflow-footer {
+    margin: 0 8px 8px;
+    padding: 7px 10px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: transparent;
+    color: var(--text-muted);
+    font: inherit;
+    font-size: 12px;
+    cursor: pointer;
+    flex-shrink: 0;
+}
+.column-overflow-footer:hover {
+    background: var(--bg-hover);
+    color: var(--text);
+}
+.column-expand-btn:focus-visible,
+.column-overflow-footer:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+}
+.column-overflow-footer[hidden],
+.kanban-column.expanded .column-overflow-footer {
+    display: none;
+}
 
 /* Press feedback: shared affordance across dashboard surfaces. */
 .settings-btn:active,
@@ -875,6 +900,7 @@ html[data-embedded="true"] .embedded-sep {
 .tab-menu-btn:active,
 .tab:active,
 .column-expand-btn:active,
+.column-overflow-footer:active,
 .filter-btn:active,
 .card-focus:active,
 .card-refresh-btn:active,

@@ -260,6 +260,70 @@ def test_kanban_blocked_column_is_expandable(jinja_env):
     assert "agent:web" in badge_texts
 
 
+def test_truncated_blocked_column_renders_full_list_footer(jinja_env):
+    config = make_config()
+    config.agents = {"agent:web": make_agent_config()}
+    blocked_issues = [
+        Issue(
+            number=issue_number,
+            title=f"Blocked issue {issue_number}",
+            labels=["agent:web", "blocked-failed"],
+        )
+        for issue_number in range(1, 14)
+    ]
+    state = OrchestratorState(
+        startup_status="complete",
+        cached_scope_issues=blocked_issues,
+    )
+    vm = build_dashboard_view_model(
+        OrchestratorStub(state=state, config=config),
+        provider_circuit=NO_PROVIDER_CIRCUIT_STATUS,
+        active_tab="flow",
+        e2e_status_provider=e2e_disabled,
+    )
+
+    soup = render_dashboard(jinja_env, vm)
+    blocked_col = soup.select_one('[data-column="blocked"]')
+    assert blocked_col is not None
+    footer = blocked_col.select_one(".column-overflow-footer")
+    assert footer is not None
+    assert footer.get_text(" ", strip=True) == "… 1 more"
+    assert footer.get("hidden") is None
+    assert footer.get("aria-controls") == "column-blocked-expanded"
+    assert footer.get("aria-expanded") == "false"
+    assert footer.get("onclick") == "expandColumnFromOverflow(this)"
+
+    expanded = blocked_col.select_one("#column-blocked-expanded")
+    assert expanded is not None
+    assert expanded.get("role") == "region"
+    assert expanded.get("aria-label") == "Blocked full list"
+    assert expanded.get("aria-labelledby") is None
+
+
+def test_complete_compact_column_keeps_full_list_footer_hidden(jinja_env):
+    config = make_config()
+    config.agents = {"agent:web": make_agent_config()}
+    state = OrchestratorState(
+        startup_status="complete",
+        cached_queue_issues=[
+            Issue(number=1, title="Only item", labels=["agent:web"]),
+        ],
+    )
+    vm = build_dashboard_view_model(
+        OrchestratorStub(state=state, config=config),
+        provider_circuit=NO_PROVIDER_CIRCUIT_STATUS,
+        active_tab="flow",
+        e2e_status_provider=e2e_disabled,
+    )
+
+    soup = render_dashboard(jinja_env, vm)
+    queued_col = soup.select_one('[data-column="queued"]')
+    assert queued_col is not None
+    footer = queued_col.select_one(".column-overflow-footer")
+    assert footer is not None
+    assert footer.has_attr("hidden")
+
+
 def test_kanban_running_column_is_expandable_and_routes_cancel_to_menu(jinja_env):
     config = make_config()
     config.agents = {"agent:web": make_agent_config()}

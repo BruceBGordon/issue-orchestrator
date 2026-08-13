@@ -433,6 +433,7 @@ export interface FailedE2ETestExecutionPayload {
 export interface FlowColumnPayload {
   count: number;
   expandable?: boolean;
+  hidden_count: number;
   id: string;
   items: IssueItemPayload[];
   session_scoped?: boolean;

@@ -1969,6 +1969,17 @@ def test_stack_dashboard_card_matches_ui_openapi() -> None:
     assert card["stack_signal"]
 
 
+def test_flow_column_hidden_count_is_required_by_ui_openapi() -> None:
+    payload = _stacked_view_model_dict()
+
+    queued = next(column for column in payload["flow_columns"] if column["id"] == "queued")
+    assert queued["hidden_count"] == 0
+    del queued["hidden_count"]
+
+    with pytest.raises(JsonSchemaValidationError):
+        _validator("DashboardViewModelPayload").validate(payload)
+
+
 def test_malformed_stack_dependency_rejected_by_ui_openapi() -> None:
     payload = _stacked_view_model_dict()
     # has_stack_edges must be a bool and required fields are missing, so this

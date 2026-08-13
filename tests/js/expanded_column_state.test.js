@@ -41,6 +41,7 @@ test('dashboard refresh keeps server column count instead of preview length', ()
 
     assert.match(dashboardJs, /const serverCount = Number\(col\.count\);/);
     assert.match(dashboardJs, /Number\.isFinite\(serverCount\) \? serverCount : visibleItems\.length/);
+    assert.match(dashboardJs, /syncColumnOverflowFooter\(colEl, col\)/);
     assert.doesNotMatch(dashboardJs, /countEl\.textContent = visibleItems\.length/);
 });
 

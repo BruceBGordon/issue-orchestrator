@@ -447,6 +447,7 @@ class FlowColumnPayload(BaseModel):
     model_config = ConfigDict(extra="allow")
     count: int
     expandable: bool | None = None
+    hidden_count: int = Field(..., ge=0, strict=True)
     id: str
     items: list[IssueItemPayload]
     session_scoped: bool | None = None
