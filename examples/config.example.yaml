@@ -227,14 +227,15 @@ merge_queue:
 
 cleanup:
   # Orchestrator-owned issue worktrees are removed only after the applicable
-  # review gate. Set false to retain them for manual inspection.
+  # review gate. Timing is independent of the action flags below: disabling
+  # tab closure does not make worktree removal happen before review.
   with_tech_lead:
     close_ai_session_tabs: true
     remove_worktrees: true
   without_tech_lead:
-    wait_for_code_review: true
+    wait_for_code_review: true  # false runs selected actions on completion
     close_ai_session_tabs: true
-    remove_worktrees: true
+    remove_worktrees: true      # false retains worktrees for inspection
 
 validation:
   quick:

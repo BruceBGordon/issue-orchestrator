@@ -1008,16 +1008,7 @@ class CompletionHandler:
         pending_cleanup = None
 
         if status == SessionStatus.COMPLETED and is_work_session and pr_url and pr_number:
-            # Check if we should defer cleanup based on review workflow
-            if self.config.tech_lead_enabled:
-                # Tech Lead workflow: defer until tech_lead review passes
-                should_defer = self.config.cleanup.with_tech_lead.close_ai_session_tabs
-            elif self.config.code_review_agent:
-                # Code review only: defer if configured to wait
-                should_defer = (
-                    self.config.cleanup.without_tech_lead.wait_for_code_review
-                    and self.config.cleanup.without_tech_lead.close_ai_session_tabs
-                )
+            should_defer = self._should_wait_for_review_before_cleanup()
 
         if should_defer:
             # should_defer is only True if pr_number and pr_url are set (line 337)
@@ -1033,6 +1024,22 @@ class CompletionHandler:
             logger.info(f"[CLEANUP] Deferred cleanup for #{session.issue.number} until review completes")
 
         return should_defer, pending_cleanup
+
+    def _should_wait_for_review_before_cleanup(self) -> bool:
+        """Return whether any configured cleanup action waits for review."""
+        if self.config.tech_lead_enabled:
+            cleanup = self.config.cleanup.with_tech_lead
+            wait_for_review = True
+        elif self.config.code_review_agent:
+            cleanup = self.config.cleanup.without_tech_lead
+            wait_for_review = cleanup.wait_for_code_review
+        else:
+            return False
+
+        cleanup_requested = (
+            cleanup.close_ai_session_tabs or cleanup.remove_worktrees
+        )
+        return wait_for_review and cleanup_requested
 
     def _should_queue_review(
         self,

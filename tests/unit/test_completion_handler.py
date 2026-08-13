@@ -878,12 +878,28 @@ class TestPRDetection:
 class TestCleanupStrategy:
     """Tests for cleanup strategy determination."""
 
-    def test_completed_work_session_with_tech_lead_defers_cleanup(
-        self, config: Config, agent_config: AgentConfig, tmp_worktree: Path
+    @pytest.mark.parametrize(
+        ("close_tabs", "remove_worktrees", "expected_defer"),
+        [
+            pytest.param(True, True, True, id="both-actions"),
+            pytest.param(True, False, True, id="close-tabs-only"),
+            pytest.param(False, True, True, id="remove-worktree-only"),
+            pytest.param(False, False, False, id="no-actions"),
+        ],
+    )
+    def test_tech_lead_review_gate_is_independent_of_cleanup_actions(
+        self,
+        config: Config,
+        agent_config: AgentConfig,
+        tmp_worktree: Path,
+        close_tabs: bool,
+        remove_worktrees: bool,
+        expected_defer: bool,
     ) -> None:
-        """Work session with tech lead agent configured defers cleanup."""
+        """Either selected cleanup action waits for tech-lead review."""
         config.tech_lead_review_agent = "agent:tech-lead"
-        config.cleanup.with_tech_lead.close_ai_session_tabs = True
+        config.cleanup.with_tech_lead.close_ai_session_tabs = close_tabs
+        config.cleanup.with_tech_lead.remove_worktrees = remove_worktrees
         issue = make_issue()
         session = create_test_session(issue, agent_config, tmp_worktree, terminal_id="issue-1")
 
@@ -894,18 +910,40 @@ class TestCleanupStrategy:
 
         result = handler.process_completion(session, SessionStatus.COMPLETED)
 
-        assert result.should_defer_cleanup is True
-        assert result.pending_cleanup is not None
-        assert result.pending_cleanup.pr_number == 42
+        assert result.should_defer_cleanup is expected_defer
+        assert (result.pending_cleanup is not None) is expected_defer
+        if result.pending_cleanup is not None:
+            assert result.pending_cleanup.pr_number == 42
 
-    def test_completed_work_session_without_tech_lead_uses_code_review_config(
-        self, config: Config, agent_config: AgentConfig, tmp_worktree: Path
+    @pytest.mark.parametrize(
+        ("wait_for_review", "close_tabs", "remove_worktrees", "expected_defer"),
+        [
+            pytest.param(True, True, True, True, id="wait-both-actions"),
+            pytest.param(True, True, False, True, id="wait-close-tabs-only"),
+            pytest.param(True, False, True, True, id="wait-remove-worktree-only"),
+            pytest.param(True, False, False, False, id="wait-no-actions"),
+            pytest.param(False, True, True, False, id="immediate-both-actions"),
+            pytest.param(False, True, False, False, id="immediate-close-tabs-only"),
+            pytest.param(False, False, True, False, id="immediate-remove-worktree-only"),
+            pytest.param(False, False, False, False, id="immediate-no-actions"),
+        ],
+    )
+    def test_code_review_timing_is_independent_of_cleanup_actions(
+        self,
+        config: Config,
+        agent_config: AgentConfig,
+        tmp_worktree: Path,
+        wait_for_review: bool,
+        close_tabs: bool,
+        remove_worktrees: bool,
+        expected_defer: bool,
     ) -> None:
-        """Work session without tech_lead uses code_review cleanup config."""
+        """The wait flag controls timing; action flags control cleanup work."""
         config.tech_lead_review_agent = None
         config.code_review_agent = "agent:reviewer"
-        config.cleanup.without_tech_lead.wait_for_code_review = True
-        config.cleanup.without_tech_lead.close_ai_session_tabs = True
+        config.cleanup.without_tech_lead.wait_for_code_review = wait_for_review
+        config.cleanup.without_tech_lead.close_ai_session_tabs = close_tabs
+        config.cleanup.without_tech_lead.remove_worktrees = remove_worktrees
         issue = make_issue()
         session = create_test_session(issue, agent_config, tmp_worktree, terminal_id="issue-1")
 
@@ -916,7 +954,8 @@ class TestCleanupStrategy:
 
         result = handler.process_completion(session, SessionStatus.COMPLETED)
 
-        assert result.should_defer_cleanup is True
+        assert result.should_defer_cleanup is expected_defer
+        assert (result.pending_cleanup is not None) is expected_defer
 
     def test_disabled_tech_lead_uses_code_review_cleanup_without_erasing_agent(
         self, config: Config, agent_config: AgentConfig, tmp_worktree: Path
