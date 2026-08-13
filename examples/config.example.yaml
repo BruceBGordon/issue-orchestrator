@@ -226,13 +226,15 @@ merge_queue:
   # failure_action: "rework"        # how to route a failed queue entry: rework | needs_human
 
 cleanup:
+  # Orchestrator-owned issue worktrees are removed only after the applicable
+  # review gate. Set false to retain them for manual inspection.
   with_tech_lead:
     close_ai_session_tabs: true
-    remove_worktrees: false
+    remove_worktrees: true
   without_tech_lead:
     wait_for_code_review: true
     close_ai_session_tabs: true
-    remove_worktrees: false
+    remove_worktrees: true
 
 validation:
   quick:

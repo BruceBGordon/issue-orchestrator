@@ -23,6 +23,7 @@ from unittest.mock import MagicMock, patch
 from issue_orchestrator.domain.tech_lead_session import TechLeadCreationOrigin
 from issue_orchestrator.domain.claim import ClaimResult
 from issue_orchestrator.control.provider_resilience import ProviderResilienceManager
+from issue_orchestrator.control.launch_transaction import PendingWorkLaunchClaim
 from issue_orchestrator.domain.repository_launch_selection import (
     RepositoryLaunchSelection,
 )
@@ -104,6 +105,7 @@ from issue_orchestrator.domain.models import (
     SessionKey,
 )
 from issue_orchestrator.domain.issue_key import GitHubIssueKey, FakeIssueKey
+from issue_orchestrator.domain.pending_work import PendingWorkClaim, PendingWorkKind
 from issue_orchestrator.domain.board_snapshot import (
     BOARD_SNAPSHOT_SCHEMA_VERSION,
     BoardFailure,
@@ -142,7 +144,10 @@ from issue_orchestrator.control.board_snapshot_builder import (
     BoardSnapshotBuilder,
     StateBoardSnapshotProvider,
 )
-from issue_orchestrator.ports.worktree_manager import WorktreeReuseOptions
+from issue_orchestrator.ports.worktree_manager import (
+    RegisteredWorktree,
+    WorktreeReuseOptions,
+)
 from issue_orchestrator.ports.pull_request_tracker import PRInfo, PRRef
 from issue_orchestrator.ports.repository_host import DependencyIssueSnapshot
 from issue_orchestrator.ports.session_output import SessionOutput
@@ -284,6 +289,8 @@ class MockWorktreeManager:
         self.create_calls: list[dict] = []
         self.remove_calls: list[Path] = []
         self.remove_force_calls: list[tuple[Path, bool]] = []
+        self.checkout_only_removals: list[tuple[Path, bool]] = []
+        self.checkout_and_branch_removals: list[tuple[Path, bool]] = []
 
     def create(
         self,
@@ -319,13 +326,25 @@ class MockWorktreeManager:
             branch_name=branch_name or f"{issue_number}-feature",
         )
 
-    def remove(self, worktree_path: Path, *, force: bool = False) -> None:
+    def remove_checkout(self, worktree_path: Path, *, force: bool = False) -> None:
         self.remove_calls.append(worktree_path)
         self.remove_force_calls.append((worktree_path, force))
+        self.checkout_only_removals.append((worktree_path, force))
+
+    def remove_checkout_and_branch(
+        self, worktree_path: Path, *, force: bool = False
+    ) -> None:
+        self.remove_calls.append(worktree_path)
+        self.remove_force_calls.append((worktree_path, force))
+        self.checkout_and_branch_removals.append((worktree_path, force))
 
     def can_remove_without_user_changes(self, worktree_path: Path) -> bool:
         del worktree_path
         return False
+
+    def list_registered(self, repo_root: Path) -> tuple[RegisteredWorktree, ...]:
+        del repo_root
+        return ()
 
 
 class MockWorkingCopy:
@@ -1066,8 +1085,8 @@ class TestLaunchIssueSession:
         self, launcher_bundle, mock_worktree_manager, sample_config, tmp_path
     ):
         """A scratch investigation worktree has no reuse path, so a launch that
-        fails at terminal-session creation must remove it rather than leak it
-        (#6823) — unlike a coding worktree, which is kept for retry reuse."""
+        fails at terminal-session creation must remove both checkout and branch;
+        ordinary failed launches preserve their reusable branch (#6823)."""
         prompt_path = tmp_path / "prompt.md"
         sample_config.agents["agent:tech-lead"] = AgentConfig(
             prompt_path=prompt_path,
@@ -1104,6 +1123,131 @@ class TestLaunchIssueSession:
         # F8: a disposable scratch worktree is FORCE-removed — a partial launch
         # can leave an untracked artifact that a non-forced remove would fail on.
         assert (scratch_path, True) in mock_worktree_manager.remove_force_calls
+
+    @pytest.mark.parametrize(
+        "failure_stage",
+        [
+            "pending_work_claim",
+            "tech_lead_prep",
+            "setup",
+            "in_progress_label",
+            "terminal",
+        ],
+    )
+    @pytest.mark.parametrize("disposable", [False, True])
+    def test_pre_active_failure_cleanup_owns_branch_policy(
+        self,
+        failure_stage,
+        disposable,
+        launcher_bundle,
+        mock_worktree_manager,
+        mock_command_runner,
+        sample_config,
+        tmp_path,
+    ):
+        """Every pre-active failure preserves ordinary branches and deletes
+        disposable scratch branches through one cleanup owner."""
+        prompt_path = tmp_path / "prompt.md"
+        sample_config.agents["agent:tech-lead"] = AgentConfig(
+            prompt_path=prompt_path,
+            model="sonnet",
+            timeout_minutes=45,
+        )
+        sample_config.tech_lead_review_agent = "agent:tech-lead"
+        work_claim = None
+        claim_store = MagicMock()
+        if failure_stage == "pending_work_claim":
+            claim_store.hold_pending_work_claim.side_effect = RuntimeError(
+                "claim store failed"
+            )
+        elif failure_stage == "tech_lead_prep":
+            launcher_bundle.board_snapshot_provider.error = RuntimeError("prep failed")
+        elif failure_stage == "setup":
+            sample_config.setup_worktree = ["make worktree-setup"]
+            mock_command_runner.results = [
+                CommandResult(
+                    returncode=1,
+                    stdout="",
+                    stderr="setup failed",
+                    timed_out=False,
+                )
+            ]
+        elif failure_stage == "in_progress_label":
+            def apply_action(action):
+                if isinstance(action, AddLabelAction) and action.label == "in-progress":
+                    return ActionResult.fail(action, "label failed")
+                return ActionResult.ok(action)
+
+            launcher_bundle.action_applier.apply = MagicMock(
+                side_effect=apply_action
+            )
+        else:
+            launcher_bundle.create_session_override[0] = (
+                lambda _name, _cmd, _wd, _title: False
+            )
+
+        issue = Issue(
+            number=5980,
+            title="Tech Lead launch",
+            labels=["agent:tech-lead"],
+            repo="test/repo",
+        )
+        flavor = (
+            TechLeadSessionFlavor.FAILURE_INVESTIGATION
+            if disposable
+            else TechLeadSessionFlavor.BATCH_REVIEW
+        )
+        if failure_stage == "pending_work_claim":
+            work_claim = PendingWorkLaunchClaim(
+                claim=PendingWorkClaim(
+                    kind=PendingWorkKind.TECH_LEAD,
+                    request=PendingTechLeadReview(
+                        issue_number=issue.number,
+                        title=issue.title,
+                        flavor=flavor,
+                        failure=(
+                            DiscoveredFailure(
+                                issue.number,
+                                issue.title,
+                                "failed",
+                            )
+                            if flavor
+                            is TechLeadSessionFlavor.FAILURE_INVESTIGATION
+                            else None
+                        ),
+                    ),
+                ),
+                claims=claim_store,
+            )
+
+        launch_kwargs = {}
+        if work_claim is not None:
+            launch_kwargs["work_claim"] = work_claim
+        result = launcher_bundle.launcher.launch_issue_session(
+            issue,
+            active_sessions=[],
+            tech_lead_scope=TechLeadLaunchScope(flavor=flavor),
+            **launch_kwargs,
+        )
+
+        assert result.success is False
+        if failure_stage == "pending_work_claim":
+            assert result.disposition is LaunchDisposition.CLAIM_UNRECORDED
+            claim_store.hold_pending_work_claim.assert_called_once()
+        (create_call,) = mock_worktree_manager.create_calls
+        worktree_path = tmp_path / (
+            create_call["worktree_name"] or f"worktree-{issue.number}"
+        )
+        if disposable:
+            assert mock_worktree_manager.checkout_and_branch_removals == [
+                (worktree_path, True)
+            ]
+            assert mock_worktree_manager.checkout_only_removals == []
+        else:
+            assert mock_worktree_manager.checkout_only_removals == [
+                (worktree_path, False)
+            ]
+            assert mock_worktree_manager.checkout_and_branch_removals == []
 
     def test_coding_launch_uses_focus_worktree_not_scratch(
         self, session_launcher, mock_worktree_manager, sample_issue

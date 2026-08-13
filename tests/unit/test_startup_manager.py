@@ -11,6 +11,7 @@ from issue_orchestrator.control.session_launch_types import LaunchResult
 from issue_orchestrator.control.session_routing import orchestrator_launch_tech_lead_session
 from issue_orchestrator.control.startup_manager import StartupManager
 from issue_orchestrator.control.issue_fetch_resilience import IssueFetchResilience
+from issue_orchestrator.control.worktree_reconciliation import WorktreeRecoverySummary
 from issue_orchestrator.control.action_applier import ActionApplier
 from issue_orchestrator.control.actions import AddLabelAction, RemoveLabelAction
 from issue_orchestrator.execution.label_store import LabelStore
@@ -26,6 +27,12 @@ from issue_orchestrator.domain.models import (
     ORCHESTRATOR_PR_MARKER,
 )
 from issue_orchestrator.domain.tech_lead_session import TechLeadSessionFlavor
+
+
+def _startup_worktree_reconciler() -> MagicMock:
+    reconciler = MagicMock()
+    reconciler.recover.return_value = WorktreeRecoverySummary(0, 0, 0)
+    return reconciler
 
 
 class _FakeLabelSet:
@@ -147,6 +154,7 @@ def startup_manager(
         launch_session_fn=lambda issue: None,
         update_queue_cache_fn=lambda: None,
         issue_fetch_resilience=IssueFetchResilience("owner/repo"),
+        startup_worktree_reconciler=_startup_worktree_reconciler(),
         label_store=mock_label_store,
     )
 
@@ -162,6 +170,9 @@ class TestStartupManagerBasic:
 
         assert sample_state.startup_status == "complete"
         assert sample_state.startup_message == ""
+        startup_manager._startup_worktree_reconciler.recover.assert_called_once_with(  # noqa: SLF001
+            sample_state
+        )
 
     @pytest.mark.asyncio
     async def test_run_startup_emits_config_event(
@@ -364,6 +375,7 @@ class TestStartupManagerInProgressIssues:
             launch_session_fn=lambda issue: None,
             update_queue_cache_fn=lambda: None,
             issue_fetch_resilience=IssueFetchResilience("owner/repo"),
+            startup_worktree_reconciler=_startup_worktree_reconciler(),
             queue_cache_store=queue_cache_store,
             label_store=mock_label_store,
         )
@@ -549,6 +561,7 @@ class TestStartupManagerLabelStoreReconcile:
             launch_session_fn=lambda issue: None,
             update_queue_cache_fn=lambda: None,
             issue_fetch_resilience=IssueFetchResilience("owner/repo"),
+            startup_worktree_reconciler=_startup_worktree_reconciler(),
             label_store=store,
         )
 
@@ -619,6 +632,7 @@ class TestStartupManagerLabelStoreReconcile:
             launch_session_fn=lambda issue: None,
             update_queue_cache_fn=lambda: None,
             issue_fetch_resilience=IssueFetchResilience("owner/repo"),
+            startup_worktree_reconciler=_startup_worktree_reconciler(),
             queue_cache_store=queue_cache_store,
             label_store=store,
         )
@@ -1319,6 +1333,7 @@ class TestStartupManagerResumePartialWork:
             launch_session_fn=launch_session,
             update_queue_cache_fn=lambda: None,
             issue_fetch_resilience=IssueFetchResilience("owner/repo"),
+            startup_worktree_reconciler=_startup_worktree_reconciler(),
             label_store=mock_label_store,
         )
 
@@ -1378,6 +1393,7 @@ class TestStartupManagerResumePartialWork:
             launch_session_fn=launch_session,
             update_queue_cache_fn=lambda: None,
             issue_fetch_resilience=IssueFetchResilience("owner/repo"),
+            startup_worktree_reconciler=_startup_worktree_reconciler(),
             label_store=mock_label_store,
         )
 
@@ -1705,6 +1721,7 @@ class TestStartupGitHubCallBudget:
             launch_session_fn=lambda issue: None,
             update_queue_cache_fn=lambda: None,
             issue_fetch_resilience=IssueFetchResilience("owner/repo"),
+            startup_worktree_reconciler=_startup_worktree_reconciler(),
         )
 
         await sm.run_startup(OrchestratorState())
@@ -1737,6 +1754,7 @@ class TestStartupGitHubCallBudget:
             launch_session_fn=lambda issue: None,
             update_queue_cache_fn=lambda: None,
             issue_fetch_resilience=IssueFetchResilience("owner/repo"),
+            startup_worktree_reconciler=_startup_worktree_reconciler(),
         )
 
         await sm.run_startup(OrchestratorState())
@@ -1762,6 +1780,7 @@ class TestStartupGitHubCallBudget:
             launch_session_fn=lambda issue: None,
             update_queue_cache_fn=lambda: None,
             issue_fetch_resilience=IssueFetchResilience("owner/repo"),
+            startup_worktree_reconciler=_startup_worktree_reconciler(),
         )
 
         await sm.run_startup(OrchestratorState())
@@ -1813,6 +1832,7 @@ class TestStartupGitHubCallBudget:
             launch_session_fn=lambda issue: None,
             update_queue_cache_fn=lambda: None,
             issue_fetch_resilience=IssueFetchResilience("owner/repo"),
+            startup_worktree_reconciler=_startup_worktree_reconciler(),
             queue_cache_store=mock_store,
         )
 
@@ -1850,6 +1870,7 @@ class TestStartupGitHubCallBudget:
             launch_session_fn=lambda issue: None,
             update_queue_cache_fn=lambda: None,
             issue_fetch_resilience=IssueFetchResilience("owner/repo"),
+            startup_worktree_reconciler=_startup_worktree_reconciler(),
             queue_cache_store=mock_store,
         )
 
@@ -1881,6 +1902,7 @@ class TestStartupGitHubCallBudget:
             launch_session_fn=lambda issue: None,
             update_queue_cache_fn=lambda: None,
             issue_fetch_resilience=IssueFetchResilience("owner/repo"),
+            startup_worktree_reconciler=_startup_worktree_reconciler(),
             queue_cache_store=mock_store,
         )
 
@@ -1918,6 +1940,7 @@ class TestStartupGitHubCallBudget:
             launch_session_fn=lambda issue: None,
             update_queue_cache_fn=update_queue_fn,
             issue_fetch_resilience=IssueFetchResilience("owner/repo"),
+            startup_worktree_reconciler=_startup_worktree_reconciler(),
             queue_cache_store=mock_store,
         )
 
@@ -2021,6 +2044,7 @@ class TestStartupSweepsThePendingWorkLedger:
             launch_session_fn=lambda issue: None,
             update_queue_cache_fn=lambda: None,
             issue_fetch_resilience=IssueFetchResilience("owner/repo"),
+            startup_worktree_reconciler=_startup_worktree_reconciler(),
             label_store=mock_label_store,
         )
 

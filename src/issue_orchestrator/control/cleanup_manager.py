@@ -191,7 +191,7 @@ class CleanupManager:
     def _remove_worktree_for_cleanup(self, worktree_path: Path, *, issue_number: int) -> bool:
         """Remove a worktree, escalating only when no user changes would be lost."""
         try:
-            self._worktree_manager.remove(worktree_path)
+            self._worktree_manager.remove_checkout(worktree_path)
             return True
         except Exception as first_error:
             try:
@@ -221,7 +221,7 @@ class CleanupManager:
                 issue_number,
             )
             try:
-                self._worktree_manager.remove(worktree_path, force=True)
+                self._worktree_manager.remove_checkout(worktree_path, force=True)
                 return True
             except Exception as force_error:
                 logger.warning(

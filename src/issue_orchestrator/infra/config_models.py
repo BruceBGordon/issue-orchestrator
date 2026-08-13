@@ -27,7 +27,7 @@ class CleanupWithTechLead:
     """Cleanup settings when tech_lead review is enabled."""
 
     close_ai_session_tabs: bool = True
-    remove_worktrees: bool = False
+    remove_worktrees: bool = True
 
 
 @dataclass
@@ -36,7 +36,7 @@ class CleanupWithoutTechLead:
 
     wait_for_code_review: bool = True  # True = after code review, False = on completion
     close_ai_session_tabs: bool = True
-    remove_worktrees: bool = False
+    remove_worktrees: bool = True
 
 
 @dataclass

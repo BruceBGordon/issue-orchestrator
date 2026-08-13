@@ -5,6 +5,14 @@
 
 export type TimelineView = "user" | "ops" | "debug" | "raw";
 
+export type WorktreeAuditActivityEvidence = "known" | "unknown";
+
+export type WorktreeAuditDisposition = "managed" | "cleanup_candidate" | "retained";
+
+export type WorktreeAuditKind = "issue" | "reviewer" | "tech_lead_scratch" | "external";
+
+export type WorktreeAuditScope = "configured" | "repo-parent-fallback";
+
 export interface AgentIdentityPayload {
   name: string;
   role: "coder" | "reviewer" | "rework" | "validator" | "e2e_runner" | "orchestrator";
@@ -1315,6 +1323,30 @@ export interface ViewModelSnapshotPayload {
   count: number;
   rows: IssueRowPayload[];
   view_model: DashboardViewModelPayload;
+}
+
+export interface WorktreeAuditEntryPayload {
+  disposition: WorktreeAuditDisposition;
+  kind: WorktreeAuditKind;
+  name: string;
+  path: string;
+  reason: string;
+}
+
+export interface WorktreeAuditRequestPayload {
+  repo_root: string;
+}
+
+export interface WorktreeAuditResponsePayload {
+  activity_evidence: WorktreeAuditActivityEvidence;
+  audit_unavailable: boolean;
+  cleanup_candidates: WorktreeAuditEntryPayload[];
+  issue_cleanup_enabled: boolean | null;
+  message: string;
+  note: string | null;
+  scope: WorktreeAuditScope;
+  stale_worktrees: WorktreeAuditEntryPayload[];
+  worktrees: WorktreeAuditEntryPayload[];
 }
 
 export type CodingAttemptPayload = RunningCodingAttemptPayload | CompletedCodingAttemptPayload | PublishFailedCodingAttemptPayload | BlockedCodingAttemptPayload | FailedCodingAttemptPayload | MissingCodingEvidencePayload;

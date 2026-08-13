@@ -1665,9 +1665,10 @@ class ActionApplier:
             # make ``git worktree remove`` fail (exit 128) and leak it. A normal
             # coding worktree stays non-forced so user work is never discarded
             # (#6824 F8).
-            self.worktree_manager.remove(
-                Path(action.worktree_path), force=action.disposable_worktree
-            )
+            remove_worktree = self.worktree_manager.remove_checkout
+            if action.disposable_worktree:
+                remove_worktree = self.worktree_manager.remove_checkout_and_branch
+            remove_worktree(Path(action.worktree_path), force=action.disposable_worktree)
             logger.info(issue_log(action.issue_number, "Removed worktree: %s"), action.worktree_path)
         except Exception as e:
             errors.append(f"remove worktree: {e}")
@@ -1696,7 +1697,7 @@ class ActionApplier:
             )
 
         try:
-            self.worktree_manager.remove(Path(action.worktree_path))
+            self.worktree_manager.remove_checkout(Path(action.worktree_path))
             # Notify async completion processing that worktree is gone
             if self.on_worktree_removed:
                 self.on_worktree_removed(action.worktree_path)

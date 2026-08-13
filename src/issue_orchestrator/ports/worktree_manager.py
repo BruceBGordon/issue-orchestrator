@@ -14,6 +14,10 @@ from pathlib import Path
 from typing import Protocol
 
 
+WORKTREE_ID_MARKER = Path(".issue-orchestrator/worktree-id")
+REVIEWER_OWNED_HEAD_MARKER = Path(".issue-orchestrator/reviewer-owned-head")
+
+
 @dataclass
 class WorktreeInfo:
     """Information about a created worktree."""
@@ -24,6 +28,24 @@ class WorktreeInfo:
     rebase_failed: bool = False  # True if rebase onto main failed (work was discarded)
     uncommitted_discarded: int = 0  # Count of uncommitted changes discarded during reset
     commits_discarded: int = 0  # Count of commits discarded during reset (rebase failure)
+
+
+@dataclass(frozen=True)
+class RegisteredWorktree:
+    """A worktree registered in a repository's git metadata."""
+    path: Path
+    head: str
+    branch: str | None = None
+    locked: bool = False
+    prunable: bool = False
+
+
+@dataclass(frozen=True)
+class ReviewerHeadOwnership:
+    """Persisted evidence of the detached tip installed by reviewer lifecycle."""
+
+    marker_present: bool
+    expected_head: str | None
 
 
 @dataclass
@@ -90,8 +112,8 @@ class WorktreeManager(Protocol):
         """
         ...
 
-    def remove(self, worktree_path: Path, *, force: bool = False) -> None:
-        """Remove a git worktree.
+    def remove_checkout(self, worktree_path: Path, *, force: bool = False) -> None:
+        """Remove a git worktree checkout while preserving its local branch.
 
         Args:
             worktree_path: Path to the worktree to remove
@@ -104,12 +126,37 @@ class WorktreeManager(Protocol):
         """
         ...
 
+    def remove_checkout_and_branch(
+        self,
+        worktree_path: Path,
+        *,
+        force: bool = False,
+    ) -> None:
+        """Remove a disposable checkout and its associated local branch.
+
+        This destructive operation is reserved for owners whose lifecycle
+        contract explicitly permits branch deletion, such as scratch/reset
+        cleanup. Ordinary review-gated retention cleanup must call
+        :meth:`remove_checkout` instead.
+        """
+        ...
+
     def can_remove_without_user_changes(self, worktree_path: Path) -> bool:
         """Return true when forced removal would only discard owned artifacts.
 
         Implementations must return false when tracked changes are present or
         when untracked paths are not known runtime/dependency outputs.
         """
+        ...
+
+    def read_reviewer_head_ownership(
+        self, worktree_path: Path
+    ) -> ReviewerHeadOwnership:
+        """Read typed reviewer-tip evidence without exposing marker storage."""
+        ...
+
+    def list_registered(self, repo_root: Path) -> tuple[RegisteredWorktree, ...]:
+        """Return the worktrees registered for ``repo_root`` by git."""
         ...
 
     def extract_issue_number(self, branch_name: str) -> int | None:

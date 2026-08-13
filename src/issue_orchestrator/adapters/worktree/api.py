@@ -15,7 +15,12 @@ from ._worktree import (
 )
 from ._worktree_errors import WorktreeError
 from ._worktree_hooks import HOOKS_DIR, install_hooks
-from ._worktree_runtime import install_claude_settings, sync_cli_tools
+from ._worktree_runtime import (
+    install_claude_settings,
+    install_worktree_identity,
+    read_reviewer_head_ownership,
+    sync_cli_tools,
+)
 from ._worktree_runtime_setup import WorktreeRuntimeSetup, WorktreeRuntimeState
 
 
@@ -37,5 +42,7 @@ __all__ = [
     "find_worktree_for_branch",
     "HOOKS_DIR",
     "install_claude_settings",
+    "install_worktree_identity",
+    "read_reviewer_head_ownership",
     "sync_cli_tools",
 ]

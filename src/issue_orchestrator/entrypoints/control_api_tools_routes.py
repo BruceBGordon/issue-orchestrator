@@ -10,6 +10,10 @@ import json
 from fastapi import APIRouter, Query, Request
 from fastapi.responses import JSONResponse
 
+from ..contracts.ui_openapi_models import (
+    WorktreeAuditRequestPayload,
+    WorktreeAuditResponsePayload,
+)
 from ..execution.control_center_actions import (
     AuditActionRequest,
     ConfiguredRepoActionRequest,
@@ -109,28 +113,27 @@ async def tools_labels_init(
     return JSONResponse(result.payload, status_code=result.status_code)
 
 
-@control_tools_router.post("/control/tools/worktrees/cleanup")
+@control_tools_router.post(
+    "/control/tools/worktrees/cleanup",
+    response_model=WorktreeAuditResponsePayload,
+)
 async def tools_worktrees_cleanup(
-    request: Request,
+    body: WorktreeAuditRequestPayload,
     deps: ControlApiToolsDependency,
-) -> JSONResponse:
-    """List stale worktrees (read-only, no deletion).
+) -> WorktreeAuditResponsePayload | JSONResponse:
+    """Audit registered worktrees (read-only, no deletion).
 
-    This endpoint only LISTS stale worktrees. It does not delete them.
-    Users should run `git worktree prune` manually to clean up.
+    The response uses the same ownership and safety policy as startup cleanup.
+    It never deletes worktrees and does not recommend ``git worktree prune``,
+    which only removes stale registrations rather than live worktree paths.
 
     JSON body:
         repo_root: str - Repository root path
 
     Returns:
-        List of stale worktrees and instructions for cleanup.
+        Classified registered worktrees and safe cleanup candidates.
     """
-    try:
-        body = await request.json()
-    except json.JSONDecodeError:
-        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
-
-    repo_path = deps.validate_repo_root(body.get("repo_root"))
+    repo_path = deps.validate_repo_root(body.repo_root)
     if repo_path is None:
         return JSONResponse({"error": "Invalid repo_root"}, status_code=400)
 
@@ -141,4 +144,6 @@ async def tools_worktrees_cleanup(
             selection=actions.effective_launch_selection(repo_path),
         ),
     )
-    return JSONResponse(result.payload, status_code=result.status_code)
+    if result.status_code != 200:
+        return JSONResponse(result.payload, status_code=result.status_code)
+    return WorktreeAuditResponsePayload.model_validate(result.payload)

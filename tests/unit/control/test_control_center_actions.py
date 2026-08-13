@@ -27,11 +27,22 @@ from issue_orchestrator.execution.control_center_actions import (
     TraceActionRequest,
     TraceIssueCommand,
 )
+from issue_orchestrator.control.worktree_reconciliation import (
+    WorktreeActivityEvidence,
+    WorktreeAuditOwner,
+)
 from issue_orchestrator.domain.repository_launch_selection import (
     RepositoryLaunchSelection,
 )
 from issue_orchestrator.infra.repo_lock import acquire_lock, release_lock
 from issue_orchestrator.infra.supervisor import MultiInstanceStatus, SupervisorStatus
+from issue_orchestrator.ports.worktree_manager import (
+    RegisteredWorktree,
+    ReviewerHeadOwnership,
+)
+from issue_orchestrator.execution.control_center_worktree_audit import (
+    ControlCenterWorktreeAuditOwner,
+)
 
 
 @pytest.mark.asyncio
@@ -332,9 +343,13 @@ async def test_refresh_command_forwards_inflight_ids(monkeypatch: pytest.MonkeyP
 async def test_stale_worktrees_fallback_without_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     repo_root = tmp_path / "trustlist"
     repo_root.mkdir()
-    stale = tmp_path / "trustlist-4070"
-    stale.mkdir()
-    (stale / ".git").write_text("gitdir: /tmp/fake")
+    (repo_root / ".git").mkdir()
+    managed = tmp_path / "trustlist-4070"
+    reviewer = tmp_path / "trustlist-4070-review-20260812T010203123456Z"
+    for path in (managed, reviewer):
+        marker = path / ".issue-orchestrator" / "worktree-id"
+        marker.parent.mkdir(parents=True)
+        marker.write_text("wt-owned", encoding="utf-8")
 
     # Force fallback mode (no config available).
     monkeypatch.setattr(
@@ -342,13 +357,27 @@ async def test_stale_worktrees_fallback_without_config(monkeypatch: pytest.Monke
         lambda repo_root, selection: (_ for _ in ()).throw(FileNotFoundError()),
     )
 
-    fake_git = SimpleNamespace(list_active_worktrees=lambda _repo: set())
-    monkeypatch.setattr(
-        "issue_orchestrator.execution.git_working_copy.GitWorkingCopy",
-        lambda: fake_git,
+    fake_git = SimpleNamespace(
+        list_registered=lambda _repo: (
+            RegisteredWorktree(managed, "a" * 40, "4070-fix"),
+            RegisteredWorktree(reviewer, "a" * 40, None),
+        ),
+        can_remove_without_user_changes=lambda _path: True,
+        read_reviewer_head_ownership=lambda _path: ReviewerHeadOwnership(
+            marker_present=False,
+            expected_head=None,
+        ),
+    )
+    activity_reader = SimpleNamespace(
+        read=lambda _repo, _selection: WorktreeActivityEvidence.known(set()),
     )
 
-    cmd = ListStaleWorktreesCommand()
+    cmd = ListStaleWorktreesCommand(
+        ControlCenterWorktreeAuditOwner(
+            WorktreeAuditOwner(fake_git),
+            activity_reader,
+        )
+    )
     result = await cmd.execute(
         ConfiguredRepoActionRequest(
             repo_root=repo_root,
@@ -359,7 +388,87 @@ async def test_stale_worktrees_fallback_without_config(monkeypatch: pytest.Monke
     assert result.status_code == 200
     assert result.payload["scope"] == "repo-parent-fallback"
     paths = [entry["path"] for entry in result.payload["stale_worktrees"]]
-    assert str(stale) in paths
+    assert paths == [str(reviewer)]
+    assert {entry["path"] for entry in result.payload["worktrees"]} == {
+        str(managed),
+        str(reviewer),
+    }
+    assert "cleanup_command" not in result.payload
+
+
+@pytest.mark.asyncio
+async def test_worktree_audit_uses_selected_config_and_retains_active_disposables(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    repo_root = tmp_path / "project"
+    repo_root.mkdir()
+    (repo_root / ".git").mkdir()
+    selected_base = tmp_path / "selected-worktrees"
+    selected_base.mkdir()
+    reviewer = selected_base / "project-41-review-20260812T010203123456Z"
+    scratch = selected_base / "project-tech-lead-42-abcdef123456"
+    for path in (reviewer, scratch):
+        marker = path / ".issue-orchestrator" / "worktree-id"
+        marker.parent.mkdir(parents=True)
+        marker.write_text("wt-owned", encoding="utf-8")
+
+    selection = RepositoryLaunchSelection.parse(
+        mode="codex",
+        config_name="second.yaml",
+    )
+    selected_config = SimpleNamespace(
+        worktree_base=selected_base,
+        tech_lead_enabled=False,
+        cleanup=SimpleNamespace(
+            without_tech_lead=SimpleNamespace(remove_worktrees=True),
+        ),
+    )
+    loaded: list[tuple[Path, RepositoryLaunchSelection]] = []
+    monkeypatch.setattr(
+        "issue_orchestrator.execution.control_center_runtime.load_config_for_selection",
+        lambda repo, requested: loaded.append((repo, requested)) or selected_config,
+    )
+    fake_git = SimpleNamespace(
+        list_registered=lambda _repo: (
+            RegisteredWorktree(reviewer, "a" * 40, None),
+            RegisteredWorktree(
+                scratch,
+                "b" * 40,
+                "tech-lead-investigation-42-abcdef123456",
+            ),
+        ),
+        can_remove_without_user_changes=lambda _path: True,
+    )
+    activity_reader = SimpleNamespace(
+        read=lambda _repo, requested: (
+            WorktreeActivityEvidence.known({reviewer, scratch})
+            if requested == selection
+            else WorktreeActivityEvidence.unknown()
+        ),
+    )
+    command = ListStaleWorktreesCommand(
+        ControlCenterWorktreeAuditOwner(
+            WorktreeAuditOwner(fake_git),
+            activity_reader,
+        )
+    )
+
+    result = await command.execute(
+        ConfiguredRepoActionRequest(repo_root=repo_root, selection=selection)
+    )
+
+    assert loaded == [(repo_root, selection)]
+    assert result.payload["issue_cleanup_enabled"] is True
+    assert result.payload["activity_evidence"] == "known"
+    assert result.payload["cleanup_candidates"] == []
+    assert {entry["kind"] for entry in result.payload["worktrees"]} == {
+        "reviewer",
+        "tech_lead_scratch",
+    }
+    assert {entry["disposition"] for entry in result.payload["worktrees"]} == {
+        "retained"
+    }
 
 
 @pytest.mark.asyncio

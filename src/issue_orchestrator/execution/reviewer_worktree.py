@@ -15,11 +15,14 @@ Lifecycle:
 from __future__ import annotations
 
 import logging
+import os
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+from ..adapters.worktree.api import WorktreeError, install_worktree_identity
 from ..domain.review_exchange import REVIEWER_WORKTREE_CHECKOUT_FAILURE_MARKER
+from ..ports.worktree_manager import REVIEWER_OWNED_HEAD_MARKER, WORKTREE_ID_MARKER
 
 logger = logging.getLogger(__name__)
 
@@ -132,6 +135,22 @@ def create_reviewer_worktree(
                 "target_sha": tip_sha,
             },
         ) from exc
+    try:
+        install_worktree_identity(sibling)
+        _persist_owned_head(sibling, tip_sha)
+    except (WorktreeError, ReviewerWorktreeError) as exc:
+        try:
+            _git(repo_root, ["worktree", "remove", str(sibling), "--force"])
+        except ReviewerWorktreeError:
+            logger.exception("Failed to roll back unowned reviewer worktree %s", sibling)
+        raise ReviewerWorktreeError(
+            f"Failed to install reviewer ownership in worktree {sibling}: {exc}",
+            context={
+                "reviewer_worktree": str(sibling),
+                "coder_branch": coder_branch,
+                "target_sha": tip_sha,
+            },
+        ) from exc
     logger.info(
         "Created reviewer worktree path=%s coder_branch=%s tip=%s",
         sibling,
@@ -169,6 +188,7 @@ def fast_forward_reviewer_worktree(reviewer: ReviewerWorktree) -> str:
             enriched.diagnostic(),
         )
         raise enriched from exc
+    _persist_owned_head(reviewer.path, tip_sha)
     logger.debug(
         "Fast-forwarded reviewer worktree path=%s tip=%s",
         reviewer.path,
@@ -189,12 +209,30 @@ def remove_reviewer_worktree(
     if not reviewer.path.exists():
         return
     repo_root = _resolve_repo_root(reviewer.path)
+    marker_contents: dict[Path, str] = {}
+    for relative_marker in (WORKTREE_ID_MARKER, REVIEWER_OWNED_HEAD_MARKER):
+        marker = reviewer.path / relative_marker
+        try:
+            marker_contents[marker] = marker.read_text(encoding="utf-8")
+            marker.unlink()
+        except OSError:
+            continue
     args = ["worktree", "remove", str(reviewer.path)]
     if force:
         args.append("--force")
     try:
         _git(repo_root, args)
     except ReviewerWorktreeError as exc:
+        if reviewer.path.exists():
+            for marker, marker_content in marker_contents.items():
+                try:
+                    marker.parent.mkdir(parents=True, exist_ok=True)
+                    marker.write_text(marker_content, encoding="utf-8")
+                except OSError:
+                    logger.exception(
+                        "Failed to restore reviewer ownership marker after removal failure: %s",
+                        marker,
+                    )
         if force:
             logger.warning(
                 "git worktree remove --force failed for %s: %s",
@@ -242,6 +280,29 @@ def _resolve_repo_root(worktree_path: Path) -> Path:
 def _resolve_branch_tip(repo_root: Path, branch: str) -> str:
     result = _git(repo_root, ["rev-parse", branch])
     return result.stdout.strip()
+
+
+def _persist_owned_head(worktree_path: Path, head: str) -> None:
+    """Record the exact detached tip installed by the reviewer lifecycle.
+
+    Startup recovery compares this value with the registered detached HEAD.
+    A failed or interrupted write therefore fails closed: recovery retains the
+    checkout rather than guessing whether a reviewer committed local work.
+    """
+    marker = worktree_path / REVIEWER_OWNED_HEAD_MARKER
+    try:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(marker, flags, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as owned_head_file:
+            owned_head_file.write(f"{head}\n")
+    except OSError as exc:
+        raise ReviewerWorktreeError(
+            f"Failed to persist reviewer owned HEAD at {marker}: {exc}",
+            context={"reviewer_worktree": str(worktree_path), "target_sha": head},
+        ) from exc
 
 
 def _git(cwd: Path, args: list[str]) -> subprocess.CompletedProcess[str]:

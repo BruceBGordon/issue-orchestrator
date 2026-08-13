@@ -2923,7 +2923,7 @@ class TestImmediateCleanup:
         support_for_cleanup._immediate_cleanup(session, SessionStatus.COMPLETED)  # noqa: SLF001
 
         # Should have called worktree remove
-        support_for_cleanup.worktree_manager.remove.assert_called_once()
+        support_for_cleanup.worktree_manager.remove_checkout.assert_called_once()
 
     def test_kills_session_terminal(self, support_for_cleanup, tmp_path):
         """_immediate_cleanup always attempts to kill session terminal."""
@@ -2942,7 +2942,7 @@ class TestImmediateCleanup:
         session = make_session(issue, tmp_path=tmp_path)
 
         # Make both operations fail
-        support_for_cleanup.worktree_manager.remove.side_effect = Exception("Worktree error")
+        support_for_cleanup.worktree_manager.remove_checkout.side_effect = Exception("Worktree error")
         support_for_cleanup.kill_session.side_effect = Exception("Kill error")
 
         # noqa: SLF001 - Testing error handling behavior of private method

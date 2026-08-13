@@ -120,6 +120,15 @@ merge_queue:
   enqueue_after: "code-reviewed"
   failure_action: "rework"
 
+cleanup:
+  with_tech_lead:
+    close_ai_session_tabs: true
+    remove_worktrees: true
+  without_tech_lead:
+    wait_for_code_review: true
+    close_ai_session_tabs: true
+    remove_worktrees: true
+
 validation:
   quick:
     cmd: make validate-quick

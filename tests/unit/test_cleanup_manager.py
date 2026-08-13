@@ -88,7 +88,7 @@ def mock_worktree_manager():
     """Create a mock worktree manager."""
     mgr = MagicMock()
     mgr.extract_issue_number.return_value = None
-    mgr.remove.return_value = None
+    mgr.remove_checkout.return_value = None
     mgr.can_remove_without_user_changes.return_value = False
     return mgr
 
@@ -319,7 +319,7 @@ class TestProcessDeferredCleanups:
 
         cleanup_manager.process_deferred_cleanups(pending)
 
-        mock_worktree_manager.remove.assert_called_once_with(worktree_path)
+        mock_worktree_manager.remove_checkout.assert_called_once_with(worktree_path)
 
     def test_handles_kill_session_failure(
         self, cleanup_manager, cleanup_manager_bundle, mock_config, mock_repository_host, caplog
@@ -353,7 +353,7 @@ class TestProcessDeferredCleanups:
     ):
         """Worktree removal failure is logged and cleanup remains pending."""
         mock_config.tech_lead_review_agent = "agent:tech-lead"
-        mock_worktree_manager.remove.side_effect = Exception("Permission denied")
+        mock_worktree_manager.remove_checkout.side_effect = Exception("Permission denied")
 
         pending = [
             make_pending_cleanup(
@@ -381,7 +381,7 @@ class TestProcessDeferredCleanups:
         """Runtime-only untracked artifacts do not strand deferred cleanups."""
         mock_config.tech_lead_review_agent = "agent:tech-lead"
         worktree_path = Path("/tmp/worktree")
-        mock_worktree_manager.remove.side_effect = [Exception("dirty"), None]
+        mock_worktree_manager.remove_checkout.side_effect = [Exception("dirty"), None]
         mock_worktree_manager.can_remove_without_user_changes.return_value = True
 
         pending = [
@@ -400,7 +400,7 @@ class TestProcessDeferredCleanups:
         result = cleanup_manager.process_deferred_cleanups(pending)
 
         assert result == []
-        assert mock_worktree_manager.remove.call_args_list == [
+        assert mock_worktree_manager.remove_checkout.call_args_list == [
             call(worktree_path),
             call(worktree_path, force=True),
         ]
@@ -411,7 +411,7 @@ class TestProcessDeferredCleanups:
         """Tracked or non-runtime dirty state remains pending for operator review."""
         mock_config.tech_lead_review_agent = "agent:tech-lead"
         worktree_path = Path("/tmp/worktree")
-        mock_worktree_manager.remove.side_effect = Exception("dirty")
+        mock_worktree_manager.remove_checkout.side_effect = Exception("dirty")
         mock_worktree_manager.can_remove_without_user_changes.return_value = False
 
         pending = [
@@ -430,7 +430,7 @@ class TestProcessDeferredCleanups:
         result = cleanup_manager.process_deferred_cleanups(pending)
 
         assert result == pending
-        mock_worktree_manager.remove.assert_called_once_with(worktree_path)
+        mock_worktree_manager.remove_checkout.assert_called_once_with(worktree_path)
 
     def test_handles_pr_fetch_failure(
         self, cleanup_manager, mock_config, mock_repository_host, caplog
@@ -566,7 +566,7 @@ class TestRecoverOrphanedCleanups:
         result = cleanup_manager.recover_orphaned_cleanups()
 
         assert result == 0
-        mock_worktree_manager.remove.assert_not_called()
+        mock_worktree_manager.remove_checkout.assert_not_called()
 
     def test_cleans_up_orphaned_worktrees(
         self, cleanup_manager, cleanup_manager_bundle, mock_config, mock_repository_host, mock_worktree_manager, tmp_path
@@ -592,7 +592,7 @@ class TestRecoverOrphanedCleanups:
         result = cleanup_manager.recover_orphaned_cleanups()
 
         assert result == 1
-        mock_worktree_manager.remove.assert_called_once()
+        mock_worktree_manager.remove_checkout.assert_called_once()
 
     def test_handles_pr_fetch_failure(
         self, cleanup_manager, mock_config, mock_repository_host, caplog
@@ -646,7 +646,7 @@ class TestRecoverOrphanedCleanups:
                    labels=[], body="", state="open")
         ]
         mock_worktree_manager.extract_issue_number.return_value = 123
-        mock_worktree_manager.remove.side_effect = Exception("Cannot remove")
+        mock_worktree_manager.remove_checkout.side_effect = Exception("Cannot remove")
 
         cleanup_manager_bundle.session_exists.return_value = False
 

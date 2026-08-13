@@ -31,6 +31,8 @@ from issue_orchestrator.contracts.ui_openapi_models import (
     RepositorySetupPreviewPayload,
     RepositorySetupResultPayload,
     ViewModelSnapshotPayload,
+    WorktreeAuditRequestPayload,
+    WorktreeAuditResponsePayload,
 )
 from issue_orchestrator.domain.issue_key import FakeIssueKey
 from issue_orchestrator.domain.models import (
@@ -206,6 +208,50 @@ def _e2e_timeline_cycle(*events: dict[str, object]) -> dict[str, object]:
         "events": list(events),
         "summary": "E2E execution",
     }
+
+
+def test_worktree_audit_request_and_response_match_ui_openapi() -> None:
+    request = {"repo_root": "/repos/project"}
+    response = {
+        "worktrees": [
+            {
+                "path": "/repos/project-41",
+                "name": "project-41",
+                "kind": "issue",
+                "disposition": "managed",
+                "reason": "review-gated cleanup",
+            },
+            {
+                "path": "/repos/project-tech-lead-42-abcdef123456",
+                "name": "project-tech-lead-42-abcdef123456",
+                "kind": "tech_lead_scratch",
+                "disposition": "retained",
+                "reason": "active session restored at startup",
+            },
+        ],
+        "cleanup_candidates": [],
+        "stale_worktrees": [],
+        "message": "Read-only audit complete.",
+        "issue_cleanup_enabled": True,
+        "activity_evidence": "known",
+        "audit_unavailable": False,
+        "scope": "configured",
+        "note": None,
+    }
+
+    _validator("WorktreeAuditRequestPayload").validate(request)
+    _validator("WorktreeAuditResponsePayload").validate(response)
+    WorktreeAuditRequestPayload.model_validate(request)
+    WorktreeAuditResponsePayload.model_validate(response)
+
+    schema = __import__("json").loads(Path("docs/api/ui-openapi.json").read_text())
+    operation = schema["paths"]["/control/tools/worktrees/cleanup"]["post"]
+    assert operation["requestBody"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/WorktreeAuditRequestPayload"
+    }
+    assert operation["responses"]["200"]["content"]["application/json"][
+        "schema"
+    ] == {"$ref": "#/components/schemas/WorktreeAuditResponsePayload"}
 
 
 def test_repository_setup_command_and_results_match_ui_openapi() -> None:

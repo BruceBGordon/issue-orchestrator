@@ -572,25 +572,36 @@ class SessionLauncher:
         """Check if this agent type is the tech_lead review agent."""
         return is_tech_lead_session(self.config.tech_lead_review_agent, agent_type)
 
-    def _remove_scratch_worktree_if_disposable(
-        self, issue_number: int, worktree_path: Path, is_scratch: bool
+    def _cleanup_pre_active_launch_worktree(
+        self,
+        issue_number: int,
+        worktree_path: Path,
+        *,
+        disposable: bool,
+        failure_stage: str,
     ) -> None:
-        """Best-effort removal of a disposable scratch investigation worktree.
-
-        A no-op unless ``is_scratch`` (so callers stay branch-free): used on the
-        pre-active launch-failure paths that keep an ordinary coding worktree for
-        reuse — a scratch worktree has no reuse path, so it must be removed
-        rather than leaked (#6823)."""
-        if not is_scratch:
-            return
+        """Apply one ordinary-vs-disposable policy to failed launch cleanup."""
         try:
-            # Scratch-only by construction (guarded above): force removal so a
-            # leftover untracked artifact can't fail it and leak it (#6824 F8).
-            self._worktree_manager.remove(worktree_path, force=True)
-            logger.info(issue_log(issue_number, "Removed scratch investigation worktree: %s"), worktree_path)
+            remove = self._worktree_manager.remove_checkout
+            if disposable:
+                remove = self._worktree_manager.remove_checkout_and_branch
+            remove(worktree_path, force=disposable)
+            logger.info(
+                issue_log(
+                    issue_number,
+                    "Cleaned up worktree after %s: %s",
+                ),
+                failure_stage,
+                worktree_path,
+            )
         except Exception as e:
             logger.warning(
-                issue_log(issue_number, "Failed to remove scratch investigation worktree: %s"), e
+                issue_log(
+                    issue_number,
+                    "Failed to remove worktree after %s: %s",
+                ),
+                failure_stage,
+                e,
             )
 
     def _prepare_tech_lead_session_data(
@@ -630,6 +641,8 @@ class SessionLauncher:
     def _fail_launch_for_tech_lead_prep(
         self, issue: "IssueProtocol", ctx: WorktreeContext, session_name: str,
         worktree_path: Path, claim: ClaimAcquisitionResult, error: Exception,
+        *,
+        disposable_worktree: bool,
     ) -> LaunchResult:
         """Fail the launch when required tech_lead inputs cannot be prepared; the
         result is retry-queued (transient inputs; queue owner bounds retries) and
@@ -645,14 +658,12 @@ class SessionLauncher:
                 "error": str(error),
             },
         ))
-        try:
-            self._worktree_manager.remove(worktree_path)
-            logger.info(issue_log(issue.number, "Cleaned up worktree after tech_lead data failure: %s"), worktree_path)
-        except Exception as cleanup_error:
-            logger.warning(
-                issue_log(issue.number, "Failed to remove worktree after tech_lead data failure: %s"),
-                cleanup_error,
-            )
+        self._cleanup_pre_active_launch_worktree(
+            issue.number,
+            worktree_path,
+            disposable=disposable_worktree,
+            failure_stage="tech_lead data failure",
+        )
         self._discard_tech_lead_authority_after_failed_launch(issue, ctx)
         self._release_claim_if_held(issue.number, claim)
         return LaunchResult(None, False, f"Tech Lead session data preparation failed: {error}", disposition=LaunchDisposition.RETRYABLE_FAILURE)
@@ -846,6 +857,12 @@ class SessionLauncher:
         # Durable before anything irreversible: no terminal, no label
         # transitions, no queue removal (#6999 A2).
         if failure := work_claim.hold_before_spawn(run, issue_number=issue.number):
+            self._cleanup_pre_active_launch_worktree(
+                issue.number,
+                worktree_path,
+                disposable=is_scratch_investigation,
+                failure_stage="pending-work claim failure",
+            )
             self._release_claim_if_held(issue.number, claim)
             return failure
 
@@ -868,7 +885,13 @@ class SessionLauncher:
                 )
             except Exception as e:
                 return self._fail_launch_for_tech_lead_prep(
-                    issue, ctx, session_name, worktree_path, claim, e
+                    issue,
+                    ctx,
+                    session_name,
+                    worktree_path,
+                    claim,
+                    e,
+                    disposable_worktree=is_scratch_investigation,
                 )
 
             logger.info(
@@ -913,14 +936,12 @@ class SessionLauncher:
                             "error": str(e),
                         },
                     ))
-                    try:
-                        self._worktree_manager.remove(worktree_path)
-                        logger.info(issue_log(issue.number, "Cleaned up worktree after setup failure: %s"), worktree_path)
-                    except Exception as cleanup_error:
-                        logger.warning(
-                            issue_log(issue.number, "Failed to remove worktree after setup failure: %s"),
-                            cleanup_error,
-                        )
+                    self._cleanup_pre_active_launch_worktree(
+                        issue.number,
+                        worktree_path,
+                        disposable=is_scratch_investigation,
+                        failure_stage="setup failure",
+                    )
                     self._release_claim_if_held(issue.number, claim)
                     return LaunchResult(None, False, f"Setup commands failed: {e}")
 
@@ -953,11 +974,12 @@ class SessionLauncher:
                         "reason": "in_progress_label_failed",
                     },
                 ))
-                try:
-                    self._worktree_manager.remove(worktree_path)
-                    logger.info(issue_log(issue.number, "Cleaned up worktree after launch failure: %s"), worktree_path)
-                except Exception as e:
-                    logger.warning(issue_log(issue.number, "Failed to remove worktree after launch failure: %s"), e)
+                self._cleanup_pre_active_launch_worktree(
+                    issue.number,
+                    worktree_path,
+                    disposable=is_scratch_investigation,
+                    failure_stage="in-progress label failure",
+                )
                 self._release_claim_if_held(issue.number, claim)
                 return LaunchResult(None, False, "Failed to add in-progress label")
             label_time = time.time() - step_start
@@ -1041,12 +1063,11 @@ class SessionLauncher:
                         issue_key=issue.key.stable_id(),
                     ),
                 ], context="launch_session_creation_failed")
-                # A coding worktree is kept for reuse on retry, but a scratch
-                # investigation worktree is a throwaway with no reuse path — the
-                # session never became active, so remove it here to avoid leaking
-                # a scratch workspace (#6823).
-                self._remove_scratch_worktree_if_disposable(
-                    issue.number, worktree_path, is_scratch_investigation
+                self._cleanup_pre_active_launch_worktree(
+                    issue.number,
+                    worktree_path,
+                    disposable=is_scratch_investigation,
+                    failure_stage="terminal creation failure",
                 )
                 self._release_claim_if_held(issue.number, claim)
                 return LaunchResult.terminal_spawn_failed()

@@ -2713,6 +2713,53 @@ function renderGoalPilotStatus(status, skillsCount = null) {
     `;
 }
 
+function renderWorktreeAudit(data) {
+    const worktrees = data.worktrees || [];
+    let html = `<p>${escapeHtml(data.message)}</p>`;
+    if (worktrees.length > 0) {
+        const candidates = worktrees.filter(wt => wt.disposition === 'cleanup_candidate');
+        const managed = worktrees.filter(wt => wt.disposition === 'managed');
+        const retained = worktrees.filter(wt => wt.disposition === 'retained');
+        html += `<p><strong>${candidates.length}</strong> cleanup candidate(s), <strong>${managed.length}</strong> managed issue worktree(s), and <strong>${retained.length}</strong> retained worktree(s).</p>`;
+        html += '<ul style="margin: 8px 0; padding-left: 20px;">';
+        worktrees.forEach(wt => {
+            html += `<li><code>${escapeHtml(wt.path)}</code><br><span>${escapeHtml(wt.kind)} — ${escapeHtml(wt.disposition)}: ${escapeHtml(wt.reason)}</span></li>`;
+        });
+        html += '</ul>';
+    }
+    if (typeof data.issue_cleanup_enabled === 'boolean') {
+        const status = data.issue_cleanup_enabled ? 'enabled' : 'disabled';
+        html += `<p><strong>Review-gated issue cleanup:</strong> ${status} in the selected config.</p>`;
+    }
+    if (data.note) {
+        html += `<p>${escapeHtml(data.note)}</p>`;
+    }
+    return html;
+}
+
+async function requestWorktreeAudit(repoPath) {
+    try {
+        const response = await fetch('/control/tools/worktrees/cleanup', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ repo_root: repoPath })
+        });
+        let data;
+        try {
+            data = await response.json();
+        } catch (_error) {
+            data = {};
+        }
+        if (!response.ok) {
+            const detail = data.error || data.detail || 'Worktree audit failed';
+            return `<div class="error-message">${escapeHtml(detail)}</div>`;
+        }
+        return renderWorktreeAudit(data);
+    } catch (error) {
+        return `<div class="error-message">Failed to audit worktrees: ${escapeHtml(error.message)}</div>`;
+    }
+}
+
 // ============================================
 // Event Listeners
 // ============================================
@@ -3536,7 +3583,8 @@ document.addEventListener('DOMContentLoaded', () => {
         document.getElementById('labelsResultsModal').classList.remove('active');
     });
 
-    // List Stale Worktrees Tool (read-only, no deletion)
+    // Action contract: POST /control/tools/worktrees/cleanup is a read-only audit.
+    // It returns worktrees[] with kind/disposition/reason and never deletes paths.
     document.getElementById('cleanupWorktreesTool').addEventListener('click', async () => {
         const repoPath = getToolRepoPath({ requireConfig: false });
         if (!repoPath) {
@@ -3544,44 +3592,11 @@ document.addEventListener('DOMContentLoaded', () => {
             return;
         }
 
-        document.getElementById('worktreesContent').innerHTML = '<div class="loading-spinner"></div> Scanning for stale worktrees...';
+        document.getElementById('worktreesContent').innerHTML = '<div class="loading-spinner"></div> Auditing registered worktrees...';
         document.getElementById('worktreesModal').classList.add('active');
 
-        try {
-            const response = await fetch('/control/tools/worktrees/cleanup', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ repo_root: repoPath })
-            });
-            const data = await response.json();
-
-            if (data.error) {
-                document.getElementById('worktreesContent').innerHTML =
-                    `<div class="error-message">${escapeHtml(data.error)}</div>`;
-                return;
-            }
-
-            const staleList = data.stale_worktrees || [];
-            if (staleList.length === 0) {
-                document.getElementById('worktreesContent').innerHTML =
-                    '<p style="color: var(--success-color);">No stale worktrees found. All clean!</p>';
-            } else {
-                let html = `<p>Found <strong>${staleList.length}</strong> stale worktree(s):</p>`;
-                html += '<ul style="margin: 8px 0; padding-left: 20px;">';
-                staleList.forEach(wt => {
-                    html += `<li><code>${escapeHtml(wt.path || wt)}</code></li>`;
-                });
-                html += '</ul>';
-                if (data.cleanup_command) {
-                    html += '<p style="margin-top: 16px;"><strong>To clean up, run in terminal:</strong></p>';
-                    html += `<pre style="background: var(--bg-tertiary); padding: 12px; border-radius: 8px; font-size: 12px; overflow-x: auto; user-select: all;">${escapeHtml(data.cleanup_command)}</pre>`;
-                }
-                document.getElementById('worktreesContent').innerHTML = html;
-            }
-        } catch (error) {
-            document.getElementById('worktreesContent').innerHTML =
-                `<div class="error-message">Failed to scan worktrees: ${escapeHtml(error.message)}</div>`;
-        }
+        document.getElementById('worktreesContent').innerHTML =
+            await requestWorktreeAudit(repoPath);
     });
     document.getElementById('closeWorktreesModal').addEventListener('click', () => {
         document.getElementById('worktreesModal').classList.remove('active');

@@ -484,12 +484,12 @@ def load_cleanup_section(config: "Config", cleanup_section: dict) -> None:
         config.cleanup = CleanupConfig(
             with_tech_lead=CleanupWithTechLead(
                 close_ai_session_tabs=with_tech_lead_data.get("close_ai_session_tabs", True),
-                remove_worktrees=with_tech_lead_data.get("remove_worktrees", False),
+                remove_worktrees=with_tech_lead_data.get("remove_worktrees", True),
             ),
             without_tech_lead=CleanupWithoutTechLead(
                 wait_for_code_review=without_tech_lead_data.get("wait_for_code_review", True),
                 close_ai_session_tabs=without_tech_lead_data.get("close_ai_session_tabs", True),
-                remove_worktrees=without_tech_lead_data.get("remove_worktrees", False),
+                remove_worktrees=without_tech_lead_data.get("remove_worktrees", True),
             ),
         )
 

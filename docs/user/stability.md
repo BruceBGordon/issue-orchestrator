@@ -359,6 +359,7 @@ contracted route goes missing or stops using its generated response model.
 | `/control/setup/preview` | Control Center |
 | `/control/setup/prereqs` | Control Center |
 | `/control/setup/save` | Control Center |
+| `/control/tools/worktrees/cleanup` | Control Center |
 
 `tests/unit/test_public_api_surface_docs.py` asserts this table equals the
 OpenAPI path set exactly, so contracting a new route cannot leave it classified

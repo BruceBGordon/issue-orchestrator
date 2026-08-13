@@ -78,6 +78,10 @@ from ..control.completion_handler import (
     get_review_machine as _ch_get_review_machine,
 )
 from ..control.startup_manager import StartupManager
+from ..control.worktree_reconciliation import (
+    StartupWorktreeReconciler,
+    WorktreeAuditOwner,
+)
 from ..control.issue_fetch_resilience import (
     IssueFetchResilience,
     FetchFailureVerdict,
@@ -341,10 +345,20 @@ class Orchestrator:
             lambda r: self._restore_running_sessions(r),
             self.launch_session, self.update_queue_cache,
             self._issue_fetch_resilience,
+            self._startup_worktree_reconciler,
             queue_cache_store=self.deps.queue_cache_store,
             label_manager=self.deps.label_manager,
             label_store=self.deps.label_store,
             tech_lead_authority=self.deps.services.tech_lead_authority,
+        )
+
+    @cached_property
+    def _startup_worktree_reconciler(self) -> StartupWorktreeReconciler:
+        return StartupWorktreeReconciler(
+            self.config,
+            self._cleanup_manager,
+            self.deps.worktree_manager,
+            WorktreeAuditOwner(self.deps.worktree_manager),
         )
 
     async def startup(self) -> None:
