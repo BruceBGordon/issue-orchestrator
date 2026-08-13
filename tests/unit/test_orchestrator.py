@@ -1214,6 +1214,108 @@ class TestHandleSessionCompletion:
         # An ordinary coding session's worktree is not a scratch workspace.
         assert cleanup.scratch_worktree is False
 
+    def test_completed_session_with_no_cleanup_actions_has_no_cleanup_effects(
+        self,
+        sample_config,
+        mock_worktree_manager,
+    ):
+        """No selected action never enters the cleanup lifecycle boundary."""
+        from issue_orchestrator.control.actions import CleanupSessionAction
+
+        sample_config.tech_lead_review_agent = None
+        sample_config.code_review_agent = None
+        sample_config.cleanup.without_tech_lead.close_ai_session_tabs = False
+        sample_config.cleanup.without_tech_lead.remove_worktrees = False
+
+        runner = MockSessionRunner()
+        pair_registry = MagicMock()
+        background_jobs = MagicMock()
+        issue = create_issue(1)
+        session = create_session(
+            issue,
+            worktree_path=mock_worktree_manager.worktree_path,
+        )
+        orchestrator = create_test_orchestrator(
+            sample_config,
+            worktree_manager=mock_worktree_manager,
+            runner=runner,
+        )
+        orchestrator.deps.action_applier.pair_registry = pair_registry
+        orchestrator.deps.action_applier.background_job_supervisor = background_jobs
+        orchestrator.state.active_sessions.append(session)
+
+        orchestrator.handle_session_completion(session, SessionStatus.COMPLETED)
+
+        assert orchestrator.state.pending_cleanups == []
+        assert orchestrator.state.immediate_cleanups == []
+        runtime_terminalization_calls = list(runner.plugin.kill_session_calls)
+
+        snapshot = orchestrator.deps.fact_gatherer.create_snapshot(
+            orchestrator.state,
+            [],
+        )
+        plan = orchestrator.deps.planner.plan(snapshot)
+        cleanup_actions = [
+            action
+            for action in plan.actions
+            if isinstance(action, CleanupSessionAction)
+        ]
+        assert cleanup_actions == []
+
+        orchestrator._apply_plan(plan)  # noqa: SLF001 - behavior boundary
+
+        pair_registry.release.assert_not_called()
+        background_jobs.cancel_matching.assert_not_called()
+        assert runner.plugin.kill_session_calls == runtime_terminalization_calls
+        mock_worktree_manager.remove_checkout.assert_not_called()
+        assert orchestrator.deps.events.get_events_by_name(
+            str(EventName.CLEANUP_COMPLETED)
+        ) == []
+
+    def test_no_actions_apply_error_records_immediate_failed_cleanup(
+        self,
+        sample_config,
+        mock_worktree_manager,
+    ):
+        """The post-apply effective failure overrides a pre-apply NONE decision."""
+        sample_config.tech_lead_review_agent = None
+        sample_config.code_review_agent = None
+        sample_config.cleanup.without_tech_lead.close_ai_session_tabs = False
+        sample_config.cleanup.without_tech_lead.remove_worktrees = False
+
+        issue = create_issue(1)
+        session = create_session(
+            issue,
+            worktree_path=mock_worktree_manager.worktree_path,
+        )
+        orchestrator = create_test_orchestrator(
+            sample_config,
+            worktree_manager=mock_worktree_manager,
+        )
+        orchestrator.state.active_sessions.append(session)
+        apply_error = RuntimeError("completion action apply failed")
+        orchestrator.deps.action_applier.apply_all = MagicMock(
+            side_effect=apply_error
+        )
+
+        with pytest.raises(RuntimeError, match="completion action apply failed"):
+            orchestrator.handle_session_completion(session, SessionStatus.COMPLETED)
+
+        assert orchestrator.state.completed_today == []
+        assert orchestrator.state.session_history[-1].status == "failed"
+        failed_events = orchestrator.deps.events.get_events_by_name(
+            str(EventName.SESSION_FAILED)
+        )
+        assert len(failed_events) == 1
+        assert orchestrator.deps.events.get_events_by_name(
+            str(EventName.SESSION_COMPLETED)
+        ) == []
+        assert orchestrator.state.pending_cleanups == []
+        [cleanup] = orchestrator.state.immediate_cleanups
+        assert cleanup.issue_number == issue.number
+        assert cleanup.terminal_id == session.terminal_id
+        assert cleanup.reason == SessionStatus.FAILED.value
+
     def test_handle_completion_marks_scratch_worktree_for_investigation(
         self,
         sample_config,
@@ -1224,6 +1326,8 @@ class TestHandleSessionCompletion:
         throwaway worktree on completion regardless of the cleanup config."""
         import dataclasses
 
+        sample_config.cleanup.without_tech_lead.close_ai_session_tabs = False
+        sample_config.cleanup.without_tech_lead.remove_worktrees = False
         issue = create_issue(1)
         session = dataclasses.replace(
             create_session(issue, worktree_path=mock_worktree_manager.worktree_path),

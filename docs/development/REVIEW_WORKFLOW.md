@@ -290,14 +290,24 @@ cleanup:
 
 Worktree removal defaults to `true` for new and omitted configurations. It
 still waits for the applicable review gate. Set it to `false` to retain issue
-worktrees for inspection. Review-gated cleanup removes only the checkout and
-preserves its local branch, including local-only commits. Branch deletion is
-reserved for explicitly disposable scratch/reset lifecycle owners. On startup,
-the orchestrator also reconciles proven inactive reviewer and tech-lead scratch
-worktrees. Manual, active, activity-unknown, initializing-engine, ambiguous,
-and reviewer worktrees whose detached HEAD differs from the exact tip recorded
-by the reviewer lifecycle are retained. Reviewer worktrees created before that
-tip marker existed use the stricter legacy proof that HEAD still equals the
+worktrees for inspection. Cleanup timing and actions are independent: if either
+`close_ai_session_tabs` or `remove_worktrees` is enabled, the selected actions
+wait for the applicable review gate. For example, setting tab closure to
+`false` and worktree removal to `true` leaves the tab open and removes the
+checkout only after review. Without tech-lead review,
+`wait_for_code_review: false` instead runs the selected actions on completion.
+If both action flags are `false`, an ordinary successful completion does not
+enter the cleanup lifecycle. Failure/timeout/block teardown and disposable
+scratch-worktree removal remain immediate lifecycle boundaries.
+
+Review-gated cleanup removes only the checkout and preserves its local branch,
+including local-only commits. Branch deletion is reserved for explicitly
+disposable scratch/reset lifecycle owners. On startup, the orchestrator also
+reconciles proven inactive reviewer and tech-lead scratch worktrees. Manual,
+active, activity-unknown, initializing-engine, ambiguous, and reviewer
+worktrees whose detached HEAD differs from the exact tip recorded by the
+reviewer lifecycle are retained. Reviewer worktrees created before that tip
+marker existed use the stricter legacy proof that HEAD still equals the
 registered parent worktree tip.
 
 ## UI Phase Detection

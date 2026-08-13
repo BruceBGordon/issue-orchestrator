@@ -12,7 +12,10 @@ from issue_orchestrator.control.actions import (
     ResetRetryIssueAction,
 )
 from issue_orchestrator.control.claim_gate import ClaimLostError
-from issue_orchestrator.control.completion_handler import CompletionHandler
+from issue_orchestrator.control.completion_handler import (
+    CleanupDecision,
+    CompletionHandler,
+)
 from issue_orchestrator.control.label_manager import LabelManager
 from issue_orchestrator.control.open_issue_corpus import OpenIssueCorpusManager
 from issue_orchestrator.control.reconciliation import (
@@ -361,8 +364,7 @@ class TestCompletionPipelineEligibility:
                 runtime_minutes=3,
                 pr_url=None,
             ),
-            should_defer_cleanup=False,
-            pending_cleanup=None,
+            cleanup=CleanupDecision.immediate(),
             should_queue_review=False,
             pr_url=None,
             pr_number=None,

@@ -1721,6 +1721,25 @@ class TestCleanupSessionAction:
         mock_sessions.stop.assert_called_once()
         mock_worktree_manager.remove_checkout.assert_not_called()
 
+    def test_cleanup_worktree_only(
+        self, applier, mock_sessions, mock_worktree_manager, tmp_path
+    ):
+        """Worktree removal does not implicitly close the session tab."""
+        action = CleanupSessionAction(
+            issue_number=123,
+            pr_number=456,
+            terminal_id="issue-123",
+            worktree_path=str(tmp_path),
+            close_tabs=False,
+            remove_worktrees=True,
+        )
+
+        result = applier.apply(action)
+
+        assert result.success
+        mock_sessions.stop.assert_not_called()
+        mock_worktree_manager.remove_checkout.assert_called_once()
+
     def test_disposable_worktree_cleanup_forces_removal(
         self, applier, mock_sessions, mock_worktree_manager, tmp_path
     ):

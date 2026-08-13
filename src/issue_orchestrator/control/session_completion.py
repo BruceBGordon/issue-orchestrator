@@ -29,6 +29,7 @@ from ..ports.pending_work_claim_store import PendingWorkClaimStore
 from ..ports.session_output import SessionOutput
 from ..ports.worktree_manager import WorktreeManager
 from .active_sessions import has_active_terminal
+from .completion_cleanup_state import CompletionCleanupStateOwner
 from .completion_dispatcher import (
     CompletedDecision,
     CompletionDispatcher,
@@ -462,20 +463,7 @@ def handle_session_completion(  # noqa: C901, PLR0912 - handles validation, acti
             required_act_outcome,
         )
     )
-    if result.should_defer_cleanup and result.pending_cleanup:
-        state.pending_cleanups.append(result.pending_cleanup)
-    else:
-        # Record immediate cleanup as a fact for the Planner to handle
-        from ..domain.models import ImmediateCleanup
-        state.immediate_cleanups.append(ImmediateCleanup(
-            issue_number=session.issue.number,
-            terminal_id=session.terminal_id,
-            worktree_path=str(session.worktree_path),
-            reason=effective_status.value,
-            # A disposable tech-lead-investigation scratch worktree is removed on
-            # completion regardless of the cleanup config (#6823).
-            scratch_worktree=session.scratch_worktree,
-        ))
+    CompletionCleanupStateOwner(state).record(result.cleanup, session, effective_status)
 
     if result.should_queue_review and result.pr_url and result.pr_number:
         state.discovered_reviews.append(DiscoveredReview(

@@ -73,17 +73,51 @@ class RunAuditTrigger(str, Enum):
     RUNTIME_THRESHOLD = "runtime-threshold"
 
 
+class CleanupDisposition(str, Enum):
+    """When completion should hand cleanup work to the planner."""
+
+    DEFERRED = "deferred"
+    IMMEDIATE = "immediate"
+    NONE = "none"
+
+
+@dataclass(frozen=True)
+class CleanupDecision:
+    """Cleanup disposition and its disposition-specific payload."""
+
+    disposition: CleanupDisposition
+    pending_cleanup: PendingCleanup | None = None
+
+    def __post_init__(self) -> None:
+        has_pending_cleanup = self.pending_cleanup is not None
+        if has_pending_cleanup != (self.disposition is CleanupDisposition.DEFERRED):
+            raise ValueError(
+                "pending_cleanup must be present only for deferred cleanup"
+            )
+
+    @classmethod
+    def deferred(cls, pending_cleanup: PendingCleanup) -> "CleanupDecision":
+        return cls(CleanupDisposition.DEFERRED, pending_cleanup)
+
+    @classmethod
+    def immediate(cls) -> "CleanupDecision":
+        return cls(CleanupDisposition.IMMEDIATE)
+
+    @classmethod
+    def none(cls) -> "CleanupDecision":
+        return cls(CleanupDisposition.NONE)
+
+
 @dataclass
 class CompletionResult:
     """Result of processing a session completion."""
 
     history_entry: SessionHistoryEntry
+    cleanup: CleanupDecision
     history_status: SessionStatus = SessionStatus.COMPLETED
     pr_url: Optional[str] = None
     pr_number: Optional[int] = None
-    should_defer_cleanup: bool = False
     should_queue_review: bool = False
-    pending_cleanup: Optional[PendingCleanup] = None
     actions: tuple[Action, ...] = ()
 
 
@@ -223,7 +257,7 @@ class CompletionHandler:
             self._update_state_machines(session, history_status, pr_url)
 
         # Determine cleanup strategy
-        should_defer, pending_cleanup = self._determine_cleanup_strategy(
+        cleanup = self._determine_cleanup_strategy(
             session, status, pr_url, pr_number
         )
 
@@ -308,20 +342,20 @@ class CompletionHandler:
             history_status=history_status,
             pr_url=pr_url,
             pr_number=pr_number,
-            should_defer_cleanup=should_defer,
+            cleanup=cleanup,
             should_queue_review=should_queue_review,
-            pending_cleanup=pending_cleanup,
             actions=completion_actions,
         )
         total_duration = time.monotonic() - start_time
         logger.info(
-            "Completion processed: issue=%s session=%s status=%s pr_number=%s queue_review=%s defer_cleanup=%s elapsed=%.2fs",
+            "Completion processed: issue=%s session=%s status=%s pr_number=%s "
+            "queue_review=%s cleanup=%s elapsed=%.2fs",
             session.issue.number,
             session.terminal_id,
             status.value,
             pr_number,
             should_queue_review,
-            should_defer,
+            cleanup.disposition.value,
             total_duration,
             extra=log_context(issue_key=issue_key, session_id=session.terminal_id),
         )
@@ -993,35 +1027,26 @@ class CompletionHandler:
         status: SessionStatus,
         pr_url: Optional[str],
         pr_number: Optional[int],
-    ) -> tuple[bool, Optional[PendingCleanup]]:
-        """Determine if cleanup should be deferred and create PendingCleanup if so.
+    ) -> CleanupDecision:
+        """Select deferred, immediate, or no cleanup for this completion."""
+        if status != SessionStatus.COMPLETED or session.scratch_worktree:
+            return CleanupDecision.immediate()
 
-        Returns:
-            Tuple of (should_defer, pending_cleanup)
-        """
+        if not self._cleanup_actions_requested():
+            return CleanupDecision.none()
+
         is_work_session = session.key.task not in {
             TaskKind.REVIEW,
             TaskKind.RETROSPECTIVE_REVIEW,
             TaskKind.REWORK,
         }
-        should_defer = False
-        pending_cleanup = None
 
-        if status == SessionStatus.COMPLETED and is_work_session and pr_url and pr_number:
-            # Check if we should defer cleanup based on review workflow
-            if self.config.tech_lead_enabled:
-                # Tech Lead workflow: defer until tech_lead review passes
-                should_defer = self.config.cleanup.with_tech_lead.close_ai_session_tabs
-            elif self.config.code_review_agent:
-                # Code review only: defer if configured to wait
-                should_defer = (
-                    self.config.cleanup.without_tech_lead.wait_for_code_review
-                    and self.config.cleanup.without_tech_lead.close_ai_session_tabs
-                )
-
-        if should_defer:
-            # should_defer is only True if pr_number and pr_url are set (line 337)
-            assert pr_number is not None and pr_url is not None
+        if (
+            is_work_session
+            and pr_url
+            and pr_number
+            and self._should_wait_for_review_before_cleanup()
+        ):
             pending_cleanup = PendingCleanup(
                 issue=session.issue,
                 pr_number=pr_number,
@@ -1031,8 +1056,25 @@ class CompletionHandler:
                 worktree_path=session.worktree_path,
             )
             logger.info(f"[CLEANUP] Deferred cleanup for #{session.issue.number} until review completes")
+            return CleanupDecision.deferred(pending_cleanup)
 
-        return should_defer, pending_cleanup
+        return CleanupDecision.immediate()
+
+    def _should_wait_for_review_before_cleanup(self) -> bool:
+        """Return whether this workflow gates cleanup on review."""
+        if self.config.tech_lead_enabled:
+            return True
+        if self.config.code_review_agent:
+            return self.config.cleanup.without_tech_lead.wait_for_code_review
+        return False
+
+    def _cleanup_actions_requested(self) -> bool:
+        """Return whether ordinary completion has a selected cleanup action."""
+        if self.config.tech_lead_enabled:
+            cleanup = self.config.cleanup.with_tech_lead
+        else:
+            cleanup = self.config.cleanup.without_tech_lead
+        return cleanup.close_ai_session_tabs or cleanup.remove_worktrees
 
     def _should_queue_review(
         self,

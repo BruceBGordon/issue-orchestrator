@@ -41,7 +41,7 @@ class CleanupWithoutTechLead:
 
 @dataclass
 class CleanupConfig:
-    """Cleanup configuration - when to close tabs and remove worktrees."""
+    """Cleanup timing and independently selected cleanup actions."""
 
     with_tech_lead: CleanupWithTechLead = field(default_factory=CleanupWithTechLead)
     without_tech_lead: CleanupWithoutTechLead = field(default_factory=CleanupWithoutTechLead)
