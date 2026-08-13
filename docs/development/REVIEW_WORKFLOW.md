@@ -296,7 +296,9 @@ wait for the applicable review gate. For example, setting tab closure to
 `false` and worktree removal to `true` leaves the tab open and removes the
 checkout only after review. Without tech-lead review,
 `wait_for_code_review: false` instead runs the selected actions on completion.
-If both action flags are `false`, cleanup has no material effect.
+If both action flags are `false`, an ordinary successful completion does not
+enter the cleanup lifecycle. Failure/timeout/block teardown and disposable
+scratch-worktree removal remain immediate lifecycle boundaries.
 
 Review-gated cleanup removes only the checkout and preserves its local branch,
 including local-only commits. Branch deletion is reserved for explicitly

@@ -3848,6 +3848,7 @@ def _complete_session(session, state, claims, *, provider_error_type):
     """Drive the production completion entrypoint for one session."""
     from unittest.mock import MagicMock
 
+    from issue_orchestrator.control.completion_handler import CleanupDecision
     from issue_orchestrator.control.session_completion import handle_session_completion
     from issue_orchestrator.domain.models import SessionStatus
     from issue_orchestrator.ports.session_output import SessionOutput
@@ -3859,8 +3860,7 @@ def _complete_session(session, state, claims, *, provider_error_type):
     completion_handler.process_completion.return_value = MagicMock(
         actions=[],
         history_entry=None,
-        should_defer_cleanup=False,
-        pending_cleanup=None,
+        cleanup=CleanupDecision.immediate(),
         should_queue_review=False,
         pr_url=None,
         pr_number=None,

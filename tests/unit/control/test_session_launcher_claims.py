@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch, PropertyMock
 
 import pytest
 
+from issue_orchestrator.control.completion_handler import CleanupDecision
 from issue_orchestrator.domain.claim import ClaimResult, ClaimState
 from issue_orchestrator.domain.coder_prompt import PreparedCoderPromptAddendum
 from issue_orchestrator.domain.lease_config import LeaseConfig
@@ -416,9 +417,8 @@ class TestSessionCompletionClaimRelease:
         mock_completion_handler.process_completion.return_value = MagicMock(
             actions=(),
             history_entry=MagicMock(),
-            should_defer_cleanup=False,
+            cleanup=CleanupDecision.immediate(),
             should_queue_review=False,
-            pending_cleanup=None,
         )
 
         handle_session_completion(
@@ -487,9 +487,8 @@ class TestSessionCompletionClaimRelease:
         mock_completion_handler.process_completion.return_value = MagicMock(
             actions=(),
             history_entry=MagicMock(),
-            should_defer_cleanup=False,
+            cleanup=CleanupDecision.immediate(),
             should_queue_review=False,
-            pending_cleanup=None,
         )
 
         handle_session_completion(
