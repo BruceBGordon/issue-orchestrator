@@ -1272,6 +1272,50 @@ class TestHandleSessionCompletion:
             str(EventName.CLEANUP_COMPLETED)
         ) == []
 
+    def test_no_actions_apply_error_records_immediate_failed_cleanup(
+        self,
+        sample_config,
+        mock_worktree_manager,
+    ):
+        """The post-apply effective failure overrides a pre-apply NONE decision."""
+        sample_config.tech_lead_review_agent = None
+        sample_config.code_review_agent = None
+        sample_config.cleanup.without_tech_lead.close_ai_session_tabs = False
+        sample_config.cleanup.without_tech_lead.remove_worktrees = False
+
+        issue = create_issue(1)
+        session = create_session(
+            issue,
+            worktree_path=mock_worktree_manager.worktree_path,
+        )
+        orchestrator = create_test_orchestrator(
+            sample_config,
+            worktree_manager=mock_worktree_manager,
+        )
+        orchestrator.state.active_sessions.append(session)
+        apply_error = RuntimeError("completion action apply failed")
+        orchestrator.deps.action_applier.apply_all = MagicMock(
+            side_effect=apply_error
+        )
+
+        with pytest.raises(RuntimeError, match="completion action apply failed"):
+            orchestrator.handle_session_completion(session, SessionStatus.COMPLETED)
+
+        assert orchestrator.state.completed_today == []
+        assert orchestrator.state.session_history[-1].status == "failed"
+        failed_events = orchestrator.deps.events.get_events_by_name(
+            str(EventName.SESSION_FAILED)
+        )
+        assert len(failed_events) == 1
+        assert orchestrator.deps.events.get_events_by_name(
+            str(EventName.SESSION_COMPLETED)
+        ) == []
+        assert orchestrator.state.pending_cleanups == []
+        [cleanup] = orchestrator.state.immediate_cleanups
+        assert cleanup.issue_number == issue.number
+        assert cleanup.terminal_id == session.terminal_id
+        assert cleanup.reason == SessionStatus.FAILED.value
+
     def test_handle_completion_marks_scratch_worktree_for_investigation(
         self,
         sample_config,

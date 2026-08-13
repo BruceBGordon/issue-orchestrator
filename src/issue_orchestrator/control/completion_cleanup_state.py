@@ -26,28 +26,37 @@ class CompletionCleanupStateOwner:
         effective_status: SessionStatus,
     ) -> None:
         """Record exactly the fact selected by the completion decision owner."""
+        if effective_status is not SessionStatus.COMPLETED:
+            self._record_immediate(session, effective_status)
+            return
+
         if decision.disposition is CleanupDisposition.DEFERRED:
             assert decision.pending_cleanup is not None
             self._pending.append(decision.pending_cleanup)
             return
 
         if decision.disposition is CleanupDisposition.IMMEDIATE:
-            self._immediate.append(
-                ImmediateCleanup(
-                    issue_number=session.issue.number,
-                    terminal_id=session.terminal_id,
-                    worktree_path=str(session.worktree_path),
-                    reason=effective_status.value,
-                    # Disposable tech-lead investigation worktrees are removed
-                    # on completion regardless of ordinary cleanup settings.
-                    scratch_worktree=session.scratch_worktree,
-                )
-            )
+            self._record_immediate(session, effective_status)
             return
 
         if decision.disposition is CleanupDisposition.NONE:
             return
 
-        raise ValueError(
-            f"Unhandled cleanup disposition: {decision.disposition!r}"
+        raise ValueError(f"Unhandled cleanup disposition: {decision.disposition!r}")
+
+    def _record_immediate(
+        self,
+        session: Session,
+        effective_status: SessionStatus,
+    ) -> None:
+        self._immediate.append(
+            ImmediateCleanup(
+                issue_number=session.issue.number,
+                terminal_id=session.terminal_id,
+                worktree_path=str(session.worktree_path),
+                reason=effective_status.value,
+                # Disposable tech-lead investigation worktrees are removed
+                # on completion regardless of ordinary cleanup settings.
+                scratch_worktree=session.scratch_worktree,
+            )
         )
