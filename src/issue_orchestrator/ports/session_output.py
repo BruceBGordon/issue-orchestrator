@@ -477,6 +477,8 @@ class SessionOutput(Protocol):
         issue_number: int,
         parent_session_name: str,
         agent_label: str,
+        retention_days: int = 7,
+        retention_tier: str = "hot",
     ) -> "ReviewExchangeRun":
         """Allocate a typed run directory for one review exchange."""
         ...

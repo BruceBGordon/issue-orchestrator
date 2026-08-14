@@ -236,6 +236,59 @@ def test_build_session_diagnostics_dialog_actions():
     assert "/wt/validation-stderr.log" in paths
 
 
+@pytest.mark.parametrize(
+    ("status", "available", "expected_text", "expect_actions"),
+    [
+        ("active", True, "Active — retention starts when the run ends", True),
+        ("retained", True, "Retained", True),
+        ("pinned", True, "Pinned — retained until unpinned", True),
+        (
+            "expired",
+            False,
+            "Expired — artifacts are no longer available",
+            False,
+        ),
+        (
+            "missing",
+            False,
+            "Unavailable — retained artifacts could not be found",
+            False,
+        ),
+    ],
+)
+def test_session_diagnostics_uses_owner_evidence_state(
+    status: str,
+    available: bool,
+    expected_text: str,
+    expect_actions: bool,
+) -> None:
+    expires_at = "2026-08-20T12:00:00+00:00" if status == "retained" else None
+    dialog = build_session_diagnostics_dialog(
+        42,
+        {
+            "run_dir": "/archive/42/run-1",
+            "manifest": None if status == "missing" else {"run_id": "run-1"},
+            "timeline_evidence": {
+                "run_dir": "/archive/42/run-1",
+                "status": status,
+                "label": status.title(),
+                "available": available,
+                "pinned": status == "pinned",
+                "archived": status != "active",
+                "expires_at": expires_at,
+                "help_text": "Evidence lifecycle help.",
+                "unpin_expires_immediately": False,
+            },
+        },
+    )
+
+    rows = _rows_to_map(dialog["rows"])
+    assert rows["Timeline Evidence"] == expected_text
+    if status == "retained":
+        assert rows["Evidence Expires"] == expires_at
+    assert bool(dialog["actions"]) is expect_actions
+
+
 def test_build_session_diagnostics_dialog_passed_outcome_has_no_reason_row():
     """Closes the bug-1 narrative on the read side: a passed validation
     must produce a "Validation Status: passed" row but NO "Validation

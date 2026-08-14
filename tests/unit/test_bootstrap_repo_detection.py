@@ -735,6 +735,9 @@ class TestBuildOrchestratorForTesting:
             )
 
             assert orch.deps.action_applier is custom_action_applier
+            assert custom_action_applier.review_exchange_canceller == (
+                orch.deps.completion_processor.cancel_review_exchange_for_issue
+            )
 
     def test_build_orchestrator_for_testing_creates_default_action_applier(
         self, minimal_config: Config, mock_github: MagicMock
@@ -748,6 +751,9 @@ class TestBuildOrchestratorForTesting:
             )
 
             assert orch.deps.action_applier is not None
+            assert orch.deps.action_applier.review_exchange_canceller == (
+                orch.deps.completion_processor.cancel_review_exchange_for_issue
+            )
 
     def test_build_orchestrator_for_testing_with_custom_fact_gatherer(
         self, minimal_config: Config, mock_github: MagicMock

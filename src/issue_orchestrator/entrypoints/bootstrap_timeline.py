@@ -48,6 +48,8 @@ def create_timeline_composition(config: Config) -> TimelineComposition:
     evidence = FileSystemTimelineEvidence(
         archive_root=repository_state / "timeline-evidence",
         timeline_store=store,
+        retention_days=config.session_output_retention_days,
+        retention_tier=config.session_output_retention_tier,
     )
     return TimelineComposition(
         instance_id=instance_id,

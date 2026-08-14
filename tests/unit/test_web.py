@@ -185,6 +185,13 @@ def create_mock_orchestrator():
     mock_deps = MagicMock()
     mock_deps.publish_recovery = MagicMock()
     mock_deps.publish_recovery.can_retry_publish.return_value = False
+    mock_deps.completion_processor = MagicMock()
+    mock_deps.completion_processor.cancel_review_exchange_for_issue.side_effect = (
+        lambda issue_number, _reason: SimpleNamespace(
+            issue_number=issue_number,
+            cancelled_job_ids=(),
+        )
+    )
     mock_deps.timeline_reader = MagicMock()
     mock_orch.deps = mock_deps
     mock_orch.scheduler = MagicMock()
@@ -353,4 +360,3 @@ def _first_cycle(payload: dict[str, Any]) -> dict[str, Any]:
     first = cycles[0]
     assert isinstance(first, dict)
     return first
-

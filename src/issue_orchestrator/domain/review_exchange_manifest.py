@@ -26,7 +26,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .review_exchange_summary import ReviewExchangeStatus
 
 
 @dataclass(frozen=True)
@@ -158,31 +157,19 @@ class ReviewExchangeRecordingPaths:
 
 @dataclass(frozen=True)
 class ReviewExchangeSummaryManifestUpdate:
-    """Manifest fields written when a summary artifact is finalized."""
+    """Artifact fields written when a review-exchange summary is stored.
+
+    Terminal outcome and retention fields belong to ``TimelineEvidence``.
+    """
 
     exchange_dir: Path
     summary_path: Path
-    ended_at: str
-    outcome: ReviewExchangeStatus
     validation_record_path: Path | None = None
-
-    def __post_init__(self) -> None:
-        if not self.ended_at:
-            raise ValueError(
-                "review exchange summary manifest update requires ended_at"
-            )
-        object.__setattr__(
-            self,
-            "outcome",
-            ReviewExchangeStatus(self.outcome),
-        )
 
     def to_manifest_fields(self) -> dict[str, str]:
         fields = {
             "review_exchange_dir": str(self.exchange_dir),
             "review_exchange_summary_path": str(self.summary_path),
-            "ended_at": self.ended_at,
-            "outcome": self.outcome.value,
         }
         if self.validation_record_path is not None:
             fields["validation_record_path"] = str(self.validation_record_path)

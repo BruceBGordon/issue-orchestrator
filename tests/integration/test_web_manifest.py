@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 
 from issue_orchestrator.entrypoints import web
 from issue_orchestrator.execution.session_output_adapter import FileSystemSessionOutput
+from issue_orchestrator.ports.timeline_evidence import NULL_TIMELINE_EVIDENCE
 
 
 def test_session_manifest_uses_history_worktree_path(tmp_path, monkeypatch) -> None:
@@ -32,7 +33,11 @@ def test_session_manifest_uses_history_worktree_path(tmp_path, monkeypatch) -> N
         repo="owner/repo",
         repo_root=tmp_path / "repo",
     )
-    dummy = SimpleNamespace(state=state, config=config)
+    dummy = SimpleNamespace(
+        state=state,
+        config=config,
+        deps=SimpleNamespace(timeline_evidence=NULL_TIMELINE_EVIDENCE),
+    )
     monkeypatch.setattr(web, "_orchestrator", dummy)
 
     client = TestClient(web.app)

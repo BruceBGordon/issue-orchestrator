@@ -66,10 +66,9 @@ from ..control.cleanup_manager import CleanupManager
 from ..control.worker_budget import worker_slot_free
 from ..control.review_exchange_lifecycle import (
     IssueRuntimeTermination,
-    ReviewExchangeCancellation,
-    cancel_issue_review_exchange,
     terminate_issue_runtime,
 )
+from ..control.review_exchange_contracts import ReviewExchangeCancellationResult
 from ..control.completion_handler import (
     CompletionHandler,
     launch_review_by_number as _ch_launch_review_by_number,
@@ -221,17 +220,15 @@ class Orchestrator:
         issue_number: int,
         *,
         reason: str,
-    ) -> ReviewExchangeCancellation:
+    ) -> ReviewExchangeCancellationResult:
         """Cancel issue-scoped review-exchange runtime work.
 
         Entrypoints use this behavior-level facade instead of reaching
         through ``deps`` to find lifecycle collaborators.
         """
-        return cancel_issue_review_exchange(
-            issue_number=issue_number,
-            reason=reason,
-            pair_registry=self.deps.services.pair_registry,
-            job_supervisor=self.deps.services.background_job_supervisor,
+        return self.deps.completion_processor.cancel_review_exchange_for_issue(
+            issue_number,
+            reason,
         )
 
     def terminate_issue_runtime_for_issue(
@@ -244,8 +241,9 @@ class Orchestrator:
         return terminate_issue_runtime(
             issue_number=issue_number,
             reason=reason,
-            pair_registry=self.deps.services.pair_registry,
-            job_supervisor=self.deps.services.background_job_supervisor,
+            review_exchange_canceller=(
+                self.deps.completion_processor.cancel_review_exchange_for_issue
+            ),
             session_manager=self.deps.session_manager,
             active_sessions=self.state.active_sessions,
             publish_recovery=self.deps.publish_recovery,

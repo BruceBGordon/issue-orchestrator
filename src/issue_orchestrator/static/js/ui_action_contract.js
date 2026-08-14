@@ -122,7 +122,7 @@
         };
     }
 
-    function buildTimelineEvidencePinRequest(issueNumber, runDir, pinned) {
+    function buildTimelineEvidencePinRequest(issueNumber, runDir, pinned, repoRoot = null) {
         const normalized = normalizeIssueNumbers([issueNumber]);
         if (normalized.length !== 1) {
             throw new Error(`Invalid issue number for Timeline evidence pin: ${issueNumber}`);
@@ -130,8 +130,11 @@
         if (!runDir) {
             throw new Error('runDir is required for Timeline evidence pin');
         }
+        const endpoint = repoRoot
+            ? `${ENDPOINTS.TIMELINE_EVIDENCE_PIN(normalized[0])}?repo_root=${encodeURIComponent(String(repoRoot))}`
+            : ENDPOINTS.TIMELINE_EVIDENCE_PIN(normalized[0]);
         return {
-            endpoint: ENDPOINTS.TIMELINE_EVIDENCE_PIN(normalized[0]),
+            endpoint,
             method: 'PUT',
             body: { run_dir: String(runDir), pinned: Boolean(pinned) },
         };
@@ -234,6 +237,10 @@
         const sinceHash = typeof options.since_hash === 'string' ? options.since_hash : '';
         if (sinceHash) {
             params.set('since_hash', sinceHash);
+        }
+        const repoRoot = typeof options.repo_root === 'string' ? options.repo_root.trim() : '';
+        if (repoRoot) {
+            params.set('repo_root', repoRoot);
         }
         return {
             endpoint: `${ENDPOINTS.TERMINAL_RECORDING(normalized[0])}?${params.toString()}`,

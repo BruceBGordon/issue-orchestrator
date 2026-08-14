@@ -3,6 +3,7 @@ let logFollow = true;
 let logIssue = null;
 let logRunDir = null;
 let logRecordingContext = null;
+let logRepoRoot = null;
 let sessionReplayState = null;
 
 // Cap the idle gap honored between recorded events during playback. Real
@@ -66,6 +67,7 @@ async function refreshAgentLog(issueNumber, forceScroll = false, runDir = null) 
             ? sessionReplayState.recordingContext.session_role
             : null,
         since_hash: inTranscriptMode ? (sessionReplayState.transcriptHash || '') : '',
+        repo_root: logRepoRoot,
     });
     const res = await fetch(request.endpoint, { method: request.method });
     const data = await res.json().catch(() => ({}));
@@ -123,6 +125,7 @@ async function openAgentLog(issueNumber, logLabel = 'Session Recording', runDir 
     clearDiagnosticsActionMessage();
     logIssue = issueNumber;
     logRunDir = runDir;
+    logRepoRoot = context && context.repo_root ? String(context.repo_root) : null;
     logRecordingContext = context && (context.round_index || context.session_role) ? {
         round_index: Number.isInteger(Number(context.round_index)) ? Number(context.round_index) : null,
         session_role: context.session_role ? String(context.session_role).trim() : null,
@@ -132,6 +135,7 @@ async function openAgentLog(issueNumber, logLabel = 'Session Recording', runDir 
         limit: 0,
         round_index: logRecordingContext ? logRecordingContext.round_index : null,
         session_role: logRecordingContext ? logRecordingContext.session_role : null,
+        repo_root: logRepoRoot,
     });
     const res = await fetch(request.endpoint, { method: request.method });
     const data = await res.json().catch(() => ({}));
@@ -288,13 +292,17 @@ async function openReviewTranscript(issueNumber, runDir = null, context = null, 
     }
 }
 
-async function copyAgentLogAction(issueNumber, runDir = null) {
+async function copyAgentLogAction(issueNumber, runDir = null, context = null) {
     if (!runDir) {
         showToast('No run-scoped session recording is available to copy', true);
         return;
     }
     try {
-        const request = uiActionContract.buildTerminalRecordingRequest(issueNumber, runDir, { offset: 0, limit: 0 });
+        const request = uiActionContract.buildTerminalRecordingRequest(issueNumber, runDir, {
+            offset: 0,
+            limit: 0,
+            repo_root: context && context.repo_root ? context.repo_root : null,
+        });
         const res = await fetch(request.endpoint, { method: request.method });
         const data = await res.json().catch(() => ({}));
         if (!res.ok || data.error) {
@@ -823,4 +831,3 @@ function updateSessionReplayUi() {
         followToggleEl.checked = !!sessionReplayState.follow;
     }
 }
-

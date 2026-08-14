@@ -7,6 +7,9 @@ from unittest.mock import MagicMock
 from issue_orchestrator.control.github_workflow import GitHubWorkflow
 from issue_orchestrator.control.action_applier import ActionApplier
 from issue_orchestrator.control.actions import ReconcileHistoryEntryAction
+from issue_orchestrator.control.review_exchange_lifecycle import (
+    ReviewExchangeCancellation,
+)
 from issue_orchestrator.control.orchestrator_support import (
     emit_queue_changes,
     track_stale_ticks,
@@ -26,6 +29,12 @@ from issue_orchestrator.domain.models import Issue, OrchestratorState, SessionHi
 from issue_orchestrator.events import EventContext, EventName
 from issue_orchestrator.infra.config import Config
 from tests.conftest import MockEventSink
+
+
+def _no_review_exchange_work(
+    issue_number: int, _reason: str
+) -> ReviewExchangeCancellation:
+    return ReviewExchangeCancellation(issue_number, ())
 
 
 def test_queue_changed_event_payload_shape():
@@ -177,17 +186,21 @@ def test_history_reconciled_event_payload_shape():
         sessions=MagicMock(),
         events=events,
         history_owner=SessionHistoryOwner([entry]),
+        review_exchange_canceller=_no_review_exchange_work,
     )
 
-    applier.apply(ReconcileHistoryEntryAction(
-        issue_number=228,
-        pr_number=318,
-        pr_url="https://github.com/owner/repo/pull/318",
-        status="merged",
-        source="pull_request",
-        issue_key="M1-228",
-        reason="PR merged; awaiting merge reconciled",
-    ))
+    result = applier.apply(
+        ReconcileHistoryEntryAction(
+            issue_number=228,
+            pr_number=318,
+            pr_url="https://github.com/owner/repo/pull/318",
+            status="merged",
+            source="pull_request",
+            issue_key="M1-228",
+            reason="PR merged; awaiting merge reconciled",
+        )
+    )
+    assert result.success
 
     matches = events.get_events_by_name(EventName.HISTORY_RECONCILED)
     assert len(matches) == 1

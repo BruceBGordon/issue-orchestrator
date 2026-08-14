@@ -41,15 +41,14 @@ from ..ports.timeline_evidence import NULL_TIMELINE_EVIDENCE, TimelineEvidence
 from ..domain.models import RETROSPECTIVE_REVIEW_TERMINAL_PREFIX, Session
 
 if TYPE_CHECKING:
-    from .background_job_supervisor import BackgroundJobSupervisor
     from .label_manager import LabelManager
     from .review_exchange_lifecycle import IssueRuntimeTermination
     from .review_exchange_lifecycle import PublishRetryAbandoner
-    from .review_exchange_lifecycle import ReviewExchangeCancellation
-    from ..ports.label_store import LabelStore
-    from ..ports.persistent_exchange_pair_registry import (
-        PersistentExchangePairRegistry,
+    from .review_exchange_contracts import (
+        ReviewExchangeCanceller,
+        ReviewExchangeCancellationResult,
     )
+    from ..ports.label_store import LabelStore
     from ..ports.promotion_target import PromotionTargetHost
     from ..ports.tech_lead_authority import TechLeadAuthorityStore
     from .retry_history_state import ExpediteLane
@@ -72,10 +71,7 @@ from .needs_human_block import (
 )
 from .reconciliation import ReconciliationRequired
 from .claim_gate import ClaimGate, ClaimLostError
-from .review_exchange_lifecycle import (
-    cancel_issue_review_exchange,
-    terminate_issue_runtime,
-)
+from .review_exchange_lifecycle import terminate_issue_runtime
 from .close_on_merge import run_close_on_merge_fallback
 from .actions import (
     Action,
@@ -168,13 +164,10 @@ class ActionApplier:
     # standing. An explicit null object rather than an optional: it governs no
     # label, so an applier holding it behaves exactly as it did before.
     needs_human_block: SharedNeedsHumanBlock = NO_OTHER_NEEDS_HUMAN_CAUSES
-    # Issue-scoped persistent coder/reviewer subprocess pair registry.
-    # Used with the background supervisor to terminate hidden review-exchange
-    # runtime work at issue lifecycle boundaries. ADR 0026 / B2.
-    pair_registry: Optional["PersistentExchangePairRegistry"] = None
-    # Shared background-job supervisor. Used with pair_registry to make
-    # issue/rework cancellation a terminal review-exchange lifecycle event.
-    background_job_supervisor: Optional["BackgroundJobSupervisor"] = None
+    # Behavior-level owner for cancellation and terminal evidence finalization.
+    # Wired after completion-pipeline construction; cancellation fails fast if
+    # a composition path reaches it without this owner.
+    review_exchange_canceller: Optional["ReviewExchangeCanceller"] = None
     # Publish-retry owner, abandoned at issue terminal boundaries via the shared
     # runtime terminator so a late republish cannot repopulate a terminated
     # issue. Wired post-construction (PublishRecoveryService needs this applier).
@@ -1112,7 +1105,7 @@ class ActionApplier:
         ref: SessionRef,
         *,
         reason: str,
-    ) -> "ReviewExchangeCancellation | None":
+    ) -> "ReviewExchangeCancellationResult | None":
         if ref.session_type not in {SessionType.ISSUE, SessionType.REWORK}:
             return None
         return self._cancel_review_exchange_for_issue(ref.number, reason=reason)
@@ -1122,13 +1115,10 @@ class ActionApplier:
         issue_number: int,
         *,
         reason: str,
-    ) -> "ReviewExchangeCancellation | None":
-        return cancel_issue_review_exchange(
-            issue_number=issue_number,
-            reason=reason,
-            pair_registry=self.pair_registry,
-            job_supervisor=self.background_job_supervisor,
-        )
+    ) -> "ReviewExchangeCancellationResult | None":
+        if self.review_exchange_canceller is None:
+            raise RuntimeError("review-exchange cancellation owner is not configured")
+        return self.review_exchange_canceller(issue_number, reason)
 
     def _terminate_issue_runtime_for_issue(
         self,
@@ -1139,11 +1129,15 @@ class ActionApplier:
         return terminate_issue_runtime(
             issue_number=issue_number,
             reason=reason,
-            pair_registry=self.pair_registry,
-            job_supervisor=self.background_job_supervisor,
+            review_exchange_canceller=self._require_review_exchange_canceller(),
             session_manager=self.sessions,
             publish_recovery=self.publish_recovery,
         )
+
+    def _require_review_exchange_canceller(self) -> "ReviewExchangeCanceller":
+        if self.review_exchange_canceller is None:
+            raise RuntimeError("review-exchange cancellation owner is not configured")
+        return self.review_exchange_canceller
 
     def _apply_queue_operation(self, action: Action) -> ActionResult:
         """Queue operations are handled by orchestrator state.
@@ -1591,8 +1585,6 @@ class ActionApplier:
             on_worktree_removed=self.on_worktree_removed,
         )
 
-        self.events.publish(make_trace_event(EventName.CLEANUP_COMPLETED, {"issue_number": action.issue_number, "pr_number": action.pr_number}))
-
         details = {
             "issue_number": action.issue_number,
             "pr_number": action.pr_number,
@@ -1604,12 +1596,18 @@ class ActionApplier:
         if errors:
             return ActionResult.fail(action, "; ".join(errors), **details)
 
+        self.events.publish(
+            make_trace_event(
+                EventName.CLEANUP_COMPLETED,
+                {"issue_number": action.issue_number, "pr_number": action.pr_number},
+            )
+        )
         return ActionResult.ok(action, **details)
 
     def _cancel_review_exchange_for_cleanup(
         self,
         action: "CleanupSessionAction",
-    ) -> "ReviewExchangeCancellation | None":
+    ) -> "ReviewExchangeCancellationResult | None":
         ref = self._cleanup_review_exchange_session_ref(action)
         return self._cancel_review_exchange_for_session_ref(
             ref,

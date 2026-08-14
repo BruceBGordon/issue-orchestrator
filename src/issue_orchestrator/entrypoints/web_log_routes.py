@@ -15,6 +15,7 @@ from .web_session_routes import (
     preview_lines_from_claude_jsonl as _preview_lines_from_claude_jsonl,
     preview_lines_from_terminal_recording as _preview_lines_from_terminal_recording,
 )
+from .web_session_manifest import unavailable_evidence_response
 
 web_log_router = APIRouter()
 
@@ -99,6 +100,13 @@ async def get_agent_ui_log(
         }, status_code=400)
 
     run_identity = RunIdentity(issue_number=issue_number, run_dir=Path(run_dir))
+    unavailable = unavailable_evidence_response(
+        orchestrator,
+        issue_number,
+        run_identity.run_dir,
+    )
+    if unavailable is not None:
+        return unavailable
     accessor = ManifestAccessor(run_identity)
     stream_observation = _build_ui_log_stream_observation(run_identity.run_dir, resolved_log_path=None)
     try:

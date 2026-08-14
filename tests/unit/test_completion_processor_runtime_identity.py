@@ -18,6 +18,7 @@ from issue_orchestrator.domain.models import (
 from issue_orchestrator.domain.runtime_identity import RuntimeIdentity
 from issue_orchestrator.execution.session_output_adapter import FileSystemSessionOutput
 from issue_orchestrator.ports.pull_request_tracker import PRInfo
+from issue_orchestrator.ports.timeline_evidence import NULL_TIMELINE_EVIDENCE
 from issue_orchestrator.ports.working_copy import (
     BranchPathsResult,
     BranchTextFilesResult,
@@ -91,6 +92,7 @@ def test_completion_processor_stamps_runtime_identity_on_created_pr(
     session_output = FileSystemSessionOutput()
     processor = CompletionProcessor(
         agent_callback_endpoint=ready_callback_endpoint(),
+        timeline_evidence=NULL_TIMELINE_EVIDENCE,
         label_adapter=label_adapter,
         pr_adapter=pr_adapter,
         git_adapter=git_adapter,

@@ -13,6 +13,7 @@ from ..domain.timeline_evidence import (
     TimelineEvidenceState,
     TimelineEvidenceStatus,
 )
+from ..domain.run_manifest import RunManifest
 from ..ports.timeline_evidence import TimelineEvidence
 
 logger = logging.getLogger(__name__)
@@ -79,6 +80,14 @@ class TimelineEvidencePresentation:
         if self.state is None:
             return list(run_actions())
         actions = list(run_actions()) if self.state.available else []
+        if self.state.archived and not _archived_orchestrator_log_available(
+            self.state
+        ):
+            actions = [
+                action
+                for action in actions
+                if action.get("type") != "open_orchestrator_log"
+            ]
         if include_pin and self.state.status in {
             TimelineEvidenceStatus.RETAINED,
             TimelineEvidenceStatus.PINNED,
@@ -106,6 +115,20 @@ class TimelineEvidencePresentation:
                 else ""
             ),
         }
+
+
+def _archived_orchestrator_log_available(state: TimelineEvidenceState) -> bool:
+    """Return whether an archived run owns a readable local log tail."""
+    run_dir = state.identity.run_dir
+    try:
+        tail_value = RunManifest.load(run_dir).orchestrator_tail
+        if not tail_value:
+            return False
+        tail_path = Path(tail_value).resolve(strict=True)
+        tail_path.relative_to(run_dir.resolve(strict=True))
+    except (FileNotFoundError, OSError, ValueError):
+        return False
+    return tail_path.is_file()
 
 
 def present_timeline_evidence(
@@ -192,6 +215,24 @@ def attach_timeline_evidence(
         )
         decorated.append(event_with_evidence)
     return TimelineEventBatch(decorated)
+
+
+def scope_timeline_actions_to_repository(
+    batch: TimelineEventBatch,
+    repo_root: Path,
+) -> TimelineEventBatch:
+    """Carry Control Center repository scope on every Timeline command."""
+    scoped_events: list[dict[str, Any]] = []
+    for event in batch.events:
+        scoped_event = dict(event)
+        scoped_actions: list[Mapping[str, Any]] = []
+        for action in _existing_actions(event):
+            scoped_action = dict(action)
+            scoped_action["repo_root"] = str(repo_root)
+            scoped_actions.append(scoped_action)
+        scoped_event["actions"] = scoped_actions
+        scoped_events.append(scoped_event)
+    return TimelineEventBatch(scoped_events)
 
 
 def _existing_actions(event: Mapping[str, Any]) -> list[Mapping[str, Any]]:

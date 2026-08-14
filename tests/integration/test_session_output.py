@@ -11,6 +11,7 @@ from issue_orchestrator.control.completion_processor import CompletionProcessor
 from issue_orchestrator.domain.models import CompletionOutcome, CompletionRecord, get_completion_path
 from issue_orchestrator.execution.session_output_adapter import FileSystemSessionOutput as SessionOutputManager
 from issue_orchestrator.ports.pull_request_tracker import PRInfo
+from issue_orchestrator.ports.timeline_evidence import NULL_TIMELINE_EVIDENCE
 from issue_orchestrator.ports.working_copy import PushResult
 from tests.callback_endpoint_helpers import ready_callback_endpoint
 
@@ -120,6 +121,7 @@ def test_session_output_manifest_and_validation_pointer(tmp_path: Path) -> None:
 
     processor = CompletionProcessor(
         agent_callback_endpoint=ready_callback_endpoint(),
+        timeline_evidence=NULL_TIMELINE_EVIDENCE,
         label_adapter=DummyLabelAdapter(),
         pr_adapter=DummyPRAdapter(),
         git_adapter=DummyGitAdapter(),
@@ -299,6 +301,7 @@ def test_review_completion_writes_feedback_file(tmp_path: Path) -> None:
 
     processor = CompletionProcessor(
         agent_callback_endpoint=ready_callback_endpoint(),
+        timeline_evidence=NULL_TIMELINE_EVIDENCE,
         label_adapter=DummyLabelAdapter(),
         pr_adapter=DummyPRAdapter(),
         git_adapter=DummyGitAdapter(),
@@ -348,6 +351,7 @@ def test_feedback_file_not_written_for_approved(tmp_path: Path) -> None:
 
     processor = CompletionProcessor(
         agent_callback_endpoint=ready_callback_endpoint(),
+        timeline_evidence=NULL_TIMELINE_EVIDENCE,
         label_adapter=DummyLabelAdapter(),
         pr_adapter=DummyPRAdapter(),
         git_adapter=DummyGitAdapter(),

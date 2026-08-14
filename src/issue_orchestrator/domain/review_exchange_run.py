@@ -54,12 +54,15 @@ class ReviewExchangeRunAssets:
 class ReviewExchangeRun:
     """A concrete review-exchange session run allocated by the run owner."""
 
+    issue_number: int
     session_name: str
     run_id: str
     parent_session_name: str
     assets: ReviewExchangeRunAssets
 
     def __post_init__(self) -> None:
+        if self.issue_number <= 0:
+            raise ValueError("review exchange run requires a positive issue_number")
         if not self.session_name:
             raise ValueError("review exchange run requires session_name")
         if not self.run_id:

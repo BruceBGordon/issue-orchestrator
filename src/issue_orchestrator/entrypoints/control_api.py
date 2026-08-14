@@ -61,6 +61,9 @@ from ..ports.repository_engine_supervisor import SupervisorOps
 from ..ports import RepositoryHost
 from ..control.goal_pilot import GoalPilot
 from ..execution.control_center_actions import ControlCenterActions
+from ..execution.control_center_timeline_evidence import (
+    ControlCenterTimelineEvidenceAccess,
+)
 from ..execution.repository_setup_validation import (
     RepositorySetupValidationDetectorAdapter,
 )
@@ -80,7 +83,11 @@ from .control_api_goal_pilot_support import (
     install_control_api_goal_pilot_dependencies,
 )
 from .control_api_e2e_runs import control_e2e_runs_router
-from .timeline_projection_boundary import timeline_projection_endpoint
+from .control_api_timeline_routes import control_timeline_router
+from .control_api_timeline_support import (
+    ControlApiTimelineDependencies,
+    install_control_api_timeline_dependencies,
+)
 from .control_api_orchestrator_routes import control_orchestrator_router
 from .control_api_orchestrator_support import (
     ControlApiOrchestratorDependencies,
@@ -123,12 +130,6 @@ from .control_api_tools_support import (
     install_control_api_tools_dependencies,
 )
 from .control_api_e2e_triage import control_e2e_triage_router
-from .timeline_presentation import (
-    _build_phase_toc,
-    _build_timeline_cycles,
-    _decorate_timeline_events,
-    _filter_timeline_events,
-)
 
 # Path to templates
 _TEMPLATES_DIR = Path(__file__).parent.parent / "templates"
@@ -1180,6 +1181,15 @@ install_control_api_setup_dependencies(
         validation_detector=RepositorySetupValidationDetectorAdapter(),
     ),
 )
+install_control_api_timeline_dependencies(
+    control_app,
+    ControlApiTimelineDependencies(
+        timeline_evidence=ControlCenterTimelineEvidenceAccess(
+            get_supervisor=get_supervisor,
+        ),
+        validate_repo_root=_validate_repo_root,
+    ),
+)
 control_app.include_router(control_orchestrator_router)
 control_app.include_router(control_shutdown_router)
 control_app.include_router(control_goal_pilot_router)
@@ -1189,101 +1199,4 @@ control_app.include_router(control_repo_router)
 control_app.include_router(control_setup_router)
 control_app.include_router(control_e2e_runs_router)
 control_app.include_router(control_e2e_triage_router)
-
-
-@control_app.get("/api/session/terminal-recording/{issue_number}")
-async def control_terminal_recording(
-    issue_number: int,
-    offset: int = 0,
-    limit: int = 200,
-    run_dir: str | None = None,
-    round_index: int | None = None,
-    session_role: str | None = None,
-) -> JSONResponse:
-    """Terminal recording endpoint on control center — delegates to shared implementation."""
-    from ..entrypoints.web import serve_terminal_recording
-
-    return serve_terminal_recording(
-        issue_number,
-        run_dir,
-        offset,
-        limit,
-        round_index,
-        session_role,
-    )
-
-
-@control_app.get("/api/issue-detail/{issue_number}")
-@timeline_projection_endpoint("control_issue_detail")
-async def control_issue_detail(
-    issue_number: int,
-    repo_root: str = Query(...),
-    view: str = Query("user"),
-) -> JSONResponse:
-    """Issue detail endpoint on control center.
-
-    Reads timeline events from the E2E worktree's timeline.sqlite for E2E
-    test issues, then runs them through the same view model pipeline as
-    the dashboard's issue-detail endpoint. Returns the same payload shape
-    so the existing renderJourneyTimeline JS works without changes.
-    """
-    from ..execution.timeline_store import read_timeline_records
-    from ..infra.e2e_worktree import get_e2e_worktree_path
-    from ..timeline import TimelineStream
-    from ..view_models.issue_detail import build_issue_detail_view_model
-    from ..view_models.timeline_view import normalize_timeline_view
-
-    validated_root = _validate_repo_root(repo_root)
-    if validated_root is None:
-        return JSONResponse({"error": "Invalid repo_root"}, status_code=400)
-
-    view = normalize_timeline_view(view)
-
-    # Try base repo timeline first, then E2E worktree timeline
-    candidates = [
-        validated_root / ".issue-orchestrator" / "state" / "timeline.sqlite",
-        get_e2e_worktree_path(validated_root)
-        / ".issue-orchestrator"
-        / "state"
-        / "timeline.sqlite",
-    ]
-    records: list = []
-    for db_path in candidates:
-        if not db_path.exists():
-            continue
-        try:
-            found = read_timeline_records(db_path, issue_number, limit=5000)
-            if found:
-                records = found
-                break
-        except Exception:
-            logger.debug("Could not read timeline from %s", db_path, exc_info=True)
-
-    if not records:
-        return JSONResponse(
-            {
-                "error": "not_found",
-                "detail": f"No timeline events for issue {issue_number}",
-            },
-            status_code=404,
-        )
-
-    stream = TimelineStream.from_records(issue_number, records)
-    raw_events = [evt.to_dict() for evt in stream.events]
-    filtered_events = _filter_timeline_events(raw_events)
-    decorated = _decorate_timeline_events(filtered_events, issue_number)
-    phase_toc = _build_phase_toc(decorated)
-    cycles = _build_timeline_cycles(decorated)
-
-    payload = build_issue_detail_view_model(
-        issue_number=issue_number,
-        title=f"Issue #{issue_number}",
-        issue_url="",
-        events=decorated,
-        phase_toc=phase_toc,
-        cycles=cycles,
-        context=None,
-        view=view,
-        raw_events=raw_events,
-    )
-    return JSONResponse(payload)
+control_app.include_router(control_timeline_router)

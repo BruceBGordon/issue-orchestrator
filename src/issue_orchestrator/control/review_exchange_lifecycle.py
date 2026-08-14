@@ -13,6 +13,10 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Iterable, Protocol
 
 from .completion_review_exchange import is_review_exchange_job_for_issue
+from .review_exchange_contracts import (
+    ReviewExchangeCanceller,
+    ReviewExchangeCancellationResult,
+)
 
 if TYPE_CHECKING:
     from ..domain.models import Session
@@ -67,7 +71,7 @@ class IssueRuntimeTermination:
     """Result of applying an issue-scoped runtime lifecycle boundary."""
 
     issue_number: int
-    review_exchange: ReviewExchangeCancellation
+    review_exchange: ReviewExchangeCancellationResult
     stopped_session_ids: tuple[str, ...]
     cleared_active_session_ids: tuple[str, ...]
 
@@ -102,6 +106,11 @@ def cancel_issue_review_exchange(
                 reason=reason,
             )
         )
+        if cancelled and not job_supervisor.wait_until_stopped(cancelled):
+            raise RuntimeError(
+                "cancelled review-exchange worker did not stop before cleanup: "
+                + ",".join(cancelled)
+            )
     if pair_registry is not None or cancelled:
         logger.info(
             "[REVIEW_EXCHANGE] cancelled issue=%d reason=%s jobs=%s",
@@ -119,8 +128,7 @@ def terminate_issue_runtime(
     *,
     issue_number: int,
     reason: str,
-    pair_registry: "PersistentExchangePairRegistry | None",
-    job_supervisor: "BackgroundJobSupervisor | None",
+    review_exchange_canceller: ReviewExchangeCanceller,
     session_manager: "SessionManager | None" = None,
     active_sessions: list["Session"] | None = None,
     publish_recovery: "PublishRetryAbandoner | None" = None,
@@ -145,12 +153,7 @@ def terminate_issue_runtime(
             f"SessionManager: issue={issue_number} sessions={sorted(matching_active)}"
         )
 
-    review_exchange = cancel_issue_review_exchange(
-        issue_number=issue_number,
-        reason=reason,
-        pair_registry=pair_registry,
-        job_supervisor=job_supervisor,
-    )
+    review_exchange = review_exchange_canceller(issue_number, reason)
 
     if publish_recovery is not None:
         # Publish-retry work has its own owner/runner outside the review-exchange

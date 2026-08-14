@@ -31,8 +31,10 @@ async def set_timeline_evidence_pin(
     issue_number: int,
     payload: TimelineEvidencePinRequestPayload,
     orchestrator: WebOrchestratorDependency,
+    repo_root: str | None = None,
 ) -> TimelineEvidenceStatePayload | JSONResponse:
     """Set retention pin state for one exact Timeline run."""
+    del repo_root  # Repository Engine already owns one configured repository.
     if not orchestrator:
         return JSONResponse({"error": "Orchestrator not running"}, status_code=503)
     command = SetTimelineEvidencePinCommand(

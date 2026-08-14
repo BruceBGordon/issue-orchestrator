@@ -6,9 +6,11 @@ from pathlib import Path
 from typing import Protocol
 
 from ..domain.timeline_evidence import (
+    FinalizeTimelineEvidenceCommand,
     SetTimelineEvidencePinCommand,
     TimelineEvidenceIdentity,
     TimelineEvidenceState,
+    TimelineEvidenceStatus,
 )
 
 
@@ -25,6 +27,12 @@ class TimelineEvidence(Protocol):
         self, command: SetTimelineEvidencePinCommand
     ) -> TimelineEvidenceState:
         """Set one exact run's pin state and return its resulting state."""
+        ...
+
+    def finalize_terminal(
+        self, command: FinalizeTimelineEvidenceCommand
+    ) -> TimelineEvidenceState:
+        """Finalize one run's terminal timestamp and configured expiry."""
         ...
 
     def archive_worktree(self, issue_number: int, worktree_path: Path) -> int:
@@ -54,6 +62,19 @@ class NullTimelineEvidence:
     ) -> TimelineEvidenceState:
         del command
         raise RuntimeError("Timeline evidence retention is not configured")
+
+    def finalize_terminal(
+        self, command: FinalizeTimelineEvidenceCommand
+    ) -> TimelineEvidenceState:
+        return TimelineEvidenceState(
+            identity=command.identity,
+            status=TimelineEvidenceStatus.MISSING,
+            label="Evidence unavailable",
+            available=False,
+            pinned=False,
+            archived=False,
+            help_text="Timeline evidence retention is not configured.",
+        )
 
     def archive_worktree(self, issue_number: int, worktree_path: Path) -> int:
         del issue_number, worktree_path

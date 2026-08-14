@@ -44,6 +44,7 @@ if TYPE_CHECKING:
         InMemoryPersistentExchangePairRegistry,
     )
     from ..ports.tech_lead_authority import TechLeadAuthorityStore
+    from ..ports.timeline_evidence import TimelineEvidence
 
 
 class CompletionRepositoryPorts(LabelAdapter, PRAdapter, Protocol):
@@ -109,6 +110,7 @@ def create_completion_components(
     # NEEDS_HUMAN completion outcome routes through it, and the label adapter
     # below refuses that label by value, so the two halves cannot disagree.
     needs_human_block: "SharedNeedsHumanBlock",
+    timeline_evidence: "TimelineEvidence",
     coder_prompt_addendum: CoderPromptAddendumProvider = NO_CODER_PROMPT_ADDENDUM,
 ) -> tuple[
     "CompletionProcessor | None",
@@ -188,6 +190,7 @@ def create_completion_components(
         runtime_identity=runtime_identity.resolve_runtime_identity(),
         tech_lead_authority=tech_lead_authority,
         needs_human_block=needs_human_block,
+        timeline_evidence=timeline_evidence,
     )
 
     session_controller_instance = SessionController(
@@ -203,7 +206,7 @@ def create_completion_components(
         attempt_store=attempt_store,
         validation_attempt_key_factory=_validation_attempt_key_factory(config),
         max_validation_retries=config.retry.max_validation_retries,
-        review_exchange_canceller=_cancel_review_exchange,
+        review_exchange_canceller=completion_processor.cancel_review_exchange_for_issue,
     )
 
     completion_handler_factory = (
@@ -216,6 +219,7 @@ def create_completion_components(
             open_issue_corpus=open_issue_corpus,
             label_manager=label_manager,
             provider_resilience=provider_resilience,
+            timeline_evidence=timeline_evidence,
         )
         if repository_host is not None
         and tech_lead_authority is not None
@@ -240,6 +244,7 @@ def build_completion_handler_factory(
     open_issue_corpus: "OpenIssueCorpusManager",
     label_manager: "LabelManager",
     provider_resilience: ProviderResilienceManager,
+    timeline_evidence: "TimelineEvidence",
 ) -> "CompletionHandlerFactory":
     """Implement ``ports.completion_handler_factory.CompletionHandlerFactory``.
 
@@ -271,6 +276,7 @@ def build_completion_handler_factory(
             open_issue_corpus,
             lambda n: active_session_run_id(active_sessions(), n),
             provider_availability,
+            timeline_evidence,
             remove_session_machine_fn=state_machines.remove_session_machine,
             label_manager=label_manager,
         )

@@ -9,6 +9,7 @@ import pytest
 
 from issue_orchestrator.domain.run_manifest import RunManifest
 from issue_orchestrator.domain.timeline_evidence import (
+    FinalizeTimelineEvidenceCommand,
     SetTimelineEvidencePinCommand,
     TimelineEvidenceIdentity,
     TimelineEvidenceStatus,
@@ -105,6 +106,56 @@ def test_archive_rewrites_manifest_and_timeline_paths_before_cleanup(
         owner.describe(TimelineEvidenceIdentity(42, archived)).status
         is TimelineEvidenceStatus.RETAINED
     )
+
+
+def test_terminal_finalization_uses_owner_policy_and_is_idempotent(
+    tmp_path: Path,
+) -> None:
+    ended_at = datetime(2026, 8, 13, 12, tzinfo=timezone.utc)
+    output = FileSystemSessionOutput()
+    run = output.start_run(
+        tmp_path / "worktree",
+        "issue-42",
+        issue_number=42,
+        retention_days=7,
+        retention_tier="hot",
+    )
+    owner = FileSystemTimelineEvidence(
+        archive_root=tmp_path / "state" / "timeline-evidence",
+        timeline_store=SqliteTimelineStore(tmp_path / "timeline.sqlite"),
+        retention_days=21,
+        retention_tier="cold",
+        now=lambda: ended_at,
+    )
+    identity = TimelineEvidenceIdentity(42, run.run_dir)
+
+    state = owner.finalize_terminal(
+        FinalizeTimelineEvidenceCommand(
+            identity=identity,
+            outcome="failed",
+            ended_at=ended_at.isoformat(),
+        )
+    )
+    original = RunManifest.load(run.run_dir)
+
+    assert state.status is TimelineEvidenceStatus.RETAINED
+    assert original.retention_days == 21
+    assert original.retention_tier == "cold"
+    assert datetime.fromisoformat(original.retention_expires_at or "") == (
+        ended_at + timedelta(days=21)
+    )
+
+    owner.finalize_terminal(
+        FinalizeTimelineEvidenceCommand(
+            identity=identity,
+            outcome="timed_out",
+            ended_at=(ended_at + timedelta(days=1)).isoformat(),
+        )
+    )
+    retried = RunManifest.load(run.run_dir)
+    assert retried.ended_at == original.ended_at
+    assert retried.retention_expires_at == original.retention_expires_at
+    assert retried.outcome == "failed"
 
 
 def test_pin_survives_expiry_until_unpin_then_expires_immediately(
@@ -259,9 +310,19 @@ def test_archive_copies_declared_claude_log_link_as_a_regular_file(
     external_log.write_text('{"type":"assistant"}\n')
     (run_dir / "claude-session.jsonl").symlink_to(external_log)
     (run_dir / "claude-session.path").write_text(str(external_log))
+    (run_dir / "claude-log.path").write_text(str(external_log.parent))
     manifest = RunManifest.load(run_dir)
     manifest.claude_log_path = str(external_log)
+    artifacts = manifest.artifacts or {}
+    artifacts["claude_log"] = {
+        "kind": "claude_jsonl",
+        "path": str(external_log),
+    }
+    manifest.artifacts = artifacts
     manifest.save()
+    FileSystemSessionOutput().update_manifest(
+        run_dir, {"claude_log_dir": str(external_log.parent)}
+    )
     owner = FileSystemTimelineEvidence(
         archive_root=tmp_path / "state" / "timeline-evidence",
         timeline_store=_timeline_store_with_run(
@@ -277,8 +338,12 @@ def test_archive_copies_declared_claude_log_link_as_a_regular_file(
     assert archived_log.is_file()
     assert not archived_log.is_symlink()
     assert archived_log.read_text() == external_log.read_text()
-    assert RunManifest.load(archived).claude_log_path == str(archived_log)
+    archived_manifest = RunManifest.load(archived)
+    assert archived_manifest.claude_log_path == str(archived_log)
+    assert archived_manifest.to_dict().get("claude_log_dir") is None
+    assert archived_manifest.artifacts["claude_log"]["path"] == str(archived_log)
     assert (archived / "claude-session.path").read_text() == str(archived_log)
+    assert (archived / "claude-log.path").read_text() == str(archived)
 
 
 def test_archive_rejects_undeclared_symlinks(tmp_path: Path) -> None:

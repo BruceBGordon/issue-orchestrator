@@ -8,6 +8,7 @@ from unittest.mock import Mock
 import pytest
 
 from issue_orchestrator.control.review_exchange_lifecycle import (
+    cancel_issue_review_exchange,
     terminate_issue_runtime,
 )
 
@@ -37,6 +38,15 @@ class _FakePublishRetryAbandoner:
         self.abandoned.append(issue_number)
 
 
+def _canceller(pair_registry=None, job_supervisor=None):
+    return lambda issue_number, reason: cancel_issue_review_exchange(
+        issue_number=issue_number,
+        reason=reason,
+        pair_registry=pair_registry,
+        job_supervisor=job_supervisor,
+    )
+
+
 def test_terminate_issue_runtime_abandons_publish_retry() -> None:
     """The shared boundary must also abandon in-flight publish retries."""
     publish_recovery = _FakePublishRetryAbandoner()
@@ -44,8 +54,7 @@ def test_terminate_issue_runtime_abandons_publish_retry() -> None:
     terminate_issue_runtime(
         issue_number=230,
         reason="issue-completed",
-        pair_registry=None,
-        job_supervisor=None,
+        review_exchange_canceller=_canceller(),
         publish_recovery=publish_recovery,
     )
 
@@ -57,8 +66,7 @@ def test_terminate_issue_runtime_without_publish_recovery_is_noop() -> None:
     result = terminate_issue_runtime(
         issue_number=230,
         reason="issue-completed",
-        pair_registry=None,
-        job_supervisor=None,
+        review_exchange_canceller=_canceller(),
     )
 
     assert result.issue_number == 230
@@ -79,14 +87,16 @@ def test_terminate_issue_runtime_stops_issue_rework_and_hidden_exchange() -> Non
     result = terminate_issue_runtime(
         issue_number=230,
         reason="reset-retry",
-        pair_registry=pair_registry,
-        job_supervisor=job_supervisor,
+        review_exchange_canceller=_canceller(pair_registry, job_supervisor),
         session_manager=session_manager,
         active_sessions=active_sessions,
     )
 
     pair_registry.release.assert_called_once_with(230, reason="reset-retry")
     job_supervisor.cancel_matching.assert_called_once()
+    job_supervisor.wait_until_stopped.assert_called_once_with(
+        ("review-exchange:230:coding-1",)
+    )
     predicate = job_supervisor.cancel_matching.call_args.args[0]
     assert predicate("review-exchange:230:coding-1")
     assert not predicate("review-exchange:231:coding-1")
@@ -100,6 +110,23 @@ def test_terminate_issue_runtime_stops_issue_rework_and_hidden_exchange() -> Non
     ]
 
 
+def test_cancelled_worker_must_stop_before_runtime_cleanup_can_continue() -> None:
+    pair_registry = Mock()
+    job_supervisor = Mock()
+    job_supervisor.cancel_matching.return_value = ["review-exchange:230:coding-1"]
+    job_supervisor.wait_until_stopped.return_value = False
+
+    with pytest.raises(RuntimeError, match="did not stop before cleanup"):
+        cancel_issue_review_exchange(
+            issue_number=230,
+            reason="session-cleanup",
+            pair_registry=pair_registry,
+            job_supervisor=job_supervisor,
+        )
+
+    pair_registry.release.assert_called_once_with(230, reason="session-cleanup")
+
+
 def test_terminate_issue_runtime_clears_stale_active_session_records() -> None:
     session_manager = _FakeSessionManager(set())
     active_sessions = [_active_session("issue-230"), _active_session("issue-231")]
@@ -107,8 +134,7 @@ def test_terminate_issue_runtime_clears_stale_active_session_records() -> None:
     result = terminate_issue_runtime(
         issue_number=230,
         reason="issue-completed",
-        pair_registry=None,
-        job_supervisor=None,
+        review_exchange_canceller=_canceller(),
         session_manager=session_manager,
         active_sessions=active_sessions,
     )
@@ -126,8 +152,7 @@ def test_terminate_issue_runtime_requires_session_manager_for_active_records() -
         terminate_issue_runtime(
             issue_number=230,
             reason="reset-retry",
-            pair_registry=pair_registry,
-            job_supervisor=None,
+            review_exchange_canceller=_canceller(pair_registry),
             session_manager=None,
             active_sessions=[_active_session("issue-230")],
         )

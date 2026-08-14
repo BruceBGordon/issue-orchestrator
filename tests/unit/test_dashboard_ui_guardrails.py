@@ -2122,7 +2122,11 @@ def test_review_feedback_modal_resolves_requested_issue_detail() -> None:
     assert "issueDetailData.issue_number === issueNumber" in body
     # Review feedback always fetches with ops view so review.comment_added
     # events (ops-only) are included regardless of the user's current view.
-    assert "fetch(`/api/issue-detail/${issueNumber}?view=ops`)" in body
+    assert "const repoRootQuery = currentIssueDetailRepoRoot" in body
+    assert (
+        "fetch(`/api/issue-detail/${issueNumber}?view=ops${repoRootQuery}`)"
+        in body
+    )
 
 
 def test_review_feedback_modal_includes_exchange_round_events() -> None:
@@ -2870,7 +2874,11 @@ def test_issue_timeline_surface_uses_contracted_issue_detail_route_only() -> Non
         "function openIssueTimeline(issueNumber, triggerEl = null, opts = {}) {" in js
     )
     assert "return openIssueDetail(issueNumber, triggerEl, {...opts, focus: 'timeline'});" in js
-    assert "`/api/issue-detail/${issueNumber}?view=${timelineView}`" in js
+    assert (
+        "`/api/issue-detail/${issueNumber}?view=${timelineView}${repoRootQuery}`"
+        in js
+    )
+    assert "encodeURIComponent(currentIssueDetailRepoRoot)" in js
 
 
 def test_timeline_view_state_has_a_single_writer() -> None:

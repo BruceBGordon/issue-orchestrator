@@ -188,6 +188,13 @@
             "in": "path",
             "required": true,
             "schema": {"type": "integer", "minimum": 1}
+          },
+          {
+            "name": "repo_root",
+            "in": "query",
+            "required": false,
+            "description": "Control Center repository scope; omitted on a Repository Engine.",
+            "schema": {"type": "string"}
           }
         ],
         "requestBody": {
@@ -424,6 +431,13 @@
             "in": "query",
             "required": false,
             "schema": {"$ref": "#/components/schemas/TimelineView", "default": "user"}
+          },
+          {
+            "name": "repo_root",
+            "in": "query",
+            "required": false,
+            "description": "Control Center repository scope; omitted on a Repository Engine.",
+            "schema": {"type": "string"}
           }
         ],
         "responses": {
@@ -435,6 +449,67 @@
               }
             }
           }
+        }
+      }
+    },
+    "/api/session/terminal-recording/{issue_number}": {
+      "get": {
+        "summary": "Read an exact run's terminal recording while evidence is retained",
+        "parameters": [
+          {
+            "name": "issue_number",
+            "in": "path",
+            "required": true,
+            "schema": {"type": "integer", "minimum": 1}
+          },
+          {
+            "name": "run_dir",
+            "in": "query",
+            "required": true,
+            "schema": {"type": "string"}
+          },
+          {
+            "name": "repo_root",
+            "in": "query",
+            "required": false,
+            "description": "Control Center repository scope; omitted on a Repository Engine.",
+            "schema": {"type": "string"}
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {"type": "integer", "default": 0}
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {"type": "integer", "default": 200}
+          },
+          {
+            "name": "round_index",
+            "in": "query",
+            "required": false,
+            "schema": {"type": "integer", "minimum": 1}
+          },
+          {
+            "name": "session_role",
+            "in": "query",
+            "required": false,
+            "schema": {"type": "string"}
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Terminal recording replay payload",
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "#/components/schemas/TerminalRecordingPayload"}
+              }
+            }
+          },
+          "410": {"description": "The exact run's Timeline evidence expired or is unavailable"}
         }
       }
     },
@@ -1270,6 +1345,39 @@
           "expires_at": {"type": ["string", "null"]},
           "help_text": {"type": "string"},
           "unpin_expires_immediately": {"type": "boolean"}
+        }
+      },
+      "TerminalRecordingPayload": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["issue_number", "recording_path", "render_mode"],
+        "properties": {
+          "issue_number": {"type": "integer", "minimum": 1},
+          "recording_path": {"type": "string"},
+          "render_mode": {"type": "string", "enum": ["terminal", "transcript"]},
+          "transcript_lines": {
+            "type": ["array", "null"],
+            "items": {"type": "string"}
+          },
+          "transcript_hash": {"type": ["string", "null"]},
+          "unchanged": {"type": "boolean"},
+          "content_type": {"type": "string"},
+          "total_events": {"type": "integer", "minimum": 0},
+          "initial_geometry": {
+            "type": ["object", "null"],
+            "additionalProperties": {"type": "integer"}
+          },
+          "offset": {"type": "integer", "minimum": 0},
+          "truncated": {"type": "boolean"},
+          "chapters": {
+            "type": ["array", "null"],
+            "items": {"type": "object", "additionalProperties": true}
+          },
+          "recording_event_index": {"type": ["integer", "null"], "minimum": 0},
+          "events": {
+            "type": "array",
+            "items": {"type": "object", "additionalProperties": true}
+          }
         }
       },
       "E2ERunDetailPayload": {

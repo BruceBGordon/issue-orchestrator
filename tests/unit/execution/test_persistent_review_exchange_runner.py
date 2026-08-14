@@ -108,6 +108,7 @@ def _make_agent(
 def _make_exchange_run(tmp_path: Path) -> ReviewExchangeRun:
     run_dir = tmp_path / ".issue-orchestrator" / "sessions" / "r1__review-exchange-42"
     return ReviewExchangeRun(
+        issue_number=42,
         session_name="review-exchange-42",
         run_id="r1",
         parent_session_name="coding-42",

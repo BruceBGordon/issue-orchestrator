@@ -1,5 +1,6 @@
 let currentIssueDetailE2ERunId = null;
 let currentIssueDetailFocus = null;
+let currentIssueDetailRepoRoot = null;
 
 function _lazyDashboardFunction(name) {
     return () => {
@@ -102,9 +103,15 @@ async function openIssueDetail(issueNumber, triggerEl = null, opts = {}) {
     currentIssueDetailE2ERunId = Number.isInteger(requestedE2ERunId) && requestedE2ERunId > 0
         ? requestedE2ERunId
         : null;
+    currentIssueDetailRepoRoot = opts && opts.repoRoot
+        ? String(opts.repoRoot)
+        : null;
+    const repoRootQuery = currentIssueDetailRepoRoot
+        ? `&repo_root=${encodeURIComponent(currentIssueDetailRepoRoot)}`
+        : '';
     const url = currentIssueDetailE2ERunId
         ? `/api/e2e-run/${currentIssueDetailE2ERunId}/issue-detail/${issueNumber}?view=${timelineView}`
-        : `/api/issue-detail/${issueNumber}?view=${timelineView}`;
+        : `/api/issue-detail/${issueNumber}?view=${timelineView}${repoRootQuery}`;
 
     try {
         const res = await fetch(url);
@@ -482,9 +489,12 @@ async function setTimelineView(view) {
     if (issueDetailData) {
         const issueNumber = issueDetailData.issue_number;
         const e2eRunId = currentIssueDetailE2ERunId || issueDetailData.e2e_run_id || null;
+        const repoRootQuery = currentIssueDetailRepoRoot
+            ? `&repo_root=${encodeURIComponent(currentIssueDetailRepoRoot)}`
+            : '';
         const url = e2eRunId
             ? `/api/e2e-run/${e2eRunId}/issue-detail/${issueNumber}?view=${resolvedView}`
-            : `/api/issue-detail/${issueNumber}?view=${resolvedView}`;
+            : `/api/issue-detail/${issueNumber}?view=${resolvedView}${repoRootQuery}`;
         try {
             const res = await fetch(url);
             if (res.ok) {
@@ -616,7 +626,10 @@ async function openReviewFeedback(issueNumber, context = null) {
         } else {
             // Always fetch with ops view — review.comment_added is ops-only,
             // so Story view would omit review comment evidence.
-            const detailRes = await fetch(`/api/issue-detail/${issueNumber}?view=ops`);
+            const repoRootQuery = currentIssueDetailRepoRoot
+                ? `&repo_root=${encodeURIComponent(currentIssueDetailRepoRoot)}`
+                : '';
+            const detailRes = await fetch(`/api/issue-detail/${issueNumber}?view=ops${repoRootQuery}`);
             if (detailRes.ok) {
                 detailForIssue = await detailRes.json();
             }

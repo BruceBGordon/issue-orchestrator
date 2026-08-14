@@ -29,6 +29,7 @@ from issue_orchestrator.control.completion_processor import CompletionProcessor
 from issue_orchestrator.control.pr_scanner import PRScanner
 from issue_orchestrator.domain.issue_key import GitHubIssueKey
 from issue_orchestrator.ports.pull_request_tracker import PRInfo
+from issue_orchestrator.ports.timeline_evidence import NULL_TIMELINE_EVIDENCE
 from issue_orchestrator.execution.session_output_adapter import FileSystemSessionOutput
 from tests.callback_endpoint_helpers import ready_callback_endpoint
 
@@ -132,6 +133,7 @@ class TestPRAlreadyExistsHandling:
         session_output = FileSystemSessionOutput()
         processor = CompletionProcessor(
             agent_callback_endpoint=ready_callback_endpoint(),
+            timeline_evidence=NULL_TIMELINE_EVIDENCE,
             label_adapter=mock_label_adapter,
             pr_adapter=mock_pr_adapter,
             git_adapter=mock_git_adapter,
@@ -175,6 +177,7 @@ class TestPRAlreadyExistsHandling:
         session_output = FileSystemSessionOutput()
         processor = CompletionProcessor(
             agent_callback_endpoint=ready_callback_endpoint(),
+            timeline_evidence=NULL_TIMELINE_EVIDENCE,
             label_adapter=mock_label_adapter,
             pr_adapter=mock_pr_adapter,
             git_adapter=mock_git_adapter,
@@ -217,6 +220,7 @@ class TestPRAlreadyExistsHandling:
         session_output = FileSystemSessionOutput()
         processor = CompletionProcessor(
             agent_callback_endpoint=ready_callback_endpoint(),
+            timeline_evidence=NULL_TIMELINE_EVIDENCE,
             label_adapter=mock_label_adapter,
             pr_adapter=mock_pr_adapter,
             git_adapter=mock_git_adapter,

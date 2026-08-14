@@ -35,6 +35,15 @@ class SetTimelineEvidencePinCommand:
 
 
 @dataclass(frozen=True)
+class FinalizeTimelineEvidenceCommand:
+    """Finalize retention for one exact run at its terminal boundary."""
+
+    identity: TimelineEvidenceIdentity
+    outcome: str
+    ended_at: str | None = None
+
+
+@dataclass(frozen=True)
 class TimelineEvidenceState:
     """Typed retention state rendered by Timeline and returned by commands."""
 

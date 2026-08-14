@@ -11,6 +11,8 @@ from typing import Any, Literal
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 
+from ..contracts.ui_openapi_models import TerminalRecordingPayload
+
 from ..domain.exchange_chapter import (
     CHAPTER_SECTION_PROMPT,
     ExchangeChapter,
@@ -23,7 +25,6 @@ from ..execution.review_exchange_transcript import (
     render_review_exchange_transcript,
 )
 from ..execution.session_output_adapter import EXCHANGE_CHAPTERS_NAME
-from ..execution.validation_failure_summary import load_validation_failure_summary
 from ..infra.claude_jsonl import claude_jsonl_entry_preview_lines
 from ..infra.session_log_prettify import (
     extract_codex_transcript,
@@ -36,7 +37,11 @@ from .web_session_context import (
     ReviewArtifactReaderDependency,
     WebOrchestratorDependency,
     resolve_issue_session_context,
-    worktree_path_from_run_dir,
+)
+from .web_orchestrator_log import orchestrator_log_response
+from .web_session_manifest import (
+    session_manifest_response,
+    unavailable_evidence_response as _unavailable_evidence_response,
 )
 
 logger = logging.getLogger(__name__)
@@ -502,7 +507,10 @@ def serve_terminal_recording(
         return JSONResponse({"error": f"Failed to read terminal recording: {exc}"}, status_code=500)
 
 
-@web_session_router.get("/api/session/terminal-recording/{issue_number}")
+@web_session_router.get(
+    "/api/session/terminal-recording/{issue_number}",
+    response_model=TerminalRecordingPayload,
+)
 async def get_terminal_recording(
     issue_number: int,
     orchestrator: WebOrchestratorDependency,
@@ -512,10 +520,18 @@ async def get_terminal_recording(
     round_index: int | None = None,
     session_role: str | None = None,
     since_hash: str | None = None,
+    repo_root: str | None = None,
 ) -> JSONResponse:
     """Return the canonical raw terminal recording for a run."""
+    del repo_root  # Repository Engine already owns one configured repository.
     if orchestrator is None:
         return JSONResponse({"error": "Orchestrator not running"}, status_code=503)
+    if run_dir:
+        unavailable = _unavailable_evidence_response(
+            orchestrator, issue_number, Path(run_dir)
+        )
+        if unavailable is not None:
+            return unavailable
     return serve_terminal_recording(
         issue_number,
         run_dir,
@@ -723,152 +739,6 @@ def _stream_file_observation(path: Path) -> dict[str, Any]:
     return data
 
 
-def _manifest_response(
-    run_dir: Path,
-    session_name: str | None,
-    *,
-    config: Any = None,
-    include_passed_validation: bool = False,
-) -> JSONResponse:
-    """Load RunManifest + analysis from run_dir and return as JSON.
-
-    `config` is the orchestrator's runtime config; when supplied, it
-    threads `validation.junit_xml_paths` into the validation summary so
-    the dashboard's `/api/dialog/validation-failure/` route receives
-    structured JUnit cases for repos that emit them. Without this
-    threading the dialog payload's `junit_cases` field is empty even
-    when JUnit XML is configured — see PR #6203 review.
-
-    `include_passed_validation` opts the dialog endpoint into a
-    `validation_failure` payload key for passed runs too (so the same
-    dialog can render both outcomes). Defaults to False to preserve the
-    existing /api/session/manifest/ contract — passed runs do not get a
-    `validation_failure` field there.
-    """
-    from ..control.session_analyzer import load_analysis
-    from ..domain.run_manifest import RunManifest
-    from ..execution.validation_failure_summary import (
-        load_validation_failure_summary_with_config,
-    )
-
-    try:
-        manifest = RunManifest.load(run_dir)
-    except FileNotFoundError:
-        return JSONResponse(
-            {
-                "run_dir": str(run_dir),
-                "session_name": session_name,
-                "manifest": None,
-            }
-        )
-    except Exception as exc:
-        return JSONResponse({"error": f"Failed to read manifest: {exc}"}, status_code=500)
-
-    result: dict[str, Any] = {
-        "run_dir": str(run_dir),
-        "session_name": session_name,
-        "manifest": manifest.to_dict(),
-    }
-    session_identity_path = run_dir / "session-identity.json"
-    if session_identity_path.exists():
-        try:
-            result["session_identity"] = json.loads(session_identity_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            logger.debug("Failed to read session identity: %s", session_identity_path, exc_info=True)
-
-    analysis = load_analysis(run_dir)
-    if analysis:
-        result["analysis"] = {
-            "headline": analysis.headline,
-            "detail": analysis.detail,
-            "suggestions": list(analysis.suggestions),
-        }
-
-    if config is not None:
-        validation_failure = load_validation_failure_summary_with_config(
-            run_dir, config=config, include_passed=include_passed_validation,
-        )
-    else:
-        validation_failure = load_validation_failure_summary(
-            run_dir, include_passed=include_passed_validation,
-        )
-    if validation_failure is not None:
-        result["validation_failure"] = validation_failure.to_dict()
-
-    return JSONResponse(result)
-
-
-def session_manifest_response(
-    issue_number: int,
-    orchestrator: WebOrchestratorDependency,
-    run_dir: str | None = None,
-    *,
-    include_passed_validation: bool = False,
-) -> JSONResponse:  # noqa: C901, PLR0912
-    """Build the session manifest response for an issue.
-
-    Pass ``include_passed_validation=True`` from the validation dialog
-    endpoint so passed runs also populate the ``validation_failure``
-    payload key — same dialog renders both outcomes.
-    """
-    if orchestrator is None:
-        return JSONResponse({"error": "Orchestrator not running"}, status_code=503)
-
-    requested_run_dir = run_dir
-    context = resolve_issue_session_context(orchestrator, issue_number)
-    worktree_path = context.worktree_path
-    session_name = context.session_name
-    resolved_run_dir = context.run_dir
-
-    if requested_run_dir:
-        candidate = Path(requested_run_dir)
-        if candidate.exists():
-            resolved_run_dir = candidate
-
-    if resolved_run_dir:
-        from ..execution.session_output_adapter import FileSystemSessionOutput
-
-        session_output = FileSystemSessionOutput()
-        if not session_name:
-            session_name = session_output.session_name_from_path(str(resolved_run_dir))
-        session_output.attach_claude_log(resolved_run_dir)
-        return _manifest_response(
-            resolved_run_dir,
-            session_name,
-            config=orchestrator.config,
-            include_passed_validation=include_passed_validation,
-        )
-
-    if not worktree_path:
-        return JSONResponse(
-            {
-                "error": f"No worktree path found for issue #{issue_number}",
-                "hint": "Session may have been cleaned up or never started",
-            },
-            status_code=404,
-        )
-
-    from ..execution.session_output_adapter import FileSystemSessionOutput
-
-    session_output = FileSystemSessionOutput()
-    resolved_run_dir = session_output.find_run_dir_for_issue(worktree_path, issue_number)
-    if not resolved_run_dir:
-        return JSONResponse(
-            {
-                "error": "No session run found",
-                "hint": "Session may not have started or output was removed",
-            },
-            status_code=404,
-        )
-    session_output.attach_claude_log(resolved_run_dir)
-    return _manifest_response(
-        resolved_run_dir,
-        session_name,
-        config=orchestrator.config,
-        include_passed_validation=include_passed_validation,
-    )
-
-
 @web_session_router.get("/api/session/manifest/{issue_number}")
 async def get_session_manifest(
     issue_number: int,
@@ -883,7 +753,7 @@ async def get_session_manifest(
 async def get_session_worktree(
     issue_number: int,
     orchestrator: WebOrchestratorDependency,
-) -> JSONResponse:  # noqa: C901
+) -> JSONResponse:
     """Get the worktree path for a session (active or history)."""
     if not orchestrator:
         return JSONResponse({"error": "Orchestrator not running"}, status_code=503)
@@ -907,7 +777,7 @@ async def get_session_worktree(
 def session_phases_response(
     issue_number: int,
     orchestrator: WebOrchestratorDependency,
-) -> JSONResponse:  # noqa: C901
+) -> JSONResponse:
     """Build the linear phase history response for an issue."""
     if not orchestrator:
         return JSONResponse({"error": "Orchestrator not running"}, status_code=503)
@@ -967,90 +837,13 @@ async def get_session_phases(
 
 
 @web_session_router.get("/api/session/orchestrator-log/{issue_number}")
-async def get_filtered_orchestrator_log(  # noqa: C901, PLR0912
+async def get_filtered_orchestrator_log(
     issue_number: int,
     orchestrator: WebOrchestratorDependency,
     run_dir: str | None = None,
 ) -> JSONResponse:
     """Generate and return a filtered orchestrator log for an issue."""
-    if not orchestrator:
-        return JSONResponse({"error": "Orchestrator not running"}, status_code=503)
-
-    from ..execution.session_output_adapter import FileSystemSessionOutput
-    from ..infra.logging_config import get_repo_log_path
-
-    session_output = FileSystemSessionOutput()
-    context = resolve_issue_session_context(orchestrator, issue_number)
-    worktree_path = context.worktree_path
-    session_name = context.session_name
-    resolved_run_dir = context.run_dir
-    if run_dir:
-        candidate = Path(run_dir)
-        if candidate.exists():
-            resolved_run_dir = candidate
-            inferred_worktree = worktree_path_from_run_dir(candidate)
-            if inferred_worktree:
-                worktree_path = inferred_worktree
-            session_name = session_output.session_name_from_path(str(candidate))
-
-    if not worktree_path:
-        return JSONResponse({"error": f"No worktree found for issue #{issue_number}"}, status_code=404)
-
-    if not session_name:
-        session_name = session_output.session_name_from_path(str(resolved_run_dir)) if resolved_run_dir else None
-    if not session_name:
-        return JSONResponse(
-            {
-                "error": "Could not determine session name for issue log filtering",
-                "worktree_path": str(worktree_path),
-            },
-            status_code=500,
-        )
-
-    log_path = get_repo_log_path(orchestrator.config.repo_root)
-    if not log_path.exists():
-        return JSONResponse(
-            {
-                "error": "Orchestrator log file not found",
-                "full_log_path": str(log_path),
-            },
-            status_code=404,
-        )
-
-    if not resolved_run_dir:
-        resolved_run_dir = session_output.find_run_dir_for_issue(worktree_path, issue_number)
-    if not resolved_run_dir:
-        return JSONResponse(
-            {
-                "error": "Could not find session run directory",
-                "worktree_path": str(worktree_path),
-            },
-            status_code=500,
-        )
-    tail_path = session_output.write_orchestrator_tail(
-        resolved_run_dir,
-        log_path,
-        issue_number,
-        session_name,
-        max_lines=500,
-    )
-    if not tail_path:
-        return JSONResponse(
-            {
-                "error": (
-                    f"No issue-scoped orchestrator log entries found for issue #{issue_number}"
-                ),
-            },
-            status_code=500,
-        )
-
-    return JSONResponse(
-        {
-            "filtered_log_path": str(tail_path),
-            "full_log_path": str(log_path),
-            "issue_number": issue_number,
-        }
-    )
+    return orchestrator_log_response(issue_number, orchestrator, run_dir)
 
 
 @web_session_router.get("/api/session/claude-log/{issue_number}")
@@ -1059,7 +852,7 @@ async def get_claude_log_content(
     orchestrator: WebOrchestratorDependency,
     limit: int = 200,
     run_dir: str | None = None,
-) -> JSONResponse:  # noqa: C901, PLR0912
+) -> JSONResponse:
     """Fetch and parse Claude session log for viewing in the dashboard."""
     if not orchestrator:
         return JSONResponse({"error": "Orchestrator not running"}, status_code=503)
@@ -1073,6 +866,11 @@ async def get_claude_log_content(
         )
 
     run_identity = RunIdentity(issue_number=issue_number, run_dir=Path(run_dir))
+    unavailable = _unavailable_evidence_response(
+        orchestrator, issue_number, run_identity.run_dir
+    )
+    if unavailable is not None:
+        return unavailable
     accessor = ManifestAccessor(run_identity)
     try:
         artifact = accessor.get_claude_log()
@@ -1135,6 +933,11 @@ async def get_review_transcript_content(
         )
 
     run_identity = RunIdentity(issue_number=issue_number, run_dir=Path(run_dir))
+    unavailable = _unavailable_evidence_response(
+        orchestrator, issue_number, run_identity.run_dir
+    )
+    if unavailable is not None:
+        return unavailable
     accessor = ManifestAccessor(run_identity)
     try:
         artifact = accessor.get_review_exchange_transcript(allow_empty=True)
@@ -1208,6 +1011,11 @@ async def get_review_artifact_content(
         )
 
     run_identity = RunIdentity(issue_number=issue_number, run_dir=Path(run_dir))
+    unavailable = _unavailable_evidence_response(
+        orchestrator, issue_number, run_identity.run_dir
+    )
+    if unavailable is not None:
+        return unavailable
     try:
         artifact = review_artifact_reader.read_review_artifact(
             ReviewArtifactReadCommand(
@@ -1262,6 +1070,11 @@ async def get_session_prompt_content(
         )
 
     run_identity = RunIdentity(issue_number=issue_number, run_dir=Path(run_dir))
+    unavailable = _unavailable_evidence_response(
+        orchestrator, issue_number, run_identity.run_dir
+    )
+    if unavailable is not None:
+        return unavailable
     accessor = ManifestAccessor(run_identity)
     try:
         artifact = accessor.get_session_prompt()

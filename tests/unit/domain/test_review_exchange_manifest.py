@@ -18,7 +18,6 @@ from issue_orchestrator.domain.review_exchange_manifest import (
     ReviewExchangeRecordingPaths,
     ReviewExchangeSummaryManifestUpdate,
 )
-from issue_orchestrator.domain.review_exchange_summary import ReviewExchangeStatus
 
 
 # ---------------------------------------------------------------------------
@@ -199,16 +198,12 @@ class TestReviewExchangeSummaryManifestUpdate:
         update = ReviewExchangeSummaryManifestUpdate(
             exchange_dir=Path("/wt/r1/review-exchange"),
             summary_path=Path("/wt/r1/review-exchange/summary.json"),
-            ended_at="2026-06-04T10:15:00Z",
-            outcome=ReviewExchangeStatus.OK,
             validation_record_path=Path("/wt/r1/review-exchange/validation.json"),
         )
 
         assert update.to_manifest_fields() == {
             "review_exchange_dir": "/wt/r1/review-exchange",
             "review_exchange_summary_path": "/wt/r1/review-exchange/summary.json",
-            "ended_at": "2026-06-04T10:15:00Z",
-            "outcome": "ok",
             "validation_record_path": "/wt/r1/review-exchange/validation.json",
         }
 
@@ -216,25 +211,9 @@ class TestReviewExchangeSummaryManifestUpdate:
         update = ReviewExchangeSummaryManifestUpdate(
             exchange_dir=Path("/wt/r1/review-exchange"),
             summary_path=Path("/wt/r1/review-exchange/summary.json"),
-            ended_at="2026-06-04T10:15:00Z",
-            outcome=ReviewExchangeStatus.STOPPED,
         )
 
         assert update.to_manifest_fields() == {
             "review_exchange_dir": "/wt/r1/review-exchange",
             "review_exchange_summary_path": "/wt/r1/review-exchange/summary.json",
-            "ended_at": "2026-06-04T10:15:00Z",
-            "outcome": "stopped",
         }
-
-    def test_rejects_empty_ended_at(self) -> None:
-        with pytest.raises(
-            ValueError,
-            match="review exchange summary manifest update requires ended_at",
-        ):
-            ReviewExchangeSummaryManifestUpdate(
-                exchange_dir=Path("/wt/r1/review-exchange"),
-                summary_path=Path("/wt/r1/review-exchange/summary.json"),
-                ended_at="",
-                outcome=ReviewExchangeStatus.OK,
-            )

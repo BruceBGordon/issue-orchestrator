@@ -94,10 +94,8 @@ def build_tech_lead_reset_retry_executor(
     # Lazy: web_retry_history_routes pulls in the FastAPI routing stack,
     # which composition should not load at module-import time.
     from ..control.maintenance import reset_issue
-    from .web_retry_history_routes import (
-        has_active_reset_retry_runtime,
-        reset_and_retry_issue,
-    )
+    from .web_retry_history_routes import reset_and_retry_issue
+    from .web_retry_runtime import has_active_reset_retry_runtime
 
     deps = orchestrator.deps
     label_manager = deps.label_manager

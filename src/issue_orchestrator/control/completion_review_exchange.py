@@ -2,6 +2,7 @@
 
 import json
 import logging
+import threading
 from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
@@ -11,10 +12,15 @@ from ..domain.completion_finalization import ReviewExchangeRunningQuery
 from ..domain.review_exchange_run import ReviewExchangeRun, ReviewExchangeRunAssets
 from ..domain.review_exchange_resume import ResumeDecision
 from ..domain.review_artifacts import review_artifacts_from_exchange_result
+from ..domain.timeline_evidence import (
+    FinalizeTimelineEvidenceCommand,
+    TimelineEvidenceIdentity,
+)
 from ..domain.runtime_config import RuntimeConfigReference
 from ..ports.background_job import NullBackgroundJobRunner
 from ..ports.review_exchange_runner import ReviewExchangeRunner
 from ..ports.session_output import SessionOutput
+from ..ports.timeline_evidence import TimelineEvidence
 from .background_job_supervisor import (
     BackgroundJobCancelledError,
     BackgroundJobTimeoutError,
@@ -26,7 +32,10 @@ from .review_exchange_cache_resolution import (
     ReuseResumeResolution,
     ReviewExchangeCacheResolver,
 )
-from .review_exchange_contracts import ReviewExchangeCanceller
+from .review_exchange_contracts import (
+    ReviewExchangeCanceller,
+    ReviewExchangeCancellationResult,
+)
 from .review_publish_pipeline import resolve_review_publish_pipeline
 
 
@@ -202,6 +211,7 @@ class CompletionReviewExchange:
         job_supervisor: BackgroundJobSupervisor | None = None,
         review_exchange_canceller: ReviewExchangeCanceller | None = None,
         agent_callback_endpoint: "AgentCallbackEndpoint",
+        timeline_evidence: TimelineEvidence,
     ) -> None:
         self._config = config
         self._session_output = session_output
@@ -210,6 +220,9 @@ class CompletionReviewExchange:
         self._emit_review_outcome = emit_review_outcome
         self._review_exchange_canceller = review_exchange_canceller
         self._agent_callback_endpoint = agent_callback_endpoint
+        self._timeline_evidence = timeline_evidence
+        self._review_runs_lock = threading.Lock()
+        self._review_runs_by_job_id: dict[str, ReviewExchangeRun] = {}
         # Supervisor injection is REQUIRED for the async failure path to work:
         # ``take_failure`` only returns values that ``tick()`` has populated,
         # and ``tick()`` must be called from the orchestrator's main loop.
@@ -363,6 +376,34 @@ class CompletionReviewExchange:
             session_name=query.session_name,
             run_id=query.run_id,
         )
+
+    def cancel_issue(
+        self,
+        issue_number: int,
+        reason: str,
+    ) -> ReviewExchangeCancellationResult:
+        """Cancel one issue's runtime and terminalize every owned review run."""
+        return self._cancel_issue(issue_number, reason, outcome="cancelled")
+
+    def _cancel_issue(
+        self,
+        issue_number: int,
+        reason: str,
+        *,
+        outcome: str,
+    ) -> ReviewExchangeCancellationResult:
+        if self._review_exchange_canceller is None:
+            raise RuntimeError("review-exchange cancellation owner is not configured")
+        cancellation = self._review_exchange_canceller(issue_number, reason)
+        with self._review_runs_lock:
+            job_ids = tuple(
+                job_id
+                for job_id, review_run in self._review_runs_by_job_id.items()
+                if review_run.issue_number == issue_number
+            )
+        for job_id in job_ids:
+            self._finalize_background_review_run(job_id, outcome=outcome)
+        return cancellation
 
     def is_review_exchange_within_deadline_for_completion(
         self,
@@ -564,6 +605,7 @@ class CompletionReviewExchange:
         failure = self._job_supervisor.take_failure(job_id)
         if failure is None:
             return None
+        self._finalize_background_review_run(job_id, outcome="error")
         cancel_error = self._cancel_runtime_after_background_failure(
             issue_number=issue_number,
             job_id=job_id,
@@ -613,7 +655,11 @@ class CompletionReviewExchange:
             )
             return None
         try:
-            cancellation = self._review_exchange_canceller(issue_number, reason)
+            cancellation = self._cancel_issue(
+                issue_number,
+                reason,
+                outcome="error",
+            )
         except Exception as exc:  # noqa: BLE001 - failure path must still halt visibly
             logger.exception(
                 "[REVIEW_EXCHANGE] failed to cancel runtime after background "
@@ -676,6 +722,7 @@ class CompletionReviewExchange:
             )
             if cancel_error:
                 errors.append(cancel_error)
+            self._finalize_background_review_run(job_id, outcome="error")
             logger.error(
                 "[REVIEW_EXCHANGE] refusing unbounded background wait "
                 "issue=%d job_id=%s elapsed=%s",
@@ -734,17 +781,24 @@ class CompletionReviewExchange:
         finishes, which is the signal the next tick uses to resume processing.
         """
 
+        with self._review_runs_lock:
+            self._review_runs_by_job_id[job_id] = review_run
+
         def _job() -> None:
             try:
-                outcome = run_review_exchange_loop(
-                    exchange_run=review_run,
-                    worktree=worktree,
-                    issue_number=issue_number,
-                    issue_title=issue_title,
-                    session_name=session_name,
-                    agent_label=agent_label,
-                    initial_validation_record_path=initial_validation_record_path,
-                    approval_gate=approval_gate,
+                self._execute_terminal_review_run(
+                    review_run=review_run,
+                    current_head_sha=current_head_sha,
+                    execute=lambda: run_review_exchange_loop(
+                        exchange_run=review_run,
+                        worktree=worktree,
+                        issue_number=issue_number,
+                        issue_title=issue_title,
+                        session_name=session_name,
+                        agent_label=agent_label,
+                        initial_validation_record_path=initial_validation_record_path,
+                        approval_gate=approval_gate,
+                    ),
                 )
             except Exception:
                 logger.exception(
@@ -753,19 +807,19 @@ class CompletionReviewExchange:
                     job_id,
                 )
                 raise
+            finally:
+                with self._review_runs_lock:
+                    self._review_runs_by_job_id.pop(job_id, None)
 
-            self._require_matching_review_run(outcome, review_run)
-            self.store_review_exchange_summary(
-                review_run=review_run,
-                exchange_result=outcome,
-                current_head_sha=current_head_sha,
-            )
-
-        return self._job_supervisor.submit(
+        submitted = self._job_supervisor.submit(
             job_id,
             _job,
             timeout_seconds=self._review_exchange_job_timeout_seconds(agent_label),
         )
+        if not submitted:
+            with self._review_runs_lock:
+                self._review_runs_by_job_id.pop(job_id, None)
+        return submitted
 
     def _dispatch_resume_decision(
         self,
@@ -960,17 +1014,20 @@ class CompletionReviewExchange:
         run_review_exchange_loop: RunReviewExchangeLoop,
         approval_gate: "ReviewExchangeApprovalGate | None",
     ) -> tuple[str, ReviewExchangeOutcome, bool]:
-        exchange_result = run_review_exchange_loop(
-            exchange_run=review_run,
-            worktree=worktree,
-            issue_number=issue_number,
-            issue_title=issue_title,
-            session_name=session_name,
-            agent_label=agent_label,
-            initial_validation_record_path=initial_validation_record_path,
-            approval_gate=approval_gate,
+        exchange_result = self._execute_terminal_review_run(
+            review_run=review_run,
+            current_head_sha=current_head_sha,
+            execute=lambda: run_review_exchange_loop(
+                exchange_run=review_run,
+                worktree=worktree,
+                issue_number=issue_number,
+                issue_title=issue_title,
+                session_name=session_name,
+                agent_label=agent_label,
+                initial_validation_record_path=initial_validation_record_path,
+                approval_gate=approval_gate,
+            ),
         )
-        self._require_matching_review_run(exchange_result, review_run)
         run_assets = review_run.assets
         review_run_dir = run_assets.run_dir
         if exchange_result.status != "ok":
@@ -1016,11 +1073,6 @@ class CompletionReviewExchange:
             summary=reviewer_summary,
             run_dir=review_run_dir,
             artifacts=self._review_artifacts_from_outcome(exchange_result),
-        )
-        self.store_review_exchange_summary(
-            review_run=review_run,
-            exchange_result=exchange_result,
-            current_head_sha=current_head_sha,
         )
         return exchange_mode, exchange_result, False
 
@@ -1079,11 +1131,23 @@ class CompletionReviewExchange:
         parent_session_name: str,
         agent_label: str,
     ) -> ReviewExchangeRun:
+        retention_days = (
+            self._config.session_output_retention_days
+            if self._config is not None
+            else 7
+        )
+        retention_tier = (
+            self._config.session_output_retention_tier
+            if self._config is not None
+            else "hot"
+        )
         return self._session_output.start_review_exchange_run(
             worktree,
             issue_number=issue_number,
             parent_session_name=parent_session_name,
             agent_label=agent_label,
+            retention_days=retention_days,
+            retention_tier=retention_tier,
         )
 
     @staticmethod
@@ -1106,12 +1170,61 @@ class CompletionReviewExchange:
         current_head_sha: str | None = None,
     ) -> None:
         self._require_matching_review_run(exchange_result, review_run)
-        if not exchange_result.summary:
-            return
-        summary = exchange_result.summary.with_head_sha_if_missing(current_head_sha)
-        self._session_output.store_review_exchange_summary(
-            review_run,
-            summary,
+        summary = exchange_result.summary
+        if summary is not None:
+            summary = summary.with_head_sha_if_missing(current_head_sha)
+            self._session_output.store_review_exchange_summary(
+                review_run,
+                summary,
+            )
+        outcome = (
+            summary.status.value
+            if summary is not None
+            else exchange_result.status.value
+        )
+        self._finalize_review_run(review_run, outcome=outcome)
+
+    def _execute_terminal_review_run(
+        self,
+        *,
+        review_run: ReviewExchangeRun,
+        current_head_sha: str | None,
+        execute: Callable[[], ReviewExchangeOutcome],
+    ) -> ReviewExchangeOutcome:
+        """Run one exchange and finalize its evidence on every exit path."""
+        try:
+            exchange_result = execute()
+            self._require_matching_review_run(exchange_result, review_run)
+            self.store_review_exchange_summary(
+                review_run=review_run,
+                exchange_result=exchange_result,
+                current_head_sha=current_head_sha,
+            )
+        except Exception:
+            self._finalize_review_run(review_run, outcome="error")
+            raise
+        return exchange_result
+
+    def _finalize_background_review_run(self, job_id: str, *, outcome: str) -> None:
+        with self._review_runs_lock:
+            review_run = self._review_runs_by_job_id.pop(job_id, None)
+        if review_run is not None:
+            self._finalize_review_run(review_run, outcome=outcome)
+
+    def _finalize_review_run(
+        self,
+        review_run: ReviewExchangeRun,
+        *,
+        outcome: str,
+    ) -> None:
+        self._timeline_evidence.finalize_terminal(
+            FinalizeTimelineEvidenceCommand(
+                identity=TimelineEvidenceIdentity(
+                    review_run.issue_number,
+                    review_run.assets.run_dir,
+                ),
+                outcome=outcome,
+            )
         )
 
     def decide_review_exchange_resumption(

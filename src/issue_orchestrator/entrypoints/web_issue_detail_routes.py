@@ -507,8 +507,10 @@ async def get_issue_detail(
     issue_number: int,
     orchestrator: WebOrchestratorDependency,
     view: str = "user",
+    repo_root: str | None = None,
 ) -> IssueDetailPayload | JSONResponse:
     """Get an issue-detail payload for drawer rendering."""
+    del repo_root  # Repository Engine already owns one configured repository.
     if not orchestrator:
         return JSONResponse({"error": "Orchestrator not running"}, status_code=503)
 

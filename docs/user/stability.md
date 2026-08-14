@@ -350,6 +350,7 @@ contracted route goes missing or stops using its generated response model.
 | `/api/issues/{issue_number}/timeline-evidence/pin` | Repository Engine |
 | `/api/retrospective-review` | Repository Engine |
 | `/api/retrospective-review/preflight` | Repository Engine |
+| `/api/session/terminal-recording/{issue_number}` | Repository Engine |
 | `/api/tech-lead/runs` | Repository Engine |
 | `/api/view-model` | Repository Engine |
 | `/api/view-model-snapshot` | Repository Engine |

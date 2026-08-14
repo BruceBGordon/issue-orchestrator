@@ -204,6 +204,22 @@ class BackgroundJobSupervisor:
         ]
         return [job_id for job_id in job_ids if self.cancel(job_id, reason=reason)]
 
+    def wait_until_stopped(
+        self,
+        job_ids: list[str] | tuple[str, ...],
+        *,
+        timeout_seconds: float = 5.0,
+        poll_seconds: float = 0.01,
+    ) -> bool:
+        """Wait for cancelled workers to stop writing before destructive cleanup."""
+        deadline = time.monotonic() + max(0.0, timeout_seconds)
+        while any(self._runner.is_running(job_id) for job_id in job_ids):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            time.sleep(min(max(0.001, poll_seconds), remaining))
+        return True
+
     def tick(self) -> None:
         """Drain completed jobs; store any failures keyed by job_id."""
         for done in self._runner.drain_completed():

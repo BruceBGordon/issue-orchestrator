@@ -14,22 +14,22 @@ class TestHistoryEndpoints:
 
     def test_configured_attr_ignores_unconfigured_mock_children(self):
         """Dependency probing must not treat MagicMock child mocks as wiring."""
-        from issue_orchestrator.entrypoints.web_retry_history_routes import _configured_attr
+        from issue_orchestrator.entrypoints.web_retry_runtime import configured_attr
 
         deps = MagicMock()
 
-        assert _configured_attr(deps, "session_manager") is None
+        assert configured_attr(deps, "session_manager") is None
         _ = deps.session_manager
-        assert _configured_attr(deps, "session_manager") is None
+        assert configured_attr(deps, "session_manager") is None
 
         session_manager = Mock()
         deps.session_manager = session_manager
 
-        assert _configured_attr(deps, "session_manager") is session_manager
+        assert configured_attr(deps, "session_manager") is session_manager
 
     def test_configured_attr_supports_slotted_runtime_objects(self):
         """Real slotted runtime collaborators still support explicit lookup."""
-        from issue_orchestrator.entrypoints.web_retry_history_routes import _configured_attr
+        from issue_orchestrator.entrypoints.web_retry_runtime import configured_attr
 
         class SlottedDeps:
             __slots__ = ("session_manager",)
@@ -40,7 +40,7 @@ class TestHistoryEndpoints:
         session_manager = object()
 
         assert (
-            _configured_attr(SlottedDeps(session_manager), "session_manager")
+            configured_attr(SlottedDeps(session_manager), "session_manager")
             is session_manager
         )
 
@@ -234,8 +234,8 @@ class TestHistoryEndpoints:
         assert event_arg.data["pending_labels"] == [lm.reset_retry_pending]
         assert event_arg.data["from_scratch"] is False
 
-    def test_reset_retry_cancels_review_exchange_runtime(self):
-        """Reset is terminal for issue-scoped pair and background job."""
+    def test_reset_retry_cancels_review_exchange_through_completion_owner(self):
+        """Reset delegates review-run teardown to the completion owner."""
         from issue_orchestrator.control.maintenance import ResetResult
 
         mock_orch = create_mock_orchestrator()
@@ -250,6 +250,15 @@ class TestHistoryEndpoints:
         mock_orch.deps.services = SimpleNamespace(
             pair_registry=pair_registry,
             background_job_supervisor=job_supervisor,
+        )
+        cancel_review_exchange = MagicMock(
+            return_value=SimpleNamespace(
+                issue_number=4057,
+                cancelled_job_ids=("review-exchange:4057:coding-1",),
+            )
+        )
+        mock_orch.deps.completion_processor.cancel_review_exchange_for_issue = (
+            cancel_review_exchange
         )
         session_manager = Mock()
         session_manager.exists.side_effect = (
@@ -302,15 +311,10 @@ class TestHistoryEndpoints:
 
         assert response.status_code == 200
         assert response.json()["failed"] == []
-        pair_registry.release.assert_called_once_with(
-            4057,
-            reason="reset-retry",
-        )
+        cancel_review_exchange.assert_called_once_with(4057, "reset-retry")
+        pair_registry.release.assert_not_called()
         legacy_pair_registry.release.assert_not_called()
-        job_supervisor.cancel_matching.assert_called_once()
-        predicate = job_supervisor.cancel_matching.call_args.args[0]
-        assert predicate("review-exchange:4057:coding-1")
-        assert not predicate("review-exchange:4058:coding-1")
+        job_supervisor.cancel_matching.assert_not_called()
         assert [call.args[0].name for call in session_manager.stop.call_args_list] == [
             "issue-4057",
             "rework-4057",

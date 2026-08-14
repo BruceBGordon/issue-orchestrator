@@ -21,6 +21,8 @@ def start_review_exchange_run(
     issue_number: int,
     parent_session_name: str,
     agent_label: str,
+    retention_days: int = 7,
+    retention_tier: str = "hot",
 ) -> ReviewExchangeRun:
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     session_name = f"review-exchange-{issue_number}-{timestamp}"
@@ -31,10 +33,13 @@ def start_review_exchange_run(
         agent_label=agent_label,
         backend="persistent-pty",
         orchestrator_log=str(get_repo_log_path(worktree_path)),
+        retention_days=retention_days,
+        retention_tier=retention_tier,
     )
     assets = ReviewExchangeRunAssets.from_run_dir(run.run_dir)
     assets.exchange_dir.mkdir(parents=True, exist_ok=True)
     return ReviewExchangeRun(
+        issue_number=issue_number,
         session_name=session_name,
         run_id=run.run_id,
         parent_session_name=parent_session_name,
@@ -64,8 +69,6 @@ def store_review_exchange_summary(
         ReviewExchangeSummaryManifestUpdate(
             exchange_dir=exchange_dir,
             summary_path=summary_path,
-            ended_at=datetime.now(timezone.utc).isoformat(),
-            outcome=summary.status,
             validation_record_path=validation_record_path,
         ).to_manifest_fields(),
     )

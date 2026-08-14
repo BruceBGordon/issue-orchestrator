@@ -49,7 +49,7 @@ from .completion_action_planner import (
     CompletionActionPlanner,
     has_review_exchange_errors,
 )
-from .completion_manifest import enrich_terminal_run_manifest
+from .completion_manifest import enrich_run_runtime_manifest
 from .tech_lead_completion import discard_tech_lead_authority_after_completion
 from .invalid_record_actions import (
     failure_event_reason,
@@ -62,6 +62,11 @@ from .review_routing import should_queue_pr_review
 from .session_run_resolution import resolve_session_run_dir
 from pathlib import Path
 from ..infra.run_audit import write_run_audit
+from ..domain.timeline_evidence import (
+    FinalizeTimelineEvidenceCommand,
+    TimelineEvidenceIdentity,
+)
+from ..ports.timeline_evidence import TimelineEvidence
 
 logger = logging.getLogger(__name__)
 
@@ -142,12 +147,14 @@ class CompletionHandler:
         open_issue_corpus: "OpenIssueCorpusManager",
         active_session_run_id: Callable[[int], str | None],
         provider_availability: "ProviderAvailabilityPolicy",
+        timeline_evidence: TimelineEvidence,
         remove_session_machine_fn: Callable[[str], None] | None = None,
         label_manager: "LabelManager | None" = None,
     ):
         self.config = config
         self.events = events
         self.repository_host = repository_host
+        self.timeline_evidence = timeline_evidence
         self._get_issue_machine = get_issue_machine_fn
         self._get_session_machine = get_session_machine_fn
         self._get_review_machine = get_review_machine_fn
@@ -321,12 +328,17 @@ class CompletionHandler:
             )
 
         # Enrich manifest with runtime context + log tail
-        enrich_terminal_run_manifest(
+        run_dir = self._resolve_session_run_dir(session)
+        enrich_run_runtime_manifest(
             session=session,
-            status=status,
-            run_dir=self._resolve_session_run_dir(session),
+            run_dir=run_dir,
             session_output=self._session_output,
-            retention_days=self.config.session_output_retention_days,
+        )
+        self.timeline_evidence.finalize_terminal(
+            FinalizeTimelineEvidenceCommand(
+                identity=TimelineEvidenceIdentity(session.issue.number, run_dir),
+                outcome=status.value,
+            )
         )
 
         audit_actions = self._create_run_audit_and_actions(

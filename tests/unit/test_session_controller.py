@@ -51,6 +51,7 @@ from issue_orchestrator.domain.session_run import SessionRunAssets
 from issue_orchestrator.ports import NullEventSink
 from issue_orchestrator.ports.event_sink import TraceEvent
 from issue_orchestrator.ports.provider_resilience import ProviderErrorType
+from issue_orchestrator.ports.timeline_evidence import NULL_TIMELINE_EVIDENCE
 from issue_orchestrator.execution.session_output_adapter import FileSystemSessionOutput
 from tests.callback_endpoint_helpers import ready_callback_endpoint
 
@@ -2094,6 +2095,7 @@ class TestSessionControllerValidationCaching:
 
         processor = CompletionProcessor(
             agent_callback_endpoint=ready_callback_endpoint(),
+            timeline_evidence=NULL_TIMELINE_EVIDENCE,
             label_adapter=label_adapter,
             pr_adapter=pr_adapter,
             git_adapter=git_adapter,

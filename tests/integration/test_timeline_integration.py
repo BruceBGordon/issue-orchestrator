@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import sqlite3
 import base64
+import shutil
+from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -34,6 +36,11 @@ from issue_orchestrator.execution.timeline_writer import DefaultTimelineWriter
 from issue_orchestrator.execution.session_output_adapter import FileSystemSessionOutput
 from issue_orchestrator.ports.event_sink import TraceEvent
 from issue_orchestrator.domain.models import Issue
+from issue_orchestrator.domain.timeline_evidence import (
+    FinalizeTimelineEvidenceCommand,
+    TimelineEvidenceIdentity,
+)
+from issue_orchestrator.execution.timeline_evidence import FileSystemTimelineEvidence
 
 from tests.conftest import MockEventSink, MockSessionRunner, build_test_orchestrator_deps
 
@@ -50,6 +57,17 @@ def _build_orchestrator_with_sqlite_timeline(sample_config, mock_repository_host
     )
     timeline_reader = DefaultTimelineReader(timeline_store)
     timeline_writer = DefaultTimelineWriter(timeline_store)
+    timeline_evidence = FileSystemTimelineEvidence(
+        archive_root=(
+            sample_config.repo_root
+            / ".issue-orchestrator"
+            / "state"
+            / "timeline-evidence"
+        ),
+        timeline_store=timeline_store,
+        retention_days=sample_config.session_output_retention_days,
+        retention_tier=sample_config.session_output_retention_tier,
+    )
 
     runner = MockSessionRunner()
     runner.plugin.session_exists_override = False
@@ -63,6 +81,7 @@ def _build_orchestrator_with_sqlite_timeline(sample_config, mock_repository_host
         working_copy=GitWorkingCopy(),
         timeline_reader=timeline_reader,
         timeline_writer=timeline_writer,
+        timeline_evidence=timeline_evidence,
     )
     return Orchestrator(config=sample_config, deps=deps), timeline_writer
 
@@ -1497,6 +1516,195 @@ def test_session_diagnostics_dialog_integration_exposes_existing_paths_and_run_s
         ]
         assert run_scoped_actions
         assert all(action.get("run_dir") == run_dir for action in run_scoped_actions)
+    finally:
+        web.set_orchestrator(None)
+
+
+def test_archived_session_inspection_is_local_and_read_only(
+    sample_config,
+    mock_repository_host,
+) -> None:
+    """Diagnostics and replay must never reattach mutable external evidence."""
+    orch, timeline_writer = _build_orchestrator_with_sqlite_timeline(
+        sample_config, mock_repository_host
+    )
+    issue_number = 4065
+    worktree = sample_config.repo_root / "wt-4065-archive"
+    worktree.mkdir(parents=True)
+    output = FileSystemSessionOutput()
+    run = output.start_run(worktree, "issue-4065", issue_number=issue_number)
+    _write_terminal_recording(
+        run.run_dir / "terminal-recording.jsonl", "archived terminal output\n"
+    )
+    external_log = sample_config.repo_root / "external-claude" / "session.jsonl"
+    external_log.parent.mkdir(parents=True)
+    original_claude = '{"type":"assistant","content":"archived answer"}\n'
+    external_log.write_text(original_claude, encoding="utf-8")
+    (run.run_dir / "claude-session.jsonl").symlink_to(external_log)
+    (run.run_dir / "claude-session.path").write_text(
+        str(external_log), encoding="utf-8"
+    )
+    orchestrator_tail = run.run_dir / "orchestrator-tail.log"
+    orchestrator_tail.write_text("archived orchestrator output\n", encoding="utf-8")
+    output.update_manifest(
+        run.run_dir,
+        {
+            "claude_log_path": str(external_log),
+            "claude_log_dir": str(external_log.parent),
+            "orchestrator_tail": str(orchestrator_tail),
+        },
+    )
+    timeline_writer.record(
+        TraceEvent(
+            EventName.SESSION_FAILED,
+            {
+                "issue_number": issue_number,
+                "run_id": run.run_id,
+                "run_dir": str(run.run_dir),
+                "task": "code",
+                "agent": "agent:backend",
+            },
+        )
+    )
+    owner = orch.deps.timeline_evidence
+    owner.finalize_terminal(
+        FinalizeTimelineEvidenceCommand(
+            identity=TimelineEvidenceIdentity(issue_number, run.run_dir),
+            outcome="failed",
+            ended_at=datetime.now(timezone.utc).isoformat(),
+        )
+    )
+    assert owner.archive_worktree(issue_number, worktree) == 1
+    archived = (
+        sample_config.repo_root
+        / ".issue-orchestrator"
+        / "state"
+        / "timeline-evidence"
+        / str(issue_number)
+        / run.run_dir.name
+    )
+    archived_log = archived / "claude-session.jsonl"
+    archived_tail = archived / orchestrator_tail.name
+    manifest_before = (archived / "manifest.json").read_bytes()
+
+    web.set_orchestrator(orch)
+    try:
+        client = TestClient(web.app)
+        diagnostics = client.get(
+            f"/api/dialog/session-diagnostics/{issue_number}",
+            params={"run_dir": str(archived)},
+        )
+        assert diagnostics.status_code == 200
+        assert (archived / "manifest.json").read_bytes() == manifest_before
+        assert archived_log.is_file() and not archived_log.is_symlink()
+
+        external_log.write_text(
+            '{"type":"assistant","content":"changed externally"}\n',
+            encoding="utf-8",
+        )
+        external_log.unlink()
+        shutil.rmtree(worktree)
+
+        claude = client.get(
+            f"/api/session/claude-log/{issue_number}",
+            params={"run_dir": str(archived)},
+        )
+        terminal = client.get(
+            f"/api/session/terminal-recording/{issue_number}",
+            params={"run_dir": str(archived)},
+        )
+        orchestrator_log = client.get(
+            f"/api/session/orchestrator-log/{issue_number}",
+            params={"run_dir": str(archived)},
+        )
+        assert claude.status_code == 200
+        assert claude.json()["entries"][0]["content"] == "archived answer"
+        assert terminal.status_code == 200
+        assert terminal.json()["events"]
+        assert orchestrator_log.status_code == 200
+        assert orchestrator_log.json() == {
+            "filtered_log_path": str(archived_tail),
+            "full_log_path": None,
+            "issue_number": issue_number,
+        }
+        assert archived_tail.read_text(encoding="utf-8") == (
+            "archived orchestrator output\n"
+        )
+        assert archived_log.read_text(encoding="utf-8") == original_claude
+        assert not archived_log.is_symlink()
+        assert (archived / "manifest.json").read_bytes() == manifest_before
+    finally:
+        web.set_orchestrator(None)
+
+
+def test_unavailable_timeline_evidence_has_no_actions_or_artifact_bypass(
+    sample_config,
+    mock_repository_host,
+) -> None:
+    orch, _timeline_writer = _build_orchestrator_with_sqlite_timeline(
+        sample_config, mock_repository_host
+    )
+    issue_number = 4066
+    run_dir = Path(
+        _start_run_with_artifacts(
+            sample_config.repo_root,
+            issue_number=issue_number,
+            session_name="issue-4066-code",
+        )
+    )
+    orch.deps.timeline_evidence.finalize_terminal(
+        FinalizeTimelineEvidenceCommand(
+            identity=TimelineEvidenceIdentity(issue_number, run_dir),
+            outcome="failed",
+            ended_at="2020-01-01T00:00:00+00:00",
+        )
+    )
+    missing_archive = (
+        sample_config.repo_root
+        / ".issue-orchestrator"
+        / "state"
+        / "timeline-evidence"
+        / str(issue_number)
+        / "missing-run"
+    )
+
+    web.set_orchestrator(orch)
+    try:
+        client = TestClient(web.app)
+        for unavailable_run, expected_text in (
+            (run_dir, "Expired — artifacts are no longer available"),
+            (missing_archive, "Unavailable — retained artifacts could not be found"),
+        ):
+            diagnostics = client.get(
+                f"/api/dialog/session-diagnostics/{issue_number}",
+                params={"run_dir": str(unavailable_run)},
+            )
+            assert diagnostics.status_code == 200
+            payload = diagnostics.json()
+            rows = {row["label"]: row["value"] for row in payload["rows"]}
+            assert rows["Timeline Evidence"] == expected_text
+            assert payload["actions"] == []
+
+            artifact_routes = (
+                ("terminal-recording", {}),
+                ("claude-log", {}),
+                ("review-transcript", {}),
+                ("prompt", {}),
+                ("orchestrator-log", {}),
+                (
+                    "review-artifact",
+                    {
+                        "artifact_path": "review.md",
+                        "artifact_type": "report",
+                    },
+                ),
+            )
+            for route, extra_params in artifact_routes:
+                response = client.get(
+                    f"/api/session/{route}/{issue_number}",
+                    params={"run_dir": str(unavailable_run), **extra_params},
+                )
+                assert response.status_code == 410, route
     finally:
         web.set_orchestrator(None)
 

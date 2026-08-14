@@ -17,6 +17,7 @@ from issue_orchestrator.domain.models import AgentConfig, Issue, Session, Sessio
 from issue_orchestrator.observation.observation import SessionObservation, SessionObservationResult
 from issue_orchestrator.observation.observer import SessionObserver
 from issue_orchestrator.ports import TraceEvent
+from issue_orchestrator.ports.timeline_evidence import NULL_TIMELINE_EVIDENCE
 from issue_orchestrator.execution.session_output_adapter import FileSystemSessionOutput
 from tests.unit.session_run_helpers import make_session_run_assets
 from tests.callback_endpoint_helpers import ready_callback_endpoint
@@ -146,6 +147,7 @@ def test_timeout_observation_and_decision(tmp_path):
 
     completion_processor = CompletionProcessor(
         agent_callback_endpoint=ready_callback_endpoint(),
+        timeline_evidence=NULL_TIMELINE_EVIDENCE,
         label_adapter=StubLabelAdapter(),
         pr_adapter=StubPrAdapter(),
         git_adapter=StubGitAdapter(),

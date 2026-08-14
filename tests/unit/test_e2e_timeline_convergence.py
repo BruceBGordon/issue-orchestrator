@@ -26,7 +26,7 @@ def _patch_closing_timeline_store(monkeypatch, reads):
     instances = []
 
     class ClosingTimelineStore:
-        def __init__(self, db_path):
+        def __init__(self, db_path, config=None):
             self.db_path = db_path
             self.closed = False
             instances.append(self)
@@ -35,6 +35,9 @@ def _patch_closing_timeline_store(monkeypatch, reads):
             return self
 
         def __exit__(self, exc_type, exc, traceback):
+            self.closed = True
+
+        def close(self):
             self.closed = True
 
         def read(self, issue_number, limit=None):
@@ -2450,6 +2453,19 @@ class TestE2ETimelineControlEndpoint:
 class TestControlIssueDetailEndpoint:
     """Control center serves issue detail from base repo or E2E worktree timeline."""
 
+    @pytest.fixture(autouse=True)
+    def _configured_repository(self, tmp_path):
+        config_path = (
+            tmp_path
+            / ".issue-orchestrator"
+            / "config"
+            / "modes"
+            / "default"
+            / "default.yaml"
+        )
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text("{}\n", encoding="utf-8")
+
     def test_serves_issue_detail_from_base_repo(self, tmp_path):
         """Control endpoint reads from base repo timeline.sqlite."""
         from fastapi.testclient import TestClient
@@ -2527,6 +2543,79 @@ class TestControlIssueDetailEndpoint:
             params={"repo_root": str(tmp_path)},
         )
         assert response.status_code == 404
+
+    @pytest.mark.parametrize(
+        ("expires_at", "expected_status", "expect_actions"),
+        [
+            ("2020-01-01T00:00:00+00:00", "expired", False),
+            ("2099-01-01T00:00:00+00:00", "retained", True),
+        ],
+    )
+    def test_control_issue_detail_enforces_and_scopes_retention_actions(
+        self,
+        tmp_path,
+        expires_at,
+        expected_status,
+        expect_actions,
+    ):
+        from fastapi.testclient import TestClient
+        from issue_orchestrator.domain.run_manifest import RunManifest
+        from issue_orchestrator.execution.session_output_adapter import (
+            FileSystemSessionOutput,
+        )
+        from issue_orchestrator.execution.timeline_store import SqliteTimelineStore
+        from issue_orchestrator.entrypoints.control_api import control_app
+
+        run = FileSystemSessionOutput().start_run(
+            tmp_path / "worktree",
+            "issue-42",
+            issue_number=42,
+        )
+        (run.run_dir / "terminal-recording.jsonl").write_text(
+            "{}\n",
+            encoding="utf-8",
+        )
+        manifest = RunManifest.load(run.run_dir)
+        manifest.ended_at = "2026-01-01T00:00:00+00:00"
+        manifest.retention_expires_at = expires_at
+        manifest.evidence_available = True
+        manifest.save()
+        database = tmp_path / ".issue-orchestrator" / "state" / "timeline.sqlite"
+        with SqliteTimelineStore(database) as store:
+            store.append(
+                42,
+                TimelineRecord(
+                    event_id="completed-42",
+                    timestamp="2026-01-01T00:00:00Z",
+                    event="session.completed",
+                    source_event="session.completed",
+                    data={
+                        "run_dir": str(run.run_dir),
+                        "logical_run": 1,
+                        "logical_cycle": 1,
+                        "logical_phase": "coding",
+                        "timeline_schema_version": 4,
+                        "views": ["user", "ops", "debug"],
+                    },
+                ),
+            )
+
+        response = TestClient(control_app).get(
+            "/api/issue-detail/42",
+            params={"repo_root": str(tmp_path)},
+        )
+
+        assert response.status_code == 200
+        event = response.json()["events"][-1]
+        assert event["evidence"]["status"] == expected_status
+        actions = event["actions"]
+        assert bool(actions) is expect_actions
+        if expect_actions:
+            assert all(action["repo_root"] == str(tmp_path) for action in actions)
+            assert any(
+                action["type"] == "set_timeline_evidence_pin"
+                for action in actions
+            )
 
     def test_control_issue_detail_closes_transient_store_on_success(
         self,

@@ -655,6 +655,8 @@ Timestamp: {self._now_iso()}
         issue_number: int,
         parent_session_name: str,
         agent_label: str,
+        retention_days: int = 7,
+        retention_tier: str = "hot",
     ) -> ReviewExchangeRun:
         return _start_review_exchange_run(
             self.start_run,
@@ -662,6 +664,8 @@ Timestamp: {self._now_iso()}
             issue_number=issue_number,
             parent_session_name=parent_session_name,
             agent_label=agent_label,
+            retention_days=retention_days,
+            retention_tier=retention_tier,
         )
 
     def store_review_exchange_summary(

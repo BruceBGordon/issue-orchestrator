@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, Literal, get_args
 
 from ..domain.artifact_contracts import (
@@ -11,7 +10,12 @@ from ..domain.artifact_contracts import (
     ValidationOutcome,
     ValidationPassed,
     ValidationRetry,
-    validation_outcome_from_manifest_fields,
+)
+from .session_diagnostics import (
+    SessionDiagnosticAnalysis,
+    SessionDiagnosticFollowUpIssue,
+    SessionDiagnosticsContext,
+    present_session_evidence,
 )
 
 @dataclass(frozen=True)
@@ -36,230 +40,15 @@ class DialogSection:
         }
 
 
-@dataclass(frozen=True)
-class SessionDiagnosticsContext:
-    issue_number: int
-    session_name: str
-    started_at: str
-    run_id: str
-    backend: str
-    agent_label: str
-    claude_session_id: str
-    worktree: str
-    retention_tier: str
-    retention_expires_at: str
-    retention_pinned: str
-    run_dir: str
-    claude_log_path: str
-    claude_log_dir: str
-    orchestrator_log: str
-    diagnostic_path: str
-    validation_path: str
-    validation_output_path: str
-    validation_stderr_path: str
-    run_audit_path: str
-    # Typed validation outcome (None when no outcome recorded yet).
-    # Replaces the previous loose ``validation_status`` /
-    # ``validation_reason`` string pair, which could carry a stale
-    # failure reason alongside a passed status when manifests were
-    # written by pre-#6302 writers (or hand-edited). The discriminated
-    # union forbids that combination at the type level.
-    validation_outcome: "ValidationOutcome | None"
-    branch: str
-    task: str
-    claude_args: str
-    claude_prompt_mode: str
-    provider: str
-    model: str
-    permission_mode: str
-    timeout_minutes: str
-    extra_provider_args: str
-    session_settings_path: str
-
-    @classmethod
-    def from_payload(
-        cls,
-        issue_number: int,
-        manifest_payload: dict[str, Any],
-    ) -> "SessionDiagnosticsContext":
-        manifest = manifest_payload.get("manifest") or {}
-        session_identity = manifest_payload.get("session_identity") or {}
-        worktree = str(manifest.get("worktree") or "")
-        session_name = str(manifest.get("session_name") or manifest_payload.get("session_name") or "")
-        diagnostic_path = _join_worktree_path(worktree, manifest.get("diagnostic_path"))
-        validation_path = _join_worktree_path(worktree, manifest.get("validation_record_path"))
-        validation_output_path = _join_worktree_path(
-            worktree,
-            manifest.get("validation_output_path") or manifest.get("validation_stdout"),
-        )
-        validation_stderr_path = _join_worktree_path(
-            worktree,
-            manifest.get("validation_stderr"),
-        )
-        run_audit_path = _join_worktree_path(worktree, manifest.get("run_audit_path"))
-        return cls(
-            issue_number=issue_number,
-            session_name=session_name,
-            started_at=str(manifest.get("started_at") or ""),
-            run_id=str(manifest.get("run_id") or ""),
-            backend=str(manifest.get("backend") or ""),
-            agent_label=str(manifest.get("agent_label") or ""),
-            claude_session_id=str(manifest.get("claude_session_id") or ""),
-            worktree=worktree,
-            retention_tier=str(manifest.get("retention_tier") or ""),
-            retention_expires_at=str(manifest.get("retention_expires_at") or ""),
-            retention_pinned=str(manifest.get("retention_pinned") if "retention_pinned" in manifest else ""),
-            run_dir=str(manifest.get("run_dir") or manifest_payload.get("run_dir") or ""),
-            claude_log_path=str(manifest.get("claude_log_path") or ""),
-            claude_log_dir=str(manifest.get("claude_log_dir") or ""),
-            orchestrator_log=str(manifest.get("orchestrator_log") or ""),
-            diagnostic_path=diagnostic_path,
-            validation_path=validation_path,
-            validation_output_path=validation_output_path,
-            validation_stderr_path=validation_stderr_path,
-            run_audit_path=run_audit_path,
-            validation_outcome=validation_outcome_from_manifest_fields(
-                validation_passed=manifest.get("validation_passed"),
-                validation_status=manifest.get("validation_status"),
-                validation_reason=manifest.get("validation_reason"),
-            ),
-            branch=str(session_identity.get("branch") or ""),
-            task=str(session_identity.get("task") or ""),
-            claude_args=str(session_identity.get("claude_args") or ""),
-            claude_prompt_mode=str(session_identity.get("claude_prompt_mode") or ""),
-            provider=str(session_identity.get("provider") or ""),
-            model=str(session_identity.get("model") or ""),
-            permission_mode=str(session_identity.get("permission_mode") or ""),
-            timeout_minutes=str(session_identity.get("timeout_minutes") or ""),
-            extra_provider_args=_format_extra_provider_args(session_identity.get("extra_provider_args")),
-            session_settings_path=str(Path(manifest_payload.get("run_dir") or "") / "session-identity.json")
-            if manifest_payload.get("run_dir")
-            else "",
-        )
-
-
-@dataclass(frozen=True)
-class SessionDiagnosticAnalysis:
-    """Human-oriented diagnostic summary for the current run."""
-
-    headline: str
-    detail: str | None = None
-    suggestions: tuple[str, ...] = ()
-
-    @classmethod
-    def from_payload(cls, payload: dict[str, Any] | None) -> "SessionDiagnosticAnalysis | None":
-        if not isinstance(payload, dict):
-            return None
-        headline = payload.get("headline")
-        if not isinstance(headline, str) or not headline.strip():
-            return None
-        detail = payload.get("detail")
-        suggestions_raw = payload.get("suggestions")
-        suggestions = tuple(
-            item for item in suggestions_raw
-            if isinstance(item, str) and item.strip()
-        ) if isinstance(suggestions_raw, list) else ()
-        return cls(
-            headline=headline,
-            detail=detail if isinstance(detail, str) and detail.strip() else None,
-            suggestions=suggestions,
-        )
-
-    def to_dict(self) -> dict[str, Any]:
-        payload: dict[str, Any] = {"headline": self.headline}
-        if self.detail is not None:
-            payload["detail"] = self.detail
-        if self.suggestions:
-            payload["suggestions"] = list(self.suggestions)
-        return payload
-
-
-@dataclass(frozen=True)
-class SessionDiagnosticFollowUpIssue:
-    title: str
-    reason: str
-    evidence: str | None = None
-    suggested_labels: tuple[str, ...] = ()
-    blocking: bool = False
-
-    @classmethod
-    def from_payload(cls, payload: dict[str, Any]) -> "SessionDiagnosticFollowUpIssue | None":
-        if not isinstance(payload, dict):
-            return None
-        title = payload.get("title")
-        reason = payload.get("reason")
-        if not isinstance(title, str) or not title.strip():
-            return None
-        if not isinstance(reason, str) or not reason.strip():
-            return None
-        evidence = payload.get("evidence")
-        labels_raw = payload.get("suggested_labels")
-        suggested_labels = tuple(
-            item for item in labels_raw if isinstance(item, str) and item.strip()
-        ) if isinstance(labels_raw, list) else ()
-        blocking = payload.get("blocking", False)
-        return cls(
-            title=title,
-            reason=reason,
-            evidence=evidence if isinstance(evidence, str) and evidence.strip() else None,
-            suggested_labels=suggested_labels,
-            blocking=blocking if isinstance(blocking, bool) else False,
-        )
-
-    def to_dict(self) -> dict[str, Any]:
-        payload: dict[str, Any] = {
-            "title": self.title,
-            "reason": self.reason,
-            "blocking": self.blocking,
-        }
-        if self.evidence is not None:
-            payload["evidence"] = self.evidence
-        if self.suggested_labels:
-            payload["suggested_labels"] = list(self.suggested_labels)
-        return payload
-
-
 def _outcome_reason(outcome: ValidationOutcome | None) -> str | None:
-    """Project a typed outcome down to a reason string for fallback chains.
-
-    ``ValidationPassed`` has no reason field at all — returns ``None`` so
-    the stale-reason-on-success class of bug is unrepresentable on this
-    code path. ``ValidationFailed`` / ``ValidationRetry`` always carry a
-    non-empty reason by construction.
-    """
+    """Project failure/retry outcomes down to their diagnostic reason."""
     if isinstance(outcome, (ValidationFailed, ValidationRetry)):
         return outcome.reason
     return None
 
 
-def _join_worktree_path(worktree: str, rel_path: Any) -> str:
-    """Resolve manifest path to an openable filesystem path.
-
-    - Absolute path values are returned as-is.
-    - Relative path values are resolved under worktree.
-    - Missing worktree + relative path returns empty string.
-    """
-    rel_value = str(rel_path or "")
-    if not rel_value:
-        return ""
-    rel_candidate = Path(rel_value)
-    if rel_candidate.is_absolute():
-        return str(rel_candidate)
-    if not worktree:
-        return ""
-    return str(Path(worktree) / rel_candidate)
-
-
 def _build_session_diagnostics_rows(ctx: SessionDiagnosticsContext) -> list[DialogRow]:
-    if ctx.retention_pinned == "True":
-        evidence_retention = "Pinned — retained until unpinned"
-        evidence_value_kind = None
-    elif ctx.retention_expires_at:
-        evidence_retention = ctx.retention_expires_at
-        evidence_value_kind = "timestamp"
-    else:
-        evidence_retention = "Starts when the run ends"
-        evidence_value_kind = None
+    evidence = present_session_evidence(ctx)
     rows = [
         DialogRow("Session", ctx.session_name or "-"),
         DialogRow("Started", ctx.started_at or "-", value_kind="timestamp"),
@@ -277,13 +66,12 @@ def _build_session_diagnostics_rows(ctx: SessionDiagnosticsContext) -> list[Dial
         DialogRow("Prompt Mode", ctx.claude_prompt_mode or "-"),
         DialogRow("Claude Session", ctx.claude_session_id or "-"),
         DialogRow("Retention Tier", ctx.retention_tier or "-"),
-        DialogRow(
-            "Timeline Evidence",
-            evidence_retention,
-            value_kind=evidence_value_kind,
-        ),
-        DialogRow("Worktree", ctx.worktree or "-"),
     ]
+    rows.extend(
+        DialogRow(row.label, row.value, value_kind=row.value_kind)
+        for row in evidence.rows
+    )
+    rows.append(DialogRow("Worktree", ctx.worktree or "-"))
     # Project the typed outcome into Status + Reason rows. The union
     # guarantees: passed has no reason field at all (so the stale-
     # reason-on-success bug surfaces here as an absent Reason row,
@@ -302,6 +90,9 @@ def _build_session_diagnostics_rows(ctx: SessionDiagnosticsContext) -> list[Dial
 
 
 def _build_session_diagnostics_actions(ctx: SessionDiagnosticsContext) -> list[dict[str, Any]]:
+    evidence = present_session_evidence(ctx)
+    if not evidence.artifacts_available:
+        return []
     actions: list[dict[str, Any]] = []
     _append_open_path(actions, "Open Session Dir", ctx.run_dir, group="diagnostics")
     _append_open_path(actions, "Open Session Settings", ctx.session_settings_path, group="diagnostics")
@@ -329,14 +120,21 @@ def _build_session_diagnostics_actions(ctx: SessionDiagnosticsContext) -> list[d
         )
         _append_open_path(actions, "Open Claude Log File", ctx.claude_log_path, group="session_evidence")
     _append_open_path(actions, "Open Claude Log Dir", ctx.claude_log_dir, group="session_evidence")
-    _append_run_scoped_action(
-        actions,
-        ctx,
-        action_type="open_orchestrator_log",
-        label="Open Orchestrator Log",
-        group="session_evidence",
-    )
-    _append_open_path(actions, "Open Full Log", ctx.orchestrator_log, group="session_evidence")
+    if evidence.show_orchestrator_log:
+        _append_run_scoped_action(
+            actions,
+            ctx,
+            action_type="open_orchestrator_log",
+            label="Open Orchestrator Log",
+            group="session_evidence",
+        )
+    if evidence.show_full_orchestrator_log:
+        _append_open_path(
+            actions,
+            "Open Full Log",
+            ctx.orchestrator_log,
+            group="session_evidence",
+        )
     _append_open_path(actions, "Open Diagnostic", ctx.diagnostic_path, group="diagnostics")
     _append_open_path(actions, "Open Run Audit", ctx.run_audit_path, group="diagnostics")
     _append_open_path(actions, "Open Validation Record", ctx.validation_path, group="validation_artifacts")
@@ -398,13 +196,6 @@ def _validated_session_action_group(group: str) -> str:
         allowed = ", ".join(sorted(_SESSION_DIAGNOSTIC_ACTION_GROUPS))
         raise ValueError(f"Unknown session diagnostics action group {group!r}; expected one of: {allowed}")
     return group
-
-
-def _format_extra_provider_args(raw: Any) -> str:
-    if not isinstance(raw, dict) or not raw:
-        return ""
-    parts = [f"{key}={value}" for key, value in sorted(raw.items())]
-    return ", ".join(parts)
 
 
 def build_info_dialog(info: dict[str, Any]) -> dict[str, Any]:

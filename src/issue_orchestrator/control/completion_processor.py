@@ -71,6 +71,7 @@ from ..ports.review_exchange_runner import (
     ReviewExchangeRunner,
 )
 from ..ports.session_output import SessionOutput, ValidationRecord
+from ..ports.timeline_evidence import TimelineEvidence
 from .validation import PublishGate, ValidationRecordStore
 from .completion_pr_collision import (
     create_pr_with_collision_handling,
@@ -105,7 +106,10 @@ from .completion_types import (
     REVIEW_EXCHANGE_ERROR_PREFIX,
 )
 from .pre_publish_gate import PrePublishGate, PrePublishGateResult
-from .review_exchange_contracts import ReviewExchangeCanceller
+from .review_exchange_contracts import (
+    ReviewExchangeCanceller,
+    ReviewExchangeCancellationResult,
+)
 from .review_cache_boundary import review_cache_boundary_started_at
 from .review_exchange_pr_comment import (
     GITHUB_COMMENT_BODY_LIMIT,
@@ -210,6 +214,9 @@ class CompletionProcessor:
         # Required: an agent with no callback endpoint cannot report
         # anything back, so there is no sensible default to fall back to.
         agent_callback_endpoint: "AgentCallbackEndpoint",
+        # Required: every terminal coding and review-exchange run must receive
+        # an evidence-retention decision from the shared owner.
+        timeline_evidence: TimelineEvidence,
         review_artifact_reader: ReviewArtifactReader | None = None,
         runtime_identity: RuntimeIdentity | None = None,
         tech_lead_authority: "TechLeadAuthorityStore | None" = None,
@@ -280,6 +287,7 @@ class CompletionProcessor:
             job_supervisor=background_job_supervisor,
             review_exchange_canceller=review_exchange_canceller,
             agent_callback_endpoint=agent_callback_endpoint,
+            timeline_evidence=timeline_evidence,
         )
         # Per-(session, head_sha) consecutive validation-failed reroute count.
         # The reroute path can re-enter every tick when downstream rework
@@ -336,6 +344,14 @@ class CompletionProcessor:
     def attach_stack_publish_gate(self, gate: "StackBaseGate") -> None:
         """Wire the stack publish-gate owner (ADR-0029 / #6596)."""
         self._stack_publish_gate = gate
+
+    def cancel_review_exchange_for_issue(
+        self,
+        issue_number: int,
+        reason: str,
+    ) -> ReviewExchangeCancellationResult:
+        """Cancel and terminalize all review-exchange work for one issue."""
+        return self._review_exchange.cancel_issue(issue_number, reason)
 
     def _get_label(self, key: str) -> str:
         """Get label name from config, or use default."""

@@ -141,19 +141,16 @@ def test_start_paused_requests_initial_queue_refresh(sample_config):
     assert orchestrator.state.queue_refresh_requested is True
 
 
-def test_cancel_review_exchange_for_issue_delegates_to_lifecycle_services(sample_config):
+def test_cancel_review_exchange_for_issue_delegates_to_completion_owner(sample_config):
     orchestrator = create_test_orchestrator(sample_config)
-    pair_registry = MagicMock()
-    job_supervisor = MagicMock()
-    job_supervisor.cancel_matching.return_value = ["review-exchange:77:issue-77"]
-    object.__setattr__(
-        orchestrator.deps,
-        "services",
-        replace(
-            orchestrator.deps.services,
-            pair_registry=pair_registry,
-            background_job_supervisor=job_supervisor,
-        ),
+    cancel_review_exchange = MagicMock(
+        return_value=SimpleNamespace(
+            issue_number=77,
+            cancelled_job_ids=("review-exchange:77:issue-77",),
+        )
+    )
+    orchestrator.deps.completion_processor.cancel_review_exchange_for_issue = (
+        cancel_review_exchange
     )
 
     result = orchestrator.cancel_review_exchange_for_issue(
@@ -163,32 +160,25 @@ def test_cancel_review_exchange_for_issue_delegates_to_lifecycle_services(sample
 
     assert result.issue_number == 77
     assert result.cancelled_job_ids == ("review-exchange:77:issue-77",)
-    pair_registry.release.assert_called_once_with(77, reason="operator-terminated")
-    job_supervisor.cancel_matching.assert_called_once()
-    predicate = job_supervisor.cancel_matching.call_args.args[0]
-    assert predicate("review-exchange:77:issue-77")
-    assert not predicate("review-exchange:78:issue-78")
+    cancel_review_exchange.assert_called_once_with(77, "operator-terminated")
 
 
 def test_terminate_issue_runtime_for_issue_delegates_to_canonical_services(sample_config):
     orchestrator = create_test_orchestrator(sample_config)
-    pair_registry = MagicMock()
-    job_supervisor = MagicMock()
-    job_supervisor.cancel_matching.return_value = ["review-exchange:77:issue-77"]
+    cancel_review_exchange = MagicMock(
+        return_value=SimpleNamespace(
+            issue_number=77,
+            cancelled_job_ids=("review-exchange:77:issue-77",),
+        )
+    )
+    orchestrator.deps.completion_processor.cancel_review_exchange_for_issue = (
+        cancel_review_exchange
+    )
     session_manager = MagicMock()
     session_manager.exists.side_effect = (
         lambda ref: ref.name in {"issue-77", "rework-77"}
     )
     object.__setattr__(orchestrator.deps, "session_manager", session_manager)
-    object.__setattr__(
-        orchestrator.deps,
-        "services",
-        replace(
-            orchestrator.deps.services,
-            pair_registry=pair_registry,
-            background_job_supervisor=job_supervisor,
-        ),
-    )
     orchestrator.state.active_sessions = [
         SimpleNamespace(
             terminal_id="issue-77",
@@ -213,7 +203,7 @@ def test_terminate_issue_runtime_for_issue_delegates_to_canonical_services(sampl
     assert result.stopped_session_ids == ("issue-77", "rework-77")
     assert result.cleared_active_session_ids == ("issue-77", "rework-77")
     assert result.cancelled_job_ids == ("review-exchange:77:issue-77",)
-    pair_registry.release.assert_called_once_with(77, reason="operator-terminated")
+    cancel_review_exchange.assert_called_once_with(77, "operator-terminated")
     assert [call.args[0].name for call in session_manager.stop.call_args_list] == [
         "issue-77",
         "rework-77",

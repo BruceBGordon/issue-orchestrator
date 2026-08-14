@@ -1234,6 +1234,23 @@ class TechLeadRunRequestPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
     scope: TechLeadRunScopePayload
 
+class TerminalRecordingPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    chapters: list[dict[str, Any]] | None = None
+    content_type: str | None = None
+    events: list[dict[str, Any]] | None = None
+    initial_geometry: dict[str, int] | None = None
+    issue_number: int = Field(..., ge=1, strict=True)
+    offset: int | None = Field(default=None, ge=0, strict=True)
+    recording_event_index: int | None = Field(default=None, ge=0)
+    recording_path: str
+    render_mode: Literal['terminal', 'transcript']
+    total_events: int | None = Field(default=None, ge=0, strict=True)
+    transcript_hash: str | None = None
+    transcript_lines: list[str] | None = None
+    truncated: bool | None = None
+    unchanged: bool | None = None
+
 class TestCaseHistoryPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
     outcome: str

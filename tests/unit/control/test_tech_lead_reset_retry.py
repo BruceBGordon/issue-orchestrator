@@ -53,6 +53,7 @@ from issue_orchestrator.ports.open_issue_corpus_store import (
     InMemoryOpenIssueCorpusStore,
 )
 from issue_orchestrator.ports.tech_lead_authority import InMemoryTechLeadAuthorityStore
+from issue_orchestrator.ports.timeline_evidence import NULL_TIMELINE_EVIDENCE
 from tests.conftest import make_provider_availability
 from tests.unit.session_run_helpers import make_session_run_assets
 
@@ -624,6 +625,7 @@ class TestEffectiveTerminalOutcomeEvents:
             ),
             active_session_run_id=lambda _issue_number: None,
             provider_availability=make_provider_availability(config),
+            timeline_evidence=NULL_TIMELINE_EVIDENCE,
             mandated_action=mandated_action,
         )
 

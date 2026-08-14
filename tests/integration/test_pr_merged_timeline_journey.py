@@ -46,6 +46,9 @@ import pytest
 
 from issue_orchestrator.control.action_applier import ActionApplier
 from issue_orchestrator.control.actions import ReconcileHistoryEntryAction
+from issue_orchestrator.control.review_exchange_lifecycle import (
+    ReviewExchangeCancellation,
+)
 from issue_orchestrator.control.session_history import SessionHistoryOwner
 from issue_orchestrator.domain.models import SessionHistoryEntry
 from issue_orchestrator.events import EventName
@@ -92,6 +95,12 @@ class _ListSink(EventSink):
         self.events.append(event)
 
 
+def _no_review_exchange_work(
+    issue_number: int, _reason: str
+) -> ReviewExchangeCancellation:
+    return ReviewExchangeCancellation(issue_number, ())
+
+
 def _build_applier_with_dual_sink(
     history_entries: list[SessionHistoryEntry],
     store: TimelineStore,
@@ -117,6 +126,7 @@ def _build_applier_with_dual_sink(
         worktree_manager=MagicMock(),
         fresh_issue_reader=fresh_issue_reader,
         reconcile=False,
+        review_exchange_canceller=_no_review_exchange_work,
     )
     applier.history_owner = SessionHistoryOwner(history_entries)
     return applier, list_sink

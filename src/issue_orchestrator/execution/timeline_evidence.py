@@ -9,12 +9,13 @@ import shutil
 import threading
 import time
 from collections.abc import Callable
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
 
 from ..domain.run_manifest import MANIFEST_FILENAME, RunManifest
 from ..domain.timeline_evidence import (
+    FinalizeTimelineEvidenceCommand,
     SetTimelineEvidencePinCommand,
     TimelineEvidenceIdentity,
     TimelineEvidenceState,
@@ -29,6 +30,7 @@ logger = logging.getLogger(__name__)
 _PRUNE_MARKER = ".last-pruned"
 _CLAUDE_SESSION_LOG_NAME = "claude-session.jsonl"
 _CLAUDE_SESSION_PATH_NAME = "claude-session.path"
+_CLAUDE_LOG_DIR_PATH_NAME = "claude-log.path"
 
 
 class FileSystemTimelineEvidence:
@@ -39,12 +41,16 @@ class FileSystemTimelineEvidence:
         *,
         archive_root: Path,
         timeline_store: TimelineStore,
+        retention_days: int = 7,
+        retention_tier: str = "hot",
         now: Callable[[], datetime] | None = None,
         wall_time: Callable[[], float] = time.time,
         prune_interval_seconds: int = 3600,
     ) -> None:
         self._archive_root = archive_root.resolve()
         self._timeline_store = timeline_store
+        self._retention_days = max(0, retention_days)
+        self._retention_tier = retention_tier
         self._now = now or (lambda: datetime.now(timezone.utc))
         self._wall_time = wall_time
         self._prune_interval_seconds = prune_interval_seconds
@@ -187,6 +193,44 @@ class FileSystemTimelineEvidence:
         if state is None:
             raise RuntimeError("Timeline evidence state disappeared after pin update")
         return state
+
+    def finalize_terminal(
+        self, command: FinalizeTimelineEvidenceCommand
+    ) -> TimelineEvidenceState:
+        """Finalize terminal retention once, preserving the first end time."""
+        with self._lock:
+            run_dir = command.identity.run_dir.resolve()
+            manifest = RunManifest.load(run_dir)
+            self._require_issue(
+                command.identity.issue_number,
+                manifest,
+                run_dir,
+            )
+            if not command.outcome.strip():
+                raise ValueError("Timeline evidence terminal outcome is required")
+
+            was_terminal = manifest.ended_at is not None
+            if manifest.outcome is None:
+                manifest.outcome = command.outcome
+            if manifest.ended_at is None:
+                manifest.ended_at = command.ended_at or self._now().isoformat()
+            if not was_terminal or manifest.retention_expires_at is None:
+                ended_at = parse_retention_timestamp(manifest.ended_at)
+                if ended_at is None:
+                    raise ValueError("Timeline evidence terminal timestamp is required")
+                manifest.retention_days = self._retention_days
+                manifest.retention_tier = self._retention_tier
+                manifest.retention_expires_at = (
+                    ended_at + timedelta(days=self._retention_days)
+                ).isoformat()
+            if manifest.evidence_available is None:
+                manifest.evidence_available = True
+            manifest.save()
+
+            state = self._describe(command.identity)
+            if state is None:
+                raise RuntimeError("Finalized Timeline evidence state is unavailable")
+            return state
 
     def archive_worktree(self, issue_number: int, worktree_path: Path) -> int:
         """Copy exact run directories, then relocate their Timeline references."""
@@ -366,9 +410,18 @@ class FileSystemTimelineEvidence:
             return
         archived_claude_log_path = str(target / _CLAUDE_SESSION_LOG_NAME)
         manifest["claude_log_path"] = archived_claude_log_path
+        manifest["claude_log_dir"] = None
+        artifacts = manifest.get("artifacts")
+        if isinstance(artifacts, dict):
+            claude_artifact = artifacts.get("claude_log")
+            if isinstance(claude_artifact, dict):
+                claude_artifact["path"] = archived_claude_log_path
         claude_session_path = staging / _CLAUDE_SESSION_PATH_NAME
         if claude_session_path.is_file():
             claude_session_path.write_text(archived_claude_log_path)
+        claude_log_dir_path = staging / _CLAUDE_LOG_DIR_PATH_NAME
+        if claude_log_dir_path.is_file():
+            claude_log_dir_path.write_text(str(target))
 
     def _expire_run(self, run_dir: Path, manifest: RunManifest) -> None:
         if not self._is_archived_run(run_dir):

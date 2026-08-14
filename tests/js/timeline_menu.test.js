@@ -337,9 +337,12 @@ test('pinning timeline evidence posts through the typed request and refreshes it
         run_dir: '/runs/failed-42',
         pinned: true,
         confirm_message: '',
+        repo_root: '/repos/project',
     });
 
-    assert.deepEqual(calls[0], ['request', 42, '/runs/failed-42', true]);
+    assert.deepEqual(calls[0], [
+        'request', 42, '/runs/failed-42', true, '/repos/project',
+    ]);
     const fetchCall = calls.find(call => call[0] === 'fetch');
     assert.equal(fetchCall[1], '/api/issues/42/timeline-evidence/pin');
     assert.equal(fetchCall[2].method, 'PUT');
@@ -352,6 +355,7 @@ test('pinning timeline evidence posts through the typed request and refreshes it
     assert.equal(refreshCall[1], 42);
     assert.equal(refreshCall[2], null);
     assert.equal(refreshCall[3].focus, 'timeline');
+    assert.equal(refreshCall[3].repoRoot, '/repos/project');
 });
 
 test('expired evidence unpin confirmation can cancel before mutation', async () => {

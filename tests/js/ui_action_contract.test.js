@@ -73,6 +73,16 @@ test('buildTimelineEvidencePinRequest returns exact-run typed command', () => {
     assert.deepEqual(req.body, { run_dir: '/runs/failed-4057', pinned: true });
 });
 
+test('buildTimelineEvidencePinRequest preserves Control Center repository scope', () => {
+    const req = uiActionContract.buildTimelineEvidencePinRequest(
+        4057, '/runs/failed-4057', true, '/repos/project one',
+    );
+    assert.equal(
+        req.endpoint,
+        '/api/issues/4057/timeline-evidence/pin?repo_root=%2Frepos%2Fproject%20one',
+    );
+});
+
 test('buildTimelineEvidencePinRequest rejects missing runDir', () => {
     assert.throws(
         () => uiActionContract.buildTimelineEvidencePinRequest(4057, '', true),
@@ -108,6 +118,18 @@ test('buildTerminalRecordingRequest includes review phase scoping params', () =>
         '/api/session/terminal-recording/4057?run_dir=%2Ftmp%2Frun&offset=0&limit=0&round_index=2&session_role=reviewer',
     );
     assert.equal(req.method, 'GET');
+});
+
+test('buildTerminalRecordingRequest preserves Control Center repository scope', () => {
+    const req = uiActionContract.buildTerminalRecordingRequest(4057, '/tmp/run', {
+        offset: 0,
+        limit: 0,
+        repo_root: '/repos/project one',
+    });
+    assert.equal(
+        req.endpoint,
+        '/api/session/terminal-recording/4057?run_dir=%2Ftmp%2Frun&offset=0&limit=0&repo_root=%2Frepos%2Fproject+one',
+    );
 });
 
 test('buildTerminalRecordingRequest passes since_hash when provided (transcript short-circuit)', () => {

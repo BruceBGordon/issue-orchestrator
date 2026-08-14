@@ -697,6 +697,7 @@ def build_orchestrator(
         open_issue_corpus=tech_lead.open_issue_corpus,
         repository_host=github,
         needs_human_block=pending_work.needs_human_block,
+        timeline_evidence=timeline_evidence,
         coder_prompt_addendum=coder_prompt_addendum,
     )
     _wire_stack_publish_gate(
@@ -749,15 +750,14 @@ def build_orchestrator(
     from ..execution.label_store import LabelStore
     label_store = LabelStore(state_dir(config.repo_root) / "label_store.sqlite")
 
-    # Wire post-construction collaborators into action_applier: the pair
-    # registry + shared supervisor so escalation / history-reconcile /
-    # STOP_SESSION boundaries terminate hidden review-exchange runtime,
-    # label_store for write-through persistence, and publish_recovery so
-    # issue terminal boundaries abandon publish retries (post-construction
-    # because PublishRecoveryService depends on this applier).
+    # Wire post-construction collaborators into action_applier: the completion
+    # owner terminalizes hidden review-exchange work and its evidence at every
+    # issue boundary; label_store provides write-through persistence; and
+    # publish_recovery prevents late retry work from repopulating an issue.
     if action_applier is not None:
-        action_applier.pair_registry = pair_registry
-        action_applier.background_job_supervisor = background_job_supervisor
+        action_applier.review_exchange_canceller = (
+            completion_processor.cancel_review_exchange_for_issue
+        )
         action_applier.label_store = label_store
         action_applier.publish_recovery = publish_recovery
         action_applier.timeline_evidence = timeline_evidence
@@ -1075,8 +1075,6 @@ def build_orchestrator_for_testing(
     agent_callback_endpoint.declare_unavailable()
 
     if action_applier is not None:
-        action_applier.pair_registry = pair_registry_for_testing
-        action_applier.background_job_supervisor = background_job_supervisor
         action_applier.tech_lead_ops = tech_lead_authority_for_testing
         action_applier.promotion_target = tech_lead.promotion_target
 
@@ -1120,6 +1118,7 @@ def build_orchestrator_for_testing(
         runtime_identity=runtime_identity.resolve_runtime_identity(),
         tech_lead_authority=tech_lead_authority_for_testing,
         needs_human_block=pending_work.needs_human_block,
+        timeline_evidence=NULL_TIMELINE_EVIDENCE,
     )
     _wire_stack_publish_gate(
         completion_processor, _dependency_evaluator, github, command_runner, config,
@@ -1137,7 +1136,7 @@ def build_orchestrator_for_testing(
         validation_timeout_seconds=config.validation.quick.timeout_seconds,
         attempt_store=attempt_store,
         validation_attempt_key_factory=_validation_attempt_key_factory(config),
-        review_exchange_canceller=_cancel_review_exchange_for_testing,
+        review_exchange_canceller=completion_processor.cancel_review_exchange_for_issue,
     )
 
     # Create LabelSync for testing
@@ -1191,6 +1190,9 @@ def build_orchestrator_for_testing(
         action_applier.publish_recovery = publish_recovery
         action_applier.run_ownership = run_ownership
         action_applier.timeline_evidence = timeline_evidence
+        action_applier.review_exchange_canceller = (
+            completion_processor.cancel_review_exchange_for_issue
+        )
 
     infra_services = InfraServices(
         label_manager=label_manager,
@@ -1246,6 +1248,7 @@ def build_orchestrator_for_testing(
         open_issue_corpus=tech_lead.open_issue_corpus,
         label_manager=label_manager,
         provider_resilience=provider_resilience,
+        timeline_evidence=timeline_evidence,
     )
     deps = OrchestratorDeps(
         events=events,

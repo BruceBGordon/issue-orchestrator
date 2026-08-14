@@ -469,7 +469,7 @@ function runTimelineEventAction(action) {
         return;
     }
     if (action.type === 'copy_agent_log' && action.issue_number) {
-        copyAgentLogAction(action.issue_number, action.run_dir || null);
+        copyAgentLogAction(action.issue_number, action.run_dir || null, action);
         return;
     }
     if (action.type === 'view_claude_log' && action.issue_number) {
@@ -525,6 +525,7 @@ async function setTimelineEvidencePinned(action) {
             action.issue_number,
             action.run_dir,
             action.pinned,
+            action.repo_root || null,
         );
         const response = await fetch(request.endpoint, {
             method: request.method,
@@ -537,7 +538,10 @@ async function setTimelineEvidencePinned(action) {
         }
         showToast(data.pinned ? 'Timeline evidence pinned' : 'Timeline evidence unpinned');
         if (issueDetailData && issueDetailData.issue_number === Number(action.issue_number)) {
-            await openIssueDetail(action.issue_number, null, { focus: 'timeline' });
+            await openIssueDetail(action.issue_number, null, {
+                focus: 'timeline',
+                repoRoot: action.repo_root || null,
+            });
         }
     } catch (err) {
         showToast(`Could not update Timeline evidence: ${err.message || err}`, 'error');

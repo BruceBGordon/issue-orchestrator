@@ -38,6 +38,7 @@ from issue_orchestrator.execution.persistent_role_prompt_policy import (
 )
 from issue_orchestrator.execution.session_output_adapter import FileSystemSessionOutput
 from issue_orchestrator.ports import TraceEvent
+from issue_orchestrator.ports.timeline_evidence import NULL_TIMELINE_EVIDENCE
 from tests.callback_endpoint_helpers import ready_callback_endpoint
 
 
@@ -6857,6 +6858,7 @@ class TestProductionLayoutCacheResolution:
         }
         return CompletionReviewExchange(
             agent_callback_endpoint=ready_callback_endpoint(),
+            timeline_evidence=NULL_TIMELINE_EVIDENCE,
             config=cfg,
             session_output=session_output,
             emit_review_started=lambda **_: None,

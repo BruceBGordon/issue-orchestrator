@@ -19,6 +19,7 @@ from issue_orchestrator.execution.thread_background_job_runner import (
     ThreadBackgroundJobRunner,
 )
 from tests.callback_endpoint_helpers import ready_callback_endpoint
+from issue_orchestrator.ports.timeline_evidence import NULL_TIMELINE_EVIDENCE
 
 
 def test_successful_job_leaves_no_failure_record() -> None:
@@ -259,6 +260,12 @@ def test_cancel_matching_cancels_only_matching_supervised_jobs() -> None:
     assert supervisor.is_running("review-exchange:99:coding-1") is True
 
     release.set()
+    assert supervisor.wait_until_stopped(
+        cancelled,
+        timeout_seconds=5.0,
+    ) is True
+
+    release.set()
     assert runner.wait_until_idle(timeout=5.0)
 
 
@@ -340,6 +347,7 @@ def test_review_exchange_halts_when_supervisor_records_failure() -> None:
 
     review = CompletionReviewExchange(
         agent_callback_endpoint=ready_callback_endpoint(),
+        timeline_evidence=NULL_TIMELINE_EVIDENCE,
         config=cfg,
         session_output=_SessionOutput(Path("/tmp")),  # type: ignore[arg-type]
         emit_review_started=lambda **_: None,

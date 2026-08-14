@@ -20,6 +20,9 @@ import pytest
 from issue_orchestrator.control.completion_review_exchange import (
     CompletionReviewExchange,
 )
+from issue_orchestrator.control.review_exchange_lifecycle import (
+    ReviewExchangeCancellation,
+)
 from issue_orchestrator.domain.review_exchange import (
     ReviewExchangeOutcome,
     ReviewExchangeResponse,
@@ -36,8 +39,13 @@ from issue_orchestrator.domain.models import (
 )
 from issue_orchestrator.infra.config import Config
 from issue_orchestrator.domain.models import AgentConfig
+from issue_orchestrator.domain.run_manifest import RunManifest
+from issue_orchestrator.execution.session_output_adapter import FileSystemSessionOutput
+from issue_orchestrator.execution.timeline_evidence import FileSystemTimelineEvidence
 from issue_orchestrator.ports.background_job import CompletedJob
 from issue_orchestrator.ports.session_output import ReviewExchangeSummary, SessionOutput
+from issue_orchestrator.ports.timeline_evidence import NULL_TIMELINE_EVIDENCE
+from issue_orchestrator.ports.timeline_store import NullTimelineStore
 from tests.callback_endpoint_helpers import ready_callback_endpoint
 
 
@@ -69,6 +77,14 @@ class _FakeReviewExchangeRunner:
 
     def job_timeout_seconds(self, **_: Any) -> float | None:
         return 60.0
+
+
+class _CapturingTimelineEvidence:
+    def __init__(self) -> None:
+        self.finalized: list[Any] = []
+
+    def finalize_terminal(self, command: Any) -> None:
+        self.finalized.append(command)
 
 
 class _FakeJobRunner:
@@ -154,8 +170,11 @@ class _FakeSessionOutput:
         issue_number: int,
         parent_session_name: str,
         agent_label: str,
+        retention_days: int = 7,
+        retention_tier: str = "hot",
     ) -> ReviewExchangeRun:
         run = ReviewExchangeRun(
+            issue_number=issue_number,
             session_name=f"review-exchange-{issue_number}-{len(self.started_runs) + 1}",
             run_id=f"exchange-run-{len(self.started_runs) + 1}",
             parent_session_name=parent_session_name,
@@ -168,6 +187,7 @@ class _FakeSessionOutput:
         self, parent_session_name: str = "coding-1"
     ) -> ReviewExchangeRun:
         return ReviewExchangeRun(
+            issue_number=230,
             session_name="review-exchange-230",
             run_id="exchange-run-cached",
             parent_session_name=parent_session_name,
@@ -333,6 +353,8 @@ def _build(
     outcome_events: list[dict[str, Any]],
     *,
     require_validation: bool = False,
+    timeline_evidence: Any = NULL_TIMELINE_EVIDENCE,
+    review_exchange_canceller: Any | None = None,
 ) -> tuple[CompletionReviewExchange, _FakeSessionOutput]:
     from issue_orchestrator.control.background_job_supervisor import (
         BackgroundJobSupervisor,
@@ -358,6 +380,8 @@ def _build(
         emit_review_outcome=_on_outcome,
         review_exchange_runner=_FakeReviewExchangeRunner(),
         job_supervisor=BackgroundJobSupervisor(job_runner),
+        review_exchange_canceller=review_exchange_canceller,
+        timeline_evidence=cast(Any, timeline_evidence),
     )
     return review, session_output
 
@@ -404,6 +428,96 @@ def test_first_pass_submits_background_job_and_returns_deferred(tmp_path: Path) 
     assert called == []
     # Job id is stable for the same (issue, session_name).
     assert job_runner.submitted[0][0] == "review-exchange:230:coding-1:coding-run-1"
+
+
+def test_background_exception_finalizes_started_review_run(tmp_path: Path) -> None:
+    job_runner = _FakeJobRunner()
+    evidence = _CapturingTimelineEvidence()
+    review, _ = _build(
+        tmp_path,
+        job_runner,
+        [],
+        [],
+        timeline_evidence=evidence,
+    )
+
+    def failing_loop(**_: Any) -> ReviewExchangeOutcome:
+        raise RuntimeError("review process crashed")
+
+    result = review.prepare_review_exchange(
+        requested_actions=(RequestedAction.CREATE_PR,),
+        worktree=tmp_path,
+        issue_number=230,
+        issue_title="Example",
+        session_name="coding-1",
+        run_id="coding-run-1",
+        agent_label="agent:backend",
+        record=_make_record(),
+        errors=[],
+        actions_taken=[],
+        run_review_exchange_loop=failing_loop,
+    )
+    assert result[-1] is True
+
+    with pytest.raises(RuntimeError, match="review process crashed"):
+        job_runner.submitted[0][1]()
+
+    assert len(evidence.finalized) == 1
+    assert evidence.finalized[0].identity.issue_number == 230
+    assert evidence.finalized[0].outcome == "error"
+
+
+def test_external_cancellation_finalizes_started_review_run_once(tmp_path: Path) -> None:
+    job_runner = _FakeJobRunner()
+    evidence = _CapturingTimelineEvidence()
+    cancellations: list[tuple[int, str]] = []
+
+    def cancel_runtime(issue_number: int, reason: str) -> ReviewExchangeCancellation:
+        cancellations.append((issue_number, reason))
+        return ReviewExchangeCancellation(
+            issue_number=issue_number,
+            cancelled_job_ids=("review-exchange:230:coding-1:coding-run-1",),
+        )
+
+    review, _ = _build(
+        tmp_path,
+        job_runner,
+        [],
+        [],
+        timeline_evidence=evidence,
+        review_exchange_canceller=cancel_runtime,
+    )
+
+    result = review.prepare_review_exchange(
+        requested_actions=(RequestedAction.CREATE_PR,),
+        worktree=tmp_path,
+        issue_number=230,
+        issue_title="Example",
+        session_name="coding-1",
+        run_id="coding-run-1",
+        agent_label="agent:backend",
+        record=_make_record(),
+        errors=[],
+        actions_taken=[],
+        run_review_exchange_loop=lambda **_: pytest.fail(
+            "deferred review must not run on the caller thread"
+        ),
+    )
+    assert result[-1] is True
+
+    cancellation = review.cancel_issue(230, "session-timeout")
+
+    assert cancellation.cancelled_job_ids == (
+        "review-exchange:230:coding-1:coding-run-1",
+    )
+    assert cancellations == [(230, "session-timeout")]
+    assert len(evidence.finalized) == 1
+    assert evidence.finalized[0].identity.issue_number == 230
+    assert evidence.finalized[0].outcome == "cancelled"
+
+    review.cancel_issue(230, "session-timeout-retry")
+
+    assert len(evidence.finalized) == 1
 
 
 def test_background_job_forwards_approval_gate_to_loop(tmp_path: Path) -> None:
@@ -468,6 +582,7 @@ def test_background_deadline_is_derived_from_runner_port(tmp_path: Path) -> None
     cfg = _make_config(tmp_path)
     review = CompletionReviewExchange(
         agent_callback_endpoint=ready_callback_endpoint(),
+        timeline_evidence=NULL_TIMELINE_EVIDENCE,
         config=cfg,
         session_output=cast(SessionOutput, _FakeSessionOutput(tmp_path)),
         emit_review_started=lambda **_: None,
@@ -565,6 +680,7 @@ def test_running_background_job_without_deadline_halts(tmp_path: Path) -> None:
         return _Cancellation(cancelled_job_ids=cancelled)
 
     errors: list[str] = []
+    evidence = _CapturingTimelineEvidence()
     review = CompletionReviewExchange(
         agent_callback_endpoint=ready_callback_endpoint(),
         config=_make_config(tmp_path),
@@ -574,6 +690,7 @@ def test_running_background_job_without_deadline_halts(tmp_path: Path) -> None:
         review_exchange_runner=_NoDeadlineRunner(),
         job_supervisor=supervisor,
         review_exchange_canceller=cancel,
+        timeline_evidence=cast(Any, evidence),
     )
 
     def fake_loop(**_: Any) -> ReviewExchangeOutcome:
@@ -624,6 +741,8 @@ def test_running_background_job_without_deadline_halts(tmp_path: Path) -> None:
         "review_exchange: background job is running without a supervisor "
         "deadline: job_id=review-exchange:230:coding-1:coding-run-1"
     ]
+    assert len(evidence.finalized) == 1
+    assert evidence.finalized[0].outcome == "error"
 
 
 def test_within_deadline_for_completion_returns_false_for_unbounded_job(
@@ -655,6 +774,7 @@ def test_within_deadline_for_completion_returns_false_for_unbounded_job(
     supervisor = BackgroundJobSupervisor(job_runner)
     review = CompletionReviewExchange(
         agent_callback_endpoint=ready_callback_endpoint(),
+        timeline_evidence=NULL_TIMELINE_EVIDENCE,
         config=_make_config(tmp_path),
         session_output=cast(SessionOutput, _FakeSessionOutput(tmp_path)),
         emit_review_started=lambda **_: None,
@@ -714,6 +834,7 @@ def test_within_deadline_for_completion_returns_true_for_bounded_running_job(
     # the BG job is bounded and still inside it.
     review = CompletionReviewExchange(
         agent_callback_endpoint=ready_callback_endpoint(),
+        timeline_evidence=NULL_TIMELINE_EVIDENCE,
         config=_make_config(tmp_path),
         session_output=cast(SessionOutput, _FakeSessionOutput(tmp_path)),
         emit_review_started=lambda **_: None,
@@ -778,6 +899,7 @@ def test_background_deadline_failure_cancels_runtime(tmp_path: Path) -> None:
         return _Cancellation(cancelled_job_ids=cancelled)
 
     errors: list[str] = []
+    evidence = _CapturingTimelineEvidence()
     review = CompletionReviewExchange(
         agent_callback_endpoint=ready_callback_endpoint(),
         config=_make_config(tmp_path),
@@ -787,6 +909,7 @@ def test_background_deadline_failure_cancels_runtime(tmp_path: Path) -> None:
         review_exchange_runner=_ShortTimeoutRunner(),
         job_supervisor=supervisor,
         review_exchange_canceller=cancel,
+        timeline_evidence=cast(Any, evidence),
     )
 
     def fake_loop(**_: Any) -> ReviewExchangeOutcome:
@@ -834,6 +957,8 @@ def test_background_deadline_failure_cancels_runtime(tmp_path: Path) -> None:
     ]
     assert supervisor.is_running("review-exchange:230:coding-1:coding-run-1") is False
     assert any("background job exceeded deadline" in error for error in errors)
+    assert len(evidence.finalized) == 1
+    assert evidence.finalized[0].identity.issue_number == 230
 
 
 def test_tick_after_completion_resolves_cached_outcome(
@@ -1467,6 +1592,7 @@ def test_no_job_runner_falls_back_to_inline_execution(
 
     review = CompletionReviewExchange(
         agent_callback_endpoint=ready_callback_endpoint(),
+        timeline_evidence=NULL_TIMELINE_EVIDENCE,
         config=_make_config(tmp_path),
         session_output=cast(SessionOutput, session_output),
         emit_review_started=lambda **kw: started.append(kw),
@@ -1534,6 +1660,7 @@ def test_inline_review_exchange_halt_is_logged(
 
     review = CompletionReviewExchange(
         agent_callback_endpoint=ready_callback_endpoint(),
+        timeline_evidence=NULL_TIMELINE_EVIDENCE,
         config=_make_config(tmp_path),
         session_output=cast(SessionOutput, session_output),
         emit_review_started=lambda **kw: started.append(kw),
@@ -1633,6 +1760,7 @@ def test_retry_does_not_reconsume_prior_run_timeout_cancellation(
 
     review = CompletionReviewExchange(
         agent_callback_endpoint=ready_callback_endpoint(),
+        timeline_evidence=NULL_TIMELINE_EVIDENCE,
         config=_make_config(tmp_path),
         session_output=cast(SessionOutput, _FakeSessionOutput(tmp_path)),
         emit_review_started=lambda **_: None,
@@ -1698,3 +1826,80 @@ def test_retry_does_not_reconsume_prior_run_timeout_cancellation(
         "review-exchange:230:coding-1:run-a",
         "review-exchange:230:coding-1:run-b",
     ]
+
+
+@pytest.mark.parametrize(
+    ("status", "reason"),
+    [
+        ("ok", "reviewer_ok"),
+        ("stopped", "max_rounds_exceeded"),
+        ("stopped", "reviewer_reports_no_progress"),
+        ("error", "reviewer_no_completion"),
+        ("error", "coder_no_completion"),
+    ],
+)
+def test_every_review_terminal_uses_configured_retention_owner(
+    tmp_path: Path,
+    status: str,
+    reason: str,
+) -> None:
+    config = _make_config(tmp_path)
+    config.session_output_retention_days = 19
+    config.session_output_retention_tier = "cold"
+    session_output = FileSystemSessionOutput()
+    owner = FileSystemTimelineEvidence(
+        archive_root=tmp_path / "state" / "timeline-evidence",
+        timeline_store=NullTimelineStore(),
+        retention_days=19,
+        retention_tier="cold",
+    )
+    review = CompletionReviewExchange(
+        agent_callback_endpoint=ready_callback_endpoint(),
+        config=config,
+        session_output=session_output,
+        emit_review_started=lambda **_: None,
+        emit_review_outcome=lambda **_: None,
+        review_exchange_runner=_FakeReviewExchangeRunner(),
+        timeline_evidence=owner,
+    )
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    review_run = review._start_review_exchange_run(  # noqa: SLF001
+        worktree=worktree,
+        issue_number=230,
+        parent_session_name="coding-1",
+        agent_label="agent:backend",
+    )
+    initial_manifest = RunManifest.load(review_run.assets.run_dir)
+    assert initial_manifest.retention_days == 19
+    assert initial_manifest.retention_tier == "cold"
+
+    summary = _summary(status=status, reason=reason, rounds=1)
+    outcome = ReviewExchangeOutcome(
+        status=status,
+        rounds=1,
+        reason=reason,
+        run_assets=review_run.assets,
+        summary=summary,
+    )
+    review.store_review_exchange_summary(
+        review_run=review_run,
+        exchange_result=outcome,
+    )
+
+    manifest = RunManifest.load(review_run.assets.run_dir)
+    assert manifest.outcome == status
+    assert manifest.ended_at is not None
+    assert manifest.retention_days == 19
+    assert manifest.retention_tier == "cold"
+    assert manifest.retention_expires_at is not None
+
+    first_ended_at = manifest.ended_at
+    first_expiry = manifest.retention_expires_at
+    review.store_review_exchange_summary(
+        review_run=review_run,
+        exchange_result=outcome,
+    )
+    retried = RunManifest.load(review_run.assets.run_dir)
+    assert retried.ended_at == first_ended_at
+    assert retried.retention_expires_at == first_expiry

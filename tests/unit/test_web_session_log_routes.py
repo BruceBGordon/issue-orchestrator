@@ -7,6 +7,11 @@ from tests.unit.test_web import *  # noqa: F403
 from issue_orchestrator.control.review_exchange_lifecycle import (
     ReviewExchangeCancellation,
 )
+from issue_orchestrator.domain.timeline_evidence import (
+    TimelineEvidenceIdentity,
+    TimelineEvidenceState,
+    TimelineEvidenceStatus,
+)
 
 globals().update(
     {name: value for name, value in vars(_support).items() if not name.startswith("__")}
@@ -420,6 +425,45 @@ class TestIssueLogEndpointsUseLatestHistory:
             assert payload["error"] == "run_dir is required"
         finally:
             set_orchestrator(None)
+
+    def test_agent_ui_log_rejects_logically_expired_unpruned_run(
+        self, tmp_path: Path
+    ) -> None:
+        """The legacy exact-run route enforces retention before reading files."""
+        from issue_orchestrator.execution.session_output_adapter import (
+            FileSystemSessionOutput,
+        )
+
+        mock_orch = create_mock_orchestrator()
+        worktree = tmp_path / "wt-expired-local-log"
+        worktree.mkdir(parents=True)
+        run = FileSystemSessionOutput().start_run(
+            worktree, "issue-123", issue_number=123
+        )
+        self._write_terminal_recording(run.run_dir, "expired but still present\n")
+        mock_orch.deps.timeline_evidence.describe.return_value = (
+            TimelineEvidenceState(
+                identity=TimelineEvidenceIdentity(123, run.run_dir),
+                status=TimelineEvidenceStatus.EXPIRED,
+                label="Evidence expired",
+                available=False,
+                pinned=False,
+                archived=False,
+                help_text="Retention elapsed.",
+            )
+        )
+
+        set_orchestrator(mock_orch)
+        try:
+            response = TestClient(app).get(
+                f"/api/log/local/123?run_dir={run.run_dir}"
+            )
+        finally:
+            set_orchestrator(None)
+
+        assert response.status_code == 410
+        assert response.json()["error"] == "Evidence expired"
+        assert run.log_path.is_file()
 
     def test_agent_ui_log_serves_file_content_directly(self, tmp_path: Path):
         """GET /api/log/local serves pre-cleaned file content, filtering only blanks."""

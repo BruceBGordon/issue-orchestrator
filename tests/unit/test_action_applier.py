@@ -2,7 +2,7 @@
 
 import logging
 import pytest
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import MagicMock, Mock, call, patch
 from pathlib import Path
 
 from issue_orchestrator.domain.tech_lead_session import TechLeadCreationOrigin
@@ -38,6 +38,10 @@ from issue_orchestrator.control.orchestrator_support import (
 )
 from issue_orchestrator.control.session_history import SessionHistoryOwner
 from issue_orchestrator.control.session_manager import SessionType
+from issue_orchestrator.control.review_exchange_lifecycle import (
+    ReviewExchangeCancellation,
+    cancel_issue_review_exchange,
+)
 from issue_orchestrator.domain.models import (
     AgentConfig,
     DiscoveredFailure,
@@ -52,6 +56,12 @@ from issue_orchestrator.domain.tech_lead_session import (
 from issue_orchestrator.events import EventName
 from issue_orchestrator.ports.claim_manager import ClaimManager
 from issue_orchestrator.ports.tech_lead_authority import InMemoryTechLeadAuthorityStore
+
+
+def _no_review_exchange_work(
+    issue_number: int, _reason: str
+) -> ReviewExchangeCancellation:
+    return ReviewExchangeCancellation(issue_number, ())
 
 
 @pytest.fixture
@@ -115,7 +125,7 @@ def applier(
         single_instance_run_ownership,
     )
 
-    return ActionApplier(
+    action_applier = ActionApplier(
         labels=mock_labels,
         sessions=mock_sessions,
         events=mock_events,
@@ -127,6 +137,19 @@ def applier(
         # round 2 F3), so the applier that owns the create needs the run owner.
         run_ownership=single_instance_run_ownership(),
     )
+    action_applier.review_exchange_canceller = lambda issue_number, reason: (
+        cancel_issue_review_exchange(
+            issue_number=issue_number,
+            reason=reason,
+            pair_registry=getattr(action_applier, "pair_registry", None),
+            job_supervisor=getattr(
+                action_applier,
+                "background_job_supervisor",
+                None,
+            ),
+        )
+    )
+    return action_applier
 
 
 class TestAddLabelAction:
@@ -1684,7 +1707,9 @@ class TestSurfaceTechLeadProposalAction:
 class TestCleanupSessionAction:
     """Tests for CLEANUP_SESSION action."""
 
-    def test_cleanup_full(self, applier, mock_sessions, mock_worktree_manager, tmp_path):
+    def test_cleanup_full(
+        self, applier, mock_sessions, mock_worktree_manager, mock_events, tmp_path
+    ):
         """Test full cleanup - close tab and remove worktree."""
         mock_sessions.exists.return_value = True
         evidence = Mock()
@@ -1705,6 +1730,12 @@ class TestCleanupSessionAction:
         evidence.archive_worktree.assert_called_once_with(123, Path(str(tmp_path)))
         mock_sessions.stop.assert_called_once()
         mock_worktree_manager.remove_checkout.assert_called_once()
+        completed_events = [
+            call.args[0]
+            for call in mock_events.publish.call_args_list
+            if call.args[0].name == EventName.CLEANUP_COMPLETED
+        ]
+        assert len(completed_events) == 1
 
     def test_periodic_prune_routes_through_evidence_owner(self, applier):
         evidence = Mock()
@@ -1718,7 +1749,7 @@ class TestCleanupSessionAction:
         evidence.prune_expired.assert_called_once_with()
 
     def test_cleanup_keeps_worktree_when_evidence_archive_fails(
-        self, applier, mock_worktree_manager, tmp_path
+        self, applier, mock_worktree_manager, mock_events, tmp_path
     ):
         evidence = Mock()
         evidence.archive_worktree.side_effect = RuntimeError("archive failed")
@@ -1737,6 +1768,10 @@ class TestCleanupSessionAction:
         assert not result.success
         assert "archive failed" in result.error
         mock_worktree_manager.remove_checkout.assert_not_called()
+        published_names = [
+            call.args[0].name for call in mock_events.publish.call_args_list
+        ]
+        assert EventName.CLEANUP_COMPLETED not in published_names
 
     def test_cleanup_tabs_only(self, applier, mock_sessions, mock_worktree_manager, tmp_path):
         """Test cleanup with only tab closing."""
@@ -1819,6 +1854,7 @@ class TestCleanupSessionAction:
             labels=mock_labels, sessions=mock_sessions, events=mock_events,
             repository_host=mock_repository_host, worktree_manager=mock_worktree_manager,
             fresh_issue_reader=mock_fresh_issue_reader, reconcile=False,
+            review_exchange_canceller=_no_review_exchange_work,
             on_worktree_removed=_boom,
         )
         action = CleanupSessionAction(
@@ -1892,6 +1928,41 @@ class TestCleanupSessionAction:
         assert not predicate("review-exchange:124:coding-1")
         mock_sessions.stop.assert_called_once()
         mock_worktree_manager.remove_checkout.assert_called_once()
+
+    def test_cleanup_waits_for_review_owner_before_archive_and_removal(
+        self,
+        applier,
+        mock_worktree_manager,
+        tmp_path,
+    ):
+        """Destructive cleanup starts only after review work is terminal."""
+        operations = Mock()
+        operations.cancel.return_value = ReviewExchangeCancellation(
+            issue_number=123,
+            cancelled_job_ids=("review-exchange:123:coding-1",),
+        )
+        applier.review_exchange_canceller = operations.cancel
+        evidence = Mock()
+        evidence.archive_worktree = operations.archive_worktree
+        applier.timeline_evidence = evidence
+        mock_worktree_manager.remove_checkout = operations.remove_checkout
+        action = CleanupSessionAction(
+            issue_number=123,
+            pr_number=456,
+            terminal_id="issue-123",
+            worktree_path=str(tmp_path),
+            close_tabs=False,
+            remove_worktrees=True,
+        )
+
+        result = applier.apply(action)
+
+        assert result.success
+        assert operations.method_calls == [
+            call.cancel(123, "session-cleanup"),
+            call.archive_worktree(123, Path(str(tmp_path))),
+            call.remove_checkout(Path(str(tmp_path)), force=False),
+        ]
 
     def test_cleanup_without_terminal_id_logs_issue_lifecycle_default(
         self,
@@ -2150,6 +2221,7 @@ class TestRecoverTerminalIssueAction:
             label_manager=real_label_manager,
             label_store=label_store,
             reconcile=reconcile,
+            review_exchange_canceller=_no_review_exchange_work,
         )
         applier.history_owner = SessionHistoryOwner([history_entry])
         return applier
@@ -2201,6 +2273,7 @@ class TestRecoverTerminalIssueAction:
             label_manager=real_label_manager,
             label_store=None,
             reconcile=False,
+            review_exchange_canceller=_no_review_exchange_work,
         )
 
         orch = MagicMock()

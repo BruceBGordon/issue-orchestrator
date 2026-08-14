@@ -14,6 +14,9 @@ from issue_orchestrator.control.awaiting_merge_reconciler import (
     classify_pr_set_drift,
 )
 from issue_orchestrator.control.label_manager import LabelManager
+from issue_orchestrator.control.review_exchange_lifecycle import (
+    ReviewExchangeCancellation,
+)
 from issue_orchestrator.control.session_history import SessionHistoryOwner
 from issue_orchestrator.domain.models import (
     Issue,
@@ -34,6 +37,12 @@ from issue_orchestrator.ports.repository_host import (
     DependencyIssueSnapshot,
     RepositoryHostError,
 )
+
+
+def _no_review_exchange_work(
+    issue_number: int, _reason: str
+) -> ReviewExchangeCancellation:
+    return ReviewExchangeCancellation(issue_number, ())
 
 
 def _wire_pr(
@@ -865,8 +874,9 @@ def test_second_reconcile_pass_on_terminal_entry_is_noop() -> None:
         sessions=MagicMock(),
         events=events,
         history_owner=SessionHistoryOwner(state.session_history),
+        review_exchange_canceller=_no_review_exchange_work,
     )
-    applier.apply(action)
+    assert applier.apply(action).success
     second_result = reconciler.discover(state)
 
     assert first_result.checked == 1

@@ -39,7 +39,8 @@ from ..view_models.dialogs import (
     build_validation_failure_dialog,
 )
 from .web_session_context import WebOrchestratorDependency
-from .web_session_routes import session_manifest_response, session_phases_response
+from .web_session_manifest import session_manifest_response
+from .web_session_routes import session_phases_response
 
 if TYPE_CHECKING:
     from ..infra.orchestrator import Orchestrator

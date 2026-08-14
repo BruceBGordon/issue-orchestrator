@@ -29,6 +29,10 @@ from issue_orchestrator.control.needs_human_block import (
     NeedsHumanBlock,
     NeedsHumanCause,
 )
+from issue_orchestrator.control.review_exchange_lifecycle import (
+    ReviewExchangeCancellation,
+)
+from issue_orchestrator.ports.timeline_evidence import NULL_TIMELINE_EVIDENCE
 
 
 class _LiveLabelWriter:
@@ -60,6 +64,13 @@ from issue_orchestrator.domain.models import (
     SessionKey,
     TaskKind,
 )
+
+
+def _no_review_exchange_work(
+    issue_number: int, _reason: str
+) -> ReviewExchangeCancellation:
+    """Explicit null owner for production appliers with no review runtime."""
+    return ReviewExchangeCancellation(issue_number, ())
 from issue_orchestrator.events import EventName
 from tests.unit.session_run_helpers import make_session_run_assets
 
@@ -1099,6 +1110,7 @@ class TestTheBlockOwnerIsNotBypassableInProduction:
             fresh_issue_reader=_FreshReader(),
             reconcile=True,
             needs_human_block=block,
+            review_exchange_canceller=_no_review_exchange_work,
         )
         quarantine = build_claim_quarantine_owner(
             store=claims,
@@ -1191,6 +1203,7 @@ class TestTheBlockOwnerIsNotBypassableInProduction:
             git_adapter=git_adapter,
             session_output=session_output,
             agent_callback_endpoint=MagicMock(),
+            timeline_evidence=NULL_TIMELINE_EVIDENCE,
             label_config={"needs_human": labels.needs_human},
             needs_human_block=block,
         )

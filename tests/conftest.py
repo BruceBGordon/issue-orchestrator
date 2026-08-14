@@ -828,6 +828,7 @@ def build_test_orchestrator_deps(
     lease_renewer=None,
     timeline_reader=None,
     timeline_writer=None,
+    timeline_evidence=None,
     provider_readiness_probe=None,
 ):
     """Factory function to create OrchestratorDeps for testing.
@@ -908,7 +909,36 @@ def build_test_orchestrator_deps(
     from issue_orchestrator.execution.persistent_review_exchange_runner import (
         PersistentReviewExchangeRunner,
     )
+    from issue_orchestrator.control.background_job_supervisor import (
+        BackgroundJobSupervisor,
+    )
+    from issue_orchestrator.control.review_exchange_lifecycle import (
+        ReviewExchangeCancellation,
+        cancel_issue_review_exchange,
+    )
+    from issue_orchestrator.ports.background_job import NullBackgroundJobRunner
     agent_callback_endpoint = ready_callback_endpoint()
+
+    from issue_orchestrator.ports.timeline_evidence import NULL_TIMELINE_EVIDENCE
+
+    timeline_evidence = (
+        timeline_evidence
+        if timeline_evidence is not None
+        else NULL_TIMELINE_EVIDENCE
+    )
+    _fact_gatherer.timeline_evidence = timeline_evidence
+    pair_registry = InMemoryPersistentExchangePairRegistry()
+    background_job_supervisor = BackgroundJobSupervisor(NullBackgroundJobRunner())
+
+    def _cancel_review_exchange(
+        issue_number: int, reason: str
+    ) -> ReviewExchangeCancellation:
+        return cancel_issue_review_exchange(
+            issue_number=issue_number,
+            reason=reason,
+            pair_registry=pair_registry,
+            job_supervisor=background_job_supervisor,
+        )
 
     completion_processor = CompletionProcessor(
         agent_callback_endpoint=agent_callback_endpoint,
@@ -918,7 +948,7 @@ def build_test_orchestrator_deps(
         event_bus=None,
         session_output=session_output,
         review_exchange_runner=PersistentReviewExchangeRunner(
-            session_output, InMemoryPersistentExchangePairRegistry(),
+            session_output, pair_registry,
         ),
         label_config={
             "blocked": config.get_label_blocked(),
@@ -929,6 +959,9 @@ def build_test_orchestrator_deps(
             "in_progress": config.get_label_in_progress(),
         },
         config=config,
+        background_job_supervisor=background_job_supervisor,
+        review_exchange_canceller=_cancel_review_exchange,
+        timeline_evidence=timeline_evidence,
     )
     _session_controller = session_controller or SessionController(
         completion_processor=completion_processor,
@@ -939,6 +972,7 @@ def build_test_orchestrator_deps(
         validation_cmd=config.validation.quick.cmd,
         validation_timeout_seconds=config.validation.quick.timeout_seconds,
         max_validation_retries=config.retry.max_validation_retries,
+        review_exchange_canceller=completion_processor.cancel_review_exchange_for_issue,
     )
     pr_scanner = PRScanner(
         config=config,
@@ -957,6 +991,10 @@ def build_test_orchestrator_deps(
         worktree_manager=worktree_manager,
         fresh_issue_reader=fresh_reader,
         reconcile=False,
+    )
+    _action_applier.timeline_evidence = timeline_evidence
+    _action_applier.review_exchange_canceller = (
+        completion_processor.cancel_review_exchange_for_issue
     )
 
     health_gate = HealthGate(rate_limit_threshold=100)
@@ -1043,8 +1081,6 @@ def build_test_orchestrator_deps(
     from issue_orchestrator.ports.provider_readiness import (
         NO_PROVIDER_READINESS_PROBE,
     )
-    from issue_orchestrator.ports.timeline_evidence import NULL_TIMELINE_EVIDENCE
-
     readiness_probe = provider_readiness_probe or NO_PROVIDER_READINESS_PROBE
 
     infra_services = InfraServices(
@@ -1056,7 +1092,7 @@ def build_test_orchestrator_deps(
         timeline_reader=timeline_reader,
         timeline_store=NullTimelineStore(),
         timeline_writer=timeline_writer,
-        timeline_evidence=NULL_TIMELINE_EVIDENCE,
+        timeline_evidence=timeline_evidence,
         goal_pilot_store=goal_pilot_store,
         attempt_store=attempt_store,
         tech_lead_authority=tech_lead_authority,
@@ -1162,6 +1198,7 @@ def build_test_orchestrator_deps(
             open_issue_corpus=open_issue_corpus,
             label_manager=label_manager,
             provider_resilience=provider_resilience,
+            timeline_evidence=timeline_evidence,
         ),
         # ...and for the operator retry/dismiss command, whose transition spans
         # GitHub labels and the local retry/queue state (#6999 F5).

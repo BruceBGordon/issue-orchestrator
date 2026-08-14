@@ -231,3 +231,40 @@ def test_evidence_is_resolved_once_and_shown_on_the_latest_exact_run_row(
         action["type"] == "set_timeline_evidence_pin"
         for action in decorated[1]["actions"]
     )
+
+
+def test_archived_success_without_local_tail_hides_orchestrator_log_action(
+    tmp_path: Path,
+) -> None:
+    from issue_orchestrator.execution.session_output_adapter import (
+        FileSystemSessionOutput,
+    )
+
+    run = FileSystemSessionOutput().start_run(
+        tmp_path / "worktree", "issue-4057", issue_number=4057
+    )
+    state = TimelineEvidenceState(
+        identity=TimelineEvidenceIdentity(4057, run.run_dir),
+        status=TimelineEvidenceStatus.RETAINED,
+        label="Evidence retained",
+        available=True,
+        pinned=False,
+        archived=True,
+        help_text="Retained for seven days.",
+    )
+    event = {
+        "event": "session.completed",
+        "timeline_schema_version": TIMELINE_SCHEMA_VERSION,
+        "issue_number": 4057,
+        "run_dir": str(run.run_dir),
+    }
+
+    [decorated] = attach_timeline_evidence(
+        TimelineEventBatch(_decorate_timeline_events([event], 4057)),
+        4057,
+        _EvidenceReader(state),
+    ).events
+
+    action_types = {action["type"] for action in decorated["actions"]}
+    assert "open_orchestrator_log" not in action_types
+    assert "set_timeline_evidence_pin" in action_types

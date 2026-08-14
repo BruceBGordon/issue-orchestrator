@@ -6,7 +6,6 @@ import json
 import logging
 import time
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from fastapi import APIRouter, Request
@@ -18,16 +17,13 @@ from ..control.queue_cache import (
     clear_issue_refresh,
     record_issue_refreshes,
 )
-from ..control.review_exchange_lifecycle import (
-    has_active_issue_runtime,
-    terminate_issue_runtime,
-)
 from ..control.retry_history_state import RetryHistoryState
 from ..events import EventName
 from ..history import latest_history_entries_by_issue
 from ..ports.event_sink import make_trace_event
 from .web_issue_number_payload import parse_issue_numbers_payload
 from .web_session_context import WebOrchestratorDependency
+from .web_retry_runtime import terminate_reset_retry_runtime
 
 if TYPE_CHECKING:
     from ..control.maintenance import ResetResult
@@ -346,7 +342,7 @@ def reset_and_retry_issue(  # noqa: PLR0913
         # terminals and hidden review-exchange pair/job work before local
         # state or worktrees are removed, otherwise a live subprocess can keep
         # writing into a reset attempt or leave stale active-session gating.
-        _terminate_reset_retry_runtime(
+        terminate_reset_retry_runtime(
             issue_number=issue_number,
             state=state,
             deps=deps,
@@ -482,104 +478,6 @@ def reset_and_retry_issue(  # noqa: PLR0913
             exc_info=True,
         )
         return None, {"issue": issue_number, "error": str(exc)}
-
-
-@dataclass(frozen=True)
-class _ResetRetryRuntimeOwners:
-    """The runtime owners the reset boundary would terminate for one issue.
-
-    Resolved once and shared by both the termination boundary and the
-    freshness activity check so the reset teardown and the "is this proposal
-    still fresh?" predicate can never read a different owner set (#6777).
-    """
-
-    pair_registry: Any
-    job_supervisor: Any
-    session_manager: Any
-    active_sessions: Any
-    publish_recovery: Any
-
-
-def _reset_retry_runtime_owners(
-    state: "OrchestratorState", deps: Any
-) -> _ResetRetryRuntimeOwners:
-    """Resolve every runtime owner the reset boundary touches for an issue."""
-    services = _configured_attr(deps, "services")
-    return _ResetRetryRuntimeOwners(
-        pair_registry=_configured_attr(services, "pair_registry"),
-        job_supervisor=_configured_attr(services, "background_job_supervisor"),
-        session_manager=_configured_attr(deps, "session_manager"),
-        active_sessions=state.active_sessions,
-        # Publish-retry work has its own owner/runner outside the review-exchange
-        # supervisor; the shared runtime boundary abandons it on the same
-        # teardown so a late republish cannot repopulate the attempt being reset.
-        publish_recovery=_configured_attr(deps, "publish_recovery"),
-    )
-
-
-def has_active_reset_retry_runtime(
-    *,
-    issue_number: int,
-    state: "OrchestratorState",
-    deps: Any,
-) -> bool:
-    """Would the reset boundary terminate live runtime for this issue?
-
-    Shares its owner set with :func:`_terminate_reset_retry_runtime` via
-    :func:`_reset_retry_runtime_owners`, so an agent-authored reset proposal's
-    freshness check and the reset teardown consult exactly the same runtime
-    owners — visible issue/rework sessions, the persistent coder/reviewer pair,
-    supervised review-exchange jobs, and pending publish retry. A stale proposal
-    therefore stale-downgrades with zero effects whenever ANY of them is active,
-    and can never terminate live work the check did not observe.
-    """
-    owners = _reset_retry_runtime_owners(state, deps)
-    return has_active_issue_runtime(
-        issue_number=issue_number,
-        pair_registry=owners.pair_registry,
-        job_supervisor=owners.job_supervisor,
-        session_manager=owners.session_manager,
-        active_sessions=owners.active_sessions,
-        publish_recovery=owners.publish_recovery,
-    )
-
-
-def _terminate_reset_retry_runtime(
-    *,
-    issue_number: int,
-    state: "OrchestratorState",
-    deps: Any,
-) -> None:
-    owners = _reset_retry_runtime_owners(state, deps)
-    terminate_issue_runtime(
-        issue_number=issue_number,
-        reason="reset-retry",
-        pair_registry=owners.pair_registry,
-        job_supervisor=owners.job_supervisor,
-        session_manager=owners.session_manager,
-        active_sessions=owners.active_sessions,
-        publish_recovery=owners.publish_recovery,
-    )
-
-
-def _configured_attr(obj: Any, name: str) -> Any | None:
-    """Return explicitly configured dataclass/test attributes only.
-
-    Unit route tests use ``MagicMock`` dependency bundles. Plain ``getattr``
-    would manufacture child mocks for collaborators that were never wired,
-    which makes lifecycle code think a session manager exists. Real
-    dataclass-based dependencies and explicitly assigned test doubles both
-    surface through ``vars``. Real slotted runtime objects may use normal
-    attribute lookup after ``vars`` proves the object has no instance
-    dictionary.
-    """
-    if obj is None:
-        return None
-    try:
-        values = vars(obj)
-    except TypeError:
-        return getattr(obj, name, None)
-    return values.get(name)
 
 
 def _clear_scratch_retry_pending_state(

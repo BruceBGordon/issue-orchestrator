@@ -1210,6 +1210,23 @@ export interface TechLeadRunRequestPayload {
   scope: TechLeadRunScopePayload;
 }
 
+export interface TerminalRecordingPayload {
+  chapters?: Record<string, any>[] | null;
+  content_type?: string;
+  events?: Record<string, any>[];
+  initial_geometry?: Record<string, number> | null;
+  issue_number: number;
+  offset?: number;
+  recording_event_index?: number | null;
+  recording_path: string;
+  render_mode: "terminal" | "transcript";
+  total_events?: number;
+  transcript_hash?: string | null;
+  transcript_lines?: string[] | null;
+  truncated?: boolean;
+  unchanged?: boolean;
+}
+
 export interface TestCaseHistoryPayload {
   outcome: string;
   run_id: number;

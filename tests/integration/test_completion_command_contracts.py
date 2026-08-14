@@ -30,6 +30,7 @@ from issue_orchestrator.domain.session_key import SessionKey, TaskKind
 from issue_orchestrator.execution.session_output_adapter import FileSystemSessionOutput
 from issue_orchestrator.infra.config import Config
 from issue_orchestrator.ports.tech_lead_authority import InMemoryTechLeadAuthorityStore
+from issue_orchestrator.ports.timeline_evidence import NULL_TIMELINE_EVIDENCE
 from issue_orchestrator.ports.open_issue_corpus_store import (
     InMemoryOpenIssueCorpusStore,
 )
@@ -387,6 +388,7 @@ def test_completion_record_drives_expected_review_actions(
     pr_adapter = _RecordingPRAdapter()
     processor = CompletionProcessor(
         agent_callback_endpoint=ready_callback_endpoint(),
+        timeline_evidence=NULL_TIMELINE_EVIDENCE,
         label_adapter=label_adapter,
         pr_adapter=pr_adapter,
         git_adapter=_NoopGitAdapter(),
@@ -478,6 +480,7 @@ def test_publish_failure_multi_attempt_contract(tmp_path: Path, lm: LabelManager
         ),
         active_session_run_id=lambda _n: None,
         provider_availability=make_provider_availability(config),
+        timeline_evidence=NULL_TIMELINE_EVIDENCE,
     )
 
     for _ in range(3):

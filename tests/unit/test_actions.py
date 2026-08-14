@@ -19,6 +19,9 @@ from issue_orchestrator.control.actions import (
     ReconcileHistoryEntryAction,
 )
 from issue_orchestrator.control.action_applier import ActionApplier
+from issue_orchestrator.control.review_exchange_lifecycle import (
+    ReviewExchangeCancellation,
+)
 from issue_orchestrator.control.session_manager import SessionManager, SessionRef, SessionType
 from issue_orchestrator.ports import NullEventSink, TraceEvent
 
@@ -31,6 +34,13 @@ class CollectingEventSink:
 
     def publish(self, event: TraceEvent) -> None:
         self.events.append(event)
+
+
+def _no_review_exchange_work(
+    issue_number: int, _reason: str
+) -> ReviewExchangeCancellation:
+    """Explicit null owner for action tests without review-exchange runtime."""
+    return ReviewExchangeCancellation(issue_number, ())
 
 
 class MockLabelSet:
@@ -285,6 +295,7 @@ class TestActionApplier:
             labels=mock_labels,
             sessions=session_manager,
             events=collecting_sink,
+            review_exchange_canceller=_no_review_exchange_work,
         )
 
     def test_apply_add_label(self, applier, mock_labels):

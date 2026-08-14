@@ -26,6 +26,7 @@ from issue_orchestrator.domain.models import (
     AgentConfig,
 )
 from issue_orchestrator.ports import TraceEvent, NullEventSink
+from issue_orchestrator.ports.timeline_evidence import NULL_TIMELINE_EVIDENCE
 from issue_orchestrator.control.session_controller import SessionController, SessionDecision
 from issue_orchestrator.control.completion_processor import CompletionProcessor
 from issue_orchestrator.execution.session_output_adapter import FileSystemSessionOutput
@@ -130,6 +131,7 @@ def completion_processor(mock_label_adapter, mock_pr_adapter, mock_git_adapter):
     """Create a CompletionProcessor with mocked adapters."""
     return CompletionProcessor(
         agent_callback_endpoint=ready_callback_endpoint(),
+        timeline_evidence=NULL_TIMELINE_EVIDENCE,
         label_adapter=mock_label_adapter,
         pr_adapter=mock_pr_adapter,
         git_adapter=mock_git_adapter,

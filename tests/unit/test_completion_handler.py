@@ -49,6 +49,12 @@ from issue_orchestrator.ports.session_output import SessionOutput
 from issue_orchestrator.events import EventName
 from issue_orchestrator.contracts.public import SessionCompletedPayload
 from issue_orchestrator.execution.session_output_adapter import FileSystemSessionOutput
+from issue_orchestrator.execution.timeline_evidence import FileSystemTimelineEvidence
+from issue_orchestrator.ports.timeline_evidence import (
+    NULL_TIMELINE_EVIDENCE,
+    TimelineEvidence,
+)
+from issue_orchestrator.ports.timeline_store import NullTimelineStore
 from tests.conftest import make_provider_availability
 from tests.unit.session_run_helpers import make_session_run_assets
 
@@ -147,6 +153,7 @@ def make_handler(
     session_machine: Any | None = None,
     review_machine: Any | None = None,
     session_output: SessionOutput | None = None,
+    timeline_evidence: TimelineEvidence | None = None,
 ) -> CompletionHandler:
     """Create a CompletionHandler with sensible defaults."""
     default_session_output = Mock(spec=SessionOutput)
@@ -173,6 +180,20 @@ def make_handler(
     from issue_orchestrator.control.open_issue_corpus import OpenIssueCorpusManager
 
     resolved_repository_host = repository_host or make_repository_host()
+    resolved_session_output = session_output or default_session_output
+    if timeline_evidence is None:
+        timeline_evidence = (
+            FileSystemTimelineEvidence(
+                archive_root=config.repo_root
+                / ".issue-orchestrator"
+                / "timeline-evidence",
+                timeline_store=NullTimelineStore(),
+                retention_days=config.session_output_retention_days,
+                retention_tier=config.session_output_retention_tier,
+            )
+            if isinstance(resolved_session_output, FileSystemSessionOutput)
+            else NULL_TIMELINE_EVIDENCE
+        )
     return CompletionHandler(
         config=config,
         events=events if events is not None else NullEventSink(),
@@ -180,7 +201,7 @@ def make_handler(
         get_issue_machine_fn=lambda _issue: issue_machine,
         get_session_machine_fn=lambda _terminal_id: session_machine,
         get_review_machine_fn=lambda _pr_number: review_machine,
-        session_output=session_output if session_output is not None else default_session_output,
+        session_output=resolved_session_output,
         tech_lead_authority=tech_lead_authority,
         open_issue_corpus=OpenIssueCorpusManager(
             resolved_repository_host,
@@ -189,6 +210,7 @@ def make_handler(
         ),
         active_session_run_id=lambda _n: None,
         provider_availability=make_provider_availability(config),
+        timeline_evidence=timeline_evidence,
     )
 
 
@@ -1763,6 +1785,54 @@ class TestLabelActionGeneration:
         assert manifest["evidence_available"] is True
         audit_payload = Path(manifest["run_audit_path"]).read_text()
         assert "\"outcome\": \"timed_out\"" in audit_payload
+
+    @pytest.mark.parametrize(
+        "status",
+        [
+            SessionStatus.COMPLETED,
+            SessionStatus.FAILED,
+            SessionStatus.TIMED_OUT,
+            SessionStatus.VALIDATION_FAILED,
+            SessionStatus.BLOCKED,
+            SessionStatus.NEEDS_HUMAN,
+        ],
+    )
+    def test_every_terminal_status_finalizes_timeline_evidence(
+        self,
+        config: Config,
+        agent_config: AgentConfig,
+        tmp_worktree: Path,
+        status: SessionStatus,
+    ) -> None:
+        config.session_output_retention_days = 11
+        config.session_output_retention_tier = "cold"
+        issue = make_issue(number=123, labels=["agent:test"])
+        session_output = FileSystemSessionOutput()
+        run = session_output.start_run(tmp_worktree, "coding-1", issue_number=123)
+        session = create_test_session(
+            issue,
+            agent_config,
+            tmp_worktree,
+            run_assets=run,
+        )
+        handler = make_handler(
+            config,
+            repository_host=make_repository_host(
+                issue_info=SimpleNamespace(labels=["agent:test"])
+            ),
+            session_output=session_output,
+        )
+
+        handler.process_completion(session, status)
+
+        manifest = session_output.read_manifest(run.run_dir)
+        assert manifest is not None
+        assert manifest["outcome"] == status.value
+        assert manifest["retention_days"] == 11
+        assert manifest["retention_tier"] == "cold"
+        ended_at = datetime.fromisoformat(manifest["ended_at"])
+        expires_at = datetime.fromisoformat(manifest["retention_expires_at"])
+        assert expires_at - ended_at == timedelta(days=11)
 
     def test_timeout_audit_can_be_disabled(self, config: Config, agent_config: AgentConfig, tmp_worktree: Path) -> None:
         config.review_run_audit_on_timeout = False
