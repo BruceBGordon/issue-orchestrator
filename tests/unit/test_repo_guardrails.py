@@ -62,9 +62,9 @@ def _make_loaded_config(
     config_name: str = "main.yaml",
     mode: str | None = None,
 ) -> Config:
-    config_dir = repo / ".issue-orchestrator" / "config"
-    if mode is not None:
-        config_dir = config_dir / "modes" / mode
+    config_dir = (
+        repo / ".issue-orchestrator" / "config" / "modes" / (mode or "default")
+    )
     config_dir.mkdir(parents=True, exist_ok=True)
     config_path = config_dir / config_name
     config_path.write_text(
@@ -325,10 +325,18 @@ def test_render_verify_pr_script_bakes_python_when_requested() -> None:
 def test_render_verify_pr_script_exports_selected_config_name() -> None:
     rendered = _render_verify_pr_script(
         "make validate-pr",
-        selected_config_name="main.yaml",
+        selected_config_name="modes/default/main.yaml",
     )
 
     assert "export ISSUE_ORCHESTRATOR_CONFIG_NAME=main.yaml" in rendered
+
+
+def test_render_verify_pr_script_rejects_flat_config_selection() -> None:
+    with pytest.raises(RepoGuardrailsError, match="modes/<mode>/<config>"):
+        _render_verify_pr_script(
+            "make validate-pr",
+            selected_config_name="main.yaml",
+        )
 
 
 def test_render_verify_pr_script_exports_complete_mode_selection() -> None:

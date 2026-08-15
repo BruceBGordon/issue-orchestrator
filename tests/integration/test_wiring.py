@@ -185,6 +185,7 @@ class TestCLIWiring:
         # Patch at config module level since it's imported inside cmd_start
         with patch('issue_orchestrator.infra.config.Config.find_and_load') as mock_config:
             mock_cfg = MagicMock()
+            mock_cfg.config_path = None
             mock_cfg.agents = {"agent:test": MagicMock()}
             mock_cfg.max_concurrent_sessions = 2
             mock_cfg.repo_root = Path("/fake")
@@ -220,6 +221,7 @@ class TestCLIWiring:
 
         with patch('issue_orchestrator.infra.config.Config.find_and_load') as mock_config:
             mock_cfg = MagicMock()
+            mock_cfg.config_path = None
             mock_cfg.agents = {"agent:test": MagicMock()}
             mock_cfg.repo_root = Path("/fake")
             mock_cfg.repo = None

@@ -10,7 +10,9 @@ import shlex
 import shutil
 
 from ..adapters.git.git_cli import GitCLI, SubprocessCommandRunner
+from ..domain.repository_launch_selection import RepositoryLaunchSelection
 from .config import Config
+from .config_paths import MODES_DIR, require_engine_launch_config_path
 from .hooks._python_path import (
     ORCHESTRATOR_PYTHON_ENV,
     shell_quote_issue_orchestrator_python,
@@ -442,10 +444,16 @@ def _render_verify_pr_script(
     selection_marker = ""
     if selected_config_name:
         relative_config = Path(selected_config_name)
-        mode = (
-            relative_config.parts[1]
-            if len(relative_config.parts) == 3 and relative_config.parts[0] == "modes"
-            else "default"
+        if len(relative_config.parts) != 3 or relative_config.parts[0] != MODES_DIR:
+            raise RepoGuardrailsError(
+                "Managed verify-pr selections must use modes/<mode>/<config>"
+            )
+        selection = RepositoryLaunchSelection.parse(
+            mode=relative_config.parts[1],
+            config_name=relative_config.parts[2],
+        )
+        relative_config = (
+            Path(MODES_DIR) / selection.mode.value / selection.config.value
         )
         config_name_export = f"""# Preserve the engine's complete runtime selection. A human push has no
 # selection, so use the mode that generated this managed fallback. A partial
@@ -456,7 +464,7 @@ if [ -z "${{ISSUE_ORCHESTRATOR_MODE:-}}" ] ||
   selected_config_rel={shlex.quote(relative_config.as_posix())}
   export ISSUE_ORCHESTRATOR_CONFIG_NAME={shlex.quote(relative_config.name)}
   export ISSUE_ORCHESTRATOR_CONFIG_PATH="$repo_root/.issue-orchestrator/config/$selected_config_rel"
-  export ISSUE_ORCHESTRATOR_MODE={shlex.quote(mode)}
+  export ISSUE_ORCHESTRATOR_MODE={shlex.quote(selection.mode.value)}
 fi
 """
         selection_marker = (
@@ -512,6 +520,7 @@ def _selected_config_name(config: Config, repo_root: Path) -> str | None:
     config_path = config.config_path
     if config_path is None:
         return None
+    config_path = require_engine_launch_config_path(config_path)
     config_root = (repo_root / ".issue-orchestrator" / "config").resolve()
     try:
         return config_path.resolve().relative_to(config_root).as_posix()
