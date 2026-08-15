@@ -18,9 +18,11 @@ from .hooks._python_path import (
     shell_quote_issue_orchestrator_python,
 )
 from .hooks.hooks import (
+    UnsupportedAiAgentError,
     detect_agents_from_config,
     get_adapter,
     install_hooks_for_config,
+    validate_hook_installation_targets,
 )
 
 logger = logging.getLogger(__name__)
@@ -160,6 +162,7 @@ def setup_repo_guardrails(
 ) -> RepoGuardrailsInstallResult:
     """Install repo-level guardrails and agent hooks for a target repository."""
     repo_root = (target_root or config.repo_root).resolve()
+    selected_config_name = _selected_config_name(config, repo_root)
     git = _new_git_cli()
     local_hooks_path = _get_local_hooks_path(repo_root, git)
     resolved_validation_cmd = (
@@ -169,6 +172,11 @@ def setup_repo_guardrails(
         raise RepoGuardrailsError(
             "validation.publish.cmd is not configured. Set it in YAML or pass --validation-cmd."
         )
+
+    try:
+        validate_hook_installation_targets(config, repo_root)
+    except (OSError, RuntimeError, UnsupportedAiAgentError, ValueError) as exc:
+        raise RepoGuardrailsError(str(exc)) from exc
 
     hooks_path_value, hooks_dir = _resolve_repo_hooks_dir(
         repo_root,
@@ -192,7 +200,7 @@ def setup_repo_guardrails(
     _install_verify_script(
         result.verify_script,
         resolved_validation_cmd,
-        selected_config_name=_selected_config_name(config, repo_root),
+        selected_config_name=selected_config_name,
         result=result,
     )
     _install_helper_script(result.helper_script, result)
@@ -520,7 +528,10 @@ def _selected_config_name(config: Config, repo_root: Path) -> str | None:
     config_path = config.config_path
     if config_path is None:
         return None
-    config_path = require_engine_launch_config_path(config_path)
+    try:
+        config_path = require_engine_launch_config_path(config_path)
+    except ValueError as exc:
+        raise RepoGuardrailsError(str(exc)) from exc
     config_root = (repo_root / ".issue-orchestrator" / "config").resolve()
     try:
         return config_path.resolve().relative_to(config_root).as_posix()

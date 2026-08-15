@@ -1194,6 +1194,7 @@ class Config(ConfigLaunchIdentity, RuntimeConfigReferenceOwner, TechLeadActivati
     @classmethod
     def load(cls, config_path: Path, overrides: Optional[list[str]] = None) -> "Config":
         """Load configuration from YAML file."""
+        launch_selection = selection_from_config_path(config_path)
         if not config_path.exists():
             raise FileNotFoundError(f"Config file not found: {config_path}")
 
@@ -1208,7 +1209,7 @@ class Config(ConfigLaunchIdentity, RuntimeConfigReferenceOwner, TechLeadActivati
 
         config = cls()
         config.config_path = config_path.resolve()
-        config.launch_selection = selection_from_config_path(config.config_path)
+        config.launch_selection = launch_selection
 
         # Extract all sections with validation
         sections = extract_config_sections(data, config_path)

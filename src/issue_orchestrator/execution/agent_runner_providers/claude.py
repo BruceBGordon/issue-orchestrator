@@ -14,6 +14,8 @@ from issue_orchestrator.ports.provider_resilience import ProviderErrorType
 from .base import CLIProvider
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from issue_orchestrator.domain.sandbox_scope import SandboxScope
     from issue_orchestrator.ports.command_runner import CommandRunner
 
@@ -57,6 +59,7 @@ class ClaudeCodeProvider(CLIProvider):
         model: str | None = None,
         *,
         sandbox_scope: "SandboxScope | None" = None,
+        working_directory: "Path | None" = None,
         **kwargs: str,
     ) -> list[str]:
         """Build a Claude Code CLI command for interactive mode.

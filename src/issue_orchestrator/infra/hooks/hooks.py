@@ -35,6 +35,11 @@ from ._hook_test_runner import (
     is_blocked,
     run_hook_test_cases,
 )
+from ._installation import (
+    install_hooks_for_config,
+    install_shared_hook_policy,
+    validate_hook_installation_targets,
+)
 from ...adapters.hooks._process_group import run_command_in_process_group
 from ...adapters.hooks.codex import CodexAdapter
 from ._types import (
@@ -214,7 +219,9 @@ class ClaudeCodeAdapter(AiAgentAdapter):
         self, hook_script: Path, checks_passed: list, checks_failed: list
     ) -> None:
         """Run hook test cases and record results."""
-        run_hook_test_cases(self._test_hook_blocks, hook_script, checks_passed, checks_failed)
+        run_hook_test_cases(
+            self._test_hook_blocks, hook_script, checks_passed, checks_failed
+        )
 
     def verify_hooks(self, project_root: Path) -> VerificationResult:
         """Verify Claude Code hooks are working."""
@@ -483,7 +490,9 @@ class CursorAdapter(AiAgentAdapter):
         self, hook_script: Path, checks_passed: list, checks_failed: list
     ) -> None:
         """Run hook test cases and record results."""
-        run_hook_test_cases(self._test_hook_blocks, hook_script, checks_passed, checks_failed)
+        run_hook_test_cases(
+            self._test_hook_blocks, hook_script, checks_passed, checks_failed
+        )
 
     def verify_hooks(self, project_root: Path) -> VerificationResult:
         """Verify Cursor hooks are working."""
@@ -737,7 +746,9 @@ class GeminiAdapter(AiAgentAdapter):
         self, hook_script: Path, checks_passed: list, checks_failed: list
     ) -> None:
         """Run hook test cases and record results."""
-        run_hook_test_cases(self._test_hook_blocks, hook_script, checks_passed, checks_failed)
+        run_hook_test_cases(
+            self._test_hook_blocks, hook_script, checks_passed, checks_failed
+        )
 
     def verify_hooks(self, project_root: Path) -> VerificationResult:
         """Verify Gemini CLI hooks are working."""
@@ -974,7 +985,9 @@ class CopilotAdapter(AiAgentAdapter):
         self, hook_script: Path, checks_passed: list, checks_failed: list
     ) -> None:
         """Run hook test cases and record results."""
-        run_hook_test_cases(self._test_hook_blocks, hook_script, checks_passed, checks_failed)
+        run_hook_test_cases(
+            self._test_hook_blocks, hook_script, checks_passed, checks_failed
+        )
 
     def verify_hooks(self, project_root: Path) -> VerificationResult:
         """Verify Copilot CLI hooks are working."""
@@ -1099,6 +1112,9 @@ class UnsupportedAdapter(AiAgentAdapter):
     def install_hooks(self, project_root: Path) -> list[Path]:
         raise UnsupportedAiAgentError(self._agent_type, self._reason)
 
+    def validate_installation_target(self, project_root: Path) -> None:
+        raise UnsupportedAiAgentError(self._agent_type, self._reason)
+
     def verify_hooks(self, project_root: Path) -> VerificationResult:
         raise UnsupportedAiAgentError(self._agent_type, self._reason)
 
@@ -1197,29 +1213,6 @@ def detect_agents_from_config(config) -> dict[str, AiAgentType]:
     return result
 
 
-def install_hooks_for_config(
-    config, project_root: Path
-) -> dict[AiAgentType, list[Path]]:
-    """Install hooks for all AI agents detected in config.
-
-    Returns:
-        Dict mapping AiAgentType to list of files created
-
-    Raises:
-        UnsupportedAiAgentError: If any config uses an unsupported AI agent
-    """
-    agent_types = detect_agents_from_config(config)
-    unique_types = set(agent_types.values())
-
-    results = {}
-    for agent_type in unique_types:
-        adapter = get_adapter(agent_type)
-        files = adapter.install_hooks(project_root)
-        results[agent_type] = files
-
-    return results
-
-
 def verify_hooks_for_config(
     config, project_root: Path
 ) -> dict[AiAgentType, VerificationResult]:
@@ -1270,5 +1263,7 @@ __all__ = [
     "detect_ai_agent",
     "get_adapter",
     "install_hooks_for_config",
+    "install_shared_hook_policy",
+    "validate_hook_installation_targets",
     "verify_hooks_for_config",
 ]

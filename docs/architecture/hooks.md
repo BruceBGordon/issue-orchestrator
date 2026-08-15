@@ -35,7 +35,7 @@ flowchart TB
 
 | Layer | Mechanism | Bypassable? |
 |-------|-----------|-------------|
-| **1. AI Agent** | Claude `PreToolUse`, Cursor `beforeShellExecution`, Copilot `--deny-tool`, Codex `Execpolicy` | Not by the agent |
+| **1. AI Agent** | Claude/Codex `PreToolUse`, Cursor `beforeShellExecution`, Copilot `--deny-tool`, Codex `Execpolicy` | Not by the agent |
 | **2. Git Hooks** | Pre-push wrapper chains project + orchestrator hooks, audit trail | `--no-verify` (but Layer 1 blocks that) |
 | **3. Server-Side** | GitHub branch protection, required status checks | Cannot be bypassed |
 
@@ -72,9 +72,10 @@ These are installed and refreshed in the target project by `issue-orchestrator s
 | Hook | Type | Location | Purpose | Critical? |
 |------|------|----------|---------|-----------|
 | PreToolUse (Claude) | Claude Code | `.claude/hooks/block-no-verify.sh` | Blocks `git push --no-verify` at AI level | **YES** |
+| PreToolUse (Codex) | Codex CLI | Invocation hook using the packaged policy; `.codex/hooks.json` is defense in depth for manual sessions | Evaluates the full Bash command before execution | **YES** |
 | beforeShellExecution (Cursor) | Cursor | `.cursor/hooks.json` | Blocks `git push --no-verify` at AI level | **YES** |
 | Pre-push | Git | `.githooks/pre-push` | Runs project tests/linters before push | **YES** |
-| Execpolicy rules (Codex) | Codex CLI | `.codex/rules/orchestrator.rules` | Blocks dangerous commands outside sandbox | **YES** |
+| Execpolicy rules (Codex) | Codex CLI | `.codex/rules/orchestrator.rules` | Prefix-based defense in depth outside the sandbox | **YES** |
 | AGENTS.md / CLAUDE.md | Policy | `AGENTS.md` (`CLAUDE.md` symlink for compatibility) | Documents prohibited actions | Advisory |
 
 Managed pre-push guardrails also support an optional
@@ -93,7 +94,7 @@ the dispatch.
 | Claude Code | `PreToolUse` in `.claude/settings.json` | ✅ Yes (exit 2) | ✅ |
 | Cursor (1.7+) | `beforeShellExecution` in `.cursor/hooks.json` | ✅ Yes (`"permission": "deny"`) | ✅ |
 | GitHub Copilot CLI | `--deny-tool` flags | ✅ Yes (glob patterns) | ✅ |
-| OpenAI Codex CLI | `Execpolicy` rules | ✅ Yes | ✅ |
+| OpenAI Codex CLI | `PreToolUse` hook + `Execpolicy` rules | ✅ Yes (exit 2) | ✅ |
 | Gemini CLI | In development | ⚠️ Not yet | ❌ |
 | Aider | None (lint only) | ❌ No | ❌ |
 
@@ -108,9 +109,12 @@ Intercepts commands before the AI can execute them:
 ```bash
 # BLOCKED - exit 2 prevents execution
 git push --no-verify
+git push origin main --no-verify
 git commit --no-verify -m "message"
 git -c core.hooksPath=/dev/null push
-git config --local core.hooksPath /dev/null
+git -c core.hooksPath=/tmp/empty-hooks push
+git config --local core.hooksPath /tmp/empty-hooks
+git config --worktree --unset core.hooksPath
 gh pr merge 123                          # Agents cannot merge PRs
 gh pr merge 123 --squash
 gh api repos/owner/repo/pulls/123/merge  # API merge also blocked
@@ -118,6 +122,7 @@ gh api repos/owner/repo/pulls/123/merge  # API merge also blocked
 # ALLOWED - passes through
 git push
 git commit -m "message"
+git config --get core.hooksPath             # Explicit read is safe
 gh pr create --title "..."               # Creating PRs is fine
 gh pr view 123                           # Viewing PRs is fine
 ```
@@ -217,7 +222,32 @@ If an agent is configured in YAML, missing its CLI or hook wiring is a **failure
 | Gemini | `.gemini/hooks` + `.gemini/settings.json` + script tests | ✅ Supported (spawns Gemini) |
 | Cursor | `.cursor/hooks` + `.cursor/hooks.json` + script tests | ✅ Supported (spawns Cursor Agent) |
 | Copilot | `.github/hooks` + `.github/hooks.json` + script tests | ✅ Supported (spawns Copilot CLI) |
-| Codex CLI | `.codex/rules/orchestrator.rules` + `codex execpolicy check` | ❌ Not supported |
+| Codex CLI | `.codex/hooks.json` + hook script tests + `.codex/rules/orchestrator.rules` + isolated runtime-home checks + `codex execpolicy check` | ✅ Supported (spawns Codex with the production invocation hook) |
+
+Orchestrated Codex sessions do not rely on project-hook trust, which is scoped
+to an exact worktree path. `setup-hooks` creates an isolated Codex runtime home
+with no user hooks. Provider launches record only managed `untrusted` decisions
+for the checkout and linked-worktree trust keys, use that home, disable plugins,
+and inject a synchronous session hook whose
+absolute interpreter and packaged policy are outside the agent's write root.
+The checked-in `.codex/hooks.json`, shell wrapper, and Execpolicy rules remain
+useful defense in depth for manual Codex sessions; the shell wrapper is not the
+orchestrated security boundary. The trust-bypass flag applies to every hook
+Codex loads, so an installation whose system policy independently pre-trusts a
+project must also treat that project's hooks as trusted operator code.
+
+The behavioral evaluator recognizes literal Git invocations and literal
+commands passed through common shell `-c` forms. Arbitrary shell dataflow—such
+as constructing the executable or a short option entirely through variables—is
+outside this parser's boundary; repository Git hooks and the push guard remain
+the underlying enforcement layers.
+
+The AI gate uses the same isolated runtime and invocation hook as production.
+It requires Codex's router-level PreToolUse denial containing the nonce command
+and exact block marker; a model message, sandbox rejection, or ordinary Git
+failure is not accepted as success. See the
+[Codex hooks documentation](https://developers.openai.com/codex/hooks) for the
+hook and trust model.
 
 ### Hook Validation Config
 
@@ -229,7 +259,6 @@ make verify-hooks-all
 
 This runs `issue-orchestrator setup-hooks` with `.issue-orchestrator/config/maintenance/hooks-validate.yaml`,
 which installs hooks and executes AI gate tests for the configured agents.
-Codex is intentionally excluded because AI gate tests are not yet supported.
 
 ### Verification Marker
 
@@ -290,6 +319,11 @@ $ issue-orchestrator setup
       For Cursor:
         Created: .cursor/hooks/block-no-verify.js
         Updated: .cursor/hooks.json
+
+      For Codex:
+        Created: .codex/hooks/block-no-verify.sh
+        Updated: .codex/hooks.json
+        Created: .codex/rules/orchestrator.rules
 
 [3/4] Installing pre-push wrapper...
       Existing hook found: .githooks/pre-push

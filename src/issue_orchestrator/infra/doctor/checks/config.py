@@ -5,6 +5,7 @@ from typing import Optional
 
 from ..types import Check
 from ...config import Config
+from ...config_paths import require_engine_launch_config_path
 
 
 def load_config_with_checks(
@@ -17,6 +18,7 @@ def load_config_with_checks(
         if config_path.exists():
             try:
                 config = Config.load(config_path)
+                require_engine_launch_config_path(config_path)
                 checks.append(Check(
                     name="Config File",
                     status="ok",
@@ -46,6 +48,7 @@ def load_config_with_checks(
             config_file = get_config_path(cwd, available[0])
             try:
                 config = Config.load(config_file)
+                require_engine_launch_config_path(config_file)
                 checks.append(Check(
                     name="Config File",
                     status="ok",
@@ -63,6 +66,17 @@ def load_config_with_checks(
                 name="Config File",
                 status="warning",
                 detail="Not found in current directory",
+            ))
+            return None, checks, True
+
+    if config.config_path is not None:
+        try:
+            require_engine_launch_config_path(config.config_path)
+        except ValueError as exc:
+            checks.append(Check(
+                name="Config File",
+                status="error",
+                detail=f"Failed to load: {exc}",
             ))
             return None, checks, True
 

@@ -61,12 +61,8 @@ hooks:
         repo_path, config_file = repo_with_config
 
         # Mock all adapter methods to avoid real hook operations
-        monkeypatch.setattr(
-            ClaudeCodeAdapter, "is_installed", lambda self, path: True
-        )
-        monkeypatch.setattr(
-            ClaudeCodeAdapter, "install_hooks", lambda self, path: []
-        )
+        monkeypatch.setattr(ClaudeCodeAdapter, "is_installed", lambda self, path: True)
+        monkeypatch.setattr(ClaudeCodeAdapter, "install_hooks", lambda self, path: [])
         monkeypatch.setattr(
             ClaudeCodeAdapter,
             "verify_hooks",
@@ -102,9 +98,117 @@ hooks:
         assert "claude-code" in state.last_results
         assert state.last_results["claude-code"].success is True
 
-    def test_setup_hooks_fails_on_ai_gate_failure(
+    def test_setup_hooks_reports_invalid_codex_registration(
+        self, repo_with_config, capsys
+    ):
+        from issue_orchestrator.entrypoints.cli import cmd_setup_hooks
+
+        repo_path, config_file = repo_with_config
+        config_file.write_text(
+            config_file.read_text().replace("provider: claude-code", "provider: codex")
+        )
+        hooks_json = repo_path / ".codex" / "hooks.json"
+        hooks_json.parent.mkdir()
+        hooks_json.write_text('{"hooks": []}\n')
+
+        result = cmd_setup_hooks(
+            argparse.Namespace(config=str(config_file), target=str(repo_path))
+        )
+
+        assert result == 1
+        output = " ".join(capsys.readouterr().out.split())
+        assert "hooks must be a JSON object" in output
+
+    def test_setup_hooks_invalidates_gate_before_installation_mutates_then_fails(
         self, repo_with_config, monkeypatch
     ):
+        from issue_orchestrator.entrypoints.cli import cmd_setup_hooks
+        from issue_orchestrator.infra.ai_gate_state import (
+            AiGateState,
+            load_ai_gate_state,
+            save_ai_gate_state,
+        )
+        from issue_orchestrator.infra.hooks.hooks import ClaudeCodeAdapter
+
+        repo_path, config_file = repo_with_config
+        save_ai_gate_state(
+            repo_path,
+            AiGateState(last_check=datetime.now(timezone.utc)),
+        )
+
+        def fail_after_mutation(self, path):
+            (path / "partially-updated-hook").write_text("changed")
+            raise ValueError("installation failed after mutation")
+
+        monkeypatch.setattr(ClaudeCodeAdapter, "install_hooks", fail_after_mutation)
+
+        result = cmd_setup_hooks(
+            argparse.Namespace(config=str(config_file), target=str(repo_path))
+        )
+
+        assert result == 1
+        assert (repo_path / "partially-updated-hook").is_file()
+        assert load_ai_gate_state(repo_path).last_check is None
+
+    def test_setup_hooks_accepts_maintenance_config(
+        self, repo_with_config, monkeypatch
+    ):
+        """Hook verification may use the dedicated maintenance config."""
+        from issue_orchestrator.entrypoints.cli import cmd_setup_hooks
+        from issue_orchestrator.infra.hooks.hooks import (
+            AiAgentType,
+            ClaudeCodeAdapter,
+            VerificationResult,
+        )
+
+        repo_path, config_file = repo_with_config
+        maintenance = (
+            repo_path / ".issue-orchestrator/config/maintenance/hooks-validate.yaml"
+        )
+        maintenance.parent.mkdir(parents=True)
+        maintenance.write_text(
+            config_file.read_text(encoding="utf-8"), encoding="utf-8"
+        )
+        monkeypatch.setattr(ClaudeCodeAdapter, "install_hooks", lambda self, path: [])
+        monkeypatch.setattr(
+            ClaudeCodeAdapter,
+            "verify_hooks",
+            lambda self, path: VerificationResult(
+                success=True,
+                meta_agent=AiAgentType.CLAUDE_CODE,
+                checks_passed=["hook_script"],
+                checks_failed=[],
+            ),
+        )
+        monkeypatch.setattr(
+            ClaudeCodeAdapter,
+            "test_ai_gate",
+            lambda self, path, timeout=30: (True, "blocked git push --no-verify"),
+        )
+
+        exit_code = cmd_setup_hooks(
+            argparse.Namespace(config=str(maintenance), target=str(repo_path))
+        )
+
+        assert exit_code == 0
+
+    def test_setup_hooks_reports_flat_config_layout_error(
+        self, repo_with_config, capsys
+    ):
+        from issue_orchestrator.entrypoints.cli import cmd_setup_hooks
+
+        repo_path, config_file = repo_with_config
+        flat = repo_path / ".issue-orchestrator/config/default.yaml"
+        flat.write_text(config_file.read_text(encoding="utf-8"), encoding="utf-8")
+
+        exit_code = cmd_setup_hooks(
+            argparse.Namespace(config=str(flat), target=str(repo_path))
+        )
+
+        assert exit_code == 1
+        assert "config/modes/<mode>/" in capsys.readouterr().out
+
+    def test_setup_hooks_fails_on_ai_gate_failure(self, repo_with_config, monkeypatch):
         """Test that setup-hooks returns non-zero when AI gate test fails."""
         from issue_orchestrator.infra.hooks.hooks import (
             ClaudeCodeAdapter,
@@ -116,12 +220,8 @@ hooks:
         repo_path, config_file = repo_with_config
 
         # Mock adapter methods - AI gate test fails
-        monkeypatch.setattr(
-            ClaudeCodeAdapter, "is_installed", lambda self, path: True
-        )
-        monkeypatch.setattr(
-            ClaudeCodeAdapter, "install_hooks", lambda self, path: []
-        )
+        monkeypatch.setattr(ClaudeCodeAdapter, "is_installed", lambda self, path: True)
+        monkeypatch.setattr(ClaudeCodeAdapter, "install_hooks", lambda self, path: [])
         monkeypatch.setattr(
             ClaudeCodeAdapter,
             "verify_hooks",
@@ -323,4 +423,6 @@ hooks:
         # Cached failure triggered re-run; re-run passed → ok
         assert ai_gate.status == "ok"
         assert ai_gate.expandable["ran"] is True
-        assert ai_gate.expandable["triggered_by"] == "cached failure retry (claude-code)"
+        assert (
+            ai_gate.expandable["triggered_by"] == "cached failure retry (claude-code)"
+        )

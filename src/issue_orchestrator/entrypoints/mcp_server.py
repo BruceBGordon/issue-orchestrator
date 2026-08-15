@@ -670,6 +670,8 @@ mcp = FastMCP("Issue Orchestrator", json_response=True)
 
 
 def _resolve_settings(args: argparse.Namespace) -> McpSettings:
+    from ..infra.config_paths import require_engine_launch_config_path
+
     repo_root = Path(
         args.repo_root or os.environ.get("IO_E2E_REPO_ROOT", "") or Path.cwd()
     )
@@ -678,6 +680,7 @@ def _resolve_settings(args: argparse.Namespace) -> McpSettings:
         config_path = Path(config_path_str)
     else:
         config_path = get_config_path(repo_root, args.config_name, args.mode)
+    config_path = require_engine_launch_config_path(config_path)
     if not config_path.exists():
         raise FileNotFoundError(f"Config file not found: {config_path}")
     return McpSettings(
@@ -690,6 +693,9 @@ def _resolve_settings(args: argparse.Namespace) -> McpSettings:
 
 
 def _resolve_repo_root(config_path: Path) -> Path:
+    from ..infra.config_paths import require_engine_launch_config_path
+
+    config_path = require_engine_launch_config_path(config_path)
     config = Config.load(config_path)
     if not config.repo_root:
         raise ValueError("repo_root missing in config")

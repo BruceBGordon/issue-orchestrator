@@ -6,8 +6,11 @@ argv only.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
+from issue_orchestrator.domain.sandbox_scope import SandboxUnsupportedError
 from issue_orchestrator.execution.agent_runner_providers.codex import CodexProvider
 
 
@@ -63,7 +66,8 @@ class TestCodexJsonOutputDefault:
 
     @pytest.mark.parametrize("yes_value", ["TRUE", "True", "tRuE"])
     def test_truthy_string_case_insensitive_passes_json_flag(
-        self, yes_value: str,
+        self,
+        yes_value: str,
     ) -> None:
         """Match historical behavior: ``json_output`` is parsed
         case-insensitively. Locks the contract so a downstream caller
@@ -73,7 +77,8 @@ class TestCodexJsonOutputDefault:
 
     @pytest.mark.parametrize("no_value", ["", "0", "no", "off", "False"])
     def test_falsey_strings_do_not_pass_json_flag(
-        self, no_value: str,
+        self,
+        no_value: str,
     ) -> None:
         """Any non-``true`` (case-insensitive) string is treated as
         opt-out. This matches the original parser shape and keeps the
@@ -88,10 +93,92 @@ class TestCodexBaseCommand:
     other flags. These aren't exhaustive — just enough to catch a
     structural regression."""
 
+    @pytest.fixture(autouse=True)
+    def isolated_runtime(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        from issue_orchestrator.infra.hooks.codex_session import (
+            prepare_codex_runtime_home,
+        )
+
+        user_home = tmp_path / ".test-codex-user"
+        user_home.mkdir()
+        (user_home / "auth.json").write_text("{}\n", encoding="utf-8")
+        monkeypatch.setenv("CODEX_HOME", str(user_home))
+        monkeypatch.setenv(
+            "ISSUE_ORCHESTRATOR_CODEX_RUNTIME_ROOT",
+            str(tmp_path / ".test-codex-runtime"),
+        )
+        prepare_codex_runtime_home()
+
     def test_default_starts_interactive_codex(self) -> None:
         cmd = _cmd()
         assert cmd[0] == "codex"
         assert "exec" not in cmd[:2]
+
+    def test_default_injects_invocation_scoped_guardrail(self) -> None:
+        cmd = _cmd()
+        assert "features.hooks=true" in cmd
+        assert "features.plugins=false" in cmd
+        assert "features.plugin_sharing=false" in cmd
+        assert "features.remote_plugin=false" in cmd
+        hook = next(arg for arg in cmd if arg.startswith("hooks.PreToolUse="))
+        assert "block_no_verify.py --mode codex" in hook
+        assert "--dangerously-bypass-hook-trust" in cmd
+
+    def test_no_scope_rejects_guardrail_runtime_inside_worktree(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from issue_orchestrator.infra.hooks import codex_session
+
+        policy = tmp_path / "block_no_verify.py"
+        policy.write_text("pass\n")
+        monkeypatch.setattr(codex_session.block_no_verify, "__file__", str(policy))
+
+        with pytest.raises(SandboxUnsupportedError, match="outside agent write roots"):
+            CodexProvider().build_command(prompt="task", working_directory=tmp_path)
+
+    def test_orchestrated_command_uses_isolated_codex_home(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(
+            "ISSUE_ORCHESTRATOR_CODEX_RUNTIME_ROOT", str(tmp_path / "runtime")
+        )
+        cmd = CodexProvider().build_command(
+            prompt="task", working_directory=tmp_path / "worktree"
+        )
+
+        assert cmd[0] == "env"
+        assert cmd[1].startswith("CODEX_HOME=")
+        assert cmd[2] == "codex"
+        assert (
+            f'projects."{(tmp_path / "worktree").resolve()}".trust_level="untrusted"'
+            in cmd
+        )
+
+    def test_linked_worktree_also_marks_primary_checkout_untrusted(
+        self, tmp_path: Path
+    ) -> None:
+        primary = tmp_path / "primary"
+        worktree = tmp_path / "reviewer"
+        git_dir = primary / ".git" / "worktrees" / "reviewer"
+        git_dir.mkdir(parents=True)
+        worktree.mkdir()
+        (worktree / ".git").write_text(f"gitdir: {git_dir}\n", encoding="utf-8")
+
+        cmd = CodexProvider().build_command(
+            prompt="task",
+            working_directory=worktree,
+        )
+
+        assert f'projects."{worktree}".trust_level="untrusted"' in cmd
+        assert f'projects."{primary}".trust_level="untrusted"' in cmd
+
+    def test_orchestrated_command_rejects_yolo(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="cannot use approval_mode=yolo"):
+            CodexProvider().build_command(
+                prompt="task",
+                working_directory=tmp_path,
+                approval_mode="yolo",
+            )
 
     def test_exec_mode_uses_codex_exec(self) -> None:
         cmd = _cmd(execution_mode="exec")

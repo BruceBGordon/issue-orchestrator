@@ -1059,6 +1059,7 @@ class AgentConfig:
                 prompt_for_command,
                 task_kind,
                 extra_provider_args,
+                working_directory=worktree,
                 sandbox_scope=sandbox_scope,
             )
 
@@ -1112,6 +1113,7 @@ class AgentConfig:
         task_kind: str,
         extra_provider_args: dict[str, Any] | None = None,
         *,
+        working_directory: Path,
         sandbox_scope: SandboxScope | None = None,
     ) -> str:
         """Build command using the configured provider.
@@ -1180,7 +1182,11 @@ class AgentConfig:
             # choice": let the provider use its own default model.
             model = None
         cmd_list = provider.build_command(
-            prompt=prompt, model=model, sandbox_scope=sandbox_scope, **kwargs
+            prompt=prompt,
+            model=model,
+            sandbox_scope=sandbox_scope,
+            working_directory=working_directory,
+            **kwargs,
         )
 
         # Convert to shell-safe string

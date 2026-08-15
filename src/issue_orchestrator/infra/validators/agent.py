@@ -1,11 +1,35 @@
 """Agent configuration validator."""
 
+from pathlib import Path
+import shlex
 from typing import TYPE_CHECKING
 
 from .base import ConfigValidator
 
 if TYPE_CHECKING:
     from ..config import Config
+
+
+def _custom_command_executable(agent, has_custom_command: bool) -> str:
+    if not has_custom_command or agent.provider is not None:
+        return ""
+    if not isinstance(agent.command, str):
+        return ""
+    try:
+        tokens = shlex.split(agent.command)
+    except (IndexError, TypeError, ValueError):
+        return ""
+    while tokens:
+        token = tokens.pop(0)
+        if "=" in token and not token.startswith(("/", "./")):
+            continue
+        executable = Path(token).name
+        if executable in {"command", "env"}:
+            while tokens and (tokens[0] == "--" or tokens[0].startswith("-")):
+                tokens.pop(0)
+            continue
+        return executable
+    return ""
 
 
 class AgentValidator(ConfigValidator):
@@ -42,7 +66,11 @@ class AgentValidator(ConfigValidator):
                 )
 
         for label, agent in config.agents.items():
-            errors.extend(self._validate_agent(config, label, agent, list_providers, is_valid_provider))
+            errors.extend(
+                self._validate_agent(
+                    config, label, agent, list_providers, is_valid_provider
+                )
+            )
 
         return errors
 
@@ -78,6 +106,22 @@ class AgentValidator(ConfigValidator):
                 f"Available: {list_providers()}"
             )
 
+        custom_codex = (
+            agent.provider is None
+            and has_custom_command
+            and (
+                agent.ai_system == "codex"
+                or getattr(agent, "meta_agent", None) == "codex"
+                or _custom_command_executable(agent, has_custom_command) == "codex"
+            )
+        )
+        if custom_codex:
+            errors.append(
+                f"Agent '{label}': custom Codex commands cannot receive the "
+                "orchestrator's invocation-scoped guardrail. Set "
+                "'provider: codex' and move CLI options to provider_args."
+            )
+
         # sandbox: true is a security opt-in enforceable only through a provider
         # adapter. A provider-less / custom-`command` agent launches an arbitrary
         # command the orchestrator cannot sandbox, so reject the opt-in rather than
@@ -90,7 +134,10 @@ class AgentValidator(ConfigValidator):
             )
 
         # Model validation for claude-code provider
-        if agent.provider in (None, "claude-code") and agent.model not in self.KNOWN_CLAUDE_MODELS:
+        if (
+            agent.provider in (None, "claude-code")
+            and agent.model not in self.KNOWN_CLAUDE_MODELS
+        ):
             errors.append(
                 f"Agent '{label}': unknown model '{agent.model}'. Known: {self.KNOWN_CLAUDE_MODELS}"
             )

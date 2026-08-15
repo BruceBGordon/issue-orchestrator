@@ -377,7 +377,7 @@ sandbox profile).
 
 | Symptom | Likely cause |
 |---------|--------------|
-| Server exits at startup with `Config file not found` | No `.issue-orchestrator/config/<name>.yaml` under `--repo-root`. Create one, or pass `--config`. |
+| Server exits at startup with `Config file not found` | No `.issue-orchestrator/config/modes/<mode>/<name>.yaml` under `--repo-root`. Create one, select its mode with `--mode`, or pass `--config`. |
 | Client reports the command wasn't found | The entrypoint isn't on the client's `PATH`. Use an absolute path to the virtualenv's `issue-orchestrator-mcp`. |
 | Every engine tool returns `Orchestrator not running` | The orchestrator isn't started and `--auto-start` wasn't passed. Add the flag, or start it separately. |
 | Engine tools fail with a `401`-flavored error | No Control API token reached the subprocess. Start the orchestrator once so `~/.issue-orchestrator/api-token` exists, or set `ISSUE_ORCHESTRATOR_API_TOKEN` in the client's `env`. |

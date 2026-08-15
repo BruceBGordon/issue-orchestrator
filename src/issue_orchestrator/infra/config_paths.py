@@ -36,17 +36,23 @@ class ConfigSectionError(ValueError):
 
 def selection_from_config_path(config_path: Path) -> RepositoryLaunchSelection:
     """Derive the typed launch selection encoded by config storage layout."""
-    resolved = config_path.expanduser().resolve()
-    parent = resolved.parent
-    is_mode_path = (
-        parent.parent.name == MODES_DIR
-        and parent.parent.parent.name == "config"
-        and parent.parent.parent.parent.name == ".issue-orchestrator"
-    )
-    mode = ConfigurationModeName(parent.name) if is_mode_path else None
+    lexical = config_path.expanduser().absolute()
+    mode: ConfigurationModeName | None = None
+    for parent in lexical.parents:
+        if parent.name != "config" or parent.parent.name != ".issue-orchestrator":
+            continue
+        relative = lexical.relative_to(parent)
+        if relative.parts[0] == MAINTENANCE_DIR:
+            break
+        if len(relative.parts) != 3 or relative.parts[0] != MODES_DIR:
+            raise ValueError(
+                "Repository Engine configs must live under config/modes/<mode>/"
+            )
+        mode = ConfigurationModeName(relative.parts[1])
+        break
     return RepositoryLaunchSelection.parse(
         mode=mode,
-        config_name=resolved.name,
+        config_name=lexical.name,
     )
 
 
@@ -97,8 +103,12 @@ def repo_root_from_config_path(config_path: Path) -> Path:
     return resolved.parent.parent.parent.resolve()
 
 
-def require_engine_launch_config_path(config_path: Path) -> Path:
-    """Require repository-managed launch YAML to use the mode-scoped layout."""
+def _require_managed_config_path(
+    config_path: Path,
+    *,
+    allow_maintenance: bool,
+) -> Path:
+    """Validate one explicit config against the repository-managed layout."""
     lexical = config_path.expanduser().absolute()
     for parent in lexical.parents:
         if parent.name != "config" or parent.parent.name != ".issue-orchestrator":
@@ -108,6 +118,9 @@ def require_engine_launch_config_path(config_path: Path) -> Path:
         relative = lexical.relative_to(parent)
         is_mode_launch = len(relative.parts) == 3 and relative.parts[0] == MODES_DIR
         if relative.parts[0] == MAINTENANCE_DIR:
+            is_maintenance = len(relative.parts) == 2
+            if allow_maintenance and is_maintenance:
+                return lexical.resolve()
             raise ValueError("A maintenance config cannot launch a Repository Engine")
         if not is_mode_launch:
             raise ValueError(
@@ -117,6 +130,16 @@ def require_engine_launch_config_path(config_path: Path) -> Path:
     if lexical.is_symlink():
         raise ValueError("Explicit Repository Engine configs must not be symlinks")
     return lexical.resolve()
+
+
+def require_engine_launch_config_path(config_path: Path) -> Path:
+    """Require repository-managed launch YAML to use the mode-scoped layout."""
+    return _require_managed_config_path(config_path, allow_maintenance=False)
+
+
+def require_hook_setup_config_path(config_path: Path) -> Path:
+    """Allow mode configs and the dedicated hook-maintenance namespace."""
+    return _require_managed_config_path(config_path, allow_maintenance=True)
 
 
 def resolve_relative_path(path: str | Path, repo_root: Path) -> Path:

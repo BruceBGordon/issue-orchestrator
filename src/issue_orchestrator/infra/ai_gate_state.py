@@ -185,3 +185,8 @@ def save_ai_gate_state(repo_root: Path, state: AiGateState) -> None:
 
     with open(state_path, "w") as f:
         json.dump(state.to_dict(), f, indent=2)
+
+
+def invalidate_ai_gate_state(repo_root: Path) -> None:
+    """Force the next Doctor run to re-prove live agent hook enforcement."""
+    save_ai_gate_state(repo_root, AiGateState())

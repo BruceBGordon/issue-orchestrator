@@ -6,16 +6,47 @@ Previously in ``_vendor/agent_runner/providers/codex.py``.
 """
 
 from collections.abc import Mapping
+import json
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from issue_orchestrator.ports.provider_readiness import ProviderReadiness
 from issue_orchestrator.ports.provider_resilience import ProviderErrorType
+from issue_orchestrator.infra.hooks.codex_session import (
+    build_codex_session_hook_argv,
+    codex_runtime_home,
+    prepare_codex_runtime_home,
+)
 
 from .base import CLIProvider
 
 if TYPE_CHECKING:
     from issue_orchestrator.domain.sandbox_scope import SandboxScope
     from issue_orchestrator.ports.command_runner import CommandRunner
+
+
+def _codex_project_trust_paths(working_directory: Path) -> tuple[Path, ...]:
+    """Return Codex's possible trust keys for a checkout or linked worktree."""
+    worktree = working_directory.resolve()
+    paths = [worktree]
+    git_marker = worktree / ".git"
+    try:
+        marker = git_marker.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeError):
+        return tuple(paths)
+    prefix = "gitdir:"
+    if not marker.lower().startswith(prefix):
+        return tuple(paths)
+    git_dir = Path(marker[len(prefix) :].strip()).expanduser()
+    if not git_dir.is_absolute():
+        git_dir = (worktree / git_dir).resolve()
+    else:
+        git_dir = git_dir.resolve()
+    if git_dir.parent.parent.name == ".git":
+        primary = git_dir.parent.parent.parent
+        if primary != worktree:
+            paths.append(primary)
+    return tuple(paths)
 
 
 class CodexProvider(CLIProvider):
@@ -92,6 +123,7 @@ class CodexProvider(CLIProvider):
         model: str | None = None,
         *,
         sandbox_scope: "SandboxScope | None" = None,
+        working_directory: Path | None = None,
         **kwargs: str,
     ) -> list[str]:
         """Build a Codex CLI command.
@@ -130,10 +162,52 @@ class CodexProvider(CLIProvider):
         if execution_mode == "interactive" and json_output:
             raise ValueError("Codex json_output requires execution_mode='exec'")
 
-        scope_argv = self.apply_scope(sandbox_scope) if sandbox_scope is not None else []
-
-        cmd = [self.executable, *scope_argv]
         approval_mode = kwargs.get("approval_mode", "full-auto")
+        if working_directory is not None and approval_mode == "yolo":
+            raise ValueError(
+                "Orchestrated Codex sessions cannot use approval_mode=yolo; "
+                "it would expose the isolated hook runtime to agent writes"
+            )
+
+        scope_argv = (
+            self.apply_scope(sandbox_scope) if sandbox_scope is not None else []
+        )
+
+        session_hook_argv = build_codex_session_hook_argv(
+            write_roots=(
+                (sandbox_scope.working_directory, *sandbox_scope.write_roots)
+                if sandbox_scope is not None
+                else ((working_directory,) if working_directory is not None else ())
+            )
+        )
+        project_directory = working_directory or (
+            sandbox_scope.working_directory if sandbox_scope is not None else None
+        )
+        project_trust_argv = []
+        if project_directory is not None:
+            project_paths = _codex_project_trust_paths(project_directory)
+            prepare_codex_runtime_home(untrusted_projects=project_paths)
+            for project_path in project_paths:
+                project_trust_argv.extend(
+                    [
+                        "-c",
+                        "projects."
+                        f"{json.dumps(str(project_path))}"
+                        '.trust_level="untrusted"',
+                    ]
+                )
+        prefix = (
+            ["env", f"CODEX_HOME={codex_runtime_home()}"]
+            if project_directory is not None
+            else []
+        )
+        cmd = [
+            *prefix,
+            self.executable,
+            *session_hook_argv,
+            *project_trust_argv,
+            *scope_argv,
+        ]
         if sandbox_scope is None:
             self._append_approval_flags(
                 cmd,
@@ -218,8 +292,7 @@ class CodexProvider(CLIProvider):
         if raw in {"exec", "non-interactive", "noninteractive"}:
             return "exec"
         raise ValueError(
-            "Codex execution_mode must be 'interactive' or 'exec' "
-            f"(got {raw!r})"
+            f"Codex execution_mode must be 'interactive' or 'exec' (got {raw!r})"
         )
 
     @staticmethod

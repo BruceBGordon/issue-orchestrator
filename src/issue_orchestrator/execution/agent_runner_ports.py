@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
     from issue_orchestrator.domain.sandbox_scope import SandboxScope
+    from pathlib import Path
 
 
 class AIProvider(Protocol):
@@ -31,6 +32,7 @@ class AIProvider(Protocol):
         model: str,
         *,
         sandbox_scope: "SandboxScope | None" = None,
+        working_directory: "Path | None" = None,
         **kwargs: str,
     ) -> list[str]:
         """Build the command-line invocation for this provider."""

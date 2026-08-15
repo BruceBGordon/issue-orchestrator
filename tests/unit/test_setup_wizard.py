@@ -1850,7 +1850,7 @@ class TestRunWizard:
                 "",  # filtering label
                 False,  # disable review
                 # Post-wizard (new flow)
-                ".issue-orchestrator.yaml",  # config filename
+                "",  # accept the mode-scoped default config filename
                 True,  # Apply these changes?
                 False,  # Install repo-local guardrails and AI agent hooks now?
                 False,  # Set up AI provider API keys now?
@@ -1873,20 +1873,35 @@ class TestRunWizard:
                     run_wizard(target_path=target, prompter=prompter)
 
         # Verify files were created
-        assert (target / ".issue-orchestrator.yaml").exists() or any(
+        config_path = target / ".issue-orchestrator/config/modes/default/default.yaml"
+        assert config_path.exists() or any(
             "apply" in msg.lower() for msg in prompter.printed
         )
         printed = "\n".join(prompter.printed)
         assert (
-            "Install repo guardrails + AI hooks (recommended): issue-orchestrator setup-guardrails"
+            "Install repo guardrails + AI hooks (recommended): "
+            "issue-orchestrator setup-guardrails --config "
+            ".issue-orchestrator/config/modes/default/default.yaml"
             in printed
         )
-        assert "Run: issue-orchestrator doctor" in printed
+        assert (
+            "Run: issue-orchestrator doctor --config "
+            ".issue-orchestrator/config/modes/default/default.yaml"
+        ) in printed
+        assert (
+            "Run: issue-orchestrator --config "
+            ".issue-orchestrator/config/modes/default/default.yaml init"
+        ) in printed
+        assert (
+            "Run: issue-orchestrator --config "
+            ".issue-orchestrator/config/modes/default/default.yaml start"
+        ) in printed
         assert printed.index("issue-orchestrator setup-guardrails") < printed.index(
             "issue-orchestrator doctor"
         )
         assert printed.index("issue-orchestrator doctor") < printed.index(
-            "issue-orchestrator start"
+            "issue-orchestrator --config "
+            ".issue-orchestrator/config/modes/default/default.yaml start"
         )
         assert "Trusted session interactions are enabled." in printed
         assert "auto-accept Claude's initial trust prompt" in printed

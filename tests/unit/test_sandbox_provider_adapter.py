@@ -598,6 +598,34 @@ def test_codex_rejects_project_root_markers_that_can_escape_git_root(
         validate_codex_permission_profile_compatibility(repo)
 
 
+def test_codex_validates_the_isolated_home_config_stack(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_home = tmp_path / "source-home"
+    source_home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(source_home))
+    (source_home / "config.toml").write_text(
+        'project_root_markers = [".hg"]\n', encoding="utf-8"
+    )
+    runtime_home = tmp_path / "runtime-home"
+    runtime_home.mkdir()
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    project_config = repo / ".codex" / "config.toml"
+    project_config.parent.mkdir()
+    project_config.write_text('sandbox_mode = "danger-full-access"\n', encoding="utf-8")
+
+    with pytest.raises(
+        SandboxUnsupportedError,
+        match=rf"sandbox_mode.*{re.escape(str(project_config))}",
+    ):
+        validate_codex_permission_profile_compatibility(
+            repo,
+            codex_home=runtime_home,
+        )
+
+
 @pytest.mark.parametrize(
     ("egress", "network_enabled", "web_search"),
     [
@@ -638,6 +666,7 @@ def test_codex_profile_denies_custom_codex_home(
     profile = overrides[f"permissions.{CODEX_PERMISSION_PROFILE}"]
 
     assert profile["filesystem"][str(custom_home.resolve())] == "deny"
+    assert profile["filesystem"][str(sandbox_module.codex_runtime_home())] == "deny"
 
 
 def test_codex_rejects_relative_secret_deny_path() -> None:
@@ -655,7 +684,21 @@ def test_codex_rejects_relative_secret_deny_path() -> None:
 
 def test_codex_build_command_places_scope_before_exec_and_ignores_yolo(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
+    from issue_orchestrator.infra.hooks.codex_session import (
+        prepare_codex_runtime_home,
+    )
+
+    user_home = tmp_path / ".test-codex-user"
+    user_home.mkdir()
+    (user_home / "auth.json").write_text("{}\n", encoding="utf-8")
+    monkeypatch.setenv("CODEX_HOME", str(user_home))
+    monkeypatch.setenv(
+        "ISSUE_ORCHESTRATOR_CODEX_RUNTIME_ROOT",
+        str(tmp_path / ".test-codex-runtime"),
+    )
+    prepare_codex_runtime_home()
     monkeypatch.setattr(
         sandbox_module,
         "resolve_git_worktree_access",
@@ -673,6 +716,9 @@ def test_codex_build_command_places_scope_before_exec_and_ignores_yolo(
     assert cmd.index("-a") < exec_index
     assert cmd[cmd.index("-a") + 1] == "never"
     assert "--dangerously-bypass-approvals-and-sandbox" not in cmd
+    assert "--dangerously-bypass-hook-trust" in cmd
+    assert "features.hooks=true" in cmd
+    assert any(arg.startswith("hooks.PreToolUse=") for arg in cmd)
     assert "danger-full-access" not in cmd
     assert cmd[-1] == "task"
 

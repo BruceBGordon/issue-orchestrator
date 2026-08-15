@@ -583,13 +583,14 @@ class TestAgentConfig:
 
         import shlex
         tokens = shlex.split(cmd)
-        assert tokens[0] == "codex"
-        assert "exec" not in tokens[:2]
+        assert tokens[0] == "env"
+        assert tokens[1].startswith("CODEX_HOME=")
+        assert tokens[2] == "codex"
+        assert "exec" not in tokens[:3]
         assert "--ask-for-approval" in tokens
         assert "never" in tokens
         assert "gpt-5.4" in tokens
-        config_idx = tokens.index("-c")
-        assert tokens[config_idx + 1] == 'model_reasoning_effort="xhigh"'
+        assert 'model_reasoning_effort="xhigh"' in tokens
 
 
 class TestSession:
