@@ -722,10 +722,45 @@ class TestClaudeCodeAdapter:
         decision = evaluate_command("gh pr merge 123 --squash")
         assert not decision.allowed
 
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "gh --repo owner/repo pr merge 123",
+            "gh -R owner/repo pr merge 123",
+            "gh --body text pr merge 123",
+            "gh -btext pr merge 123",
+            "'gh' 'pr' 'merge' 123",
+            "'/usr/bin/gh' --repo owner/repo pr merge 123",
+        ],
+    )
+    def test_hook_blocks_gh_pr_merge_with_global_options(
+        self, adapter, temp_project, command
+    ):
+        adapter.install_hooks(temp_project)
+        decision = evaluate_command(command)
+        assert not decision.allowed
+
     def test_hook_blocks_gh_api_merge(self, adapter, temp_project):
         """Agents cannot merge PRs via gh api."""
         adapter.install_hooks(temp_project)
         decision = evaluate_command("gh api repos/owner/repo/pulls/123/merge -X PUT")
+        assert not decision.allowed
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "gh --repo owner/repo api repos/owner/repo/issues",
+            "gh -Rowner/repo api repos/owner/repo/issues",
+            "gh --hostname github.com api repos/owner/repo/issues",
+            "gh -XPUT api repos/owner/repo/pulls/123/merge",
+            "gh --cache=1h api repos/owner/repo/issues",
+        ],
+    )
+    def test_hook_blocks_gh_api_with_global_options(
+        self, adapter, temp_project, command
+    ):
+        adapter.install_hooks(temp_project)
+        decision = evaluate_command(command)
         assert not decision.allowed
 
     def test_hook_allows_gh_pr_create(self, adapter, temp_project):
@@ -1264,6 +1299,50 @@ class TestCodexAdapter:
 
         assert verify_codex_runtime_home() == codex_runtime_home()
 
+    def test_isolated_runtime_can_prepare_before_codex_login(
+        self, temp_project, monkeypatch
+    ):
+        from issue_orchestrator.infra.hooks.codex_session import (
+            codex_runtime_home,
+            prepare_codex_runtime_home,
+            verify_codex_runtime_home,
+        )
+
+        source_home = temp_project / "logged-out-codex"
+        monkeypatch.setenv("CODEX_HOME", str(source_home))
+
+        prepare_codex_runtime_home()
+
+        assert verify_codex_runtime_home(require_auth=False) == codex_runtime_home()
+        with pytest.raises(RuntimeError, match="run `codex login` first"):
+            verify_codex_runtime_home()
+
+    def test_isolated_runtime_reports_missing_managed_auth_link(self, temp_project):
+        from issue_orchestrator.infra.hooks.codex_session import (
+            codex_runtime_home,
+            verify_codex_runtime_home,
+        )
+
+        (codex_runtime_home() / "auth.json").unlink()
+
+        with pytest.raises(RuntimeError, match="not initialized; run setup-hooks"):
+            verify_codex_runtime_home()
+
+    def test_isolated_runtime_reports_wrong_managed_auth_link(self, temp_project):
+        from issue_orchestrator.infra.hooks.codex_session import (
+            codex_runtime_home,
+            verify_codex_runtime_home,
+        )
+
+        runtime_auth = codex_runtime_home() / "auth.json"
+        runtime_auth.unlink()
+        wrong_auth = temp_project / "wrong-auth.json"
+        wrong_auth.write_text("{}\n", encoding="utf-8")
+        runtime_auth.symlink_to(wrong_auth)
+
+        with pytest.raises(RuntimeError, match="unexpected file"):
+            verify_codex_runtime_home()
+
     def test_isolated_runtime_allows_only_managed_untrusted_projects(
         self, temp_project
     ):
@@ -1273,7 +1352,7 @@ class TestCodexAdapter:
             verify_codex_runtime_home,
         )
 
-        project = temp_project / "project"
+        project = temp_project / "project-😀"
         prepare_codex_runtime_home(untrusted_projects=(project,))
 
         config = (codex_runtime_home() / "config.toml").read_text(encoding="utf-8")
@@ -1955,10 +2034,20 @@ class TestHookScriptIntegration:
     def test_hook_scripts_fail_closed_when_python_missing(
         self,
         tmp_path,
+        monkeypatch,
         adapter_cls,
         hook_rel,
         runner,
     ):
+        if adapter_cls is CodexAdapter:
+            user_home = tmp_path / ".test-codex-user"
+            user_home.mkdir()
+            (user_home / "auth.json").write_text("{}\n", encoding="utf-8")
+            monkeypatch.setenv("CODEX_HOME", str(user_home))
+            monkeypatch.setenv(
+                "ISSUE_ORCHESTRATOR_CODEX_RUNTIME_ROOT",
+                str(tmp_path / ".test-codex-runtime"),
+            )
         adapter_cls().install_hooks(tmp_path)
         hook_script = tmp_path / hook_rel
         blocked = runner(hook_script, "git status", env={"PATH": ""})
@@ -2097,12 +2186,21 @@ class TestAgentHooksParametrized:
     """
 
     @pytest.fixture(params=SUPPORTED_AGENTS_WITH_HOOKS, ids=lambda a: a.value)
-    def agent_setup(self, request, tmp_path):
+    def agent_setup(self, request, tmp_path, monkeypatch):
         """Fixture that provides adapter, test runner, and project root for each agent.
 
         This is the main DI point - it yields a tuple of (adapter, test_fn, project_root, hook_path).
         """
         agent_type = request.param
+        if agent_type is AiAgentType.CODEX:
+            user_home = tmp_path / ".test-codex-user"
+            user_home.mkdir()
+            (user_home / "auth.json").write_text("{}\n", encoding="utf-8")
+            monkeypatch.setenv("CODEX_HOME", str(user_home))
+            monkeypatch.setenv(
+                "ISSUE_ORCHESTRATOR_CODEX_RUNTIME_ROOT",
+                str(tmp_path / ".test-codex-runtime"),
+            )
         adapter = get_adapter(agent_type)
         test_fn = get_agent_test_runner(agent_type)
 

@@ -14,7 +14,6 @@ from issue_orchestrator.ports.provider_readiness import ProviderReadiness
 from issue_orchestrator.ports.provider_resilience import ProviderErrorType
 from issue_orchestrator.infra.hooks.codex_session import (
     build_codex_session_hook_argv,
-    codex_runtime_home,
     prepare_codex_runtime_home,
 )
 
@@ -47,6 +46,25 @@ def _codex_project_trust_paths(working_directory: Path) -> tuple[Path, ...]:
         if primary != worktree:
             paths.append(primary)
     return tuple(paths)
+
+
+def _validate_orchestrated_safety(
+    *,
+    sandbox_scope: "SandboxScope | None",
+    approval_mode: str,
+    sandbox_mode: str | None,
+) -> None:
+    if sandbox_scope is None and approval_mode == "yolo":
+        raise ValueError(
+            "Orchestrated Codex sessions cannot use approval_mode=yolo; "
+            "it would expose the isolated hook runtime to agent writes"
+        )
+    if sandbox_scope is None and sandbox_mode == "danger-full-access":
+        raise ValueError(
+            "Orchestrated Codex sessions without an enforcing sandbox scope "
+            "cannot use sandbox=danger-full-access; it would expose the "
+            "isolated hook runtime to agent writes"
+        )
 
 
 class CodexProvider(CLIProvider):
@@ -162,12 +180,21 @@ class CodexProvider(CLIProvider):
         if execution_mode == "interactive" and json_output:
             raise ValueError("Codex json_output requires execution_mode='exec'")
 
-        approval_mode = kwargs.get("approval_mode", "full-auto")
-        if working_directory is not None and approval_mode == "yolo":
+        project_directory = working_directory or (
+            sandbox_scope.working_directory if sandbox_scope is not None else None
+        )
+        if project_directory is None:
             raise ValueError(
-                "Orchestrated Codex sessions cannot use approval_mode=yolo; "
-                "it would expose the isolated hook runtime to agent writes"
+                "Orchestrated Codex sessions require an explicit working_directory "
+                "or sandbox scope to protect the hook policy"
             )
+
+        approval_mode = kwargs.get("approval_mode", "full-auto")
+        _validate_orchestrated_safety(
+            sandbox_scope=sandbox_scope,
+            approval_mode=approval_mode,
+            sandbox_mode=kwargs.get("sandbox"),
+        )
 
         scope_argv = (
             self.apply_scope(sandbox_scope) if sandbox_scope is not None else []
@@ -177,30 +204,22 @@ class CodexProvider(CLIProvider):
             write_roots=(
                 (sandbox_scope.working_directory, *sandbox_scope.write_roots)
                 if sandbox_scope is not None
-                else ((working_directory,) if working_directory is not None else ())
+                else (project_directory,)
             )
         )
-        project_directory = working_directory or (
-            sandbox_scope.working_directory if sandbox_scope is not None else None
-        )
         project_trust_argv = []
-        if project_directory is not None:
-            project_paths = _codex_project_trust_paths(project_directory)
-            prepare_codex_runtime_home(untrusted_projects=project_paths)
-            for project_path in project_paths:
-                project_trust_argv.extend(
-                    [
-                        "-c",
-                        "projects."
-                        f"{json.dumps(str(project_path))}"
-                        '.trust_level="untrusted"',
-                    ]
-                )
-        prefix = (
-            ["env", f"CODEX_HOME={codex_runtime_home()}"]
-            if project_directory is not None
-            else []
-        )
+        project_paths = _codex_project_trust_paths(project_directory)
+        for project_path in project_paths:
+            project_trust_argv.extend(
+                [
+                    "-c",
+                    "projects."
+                    f"{json.dumps(str(project_path), ensure_ascii=False)}"
+                    '.trust_level="untrusted"',
+                ]
+            )
+        runtime_home = prepare_codex_runtime_home(untrusted_projects=project_paths)
+        prefix = ["env", f"CODEX_HOME={runtime_home}"]
         cmd = [
             *prefix,
             self.executable,

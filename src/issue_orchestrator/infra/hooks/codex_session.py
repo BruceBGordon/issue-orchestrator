@@ -44,10 +44,6 @@ def codex_runtime_home() -> Path:
 def prepare_codex_runtime_home(*, untrusted_projects: Iterable[Path] = ()) -> Path:
     """Create the isolated Codex home and record managed untrusted projects."""
     source_auth = _source_codex_home() / "auth.json"
-    if not source_auth.is_file():
-        raise SandboxUnsupportedError(
-            f"Codex authentication not found at {source_auth}; run `codex login` first"
-        )
     runtime_home = codex_runtime_home()
     runtime_home.mkdir(parents=True, exist_ok=True, mode=0o700)
     runtime_home.chmod(0o700)
@@ -61,13 +57,13 @@ def prepare_codex_runtime_home(*, untrusted_projects: Iterable[Path] = ()) -> Pa
         raise SandboxUnsupportedError(
             f"Codex runtime auth path must be a managed symlink: {runtime_auth}"
         )
-    else:
+    elif source_auth.is_file():
         runtime_auth.symlink_to(source_auth)
-    verify_codex_runtime_home()
+    verify_codex_runtime_home(require_auth=False)
     projects = tuple(Path(path).resolve() for path in untrusted_projects)
     if projects:
         _record_untrusted_projects(runtime_home, projects)
-        verify_codex_runtime_home()
+        verify_codex_runtime_home(require_auth=False)
     return runtime_home
 
 
@@ -116,7 +112,7 @@ def _record_untrusted_projects(runtime_home: Path, projects: Iterable[Path]) -> 
             lines.extend(
                 [
                     "",
-                    f"[projects.{json.dumps(project)}]",
+                    f"[projects.{json.dumps(project, ensure_ascii=False)}]",
                     'trust_level = "untrusted"',
                 ]
             )
@@ -130,12 +126,24 @@ def _record_untrusted_projects(runtime_home: Path, projects: Iterable[Path]) -> 
             temp_path.unlink(missing_ok=True)
 
 
-def verify_codex_runtime_home() -> Path:
+def verify_codex_runtime_home(*, require_auth: bool = True) -> Path:
     """Reject hook sources and unmanaged settings in the automation home."""
     runtime_home = codex_runtime_home()
     runtime_auth = runtime_home / "auth.json"
     source_auth = _source_codex_home() / "auth.json"
-    if not runtime_auth.is_symlink() or runtime_auth.resolve() != source_auth.resolve():
+    if runtime_auth.is_symlink() and runtime_auth.resolve() != source_auth.resolve():
+        raise SandboxUnsupportedError(
+            f"Codex runtime auth link points to an unexpected file: {runtime_auth}"
+        )
+    if runtime_auth.exists() and not runtime_auth.is_symlink():
+        raise SandboxUnsupportedError(
+            f"Codex runtime auth path must be a managed symlink: {runtime_auth}"
+        )
+    if require_auth and not source_auth.is_file():
+        raise SandboxUnsupportedError(
+            f"Codex authentication not found at {source_auth}; run `codex login` first"
+        )
+    if require_auth and not runtime_auth.is_symlink():
         raise SandboxUnsupportedError(
             f"Codex automation home is not initialized; run setup-hooks: {runtime_home}"
         )

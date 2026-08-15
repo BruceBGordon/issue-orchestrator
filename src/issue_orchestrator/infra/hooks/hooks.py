@@ -55,6 +55,8 @@ from ._types import (
 
 logger = logging.getLogger(__name__)
 
+_SOURCE_ROOT = Path(__file__).resolve().parents[3]
+
 
 def _run_hook_block_test(
     hook_script: Path,
@@ -67,6 +69,9 @@ def _run_hook_block_test(
 ) -> bool | tuple[bool, str]:
     """Run a hook script with one agent's input envelope and parse its decision."""
     project_root = hook_script.parents[2] if len(hook_script.parents) >= 2 else None
+    hook_env = os.environ.copy() if env is None else env.copy()
+    if (_SOURCE_ROOT / "issue_orchestrator").is_dir():
+        hook_env.setdefault("ORCHESTRATOR_HOOK_PYTHONPATH", str(_SOURCE_ROOT))
     try:
         result = subprocess.run(
             [str(hook_script)],
@@ -75,7 +80,7 @@ def _run_hook_block_test(
             text=True,
             timeout=120,
             cwd=str(project_root) if project_root else None,
-            env=env,
+            env=hook_env,
             check=False,
         )
         blocked = is_blocked(

@@ -14,9 +14,26 @@ from issue_orchestrator.domain.sandbox_scope import SandboxUnsupportedError
 from issue_orchestrator.execution.agent_runner_providers.codex import CodexProvider
 
 
+_TEST_WORKING_DIRECTORY = Path("/tmp/io-codex-provider-test-worktree")
+
+
 def _cmd(**kwargs: str) -> list[str]:
     """Build the argv with sane defaults; return the list for assertions."""
-    return CodexProvider().build_command(prompt="task", **kwargs)
+    return CodexProvider().build_command(
+        prompt="task", working_directory=_TEST_WORKING_DIRECTORY, **kwargs
+    )
+
+
+@pytest.fixture(autouse=True)
+def isolated_runtime(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    user_home = tmp_path / ".test-codex-user"
+    user_home.mkdir()
+    (user_home / "auth.json").write_text("{}\n", encoding="utf-8")
+    monkeypatch.setenv("CODEX_HOME", str(user_home))
+    monkeypatch.setenv(
+        "ISSUE_ORCHESTRATOR_CODEX_RUNTIME_ROOT",
+        str(tmp_path / ".test-codex-runtime"),
+    )
 
 
 class TestCodexJsonOutputDefault:
@@ -93,26 +110,16 @@ class TestCodexBaseCommand:
     other flags. These aren't exhaustive — just enough to catch a
     structural regression."""
 
-    @pytest.fixture(autouse=True)
-    def isolated_runtime(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        from issue_orchestrator.infra.hooks.codex_session import (
-            prepare_codex_runtime_home,
-        )
-
-        user_home = tmp_path / ".test-codex-user"
-        user_home.mkdir()
-        (user_home / "auth.json").write_text("{}\n", encoding="utf-8")
-        monkeypatch.setenv("CODEX_HOME", str(user_home))
-        monkeypatch.setenv(
-            "ISSUE_ORCHESTRATOR_CODEX_RUNTIME_ROOT",
-            str(tmp_path / ".test-codex-runtime"),
-        )
-        prepare_codex_runtime_home()
-
     def test_default_starts_interactive_codex(self) -> None:
         cmd = _cmd()
-        assert cmd[0] == "codex"
-        assert "exec" not in cmd[:2]
+        assert cmd[0] == "env"
+        assert cmd[1].startswith("CODEX_HOME=")
+        assert cmd[2] == "codex"
+        assert "exec" not in cmd[:3]
+
+    def test_requires_explicit_working_directory_without_scope(self) -> None:
+        with pytest.raises(ValueError, match="require an explicit working_directory"):
+            CodexProvider().build_command(prompt="task")
 
     def test_default_injects_invocation_scoped_guardrail(self) -> None:
         cmd = _cmd()
@@ -172,6 +179,17 @@ class TestCodexBaseCommand:
         assert f'projects."{worktree}".trust_level="untrusted"' in cmd
         assert f'projects."{primary}".trust_level="untrusted"' in cmd
 
+    def test_project_trust_key_preserves_non_bmp_path(self, tmp_path: Path) -> None:
+        worktree = tmp_path / "reviewer-😀"
+
+        cmd = CodexProvider().build_command(
+            prompt="task",
+            working_directory=worktree,
+        )
+
+        assert f'projects."{worktree}".trust_level="untrusted"' in cmd
+        assert "\\ud83d" not in " ".join(cmd)
+
     def test_orchestrated_command_rejects_yolo(self, tmp_path: Path) -> None:
         with pytest.raises(ValueError, match="cannot use approval_mode=yolo"):
             CodexProvider().build_command(
@@ -180,9 +198,21 @@ class TestCodexBaseCommand:
                 approval_mode="yolo",
             )
 
+    def test_no_scope_orchestrated_command_rejects_danger_full_access(
+        self, tmp_path: Path
+    ) -> None:
+        with pytest.raises(ValueError, match="cannot use sandbox=danger-full-access"):
+            CodexProvider().build_command(
+                prompt="task",
+                working_directory=tmp_path,
+                sandbox="danger-full-access",
+            )
+
     def test_exec_mode_uses_codex_exec(self) -> None:
         cmd = _cmd(execution_mode="exec")
-        assert cmd[0] == "codex"
+        assert cmd[0] == "env"
+        assert cmd[1].startswith("CODEX_HOME=")
+        assert cmd[2] == "codex"
         assert "exec" in cmd
 
     def test_full_auto_default(self) -> None:
@@ -200,19 +230,18 @@ class TestCodexBaseCommand:
         assert cmd.index("--ask-for-approval") < cmd.index("exec")
         assert cmd[cmd.index("--sandbox") + 1] == "workspace-write"
 
-    def test_yolo_swaps_to_dangerously_bypass(self) -> None:
-        cmd = _cmd(approval_mode="yolo")
-        assert "--dangerously-bypass-approvals-and-sandbox" in cmd
-        assert "--full-auto" not in cmd
+    def test_no_directory_rejects_yolo(self) -> None:
+        with pytest.raises(ValueError, match="cannot use approval_mode=yolo"):
+            _cmd(approval_mode="yolo")
 
-    def test_exec_yolo_flag_precedes_subcommand(self) -> None:
-        cmd = _cmd(execution_mode="exec", approval_mode="yolo")
-        assert cmd.index("--dangerously-bypass-approvals-and-sandbox") < cmd.index(
-            "exec"
-        )
+    def test_no_directory_rejects_danger_full_access(self) -> None:
+        with pytest.raises(ValueError, match="cannot use sandbox=danger-full-access"):
+            _cmd(sandbox="danger-full-access")
 
     def test_prompt_is_last_arg(self) -> None:
-        cmd = CodexProvider().build_command(prompt="hello world")
+        cmd = CodexProvider().build_command(
+            prompt="hello world", working_directory=_TEST_WORKING_DIRECTORY
+        )
         assert cmd[-1] == "hello world"
 
     def test_provider_is_interactive_by_default(self) -> None:

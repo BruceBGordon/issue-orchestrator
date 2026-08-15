@@ -51,7 +51,10 @@ def _venv_path_prefix() -> str:
 
 
 def _wait_for_pty_idle(
-    session: object, *, quiet_seconds: float, max_wait: float,
+    session: object,
+    *,
+    quiet_seconds: float,
+    max_wait: float,
 ) -> None:
     """Drain the PTY until output stays quiet for ``quiet_seconds``.
 
@@ -197,10 +200,13 @@ def test_persistent_send_round_multi_round_real_codex_interactive() -> None:
         execution_mode="interactive",
         approval_mode="full-auto",
         reasoning_effort="low",
+        working_directory=work_dir,
     )
 
     session = open_persistent_session(
-        command=command, working_dir=work_dir, env=env,
+        command=command,
+        working_dir=work_dir,
+        env=env,
     )
     try:
         assert session.proc.poll() is None, (

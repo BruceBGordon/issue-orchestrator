@@ -72,7 +72,7 @@ These are installed and refreshed in the target project by `issue-orchestrator s
 | Hook | Type | Location | Purpose | Critical? |
 |------|------|----------|---------|-----------|
 | PreToolUse (Claude) | Claude Code | `.claude/hooks/block-no-verify.sh` | Blocks `git push --no-verify` at AI level | **YES** |
-| PreToolUse (Codex) | Codex CLI | Invocation hook using the packaged policy; `.codex/hooks.json` is defense in depth for manual sessions | Evaluates the full Bash command before execution | **YES** |
+| PreToolUse (Codex) | Codex CLI | Invocation hook using the packaged policy; `.codex/hooks.json` is defense in depth for manual sessions | Inspects direct and common composed shell forms before execution | **YES** |
 | beforeShellExecution (Cursor) | Cursor | `.cursor/hooks.json` | Blocks `git push --no-verify` at AI level | **YES** |
 | Pre-push | Git | `.githooks/pre-push` | Runs project tests/linters before push | **YES** |
 | Execpolicy rules (Codex) | Codex CLI | `.codex/rules/orchestrator.rules` | Prefix-based defense in depth outside the sandbox | **YES** |
@@ -236,11 +236,12 @@ orchestrated security boundary. The trust-bypass flag applies to every hook
 Codex loads, so an installation whose system policy independently pre-trusts a
 project must also treat that project's hooks as trusted operator code.
 
-The behavioral evaluator recognizes literal Git invocations and literal
-commands passed through common shell `-c` forms. Arbitrary shell dataflow—such
-as constructing the executable or a short option entirely through variables—is
-outside this parser's boundary; repository Git hooks and the push guard remain
-the underlying enforcement layers.
+The behavioral evaluator recognizes literal invocations, simple literal
+`git`/`gh` command bindings, and commands passed through common shell `-c`
+and control forms. It is not a general shell interpreter: process substitution,
+function and `case` grammar, and arbitrary transformed shell dataflow remain
+outside this parser's boundary. Repository Git hooks, credential isolation, and
+the push guard are the underlying authority-enforcement layers.
 
 The AI gate uses the same isolated runtime and invocation hook as production.
 It requires Codex's router-level PreToolUse denial containing the nonce command

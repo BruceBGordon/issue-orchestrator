@@ -42,9 +42,8 @@ class CodexAdapter(AiAgentAdapter):
     """Adapter for OpenAI Codex CLI.
 
     Codex CLI uses project-scoped Starlark rules and PreToolUse hooks. Rules
-    provide fast prefix-based defense in depth; the hook evaluates the whole
-    Bash command so bypass flags cannot hide at an unsupported argument
-    position.
+    provide fast prefix-based defense in depth; the hook inspects direct and
+    common composed shell forms, including suffix flags and quoted arguments.
     """
 
     @property
@@ -182,7 +181,7 @@ class CodexAdapter(AiAgentAdapter):
         prepare_codex_runtime_home()
 
     def install_hooks(self, project_root: Path) -> list[Path]:
-        """Install Codex CLI rules and its full-command PreToolUse hook.
+        """Install Codex CLI rules and its command-inspecting PreToolUse hook.
 
         Existing unrelated project hooks are preserved.
         """

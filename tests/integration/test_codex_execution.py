@@ -37,10 +37,7 @@ def is_codex_available() -> bool:
 def require_codex():
     """Fixture that fails fast if Codex CLI is not installed."""
     if not is_codex_available():
-        pytest.fail(
-            "Codex CLI not found!\n"
-            "Install Codex: npm install -g @openai/codex"
-        )
+        pytest.fail("Codex CLI not found!\nInstall Codex: npm install -g @openai/codex")
 
 
 @pytest.mark.skipif(not is_codex_available(), reason="Codex CLI not installed")
@@ -82,19 +79,27 @@ class TestCodexExecution:
         subprocess.run(["git", "init"], cwd=tmp_path, capture_output=True, check=True)
         subprocess.run(
             ["git", "config", "user.email", "test@test.com"],
-            cwd=tmp_path, capture_output=True, check=True
+            cwd=tmp_path,
+            capture_output=True,
+            check=True,
         )
         subprocess.run(
             ["git", "config", "user.name", "Test"],
-            cwd=tmp_path, capture_output=True, check=True
+            cwd=tmp_path,
+            capture_output=True,
+            check=True,
         )
 
         # Create a dummy file so git has something
         (tmp_path / "README.md").write_text("# Test\n")
-        subprocess.run(["git", "add", "."], cwd=tmp_path, capture_output=True, check=True)
+        subprocess.run(
+            ["git", "add", "."], cwd=tmp_path, capture_output=True, check=True
+        )
         subprocess.run(
             ["git", "commit", "-m", "init"],
-            cwd=tmp_path, capture_output=True, check=True
+            cwd=tmp_path,
+            capture_output=True,
+            check=True,
         )
 
         result = subprocess.run(
@@ -133,7 +138,9 @@ class TestCodexWithAgentRunner:
         """
         # Use vendored AgentRunner — Codex tests exercise the subprocess-based
         # runner (not the unified pexpect-based one in execution.agent_runner).
-        from issue_orchestrator.execution.subprocess_runner import SubprocessAgentRunner as AgentRunner
+        from issue_orchestrator.execution.subprocess_runner import (
+            SubprocessAgentRunner as AgentRunner,
+        )
         from issue_orchestrator.execution.agent_runner_types import AgentSpec as RunSpec
         from issue_orchestrator.agent_runner.providers import CodexProvider
 
@@ -141,17 +148,25 @@ class TestCodexWithAgentRunner:
         subprocess.run(["git", "init"], cwd=tmp_path, capture_output=True, check=True)
         subprocess.run(
             ["git", "config", "user.email", "test@test.com"],
-            cwd=tmp_path, capture_output=True, check=True
+            cwd=tmp_path,
+            capture_output=True,
+            check=True,
         )
         subprocess.run(
             ["git", "config", "user.name", "Test"],
-            cwd=tmp_path, capture_output=True, check=True
+            cwd=tmp_path,
+            capture_output=True,
+            check=True,
         )
         (tmp_path / "README.md").write_text("# Test\n")
-        subprocess.run(["git", "add", "."], cwd=tmp_path, capture_output=True, check=True)
+        subprocess.run(
+            ["git", "add", "."], cwd=tmp_path, capture_output=True, check=True
+        )
         subprocess.run(
             ["git", "commit", "-m", "init"],
-            cwd=tmp_path, capture_output=True, check=True
+            cwd=tmp_path,
+            capture_output=True,
+            check=True,
         )
 
         output_dir = tmp_path / "output"
@@ -161,6 +176,7 @@ class TestCodexWithAgentRunner:
         cmd = provider.build_command(
             prompt="Echo the word SUCCESS and exit.",
             execution_mode="exec",
+            working_directory=tmp_path,
             json_output="false",
         )
 
@@ -203,28 +219,40 @@ class TestCodexAgentDoneInvocation:
         # Create worktree-like structure with git repo + local origin remote.
         # Completion command preflight now validates push viability, so origin must exist.
         remote_repo = tmp_path / "origin.git"
-        subprocess.run(["git", "init", "--bare", str(remote_repo)], capture_output=True, check=True)
+        subprocess.run(
+            ["git", "init", "--bare", str(remote_repo)], capture_output=True, check=True
+        )
 
         worktree = tmp_path / "test-worktree"
         worktree.mkdir()
         subprocess.run(["git", "init"], cwd=worktree, capture_output=True, check=True)
         subprocess.run(
             ["git", "config", "user.email", "test@test.com"],
-            cwd=worktree, capture_output=True, check=True
+            cwd=worktree,
+            capture_output=True,
+            check=True,
         )
         subprocess.run(
             ["git", "config", "user.name", "Test"],
-            cwd=worktree, capture_output=True, check=True
+            cwd=worktree,
+            capture_output=True,
+            check=True,
         )
         (worktree / "README.md").write_text("# Test\n")
-        subprocess.run(["git", "add", "."], cwd=worktree, capture_output=True, check=True)
+        subprocess.run(
+            ["git", "add", "."], cwd=worktree, capture_output=True, check=True
+        )
         subprocess.run(
             ["git", "commit", "-m", "init"],
-            cwd=worktree, capture_output=True, check=True
+            cwd=worktree,
+            capture_output=True,
+            check=True,
         )
         subprocess.run(
             ["git", "remote", "add", "origin", str(remote_repo)],
-            cwd=worktree, capture_output=True, check=True
+            cwd=worktree,
+            capture_output=True,
+            check=True,
         )
 
         completion_dir = worktree / ".issue-orchestrator"
@@ -246,7 +274,8 @@ class TestCodexAgentDoneInvocation:
 
         result = subprocess.run(
             [
-                "codex", "exec",
+                "codex",
+                "exec",
                 "--dangerously-bypass-approvals-and-sandbox",
                 prompt,
             ],
@@ -289,24 +318,33 @@ class TestCodexAgentDoneInvocation:
         subprocess.run(["git", "init"], cwd=tmp_path, capture_output=True, check=True)
         subprocess.run(
             ["git", "config", "user.email", "test@test.com"],
-            cwd=tmp_path, capture_output=True, check=True
+            cwd=tmp_path,
+            capture_output=True,
+            check=True,
         )
         subprocess.run(
             ["git", "config", "user.name", "Test"],
-            cwd=tmp_path, capture_output=True, check=True
+            cwd=tmp_path,
+            capture_output=True,
+            check=True,
         )
         (tmp_path / "README.md").write_text("# Test\n")
-        subprocess.run(["git", "add", "."], cwd=tmp_path, capture_output=True, check=True)
+        subprocess.run(
+            ["git", "add", "."], cwd=tmp_path, capture_output=True, check=True
+        )
         subprocess.run(
             ["git", "commit", "-m", "init"],
-            cwd=tmp_path, capture_output=True, check=True
+            cwd=tmp_path,
+            capture_output=True,
+            check=True,
         )
 
         verify_file = tmp_path / "codex_was_here.txt"
 
         result = subprocess.run(
             [
-                "codex", "exec",
+                "codex",
+                "exec",
                 "--dangerously-bypass-approvals-and-sandbox",
                 f"Create a file at {verify_file} containing exactly the text VERIFIED. "
                 "Use the write_file tool or echo command. Do not explain, just do it.",
@@ -322,7 +360,9 @@ class TestCodexAgentDoneInvocation:
         print(f"Return code: {result.returncode}")
 
         # Verify Codex created the file
-        assert verify_file.exists(), f"Codex did not create verification file. Output: {result.stdout}"
+        assert verify_file.exists(), (
+            f"Codex did not create verification file. Output: {result.stdout}"
+        )
         content = verify_file.read_text().strip()
         assert "VERIFIED" in content, f"Verification file has wrong content: {content}"
 
@@ -345,7 +385,9 @@ class TestCodexWithAgentRunnerFullPath:
         """
         # Use vendored AgentRunner — Codex tests exercise the subprocess-based
         # runner (not the unified pexpect-based one in execution.agent_runner).
-        from issue_orchestrator.execution.subprocess_runner import SubprocessAgentRunner as AgentRunner
+        from issue_orchestrator.execution.subprocess_runner import (
+            SubprocessAgentRunner as AgentRunner,
+        )
         from issue_orchestrator.execution.agent_runner_types import AgentSpec as RunSpec
         from issue_orchestrator.agent_runner.providers import CodexProvider
 
@@ -359,17 +401,25 @@ class TestCodexWithAgentRunnerFullPath:
         subprocess.run(["git", "init"], cwd=worktree, capture_output=True, check=True)
         subprocess.run(
             ["git", "config", "user.email", "test@test.com"],
-            cwd=worktree, capture_output=True, check=True
+            cwd=worktree,
+            capture_output=True,
+            check=True,
         )
         subprocess.run(
             ["git", "config", "user.name", "Test"],
-            cwd=worktree, capture_output=True, check=True
+            cwd=worktree,
+            capture_output=True,
+            check=True,
         )
         (worktree / "README.md").write_text("# Test\n")
-        subprocess.run(["git", "add", "."], cwd=worktree, capture_output=True, check=True)
+        subprocess.run(
+            ["git", "add", "."], cwd=worktree, capture_output=True, check=True
+        )
         subprocess.run(
             ["git", "commit", "-m", "init"],
-            cwd=worktree, capture_output=True, check=True
+            cwd=worktree,
+            capture_output=True,
+            check=True,
         )
 
         io_dir = worktree / ".issue-orchestrator"
@@ -388,7 +438,8 @@ class TestCodexWithAgentRunnerFullPath:
         cmd = provider.build_command(
             prompt=prompt,
             execution_mode="exec",
-            approval_mode="yolo",  # Skip approvals for testing
+            approval_mode="full-auto",
+            working_directory=worktree,
             json_output="false",
         )
 
@@ -410,7 +461,9 @@ class TestCodexWithAgentRunnerFullPath:
         print(f"  exit_code: {result.exit_code}")
         print(f"  timed_out: {result.timed_out}")
         print(f"  duration: {result.duration_seconds:.1f}s")
-        print(f"  stderr (launch errors): {result.stderr[:500] if result.stderr else 'empty'}")
+        print(
+            f"  stderr (launch errors): {result.stderr[:500] if result.stderr else 'empty'}"
+        )
 
         # Check for completion.json
         completion_files = list(io_dir.glob("completion*.json"))
