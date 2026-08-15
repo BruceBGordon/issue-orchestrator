@@ -2262,9 +2262,16 @@ class TestAgentHooksParametrized:
         blocked = test_fn(hook_path, "gh pr create --title 'test'")
         assert not blocked, f"{adapter.agent_type.value}: wrongly blocked gh pr create"
 
-    def test_adapter_verification_passes(self, agent_setup):
+    def test_adapter_verification_passes(self, agent_setup, monkeypatch):
         """Verify the adapter's own verification passes."""
         adapter, _, project_root, _ = agent_setup
+        if adapter.agent_type is AiAgentType.CODEX:
+            monkeypatch.setattr(shutil, "which", lambda _cmd: "/usr/bin/codex")
+            monkeypatch.setattr(
+                adapter,
+                "_execpolicy_allows",
+                lambda _rules, command: command != ["git", "push", "--no-verify"],
+            )
         result = adapter.verify_hooks(project_root)
         assert result.success, (
             f"{adapter.agent_type.value}: verification failed: {result.checks_failed}"
