@@ -125,7 +125,7 @@ class TestGetConfigStatus:
     """Tests for _get_config_status function."""
 
     def test_ready_with_configs(self, tmp_path):
-        config_dir = tmp_path / ".issue-orchestrator" / "config"
+        config_dir = tmp_path / ".issue-orchestrator/config/modes/default"
         config_dir.mkdir(parents=True)
         (config_dir / "default.yaml").write_text("repo: test")
 
@@ -138,7 +138,7 @@ class TestGetConfigStatus:
         assert modes == ["default"]
         assert mode_configs == {"default": ["default.yaml"]}
 
-    def test_legacy_config(self, tmp_path):
+    def test_root_config_does_not_satisfy_managed_layout(self, tmp_path):
         (tmp_path / ".issue-orchestrator.yaml").write_text("repo: test")
 
         with patch(
@@ -146,7 +146,7 @@ class TestGetConfigStatus:
             return_value=[],
         ):
             status, modes, mode_configs = _get_config_status(tmp_path)
-        assert status == "legacy"
+        assert status == "needs_setup"
         assert modes == []
         assert mode_configs == {}
 

@@ -821,10 +821,9 @@ function resolveActiveRepo() {
     return { path, source, repo };
 }
 
-function repoHasConfig(repo, source) {
+function repoHasConfig(repo) {
     if (!repo) return false;
     if (repo.configs && repo.configs.length > 0) return true;
-    if (source === 'discovered' && repo.status === 'legacy') return true;
     if (repo.status && (repo.status.state === 'running' || repo.status.state === 'partial' || repo.status.paused)) {
         return true;
     }
@@ -835,7 +834,7 @@ function getToolRepoPath(options = {}) {
     const requireConfig = options.requireConfig === true;
     const active = resolveActiveRepo();
     if (active) {
-        if (!requireConfig || repoHasConfig(active.repo, active.source)) {
+        if (!requireConfig || repoHasConfig(active.repo)) {
             return active.path;
         }
     }
@@ -859,7 +858,7 @@ function updateToolsScopeNote() {
         el.textContent = 'Tools scope: no repository selected.';
         return;
     }
-    const hasConfig = repoHasConfig(active.repo, active.source);
+    const hasConfig = repoHasConfig(active.repo);
     const configNote = hasConfig ? 'config available' : 'config not found';
     el.textContent = `Tools scope: ${active.path} (${configNote}).`;
 }
@@ -1198,9 +1197,8 @@ function renderRepos() {
 
 function renderDiscoveredRepoCard(repo) {
     const isReady = repo.status === 'ready';
-    const isLegacy = repo.status === 'legacy';
-    const badgeClass = isReady ? 'ready' : (isLegacy ? 'legacy' : 'needs-setup');
-    const badgeText = isReady ? 'Ready' : (isLegacy ? 'Legacy config' : 'Needs Setup');
+    const badgeClass = isReady ? 'ready' : 'needs-setup';
+    const badgeText = isReady ? 'Ready' : 'Needs Setup';
 
     const configMarkup = repo.configs?.length ? `
         <div class="repo-card-config">

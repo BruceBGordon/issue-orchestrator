@@ -147,30 +147,15 @@ def find_existing_config(
     start_path: Path | None = None,
 ) -> tuple[Path | None, dict | None]:
     """Find an existing orchestrator config starting at ``start_path``."""
-    from ..infra.config import CONFIG_DIR, DEFAULT_CONFIG_NAME
+    from ..infra.config import get_config_path, list_configs
 
     if start_path is None:
         start_path = Path.cwd()
 
-    candidates = [
-        f"{CONFIG_DIR}/modes/default/{DEFAULT_CONFIG_NAME}",
-        f"{CONFIG_DIR}/modes/default/*.yaml",
-        f"{CONFIG_DIR}/{DEFAULT_CONFIG_NAME}",
-        f"{CONFIG_DIR}/*.yaml",
-    ]
-
     current = start_path
     while current != current.parent:
-        for candidate in candidates:
-            if "*" in candidate:
-                matches = list(current.glob(candidate))
-                if not matches:
-                    continue
-                config_path = matches[0]
-            else:
-                config_path = current / candidate
-                if not config_path.exists():
-                    continue
+        for config_name in list_configs(current):
+            config_path = get_config_path(current, config_name)
             try:
                 with open(config_path) as handle:
                     return config_path, yaml.safe_load(handle)
@@ -184,7 +169,7 @@ def find_existing_config(
 def find_existing_default_config(
     start_path: Path | None = None,
 ) -> tuple[Path | None, dict | None]:
-    """Find the legacy default config used by the Control Center setup API."""
+    """Find the default mode config used by the Control Center setup API."""
     from ..infra.config import find_config_file
 
     config_path = find_config_file(start_path)

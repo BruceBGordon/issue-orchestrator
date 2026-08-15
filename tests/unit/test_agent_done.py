@@ -1165,7 +1165,7 @@ class TestAgentGateIntegration:
     def test_record_validation_artifacts_records_junit_from_validation_config(
         self, tmp_path: Path
     ):
-        config_dir = tmp_path / ".issue-orchestrator" / "config"
+        config_dir = tmp_path / ".issue-orchestrator/config/modes/default"
         config_dir.mkdir(parents=True)
         (config_dir / "default.yaml").write_text(
             """
@@ -1267,7 +1267,7 @@ validation:
         subprocess.run(["git", "commit", "-m", "Initial"], cwd=tmp_path, capture_output=True)
 
         # Create config with passing validation
-        config_dir = tmp_path / ".issue-orchestrator" / "config"
+        config_dir = tmp_path / ".issue-orchestrator/config/modes/default"
         config_dir.mkdir(parents=True)
         config_path = config_dir / "default.yaml"
         config_path.write_text("""
@@ -1311,7 +1311,7 @@ validation:
         subprocess.run(["git", "commit", "-m", "Initial"], cwd=tmp_path, capture_output=True)
 
         # Create config with failing validation
-        config_dir = tmp_path / ".issue-orchestrator" / "config"
+        config_dir = tmp_path / ".issue-orchestrator/config/modes/default"
         config_dir.mkdir(parents=True)
         config_path = config_dir / "default.yaml"
         config_path.write_text("""
@@ -1378,7 +1378,7 @@ validation:
         subprocess.run(["git", "commit", "-m", "Initial"], cwd=tmp_path, capture_output=True)
 
         # Create config with validation that outputs error to stderr
-        config_dir = tmp_path / ".issue-orchestrator" / "config"
+        config_dir = tmp_path / ".issue-orchestrator/config/modes/default"
         config_dir.mkdir(parents=True)
         config_path = config_dir / "default.yaml"
         # This command outputs to stderr and exits with error
@@ -1432,7 +1432,7 @@ validation:
         subprocess.run(["git", "commit", "-m", "Initial"], cwd=tmp_path, capture_output=True)
 
         # Create ONLY main.yaml (no default.yaml). Validation must still run.
-        config_dir = tmp_path / ".issue-orchestrator" / "config"
+        config_dir = tmp_path / ".issue-orchestrator/config/modes/default"
         config_dir.mkdir(parents=True)
         (config_dir / "main.yaml").write_text(
             """
@@ -1497,7 +1497,7 @@ validation:
         subprocess.run(["git", "commit", "-m", "Initial"], cwd=tmp_path, capture_output=True)
 
         # Only default exists; selected config points to missing main.yaml.
-        config_dir = tmp_path / ".issue-orchestrator" / "config"
+        config_dir = tmp_path / ".issue-orchestrator/config/modes/default"
         config_dir.mkdir(parents=True)
         (config_dir / "default.yaml").write_text(
             """
@@ -1553,7 +1553,7 @@ validation:
         subprocess.run(["git", "commit", "-m", "Initial"], cwd=tmp_path, capture_output=True)
 
         # Create config with validation that would fail
-        config_dir = tmp_path / ".issue-orchestrator" / "config"
+        config_dir = tmp_path / ".issue-orchestrator/config/modes/default"
         config_dir.mkdir(parents=True)
         config_path = config_dir / "default.yaml"
         config_path.write_text("""
@@ -1696,7 +1696,7 @@ class TestOrchestratorModeSkips:
 
     def _setup_config_with_failing_validation(self, tmp_path):
         """Create config with a validation command that fails."""
-        config_dir = tmp_path / ".issue-orchestrator" / "config"
+        config_dir = tmp_path / ".issue-orchestrator/config/modes/default"
         config_dir.mkdir(parents=True)
         (config_dir / "default.yaml").write_text(
             "validation:\n  quick:\n    cmd: 'exit 1'\n    timeout_seconds: 10\n"
@@ -1705,7 +1705,7 @@ class TestOrchestratorModeSkips:
 
     def _setup_config_with_passing_validation(self, tmp_path):
         """Create config with a validation command that passes."""
-        config_dir = tmp_path / ".issue-orchestrator" / "config"
+        config_dir = tmp_path / ".issue-orchestrator/config/modes/default"
         config_dir.mkdir(parents=True)
         (config_dir / "default.yaml").write_text(
             "validation:\n  quick:\n    cmd: 'exit 0'\n    timeout_seconds: 10\n"
@@ -1914,7 +1914,7 @@ class TestOrchestratorModeSkips:
     def test_orchestrator_mode_requires_explicit_run_dir(self, _mock_dirty, tmp_path, capsys):
         """Orchestrated validation must use the owner-injected run directory."""
         self._setup_git_repo(tmp_path)
-        config_dir = tmp_path / ".issue-orchestrator" / "config"
+        config_dir = tmp_path / ".issue-orchestrator/config/modes/default"
         config_dir.mkdir(parents=True)
         (config_dir / "default.yaml").write_text(
             "validation:\n  quick:\n    cmd: 'exit 0'\n    timeout_seconds: 10\n"
@@ -1948,7 +1948,7 @@ class TestOrchestratorModeSkips:
     ):
         """The injected run directory must belong to the completing session."""
         self._setup_git_repo(tmp_path)
-        config_dir = tmp_path / ".issue-orchestrator" / "config"
+        config_dir = tmp_path / ".issue-orchestrator/config/modes/default"
         config_dir.mkdir(parents=True)
         (config_dir / "default.yaml").write_text(
             "validation:\n  quick:\n    cmd: 'exit 0'\n    timeout_seconds: 10\n"
@@ -2003,7 +2003,7 @@ class TestPostValidationDirtyRecheck:
         subprocess.run(["git", "commit", "-m", "Initial"], cwd=tmp_path, capture_output=True, check=True)
 
     def _setup_config_with_passing_validation(self, tmp_path):
-        config_dir = tmp_path / ".issue-orchestrator" / "config"
+        config_dir = tmp_path / ".issue-orchestrator/config/modes/default"
         config_dir.mkdir(parents=True)
         (config_dir / "default.yaml").write_text(
             "validation:\n  quick:\n    cmd: 'exit 0'\n    timeout_seconds: 10\n"

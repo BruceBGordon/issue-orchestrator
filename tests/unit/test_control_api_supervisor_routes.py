@@ -522,7 +522,9 @@ class TestActionEndpointMapping:
         supervisor_client: TestClient,
         tmp_path: Path,
     ) -> None:
-        config_dir = tmp_path / ".issue-orchestrator" / "config"
+        config_dir = (
+            tmp_path / ".issue-orchestrator" / "config" / "modes" / "default"
+        )
         config_dir.mkdir(parents=True)
         (config_dir / "default.yaml").write_text(
             "repo:\n  name: owner/repo\nvalidation:\n  publish:\n    cmd: pytest\n",
@@ -607,7 +609,9 @@ class TestActionEndpointMapping:
         supervisor_client: TestClient,
         tmp_path: Path,
     ) -> None:
-        config_dir = tmp_path / ".issue-orchestrator" / "config"
+        config_dir = (
+            tmp_path / ".issue-orchestrator" / "config" / "modes" / "default"
+        )
         config_dir.mkdir(parents=True)
         (config_dir / "default.yaml").write_text(
             "validation:\n  publish:\n    cmd: pytest\n",
@@ -995,7 +999,10 @@ class TestSupervisorStart:
         )
 
         selection = RepositoryLaunchSelection.default()
-        config_path = tmp_path / ".issue-orchestrator/config/default.yaml"
+        config_path = (
+            tmp_path
+            / ".issue-orchestrator/config/modes/default/default.yaml"
+        )
         config_path.parent.mkdir(parents=True)
         config_path.write_text("agents: {}\n", encoding="utf-8")
         fingerprint = Config.load(config_path).config_fingerprint
@@ -1036,7 +1043,9 @@ class TestSupervisorStart:
         from issue_orchestrator.infra.doctor.types import DoctorResult
         from issue_orchestrator.infra.launcher import LaunchResult, LaunchStatus
 
-        config_dir = tmp_path / ".issue-orchestrator" / "config"
+        config_dir = (
+            tmp_path / ".issue-orchestrator" / "config" / "modes" / "default"
+        )
         config_dir.mkdir(parents=True)
         (config_dir / "default.yaml").write_text("agents: {}\n")
 
@@ -1134,7 +1143,9 @@ class TestSupervisorStart:
         mock_supervisor: MagicMock,
     ) -> None:
         """Identity mismatch with failed stop should fail closed."""
-        config_dir = tmp_path / ".issue-orchestrator" / "config"
+        config_dir = (
+            tmp_path / ".issue-orchestrator" / "config" / "modes" / "default"
+        )
         config_dir.mkdir(parents=True)
         (config_dir / "default.yaml").write_text("agents: {}\n")
 
@@ -1189,7 +1200,9 @@ class TestSupervisorStart:
         from issue_orchestrator.infra.doctor.types import DoctorResult
 
         # Create config file (required since start endpoint loads config to check instances)
-        config_dir = tmp_path / ".issue-orchestrator" / "config"
+        config_dir = (
+            tmp_path / ".issue-orchestrator" / "config" / "modes" / "default"
+        )
         config_dir.mkdir(parents=True)
         (config_dir / "default.yaml").write_text("agents: {}\n")
 
@@ -1250,7 +1263,9 @@ class TestSupervisorStart:
         from issue_orchestrator.infra.doctor.types import DoctorResult
         from issue_orchestrator.infra.launcher import LaunchResult, LaunchStatus
 
-        config_dir = tmp_path / ".issue-orchestrator" / "config"
+        config_dir = (
+            tmp_path / ".issue-orchestrator" / "config" / "modes" / "default"
+        )
         config_dir.mkdir(parents=True)
         (config_dir / "default.yaml").write_text("agents: {}\n")
 
@@ -1298,7 +1313,9 @@ class TestSupervisorStart:
         from issue_orchestrator.infra.launcher import LaunchResult, LaunchStatus
 
         # Create config file
-        config_dir = tmp_path / ".issue-orchestrator" / "config"
+        config_dir = (
+            tmp_path / ".issue-orchestrator" / "config" / "modes" / "default"
+        )
         config_dir.mkdir(parents=True)
         (config_dir / "default.yaml").write_text("agents: {}\n")
 

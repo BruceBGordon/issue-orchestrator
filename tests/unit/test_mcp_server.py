@@ -12,8 +12,11 @@ from issue_orchestrator.entrypoints.mcp_server import (
     McpApp,
     McpSettings,
     OrchestratorHttpClient,
+    _resolve_repo_root,
+    _resolve_settings,
     _mcp_repos_allowlist,
     _validate_repo_start_path,
+    build_arg_parser,
 )
 from issue_orchestrator.execution.repository_engine_start import (
     RepositoryEngineStartResult,
@@ -55,6 +58,39 @@ def _repo_settings(
         auto_start=auto_start,
     )
     return settings, Config.load(config_path)
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    [
+        ".issue-orchestrator/config/default.yaml",
+        ".issue-orchestrator/config/maintenance/hooks-validate.yaml",
+    ],
+)
+def test_resolve_settings_rejects_non_launch_managed_config(
+    tmp_path: Path, relative_path: str
+) -> None:
+    repo = tmp_path / "repo"
+    config_path = repo / relative_path
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text("agents: {}\n", encoding="utf-8")
+    args = build_arg_parser().parse_args(
+        ["--repo-root", str(repo), "--config", str(config_path)]
+    )
+
+    with pytest.raises(ValueError, match="config/modes/<mode>/|maintenance config"):
+        _resolve_settings(args)
+
+
+def test_resolve_repo_root_rejects_flat_managed_config_before_load(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "repo/.issue-orchestrator/config/default.yaml"
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text("repo:\n  root: /tmp/should-not-load\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="config/modes/<mode>/"):
+        _resolve_repo_root(config_path)
 
 
 def test_http_client_keeps_internal_api_base_url_local() -> None:

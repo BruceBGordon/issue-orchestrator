@@ -163,6 +163,36 @@ def test_cli_request_preserves_explicit_legacy_config_path(tmp_path: Path) -> No
     assert request.config_target == RepositorySetupExplicitConfig(config_path.resolve())
 
 
+def test_cli_request_rejects_flat_managed_config_path(tmp_path: Path) -> None:
+    config_path = tmp_path / ".issue-orchestrator/config/main.yaml"
+
+    with pytest.raises(ValueError, match="config/modes/<mode>/"):
+        build_cli_repository_setup_request(
+            owner=build_repository_setup_owner(MagicMock(), MagicMock()),
+            config={"repo": {"name": "owner/repo"}, "agents": {}},
+            repo_root=tmp_path,
+            config_path=config_path,
+        )
+
+    assert not config_path.exists()
+
+
+def test_cli_request_rejects_symlinked_mode_config_path(tmp_path: Path) -> None:
+    outside = tmp_path / "outside.yaml"
+    outside.write_text("agents: {}\n", encoding="utf-8")
+    config_path = tmp_path / ".issue-orchestrator/config/modes/default/main.yaml"
+    config_path.parent.mkdir(parents=True)
+    config_path.symlink_to(outside)
+
+    with pytest.raises(ValueError, match="must not be symbolic links"):
+        build_cli_repository_setup_request(
+            owner=build_repository_setup_owner(MagicMock(), MagicMock()),
+            config={"repo": {"name": "owner/repo"}, "agents": {}},
+            repo_root=tmp_path,
+            config_path=config_path,
+        )
+
+
 def test_cli_surfaces_owner_partial_outcome() -> None:
     owner = MagicMock()
     owner.execute.side_effect = RepositorySetupExecutionError(

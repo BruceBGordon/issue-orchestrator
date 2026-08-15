@@ -10,15 +10,19 @@ import shlex
 import shutil
 
 from ..adapters.git.git_cli import GitCLI, SubprocessCommandRunner
+from ..domain.repository_launch_selection import RepositoryLaunchSelection
 from .config import Config
+from .config_paths import MODES_DIR, require_engine_launch_config_path
 from .hooks._python_path import (
     ORCHESTRATOR_PYTHON_ENV,
     shell_quote_issue_orchestrator_python,
 )
 from .hooks.hooks import (
+    UnsupportedAiAgentError,
     detect_agents_from_config,
     get_adapter,
     install_hooks_for_config,
+    validate_hook_installation_targets,
 )
 
 logger = logging.getLogger(__name__)
@@ -158,6 +162,7 @@ def setup_repo_guardrails(
 ) -> RepoGuardrailsInstallResult:
     """Install repo-level guardrails and agent hooks for a target repository."""
     repo_root = (target_root or config.repo_root).resolve()
+    selected_config_name = _selected_config_name(config, repo_root)
     git = _new_git_cli()
     local_hooks_path = _get_local_hooks_path(repo_root, git)
     resolved_validation_cmd = (
@@ -167,6 +172,11 @@ def setup_repo_guardrails(
         raise RepoGuardrailsError(
             "validation.publish.cmd is not configured. Set it in YAML or pass --validation-cmd."
         )
+
+    try:
+        validate_hook_installation_targets(config, repo_root)
+    except (OSError, RuntimeError, UnsupportedAiAgentError, ValueError) as exc:
+        raise RepoGuardrailsError(str(exc)) from exc
 
     hooks_path_value, hooks_dir = _resolve_repo_hooks_dir(
         repo_root,
@@ -190,7 +200,7 @@ def setup_repo_guardrails(
     _install_verify_script(
         result.verify_script,
         resolved_validation_cmd,
-        selected_config_name=_selected_config_name(config, repo_root),
+        selected_config_name=selected_config_name,
         result=result,
     )
     _install_helper_script(result.helper_script, result)
@@ -442,10 +452,16 @@ def _render_verify_pr_script(
     selection_marker = ""
     if selected_config_name:
         relative_config = Path(selected_config_name)
-        mode = (
-            relative_config.parts[1]
-            if len(relative_config.parts) == 3 and relative_config.parts[0] == "modes"
-            else "default"
+        if len(relative_config.parts) != 3 or relative_config.parts[0] != MODES_DIR:
+            raise RepoGuardrailsError(
+                "Managed verify-pr selections must use modes/<mode>/<config>"
+            )
+        selection = RepositoryLaunchSelection.parse(
+            mode=relative_config.parts[1],
+            config_name=relative_config.parts[2],
+        )
+        relative_config = (
+            Path(MODES_DIR) / selection.mode.value / selection.config.value
         )
         config_name_export = f"""# Preserve the engine's complete runtime selection. A human push has no
 # selection, so use the mode that generated this managed fallback. A partial
@@ -456,7 +472,7 @@ if [ -z "${{ISSUE_ORCHESTRATOR_MODE:-}}" ] ||
   selected_config_rel={shlex.quote(relative_config.as_posix())}
   export ISSUE_ORCHESTRATOR_CONFIG_NAME={shlex.quote(relative_config.name)}
   export ISSUE_ORCHESTRATOR_CONFIG_PATH="$repo_root/.issue-orchestrator/config/$selected_config_rel"
-  export ISSUE_ORCHESTRATOR_MODE={shlex.quote(mode)}
+  export ISSUE_ORCHESTRATOR_MODE={shlex.quote(selection.mode.value)}
 fi
 """
         selection_marker = (
@@ -512,6 +528,10 @@ def _selected_config_name(config: Config, repo_root: Path) -> str | None:
     config_path = config.config_path
     if config_path is None:
         return None
+    try:
+        config_path = require_engine_launch_config_path(config_path)
+    except ValueError as exc:
+        raise RepoGuardrailsError(str(exc)) from exc
     config_root = (repo_root / ".issue-orchestrator" / "config").resolve()
     try:
         return config_path.resolve().relative_to(config_root).as_posix()

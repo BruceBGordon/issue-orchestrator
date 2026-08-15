@@ -2657,7 +2657,14 @@ class TestAuthCircuitSettingsAreValidatedAtStartup:
         """The values arrive as raw YAML, so the check must be on that path."""
         from issue_orchestrator.infra.config import Config
 
-        config_path = tmp_path / ".issue-orchestrator" / "config" / "default.yaml"
+        config_path = (
+            tmp_path
+            / ".issue-orchestrator"
+            / "config"
+            / "modes"
+            / "default"
+            / "default.yaml"
+        )
         config_path.parent.mkdir(parents=True, exist_ok=True)
         config_path.write_text(
             "repo:\n  name: owner/repo\n"

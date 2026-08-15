@@ -36,17 +36,23 @@ class ConfigSectionError(ValueError):
 
 def selection_from_config_path(config_path: Path) -> RepositoryLaunchSelection:
     """Derive the typed launch selection encoded by config storage layout."""
-    resolved = config_path.expanduser().resolve()
-    parent = resolved.parent
-    is_mode_path = (
-        parent.parent.name == MODES_DIR
-        and parent.parent.parent.name == "config"
-        and parent.parent.parent.parent.name == ".issue-orchestrator"
-    )
-    mode = ConfigurationModeName(parent.name) if is_mode_path else None
+    lexical = config_path.expanduser().absolute()
+    mode: ConfigurationModeName | None = None
+    for parent in lexical.parents:
+        if parent.name != "config" or parent.parent.name != ".issue-orchestrator":
+            continue
+        relative = lexical.relative_to(parent)
+        if relative.parts[0] == MAINTENANCE_DIR:
+            break
+        if len(relative.parts) != 3 or relative.parts[0] != MODES_DIR:
+            raise ValueError(
+                "Repository Engine configs must live under config/modes/<mode>/"
+            )
+        mode = ConfigurationModeName(relative.parts[1])
+        break
     return RepositoryLaunchSelection.parse(
         mode=mode,
-        config_name=resolved.name,
+        config_name=lexical.name,
     )
 
 
@@ -83,8 +89,6 @@ def repo_root_from_config_path(config_path: Path) -> Path:
 
     Mode configs live at
     ``<repo>/.issue-orchestrator/config/modes/<mode>/<name>.yaml``.
-    A centralized ancestor lookup also recognizes the inexpensive legacy flat
-    layout used by older fixtures and repositories.
 
     This is the SINGLE SOURCE OF TRUTH for this calculation.
     """
@@ -99,8 +103,12 @@ def repo_root_from_config_path(config_path: Path) -> Path:
     return resolved.parent.parent.parent.resolve()
 
 
-def require_engine_launch_config_path(config_path: Path) -> Path:
-    """Reject repository-managed maintenance YAML as an engine launch config."""
+def _require_managed_config_path(
+    config_path: Path,
+    *,
+    allow_maintenance: bool,
+) -> Path:
+    """Validate one explicit config against the repository-managed layout."""
     lexical = config_path.expanduser().absolute()
     for parent in lexical.parents:
         if parent.name != "config" or parent.parent.name != ".issue-orchestrator":
@@ -108,13 +116,13 @@ def require_engine_launch_config_path(config_path: Path) -> Path:
         repo_root = parent.parent.parent
         _require_repo_contained_config_path(repo_root, lexical)
         relative = lexical.relative_to(parent)
-        is_legacy_launch = len(relative.parts) == 1
-        is_mode_launch = (
-            len(relative.parts) == 3 and relative.parts[0] == MODES_DIR
-        )
+        is_mode_launch = len(relative.parts) == 3 and relative.parts[0] == MODES_DIR
         if relative.parts[0] == MAINTENANCE_DIR:
+            is_maintenance = len(relative.parts) == 2
+            if allow_maintenance and is_maintenance:
+                return lexical.resolve()
             raise ValueError("A maintenance config cannot launch a Repository Engine")
-        if not is_legacy_launch and not is_mode_launch:
+        if not is_mode_launch:
             raise ValueError(
                 "Repository Engine configs must live under config/modes/<mode>/"
             )
@@ -122,6 +130,16 @@ def require_engine_launch_config_path(config_path: Path) -> Path:
     if lexical.is_symlink():
         raise ValueError("Explicit Repository Engine configs must not be symlinks")
     return lexical.resolve()
+
+
+def require_engine_launch_config_path(config_path: Path) -> Path:
+    """Require repository-managed launch YAML to use the mode-scoped layout."""
+    return _require_managed_config_path(config_path, allow_maintenance=False)
+
+
+def require_hook_setup_config_path(config_path: Path) -> Path:
+    """Allow mode configs and the dedicated hook-maintenance namespace."""
+    return _require_managed_config_path(config_path, allow_maintenance=True)
 
 
 def resolve_relative_path(path: str | Path, repo_root: Path) -> Path:
@@ -179,7 +197,7 @@ def _require_repo_contained_config_path(repo_root: Path, candidate: Path) -> Pat
 
 
 def configuration_mode_from_path(config_path: Path) -> ConfigurationModeName:
-    """Derive a mode from a resolved config path, defaulting for flat configs."""
+    """Derive a mode from a resolved config path."""
     return selection_from_config_path(config_path).mode
 
 
@@ -252,15 +270,7 @@ def list_modes(repo_root: Path) -> list[str]:
         if modes_dir.exists()
         else []
     )
-    legacy_configs = [
-        path
-        for path in get_config_dir(repo_root).glob("*.yaml")
-        if path.is_file() and not path.is_symlink()
-    ]
-    default_mode_dir = get_mode_dir(repo_root, ConfigurationModeName("default"))
-    if legacy_configs and "default" not in modes and not default_mode_dir.exists():
-        modes.insert(0, "default")
-    elif "default" in modes:
+    if "default" in modes:
         modes.remove("default")
         modes.insert(0, "default")
     return modes
@@ -276,25 +286,13 @@ def list_configs(
     )
     mode_dir = get_mode_dir(repo_root, validated_mode)
     _require_repo_contained_config_path(repo_root, mode_dir / "placeholder.yaml")
-    if mode_dir.exists():
-        configs = sorted(
-            file.name
-            for file in mode_dir.glob("*.yaml")
-            if file.is_file() and not file.is_symlink()
-        )
-    elif validated_mode.value == "default":
-        config_dir = get_config_dir(repo_root)
-        configs = (
-            sorted(
-                file.name
-                for file in config_dir.glob("*.yaml")
-                if file.is_file() and not file.is_symlink()
-            )
-            if config_dir.exists()
-            else []
-        )
-    else:
+    if not mode_dir.exists():
         return []
+    configs = sorted(
+        file.name
+        for file in mode_dir.glob("*.yaml")
+        if file.is_file() and not file.is_symlink()
+    )
     if DEFAULT_CONFIG_NAME in configs:
         configs.remove(DEFAULT_CONFIG_NAME)
         configs.insert(0, DEFAULT_CONFIG_NAME)
@@ -306,23 +304,12 @@ def get_config_path(
     config_name: str = DEFAULT_CONFIG_NAME,
     mode: str | ConfigurationModeName = "default",
 ) -> Path:
-    """Resolve one typed mode/config pair to a contained config path.
-
-    Flat default configs remain readable as a centralized, low-cost
-    compatibility path. New writes resolve into ``modes/default``.
-    """
+    """Resolve one typed mode/config pair to a contained config path."""
     selection = RepositoryLaunchSelection.parse(mode=mode, config_name=config_name)
     mode_dir = get_mode_dir(repo_root, selection.mode)
     mode_path = _require_repo_contained_config_path(
         repo_root, mode_dir / selection.config.value
     )
-    legacy_path = get_config_dir(repo_root) / selection.config.value
-    if (
-        selection.mode == ConfigurationModeName.default()
-        and not mode_dir.exists()
-        and legacy_path.exists()
-    ):
-        return _require_repo_contained_config_path(repo_root, legacy_path)
     return mode_path
 
 

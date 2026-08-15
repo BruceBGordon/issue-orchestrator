@@ -16,8 +16,8 @@ from issue_orchestrator.execution.repository_setup_files import (
 from issue_orchestrator.execution.repository_setup_github_authorization import (
     repository_setup_github_authorization_codec,
 )
-from issue_orchestrator.infra.config import Config, get_config_dir
-from issue_orchestrator.infra.config_paths import get_mode_dir
+from issue_orchestrator.infra.config import Config
+from issue_orchestrator.infra.config_paths import get_config_path, get_mode_dir
 from issue_orchestrator.ports.repository_setup import RepositorySetupFileSystemError
 from issue_orchestrator.ports.repository_setup import RepositorySetupNamedConfig
 
@@ -61,6 +61,30 @@ def test_setup_file_adapter_plans_and_writes_runnable_contained_artifacts(
 
     assert written == tuple(file.path for file in plan.files)
     assert Config.load(config_file.path).validate() == []
+
+
+def test_setup_uses_mode_scoped_target_when_flat_config_exists(
+    tmp_path: Path,
+) -> None:
+    flat_config = tmp_path / ".issue-orchestrator/config/default.yaml"
+    flat_config.parent.mkdir(parents=True)
+    flat_config.write_text("sentinel\n", encoding="utf-8")
+
+    plan = RepositorySetupFileSystemAdapter().plan(
+        repo_root=tmp_path,
+        config_target=RepositorySetupNamedConfig(RepositoryConfigName("default")),
+        config=_command(tmp_path).build_config(
+            repository_setup_github_authorization_codec
+        ),
+        include_prompts=False,
+    )
+
+    config_file = plan.files[0]
+    assert config_file.path == (
+        tmp_path / ".issue-orchestrator/config/modes/default/default.yaml"
+    )
+    assert config_file.action == "create"
+    assert flat_config.read_text(encoding="utf-8") == "sentinel\n"
 
 
 def test_setup_command_choice_plans_internal_reviewer_instructions(
@@ -194,7 +218,7 @@ def test_setup_file_adapter_preserves_existing_file_when_atomic_replace_fails(
     tmp_path: Path,
 ) -> None:
     adapter = RepositorySetupFileSystemAdapter()
-    config_path = get_config_dir(tmp_path) / "default.yaml"
+    config_path = get_config_path(tmp_path)
     config_path.parent.mkdir(parents=True)
     config_path.write_text("sentinel", encoding="utf-8")
     plan = adapter.plan(

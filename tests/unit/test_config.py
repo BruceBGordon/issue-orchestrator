@@ -32,7 +32,12 @@ class TestConfig:
                     prompt_path.parent.mkdir(parents=True, exist_ok=True)
                     prompt_path.write_text("Prompt\n", encoding="utf-8")
             installed_path = (
-                tmp_path / ".issue-orchestrator" / "config" / "default.yaml"
+                tmp_path
+                / ".issue-orchestrator"
+                / "config"
+                / "modes"
+                / "default"
+                / "default.yaml"
             )
             installed_path.parent.mkdir(parents=True, exist_ok=True)
             installed_path.write_text(
@@ -56,7 +61,14 @@ class TestConfig:
 
     def test_merge_queue_parses_from_yaml(self, tmp_path):
         """A merge_queue section is parsed onto Config."""
-        path = tmp_path / ".issue-orchestrator" / "config" / "default.yaml"
+        path = (
+            tmp_path
+            / ".issue-orchestrator"
+            / "config"
+            / "modes"
+            / "default"
+            / "default.yaml"
+        )
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(
             "repo:\n  name: owner/repo\n"
@@ -80,7 +92,14 @@ class TestConfig:
         per-agent: an agent that omits it stays ``False`` even when
         ``default_agent`` (wrongly) sets ``sandbox: true``.
         """
-        path = tmp_path / ".issue-orchestrator" / "config" / "default.yaml"
+        path = (
+            tmp_path
+            / ".issue-orchestrator"
+            / "config"
+            / "modes"
+            / "default"
+            / "default.yaml"
+        )
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(
             "repo:\n  name: owner/repo\n"
@@ -118,7 +137,14 @@ class TestConfig:
 
     def test_merge_queue_rejects_unknown_failure_action(self, tmp_path):
         """A typo in an enum field fails loud at load time."""
-        path = tmp_path / ".issue-orchestrator" / "config" / "default.yaml"
+        path = (
+            tmp_path
+            / ".issue-orchestrator"
+            / "config"
+            / "modes"
+            / "default"
+            / "default.yaml"
+        )
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(
             "repo:\n  name: owner/repo\nmerge_queue:\n  failure_action: explode\n",
@@ -694,8 +720,7 @@ agents:
   agent:test:
     prompt: /tmp/prompt.txt
 """
-        # Config is now in .issue-orchestrator/config/default.yaml
-        config_dir = tmp_path / ".issue-orchestrator" / "config"
+        config_dir = tmp_path / ".issue-orchestrator/config/modes/default"
         config_dir.mkdir(parents=True)
         config_file = config_dir / "default.yaml"
         config_file.write_text(config_content)
@@ -713,8 +738,7 @@ agents:
   agent:parent:
     prompt: /tmp/prompt.txt
 """
-        # Config is now in .issue-orchestrator/config/default.yaml
-        config_dir = tmp_path / ".issue-orchestrator" / "config"
+        config_dir = tmp_path / ".issue-orchestrator/config/modes/default"
         config_dir.mkdir(parents=True)
         config_file = config_dir / "default.yaml"
         config_file.write_text(config_content)
@@ -731,8 +755,7 @@ agents:
 
     def test_config_find_and_load_in_hidden_dir(self, tmp_path, monkeypatch):
         """Test finding config in .issue-orchestrator/config subdirectory."""
-        # Config is now in .issue-orchestrator/config/default.yaml
-        config_dir = tmp_path / ".issue-orchestrator" / "config"
+        config_dir = tmp_path / ".issue-orchestrator/config/modes/default"
         config_dir.mkdir(parents=True)
 
         config_content = """
@@ -757,9 +780,8 @@ agents:
             Config.find_and_load()
 
     def test_config_find_uses_standard_location(self, tmp_path, monkeypatch):
-        """Test that config is loaded from .issue-orchestrator/config/ directory."""
-        # Config must be in .issue-orchestrator/config/default.yaml
-        config_dir = tmp_path / ".issue-orchestrator" / "config"
+        """Test that config is loaded from the default mode directory."""
+        config_dir = tmp_path / ".issue-orchestrator/config/modes/default"
         config_dir.mkdir(parents=True)
 
         config_content = """
@@ -2693,9 +2715,8 @@ agents:
     prompt: {prompt_file}
     ai_system: claude-code
 """
-        # Config must be at <repo>/.issue-orchestrator/config/<name>.yaml
-        # so repo_root is correctly calculated (3 levels up)
-        config_dir = tmp_path / ".issue-orchestrator" / "config"
+        # Config must use the managed mode-scoped layout so repo_root is inferred.
+        config_dir = tmp_path / ".issue-orchestrator/config/modes/default"
         config_dir.mkdir(parents=True)
         config_file = config_dir / "default.yaml"
         config_file.write_text(config_content)
@@ -2713,7 +2734,7 @@ agents:
         """A config omission must not place generated worktrees beside every repo."""
         repo_root = tmp_path / "repo"
         prompt_file = repo_root / "prompt.md"
-        config_dir = repo_root / ".issue-orchestrator" / "config"
+        config_dir = repo_root / ".issue-orchestrator/config/modes/default"
         config_dir.mkdir(parents=True)
         prompt_file.write_text("# Test prompt")
         config_file = config_dir / "default.yaml"
@@ -2746,8 +2767,8 @@ agents:
   agent:test:
     prompt: {prompt_file}
 """
-        # Config must be at <repo>/.issue-orchestrator/config/<name>.yaml
-        config_dir = tmp_path / ".issue-orchestrator" / "config"
+        # Config must use the managed mode-scoped layout.
+        config_dir = tmp_path / ".issue-orchestrator/config/modes/default"
         config_dir.mkdir(parents=True)
         config_file = config_dir / "default.yaml"
         config_file.write_text(config_content)

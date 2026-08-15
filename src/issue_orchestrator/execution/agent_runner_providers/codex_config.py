@@ -30,9 +30,16 @@ def _read_codex_config(path: Path) -> dict[str, Any]:
         ) from exc
 
 
-def _base_config_layers() -> tuple[tuple[Path, dict[str, Any]], ...]:
+def _base_config_layers(
+    *, codex_home: Path | None = None
+) -> tuple[tuple[Path, dict[str, Any]], ...]:
     """Load the lower-precedence system and user config layers."""
-    paths = (Path("/etc/codex/config.toml"), resolve_codex_home() / "config.toml")
+    effective_home = (
+        codex_home.expanduser().resolve()
+        if codex_home is not None
+        else resolve_codex_home()
+    )
+    paths = (Path("/etc/codex/config.toml"), effective_home / "config.toml")
     return tuple((path, _read_codex_config(path)) for path in paths if path.is_file())
 
 
@@ -97,6 +104,8 @@ def _project_config_files(
 
 def _loaded_config_layers(
     working_directory: Path,
+    *,
+    codex_home: Path | None = None,
 ) -> tuple[tuple[Path, dict[str, Any]], ...]:
     """Load every documented config layer that can disable profiles.
 
@@ -109,7 +118,7 @@ def _loaded_config_layers(
 
     https://learn.chatgpt.com/docs/config-file/config-basic#configuration-precedence
     """
-    base_layers = _base_config_layers()
+    base_layers = _base_config_layers(codex_home=codex_home)
     root_markers = _project_root_markers(base_layers)
     project_layers = tuple(
         (path, _read_codex_config(path))
@@ -123,6 +132,8 @@ def _loaded_config_layers(
 
 def validate_codex_permission_profile_compatibility(
     working_directory: Path,
+    *,
+    codex_home: Path | None = None,
 ) -> None:
     """Fail if a loaded legacy setting would silently disable the profile.
 
@@ -132,7 +143,10 @@ def validate_codex_permission_profile_compatibility(
     is no invocation-level unset. Detect every documented layer before launch
     so ``sandbox: true`` cannot silently degrade.
     """
-    for path, config in _loaded_config_layers(working_directory):
+    for path, config in _loaded_config_layers(
+        working_directory,
+        codex_home=codex_home,
+    ):
         if "sandbox_mode" in config:
             raise SandboxUnsupportedError(
                 "Codex sandbox permission profiles are disabled by legacy "

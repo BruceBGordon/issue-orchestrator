@@ -789,11 +789,6 @@ body {
     50% { opacity: 1; }
 }
 
-.repo-card-badge.legacy {
-    background: rgba(210, 153, 34, 0.15);
-    color: var(--accent-yellow);
-}
-
 .repo-card.discovered {
     border-style: dashed;
 }

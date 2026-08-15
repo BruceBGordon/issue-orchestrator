@@ -3,6 +3,7 @@
 from collections.abc import Mapping
 import logging
 from pathlib import Path
+import shlex
 
 from ..types import Check
 from ...config import Config
@@ -14,6 +15,18 @@ from ...repo_guardrails import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _setup_command(config: Config, subcommand: str) -> str:
+    """Render a remediation command that preserves the selected config."""
+    command = f"issue-orchestrator {subcommand}"
+    if config.config_path is None:
+        return command
+    try:
+        selected_path = config.config_path.relative_to(config.repo_root)
+    except ValueError:
+        selected_path = config.config_path
+    return f"{command} --config {shlex.quote(str(selected_path))}"
 
 
 def _check_hook_installation(
@@ -58,7 +71,7 @@ def _check_hook_installation(
             detail=(
                 "Hooks not installed for: "
                 f"{', '.join(sorted(missing_hooks))}. "
-                "Run 'issue-orchestrator setup-hooks'"
+                f"Run '{_setup_command(config, 'setup-hooks')}'"
             ),
         ), False
 
@@ -335,11 +348,12 @@ def check_repo_guardrails(config: Config) -> list[Check]:
     status = inspect_repo_guardrails(config.repo_root, config=config)
 
     if not status.pre_push_exists and not status.verify_exists:
+        setup_command = _setup_command(config, "setup-guardrails")
         return [
             Check(
                 name="Repo Guardrails",
                 status="warning",
-                detail="Not installed. Run 'issue-orchestrator setup-guardrails'.",
+                detail=f"Not installed. Run '{setup_command}'.",
             )
         ]
 
@@ -347,12 +361,12 @@ def check_repo_guardrails(config: Config) -> list[Check]:
     managed_agents = _managed_agent_names(status)
 
     if problems:
+        setup_command = _setup_command(config, "setup-guardrails")
         return [
             Check(
                 name="Repo Guardrails",
                 status="error",
-                detail="; ".join(problems)
-                + ". Run 'issue-orchestrator setup-guardrails'.",
+                detail="; ".join(problems) + f". Run '{setup_command}'.",
             )
         ]
 
@@ -485,6 +499,7 @@ def check_worktree_hook_corruption(config: Config) -> list[Check]:
         ]
 
     rel_paths = ", ".join(_display_path(config.repo_root, p) for p in corrupt)
+    setup_command = _setup_command(config, "setup-guardrails")
     return [
         Check(
             name="Pre-push Hook Corruption",
@@ -492,7 +507,7 @@ def check_worktree_hook_corruption(config: Config) -> list[Check]:
             detail=(
                 f"Corrupt pre-push.project detected ({len(corrupt)}): {rel_paths}. "
                 "Contains the managed wrapper marker; executing it would recurse. "
-                "Run 'issue-orchestrator setup-guardrails' or delete/rename the files."
+                f"Run '{setup_command}' or delete/rename the files."
             ),
         )
     ]

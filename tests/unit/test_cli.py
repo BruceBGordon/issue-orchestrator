@@ -356,6 +356,21 @@ class TestDeclaredCommandSurface:
         with pytest.raises(SystemExit):
             parser.parse_args(["teleport"])
 
+    @pytest.mark.parametrize("command", ["init", "start"])
+    def test_runtime_commands_accept_config_as_top_level_option(self, command):
+        parser = build_parser(self._handlers())
+
+        args = parser.parse_args(
+            [
+                "--config",
+                ".issue-orchestrator/config/modes/default/default.yaml",
+                command,
+            ]
+        )
+
+        assert args.command == command
+        assert args.config.endswith("/modes/default/default.yaml")
+
     def test_build_parser_rejects_a_command_missing_from_the_declared_surface(
         self, monkeypatch
     ):
@@ -514,6 +529,24 @@ class TestCmdSetupGuardrails:
         assert result == 0
         assert (subprocess_repo / ".githooks" / "pre-push").exists()
         assert (subprocess_repo / "scripts" / "verify-pr.sh").exists()
+
+    def test_cmd_setup_guardrails_reports_flat_config_layout_error(
+        self, tmp_path, capsys
+    ):
+        flat = tmp_path / ".issue-orchestrator/config/default.yaml"
+        flat.parent.mkdir(parents=True)
+        flat.write_text("agents: {}\n", encoding="utf-8")
+        args = argparse.Namespace(
+            config=str(flat),
+            target=str(tmp_path),
+            validation_cmd=None,
+            hooks_dir=None,
+        )
+
+        result = cmd_setup_guardrails(args)
+
+        assert result == 1
+        assert "config/modes/<mode>/" in capsys.readouterr().out
 
     def test_cmd_setup_guardrails_requires_validation_cmd(self, tmp_path, monkeypatch):
         repo = tmp_path / "repo"

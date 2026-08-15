@@ -848,15 +848,16 @@ def test_synthetic_raw_tui_review_exchange_suppresses_bootstrap_response(
 @pytest.mark.skipif(not _CODEX_READY, reason="codex CLI not installed or not logged in")
 @pytest.mark.live_codex
 def test_real_interactive_codex_reviewer_round_trips_through_exchange(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """LIVE smoke: REAL interactive codex as the reviewer through the REAL
     exchange loop — the seams no stub covers:
 
       - the production ``build_reviewer_prompt`` output driving real codex,
       - the exchange-built provider command (no ``command`` override),
-      - codex booting in the exchange-created reviewer worktree and calling
-        back into the orchestrator-owned mailbox through ``exchange-respond``,
+      - codex booting in the exchange-created reviewer worktree and writing
+        its verdict through the sandbox-compatible response-file channel,
       - real codex emitting protocol-valid verdict JSON the exchange parses.
 
     The verdict itself is the LLM's judgment and is deliberately NOT pinned:
@@ -867,7 +868,17 @@ def test_real_interactive_codex_reviewer_round_trips_through_exchange(
     If codex requests changes, the stub coder responds and round 2 also
     exercises ``send_round`` injection into real codex through the exchange.
     """
+    from issue_orchestrator.infra.hooks.codex_session import (
+        codex_runtime_home,
+        prepare_codex_runtime_home,
+    )
+
     coder_wt, _branch = _bootstrap_git_worktree(tmp_path)
+    monkeypatch.setenv(
+        "ISSUE_ORCHESTRATOR_CODEX_RUNTIME_ROOT",
+        str(tmp_path / ".test-codex-runtime"),
+    )
+    prepare_codex_runtime_home()
     prompt_path = tmp_path / "prompt.md"
     prompt_path.write_text("Stub agent prompt", encoding="utf-8")
 
@@ -881,16 +892,16 @@ def test_real_interactive_codex_reviewer_round_trips_through_exchange(
     )
     # Reviewer = REAL codex: ai_system only, no command override, so the
     # exchange builds the production interactive invocation itself.
-    # Low reasoning effort keeps the live review fast; approval_mode=yolo is
-    # required because the mailbox verdict is delivered through the loopback
-    # Control API, which Codex's workspace-write sandbox blocks. The model is
-    # left unset on purpose — the claude-vocabulary field default must NOT leak
-    # into the codex invocation (the second bug this smoke test caught).
+    # Low reasoning effort keeps the live review fast. The protected Codex
+    # session hook requires an enforcing sandbox, so this production-path smoke
+    # uses the same full-auto mode as repository configs. The model is left
+    # unset on purpose — the claude-vocabulary field default must NOT leak into
+    # the codex invocation (the second bug this smoke test caught).
     reviewer = AgentConfig(
         prompt_path=prompt_path,
         ai_system="codex",
         timeout_minutes=10,
-        provider_args={"reasoning_effort": "low", "approval_mode": "yolo"},
+        provider_args={"reasoning_effort": "low", "approval_mode": "full-auto"},
     )
     config = _make_config(tmp_path, coder, reviewer_agent=reviewer)
 
@@ -904,7 +915,7 @@ def test_real_interactive_codex_reviewer_round_trips_through_exchange(
     with _review_exchange_mailbox_server(monkeypatch) as (
         port,
         mailbox,
-        deliveries,
+        _deliveries,
     ):
         config.control_api_port = port
         cre = CompletionReviewExchange(
@@ -934,8 +945,6 @@ def test_real_interactive_codex_reviewer_round_trips_through_exchange(
             event_context=EventContext(),
         )
 
-    assert deliveries, "real codex did not deliver a verdict through the mailbox"
-
     round_completed = [
         evt
         for evt in captured_events
@@ -959,6 +968,9 @@ def test_real_interactive_codex_reviewer_round_trips_through_exchange(
     assert outcome.reason not in mechanics_failures, (
         f"exchange mechanics failed with real codex: {outcome}"
     )
+    assert 'trust_level = "trusted"' not in (
+        codex_runtime_home() / "config.toml"
+    ).read_text(encoding="utf-8")
     assert outcome.rounds >= 1
 
 
@@ -1709,7 +1721,8 @@ def test_persistent_pair_response_and_completion_paths_stable_across_exchanges(
 
 
 def test_persistent_review_exchange_end_to_end_through_mailbox(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Activate the orchestrator-owned mailbox end to end (PR #6550 finding 1).
 

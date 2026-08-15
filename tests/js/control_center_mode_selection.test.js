@@ -192,6 +192,32 @@ test('a repository configured only in a non-default mode can start', () => {
     assert.doesNotMatch(html, /Needs Setup/);
 });
 
+test('discovered repositories expose only strict ready or setup states', () => {
+    const { context } = loadSelectionHelpers();
+    const ready = context.renderDiscoveredRepoCard({
+        path: '/ready',
+        name: 'ready',
+        status: 'ready',
+        configs: ['main.yaml'],
+    });
+    const needsSetup = context.renderDiscoveredRepoCard({
+        path: '/flat-only',
+        name: 'flat-only',
+        status: 'needs_setup',
+        configs: [],
+    });
+
+    assert.match(ready, />Ready</);
+    assert.match(ready, /data-action="register"/);
+    assert.match(needsSetup, />Needs Setup</);
+    assert.match(needsSetup, /data-action="setup"/);
+    assert.equal(
+        context.repoHasConfig({ status: 'legacy', configs: [] }),
+        false,
+    );
+    assert.doesNotMatch(`${ready}${needsSetup}`, /Legacy config/);
+});
+
 test('changing the card mode persists and rerenders that mode config list', async () => {
     const { context } = loadSelectionHelpers();
     const repo = repository();

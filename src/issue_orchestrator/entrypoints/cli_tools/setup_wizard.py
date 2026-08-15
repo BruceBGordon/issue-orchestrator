@@ -1,5 +1,6 @@
 """Interactive setup wizard for issue-orchestrator."""
 
+import shlex
 import sys
 from pathlib import Path
 from collections.abc import Iterable, Mapping, MutableMapping
@@ -1373,9 +1374,10 @@ def run_wizard(  # noqa: C901, PLR0912 - main wizard entry point with prerequisi
 
     # Determine config file path and collect the write
     # Use absolute paths to avoid issues with cwd
-    from ...infra.config import CONFIG_DIR, DEFAULT_CONFIG_NAME
+    from ...infra.config import get_config_path
 
-    default_config_path = f"{CONFIG_DIR}/modes/default/{DEFAULT_CONFIG_NAME}"
+    default_config_path = get_config_path(target_path)
+    default_config_display = default_config_path.relative_to(target_path).as_posix()
 
     if existing_config_path:
         output_path = (
@@ -1384,14 +1386,30 @@ def run_wizard(  # noqa: C901, PLR0912 - main wizard entry point with prerequisi
             else existing_config_path
         )
     elif dry_run:
-        output_path = target_path / default_config_path
+        output_path = default_config_path
     else:
         user_path = Path(
-            prompter.input(f"Config filename ({target_path}/)", default_config_path)
+            prompter.input(f"Config filename ({target_path}/)", default_config_display)
         )
         output_path = (
             target_path / user_path if not user_path.is_absolute() else user_path
         )
+
+    def selected_command(subcommand: str, *, config_is_global: bool = False) -> str:
+        try:
+            displayed_path = output_path.resolve().relative_to(target_path.resolve())
+        except ValueError:
+            displayed_path = output_path.resolve()
+        config_option = f"--config {shlex.quote(str(displayed_path))}"
+        if config_is_global:
+            return f"issue-orchestrator {config_option} {subcommand}"
+        return f"issue-orchestrator {subcommand} {config_option}"
+
+    setup_hooks_command = selected_command("setup-hooks")
+    setup_guardrails_command = selected_command("setup-guardrails")
+    doctor_command = selected_command("doctor")
+    init_command = selected_command("init", config_is_global=True)
+    start_command = selected_command("start", config_is_global=True)
 
     setup_owner = build_repository_setup_owner(
         _create_cli_repository_setup_host,
@@ -1461,7 +1479,7 @@ def run_wizard(  # noqa: C901, PLR0912 - main wizard entry point with prerequisi
             except Exception as exc:
                 prompter.print(f"\n⚠ Repo guardrail setup failed: {exc}")
                 prompter.print(
-                    "  You can retry later with: issue-orchestrator setup-guardrails"
+                    f"  You can retry later with: {setup_guardrails_command}"
                 )
     else:
         install_hooks_now = prompter.yes_no(
@@ -1485,13 +1503,11 @@ def run_wizard(  # noqa: C901, PLR0912 - main wizard entry point with prerequisi
                     )
             except Exception as exc:
                 prompter.print(f"\n⚠ Hook installation failed: {exc}")
-                prompter.print(
-                    "  You can retry later with: issue-orchestrator setup-hooks"
-                )
+                prompter.print(f"  You can retry later with: {setup_hooks_command}")
         if not publish_validation_cmd:
             prompter.print(
                 "\nRepo-local pre-push guardrails skipped: configure validation.publish.cmd first, "
-                "then run 'issue-orchestrator setup-guardrails'."
+                f"then run '{setup_guardrails_command}'."
             )
 
     # Optional AI provider key setup
@@ -1530,22 +1546,22 @@ def run_wizard(  # noqa: C901, PLR0912 - main wizard entry point with prerequisi
 
     if not setup_repo_guardrails_now and has_validation_cmd:
         prompter.print(
-            f"\n  {step_number}. Install repo guardrails + AI hooks (recommended): issue-orchestrator setup-guardrails"
+            f"\n  {step_number}. Install repo guardrails + AI hooks (recommended): {setup_guardrails_command}"
         )
         step_number += 1
     elif not install_hooks_now:
         prompter.print(
-            f"\n  {step_number}. Install AI agent hooks (recommended): issue-orchestrator setup-hooks"
+            f"\n  {step_number}. Install AI agent hooks (recommended): {setup_hooks_command}"
         )
         step_number += 1
         prompter.print(
-            f"  {step_number}. Configure validation.publish.cmd, then set up repo guardrails (recommended): issue-orchestrator setup-guardrails"
+            f"  {step_number}. Configure validation.publish.cmd, then set up repo guardrails (recommended): {setup_guardrails_command}"
         )
         step_number += 1
 
-    prompter.print(f"\n  {step_number}. Run: issue-orchestrator doctor")
+    prompter.print(f"\n  {step_number}. Run: {doctor_command}")
     step_number += 1
-    prompter.print(f"\n  {step_number}. Run: issue-orchestrator init")
+    prompter.print(f"\n  {step_number}. Run: {init_command}")
     step_number += 1
     prompter.print(
         f"\n  {step_number}. Commit the generated onboarding files before start."
@@ -1573,7 +1589,7 @@ def run_wizard(  # noqa: C901, PLR0912 - main wizard entry point with prerequisi
         prompter.print(f"     • {label}")
     step_number += 1
 
-    prompter.print(f"\n  {step_number}. Run: issue-orchestrator start")
+    prompter.print(f"\n  {step_number}. Run: {start_command}")
 
     if _config_uses_claude_code(config):
         _print_claude_code_next_steps(prompter, config)

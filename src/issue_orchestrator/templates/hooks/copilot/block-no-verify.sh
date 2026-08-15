@@ -26,7 +26,7 @@ input="$(< /dev/stdin)"
 
 fallback_block_no_verify() {
     local payload="$1"
-    if [[ "$payload" == *"--no-verify"* && "$payload" == *"git"* ]]; then
+    if [[ "$payload" == *"--no-veri"* && "$payload" == *"git"* ]]; then
         return 0
     fi
     if [[ "$payload" == *"gh pr merge"* ]]; then
@@ -35,13 +35,10 @@ fallback_block_no_verify() {
     if [[ "$payload" == *"gh api"* && "$payload" == *"/merge"* ]]; then
         return 0
     fi
-    if [[ "$payload" == *"git commit -n"* ]]; then
+    if [[ "$payload" == *"git commit"* && "$payload" == *"-n"* ]]; then
         return 0
     fi
-    if [[ "$payload" == *"core.hooksPath=/dev/null"* ]]; then
-        return 0
-    fi
-    if [[ "$payload" == *"git config"* && "$payload" == *"core.hooksPath"* && "$payload" == *"/dev/null"* ]]; then
+    if [[ "$payload" == *"git"* && "$payload" == *"core.hooksPath"* ]]; then
         return 0
     fi
     return 1

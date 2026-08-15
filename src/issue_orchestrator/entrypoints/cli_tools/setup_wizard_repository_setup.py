@@ -16,6 +16,7 @@ from ...control.repository_setup import (
 )
 from ...domain.repository_config_name import RepositoryConfigName
 from ...infra.config import get_config_path
+from ...infra.config_paths import require_engine_launch_config_path
 from ...ports.repository_setup import (
     RepositorySetupConfigTarget,
     RepositorySetupExplicitConfig,
@@ -117,7 +118,7 @@ def _config_target(
     config_path: Path,
 ) -> RepositorySetupConfigTarget:
     resolved_root = repo_root.resolve()
-    resolved_path = config_path.resolve()
+    resolved_path = require_engine_launch_config_path(config_path)
     try:
         name = RepositoryConfigName(resolved_path.name)
     except ValueError:

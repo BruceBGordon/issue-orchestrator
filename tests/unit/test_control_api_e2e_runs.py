@@ -424,7 +424,9 @@ class TestE2ETriageEndpoint:
         from issue_orchestrator.infra.e2e_db import E2EDB
 
         # Create config file for _load_config_by_name
-        config_dir = tmp_path / ".issue-orchestrator" / "config"
+        config_dir = (
+            tmp_path / ".issue-orchestrator" / "config" / "modes" / "default"
+        )
         config_dir.mkdir(parents=True)
         (config_dir / "default.yaml").write_text("repo:\n  name: test/repo\ne2e:\n  enabled: true\n  pytest_paths: ['tests/e2e']\n")
 
@@ -499,7 +501,9 @@ class TestE2ETriageEndpoint:
         from issue_orchestrator.infra.e2e_db import E2EDB
 
         # Create config file for _load_config_by_name
-        config_dir = tmp_path / ".issue-orchestrator" / "config"
+        config_dir = (
+            tmp_path / ".issue-orchestrator" / "config" / "modes" / "default"
+        )
         config_dir.mkdir(parents=True)
         (config_dir / "default.yaml").write_text("repo:\n  name: test/repo\ne2e:\n  enabled: true\n  pytest_paths: ['tests/e2e']\n")
 

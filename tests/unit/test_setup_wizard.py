@@ -644,7 +644,7 @@ class TestFindExistingConfig:
 
     def test_finds_config_in_current_dir(self, tmp_path):
         """Test finding config in current directory."""
-        config_dir = tmp_path / ".issue-orchestrator" / "config"
+        config_dir = tmp_path / ".issue-orchestrator/config/modes/default"
         config_dir.mkdir(parents=True)
         config_file = config_dir / "default.yaml"
         config_file.write_text("repo:\n  name: owner/repo\nagents: {}")
@@ -655,8 +655,8 @@ class TestFindExistingConfig:
         assert config["repo"]["name"] == "owner/repo"
 
     def test_finds_config_in_hidden_dir(self, tmp_path):
-        """Test finding config in .issue-orchestrator/config directory."""
-        config_dir = tmp_path / ".issue-orchestrator" / "config"
+        """Test finding a named config in the default mode directory."""
+        config_dir = tmp_path / ".issue-orchestrator/config/modes/default"
         config_dir.mkdir(parents=True)
         config_file = config_dir / "custom.yaml"
         config_file.write_text("repo:\n  name: owner/repo")
@@ -672,10 +672,21 @@ class TestFindExistingConfig:
         assert path is None
         assert config is None
 
+    def test_ignores_flat_managed_config(self, tmp_path):
+        """Flat managed configs are not valid setup inputs."""
+        config_file = tmp_path / ".issue-orchestrator/config/default.yaml"
+        config_file.parent.mkdir(parents=True)
+        config_file.write_text("repo:\n  name: owner/repo\n")
+
+        path, config = find_existing_config(tmp_path)
+
+        assert path is None
+        assert config is None
+
     def test_prefers_root_over_hidden(self, tmp_path):
         """Test that default.yaml is preferred over other yaml files."""
         # Create default config
-        config_dir = tmp_path / ".issue-orchestrator" / "config"
+        config_dir = tmp_path / ".issue-orchestrator/config/modes/default"
         config_dir.mkdir(parents=True)
         default_config = config_dir / "default.yaml"
         default_config.write_text("repo:\n  name: default/repo")
@@ -691,11 +702,11 @@ class TestFindExistingConfig:
 
 
 class TestFindExistingDefaultConfig:
-    """Test legacy Control Center config discovery."""
+    """Test default-mode Control Center config discovery."""
 
     def test_only_finds_default_yaml(self, tmp_path):
         """Control Center detection should ignore non-default config files."""
-        config_dir = tmp_path / ".issue-orchestrator" / "config"
+        config_dir = tmp_path / ".issue-orchestrator/config/modes/default"
         config_dir.mkdir(parents=True)
         (config_dir / "custom.yaml").write_text("repo:\n  name: owner/repo")
 
@@ -706,7 +717,7 @@ class TestFindExistingDefaultConfig:
 
     def test_returns_path_and_none_when_config_cannot_be_read(self, tmp_path):
         """Control Center detection should preserve the path on read failure."""
-        config_dir = tmp_path / ".issue-orchestrator" / "config"
+        config_dir = tmp_path / ".issue-orchestrator/config/modes/default"
         config_dir.mkdir(parents=True)
         config_file = config_dir / "default.yaml"
         config_file.write_text("repo:\n  name: owner/repo")
@@ -1839,7 +1850,7 @@ class TestRunWizard:
                 "",  # filtering label
                 False,  # disable review
                 # Post-wizard (new flow)
-                ".issue-orchestrator.yaml",  # config filename
+                "",  # accept the mode-scoped default config filename
                 True,  # Apply these changes?
                 False,  # Install repo-local guardrails and AI agent hooks now?
                 False,  # Set up AI provider API keys now?
@@ -1862,20 +1873,35 @@ class TestRunWizard:
                     run_wizard(target_path=target, prompter=prompter)
 
         # Verify files were created
-        assert (target / ".issue-orchestrator.yaml").exists() or any(
+        config_path = target / ".issue-orchestrator/config/modes/default/default.yaml"
+        assert config_path.exists() or any(
             "apply" in msg.lower() for msg in prompter.printed
         )
         printed = "\n".join(prompter.printed)
         assert (
-            "Install repo guardrails + AI hooks (recommended): issue-orchestrator setup-guardrails"
+            "Install repo guardrails + AI hooks (recommended): "
+            "issue-orchestrator setup-guardrails --config "
+            ".issue-orchestrator/config/modes/default/default.yaml"
             in printed
         )
-        assert "Run: issue-orchestrator doctor" in printed
+        assert (
+            "Run: issue-orchestrator doctor --config "
+            ".issue-orchestrator/config/modes/default/default.yaml"
+        ) in printed
+        assert (
+            "Run: issue-orchestrator --config "
+            ".issue-orchestrator/config/modes/default/default.yaml init"
+        ) in printed
+        assert (
+            "Run: issue-orchestrator --config "
+            ".issue-orchestrator/config/modes/default/default.yaml start"
+        ) in printed
         assert printed.index("issue-orchestrator setup-guardrails") < printed.index(
             "issue-orchestrator doctor"
         )
         assert printed.index("issue-orchestrator doctor") < printed.index(
-            "issue-orchestrator start"
+            "issue-orchestrator --config "
+            ".issue-orchestrator/config/modes/default/default.yaml start"
         )
         assert "Trusted session interactions are enabled." in printed
         assert "auto-accept Claude's initial trust prompt" in printed

@@ -26,6 +26,42 @@ def test_check_hook_verification_no_agents_reports_ai_agent_check():
     )
 
 
+def test_missing_hooks_remediation_preserves_selected_config(
+    tmp_path, monkeypatch
+):
+    config_path = tmp_path / ".issue-orchestrator/config/modes/default/main.yaml"
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text(
+        "agents:\n"
+        "  agent:reviewer:\n"
+        "    prompt: reviewer.md\n"
+        "    provider: codex\n"
+        "    ai_system: codex\n"
+    )
+    config = Config.load(config_path)
+    adapter = MagicMock()
+    adapter.is_installed.return_value = False
+    monkeypatch.setattr(
+        "issue_orchestrator.infra.doctor.checks.hooks.get_adapter",
+        lambda _agent_type: adapter,
+    )
+    monkeypatch.setattr(
+        "issue_orchestrator.infra.doctor.checks.hooks._get_unsupported_types",
+        lambda _agent_types: set(),
+    )
+
+    checks = hook_checks.check_hook_verification(config)
+
+    installation = next(
+        check for check in checks if check.name == "AI Agent Hooks (Installation)"
+    )
+    assert installation.status == "error"
+    assert (
+        "issue-orchestrator setup-hooks --config "
+        ".issue-orchestrator/config/modes/default/main.yaml"
+    ) in installation.detail
+
+
 def test_check_repo_guardrails_warns_when_not_installed(tmp_path):
     subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
     config = Config(repo_root=tmp_path)

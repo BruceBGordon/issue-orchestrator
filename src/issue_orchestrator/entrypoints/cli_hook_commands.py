@@ -11,6 +11,19 @@ from . import cli_support
 console = Console()
 
 
+def _target_root(args: argparse.Namespace, repo_root: Path) -> Path:
+    target = getattr(args, "target", None)
+    return Path(target).resolve() if target else repo_root
+
+
+def _record_installed_files(
+    files: list[Path], target_root: Path, installed: list[Path]
+) -> None:
+    for path in files:
+        console.print(f"  [green]✓[/green] {path.relative_to(target_root)}")
+        installed.append(path)
+
+
 def _print_setup_ai_gate_failure(
     *, agent_name: str, summary: str, details: str
 ) -> None:
@@ -247,23 +260,31 @@ def cmd_verify(args: argparse.Namespace) -> int:  # noqa: C901, PLR0912 - multi-
 
 def cmd_setup_hooks(args: argparse.Namespace) -> int:  # noqa: C901, PLR0912 - multi-step setup with per-agent install, verify, and AI gate tests
     """Install AI agent hooks for the target project."""
-    from ..infra.ai_gate_state import load_ai_gate_state, save_ai_gate_state
+    from ..infra.ai_gate_state import (
+        invalidate_ai_gate_state,
+        load_ai_gate_state,
+        save_ai_gate_state,
+    )
     from ..infra.hooks.hooks import (
         UnsupportedAiAgentError,
         detect_agents_from_config,
         format_ai_gate_console_details,
         get_adapter,
+        install_shared_hook_policy,
         summarize_ai_gate_message,
+        validate_hook_installation_targets,
     )
 
     console.print("[bold cyan]Installing AI Agent Hooks[/bold cyan]\n")
 
     # Load config
     try:
-        config = cli_support.load_config(args)
-    except FileNotFoundError as exc:
+        config = cli_support.load_config(args, allow_maintenance_config=True)
+    except (FileNotFoundError, ValueError) as exc:
         console.print(f"[red]Error: {exc}[/red]")
-        console.print("No config found. Run 'issue-orchestrator setup' to create one.")
+        console.print(
+            "Use a mode-scoped config, or run 'issue-orchestrator setup' to create one."
+        )
         return 1
 
     # Detect AI agents from config
@@ -277,11 +298,7 @@ def cmd_setup_hooks(args: argparse.Namespace) -> int:  # noqa: C901, PLR0912 - m
     console.print()
 
     # Determine target directory
-    target_root = (
-        Path(args.target).resolve()
-        if hasattr(args, "target") and args.target
-        else config.repo_root
-    )
+    target_root = _target_root(args, config.repo_root)
 
     console.print(f"[bold]Target Project:[/bold] {target_root}\n")
 
@@ -290,16 +307,24 @@ def cmd_setup_hooks(args: argparse.Namespace) -> int:  # noqa: C901, PLR0912 - m
     supported_adapters = []
     verification_failures = []
 
+    try:
+        validate_hook_installation_targets(config, target_root)
+        invalidate_ai_gate_state(target_root)
+        shared_policy = install_shared_hook_policy(target_root)
+        console.print(f"  [green]✓[/green] {shared_policy.relative_to(target_root)}")
+        installed.append(shared_policy)
+    except (OSError, RuntimeError, UnsupportedAiAgentError, ValueError) as exc:
+        reason = getattr(exc, "reason", str(exc))
+        console.print(f"[red]Error: {reason}[/red]")
+        return 1
+
     for agent_type in unique_types:
         try:
             adapter = get_adapter(agent_type)
 
             console.print(f"[cyan]Installing hooks for {agent_type.value}...[/cyan]")
             files = adapter.install_hooks(target_root)
-
-            for f in files:
-                console.print(f"  [green]✓[/green] {f.relative_to(target_root)}")
-                installed.append(f)
+            _record_installed_files(files, target_root, installed)
 
             # Verify installation
             result = adapter.verify_hooks(target_root)
@@ -314,8 +339,9 @@ def cmd_setup_hooks(args: argparse.Namespace) -> int:  # noqa: C901, PLR0912 - m
                     console.print(f"    [red]✗[/red] {failure}")
                 verification_failures.append(agent_type.value)
 
-        except UnsupportedAiAgentError as exc:
-            console.print(f"  [red]✗[/red] {agent_type.value}: {exc.reason}")
+        except (OSError, RuntimeError, UnsupportedAiAgentError, ValueError) as exc:
+            reason = getattr(exc, "reason", str(exc))
+            console.print(f"  [red]✗[/red] {agent_type.value}: {reason}")
             errors.append(str(exc))
 
     console.print()
@@ -325,7 +351,7 @@ def cmd_setup_hooks(args: argparse.Namespace) -> int:  # noqa: C901, PLR0912 - m
             f"[bold red]Setup completed with {len(errors)} error(s)[/bold red]"
         )
         console.print(
-            "\n[yellow]Some AI agents are not supported. Consider using Claude Code.[/yellow]"
+            "\n[yellow]One or more hook installations failed; fix the errors above and retry.[/yellow]"
         )
         return 1
 
@@ -417,16 +443,14 @@ def cmd_setup_guardrails(args: argparse.Namespace) -> int:
 
     try:
         config = cli_support.load_config(args)
-    except FileNotFoundError as exc:
+    except (FileNotFoundError, ValueError) as exc:
         console.print(f"[red]Error: {exc}[/red]")
-        console.print("No config found. Run 'issue-orchestrator setup' first.")
+        console.print(
+            "Use a mode-scoped config, or run 'issue-orchestrator setup' first."
+        )
         return 1
 
-    target_root = (
-        Path(args.target).resolve()
-        if getattr(args, "target", None)
-        else config.repo_root
-    )
+    target_root = _target_root(args, config.repo_root)
     validation_cmd = getattr(args, "validation_cmd", None)
     hooks_path = getattr(args, "hooks_dir", None)
 
