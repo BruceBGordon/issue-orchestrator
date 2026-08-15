@@ -39,8 +39,9 @@ what that covers.
    issue-orchestrator-mcp --help
    ```
 
-2. Create a repo config at `.issue-orchestrator/config/default.yaml` in the
-   repository you want to control. Start from
+2. Create a repo config at
+   `.issue-orchestrator/config/modes/default/default.yaml` in the repository
+   you want to control. Start from
    [`examples/config.example.yaml`](../../examples/config.example.yaml) if
    you're new. **The config file must exist** — the server exits immediately
    with `Config file not found: <path>` otherwise.
@@ -64,7 +65,8 @@ MCP **client** launches it; you don't start it by hand.
 |------|---------|---------|
 | `--repo-root PATH` | current working directory | Repository this server controls. |
 | `--config PATH` | *(unset)* | Explicit path to a config file. When given without `--repo-root`, the repo root is read from the config's `repo_root`. |
-| `--config-name NAME` | `default.yaml` | Config filename to resolve under `<repo-root>/.issue-orchestrator/config/`. Ignored when `--config` is given. |
+| `--config-name NAME` | `default.yaml` | Config filename to resolve inside the selected mode directory. Ignored when `--config` is given. |
+| `--mode NAME` | `default` | Configuration mode to resolve under `<repo-root>/.issue-orchestrator/config/modes/`. Ignored when `--config` is given. |
 | `--instance-id ID` | *(unset)* | Selects one instance when a repo runs multiple orchestrators. |
 | `--host HOST` | `127.0.0.1` | Host used for outgoing Control API calls. |
 | `--auto-start` | off | Start the orchestrator on demand if it isn't running. Without it, engine-level tools fail with `Orchestrator not running`. |

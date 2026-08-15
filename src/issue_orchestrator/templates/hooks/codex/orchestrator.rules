@@ -1,6 +1,6 @@
 # Orchestrator safety rules for Codex CLI
 # These rules prevent agents from bypassing pre-push hooks
-# Install to: ~/.codex/rules/orchestrator.rules
+# Install to: .codex/rules/orchestrator.rules
 
 # Block git push --no-verify (and variants)
 prefix_rule(

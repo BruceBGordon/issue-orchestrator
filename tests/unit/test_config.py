@@ -694,8 +694,7 @@ agents:
   agent:test:
     prompt: /tmp/prompt.txt
 """
-        # Config is now in .issue-orchestrator/config/default.yaml
-        config_dir = tmp_path / ".issue-orchestrator" / "config"
+        config_dir = tmp_path / ".issue-orchestrator/config/modes/default"
         config_dir.mkdir(parents=True)
         config_file = config_dir / "default.yaml"
         config_file.write_text(config_content)
@@ -713,8 +712,7 @@ agents:
   agent:parent:
     prompt: /tmp/prompt.txt
 """
-        # Config is now in .issue-orchestrator/config/default.yaml
-        config_dir = tmp_path / ".issue-orchestrator" / "config"
+        config_dir = tmp_path / ".issue-orchestrator/config/modes/default"
         config_dir.mkdir(parents=True)
         config_file = config_dir / "default.yaml"
         config_file.write_text(config_content)
@@ -731,8 +729,7 @@ agents:
 
     def test_config_find_and_load_in_hidden_dir(self, tmp_path, monkeypatch):
         """Test finding config in .issue-orchestrator/config subdirectory."""
-        # Config is now in .issue-orchestrator/config/default.yaml
-        config_dir = tmp_path / ".issue-orchestrator" / "config"
+        config_dir = tmp_path / ".issue-orchestrator/config/modes/default"
         config_dir.mkdir(parents=True)
 
         config_content = """
@@ -757,9 +754,8 @@ agents:
             Config.find_and_load()
 
     def test_config_find_uses_standard_location(self, tmp_path, monkeypatch):
-        """Test that config is loaded from .issue-orchestrator/config/ directory."""
-        # Config must be in .issue-orchestrator/config/default.yaml
-        config_dir = tmp_path / ".issue-orchestrator" / "config"
+        """Test that config is loaded from the default mode directory."""
+        config_dir = tmp_path / ".issue-orchestrator/config/modes/default"
         config_dir.mkdir(parents=True)
 
         config_content = """

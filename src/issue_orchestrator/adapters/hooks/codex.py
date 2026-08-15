@@ -162,6 +162,9 @@ class CodexAdapter(AiAgentAdapter):
         data = json.loads(result.stdout)
         decision = data.get("decision") or data.get("strictest_decision")
         if decision is None:
+            matched_rules = data.get("matchedRules")
+            if matched_rules == []:
+                return True
             # Fallback: search any decision-like field
             serialized = json.dumps(data).lower()
             if "forbidden" in serialized:

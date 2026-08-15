@@ -73,7 +73,7 @@ class RepoStatus:
 
     path: str
     name: str
-    config_status: Literal["ready", "needs_setup", "legacy"]
+    config_status: Literal["ready", "needs_setup"]
     orchestrator_state: Literal["running", "stopped", "failed", "paused"]
     orchestrator_pid: int | None = None
     orchestrator_port: int | None = None
@@ -282,7 +282,7 @@ def get_orchestrator_details(
 def _get_config_status(
     repo_path: Path,
 ) -> tuple[
-    Literal["ready", "needs_setup", "legacy"],
+    Literal["ready", "needs_setup"],
     list[str],
     dict[str, list[str]],
 ]:
@@ -294,10 +294,6 @@ def _get_config_status(
     mode_configs = {mode: list_configs(repo_path, mode) for mode in modes}
     if any(mode_configs.values()):
         return "ready", modes, mode_configs
-
-    legacy_config = (repo_path / ".issue-orchestrator.yaml").exists()
-    if legacy_config:
-        return "legacy", [], {}
 
     return "needs_setup", [], {}
 

@@ -155,8 +155,6 @@ def find_existing_config(
     candidates = [
         f"{CONFIG_DIR}/modes/default/{DEFAULT_CONFIG_NAME}",
         f"{CONFIG_DIR}/modes/default/*.yaml",
-        f"{CONFIG_DIR}/{DEFAULT_CONFIG_NAME}",
-        f"{CONFIG_DIR}/*.yaml",
     ]
 
     current = start_path
@@ -184,7 +182,7 @@ def find_existing_config(
 def find_existing_default_config(
     start_path: Path | None = None,
 ) -> tuple[Path | None, dict | None]:
-    """Find the legacy default config used by the Control Center setup API."""
+    """Find the default mode config used by the Control Center setup API."""
     from ..infra.config import find_config_file
 
     config_path = find_config_file(start_path)

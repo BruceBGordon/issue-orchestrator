@@ -42,7 +42,7 @@ class TestLoadValidationCmd:
 
     def test_returns_none_when_no_cmd(self, temp_worktree):
         """Test returns None when cmd not configured."""
-        config_dir = temp_worktree / ".issue-orchestrator" / "config"
+        config_dir = temp_worktree / ".issue-orchestrator" / "config" / "modes" / "default"
         config_dir.mkdir(parents=True)
         config_path = config_dir / "default.yaml"
         config_path.write_text("some_key: value\n")
@@ -53,7 +53,7 @@ class TestLoadValidationCmd:
 
     def test_returns_cmd_when_configured(self, temp_worktree):
         """Test returns command when configured."""
-        config_dir = temp_worktree / ".issue-orchestrator" / "config"
+        config_dir = temp_worktree / ".issue-orchestrator" / "config" / "modes" / "default"
         config_dir.mkdir(parents=True, exist_ok=True)
         config_path = config_dir / "default.yaml"
         config_path.write_text("""
@@ -70,7 +70,7 @@ validation:
 
     def test_prefers_selected_config_name_env(self, temp_worktree, monkeypatch):
         """Test selected config name env overrides default config discovery."""
-        config_dir = temp_worktree / ".issue-orchestrator" / "config"
+        config_dir = temp_worktree / ".issue-orchestrator" / "config" / "modes" / "default"
         config_dir.mkdir(parents=True, exist_ok=True)
         (config_dir / "main.yaml").write_text("""
 validation:
@@ -88,7 +88,7 @@ validation:
 
     def test_missing_selected_config_name_raises(self, temp_worktree, monkeypatch):
         """Test explicit selected config name fails loudly when missing."""
-        config_dir = temp_worktree / ".issue-orchestrator" / "config"
+        config_dir = temp_worktree / ".issue-orchestrator" / "config" / "modes" / "default"
         config_dir.mkdir(parents=True, exist_ok=True)
         (config_dir / "default.yaml").write_text("""
 validation:
@@ -104,7 +104,7 @@ validation:
 
     def test_uses_default_timeout(self, temp_worktree):
         """Test uses default timeout when not specified."""
-        config_dir = temp_worktree / ".issue-orchestrator" / "config"
+        config_dir = temp_worktree / ".issue-orchestrator" / "config" / "modes" / "default"
         config_dir.mkdir(parents=True, exist_ok=True)
         config_path = config_dir / "default.yaml"
         config_path.write_text("""
@@ -120,7 +120,7 @@ validation:
 
     def test_reads_dirty_check_mode(self, temp_worktree):
         """Test reads dirty_check from config."""
-        config_dir = temp_worktree / ".issue-orchestrator" / "config"
+        config_dir = temp_worktree / ".issue-orchestrator" / "config" / "modes" / "default"
         config_dir.mkdir(parents=True, exist_ok=True)
         config_path = config_dir / "default.yaml"
         config_path.write_text("""
@@ -220,7 +220,7 @@ class TestRunPrepushCheck:
         """Test returns 0 when validation passes."""
 
         # Create config with passing command
-        config_dir = temp_worktree / ".issue-orchestrator" / "config"
+        config_dir = temp_worktree / ".issue-orchestrator" / "config" / "modes" / "default"
         config_dir.mkdir(parents=True)
         config_path = config_dir / "default.yaml"
         config_path.write_text("""
@@ -240,7 +240,7 @@ validation:
 
     def test_uses_selected_config_name_env_for_run(self, temp_worktree, monkeypatch):
         """Test full prepush run honors the selected config env."""
-        config_dir = temp_worktree / ".issue-orchestrator" / "config"
+        config_dir = temp_worktree / ".issue-orchestrator" / "config" / "modes" / "default"
         config_dir.mkdir(parents=True)
         marker_file = temp_worktree / "selected-validation-ran"
         (config_dir / "main.yaml").write_text(f"""
@@ -264,7 +264,7 @@ validation:
         """Test returns 1 when validation fails."""
 
         # Create config with failing command
-        config_dir = temp_worktree / ".issue-orchestrator" / "config"
+        config_dir = temp_worktree / ".issue-orchestrator" / "config" / "modes" / "default"
         config_dir.mkdir(parents=True)
         config_path = config_dir / "default.yaml"
         config_path.write_text("""
@@ -284,7 +284,7 @@ validation:
 
     def test_failed_validation_persists_hook_diagnostics(self, temp_worktree):
         """Test pre-push failures keep stdout/stderr artifacts after the hook exits."""
-        config_dir = temp_worktree / ".issue-orchestrator" / "config"
+        config_dir = temp_worktree / ".issue-orchestrator" / "config" / "modes" / "default"
         config_dir.mkdir(parents=True)
         config_path = config_dir / "default.yaml"
         config_path.write_text("""
@@ -355,7 +355,7 @@ validation:
         """Test uses cache on second run."""
 
         # Create config with command that creates a file (to track runs)
-        config_dir = temp_worktree / ".issue-orchestrator" / "config"
+        config_dir = temp_worktree / ".issue-orchestrator" / "config" / "modes" / "default"
         config_dir.mkdir(parents=True)
         marker_file = temp_worktree / "validation_ran"
         config_path = config_dir / "default.yaml"
@@ -409,7 +409,7 @@ validation:
     def test_blocks_when_tracked_dirty(self, temp_worktree):
         """Test blocks push when tracked files are dirty."""
 
-        config_dir = temp_worktree / ".issue-orchestrator" / "config"
+        config_dir = temp_worktree / ".issue-orchestrator" / "config" / "modes" / "default"
         config_dir.mkdir(parents=True)
         config_path = config_dir / "default.yaml"
         config_path.write_text("""
@@ -433,7 +433,7 @@ validation:
     def test_allows_when_dirty_check_off(self, temp_worktree):
         """Test allows push when dirty check is disabled."""
 
-        config_dir = temp_worktree / ".issue-orchestrator" / "config"
+        config_dir = temp_worktree / ".issue-orchestrator" / "config" / "modes" / "default"
         config_dir.mkdir(parents=True)
         config_path = config_dir / "default.yaml"
         config_path.write_text("""
@@ -456,7 +456,7 @@ validation:
     def test_allows_staged_when_unstaged_mode(self, temp_worktree):
         """Test unstaged mode allows staged changes."""
 
-        config_dir = temp_worktree / ".issue-orchestrator" / "config"
+        config_dir = temp_worktree / ".issue-orchestrator" / "config" / "modes" / "default"
         config_dir.mkdir(parents=True)
         config_path = config_dir / "default.yaml"
         config_path.write_text("""
@@ -485,7 +485,7 @@ validation:
     def test_blocks_when_all_mode_with_untracked_files(self, temp_worktree):
         """Mode 'all' blocks when untracked files are present."""
 
-        config_dir = temp_worktree / ".issue-orchestrator" / "config"
+        config_dir = temp_worktree / ".issue-orchestrator" / "config" / "modes" / "default"
         config_dir.mkdir(parents=True)
         config_path = config_dir / "default.yaml"
         config_path.write_text("""
@@ -508,7 +508,7 @@ validation:
     def test_rejects_invalid_dirty_mode(self, temp_worktree, capsys):
         """Test invalid dirty mode exits 1 and reports error when verbose."""
 
-        config_dir = temp_worktree / ".issue-orchestrator" / "config"
+        config_dir = temp_worktree / ".issue-orchestrator" / "config" / "modes" / "default"
         config_dir.mkdir(parents=True)
         config_path = config_dir / "default.yaml"
         config_path.write_text("""
@@ -531,7 +531,7 @@ validation:
     def test_dirty_only_skips_validation_command(self, temp_worktree):
         """Dirty-only mode should not execute validation command."""
 
-        config_dir = temp_worktree / ".issue-orchestrator" / "config"
+        config_dir = temp_worktree / ".issue-orchestrator" / "config" / "modes" / "default"
         config_dir.mkdir(parents=True)
         marker_file = temp_worktree / "validation_ran"
         config_path = config_dir / "default.yaml"
@@ -554,7 +554,7 @@ validation:
     def test_dirty_only_still_blocks_when_dirty(self, temp_worktree):
         """Dirty-only mode must still enforce dirty-tree policy."""
 
-        config_dir = temp_worktree / ".issue-orchestrator" / "config"
+        config_dir = temp_worktree / ".issue-orchestrator" / "config" / "modes" / "default"
         config_dir.mkdir(parents=True)
         config_path = config_dir / "default.yaml"
         config_path.write_text("""
@@ -577,7 +577,7 @@ validation:
     def test_allows_runtime_session_latest_dirty_file(self, temp_worktree):
         """Runtime session-latest metadata should not block dirty-tree guard."""
 
-        config_dir = temp_worktree / ".issue-orchestrator" / "config"
+        config_dir = temp_worktree / ".issue-orchestrator" / "config" / "modes" / "default"
         config_dir.mkdir(parents=True)
         config_path = config_dir / "default.yaml"
         config_path.write_text("""
@@ -617,7 +617,7 @@ validation:
     ):
         """Guard should still fail if non-excluded files are dirty."""
 
-        config_dir = temp_worktree / ".issue-orchestrator" / "config"
+        config_dir = temp_worktree / ".issue-orchestrator" / "config" / "modes" / "default"
         config_dir.mkdir(parents=True)
         config_path = config_dir / "default.yaml"
         config_path.write_text("""
@@ -657,7 +657,7 @@ validation:
     def test_allows_claude_settings_dirty_file(self, temp_worktree):
         """Claude CLI .claude/settings.json should not block dirty-tree guard."""
 
-        config_dir = temp_worktree / ".issue-orchestrator" / "config"
+        config_dir = temp_worktree / ".issue-orchestrator" / "config" / "modes" / "default"
         config_dir.mkdir(parents=True)
         config_path = config_dir / "default.yaml"
         config_path.write_text("""
@@ -700,7 +700,7 @@ validation:
         path where None collapsed to [] (PR #6159 reviewer feedback)."""
         from issue_orchestrator.execution import GitWorkingCopy
 
-        config_dir = temp_worktree / ".issue-orchestrator" / "config"
+        config_dir = temp_worktree / ".issue-orchestrator" / "config" / "modes" / "default"
         config_dir.mkdir(parents=True)
         marker_file = temp_worktree / "validation_ran"
         config_path = config_dir / "default.yaml"
@@ -731,7 +731,7 @@ validation:
     def test_verbose_output_lists_dirty_files(self, temp_worktree, capsys):
         """Verbose dirty guard output should include dirty file paths."""
 
-        config_dir = temp_worktree / ".issue-orchestrator" / "config"
+        config_dir = temp_worktree / ".issue-orchestrator" / "config" / "modes" / "default"
         config_dir.mkdir(parents=True)
         config_path = config_dir / "default.yaml"
         config_path.write_text("""
@@ -757,7 +757,7 @@ validation:
     def test_verbose_output_clips_dirty_file_list(self, temp_worktree, capsys):
         """Dirty file listing should be clipped with ellipsis for long lists."""
 
-        config_dir = temp_worktree / ".issue-orchestrator" / "config"
+        config_dir = temp_worktree / ".issue-orchestrator" / "config" / "modes" / "default"
         config_dir.mkdir(parents=True)
         config_path = config_dir / "default.yaml"
         config_path.write_text("""

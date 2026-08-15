@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 from pathlib import Path
 
 import pytest
@@ -10,11 +11,13 @@ from issue_orchestrator.domain.repository_launch_selection import (
     RepositoryLaunchSelection,
 )
 from issue_orchestrator.infra.config import Config
+from issue_orchestrator.entrypoints.cli_support import load_config
 from issue_orchestrator.infra.config_paths import (
     get_config_path,
     list_configs,
     list_modes,
     repo_root_from_config_path,
+    require_engine_launch_config_path,
     selection_from_config_path,
 )
 
@@ -110,30 +113,39 @@ def test_effective_fingerprint_refresh_is_stable_and_override_sensitive(
     assert len(config.config_fingerprint) == 64
 
 
-def test_non_default_mode_never_falls_back_to_flat_config(tmp_path: Path) -> None:
-    legacy = tmp_path / ".issue-orchestrator/config/main.yaml"
-    legacy.parent.mkdir(parents=True)
-    legacy.write_text("agents: {}\n", encoding="utf-8")
+def test_flat_managed_configs_are_not_discovered_or_resolved(tmp_path: Path) -> None:
+    flat = tmp_path / ".issue-orchestrator/config/main.yaml"
+    flat.parent.mkdir(parents=True)
+    flat.write_text("agents: {}\n", encoding="utf-8")
 
-    assert list_modes(tmp_path) == ["default"]
-    assert list_configs(tmp_path, "codex") == []
-    assert get_config_path(tmp_path, "main", "codex") != legacy
-
-
-def test_nested_default_mode_disables_per_file_legacy_fallback(tmp_path: Path) -> None:
-    nested = tmp_path / ".issue-orchestrator/config/modes/default"
-    nested.mkdir(parents=True)
-    (nested / "main.yaml").write_text("agents: {}\n", encoding="utf-8")
-    legacy = tmp_path / ".issue-orchestrator/config/legacy.yaml"
-    legacy.write_text("agents: {}\n", encoding="utf-8")
-
-    resolved = get_config_path(tmp_path, "legacy.yaml", "default")
-
-    assert resolved == nested / "legacy.yaml"
-    assert not resolved.exists()
+    assert list_modes(tmp_path) == []
+    assert list_configs(tmp_path, "default") == []
+    assert get_config_path(tmp_path, "main", "default") == (
+        tmp_path / ".issue-orchestrator/config/modes/default/main.yaml"
+    )
 
 
-def test_empty_default_mode_directory_disables_legacy_mode_discovery(
+def test_flat_managed_config_is_rejected_as_engine_launch_config(
+    tmp_path: Path,
+) -> None:
+    flat = tmp_path / ".issue-orchestrator/config/main.yaml"
+    flat.parent.mkdir(parents=True)
+    flat.write_text("agents: {}\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="config/modes/<mode>/"):
+        require_engine_launch_config_path(flat)
+
+
+def test_cli_rejects_explicit_flat_managed_config(tmp_path: Path) -> None:
+    flat = tmp_path / ".issue-orchestrator/config/main.yaml"
+    flat.parent.mkdir(parents=True)
+    flat.write_text("repo:\n  name: owner/repo\nagents: {}\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="config/modes/<mode>/"):
+        load_config(argparse.Namespace(config=str(flat), mode=None, set=[]))
+
+
+def test_empty_default_mode_directory_is_not_launchable(
     tmp_path: Path,
 ) -> None:
     config_dir = tmp_path / ".issue-orchestrator/config"

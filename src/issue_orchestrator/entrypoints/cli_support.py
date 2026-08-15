@@ -170,6 +170,7 @@ def load_config(args: argparse.Namespace) -> "Config":
         FileNotFoundError: If config file not found
     """
     from ..infra.config import Config
+    from ..infra.config_paths import require_engine_launch_config_path
 
     overrides = getattr(args, "set", None) or []
     if hasattr(args, "config") and args.config:
@@ -182,8 +183,15 @@ def load_config(args: argparse.Namespace) -> "Config":
                 "Explicit --mode does not match --config path: "
                 f"mode={explicit_mode!r} path_mode={config.configuration_mode!r}"
             )
+        loaded_path = config.config_path
+        if loaded_path is None:
+            raise ValueError("Loaded config did not retain its source path")
+        require_engine_launch_config_path(loaded_path)
         return config
-    return Config.find_and_load(
+    config = Config.find_and_load(
         overrides=overrides,
         mode=getattr(args, "mode", None) or "default",
     )
+    if config.config_path is not None:
+        require_engine_launch_config_path(config.config_path)
+    return config

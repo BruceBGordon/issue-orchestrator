@@ -1212,6 +1212,7 @@ class TestCodexAdapter:
         rules_file = temp_project / ".codex" / "rules" / "orchestrator.rules"
 
         content = rules_file.read_text()
+        assert "# Install to: .codex/rules/orchestrator.rules" in content
         assert 'decision = "forbidden"' in content
         assert 'pattern = ["git", "push", "--no-verify"]' in content
         assert 'pattern = ["gh", "pr", "merge"]' in content
@@ -1237,6 +1238,41 @@ class TestCodexAdapter:
         assert result.success
         assert result.meta_agent == AiAgentType.CODEX
         assert len(result.checks_failed) == 0
+
+    def test_verify_hooks_treats_empty_execpolicy_matches_as_allowed(
+        self, adapter, temp_project, monkeypatch
+    ):
+        adapter.install_hooks(temp_project)
+        monkeypatch.setattr(shutil, "which", lambda _cmd: "/usr/local/bin/codex")
+
+        def run_execpolicy(command, **_kwargs):
+            payload = (
+                {"matchedRules": [], "decision": None}
+                if command[-4:] == ["git", "push", "origin", "main"]
+                else {
+                    "matchedRules": [
+                        {
+                            "prefixRuleMatch": {
+                                "decision": "forbidden",
+                            }
+                        }
+                    ],
+                    "decision": "forbidden",
+                }
+            )
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout=json.dumps(payload),
+                stderr="",
+            )
+
+        monkeypatch.setattr(subprocess, "run", run_execpolicy)
+
+        result = adapter.verify_hooks(temp_project)
+
+        assert result.success
+        assert "execpolicy_allows:git push origin main" in result.checks_passed
 
     def test_verify_hooks_fails_when_not_installed(self, adapter, temp_project):
         result = adapter.verify_hooks(temp_project)

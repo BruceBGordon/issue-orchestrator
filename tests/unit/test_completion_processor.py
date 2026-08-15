@@ -74,7 +74,14 @@ from tests.unit.session_run_helpers import make_session_run_assets
 
 
 def _write_test_config(tmp_path: Path) -> Path:
-    config_path = tmp_path / ".issue-orchestrator" / "config" / "default.yaml"
+    config_path = (
+        tmp_path
+        / ".issue-orchestrator"
+        / "config"
+        / "modes"
+        / "default"
+        / "default.yaml"
+    )
     config_path.parent.mkdir(parents=True, exist_ok=True)
     if not config_path.exists():
         config_path.write_text(
@@ -694,7 +701,10 @@ class TestRuntimeArtifactBranchGuard:
         mock_git_adapter.branch_post_image_paths_against_base = Mock(
             return_value=BranchPathsResult(
                 success=True,
-                paths=(".issue-orchestrator/config/main.yaml", "src/app.py"),
+                paths=(
+                    ".issue-orchestrator/config/modes/default/main.yaml",
+                    "src/app.py",
+                ),
             )
         )
 

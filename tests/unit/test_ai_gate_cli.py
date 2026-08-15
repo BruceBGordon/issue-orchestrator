@@ -20,7 +20,7 @@ class TestAiGateCLI:
     def repo_with_config(self, tmp_path):
         """Create a minimal repo with config for testing."""
         # Create config directory
-        config_dir = tmp_path / ".issue-orchestrator" / "config"
+        config_dir = tmp_path / ".issue-orchestrator/config/modes/default"
         config_dir.mkdir(parents=True, exist_ok=True)
 
         # Create config file

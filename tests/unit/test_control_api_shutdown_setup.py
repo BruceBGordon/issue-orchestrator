@@ -490,10 +490,10 @@ class TestControlCenterSetupRoutes:
         assert not (repo_root / ".issue-orchestrator").exists()
 
     def test_setup_detect_ignores_non_default_config_files(self, tmp_path):
-        """Detect should only surface the legacy default config file."""
+        """Detect should only surface the default mode's default config file."""
         repo_root = tmp_path / "repo"
         repo_root.mkdir()
-        config_dir = repo_root / ".issue-orchestrator" / "config"
+        config_dir = repo_root / ".issue-orchestrator/config/modes/default"
         config_dir.mkdir(parents=True)
         (config_dir / "custom.yaml").write_text("repo:\n  name: owner/repo\n")
         (repo_root / "Makefile").write_text(
@@ -527,7 +527,9 @@ class TestControlCenterSetupRoutes:
     def test_setup_detect_never_returns_existing_inline_token(self, tmp_path):
         """Existing legacy secrets stay server-side until the user replaces them."""
         repo_root = tmp_path / "repo"
-        config_path = repo_root / ".issue-orchestrator/config/default.yaml"
+        config_path = (
+            repo_root / ".issue-orchestrator/config/modes/default/default.yaml"
+        )
         config_path.parent.mkdir(parents=True)
         config_path.write_text(
             "repo:\n"

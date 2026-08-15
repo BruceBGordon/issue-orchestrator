@@ -328,7 +328,7 @@ class TestSupervisorStartErrorSurfacing:
         )
 
         # Also need config dir for start() to work
-        config_dir = tmp_path / ".issue-orchestrator" / "config"
+        config_dir = tmp_path / ".issue-orchestrator" / "config" / "modes" / "default"
         config_dir.mkdir(parents=True)
         (config_dir / "default.yaml").write_text("agents: {}\n")
 
@@ -357,7 +357,7 @@ class TestSupervisorStartErrorSurfacing:
             "2024-01-01 [INFO] Some final message\n"
         )
 
-        config_dir = tmp_path / ".issue-orchestrator" / "config"
+        config_dir = tmp_path / ".issue-orchestrator" / "config" / "modes" / "default"
         config_dir.mkdir(parents=True)
         (config_dir / "default.yaml").write_text("agents: {}\n")
 
@@ -377,7 +377,7 @@ class TestSupervisorStartErrorSurfacing:
         state_dir = tmp_path / ".issue-orchestrator" / "state"
         state_dir.mkdir(parents=True)
 
-        config_dir = tmp_path / ".issue-orchestrator" / "config"
+        config_dir = tmp_path / ".issue-orchestrator" / "config" / "modes" / "default"
         config_dir.mkdir(parents=True)
         (config_dir / "default.yaml").write_text("agents: {}\n")
 
@@ -395,7 +395,7 @@ class TestSupervisorStartErrorSurfacing:
 
     def test_start_paused_adds_subprocess_flag(self, tmp_path: Path) -> None:
         """Supervisor passes --start-paused to the child process before launch."""
-        config_dir = tmp_path / ".issue-orchestrator" / "config"
+        config_dir = tmp_path / ".issue-orchestrator" / "config" / "modes" / "default"
         config_dir.mkdir(parents=True)
         (config_dir / "default.yaml").write_text("agents: {}\n")
 
@@ -417,7 +417,7 @@ class TestSupervisorStartErrorSurfacing:
 
     def test_start_log_level_adds_subprocess_flag(self, tmp_path: Path) -> None:
         """Supervisor passes explicit engine log level to the child process."""
-        config_dir = tmp_path / ".issue-orchestrator" / "config"
+        config_dir = tmp_path / ".issue-orchestrator" / "config" / "modes" / "default"
         config_dir.mkdir(parents=True)
         (config_dir / "default.yaml").write_text("agents: {}\n")
 
@@ -443,7 +443,7 @@ class TestSupervisorStartErrorSurfacing:
         """Supervisor lets Control Center opt repository engines into DEBUG logs."""
         from issue_orchestrator.infra.supervisor import ENGINE_LOG_LEVEL_ENV
 
-        config_dir = tmp_path / ".issue-orchestrator" / "config"
+        config_dir = tmp_path / ".issue-orchestrator" / "config" / "modes" / "default"
         config_dir.mkdir(parents=True)
         (config_dir / "default.yaml").write_text("agents: {}\n")
         monkeypatch.setenv(ENGINE_LOG_LEVEL_ENV, "debug")
@@ -470,7 +470,7 @@ class TestSupervisorStartErrorSurfacing:
         """Invalid engine log-level env should fail fast instead of launching."""
         from issue_orchestrator.infra.supervisor import ENGINE_LOG_LEVEL_ENV
 
-        config_dir = tmp_path / ".issue-orchestrator" / "config"
+        config_dir = tmp_path / ".issue-orchestrator" / "config" / "modes" / "default"
         config_dir.mkdir(parents=True)
         (config_dir / "default.yaml").write_text("agents: {}\n")
         monkeypatch.setenv(ENGINE_LOG_LEVEL_ENV, "verbose")
@@ -535,7 +535,7 @@ class TestMultiInstanceSupport:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Multi-instance startup passes --start-paused intent to each child."""
-        config_dir = tmp_path / ".issue-orchestrator" / "config"
+        config_dir = tmp_path / ".issue-orchestrator" / "config" / "modes" / "default"
         config_dir.mkdir(parents=True)
         (config_dir / "default.yaml").write_text("instances: 2\nagents: {}\n")
 
@@ -591,7 +591,7 @@ class TestMultiInstanceSupport:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Multi-instance startup passes log-level intent to each child."""
-        config_dir = tmp_path / ".issue-orchestrator" / "config"
+        config_dir = tmp_path / ".issue-orchestrator" / "config" / "modes" / "default"
         config_dir.mkdir(parents=True)
         (config_dir / "default.yaml").write_text("instances: 2\nagents: {}\n")
 
@@ -645,7 +645,7 @@ class TestMultiInstanceSupport:
     def test_start_instances_rolls_back_prior_children_when_later_start_fails(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        config_path = tmp_path / ".issue-orchestrator/config/default.yaml"
+        config_path = tmp_path / ".issue-orchestrator/config/modes/default/default.yaml"
         config_path.parent.mkdir(parents=True)
         config_path.write_text("instances: 2\nagents: {}\n", encoding="utf-8")
         first = LockInfo(
@@ -683,7 +683,7 @@ class TestMultiInstanceSupport:
     def test_start_instances_rolls_back_when_later_port_allocation_fails(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        config_path = tmp_path / ".issue-orchestrator/config/default.yaml"
+        config_path = tmp_path / ".issue-orchestrator/config/modes/default/default.yaml"
         config_path.parent.mkdir(parents=True)
         config_path.write_text("instances: 2\nagents: {}\n", encoding="utf-8")
         first = LockInfo(
@@ -722,7 +722,7 @@ class TestMultiInstanceSupport:
     def test_start_instances_kills_attempt_pid_when_lock_is_not_published(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        config_path = tmp_path / ".issue-orchestrator/config/default.yaml"
+        config_path = tmp_path / ".issue-orchestrator/config/modes/default/default.yaml"
         config_path.parent.mkdir(parents=True)
         config_path.write_text("instances: 2\nagents: {}\n", encoding="utf-8")
         synthetic = LockInfo(
@@ -834,7 +834,7 @@ class TestStatusAllInstances:
     def test_status_all_instances_no_running(self, tmp_path: Path) -> None:
         """status_all_instances returns empty list when no instances running."""
         # Create minimal config for expected_count
-        config_dir = tmp_path / ".issue-orchestrator" / "config"
+        config_dir = tmp_path / ".issue-orchestrator" / "config" / "modes" / "default"
         config_dir.mkdir(parents=True)
         (config_dir / "default.yaml").write_text("agents: {}\n")
 
@@ -863,7 +863,7 @@ class TestStatusAllInstances:
             json.dump(lock_data, f)
 
         # Create minimal config
-        config_dir = tmp_path / ".issue-orchestrator" / "config"
+        config_dir = tmp_path / ".issue-orchestrator" / "config" / "modes" / "default"
         config_dir.mkdir(parents=True)
         (config_dir / "default.yaml").write_text("agents: {}\n")
 
@@ -895,7 +895,7 @@ class TestStatusAllInstances:
                 json.dump(lock_data, f)
 
         # Create config with instances: 2
-        config_dir = tmp_path / ".issue-orchestrator" / "config"
+        config_dir = tmp_path / ".issue-orchestrator" / "config" / "modes" / "default"
         config_dir.mkdir(parents=True)
         (config_dir / "default.yaml").write_text("agents: {}\nui:\n  instances: 2\n")
 
