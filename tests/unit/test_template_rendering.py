@@ -286,6 +286,7 @@ def test_truncated_blocked_column_renders_full_list_footer(jinja_env):
     vm = build_dashboard_view_model(
         OrchestratorStub(state=state, config=config),
         provider_circuit=NO_PROVIDER_CIRCUIT_STATUS,
+        tech_lead_history=NO_TECH_LEAD_RUN_HISTORY,
         active_tab="flow",
         e2e_status_provider=e2e_disabled,
     )
@@ -320,6 +321,7 @@ def test_complete_compact_column_keeps_full_list_footer_hidden(jinja_env):
     vm = build_dashboard_view_model(
         OrchestratorStub(state=state, config=config),
         provider_circuit=NO_PROVIDER_CIRCUIT_STATUS,
+        tech_lead_history=NO_TECH_LEAD_RUN_HISTORY,
         active_tab="flow",
         e2e_status_provider=e2e_disabled,
     )

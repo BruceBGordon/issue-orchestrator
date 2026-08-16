@@ -1622,6 +1622,7 @@ def test_blocked_column_reports_items_omitted_from_compact_preview():
     view_model = build_dashboard_view_model(
         orchestrator,
         provider_circuit=NO_PROVIDER_CIRCUIT_STATUS,
+        tech_lead_history=NO_TECH_LEAD_RUN_HISTORY,
         queue_page=1,
         active_tab="flow",
         e2e_page=1,
