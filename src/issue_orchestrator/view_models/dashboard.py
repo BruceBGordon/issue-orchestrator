@@ -26,6 +26,11 @@ from .dependency_gate import (
 )
 from .issue_card_labels import blocked_summary, display_labels as _display_labels
 from .issue_card_labels import provider_badge, provider_badge_payload, provider_signal
+from .dashboard_freshness import (
+    TICK_STALL_FLOOR_SECONDS,
+    format_age_seconds,
+    stale_reason_for,
+)
 from .provider_circuit import ProviderCircuitStatusView, read_provider_circuit_status
 from .tech_lead_activity import TechLeadActivityView, read_tech_lead_activity
 from .tech_lead_run_actions import TechLeadRunActionsView, read_tech_lead_run_actions
@@ -333,21 +338,6 @@ def _queue_wait_reason(
     return f"Waiting: {queue_position - 1} runnable queued ahead"
 
 
-def _format_age_seconds(seconds: float | int | None) -> str:
-    if seconds is None:
-        return "never"
-    if seconds < 60:
-        return f"{int(seconds)}s"
-    if seconds < 3600:
-        return f"{int(seconds // 60)}m"
-    if seconds < 86400:
-        return f"{int(seconds // 3600)}h"
-    return f"{int(seconds // 86400)}d"
-
-
-_TICK_STALL_FLOOR_SECONDS = 5  # Floor so a misconfiguration can't false-positive every tick
-
-
 def _refresh_meta_for_issue(state, config, issue_number: int, now_ts: float) -> dict[str, Any]:
     per_issue = state.issue_last_refreshed_at.get(issue_number)
     fallback = state.queue_last_refresh_at if state.queue_last_refresh_at > 0 else None
@@ -355,12 +345,12 @@ def _refresh_meta_for_issue(state, config, issue_number: int, now_ts: float) -> 
     age_seconds = (now_ts - last_refreshed_at) if last_refreshed_at else None
     stale_threshold = max(60, int(getattr(config, "flow_refresh_stale_seconds", 900)))
     tick_stall_threshold = max(
-        _TICK_STALL_FLOOR_SECONDS,
+        TICK_STALL_FLOOR_SECONDS,
         int(getattr(config, "tick_stall_threshold_seconds", 60)),
     )
     is_stale = age_seconds is None or age_seconds > stale_threshold
-    freshness_label = f"{_format_age_seconds(age_seconds)} ago" if age_seconds is not None else "never refreshed"
-    stale_reason = _stale_reason_for(
+    freshness_label = f"{format_age_seconds(age_seconds)} ago" if age_seconds is not None else "never refreshed"
+    stale_reason = stale_reason_for(
         state=state,
         age_seconds=age_seconds,
         is_stale=is_stale,
@@ -375,50 +365,6 @@ def _refresh_meta_for_issue(state, config, issue_number: int, now_ts: float) -> 
         "is_stale": is_stale,
         "stale_reason": stale_reason,
     }
-
-
-def _stale_reason_for(
-    *,
-    state,
-    age_seconds: float | None,
-    is_stale: bool,
-    stale_threshold: int,
-    tick_stall_threshold: int,
-    now_ts: float,
-) -> str:
-    """Explain staleness using the orchestrator heartbeat when possible.
-
-    Plain "refresh age > threshold" is rarely the real story: the underlying
-    cause is almost always that the main loop is stuck doing something slow
-    (subprocess, GH API call, lock). When ``last_tick_completed_at`` shows
-    the loop hasn't finished a tick recently, say so and name the phase —
-    that's actionable. Fall back to the legacy threshold text when the
-    heartbeat looks healthy but GitHub refresh happens to lag.
-    """
-    if age_seconds is None:
-        return "Not refreshed from GitHub yet"
-    tick_stall_reason = _tick_stall_reason(state, now_ts, tick_stall_threshold)
-    if tick_stall_reason:
-        return tick_stall_reason
-    if is_stale:
-        return f"Older than {_format_age_seconds(stale_threshold)} stale threshold"
-    return ""
-
-
-def _tick_stall_reason(state, now_ts: float, threshold_seconds: int) -> str:
-    last_completed = getattr(state, "last_tick_completed_at", 0.0) or 0.0
-    last_started = getattr(state, "last_tick_started_at", 0.0) or 0.0
-    if last_completed <= 0 and last_started <= 0:
-        return ""  # orchestrator hasn't reported a heartbeat yet
-    reference = last_completed if last_completed > 0 else last_started
-    tick_age = now_ts - reference
-    if tick_age <= threshold_seconds:
-        return ""
-    phase = (getattr(state, "current_tick_phase", "") or "").strip() or "idle"
-    age_label = _format_age_seconds(tick_age)
-    return (
-        f"Orchestrator tick stalled — last completion {age_label} ago (phase: {phase})"
-    )
 
 
 def _attach_refresh_meta(items: list[dict[str, Any]], state, config, now_ts: float) -> None:
@@ -1359,7 +1305,7 @@ def build_dashboard_view_model(
         "lastNetworkSyncAt": state.queue_last_network_sync_at if state else 0.0,
         "lastRefreshAgeSeconds": queue_last_refresh_age,
         "lastRefreshLabel": (
-            f"{_format_age_seconds(queue_last_refresh_age)} ago"
+            f"{format_age_seconds(queue_last_refresh_age)} ago"
             if queue_last_refresh_age >= 0
             else "never"
         ),

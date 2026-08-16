@@ -46,6 +46,7 @@ from .actions import (
     AddLabelAction,
     RemoveLabelAction,
 )
+from .completion_pr_lookup import CompletionPrLookup
 from .completion_action_planner import (
     CompletionActionPlanner,
     has_review_exchange_errors,
@@ -149,6 +150,7 @@ class CompletionHandler:
         self.config = config
         self.events = events
         self.repository_host = repository_host
+        self._pr_lookup = CompletionPrLookup(repository_host)
         self._get_issue_machine = get_issue_machine_fn
         self._get_session_machine = get_session_machine_fn
         self._get_review_machine = get_review_machine_fn
@@ -221,7 +223,10 @@ class CompletionHandler:
         review_exchange_halted = review_exchange_halted or has_review_exchange_errors(processing_errors)
 
         # Fetch PR info if completed (or use hint from completion processor)
-        pr_url, pr_number, pr_infos = self._fetch_pr_info(session, status, pr_url_hint=pr_url_hint)
+        resolved_pr = self._pr_lookup.for_session(session, status, pr_url_hint=pr_url_hint)
+        pr_url, pr_number, pr_infos = (
+            resolved_pr.url, resolved_pr.number, resolved_pr.pull_requests,
+        )
         if pr_infos:
             self._emit_pr_view_changed(
                 pr_infos[0],
@@ -497,96 +502,6 @@ class CompletionHandler:
             )
             return []
         return [str(label) for label in labels]
-
-    def _fetch_pr_info(
-        self,
-        session: Session,
-        status: SessionStatus,
-        pr_url_hint: Optional[str] = None,
-    ) -> tuple[Optional[str], Optional[int], Optional[list[Any]]]:
-        """Fetch PR info for a completed session.
-
-        Returns ``(pr_url, pr_number, prs_list)``; ``pr_url_hint`` short-circuits
-        the branch lookup (dry-run mode).
-        """
-        pr_url = None
-        pr_number = None
-        prs = None
-
-        if status != SessionStatus.COMPLETED:
-            return pr_url, pr_number, prs
-
-        if session.key.task == TaskKind.RETROSPECTIVE_REVIEW:
-            return None, None, None
-
-        if pr_url_hint:
-            return self._fetch_pr_info_from_hint(session, pr_url_hint)
-
-        return self._fetch_pr_info_from_branch_or_review_fallback(session)
-
-    def _fetch_pr_info_from_hint(
-        self,
-        session: Session,
-        pr_url_hint: str,
-    ) -> tuple[Optional[str], Optional[int], Optional[list[Any]]]:
-        pr_url = pr_url_hint
-        pr_number: Optional[int] = None
-        prs: Optional[list[Any]] = None
-
-        match = re.search(r"/pull/(\d+)", pr_url)
-        if match:
-            pr_number = int(match.group(1))
-            try:
-                pr_info = self.repository_host.get_pr(pr_number)
-            except Exception as e:
-                logger.warning("Failed to fetch PR %s for PR hint: %s", pr_number, e)
-            else:
-                if pr_info:
-                    prs = [pr_info]
-
-        logger.info(
-            "[PR_HINT] Using PR from completion processor: %s (number=%s)",
-            pr_url,
-            pr_number,
-            extra=log_context(issue_key=session.key.issue.stable_id(), session_id=session.terminal_id),
-        )
-        return pr_url, pr_number, prs
-
-    def _fetch_pr_info_from_branch_or_review_fallback(
-        self,
-        session: Session,
-    ) -> tuple[Optional[str], Optional[int], Optional[list[Any]]]:
-        logger.debug("[ADAPTER] Using GitHubAdapter for get_prs_for_branch")
-        start = time.monotonic()
-        pr_infos = self.repository_host.get_prs_for_branch(session.branch_name)
-        duration = time.monotonic() - start
-        logger.info(
-            "Fetched PRs for branch in %.2fs: branch=%s count=%d",
-            duration,
-            session.branch_name,
-            len(pr_infos),
-            extra=log_context(issue_key=session.key.issue.stable_id(), session_id=session.terminal_id),
-        )
-        if pr_infos:
-            return pr_infos[0].url, pr_infos[0].number, list(pr_infos)
-
-        if session.pr_number is None:
-            return None, None, None
-
-        try:
-            review_pr = self.repository_host.get_pr(session.pr_number)
-        except Exception as e:
-            logger.warning(
-                "Failed to fetch PR %s for review session fallback: %s",
-                session.pr_number,
-                e,
-            )
-            return None, None, None
-
-        if review_pr:
-            return review_pr.url, review_pr.number, [review_pr]
-
-        return None, None, None
 
     def _create_history_entry(
         self,
