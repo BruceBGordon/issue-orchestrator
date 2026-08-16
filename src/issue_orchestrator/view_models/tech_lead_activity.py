@@ -57,7 +57,7 @@ _PHASE_LABELS: dict[TechLeadRunPhase, str] = {
 }
 
 # The tone each phase renders with. A CLASS name, not a colour: the stylesheet
-# owns the palette, and both themes get the same four semantic buckets.
+# owns the palette, and both themes get the same semantic buckets.
 _PHASE_TONES: dict[TechLeadRunPhase, str] = {
     TechLeadRunPhase.RUNNING: "active",
     TechLeadRunPhase.COMPLETED: "good",

@@ -10,14 +10,19 @@ GitHub issue on the *client's* board.
 ADR-0033 splits those two jobs by owner: coordination is shared (GitHub), the
 run record is LOCAL to the engine that won the run. This module is the local
 side's vocabulary — one record per run, referencing its subject rather than
-being it, and pointing at the artifacts the run already produces (the session
-run directory and its terminal recording, the same capture session-replay
-reads) instead of copying them.
+being it, and pointing at the artifacts the run left behind. Those artifacts
+are the run's OWN output (its terminal recording, its report, its decision),
+but the record cannot point into where the run wrote them: that is a worktree
+the run does not own — throwaway scratch for a failure investigation (#6823),
+an anchor worktree otherwise — and cleanup may remove it the moment the run
+ends. So a concluding run has the artifacts it actually produced copied out
+into an engine-owned archive, and :class:`.TechLeadRunArtifacts` records where
+that copy is and which kinds are in it (#6858 F4).
 
 Why a record rather than "just read the session": a session is a *physical*
 attempt at a run. Sessions are dropped from live state when they end, their
-worktrees are disposable scratch (#6823), and a run can outlive several ticks
-of queueing before one ever starts. The run is the durable thing an operator
+worktrees are disposable (#6823), and a run can outlive several ticks of
+queueing before one ever starts. The run is the durable thing an operator
 asks about ("what did the last health review conclude?"), so it gets its own
 identity, its own lifecycle, and its own home.
 """
@@ -67,9 +72,9 @@ class TechLeadRunPhase(str, Enum):
     terminal process", and it carries states (``needs_validation_retry``,
     ``validation_failed``) that describe a coding agent's publish pipeline and
     mean nothing for an audit that files proposals. Projecting the session's
-    terminal status onto these four is a mapping the recorder owns once, so the
-    activity surface never has to explain a coding-shaped word to an operator
-    reading about a health review.
+    terminal status onto the phases below is a mapping the recorder owns once,
+    so the activity surface never has to explain a coding-shaped word to an
+    operator reading about a health review.
     """
 
     RUNNING = "running"
@@ -142,7 +147,7 @@ class TechLeadRunRecord:
     # Where the run's PRESERVED artifacts are, once it has ended. ``None`` while
     # a run is still going, and also for a run whose artifacts could not be
     # preserved — the record then truthfully offers no drill-down rather than a
-    # button pointing into a deleted scratch worktree (#6858 F4).
+    # button pointing into a worktree that cleanup has removed (#6858 F4).
     artifacts: Optional[TechLeadRunArtifacts] = None
 
     def __post_init__(self) -> None:
@@ -211,9 +216,15 @@ class TechLeadRunRecord:
         returns, so the invariant belongs on the transition, not on each caller.
         """
         if not phase.is_terminal:
+            # The alternatives are read off the enum rather than spelled out, so
+            # a phase added later cannot leave this message naming a vocabulary
+            # the type no longer has.
+            conclusions = ", ".join(
+                member.value for member in TechLeadRunPhase if member.is_terminal
+            )
             raise ValueError(
-                f"{phase.value} is not a conclusion; a run concludes as"
-                " completed, failed, or withdrawn"
+                f"{phase.value} is not a conclusion; a run concludes as one of:"
+                f" {conclusions}"
             )
         return replace(
             self,
