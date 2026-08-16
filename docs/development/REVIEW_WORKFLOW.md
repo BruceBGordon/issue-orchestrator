@@ -2,14 +2,19 @@
 
 ## The Review Loop
 
-The core concept: an agent codes, a reviewer checks, and they iterate until the code is approved or the orchestrator escalates.
+The core concept: an agent codes, a reviewer checks, and they iterate until the code is approved or the orchestrator escalates. An optional coder-owned internal review loop can run within each coder turn before that independent review.
 
-This flow begins after validation passes. When an agent completes work, the orchestrator processes the completion record — which includes running the validation gate (tests, linting, architecture checks). Only after validation succeeds does the review loop start.
+The independent review flow begins after validation passes. When an agent completes work, the orchestrator processes the completion record — which includes running the validation gate (tests, linting, architecture checks). The optional internal review happens inside the coder turn before that completion; only after completion and validation does the external review loop start.
 
 ```mermaid
 flowchart TD
-  DONE["Agent completes work"] --> VAL{"Validation gate"}
-  VAL -->|fails| BLOCKED["Blocked — validation failed"]
+  CODE["Coder implements and tests"] --> INTERNAL{"Internal review enabled?"}
+  INTERNAL -->|yes| IREVIEW["Coder iterates with one spawned reviewer"]
+  IREVIEW -->|approved| DONE["Agent completes work"]
+  IREVIEW -->|limit / stuck| INTERNAL_BLOCK["Blocked or needs human"]
+  INTERNAL -->|no| DONE
+  DONE --> VAL{"Validation gate"}
+  VAL -->|fails| VAL_BLOCK["Blocked — validation failed"]
   VAL -->|passes| REVIEW["Reviewer checks code"]
   REVIEW --> ARTIFACTS["Review report + decision JSON"]
   ARTIFACTS -->|approved| PR["PR created / marked reviewed"]
@@ -19,6 +24,21 @@ flowchart TD
 ```
 
 **Cycle limits prevent infinite loops.** The orchestrator tracks rework iterations (`rework-cycle-N` labels on GitHub). After `max_rework_cycles` (default: 5), it stops the loop and escalates to a human. For in-process exchange modes, `max_rounds` and `max_no_progress` provide additional stopping conditions — if the reviewer reports no progress for consecutive rounds, the loop stops early.
+
+### Internal Review Within a Coder Turn
+
+When `review.internal.enabled` is true, the orchestrator appends the configured
+coder-facing instructions to every coder prompt: initial coding, validation
+retry, draft-PR rework, and the coder side of an in-process review exchange.
+The coder spawns exactly one lightweight internal reviewer and iterates with the
+same reviewer until it returns `APPROVED`. A successful coder completion is not
+allowed before that approval; an unavailable reviewer, unresolved finding, or
+exhausted `max_rounds` requires a blocked or needs-human result.
+
+This is intentionally a prompt-level, high-speed loop. It creates no review
+artifacts, labels, completion protocol, or orchestrator-managed round state.
+The ordinary external reviewer remains independent and receives the improved
+implementation through the unchanged outer workflow.
 
 ## Exchange Mechanisms
 
@@ -185,6 +205,12 @@ review:
   enabled: true
   default: "agent:reviewer"            # Default reviewer agent
 
+  # Coder-owned loop inside every coder turn (independent review still follows)
+  internal:
+    enabled: false
+    max_rounds: 5                      # Reviewer verdicts before coder blocks
+    instructions: ".io/internal-review.md" # Relative to the configured repository root
+
   # Exchange mechanism
   exchange:
     mode: "via-local-loop"             # via-local-loop, via-draft-pr, via-mcp, auto
@@ -206,11 +232,19 @@ review:
   tech_lead_review_on_failure: true       # React to failed/timed-out/unexplained blocked sessions
 
 tech_lead:
+  enabled: true                         # One master switch for all new tech-lead work
   health_review:
     interval_minutes: 240              # Periodic floor; 0 disables interval
     storm_threshold: 3                 # K recent problems -> one health review; 0 disables
     storm_window_minutes: 5            # Settle window for the problem cohort
 ```
+
+Set only `tech_lead.enabled: false` to stop all new batch reviews, failure
+investigations, periodic/storm health reviews, stuck sweeps, manual runs,
+proposal reconciliation, and finding promotion. The detailed settings remain
+configured for a one-line re-enable. Already-running sessions may finish. For
+backward compatibility, omitting the key retains the historical behavior:
+configuring `review.tech_lead_review_agent` enables the workflow.
 
 ## Key Design Decisions
 
@@ -246,13 +280,35 @@ Control when AI session tabs close and worktrees are removed:
 cleanup:
   with_tech_lead:                    # When tech lead review is enabled
     close_ai_session_tabs: true   # Close tabs after tech lead review
-    remove_worktrees: false       # Keep worktrees for reference
+    remove_worktrees: true        # Remove owned worktrees after tech lead review
 
   without_tech_lead:                 # When tech lead review is NOT enabled
     wait_for_code_review: true    # true = after code review, false = on completion
     close_ai_session_tabs: true
-    remove_worktrees: false
+    remove_worktrees: true
 ```
+
+Worktree removal defaults to `true` for new and omitted configurations. It
+still waits for the applicable review gate. Set it to `false` to retain issue
+worktrees for inspection. Cleanup timing and actions are independent: if either
+`close_ai_session_tabs` or `remove_worktrees` is enabled, the selected actions
+wait for the applicable review gate. For example, setting tab closure to
+`false` and worktree removal to `true` leaves the tab open and removes the
+checkout only after review. Without tech-lead review,
+`wait_for_code_review: false` instead runs the selected actions on completion.
+If both action flags are `false`, an ordinary successful completion does not
+enter the cleanup lifecycle. Failure/timeout/block teardown and disposable
+scratch-worktree removal remain immediate lifecycle boundaries.
+
+Review-gated cleanup removes only the checkout and preserves its local branch,
+including local-only commits. Branch deletion is reserved for explicitly
+disposable scratch/reset lifecycle owners. On startup, the orchestrator also
+reconciles proven inactive reviewer and tech-lead scratch worktrees. Manual,
+active, activity-unknown, initializing-engine, ambiguous, and reviewer
+worktrees whose detached HEAD differs from the exact tip recorded by the
+reviewer lifecycle are retained. Reviewer worktrees created before that tip
+marker existed use the stricter legacy proof that HEAD still equals the
+registered parent worktree tip.
 
 ## UI Phase Detection
 

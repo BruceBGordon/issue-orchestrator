@@ -88,10 +88,11 @@ class TechLeadRunActionsContract(ContractBase):
     # work waits behind it.
     globalBarrierActive: bool
     # "" when the engine can run tech-lead work; otherwise the single sentence
-    # the dashboard renders for both actions. Published so engine-availability
-    # policy has one implementation, on the server side of the boundary.
+    # distinguishing a stopped/paused engine, a missing agent, or an explicit
+    # tech-lead disable. Published so availability policy has one server owner.
     unavailableReason: str = ""
-    # True only when the missing piece is configuration (remedy: Settings).
+    # True when Settings is the remedy: the agent is missing or tech lead is
+    # explicitly disabled.
     needsSettings: bool = False
 
 
@@ -179,6 +180,8 @@ class DashboardDataContract(ContractBase):
     queueRefreshSeconds: int
     repo: Optional[str]
     repoRoot: Optional[str]
+    configName: str
+    configMode: str
     githubOwner: Optional[str]
     githubRepo: Optional[str]
     e2eLastRun: Optional[dict[str, Any]] = None

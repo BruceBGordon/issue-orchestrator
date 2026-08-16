@@ -359,6 +359,7 @@ class TestTechLeadWorkflow:
     @pytest.fixture
     def mock_config(self):
         config = MagicMock()
+        config.tech_lead_enabled = True
         config.tech_lead_review_agent = "agent:tech-lead"
         config.tech_lead_review_threshold = 3
         config.max_concurrent_sessions = 3
@@ -379,6 +380,7 @@ class TestTechLeadWorkflow:
     def test_is_configured_returns_false_when_not_configured(self, collecting_sink):
         """Test is_configured returns False when not configured."""
         config = MagicMock()
+        config.tech_lead_enabled = False
         config.tech_lead_review_agent = None
         workflow = TechLeadWorkflow(config=config, events=collecting_sink)
         assert workflow.is_configured() is False
@@ -386,6 +388,7 @@ class TestTechLeadWorkflow:
     def test_should_launch_skips_when_not_configured(self, collecting_sink):
         """Test skips when not configured."""
         config = MagicMock()
+        config.tech_lead_enabled = False
         config.tech_lead_review_agent = None
         workflow = TechLeadWorkflow(config=config, events=collecting_sink)
 

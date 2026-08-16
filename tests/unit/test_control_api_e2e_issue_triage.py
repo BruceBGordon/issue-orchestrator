@@ -169,7 +169,9 @@ class TestE2EQuarantineModifyEndpoint:
     @staticmethod
     def _write_config(tmp_path: Path) -> None:
         """Write a minimal config with quarantine_file set."""
-        config_dir = tmp_path / ".issue-orchestrator" / "config"
+        config_dir = (
+            tmp_path / ".issue-orchestrator" / "config" / "modes" / "default"
+        )
         config_dir.mkdir(parents=True, exist_ok=True)
         (config_dir / "default.yaml").write_text(
             "repo:\n  name: test/repo\ne2e:\n  enabled: true\n"
@@ -268,7 +270,9 @@ class TestE2EFlakyTestsEndpoint:
     @staticmethod
     def _write_config(tmp_path: Path) -> None:
         """Write a minimal config with quarantine_file set."""
-        config_dir = tmp_path / ".issue-orchestrator" / "config"
+        config_dir = (
+            tmp_path / ".issue-orchestrator" / "config" / "modes" / "default"
+        )
         config_dir.mkdir(parents=True, exist_ok=True)
         (config_dir / "default.yaml").write_text(
             "repo:\n  name: test/repo\ne2e:\n  enabled: true\n"
@@ -386,8 +390,15 @@ class TestE2ETestDetailEndpoint:
         """Test not found should return 404."""
         from issue_orchestrator.infra.e2e_db import E2EDB
 
+        config_dir = (
+            tmp_path / ".issue-orchestrator" / "config" / "modes" / "default"
+        )
+        config_dir.mkdir(parents=True)
+        (config_dir / "default.yaml").write_text(
+            "repo:\n  name: test/repo\ne2e:\n  enabled: true\n"
+            "  pytest_paths: ['tests/e2e']\n"
+        )
         db_dir = tmp_path / ".issue-orchestrator"
-        db_dir.mkdir(exist_ok=True)
         db_path = db_dir / "e2e.db"
         db = E2EDB(db_path)
 
@@ -410,7 +421,9 @@ class TestE2ETestDetailEndpoint:
         from issue_orchestrator.infra.e2e_db import E2EDB
 
         # Create config file for _load_config_by_name
-        config_dir = tmp_path / ".issue-orchestrator" / "config"
+        config_dir = (
+            tmp_path / ".issue-orchestrator" / "config" / "modes" / "default"
+        )
         config_dir.mkdir(parents=True, exist_ok=True)
         (config_dir / "default.yaml").write_text("repo:\n  name: test/repo\ne2e:\n  enabled: true\n  pytest_paths: ['tests/e2e']\n")
 
@@ -484,7 +497,9 @@ class TestE2EStatusAttentionFields:
         from issue_orchestrator.infra.e2e_db import E2EDB
 
         # Create config with correct name (default.yaml)
-        config_dir = tmp_path / ".issue-orchestrator" / "config"
+        config_dir = (
+            tmp_path / ".issue-orchestrator" / "config" / "modes" / "default"
+        )
         config_dir.mkdir(parents=True)
         config_file = config_dir / "default.yaml"
         config_file.write_text("""
@@ -532,7 +547,9 @@ e2e:
         from issue_orchestrator.infra.e2e_db import E2EDB
 
         # Create config
-        config_dir = tmp_path / ".issue-orchestrator" / "config"
+        config_dir = (
+            tmp_path / ".issue-orchestrator" / "config" / "modes" / "default"
+        )
         config_dir.mkdir(parents=True)
         config_file = config_dir / "default.yaml"
         config_file.write_text("""
@@ -589,7 +606,9 @@ e2e:
         from issue_orchestrator.infra.e2e_db import E2EDB
 
         # Create config
-        config_dir = tmp_path / ".issue-orchestrator" / "config"
+        config_dir = (
+            tmp_path / ".issue-orchestrator" / "config" / "modes" / "default"
+        )
         config_dir.mkdir(parents=True)
         config_file = config_dir / "default.yaml"
         config_file.write_text("""

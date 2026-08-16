@@ -26,6 +26,42 @@ def test_check_hook_verification_no_agents_reports_ai_agent_check():
     )
 
 
+def test_missing_hooks_remediation_preserves_selected_config(
+    tmp_path, monkeypatch
+):
+    config_path = tmp_path / ".issue-orchestrator/config/modes/default/main.yaml"
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text(
+        "agents:\n"
+        "  agent:reviewer:\n"
+        "    prompt: reviewer.md\n"
+        "    provider: codex\n"
+        "    ai_system: codex\n"
+    )
+    config = Config.load(config_path)
+    adapter = MagicMock()
+    adapter.is_installed.return_value = False
+    monkeypatch.setattr(
+        "issue_orchestrator.infra.doctor.checks.hooks.get_adapter",
+        lambda _agent_type: adapter,
+    )
+    monkeypatch.setattr(
+        "issue_orchestrator.infra.doctor.checks.hooks._get_unsupported_types",
+        lambda _agent_types: set(),
+    )
+
+    checks = hook_checks.check_hook_verification(config)
+
+    installation = next(
+        check for check in checks if check.name == "AI Agent Hooks (Installation)"
+    )
+    assert installation.status == "error"
+    assert (
+        "issue-orchestrator setup-hooks --config "
+        ".issue-orchestrator/config/modes/default/main.yaml"
+    ) in installation.detail
+
+
 def test_check_repo_guardrails_warns_when_not_installed(tmp_path):
     subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
     config = Config(repo_root=tmp_path)
@@ -101,6 +137,25 @@ def test_check_repo_guardrails_reports_drifted_managed_ai_hook(tmp_path):
     assert ".claude/hooks/block-no-verify.sh" in checks[0].detail
 
 
+def test_check_repo_guardrails_reports_baked_mode_selection_drift(tmp_path):
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
+    default_path = tmp_path / ".issue-orchestrator/config/modes/default/main.yaml"
+    codex_path = tmp_path / ".issue-orchestrator/config/modes/codex/main.yaml"
+    default_path.parent.mkdir(parents=True)
+    codex_path.parent.mkdir(parents=True)
+    yaml_text = "validation:\n  publish:\n    cmd: make validate-pr\nagents: {}\n"
+    default_path.write_text(yaml_text)
+    codex_path.write_text(yaml_text)
+    default_config = Config.load(default_path)
+    codex_config = Config.load(codex_path)
+
+    setup_repo_guardrails(default_config)
+    checks = hook_checks.check_repo_guardrails(codex_config)
+
+    assert checks[0].status == "error"
+    assert "configuration selection drifted" in checks[0].detail
+
+
 class TestAiGate:
     """Tests for _check_ai_gate_report function."""
 
@@ -136,6 +191,8 @@ class TestAiGate:
 
     def test_ai_gate_fresh_shows_previous_results(self, tmp_path, monkeypatch):
         """Test that fresh AI gate test shows previous results."""
+        from issue_orchestrator.infra.hooks.hooks import AiAgentType
+
         config = Config(repo_root=tmp_path)
         config.hooks.ai_gate.interval_days = 7
 
@@ -158,7 +215,7 @@ class TestAiGate:
 
         result = hook_checks._check_ai_gate_report(
             config=config,
-            unique_types=set(),
+            unique_types={AiAgentType.CLAUDE_CODE},
             unsupported_types=set(),
             hooks_ok=True,
         )
@@ -259,6 +316,7 @@ class TestAiGate:
         old_state = AiGateState(
             last_check=datetime.now(timezone.utc) - timedelta(days=10),
             last_results={},
+            required_agent_types=("claude-code",),
         )
         monkeypatch.setattr(
             "issue_orchestrator.infra.doctor.checks.hooks.load_ai_gate_state",

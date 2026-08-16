@@ -6,7 +6,9 @@ from unittest.mock import MagicMock, patch, PropertyMock
 
 import pytest
 
+from issue_orchestrator.control.completion_handler import CleanupDecision
 from issue_orchestrator.domain.claim import ClaimResult, ClaimState
+from issue_orchestrator.domain.coder_prompt import PreparedCoderPromptAddendum
 from issue_orchestrator.domain.lease_config import LeaseConfig
 from issue_orchestrator.domain.models import Session, SessionStatus
 from tests.callback_endpoint_helpers import ready_callback_endpoint
@@ -129,10 +131,10 @@ class TestSessionLauncherClaimAcquisition:
             claim.lease_expires_at - claim.lease_acquired_at
         ).total_seconds() == 30
 
-    def test_launch_acquires_claim_before_worktree(
+    def test_launch_prepares_prompt_before_acquiring_claim(
         self, mock_claim_manager, mock_events
     ):
-        """Claim is acquired before worktree creation."""
+        """Required prompt input is resolved before the claim mutates GitHub."""
         # Track order of operations
         operations = []
 
@@ -207,6 +209,14 @@ class TestSessionLauncherClaimAcquisition:
                     review_guard_label="io:auto-retried-interrupted-review",
                 ))
 
+                prompt_provider = MagicMock()
+
+                def prepare_prompt(*args, **kwargs):
+                    operations.append(("prompt", kwargs["agent_label"]))
+                    return PreparedCoderPromptAddendum(None)
+
+                prompt_provider.prepare.side_effect = prepare_prompt
+
                 launcher = SessionLauncher(
                     config=mock_config,
                     events=mock_events,
@@ -227,12 +237,14 @@ class TestSessionLauncherClaimAcquisition:
                     claim_manager=mock_claim_manager,
                     board_snapshot_provider=NullBoardSnapshotProvider(),
                     agent_callback_endpoint=ready_callback_endpoint(),
+                    coder_prompt_addendum=prompt_provider,
                 )
 
                 issue = MockIssue()
                 result = launcher.launch_issue_session(issue, [])
 
-                # Verify claim happens before worktree
+                # Trusted prompt input is read first; the claim then protects
+                # every mutation performed by worktree creation/reset.
                 claim_idx = next(
                     (i for i, op in enumerate(operations) if op[0] == "claim"), -1
                 )
@@ -242,7 +254,11 @@ class TestSessionLauncherClaimAcquisition:
 
                 assert claim_idx >= 0, "Claim should have been attempted"
                 assert worktree_idx >= 0, "Worktree should have been created"
-                assert claim_idx < worktree_idx, "Claim should happen before worktree"
+                prompt_idx = next(
+                    (i for i, op in enumerate(operations) if op[0] == "prompt"), -1
+                )
+                assert prompt_idx >= 0, "Prompt input should have been prepared"
+                assert prompt_idx < claim_idx < worktree_idx
 
     def test_launch_fails_if_claim_fails(self, mock_claim_manager, mock_events):
         """Launch fails if claim acquisition fails."""
@@ -262,13 +278,14 @@ class TestSessionLauncherClaimAcquisition:
             jitter=False,
         ))
 
+        worktree_manager = MagicMock()
         launcher = SessionLauncher(
             config=mock_config,
             events=mock_events,
             repository_host=MagicMock(),
             action_applier=MagicMock(),
             session_manager=MagicMock(),
-            worktree_manager=MagicMock(),
+            worktree_manager=worktree_manager,
             working_copy=MagicMock(),
             command_runner=MagicMock(),
             session_output=MagicMock(),
@@ -289,6 +306,7 @@ class TestSessionLauncherClaimAcquisition:
 
         assert result.success is False
         assert "claim" in result.reason.lower()
+        worktree_manager.create.assert_not_called()
 
     def test_launch_releases_claim_on_convergence_failure(
         self, mock_claim_manager, mock_events
@@ -310,13 +328,14 @@ class TestSessionLauncherClaimAcquisition:
             jitter=False,
         ))
 
+        worktree_manager = MagicMock()
         launcher = SessionLauncher(
             config=mock_config,
             events=mock_events,
             repository_host=MagicMock(),
             action_applier=MagicMock(),
             session_manager=MagicMock(),
-            worktree_manager=MagicMock(),
+            worktree_manager=worktree_manager,
             working_copy=MagicMock(),
             command_runner=MagicMock(),
             session_output=MagicMock(),
@@ -340,6 +359,7 @@ class TestSessionLauncherClaimAcquisition:
         # Verify claim was released
         assert len(mock_claim_manager.release_claim_calls) == 1
         assert mock_claim_manager.release_claim_calls[0][0] == issue.number
+        worktree_manager.create.assert_not_called()
 
 
 class TestSessionCompletionClaimRelease:
@@ -397,9 +417,8 @@ class TestSessionCompletionClaimRelease:
         mock_completion_handler.process_completion.return_value = MagicMock(
             actions=(),
             history_entry=MagicMock(),
-            should_defer_cleanup=False,
+            cleanup=CleanupDecision.immediate(),
             should_queue_review=False,
-            pending_cleanup=None,
         )
 
         handle_session_completion(
@@ -468,9 +487,8 @@ class TestSessionCompletionClaimRelease:
         mock_completion_handler.process_completion.return_value = MagicMock(
             actions=(),
             history_entry=MagicMock(),
-            should_defer_cleanup=False,
+            cleanup=CleanupDecision.immediate(),
             should_queue_review=False,
-            pending_cleanup=None,
         )
 
         handle_session_completion(

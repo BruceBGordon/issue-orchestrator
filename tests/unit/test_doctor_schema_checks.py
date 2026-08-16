@@ -57,6 +57,61 @@ class TestRunSchemaChecks:
         assert len(quarantine_checks) >= 1
         assert quarantine_checks[0].status == "warning"
 
+    def test_internal_review_instructions_must_be_a_file(self, tmp_path):
+        """An existing directory cannot satisfy a file-backed prompt field."""
+        (tmp_path / ".io").mkdir()
+        cfg = Config()
+        cfg.repo_root = tmp_path
+        cfg.internal_review_enabled = True
+        cfg.internal_review_instructions = ".io"
+
+        checks = run_schema_checks(cfg)
+
+        internal_checks = [
+            check for check in checks if check.name == "Internal Review Instructions"
+        ]
+        assert len(internal_checks) == 1
+        assert internal_checks[0].status == "error"
+        assert "File '.io' is missing or not a regular file" in internal_checks[0].detail
+
+    def test_internal_review_instructions_reject_symlink_escape(self, tmp_path):
+        """Doctor and runtime enforce the same repository containment boundary."""
+        outside = tmp_path.parent / "outside-internal-review.md"
+        outside.write_text("outside", encoding="utf-8")
+        instructions = tmp_path / ".io" / "internal-review.md"
+        instructions.parent.mkdir()
+        instructions.symlink_to(outside)
+        cfg = Config()
+        cfg.repo_root = tmp_path
+        cfg.internal_review_enabled = True
+        cfg.internal_review_instructions = ".io/internal-review.md"
+
+        checks = run_schema_checks(cfg)
+
+        internal_checks = [
+            check for check in checks if check.name == "Internal Review Instructions"
+        ]
+        assert len(internal_checks) == 1
+        assert internal_checks[0].status == "error"
+        assert "resolves outside the repository" in internal_checks[0].detail
+
+    def test_internal_review_instructions_allow_contained_file_symlink(self, tmp_path):
+        """A symlink to a regular file inside the repository remains valid."""
+        internal_dir = tmp_path / ".io"
+        internal_dir.mkdir()
+        (internal_dir / "shared-review.md").write_text("review", encoding="utf-8")
+        (internal_dir / "internal-review.md").symlink_to("shared-review.md")
+        cfg = Config()
+        cfg.repo_root = tmp_path
+        cfg.internal_review_enabled = True
+        cfg.internal_review_instructions = ".io/internal-review.md"
+
+        checks = run_schema_checks(cfg)
+
+        assert not any(
+            check.name == "Internal Review Instructions" for check in checks
+        )
+
     def test_path_checks_use_config_repo_root_not_cwd(
         self,
         monkeypatch,

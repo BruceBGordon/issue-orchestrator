@@ -962,7 +962,10 @@ def test_locators_persisted_before_publish_failed_labels_applied(make_session, t
     terminalized FAILED, and only THEN is the error re-raised. Before that fix the
     apply raise skipped ``finalize_terminal_outcome`` entirely, so this asserts it
     now runs with the effective FAILED status on the raising-apply path."""
-    from issue_orchestrator.control.completion_handler import SessionStatus
+    from issue_orchestrator.control.completion_handler import (
+        CleanupDecision,
+        SessionStatus,
+    )
     from issue_orchestrator.control.session_completion import handle_session_completion
 
     lm = LabelManager(_config(tmp_path))
@@ -993,8 +996,7 @@ def test_locators_persisted_before_publish_failed_labels_applied(make_session, t
         ),
         pr_url=None,
         pr_number=None,
-        should_defer_cleanup=False,
-        pending_cleanup=None,
+        cleanup=CleanupDecision.immediate(),
         should_queue_review=False,
     )
     # Applying the publish-failed label crashes (simulates a mid-apply failure).

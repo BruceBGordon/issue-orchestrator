@@ -18,72 +18,34 @@ import socket
 import subprocess
 import sys
 import time
-from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Literal, Protocol, runtime_checkable
+from typing import Any, Callable
 
+from .config_identity import (
+    EXPECTED_CONFIG_FINGERPRINT_ENV,
+    assert_expected_config_fingerprint,
+)
 from .repo_identity import normalize_repo_root, serialize_repo_identity, state_dir
 from .repo_lock import (
     AlreadyRunning,
     LockInfo,
+    assert_repository_configuration_identity,
     is_locked,
     list_instance_locks,
     read_lock,
     release_lock,
 )
+from .supervisor_models import MultiInstanceStatus, SupervisorStatus
 from . import shutdown_timing
 
-DEFAULT_ENGINE_GRACEFUL_TIMEOUT_SECONDS = shutdown_timing.DEFAULT_ENGINE_GRACEFUL_TIMEOUT_SECONDS
+DEFAULT_ENGINE_GRACEFUL_TIMEOUT_SECONDS = (
+    shutdown_timing.DEFAULT_ENGINE_GRACEFUL_TIMEOUT_SECONDS
+)
 
 logger = logging.getLogger(__name__)
 _EXPECTED_IDENTITY_ENV = "ISSUE_ORCHESTRATOR_EXPECTED_IDENTITY"
 ENGINE_LOG_LEVEL_ENV = "ISSUE_ORCHESTRATOR_ENGINE_LOG_LEVEL"
 _VALID_ENGINE_LOG_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR"})
-
-
-@dataclass
-class SupervisorStatus:
-    """Status of an orchestrator for a repository (or specific instance)."""
-
-    state: Literal["running", "stopped", "failed", "unknown"]
-    pid: int | None = None
-    port: int | None = None
-    started_at: str | None = None
-    recovered: bool = False
-    error: str | None = None
-    instance_id: str | None = None  # For multi-instance deployments
-
-    def to_dict(self) -> dict:
-        """Convert to dict for JSON serialization."""
-        result = {
-            "state": self.state,
-            "pid": self.pid,
-            "port": self.port,
-            "started_at": self.started_at,
-            "recovered": self.recovered,
-            "error": self.error,
-        }
-        if self.instance_id is not None:
-            result["instance_id"] = self.instance_id
-        return result
-
-
-@dataclass
-class MultiInstanceStatus:
-    """Status of all orchestrator instances for a repository."""
-
-    repo_root: str
-    instances: list[SupervisorStatus] = field(default_factory=list)
-    expected_count: int = 1  # From config.instances
-
-    def to_dict(self) -> dict:
-        """Convert to dict for JSON serialization."""
-        return {
-            "repo_root": self.repo_root,
-            "instances": [s.to_dict() for s in self.instances],
-            "expected_count": self.expected_count,
-            "running_count": sum(1 for s in self.instances if s.state == "running"),
-        }
 
 
 def find_free_port() -> int:
@@ -124,13 +86,17 @@ def _check_and_cleanup_stale_lock(repo_root: Path, instance_id: str | None) -> N
     try:
         os.kill(info.pid, 0)
         raise AlreadyRunning(
-            pid=info.pid, repo_root=repo_root,
-            port=info.http_port, instance_id=instance_id,
+            pid=info.pid,
+            repo_root=repo_root,
+            port=info.http_port,
+            instance_id=instance_id,
         )
     except OSError:
         logger.info(
             "Cleaning up stale lock for %s instance=%s (pid %d not running)",
-            repo_root, instance_id or "default", info.pid,
+            repo_root,
+            instance_id or "default",
+            info.pid,
         )
         release_lock(repo_root, info.pid, instance_id)
 
@@ -141,7 +107,9 @@ def _extract_error_from_log(log_file: Path) -> str:
         return ""
     try:
         lines = log_file.read_text().splitlines()
-        error_lines = [l for l in lines if "ERROR" in l or "Traceback" in l or "ValueError" in l]
+        error_lines = [
+            l for l in lines if "ERROR" in l or "Traceback" in l or "ValueError" in l
+        ]
         if error_lines:
             return f"\n\nError from log:\n  {error_lines[-1]}"
         for line in reversed(lines):
@@ -174,6 +142,18 @@ def _engine_log_level_args(log_level: str | None) -> list[str]:
     return ["--log-level", engine_log_level]
 
 
+def _engine_subprocess_env(
+    expected_identity: dict[str, Any] | None,
+    expected_config_fingerprint: str | None,
+) -> dict[str, str]:
+    env = os.environ.copy()
+    if expected_identity is not None:
+        env[_EXPECTED_IDENTITY_ENV] = serialize_repo_identity(expected_identity)
+    if expected_config_fingerprint is not None:
+        env[EXPECTED_CONFIG_FINGERPRINT_ENV] = expected_config_fingerprint
+    return env
+
+
 def start(
     repo_root: Path | str,
     config_name: str = "default.yaml",
@@ -183,17 +163,23 @@ def start(
     start_paused: bool = False,
     log_level: str | None = None,
     *,
+    mode: str = "default",
+    expected_config_fingerprint: str | None = None,
     spawn_process: Callable[..., Any] | None = None,
 ) -> LockInfo:
     """Start an orchestrator for the given repository."""
     from .config import Config, get_config_path
 
     repo_root = normalize_repo_root(repo_root)
-    config_path = get_config_path(repo_root, config_name)
+    config_path = get_config_path(repo_root, config_name, mode)
     if not config_path.exists():
         raise FileNotFoundError(f"Config file not found: {config_path}")
 
     config = Config.load(config_path)
+    assert_expected_config_fingerprint(
+        config.config_fingerprint,
+        expected_config_fingerprint,
+    )
     if port is None:
         port = config.web_port
 
@@ -215,21 +201,23 @@ def start(
         "--no-browser",
         "--config",
         str(config_path),
+        "--mode",
+        mode,
     ]
     if start_paused:
         cmd.append("--start-paused")
     cmd.extend(_engine_log_level_args(log_level))
 
     # Set up environment for the subprocess
-    env = os.environ.copy()
-    if expected_identity is not None:
-        env[_EXPECTED_IDENTITY_ENV] = serialize_repo_identity(expected_identity)
+    env = _engine_subprocess_env(expected_identity, expected_config_fingerprint)
     if instance_id:
         env["INSTANCE_ID"] = instance_id
         cmd.extend(["--instance-id", instance_id])
 
     instance_str = f" instance={instance_id}" if instance_id else ""
-    logger.info("Starting orchestrator for %s%s on port %d", repo_root, instance_str, port)
+    logger.info(
+        "Starting orchestrator for %s%s on port %d", repo_root, instance_str, port
+    )
     logger.debug("Command: %s", " ".join(cmd))
 
     _spawn = spawn_process or subprocess.Popen
@@ -251,9 +239,14 @@ def start(
 
     # Wait for the process to create its lock file
     import time
+
     for _ in range(50):  # Wait up to 5 seconds
         info = read_lock(repo_root, instance_id)
         if info is not None and info.pid == process.pid:
+            assert_expected_config_fingerprint(
+                info.config_fingerprint,
+                expected_config_fingerprint,
+            )
             return info
         if process.poll() is not None:
             break
@@ -277,6 +270,9 @@ def start(
         state_dir=str(state_dir(repo_root)),
         recovered=False,
         instance_id=instance_id,
+        configuration_mode=mode,
+        config_name=config_name,
+        config_fingerprint=config.config_fingerprint,
     )
 
 
@@ -299,8 +295,13 @@ def _kill_by_port(port: int, use_sigkill: bool = False) -> bool:
                 try:
                     pid = int(pid_str)
                     os.kill(pid, sig)
-                    logger.warning("port-based kill: %s pid=%d port=%d (cross-repo "
-                                   "if another orchestrator)", sig.name, pid, port)
+                    logger.warning(
+                        "port-based kill: %s pid=%d port=%d (cross-repo "
+                        "if another orchestrator)",
+                        sig.name,
+                        pid,
+                        port,
+                    )
                     killed = True
                 except (ProcessLookupError, ValueError):
                     pass
@@ -349,7 +350,9 @@ def _request_graceful_shutdown(
     try:
         logger.info(
             "Requesting graceful shutdown via HTTP on port %d (reason=%r actor=%r)",
-            port, reason, actor,
+            port,
+            reason,
+            actor,
         )
         req = urllib.request.Request(
             f"http://127.0.0.1:{port}/api/shutdown",
@@ -407,6 +410,7 @@ def stop_by_port(
             logger.debug("HTTP shutdown failed on port %d: %s", port, e)
 
         import time
+
         time.sleep(0.5)
         if not _is_port_in_use(port):
             return True
@@ -414,6 +418,7 @@ def stop_by_port(
     killed = _kill_by_port(port, use_sigkill=force)
     if killed:
         import time
+
         time.sleep(0.5)
         return not _is_port_in_use(port)
     return False
@@ -437,7 +442,9 @@ def _send_kill_signal(pid: int, force: bool) -> None:
     try:
         os.killpg(pid, sig)
     except OSError as e:
-        logger.warning("Failed to kill process group %d: %s, trying single process", pid, e)
+        logger.warning(
+            "Failed to kill process group %d: %s, trying single process", pid, e
+        )
         try:
             os.kill(pid, sig)
         except OSError as e2:
@@ -454,6 +461,7 @@ def stop(
     graceful_timeout_seconds: float = DEFAULT_ENGINE_GRACEFUL_TIMEOUT_SECONDS,
     force_if_graceful_fails: bool = True,
     stop_policy: shutdown_timing.StopPolicy | None = None,
+    expected_pid: int | None = None,
 ) -> bool:
     """Stop the orchestrator; ``reason`` records the caller's intent."""
     if not reason or not reason.strip():
@@ -468,6 +476,15 @@ def stop(
     if info is None:
         logger.debug("No lock file found for %s (already stopped)", repo_root)
         return True
+
+    if expected_pid is not None and info.pid != expected_pid:
+        logger.warning(
+            "Refusing to stop replacement instance %s pid=%d; expected pid=%d",
+            instance_id or "default",
+            info.pid,
+            expected_pid,
+        )
+        return False
 
     pid, port = info.pid, info.http_port
 
@@ -486,8 +503,7 @@ def stop(
         force_requested=force,
         force_on_timeout=force_if_graceful_fails,
         request_graceful=lambda: bool(
-            port
-            and _request_graceful_shutdown(port, reason=reason, actor=actor)
+            port and _request_graceful_shutdown(port, reason=reason, actor=actor)
         ),
         terminate=lambda: _send_kill_signal(pid, force=False),
         force_stop=lambda: _force_stop(repo_root, pid, port, instance_id),
@@ -496,6 +512,27 @@ def stop(
     stopped = controller.stop()
     logger.info("Orchestrator stop attempt completed pid=%d stopped=%s", pid, stopped)
     return stopped
+
+
+def stop_tracked_instance(
+    repo_root: Path | str,
+    tracked: SupervisorStatus,
+    *,
+    reason: str,
+    actor: str,
+) -> bool:
+    """Stop and verify only the exact process represented by ``tracked``."""
+    if tracked.pid is None:
+        return False
+    stopped = stop(
+        repo_root,
+        force=True,
+        instance_id=tracked.instance_id,
+        reason=reason,
+        actor=actor,
+        expected_pid=tracked.pid,
+    )
+    return stopped and not shutdown_timing.process_is_alive(tracked.pid)
 
 
 def _force_stop(
@@ -571,6 +608,7 @@ def _force_kill_by_port_last_resort(
         return False
 
     import time
+
     logger.warning("Force killing by port %d", port)
     _kill_by_port(port, use_sigkill=True)
     time.sleep(0.5)
@@ -612,6 +650,9 @@ def status(repo_root: Path | str, instance_id: str | None = None) -> SupervisorS
             recovered=info.recovered,
             error="Process not running (stale lock)",
             instance_id=instance_id,
+            configuration_mode=info.configuration_mode,
+            config_name=info.config_name,
+            config_fingerprint=info.config_fingerprint,
         )
 
     return SupervisorStatus(
@@ -621,6 +662,9 @@ def status(repo_root: Path | str, instance_id: str | None = None) -> SupervisorS
         started_at=info.started_at,
         recovered=info.recovered,
         instance_id=instance_id,
+        configuration_mode=info.configuration_mode,
+        config_name=info.config_name,
+        config_fingerprint=info.config_fingerprint,
     )
 
 
@@ -636,6 +680,9 @@ def start_instances(
     expected_identity: dict[str, Any] | None = None,
     start_paused: bool = False,
     log_level: str | None = None,
+    *,
+    mode: str = "default",
+    expected_config_fingerprint: str | None = None,
 ) -> list[LockInfo]:
     """Start multiple orchestrator instances for a repository.
 
@@ -651,8 +698,12 @@ def start_instances(
     from .config import Config, get_config_path
 
     repo_root = normalize_repo_root(repo_root)
-    config_path = get_config_path(repo_root, config_name)
+    config_path = get_config_path(repo_root, config_name, mode)
     config = Config.load(config_path)
+    assert_expected_config_fingerprint(
+        config.config_fingerprint,
+        expected_config_fingerprint,
+    )
 
     if count is None:
         count = config.instances
@@ -666,15 +717,23 @@ def start_instances(
                 expected_identity=expected_identity,
                 start_paused=start_paused,
                 log_level=log_level,
+                mode=mode,
+                expected_config_fingerprint=expected_config_fingerprint,
             )
         ]
 
     # Multi-instance mode
+    assert_repository_configuration_identity(
+        repo_root,
+        configuration_mode=config.configuration_mode,
+        config_name=config.config_name,
+        config_fingerprint=config.config_fingerprint,
+    )
     results = []
     for i in range(1, count + 1):
         instance_id = f"orchestrator-{i}"
-        port = find_free_port()
         try:
+            port = find_free_port()
             info = start(
                 repo_root,
                 config_name,
@@ -683,6 +742,8 @@ def start_instances(
                 expected_identity=expected_identity,
                 start_paused=start_paused,
                 log_level=log_level,
+                mode=mode,
+                expected_config_fingerprint=expected_config_fingerprint,
             )
             results.append(info)
             logger.info("Started instance %s on port %d", instance_id, port)
@@ -690,8 +751,62 @@ def start_instances(
             logger.warning("Instance %s already running, skipping", instance_id)
         except Exception as e:
             logger.error("Failed to start instance %s: %s", instance_id, e)
+            _rollback_started_instances(repo_root, results, cause=e)
+            raise
 
     return results
+
+
+def _rollback_started_instances(
+    repo_root: Path,
+    started: list[LockInfo],
+    *,
+    cause: Exception,
+) -> None:
+    """Stop every child published by a failed multi-instance start attempt."""
+    failed: list[str] = []
+    for info in reversed(started):
+        if not _rollback_started_instance(repo_root, info):
+            failed.append(f"{info.instance_id}: process {info.pid} survived rollback")
+    if failed:
+        raise RuntimeError(
+            "Multi-instance start failed and rollback was incomplete: "
+            + "; ".join(failed)
+        ) from cause
+
+
+def _rollback_started_instance(repo_root: Path, info: LockInfo) -> bool:
+    """Stop and verify one exact process created by the current start attempt."""
+    try:
+        stop(
+            repo_root,
+            force=True,
+            instance_id=info.instance_id,
+            reason="rollback partial multi-instance start",
+            actor="supervisor.start_instances.rollback",
+        )
+    except Exception:
+        logger.exception("Normal rollback failed for instance %s", info.instance_id)
+    if not shutdown_timing.process_is_alive(info.pid):
+        return True
+
+    published = read_lock(repo_root, info.instance_id)
+    if published is not None and published.pid != info.pid:
+        logger.error(
+            "Refusing to terminate replacement instance %s pid=%d while rolling back pid=%d",
+            info.instance_id,
+            published.pid,
+            info.pid,
+        )
+        return False
+
+    _send_kill_signal(info.pid, force=True)
+    if not _wait_for_process_exit_after_force(info.pid, timeout_iterations=20):
+        return False
+    published_after_exit = read_lock(repo_root, info.instance_id)
+    if published_after_exit is not None and published_after_exit.pid == info.pid:
+        release_lock(repo_root, info.pid, info.instance_id)
+    return True
 
 
 def stop_all_instances(
@@ -759,6 +874,8 @@ def stop_all_instances(
 def status_all_instances(
     repo_root: Path | str,
     config_name: str = "default.yaml",
+    *,
+    mode: str = "default",
 ) -> MultiInstanceStatus:
     """Get status of all orchestrator instances for a repository.
 
@@ -774,7 +891,7 @@ def status_all_instances(
     repo_root = normalize_repo_root(repo_root)
 
     # Load config to get expected instance count
-    config_path = get_config_path(repo_root, config_name)
+    config_path = get_config_path(repo_root, config_name, mode)
     try:
         config = Config.load(config_path)
         expected_count = config.instances
@@ -799,186 +916,3 @@ def status_all_instances(
         instances=instances,
         expected_count=expected_count,
     )
-
-
-# =============================================================================
-# SupervisorOps protocol for dependency injection
-# =============================================================================
-
-
-@runtime_checkable
-class SupervisorOps(Protocol):
-    """Protocol for supervisor operations, enabling DI in tests."""
-
-    def start(
-        self,
-        repo_root: Path | str,
-        config_name: str = "default.yaml",
-        instance_id: str | None = None,
-        port: int | None = None,
-        expected_identity: dict[str, Any] | None = None,
-        start_paused: bool = False,
-        log_level: str | None = None,
-    ) -> LockInfo: ...
-
-    def stop(
-        self,
-        repo_root: Path | str,
-        force: bool = False,
-        instance_id: str | None = None,
-        *,
-        reason: str,
-        actor: str = "supervisor.stop",
-        graceful_timeout_seconds: float = DEFAULT_ENGINE_GRACEFUL_TIMEOUT_SECONDS,
-        force_if_graceful_fails: bool = True,
-        stop_policy: shutdown_timing.StopPolicy | None = None,
-    ) -> bool: ...
-
-    def stop_by_port(
-        self,
-        port: int,
-        *,
-        reason: str,
-        actor: str = "supervisor.stop_by_port",
-        force: bool = False,
-    ) -> bool: ...
-
-    def status(
-        self, repo_root: Path | str, instance_id: str | None = None
-    ) -> SupervisorStatus: ...
-
-    def start_instances(
-        self,
-        repo_root: Path | str,
-        config_name: str = "default.yaml",
-        count: int | None = None,
-        expected_identity: dict[str, Any] | None = None,
-        start_paused: bool = False,
-        log_level: str | None = None,
-    ) -> list[LockInfo]: ...
-
-    def stop_all_instances(
-        self,
-        repo_root: Path | str,
-        force: bool = False,
-        *,
-        reason: str,
-        actor: str = "supervisor.stop_all_instances",
-        graceful_timeout_seconds: float = DEFAULT_ENGINE_GRACEFUL_TIMEOUT_SECONDS,
-        force_if_graceful_fails: bool = True,
-        stop_policy: shutdown_timing.StopPolicy | None = None,
-    ) -> int: ...
-
-    def status_all_instances(
-        self,
-        repo_root: Path | str,
-        config_name: str = "default.yaml",
-    ) -> MultiInstanceStatus: ...
-
-
-class DefaultSupervisorOps:
-    """Delegates to module-level functions."""
-
-    def start(
-        self,
-        repo_root: Path | str,
-        config_name: str = "default.yaml",
-        instance_id: str | None = None,
-        port: int | None = None,
-        expected_identity: dict[str, Any] | None = None,
-        start_paused: bool = False,
-        log_level: str | None = None,
-    ) -> LockInfo:
-        return start(
-            repo_root=repo_root,
-            config_name=config_name,
-            instance_id=instance_id,
-            port=port,
-            expected_identity=expected_identity,
-            start_paused=start_paused,
-            log_level=log_level,
-        )
-
-    def stop(
-        self,
-        repo_root: Path | str,
-        force: bool = False,
-        instance_id: str | None = None,
-        *,
-        reason: str,
-        actor: str = "supervisor.stop",
-        graceful_timeout_seconds: float = DEFAULT_ENGINE_GRACEFUL_TIMEOUT_SECONDS,
-        force_if_graceful_fails: bool = True,
-        stop_policy: shutdown_timing.StopPolicy | None = None,
-    ) -> bool:
-        return stop(
-            repo_root,
-            force,
-            instance_id,
-            reason=reason,
-            actor=actor,
-            graceful_timeout_seconds=graceful_timeout_seconds,
-            force_if_graceful_fails=force_if_graceful_fails,
-            stop_policy=stop_policy,
-        )
-
-    def stop_by_port(
-        self,
-        port: int,
-        *,
-        reason: str,
-        actor: str = "supervisor.stop_by_port",
-        force: bool = False,
-    ) -> bool:
-        return stop_by_port(port, reason=reason, actor=actor, force=force)
-
-    def status(
-        self, repo_root: Path | str, instance_id: str | None = None
-    ) -> SupervisorStatus:
-        return status(repo_root, instance_id)
-
-    def start_instances(
-        self,
-        repo_root: Path | str,
-        config_name: str = "default.yaml",
-        count: int | None = None,
-        expected_identity: dict[str, Any] | None = None,
-        start_paused: bool = False,
-        log_level: str | None = None,
-    ) -> list[LockInfo]:
-        return start_instances(
-            repo_root=repo_root,
-            config_name=config_name,
-            count=count,
-            expected_identity=expected_identity,
-            start_paused=start_paused,
-            log_level=log_level,
-        )
-
-    def stop_all_instances(
-        self,
-        repo_root: Path | str,
-        force: bool = False,
-        *,
-        reason: str,
-        actor: str = "supervisor.stop_all_instances",
-        graceful_timeout_seconds: float = DEFAULT_ENGINE_GRACEFUL_TIMEOUT_SECONDS,
-        force_if_graceful_fails: bool = True,
-        stop_policy: shutdown_timing.StopPolicy | None = None,
-    ) -> int:
-        return stop_all_instances(
-            repo_root,
-            force,
-            reason=reason,
-            actor=actor,
-            graceful_timeout_seconds=graceful_timeout_seconds,
-            force_if_graceful_fails=force_if_graceful_fails,
-            stop_policy=stop_policy,
-        )
-
-    def status_all_instances(
-        self,
-        repo_root: Path | str,
-        config_name: str = "default.yaml",
-    ) -> MultiInstanceStatus:
-        return status_all_instances(repo_root, config_name)

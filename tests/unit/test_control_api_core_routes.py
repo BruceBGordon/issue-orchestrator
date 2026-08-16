@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from tests.unit import test_control_api as _support
 from tests.unit.route_helpers import route_path_counts
 from tests.unit.test_control_api import *  # noqa: F403
+from issue_orchestrator.infra.repo_registry import RegisteredRepo
 
 globals().update(
     {name: value for name, value in vars(_support).items() if not name.startswith("__")}
@@ -100,7 +101,9 @@ class TestGoalPilotRoutes:
 
         pilot = MagicMock()
         pilot.reorder_journeys.return_value = {"status": "ok"}
-        original_deps = getattr(control_app.state, "control_api_goal_pilot_dependencies")
+        original_deps = getattr(
+            control_app.state, "control_api_goal_pilot_dependencies"
+        )
         install_control_api_goal_pilot_dependencies(
             control_app,
             ControlApiGoalPilotDependencies(
@@ -118,7 +121,9 @@ class TestGoalPilotRoutes:
 
         assert response.status_code == 200
         assert response.json() == {"status": "ok"}
-        pilot.reorder_journeys.assert_called_once_with("run-1", ["journey-1", "journey-2"])
+        pilot.reorder_journeys.assert_called_once_with(
+            "run-1", ["journey-1", "journey-2"]
+        )
 
 
 class TestOrchestratorNotInitialized:
@@ -179,6 +184,7 @@ class TestOrchestratorNotInitialized:
 
         assert response.status_code == 503
         assert response.json()["error"] == "Orchestrator not initialized"
+
 
 class TestEventHubNotInitialized:
     """Test SSE endpoints when event_hub is None."""
@@ -275,7 +281,9 @@ class TestResumeEndpoint:
 class TestControlCenterTemplate:
     """Test rendered control center UI copy and scope labels."""
 
-    def test_control_center_ui_uses_engine_terminology(self, client_without_orchestrator):
+    def test_control_center_ui_uses_engine_terminology(
+        self, client_without_orchestrator
+    ):
         response = client_without_orchestrator.get("/")
 
         assert response.status_code == 200
@@ -325,10 +333,15 @@ class TestControlCenterTemplate:
         response = client_without_orchestrator.get("/")
 
         assert response.status_code == 200
-        assert response.headers["Cache-Control"] == "no-cache, no-store, must-revalidate"
+        assert (
+            response.headers["Cache-Control"] == "no-cache, no-store, must-revalidate"
+        )
         assert response.headers["Pragma"] == "no-cache"
         assert response.headers["Expires"] == "0"
-        assert '<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">' in response.text
+        assert (
+            '<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">'
+            in response.text
+        )
         assert '<meta http-equiv="Pragma" content="no-cache">' in response.text
         assert '<meta http-equiv="Expires" content="0">' in response.text
 
@@ -362,7 +375,9 @@ class TestControlCenterTemplate:
 
     def test_control_center_static_assets_are_served(self, client_without_orchestrator):
         css_response = client_without_orchestrator.get("/static/css/control_center.css")
-        browser_auth_response = client_without_orchestrator.get("/static/js/browser_auth.js")
+        browser_auth_response = client_without_orchestrator.get(
+            "/static/js/browser_auth.js"
+        )
         setup_commands_response = client_without_orchestrator.get(
             "/static/js/control_center_setup_commands.js"
         )
@@ -387,7 +402,8 @@ class TestControlCenterTemplate:
         assert "<svg" in logo_response.text
 
     def test_control_center_cache_buster_is_consistent_across_assets(
-        self, client_without_orchestrator,
+        self,
+        client_without_orchestrator,
     ):
         """All ``?v=<token>`` query strings on a single render must share the same token.
 
@@ -402,14 +418,14 @@ class TestControlCenterTemplate:
 
         assert tokens, "Expected at least one ?v= cache-buster on a static URL"
         assert len(tokens) == 1, (
-            f"All static assets should share one cache-buster per render, "
-            f"got: {tokens}"
+            f"All static assets should share one cache-buster per render, got: {tokens}"
         )
         # Defensive: token should never be the literal placeholder.
         assert "{{" not in next(iter(tokens))
 
     def test_control_center_cache_buster_is_stable_within_a_process(
-        self, client_without_orchestrator,
+        self,
+        client_without_orchestrator,
     ):
         """Two requests in the same process get the same token.
 
@@ -427,7 +443,9 @@ class TestControlCenterTemplate:
         assert token_a and token_b
         assert token_a.group(1) == token_b.group(1)
 
-    def test_control_center_favicon_uses_packaged_logo(self, client_without_orchestrator):
+    def test_control_center_favicon_uses_packaged_logo(
+        self, client_without_orchestrator
+    ):
         response = client_without_orchestrator.get("/favicon.ico")
 
         assert response.status_code == 200
@@ -461,11 +479,12 @@ class TestControlCenterRepoContext:
         other.mkdir()
 
         repos = [
-            SimpleNamespace(
+            RegisteredRepo(
                 path=str(other),
                 name="other",
                 added_at="2026-01-01T00:00:00+00:00",
                 selected_config="default.yaml",
+                selected_mode="default",
                 health=None,
             )
         ]
@@ -475,11 +494,12 @@ class TestControlCenterRepoContext:
 
         def fake_add_repo(path: str):
             repos.append(
-                SimpleNamespace(
+                RegisteredRepo(
                     path=str(Path(path)),
                     name=Path(path).name,
                     added_at="2026-01-01T00:00:00+00:00",
                     selected_config="default.yaml",
+                    selected_mode="default",
                     health=None,
                 )
             )
@@ -514,6 +534,132 @@ class TestControlCenterRepoContext:
         assert data["preferred_repo_root"] == str(preferred)
 
 
+class TestRepositoryLaunchSelectionEndpoint:
+    def test_selection_change_is_rejected_while_engine_runs(
+        self,
+        supervisor_client: TestClient,
+        tmp_path: Path,
+        mock_supervisor: MagicMock,
+    ) -> None:
+        mock_supervisor.status_all_instances.return_value = MultiInstanceStatus(
+            repo_root=str(tmp_path),
+            instances=[
+                SupervisorStatus(
+                    state="running",
+                    instance_id="orchestrator-1",
+                )
+            ],
+        )
+
+        response = supervisor_client.post(
+            "/control/repos/select-config",
+            json={
+                "repo_root": str(tmp_path),
+                "mode": "codex",
+                "config_name": "main.yaml",
+            },
+        )
+
+        assert response.status_code == 409
+        assert response.json()["error"] == "engine_running"
+
+    def test_selection_change_is_rejected_while_orphan_engine_runs(
+        self,
+        supervisor_client: TestClient,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        mock_supervisor: MagicMock,
+    ) -> None:
+        from issue_orchestrator.execution import control_center_runtime
+
+        mock_supervisor.status_all_instances.return_value = MultiInstanceStatus(
+            repo_root=str(tmp_path),
+        )
+        monkeypatch.setattr(
+            control_center_runtime,
+            "detect_repository_orchestrators",
+            lambda *_args, **_kwargs: [{"port": 18080}],
+        )
+
+        response = supervisor_client.post(
+            "/control/repos/select-config",
+            json={
+                "repo_root": str(tmp_path),
+                "mode": "codex",
+                "config_name": "main.yaml",
+            },
+        )
+
+        assert response.status_code == 409
+        assert response.json()["error"] == "engine_running"
+        assert "untracked" in response.json()["detail"]
+
+    def test_selection_endpoint_persists_complete_typed_selection(
+        self,
+        supervisor_client: TestClient,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        mock_supervisor: MagicMock,
+    ) -> None:
+        from issue_orchestrator.infra import repo_registry
+
+        captured: list[object] = []
+        config_path = tmp_path / ".issue-orchestrator/config/modes/codex/main.yaml"
+        config_path.parent.mkdir(parents=True)
+        config_path.write_text("agents: {}\n")
+        mock_supervisor.status_all_instances.return_value = MultiInstanceStatus(
+            repo_root=str(tmp_path),
+        )
+        mock_supervisor.status.return_value = SupervisorStatus(state="stopped")
+        monkeypatch.setattr(
+            repo_registry,
+            "set_selected_launch_selection",
+            lambda _path, selection: captured.append(selection) or True,
+        )
+
+        response = supervisor_client.post(
+            "/control/repos/select-config",
+            json={
+                "repo_root": str(tmp_path),
+                "mode": "codex",
+                "config_name": "main",
+            },
+        )
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "status": "ok",
+            "mode": "codex",
+            "config_name": "main.yaml",
+        }
+        assert captured[0].to_dict() == {
+            "mode": "codex",
+            "config_name": "main.yaml",
+        }
+
+    def test_selection_endpoint_rejects_missing_mode_config(
+        self,
+        supervisor_client: TestClient,
+        tmp_path: Path,
+        mock_supervisor: MagicMock,
+    ) -> None:
+        mock_supervisor.status_all_instances.return_value = MultiInstanceStatus(
+            repo_root=str(tmp_path),
+        )
+
+        response = supervisor_client.post(
+            "/control/repos/select-config",
+            json={
+                "repo_root": str(tmp_path),
+                "mode": "codex",
+                "config_name": "missing.yaml",
+            },
+        )
+
+        assert response.status_code == 404
+        assert response.json()["error"] == "config_not_found"
+
+
 # --- Test: Refresh Endpoint ---
 
 
@@ -536,23 +682,24 @@ class TestRefreshEndpoint:
 
         response = client.post(
             "/api/refresh",
-            json={"inflight_stable_ids": ["issue-1", "issue-2", "issue-3"]}
+            json={"inflight_stable_ids": ["issue-1", "issue-2", "issue-3"]},
         )
 
         assert response.status_code == 200
         assert response.json() == {"status": "refresh_requested"}
         mock_orch.request_refresh.assert_called_once()
         call_args = mock_orch.request_refresh.call_args
-        assert call_args.kwargs["inflight_stable_ids"] == {"issue-1", "issue-2", "issue-3"}
+        assert call_args.kwargs["inflight_stable_ids"] == {
+            "issue-1",
+            "issue-2",
+            "issue-3",
+        }
 
     def test_refresh_with_integer_stable_ids(self, client_with_orchestrator):
         """Refresh converts integer stable_ids to strings."""
         client, mock_orch = client_with_orchestrator
 
-        response = client.post(
-            "/api/refresh",
-            json={"inflight_stable_ids": [1, 2, 3]}
-        )
+        response = client.post("/api/refresh", json={"inflight_stable_ids": [1, 2, 3]})
 
         assert response.status_code == 200
         call_args = mock_orch.request_refresh.call_args
@@ -565,7 +712,7 @@ class TestRefreshEndpoint:
         response = client.post(
             "/api/refresh",
             content="not valid json",
-            headers={"Content-Type": "application/json"}
+            headers={"Content-Type": "application/json"},
         )
 
         assert response.status_code == 200
@@ -582,6 +729,220 @@ class TestRefreshEndpoint:
 
 
 class TestControlReposDashboardUrl:
+    def test_control_repos_detects_nonselected_orphan_without_lock(
+        self,
+        supervisor_client: TestClient,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        mock_supervisor: MagicMock,
+    ) -> None:
+        from issue_orchestrator.entrypoints import control_api
+        from issue_orchestrator.execution import control_center_repo_status
+        from issue_orchestrator.infra import repo_registry
+
+        repo = tmp_path / "repo"
+        for mode in ("default", "codex"):
+            config = repo / f".issue-orchestrator/config/modes/{mode}/main.yaml"
+            config.parent.mkdir(parents=True, exist_ok=True)
+            config.write_text("agents: {}\n", encoding="utf-8")
+        monkeypatch.setattr(
+            repo_registry,
+            "list_repos",
+            lambda: [
+                RegisteredRepo(
+                    path=str(repo),
+                    selected_mode="default",
+                    selected_config="main.yaml",
+                )
+            ],
+        )
+        monkeypatch.setattr(repo_registry, "add_repo", lambda path: None)
+        monkeypatch.setattr(control_api, "_preferred_repo_root", lambda: None)
+        monkeypatch.setattr(
+            control_center_repo_status,
+            "detect_repository_orchestrators",
+            lambda _repo: [
+                {
+                    "port": 19090,
+                    "info": {
+                        "configuration_mode": "codex",
+                        "config_name": "main.yaml",
+                        "config_fingerprint": "codex-fingerprint",
+                    },
+                    "status": {"active_sessions": []},
+                }
+            ],
+        )
+        mock_supervisor.status.return_value = SupervisorStatus(state="stopped")
+        mock_supervisor.status_all_instances.return_value = MultiInstanceStatus(
+            repo_root=str(repo)
+        )
+
+        payload = supervisor_client.get("/control/repos").json()["repos"][0]
+
+        assert payload["status"]["state"] == "running"
+        assert payload["status"]["orphaned"] is True
+        assert payload["selected_mode"] == "default"
+        assert payload["active_mode"] == "codex"
+
+    def test_control_repos_uses_active_lock_identity_for_multi_instance_topology(
+        self,
+        supervisor_client: TestClient,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        mock_supervisor: MagicMock,
+    ) -> None:
+        from issue_orchestrator.entrypoints import control_api
+        from issue_orchestrator.execution import control_center_repo_status
+        from issue_orchestrator.infra import repo_registry
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        monkeypatch.setattr(
+            repo_registry,
+            "list_repos",
+            lambda: [
+                RegisteredRepo(
+                    path=str(repo),
+                    selected_mode="default",
+                    selected_config="main.yaml",
+                )
+            ],
+        )
+        monkeypatch.setattr(repo_registry, "add_repo", lambda path: None)
+        monkeypatch.setattr(control_api, "_preferred_repo_root", lambda: None)
+        monkeypatch.setattr(
+            control_center_repo_status,
+            "enrich_runtime_health",
+            lambda _path, payload, **_kwargs: payload,
+        )
+        monkeypatch.setattr(
+            control_center_repo_status,
+            "_apply_internal_runtime_state",
+            lambda _payload, _port: None,
+        )
+        mock_supervisor.status_all_instances.return_value = MultiInstanceStatus(
+            repo_root=str(repo),
+            instances=[
+                SupervisorStatus(
+                    state="running",
+                    pid=101,
+                    port=19101,
+                    instance_id="orchestrator-1",
+                    configuration_mode="codex",
+                    config_name="other.yaml",
+                    config_fingerprint="active-fingerprint",
+                ),
+                SupervisorStatus(
+                    state="running",
+                    pid=102,
+                    port=19102,
+                    instance_id="orchestrator-2",
+                    configuration_mode="codex",
+                    config_name="other.yaml",
+                    config_fingerprint="active-fingerprint",
+                ),
+            ],
+        )
+
+        response = supervisor_client.get("/control/repos")
+
+        assert response.status_code == 200
+        payload = response.json()["repos"][0]
+        assert payload["selected_mode"] == "default"
+        assert payload["active_mode"] == "codex"
+        assert payload["active_config"] == "other.yaml"
+        assert payload["active_config_fingerprint"] == "active-fingerprint"
+        assert payload["expected_instances"] == 2
+        assert payload["status"]["state"] == "running"
+        assert payload["status"]["configuration_mode"] == "codex"
+        assert len(payload["instances"]) == 2
+
+    def test_control_repos_reports_conflicting_active_identities_deterministically(
+        self,
+        supervisor_client: TestClient,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        mock_supervisor: MagicMock,
+    ) -> None:
+        from issue_orchestrator.entrypoints import control_api
+        from issue_orchestrator.execution import control_center_repo_status
+        from issue_orchestrator.infra import repo_registry
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        monkeypatch.setattr(
+            repo_registry,
+            "list_repos",
+            lambda: [
+                RegisteredRepo(
+                    path=str(repo),
+                    selected_mode="default",
+                    selected_config="main.yaml",
+                )
+            ],
+        )
+        monkeypatch.setattr(repo_registry, "add_repo", lambda path: None)
+        monkeypatch.setattr(control_api, "_preferred_repo_root", lambda: None)
+        monkeypatch.setattr(
+            control_center_repo_status,
+            "enrich_runtime_health",
+            lambda _path, payload, **_kwargs: payload,
+        )
+        mock_supervisor.status_all_instances.return_value = MultiInstanceStatus(
+            repo_root=str(repo),
+            instances=[
+                SupervisorStatus(
+                    state="running",
+                    pid=102,
+                    instance_id="orchestrator-2",
+                    configuration_mode="codex",
+                    config_name="z.yaml",
+                    config_fingerprint="z-fingerprint",
+                ),
+                SupervisorStatus(
+                    state="running",
+                    pid=101,
+                    instance_id="orchestrator-1",
+                    configuration_mode="claude",
+                    config_name="a.yaml",
+                    config_fingerprint="a-fingerprint",
+                ),
+            ],
+        )
+
+        payload = supervisor_client.get("/control/repos").json()["repos"][0]
+
+        assert payload["selected_mode"] == "default"
+        assert payload["selected_config"] == "main.yaml"
+        assert payload["active_mode"] == "claude"
+        assert payload["active_config"] == "a.yaml"
+        assert payload["configuration_identity_conflict"] is True
+
+    def test_legacy_repo_status_route_reports_mode_scoped_configs(
+        self,
+        supervisor_client: TestClient,
+        tmp_path: Path,
+        mock_supervisor: MagicMock,
+    ) -> None:
+        from urllib.parse import quote
+
+        repo = tmp_path / "repo"
+        config = repo / ".issue-orchestrator/config/modes/codex/main.yaml"
+        config.parent.mkdir(parents=True)
+        config.write_text("agents: {}\n", encoding="utf-8")
+        mock_supervisor.status.return_value = SupervisorStatus(state="stopped")
+
+        response = supervisor_client.get(
+            f"/api/repos/{quote(str(repo), safe='')}/status"
+        )
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["configs"] == []
+        assert payload["modes"] == ["codex"]
+        assert payload["mode_configs"] == {"codex": ["main.yaml"]}
+
     def test_control_repos_exposes_codespaces_dashboard_url(
         self,
         supervisor_client: TestClient,
@@ -599,11 +960,12 @@ class TestControlReposDashboardUrl:
             repo_registry,
             "list_repos",
             lambda: [
-                SimpleNamespace(
+                RegisteredRepo(
                     path=str(repo),
                     name=repo.name,
                     added_at="2026-01-01T00:00:00+00:00",
                     selected_config="main.yaml",
+                    selected_mode="default",
                     health=None,
                 )
             ],
@@ -612,7 +974,10 @@ class TestControlReposDashboardUrl:
         monkeypatch.setattr(control_api, "_preferred_repo_root", lambda: None)
         monkeypatch.setenv("CODESPACE_NAME", "octo-space")
         monkeypatch.setenv("GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN", "app.github.dev")
-        monkeypatch.setattr("httpx.get", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("no probe")))  # type: ignore[arg-type]
+        monkeypatch.setattr(
+            "httpx.get",
+            lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("no probe")),
+        )  # type: ignore[arg-type]
 
         mock_supervisor.status.return_value = SupervisorStatus(
             state="running",
@@ -624,7 +989,10 @@ class TestControlReposDashboardUrl:
 
         assert response.status_code == 200
         data = response.json()
-        assert data["repos"][0]["dashboard_url"] == "https://octo-space-55543.app.github.dev/"
+        assert (
+            data["repos"][0]["dashboard_url"]
+            == "https://octo-space-55543.app.github.dev/"
+        )
 
     def test_control_repos_omits_dashboard_url_when_port_is_unresolved(
         self,
@@ -643,11 +1011,12 @@ class TestControlReposDashboardUrl:
             repo_registry,
             "list_repos",
             lambda: [
-                SimpleNamespace(
+                RegisteredRepo(
                     path=str(repo),
                     name=repo.name,
                     added_at="2026-01-01T00:00:00+00:00",
                     selected_config="main.yaml",
+                    selected_mode="default",
                     health=None,
                 )
             ],
@@ -855,12 +1224,17 @@ class TestHealthEndpoint:
         assert data["orchestrator"]["status"] == "not_initialized"
         assert "terminal" in data
 
-    def test_health_returns_degraded_when_terminal_unhealthy(self, client_with_orchestrator):
+    def test_health_returns_degraded_when_terminal_unhealthy(
+        self, client_with_orchestrator
+    ):
         """Health endpoint returns 503 when terminal health check fails."""
         client, mock_orchestrator = client_with_orchestrator
 
         # Mock unhealthy terminal
-        mock_orchestrator.deps.runner.terminal_health_check.return_value = {"healthy": False, "error": "test"}
+        mock_orchestrator.deps.runner.terminal_health_check.return_value = {
+            "healthy": False,
+            "error": "test",
+        }
 
         response = client.get("/api/health")
 
@@ -899,7 +1273,10 @@ class TestGHAuditReportEndpoint:
         """gh_audit_report returns 400 when audit is disabled."""
         client, _ = client_with_orchestrator
 
-        with patch("issue_orchestrator.entrypoints.control_api.gh_audit.enabled", return_value=False):
+        with patch(
+            "issue_orchestrator.entrypoints.control_api.gh_audit.enabled",
+            return_value=False,
+        ):
             response = client.post("/api/gh_audit_report")
 
         assert response.status_code == 400
@@ -909,8 +1286,14 @@ class TestGHAuditReportEndpoint:
         """gh_audit_report returns path when audit is enabled."""
         client, _ = client_with_orchestrator
 
-        with patch("issue_orchestrator.entrypoints.control_api.gh_audit.enabled", return_value=True):
-            with patch("issue_orchestrator.entrypoints.control_api.gh_audit.emit_report", return_value="/tmp/report.json"):
+        with patch(
+            "issue_orchestrator.entrypoints.control_api.gh_audit.enabled",
+            return_value=True,
+        ):
+            with patch(
+                "issue_orchestrator.entrypoints.control_api.gh_audit.emit_report",
+                return_value="/tmp/report.json",
+            ):
                 response = client.post("/api/gh_audit_report")
 
         assert response.status_code == 200
@@ -931,7 +1314,9 @@ class TestSnapshotEndpoint:
         mock_orch.event_context.tick_id = 10
 
         # Mock SnapshotBuilder
-        with patch("issue_orchestrator.entrypoints.control_api.asyncio.to_thread") as mock_to_thread:
+        with patch(
+            "issue_orchestrator.entrypoints.control_api.asyncio.to_thread"
+        ) as mock_to_thread:
             mock_to_thread.return_value = {
                 "snapshot_id": 42,
                 "tick_id": 10,
@@ -950,7 +1335,9 @@ class TestSnapshotEndpoint:
         """Snapshot endpoint returns 500 when snapshot building fails."""
         client, mock_orch = client_with_orchestrator
 
-        with patch("issue_orchestrator.entrypoints.control_api.asyncio.to_thread") as mock_to_thread:
+        with patch(
+            "issue_orchestrator.entrypoints.control_api.asyncio.to_thread"
+        ) as mock_to_thread:
             mock_to_thread.side_effect = Exception("Build failed")
 
             response = client.get("/api/snapshot")

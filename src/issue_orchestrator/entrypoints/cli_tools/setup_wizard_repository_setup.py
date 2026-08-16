@@ -15,7 +15,8 @@ from ...control.repository_setup import (
     RepositorySetupResult,
 )
 from ...domain.repository_config_name import RepositoryConfigName
-from ...infra.config import get_config_dir, get_config_path
+from ...infra.config import get_config_path
+from ...infra.config_paths import require_engine_launch_config_path
 from ...ports.repository_setup import (
     RepositorySetupConfigTarget,
     RepositorySetupExplicitConfig,
@@ -117,15 +118,14 @@ def _config_target(
     config_path: Path,
 ) -> RepositorySetupConfigTarget:
     resolved_root = repo_root.resolve()
-    resolved_path = config_path.resolve()
-    if resolved_path.parent == get_config_dir(resolved_root).resolve():
-        try:
-            name = RepositoryConfigName(resolved_path.name)
-        except ValueError:
-            pass
-        else:
-            if get_config_path(resolved_root, name.value).resolve() == resolved_path:
-                return RepositorySetupNamedConfig(name)
+    resolved_path = require_engine_launch_config_path(config_path)
+    try:
+        name = RepositoryConfigName(resolved_path.name)
+    except ValueError:
+        pass
+    else:
+        if get_config_path(resolved_root, name.value).resolve() == resolved_path:
+            return RepositorySetupNamedConfig(name)
     return RepositorySetupExplicitConfig(resolved_path)
 
 

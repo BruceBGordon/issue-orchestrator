@@ -24,8 +24,8 @@ from issue_orchestrator.adapters.worktree.api import (
 from issue_orchestrator.adapters.worktree._worktree_runtime import (
     ALLOW_NO_VERIFY_DRY_RUN_PATH,
     CLAUDE_SETTINGS_FOR_AGENTS,
-    WORKTREE_ID_MARKER,
 )
+from issue_orchestrator.ports.worktree_manager import WORKTREE_ID_MARKER
 from tests.unit.worktree_git_helpers import (
     block_worktree_config_writes,
     effective_hooks_path,
@@ -102,7 +102,7 @@ class TestApplyProducesRunnableWorktree:
             repo_root / ".git" / "worktrees" / "repo-123" / "info" / "exclude"
         ).read_text()
         assert ".claude/settings.json" in exclude_text
-        assert WORKTREE_ID_MARKER in exclude_text
+        assert str(WORKTREE_ID_MARKER) in exclude_text
         assert str(state.synced_cli_tool_paths[0]) in exclude_text
 
     def test_apply_reports_what_it_did(self, repo_root, worktree_path):

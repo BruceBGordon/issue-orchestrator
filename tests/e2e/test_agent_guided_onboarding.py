@@ -348,7 +348,7 @@ def _build_onboarding_prompt(provider_name: str, source_root: Path) -> str:
         - Install repo guardrails / AI hooks when asked.
         - Do not set up provider API keys in the wizard.
         - After setup, run `issue-orchestrator doctor` and `issue-orchestrator init`.
-        - Edit `.issue-orchestrator/config/default.yaml` so `worktrees.seed_ref: HEAD`.
+        - Edit `.issue-orchestrator/config/modes/default/default.yaml` so `worktrees.seed_ref: HEAD`.
         - Commit all generated onboarding files locally with commit message `Add onboarding files`.
         - Do not push.
         - Stop once the onboarding files are committed and `issue-orchestrator doctor` passes.
@@ -516,7 +516,14 @@ async def test_live_agent_guided_existing_repo_onboarding_launches_first_issue(
     assert current_head != base_head, "Expected onboarding agent to commit generated files"
     assert _git(target_repo, "log", "-1", "--format=%s").stdout.strip() == "Add onboarding files"
 
-    config_path = target_repo / ".issue-orchestrator" / "config" / "default.yaml"
+    config_path = (
+        target_repo
+        / ".issue-orchestrator"
+        / "config"
+        / "modes"
+        / "default"
+        / "default.yaml"
+    )
     assert config_path.exists(), "Expected default onboarding config to be created"
     assert (target_repo / ".prompts" / "onboarding.md").exists(), "Expected onboarding prompt file"
 

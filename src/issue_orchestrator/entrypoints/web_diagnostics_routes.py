@@ -109,6 +109,9 @@ def _info_payload(
         "version": package_version("issue-orchestrator"),
         "repo": config.repo,
         "repo_root": str(config.repo_root) if config.repo_root else None,
+        "configuration_mode": config.configuration_mode,
+        "config_name": config.config_name,
+        "config_fingerprint": config.config_fingerprint,
         "ui_mode": config.ui_mode,
         "terminal_backend": config.terminal_adapter or "subprocess",
         "client_capabilities": {

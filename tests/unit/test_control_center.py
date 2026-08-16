@@ -371,14 +371,17 @@ def test_start_buttons_are_disabled_while_start_is_pending() -> None:
     assert "const pendingRepoStarts = new Set();" in script
     assert "const REPO_START_POLL_INTERVAL_MS = 250;" in script
     assert "const REPO_START_TIMEOUT_MS = 15000;" in script
-    assert "function getSelectedRepoConfig(repo, preferredConfig = null)" in script
-    assert "function requiresExplicitRepoConfigSelection(repo, selectedConfig)" in script
+    assert "function getSelectedRepoConfig(repo, preferredConfig = null, mode = null)" in script
+    assert (
+        "function requiresExplicitRepoConfigSelection(repo, selectedConfig, mode = null)"
+        in script
+    )
     assert "if (pendingRepoStarts.has(path))" in script
     assert "pendingRepoStarts.add(path);" in script
     assert "pendingRepoStarts.delete(path);" in script
     assert "async function waitForRepoToBeReady(path)" in script
     assert "await waitForRepoToBeReady(path);" in script
-    assert "config = getValidRepoConfig(repo, config);" in script
+    assert "config = getValidRepoConfig(repo, config, mode);" in script
     assert "throw new Error('Select a valid config before starting this repository engine');" in script
     assert (
         "function showDoctorResultsModal(title, data, prefixMessage = null, "
@@ -392,7 +395,7 @@ def test_start_buttons_are_disabled_while_start_is_pending() -> None:
     assert "if (!confirmed) {" in script
     assert "/control/orchestrator/guardrails/repair" in script
     assert "Repair Guardrails" in template
-    assert "{ repoRoot: path, configName: config }" in script
+    assert "{ repoRoot: path, configName: config, mode }" in script
     assert "Guardrails repaired (${fileCount} file${fileCount === 1 ? '' : 's'} written)" in script
     assert "if (!data) {" in script
     assert "if (error.error === 'doctor_failed' && error.doctor)" in script

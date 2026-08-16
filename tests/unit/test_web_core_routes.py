@@ -229,6 +229,9 @@ class TestApiStatusEndpoint:
         assert data["active_sessions"][0]["issue_number"] == 1
         assert data["active_sessions"][0]["title"] == "Test Issue"
         assert data["active_sessions"][0]["branch"] == "feature/issue-1"
+        assert data["active_sessions"][0]["worktree_path"] == str(
+            session.worktree_path
+        )
         set_orchestrator(None)
 
     def test_status_when_orchestrator_not_running(self):
@@ -884,6 +887,9 @@ class TestInfoEndpoint:
         assert response.status_code == 200
         data = response.json()
         assert data["repo"] == "owner/repo"
+        assert data["configuration_mode"] == mock_orch.config.configuration_mode
+        assert data["config_name"] == mock_orch.config.config_name
+        assert data["config_fingerprint"] == mock_orch.config.config_fingerprint
         assert data["ui_mode"] == "web"
         assert data["max_sessions"] == 3
         assert data["active_sessions"] == 1

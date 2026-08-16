@@ -110,6 +110,9 @@ class AiAgentAdapter(ABC):
         """Describe the repo-local files managed by this adapter."""
         return HookInstallationLayout()
 
+    def validate_installation_target(self, project_root: Path) -> None:
+        """Validate existing registration state before any setup writes."""
+
     def supports_ai_gate(self) -> bool:
         """Return True if this adapter supports AI gate testing."""
         return False

@@ -11,18 +11,21 @@ import copy
 import json
 import logging
 import shutil
+import stat
 import uuid
 from pathlib import Path
 from typing import Any
 
 from ...infra.runtime_artifacts import RUNTIME_IGNORE_FILE, load_runtime_ignore_patterns
+from ...ports.worktree_manager import (
+    REVIEWER_OWNED_HEAD_MARKER,
+    ReviewerHeadOwnership,
+    WORKTREE_ID_MARKER,
+)
 from ._worktree_errors import WorktreeError
 from ._worktree_git import _git_run
 
 logger = logging.getLogger(__name__)
-
-# Marker file name for worktree identity.
-WORKTREE_ID_MARKER = ".issue-orchestrator/worktree-id"
 
 # Claude Code settings to enforce completion command usage on exit.
 # The Stop hook checks for a marker file that coding-done/reviewer-done creates.
@@ -48,7 +51,8 @@ WORKTREE_LOCAL_EXCLUDE_PATHS: tuple[Path, ...] = (
     Path(".venv"),
     Path(".claude/settings.json"),
     Path(".claude/scheduled_tasks.lock"),
-    Path(WORKTREE_ID_MARKER),
+    WORKTREE_ID_MARKER,
+    REVIEWER_OWNED_HEAD_MARKER,
     ALLOW_NO_VERIFY_DRY_RUN_PATH,
     Path(".issue-orchestrator/ai-gate-state.json"),
     Path(".issue-orchestrator/backups"),
@@ -76,7 +80,8 @@ __all__ = [
     "WORKTREE_TRACKED_RUNTIME_PATHS",
     "_configure_no_verify_dry_run",
     "_hide_runtime_artifacts_from_git_status",
-    "_install_worktree_identity",
+    "install_worktree_identity",
+    "read_reviewer_head_ownership",
     "_link_repo_venv_into_worktree",
     "install_claude_settings",
     "sync_cli_tools",
@@ -213,7 +218,7 @@ def _read_worktree_identity(marker_path: Path) -> str | None:
     return existing_id
 
 
-def _install_worktree_identity(worktree_path: Path) -> str:
+def install_worktree_identity(worktree_path: Path) -> str:
     """
     Install a unique identity marker in the worktree.
 
@@ -253,6 +258,28 @@ def _install_worktree_identity(worktree_path: Path) -> str:
         ) from exc
     logger.info("Installed worktree identity: %s", worktree_id)
     return worktree_id
+
+
+def read_reviewer_head_ownership(worktree_path: Path) -> ReviewerHeadOwnership:
+    """Translate the reviewer metadata file into typed, fail-closed evidence."""
+    marker = worktree_path / REVIEWER_OWNED_HEAD_MARKER
+    try:
+        mode = marker.lstat().st_mode
+    except FileNotFoundError:
+        return ReviewerHeadOwnership(marker_present=False, expected_head=None)
+    except OSError:
+        return ReviewerHeadOwnership(marker_present=True, expected_head=None)
+    if not stat.S_ISREG(mode):
+        return ReviewerHeadOwnership(marker_present=True, expected_head=None)
+    try:
+        expected_head = marker.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeError):
+        return ReviewerHeadOwnership(marker_present=True, expected_head=None)
+    valid_length = len(expected_head) in {40, 64}
+    valid_hex = all(character in "0123456789abcdef" for character in expected_head)
+    if not valid_length or not valid_hex:
+        return ReviewerHeadOwnership(marker_present=True, expected_head=None)
+    return ReviewerHeadOwnership(marker_present=True, expected_head=expected_head)
 
 
 def _worktree_git_dir(worktree_path: Path) -> Path | None:

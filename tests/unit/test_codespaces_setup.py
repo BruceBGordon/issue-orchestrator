@@ -8,7 +8,14 @@ from issue_orchestrator.infra.config import Config
 
 def test_codespaces_config_loads_with_stable_web_ports() -> None:
     repo_root = Path(__file__).resolve().parents[2]
-    config_path = repo_root / ".issue-orchestrator" / "config" / "z-codespaces.yaml"
+    config_path = (
+        repo_root
+        / ".issue-orchestrator"
+        / "config"
+        / "modes"
+        / "default"
+        / "z-codespaces.yaml"
+    )
 
     config = Config.load(config_path)
 
@@ -23,7 +30,14 @@ def test_codespaces_config_loads_with_stable_web_ports() -> None:
 
 def test_main_config_uses_raw_validate_pr_as_publish_gate() -> None:
     repo_root = Path(__file__).resolve().parents[2]
-    config_path = repo_root / ".issue-orchestrator" / "config" / "main.yaml"
+    config_path = (
+        repo_root
+        / ".issue-orchestrator"
+        / "config"
+        / "modes"
+        / "default"
+        / "main.yaml"
+    )
 
     config = Config.load(config_path)
 

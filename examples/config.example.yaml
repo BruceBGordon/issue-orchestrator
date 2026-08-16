@@ -1,5 +1,5 @@
 # Example issue-orchestrator configuration
-# Copy to your repo as .issue-orchestrator/config/default.yaml
+# Copy to your repo as .issue-orchestrator/config/modes/default/default.yaml
 
 repo:
   # name: "owner/repo-name"      # Optional override; defaults to git remote
@@ -179,6 +179,13 @@ review:
   tech_lead_review_on_failure: true
   max_rework_cycles: 5
   reviewer_feedback_cache_minutes: 5
+  # Optional fast review loop owned by each coder turn. The configured file is
+  # appended to coder prompts; it tells the coder how to spawn and iterate with
+  # one internal reviewer before the normal independent review begins.
+  internal:
+    enabled: false
+    max_rounds: 5
+    instructions: ".io/internal-review.md"
   nits:
     default_policy: "surface"     # ignore, surface, address
     by_agent: {}                  # e.g. agent:frontend: address
@@ -219,13 +226,16 @@ merge_queue:
   # failure_action: "rework"        # how to route a failed queue entry: rework | needs_human
 
 cleanup:
+  # Orchestrator-owned issue worktrees are removed only after the applicable
+  # review gate. Timing is independent of the action flags below: disabling
+  # tab closure does not make worktree removal happen before review.
   with_tech_lead:
     close_ai_session_tabs: true
-    remove_worktrees: false
+    remove_worktrees: true
   without_tech_lead:
-    wait_for_code_review: true
+    wait_for_code_review: true  # false runs selected actions on completion
     close_ai_session_tabs: true
-    remove_worktrees: false
+    remove_worktrees: true      # false retains worktrees for inspection
 
 validation:
   quick:
@@ -380,6 +390,11 @@ milestones:
   foundation: "M0"
 
 tech_lead:
+  # Master switch for every new tech-lead run and supporting lane. Keep the
+  # detailed settings below configured; changing only this value disables or
+  # restores batch reviews, failure investigations, health/stuck triggers,
+  # manual runs, proposal reconciliation, and finding promotion.
+  enabled: true
   inherit_labels: []
   explicit_labels: []
   milestone_strategy:
@@ -412,7 +427,7 @@ tech_lead:
   # Unwired act-level actions (kill_hung_session) must stay "propose"
   # until their executors land (#6764) - "execute" fails at startup.
   # A create_issue follow-up routes its new issue to review.tech_lead_follow_up_agent
-  # (set above; REQUIRED whenever review.tech_lead_review_agent is configured, #6779).
+  # (set above; REQUIRED whenever tech_lead.enabled is true, #6779).
   # authority:
   #   post_comment: "execute"       # execute | propose
   #   create_issue: "execute"       # execute | propose (propose = gated issue)
@@ -423,8 +438,9 @@ tech_lead:
   # the periodic floor. A storm of K recent blocked/failed problem issues
   # creates one immediate health review instead of K investigations. The
   # anchor closes automatically when the review lands with a valid decision.
-  # Requires review.tech_lead_review_agent. interval_minutes=0 disables only the
-  # periodic trigger; storm_threshold=0 disables only storm escalation.
+  # Requires tech_lead.enabled and review.tech_lead_review_agent.
+  # interval_minutes=0 disables only the periodic trigger; storm_threshold=0
+  # disables only storm escalation.
   # health_review:
   #   interval_minutes: 240
   #   storm_threshold: 3
@@ -440,9 +456,8 @@ tech_lead:
   #       the issue while gated declines it permanently (never re-filed).
   #     auto files it ungated - immediately runnable in the target's pipeline.
   #     off disables the lane entirely (no issues filed, no follow-up reads).
-  #     The lane is also inert without review.tech_lead_review_agent - it
-  #     actuates tech-lead findings, so removing the tech lead turns it off
-  #     completely. Durable rows are kept, so re-adding the agent resumes it.
+  #     The lane is also inert while tech_lead.enabled is false. Durable rows
+  #     are kept, so re-enabling resumes it where it stopped.
   #   min_evidence: observations a signature must accrue before it is eligible.
   #     Counted in the orchestrator-owned pattern ledger, so comments on the
   #     case file cannot inflate it.

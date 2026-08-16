@@ -39,8 +39,9 @@ what that covers.
    issue-orchestrator-mcp --help
    ```
 
-2. Create a repo config at `.issue-orchestrator/config/default.yaml` in the
-   repository you want to control. Start from
+2. Create a repo config at
+   `.issue-orchestrator/config/modes/default/default.yaml` in the repository
+   you want to control. Start from
    [`examples/config.example.yaml`](../../examples/config.example.yaml) if
    you're new. **The config file must exist** — the server exits immediately
    with `Config file not found: <path>` otherwise.
@@ -64,7 +65,8 @@ MCP **client** launches it; you don't start it by hand.
 |------|---------|---------|
 | `--repo-root PATH` | current working directory | Repository this server controls. |
 | `--config PATH` | *(unset)* | Explicit path to a config file. When given without `--repo-root`, the repo root is read from the config's `repo_root`. |
-| `--config-name NAME` | `default.yaml` | Config filename to resolve under `<repo-root>/.issue-orchestrator/config/`. Ignored when `--config` is given. |
+| `--config-name NAME` | `default.yaml` | Config filename to resolve inside the selected mode directory. Ignored when `--config` is given. |
+| `--mode NAME` | `default` | Configuration mode to resolve under `<repo-root>/.issue-orchestrator/config/modes/`. Ignored when `--config` is given. |
 | `--instance-id ID` | *(unset)* | Selects one instance when a repo runs multiple orchestrators. |
 | `--host HOST` | `127.0.0.1` | Host used for outgoing Control API calls. |
 | `--auto-start` | off | Start the orchestrator on demand if it isn't running. Without it, engine-level tools fail with `Orchestrator not running`. |
@@ -158,9 +160,11 @@ Two tools deviate from that shape:
   port is known. It points at the doctor report so a client can surface the
   reason the launch failed. See
   [Start results](#start-results) for the full mapping.
-- `orchestrator.repos.start` reports its failures as a plain string in `error`
-  (`{"error": "Repository path … is not a git checkout"}`) rather than an
-  object. That covers both path validation and a failed launch. Every other
+- `orchestrator.repos.start` reports static path-validation failures as a plain
+  string in `error` (`{"error": "Repository path … is not a git checkout"}`).
+  Once a launch selection reaches the shared start command, failures use a
+  stable string error code plus `detail`, such as
+  `{"error": "launch_failed", "detail": "port already bound"}`. Every other
   tool uses the `{message, type}` object above — including
   `orchestrator.repos.stop`, which has no plain-string path at all and reports
   a refused stop through its `status` field instead.
@@ -179,19 +183,21 @@ alone — never by re-reading `launch.status`.
 | `already_running` | Lost a start race — it is already up. | *(none)* |
 | `doctor_error` | A doctor check failed; nothing was started. | `{"message": "Doctor checks failed — <check>: <detail>; …", "type": "DoctorError"}` |
 | `launch_error` | Doctor passed, the subprocess failed to start. | `{"message": "<launcher error>", "type": "LaunchError"}` |
+| `configuration_conflict` | A live engine owns a different mode/config/fingerprint. | `{"message": "<identity conflict>", "type": "ConfigurationConflict"}` |
 
 That table is the complete vocabulary, and the classification is total rather
 than "anything unrecognised is fine". There is no default-to-success branch on
-either side of it: a status outside the five above is reported as an
+either side of it: a status outside the six above is reported as an
 `UnknownLaunchStatusError`, and a status added to the server's vocabulary
 without being declared a success or a failure is refused at startup and reported
 as an `UnclassifiedLaunchStatusError`. Neither can reach a client as a started
 orchestrator, so a client can trust `error` without also validating
 `launch.status`.
 
-The `launch` object is always returned when this call ran the launcher — it
-carries the full doctor report and the launcher's own `status`/`launched`
-fields for display. Treat it as operator detail, not as the success signal.
+The `launch` object is always returned when this call attempted startup. It
+carries the shared start command's `status`/`launched` fields, configuration
+identity, and doctor detail when preflight ran. Treat it as operator detail,
+not as the success signal.
 
 An unexpected exception (a missing config file, an unreadable state directory)
 produces the ordinary `{message, type}` error with the exception's class name
@@ -235,7 +241,7 @@ they do and do not see.
 |------|-----------|---------|
 | `orchestrator.state` | *(none)* | `{"dashboard": {"running", "pid", "port", "started_at"}, "repos": [...], "current_directory", "is_orchestrator_codebase", "cwd_is_git_repo"}` — the full system state behind the unified dashboard. |
 | `orchestrator.repos` | *(none)* | `{"repos": [{"path", "name", "config_status", "orchestrator_state", "orchestrator_pid", "orchestrator_port", "configs", "selected_config", "is_current_dir"}]}`. |
-| `orchestrator.repos.start` | `repo_path: str`, `config_name: str = "default.yaml"` | `{"status": "started", "pid", "port"}`, or a plain-string `{"error": "…"}` when the path fails validation (see below) or the launch fails. |
+| `orchestrator.repos.start` | `repo_path: str`, `config_name: str = "default.yaml"`, `mode: str = "default"` | `{"status": "started", "pid", "port", "mode", "config_name", "config_fingerprint"}`. Static path failures use a descriptive string `error`; start-command failures use a stable string `error` code plus `detail`. |
 | `orchestrator.repos.stop` | `repo_path: str`, `force: bool = false` | `{"status": "stopped" \| "failed"}`. |
 
 #### Scope of the repository tools
@@ -371,7 +377,7 @@ sandbox profile).
 
 | Symptom | Likely cause |
 |---------|--------------|
-| Server exits at startup with `Config file not found` | No `.issue-orchestrator/config/<name>.yaml` under `--repo-root`. Create one, or pass `--config`. |
+| Server exits at startup with `Config file not found` | No `.issue-orchestrator/config/modes/<mode>/<name>.yaml` under `--repo-root`. Create one, select its mode with `--mode`, or pass `--config`. |
 | Client reports the command wasn't found | The entrypoint isn't on the client's `PATH`. Use an absolute path to the virtualenv's `issue-orchestrator-mcp`. |
 | Every engine tool returns `Orchestrator not running` | The orchestrator isn't started and `--auto-start` wasn't passed. Add the flag, or start it separately. |
 | Engine tools fail with a `401`-flavored error | No Control API token reached the subprocess. Start the orchestrator once so `~/.issue-orchestrator/api-token` exists, or set `ISSUE_ORCHESTRATOR_API_TOKEN` in the client's `env`. |

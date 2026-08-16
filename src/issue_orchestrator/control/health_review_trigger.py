@@ -86,8 +86,8 @@ HEALTH_REVIEW_ISSUE_TITLE = "Health Review — walk the floor"
 _ANCHOR_SCAN_LIMIT = 100
 
 def health_review_interval_minutes(config: "Config") -> int:
-    """Effective health-review interval; 0 when disabled or no tech lead agent."""
-    if not config.tech_lead_review_agent:
+    """Effective health-review interval; 0 when the tech lead is disabled."""
+    if not config.tech_lead_enabled:
         return 0
     return config.tech_lead.health_review.interval_minutes
 
@@ -589,10 +589,10 @@ def ensure_on_demand_health_review_anchor(
     to launch, or ``None`` when no tech lead agent is configured (health review is
     meaningless without one) or anchor creation failed.
     """
-    if not config.tech_lead_review_agent:
+    if not config.tech_lead_enabled:
         logger.warning(
-            "On-demand health review requested but no tech_lead_review_agent is "
-            "configured; nothing to launch"
+            "On-demand health review requested while tech_lead is disabled or "
+            "has no configured agent; nothing to launch"
         )
         return None
     existing = discover_open_health_review_anchor(repository_host, config)
@@ -710,6 +710,9 @@ def recover_pending_tech_lead_anchors(
     ledgers. The same ``split_tech_lead_case_file_issues`` owner the fact gatherer
     uses excludes them here before anchor recovery.
     """
+    if not config.tech_lead_enabled:
+        return
+
     from .pending_session_queues import TechLeadQueueOutcome
     from .tech_lead_case_files import split_tech_lead_case_file_issues
     from .tech_lead_proposals import reconcile_tech_lead_proposals

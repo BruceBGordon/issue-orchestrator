@@ -67,6 +67,31 @@ def test_repository_setup_uses_command_controller_and_accessible_modal() -> None
     assert browser_auth < commands < controller < main
 
 
+def test_engine_mode_selection_is_accessible_and_startup_scoped() -> None:
+    script = _read(CONTROL_CENTER_JS)
+    template = _read(CONTROL_CENTER_TEMPLATE)
+
+    assert 'data-action="select-mode"' in script
+    assert 'aria-label="Configuration mode for ' in script
+    assert "modeSelect.disabled = repoState !== 'not running';" in script
+    assert "configuration mode (default: default)" not in template.lower()
+    assert 'id="menuModeSelect"' in template
+    assert '<label for="menuModeSelect">Mode</label>' in template
+    assert 'aria-controls="actionMenu" aria-expanded="false"' in template
+    assert "actionMenuButton?.setAttribute('aria-expanded', 'false');" in script
+    assert "btn.setAttribute('aria-expanded', 'true');" in script
+    assert "body: JSON.stringify({ repo_root: path, config_name: config, mode," in script
+
+
+def test_worktree_audit_modal_has_accessible_read_only_structure() -> None:
+    script = _read(CONTROL_CENTER_JS)
+    template = _read(CONTROL_CENTER_TEMPLATE)
+
+    assert "POST /control/tools/worktrees/cleanup is a read-only audit" in script
+    assert "cleanup_command" not in script
+    assert 'id="worktreesContent" aria-live="polite"' in template
+    assert 'aria-labelledby="worktreesModalTitle"' in template
+    assert "Audit Worktrees" in template
 _SHUTDOWN_REASON_ROUTES = (
     "/control/orchestrator/stop",
     "/api/shutdown",

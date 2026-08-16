@@ -14,6 +14,10 @@ from typing import TYPE_CHECKING, Callable, Optional
 
 from ..control.needs_human_block import SharedNeedsHumanBlock
 from ..control.session_launcher import SessionLauncher
+from ..ports.coder_prompt import (
+    CoderPromptAddendumProvider,
+    NO_CODER_PROMPT_ADDENDUM,
+)
 from ..ports.provider_readiness import ProviderReadinessProbe
 
 if TYPE_CHECKING:
@@ -48,6 +52,7 @@ def build_session_launcher_factory(
     agent_callback_endpoint: "AgentCallbackEndpoint",
     provider_readiness_probe: ProviderReadinessProbe,
     needs_human_block: SharedNeedsHumanBlock,
+    coder_prompt_addendum: CoderPromptAddendumProvider = NO_CODER_PROMPT_ADDENDUM,
 ) -> "SessionLauncherFactory":
     """Bind the application dependencies; return the facade-facing factory."""
 
@@ -84,6 +89,7 @@ def build_session_launcher_factory(
             agent_callback_endpoint=agent_callback_endpoint,
             provider_readiness_probe=provider_readiness_probe,
             needs_human_block=needs_human_block,
+            coder_prompt_addendum=coder_prompt_addendum,
         )
 
     return _factory

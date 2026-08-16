@@ -1,6 +1,43 @@
 # Configuration
 
-Configuration lives in `.issue-orchestrator/config/default.yaml` (or a named config like `main.yaml`).
+Launchable configuration lives in
+`.issue-orchestrator/config/modes/<mode>/default.yaml` (or a named config such
+as `main.yaml`). The Control Center selects a typed `(mode, config)` pair when
+it starts a Repository Engine.
+
+## Configuration modes
+
+Each mode is a directory containing complete, coherent configuration files:
+
+```text
+.issue-orchestrator/config/
+  modes/
+    default/
+      main.yaml
+    codex/
+      main.yaml
+    claude/
+      main.yaml
+  maintenance/
+    hooks-validate.yaml
+```
+
+Use modes to switch provider/model budgets or compare agent configurations.
+The common case remains `default`; Control Center hides the mode selector when
+no alternative exists. Mode and config controls are disabled while the
+Repository Engine is Running or Paused. Stop the engine and drain any surviving
+agent sessions before switching. A missing mode/config pair fails startup;
+there is no cross-mode fallback.
+
+From the CLI, global selection options precede the command:
+
+```bash
+issue-orchestrator --mode codex start
+issue-orchestrator --config .issue-orchestrator/config/modes/codex/main.yaml start
+```
+
+Files under `maintenance/` are not launch modes. They support repository
+maintenance such as exercising every hook adapter.
 
 ---
 
@@ -166,6 +203,31 @@ agents:
     prompt: ".issue-orchestrator/prompts/reviewer.md"
     model: "sonnet"
 ```
+
+### Enable the Coder's Internal Review Loop
+
+The optional internal loop asks every coder turn—including validation retries,
+rework turns, and coder turns inside `via-local-loop`—to spawn one lightweight
+reviewer and iterate with it before reporting success. This improves the change
+presented to the independent review workflow; it does not replace that workflow
+or change `review.exchange.mode`.
+
+```yaml
+review:
+  internal:
+    enabled: true
+    max_rounds: 5
+    instructions: ".io/internal-review.md"
+```
+
+`instructions` is a coder-facing Markdown file relative to the orchestrator's
+configured repository root. Its trusted contents are read before launch claims
+or worktree mutation and appended to each coder prompt inside a fixed contract requiring
+approval from the same internally spawned reviewer. If the reviewer cannot be
+spawned, approval cannot be reached, or the round limit is exhausted, the coder
+must report blocked (or needs-human when a human decision is required), not
+successful completion. Repository setup creates the canonical instructions
+file when internal review is enabled and the configured file is missing.
 
 ### Declare Repo-Scoped GitHub Auth
 

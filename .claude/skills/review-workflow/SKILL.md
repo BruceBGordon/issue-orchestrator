@@ -99,6 +99,10 @@ next review turn if the provider is one-shot.
 ## Review Pipeline
 
 ```
+[Internal Review] (optional, coder-owned)
+  Every coder turn spawns one internal reviewer and iterates until approved;
+  blocked/needs-human on unavailable reviewer, unresolved findings, or round limit
+       │
 Work Agent completes and validation passes
        │
 [Review Exchange] (default: via-local-loop)
@@ -190,6 +194,11 @@ review:
   enabled: true
   default: "agent:reviewer"
   max_rework_cycles: 10
+
+  internal:
+    enabled: false
+    max_rounds: 5
+    instructions: ".io/internal-review.md"
 
   nits:
     default_policy: "surface"     # ignore | surface | address

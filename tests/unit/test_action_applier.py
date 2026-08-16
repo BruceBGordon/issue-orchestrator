@@ -1700,7 +1700,7 @@ class TestCleanupSessionAction:
 
         assert result.success
         mock_sessions.stop.assert_called_once()
-        mock_worktree_manager.remove.assert_called_once()
+        mock_worktree_manager.remove_checkout.assert_called_once()
 
     def test_cleanup_tabs_only(self, applier, mock_sessions, mock_worktree_manager, tmp_path):
         """Test cleanup with only tab closing."""
@@ -1719,7 +1719,26 @@ class TestCleanupSessionAction:
 
         assert result.success
         mock_sessions.stop.assert_called_once()
-        mock_worktree_manager.remove.assert_not_called()
+        mock_worktree_manager.remove_checkout.assert_not_called()
+
+    def test_cleanup_worktree_only(
+        self, applier, mock_sessions, mock_worktree_manager, tmp_path
+    ):
+        """Worktree removal does not implicitly close the session tab."""
+        action = CleanupSessionAction(
+            issue_number=123,
+            pr_number=456,
+            terminal_id="issue-123",
+            worktree_path=str(tmp_path),
+            close_tabs=False,
+            remove_worktrees=True,
+        )
+
+        result = applier.apply(action)
+
+        assert result.success
+        mock_sessions.stop.assert_not_called()
+        mock_worktree_manager.remove_checkout.assert_called_once()
 
     def test_disposable_worktree_cleanup_forces_removal(
         self, applier, mock_sessions, mock_worktree_manager, tmp_path
@@ -1741,7 +1760,9 @@ class TestCleanupSessionAction:
         result = applier.apply(action)
 
         assert result.success
-        mock_worktree_manager.remove.assert_called_once_with(Path(str(tmp_path)), force=True)
+        mock_worktree_manager.remove_checkout_and_branch.assert_called_once_with(
+            Path(str(tmp_path)), force=True
+        )
 
     def test_disposable_cleanup_succeeds_when_removed_callback_fails(
         self, mock_labels, mock_sessions, mock_events, mock_repository_host,
@@ -1770,7 +1791,9 @@ class TestCleanupSessionAction:
         result = applier.apply(action)
 
         assert result.success  # removal completed; callback failure doesn't re-fail it
-        mock_worktree_manager.remove.assert_called_once_with(Path(str(tmp_path)), force=True)
+        mock_worktree_manager.remove_checkout_and_branch.assert_called_once_with(
+            Path(str(tmp_path)), force=True
+        )
 
     def test_non_disposable_worktree_cleanup_is_not_forced(
         self, applier, mock_sessions, mock_worktree_manager, tmp_path
@@ -1792,7 +1815,9 @@ class TestCleanupSessionAction:
         result = applier.apply(action)
 
         assert result.success
-        mock_worktree_manager.remove.assert_called_once_with(Path(str(tmp_path)), force=False)
+        mock_worktree_manager.remove_checkout.assert_called_once_with(
+            Path(str(tmp_path)), force=False
+        )
 
     def test_cleanup_issue_session_releases_review_exchange_lifecycle(
         self, applier, mock_sessions, mock_worktree_manager, tmp_path
@@ -1827,7 +1852,7 @@ class TestCleanupSessionAction:
         assert predicate("review-exchange:123:coding-1")
         assert not predicate("review-exchange:124:coding-1")
         mock_sessions.stop.assert_called_once()
-        mock_worktree_manager.remove.assert_called_once()
+        mock_worktree_manager.remove_checkout.assert_called_once()
 
     def test_cleanup_without_terminal_id_logs_issue_lifecycle_default(
         self,
@@ -1861,7 +1886,7 @@ class TestCleanupSessionAction:
         assert "missing terminal_id; assuming issue session" in caplog.text
         pair_registry.release.assert_called_once_with(123, reason="session-cleanup")
         mock_sessions.stop.assert_not_called()
-        mock_worktree_manager.remove.assert_called_once()
+        mock_worktree_manager.remove_checkout.assert_called_once()
 
     def test_cleanup_review_session_does_not_release_issue_exchange(
         self, applier, mock_sessions, mock_worktree_manager, tmp_path
@@ -1901,7 +1926,7 @@ class TestRemoveWorktreeAction:
         result = applier.apply(action)
 
         assert result.success
-        mock_worktree_manager.remove.assert_called_once()
+        mock_worktree_manager.remove_checkout.assert_called_once()
 
     def test_remove_worktree_no_manager(self, applier, tmp_path):
         """Test worktree removal without manager."""

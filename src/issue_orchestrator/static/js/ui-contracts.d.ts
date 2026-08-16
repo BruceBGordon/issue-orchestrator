@@ -5,6 +5,14 @@
 
 export type TimelineView = "user" | "ops" | "debug" | "raw";
 
+export type WorktreeAuditActivityEvidence = "known" | "unknown";
+
+export type WorktreeAuditDisposition = "managed" | "cleanup_candidate" | "retained";
+
+export type WorktreeAuditKind = "issue" | "reviewer" | "tech_lead_scratch" | "external";
+
+export type WorktreeAuditScope = "configured" | "repo-parent-fallback";
+
 export interface AgentIdentityPayload {
   name: string;
   role: "coder" | "reviewer" | "rework" | "validator" | "e2e_runner" | "orchestrator";
@@ -96,6 +104,8 @@ export interface CycleValidationBadgePayload {
 
 export interface DashboardDataPayload {
   agents: string[];
+  configMode: string;
+  configName: string;
   e2eLastRun?: Record<string, any> | null;
   e2eRunning: boolean;
   githubOwner: string;
@@ -432,6 +442,7 @@ export interface FailedE2ETestExecutionPayload {
 export interface FlowColumnPayload {
   count: number;
   expandable?: boolean;
+  hidden_count: number;
   id: string;
   items: IssueItemPayload[];
   session_scoped?: boolean;
@@ -810,12 +821,15 @@ export interface RecentE2ERunsPayload {
 
 export interface RepositorySetupCommandPayload {
   config_name?: string;
+  configure_internal_reviewer: boolean;
   configure_reviewer: boolean;
   configure_tech_lead: boolean;
   create_labels?: boolean;
   create_prompts?: boolean;
   effort: "low" | "medium" | "high" | "xhigh" | "max";
   github_authorization: RepositorySetupGitHubAuthorizationPayload;
+  internal_review_instructions: string;
+  internal_review_max_rounds: number;
   model: "haiku" | "sonnet" | "opus";
   replace_existing?: boolean;
   repo_name: string;
@@ -1337,6 +1351,30 @@ export interface ViewModelSnapshotPayload {
   count: number;
   rows: IssueRowPayload[];
   view_model: DashboardViewModelPayload;
+}
+
+export interface WorktreeAuditEntryPayload {
+  disposition: WorktreeAuditDisposition;
+  kind: WorktreeAuditKind;
+  name: string;
+  path: string;
+  reason: string;
+}
+
+export interface WorktreeAuditRequestPayload {
+  repo_root: string;
+}
+
+export interface WorktreeAuditResponsePayload {
+  activity_evidence: WorktreeAuditActivityEvidence;
+  audit_unavailable: boolean;
+  cleanup_candidates: WorktreeAuditEntryPayload[];
+  issue_cleanup_enabled: boolean | null;
+  message: string;
+  note: string | null;
+  scope: WorktreeAuditScope;
+  stale_worktrees: WorktreeAuditEntryPayload[];
+  worktrees: WorktreeAuditEntryPayload[];
 }
 
 export type CodingAttemptPayload = RunningCodingAttemptPayload | CompletedCodingAttemptPayload | PublishFailedCodingAttemptPayload | BlockedCodingAttemptPayload | FailedCodingAttemptPayload | MissingCodingEvidencePayload;

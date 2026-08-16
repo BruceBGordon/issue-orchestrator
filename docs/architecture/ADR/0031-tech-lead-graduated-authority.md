@@ -112,6 +112,7 @@ artifact, not the CLI flags, carries the structure.
 
 ```yaml
 tech_lead:
+  enabled: true                  # master switch for all new tech-lead work
   authority:
     post_comment: execute        # execute | propose
     create_issue: execute
@@ -361,10 +362,10 @@ Constraints that make this safe to leave on:
   actuation on the tick a pattern finally firms up.
 - **One activation/readiness decision**, consumed by configuration validation,
   doctor, fact gathering, and route resolution alike. The lane is active only
-  with a promotion mode other than `off`, a configured repository, AND a
-  configured tech-lead agent — removing the tech lead turns the lane off
-  completely, including its cross-repo reads, and the durable rows are kept so
-  re-enabling resumes where it stopped. An active lane's remaining dependencies
+  when the master tech-lead workflow is enabled, the promotion mode is not
+  `off`, and a repository is configured. Turning `tech_lead.enabled` off stops
+  the lane completely, including its cross-repo reads, and the durable rows are
+  kept so re-enabling resumes where it stopped. An active lane's dependencies
   (a follow-up worker agent for any route that carries this repo's label) are
   startup errors, never tick-time exceptions.
 - **`self`-routed promotions face the managed repo's own gates.** They carry

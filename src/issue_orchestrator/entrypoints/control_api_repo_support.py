@@ -11,7 +11,8 @@ from fastapi import Depends, FastAPI, Request
 _REPO_DEPENDENCIES_STATE_KEY = "control_api_repo_dependencies"
 
 if TYPE_CHECKING:
-    from ..infra.supervisor import SupervisorOps
+    from ..execution.control_center_actions import ControlCenterActions
+    from ..ports.repository_engine_supervisor import SupervisorOps
 
 
 @dataclass(frozen=True)
@@ -19,6 +20,7 @@ class ControlApiRepoDependencies:
     """Dependency hooks needed by Control Center repo-status routes."""
 
     get_supervisor: Callable[[], SupervisorOps]
+    get_control_actions: Callable[[], ControlCenterActions]
     validate_repo_root: Callable[[str | None], Path | None]
     get_preferred_repo_root: Callable[[], Path | None]
     get_expected_engine_identity_raw: Callable[[], str | None]

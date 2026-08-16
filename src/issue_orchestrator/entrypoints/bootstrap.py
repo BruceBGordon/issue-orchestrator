@@ -17,7 +17,6 @@ Principle: "No Nulls in Orchestrator"
 
 import logging
 import os
-import sys
 import time
 from typing import TYPE_CHECKING, cast
 from uuid import uuid4
@@ -29,6 +28,10 @@ from .bootstrap_provider import (
     build_provider_launch_sampler,
     build_provider_readiness_probe,
     build_provider_resilience,
+)
+from .bootstrap_environment import (
+    ISSUE_ORCHESTRATOR_PYTHON_ENV as ISSUE_ORCHESTRATOR_PYTHON_ENV,
+    export_orchestrator_python as export_orchestrator_python,
 )
 from .bootstrap_claims import ClaimComponents, assemble_claim_components, lease_config_from
 from .bootstrap_pair_registry import build_pair_registry_with_worktree_hook
@@ -97,6 +100,7 @@ from ..ports.provider_readiness import (
 )
 from ..execution.session_output_adapter import FileSystemSessionOutput
 from ..execution.review_artifact_reader import ManifestReviewArtifactReader
+from ..execution.internal_review_prompt import build_coder_prompt_addendum_provider
 from ..execution.thread_background_job_runner import ThreadBackgroundJobRunner
 from ..control.completion_dispatcher import (
     BackgroundCompletionDispatcher,
@@ -137,25 +141,6 @@ if TYPE_CHECKING:
     from ..ports.tech_lead_authority import TechLeadAuthorityStore
 
 logger = logging.getLogger(__name__)
-
-
-ISSUE_ORCHESTRATOR_PYTHON_ENV = "ISSUE_ORCHESTRATOR_PYTHON"
-
-
-def export_orchestrator_python() -> None:
-    """Publish the orchestrator's interpreter path for child subprocesses.
-
-    The pre-push hook installed in every target-repo worktree calls a helper
-    from the ``issue_orchestrator`` package, but a Kotlin/Node/etc. target
-    has no venv where the package is importable. This exports
-    ``ISSUE_ORCHESTRATOR_PYTHON=sys.executable`` so any subprocess the
-    orchestrator spawns (``git push`` and its hooks, most importantly) can
-    resolve a Python that *can* import us.
-
-    Uses ``setdefault`` so operator overrides (tests, dev envs that point
-    at a different interpreter) are never clobbered.
-    """
-    os.environ.setdefault(ISSUE_ORCHESTRATOR_PYTHON_ENV, sys.executable)
 
 
 def _resolve_repo(config: Config) -> str | None:
@@ -591,6 +576,7 @@ def build_orchestrator(
 
     # Create IO adapters
     worktree_manager, working_copy, command_runner, session_output = _create_io_adapters(github_auth)
+    coder_prompt_addendum = build_coder_prompt_addendum_provider(config)
 
     provider_readiness_probe = build_provider_readiness_probe(command_runner)
     provider_launch_sampler = build_provider_launch_sampler(
@@ -722,6 +708,7 @@ def build_orchestrator(
         open_issue_corpus=tech_lead.open_issue_corpus,
         repository_host=github,
         needs_human_block=pending_work.needs_human_block,
+        coder_prompt_addendum=coder_prompt_addendum,
     )
     _wire_stack_publish_gate(
         completion_processor, _dependency_evaluator, github, command_runner, config,
@@ -829,6 +816,7 @@ def build_orchestrator(
         agent_callback_endpoint=agent_callback_endpoint,
         provider_readiness_probe=provider_readiness_probe,
         needs_human_block=pending_work.needs_human_block,
+        coder_prompt_addendum=coder_prompt_addendum,
     )
     deps = OrchestratorDeps(
         events=events,
@@ -977,6 +965,7 @@ def build_orchestrator_for_testing(
     working_copy = GitWorkingCopy()
     command_runner = LocalCommandRunner()
     session_output = FileSystemSessionOutput()
+    coder_prompt_addendum = build_coder_prompt_addendum_provider(config)
 
     # A test composition must never shell out to a real provider CLI: readiness
     # defaults to the explicit "no probe wired" reader (UNKNOWN => launchable,
@@ -1124,7 +1113,10 @@ def build_orchestrator_for_testing(
         git_adapter=working_copy,
         session_output=session_output,
         review_exchange_runner=PersistentReviewExchangeRunner(
-            session_output, pair_registry_for_testing, turn_mailbox=turn_mailbox,
+            session_output,
+            pair_registry_for_testing,
+            turn_mailbox=turn_mailbox,
+            coder_prompt_addendum=coder_prompt_addendum,
         ),
         event_bus=None,
         label_config=label_manager.to_label_config_dict(),
@@ -1249,6 +1241,7 @@ def build_orchestrator_for_testing(
         agent_callback_endpoint=agent_callback_endpoint,
         provider_readiness_probe=provider_readiness_probe,
         needs_human_block=pending_work.needs_human_block,
+        coder_prompt_addendum=coder_prompt_addendum,
     )
     completion_handler_factory = build_completion_handler_factory(
         config,

@@ -13,6 +13,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from ..domain.repository_launch_selection import (
+    RepositoryConfigurationIdentity,
+    RepositoryLaunchSelection,
+)
+
 from .logging_config import read_log_tail
 from .repo_identity import state_dir
 from .startup_errors import read_startup_failure
@@ -28,6 +33,7 @@ class DiagnosticBundle:
     doctor_output: dict[str, Any] = field(default_factory=dict)
     config_files: dict[str, str] = field(default_factory=dict)
     timestamp: str = ""
+    configuration_identity: dict[str, str] | None = None
 
     def __post_init__(self):
         if not self.timestamp:
@@ -41,6 +47,16 @@ class DiagnosticBundle:
             f"Bundle path: {self.bundle_path}",
             "",
         ]
+        if self.configuration_identity:
+            lines.extend(
+                [
+                    "## Effective Configuration Identity",
+                    f"Mode: {self.configuration_identity['mode']}",
+                    f"Config: {self.configuration_identity['config_name']}",
+                    f"Fingerprint: {self.configuration_identity['config_fingerprint']}",
+                    "",
+                ]
+            )
 
         # Last failure
         lines.append("## Last Startup Failure")
@@ -102,7 +118,10 @@ def _get_safe_env() -> dict[str, str]:
     return {k: v for k, v in os.environ.items() if k not in unsafe_keys}
 
 
-def create_diagnostic_bundle(repo_root: Path) -> DiagnosticBundle:
+def create_diagnostic_bundle(
+    repo_root: Path,
+    identity: RepositoryConfigurationIdentity | None = None,
+) -> DiagnosticBundle:
     """Create a diagnostic bundle for a repository.
 
     Args:
@@ -115,7 +134,17 @@ def create_diagnostic_bundle(repo_root: Path) -> DiagnosticBundle:
     bundle_dir = state_dir(repo_root) / "diagnostics" / timestamp
     bundle_dir.mkdir(parents=True, exist_ok=True)
 
-    bundle = DiagnosticBundle(bundle_path=bundle_dir)
+    bundle = DiagnosticBundle(
+        bundle_path=bundle_dir,
+        configuration_identity=(
+            {
+                **identity.selection.to_dict(),
+                "config_fingerprint": identity.fingerprint,
+            }
+            if identity is not None
+            else None
+        ),
+    )
 
     # 1. Last failure
     failure = read_startup_failure(repo_root)
@@ -136,15 +165,19 @@ def create_diagnostic_bundle(repo_root: Path) -> DiagnosticBundle:
 
     # 3. Doctor output
     try:
-        from .config import Config, list_configs, get_config_path
+        from .config import Config, get_config_path
         from .doctor import run_doctor
         from ..execution.command_runner import LocalCommandRunner
 
         config = None
         config_path = None
-        available = list_configs(repo_root)
-        if available:
-            config_path = get_config_path(repo_root, available[0])
+        selection = identity.selection if identity else _diagnostic_selection(repo_root)
+        if selection is not None:
+            config_path = get_config_path(
+                repo_root,
+                selection.config.value,
+                selection.mode,
+            )
             try:
                 config = Config.load(config_path)
             except Exception:
@@ -157,17 +190,8 @@ def create_diagnostic_bundle(repo_root: Path) -> DiagnosticBundle:
     except Exception:
         pass
 
-    # 4. Config files (from new location)
-    from .config import get_config_dir
-    config_dir = get_config_dir(repo_root)
-    if config_dir.exists():
-        for config_file in config_dir.glob("*.yaml"):
-            try:
-                content = config_file.read_text()
-                bundle.config_files[config_file.name] = content
-                shutil.copy(config_file, bundle_dir / config_file.name)
-            except OSError:
-                pass
+    # 4. Config files, preserving mode/maintenance directory identity.
+    _collect_diagnostic_configs(repo_root, bundle)
 
     # 5. Write bundle summary
     summary = bundle.to_summary()
@@ -175,6 +199,53 @@ def create_diagnostic_bundle(repo_root: Path) -> DiagnosticBundle:
         f.write(summary)
 
     return bundle
+
+
+def _diagnostic_selection(repo_root: Path) -> RepositoryLaunchSelection | None:
+    """Choose desired selection when valid, otherwise first typed inventory item."""
+    from .config import list_configs, list_modes
+    from .repo_registry import load_registry
+
+    inventory = [
+        RepositoryLaunchSelection.parse(mode=mode, config_name=config_name)
+        for mode in list_modes(repo_root)
+        for config_name in list_configs(repo_root, mode)
+    ]
+    desired = next(
+        (
+            repo.launch_selection
+            for repo in load_registry().repos
+            if repo.path == str(repo_root.resolve())
+        ),
+        None,
+    )
+    if desired in inventory:
+        return desired
+    return inventory[0] if inventory else None
+
+
+def _collect_diagnostic_configs(
+    repo_root: Path,
+    bundle: DiagnosticBundle,
+) -> None:
+    """Copy every non-symlink YAML config with its relative identity intact."""
+    from .config import get_config_dir
+
+    config_dir = get_config_dir(repo_root)
+    if not config_dir.exists():
+        return
+    for config_file in sorted(config_dir.rglob("*.yaml")):
+        if config_file.is_symlink() or not config_file.is_file():
+            continue
+        try:
+            content = config_file.read_text()
+            relative = config_file.relative_to(config_dir)
+            bundle.config_files[relative.as_posix()] = content
+            destination = bundle.bundle_path / "config" / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy(config_file, destination)
+        except OSError:
+            pass
 
 
 @dataclass
@@ -199,6 +270,7 @@ class DiagnoseResult:
 def run_ai_diagnose(
     repo_root: Path,
     timeout_seconds: int = 120,
+    identity: RepositoryConfigurationIdentity | None = None,
 ) -> DiagnoseResult:
     """Run AI diagnosis on the orchestrator.
 
@@ -212,7 +284,7 @@ def run_ai_diagnose(
         DiagnoseResult with report or error
     """
     # Create diagnostic bundle
-    bundle = create_diagnostic_bundle(repo_root)
+    bundle = create_diagnostic_bundle(repo_root, identity)
 
     # Build the prompt
     prompt = f"""You are diagnosing issues with the issue-orchestrator system.

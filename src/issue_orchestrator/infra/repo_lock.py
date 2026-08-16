@@ -47,6 +47,32 @@ class AlreadyRunning(Exception):
         )
 
 
+class ConfigurationIdentityConflict(Exception):
+    """Raised when a repository already has a different live configuration owner."""
+
+    def __init__(
+        self,
+        repo_root: Path,
+        *,
+        requested: tuple[str, str, str],
+        active: tuple[str, str, str],
+    ) -> None:
+        self.repo_root = repo_root
+        self.requested = requested
+        self.active = active
+        super().__init__(
+            "Repository already has a live engine with configuration identity "
+            f"{active[0]!r}/{active[1]!r} ({active[2][:12] or 'no fingerprint'}); "
+            "stop every repository engine before starting "
+            f"{requested[0]!r}/{requested[1]!r} "
+            f"({requested[2][:12] or 'no fingerprint'})"
+        )
+
+
+class RepositoryLifecycleBusy(Exception):
+    """Raised when a live repository lifecycle owner holds the shared gate."""
+
+
 @dataclass
 class LockInfo:
     """Information stored in the lock file."""
@@ -59,6 +85,9 @@ class LockInfo:
     recovered: bool = False
     instance_id: str | None = None  # For multi-instance deployments
     last_heartbeat_at: str | None = None
+    configuration_mode: str = "default"
+    config_name: str = "default.yaml"
+    config_fingerprint: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dict for JSON serialization."""
@@ -70,6 +99,9 @@ class LockInfo:
             "state_dir": self.state_dir,
             "recovered": self.recovered,
             "last_heartbeat_at": self.last_heartbeat_at,
+            "configuration_mode": self.configuration_mode,
+            "config_name": self.config_name,
+            "config_fingerprint": self.config_fingerprint,
         }
         if self.instance_id is not None:
             result["instance_id"] = self.instance_id
@@ -87,6 +119,9 @@ class LockInfo:
             recovered=data.get("recovered", False),
             instance_id=data.get("instance_id"),
             last_heartbeat_at=data.get("last_heartbeat_at"),
+            configuration_mode=data.get("configuration_mode", "default"),
+            config_name=data.get("config_name", "default.yaml"),
+            config_fingerprint=data.get("config_fingerprint", ""),
         )
 
 
@@ -164,6 +199,16 @@ def _instance_gate_path(repo_root: Path, instance_id: str) -> Path:
     return locks_dir(repo_root) / f"{instance_id}.lock"
 
 
+def _configuration_owner_gate_path(repo_root: Path) -> Path:
+    """Serialize configuration-owner checks performed by named instances."""
+    return locks_dir(repo_root) / "configuration-owner.lock"
+
+
+def _lifecycle_mutation_gate_path(repo_root: Path) -> Path:
+    """Serialize parent startup transactions with launch-selection changes."""
+    return locks_dir(repo_root) / "lifecycle-mutation.lock"
+
+
 def _acquire_gate(path: Path, *, exclusive: bool) -> int:
     """Open ``path`` and take a non-blocking flock; raise BlockingIOError on conflict.
 
@@ -183,10 +228,26 @@ def _acquire_gate(path: Path, *, exclusive: bool) -> int:
     return fd
 
 
+def _acquire_serialization_gate(path: Path) -> int:
+    """Take a short-lived blocking exclusive flock used only for publication."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+    except OSError:
+        os.close(fd)
+        raise
+    return fd
+
+
 def acquire_lock(
     repo_root: Path | str,
     port: int | None = None,
     instance_id: str | None = None,
+    *,
+    configuration_mode: str = "default",
+    config_name: str = "default.yaml",
+    config_fingerprint: str = "",
 ) -> LockInfo:
     """Acquire the repository lock atomically (or instance-specific lock).
 
@@ -211,51 +272,114 @@ def acquire_lock(
     lock_path = lock_file(repo_root, instance_id)
     exclusive = instance_id is None
 
-    # 1. Repo-wide gate — the cross-mode atomic owner.
-    try:
-        gate_fd = _acquire_gate(_repo_gate_path(repo_root), exclusive=exclusive)
-    except OSError as exc:
-        raise _already_running(repo_root, lock_path, instance_id) from exc
-    held = [gate_fd]
-
-    # 2. Per-instance gate — reject a duplicate SAME instance_id (multi only;
-    #    single-instance/one-shot are already fully excluded by the LOCK_EX gate).
+    # Named instances share the repo gate, so serialize their identity check and
+    # metadata publication with a short-lived exclusive owner gate. Without this
+    # gate, two first instances using different modes could both observe no
+    # metadata and publish conflicting identities.
+    owner_gate_fd: int | None = None
     if instance_id is not None:
+        owner_gate_fd = _acquire_serialization_gate(
+            _configuration_owner_gate_path(repo_root)
+        )
+
+    held: list[int] = []
+    try:
+        # 1. Repo-wide lifecycle gate.
         try:
             held.append(
-                _acquire_gate(_instance_gate_path(repo_root, instance_id), exclusive=True)
+                _acquire_gate(_repo_gate_path(repo_root), exclusive=exclusive)
             )
         except OSError as exc:
-            _release_fds(held)
             raise _already_running(repo_root, lock_path, instance_id) from exc
 
-    # Gate(s) held. Compatibility guard (#6824 R2): a live process may have
-    # recorded metadata under the PRE-flock implementation (which held no gate),
-    # so winning the gate does NOT prove that process is gone. Check EVERY
-    # conflicting legacy advertisement across modes, not just this mode's file.
-    legacy = _conflicting_legacy_holder(repo_root, lock_path, instance_id)
-    if legacy is not None:
-        _release_fds(held)
-        raise AlreadyRunning(
-            pid=legacy.pid,
-            repo_root=repo_root,
-            port=legacy.http_port,
-            instance_id=legacy.instance_id,
+        # 2. Per-instance gate — reject a duplicate SAME instance_id (multi only;
+        #    single-instance/one-shot are already excluded by the LOCK_EX gate).
+        if instance_id is not None:
+            try:
+                held.append(
+                    _acquire_gate(
+                        _instance_gate_path(repo_root, instance_id), exclusive=True
+                    )
+                )
+            except OSError as exc:
+                raise _already_running(repo_root, lock_path, instance_id) from exc
+
+        # A live pre-flock process has metadata but no gate. Check every legacy
+        # advertisement that conflicts with this lifecycle before publishing.
+        legacy = _conflicting_legacy_holder(repo_root, lock_path, instance_id)
+        if legacy is not None:
+            raise AlreadyRunning(
+                pid=legacy.pid,
+                repo_root=repo_root,
+                port=legacy.http_port,
+                instance_id=legacy.instance_id,
+            )
+        if instance_id is not None:
+            assert_repository_configuration_identity(
+                repo_root,
+                configuration_mode=configuration_mode,
+                config_name=config_name,
+                config_fingerprint=config_fingerprint,
+            )
+        recovered = _read_lock(lock_path) is not None
+        info = LockInfo(
+            repo_root=str(repo_root),
+            pid=os.getpid(),
+            started_at=datetime.now(timezone.utc).isoformat(),
+            http_port=port,
+            state_dir=str(state_dir(repo_root)),
+            recovered=recovered,
+            instance_id=instance_id,
+            last_heartbeat_at=datetime.now(timezone.utc).isoformat(),
+            configuration_mode=configuration_mode,
+            config_name=config_name,
+            config_fingerprint=config_fingerprint,
         )
-    recovered = _read_lock(lock_path) is not None
-    info = LockInfo(
-        repo_root=str(repo_root),
-        pid=os.getpid(),
-        started_at=datetime.now(timezone.utc).isoformat(),
-        http_port=port,
-        state_dir=str(state_dir(repo_root)),
-        recovered=recovered,
-        instance_id=instance_id,
-        last_heartbeat_at=datetime.now(timezone.utc).isoformat(),
+        _write_lock(lock_path, info)
+        _HELD_GATE_FDS.setdefault(str(lock_path), []).extend(held)
+        held = []
+        return info
+    finally:
+        # Any failure before successful publication releases every lifecycle
+        # gate. The short-lived owner gate is never retained by a live engine.
+        _release_fds(held)
+        if owner_gate_fd is not None:
+            _release_fds([owner_gate_fd])
+
+
+def assert_repository_configuration_identity(
+    repo_root: Path | str,
+    *,
+    configuration_mode: str,
+    config_name: str,
+    config_fingerprint: str,
+) -> None:
+    """Fail when any live named instance owns a different configuration.
+
+    ``acquire_lock`` invokes this while holding the configuration-owner gate,
+    which makes the check atomic with publishing a new named lock. Supervisors
+    may also call it before spawning processes to fail before a partial launch;
+    the lock-level invocation remains the authoritative race-free guard.
+    """
+    repo_root = normalize_repo_root(repo_root)
+    requested = (configuration_mode, config_name, config_fingerprint)
+    active_identities = sorted(
+        {
+            (
+                info.configuration_mode,
+                info.config_name,
+                info.config_fingerprint,
+            )
+            for info in list_instance_locks(repo_root)
+        }
     )
-    _write_lock(lock_path, info)
-    _HELD_GATE_FDS.setdefault(str(lock_path), []).extend(held)
-    return info
+    for active in active_identities:
+        if active != requested:
+            raise ConfigurationIdentityConflict(
+                repo_root,
+                requested=requested,
+                active=active,
+            )
 
 
 def _already_running(
@@ -314,6 +438,43 @@ def _release_fds(fds: list[int]) -> None:
             pass
 
 
+@contextmanager
+def repository_lifecycle_mutation(repo_root: Path | str) -> Iterator[None]:
+    """Serialize short-lived lifecycle decisions before a child owns the repo."""
+    normalized = normalize_repo_root(repo_root)
+    try:
+        gate_fd = _acquire_gate(
+            _lifecycle_mutation_gate_path(normalized),
+            exclusive=True,
+        )
+    except OSError as exc:
+        raise RepositoryLifecycleBusy from exc
+    try:
+        yield
+    finally:
+        _release_fds([gate_fd])
+
+
+@contextmanager
+def exclusive_repository_lifecycle(repo_root: Path | str) -> Iterator[None]:
+    """Hold the shared repository gate while mutating lifecycle-owned state.
+
+    Repository engines retain this gate for their entire lifetime. Selection
+    changes use the same gate so the running check and registry write are one
+    atomic lifecycle operation rather than a read-check-write race.
+    """
+    normalized = normalize_repo_root(repo_root)
+    with repository_lifecycle_mutation(normalized):
+        try:
+            gate_fd = _acquire_gate(_repo_gate_path(normalized), exclusive=True)
+        except OSError as exc:
+            raise RepositoryLifecycleBusy from exc
+        try:
+            yield
+        finally:
+            _release_fds([gate_fd])
+
+
 def release_lock(
     repo_root: Path | str,
     pid: int | None = None,
@@ -344,16 +505,18 @@ def release_lock(
         return False
 
     held = _HELD_GATE_FDS.pop(str(lock_path), [])
-    _release_fds(held)
-
-    if existing is None:
-        return bool(held)
-
     try:
-        lock_path.unlink()
-        return True
-    except OSError:
-        return False
+        if existing is None:
+            return bool(held)
+        try:
+            # Metadata deletion is part of the owned publication lifecycle:
+            # keep the flock until the old advertisement is gone.
+            lock_path.unlink()
+            return True
+        except OSError:
+            return False
+    finally:
+        _release_fds(held)
 
 
 @contextmanager

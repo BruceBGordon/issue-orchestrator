@@ -102,6 +102,7 @@ from issue_orchestrator.execution.agent_runner_providers.sandbox import (
     build_claude_sandbox_argv,
 )
 from issue_orchestrator.execution.agent_runner_providers.codex import CodexProvider
+from issue_orchestrator.infra.hooks.codex_session import prepare_codex_runtime_home
 from tests.process_group_run import run_in_process_group
 from tests.sandbox_probe_retry import ProbeRun, run_until_paths_created
 
@@ -344,31 +345,37 @@ def test_tool_events_supports_system_permission_denial_message() -> None:
     denial = "Permission to use Write has been denied in don't ask mode."
     stream = "\n".join(
         [
-            json.dumps({
-                "type": "assistant",
-                "message": {
-                    "content": [
-                        {
-                            "type": "tool_use",
-                            "id": tool_use_id,
-                            "name": "Write",
-                            "input": {"file_path": target, "content": "blocked"},
-                        }
-                    ]
-                },
-            }),
-            json.dumps({
-                "type": "system",
-                "subtype": "status",
-                "message": "non-tool status text",
-            }),
-            json.dumps({
-                "type": "system",
-                "subtype": "permission_denied",
-                "tool_name": "Write",
-                "tool_use_id": tool_use_id,
-                "message": denial,
-            }),
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": tool_use_id,
+                                "name": "Write",
+                                "input": {"file_path": target, "content": "blocked"},
+                            }
+                        ]
+                    },
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "system",
+                    "subtype": "status",
+                    "message": "non-tool status text",
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "system",
+                    "subtype": "permission_denied",
+                    "tool_name": "Write",
+                    "tool_use_id": tool_use_id,
+                    "message": denial,
+                }
+            ),
         ]
     )
 
@@ -692,6 +699,11 @@ def test_generated_sandbox_settings_enforced_by_os(tmp_path: Path) -> None:
 )
 @pytest.mark.usefixtures("isolated_codex_home")
 def test_generated_codex_profile_enforced_by_os(tmp_path: Path) -> None:
+    isolated_home = Path(os.environ["CODEX_HOME"])
+    if not (isolated_home / "auth.json").is_file():
+        pytest.skip("codex is not authenticated on this host")
+    prepare_codex_runtime_home()
+
     base_repo = tmp_path / "codex-base"
     base_repo.mkdir()
     subprocess.run(["git", "init", "-q"], cwd=base_repo, check=True)
@@ -727,6 +739,14 @@ def test_generated_codex_profile_enforced_by_os(tmp_path: Path) -> None:
         text=True,
     ).stdout.strip()
     base_ref = base_repo / ".git" / base_ref_name
+    subprocess.run(
+        ["git", "config", "user.name", "Sandbox Test"], cwd=base_repo, check=True
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "sandbox@example.invalid"],
+        cwd=base_repo,
+        check=True,
+    )
     shared_git_config = base_repo / ".git" / "config"
     shared_git_config_before = shared_git_config.read_text(encoding="utf-8")
     worktree = tmp_path / "codex-worktree"
@@ -775,8 +795,7 @@ def test_generated_codex_profile_enforced_by_os(tmp_path: Path) -> None:
             (
                 f"git -C {quote(str(worktree))} add inside.txt > "
                 f"{quote(str(commit_result))} 2>&1 && git -C "
-                f"{quote(str(worktree))} -c user.name='Sandbox Test' -c "
-                "user.email=sandbox@example.invalid commit -m sandbox-positive >> "
+                f"{quote(str(worktree))} commit -m sandbox-positive >> "
                 f"{quote(str(commit_result))} 2>&1 || true"
             ),
             f"(printf '%s' ESCAPED > {quote(str(escaped))}) 2>/dev/null || true",

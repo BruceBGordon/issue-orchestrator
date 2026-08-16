@@ -17,4 +17,3 @@ from __future__ import annotations
 
 #: Human-facing display name of the tech lead agent.
 TECH_LEAD_DISPLAY_NAME = "Tech Lead"
-

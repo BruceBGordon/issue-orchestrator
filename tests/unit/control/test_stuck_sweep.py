@@ -35,9 +35,11 @@ def _config(
     tech_lead_agent: str | None = "agent:tech-lead",
     on_failure: bool = True,
     filter_label: str | None = None,
+    tech_lead_enabled: bool | None = None,
 ) -> Config:
     config = Config()
     config.tech_lead_review_agent = tech_lead_agent
+    config.tech_lead.enabled = tech_lead_enabled
     config.tech_lead_review_on_failure = on_failure
     config.filtering.label = filter_label
     config.tech_lead.stuck_sweep.enabled = enabled
@@ -94,6 +96,12 @@ def _issue(number: int, *, labels, state: str = "open", title: str | None = None
 
 def test_due_false_when_disabled():
     config = _config(enabled=False)
+    assert stuck_sweep_due(config, OrchestratorState(), now=10_000.0) is False
+
+
+def test_due_false_when_master_switch_is_disabled():
+    config = _config(enabled=True, tech_lead_enabled=False)
+    assert config.tech_lead_review_agent == "agent:tech-lead"
     assert stuck_sweep_due(config, OrchestratorState(), now=10_000.0) is False
 
 

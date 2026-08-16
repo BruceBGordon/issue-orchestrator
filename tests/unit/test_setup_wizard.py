@@ -33,9 +33,30 @@ from issue_orchestrator.entrypoints.setup_wizard_common import (
     plan_setup_labels,
     write_missing_setup_prompts,
 )
+from issue_orchestrator.execution.repository_setup_artifacts import (
+    plan_missing_setup_prompts,
+)
 from issue_orchestrator.ports.repository_setup import (
     RepositorySetupGitHubVerification,
 )
+
+
+@pytest.mark.parametrize(
+    ("review", "section", "wait_for_review"),
+    [
+        ({"tech_lead_review_agent": "agent:lead"}, "with_tech_lead", None),
+        ({"enabled": True}, "without_tech_lead", True),
+        ({}, "without_tech_lead", False),
+    ],
+)
+def test_generated_configs_default_to_review_gated_worktree_cleanup(
+    review: dict, section: str, wait_for_review: bool | None,
+) -> None:
+    cleanup = setup_wizard_module.default_cleanup_config({"review": review})
+
+    assert cleanup[section]["remove_worktrees"] is True
+    if wait_for_review is not None:
+        assert cleanup[section]["wait_for_code_review"] is wait_for_review
 
 
 @pytest.fixture(autouse=True)
@@ -94,6 +115,11 @@ class MockPrompter:
         return answer if answer != "" else default
 
     def yes_no(self, question: str, default: bool = True) -> bool:
+        if question == "Enable coder-owned internal reviewer loop?" and (
+            self.answer_index >= len(self.answers)
+            or not isinstance(self.answers[self.answer_index], bool)
+        ):
+            return default
         answer = self._get_answer(question)
         if isinstance(answer, bool):
             return answer
@@ -120,6 +146,74 @@ def test_prompt_int_retries_on_invalid_input() -> None:
 
     assert value == 8080
     assert any("Invalid number" in msg for msg in prompter.printed)
+
+
+def test_wizard_collects_internal_reviewer_configuration() -> None:
+    prompter = MockPrompter([True, "3", ".io/fast-review.md"])
+    config: dict[str, object] = {
+        "review": {"enabled": True},
+    }
+
+    setup_wizard_module._collect_internal_reviewer(prompter, config)  # noqa: SLF001
+
+    assert config["review"]["internal"] == {
+        "enabled": True,
+        "max_rounds": 3,
+        "instructions": ".io/fast-review.md",
+    }
+
+
+def test_wizard_preserves_existing_internal_reviewer_configuration(
+    tmp_path: Path,
+) -> None:
+    config: dict[str, object] = {
+        "review": {
+            "enabled": True,
+            "internal": {
+                "enabled": True,
+                "max_rounds": 7,
+                "instructions": ".io/custom-internal-review.md",
+            },
+        },
+    }
+    prompter = MockPrompter([True, "", ""])
+
+    setup_wizard_module._collect_internal_reviewer(prompter, config)  # noqa: SLF001
+
+    assert config["review"]["internal"] == {
+        "enabled": True,
+        "max_rounds": 7,
+        "instructions": ".io/custom-internal-review.md",
+    }
+    planned = plan_missing_setup_prompts(config, tmp_path)
+    assert [(item.agent, item.path) for item in planned] == [
+        ("internal-review", tmp_path / ".io/custom-internal-review.md"),
+    ]
+
+
+def test_wizard_explicitly_disables_existing_internal_reviewer(
+    tmp_path: Path,
+) -> None:
+    config: dict[str, object] = {
+        "review": {
+            "enabled": True,
+            "internal": {
+                "enabled": True,
+                "max_rounds": 7,
+                "instructions": ".io/custom-internal-review.md",
+            },
+        },
+    }
+    prompter = MockPrompter([False])
+
+    setup_wizard_module._collect_internal_reviewer(prompter, config)  # noqa: SLF001
+
+    assert config["review"]["internal"] == {
+        "enabled": False,
+        "max_rounds": 7,
+        "instructions": ".io/custom-internal-review.md",
+    }
+    assert plan_missing_setup_prompts(config, tmp_path) == ()
 
 
 def test_prompt_claude_session_interactions_enables_rule() -> None:
@@ -550,7 +644,7 @@ class TestFindExistingConfig:
 
     def test_finds_config_in_current_dir(self, tmp_path):
         """Test finding config in current directory."""
-        config_dir = tmp_path / ".issue-orchestrator" / "config"
+        config_dir = tmp_path / ".issue-orchestrator/config/modes/default"
         config_dir.mkdir(parents=True)
         config_file = config_dir / "default.yaml"
         config_file.write_text("repo:\n  name: owner/repo\nagents: {}")
@@ -561,8 +655,8 @@ class TestFindExistingConfig:
         assert config["repo"]["name"] == "owner/repo"
 
     def test_finds_config_in_hidden_dir(self, tmp_path):
-        """Test finding config in .issue-orchestrator/config directory."""
-        config_dir = tmp_path / ".issue-orchestrator" / "config"
+        """Test finding a named config in the default mode directory."""
+        config_dir = tmp_path / ".issue-orchestrator/config/modes/default"
         config_dir.mkdir(parents=True)
         config_file = config_dir / "custom.yaml"
         config_file.write_text("repo:\n  name: owner/repo")
@@ -578,10 +672,21 @@ class TestFindExistingConfig:
         assert path is None
         assert config is None
 
+    def test_ignores_flat_managed_config(self, tmp_path):
+        """Flat managed configs are not valid setup inputs."""
+        config_file = tmp_path / ".issue-orchestrator/config/default.yaml"
+        config_file.parent.mkdir(parents=True)
+        config_file.write_text("repo:\n  name: owner/repo\n")
+
+        path, config = find_existing_config(tmp_path)
+
+        assert path is None
+        assert config is None
+
     def test_prefers_root_over_hidden(self, tmp_path):
         """Test that default.yaml is preferred over other yaml files."""
         # Create default config
-        config_dir = tmp_path / ".issue-orchestrator" / "config"
+        config_dir = tmp_path / ".issue-orchestrator/config/modes/default"
         config_dir.mkdir(parents=True)
         default_config = config_dir / "default.yaml"
         default_config.write_text("repo:\n  name: default/repo")
@@ -597,11 +702,11 @@ class TestFindExistingConfig:
 
 
 class TestFindExistingDefaultConfig:
-    """Test legacy Control Center config discovery."""
+    """Test default-mode Control Center config discovery."""
 
     def test_only_finds_default_yaml(self, tmp_path):
         """Control Center detection should ignore non-default config files."""
-        config_dir = tmp_path / ".issue-orchestrator" / "config"
+        config_dir = tmp_path / ".issue-orchestrator/config/modes/default"
         config_dir.mkdir(parents=True)
         (config_dir / "custom.yaml").write_text("repo:\n  name: owner/repo")
 
@@ -612,7 +717,7 @@ class TestFindExistingDefaultConfig:
 
     def test_returns_path_and_none_when_config_cannot_be_read(self, tmp_path):
         """Control Center detection should preserve the path on read failure."""
-        config_dir = tmp_path / ".issue-orchestrator" / "config"
+        config_dir = tmp_path / ".issue-orchestrator/config/modes/default"
         config_dir.mkdir(parents=True)
         config_file = config_dir / "default.yaml"
         config_file.write_text("repo:\n  name: owner/repo")
@@ -1340,6 +1445,7 @@ class TestWizardNewProject:
         assert config["review"]["tech_lead_follow_up_agent"] == "agent:backend"
         assert config["review"]["tech_lead_reviewed_label"] == "tech-lead-reviewed"
         assert config["review"]["tech_lead_review_threshold"] == 5
+        assert config["tech_lead"]["enabled"] is True
 
     @patch("issue_orchestrator.entrypoints.cli_tools.setup_wizard.detect_repo")
     @patch("issue_orchestrator.entrypoints.cli_tools.setup_wizard._get_repository_host")
@@ -1744,7 +1850,7 @@ class TestRunWizard:
                 "",  # filtering label
                 False,  # disable review
                 # Post-wizard (new flow)
-                ".issue-orchestrator.yaml",  # config filename
+                "",  # accept the mode-scoped default config filename
                 True,  # Apply these changes?
                 False,  # Install repo-local guardrails and AI agent hooks now?
                 False,  # Set up AI provider API keys now?
@@ -1767,20 +1873,35 @@ class TestRunWizard:
                     run_wizard(target_path=target, prompter=prompter)
 
         # Verify files were created
-        assert (target / ".issue-orchestrator.yaml").exists() or any(
+        config_path = target / ".issue-orchestrator/config/modes/default/default.yaml"
+        assert config_path.exists() or any(
             "apply" in msg.lower() for msg in prompter.printed
         )
         printed = "\n".join(prompter.printed)
         assert (
-            "Install repo guardrails + AI hooks (recommended): issue-orchestrator setup-guardrails"
+            "Install repo guardrails + AI hooks (recommended): "
+            "issue-orchestrator setup-guardrails --config "
+            ".issue-orchestrator/config/modes/default/default.yaml"
             in printed
         )
-        assert "Run: issue-orchestrator doctor" in printed
+        assert (
+            "Run: issue-orchestrator doctor --config "
+            ".issue-orchestrator/config/modes/default/default.yaml"
+        ) in printed
+        assert (
+            "Run: issue-orchestrator --config "
+            ".issue-orchestrator/config/modes/default/default.yaml init"
+        ) in printed
+        assert (
+            "Run: issue-orchestrator --config "
+            ".issue-orchestrator/config/modes/default/default.yaml start"
+        ) in printed
         assert printed.index("issue-orchestrator setup-guardrails") < printed.index(
             "issue-orchestrator doctor"
         )
         assert printed.index("issue-orchestrator doctor") < printed.index(
-            "issue-orchestrator start"
+            "issue-orchestrator --config "
+            ".issue-orchestrator/config/modes/default/default.yaml start"
         )
         assert "Trusted session interactions are enabled." in printed
         assert "auto-accept Claude's initial trust prompt" in printed

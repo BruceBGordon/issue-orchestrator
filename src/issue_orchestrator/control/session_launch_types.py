@@ -94,6 +94,16 @@ class LaunchResult:
             disposition=LaunchDisposition.RETRYABLE_FAILURE,
         )
 
+    @classmethod
+    def required_input_unavailable(cls, reason: str) -> "LaunchResult":
+        """Retain queued work when required launch input cannot be prepared."""
+        return cls(
+            None,
+            False,
+            f"Required launch input unavailable: {reason}",
+            disposition=LaunchDisposition.RETRYABLE_FAILURE,
+        )
+
     @property
     def defers_to_provider(self) -> bool:
         """Whether the provider refused and the work must stay untouched."""

@@ -30,6 +30,9 @@ class SessionEnvConfig(Protocol):
     control_api_port: int
     config_path: Path | None
 
+    @property
+    def configuration_mode(self) -> str: ...
+
 
 def api_port_export(
     control_api_port: int, callback_endpoint: "AgentCallbackEndpoint"
@@ -52,7 +55,7 @@ def api_port_export(
     return f" {ENV_PREFIX}API_PORT='{port}'"
 
 
-def config_exports(config_path: Path | None) -> str:
+def config_exports(config_path: Path | None, mode: str = "default") -> str:
     """Render the selected-config exports.
 
     ``coding-done`` / ``reviewer-done`` must resolve validation from the
@@ -64,6 +67,7 @@ def config_exports(config_path: Path | None) -> str:
     return (
         f" {ENV_PREFIX}CONFIG_NAME='{config_path.name}'"
         f" {ENV_PREFIX}CONFIG_PATH='{config_path.resolve()}'"
+        f" {ENV_PREFIX}MODE='{mode}'"
     )
 
 
@@ -90,15 +94,13 @@ def build_session_env_exports(
     """
     orch_bin = Path(sys.executable).parent
     orch_src = Path(__file__).resolve().parents[2]
-    runtime_tool_assignments = " ".join(
-        build_agent_tool_env_assignments(worktree_path)
-    )
+    runtime_tool_assignments = " ".join(build_agent_tool_env_assignments(worktree_path))
     return (
         f"export {ENV_PREFIX}COMPLETION_PATH='{completion_path}'"
         f" {ENV_PREFIX}SESSION_ID='{session_id}'"
         f" {ENV_PREFIX}AGENT_LABEL='{agent_label}'"
         f" {ENV_PREFIX}ISSUE_NUMBER='{issue_number}'"
-        f"{config_exports(config.config_path)}"
+        f"{config_exports(config.config_path, config.configuration_mode)}"
         f"{api_port_export(config.control_api_port, callback_endpoint)}"
         f" {ENV_PREFIX}VALIDATION_OUTPUT_DIR='{run_dir}'"
         f" {ENV_PREFIX}RUN_DIR='{run_dir}'"

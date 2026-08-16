@@ -1,4 +1,5 @@
-# Migrated to sectioned format
+# Default mixed-provider mode. Copy this file into another mode directory and
+# change agent provider/model settings to create an alternate launch mode.
 
 repo:
   name: issue-orchestrator/issue-orchestrator
@@ -60,7 +61,7 @@ agents:
     prompt: repo-specific/prompts/tech-lead.md
     provider: "claude-code"
     ai_system: "claude-code"
-    model: "fable"
+    model: "opus"
     timeout_minutes: 90
     reviewer: "agent:reviewer"
     provider_args:
@@ -88,6 +89,11 @@ review:
   code_review_label: needs-code-review
   code_reviewed_label: code-reviewed
   max_rework_cycles: 10
+  # Fast coder-owned review before the independent external review.
+  internal:
+    enabled: true
+    max_rounds: 10
+    instructions: "repo-specific/prompts/internal-review.md"
   nits:
     default_policy: "address"
     by_agent: {}
@@ -113,6 +119,15 @@ merge_queue:
   provider: "github"
   enqueue_after: "code-reviewed"
   failure_action: "rework"
+
+cleanup:
+  with_tech_lead:
+    close_ai_session_tabs: true
+    remove_worktrees: true
+  without_tech_lead:
+    wait_for_code_review: true
+    close_ai_session_tabs: true
+    remove_worktrees: true
 
 validation:
   quick:

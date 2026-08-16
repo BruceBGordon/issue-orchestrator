@@ -88,7 +88,9 @@ class TestDiscoverReposEndpoint:
         repo = tmp_path / "trustlist"
         repo.mkdir()
         (repo / ".git").mkdir()
-        config_dir = repo / ".issue-orchestrator" / "config"
+        config_dir = (
+            repo / ".issue-orchestrator" / "config" / "modes" / "default"
+        )
         config_dir.mkdir(parents=True)
         (config_dir / "main.yaml").write_text("repo:\n  name: test/trustlist\n")
 
@@ -116,7 +118,9 @@ class TestDiscoverReposEndpoint:
         repo = workspace / "trustlist"
         repo.mkdir(parents=True)
         (repo / ".git").mkdir()
-        config_dir = repo / ".issue-orchestrator" / "config"
+        config_dir = (
+            repo / ".issue-orchestrator" / "config" / "modes" / "default"
+        )
         config_dir.mkdir(parents=True)
         (config_dir / "main.yaml").write_text("repo:\n  name: test/trustlist\n")
 

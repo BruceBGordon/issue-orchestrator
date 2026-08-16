@@ -1,8 +1,9 @@
 """Interactive setup wizard for issue-orchestrator."""
 
+import shlex
 import sys
 from pathlib import Path
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping, MutableMapping
 from typing import Any, Optional, cast
 
 import yaml
@@ -515,7 +516,7 @@ def _print_claude_code_next_steps(
 
 def _collect_stage2_tech_lead(
     prompter: Prompter,
-    review: dict,
+    config: MutableMapping[str, Any],
     code_reviewed_label: str,
     agent_labels: Iterable[str],
 ) -> None:
@@ -529,6 +530,11 @@ def _collect_stage2_tech_lead(
     prompter.print("")
     if not prompter.yes_no("Enable Stage 2: Tech Lead batch review?", default=False):
         return
+    review = cast(dict[str, Any], config["review"])
+    config["tech_lead"] = {
+        **cast(dict[str, Any], config.get("tech_lead", {})),
+        "enabled": True,
+    }
     prompter.print("\n  --- Stage 2: Tech Lead Batch Review ---")
     review_agent = prompter.input("  tech_lead review agent label", "agent:tech-lead")
     reviewed_label = prompter.input(
@@ -553,6 +559,59 @@ def _collect_stage2_tech_lead(
             f"  ✓ tech_lead review triggers after {threshold} PRs with '{code_reviewed_label}'"
         )
     prompter.print(f"  ✓ Label flow: {code_reviewed_label} → {reviewed_label}")
+
+
+def _collect_internal_reviewer(
+    prompter: Prompter,
+    config: MutableMapping[str, Any],
+) -> None:
+    """Collect the optional fast reviewer loop owned by each coder turn."""
+    review = cast(dict[str, Any], config.setdefault("review", {"enabled": False}))
+    existing_internal = review.get("internal", {}) or {}
+    if not isinstance(existing_internal, Mapping):
+        raise ValueError("review.internal must be a mapping")
+    existing_enabled = existing_internal.get("enabled") is True
+    existing_max_rounds = existing_internal.get("max_rounds", 5)
+    if not isinstance(existing_max_rounds, int):
+        existing_max_rounds = 5
+    existing_instructions = existing_internal.get(
+        "instructions",
+        ".io/internal-review.md",
+    )
+    if not isinstance(existing_instructions, str) or not existing_instructions.strip():
+        existing_instructions = ".io/internal-review.md"
+
+    prompter.print("")
+    enabled = prompter.yes_no(
+        "Enable coder-owned internal reviewer loop?",
+        default=existing_enabled,
+    )
+    if not enabled:
+        review["internal"] = {
+            "enabled": False,
+            "max_rounds": existing_max_rounds,
+            "instructions": existing_instructions.strip(),
+        }
+        return
+    max_rounds = _prompt_int(
+        prompter,
+        "  Maximum internal review rounds",
+        existing_max_rounds,
+        min_value=1,
+        max_value=50,
+    )
+    instructions = prompter.input(
+        "  Internal reviewer instructions file",
+        existing_instructions.strip(),
+    ).strip()
+    review["internal"] = {
+        "enabled": True,
+        "max_rounds": max_rounds,
+        "instructions": instructions,
+    }
+    prompter.print(
+        "  ✓ Each coder must earn internal approval before successful completion"
+    )
 
 
 def wizard_new_project(prompter: Prompter) -> dict[str, Any]:  # noqa: C901, PLR0912 - interactive wizard with branches for each config option
@@ -829,9 +888,10 @@ def wizard_new_project(prompter: Prompter) -> dict[str, Any]:  # noqa: C901, PLR
         # Stage 2: Tech Lead Batch Review (advanced only)
         if advanced:
             _collect_stage2_tech_lead(
-                prompter, config["review"], code_reviewed_label, config["agents"]
+                prompter, config, code_reviewed_label, config["agents"]
             )
 
+    _collect_internal_reviewer(prompter, config)
     return config
 
 
@@ -1161,10 +1221,32 @@ def wizard_existing_project(  # noqa: C901, PLR0912 - interactive wizard with br
 
             # Stage 2: Tech Lead Batch Review (only if Stage 1 enabled)
             _collect_stage2_tech_lead(
-                prompter, config["review"], code_reviewed_label, config["agents"]
+                prompter, config, code_reviewed_label, config["agents"]
             )
 
+    _collect_internal_reviewer(prompter, config)
     return config, updating_existing_path
+
+
+def default_cleanup_config(config: dict) -> dict:
+    """Build safe automatic cleanup defaults for a newly generated config."""
+    review_cfg = config.get("review", {})
+    has_tech_lead = review_cfg.get("tech_lead_review_agent")
+    has_code_review = review_cfg.get("enabled") or review_cfg.get("default")
+    if has_tech_lead:
+        return {
+            "with_tech_lead": {
+                "close_ai_session_tabs": True,
+                "remove_worktrees": True,
+            }
+        }
+    return {
+        "without_tech_lead": {
+            "wait_for_code_review": bool(has_code_review),
+            "close_ai_session_tabs": True,
+            "remove_worktrees": True,
+        }
+    }
 
 
 def run_wizard(  # noqa: C901, PLR0912 - main wizard entry point with prerequisite checks, mode selection, and confirmation flow
@@ -1282,37 +1364,7 @@ def run_wizard(  # noqa: C901, PLR0912 - main wizard entry point with prerequisi
 
     # Add cleanup config with defaults (don't prompt - users can edit later)
     if "cleanup" not in config:
-        review_cfg = config.get("review", {})
-        has_tech_lead = review_cfg.get("tech_lead_review_agent")
-        has_code_review = review_cfg.get("enabled") or review_cfg.get("default")
-
-        # Include section based on their review workflow
-        if has_tech_lead:
-            # Tech Lead workflow - cleanup happens after tech_lead review
-            config["cleanup"] = {
-                "with_tech_lead": {
-                    "close_ai_session_tabs": True,
-                    "remove_worktrees": False,
-                }
-            }
-        elif has_code_review:
-            # Code review only - cleanup after code review
-            config["cleanup"] = {
-                "without_tech_lead": {
-                    "wait_for_code_review": True,
-                    "close_ai_session_tabs": True,
-                    "remove_worktrees": False,
-                }
-            }
-        else:
-            # No review workflow - cleanup on completion
-            config["cleanup"] = {
-                "without_tech_lead": {
-                    "wait_for_code_review": False,
-                    "close_ai_session_tabs": True,
-                    "remove_worktrees": False,
-                }
-            }
+        config["cleanup"] = default_cleanup_config(config)
 
     # Review config
     prompter.print("\n" + "=" * 50)
@@ -1322,11 +1374,10 @@ def run_wizard(  # noqa: C901, PLR0912 - main wizard entry point with prerequisi
 
     # Determine config file path and collect the write
     # Use absolute paths to avoid issues with cwd
-    from ...infra.config import CONFIG_DIR, DEFAULT_CONFIG_NAME
+    from ...infra.config import get_config_path
 
-    default_config_path = (
-        f"{CONFIG_DIR}/{DEFAULT_CONFIG_NAME}"  # .issue-orchestrator/config/default.yaml
-    )
+    default_config_path = get_config_path(target_path)
+    default_config_display = default_config_path.relative_to(target_path).as_posix()
 
     if existing_config_path:
         output_path = (
@@ -1335,14 +1386,30 @@ def run_wizard(  # noqa: C901, PLR0912 - main wizard entry point with prerequisi
             else existing_config_path
         )
     elif dry_run:
-        output_path = target_path / default_config_path
+        output_path = default_config_path
     else:
         user_path = Path(
-            prompter.input(f"Config filename ({target_path}/)", default_config_path)
+            prompter.input(f"Config filename ({target_path}/)", default_config_display)
         )
         output_path = (
             target_path / user_path if not user_path.is_absolute() else user_path
         )
+
+    def selected_command(subcommand: str, *, config_is_global: bool = False) -> str:
+        try:
+            displayed_path = output_path.resolve().relative_to(target_path.resolve())
+        except ValueError:
+            displayed_path = output_path.resolve()
+        config_option = f"--config {shlex.quote(str(displayed_path))}"
+        if config_is_global:
+            return f"issue-orchestrator {config_option} {subcommand}"
+        return f"issue-orchestrator {subcommand} {config_option}"
+
+    setup_hooks_command = selected_command("setup-hooks")
+    setup_guardrails_command = selected_command("setup-guardrails")
+    doctor_command = selected_command("doctor")
+    init_command = selected_command("init", config_is_global=True)
+    start_command = selected_command("start", config_is_global=True)
 
     setup_owner = build_repository_setup_owner(
         _create_cli_repository_setup_host,
@@ -1412,7 +1479,7 @@ def run_wizard(  # noqa: C901, PLR0912 - main wizard entry point with prerequisi
             except Exception as exc:
                 prompter.print(f"\n⚠ Repo guardrail setup failed: {exc}")
                 prompter.print(
-                    "  You can retry later with: issue-orchestrator setup-guardrails"
+                    f"  You can retry later with: {setup_guardrails_command}"
                 )
     else:
         install_hooks_now = prompter.yes_no(
@@ -1436,13 +1503,11 @@ def run_wizard(  # noqa: C901, PLR0912 - main wizard entry point with prerequisi
                     )
             except Exception as exc:
                 prompter.print(f"\n⚠ Hook installation failed: {exc}")
-                prompter.print(
-                    "  You can retry later with: issue-orchestrator setup-hooks"
-                )
+                prompter.print(f"  You can retry later with: {setup_hooks_command}")
         if not publish_validation_cmd:
             prompter.print(
                 "\nRepo-local pre-push guardrails skipped: configure validation.publish.cmd first, "
-                "then run 'issue-orchestrator setup-guardrails'."
+                f"then run '{setup_guardrails_command}'."
             )
 
     # Optional AI provider key setup
@@ -1481,22 +1546,22 @@ def run_wizard(  # noqa: C901, PLR0912 - main wizard entry point with prerequisi
 
     if not setup_repo_guardrails_now and has_validation_cmd:
         prompter.print(
-            f"\n  {step_number}. Install repo guardrails + AI hooks (recommended): issue-orchestrator setup-guardrails"
+            f"\n  {step_number}. Install repo guardrails + AI hooks (recommended): {setup_guardrails_command}"
         )
         step_number += 1
     elif not install_hooks_now:
         prompter.print(
-            f"\n  {step_number}. Install AI agent hooks (recommended): issue-orchestrator setup-hooks"
+            f"\n  {step_number}. Install AI agent hooks (recommended): {setup_hooks_command}"
         )
         step_number += 1
         prompter.print(
-            f"  {step_number}. Configure validation.publish.cmd, then set up repo guardrails (recommended): issue-orchestrator setup-guardrails"
+            f"  {step_number}. Configure validation.publish.cmd, then set up repo guardrails (recommended): {setup_guardrails_command}"
         )
         step_number += 1
 
-    prompter.print(f"\n  {step_number}. Run: issue-orchestrator doctor")
+    prompter.print(f"\n  {step_number}. Run: {doctor_command}")
     step_number += 1
-    prompter.print(f"\n  {step_number}. Run: issue-orchestrator init")
+    prompter.print(f"\n  {step_number}. Run: {init_command}")
     step_number += 1
     prompter.print(
         f"\n  {step_number}. Commit the generated onboarding files before start."
@@ -1524,7 +1589,7 @@ def run_wizard(  # noqa: C901, PLR0912 - main wizard entry point with prerequisi
         prompter.print(f"     • {label}")
     step_number += 1
 
-    prompter.print(f"\n  {step_number}. Run: issue-orchestrator start")
+    prompter.print(f"\n  {step_number}. Run: {start_command}")
 
     if _config_uses_claude_code(config):
         _print_claude_code_next_steps(prompter, config)

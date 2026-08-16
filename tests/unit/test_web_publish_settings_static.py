@@ -447,6 +447,55 @@ class TestSettingsEndpoints:
         finally:
             web._orchestrator = None
 
+    def test_settings_page_renders_accessible_internal_review_controls(self):
+        """Internal-review schema fields keep native labelled form controls."""
+        from issue_orchestrator.entrypoints import web
+
+        mock_orch = create_mock_orchestrator()
+        web._orchestrator = mock_orch
+        try:
+            response = TestClient(app).get("/settings")
+
+            html = response.text
+            assert response.status_code == 200
+            assert 'for="review__internal_enabled">Enable Internal Reviewer</label>' in html
+            assert (
+                'id="review__internal_enabled"\n'
+                '                           data-tab="review" '
+                'data-field="internal_enabled" data-type="boolean"'
+            ) in html
+            assert (
+                'for="review__internal_max_rounds">Internal Review Max Rounds</label>'
+                in html
+            )
+            assert 'data-field="internal_max_rounds" data-type="integer"' in html
+            assert (
+                'for="review__internal_instructions">Internal Review Instructions</label>'
+                in html
+            )
+            assert 'data-field="internal_instructions" data-type="string"' in html
+        finally:
+            web._orchestrator = None
+
+    def test_settings_page_renders_accessible_tech_lead_master_switch(self):
+        """The one-place switch is a labelled native checkbox in Review settings."""
+        from issue_orchestrator.entrypoints import web
+
+        mock_orch = create_mock_orchestrator()
+        mock_orch.config.tech_lead_review_agent = "agent:tech-lead"
+
+        web._orchestrator = mock_orch
+        try:
+            response = TestClient(app).get("/settings")
+
+            assert response.status_code == 200
+            html = response.text
+            assert 'type="checkbox" id="review__tech_lead_enabled"' in html
+            assert 'data-field="tech_lead_enabled" data-type="boolean"' in html
+            assert '<label for="review__tech_lead_enabled">Enable Tech Lead</label>' in html
+        finally:
+            web._orchestrator = None
+
     def test_settings_page_uses_server_classified_control_tokens(self):
         """GET /settings carries server-classified data-type tokens and the
         shared form-controls module instead of embedded schema JSON.

@@ -158,6 +158,7 @@ from issue_orchestrator.domain.sandbox_scope import (
     SandboxScope,
     SandboxUnsupportedError,
 )
+from issue_orchestrator.infra.hooks.codex_session import codex_runtime_home
 
 from .codex_config import (
     resolve_codex_home,
@@ -491,7 +492,7 @@ def _is_absolute_or_home_path(raw: str) -> bool:
 
 def _codex_credential_files() -> tuple[str, ...]:
     """Credential stores to deny, including an operator-set Codex home."""
-    paths = list(_CODEX_CREDENTIAL_FILES)
+    paths = [*_CODEX_CREDENTIAL_FILES, str(codex_runtime_home())]
     if os.environ.get("CODEX_HOME"):
         paths.append(str(resolve_codex_home()))
     return tuple(dict.fromkeys(paths))
@@ -589,7 +590,10 @@ def build_codex_sandbox_argv(
     versions fail loud instead of silently dropping the boundary.
     """
     if git_access is None:
-        validate_codex_permission_profile_compatibility(scope.working_directory)
+        validate_codex_permission_profile_compatibility(
+            scope.working_directory,
+            codex_home=codex_runtime_home(),
+        )
         resolved_git_access = resolve_git_worktree_access(scope.working_directory)
     else:
         resolved_git_access = git_access

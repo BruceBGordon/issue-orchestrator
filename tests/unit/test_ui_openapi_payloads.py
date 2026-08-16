@@ -31,6 +31,8 @@ from issue_orchestrator.contracts.ui_openapi_models import (
     RepositorySetupPreviewPayload,
     RepositorySetupResultPayload,
     ViewModelSnapshotPayload,
+    WorktreeAuditRequestPayload,
+    WorktreeAuditResponsePayload,
 )
 from issue_orchestrator.domain.issue_key import FakeIssueKey
 from issue_orchestrator.domain.models import (
@@ -211,6 +213,50 @@ def _e2e_timeline_cycle(*events: dict[str, object]) -> dict[str, object]:
     }
 
 
+def test_worktree_audit_request_and_response_match_ui_openapi() -> None:
+    request = {"repo_root": "/repos/project"}
+    response = {
+        "worktrees": [
+            {
+                "path": "/repos/project-41",
+                "name": "project-41",
+                "kind": "issue",
+                "disposition": "managed",
+                "reason": "review-gated cleanup",
+            },
+            {
+                "path": "/repos/project-tech-lead-42-abcdef123456",
+                "name": "project-tech-lead-42-abcdef123456",
+                "kind": "tech_lead_scratch",
+                "disposition": "retained",
+                "reason": "active session restored at startup",
+            },
+        ],
+        "cleanup_candidates": [],
+        "stale_worktrees": [],
+        "message": "Read-only audit complete.",
+        "issue_cleanup_enabled": True,
+        "activity_evidence": "known",
+        "audit_unavailable": False,
+        "scope": "configured",
+        "note": None,
+    }
+
+    _validator("WorktreeAuditRequestPayload").validate(request)
+    _validator("WorktreeAuditResponsePayload").validate(response)
+    WorktreeAuditRequestPayload.model_validate(request)
+    WorktreeAuditResponsePayload.model_validate(response)
+
+    schema = __import__("json").loads(Path("docs/api/ui-openapi.json").read_text())
+    operation = schema["paths"]["/control/tools/worktrees/cleanup"]["post"]
+    assert operation["requestBody"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/WorktreeAuditRequestPayload"
+    }
+    assert operation["responses"]["200"]["content"]["application/json"][
+        "schema"
+    ] == {"$ref": "#/components/schemas/WorktreeAuditResponsePayload"}
+
+
 def test_repository_setup_command_and_results_match_ui_openapi() -> None:
     command = {
         "repo_root": "/repos/porchpin",
@@ -221,6 +267,9 @@ def test_repository_setup_command_and_results_match_ui_openapi() -> None:
         "configure_reviewer": True,
         "reviewer_model": "opus",
         "reviewer_effort": "max",
+        "configure_internal_reviewer": True,
+        "internal_review_max_rounds": 4,
+        "internal_review_instructions": ".io/internal-review.md",
         "validation_quick_command": "make validate-quick",
         "validation_publish_command": "make validate-pr-raw",
         "worktree_base": "../worktrees/porchpin",
@@ -571,6 +620,8 @@ def _dashboard_data_payload(**overrides: object) -> dict[str, object]:
         "queueRefreshSeconds": 300,
         "repo": "test/repo",
         "repoRoot": "/tmp/repo",
+        "configName": "main.yaml",
+        "configMode": "codex",
         "githubOwner": "test",
         "githubRepo": "repo",
         "agents": ["agent:web"],
@@ -2167,6 +2218,17 @@ def test_stack_dashboard_card_matches_ui_openapi() -> None:
     assert card["stack_chip"] is not None
     assert card["stack_chip"]["status_text"]
     assert card["stack_signal"]
+
+
+def test_flow_column_hidden_count_is_required_by_ui_openapi() -> None:
+    payload = _stacked_view_model_dict()
+
+    queued = next(column for column in payload["flow_columns"] if column["id"] == "queued")
+    assert queued["hidden_count"] == 0
+    del queued["hidden_count"]
+
+    with pytest.raises(JsonSchemaValidationError):
+        _validator("DashboardViewModelPayload").validate(payload)
 
 
 def test_malformed_stack_dependency_rejected_by_ui_openapi() -> None:

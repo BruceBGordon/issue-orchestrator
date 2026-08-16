@@ -981,6 +981,35 @@ class TestRemoveWorktree:
         assert second_call[4] == "-D"
         assert second_call[5] == "123-test-branch"
 
+    @patch("issue_orchestrator.adapters.worktree._worktree.get_worktree_branch")
+    @patch("issue_orchestrator.adapters.git.git_cli.subprocess.run")
+    def test_remove_worktree_can_preserve_associated_branch(
+        self, mock_run, mock_get_branch, tmp_path
+    ):
+        """Retention cleanup removes only the checkout, never its local ref."""
+        repo_root = tmp_path / "repo"
+        repo_root.mkdir()
+        (repo_root / ".git").mkdir()
+        worktree_path = tmp_path / "worktree-123"
+        worktree_path.mkdir()
+        (worktree_path / ".git").write_text(
+            f"gitdir: {repo_root / '.git' / 'worktrees' / 'worktree-123'}"
+        )
+        mock_get_branch.return_value = "123-local-only"
+
+        def mock_git_command(*args, **kwargs):
+            cmd = args[0]
+            if "worktree" in cmd and "remove" in cmd:
+                shutil.rmtree(worktree_path)
+            return MagicMock(returncode=0, stderr="")
+
+        mock_run.side_effect = mock_git_command
+
+        remove_worktree(worktree_path, delete_branch=False)
+
+        assert mock_run.call_count == 1
+        assert mock_run.call_args.args[0][3:5] == ["worktree", "remove"]
+
     @patch("issue_orchestrator.adapters.git.git_cli.subprocess.run")
     def test_remove_worktree_not_exists(self, mock_run, tmp_path):
         """Test error when worktree doesn't exist (non-forced)."""

@@ -141,12 +141,20 @@ def build_parser(handlers: CLICommandHandlers) -> argparse.ArgumentParser:
         "-c",
         type=str,
         default=None,
-        help="Path to config file (default: .issue-orchestrator/config/default.yaml)",
+        help=(
+            "Path to config file (default: "
+            ".issue-orchestrator/config/modes/default/default.yaml)"
+        ),
     )
     parser.add_argument(
         "--set",
         action="append",
         help="Override config value (path=value). Use YAML/JSON for lists or dicts.",
+    )
+    parser.add_argument(
+        "--mode",
+        default=None,
+        help="Directory-backed configuration mode (default: default)",
     )
     subparsers = parser.add_subparsers(dest="command", required=False)
 

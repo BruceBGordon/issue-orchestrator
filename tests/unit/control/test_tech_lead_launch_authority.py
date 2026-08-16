@@ -41,6 +41,7 @@ from issue_orchestrator.domain.tech_lead_run import (
     REASON_ANCHOR_UNREADABLE,
     REASON_ISSUE_CLOSED,
     REASON_NO_LONGER_BLOCKED,
+    REASON_TECH_LEAD_DISABLED,
 )
 from issue_orchestrator.domain.tech_lead_session import (
     TechLeadLaunchScope,
@@ -256,6 +257,23 @@ def test_an_uncontested_run_actually_launches():
     assert session is not None
     assert harness.launched == [investigation]
     assert harness.held_reasons() == []
+
+
+def test_the_direct_launch_path_rechecks_the_master_switch():
+    """Work queued before a live disable cannot bypass the final authority."""
+    investigation = _investigation(42)
+    repository_host = FakeRepositoryHost({42: FakeIssue(42)})
+    harness = _Harness(pending=[investigation], repository_host=repository_host)
+    harness.config.tech_lead.enabled = False
+
+    session = harness.launch(investigation)
+
+    assert session is None
+    assert harness.launched == []
+    assert harness.held_reasons() == [REASON_TECH_LEAD_DISABLED]
+    assert harness.state.pending_tech_lead_reviews == [investigation]
+    assert repository_host.reads == []
+    assert harness.shared.submissions == []
 
 
 # ---------------------------------------------------------------------------

@@ -287,7 +287,7 @@ class TestResetIssue:
         assert result.labels_removed == ["blocked"]
 
         # Assert worktree was removed
-        mock_worktree_manager.remove.assert_called_once_with(worktree_path)
+        mock_worktree_manager.remove_checkout.assert_called_once_with(worktree_path)
 
         # Assert branch was deleted
         mock_working_copy.delete_remote_branch.assert_called_once_with(
@@ -350,8 +350,8 @@ class TestResetIssue:
         The runner stores per-SHA validation records inside the
         worktree at ``.issue-orchestrator/validation/<sha>.json``.
         ``reset_issue(from_scratch=True)`` calls
-        ``worktree_manager.remove(path, force=True)`` (the scratch path
-        — distinct from ordinary reset's plain ``remove(path)``),
+        ``worktree_manager.remove_checkout_and_branch(path, force=True)`` (the
+        scratch path — distinct from ordinary reset's checkout-only removal),
         which deletes that directory and its records. This test pins
         the scratch-specific invariant: ``from_scratch=True`` must
         invoke the force-remove call. Without it, a second attempt at
@@ -369,12 +369,12 @@ class TestResetIssue:
         # Make the mock worktree_manager actually remove the directory
         # so the test verifies the contract end-to-end. The scratch
         # path passes ``force=True``; the kwarg-accepting signature
-        # mirrors the real ``WorktreeManager.remove``.
+        # mirrors the destructive WorktreeManager operation.
         def _remove(path, force: bool = False):  # noqa: ARG001 - kwarg shape only
             import shutil
             shutil.rmtree(path, ignore_errors=True)
 
-        mock_worktree_manager.remove.side_effect = _remove
+        mock_worktree_manager.remove_checkout_and_branch.side_effect = _remove
         mock_working_copy.list_remote_branches.return_value = []
         # Scratch reset requires a repository_host for PR supersession.
         mock_repository_host = MagicMock()
@@ -403,7 +403,7 @@ class TestResetIssue:
         # regression that lets scratch reset fall back to the soft
         # remove (which can leave the worktree behind on git lock
         # errors and thus leave the validation cache intact).
-        mock_worktree_manager.remove.assert_called_once_with(
+        mock_worktree_manager.remove_checkout_and_branch.assert_called_once_with(
             worktree_path, force=True,
         )
         # Worktree directory and its validation cache must both be gone.
@@ -448,7 +448,8 @@ class TestResetIssue:
         assert result.success is True
         assert result.deleted_worktree is None
         # Worktree manager should not be called
-        mock_worktree_manager.remove.assert_not_called()
+        mock_worktree_manager.remove_checkout.assert_not_called()
+        mock_worktree_manager.remove_checkout_and_branch.assert_not_called()
 
     def test_reset_issue_no_branch(
         self,
@@ -679,7 +680,7 @@ class TestResetIssue:
         worktree_path = tmp_path / "worktrees" / "555"
         worktree_path.mkdir(parents=True)
 
-        mock_worktree_manager.remove.side_effect = Exception("Permission denied")
+        mock_worktree_manager.remove_checkout.side_effect = Exception("Permission denied")
         mock_working_copy.list_remote_branches.return_value = [
             "origin/555-feature",
         ]
@@ -857,7 +858,9 @@ class TestResetIssue:
     ):
         worktree_path = mock_config.worktree_base / f"{mock_config.repo_root.name}-559"
         worktree_path.mkdir(parents=True)
-        mock_worktree_manager.remove.side_effect = lambda path, *, force=False: path.rmdir()
+        mock_worktree_manager.remove_checkout_and_branch.side_effect = (
+            lambda path, *, force=False: path.rmdir()
+        )
         mock_working_copy.list_remote_branches.return_value = ["origin/559-scratch-old"]
         mock_working_copy.delete_remote_branch.return_value = True
         timeline_store = MagicMock()
@@ -896,7 +899,9 @@ class TestResetIssue:
         assert result.deleted_branches == ["559-scratch-old"]
         assert result.superseded_prs == [376]
         assert result.timeline_events_deleted == 9
-        mock_worktree_manager.remove.assert_called_once_with(worktree_path, force=True)
+        mock_worktree_manager.remove_checkout_and_branch.assert_called_once_with(
+            worktree_path, force=True
+        )
         supersede_actions = [
             applier_call.args[0]
             for applier_call in mock_action_applier.apply.call_args_list

@@ -111,7 +111,7 @@ mechanics, and the path to `1.0` are in
 
 | Surface | Public? | Tier during `0.x` |
 |---|---|---|
-| Config YAML schema (`.issue-orchestrator/config/*.yaml`) | Yes | Supported - keys may be added or renamed between minors |
+| Config YAML schema (`.issue-orchestrator/config/modes/<mode>/*.yaml`) | Yes | Supported - keys may be added or renamed between minors |
 | CLI (`issue-orchestrator …`) | Yes | Supported - flags may change between minors |
 | Agent completion contracts (`coding-done`, `reviewer-done`) | Yes (agent-facing) | Supported - subcommand/flag shape may change |
 | MCP server tools (`orchestrator.*`) | Yes | **Experimental** - names, args, and returns may change in any release |

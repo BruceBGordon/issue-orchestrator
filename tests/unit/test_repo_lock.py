@@ -9,6 +9,7 @@ import pytest
 
 from issue_orchestrator.infra.repo_lock import (
     AlreadyRunning,
+    ConfigurationIdentityConflict,
     LockInfo,
     acquire_lock,
     held_repo_lock,
@@ -197,10 +198,68 @@ class TestLockAtomicity:
         acquire_lock(tmp_path)
         release_lock(tmp_path)
 
+    def test_named_instances_must_share_one_configuration_identity(
+        self, tmp_path: Path
+    ) -> None:
+        acquire_lock(
+            tmp_path,
+            instance_id="a",
+            configuration_mode="claude",
+            config_name="main.yaml",
+            config_fingerprint="claude-fingerprint",
+        )
+
+        with pytest.raises(ConfigurationIdentityConflict) as exc:
+            acquire_lock(
+                tmp_path,
+                instance_id="b",
+                configuration_mode="codex",
+                config_name="main.yaml",
+                config_fingerprint="codex-fingerprint",
+            )
+
+        assert exc.value.active == (
+            "claude",
+            "main.yaml",
+            "claude-fingerprint",
+        )
+        assert not (
+            tmp_path / ".issue-orchestrator" / "locks" / "b.json"
+        ).exists()
+        release_lock(tmp_path, instance_id="a")
+
+    def test_named_instances_with_same_configuration_identity_coexist(
+        self, tmp_path: Path
+    ) -> None:
+        identity = {
+            "configuration_mode": "codex",
+            "config_name": "main.yaml",
+            "config_fingerprint": "codex-fingerprint",
+        }
+        acquire_lock(tmp_path, instance_id="a", **identity)
+        acquire_lock(tmp_path, instance_id="b", **identity)
+
+        release_lock(tmp_path, instance_id="a")
+        release_lock(tmp_path, instance_id="b")
+
     def test_same_instance_id_rejected(self, tmp_path: Path) -> None:
         acquire_lock(tmp_path, instance_id="a")
         with pytest.raises(AlreadyRunning):
             acquire_lock(tmp_path, instance_id="a")
+        release_lock(tmp_path, instance_id="a")
+
+    def test_metadata_write_failure_releases_every_acquisition_gate(
+        self, tmp_path: Path
+    ) -> None:
+        with patch(
+            "issue_orchestrator.infra.repo_lock._write_lock",
+            side_effect=OSError("disk full"),
+        ):
+            with pytest.raises(OSError, match="disk full"):
+                acquire_lock(tmp_path, instance_id="a")
+
+        info = acquire_lock(tmp_path, instance_id="a")
+        assert info.instance_id == "a"
         release_lock(tmp_path, instance_id="a")
 
     def test_live_pre_flock_metadata_is_not_overwritten(self, tmp_path: Path) -> None:

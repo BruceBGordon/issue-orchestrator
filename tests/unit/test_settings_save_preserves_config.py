@@ -304,6 +304,21 @@ def test_save_plan_emits_only_owned_changed_paths():
     ]
 
 
+def test_save_plan_persists_only_the_tech_lead_master_switch():
+    """The Review checkbox owns the one YAML path operators need to change."""
+    config = Config()
+    config.tech_lead_review_agent = "agent:tech-lead"
+    snapshot = from_config(config)
+    submitted = from_config(config)
+    submitted["review"].tech_lead_enabled = False
+
+    plan = build_save_plan(snapshot, submitted)
+
+    assert [(entry.yaml_path, entry.value) for entry in plan.entries] == [
+        ("tech_lead.enabled", False)
+    ]
+
+
 def test_save_plan_entry_reverses_list_ui_transform():
     """Comma-separated display values become list-valued persistence entries."""
     config = Config()

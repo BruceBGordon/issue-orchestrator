@@ -63,7 +63,8 @@ Ownership guidance:
 
 When GitHub sends a personal access token expiration notice, first identify the
 auth source the target repo actually uses. Check the selected config file, such
-as `.issue-orchestrator/config/default.yaml`, and inspect `repo.github`.
+as `.issue-orchestrator/config/modes/default/default.yaml`, and inspect
+`repo.github`.
 
 If GitHub offers **generate an equivalent**, use that first. Otherwise create a
 new fine-grained token with the permissions listed in the user guide.
@@ -115,8 +116,8 @@ unset token old_stty
 Then verify, and restart any engine that is already running:
 
 ```bash
-issue-orchestrator --config .issue-orchestrator/config/default.yaml doctor
-issue-orchestrator --config .issue-orchestrator/config/default.yaml restart
+issue-orchestrator --config .issue-orchestrator/config/modes/default/default.yaml doctor
+issue-orchestrator --config .issue-orchestrator/config/modes/default/default.yaml restart
 ```
 
 Do not use `issue-orchestrator auth store` to update a repo-scoped Keychain

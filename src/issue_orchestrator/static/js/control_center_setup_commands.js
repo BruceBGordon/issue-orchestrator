@@ -122,6 +122,16 @@
         ) {
             throw new Error('techLeadReviewThreshold must be an integer from 0 to 50');
         }
+        const internalReviewMaxRounds = Number(
+            options.internalReviewMaxRounds ?? 5,
+        );
+        if (
+            !Number.isInteger(internalReviewMaxRounds)
+            || internalReviewMaxRounds < 1
+            || internalReviewMaxRounds > 50
+        ) {
+            throw new Error('internalReviewMaxRounds must be an integer from 1 to 50');
+        }
         return {
             repo_root: requiredText(repoRoot, 'repoRoot'),
             repo_name: requiredText(options.repoName, 'repoName'),
@@ -131,6 +141,12 @@
             configure_reviewer: options.configureReviewer !== false,
             reviewer_model: reviewerModel,
             reviewer_effort: reviewerEffort,
+            configure_internal_reviewer: options.configureInternalReviewer === true,
+            internal_review_max_rounds: internalReviewMaxRounds,
+            internal_review_instructions: requiredText(
+                options.internalReviewInstructions ?? '.io/internal-review.md',
+                'internalReviewInstructions',
+            ),
             validation_quick_command: requiredText(
                 options.validationQuickCommand,
                 'validationQuickCommand',

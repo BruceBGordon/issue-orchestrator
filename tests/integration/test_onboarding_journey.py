@@ -158,6 +158,7 @@ def _local_onboarding_prompter() -> _QueuePrompter:
             "300",
             "",
             False,
+            False,
             "",
             True,
             True,
@@ -216,7 +217,14 @@ def test_local_onboarding_smoke_journey(tmp_path: Path, monkeypatch: pytest.Monk
     ):
         run_wizard(target_path=repo, prompter=prompter)
 
-    config_path = repo / ".issue-orchestrator" / "config" / "default.yaml"
+    config_path = (
+        repo
+        / ".issue-orchestrator"
+        / "config"
+        / "modes"
+        / "default"
+        / "default.yaml"
+    )
     assert config_path.exists()
     assert (repo / ".prompts" / "dev.md").exists()
     assert (repo / ".githooks" / "pre-push").exists()
@@ -229,6 +237,7 @@ def test_local_onboarding_smoke_journey(tmp_path: Path, monkeypatch: pytest.Monk
     config.worktree_seed_ref = "HEAD"
     config.hooks.ai_gate.interval_days = 0
     assert config.session_interactions.enabled is True
+    assert config.internal_review_enabled is False
     agent = config.agents["agent:dev"]
     agent.provider = None
     agent.command = "sh -c 'echo onboarding-smoke-agent'"

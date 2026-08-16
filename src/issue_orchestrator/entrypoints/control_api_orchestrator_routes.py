@@ -4,35 +4,39 @@ from __future__ import annotations
 
 import json
 import logging
-import time
 from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Query, Request
 from fastapi.responses import JSONResponse
 
+from ..domain.repository_launch_selection import RepositoryLaunchSelection
 from ..execution.control_center_actions import (
     DoctorActionRequest,
     RefreshActionRequest,
     RepoActionRequest,
 )
 from ..execution.control_center_runtime import (
-    build_repo_identity,
     confirm_orchestrator_at_port,
-    detect_orchestrator_by_port,
+    detect_repository_orchestrators,
     enrich_runtime_health,
-    get_selected_config,
-    is_shutdown_complete,
+    get_selected_launch_selection,
 )
 from ..infra.config import Config, get_config_path
 from ..infra.repo_guardrails import (
     RepoGuardrailsError,
-    RepoGuardrailsInstallResult,
     setup_repo_guardrails,
 )
-from ..infra.supervisor import DEFAULT_ENGINE_GRACEFUL_TIMEOUT_SECONDS, MultiInstanceStatus, SupervisorOps
+from ..infra.supervisor import (
+    DEFAULT_ENGINE_GRACEFUL_TIMEOUT_SECONDS,
+    MultiInstanceStatus,
+)
+from ..ports.repository_engine_supervisor import SupervisorOps
 from .control_api_orchestrator_support import (
     ControlApiOrchestratorDependency,
+    read_last_n_lines,
+    serialize_guardrails_result,
+    stopped_engine_payload,
 )
 from .shutdown_reason_support import parse_shutdown_reason
 
@@ -54,55 +58,13 @@ def _normalize_config_name(raw: object) -> str | None:
         config_name += ".yaml"
 
     config_path = Path(config_name)
-    if config_path.is_absolute() or config_path.name != config_name or config_name == ".yaml":
+    if (
+        config_path.is_absolute()
+        or config_path.name != config_name
+        or config_name == ".yaml"
+    ):
         return None
     return config_name
-
-
-def _repo_relative_path(repo_root: Path, path: Path) -> str:
-    try:
-        return path.resolve().relative_to(repo_root.resolve()).as_posix()
-    except ValueError:
-        return str(path)
-
-
-def _serialize_guardrails_result(result: RepoGuardrailsInstallResult) -> dict[str, object]:
-    repo_root = result.repo_root
-    return {
-        "status": "repaired",
-        "repo_root": str(repo_root),
-        "hooks_path": result.hooks_path_config,
-        "hooks_dir": _repo_relative_path(repo_root, result.hooks_dir),
-        "pre_push_hook": _repo_relative_path(repo_root, result.pre_push_hook),
-        "verify_script": _repo_relative_path(repo_root, result.verify_script),
-        "helper_script": _repo_relative_path(repo_root, result.helper_script),
-        "installed_files": [
-            _repo_relative_path(repo_root, path) for path in result.installed_files
-        ],
-        "preserved_files": [
-            _repo_relative_path(repo_root, path) for path in result.preserved_files
-        ],
-        "agent_hook_files": {
-            agent_type: [_repo_relative_path(repo_root, path) for path in paths]
-            for agent_type, paths in result.agent_hook_files.items()
-        },
-    }
-
-
-def _summarize_doctor_failures(doctor_result: Any) -> str:
-    """Return a short human-readable summary of failed doctor checks."""
-    checks = getattr(doctor_result, "checks", []) or []
-    failed = [check for check in checks if getattr(check, "status", None) == "error"]
-    if not failed:
-        return "Pre-flight checks failed"
-    parts: list[str] = []
-    for check in failed[:2]:
-        name = getattr(check, "name", "Check")
-        detail = (getattr(check, "detail", "") or "").strip()
-        parts.append(f"{name}: {detail}" if detail else name)
-    if len(failed) > 2:
-        parts.append(f"+{len(failed) - 2} more")
-    return "Pre-flight checks failed: " + "; ".join(parts)
 
 
 @control_orchestrator_router.post("/control/orchestrator/start")
@@ -111,11 +73,6 @@ async def control_start(  # noqa: C901, PLR0912 - startup orchestration spans va
     deps: ControlApiOrchestratorDependency,
 ) -> JSONResponse:
     """Start an orchestrator for a repository."""
-    from ..infra.repo_lock import AlreadyRunning
-    from ..infra.repo_registry import set_selected_config
-
-    sv = deps.get_supervisor()
-
     try:
         body = await request.json()
     except json.JSONDecodeError:
@@ -129,183 +86,28 @@ async def control_start(  # noqa: C901, PLR0912 - startup orchestration spans va
     if port is not None and (not isinstance(port, int) or port < 1 or port > 65535):
         return JSONResponse({"error": "Invalid port"}, status_code=400)
 
-    config_name = body.get("config_name", "default.yaml")
-    if not config_name.endswith(".yaml"):
-        config_name += ".yaml"
-    force_restart = bool(body.get("force_restart", False))
-    start_paused = bool(body.get("start_paused", False))
-    expected_identity = build_repo_identity(repo_root)
-
     try:
-        detected = detect_orchestrator_by_port(
-            repo_root,
-            config_name,
-            expected_identity=expected_identity,
+        selection = RepositoryLaunchSelection.parse(
+            mode=body.get("mode"),
+            config_name=body.get("config_name"),
         )
-        if detected and detected.get("identity_mismatch"):
-            stopped = sv.stop_by_port(
-                detected["port"],
-                force=True,
-                reason="engine identity mismatch detected on /control/start",
-                actor="control-center",
-            )
-            if not stopped:
-                return JSONResponse(
-                    {
-                        "error": "engine_identity_mismatch",
-                        "detail": "Mismatched engine detected and could not be stopped",
-                        "port": detected["port"],
-                        "expected_identity": detected.get("expected_identity"),
-                        "observed_identity": detected.get("observed_identity"),
-                        "identity_mismatch": detected.get("identity_mismatch"),
-                    },
-                    status_code=409,
-                )
-        elif detected and not force_restart:
-            return JSONResponse(
-                {
-                    "error": "orphaned_running",
-                    "status": "running",
-                    "port": detected["port"],
-                    "repo_root": str(repo_root),
-                    "health": detected.get("health", "unknown"),
-                    "tick_age_seconds": detected.get("tick_age_seconds"),
-                },
-                status_code=409,
-            )
-        if detected and force_restart:
-            stopped = sv.stop_by_port(
-                detected["port"],
-                force=True,
-                reason="force_restart=true on /control/start",
-                actor="control-center",
-            )
-            if not stopped:
-                return JSONResponse(
-                    {
-                        "error": "stop_failed",
-                        "detail": "Unable to stop existing orchestrator process.",
-                    },
-                    status_code=500,
-                )
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    from ..execution.repository_engine_start import RepositoryEngineStartRequest
 
-        set_selected_config(repo_root, config_name)
-
-        from ..infra.launcher import LaunchStatus, launch_subprocess
-
-        config_path = get_config_path(repo_root, config_name)
-        config = Config.load(config_path)
-
-        launch_result = launch_subprocess(
+    result = deps.get_control_actions().start_repo_engine_cmd.execute(
+        RepositoryEngineStartRequest(
             repo_root=repo_root,
-            config=config,
-            config_name=config_name,
-            supervisor_ops=sv,
-            expected_identity=expected_identity.to_dict(),
-            start_paused=start_paused,
+            selection=selection,
+            port=port,
+            force_restart=bool(body.get("force_restart", False)),
+            start_paused=bool(body.get("start_paused", False)),
+            actor="control-center",
         )
-
-        if LaunchStatus.parse(launch_result.status) is LaunchStatus.DOCTOR_ERROR:
-            return JSONResponse(
-                {
-                    "error": "doctor_failed",
-                    "detail": _summarize_doctor_failures(launch_result.doctor),
-                    "doctor": launch_result.doctor.to_dict(),
-                },
-                status_code=422,
-            )
-
-        if LaunchStatus.parse(launch_result.status) is LaunchStatus.ALREADY_RUNNING:
-            response = {
-                "error": "already_running",
-                "detail": launch_result.error or "Orchestrator already running",
-                "doctor": launch_result.doctor.to_dict(),
-            }
-            if launch_result.supervisor:
-                response.update(launch_result.supervisor)
-            return JSONResponse(response, status_code=409)
-
-        if not launch_result.launched:
-            return JSONResponse(
-                {
-                    "error": "launch_failed",
-                    "detail": launch_result.error or "Unknown launch error",
-                    "doctor": launch_result.doctor.to_dict(),
-                },
-                status_code=500,
-            )
-
-        response_data: dict[str, Any] = {
-            "status": "started",
-            "repo_root": str(repo_root),
-            "config_name": config_name,
-            "repo_identity": expected_identity.to_dict(),
-            "doctor": launch_result.doctor.to_dict(),
-        }
-        if launch_result.supervisor:
-            response_data.update(launch_result.supervisor)
-            deps.track_launched_pids(launch_result.supervisor)
-        return JSONResponse(response_data)
-    except FileNotFoundError as exc:
-        return JSONResponse(
-            {
-                "error": "config_not_found",
-                "detail": str(exc),
-            },
-            status_code=404,
-        )
-    except AlreadyRunning as exc:
-        if is_shutdown_complete(exc.port):
-            logger.info("Orchestrator in shutdown-complete state, restarting: %s", repo_root)
-            try:
-                sv.stop(
-                    repo_root,
-                    reason="restart after shutdown-complete state on /control/start",
-                    actor="control-center.start",
-                )
-                time.sleep(0.5)
-                info = sv.start(
-                    repo_root,
-                    config_name=config_name,
-                    expected_identity=expected_identity.to_dict(),
-                )
-                deps.track_launched_pids({"pid": info.pid})
-                return JSONResponse(
-                    {
-                        "status": "restarted",
-                        "pid": info.pid,
-                        "port": info.http_port,
-                        "repo_root": str(repo_root),
-                        "config_name": config_name,
-                    }
-                )
-            except Exception as restart_err:
-                logger.exception("Failed to restart orchestrator for %s", repo_root)
-                return JSONResponse(
-                    {
-                        "error": "restart_failed",
-                        "detail": str(restart_err),
-                    },
-                    status_code=500,
-                )
-        return JSONResponse(
-            {
-                "error": "already_running",
-                "pid": exc.pid,
-                "port": exc.port,
-                "repo_root": str(exc.repo_root),
-            },
-            status_code=409,
-        )
-    except Exception as exc:
-        logger.exception("Failed to start orchestrator for %s", repo_root)
-        return JSONResponse(
-            {
-                "error": "start_failed",
-                "detail": str(exc),
-            },
-            status_code=500,
-        )
+    )
+    if result.status_code == 200:
+        deps.track_launched_pids(result.payload)
+    return JSONResponse(dict(result.payload), status_code=result.status_code)
 
 
 @control_orchestrator_router.post("/control/orchestrator/stop")
@@ -348,7 +150,9 @@ async def control_stop(
         DEFAULT_ENGINE_GRACEFUL_TIMEOUT_SECONDS,
     )
     port_override = body.get("port")
-    if port_override is not None and (not isinstance(port_override, int) or port_override < 1 or port_override > 65535):
+    if port_override is not None and (
+        not isinstance(port_override, int) or port_override < 1 or port_override > 65535
+    ):
         return JSONResponse({"error": "Invalid port"}, status_code=400)
 
     if deps.global_shutdown_in_progress():
@@ -372,7 +176,9 @@ async def control_stop(
         graceful_timeout_seconds,
     )
 
-    logger.info("[control_stop] Calling supervisor.stop(%s, force=%s)", repo_root, force)
+    logger.info(
+        "[control_stop] Calling supervisor.stop(%s, force=%s)", repo_root, force
+    )
 
     try:
         status_info = sv.status(repo_root)
@@ -386,7 +192,10 @@ async def control_stop(
                     status_code=409,
                 )
             stopped = sv.stop_by_port(
-                port_override, force=force, reason=reason, actor=actor,
+                port_override,
+                force=force,
+                reason=reason,
+                actor=actor,
             )
             stopped_count = 1 if stopped else 0
         else:
@@ -399,16 +208,12 @@ async def control_stop(
                 force_if_graceful_fails=force_if_timeout or force,
             )
             stopped = stopped_count > 0
-        logger.info("[control_stop] supervisor.stop_all_instances returned: %d", stopped_count)
+        logger.info(
+            "[control_stop] supervisor.stop_all_instances returned: %d", stopped_count
+        )
 
         if stopped:
-            return JSONResponse(
-                {
-                    "status": "stopped",
-                    "repo_root": str(repo_root),
-                    "stopped_count": stopped_count,
-                }
-            )
+            return JSONResponse(stopped_engine_payload(repo_root, stopped_count))
         return JSONResponse({"status": "not_running", "repo_root": str(repo_root)})
     finally:
         deps.finish_engine_shutdown_operation(repo_root)
@@ -432,10 +237,12 @@ async def control_reconcile(
     stopped_unresponsive: list[str] = []
 
     for repo in list_repos():
+        selection = repo.launch_selection
         reconciliation = _reconcile_repo_runtime(
             sv=sv,
             repo_path=Path(repo.path),
-            selected_config=repo.selected_config or "default.yaml",
+            selected_config=selection.config.value,
+            selected_mode=selection.mode.value,
             stop_orphaned=stop_orphaned,
             stop_unresponsive=stop_unresponsive,
             force=force,
@@ -484,6 +291,7 @@ def _reconcile_repo_runtime(
     sv: SupervisorOps,
     repo_path: Path,
     selected_config: str,
+    selected_mode: str,
     stop_orphaned: bool,
     stop_unresponsive: bool,
     force: bool,
@@ -492,15 +300,59 @@ def _reconcile_repo_runtime(
     if not repo_path.exists():
         return None
 
-    multi_status = sv.status_all_instances(repo_path, config_name=selected_config)
+    multi_status = sv.status_all_instances(
+        repo_path,
+        config_name=selected_config,
+        **({"mode": selected_mode} if selected_mode != "default" else {}),
+    )
+    tracked_ports = {
+        status.port
+        for status in multi_status.instances
+        if status.state == "running" and status.port
+    }
+    orphaned = [
+        detected
+        for detected in detect_repository_orchestrators(repo_path)
+        if detected.get("port") not in tracked_ports
+    ]
+    orphaned_entries = [
+        {
+            "repo_root": str(repo_path),
+            "port": detected.get("port"),
+            "active_selection": detected.get("active_selection")
+            or detected.get("probed_selection"),
+        }
+        for detected in orphaned
+    ]
+    orphan_stop_results = (
+        [
+            sv.stop_by_port(
+                int(detected["port"]),
+                force=force,
+                reason="reconcile-runtime: stop orphaned orchestrator with no lock",
+                actor="control-center.reconcile",
+            )
+            for detected in orphaned
+            if detected.get("port")
+        ]
+        if stop_orphaned
+        else []
+    )
+    orphan_fields = {
+        "orphaned_detected": orphaned_entries,
+        "stopped_orphaned": bool(orphan_stop_results)
+        and all(orphan_stop_results),
+    }
     if _is_multi_instance_repo(multi_status):
-        return _reconcile_multi_instance_repo_runtime(
+        result = _reconcile_multi_instance_repo_runtime(
             sv=sv,
             repo_path=repo_path,
             multi_status=multi_status,
             stop_unresponsive=stop_unresponsive,
             force=force,
         )
+        result.update(orphan_fields)
+        return result
 
     status_info = sv.status(repo_path)
     if status_info.state == "failed":
@@ -511,41 +363,15 @@ def _reconcile_repo_runtime(
                 reason="reconcile-runtime: stale lock for failed orchestrator",
                 actor="control-center.reconcile",
             ),
-            "orphaned_detected": [],
-            "stopped_orphaned": False,
+            **orphan_fields,
             "unresponsive_detected": [],
             "stopped_unresponsive": False,
         }
 
     if status_info.state != "running":
-        detected = detect_orchestrator_by_port(repo_path, selected_config)
-        if not detected:
-            return {
-                "reconciled_stale_lock": False,
-                "orphaned_detected": [],
-                "stopped_orphaned": False,
-                "unresponsive_detected": [],
-                "stopped_unresponsive": False,
-            }
-        orphaned_entry = {"repo_root": str(repo_path), "port": detected.get("port")}
-        if stop_orphaned and detected.get("port"):
-            stopped = sv.stop_by_port(
-                int(detected["port"]),
-                force=force,
-                reason="reconcile-runtime: stop orphaned orchestrator with no lock",
-                actor="control-center.reconcile",
-            )
-            return {
-                "reconciled_stale_lock": False,
-                "orphaned_detected": [orphaned_entry],
-                "stopped_orphaned": stopped,
-                "unresponsive_detected": [],
-                "stopped_unresponsive": False,
-            }
         return {
             "reconciled_stale_lock": False,
-            "orphaned_detected": [orphaned_entry],
-            "stopped_orphaned": False,
+            **orphan_fields,
             "unresponsive_detected": [],
             "stopped_unresponsive": False,
         }
@@ -554,8 +380,7 @@ def _reconcile_repo_runtime(
     if payload is None or payload.get("runtime_health") != "unresponsive":
         return {
             "reconciled_stale_lock": False,
-            "orphaned_detected": [],
-            "stopped_orphaned": False,
+            **orphan_fields,
             "unresponsive_detected": [],
             "stopped_unresponsive": False,
         }
@@ -582,8 +407,7 @@ def _reconcile_repo_runtime(
         }
     return {
         "reconciled_stale_lock": False,
-        "orphaned_detected": [],
-        "stopped_orphaned": False,
+        **orphan_fields,
         "unresponsive_detected": [unresponsive_entry],
         "stopped_unresponsive": False,
     }
@@ -609,7 +433,9 @@ def _reconcile_multi_instance_repo_runtime(
     stopped_unresponsive = False
 
     instance_ids: list[str | None] = [None]
-    instance_ids.extend(f"orchestrator-{i}" for i in range(1, multi_status.expected_count + 1))
+    instance_ids.extend(
+        f"orchestrator-{i}" for i in range(1, multi_status.expected_count + 1)
+    )
     instance_ids.extend(
         inst.instance_id
         for inst in multi_status.instances
@@ -662,17 +488,21 @@ def _reconcile_multi_instance_repo_runtime(
         unresponsive_reason = (
             "reconcile-runtime: stop unresponsive multi-instance orchestrator"
         )
-        stopped = sv.stop_by_port(
-            port,
-            force=force,
-            reason=unresponsive_reason,
-            actor="control-center.reconcile",
-        ) if isinstance(port, int) else sv.stop(
-            repo_path,
-            force=force,
-            instance_id=instance_id,
-            reason=unresponsive_reason,
-            actor="control-center.reconcile",
+        stopped = (
+            sv.stop_by_port(
+                port,
+                force=force,
+                reason=unresponsive_reason,
+                actor="control-center.reconcile",
+            )
+            if isinstance(port, int)
+            else sv.stop(
+                repo_path,
+                force=force,
+                instance_id=instance_id,
+                reason=unresponsive_reason,
+                actor="control-center.reconcile",
+            )
         )
         if stopped:
             stopped_unresponsive = True
@@ -691,6 +521,7 @@ async def control_status(
     deps: ControlApiOrchestratorDependency,
     repo_root: str = Query(...),
     config_name: str | None = Query(None),
+    mode: str | None = Query(None),
 ) -> JSONResponse:
     """Get the status of the orchestrator for a repository."""
     sv = deps.get_supervisor()
@@ -699,8 +530,18 @@ async def control_status(
     if path is None:
         return JSONResponse({"error": "Invalid or missing repo_root"}, status_code=400)
 
-    selected = config_name or get_selected_config(path) or "default.yaml"
-    multi_status = sv.status_all_instances(path, config_name=selected)
+    desired = get_selected_launch_selection(path)
+    try:
+        selection = RepositoryLaunchSelection.parse(
+            mode=mode or desired.mode.value,
+            config_name=config_name or desired.config.value,
+        )
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    selected = selection.config.value
+    multi_status = sv.status_all_instances(
+        path, config_name=selected, mode=selection.mode.value
+    )
 
     if multi_status.expected_count > 1 or len(multi_status.instances) > 1:
         return JSONResponse(
@@ -721,9 +562,11 @@ async def control_status(
 
     status_info = sv.status(path)
     if status_info.state != "running":
-        detected = detect_orchestrator_by_port(path, selected)
-        if detected:
+        detected_engines = detect_repository_orchestrators(path)
+        if detected_engines:
+            detected = detected_engines[0]
             status_data = detected.get("status", {})
+            info = detected.get("info", {})
             orphaned_payload = {
                 "state": "running",
                 "pid": None,
@@ -736,9 +579,13 @@ async def control_status(
                 "tick_age_seconds": detected.get("tick_age_seconds"),
                 "shutdown_requested": status_data.get("shutdown_requested", False),
                 "active_session_count": len(status_data.get("active_sessions", [])),
+                "configuration_mode": info.get("configuration_mode"),
+                "config_name": info.get("config_name"),
+                "config_fingerprint": info.get("config_fingerprint"),
             }
             return JSONResponse(
-                enrich_runtime_health(path, orphaned_payload, orphaned=True) or orphaned_payload
+                enrich_runtime_health(path, orphaned_payload, orphaned=True)
+                or orphaned_payload
             )
 
     payload = enrich_runtime_health(path, status_info.to_dict())
@@ -844,6 +691,8 @@ async def control_last_failure(
 async def control_doctor(
     deps: ControlApiOrchestratorDependency,
     repo_root: str = Query(...),
+    config_name: str | None = Query(None),
+    mode: str | None = Query(None),
 ) -> JSONResponse:
     """Run diagnostics for a repository."""
     path = deps.validate_repo_root(repo_root)
@@ -851,7 +700,17 @@ async def control_doctor(
         return JSONResponse({"error": "Invalid or missing repo_root"}, status_code=400)
 
     actions = deps.get_control_actions()
-    result = await actions.doctor_cmd.execute(DoctorActionRequest(repo_root=path))
+    desired = get_selected_launch_selection(path)
+    try:
+        selection = RepositoryLaunchSelection.parse(
+            mode=mode or desired.mode,
+            config_name=config_name or desired.config,
+        )
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    result = await actions.doctor_cmd.execute(
+        DoctorActionRequest(repo_root=path, selection=selection)
+    )
     return JSONResponse(result.payload, status_code=result.status_code)
 
 
@@ -874,13 +733,21 @@ async def control_repair_guardrails(
     if config_name is None:
         return JSONResponse({"error": "Invalid config_name"}, status_code=400)
 
-    config_path = get_config_path(repo_root, config_name)
+    try:
+        selection = RepositoryLaunchSelection.parse(
+            mode=body.get("mode"),
+            config_name=config_name,
+        )
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    config_path = get_config_path(repo_root, config_name, selection.mode)
     if not config_path.exists():
         return JSONResponse(
             {
                 "error": "config_not_found",
                 "detail": f"Config file not found: {config_name}",
                 "config_name": config_name,
+                "mode": selection.mode.value,
             },
             status_code=404,
         )
@@ -894,12 +761,14 @@ async def control_repair_guardrails(
                 "error": "repair_failed",
                 "detail": str(exc),
                 "config_name": config_name,
+                "mode": selection.mode.value,
             },
             status_code=400,
         )
 
-    payload = _serialize_guardrails_result(result)
+    payload = serialize_guardrails_result(result)
     payload["config_name"] = config_name
+    payload["mode"] = selection.mode.value
     payload["message"] = (
         "Repo guardrails repaired. Review and commit changed files if this updated "
         "tracked files."
@@ -928,7 +797,12 @@ async def control_ai_diagnose(
     if not isinstance(timeout, int) or timeout < 10 or timeout > 600:
         timeout = 120
 
-    result = run_ai_diagnose(repo_root, timeout_seconds=timeout)
+    identity = deps.get_control_actions().effective_configuration_identity(repo_root)
+    result = run_ai_diagnose(
+        repo_root,
+        timeout_seconds=timeout,
+        identity=identity,
+    )
     return JSONResponse(result.to_dict())
 
 
@@ -950,7 +824,7 @@ async def control_log_tail(
         return JSONResponse({"lines": [], "total_lines": 0})
 
     try:
-        lines, total_lines = _read_last_n_lines(log_path, n)
+        lines, total_lines = read_last_n_lines(log_path, n)
     except OSError as exc:
         return JSONResponse(
             {
@@ -967,37 +841,6 @@ async def control_log_tail(
             "returned_lines": len(lines),
         }
     )
-
-
-def _read_last_n_lines(log_path: Path, n: int) -> tuple[list[str], int]:
-    """Read the last N lines of a log file plus its total line count."""
-    with open(log_path, "rb") as handle:
-        handle.seek(0, 2)
-        file_size = handle.tell()
-
-        lines: list[str] = []
-        chunk_size = 8192
-        remaining = file_size
-
-        while len(lines) < n + 1 and remaining > 0:
-            read_size = min(chunk_size, remaining)
-            remaining -= read_size
-            handle.seek(remaining)
-            chunk = handle.read(read_size).decode("utf-8", errors="replace")
-            chunk_lines = chunk.split("\n")
-
-            if lines:
-                lines[0] = chunk_lines[-1] + lines[0]
-                chunk_lines = chunk_lines[:-1]
-
-            lines = chunk_lines + lines
-
-        lines = lines[-n:] if len(lines) > n else lines
-
-        handle.seek(0)
-        total_lines = sum(1 for _ in handle)
-
-    return lines, total_lines
 
 
 __all__ = ["control_orchestrator_router"]

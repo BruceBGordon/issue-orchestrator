@@ -211,6 +211,43 @@ class TestAiAgentType:
             assert agent_type.value is not None
 
 
+def test_install_hooks_invalidates_gate_after_partial_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from datetime import datetime, timezone
+
+    from issue_orchestrator.infra.ai_gate_state import (
+        AiGateState,
+        load_ai_gate_state,
+        save_ai_gate_state,
+    )
+    from issue_orchestrator.infra.hooks import hooks as hooks_module
+
+    prior = AiGateState(last_check=datetime.now(timezone.utc))
+    save_ai_gate_state(tmp_path, prior)
+    monkeypatch.setattr(
+        hooks_module,
+        "detect_agents_from_config",
+        lambda _config: {"first": AiAgentType.CLAUDE_CODE},
+    )
+
+    class Adapter:
+        def validate_installation_target(self, _root: Path) -> None:
+            return None
+
+        def install_hooks(self, root: Path) -> list[Path]:
+            (root / "partially-updated-hook").write_text("changed")
+            raise ValueError("first adapter failed after mutation")
+
+    monkeypatch.setattr(hooks_module, "get_adapter", lambda _agent_type: Adapter())
+
+    with pytest.raises(ValueError, match="first adapter failed after mutation"):
+        hooks_module.install_hooks_for_config(Mock(), tmp_path)
+
+    assert (tmp_path / "partially-updated-hook").is_file()
+    assert load_ai_gate_state(tmp_path).last_check is None
+
+
 class TestDetectAiAgent:
     """Tests for detect_ai_agent function."""
 
@@ -685,10 +722,45 @@ class TestClaudeCodeAdapter:
         decision = evaluate_command("gh pr merge 123 --squash")
         assert not decision.allowed
 
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "gh --repo owner/repo pr merge 123",
+            "gh -R owner/repo pr merge 123",
+            "gh --body text pr merge 123",
+            "gh -btext pr merge 123",
+            "'gh' 'pr' 'merge' 123",
+            "'/usr/bin/gh' --repo owner/repo pr merge 123",
+        ],
+    )
+    def test_hook_blocks_gh_pr_merge_with_global_options(
+        self, adapter, temp_project, command
+    ):
+        adapter.install_hooks(temp_project)
+        decision = evaluate_command(command)
+        assert not decision.allowed
+
     def test_hook_blocks_gh_api_merge(self, adapter, temp_project):
         """Agents cannot merge PRs via gh api."""
         adapter.install_hooks(temp_project)
         decision = evaluate_command("gh api repos/owner/repo/pulls/123/merge -X PUT")
+        assert not decision.allowed
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "gh --repo owner/repo api repos/owner/repo/issues",
+            "gh -Rowner/repo api repos/owner/repo/issues",
+            "gh --hostname github.com api repos/owner/repo/issues",
+            "gh -XPUT api repos/owner/repo/pulls/123/merge",
+            "gh --cache=1h api repos/owner/repo/issues",
+        ],
+    )
+    def test_hook_blocks_gh_api_with_global_options(
+        self, adapter, temp_project, command
+    ):
+        adapter.install_hooks(temp_project)
+        decision = evaluate_command(command)
         assert not decision.allowed
 
     def test_hook_allows_gh_pr_create(self, adapter, temp_project):
@@ -714,9 +786,7 @@ class TestClaudeCodeAdapter:
     def test_hook_blocks_cat_redirect_to_git_info_exclude(self, adapter, temp_project):
         """The exact bash pattern from the tixmeup-243 incident."""
         adapter.install_hooks(temp_project)
-        decision = evaluate_command(
-            "cat >> .git/info/exclude <<'EOF'\nsrc/\nEOF"
-        )
+        decision = evaluate_command("cat >> .git/info/exclude <<'EOF'\nsrc/\nEOF")
         assert not decision.allowed
         assert "info/exclude" in decision.reason
         assert "coding-done needs_human" in decision.reason
@@ -747,9 +817,7 @@ class TestClaudeCodeAdapter:
         # the agent its valid next step.
         assert "coding-done needs_human" in decision.reason
 
-    def test_hook_blocks_append_to_subdirectory_gitignore(
-        self, adapter, temp_project
-    ):
+    def test_hook_blocks_append_to_subdirectory_gitignore(self, adapter, temp_project):
         """Arbitrary-path form — subdirectory ``.gitignore`` files are
         just as guard-hiding as the top-level one, and an agent running
         from any subdirectory can write to them."""
@@ -758,15 +826,11 @@ class TestClaudeCodeAdapter:
         assert not decision.allowed
         assert "gitignore" in decision.reason.lower()
 
-    def test_hook_blocks_append_to_absolute_path_gitignore(
-        self, adapter, temp_project
-    ):
+    def test_hook_blocks_append_to_absolute_path_gitignore(self, adapter, temp_project):
         """Absolute paths are another easy evasion of a path-literal
         regex — pin that the broadened pattern catches them."""
         adapter.install_hooks(temp_project)
-        decision = evaluate_command(
-            "echo 'src/' >> /workspace/project/.gitignore"
-        )
+        decision = evaluate_command("echo 'src/' >> /workspace/project/.gitignore")
         assert not decision.allowed
 
     def test_hook_blocks_tee_append_to_gitignore(self, adapter, temp_project):
@@ -796,9 +860,7 @@ class TestClaudeCodeAdapter:
         assert not decision.allowed
         assert ".gitignore" in decision.reason
 
-    def test_hook_blocks_sed_in_place_gitignore_flag_order(
-        self, adapter, temp_project
-    ):
+    def test_hook_blocks_sed_in_place_gitignore_flag_order(self, adapter, temp_project):
         """``sed -e '...' -i ...`` — the ``-i`` flag after a preceding
         expression flag. Must still match, otherwise flag reordering is
         a trivial evasion."""
@@ -924,6 +986,9 @@ class TestCursorAdapter:
         adapter.install_hooks(temp_project)
 
         assert adapter.is_installed(temp_project)
+
+    def test_supports_ai_gate(self, adapter):
+        assert adapter.supports_ai_gate()
 
     def test_verify_hooks_passes_after_install(self, adapter, temp_project):
         adapter.install_hooks(temp_project)
@@ -1183,7 +1248,7 @@ class TestCopilotAdapter:
 class TestCodexAdapter:
     """Tests for CodexAdapter.
 
-    Codex CLI uses Starlark rules in .codex/rules/ per project.
+    Codex CLI uses project Starlark rules plus a PreToolUse hook.
     """
 
     @pytest.fixture
@@ -1194,27 +1259,249 @@ class TestCodexAdapter:
     def temp_project(self, tmp_path):
         return tmp_path
 
+    @pytest.fixture(autouse=True)
+    def isolated_runtime(self, temp_project, monkeypatch):
+        from issue_orchestrator.infra.hooks.codex_session import (
+            prepare_codex_runtime_home,
+        )
+
+        user_home = temp_project / ".test-codex-user"
+        user_home.mkdir()
+        (user_home / "auth.json").write_text("{}\n")
+        monkeypatch.setenv("CODEX_HOME", str(user_home))
+        monkeypatch.setenv(
+            "ISSUE_ORCHESTRATOR_CODEX_RUNTIME_ROOT",
+            str(temp_project / ".test-codex-runtime"),
+        )
+        prepare_codex_runtime_home()
+
     def test_agent_type(self, adapter):
         assert adapter.agent_type == AiAgentType.CODEX
+
+    def test_isolated_runtime_rejects_unvetted_user_hook(self, temp_project):
+        from issue_orchestrator.infra.hooks.codex_session import (
+            codex_runtime_home,
+            verify_codex_runtime_home,
+        )
+
+        (codex_runtime_home() / "hooks.json").write_text('{"hooks": {}}\n')
+
+        with pytest.raises(RuntimeError, match="unvetted hook/config sources"):
+            verify_codex_runtime_home()
+
+    def test_isolated_runtime_allows_codex_managed_plugin_cache(self, temp_project):
+        from issue_orchestrator.infra.hooks.codex_session import (
+            codex_runtime_home,
+            verify_codex_runtime_home,
+        )
+
+        (codex_runtime_home() / "plugins" / "cache").mkdir(parents=True)
+
+        assert verify_codex_runtime_home() == codex_runtime_home()
+
+    def test_isolated_runtime_can_prepare_before_codex_login(
+        self, temp_project, monkeypatch
+    ):
+        from issue_orchestrator.infra.hooks.codex_session import (
+            codex_runtime_home,
+            prepare_codex_runtime_home,
+            verify_codex_runtime_home,
+        )
+
+        source_home = temp_project / "logged-out-codex"
+        monkeypatch.setenv("CODEX_HOME", str(source_home))
+
+        prepare_codex_runtime_home()
+
+        assert verify_codex_runtime_home(require_auth=False) == codex_runtime_home()
+        with pytest.raises(RuntimeError, match="run `codex login` first"):
+            verify_codex_runtime_home()
+
+    def test_isolated_runtime_reports_missing_managed_auth_link(self, temp_project):
+        from issue_orchestrator.infra.hooks.codex_session import (
+            codex_runtime_home,
+            verify_codex_runtime_home,
+        )
+
+        (codex_runtime_home() / "auth.json").unlink()
+
+        with pytest.raises(RuntimeError, match="not initialized; run setup-hooks"):
+            verify_codex_runtime_home()
+
+    def test_isolated_runtime_reports_wrong_managed_auth_link(self, temp_project):
+        from issue_orchestrator.infra.hooks.codex_session import (
+            codex_runtime_home,
+            verify_codex_runtime_home,
+        )
+
+        runtime_auth = codex_runtime_home() / "auth.json"
+        runtime_auth.unlink()
+        wrong_auth = temp_project / "wrong-auth.json"
+        wrong_auth.write_text("{}\n", encoding="utf-8")
+        runtime_auth.symlink_to(wrong_auth)
+
+        with pytest.raises(RuntimeError, match="unexpected file"):
+            verify_codex_runtime_home()
+
+    def test_isolated_runtime_allows_only_managed_untrusted_projects(
+        self, temp_project
+    ):
+        from issue_orchestrator.infra.hooks.codex_session import (
+            codex_runtime_home,
+            prepare_codex_runtime_home,
+            verify_codex_runtime_home,
+        )
+
+        project = temp_project / "project-😀"
+        prepare_codex_runtime_home(untrusted_projects=(project,))
+
+        config = (codex_runtime_home() / "config.toml").read_text(encoding="utf-8")
+        assert f'[projects."{project}"]' in config
+        assert 'trust_level = "untrusted"' in config
+        assert verify_codex_runtime_home() == codex_runtime_home()
+
+    def test_isolated_runtime_rejects_trusted_project_config(self, temp_project):
+        from issue_orchestrator.infra.hooks.codex_session import (
+            codex_runtime_home,
+            verify_codex_runtime_home,
+        )
+
+        (codex_runtime_home() / "config.toml").write_text(
+            '[projects."/tmp/project"]\ntrust_level = "trusted"\n',
+            encoding="utf-8",
+        )
+
+        with pytest.raises(RuntimeError, match="managed-project drift"):
+            verify_codex_runtime_home()
 
     def test_is_installed_false_when_missing(self, adapter, temp_project):
         assert not adapter.is_installed(temp_project)
 
-    def test_install_hooks_creates_rules_file(self, adapter, temp_project):
+    def test_install_hooks_creates_enforcement_files(self, adapter, temp_project):
         files = adapter.install_hooks(temp_project)
 
-        assert len(files) == 1
+        assert len(files) == 4
         rules_file = temp_project / ".codex" / "rules" / "orchestrator.rules"
         assert rules_file.exists()
+        hook_script = temp_project / ".codex" / "hooks" / "block-no-verify.sh"
+        assert hook_script.exists()
+        assert os.access(hook_script, os.X_OK)
+        hook_policy = temp_project / ".codex" / "hooks" / "block_no_verify.py"
+        assert hook_policy.exists()
+        assert os.access(hook_policy, os.X_OK)
+        assert "def evaluate_command" in hook_policy.read_text()
+        assert (temp_project / ".codex" / "hooks.json").exists()
 
     def test_rules_file_contains_blocking_rules(self, adapter, temp_project):
         adapter.install_hooks(temp_project)
         rules_file = temp_project / ".codex" / "rules" / "orchestrator.rules"
 
         content = rules_file.read_text()
+        assert "# Install to: .codex/rules/orchestrator.rules" in content
         assert 'decision = "forbidden"' in content
         assert 'pattern = ["git", "push", "--no-verify"]' in content
+        assert 'pattern = ["git", "-c"]' in content
         assert 'pattern = ["gh", "pr", "merge"]' in content
+
+    def test_install_hooks_merges_existing_codex_hooks(self, adapter, temp_project):
+        hooks_json = temp_project / ".codex" / "hooks.json"
+        hooks_json.parent.mkdir()
+        hooks_json.write_text(
+            json.dumps(
+                {
+                    "description": "keep me",
+                    "hooks": {
+                        "PreToolUse": [
+                            {
+                                "matcher": "Bash",
+                                "hooks": [
+                                    {"type": "command", "command": "./existing.sh"}
+                                ],
+                            }
+                        ],
+                        "Stop": [
+                            {"hooks": [{"type": "command", "command": "./stop.sh"}]}
+                        ],
+                    },
+                }
+            )
+        )
+
+        adapter.install_hooks(temp_project)
+        installed = json.loads(hooks_json.read_text())
+
+        assert installed["description"] == "keep me"
+        assert installed["hooks"]["Stop"]
+        bash_hooks = installed["hooks"]["PreToolUse"][0]["hooks"]
+        assert {hook["command"] for hook in bash_hooks} == {
+            "./existing.sh",
+            '"$(git rev-parse --show-toplevel)/.codex/hooks/block-no-verify.sh"',
+        }
+
+    def test_install_hooks_normalizes_managed_handler_to_sync(
+        self, adapter, temp_project
+    ):
+        hooks_json = temp_project / ".codex" / "hooks.json"
+        hooks_json.parent.mkdir()
+        hooks_json.write_text(
+            json.dumps(
+                {
+                    "hooks": {
+                        "PreToolUse": [
+                            {
+                                "matcher": "Bash",
+                                "hooks": [
+                                    {
+                                        "type": "command",
+                                        "command": (
+                                            '"$(git rev-parse --show-toplevel)/'
+                                            '.codex/hooks/block-no-verify.sh"'
+                                        ),
+                                        "async": True,
+                                        "timeout": 0,
+                                    }
+                                ],
+                            }
+                        ]
+                    }
+                }
+            )
+        )
+
+        adapter.install_hooks(temp_project)
+        installed = json.loads(hooks_json.read_text())
+        handler = installed["hooks"]["PreToolUse"][0]["hooks"][0]
+
+        assert "async" not in handler
+        assert "timeout" not in handler
+        assert adapter.is_installed(temp_project)
+
+    def test_install_hooks_rejects_invalid_hooks_json_without_overwriting(
+        self, adapter, temp_project
+    ):
+        hooks_json = temp_project / ".codex" / "hooks.json"
+        hooks_json.parent.mkdir()
+        hooks_json.write_text("{ invalid\n")
+
+        with pytest.raises(ValueError, match="Invalid JSON"):
+            adapter.install_hooks(temp_project)
+
+        assert hooks_json.read_text() == "{ invalid\n"
+        assert not (temp_project / ".codex/rules/orchestrator.rules").exists()
+
+    def test_install_hooks_rejects_invalid_structure_without_writes(
+        self, adapter, temp_project
+    ):
+        hooks_json = temp_project / ".codex" / "hooks.json"
+        hooks_json.parent.mkdir()
+        original = '{"hooks": []}\n'
+        hooks_json.write_text(original)
+
+        with pytest.raises(ValueError, match="hooks must be a JSON object"):
+            adapter.install_hooks(temp_project)
+
+        assert hooks_json.read_text() == original
+        assert not (temp_project / ".codex/rules/orchestrator.rules").exists()
 
     def test_is_installed_true_after_install(self, adapter, temp_project):
         adapter.install_hooks(temp_project)
@@ -1238,11 +1525,55 @@ class TestCodexAdapter:
         assert result.meta_agent == AiAgentType.CODEX
         assert len(result.checks_failed) == 0
 
+    def test_verify_hooks_treats_empty_execpolicy_matches_as_allowed(
+        self, adapter, temp_project, monkeypatch
+    ):
+        adapter.install_hooks(temp_project)
+        monkeypatch.setattr(shutil, "which", lambda _cmd: "/usr/local/bin/codex")
+
+        def run_execpolicy(command, **_kwargs):
+            payload = (
+                {"matchedRules": [], "decision": None}
+                if command[-4:] == ["git", "push", "origin", "main"]
+                else {
+                    "matchedRules": [
+                        {
+                            "prefixRuleMatch": {
+                                "decision": "forbidden",
+                            }
+                        }
+                    ],
+                    "decision": "forbidden",
+                }
+            )
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout=json.dumps(payload),
+                stderr="",
+            )
+
+        monkeypatch.setattr(subprocess, "run", run_execpolicy)
+
+        result = adapter.verify_hooks(temp_project)
+
+        assert result.success
+        assert "execpolicy_allows:git push origin main" in result.checks_passed
+
     def test_verify_hooks_fails_when_not_installed(self, adapter, temp_project):
         result = adapter.verify_hooks(temp_project)
 
         assert not result.success
         assert "rules_file_exists" in result.checks_failed[0]
+
+    def test_is_installed_rejects_rules_only_legacy_install(
+        self, adapter, temp_project
+    ):
+        rules_file = temp_project / ".codex" / "rules" / "orchestrator.rules"
+        rules_file.parent.mkdir(parents=True)
+        rules_file.write_text("legacy\n")
+
+        assert not adapter.is_installed(temp_project)
 
     def test_verify_hooks_fails_when_codex_missing(
         self, adapter, temp_project, monkeypatch
@@ -1256,6 +1587,96 @@ class TestCodexAdapter:
         assert any(
             "execpolicy_cli_available" in check for check in result.checks_failed
         )
+
+    def test_ai_gate_passes_only_on_pretooluse_marker(
+        self, adapter, temp_project, monkeypatch
+    ):
+        from issue_orchestrator.adapters.hooks import codex as codex_module
+
+        monkeypatch.setattr(shutil, "which", lambda _cmd: "/usr/local/bin/codex")
+
+        def run_codex(command, **_kwargs):
+            attempted = command[-1].split("shell tool: ", 1)[1].split(". Do not", 1)[0]
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout="",
+                stderr=(
+                    "ERROR codex_core::tools::router: error=Command blocked by "
+                    "PreToolUse hook: BLOCKED: --no-verify is forbidden. "
+                    f"Pre-push hooks must run. Command: {attempted}\n"
+                ),
+            )
+
+        monkeypatch.setattr(codex_module, "run_command_in_process_group", run_codex)
+
+        success, message = adapter.test_ai_gate(temp_project)
+
+        assert success
+        assert "PreToolUse blocked" in message
+
+    def test_ai_gate_reports_missing_invocation_hook(
+        self, adapter, temp_project, monkeypatch
+    ):
+        from issue_orchestrator.adapters.hooks import codex as codex_module
+
+        monkeypatch.setattr(shutil, "which", lambda _cmd: "/usr/local/bin/codex")
+        captured = {}
+
+        def run_codex(command, **kwargs):
+            captured["command"] = command
+            captured["cwd"] = kwargs["cwd"]
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout=(
+                    '{"type":"item.completed","item":'
+                    '{"aggregated_output":"src refspec does not match any"}}\n'
+                ),
+                stderr="",
+            )
+
+        monkeypatch.setattr(codex_module, "run_command_in_process_group", run_codex)
+
+        success, message = adapter.test_ai_gate(temp_project)
+
+        assert not success
+        assert "invocation-scoped PreToolUse hook was not observed" in message
+        prompt = captured["command"][-1]
+        assert "git push origin __io_hook_gate_missing_" in prompt
+        assert "--no-verify" in prompt
+        exec_index = captured["command"].index("exec")
+        assert captured["command"][exec_index + 1] == "--skip-git-repo-check"
+        runtime_home = Path(captured["cwd"])
+        assert captured["command"][captured["command"].index("-C") + 1] == str(
+            runtime_home
+        )
+        assert runtime_home != temp_project
+
+    def test_ai_gate_rejects_marker_in_assistant_message(
+        self, adapter, temp_project, monkeypatch
+    ):
+        from issue_orchestrator.adapters.hooks import codex as codex_module
+
+        monkeypatch.setattr(shutil, "which", lambda _cmd: "/usr/local/bin/codex")
+        event = {
+            "type": "item.completed",
+            "item": {
+                "type": "agent_message",
+                "text": "BLOCKED: --no-verify is forbidden.",
+            },
+        }
+        monkeypatch.setattr(
+            codex_module,
+            "run_command_in_process_group",
+            lambda command, **_kwargs: subprocess.CompletedProcess(
+                command, 0, stdout=json.dumps(event) + "\n", stderr=""
+            ),
+        )
+
+        success, _message = adapter.test_ai_gate(temp_project)
+
+        assert not success
 
 
 class TestUnsupportedAdapter:
@@ -1326,6 +1747,19 @@ class TestDetectAgentsFromConfig:
         result = detect_agents_from_config(mock_config)
 
         assert result["agent:test"] == AiAgentType.UNKNOWN
+
+    def test_provider_is_authoritative_over_legacy_command(self):
+        """Mode/provider changes install hooks for the effective launcher."""
+        mock_config = Mock()
+        mock_agent = Mock()
+        mock_agent.meta_agent = None
+        mock_agent.command = "claude --dangerously-skip-permissions"
+        mock_agent.resolve_launch_provider.return_value = "codex"
+        mock_config.agents = {"agent:test": mock_agent}
+
+        result = detect_agents_from_config(mock_config)
+
+        assert result["agent:test"] == AiAgentType.CODEX
 
 
 class TestParseHookInput:
@@ -1466,6 +1900,75 @@ class TestCopilotParseHookInput:
         assert self.extract_command(raw) == "git log"
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git push origin main --no-verify",
+        "git push --force origin main --no-verify",
+        "git commit -m x --no-verify",
+        "git commit --amend -n",
+        "git -c core.hooksPath=/tmp/hooks push",
+        "git -c core.hooksPath=.git/empty commit",
+        "git config --local core.hooksPath .git/empty",
+        "git config --worktree --unset core.hooksPath",
+        "git push origin main '--no-verify'",
+        "git commit -m test '--no-verify'",
+        "git commit '-n' -m test",
+        "git -c 'core.hooksPath=/tmp/empty-hooks' push origin main",
+        "git -C . config core.hooksPath /tmp/empty-hooks",
+        "git -C . config --unset core.hooksPath",
+        "git config core.hooksPath get",
+        "git config --local core.hooksPath get",
+        "git config core.hooksPath --get",
+        "git config core.hooksPath --get-all",
+        "git config rename-section core oldcore",
+        "git config remove-section core",
+        "git config edit",
+        "git config set user.name agent",
+        "git config --unset-a core.hooksPath",
+        "git config --remove-sect core",
+        "git status && git push origin main '--no-verify'",
+        "git commit -anm test",
+        "git -c color.ui=false status",
+        "git --config-env=core.hooksPath=HOOKS push origin main",
+        "GIT_CONFIG_COUNT=1 git push origin main",
+        "export GIT_CONFIG_COUNT=1; git push origin main",
+        'flag=--no-verify; git push origin main "$flag"',
+        "git push origin main $(printf %s --no-verify)",
+        "(git push origin main --no-verify)",
+        "$(git push origin main --no-verify)",
+        "`git push origin main --no-verify`",
+        "(git -C . config core.hooksPath /tmp/empty-hooks)",
+        "$(git -C . config core.hooksPath /tmp/empty-hooks)",
+        "`git config rename-section core oldcore`",
+        "git -C . config --local CORE.HOOKSPATH /tmp/empty-hooks",
+    ],
+)
+def test_shared_hook_policy_blocks_full_command_bypasses(command):
+    assert not evaluate_command(command).allowed
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git status --short",
+        "git commit -m x",
+        "git config --get core.hooksPath",
+        "git config --local --get core.hooksPath",
+        "git -C . config --get core.hooksPath",
+        "git -C . status",
+        "git switch -c new-branch",
+        "git commit -c HEAD",
+        "git log -c",
+        "git config get core.hooksPath",
+        "git config list --show-origin",
+        "git config user.name",
+    ],
+)
+def test_shared_hook_policy_allows_normal_git_and_config_reads(command):
+    assert evaluate_command(command).allowed
+
+
 class TestHookScriptIntegration:
     """Minimal end-to-end coverage for hook shell scripts."""
 
@@ -1490,23 +1993,61 @@ class TestHookScriptIntegration:
         blocked = run_copilot_hook_test(hook_script, "git push --no-verify")
         assert blocked
 
+    def test_codex_hook_script_blocks_suffix_no_verify(self, tmp_path, monkeypatch):
+        user_home = tmp_path / ".test-codex-user"
+        user_home.mkdir()
+        (user_home / "auth.json").write_text("{}\n")
+        monkeypatch.setenv("CODEX_HOME", str(user_home))
+        monkeypatch.setenv(
+            "ISSUE_ORCHESTRATOR_CODEX_RUNTIME_ROOT",
+            str(tmp_path / ".test-codex-runtime"),
+        )
+        adapter = CodexAdapter()
+        adapter.install_hooks(tmp_path)
+        hook_script = tmp_path / ".codex" / "hooks" / "block-no-verify.sh"
+        blocked = run_hook_test(hook_script, "git push origin main --no-verify")
+        assert blocked
+
     @pytest.mark.parametrize(
         ("adapter_cls", "hook_rel", "runner"),
         [
-            (ClaudeCodeAdapter, Path(".claude/hooks/block-no-verify.sh"), run_hook_test),
-            (CursorAdapter, Path(".cursor/hooks/block-no-verify.sh"), run_cursor_hook_test),
+            (
+                ClaudeCodeAdapter,
+                Path(".claude/hooks/block-no-verify.sh"),
+                run_hook_test,
+            ),
+            (
+                CursorAdapter,
+                Path(".cursor/hooks/block-no-verify.sh"),
+                run_cursor_hook_test,
+            ),
             (GeminiAdapter, Path(".gemini/hooks/block-no-verify.sh"), run_hook_test),
-            (CopilotAdapter, Path(".github/hooks/block-no-verify.sh"), run_copilot_hook_test),
+            (
+                CopilotAdapter,
+                Path(".github/hooks/block-no-verify.sh"),
+                run_copilot_hook_test,
+            ),
+            (CodexAdapter, Path(".codex/hooks/block-no-verify.sh"), run_hook_test),
         ],
-        ids=("claude", "cursor", "gemini", "copilot"),
+        ids=("claude", "cursor", "gemini", "copilot", "codex"),
     )
     def test_hook_scripts_fail_closed_when_python_missing(
         self,
         tmp_path,
+        monkeypatch,
         adapter_cls,
         hook_rel,
         runner,
     ):
+        if adapter_cls is CodexAdapter:
+            user_home = tmp_path / ".test-codex-user"
+            user_home.mkdir()
+            (user_home / "auth.json").write_text("{}\n", encoding="utf-8")
+            monkeypatch.setenv("CODEX_HOME", str(user_home))
+            monkeypatch.setenv(
+                "ISSUE_ORCHESTRATOR_CODEX_RUNTIME_ROOT",
+                str(tmp_path / ".test-codex-runtime"),
+            )
         adapter_cls().install_hooks(tmp_path)
         hook_script = tmp_path / hook_rel
         blocked = runner(hook_script, "git status", env={"PATH": ""})
@@ -1575,6 +2116,10 @@ class TestTemplatesExist:
         template = TEMPLATES_DIR / "codex" / "orchestrator.rules"
         assert template.exists(), f"Template not found: {template}"
 
+    def test_codex_hook_template_exists(self):
+        template = TEMPLATES_DIR / "codex" / "block-no-verify.sh"
+        assert template.exists(), f"Template not found: {template}"
+
 
 # =============================================================================
 # DI-Based Agent Hook Verification
@@ -1590,7 +2135,7 @@ SUPPORTED_AGENTS_WITH_HOOKS: list[AiAgentType] = [
     AiAgentType.CURSOR,
     AiAgentType.GEMINI,
     AiAgentType.COPILOT,
-    # CODEX omitted from default list as it requires special HOME handling
+    AiAgentType.CODEX,
 ]
 
 
@@ -1605,6 +2150,7 @@ def get_agent_test_runner(agent_type: AiAgentType):
         AiAgentType.GEMINI,
         AiAgentType.CURSOR,
         AiAgentType.COPILOT,
+        AiAgentType.CODEX,
     ):
         return lambda _hook_script, command: not evaluate_command(command).allowed
     raise ValueError(f"No test runner for {agent_type}")
@@ -1623,6 +2169,8 @@ def get_agent_hook_path(agent_type: AiAgentType, project_root: Path) -> Path:
         return project_root / ".gemini" / "hooks" / "block-no-verify.sh"
     elif agent_type == AiAgentType.COPILOT:
         return project_root / ".github" / "hooks" / "block-no-verify.sh"
+    elif agent_type == AiAgentType.CODEX:
+        return project_root / ".codex" / "hooks" / "block-no-verify.sh"
     else:
         raise ValueError(f"No hook path for {agent_type}")
 
@@ -1638,12 +2186,21 @@ class TestAgentHooksParametrized:
     """
 
     @pytest.fixture(params=SUPPORTED_AGENTS_WITH_HOOKS, ids=lambda a: a.value)
-    def agent_setup(self, request, tmp_path):
+    def agent_setup(self, request, tmp_path, monkeypatch):
         """Fixture that provides adapter, test runner, and project root for each agent.
 
         This is the main DI point - it yields a tuple of (adapter, test_fn, project_root, hook_path).
         """
         agent_type = request.param
+        if agent_type is AiAgentType.CODEX:
+            user_home = tmp_path / ".test-codex-user"
+            user_home.mkdir()
+            (user_home / "auth.json").write_text("{}\n", encoding="utf-8")
+            monkeypatch.setenv("CODEX_HOME", str(user_home))
+            monkeypatch.setenv(
+                "ISSUE_ORCHESTRATOR_CODEX_RUNTIME_ROOT",
+                str(tmp_path / ".test-codex-runtime"),
+            )
         adapter = get_adapter(agent_type)
         test_fn = get_agent_test_runner(agent_type)
 
@@ -1705,9 +2262,16 @@ class TestAgentHooksParametrized:
         blocked = test_fn(hook_path, "gh pr create --title 'test'")
         assert not blocked, f"{adapter.agent_type.value}: wrongly blocked gh pr create"
 
-    def test_adapter_verification_passes(self, agent_setup):
+    def test_adapter_verification_passes(self, agent_setup, monkeypatch):
         """Verify the adapter's own verification passes."""
         adapter, _, project_root, _ = agent_setup
+        if adapter.agent_type is AiAgentType.CODEX:
+            monkeypatch.setattr(shutil, "which", lambda _cmd: "/usr/bin/codex")
+            monkeypatch.setattr(
+                adapter,
+                "_execpolicy_allows",
+                lambda _rules, command: command != ["git", "push", "--no-verify"],
+            )
         result = adapter.verify_hooks(project_root)
         assert result.success, (
             f"{adapter.agent_type.value}: verification failed: {result.checks_failed}"
@@ -1780,9 +2344,8 @@ class TestAgentHooksFromConfig:
             if agent_type in (
                 AiAgentType.AIDER,
                 AiAgentType.UNKNOWN,
-                AiAgentType.CODEX,
             ):
-                continue  # Skip unsupported/special types
+                continue  # Skip unsupported types
 
             adapter = get_adapter(agent_type)
             adapter.install_hooks(tmp_path)

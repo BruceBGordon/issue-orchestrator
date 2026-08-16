@@ -157,7 +157,11 @@ def run_test_setup(config: "Config") -> bool:  # noqa: C901 - inherent complexit
     return True
 
 
-def load_config(args: argparse.Namespace) -> "Config":
+def load_config(
+    args: argparse.Namespace,
+    *,
+    allow_maintenance_config: bool = False,
+) -> "Config":
     """Load config from explicit path or search for it.
 
     Args:
@@ -170,10 +174,35 @@ def load_config(args: argparse.Namespace) -> "Config":
         FileNotFoundError: If config file not found
     """
     from ..infra.config import Config
+    from ..infra.config_paths import (
+        require_engine_launch_config_path,
+        require_hook_setup_config_path,
+    )
+
+    require_config_path = (
+        require_hook_setup_config_path
+        if allow_maintenance_config
+        else require_engine_launch_config_path
+    )
 
     overrides = getattr(args, "set", None) or []
     if hasattr(args, "config") and args.config:
-        config_path = Path(args.config)
+        config_path = require_config_path(Path(args.config))
         # Config.load() handles repo_root calculation properly
-        return Config.load(config_path, overrides=overrides)
-    return Config.find_and_load(overrides=overrides)
+        config = Config.load(config_path, overrides=overrides)
+        explicit_mode = getattr(args, "mode", None)
+        if explicit_mode and config.configuration_mode != explicit_mode:
+            raise ValueError(
+                "Explicit --mode does not match --config path: "
+                f"mode={explicit_mode!r} path_mode={config.configuration_mode!r}"
+            )
+        if config.config_path is None:
+            raise ValueError("Loaded config did not retain its source path")
+        return config
+    config = Config.find_and_load(
+        overrides=overrides,
+        mode=getattr(args, "mode", None) or "default",
+    )
+    if config.config_path is not None:
+        require_config_path(config.config_path)
+    return config

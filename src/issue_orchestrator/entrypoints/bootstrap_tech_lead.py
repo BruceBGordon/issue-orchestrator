@@ -182,7 +182,7 @@ def create_tech_lead_board_publisher(
 ) -> "TechLeadBoardPublisher | None":
     """The fact gatherer's rung-1 tech-lead-board projection sink (#6781).
 
-    Gated on a configured tech lead agent — the board projects the tech_lead
+    Gated on the enabled tech-lead workflow — the board projects the tech_lead
     ledgers (the same authority store the anchor scan classifies against),
     so with no tech lead agent there is nothing to project. When absent the
     fact gatherer's ``board_publisher`` stays ``None`` and publish is never
@@ -190,7 +190,7 @@ def create_tech_lead_board_publisher(
     artifact under the repo state dir, not a UI contract; it is refreshed
     each tick the anchor scan produces tech_lead facts.
     """
-    if not config.tech_lead_review_agent:
+    if not config.tech_lead_enabled:
         return None
     from ..control.tech_lead_board import TechLeadBoardPublisher, tech_lead_board_path
 
@@ -280,8 +280,8 @@ def create_tech_lead_composition(
     open_issue_corpus_manager = OpenIssueCorpusManager(
         repository_host,
         open_issue_corpus,
-        is_enabled=lambda: bool(
-            config.tech_lead_review_agent and config.tech_lead.dedup.enabled
+        is_enabled=lambda: (
+            config.tech_lead_enabled and config.tech_lead.dedup.enabled
         ),
     )
     board_publisher = (

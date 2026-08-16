@@ -1,0 +1,240 @@
+"""Public behavior for directory-backed configuration modes."""
+
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+
+import pytest
+
+from issue_orchestrator.domain.repository_launch_selection import (
+    RepositoryLaunchSelection,
+)
+from issue_orchestrator.infra.config import Config
+from issue_orchestrator.entrypoints.cli_support import load_config
+from issue_orchestrator.infra.config_paths import (
+    get_config_path,
+    list_configs,
+    list_modes,
+    repo_root_from_config_path,
+    require_engine_launch_config_path,
+    selection_from_config_path,
+)
+
+
+def _write_config(path: Path, *, repo: str = "owner/repo") -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "\n".join(
+            [
+                "repo:",
+                f"  name: {repo}",
+                "agents:",
+                "  agent:worker:",
+                "    prompt: prompt.md",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    (path.parents[4] / "prompt.md").write_text("Fix it", encoding="utf-8")
+
+
+def test_mode_discovery_and_resolution_are_scoped_by_mode(tmp_path: Path) -> None:
+    codex = tmp_path / ".issue-orchestrator/config/modes/codex/main.yaml"
+    default = tmp_path / ".issue-orchestrator/config/modes/default/main.yaml"
+    _write_config(codex)
+    _write_config(default)
+
+    assert list_modes(tmp_path) == ["default", "codex"]
+    assert list_configs(tmp_path, "codex") == ["main.yaml"]
+    assert get_config_path(tmp_path, "main", "codex") == codex
+    assert repo_root_from_config_path(codex) == tmp_path.resolve()
+    assert selection_from_config_path(codex).to_dict() == {
+        "mode": "codex",
+        "config_name": "main.yaml",
+    }
+
+
+def test_config_load_records_mode_and_effective_fingerprint(tmp_path: Path) -> None:
+    config_path = tmp_path / ".issue-orchestrator/config/modes/codex/main.yaml"
+    _write_config(config_path)
+
+    config = Config.load(config_path)
+
+    assert config.configuration_mode == "codex"
+    assert config.config_name == "main.yaml"
+
+
+def test_runtime_config_reference_rejects_path_selection_mode_drift(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / ".issue-orchestrator/config/modes/codex/main.yaml"
+    _write_config(config_path)
+    config = Config.load(config_path)
+    config.launch_selection = RepositoryLaunchSelection.parse(
+        mode="claude",
+        config_name="main.yaml",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="config_path and launch selection must match",
+    ):
+        config.runtime_config_reference()
+
+
+def test_runtime_config_reference_requires_the_loaded_file(tmp_path: Path) -> None:
+    config_path = tmp_path / ".issue-orchestrator/config/modes/codex/main.yaml"
+    _write_config(config_path)
+    config = Config.load(config_path)
+    config_path.unlink()
+
+    with pytest.raises(ValueError, match="must point to an existing file"):
+        config.runtime_config_reference()
+
+
+def test_effective_fingerprint_refresh_is_stable_and_override_sensitive(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / ".issue-orchestrator/config/modes/codex/main.yaml"
+    _write_config(config_path)
+    config = Config.load(config_path)
+    initial = config.config_fingerprint
+
+    assert config.refresh_config_fingerprint() == initial
+    assert config.refresh_config_fingerprint() == initial
+
+    config.filtering.label = "urgent"
+    changed = config.refresh_config_fingerprint()
+
+    assert changed != initial
+    assert config.refresh_config_fingerprint() == changed
+    assert len(config.config_fingerprint) == 64
+
+
+def test_flat_managed_configs_are_not_discovered_or_resolved(tmp_path: Path) -> None:
+    flat = tmp_path / ".issue-orchestrator/config/main.yaml"
+    flat.parent.mkdir(parents=True)
+    flat.write_text("agents: {}\n", encoding="utf-8")
+
+    assert list_modes(tmp_path) == []
+    assert list_configs(tmp_path, "default") == []
+    assert get_config_path(tmp_path, "main", "default") == (
+        tmp_path / ".issue-orchestrator/config/modes/default/main.yaml"
+    )
+
+
+def test_flat_managed_config_is_rejected_as_engine_launch_config(
+    tmp_path: Path,
+) -> None:
+    flat = tmp_path / ".issue-orchestrator/config/main.yaml"
+    flat.parent.mkdir(parents=True)
+    flat.write_text("agents: {}\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="config/modes/<mode>/"):
+        require_engine_launch_config_path(flat)
+
+    with pytest.raises(ValueError, match="config/modes/<mode>/"):
+        Config.load(flat)
+
+
+def test_cli_rejects_explicit_flat_managed_config(tmp_path: Path) -> None:
+    flat = tmp_path / ".issue-orchestrator/config/main.yaml"
+    flat.parent.mkdir(parents=True)
+    flat.write_text("repo:\n  name: owner/repo\nagents: {}\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="config/modes/<mode>/"):
+        load_config(argparse.Namespace(config=str(flat), mode=None, set=[]))
+
+
+def test_cli_rejects_symlinked_mode_config_before_loading(tmp_path: Path) -> None:
+    outside = tmp_path / "outside.yaml"
+    outside.write_text("repo:\n  name: owner/repo\nagents: {}\n", encoding="utf-8")
+    config_path = tmp_path / ".issue-orchestrator/config/modes/default/main.yaml"
+    config_path.parent.mkdir(parents=True)
+    config_path.symlink_to(outside)
+
+    with pytest.raises(ValueError, match="must not be symbolic links"):
+        load_config(argparse.Namespace(config=str(config_path), mode=None, set=[]))
+
+
+def test_cli_hook_policy_accepts_maintenance_config(tmp_path: Path) -> None:
+    maintenance = (
+        tmp_path / ".issue-orchestrator/config/maintenance/hooks-validate.yaml"
+    )
+    maintenance.parent.mkdir(parents=True)
+    maintenance.write_text(
+        "repo:\n  name: owner/repo\nagents: {}\n",
+        encoding="utf-8",
+    )
+    args = argparse.Namespace(config=str(maintenance), mode=None, set=[])
+
+    config = load_config(args, allow_maintenance_config=True)
+
+    assert config.config_path == maintenance.resolve()
+    with pytest.raises(ValueError, match="maintenance config cannot launch"):
+        load_config(args)
+
+
+def test_doctor_rejects_explicit_flat_managed_config(tmp_path: Path) -> None:
+    from issue_orchestrator.infra.doctor.checks.config import load_config_with_checks
+
+    flat = tmp_path / ".issue-orchestrator/config/main.yaml"
+    flat.parent.mkdir(parents=True)
+    flat.write_text("agents: {}\n", encoding="utf-8")
+
+    config, checks, should_stop = load_config_with_checks(None, flat)
+
+    assert config is None
+    assert should_stop
+    assert checks[0].status == "error"
+    assert "config/modes/<mode>/" in checks[0].detail
+
+
+def test_flat_managed_config_cannot_be_preloaded(tmp_path: Path) -> None:
+    flat = tmp_path / ".issue-orchestrator/config/main.yaml"
+    flat.parent.mkdir(parents=True)
+    flat.write_text("agents: {}\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="config/modes/<mode>/"):
+        Config.load(flat)
+
+
+def test_empty_default_mode_directory_is_not_launchable(
+    tmp_path: Path,
+) -> None:
+    config_dir = tmp_path / ".issue-orchestrator/config"
+    (config_dir / "modes/default").mkdir(parents=True)
+    (config_dir / "legacy.yaml").write_text("agents: {}\n", encoding="utf-8")
+
+    assert list_modes(tmp_path) == []
+
+
+def test_mode_config_symlink_is_rejected(tmp_path: Path) -> None:
+    mode_dir = tmp_path / ".issue-orchestrator/config/modes/codex"
+    mode_dir.mkdir(parents=True)
+    outside = tmp_path.parent / f"{tmp_path.name}-outside-mode-config.yaml"
+    outside.write_text("agents: {}\n", encoding="utf-8")
+    (mode_dir / "main.yaml").symlink_to(outside)
+
+    with pytest.raises(ValueError, match="must not be symbolic links"):
+        get_config_path(tmp_path, "main.yaml", "codex")
+
+
+def test_symlinked_config_ancestor_is_rejected_even_when_target_is_inside_repo(
+    tmp_path: Path,
+) -> None:
+    real_root = tmp_path / "real-config-root"
+    mode_dir = real_root / "config/modes/codex"
+    mode_dir.mkdir(parents=True)
+    (mode_dir / "main.yaml").write_text("agents: {}\n", encoding="utf-8")
+    (tmp_path / ".issue-orchestrator").symlink_to(real_root, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="must not be symbolic links"):
+        get_config_path(tmp_path, "main.yaml", "codex")
+
+
+def test_mode_path_rejects_traversal(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="Invalid configuration mode"):
+        get_config_path(tmp_path, "main", "../codex")

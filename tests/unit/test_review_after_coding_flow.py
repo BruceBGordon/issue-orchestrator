@@ -39,7 +39,11 @@ from issue_orchestrator.control.actions import (
 )
 from issue_orchestrator.control.planner import Planner
 from issue_orchestrator.control.planner_types import OrchestratorSnapshot
-from issue_orchestrator.control.completion_handler import CompletionHandler, SessionStatus
+from issue_orchestrator.control.completion_handler import (
+    CleanupDecision,
+    CompletionHandler,
+    SessionStatus,
+)
 from issue_orchestrator.control.session_completion import handle_session_completion
 from issue_orchestrator.control.scheduler import Scheduler
 from issue_orchestrator.ports.session_output import SessionOutput
@@ -169,8 +173,7 @@ class TestReviewAfterCodingFlow:
                 runtime_minutes=10,
                 pr_url="https://github.com/test/repo/pull/456",
             ),
-            should_defer_cleanup=False,
-            pending_cleanup=None,
+            cleanup=CleanupDecision.immediate(),
             should_queue_review=True,
             pr_url="https://github.com/test/repo/pull/456",
             pr_number=456,
@@ -392,8 +395,7 @@ class TestReviewNotQueuedWhenConditionsNotMet:
                 runtime_minutes=10,
                 pr_url="",  # No PR!
             ),
-            should_defer_cleanup=False,
-            pending_cleanup=None,
+            cleanup=CleanupDecision.immediate(),
             should_queue_review=False,  # No review
             pr_url=None,
             pr_number=None,
@@ -441,8 +443,7 @@ class TestReviewNotQueuedWhenConditionsNotMet:
                 runtime_minutes=1,
                 pr_url="",
             ),
-            should_defer_cleanup=False,
-            pending_cleanup=None,
+            cleanup=CleanupDecision.immediate(),
             should_queue_review=False,
             pr_url=None,
             pr_number=None,
@@ -486,8 +487,7 @@ class TestReviewNotQueuedWhenConditionsNotMet:
                 runtime_minutes=10,
                 pr_url="https://github.com/test/repo/pull/456",
             ),
-            should_defer_cleanup=False,
-            pending_cleanup=None,
+            cleanup=CleanupDecision.immediate(),
             should_queue_review=False,  # Handler respects config
             pr_url="https://github.com/test/repo/pull/456",
             pr_number=456,

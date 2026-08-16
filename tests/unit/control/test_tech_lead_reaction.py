@@ -44,9 +44,15 @@ class _IssueChecker:
         return DependencyIssueSnapshot(state=state, milestone="M1")
 
 
-def _config(*, threshold: int = 3, window_minutes: int = 5) -> Config:
+def _config(
+    *,
+    threshold: int = 3,
+    window_minutes: int = 5,
+    enabled: bool | None = None,
+) -> Config:
     config = Config()
     config.tech_lead_review_agent = "agent:tech-lead"
+    config.tech_lead.enabled = enabled
     config.tech_lead_review_on_failure = True
     config.tech_lead.health_review.storm_threshold = threshold
     config.tech_lead.health_review.storm_window_minutes = window_minutes
@@ -143,6 +149,22 @@ def test_unexplained_block_with_dependents_triggers_investigation() -> None:
     )
 
     assert reaction.investigations == (problem,)
+    assert reaction.storm_problems == ()
+
+
+def test_master_switch_prevents_failure_investigation() -> None:
+    problem = _blocked()
+    reaction = _policy(_config(enabled=False)).assess(
+        _snapshot(
+            issues=(
+                _issue(42),
+                _issue(43, body="Depends-on: #42"),
+            ),
+            problems=(problem,),
+        )
+    )
+
+    assert reaction.investigations == ()
     assert reaction.storm_problems == ()
 
 
@@ -457,6 +479,10 @@ def test_storm_possible_is_false_below_the_threshold() -> None:
 
 def test_storm_possible_is_false_when_escalation_is_disabled() -> None:
     assert storm_possible(_state_with_problems(9), _config(threshold=0)) is False
+
+
+def test_storm_possible_is_false_when_master_switch_is_disabled() -> None:
+    assert storm_possible(_state_with_problems(9), _config(enabled=False)) is False
 
 
 def test_storm_possible_counts_pending_investigations() -> None:

@@ -3,17 +3,30 @@
 from collections.abc import Mapping
 import logging
 from pathlib import Path
+import shlex
 
 from ..types import Check
 from ...config import Config
 from ...hooks.hooks import get_adapter, summarize_ai_gate_message
-from ...ai_gate_state import load_ai_gate_state, save_ai_gate_state
+from ...ai_gate_state import AiGateState, load_ai_gate_state, save_ai_gate_state
 from ...repo_guardrails import (
     MANAGED_PRE_PUSH_MARKER,
     inspect_repo_guardrails,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _setup_command(config: Config, subcommand: str) -> str:
+    """Render a remediation command that preserves the selected config."""
+    command = f"issue-orchestrator {subcommand}"
+    if config.config_path is None:
+        return command
+    try:
+        selected_path = config.config_path.relative_to(config.repo_root)
+    except ValueError:
+        selected_path = config.config_path
+    return f"{command} --config {shlex.quote(str(selected_path))}"
 
 
 def _check_hook_installation(
@@ -58,7 +71,7 @@ def _check_hook_installation(
             detail=(
                 "Hooks not installed for: "
                 f"{', '.join(sorted(missing_hooks))}. "
-                "Run 'issue-orchestrator setup-hooks'"
+                f"Run '{_setup_command(config, 'setup-hooks')}'"
             ),
         ), False
 
@@ -178,6 +191,15 @@ def _run_ai_gate_tests(
     return results, failures
 
 
+def _ai_gate_trigger_reason(state: AiGateState, required_types: set[str]) -> str:
+    """Explain why the current provider set needs a fresh AI gate run."""
+    if state.last_check is None:
+        return "first run"
+    if state.recorded_agent_types != tuple(sorted(required_types)):
+        return "configured agent set changed"
+    return "interval exceeded"
+
+
 def _check_ai_gate_report(
     config: Config,
     unique_types: set,
@@ -210,8 +232,9 @@ def _check_ai_gate_report(
             expandable=expandable,
         )
 
-    trigger_reason = "first run" if state.last_check is None else "interval exceeded"
-    if not state.is_stale(interval_days):
+    required_types = {agent_type.value for agent_type in unique_types}
+    trigger_reason = _ai_gate_trigger_reason(state, required_types)
+    if not state.is_stale(interval_days, required_types):
         # Use cached results — but only trust cached *successes*.
         # Cached failures always re-run: a transient issue (environment,
         # timing) shouldn't block every subsequent startup until someone
@@ -251,7 +274,7 @@ def _check_ai_gate_report(
         unique_types, unsupported_types, config.repo_root, expandable
     )
 
-    state.mark_checked(results)
+    state.mark_checked(results, required_types)
     save_ai_gate_state(config.repo_root, state)
 
     if not failures:
@@ -325,11 +348,12 @@ def check_repo_guardrails(config: Config) -> list[Check]:
     status = inspect_repo_guardrails(config.repo_root, config=config)
 
     if not status.pre_push_exists and not status.verify_exists:
+        setup_command = _setup_command(config, "setup-guardrails")
         return [
             Check(
                 name="Repo Guardrails",
                 status="warning",
-                detail="Not installed. Run 'issue-orchestrator setup-guardrails'.",
+                detail=f"Not installed. Run '{setup_command}'.",
             )
         ]
 
@@ -337,12 +361,12 @@ def check_repo_guardrails(config: Config) -> list[Check]:
     managed_agents = _managed_agent_names(status)
 
     if problems:
+        setup_command = _setup_command(config, "setup-guardrails")
         return [
             Check(
                 name="Repo Guardrails",
                 status="error",
-                detail="; ".join(problems)
-                + ". Run 'issue-orchestrator setup-guardrails'.",
+                detail="; ".join(problems) + f". Run '{setup_command}'.",
             )
         ]
 
@@ -367,25 +391,35 @@ def _requires_repo_local_hook_helper(agent_hooks: Mapping[str, object]) -> bool:
 
 
 def _repo_guardrail_problems(config: Config, status) -> list[str]:
-    problems = _repo_pre_push_problems(status)
+    problems = _repo_pre_push_problems(config, status)
     problems.extend(_repo_helper_problems(status))
     problems.extend(_managed_agent_hook_problems(config, status))
     return problems
 
 
-def _repo_pre_push_problems(status) -> list[str]:
+def _repo_pre_push_problems(config: Config, guardrails) -> list[str]:
     problems: list[str] = []
-    if not status.pre_push_exists:
+    if not guardrails.pre_push_exists:
         problems.append("pre-push hook missing")
-    elif not status.pre_push_executable:
+    elif not guardrails.pre_push_executable:
         problems.append("pre-push hook is not executable")
-    elif not status.pre_push_calls_verify:
+    elif not guardrails.pre_push_calls_verify:
         problems.append("pre-push hook does not call scripts/verify-pr.sh")
 
-    if not status.verify_exists:
+    if not guardrails.verify_exists:
         problems.append("scripts/verify-pr.sh missing")
-    elif not status.verify_executable:
+    elif not guardrails.verify_executable:
         problems.append("scripts/verify-pr.sh is not executable")
+    elif config.config_path is not None:
+        config_root = (config.repo_root / ".issue-orchestrator" / "config").resolve()
+        try:
+            expected_selection = (
+                config.config_path.resolve().relative_to(config_root).as_posix()
+            )
+        except ValueError:
+            expected_selection = None
+        if guardrails.verify_selected_config != expected_selection:
+            problems.append("scripts/verify-pr.sh configuration selection drifted")
     return problems
 
 
@@ -411,7 +445,9 @@ def _managed_agent_hook_problems(config: Config, status) -> list[str]:
     return problems
 
 
-def _managed_agent_file_problems(config: Config, agent_name: str, agent_status) -> list[str]:
+def _managed_agent_file_problems(
+    config: Config, agent_name: str, agent_status
+) -> list[str]:
     problems: list[str] = []
     for file_status in agent_status.managed_files:
         relative = file_status.path.relative_to(config.repo_root)
@@ -463,6 +499,7 @@ def check_worktree_hook_corruption(config: Config) -> list[Check]:
         ]
 
     rel_paths = ", ".join(_display_path(config.repo_root, p) for p in corrupt)
+    setup_command = _setup_command(config, "setup-guardrails")
     return [
         Check(
             name="Pre-push Hook Corruption",
@@ -470,7 +507,7 @@ def check_worktree_hook_corruption(config: Config) -> list[Check]:
             detail=(
                 f"Corrupt pre-push.project detected ({len(corrupt)}): {rel_paths}. "
                 "Contains the managed wrapper marker; executing it would recurse. "
-                "Run 'issue-orchestrator setup-guardrails' or delete/rename the files."
+                f"Run '{setup_command}' or delete/rename the files."
             ),
         )
     ]

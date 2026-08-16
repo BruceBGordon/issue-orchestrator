@@ -16,7 +16,8 @@ from issue_orchestrator.execution.repository_setup_files import (
 from issue_orchestrator.execution.repository_setup_github_authorization import (
     repository_setup_github_authorization_codec,
 )
-from issue_orchestrator.infra.config import Config, get_config_dir
+from issue_orchestrator.infra.config import Config
+from issue_orchestrator.infra.config_paths import get_config_path, get_mode_dir
 from issue_orchestrator.ports.repository_setup import RepositorySetupFileSystemError
 from issue_orchestrator.ports.repository_setup import RepositorySetupNamedConfig
 
@@ -46,7 +47,9 @@ def test_setup_file_adapter_plans_and_writes_runnable_contained_artifacts(
     )
 
     config_file = next(file for file in plan.files if file.kind == "config")
-    assert config_file.path.parent.resolve() == get_config_dir(tmp_path).resolve()
+    assert config_file.path.parent.resolve() == get_mode_dir(
+        tmp_path, "default"
+    ).resolve()
     assert config_file.path.name == "default.yaml"
     assert {file.agent for file in plan.files if file.kind == "prompt"} == {
         "agent:dev",
@@ -58,6 +61,57 @@ def test_setup_file_adapter_plans_and_writes_runnable_contained_artifacts(
 
     assert written == tuple(file.path for file in plan.files)
     assert Config.load(config_file.path).validate() == []
+
+
+def test_setup_uses_mode_scoped_target_when_flat_config_exists(
+    tmp_path: Path,
+) -> None:
+    flat_config = tmp_path / ".issue-orchestrator/config/default.yaml"
+    flat_config.parent.mkdir(parents=True)
+    flat_config.write_text("sentinel\n", encoding="utf-8")
+
+    plan = RepositorySetupFileSystemAdapter().plan(
+        repo_root=tmp_path,
+        config_target=RepositorySetupNamedConfig(RepositoryConfigName("default")),
+        config=_command(tmp_path).build_config(
+            repository_setup_github_authorization_codec
+        ),
+        include_prompts=False,
+    )
+
+    config_file = plan.files[0]
+    assert config_file.path == (
+        tmp_path / ".issue-orchestrator/config/modes/default/default.yaml"
+    )
+    assert config_file.action == "create"
+    assert flat_config.read_text(encoding="utf-8") == "sentinel\n"
+
+
+def test_setup_command_choice_plans_internal_reviewer_instructions(
+    tmp_path: Path,
+) -> None:
+    command = RepositorySetupCommand(
+        repo_root=tmp_path,
+        repo_name="owner/repo",
+        worker_agent_label="agent:dev",
+        model="sonnet",
+        validation_quick_command="make test-quick",
+        validation_publish_command="make validate",
+        configure_internal_reviewer=True,
+    )
+
+    plan = RepositorySetupFileSystemAdapter().plan(
+        repo_root=tmp_path,
+        config_target=RepositorySetupNamedConfig(command.config_name),
+        config=command.build_config(repository_setup_github_authorization_codec),
+        include_prompts=True,
+    )
+
+    internal_prompt = next(
+        file for file in plan.files if file.agent == "internal-review"
+    )
+    assert internal_prompt.path == tmp_path / ".io" / "internal-review.md"
+    assert "Return exactly one conversational verdict" in internal_prompt.content
 
 
 def test_setup_file_adapter_revalidates_forged_config_name(
@@ -164,7 +218,7 @@ def test_setup_file_adapter_preserves_existing_file_when_atomic_replace_fails(
     tmp_path: Path,
 ) -> None:
     adapter = RepositorySetupFileSystemAdapter()
-    config_path = get_config_dir(tmp_path) / "default.yaml"
+    config_path = get_config_path(tmp_path)
     config_path.parent.mkdir(parents=True)
     config_path.write_text("sentinel", encoding="utf-8")
     plan = adapter.plan(
@@ -214,3 +268,72 @@ def test_setup_file_adapter_plans_shared_prompt_target_once(
     assert prompt_files[0].path == (tmp_path / ".io" / "shared.md").resolve()
     assert prompt_files[0].agent == "agent:frontend"
     assert "# Frontend Agent Prompt" in prompt_files[0].content
+
+
+def test_setup_file_adapter_plans_enabled_internal_review_instructions(
+    tmp_path: Path,
+) -> None:
+    config = _command(tmp_path).build_config(
+        repository_setup_github_authorization_codec
+    )
+    config["review"]["internal"] = {
+        "enabled": True,
+        "max_rounds": 5,
+        "instructions": ".io/internal-review.md",
+    }
+
+    plan = RepositorySetupFileSystemAdapter().plan(
+        repo_root=tmp_path,
+        config_target=RepositorySetupNamedConfig(RepositoryConfigName("default")),
+        config=config,
+        include_prompts=True,
+    )
+
+    internal = [file for file in plan.files if file.agent == "internal-review"]
+    assert len(internal) == 1
+    assert internal[0].path == (tmp_path / ".io" / "internal-review.md").resolve()
+    assert "Spawn exactly one internal reviewer" in internal[0].content
+    assert "Return exactly one conversational verdict" in internal[0].content
+
+
+@pytest.mark.parametrize("instructions", ["../outside.md", "/tmp/outside.md"])
+def test_setup_file_adapter_rejects_internal_review_prompt_outside_repository(
+    tmp_path: Path,
+    instructions: str,
+) -> None:
+    config = _command(tmp_path).build_config(
+        repository_setup_github_authorization_codec
+    )
+    config["review"]["internal"] = {
+        "enabled": True,
+        "instructions": instructions,
+    }
+
+    with pytest.raises(ValueError, match="repository-relative|inside"):
+        RepositorySetupFileSystemAdapter().plan(
+            repo_root=tmp_path,
+            config_target=RepositorySetupNamedConfig(RepositoryConfigName("default")),
+            config=config,
+            include_prompts=True,
+        )
+
+
+def test_setup_file_adapter_rejects_internal_review_prompt_directory(
+    tmp_path: Path,
+) -> None:
+    config = _command(tmp_path).build_config(
+        repository_setup_github_authorization_codec
+    )
+    (tmp_path / ".io").mkdir()
+    config["review"]["internal"] = {
+        "enabled": True,
+        "instructions": " .io ",
+    }
+
+    with pytest.raises(ValueError, match="must reference a file"):
+        RepositorySetupFileSystemAdapter().plan(
+            repo_root=tmp_path,
+            config_target=RepositorySetupNamedConfig(RepositoryConfigName("default")),
+            config=config,
+            include_prompts=True,
+        )

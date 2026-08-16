@@ -385,7 +385,8 @@ def main() -> None:
         print("Either:", file=sys.stderr)
         print("  1. Pass --command 'your command here'", file=sys.stderr)
         print(
-            "  2. Configure validation.quick.cmd in .issue-orchestrator/config/*.yaml",
+            "  2. Configure validation.quick.cmd in "
+            ".issue-orchestrator/config/modes/<mode>/*.yaml",
             file=sys.stderr,
         )
         sys.exit(2)

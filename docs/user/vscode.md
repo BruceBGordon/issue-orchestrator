@@ -8,7 +8,7 @@ This extension gives you a native VS Code experience for Issue Orchestrator: liv
    - You should be able to run `issue-orchestrator-mcp --help`.
    - See [MCP Server](mcp.md) for what that entrypoint is and what it exposes.
 2. **Create a repo config** in your repo:
-   - `.issue-orchestrator/config/default.yaml`
+   - `.issue-orchestrator/config/modes/default/default.yaml`
    - Start from `examples/config.example.yaml` if you’re new.
 
 ## Install the Extension

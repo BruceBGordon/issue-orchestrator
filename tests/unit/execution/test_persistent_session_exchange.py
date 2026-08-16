@@ -28,6 +28,9 @@ from issue_orchestrator.domain.review_exchange import ReviewExchangeResponse
 from issue_orchestrator.domain.review_exchange_run import ReviewExchangeRun
 from issue_orchestrator.domain.review_exchange_summary import ReviewExchangeSummaryV1
 from issue_orchestrator.domain.runtime_config import RuntimeConfigReference
+from issue_orchestrator.domain.repository_launch_selection import (
+    RepositoryLaunchSelection,
+)
 from issue_orchestrator.events import EventContext, EventName
 from issue_orchestrator.execution import persistent_session_exchange as pse
 from issue_orchestrator.execution.persistent_role_prompt_policy import (
@@ -200,7 +203,10 @@ def _runtime_config(tmp_path: Path) -> RuntimeConfigReference:
         config_path.write_text(
             "validation:\n  quick:\n    cmd: 'true'\n", encoding="utf-8"
         )
-    return RuntimeConfigReference.from_path(config_path)
+    return RuntimeConfigReference(
+        config_path=config_path.resolve(),
+        selection=RepositoryLaunchSelection.parse(config_name=config_path.name),
+    )
 
 
 def _summary_payload(summary: dict[str, Any]) -> dict[str, Any]:

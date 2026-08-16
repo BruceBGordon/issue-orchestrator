@@ -60,6 +60,130 @@ function staleCard(overrides = {}) {
     };
 }
 
+test('live refresh shows the compact-column footer when items are omitted', () => {
+    const { syncColumnOverflowFooter } = loadModule();
+    const attributes = new Map();
+    const label = { textContent: '' };
+    const footer = {
+        hidden: true,
+        querySelector: (selector) => selector === '.column-overflow-label' ? label : null,
+        setAttribute: (name, value) => attributes.set(name, String(value)),
+    };
+    const column = {
+        querySelector: (selector) => selector === '.column-overflow-footer' ? footer : null,
+    };
+
+    syncColumnOverflowFooter(column, {
+        id: 'blocked',
+        title: 'Blocked',
+        count: 13,
+        hidden_count: 1,
+    });
+
+    assert.equal(footer.hidden, false);
+    assert.equal(label.textContent, '1 more');
+    assert.equal(attributes.get('aria-label'), 'Show full Blocked list, including 1 more item');
+});
+
+test('live refresh hides the compact-column footer when the full list is visible', () => {
+    const { syncColumnOverflowFooter } = loadModule();
+    const label = { textContent: 'stale' };
+    const footer = {
+        hidden: false,
+        querySelector: (selector) => selector === '.column-overflow-label' ? label : null,
+        setAttribute: () => {},
+    };
+    const column = {
+        querySelector: (selector) => selector === '.column-overflow-footer' ? footer : null,
+    };
+
+    syncColumnOverflowFooter(column, {
+        id: 'blocked',
+        title: 'Blocked',
+        count: 12,
+        hidden_count: 0,
+    });
+
+    assert.equal(footer.hidden, true);
+    assert.equal(label.textContent, '0 more');
+});
+
+test('live refresh preserves focus before hiding a footer that no longer has overflow', () => {
+    const context = loadModule();
+    const transitions = [];
+    let isHidden = true;
+    const label = { textContent: '' };
+    const expandButton = {
+        focus: () => {
+            transitions.push('focus-expand');
+            context.document.activeElement = expandButton;
+        },
+    };
+    const footer = {
+        querySelector: (selector) => selector === '.column-overflow-label' ? label : null,
+        setAttribute: () => {},
+    };
+    Object.defineProperty(footer, 'hidden', {
+        get: () => isHidden,
+        set: (value) => {
+            isHidden = value;
+            transitions.push(`hidden-${value}`);
+        },
+    });
+    const column = {
+        querySelector: (selector) => {
+            if (selector === '.column-overflow-footer') return footer;
+            if (selector === '.column-expand-btn') return expandButton;
+            return null;
+        },
+    };
+
+    context.syncColumnOverflowFooter(column, {
+        id: 'blocked',
+        title: 'Blocked',
+        count: 13,
+        hidden_count: 1,
+    });
+    assert.equal(isHidden, false);
+    assert.equal(label.textContent, '1 more');
+
+    context.document.activeElement = footer;
+    transitions.length = 0;
+
+    context.syncColumnOverflowFooter(column, {
+        id: 'blocked',
+        title: 'Blocked',
+        count: 12,
+        hidden_count: 0,
+    });
+
+    assert.deepEqual(transitions, ['focus-expand', 'hidden-true']);
+    assert.equal(context.document.activeElement, expandButton);
+});
+
+test('compact-column footer dispatches to the existing full-list expansion', () => {
+    const context = loadModule();
+    const calls = [];
+    let focused = false;
+    context.toggleColumnExpand = (columnId) => calls.push(columnId);
+    const column = {
+        dataset: { column: 'blocked' },
+        querySelector: (selector) => selector === '.column-expand-btn'
+            ? { focus: () => { focused = true; } }
+            : null,
+    };
+    const button = {
+        closest: (selector) => selector === '.kanban-column'
+            ? column
+            : null,
+    };
+
+    context.expandColumnFromOverflow(button);
+
+    assert.deepEqual(calls, ['blocked']);
+    assert.equal(focused, true);
+});
+
 test('compact card hides stale warning chrome when display flag is false', () => {
     const { renderCompactCardHtml } = loadModule();
 

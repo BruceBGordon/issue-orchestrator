@@ -24,7 +24,7 @@ from issue_orchestrator.ports.working_copy import (
     PushResult,
     RebaseResult,
 )
-from issue_orchestrator.ports.worktree_manager import WorktreeInfo
+from issue_orchestrator.ports.worktree_manager import RegisteredWorktree, WorktreeInfo
 from issue_orchestrator.infra.config import Config
 from tests.conftest import (
     MockGitHubAdapter,
@@ -712,13 +712,23 @@ class TempWorktreeManager:
         )
         return WorktreeInfo(path=worktree, branch_name=final_branch)
 
-    def remove(self, worktree_path: Path, *, force: bool = False) -> None:
+    def remove_checkout(self, worktree_path: Path, *, force: bool = False) -> None:
+        del worktree_path, force
+        return None
+
+    def remove_checkout_and_branch(
+        self, worktree_path: Path, *, force: bool = False
+    ) -> None:
         del worktree_path, force
         return None
 
     def can_remove_without_user_changes(self, worktree_path: Path) -> bool:
         del worktree_path
         return False
+
+    def list_registered(self, repo_root: Path) -> tuple[RegisteredWorktree, ...]:
+        del repo_root
+        return ()
 
     def extract_issue_number(self, branch_name: str) -> int | None:
         parts = branch_name.split("-")
@@ -798,7 +808,14 @@ def build_config(
 
 
 def _write_runtime_config(repo_root: Path, validation_cmd: str | None) -> Path:
-    config_path = repo_root / ".issue-orchestrator" / "config" / "default.yaml"
+    config_path = (
+        repo_root
+        / ".issue-orchestrator"
+        / "config"
+        / "modes"
+        / "default"
+        / "default.yaml"
+    )
     config_path.parent.mkdir(parents=True, exist_ok=True)
     quick = {"cmd": validation_cmd, "timeout_seconds": 5} if validation_cmd else {}
     config_path.write_text(

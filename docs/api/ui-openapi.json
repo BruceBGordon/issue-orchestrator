@@ -133,6 +133,29 @@
         }
       }
     },
+    "/control/tools/worktrees/cleanup": {
+      "post": {
+        "summary": "Audit registered worktrees without deleting them",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {"$ref": "#/components/schemas/WorktreeAuditRequestPayload"}
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Activity- and configuration-aware worktree audit",
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "#/components/schemas/WorktreeAuditResponsePayload"}
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/retrospective-review": {
       "post": {
         "summary": "Queue retrospective reviews",
@@ -758,11 +781,12 @@
       "FlowColumnPayload": {
         "type": "object",
         "additionalProperties": true,
-        "required": ["id", "title", "count", "items"],
+        "required": ["id", "title", "count", "hidden_count", "items"],
         "properties": {
           "id": {"type": "string"},
           "title": {"type": "string"},
           "count": {"type": "integer"},
+          "hidden_count": {"type": "integer", "minimum": 0},
           "items": {"type": "array", "items": {"$ref": "#/components/schemas/IssueItemPayload"}},
           "expandable": {"type": "boolean"},
           "session_scoped": {"type": "boolean"}
@@ -890,6 +914,8 @@
           "queueRefreshSeconds",
           "repo",
           "repoRoot",
+          "configName",
+          "configMode",
           "githubOwner",
           "githubRepo",
           "agents",
@@ -904,6 +930,8 @@
           "queueRefreshSeconds": {"type": "integer"},
           "repo": {"type": "string"},
           "repoRoot": {"type": "string"},
+          "configName": {"type": "string"},
+          "configMode": {"type": "string"},
           "githubOwner": {"type": "string"},
           "githubRepo": {"type": "string"},
           "e2eLastRun": {"type": ["object", "null"], "additionalProperties": true},
@@ -2637,6 +2665,77 @@
           "issues": {"type": "array", "items": {"type": "integer", "minimum": 1}}
         }
       },
+      "WorktreeAuditKind": {
+        "type": "string",
+        "enum": ["issue", "reviewer", "tech_lead_scratch", "external"]
+      },
+      "WorktreeAuditDisposition": {
+        "type": "string",
+        "enum": ["managed", "cleanup_candidate", "retained"]
+      },
+      "WorktreeAuditActivityEvidence": {
+        "type": "string",
+        "enum": ["known", "unknown"]
+      },
+      "WorktreeAuditScope": {
+        "type": "string",
+        "enum": ["configured", "repo-parent-fallback"]
+      },
+      "WorktreeAuditRequestPayload": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["repo_root"],
+        "properties": {
+          "repo_root": {"type": "string", "minLength": 1}
+        }
+      },
+      "WorktreeAuditEntryPayload": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "name", "kind", "disposition", "reason"],
+        "properties": {
+          "path": {"type": "string", "minLength": 1},
+          "name": {"type": "string", "minLength": 1},
+          "kind": {"$ref": "#/components/schemas/WorktreeAuditKind"},
+          "disposition": {"$ref": "#/components/schemas/WorktreeAuditDisposition"},
+          "reason": {"type": "string", "minLength": 1}
+        }
+      },
+      "WorktreeAuditResponsePayload": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "worktrees",
+          "cleanup_candidates",
+          "stale_worktrees",
+          "message",
+          "issue_cleanup_enabled",
+          "activity_evidence",
+          "audit_unavailable",
+          "scope",
+          "note"
+        ],
+        "properties": {
+          "worktrees": {
+            "type": "array",
+            "items": {"$ref": "#/components/schemas/WorktreeAuditEntryPayload"}
+          },
+          "cleanup_candidates": {
+            "type": "array",
+            "items": {"$ref": "#/components/schemas/WorktreeAuditEntryPayload"}
+          },
+          "stale_worktrees": {
+            "type": "array",
+            "items": {"$ref": "#/components/schemas/WorktreeAuditEntryPayload"}
+          },
+          "message": {"type": "string", "minLength": 1},
+          "issue_cleanup_enabled": {"type": ["boolean", "null"]},
+          "activity_evidence": {"$ref": "#/components/schemas/WorktreeAuditActivityEvidence"},
+          "audit_unavailable": {"type": "boolean"},
+          "scope": {"$ref": "#/components/schemas/WorktreeAuditScope"},
+          "note": {"type": ["string", "null"]}
+        }
+      },
       "RepositorySetupPrerequisiteCheckPayload": {
         "type": "object",
         "additionalProperties": false,
@@ -2777,6 +2876,9 @@
           "configure_reviewer",
           "reviewer_model",
           "reviewer_effort",
+          "configure_internal_reviewer",
+          "internal_review_max_rounds",
+          "internal_review_instructions",
           "validation_quick_command",
           "validation_publish_command",
           "github_authorization",
@@ -2808,6 +2910,18 @@
             "type": "string",
             "enum": ["low", "medium", "high", "xhigh", "max"],
             "default": "high"
+          },
+          "configure_internal_reviewer": {"type": "boolean", "default": false},
+          "internal_review_max_rounds": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 50,
+            "default": 5
+          },
+          "internal_review_instructions": {
+            "type": "string",
+            "minLength": 1,
+            "default": ".io/internal-review.md"
           },
           "validation_quick_command": {
             "type": "string",

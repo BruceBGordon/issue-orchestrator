@@ -39,7 +39,7 @@ cd /path/to/your/project
 issue-orchestrator setup
 ```
 
-This creates `.issue-orchestrator/config/default.yaml` with your repo settings and agent definitions. If you prefer to stay elsewhere, run `issue-orchestrator setup /path/to/your/project` instead. You can also copy and edit the [example config](../../examples/config.example.yaml) directly.
+This creates `.issue-orchestrator/config/modes/default/default.yaml` with your repo settings and agent definitions. If you prefer to stay elsewhere, run `issue-orchestrator setup /path/to/your/project` instead. You can also copy and edit the [example config](../../examples/config.example.yaml) directly.
 
 Alternatively, in the Control Center select **Setup** for the discovered
 repository. That workflow creates the same repository setup, defaults worktrees

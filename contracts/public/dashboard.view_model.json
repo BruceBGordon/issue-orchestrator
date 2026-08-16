@@ -10,6 +10,14 @@
           "title": "Agents",
           "type": "array"
         },
+        "configMode": {
+          "title": "Configmode",
+          "type": "string"
+        },
+        "configName": {
+          "title": "Configname",
+          "type": "string"
+        },
         "e2eLastRun": {
           "anyOf": [
             {
@@ -104,6 +112,8 @@
         "queueRefreshSeconds",
         "repo",
         "repoRoot",
+        "configName",
+        "configMode",
         "githubOwner",
         "githubRepo",
         "agents",

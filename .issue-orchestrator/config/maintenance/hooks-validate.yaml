@@ -1,6 +1,5 @@
-# Hook validation config: exercises AI gate tests for supported CLIs.
+# Maintenance-only hook validation config: exercises supported CLIs.
 # Not intended for issue execution.
-# Codex is excluded because live verification is not yet supported.
 
 agents:
   hook:claude:
@@ -29,6 +28,14 @@ agents:
     meta_agent: copilot
     ai_system: copilot
     command: "copilot -p '{initial_prompt}' --allow-tool shell(git)"
+
+  hook:codex:
+    prompt: repo-specific/prompts/simple-fix.md
+    provider: codex
+    meta_agent: codex
+    ai_system: codex
+    provider_args:
+      execution_mode: exec
 
 execution:
   terminal_adapter: subprocess

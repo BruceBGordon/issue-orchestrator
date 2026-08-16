@@ -42,6 +42,8 @@ def _dashboard_data_payload(**overrides: object) -> dict[str, object]:
         "queueRefreshSeconds": 300,
         "repo": "test/repo",
         "repoRoot": "/tmp/repo",
+        "configName": "main.yaml",
+        "configMode": "codex",
         "githubOwner": "test",
         "githubRepo": "repo",
         "agents": ["agent:web"],

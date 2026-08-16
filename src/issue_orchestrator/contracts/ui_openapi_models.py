@@ -19,6 +19,14 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 TimelineView: TypeAlias = Literal['user', 'ops', 'debug', 'raw']
 
+WorktreeAuditActivityEvidence: TypeAlias = Literal['known', 'unknown']
+
+WorktreeAuditDisposition: TypeAlias = Literal['managed', 'cleanup_candidate', 'retained']
+
+WorktreeAuditKind: TypeAlias = Literal['issue', 'reviewer', 'tech_lead_scratch', 'external']
+
+WorktreeAuditScope: TypeAlias = Literal['configured', 'repo-parent-fallback']
+
 class AgentIdentityPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
     name: str
@@ -111,6 +119,8 @@ class CycleValidationBadgePayload(BaseModel):
 class DashboardDataPayload(BaseModel):
     model_config = ConfigDict(extra="allow")
     agents: list[str]
+    configMode: str
+    configName: str
     e2eLastRun: dict[str, Any] | None = None
     e2eRunning: bool
     githubOwner: str
@@ -446,6 +456,7 @@ class FlowColumnPayload(BaseModel):
     model_config = ConfigDict(extra="allow")
     count: int
     expandable: bool | None = None
+    hidden_count: int = Field(..., ge=0, strict=True)
     id: str
     items: list[IssueItemPayload]
     session_scoped: bool | None = None
@@ -822,12 +833,15 @@ class RecentE2ERunsPayload(BaseModel):
 class RepositorySetupCommandPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
     config_name: str | None = Field(default=None, min_length=1)
+    configure_internal_reviewer: bool
     configure_reviewer: bool
     configure_tech_lead: bool
     create_labels: bool | None = None
     create_prompts: bool | None = None
     effort: Literal['low', 'medium', 'high', 'xhigh', 'max']
     github_authorization: RepositorySetupGitHubAuthorizationPayload
+    internal_review_instructions: str = Field(..., min_length=1)
+    internal_review_max_rounds: int = Field(..., ge=1, le=50, strict=True)
     model: Literal['haiku', 'sonnet', 'opus']
     replace_existing: bool | None = None
     repo_name: str = Field(..., min_length=1)
@@ -1362,6 +1376,30 @@ class ViewModelSnapshotPayload(BaseModel):
     count: int
     rows: list[IssueRowPayload]
     view_model: DashboardViewModelPayload
+
+class WorktreeAuditEntryPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    disposition: WorktreeAuditDisposition
+    kind: WorktreeAuditKind
+    name: str = Field(..., min_length=1)
+    path: str = Field(..., min_length=1)
+    reason: str = Field(..., min_length=1)
+
+class WorktreeAuditRequestPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    repo_root: str = Field(..., min_length=1)
+
+class WorktreeAuditResponsePayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    activity_evidence: WorktreeAuditActivityEvidence
+    audit_unavailable: bool
+    cleanup_candidates: list[WorktreeAuditEntryPayload]
+    issue_cleanup_enabled: bool | None
+    message: str = Field(..., min_length=1)
+    note: str | None
+    scope: WorktreeAuditScope
+    stale_worktrees: list[WorktreeAuditEntryPayload]
+    worktrees: list[WorktreeAuditEntryPayload]
 
 CodingAttemptPayload: TypeAlias = RunningCodingAttemptPayload | CompletedCodingAttemptPayload | PublishFailedCodingAttemptPayload | BlockedCodingAttemptPayload | FailedCodingAttemptPayload | MissingCodingEvidencePayload
 

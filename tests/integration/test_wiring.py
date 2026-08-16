@@ -10,6 +10,7 @@ API calls, but this tests the actual wiring between components.
 
 import asyncio
 import argparse
+import subprocess
 import pytest
 from pathlib import Path
 from unittest.mock import patch, MagicMock, AsyncMock
@@ -33,7 +34,13 @@ class TestOrchestratorWiring:
     def temp_repo(self):
         """Create a temporary git repository."""
         with TemporaryDirectory() as tmpdir:
-            yield Path(tmpdir)
+            repo = Path(tmpdir)
+            subprocess.run(
+                ["git", "init", "-q", "-b", "main"],
+                cwd=repo,
+                check=True,
+            )
+            yield repo
 
     @pytest.fixture
     def config(self, temp_repo):
@@ -178,6 +185,7 @@ class TestCLIWiring:
         # Patch at config module level since it's imported inside cmd_start
         with patch('issue_orchestrator.infra.config.Config.find_and_load') as mock_config:
             mock_cfg = MagicMock()
+            mock_cfg.config_path = None
             mock_cfg.agents = {"agent:test": MagicMock()}
             mock_cfg.max_concurrent_sessions = 2
             mock_cfg.repo_root = Path("/fake")
@@ -213,6 +221,7 @@ class TestCLIWiring:
 
         with patch('issue_orchestrator.infra.config.Config.find_and_load') as mock_config:
             mock_cfg = MagicMock()
+            mock_cfg.config_path = None
             mock_cfg.agents = {"agent:test": MagicMock()}
             mock_cfg.repo_root = Path("/fake")
             mock_cfg.repo = None

@@ -193,7 +193,7 @@
         "issueOrchestrator.configPath": {
           "type": "string",
           "default": "",
-          "description": "Config file path for issue-orchestrator (defaults to .issue-orchestrator/config/default.yaml)."
+          "description": "Config file path for issue-orchestrator (defaults to .issue-orchestrator/config/modes/default/default.yaml)."
         },
         "issueOrchestrator.instanceId": {
           "type": "string",

@@ -88,7 +88,7 @@ async def e2e_start(
         )
 
     try:
-        config = deps.load_config_by_name(repo_root, config_name)
+        config = deps.load_config(repo_root, config_name, body.get("mode", "default"))
     except FileNotFoundError:
         return JSONResponse(
             {"error": "Config not found", "detail": f"Config file not found: {config_name}"},
@@ -180,7 +180,7 @@ async def e2e_stop(
         )
 
     try:
-        config = deps.load_config_by_name(repo_root, config_name)
+        config = deps.load_config(repo_root, config_name, body.get("mode", "default"))
     except FileNotFoundError:
         return JSONResponse(
             {"error": "config_not_found", "detail": f"Config file not found: {config_name}"},
@@ -208,7 +208,7 @@ async def e2e_stop(
 async def e2e_status(
     deps: ControlApiE2EDependency,
     repo_root: str = Query(...),
-    config_name: str = Query(...),
+    config_name: str = Query(...), mode: str = Query("default"),
 ) -> JSONResponse:
     """Get E2E test runner status."""
     from ..infra.e2e_db import E2EDB
@@ -219,7 +219,7 @@ async def e2e_status(
         return JSONResponse({"error": "Invalid repo_root"}, status_code=400)
 
     try:
-        config = deps.load_config_by_name(validated_root, config_name)
+        config = deps.load_config(validated_root, config_name, mode)
     except FileNotFoundError:
         return JSONResponse(
             {"error": "config_not_found", "detail": f"Config file not found: {config_name}"},
@@ -277,7 +277,7 @@ async def e2e_status(
 async def e2e_runs(
     deps: ControlApiE2EDependency,
     repo_root: str = Query(...),
-    config_name: str = Query(...),
+    config_name: str = Query(...), mode: str = Query("default"),
     limit: int = Query(20, ge=1, le=100),
 ) -> JSONResponse:
     """List recent E2E runs."""
@@ -288,7 +288,7 @@ async def e2e_runs(
         return JSONResponse({"error": "Invalid repo_root"}, status_code=400)
 
     try:
-        config = deps.load_config_by_name(validated_root, config_name)
+        config = deps.load_config(validated_root, config_name, mode)
     except FileNotFoundError:
         return JSONResponse(
             {"error": "config_not_found", "detail": f"Config file not found: {config_name}"},
@@ -316,7 +316,7 @@ async def e2e_run_details(
     run_id: int,
     deps: ControlApiE2EDependency,
     repo_root: str = Query(...),
-    config_name: str = Query(...),
+    config_name: str = Query(...), mode: str = Query("default"),
     enhanced: bool = Query(
         False,
         description="Use enhanced response with categories and history",
@@ -336,10 +336,11 @@ async def e2e_run_details(
             status_code=404,
         )
 
+    e2e_config = deps.load_config(validated_root, config_name, mode).e2e if enhanced else None
     try:
         db = E2EDB(db_path)
         if enhanced:
-            e2e_config = deps.load_config_by_name(validated_root, config_name).e2e
+            assert e2e_config is not None
             details = db.run_details_enhanced(
                 run_id,
                 history_limit=5,
@@ -584,7 +585,7 @@ async def e2e_failed_tests(
 async def e2e_quarantine_list(
     deps: ControlApiE2EDependency,
     repo_root: str = Query(...),
-    config_name: str = Query(...),
+    config_name: str = Query(...), mode: str = Query("default"),
 ) -> JSONResponse:
     """Get the quarantine list for a repository."""
     from ..infra.e2e_db import load_quarantine_list
@@ -593,7 +594,7 @@ async def e2e_quarantine_list(
     if validated_root is None:
         return JSONResponse({"error": "Invalid repo_root"}, status_code=400)
 
-    e2e_config = deps.load_config_by_name(validated_root, config_name).e2e
+    e2e_config = deps.load_config(validated_root, config_name, mode).e2e
     quarantine_file = e2e_config.quarantine_file
     quarantine_path = validated_root / quarantine_file
     tests = load_quarantine_list(quarantine_path)
@@ -634,7 +635,7 @@ async def e2e_quarantine_modify(
     request: Request,
     deps: ControlApiE2EDependency,
     repo_root: str = Query(...),
-    config_name: str = Query(...),
+    config_name: str = Query(...), mode: str = Query("default"),
 ) -> JSONResponse:
     """Add or remove tests from the quarantine list."""
     from ..infra.e2e_db import load_quarantine_list, save_quarantine_list
@@ -656,7 +657,7 @@ async def e2e_quarantine_modify(
     if not nodeids:
         return JSONResponse({"error": "nodeids is required"}, status_code=400)
 
-    e2e_config = deps.load_config_by_name(validated_root, config_name).e2e
+    e2e_config = deps.load_config(validated_root, config_name, mode).e2e
     quarantine_file = e2e_config.quarantine_file
     quarantine_path = validated_root / quarantine_file
     current_tests = load_quarantine_list(quarantine_path)
@@ -685,7 +686,7 @@ async def e2e_quarantine_modify(
 async def e2e_stats(
     deps: ControlApiE2EDependency,
     repo_root: str = Query(...),
-    config_name: str = Query(...),
+    config_name: str = Query(...), mode: str = Query("default"),
 ) -> JSONResponse:
     """Get E2E statistics for the stats modal."""
     from ..infra.e2e_db import E2EDB, load_quarantine_list
@@ -696,7 +697,7 @@ async def e2e_stats(
         return JSONResponse({"error": "Invalid repo_root"}, status_code=400)
 
     try:
-        config = deps.load_config_by_name(validated_root, config_name)
+        config = deps.load_config(validated_root, config_name, mode)
     except FileNotFoundError:
         return JSONResponse(
             {"error": "config_not_found", "detail": f"Config file not found: {config_name}"},
@@ -758,7 +759,7 @@ async def e2e_stats(
 async def e2e_flaky_tests(
     deps: ControlApiE2EDependency,
     repo_root: str = Query(...),
-    config_name: str = Query(...),
+    config_name: str = Query(...), mode: str = Query("default"),
     threshold: int = Query(default=20),
     window: int = Query(default=10),
 ) -> JSONResponse:
@@ -776,7 +777,7 @@ async def e2e_flaky_tests(
             status_code=404,
         )
 
-    e2e_config = deps.load_config_by_name(validated_root, config_name).e2e
+    e2e_config = deps.load_config(validated_root, config_name, mode).e2e
     quarantine_file = e2e_config.quarantine_file
     quarantined = load_quarantine_list(validated_root / quarantine_file)
 

@@ -9,6 +9,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
 from ..domain.issue_key import IssueKey
+from ..domain.coder_prompt import (
+    CoderPromptAddendumUnavailable,
+    PreparedCoderPromptAddendum,
+)
 from ..domain.models import (
     AgentConfig,
     Issue,
@@ -25,6 +29,7 @@ from ..infra.logging_config import issue_log, log_context
 from ..ports import EventSink, RepositoryHost
 from ..ports.event_sink import make_run_scoped_event, make_trace_event
 from ..ports.session_output import SessionOutput
+from ..ports.coder_prompt import CoderPromptAddendumProvider
 from ..ports.worktree_manager import WorktreeManager, WorktreeReuseOptions
 from .actions import Action, AddCommentAction, AddLabelAction, RemoveLabelAction
 from .launch_transaction import (
@@ -146,6 +151,40 @@ class ReworkLaunchDependencies:
     build_session_env: SessionEnvBuilder
     check_provider_ready: ProviderReadinessChecker
     resolve_stack_decision: StackDecisionResolverFn
+    coder_prompt_addendum: CoderPromptAddendumProvider
+
+
+@dataclass(frozen=True)
+class _ReworkLaunchAdmission:
+    """All non-mutating inputs required before rework worktree preparation."""
+
+    stack_base_branch: str | None
+    coder_prompt: PreparedCoderPromptAddendum
+
+
+def _admit_rework_launch(
+    *,
+    deps: ReworkLaunchDependencies,
+    active_sessions: list[Session],
+    session_name: str,
+    issue_number: int,
+    pr_number: int,
+    coder_prompt: PreparedCoderPromptAddendum,
+) -> _ReworkLaunchAdmission | LaunchResult:
+    """Resolve non-mutating gates before worktree or queue mutations."""
+    preflight_failure, stack_base_branch = _rework_preflight(
+        deps,
+        active_sessions=active_sessions,
+        session_name=session_name,
+        issue_number=issue_number,
+        pr_number=pr_number,
+    )
+    if preflight_failure is not None:
+        return preflight_failure
+    return _ReworkLaunchAdmission(
+        stack_base_branch=stack_base_branch,
+        coder_prompt=coder_prompt,
+    )
 
 
 def _rework_preflight(
@@ -195,13 +234,14 @@ def _rework_preflight(
 
 def _rework_launch_identity(
     rework: PendingRework, deps: ReworkLaunchDependencies
-) -> "LaunchResult | tuple[AgentConfig, int]":
+) -> "LaunchResult | tuple[AgentConfig, int, PreparedCoderPromptAddendum]":
     """Everything a rework launch must know before it reads anything remote.
 
-    The agent it will run as, the issue it belongs to, and whether that agent's
-    provider is even usable. Kept ahead of :func:`resolve_rework_pr` on purpose:
-    a provider that is not ready must refuse the launch without spending a
-    GitHub read on it.
+    The agent it will run as, the issue it belongs to, required prompt input,
+    and whether that agent's provider is usable. Prompt preparation comes first
+    because provider refusal can write a shared blocked label and durable record.
+    All of this stays ahead of :func:`resolve_rework_pr`, avoiding a GitHub read
+    for any refused launch.
     """
     agent_config = deps.config.agents.get(rework.agent_type)
     if not agent_config:
@@ -211,9 +251,15 @@ def _rework_launch_identity(
         return LaunchResult(
             None, False, f"Unresolved issue number for rework {rework.issue_key}"
         )
+    prepared_coder_prompt = deps.coder_prompt_addendum.prepare(
+        task=TaskKind.REWORK,
+        agent_label=rework.agent_type,
+    )
+    if isinstance(prepared_coder_prompt, CoderPromptAddendumUnavailable):
+        return LaunchResult.required_input_unavailable(prepared_coder_prompt.reason)
     if result := deps.check_provider_ready(agent_config.provider, issue_number):
         return result
-    return agent_config, issue_number
+    return agent_config, issue_number, prepared_coder_prompt
 
 
 def launch_rework_session(
@@ -227,7 +273,7 @@ def launch_rework_session(
     resolved = _rework_launch_identity(rework, deps)
     if isinstance(resolved, LaunchResult):
         return resolved
-    agent_config, issue_number = resolved
+    agent_config, issue_number, prepared_coder_prompt = resolved
 
     issue_key = rework.issue_key
     session_key = SessionKey(issue=issue_key, task=TaskKind.REWORK)
@@ -237,15 +283,18 @@ def launch_rework_session(
     # Preflight: session conflicts, then the stack work gate. A blocked/ambiguous
     # stack predecessor fails the rework closed before the reused successor
     # worktree is reset onto the default base (#6596).
-    preflight_failure, stack_base_branch = _rework_preflight(
-        deps,
+    admission = _admit_rework_launch(
+        deps=deps,
         active_sessions=active_sessions,
         session_name=session_name,
         issue_number=issue_number,
         pr_number=pr_number,
+        coder_prompt=prepared_coder_prompt,
     )
-    if preflight_failure is not None:
-        return preflight_failure
+    if isinstance(admission, LaunchResult):
+        return admission
+    stack_base_branch = admission.stack_base_branch
+    prepared_coder_prompt = admission.coder_prompt
 
     log_transition("rework", issue_number, "QUEUED", "LAUNCHING", f"no conflicts, cycle={rework.rework_cycle}")
     logger.info(
@@ -322,7 +371,6 @@ def launch_rework_session(
     run = ctx.run
     claude_project_dir = ctx.claude_project_dir
 
-    # Durable before anything irreversible (#6999 A2).
     if failure := work_claim.hold_before_spawn(run, issue_number=issue_number):
         return failure
 
@@ -419,13 +467,14 @@ def launch_rework_session(
             pr_number=pr_number,
             existing_work=existing_work,
         )
+        rendered_prompt = prepared_coder_prompt.compose(rendered_prompt)
         prompt_path = deps.persist_session_prompt(run.run_dir, rendered_prompt)
-        base_command = agent_config.get_command(
+        base_command = agent_config.get_command_for_prompt(
+            rendered_prompt,
             issue_number=issue_number,
             issue_title=issue_title,
             worktree=worktree_path,
             pr_number=pr_number,
-            existing_work=existing_work,
             task_kind=TaskKind.REWORK.value,
         )
         base_command = deps.wrap_provider_command(base_command, agent_config, run.run_dir)

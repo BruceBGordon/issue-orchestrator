@@ -344,6 +344,30 @@ function renderCompactCards(container, items) {
     }
 }
 
+function syncColumnOverflowFooter(columnElement, column) {
+    if (!columnElement) return;
+    const footer = columnElement.querySelector('.column-overflow-footer');
+    if (!footer) return;
+
+    const hiddenCount = Number(column?.hidden_count);
+    if (!Number.isInteger(hiddenCount) || hiddenCount < 0) {
+        throw new Error(`Invalid hidden_count for dashboard column ${column?.id || 'unknown'}`);
+    }
+
+    footer.querySelector('.column-overflow-label').textContent = `${hiddenCount} more`;
+    if (hiddenCount === 0 && document.activeElement === footer) {
+        columnElement.querySelector('.column-expand-btn').focus();
+    }
+    footer.hidden = hiddenCount === 0;
+
+    const title = String(column?.title || column?.id || 'column');
+    const itemNoun = hiddenCount === 1 ? 'item' : 'items';
+    footer.setAttribute(
+        'aria-label',
+        `Show full ${title} list, including ${hiddenCount} more ${itemNoun}`,
+    );
+}
+
 const expandedColumnFingerprints = new Map();
 
 function getSelectedIssueSet(columnId) {
@@ -362,6 +386,31 @@ function reapplyExpandedSelections(columnId, selectedIssues) {
     });
 }
 
+function syncColumnExpansionAccessibility(column, isExpanded) {
+    const title = String(column.dataset.columnTitle || column.dataset.column || 'column');
+    const expandButton = column.querySelector('.column-expand-btn');
+    if (expandButton) {
+        expandButton.setAttribute('aria-expanded', String(isExpanded));
+        expandButton.setAttribute('aria-label', `${isExpanded ? 'Collapse' : 'Expand'} ${title}`);
+    }
+    const overflowFooter = column.querySelector('.column-overflow-footer');
+    if (overflowFooter) {
+        overflowFooter.setAttribute('aria-expanded', String(isExpanded));
+    }
+    const expandedRegion = column.querySelector('.column-expanded');
+    if (expandedRegion) {
+        expandedRegion.setAttribute('aria-hidden', String(!isExpanded));
+    }
+}
+
+function expandColumnFromOverflow(button) {
+    const column = button?.closest('.kanban-column');
+    const columnId = column?.dataset?.column;
+    if (!columnId) return;
+    toggleColumnExpand(columnId);
+    column.querySelector('.column-expand-btn')?.focus();
+}
+
 function toggleColumnExpand(columnId) {
     const col = document.querySelector(`[data-column="${columnId}"]`);
     if (!col) return;
@@ -371,6 +420,7 @@ function toggleColumnExpand(columnId) {
     document.querySelectorAll('.kanban-column').forEach(c => {
         c.classList.remove('expanded', 'collapsed-peer');
         c.dataset.expanded = 'false';
+        syncColumnExpansionAccessibility(c, false);
         const expanded = c.querySelector('.column-expanded');
         const cards = c.querySelector('.column-cards');
         if (expanded) expanded.style.display = 'none';
@@ -393,6 +443,7 @@ function toggleColumnExpand(columnId) {
     if (!isExpanded) {
         col.classList.add('expanded');
         col.dataset.expanded = 'true';
+        syncColumnExpansionAccessibility(col, true);
         const expanded = col.querySelector('.column-expanded');
         const cards = col.querySelector('.column-cards');
         if (expanded) expanded.style.display = '';

@@ -7,6 +7,10 @@ from pathlib import Path
 
 import pytest
 
+from issue_orchestrator.adapters.worktree.api import (
+    WorktreeError,
+    read_reviewer_head_ownership,
+)
 from issue_orchestrator.domain.review_exchange import (
     REVIEWER_WORKTREE_CHECKOUT_FAILURE_MARKER,
 )
@@ -16,6 +20,7 @@ from issue_orchestrator.execution.reviewer_worktree import (
     fast_forward_reviewer_worktree,
     remove_reviewer_worktree,
 )
+from issue_orchestrator.ports.worktree_manager import REVIEWER_OWNED_HEAD_MARKER
 
 
 def _git(cwd: Path, *args: str) -> str:
@@ -58,10 +63,15 @@ class TestReviewerWorktreeLifecycle:
         assert reviewer.path == coder.parent / f"{coder.name}-review-20260502T000000Z"
         assert reviewer.path.exists()
         assert reviewer.path.is_dir()
+        marker = reviewer.path / ".issue-orchestrator" / "worktree-id"
+        assert marker.read_text().startswith("wt-")
         # Detached HEAD: HEAD points at the same SHA as the coder branch tip.
         coder_tip = _git(repo_root, "rev-parse", branch)
         reviewer_head = _git(reviewer.path, "rev-parse", "HEAD")
         assert reviewer_head == coder_tip
+        assert (reviewer.path / REVIEWER_OWNED_HEAD_MARKER).read_text().strip() == (
+            coder_tip
+        )
         # And HEAD is detached, not on the coder's branch.
         symbolic = subprocess.run(
             ["git", "symbolic-ref", "-q", "HEAD"],
@@ -78,6 +88,32 @@ class TestReviewerWorktreeLifecycle:
             create_reviewer_worktree(
                 coder_worktree=coder, coder_branch=branch, timestamp="T",
             )
+
+    def test_create_rolls_back_when_identity_installation_fails(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        repo_root, coder, branch = _bootstrap_repo_with_branch(tmp_path)
+        sibling = coder.parent / f"{coder.name}-review-T"
+
+        def fail_identity_install(_path: Path) -> str:
+            raise WorktreeError("identity unavailable")
+
+        monkeypatch.setattr(
+            "issue_orchestrator.execution.reviewer_worktree.install_worktree_identity",
+            fail_identity_install,
+        )
+
+        with pytest.raises(ReviewerWorktreeError, match="Failed to install"):
+            create_reviewer_worktree(
+                coder_worktree=coder,
+                coder_branch=branch,
+                timestamp="T",
+            )
+
+        assert not sibling.exists()
+        assert str(sibling) not in _git(repo_root, "worktree", "list", "--porcelain")
 
     def test_fast_forward_picks_up_new_coder_commits(self, tmp_path: Path) -> None:
         repo_root, coder, branch = _bootstrap_repo_with_branch(tmp_path)
@@ -97,6 +133,26 @@ class TestReviewerWorktreeLifecycle:
 
         reviewer_head = _git(reviewer.path, "rev-parse", "HEAD")
         assert reviewer_head == new_tip
+        assert (reviewer.path / REVIEWER_OWNED_HEAD_MARKER).read_text().strip() == (
+            new_tip
+        )
+
+    def test_malformed_owned_head_marker_is_unknown_not_legacy(
+        self, tmp_path: Path
+    ) -> None:
+        _, coder, branch = _bootstrap_repo_with_branch(tmp_path)
+        reviewer = create_reviewer_worktree(
+            coder_worktree=coder, coder_branch=branch, timestamp="T",
+        )
+        (reviewer.path / REVIEWER_OWNED_HEAD_MARKER).write_text(
+            "partial-write",
+            encoding="utf-8",
+        )
+
+        evidence = read_reviewer_head_ownership(reviewer.path)
+
+        assert evidence.marker_present is True
+        assert evidence.expected_head is None
 
     def test_remove_deletes_the_worktree(self, tmp_path: Path) -> None:
         _, coder, branch = _bootstrap_repo_with_branch(tmp_path)

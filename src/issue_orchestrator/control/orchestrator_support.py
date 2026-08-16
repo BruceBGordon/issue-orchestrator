@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Optional, Callable, cast
 
 if TYPE_CHECKING:
     from types import FrameType
-    from ..domain.models import OrchestratorState, Session, SessionStatus
+    from ..domain.models import OrchestratorState
     from ..ports.queue_cache_store import QueueCacheStore
     from ..ports.tech_lead_authority import TechLeadAuthorityStore
     from ..infra.config import Config
@@ -185,20 +185,6 @@ class OrchestratorSupport:
 
     def _get_milestone_filter(self) -> str | None:
         return self.config.filtering.milestone
-
-    def _immediate_cleanup(self, session: "Session", status: "SessionStatus") -> None:
-        from ..domain.models import SessionStatus
-        if status == SessionStatus.COMPLETED and (
-            self.config.cleanup.without_tech_lead.close_ai_session_tabs or not self.config.code_review_agent
-        ):
-            try:
-                self.worktree_manager.remove(session.worktree_path) if self.worktree_manager else None
-            except Exception:
-                pass
-        try:
-            self.kill_session(session.terminal_id)
-        except Exception:
-            pass
 
     def _check_health(self, health_gate: "HealthGate") -> object:
         """Check system health using HealthGate service."""

@@ -89,6 +89,27 @@ class TestAiGateState:
         assert len(state.last_results) == 2
         assert state.last_results["claude-code"].success is True
         assert state.last_results["gemini"].success is False
+        assert state.required_agent_types == ("claude-code", "gemini")
+
+    def test_is_stale_when_required_agent_set_changes(self):
+        """A fresh cache cannot stand in for hooks required by another mode."""
+        state = AiGateState(
+            last_check=datetime.now(timezone.utc),
+            required_agent_types=("claude-code",),
+        )
+
+        assert state.is_stale(7, {"claude-code"}) is False
+        assert state.is_stale(7, {"codex"}) is True
+
+    def test_is_stale_when_required_agent_set_changes_from_empty(self):
+        """A fresh no-provider cache cannot authorize a provider-backed mode."""
+        state = AiGateState(
+            last_check=datetime.now(timezone.utc),
+            required_agent_types=(),
+        )
+
+        assert state.is_stale(7, set()) is False
+        assert state.is_stale(7, {"codex"}) is True
 
     def test_to_dict(self):
         """Test serialization to dict."""
@@ -100,12 +121,14 @@ class TestAiGateState:
                     success=True, message="Passed", timestamp=ts
                 ),
             },
+            required_agent_types=("claude-code",),
         )
 
         result = state.to_dict()
 
         assert result["last_check"] == "2024-01-15T12:00:00+00:00"
         assert result["last_results"]["claude-code"]["success"] is True
+        assert result["required_agent_types"] == ["claude-code"]
 
     def test_from_dict(self):
         """Test deserialization from dict."""
@@ -118,12 +141,14 @@ class TestAiGateState:
                     "timestamp": "2024-01-15T12:00:00+00:00",
                 },
             },
+            "required_agent_types": ["claude-code"],
         }
 
         state = AiGateState.from_dict(data)
 
         assert state.last_check.year == 2024
         assert state.last_results["claude-code"].success is True
+        assert state.required_agent_types == ("claude-code",)
 
     def test_from_dict_empty(self):
         """Test from_dict with minimal data."""

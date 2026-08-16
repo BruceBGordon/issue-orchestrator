@@ -11,6 +11,7 @@ from issue_orchestrator.infra.validation_config_loader import (
     extract_validation_config,
     load_validation_config,
     load_validation_config_from_file,
+    load_runtime_validation_config,
 )
 
 
@@ -112,3 +113,35 @@ def test_extract_validation_config_uses_only_validation_junit_paths() -> None:
     )
 
     assert result["junit_xml_paths"] == ("validation.xml", "shared.xml")
+
+
+def test_runtime_validation_config_resolves_name_with_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / ".issue-orchestrator/config/modes/codex/main.yaml"
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text("validation:\n  quick:\n    cmd: codex-check\n")
+    monkeypatch.delenv("ISSUE_ORCHESTRATOR_CONFIG_PATH", raising=False)
+    monkeypatch.delenv("ORCHESTRATOR_CONFIG_PATH", raising=False)
+    monkeypatch.setenv("ISSUE_ORCHESTRATOR_CONFIG_NAME", "main.yaml")
+    monkeypatch.setenv("ISSUE_ORCHESTRATOR_MODE", "codex")
+
+    result = load_runtime_validation_config(tmp_path)
+
+    assert result["quick"]["cmd"] == "codex-check"
+
+
+def test_runtime_validation_config_rejects_explicit_path_mode_mismatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / ".issue-orchestrator/config/modes/default/main.yaml"
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text("validation: {}\n")
+    monkeypatch.setenv("ISSUE_ORCHESTRATOR_CONFIG_PATH", str(config_path))
+    monkeypatch.setenv("ISSUE_ORCHESTRATOR_CONFIG_NAME", "main.yaml")
+    monkeypatch.setenv("ISSUE_ORCHESTRATOR_MODE", "codex")
+
+    with pytest.raises(ValueError, match="path mode"):
+        load_runtime_validation_config(tmp_path)

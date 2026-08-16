@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from .coder_prompt import append_coder_prompt_addendum
 from .review_exchange_run import ReviewExchangeRunAssets
 from .review_exchange_summary import (
     ReviewExchangeReason,
@@ -192,7 +193,7 @@ def build_coder_prompt(packet: "ReviewExchangeTurnPacket") -> str:
         raise ValueError(
             "build_coder_prompt requires packet.reviewer_feedback to be set"
         )
-    return (
+    prompt = (
         f"You are the coder in a review exchange for issue #{packet.issue_number}: {packet.issue_title}.\n"
         f"Round {packet.round_index}.\n"
         "Review the full reviewer report below and update the worktree accordingly.\n"
@@ -215,6 +216,7 @@ def build_coder_prompt(packet: "ReviewExchangeTurnPacket") -> str:
         "  exchange-respond ok --text \"Applied fixes...\"\n"
         "  exchange-respond disagree --text \"This is wrong because...\"\n"
     )
+    return append_coder_prompt_addendum(prompt, packet.coder_prompt_addendum)
 
 
 def parse_exchange_response(stdout: str) -> ReviewExchangeResponse | None:

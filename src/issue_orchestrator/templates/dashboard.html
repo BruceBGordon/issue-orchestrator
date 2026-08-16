@@ -236,10 +236,11 @@
                 {% for column in flow_columns %}
                 <article class="kanban-column {% if column.expandable %}expandable{% endif %}"
                          data-column="{{ column.id }}"
+                         data-column-title="{{ column.title }}"
                          data-expanded="false">
                     <h2 ondblclick="toggleColumnExpand('{{ column.id }}')">
                         {% if column.expandable %}
-                        <button class="column-expand-btn" onclick="toggleColumnExpand('{{ column.id }}');event.stopPropagation();" aria-label="Expand {{ column.title }}">
+                        <button type="button" class="column-expand-btn" onclick="toggleColumnExpand('{{ column.id }}');event.stopPropagation();" aria-label="Expand {{ column.title }}" aria-controls="column-{{ column.id }}-expanded" aria-expanded="false">
                             <span class="expand-chevron">&#x25B8;</span>
                         </button>
                         {% endif %}
@@ -321,7 +322,22 @@
                         {% endif %}
                     </div>
                     {% if column.expandable %}
-                    <div class="column-expanded" style="display:none;">
+                    <button type="button"
+                            class="column-overflow-footer"
+                            onclick="expandColumnFromOverflow(this)"
+                            aria-label="Show full {{ column.title }} list, including {{ column.hidden_count }} more item{% if column.hidden_count != 1 %}s{% endif %}"
+                            aria-controls="column-{{ column.id }}-expanded"
+                            aria-expanded="false"
+                            {% if column.hidden_count == 0 %}hidden{% endif %}>
+                        <span aria-hidden="true">&hellip;</span>
+                        <span class="column-overflow-label">{{ column.hidden_count }} more</span>
+                    </button>
+                    <div class="column-expanded"
+                         id="column-{{ column.id }}-expanded"
+                         role="region"
+                         aria-label="{{ column.title }} full list"
+                         aria-hidden="true"
+                         style="display:none;">
                         {% if column.id == 'blocked' %}
                         <div class="column-filter-bar">
                             <button class="filter-btn active" data-filter="all" onclick="filterBlockedColumn('all', this)">All</button>

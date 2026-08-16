@@ -15,7 +15,7 @@ target repository.
 2. Read [GitHub Token Setup (Developer)](../../../docs/development/GITHUB_TOKEN_SETUP.md#rotate-an-expiring-token).
    Use [GitHub Permissions](../../../docs/user/github-permissions.md) only for
    creating the replacement token and required permissions.
-3. Inspect `.issue-orchestrator/config/*.yaml` in the target repo and identify
+3. Inspect `.issue-orchestrator/config/modes/*/*.yaml` in the target repo and identify
    `repo.github`.
 4. Determine the authoritative source:
    - `repo.github.token`: config value wins; avoid committing secrets and ask

@@ -136,6 +136,8 @@ def test_view_model_active_session_and_dashboard_data():
     assert dashboard_data["paused"] is False
     assert dashboard_data["queueRefreshSeconds"] == 600
     assert dashboard_data["agents"] == ["agent:web"]
+    assert dashboard_data["configName"] == ""
+    assert dashboard_data["configMode"] == "default"
     assert "scope" in dashboard_data
     assert dashboard_data["refresh"]["fetchLayerEnabled"] is True
 
@@ -1598,6 +1600,40 @@ def test_publish_failed_scope_issue_survives_blocked_lane_without_queue_entry():
     blocked_item = next(item for item in view_model.blocked_items if item["issue_number"] == 4057)
     assert blocked_item["flow_stage"] == "blocked"
     assert blocked_item["blocked_summary"]
+
+
+def test_blocked_column_reports_items_omitted_from_compact_preview():
+    config = _make_config()
+    issues = [
+        Issue(
+            number=issue_number,
+            title=f"Blocked issue {issue_number}",
+            labels=["agent:web", "blocked-failed"],
+        )
+        for issue_number in range(1, 14)
+    ]
+    state = OrchestratorState(
+        startup_status="complete",
+        cached_scope_issues=issues,
+        cached_queue_issues=[],
+    )
+    orchestrator = _OrchestratorStub(state=state, config=config)
+
+    view_model = build_dashboard_view_model(
+        orchestrator,
+        provider_circuit=NO_PROVIDER_CIRCUIT_STATUS,
+        queue_page=1,
+        active_tab="flow",
+        e2e_page=1,
+        e2e_status_provider=lambda _: {"enabled": False, "running": False},
+    )
+
+    blocked_column = next(
+        column for column in view_model.flow_columns if column["id"] == "blocked"
+    )
+    assert blocked_column["count"] == 13
+    assert len(blocked_column["items"]) == 12
+    assert blocked_column["hidden_count"] == 1
 
 
 def test_review_stage_queue_item_does_not_get_queue_wait_reason():

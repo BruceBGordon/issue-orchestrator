@@ -157,6 +157,7 @@ async def e2e_triage_data(
     deps: ControlApiE2EDependency,
     repo_root: str = Query(...),
     config_name: str = Query(...),
+    mode: str = Query("default"),
 ) -> JSONResponse:
     """Get triage data for an E2E run."""
     from ..infra.e2e_db import E2EDB
@@ -172,6 +173,7 @@ async def e2e_triage_data(
             status_code=404,
         )
 
+    e2e_config = deps.load_config(validated_root, config_name, mode).e2e
     try:
         db = E2EDB(db_path)
         run = db.get_run(run_id)
@@ -184,7 +186,6 @@ async def e2e_triage_data(
         failed_results = db.get_failed_tests(run_id)
         run_issue = db.get_run_issue(run_id)
 
-        e2e_config = deps.load_config_by_name(validated_root, config_name).e2e
         flake_threshold = e2e_config.flake_threshold
         flake_window = e2e_config.flake_window_runs
 
@@ -278,6 +279,7 @@ async def e2e_test_detail(
     nodeid: str = Query(...),
     repo_root: str = Query(...),
     config_name: str = Query(...),
+    mode: str = Query("default"),
 ) -> JSONResponse:
     """Get detailed information for a single test failure."""
     from ..infra.e2e_db import E2EDB
@@ -293,6 +295,7 @@ async def e2e_test_detail(
             status_code=404,
         )
 
+    e2e_config = deps.load_config(validated_root, config_name, mode).e2e
     try:
         db = E2EDB(db_path)
         run = db.get_run(run_id)
@@ -309,7 +312,6 @@ async def e2e_test_detail(
                 status_code=404,
             )
 
-        e2e_config = deps.load_config_by_name(validated_root, config_name).e2e
         stability = db.get_test_stability(
             nodeid,
             window_runs=e2e_config.flake_window_runs,

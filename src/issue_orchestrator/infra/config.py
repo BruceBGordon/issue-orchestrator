@@ -36,9 +36,11 @@ from .config_models import (
     SessionInteractionsConfig,
     SqliteBackupConfig,
     TimelineConfig,
+    TechLeadActivationOwner,
     TechLeadConfig,
     ValidationConfig,
 )
+from .config_identity import ConfigLaunchIdentity, RuntimeConfigReferenceOwner
 from .config_paths import (
     CONFIG_DIR as CONFIG_DIR,
     DEFAULT_CONFIG_NAME as DEFAULT_CONFIG_NAME,
@@ -50,8 +52,10 @@ from .config_paths import (
     get_config_dir as get_config_dir,
     get_config_path as get_config_path,
     list_configs as list_configs,
+    list_modes as list_modes,
     repo_root_from_config_path as repo_root_from_config_path,
     resolve_relative_path as resolve_relative_path,
+    selection_from_config_path as selection_from_config_path,
 )
 from . import github_config as _github_config
 from .config_sections import (
@@ -79,6 +83,12 @@ from .config_sections import (
     parse_milestone_order,
 )
 from .config_value_rules import resolve_tech_lead_watch_label
+from .config_review_projection import (
+    internal_review_dict,
+    runtime_exchange_dict,
+    runtime_run_audit_dict,
+    serialized_internal_review_dict,
+)
 from .validation_config_loader import (
     load_validation_config as load_validation_config,
     load_validation_config_from_file as load_validation_config_from_file,
@@ -93,7 +103,7 @@ def _put_if_truthy(target: dict, key: str, value: object) -> None:
 
 
 @dataclass
-class Config:
+class Config(ConfigLaunchIdentity, RuntimeConfigReferenceOwner, TechLeadActivationOwner):
     """Orchestrator configuration."""
 
     # Agent configurations keyed by label (e.g., "agent:web")
@@ -271,7 +281,6 @@ class Config:
     tech_lead_failed_label: str = "tech-lead-failed"  # Label when tech_lead fails (matches load_review_section default)
     tech_lead_review_threshold: int = 0  # Trigger tech_lead review after N PRs (0 = manual only)
     tech_lead_review_on_failure: bool = True  # Trigger tech_lead to investigate when sessions fail
-    # Validated worker a tech_lead create_issue follow-up routes to (#6779 R9).
     tech_lead_follow_up_agent: Optional[str] = None
 
     @property
@@ -305,6 +314,11 @@ class Config:
     retrospective_review_trigger_label: str = "retrospective-review"
     retrospective_reviewed_label: str = "retrospective-reviewed"
     retrospective_changes_requested_label: str = "retrospective-changes-requested"
+
+    # Fast coder-owned review loop that runs before any successful coder handoff.
+    internal_review_enabled: bool = False
+    internal_review_max_rounds: int = 5
+    internal_review_instructions: str = ".io/internal-review.md"
 
     # Review exchange mode (via-mcp, via-local-loop, or via-draft-pr review)
     review_exchange_mode: str = "via-local-loop"
@@ -488,25 +502,6 @@ class Config:
             }
         return exchange_dict
 
-    def _runtime_exchange_dict(self) -> dict[str, object]:
-        exchange_dict: dict[str, object] = {"mode": self.review_exchange_mode}
-        exchange_dict["probe"] = {
-            "schedule": self.review_exchange_probe_schedule,
-            "interval_days": self.review_exchange_probe_interval_days,
-        }
-        exchange_dict["loop"] = {
-            "max_rounds": self.review_exchange_max_rounds,
-            "max_no_progress": self.review_exchange_max_no_progress,
-            "require_validation": self.review_exchange_require_validation,
-        }
-        return exchange_dict
-
-    def _runtime_run_audit_dict(self) -> dict[str, object]:
-        return {
-            "min_runtime_minutes": self.review_run_audit_min_runtime_minutes,
-            "on_timeout": self.review_run_audit_on_timeout,
-        }
-
     def get_label_review_keep_current_approach(self) -> str:
         """Get the reviewer keep-current-approach label with prefix if configured."""
         return self.prefixed_label(self.review_keep_current_approach_label)
@@ -518,6 +513,7 @@ class Config:
         (YAML + command line overrides) for debugging.
         """
         result = {
+            "launch_selection": self.launch_identity_dict(),
             "repo": {
                 "name": self.repo,
                 "root": str(self.repo_root),
@@ -656,14 +652,15 @@ class Config:
                 "default": self.code_review_agent,
                 "code_review_label": self.code_review_label,
                 "code_reviewed_label": self.code_reviewed_label,
-                "run_audit": self._runtime_run_audit_dict(),
+                "run_audit": runtime_run_audit_dict(self),
                 "retrospective": {
                     "enabled": self.retrospective_review_enabled,
                     "trigger_label": self.retrospective_review_trigger_label,
                     "reviewed_label": self.retrospective_reviewed_label,
                     "changes_requested_label": self.retrospective_changes_requested_label,
                 },
-                "exchange": self._runtime_exchange_dict(),
+                "internal": internal_review_dict(self),
+                "exchange": runtime_exchange_dict(self),
                 "nits": {
                     "default_policy": self.review_nits_default_policy,
                     "by_agent": dict(self.review_nits_by_agent),
@@ -707,7 +704,7 @@ class Config:
                 "fetch_limit": self.filtering.fetch_limit,
                 "max_to_start": self.filtering.max_to_start,
             },
-            "tech_lead": self.tech_lead.to_event_dict(),
+            "tech_lead": self.tech_lead.to_event_dict(enabled=self.tech_lead_enabled),
             "scheduling": {
                 "default_priority_tier": self.scheduling.default_priority_tier,
             },
@@ -1006,6 +1003,8 @@ class Config:
                 "reviewed_label": self.retrospective_reviewed_label,
                 "changes_requested_label": self.retrospective_changes_requested_label,
             }
+        if internal_review := serialized_internal_review_dict(self):
+            review_dict["internal"] = internal_review
         if self.review_nits_default_policy != "surface" or self.review_nits_by_agent:
             nits_dict: dict[str, object] = {
                 "default_policy": self.review_nits_default_policy,
@@ -1158,7 +1157,7 @@ class Config:
             hooks_dict.setdefault("ai_gate", {})["dangerous_allow_failure"] = True
         if hooks_dict:
             result["hooks"] = hooks_dict
-
+        result.update(self.explicit_tech_lead_section())
         return result
 
     def save(self, path: Optional[Path] = None) -> Path:
@@ -1195,6 +1194,7 @@ class Config:
     @classmethod
     def load(cls, config_path: Path, overrides: Optional[list[str]] = None) -> "Config":
         """Load configuration from YAML file."""
+        launch_selection = selection_from_config_path(config_path)
         if not config_path.exists():
             raise FileNotFoundError(f"Config file not found: {config_path}")
 
@@ -1209,6 +1209,7 @@ class Config:
 
         config = cls()
         config.config_path = config_path.resolve()
+        config.launch_selection = launch_selection
 
         # Extract all sections with validation
         sections = extract_config_sections(data, config_path)
@@ -1256,10 +1257,9 @@ class Config:
         config.ai_systems_allowed = parse_ai_systems_allowed(
             sections["ai_systems"].get("allowed", [])
         )
-
-
         # Parse complex optional configs
         apply_optional_sections(config, sections)
+        config.refresh_config_fingerprint()
         return config
 
     @classmethod
@@ -1267,6 +1267,7 @@ class Config:
         cls,
         start_path: Optional[Path] = None,
         config_name: str = DEFAULT_CONFIG_NAME,
+        mode: str = "default",
         overrides: Optional[list[str]] = None,
     ) -> "Config":
         """Find config file in current or parent directories and load it.
@@ -1276,7 +1277,7 @@ class Config:
             config_name: Name of config file to load (default: default.yaml)
             overrides: CLI overrides in path=value format
         """
-        config_file = find_config_file(start_path, config_name)
+        config_file = find_config_file(start_path, config_name, mode)
         if not config_file:
             raise FileNotFoundError(
                 f"No config found in {CONFIG_DIR}/ directory. "

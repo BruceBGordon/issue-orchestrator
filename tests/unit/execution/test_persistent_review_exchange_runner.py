@@ -43,7 +43,12 @@ from issue_orchestrator.domain.review_exchange_run import (
 )
 from issue_orchestrator.domain.review_exchange_summary import ReviewExchangeSummaryV1
 from issue_orchestrator.domain.runtime_config import RuntimeConfigReference
+from issue_orchestrator.domain.repository_launch_selection import (
+    RepositoryLaunchSelection,
+)
 from issue_orchestrator.execution import persistent_review_exchange_runner as prer
+from issue_orchestrator.domain.coder_prompt import PreparedCoderPromptAddendum
+from issue_orchestrator.domain.session_key import TaskKind
 
 
 @pytest.fixture
@@ -116,7 +121,10 @@ def _runtime_config(tmp_path: Path) -> RuntimeConfigReference:
         config_path.write_text(
             "validation:\n  quick:\n    cmd: 'true'\n", encoding="utf-8"
         )
-    return RuntimeConfigReference.from_path(config_path)
+    return RuntimeConfigReference(
+        config_path=config_path.resolve(),
+        selection=RepositoryLaunchSelection.parse(config_name=config_path.name),
+    )
 
 
 def _canned_outcome(exchange_run: ReviewExchangeRun) -> ReviewExchangeOutcome:
@@ -311,6 +319,37 @@ def test_run_threads_pair_registry_and_persistent_root_into_inner_runner(
     assert captured["coder_worktree_path"] == tmp_path / "coder"
     assert captured["session_output"] is runner._session_output  # noqa: SLF001
     assert captured["runtime_config"] == _runtime_config(tmp_path)
+
+
+def test_run_resolves_coder_addendum_for_coder_worktree_only(
+    monkeypatch,
+    tmp_path: Path,
+    stub_lifecycle,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    def _fake_inner(**kwargs):
+        captured.update(kwargs)
+        return _canned_outcome(kwargs["exchange_run"])
+
+    monkeypatch.setattr(prer, "run_persistent_session_exchange", _fake_inner)
+    provider = MagicMock(name="coder_prompt_addendum")
+    provider.prepare.return_value = PreparedCoderPromptAddendum(
+        "INTERNAL-CODER-ONLY"
+    )
+    runner = prer.PersistentReviewExchangeRunner(
+        MagicMock(name="session_output"),
+        MagicMock(name="pair_registry"),
+        coder_prompt_addendum=provider,
+    )
+
+    _run(runner, tmp_path)
+
+    provider.prepare.assert_called_once_with(
+        task=TaskKind.REWORK,
+        agent_label="agent:coder",
+    )
+    assert captured["coder_prompt_addendum"] == "INTERNAL-CODER-ONLY"
 
 
 def test_persistent_pair_root_helper_is_worktree_scoped(tmp_path: Path) -> None:

@@ -380,6 +380,12 @@ class FactGatherer:
         """
         from ..domain.models import TechLeadFacts
 
+        # The master switch is the outermost boundary: disabled means zero
+        # tech-lead scans, ledger reads, proposal reconciliation, or promotion
+        # polling. Durable state remains untouched for a later re-enable.
+        if not self.config.tech_lead_enabled:
+            return None
+
         now_ts = time.time() if now is None else now
         # Tech-lead attention sweep (#6823): an independent, timer-gated trigger
         # that re-injects terminally-stuck issues into the reactive-tech-lead
@@ -390,7 +396,7 @@ class FactGatherer:
 
         watch_label = self._get_tech_lead_watch_label()
         batch_armed = bool(watch_label)
-        tech_lead_agent_configured = bool(self.config.tech_lead_review_agent)
+        tech_lead_workflow_enabled = self.config.tech_lead_enabled
         health_armed = health_review_interval_minutes(self.config) > 0
         # A storm can fire an anchor on a tick the interval is NOT due — and a
         # storm-only configuration (interval_minutes=0) is never due at all.
@@ -408,7 +414,7 @@ class FactGatherer:
         # reconcile — an empty ledger produces no facts and no scan.
         ops = (
             dict(self.tech_lead_authority.list_ops())
-            if tech_lead_agent_configured and self.tech_lead_authority is not None
+            if tech_lead_workflow_enabled and self.tech_lead_authority is not None
             else {}
         )
         # The finding-promotion lane (#6957) arms INDEPENDENTLY of the batch,
@@ -567,7 +573,10 @@ class FactGatherer:
 
     def _get_tech_lead_watch_label(self) -> str | None:
         """Get the label to watch for tech_lead review (None = trigger disabled)."""
-        if not self.config.tech_lead_review_agent or self.config.tech_lead_review_threshold <= 0:
+        if (
+            not self.config.tech_lead_enabled
+            or self.config.tech_lead_review_threshold <= 0
+        ):
             return None
         return self.config.tech_lead_watch_label
 
@@ -620,7 +629,7 @@ class FactGatherer:
         from .tech_lead_case_files import split_tech_lead_case_file_issues
         from .tech_lead_proposals import reconcile_tech_lead_proposals
 
-        if not self.config.tech_lead_review_agent:
+        if not self.config.tech_lead_enabled:
             return None, None, (), (), ()
         existing = discover_open_tech_lead_anchor_issues(
             self.repository_host, self.config
@@ -699,7 +708,7 @@ class FactGatherer:
             return None
 
         # Determine cleanup settings based on workflow
-        if self.config.tech_lead_review_agent:
+        if self.config.tech_lead_enabled:
             cleanup_label = self.config.tech_lead_reviewed_label
             close_tabs = self.config.cleanup.with_tech_lead.close_ai_session_tabs
             remove_wt = self.config.cleanup.with_tech_lead.remove_worktrees
