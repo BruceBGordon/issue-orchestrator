@@ -231,10 +231,16 @@ def test_dashboard_builder_requires_an_explicit_circuit_reader():
     missing ``deps``, or missing manager as an empty (healthy) fleet — masking a
     composition error as "no outage". The reader is now a required
     behaviour-level port, so omitting it fails loudly at the call boundary.
+
+    Every OTHER required argument is supplied, so the raised ``TypeError`` can
+    only be about ``provider_circuit``. Omitting several at once would still
+    raise and still pass, but would no longer prove which one is required
+    (#6858 rework 1).
     """
-    with pytest.raises(TypeError):
+    with pytest.raises(TypeError, match="provider_circuit"):
         build_dashboard_view_model(  # type: ignore[call-arg]
             _orchestrator_stub(),
+            tech_lead_history=NO_TECH_LEAD_RUN_HISTORY,
             e2e_status_provider=lambda _: {"enabled": False, "running": False},
         )
 
