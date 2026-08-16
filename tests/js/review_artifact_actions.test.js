@@ -63,6 +63,7 @@ function loadReviewDialogSlice(overrides = {}) {
     const slice = [
         _extractFunction(source, 'function _renderReviewMarkdownInline('),
         _extractFunction(source, 'function _renderReviewMarkdown('),
+        _extractFunction(source, 'function _reviewArtifactTitleName('),
         _extractFunction(source, 'function _renderReviewArtifactContent('),
         _extractFunction(source, 'async function openReviewArtifact('),
     ].join('\n');
@@ -280,4 +281,25 @@ test('lifecycle decision command fetches and renders JSON content', async () => 
     assert.match(finalModal[2], /&quot;verdict&quot;: &quot;approved&quot;/);
     assert.match(finalModal[2], /&quot;id&quot;: &quot;N1&quot;/);
     assert.match(finalModal[2], /&quot;title&quot;: &quot;Rename helper&quot;/);
+});
+
+test('the viewer titles a tech-lead artifact with the tech lead\'s name', async () => {
+    // #6858 F4: the same endpoint and the same viewer now serve the tech lead's
+    // report/decision pair. Titling one "Review report" would put the wrong
+    // agent's name on the artifact an operator opened.
+    const { context, calls } = loadReviewDialogSlice();
+
+    await context.openReviewArtifact(
+        900,
+        '/repo/.issue-orchestrator/state/tech-lead-runs/run-900__tech-lead-900',
+        'tech-lead-data/tech-lead-report.md',
+        'tech_lead_report',
+        'markdown',
+    );
+
+    const titles = calls.filter(entry => entry[0] === 'openModal').map(entry => entry[1]);
+    assert.ok(
+        titles.every(title => title === 'Tech lead report #900'),
+        `unexpected titles: ${JSON.stringify(titles)}`,
+    );
 });

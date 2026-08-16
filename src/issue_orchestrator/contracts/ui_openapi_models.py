@@ -131,6 +131,7 @@ class DashboardDataPayload(BaseModel):
     repo: str
     repoRoot: str
     startupComplete: bool
+    techLeadActivity: TechLeadActivityPayload
     validationConfigured: bool
 
 class DashboardIterationPayload(BaseModel):
@@ -716,7 +717,7 @@ class OpenIssueTimelineCommandPayload(BaseModel):
 class OpenReviewArtifactCommandPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
     artifact_path: str
-    artifact_type: Literal['review_report', 'review_decision']
+    artifact_type: Literal['review_report', 'review_decision', 'tech_lead_report', 'tech_lead_decision']
     issue_number: int
     kind: Literal['open_review_artifact']
     label: str
@@ -1209,6 +1210,11 @@ class SwitchE2ETimelineViewCommandPayload(BaseModel):
     run_id: int = Field(..., ge=1, strict=True)
     view: TimelineView
 
+class TechLeadActivityPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    emptyMessage: str
+    entries: list[TechLeadRunActivityEntryPayload]
+
 class TechLeadGlobalHealthReviewScopePayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
     kind: Literal['global_health_review']
@@ -1217,6 +1223,28 @@ class TechLeadIssueScopePayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
     issue_number: int = Field(..., ge=1, strict=True)
     kind: Literal['issue']
+
+class TechLeadRunActivityEntryPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    anchorIssueNumber: int
+    artifacts: list[TechLeadRunArtifactCommandPayload]
+    artifactsNote: str
+    detail: str
+    endedAt: str
+    findings: int
+    flavorLabel: str
+    phase: Literal['running', 'completed', 'needs_human', 'failed', 'withdrawn']
+    phaseLabel: str
+    proposals: int
+    runId: str
+    runKey: str
+    sessionName: str
+    startedAt: str
+    subjectIssueNumber: int
+    subjectKind: Literal['issue', 'board', 'pr_manifest']
+    subjectLabel: str
+    subjectTitle: str
+    tone: Literal['active', 'good', 'warn', 'bad', 'muted']
 
 class TechLeadRunAdmissionPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -1386,6 +1414,8 @@ ReviewStagePayload: TypeAlias = ReviewNotReachedPayload | ReviewSkippedPayload |
 ReviewTranscriptEvidencePayload: TypeAlias = ReviewTranscriptAvailablePayload | ReviewTranscriptUnavailablePayload
 
 SessionRecordingEvidencePayload: TypeAlias = SessionRecordingAvailablePayload | SessionRecordingUnavailablePayload
+
+TechLeadRunArtifactCommandPayload: TypeAlias = OpenSessionRecordingCommandPayload | OpenReviewArtifactCommandPayload
 
 TechLeadRunScopePayload: TypeAlias = TechLeadGlobalHealthReviewScopePayload | TechLeadIssueScopePayload
 

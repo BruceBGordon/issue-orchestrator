@@ -18,7 +18,10 @@ from issue_orchestrator.domain.models import (
     SessionKey,
     TaskKind,
 )
-from issue_orchestrator.domain.session_run import SessionRunAssets
+from issue_orchestrator.domain.session_run import (
+    SessionRunAssets,
+    canonical_run_dir_name,
+)
 from issue_orchestrator.ports.session_output import SessionOutput
 from tests.unit.session_run_helpers import make_session_run_assets
 
@@ -136,4 +139,58 @@ def test_manifest_run_dir_must_match_injected_run_dir(tmp_path: Path) -> None:
         SessionRunAssets.from_manifest_payload(
             run_dir=wrong_run_dir,
             manifest=manifest,
+        )
+
+
+def test_a_tampered_manifest_identity_is_refused_at_restoration(tmp_path: Path) -> None:
+    """Restart restoration reloads ``run_id``/``session_name`` from the WORKTREE's
+    manifest, which the agent can write (#6858 round 7 F17).
+
+    Downstream owners trust the two halves for different things — the tech-lead
+    archive names its durable destination from the identity while reading bytes
+    from the directory — so an identity that disagrees with the directory it was
+    loaded from would let one run's evidence be filed under another run's receipt,
+    leave the real activity row stuck at Running, and never conclude it. The
+    restorer skips a session whose assets raise, so refusing here is what turns a
+    rewritten manifest into a skipped session rather than a crossed one.
+    """
+    run_assets = make_session_run_assets(tmp_path / "worktree")
+    manifest = json.loads(run_assets.manifest_path.read_text(encoding="utf-8"))
+    manifest["session_name"] = "rework-9"
+
+    with pytest.raises(ValueError, match="does not name run"):
+        SessionRunAssets.from_manifest_payload(
+            run_dir=run_assets.run_dir,
+            manifest=manifest,
+        )
+
+
+def test_a_tampered_manifest_run_id_is_refused_at_restoration(tmp_path: Path) -> None:
+    run_assets = make_session_run_assets(tmp_path / "worktree")
+    manifest = json.loads(run_assets.manifest_path.read_text(encoding="utf-8"))
+    manifest["run_id"] = "run-someone-elses"
+
+    with pytest.raises(ValueError, match="does not name run"):
+        SessionRunAssets.from_manifest_payload(
+            run_dir=run_assets.run_dir,
+            manifest=manifest,
+        )
+
+
+def test_a_run_directory_naming_another_run_is_refused(tmp_path: Path) -> None:
+    """The binding is on the pair, not on the manifest: assets assembled directly
+    with a sibling run's directory are refused the same way."""
+    run_assets = make_session_run_assets(tmp_path / "worktree")
+    sibling = run_assets.run_dir.parent / canonical_run_dir_name("run-2", "issue-2")
+    sibling.mkdir()
+
+    with pytest.raises(ValueError, match="does not name run"):
+        SessionRunAssets.from_paths(
+            session_name=run_assets.identity.session_name,
+            run_id=run_assets.identity.run_id,
+            worktree_path=run_assets.worktree_path,
+            run_dir=sibling,
+            terminal_recording_path=sibling / "terminal-recording.jsonl",
+            manifest_path=sibling / "manifest.json",
+            started_at=run_assets.identity.started_at,
         )

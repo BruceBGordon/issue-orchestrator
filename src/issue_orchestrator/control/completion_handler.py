@@ -19,6 +19,7 @@ if TYPE_CHECKING:
     from ..domain.state_machines.review_machine import ReviewStateMachine
     from ..domain.models import PendingReview, PendingRework, PendingTechLeadReview
     from ..ports.tech_lead_authority import TechLeadAuthorityStore
+    from .tech_lead_run_activity import TechLeadRunActivity
     from ..ports.provider_resilience import ProviderErrorType
     from .open_issue_corpus import OpenIssueCorpusManager
     from .provider_availability import ProviderAvailabilityPolicy
@@ -45,6 +46,7 @@ from .actions import (
     AddLabelAction,
     RemoveLabelAction,
 )
+from .completion_pr_lookup import CompletionPrLookup
 from .completion_action_planner import (
     CompletionActionPlanner,
     has_review_exchange_errors,
@@ -141,17 +143,20 @@ class CompletionHandler:
         open_issue_corpus: "OpenIssueCorpusManager",
         active_session_run_id: Callable[[int], str | None],
         provider_availability: "ProviderAvailabilityPolicy",
+        tech_lead_run_activity: "TechLeadRunActivity",
         remove_session_machine_fn: Callable[[str], None] | None = None,
         label_manager: "LabelManager | None" = None,
     ):
         self.config = config
         self.events = events
         self.repository_host = repository_host
+        self._pr_lookup = CompletionPrLookup(repository_host)
         self._get_issue_machine = get_issue_machine_fn
         self._get_session_machine = get_session_machine_fn
         self._get_review_machine = get_review_machine_fn
         self._session_output = session_output
         self._tech_lead_authority = tech_lead_authority
+        self._tech_lead_run_activity = tech_lead_run_activity
         self._remove_session_machine = remove_session_machine_fn
         if label_manager is None:
             from .label_manager import LabelManager
@@ -218,7 +223,10 @@ class CompletionHandler:
         review_exchange_halted = review_exchange_halted or has_review_exchange_errors(processing_errors)
 
         # Fetch PR info if completed (or use hint from completion processor)
-        pr_url, pr_number, pr_infos = self._fetch_pr_info(session, status, pr_url_hint=pr_url_hint)
+        resolved_pr = self._pr_lookup.for_session(session, status, pr_url_hint=pr_url_hint)
+        pr_url, pr_number, pr_infos = (
+            resolved_pr.url, resolved_pr.number, resolved_pr.pull_requests,
+        )
         if pr_infos:
             self._emit_pr_view_changed(
                 pr_infos[0],
@@ -336,6 +344,10 @@ class CompletionHandler:
             self.config, self._tech_lead_authority, session,
             processing_errors=processing_errors,
         )
+        # ADR-0033's run record is NOT closed here: the authoritative terminal
+        # status does not exist until required tech-lead actions have applied, so
+        # it closes in ``finalize_terminal_outcome`` beside the other post-apply
+        # terminal commits (#6858 round 1 F3).
 
         result = CompletionResult(
             history_entry=history_entry,
@@ -491,96 +503,6 @@ class CompletionHandler:
             return []
         return [str(label) for label in labels]
 
-    def _fetch_pr_info(
-        self,
-        session: Session,
-        status: SessionStatus,
-        pr_url_hint: Optional[str] = None,
-    ) -> tuple[Optional[str], Optional[int], Optional[list[Any]]]:
-        """Fetch PR info for a completed session.
-
-        Returns ``(pr_url, pr_number, prs_list)``; ``pr_url_hint`` short-circuits
-        the branch lookup (dry-run mode).
-        """
-        pr_url = None
-        pr_number = None
-        prs = None
-
-        if status != SessionStatus.COMPLETED:
-            return pr_url, pr_number, prs
-
-        if session.key.task == TaskKind.RETROSPECTIVE_REVIEW:
-            return None, None, None
-
-        if pr_url_hint:
-            return self._fetch_pr_info_from_hint(session, pr_url_hint)
-
-        return self._fetch_pr_info_from_branch_or_review_fallback(session)
-
-    def _fetch_pr_info_from_hint(
-        self,
-        session: Session,
-        pr_url_hint: str,
-    ) -> tuple[Optional[str], Optional[int], Optional[list[Any]]]:
-        pr_url = pr_url_hint
-        pr_number: Optional[int] = None
-        prs: Optional[list[Any]] = None
-
-        match = re.search(r"/pull/(\d+)", pr_url)
-        if match:
-            pr_number = int(match.group(1))
-            try:
-                pr_info = self.repository_host.get_pr(pr_number)
-            except Exception as e:
-                logger.warning("Failed to fetch PR %s for PR hint: %s", pr_number, e)
-            else:
-                if pr_info:
-                    prs = [pr_info]
-
-        logger.info(
-            "[PR_HINT] Using PR from completion processor: %s (number=%s)",
-            pr_url,
-            pr_number,
-            extra=log_context(issue_key=session.key.issue.stable_id(), session_id=session.terminal_id),
-        )
-        return pr_url, pr_number, prs
-
-    def _fetch_pr_info_from_branch_or_review_fallback(
-        self,
-        session: Session,
-    ) -> tuple[Optional[str], Optional[int], Optional[list[Any]]]:
-        logger.debug("[ADAPTER] Using GitHubAdapter for get_prs_for_branch")
-        start = time.monotonic()
-        pr_infos = self.repository_host.get_prs_for_branch(session.branch_name)
-        duration = time.monotonic() - start
-        logger.info(
-            "Fetched PRs for branch in %.2fs: branch=%s count=%d",
-            duration,
-            session.branch_name,
-            len(pr_infos),
-            extra=log_context(issue_key=session.key.issue.stable_id(), session_id=session.terminal_id),
-        )
-        if pr_infos:
-            return pr_infos[0].url, pr_infos[0].number, list(pr_infos)
-
-        if session.pr_number is None:
-            return None, None, None
-
-        try:
-            review_pr = self.repository_host.get_pr(session.pr_number)
-        except Exception as e:
-            logger.warning(
-                "Failed to fetch PR %s for review session fallback: %s",
-                session.pr_number,
-                e,
-            )
-            return None, None, None
-
-        if review_pr:
-            return review_pr.url, review_pr.number, [review_pr]
-
-        return None, None, None
-
     def _create_history_entry(
         self,
         session: Session,
@@ -628,21 +550,26 @@ class CompletionHandler:
         *,
         blocked_reason: Optional[str] = None,
         completion_detail: Optional[dict[str, Any]] = None,
+        processing_errors: Optional[list[str]] = None,
     ) -> None:
-        """Commit BOTH terminal consumers from the ONE effective status post-apply.
+        """Commit EVERY terminal consumer from the ONE effective status post-apply.
 
-        The terminal trace event and the cached ``SessionStateMachine`` transition
-        are the two terminal-outcome commits. ``handle_session_completion`` defers
-        both out of ``process_completion`` (``finalize_terminal=False``) and calls
-        this once with ``effective_terminal_status(history_status, outcome)`` so a
-        failed mandated reset ends the machine FAILED and emits one SESSION_FAILED —
-        never a false COMPLETED neither consumer can retract (#6777).
+        The terminal trace event, the cached ``SessionStateMachine`` transition and
+        ADR-0033's local run record are the terminal-outcome commits.
+        ``handle_session_completion`` defers them out of ``process_completion``
+        (``finalize_terminal=False``) and calls this once with
+        ``effective_terminal_status(history_status, outcome)`` so a failed mandated
+        reset ends the machine FAILED, emits one SESSION_FAILED, and records the run
+        as FAILED — never a false COMPLETED no consumer can retract (#6777, #6858).
         """
         self.emit_trace_events(
             session, effective_status, pr_url, pr_number,
             blocked_reason=blocked_reason, completion_detail=completion_detail,
         )
         self._update_state_machines(session, effective_status, pr_url)
+        self._tech_lead_run_activity.note_concluded(
+            session, effective_status, processing_errors=processing_errors,
+        )
 
     def emit_trace_events(
         self,

@@ -22,6 +22,7 @@ from issue_orchestrator.control.actions import AddLabelAction, RemoveLabelAction
 from issue_orchestrator.control.completion_handler import CompletionHandler
 from issue_orchestrator.control.completion_processor import CompletionProcessor
 from issue_orchestrator.control.open_issue_corpus import OpenIssueCorpusManager
+from issue_orchestrator.control.tech_lead_run_activity import in_memory_run_activity
 from issue_orchestrator.control.session_controller import SessionController
 from issue_orchestrator.domain.models import AgentConfig, Issue, Session, SessionStatus
 from issue_orchestrator.domain.models import CompletionOutcome
@@ -478,6 +479,7 @@ def test_publish_failure_multi_attempt_contract(tmp_path: Path, lm: LabelManager
         ),
         active_session_run_id=lambda _n: None,
         provider_availability=make_provider_availability(config),
+        tech_lead_run_activity=in_memory_run_activity(),
     )
 
     for _ in range(3):

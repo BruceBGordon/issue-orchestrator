@@ -1196,7 +1196,7 @@ async def get_review_artifact_content(
     artifact_path: str | None = None,
     artifact_type: str | None = None,
 ) -> JSONResponse:
-    """Return one run-scoped review report or decision artifact."""
+    """Return one run-scoped report/decision artifact (reviewer or tech lead)."""
     if not orchestrator:
         return JSONResponse({"error": "Orchestrator not running"}, status_code=503)
     if not run_dir:

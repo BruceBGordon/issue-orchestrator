@@ -122,7 +122,7 @@ class OpenReviewArtifactCommand(LifecycleBase):
     issue_number: int
     run_dir: str
     artifact_path: str
-    artifact_type: Literal["review_report", "review_decision"]
+    artifact_type: Literal["review_report", "review_decision", "tech_lead_report", "tech_lead_decision"]  # reviewer + tech-lead pairs (#6858 F4)
     render_mode: Literal["markdown", "json"]
 
 

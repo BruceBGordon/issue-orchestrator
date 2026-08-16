@@ -18,6 +18,7 @@ from issue_orchestrator.control.completion_handler import (
 )
 from issue_orchestrator.control.label_manager import LabelManager
 from issue_orchestrator.control.open_issue_corpus import OpenIssueCorpusManager
+from issue_orchestrator.control.tech_lead_run_activity import in_memory_run_activity
 from issue_orchestrator.control.reconciliation import (
     ExternalSnapshot,
     ReconciliationRequired,
@@ -41,6 +42,7 @@ from issue_orchestrator.domain.models import (
     SessionStatus,
 )
 from issue_orchestrator.domain.session_key import SessionKey, TaskKind
+from issue_orchestrator.domain.tech_lead_run_record import TechLeadRunPhase
 from issue_orchestrator.domain.state_machines.session_machine import (
     SessionState,
     SessionStateMachine,
@@ -543,6 +545,72 @@ class TestCompletionPipelineEligibility:
         assert entry.status == "failed"
 
 
+def _terminal_outcome_session(tmp_path, *, tech_lead_scope=None) -> Session:
+    """The session the effective-terminal-outcome tests complete.
+
+    ``tech_lead_scope`` stamps it as a tech-lead RUN, which is what makes the
+    local run record apply to it (#6858 F3).
+    """
+    issue = Issue(
+        number=17, title="Broken issue", labels=["agent:tech-lead"], repo="owner/repo"
+    )
+    return Session(
+        key=SessionKey(issue=FakeIssueKey("17"), task=TaskKind.CODE),
+        issue=issue,
+        agent_config=AgentConfig(
+            prompt_path=tmp_path / "prompt.md", timeout_minutes=45
+        ),
+        terminal_id="issue-17",
+        worktree_path=tmp_path / "worktree",
+        branch_name="17-fix",
+        lease_id="lease-17",
+        run_assets=make_session_run_assets(
+            tmp_path / "worktree", session_name="issue-17"
+        ),
+        tech_lead_scope=tech_lead_scope,
+    )
+
+
+def _terminal_outcome_handler(
+    events: InMemoryEventSink,
+    *,
+    mandated_action: ResetRetryIssueAction | None,
+    session_machine: SessionStateMachine | None = None,
+    run_activity=None,
+) -> CompletionHandler:
+    """The REAL completion handler, optionally carrying one mandated reset."""
+    repository_host = MagicMock()
+    repository_host.get_prs_for_branch.return_value = []
+    repository_host.get_pr.return_value = None
+    repository_host.get_issue_labels_fresh.return_value = []
+    session_output = MagicMock(spec=SessionOutput)
+    session_output.find_run_dir.return_value = None
+    session_output.attach_claude_log.return_value = None
+    session_output.get_log_path_for_run_dir.return_value = None
+    config = Config()
+    return _HandlerWithMandatedReset(
+        config=config,
+        events=events,
+        repository_host=repository_host,
+        get_issue_machine_fn=lambda _issue: None,
+        get_session_machine_fn=lambda _terminal_id: session_machine,
+        get_review_machine_fn=lambda _pr_number: None,
+        session_output=session_output,
+        tech_lead_authority=InMemoryTechLeadAuthorityStore(),
+        open_issue_corpus=OpenIssueCorpusManager(
+            repository_host,
+            InMemoryOpenIssueCorpusStore(),
+            is_enabled=lambda: config.tech_lead.dedup.enabled,
+        ),
+        active_session_run_id=lambda _issue_number: None,
+        provider_availability=make_provider_availability(config),
+        tech_lead_run_activity=(
+        run_activity if run_activity is not None else in_memory_run_activity()
+    ),
+        mandated_action=mandated_action,
+    )
+
+
 class _HandlerWithMandatedReset(CompletionHandler):
     """Real ``CompletionHandler`` that may also carry one decision-mandated reset
     action (standing in for the tech_lead decision that planned it), so the REAL
@@ -574,23 +642,7 @@ class TestEffectiveTerminalOutcomeEvents:
     the injected executor decides whether it commits."""
 
     def _session(self, tmp_path) -> Session:
-        issue = Issue(
-            number=17, title="Broken issue", labels=["agent:tech-lead"], repo="owner/repo"
-        )
-        return Session(
-            key=SessionKey(issue=FakeIssueKey("17"), task=TaskKind.CODE),
-            issue=issue,
-            agent_config=AgentConfig(
-                prompt_path=tmp_path / "prompt.md", timeout_minutes=45
-            ),
-            terminal_id="issue-17",
-            worktree_path=tmp_path / "worktree",
-            branch_name="17-fix",
-            lease_id="lease-17",
-            run_assets=make_session_run_assets(
-                tmp_path / "worktree", session_name="issue-17"
-            ),
-        )
+        return _terminal_outcome_session(tmp_path)
 
     def _real_handler(
         self,
@@ -599,32 +651,10 @@ class TestEffectiveTerminalOutcomeEvents:
         mandated_action: ResetRetryIssueAction | None,
         session_machine: SessionStateMachine | None = None,
     ) -> CompletionHandler:
-        repository_host = MagicMock()
-        repository_host.get_prs_for_branch.return_value = []
-        repository_host.get_pr.return_value = None
-        repository_host.get_issue_labels_fresh.return_value = []
-        session_output = MagicMock(spec=SessionOutput)
-        session_output.find_run_dir.return_value = None
-        session_output.attach_claude_log.return_value = None
-        session_output.get_log_path_for_run_dir.return_value = None
-        config = Config()
-        return _HandlerWithMandatedReset(
-            config=config,
-            events=events,
-            repository_host=repository_host,
-            get_issue_machine_fn=lambda _issue: None,
-            get_session_machine_fn=lambda _terminal_id: session_machine,
-            get_review_machine_fn=lambda _pr_number: None,
-            session_output=session_output,
-            tech_lead_authority=InMemoryTechLeadAuthorityStore(),
-            open_issue_corpus=OpenIssueCorpusManager(
-                repository_host,
-                InMemoryOpenIssueCorpusStore(),
-                is_enabled=lambda: config.tech_lead.dedup.enabled,
-            ),
-            active_session_run_id=lambda _issue_number: None,
-            provider_availability=make_provider_availability(config),
+        return _terminal_outcome_handler(
+            events,
             mandated_action=mandated_action,
+            session_machine=session_machine,
         )
 
     def _run(
@@ -869,6 +899,135 @@ class TestEffectiveTerminalOutcomeEvents:
         manager = StateMachineManager(Config())
         manager.session_machines["issue-17"] = machine
         assert manager.get_session_machine("issue-17", 17) is not machine
+
+
+class TestTheDurableRunRecordAgreesWithTheTerminalOutcome:
+    """ADR-0033's run record is finalized from the POST-APPLY status (#6858 F3).
+
+    The record used to be written inside ``process_completion``, from the agent's
+    pre-apply intent. The completion pipeline does not compute the authoritative
+    ``effective_status`` until the decision's required tech-lead actions have been
+    applied, and deliberately finalizes the terminal event, the state machine and
+    the history from THAT. So a mandated reset that failed — or an apply that
+    raised — ended the session FAILED while the activity panel had already stored
+    COMPLETED, and the store's once-only guard made that first answer permanent.
+
+    These drive the REAL pipeline end to end and compare the DURABLE phase against
+    the emitted terminal event and the history entry.
+    """
+
+    def _activity(self):
+        from issue_orchestrator.control.tech_lead_run_activity import (
+            TechLeadRunActivity,
+        )
+        from issue_orchestrator.ports.tech_lead_run_artifact_archive import (
+            DiscardedTechLeadRunArtifacts,
+        )
+        from issue_orchestrator.ports.tech_lead_run_record_store import (
+            InMemoryTechLeadRunRecordStore,
+        )
+
+        store = InMemoryTechLeadRunRecordStore()
+        return store, TechLeadRunActivity(store, DiscardedTechLeadRunArtifacts())
+
+    def _complete(self, tmp_path, *, events, activity, applier=None, executor=None):
+        """Open a tech-lead run's record, then complete it through the pipeline."""
+        from issue_orchestrator.domain.tech_lead_session import (
+            TechLeadLaunchScope,
+            TechLeadSessionFlavor,
+        )
+
+        session = _terminal_outcome_session(
+            tmp_path,
+            tech_lead_scope=TechLeadLaunchScope(
+                flavor=TechLeadSessionFlavor.FAILURE_INVESTIGATION
+            ),
+        )
+        activity.note_started(session)
+        state = OrchestratorState()
+        state.active_sessions = [session]
+        if applier is None:
+            applier = ActionApplier(
+                labels=MagicMock(),
+                sessions=MagicMock(),
+                events=MagicMock(),
+                repository_host=MagicMock(),
+            )
+            applier.tech_lead_reset_retry = executor
+        session_output = MagicMock(spec=SessionOutput)
+        session_output.attach_claude_log.return_value = None
+        handle_session_completion(
+            session=session,
+            status=SessionStatus.COMPLETED,
+            state=state,
+            completion_handler=_terminal_outcome_handler(
+                events,
+                mandated_action=make_action(issue_number=17, anchor_issue_number=17),
+                run_activity=activity,
+            ),
+            action_applier=applier,
+            observer=MagicMock(),
+            worktree_manager=None,
+            kill_session_fn=lambda _x: None,
+            config=Config(),
+            session_output=session_output,
+            claim_manager=MagicMock(),
+            events=events,
+            pending_work_claims=_test_claim_store(),
+        )
+        return state
+
+    def test_a_failed_mandated_action_records_the_run_failed(self, tmp_path):
+        """In-band failure: the agent intended completion, the reset did not commit."""
+        events = InMemoryEventSink()
+        store, activity = self._activity()
+        executor, _events, _run_reset = make_executor(
+            outcome=ResetRetryRunOutcome(success=False, error="branch delete exploded")
+        )
+
+        state = self._complete(
+            tmp_path, events=events, activity=activity, executor=executor
+        )
+
+        (record,) = store.recent(limit=5)
+        assert record.phase is TechLeadRunPhase.FAILED
+        # ...and that phase agrees with every other terminal consumer:
+        assert events.get_events(EventName.SESSION_COMPLETED.value) == []
+        assert len(events.get_events(EventName.SESSION_FAILED.value)) == 1
+        assert [entry.status for entry in state.session_history] == ["failed"]
+
+    def test_a_raised_apply_records_the_run_failed(self, tmp_path):
+        """Aborted apply: finalization still runs, so the record still agrees."""
+        events = InMemoryEventSink()
+        store, activity = self._activity()
+        raised = ClaimLostError(issue_number=17, operation="add_label")
+
+        with pytest.raises(ClaimLostError):
+            self._complete(
+                tmp_path,
+                events=events,
+                activity=activity,
+                applier=_RaisingApplier(raised),
+            )
+
+        (record,) = store.recent(limit=5)
+        assert record.phase is TechLeadRunPhase.FAILED
+        assert events.get_events(EventName.SESSION_COMPLETED.value) == []
+        assert len(events.get_events(EventName.SESSION_FAILED.value)) == 1
+
+    def test_a_committed_mandated_action_records_the_run_completed(self, tmp_path):
+        """The control: a run whose required action committed IS completed."""
+        events = InMemoryEventSink()
+        store, activity = self._activity()
+        executor, _events, _run_reset = make_executor(
+            outcome=ResetRetryRunOutcome(success=True)
+        )
+
+        self._complete(tmp_path, events=events, activity=activity, executor=executor)
+
+        (record,) = store.recent(limit=5)
+        assert record.phase is TechLeadRunPhase.COMPLETED
+        assert len(events.get_events(EventName.SESSION_COMPLETED.value)) == 1
 
 
 def _test_claim_store(tmp_path=None):

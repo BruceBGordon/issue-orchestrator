@@ -38,6 +38,21 @@ Canonical source: `src/issue_orchestrator/infra/sqlite_registry.py`
 - **Open Issue Corpus**: `.issue-orchestrator/state/open_issue_corpus.sqlite`
   - Code: `src/issue_orchestrator/infra/open_issue_corpus_store.py`
 
+- **Tech Lead Runs**: `.issue-orchestrator/state/tech_lead_runs.sqlite`
+  - Code: `src/issue_orchestrator/infra/tech_lead_run_record_store.py`
+  - ADR-0033's LOCAL run history: what tech-lead runs this engine executed, what
+    they concluded, and where their preserved artifacts are. Nothing deletes
+    these rows and nothing can rebuild them (the runs ran in worktrees that no
+    longer exist), so it is backed up and pragma-enforced like every other
+    authoritative store.
+  - Preserved run artifacts sit beside it at
+    `.issue-orchestrator/state/tech-lead-runs/<run>/`
+    (`src/issue_orchestrator/infra/tech_lead_run_artifact_archive.py`) — copied
+    out of the run's disposable worktree at its terminal seam. Unlike the rows,
+    those BYTES are bounded: symlinks/oversized files are refused, each archive
+    is staged then swapped in atomically, and retention keeps the newest
+    `ARCHIVE_RETENTION` runs, retiring the matching record locators as it prunes.
+
 ## Registry and maintenance
 
 - Registry: `src/issue_orchestrator/infra/sqlite_registry.py`

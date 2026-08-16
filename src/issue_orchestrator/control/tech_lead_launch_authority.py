@@ -60,6 +60,7 @@ if TYPE_CHECKING:
     from ..domain.models import OrchestratorState, Session
     from ..infra.config import Config
     from ..ports import EventSink, Issue, RepositoryHost
+    from .tech_lead_run_activity import TechLeadRunActivity
     from .tech_lead_run_ownership import TechLeadRunOwnership
 
 logger = logging.getLogger(__name__)
@@ -102,6 +103,7 @@ class TechLeadLaunchAuthority:
         is_blocking_any: "Callable[[Sequence[str]], bool]",
         events: "EventSink",
         launch: "Callable[[PendingTechLeadReview], Optional[Session]]",
+        activity: "TechLeadRunActivity",
     ) -> None:
         self._state = state
         self._config = config
@@ -110,6 +112,7 @@ class TechLeadLaunchAuthority:
         self._is_blocking_any = is_blocking_any
         self._events = events
         self._launch = launch
+        self._activity = activity
 
     def launch(self, tech_lead: PendingTechLeadReview) -> "Optional[Session]":
         """Start ``tech_lead`` if — and only if — it may still start."""
@@ -126,6 +129,11 @@ class TechLeadLaunchAuthority:
             # immediately; leaving it would make every other tech-lead run wait
             # out a lease for a session that never started.
             self._ownership.end_run(scope.run_key)
+            return None
+        # ADR-0033: the run's LOCAL record opens here, at the same single gate
+        # that guarantees one session per run — so the history can never show a
+        # run this authority refused, nor miss one it allowed (#6858).
+        self._activity.note_started(session)
         return session
 
     # ------------------------------------------------------------------

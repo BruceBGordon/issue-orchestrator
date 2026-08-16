@@ -90,6 +90,13 @@ def terminate_tech_lead_session(
     run_released = attempt(
         lambda: _release_run_hold(deps, session), "release the tech-lead run"
     )
+    # The local record is closed on the same terminal, for the same reason the
+    # hold is: no further tick runs after this, so a record left at RUNNING
+    # would sit on the activity surface forever claiming work that stopped
+    # (ADR-0033 / #6858).
+    attempt(
+        _void(lambda: _close_run_record(deps, session)), "close the run record"
+    )
 
     worktrees = getattr(deps, "worktree_manager", None)
     disposable = bool(
@@ -146,6 +153,25 @@ def _release_run_hold(deps: object, session: "Session") -> bool:
             " be handed back"
         )
     return ownership.end_run(scope.run_key).released
+
+
+def _close_run_record(deps: object, session: "Session") -> None:
+    """Mark the terminated session's local run record withdrawn.
+
+    The activity owner is a REQUIRED composition dependency (#6858 round 1 A2),
+    so a missing one is a wiring error and fails loudly here — the same rule the
+    run hold above follows. Reporting a clean withdrawal when nothing recorded it
+    is how the activity surface ends up claiming stopped work is still running.
+    The effect runner around this call already isolates the failure so one broken
+    receipt cannot abort the rest of the cleanup.
+    """
+    activity = getattr(deps, "tech_lead_run_activity", None)
+    if activity is None:
+        raise RuntimeError(
+            "no tech-lead run activity owner is wired, so the terminated run's"
+            " local record cannot be closed"
+        )
+    activity.note_withdrawn(session)
 
 
 def _void(effect: Callable[[], object]) -> Callable[[], Optional[bool]]:

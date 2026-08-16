@@ -116,6 +116,7 @@ export interface DashboardDataPayload {
   repo: string;
   repoRoot: string;
   startupComplete: boolean;
+  techLeadActivity: TechLeadActivityPayload;
   validationConfigured: boolean;
   [key: string]: any;
 }
@@ -704,7 +705,7 @@ export interface OpenIssueTimelineCommandPayload {
 
 export interface OpenReviewArtifactCommandPayload {
   artifact_path: string;
-  artifact_type: "review_report" | "review_decision";
+  artifact_type: "review_report" | "review_decision" | "tech_lead_report" | "tech_lead_decision";
   issue_number: number;
   kind: "open_review_artifact";
   label: string;
@@ -1185,6 +1186,11 @@ export interface SwitchE2ETimelineViewCommandPayload {
   view: TimelineView;
 }
 
+export interface TechLeadActivityPayload {
+  emptyMessage: string;
+  entries: TechLeadRunActivityEntryPayload[];
+}
+
 export interface TechLeadGlobalHealthReviewScopePayload {
   kind: "global_health_review";
 }
@@ -1192,6 +1198,28 @@ export interface TechLeadGlobalHealthReviewScopePayload {
 export interface TechLeadIssueScopePayload {
   issue_number: number;
   kind: "issue";
+}
+
+export interface TechLeadRunActivityEntryPayload {
+  anchorIssueNumber: number;
+  artifacts: TechLeadRunArtifactCommandPayload[];
+  artifactsNote: string;
+  detail: string;
+  endedAt: string;
+  findings: number;
+  flavorLabel: string;
+  phase: "running" | "completed" | "needs_human" | "failed" | "withdrawn";
+  phaseLabel: string;
+  proposals: number;
+  runId: string;
+  runKey: string;
+  sessionName: string;
+  startedAt: string;
+  subjectIssueNumber: number;
+  subjectKind: "issue" | "board" | "pr_manifest";
+  subjectLabel: string;
+  subjectTitle: string;
+  tone: "active" | "good" | "warn" | "bad" | "muted";
 }
 
 export interface TechLeadRunAdmissionPayload {
@@ -1362,6 +1390,8 @@ export type ReviewStagePayload = ReviewNotReachedPayload | ReviewSkippedPayload 
 export type ReviewTranscriptEvidencePayload = ReviewTranscriptAvailablePayload | ReviewTranscriptUnavailablePayload;
 
 export type SessionRecordingEvidencePayload = SessionRecordingAvailablePayload | SessionRecordingUnavailablePayload;
+
+export type TechLeadRunArtifactCommandPayload = OpenSessionRecordingCommandPayload | OpenReviewArtifactCommandPayload;
 
 export type TechLeadRunScopePayload = TechLeadGlobalHealthReviewScopePayload | TechLeadIssueScopePayload;
 

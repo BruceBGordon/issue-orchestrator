@@ -78,13 +78,93 @@ coordination requires a *shared* (i.e. GitHub) point.
   folding failure-investigation into the unified run model; a footprint config
   knob.
 
+## Implementation status
+
+- **Shared coordination — done (#6994).** `TechLeadRunLedgerStore` is the
+  minimal shared mechanism: one compare-and-swap ledger cell, not an issue per
+  run. `TechLeadRunOwnership` applies claim + lease + stale detection, and
+  `TechLeadLaunchAuthority` is the single gate a session may start behind. The
+  three flavors are unified under one run model whose scopes
+  (`GlobalHealthReviewScope`, `GlobalBatchReviewScope`,
+  `IssueInvestigationScope`) *reference* their subject.
+- **Local visibility — done (#6858).** `TechLeadRunRecord` is the run as the
+  winning engine remembers it: scope, phase, what it produced, and the session
+  run identity a replay drill-down needs. It is opened by the launch authority
+  and concluded from the **post-apply effective terminal status** — the same
+  value the terminal trace event, the cached state machine and the session
+  history are finalized from — so a run whose mandated action failed is never
+  recorded as completed. Its subject comes from the canonical run **scope**, and
+  the bookkeeping anchor a whole-repository run was coordinated *through* is
+  recorded separately as an anchor: the shared coordination half must not
+  masquerade as the local subject.
+  It is stored in its own SQLite file (`tech_lead_runs.sqlite`) — deliberately
+  not in the authority store, whose rows are load-bearing and deleted at each
+  run's terminal — registered in the repository SQLite registry for startup
+  integrity checks, pragma enforcement and backups.
+- **The artifacts, not just the summary — done (#6858).** A run writes its
+  evidence map, decision, report and terminal recording inside its worktree, and
+  a failure investigation's worktree is disposable scratch that completion always
+  removes. `TechLeadRunArtifactArchive` therefore copies the run's inspectable set
+  into an engine-owned directory
+  (`.issue-orchestrator/state/tech-lead-runs/<run>/`) at the terminal seam,
+  preserving the run-relative layout, and the record carries a typed
+  `TechLeadRunArtifacts` locator. `TechLeadActivityView` publishes that as the
+  dashboard's existing typed inspection commands (`open_session_recording`,
+  `open_review_artifact`), so the panel's buttons route through the one lifecycle
+  dispatcher and the browser never reconstructs a path. The whole activity
+  payload — container, entry, and the command union — is declared on the UI
+  OpenAPI boundary, so the generated Python and TypeScript clients can name what
+  the browser consumes instead of receiving it as an untyped extra.
+  The archive is a BOUNDED owner, because its source is agent-authored and its
+  destination is the operator's state volume:
+  - the archive is handed a typed `TechLeadRunSource` (run identity + the
+    engine-created worktree it is trusted relative to), never a naked path, and it
+    reaches the run directory by descending that run's own component NAMES from
+    the worktree with `O_DIRECTORY | O_NOFOLLOW` — so a renamed run directory with
+    a symlink left in its place, or a swapped `.issue-orchestrator`/`sessions`,
+    cannot redirect the copy at another run or out of the worktree. Those names
+    are validated and frozen at construction: no `..`/`.`/empty component, and
+    exactly this run's own artifact directory, because the archive names its
+    durable destination from the identity while reading bytes from the directory
+    and a source allowed to disagree would file one run's evidence under another
+    run's receipt. `canonical_run_dir_name` in `domain/session_run.py` owns that
+    one relationship, and `SessionRunAssets` binds it too — so a restart whose
+    worktree manifest was rewritten is skipped rather than crossed with another
+    run;
+  - below the anchor it opens every component `O_NOFOLLOW | O_NONBLOCK` relative
+    to its parent (the non-blocking open is what keeps a FIFO from parking a
+    completing run's terminal seam), streaming from the descriptor it validated
+    against both the per-file cap and the aggregate bytes still unspent — the same
+    discipline
+    `control/validation_record_containment.py` applies to a single agent-supplied
+    file, extracted for trees as `infra/contained_artifact_copy.py`. Nothing is
+    reopened by pathname, so a file or ancestor swapped under the walk cannot
+    redirect a read outside the run, and the byte ceiling is enforced on bytes
+    READ so an appender cannot outgrow its admission;
+  - discovery is iterative, lazy, and capped on entries, directories and depth, so
+    a pathological tree costs a refused branch rather than the engine; one
+    unreadable child never costs the artifacts already admitted;
+  - per-file/aggregate/count caps apply and log what they drop;
+  - a copy is staged in a PID-owned sibling directory and swapped in only when
+    complete, so a failed retry cannot destroy a complete receipt.
+    `reconcile()` restores a receipt a crash left renamed aside and reclaims
+    scratch owned by processes that are gone — never a live engine's active stage;
+  - retention keeps the newest runs while REPORTING what it removed, and the
+    activity owner retires the matching record locators in the same breath, so no
+    row advertises a drill-down into a directory that is gone.
+- Writes on both are best-effort by contract: the run's product is its proposals,
+  and losing the receipt must never lose the run. Because the *store* cannot know
+  whether losing durability is acceptable, it fails loudly on an unusable
+  database and the composition root makes the call — logging the loss and
+  selecting the in-memory implementation, so a read-only state directory can
+  never stop the Repository Engine from starting.
+
 ## Open questions
 
-- **Minimal coordination mechanism**: one long-lived reused "tech-lead
-  coordination" object, a claim label, or a lock — whichever coordinates across
-  instances with the least board footprint.
-- Where the local run-record lives (a local store + dashboard multi-source
-  rendering).
+- **Footprint config knob.** The whole-repository anchor issue is still a real
+  GitHub object. Now that the run record exists, the anchor's remaining job is
+  coordination — which the ledger already does — so retiring it (or making it
+  config-opt-in, per the decision above) is the next step. Tracked separately.
 
 ## Alternatives considered
 

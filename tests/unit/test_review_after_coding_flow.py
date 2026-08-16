@@ -81,6 +81,9 @@ def make_completion_handler(config: Config, repository_host) -> CompletionHandle
         InMemoryOpenIssueCorpusStore,
     )
     from issue_orchestrator.control.open_issue_corpus import OpenIssueCorpusManager
+    from issue_orchestrator.control.tech_lead_run_activity import (
+        in_memory_run_activity,
+    )
 
     return CompletionHandler(
         config=config,
@@ -98,6 +101,7 @@ def make_completion_handler(config: Config, repository_host) -> CompletionHandle
         ),
         active_session_run_id=lambda _n: None,
         provider_availability=make_provider_availability(config),
+        tech_lead_run_activity=in_memory_run_activity(),
     )
 
 

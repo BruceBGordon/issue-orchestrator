@@ -3,6 +3,9 @@
 # ruff: noqa: F403,F405,SLF001
 
 from issue_orchestrator.events.catalog import EVENT_SCHEMA_VERSION
+from issue_orchestrator.ports.tech_lead_run_record_store import (
+    NO_TECH_LEAD_RUN_HISTORY,
+)
 from issue_orchestrator.ports.provider_resilience import NO_PROVIDER_CIRCUIT_STATUS
 from tests.unit import test_web as _support
 from tests.unit.route_helpers import iter_route_paths
@@ -412,6 +415,7 @@ class TestIssueRowsEndpoint:
                 # required facade property (issue #5980 F2/A1); a stub must
                 # supply one explicitly rather than default to "healthy".
                 self.provider_circuit = NO_PROVIDER_CIRCUIT_STATUS
+                self.tech_lead_run_history = NO_TECH_LEAD_RUN_HISTORY
 
         original = get_orchestrator()
         set_orchestrator(OrchestratorStub())
@@ -446,6 +450,7 @@ class TestIssueRowsEndpoint:
                 # required facade property (issue #5980 F2/A1); a stub must
                 # supply one explicitly rather than default to "healthy".
                 self.provider_circuit = NO_PROVIDER_CIRCUIT_STATUS
+                self.tech_lead_run_history = NO_TECH_LEAD_RUN_HISTORY
 
         original = get_orchestrator()
         set_orchestrator(OrchestratorStub())

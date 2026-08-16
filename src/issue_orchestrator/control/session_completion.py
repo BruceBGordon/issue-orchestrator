@@ -413,6 +413,7 @@ def handle_session_completion(  # noqa: C901, PLR0912 - handles validation, acti
         result.pr_number,
         blocked_reason=blocked_reason,
         completion_detail=completion_detail,
+        processing_errors=processing_errors,
     )
     # completed_today is a success gate: record only on a clean EFFECTIVE completion.
     if effective_status == SessionStatus.COMPLETED:

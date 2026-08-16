@@ -4521,27 +4521,36 @@ def test_a_rewritten_run_identity_is_refused_rather_than_read_as_absent(
 ) -> None:
     """Rows are validated against the identity they were asked for.
 
-    The identity comes from the worktree manifest, which the agent can write.
-    Refusing here is what turns a rewritten manifest into a quarantined
-    terminal rather than a silently claimless one.
+    A run root whose RECORDED identity disagrees with the run asking for it — a
+    recycled run directory, or a row written by a different run — is quarantined
+    rather than read as claimless. The tamper is applied to the durable row here
+    because assets carrying an identity that disagrees with their own directory
+    can no longer be assembled at all (#6858 round 7 F17): ``SessionRunAssets``
+    binds the pair, so this store's check is the second lock rather than the first.
     """
-    from dataclasses import replace as dc_replace
+    import sqlite3
 
+    from issue_orchestrator.execution.pending_work_claim_store import STORE_FILENAME
     from issue_orchestrator.execution.pending_work_codec import (
         PendingWorkClaimDecodeError,
     )
+    from issue_orchestrator.infra.repo_identity import state_dir
 
     store = _claims(tmp_path)
     run = _run(tmp_path)
     store.hold_pending_work_claim(
         run, issue_number=7, claim=_claim("tech_lead", _pending_state("tech_lead"))
     )
-    renamed = dc_replace(
-        run, identity=dc_replace(run.identity, session_name="rework-9")
+    tampered = sqlite3.connect(state_dir(tmp_path) / STORE_FILENAME)
+    tampered.execute(
+        "UPDATE pending_work_claim SET session_name = ? WHERE run_key = ?",
+        ("rework-9", os.path.normpath(str(run.run_dir))),
     )
+    tampered.commit()
+    tampered.close()
 
     with pytest.raises(PendingWorkClaimDecodeError, match="rework-9"):
-        store.look_up_pending_work_claim(renamed)
+        store.look_up_pending_work_claim(run)
 
 
 def test_an_undecodable_claim_is_never_read_as_absent(tmp_path: Path) -> None:

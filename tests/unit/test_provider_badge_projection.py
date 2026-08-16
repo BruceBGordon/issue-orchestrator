@@ -19,6 +19,9 @@ from unittest.mock import MagicMock
 from issue_orchestrator.control.label_manager import LabelManager
 from issue_orchestrator.domain.models import AgentConfig, Issue, OrchestratorState
 from issue_orchestrator.infra.config import Config
+from issue_orchestrator.ports.tech_lead_run_record_store import (
+    NO_TECH_LEAD_RUN_HISTORY,
+)
 from issue_orchestrator.ports.provider_resilience import NO_PROVIDER_CIRCUIT_STATUS
 from issue_orchestrator.view_models.dashboard import build_dashboard_view_model
 from issue_orchestrator.view_models.dashboard_flow import (
@@ -59,6 +62,7 @@ def _cards(config: Config, issues: list[Issue]) -> dict[int, dict]:
     view_model = build_dashboard_view_model(
         _OrchestratorStub(config, issues),
         provider_circuit=NO_PROVIDER_CIRCUIT_STATUS,
+        tech_lead_history=NO_TECH_LEAD_RUN_HISTORY,
         active_tab="flow",
         e2e_status_provider=lambda _: {"enabled": False, "running": False},
     )
