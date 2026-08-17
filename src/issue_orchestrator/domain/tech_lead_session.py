@@ -849,6 +849,28 @@ class TechLeadCaseFileSummary:
 
 
 @dataclass(frozen=True)
+class GatedTechLeadProposal:
+    """One OPEN issue observed carrying the operator-approval gate (#7014).
+
+    LABEL truth about the approval backlog, as opposed to ledger truth. Every
+    gated-proposal producer attaches ``PROPOSED_TECH_LEAD_LABEL`` — act-level op
+    proposals (#6778), promoted findings (#6957), and plain follow-up issues
+    (ADR-0031 §2) — but only act-level op proposals leave a
+    ``tech_lead_proposal_ops`` row. So the ledger alone can never answer "what
+    is waiting on the operator?", and a projection that trusts only the ledger
+    renders an empty approval backlog while gated issues pile up on GitHub.
+
+    Carries what the tick's ALREADY-observed issues can say about one gated
+    issue (zero extra GitHub calls): its number, its title, and when it was
+    filed — enough for the board to rank the backlog by wait time.
+    """
+
+    issue_number: int
+    title: str
+    created_at: str = ""  # ISO timestamp; "" when the observed source lacks it
+
+
+@dataclass(frozen=True)
 class TechLeadShippedFixSummary:
     """One area-tagged fix observed at the canonical PR-merge boundary.
 

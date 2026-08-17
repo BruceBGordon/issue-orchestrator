@@ -1571,7 +1571,7 @@ class TestFactGatheringAndPlanning:
             authority, signature="anchor-close", issue_number=65, observations=2
         )
 
-        facts = _fact_gatherer(config, authority).gather_tech_lead_facts(_state())
+        facts = _fact_gatherer(config, authority).gather_tech_lead_facts(_state(), board_issues=[])
 
         assert facts is not None
         assert [item.evidence.signature for item in facts.promotable_findings] == [
@@ -1588,7 +1588,7 @@ class TestFactGatheringAndPlanning:
         authority.record_promotion(promotion=_promotion("other"))
 
         facts = _fact_gatherer(config, authority, target).gather_tech_lead_facts(
-            _state()
+            _state(), board_issues=[]
         )
 
         # Nothing armed: no facts at all, and no cross-repo read was attempted.
@@ -1641,7 +1641,7 @@ class TestFactGatheringAndPlanning:
 
         facts = _fact_gatherer(
             config, authority, InMemoryPromotionTargetHost()
-        ).gather_tech_lead_facts(_state())
+        ).gather_tech_lead_facts(_state(), board_issues=[])
 
         assert facts is not None
         assert facts.promotion_updates == (

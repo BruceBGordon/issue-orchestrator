@@ -24,6 +24,7 @@ from .session_run import SessionRunAssets
 from .tech_lead_findings import PromotionUpdate, PromotableFinding, SettledPromotion
 from .tech_lead_session import (
     ApprovedTechLeadOp,
+    GatedTechLeadProposal,
     TechLeadCaseFileSummary,
     TechLeadLaunchScope,
     TechLeadSessionFlavor,
@@ -1477,6 +1478,13 @@ class TechLeadFacts:
     # a fresh targeted read before discarding. Surfacing these as a fact keeps
     # fact gathering read-only (#6779 R10).
     absent_proposal_op_candidates: tuple[int, ...] = field(default_factory=tuple)
+    # The operator-approval backlog as LABEL truth (#7014): every OPEN issue the
+    # tick observed carrying the proposed-tech-lead gate, whether or not an op
+    # ledger row backs it. Promoted findings and plain follow-up proposals carry
+    # the same gate with no ledger row, so this is the only fact that can say
+    # how many approvals are actually pending. Projected onto the operator board
+    # beside the ledger rows; no planning reads it (approval is a human act).
+    gated_proposals: tuple["GatedTechLeadProposal", ...] = field(default_factory=tuple)
     # Open pattern case files (#6781): observation-labeled issues classified
     # from the SAME anchor scan. Projected into the board snapshot so health
     # reviews mine accumulated evidence, and into the tech_lead board file.

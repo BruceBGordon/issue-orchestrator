@@ -1365,7 +1365,7 @@ class TestPlanTechLeadIssueCreation:
         host.list_issues.return_value = []
 
         facts = FactGatherer(config=config, repository_host=host).gather_tech_lead_facts(
-            OrchestratorState()
+            OrchestratorState(), board_issues=[]
         )
         assert facts is not None
         assert facts.pr_count == 0

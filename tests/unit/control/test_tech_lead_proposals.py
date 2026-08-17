@@ -32,6 +32,7 @@ from issue_orchestrator.control.tech_lead_proposals import (
     build_op_ledger,
     build_tech_lead_proposal_issue_action,
     finalize_tech_lead_op_execution,
+    observe_gated_tech_lead_proposals,
     plan_approved_tech_lead_op_executions,
     reconcile_tech_lead_proposals,
 )
@@ -256,6 +257,72 @@ def test_reconcile_flags_ledger_row_absent_from_scan_as_candidate_only() -> None
     assert reconciled.approved == ()
     assert reconciled.anchor_candidate_issues == []
     assert reconciled.absent_op_issue_numbers == (501,)
+
+
+# --- Approval backlog: label truth (#7014) --------------------------------
+
+
+def test_backlog_includes_a_gated_issue_with_no_ledger_row() -> None:
+    """The #7014 defect: only act-level proposals leave a ledger row.
+
+    Promoted findings and proposed follow-up issues carry the same gate with no
+    ``tech_lead_proposal_ops`` row, so a backlog derived from the ledger reports
+    nothing pending while they wait on the operator.
+    """
+    promoted = _issue(6922, ["agent:backend", PROPOSED_TECH_LEAD_LABEL], title="Fix seam")
+
+    [pending] = observe_gated_tech_lead_proposals([promoted])
+
+    assert (pending.issue_number, pending.title) == (6922, "Fix seam")
+
+
+def test_backlog_excludes_issues_without_the_gate() -> None:
+    ungated = _issue(7, ["agent:backend"])
+    approved = _issue(8, ["agent:tech-lead"])  # gate removed = approved
+
+    assert observe_gated_tech_lead_proposals([ungated, approved]) == ()
+
+
+def test_backlog_folds_gate_label_case() -> None:
+    """R15: GitHub folds label names, so a canonical spelling still gates."""
+    canonical = Issue(
+        number=500, title="t", labels=["agent:tech-lead", "Proposed-Tech-Lead"]
+    )
+
+    assert [p.issue_number for p in observe_gated_tech_lead_proposals([canonical])] == [500]
+
+
+def test_backlog_excludes_a_closed_gated_issue() -> None:
+    """A closed proposal was rejected or already handled: nobody is waiting."""
+    closed = Issue(
+        number=500, title="t", labels=[PROPOSED_TECH_LEAD_LABEL], state="closed"
+    )
+
+    assert observe_gated_tech_lead_proposals([closed]) == ()
+
+
+def test_backlog_unions_observed_sets_and_orders_by_issue_number() -> None:
+    """Callers pass whatever open-issue sets the tick already holds."""
+    board = [_issue(7008, [PROPOSED_TECH_LEAD_LABEL]), _issue(6922, [PROPOSED_TECH_LEAD_LABEL])]
+    scan = [_issue(500, [PROPOSED_TECH_LEAD_LABEL]), _issue(6922, [PROPOSED_TECH_LEAD_LABEL])]
+
+    backlog = observe_gated_tech_lead_proposals(board, scan)
+
+    # Deduplicated by issue number, ordered by it, deterministic.
+    assert [p.issue_number for p in backlog] == [500, 6922, 7008]
+
+
+def test_backlog_carries_the_filing_time_the_board_ages_it_by() -> None:
+    filed = Issue(
+        number=6922,
+        title="t",
+        labels=[PROPOSED_TECH_LEAD_LABEL],
+        created_at="2026-07-28T00:00:00+00:00",
+    )
+
+    [pending] = observe_gated_tech_lead_proposals([filed])
+
+    assert pending.created_at == "2026-07-28T00:00:00+00:00"
 
 
 # --- Confirm-and-discard owner (#6779 R7/R10) -----------------------------

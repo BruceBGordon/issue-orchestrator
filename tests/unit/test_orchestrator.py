@@ -2298,7 +2298,7 @@ class TestGatherTechLeadFacts:
     """Test the fact_gatherer.gather_tech_lead_facts method for tech_lead review workflow.
 
     Tech Lead issue creation is now handled by the Planner via:
-    - fact_gatherer.gather_tech_lead_facts() gathers TechLeadFacts snapshot
+    - fact_gatherer.gather_tech_lead_facts(, board_issues=[]) gathers TechLeadFacts snapshot
     - fact_gatherer.create_snapshot() includes tech_lead_facts
     - Planner._plan_tech_lead_issue_creation() decides whether to create
     """
@@ -2310,7 +2310,7 @@ class TestGatherTechLeadFacts:
         sample_config.tech_lead_review_threshold = 5
 
         orchestrator = create_test_orchestrator(sample_config, mock_repository_host)
-        facts = orchestrator.deps.fact_gatherer.gather_tech_lead_facts(orchestrator.state)
+        facts = orchestrator.deps.fact_gatherer.gather_tech_lead_facts(orchestrator.state, board_issues=[])
         assert facts is None
 
     def test_gather_tech_lead_facts_returns_none_with_zero_threshold(self, sample_config, mock_repository_host):
@@ -2320,7 +2320,7 @@ class TestGatherTechLeadFacts:
         sample_config.tech_lead_review_threshold = 0
 
         orchestrator = create_test_orchestrator(sample_config, mock_repository_host)
-        facts = orchestrator.deps.fact_gatherer.gather_tech_lead_facts(orchestrator.state)
+        facts = orchestrator.deps.fact_gatherer.gather_tech_lead_facts(orchestrator.state, board_issues=[])
         assert facts is None
 
     def test_gather_tech_lead_facts_returns_facts_below_threshold(self, sample_config, mock_repository_host):
@@ -2336,7 +2336,7 @@ class TestGatherTechLeadFacts:
         ]
 
         orchestrator = create_test_orchestrator(sample_config, mock_repository_host)
-        facts = orchestrator.deps.fact_gatherer.gather_tech_lead_facts(orchestrator.state)
+        facts = orchestrator.deps.fact_gatherer.gather_tech_lead_facts(orchestrator.state, board_issues=[])
 
         # Facts should be returned (Planner decides whether to act)
         assert facts is not None
@@ -2359,7 +2359,7 @@ class TestGatherTechLeadFacts:
         mock_repository_host.issues = []
 
         orchestrator = create_test_orchestrator(sample_config, mock_repository_host)
-        facts = orchestrator.deps.fact_gatherer.gather_tech_lead_facts(orchestrator.state)
+        facts = orchestrator.deps.fact_gatherer.gather_tech_lead_facts(orchestrator.state, board_issues=[])
 
         assert facts is not None
         assert facts.pr_count == 3
@@ -2385,7 +2385,7 @@ class TestGatherTechLeadFacts:
         mock_repository_host.issues = [existing_issue]
 
         orchestrator = create_test_orchestrator(sample_config, mock_repository_host)
-        facts = orchestrator.deps.fact_gatherer.gather_tech_lead_facts(orchestrator.state)
+        facts = orchestrator.deps.fact_gatherer.gather_tech_lead_facts(orchestrator.state, board_issues=[])
 
         assert facts is not None
         assert facts.existing_tech_lead_issue == 100
@@ -2405,7 +2405,7 @@ class TestGatherTechLeadFacts:
         mock_repository_host.issues = []
 
         orchestrator = create_test_orchestrator(sample_config, mock_repository_host)
-        facts = orchestrator.deps.fact_gatherer.gather_tech_lead_facts(orchestrator.state)
+        facts = orchestrator.deps.fact_gatherer.gather_tech_lead_facts(orchestrator.state, board_issues=[])
 
         assert facts is not None
         assert len(facts.prs) == 2
@@ -2884,7 +2884,7 @@ class TestPauseBehavior:
     # NOTE: test_check_tech_lead_review_trigger_does_nothing_when_paused was removed
     # because check_tech_lead_review_trigger() was refactored. The pause behavior is now
     # handled by the Planner via the paused flag in OrchestratorSnapshot. The
-    # _gather_tech_lead_facts() method just gathers facts regardless of pause state;
+    # _gather_tech_lead_facts(, board_issues=[]) method just gathers facts regardless of pause state;
     # the Planner decides whether to act on them.
 
     @pytest.fixture(autouse=True)

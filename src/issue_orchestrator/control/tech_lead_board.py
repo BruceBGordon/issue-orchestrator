@@ -7,7 +7,10 @@ facts, never decisions:
 
 1. retain the latest open case-file facts behind a read-only injected reader
    so the board snapshot builder projects the ledger into later snapshots;
-2. render the operator-facing tech_lead board markdown
+2. render the operator-facing tech_lead board markdown — including the
+   approval backlog, which unions the durable op ledger with the gate labels
+   this tick observed, so a gated proposal with no ledger row is still
+   visible to the operator who has to approve it (#7014);
    (:mod:`..view_models.tech_lead_board`) and write it to
    ``.issue-orchestrator/state/tech-lead-board.md``, throttled by content
    comparison — the render is deterministic and hour-granular, so unchanged
@@ -89,7 +92,7 @@ class TechLeadBoardPublisher:
             self._case_files = facts.open_case_files
         try:
             rendered = render_tech_lead_board_md(
-                self._build_view(last_health_review_at)
+                self._build_view(facts, last_health_review_at)
             )
         except Exception:
             logger.warning("[tech-lead-board] Failed to render board", exc_info=True)
@@ -107,9 +110,20 @@ class TechLeadBoardPublisher:
         self._last_rendered = rendered
         logger.debug("[tech-lead-board] Board written: %s", self._board_path)
 
-    def _build_view(self, last_health_review_at: float) -> "TechLeadBoardView":
+    def _build_view(
+        self, facts: "TechLeadFacts", last_health_review_at: float
+    ) -> "TechLeadBoardView":
+        """Union the durable op ledger with THIS tick's observed gate labels.
+
+        The gated proposals are taken straight from the facts rather than
+        retained across ticks like the case-file projection: they are observed
+        from the board the tick always fetches, so every publish carries a
+        complete, current backlog — and a retained one would keep advertising a
+        proposal the operator has already approved (#7014).
+        """
         return build_tech_lead_board_view(
             ops=self._authority.list_ops() if self._authority is not None else (),
+            gated_proposals=facts.gated_proposals,
             case_files=self._case_files,
             area_counts=case_file_area_counts(self._case_files),
             last_health_review_at=last_health_review_at,

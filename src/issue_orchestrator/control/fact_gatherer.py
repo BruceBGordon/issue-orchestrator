@@ -23,7 +23,7 @@ Usage:
 import logging
 import re
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional, TYPE_CHECKING
 
@@ -46,6 +46,7 @@ from .tech_lead_artifact_retention import (
     clear_discovered_facts as _clear_discovered_facts,
     tech_lead_problem_artifact_hold_issue_numbers,
 )
+from .tech_lead_proposals import observe_gated_tech_lead_proposals
 from .tech_lead_reaction import storm_possible
 
 # Compatibility export: this policy lived in fact_gatherer before it gained a
@@ -224,7 +225,7 @@ class FactGatherer:
         # discovered_failures is captured below, so the reaction model sees the
         # recovered failures this tick (a next-tick capture would be dropped by
         # the end-of-tick discovered-fact clear).
-        tech_lead_facts = self.gather_tech_lead_facts(state)
+        tech_lead_facts = self.gather_tech_lead_facts(state, board_issues=issues)
         tech_lead_subjects = self.gather_tech_lead_subject_facts(state, issues)
         cleanup_facts = self.gather_cleanup_facts(state)
         e2e_occupies_slot, e2e_due = self._read_e2e_slot_facts()
@@ -343,11 +344,17 @@ class FactGatherer:
     def gather_tech_lead_facts(
         self,
         state: "OrchestratorState",
+        *,
+        board_issues: Sequence["Issue"],
         now: float | None = None,
     ) -> Optional["TechLeadFacts"]:
         """Gather facts for the tech_lead batch and health-review triggers.
 
-        Three independent triggers can each produce facts (only the case where
+        ``board_issues`` is the tick's already-fetched runnable board, required
+        rather than optional so this can never silently report an EMPTY approval
+        backlog because a caller forgot to hand over its observation (#7014).
+
+        Four independent triggers can each produce facts (only the case where
         none is active yields None):
           * BATCH fields, gated by ``tech_lead_review_threshold`` (via the watch
             label);
@@ -362,6 +369,11 @@ class FactGatherer:
             reconciled whenever it holds an op — INDEPENDENT of the batch
             review threshold (#6779 R12), so a manual-approval / default
             (threshold=0) proposal still advances and self-heals.
+          * APPROVAL-BACKLOG fields, armed by observing a gate-labeled open
+            issue on the board (#7014). This one costs no read at all — the
+            board is already in hand — and it arms independently so a repo
+            whose only tech-lead activity is a pile of gated proposals still
+            publishes an operator board that shows them.
 
         GitHub API discipline shapes every read here: due-ness and storm
         possibility are pure state/config math computed FIRST, so a health-only
@@ -428,6 +440,13 @@ class FactGatherer:
             target=self.promotion_target,
             read_budget=self.promotion_read_budget,
         )
+        # LABEL truth about the approval backlog, read off the board the tick
+        # already fetched (#7014). Every gated-proposal producer attaches the
+        # gate; only act-level ops leave a ledger row, so this — not ``ops`` —
+        # is what can say how many approvals are pending. It also ARMS fact
+        # production: a board holding gated proposals must publish a board that
+        # shows them even when nothing else about tech_lead is active.
+        gated_proposals = observe_gated_tech_lead_proposals(board_issues)
         if (
             not batch_armed
             and not health_armed
@@ -436,6 +455,7 @@ class FactGatherer:
             and not promotable
             and not promotion_updates
             and not settled
+            and not gated_proposals
         ):
             return None
 
@@ -493,6 +513,7 @@ class FactGatherer:
             existing_health_review_issue=existing_health_review_issue,
             approved_tech_lead_ops=approved_ops,
             absent_proposal_op_candidates=absent_op_candidates,
+            gated_proposals=gated_proposals,
             open_case_files=case_files,
             case_files_scanned=case_files_scanned,
             promotable_findings=promotable,

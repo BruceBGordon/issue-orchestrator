@@ -150,6 +150,13 @@ Semantics:
   most once — the op row is discarded after terminal handling (outcome
   comment + close on execution, or stale-downgrade comment + close).
   Per-instance approval and config-level trust coexist.
+  **Backlog visibility (amended by #7014).** The op ledger is not the approval
+  backlog: only act-level proposals leave a row, while `create_issue`
+  proposals and promoted findings (#6957) carry the same gate with none. The
+  local tech lead board therefore projects the backlog from the **gate label**
+  observed on the tick's open issues, unioned with the ledger for the
+  operation an approval will execute. "Open proposals: None." must never be
+  printable while a `proposed-tech-lead` issue is open.
 - **Durable pattern case files (amended by #6781).** `flag_pattern` under
   `execute` is no longer event-only. Each flag_pattern action carries a
   required `pattern_signature` (a short stable slug; a decision without one is
