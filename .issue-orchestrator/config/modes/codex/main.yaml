@@ -1,0 +1,244 @@
+# Codex-only mode: every agent runs on codex, and nothing runs on Claude.
+#
+# The strict mirror of `modes/claude/main.yaml`. Use it to run the whole
+# pipeline on one provider when the Anthropic side is rate-limited or its
+# monthly spend cap has tripped, and to A/B a full Codex pipeline against the
+# full Claude one with every other setting held constant.
+#
+# Modes have NO inheritance: each config file is complete and standalone. This
+# file is a copy of `modes/default/main.yaml` and differs from it ONLY in the
+# `agents` section — the four Claude agents (backend, frontend, mobile,
+# tech-lead) move to codex; reviewer and goal-pilot were already codex and are
+# untouched. Everything else (validation, review, merge queue, tech lead, e2e,
+# hooks) is deliberately identical, so a diff against the default mode should
+# show agent provider/model lines and nothing more. Keep it that way: any
+# non-agent change belongs in every mode file or in none.
+
+repo:
+  name: issue-orchestrator/issue-orchestrator
+  github:
+    app:
+      client_id: "Iv23lijSPfPiSZ4Dmgjz"
+      app_id: "4250697"
+      installation_id: "145305179"
+      private_key_path: "~/.config/issue-orchestrator/github-apps/issue-orchestrator-bot.private-key.pem"
+
+worktrees:
+  base: "../"
+  worktree_branch_on_recreate: delete
+  setup:
+    - make worktree-setup
+
+agents:
+  agent:backend:
+    prompt: repo-specific/prompts/simple-fix.md
+    provider: "codex"
+    ai_system: "codex"
+    model: "gpt-5.6-sol"
+    timeout_minutes: 90
+    reviewer: "agent:reviewer"
+    provider_args:
+      approval_mode: "full-auto"
+      sandbox: "workspace-write"
+      reasoning_effort: "xhigh"
+  agent:frontend:
+    prompt: repo-specific/prompts/simple-fix.md
+    provider: "codex"
+    ai_system: "codex"
+    model: "gpt-5.6-sol"
+    timeout_minutes: 90
+    reviewer: "agent:reviewer"
+    provider_args:
+      approval_mode: "full-auto"
+      sandbox: "workspace-write"
+      reasoning_effort: "xhigh"
+  agent:mobile:
+    prompt: repo-specific/prompts/simple-fix.md
+    provider: "codex"
+    ai_system: "codex"
+    model: "gpt-5.6-sol"
+    timeout_minutes: 90
+    reviewer: "agent:reviewer"
+    provider_args:
+      approval_mode: "full-auto"
+      sandbox: "workspace-write"
+      reasoning_effort: "xhigh"
+  agent:reviewer:
+    prompt: repo-specific/prompts/reviewer.md
+    provider: "codex"
+    ai_system: "codex"
+    model: "gpt-5.6-sol"
+    timeout_minutes: 45
+    provider_args:
+      approval_mode: "full-auto"
+      sandbox: "workspace-write"
+      reasoning_effort: "xhigh"
+  agent:tech-lead:
+    prompt: repo-specific/prompts/tech-lead.md
+    provider: "codex"
+    ai_system: "codex"
+    model: "gpt-5.6-sol"
+    timeout_minutes: 90
+    reviewer: "agent:reviewer"
+    provider_args:
+      approval_mode: "full-auto"
+      sandbox: "workspace-write"
+      reasoning_effort: "xhigh"
+    initial_prompt: "Tech Lead review for issue #{issue_number}: {issue_title}. Follow the instructions in {prompt}. When done, use coding-done to report completion."
+  agent:goal-pilot:
+    prompt: repo-specific/prompts/goal-pilot.md
+    provider: codex
+    model: gpt-5.6-sol
+    ai_system: codex
+    provider_args:
+      approval_mode: full-auto
+      sandbox: workspace-write
+
+execution:
+  concurrency:
+    max_concurrent_sessions: 1
+    session_timeout_minutes: 160
+  terminal_adapter: subprocess
+
+review:
+  enabled: true
+  default: agent:reviewer
+  code_review_label: needs-code-review
+  code_reviewed_label: code-reviewed
+  max_rework_cycles: 10
+  # Fast coder-owned review before the independent external review.
+  internal:
+    enabled: true
+    max_rounds: 10
+    instructions: "repo-specific/prompts/internal-review.md"
+  nits:
+    default_policy: "address"
+    by_agent: {}
+  exchange:
+    # Persistent coder<->reviewer exchange (code default; explicit for clarity,
+    # matching tixmeup's config).
+    mode: "via-local-loop"
+  # Tech lead (ADR-0031): agent:tech-lead investigates failed/timed-out
+  # sessions and files/updates its findings. Act-level actions stay in shadow
+  # (propose) by default — see the `tech_lead.authority` dials below.
+  tech_lead_review_agent: agent:tech-lead
+  # Required companion: the worker a tech lead `create_issue` follow-up routes to.
+  tech_lead_follow_up_agent: agent:backend
+  tech_lead_review_on_failure: true
+  # tech_lead_review_threshold: 5   # (optional) batch-review after N code-reviewed PRs (0 = manual only)
+
+# Route approved PRs through GitHub's native merge queue instead of reworking
+# them merely for being behind base. Requires the repo's branch protection to
+# have the merge queue enabled; otherwise enqueue attempts fail (logged, not
+# fatal). Conflicts and failed required checks still go to rework.
+merge_queue:
+  enabled: true
+  provider: "github"
+  enqueue_after: "code-reviewed"
+  failure_action: "rework"
+
+cleanup:
+  with_tech_lead:
+    close_ai_session_tabs: true
+    remove_worktrees: true
+  without_tech_lead:
+    wait_for_code_review: true
+    close_ai_session_tabs: true
+    remove_worktrees: true
+
+validation:
+  quick:
+    cmd: make validate-quick
+    timeout_seconds: 600
+  publish:
+    cmd: make validate-pr-raw
+    # This repo's local publish gate runs the full PR validation slice
+    # (unit/integration/web/vscode) and routinely exceeds 300s on busy machines,
+    # even without any live agent work in the loop.
+    timeout_seconds: 1800
+    dirty_check: tracked
+  coverage_guardrail:
+    enabled: true
+    min_percent: 85
+    apply_to: changed
+    scope:
+      - "src/issue_orchestrator/**"
+      - "packages/agent_runner/src/**"
+    coverage_type: line
+    exclude:
+      - "src/issue_orchestrator/generated/**"
+
+filtering:
+  exclude_labels: ["io-e2e-test-data", "test-data"]
+  exclude_label_prefixes: ["io:e2e:"]
+
+tech_lead:
+  inherit_labels: ["io-e2e-test-data", "test-data"]
+  # Reserved concurrency for the tech lead. With max_concurrent_sessions: 1,
+  # a single long coding session would otherwise starve tech lead entirely. A separate
+  # additive budget of 1 slot lets the tech lead (health reviews, failure
+  # investigations, batch reviews) run even when the worker budget is saturated;
+  # total live agents are then bounded at max_concurrent_sessions + 1.
+  max_concurrent: 1
+  # Graduated act-level authority (ADR-0031). reset_retry is wired to the
+  # scratch-reset owner (#6764/#6777) and graduated to execute; kill_hung_session
+  # stays a gated proposal (execute is still a startup error until fully wired).
+  authority:
+    reset_retry: propose
+    # Auto-file create_issue follow-ups directly (the default), made explicit now
+    # that it is safe: duplicate proposals are deduped against the full open
+    # backlog (#6880 gate + #6882 trusted SQL corpus), so the tech lead cannot
+    # spam duplicates. The agent's duplicate_of is verified; a verified in-scope
+    # duplicate is commented onto the existing issue, otherwise the proposal is
+    # gated for human reconciliation rather than filed twice.
+    create_issue: execute
+  # Full-backlog create_issue dedup (#6878). Enabled by default; explicit here as
+  # the safety mechanism that lets create_issue: execute run unattended.
+  dedup:
+    enabled: true
+    similarity_threshold: 0.72
+  # Periodic "walk the board" health review — uses the single session slot when
+  # due (deduped, skips at capacity).
+  health_review:
+    interval_minutes: 60
+  # Tech-lead attention sweep (#6823): a bounded, timer-gated backstop that finds
+  # open issues stuck in a terminal blocking state the normal loop cannot
+  # re-discover and re-injects each into reactive tech_lead. Bounded per issue: after
+  # max_recovery_attempts it stops re-injecting and flags the issue as exhausted.
+  # Its scan is a BROAD exhaustive open-issue read, so it runs on a slow
+  # reconcile-backstop cadence (4h) — stranded issues are quiescent, so a few
+  # hours of recovery latency is fine and keeps the broad scan off the hot path.
+  stuck_sweep:
+    enabled: true
+    interval_minutes: 240
+    max_recovery_attempts: 3
+
+goal_pilot:
+  enabled: true
+  agent: agent:goal-pilot
+
+e2e:
+  enabled: true
+  auto_run_interval_minutes: 240
+  # occupies_session_slot: true  # Make E2E a first-class worker workload: it
+  # counts against max_concurrent_sessions (not the reserved tech lead slot),
+  # starts only with a free worker slot, and occupies one while running so the
+  # planner launches one fewer agent. Left off (default) = today's parallel
+  # behavior. Turn on only if a second orchestrator-sized workload is starving
+  # live agents on this machine.
+  runner_kind: pytest
+  pytest_args:
+    - tests/e2e
+    - -v
+    - --tb=short
+    - --junitxml=.issue-orchestrator/e2e-results/issue-orchestrator-e2e.xml
+  junit_xml_paths:
+    - .issue-orchestrator/e2e-results/issue-orchestrator-e2e.xml
+  allow_retry_once: true
+  quarantine_file: tests/e2e/quarantine.txt
+  survive_restart: true
+
+hooks:
+  ai_gate:
+    interval_days: 7
+    dangerous_allow_failure: false
