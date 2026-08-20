@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch, call, AsyncMock, PropertyMock
 from tests.conftest import MockSessionRunner
 from tests.conftest import operator_paused_state
+from issue_orchestrator.domain.pause_state import PauseActor, PauseReason
 from issue_orchestrator.infra.orchestrator import Orchestrator, run_orchestrator
 from issue_orchestrator.domain.models import (
     Issue,
@@ -113,7 +114,7 @@ class MockWorktreeManager:
 def test_pause_emits_event(sample_config):
     orchestrator = create_test_orchestrator(sample_config)
 
-    orchestrator.pause()
+    orchestrator.pause(reason=PauseReason.OPERATOR, actor=PauseActor.CONTROL_API)
 
     events = orchestrator.deps.events.get_events_by_name(str(EventName.ORCHESTRATOR_PAUSED))
     assert len(events) == 1
@@ -125,7 +126,7 @@ def test_resume_emits_event(sample_config):
     orchestrator = create_test_orchestrator(sample_config)
     orchestrator.state.pause_state = operator_paused_state()
 
-    orchestrator.resume()
+    orchestrator.resume(actor=PauseActor.CONTROL_API)
 
     events = orchestrator.deps.events.get_events_by_name(str(EventName.ORCHESTRATOR_RESUMED))
     assert len(events) == 1
@@ -2102,7 +2103,7 @@ class TestControlMethods:
 
         assert orchestrator.state.paused is False
 
-        orchestrator.pause()
+        orchestrator.pause(reason=PauseReason.OPERATOR, actor=PauseActor.CONTROL_API)
 
         assert orchestrator.state.paused is True
 
@@ -2111,7 +2112,7 @@ class TestControlMethods:
         orchestrator = create_test_orchestrator(sample_config)
         orchestrator.state.pause_state = operator_paused_state()
 
-        orchestrator.resume()
+        orchestrator.resume(actor=PauseActor.CONTROL_API)
 
         assert orchestrator.state.paused is False
 

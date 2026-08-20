@@ -13,11 +13,8 @@ import json
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
-from ..domain.pause_state import (
-    PauseActor,
-    PauseReason,
-    PauseTransitionStatus,
-)
+from ..domain.pause_state import PauseActor, PauseReason, PauseTransitionStatus
+from .pause_response import transition_response
 
 control_pause_router = APIRouter()
 
@@ -43,13 +40,6 @@ async def requested_actor(request: Request, default: PauseActor) -> PauseActor:
         return default
 
 
-def transition_response(
-    status: PauseTransitionStatus, actor: PauseActor
-) -> JSONResponse:
-    """The uniform reply for a pause/resume route, echoing the recorded actor."""
-    return JSONResponse({"status": str(status), "actor": str(actor)})
-
-
 @control_pause_router.post("/api/pause")
 async def pause(request: Request) -> JSONResponse:
     """Pause the orchestrator - stop launching new sessions."""
@@ -62,8 +52,8 @@ async def pause(request: Request) -> JSONResponse:
         return JSONResponse({"error": "Orchestrator not initialized"}, status_code=503)
 
     actor = await requested_actor(request, PauseActor.CONTROL_API)
-    orchestrator.pause(reason=PauseReason.OPERATOR, actor=actor)
-    return transition_response(PauseTransitionStatus.PAUSED, actor)
+    outcome = orchestrator.pause(reason=PauseReason.OPERATOR, actor=actor)
+    return transition_response(PauseTransitionStatus.PAUSED, outcome)
 
 
 @control_pause_router.post("/api/resume")
@@ -76,5 +66,5 @@ async def resume(request: Request) -> JSONResponse:
         return JSONResponse({"error": "Orchestrator not initialized"}, status_code=503)
 
     actor = await requested_actor(request, PauseActor.CONTROL_API)
-    orchestrator.resume(actor=actor)
-    return transition_response(PauseTransitionStatus.RESUMED, actor)
+    outcome = orchestrator.resume(actor=actor)
+    return transition_response(PauseTransitionStatus.RESUMED, outcome)

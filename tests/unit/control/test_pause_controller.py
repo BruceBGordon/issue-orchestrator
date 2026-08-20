@@ -79,8 +79,26 @@ class TestPauseStateInvariants:
             PauseState(paused=True)
 
     def test_running_state_cannot_carry_a_reason(self) -> None:
-        with pytest.raises(ValueError, match="carries no reason"):
+        with pytest.raises(ValueError, match="carries no pause provenance"):
             PauseState(paused=False, reason=PauseReason.OPERATOR)
+
+    @pytest.mark.parametrize(
+        "field",
+        [
+            {"since": START},
+            {"detail": "left over from an earlier pause"},
+            {"actor": PauseActor.SYSTEM},
+        ],
+    )
+    def test_running_state_rejects_every_paused_only_field(self, field) -> None:
+        """The invariant is symmetric.
+
+        Checking only reason/actor let ``PauseState(paused=False, since=...)``
+        through, which serialized a running engine with ``paused_since``
+        populated — a state that reads as "resumed, but paused since 09:37".
+        """
+        with pytest.raises(ValueError, match="carries no pause provenance"):
+            PauseState(paused=False, **field)
 
     def test_only_the_breaker_is_an_incident(self) -> None:
         assert PauseReason.LOOP_ERROR_THRESHOLD.is_incident is True
@@ -103,11 +121,13 @@ class TestPauseStateInvariants:
 class TestPauseProvenance:
     def test_pause_records_why_who_and_when(self) -> None:
         controller, events, _ = _controller()
-        state = controller.pause(
+        outcome = controller.pause(
             reason=PauseReason.LOOP_ERROR_THRESHOLD,
             actor=PauseActor.SYSTEM,
             detail="3 consecutive tick errors",
         )
+        assert outcome.committed is True
+        state = outcome.state
         assert state.paused is True
         assert state.reason is PauseReason.LOOP_ERROR_THRESHOLD
         assert state.actor is PauseActor.SYSTEM
@@ -271,10 +291,10 @@ class TestPauseJournalDurability:
         controller, _, _ = _controller(
             journal=JsonlPauseJournal(blocked / "nested" / "pause-journal.jsonl")
         )
-        state = controller.pause(
+        outcome = controller.pause(
             reason=PauseReason.LOOP_ERROR_THRESHOLD, actor=PauseActor.SYSTEM
         )
-        assert state.paused is True
+        assert outcome.state.paused is True
 
     def test_malformed_row_does_not_hide_the_rest(self, tmp_path: Path) -> None:
         path = tmp_path / "pause-journal.jsonl"
@@ -288,3 +308,173 @@ class TestPauseJournalDurability:
         journal.record(good)
 
         assert len(journal.recent(10)) == 2
+
+
+class TestTransitionOutcomeReportsWhatWasCommitted:
+    """Review finding 6: a response must not claim a transition that never happened."""
+
+    def test_duplicate_pause_reports_the_stored_actor_not_the_requester(self) -> None:
+        controller, events, _ = _controller()
+        controller.pause(
+            reason=PauseReason.LOOP_ERROR_THRESHOLD, actor=PauseActor.SYSTEM
+        )
+        outcome = controller.pause(
+            reason=PauseReason.OPERATOR, actor=PauseActor.MCP
+        )
+
+        assert outcome.committed is False
+        assert outcome.requested_actor is PauseActor.MCP
+        # What is actually on record — the breaker, not the MCP caller.
+        assert outcome.recorded_actor is PauseActor.SYSTEM
+        assert outcome.recorded_reason is PauseReason.LOOP_ERROR_THRESHOLD
+        # And no second event/journal row was produced.
+        assert len([e for e in events.events
+                    if e.name == EventName.ORCHESTRATOR_PAUSED]) == 1
+
+    def test_resume_while_running_is_not_committed(self) -> None:
+        controller, _, _ = _controller()
+        outcome = controller.resume(actor=PauseActor.WEB_API)
+        assert outcome.committed is False
+        assert outcome.recorded_actor is None
+
+    def test_committed_pause_reports_its_own_actor(self) -> None:
+        controller, _, _ = _controller()
+        outcome = controller.pause(
+            reason=PauseReason.OPERATOR, actor=PauseActor.DASHBOARD
+        )
+        assert outcome.committed is True
+        assert outcome.recorded_actor is PauseActor.DASHBOARD
+
+
+class TestAutoResumeIsAtomic:
+    """Review finding 5: the due-check and the transition must not be separable."""
+
+    def test_resume_if_due_will_not_lift_a_deliberate_pause(self) -> None:
+        """The exact interleaving: tick sees due -> operator re-pauses -> tick acts.
+
+        With a split check/act the tick's stale decision resumed an engine a
+        human had just deliberately stopped.
+        """
+        controller, _, clock = _controller()
+        controller.pause(
+            reason=PauseReason.LOOP_ERROR_THRESHOLD, actor=PauseActor.SYSTEM
+        )
+        clock.advance(61)
+        assert controller.due_for_auto_resume() is True  # the tick's observation
+
+        # Another thread resumes, then deliberately pauses.
+        controller.resume(actor=PauseActor.WEB_API)
+        controller.pause(reason=PauseReason.OPERATOR, actor=PauseActor.WEB_API)
+
+        # The tick now acts on its stale observation.
+        outcome = controller.resume_if_due(actor=PauseActor.SYSTEM)
+
+        assert outcome.committed is False
+        assert controller.paused is True
+        assert controller.state.reason is PauseReason.OPERATOR
+        assert controller.state.actor is PauseActor.WEB_API
+
+    def test_resume_if_due_commits_when_still_due(self) -> None:
+        controller, _, clock = _controller()
+        controller.pause(
+            reason=PauseReason.LOOP_ERROR_THRESHOLD, actor=PauseActor.SYSTEM
+        )
+        clock.advance(61)
+        outcome = controller.resume_if_due(actor=PauseActor.SYSTEM)
+        assert outcome.committed is True
+        assert controller.paused is False
+
+    def test_resume_if_due_is_a_no_op_before_the_backoff(self) -> None:
+        controller, _, clock = _controller()
+        controller.pause(
+            reason=PauseReason.LOOP_ERROR_THRESHOLD, actor=PauseActor.SYSTEM
+        )
+        clock.advance(30)
+        assert controller.resume_if_due(actor=PauseActor.SYSTEM).committed is False
+        assert controller.paused is True
+
+    def test_concurrent_resume_if_due_commits_exactly_once(self) -> None:
+        """Many threads racing the same due deadline must produce one transition."""
+        import threading
+
+        controller, events, clock = _controller()
+        controller.pause(
+            reason=PauseReason.LOOP_ERROR_THRESHOLD, actor=PauseActor.SYSTEM
+        )
+        clock.advance(61)
+
+        results: list[bool] = []
+        lock = threading.Lock()
+        barrier = threading.Barrier(8)
+
+        def attempt() -> None:
+            barrier.wait()
+            committed = controller.resume_if_due(actor=PauseActor.SYSTEM).committed
+            with lock:
+                results.append(committed)
+
+        threads = [threading.Thread(target=attempt) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert results.count(True) == 1, results
+        assert len([e for e in events.events
+                    if e.name == EventName.ORCHESTRATOR_RESUMED]) == 1
+
+
+class TestBreakerCountingIsOwnedPolicy:
+    """The consecutive-error count decides WHEN a pause happens, so the pause
+    owner holds it — exactly as the backoff ladder beside it decides when one
+    lifts. It used to be loop bookkeeping on the engine, split from the policy
+    it drives.
+    """
+
+    def test_breaker_trips_only_on_the_third_consecutive_failure(self) -> None:
+        controller, _, _ = _controller()
+        boom = RuntimeError("dns gone")
+
+        assert controller.note_tick_failure(boom) is None
+        assert controller.note_tick_failure(boom) is None
+        assert controller.paused is False
+
+        outcome = controller.note_tick_failure(boom)
+        assert outcome is not None and outcome.committed is True
+        assert controller.state.reason is PauseReason.LOOP_ERROR_THRESHOLD
+        assert "dns gone" in controller.state.detail
+
+    def test_a_healthy_tick_clears_the_budget(self) -> None:
+        """Two failures then a success must not leave the engine one away."""
+        controller, _, _ = _controller()
+        boom = RuntimeError("blip")
+        controller.note_tick_failure(boom)
+        controller.note_tick_failure(boom)
+
+        controller.note_healthy_tick()
+        assert controller.consecutive_tick_errors == 0
+
+        assert controller.note_tick_failure(boom) is None
+        assert controller.paused is False
+
+    def test_resume_restarts_the_error_budget(self) -> None:
+        """After a resume the next trip must earn its own three failures."""
+        controller, _, _ = _controller()
+        boom = RuntimeError("blip")
+        for _ in range(3):
+            controller.note_tick_failure(boom)
+        assert controller.paused is True
+
+        controller.resume(actor=PauseActor.WEB_API)
+        assert controller.consecutive_tick_errors == 0
+        assert controller.note_tick_failure(boom) is None
+        assert controller.paused is False
+
+    def test_failures_while_paused_do_not_re_pause(self) -> None:
+        controller, events, _ = _controller()
+        boom = RuntimeError("blip")
+        for _ in range(6):
+            controller.note_tick_failure(boom)
+
+        assert len([e for e in events.events
+                    if e.name == EventName.ORCHESTRATOR_PAUSED]) == 1

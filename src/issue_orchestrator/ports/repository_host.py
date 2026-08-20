@@ -38,6 +38,20 @@ class RepositoryHostError(Exception):
     kind: RepositoryHostErrorKind = "other"
 
 
+class RepositoryScanIncompleteError(RepositoryHostError):
+    """An exhaustive scan could not prove it saw everything.
+
+    Categorically different from "could not reach the host": the request
+    SUCCEEDED enough to reveal that the result would be a truncated or partial
+    view — a page cap exhausted, a mid-scan non-200, a malformed page. Callers
+    that degrade gracefully on an outage must still fail loud on this, because
+    acting on a silently-incomplete list is worse than not acting at all.
+
+    Declared at the port so control-layer policy can distinguish the two without
+    importing an adapter.
+    """
+
+
 def repository_host_failure_status(exc: RepositoryHostError) -> int:
     """Map repository-host failures to client-facing HTTP status codes."""
     status_code = getattr(exc, "status_code", None)

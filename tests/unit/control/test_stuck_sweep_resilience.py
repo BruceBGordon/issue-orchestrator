@@ -1,5 +1,9 @@
 """The stuck sweep must not spend the tick's error budget on a network blip.
 
+Driven through ``gather_tech_lead_facts`` — the public seam that owns the
+sweep — rather than the private helper, so these cover the boundary a real
+tick crosses.
+
 Regression cover for a real incident. The queue fetch runs its GitHub read under
 ``IssueFetchResilience``, so a transient DNS failure is absorbed there ("keeping
 cached queue; will retry next cycle"). The stuck sweep issues its OWN exhaustive
@@ -14,11 +18,18 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from issue_orchestrator.adapters.github.errors import GitHubAuthError
+from issue_orchestrator.adapters.github.errors import (
+    GitHubAuthError,
+    GitHubHttpError,
+    GitHubScanIncompleteError,
+)
 from issue_orchestrator.control.fact_gatherer import FactGatherer
 from issue_orchestrator.domain.models import OrchestratorState
 from issue_orchestrator.infra.config import Config
-from issue_orchestrator.ports.repository_host import RepositoryHostError
+from issue_orchestrator.ports.repository_host import (
+    RepositoryHostError,
+    RepositoryScanIncompleteError,
+)
 
 # The exact failure observed: a DNS drop while the host slept, surfaced as an
 # App-installation-token request failure.
@@ -58,7 +69,7 @@ class TestStuckSweepTransientFailure:
         state = OrchestratorState()
 
         # Must not raise.
-        gatherer._run_stuck_sweep_if_due(state, now=SWEEP_DUE_AT)
+        gatherer.gather_tech_lead_facts(state, now=SWEEP_DUE_AT)
 
     def test_failed_sweep_stays_due_so_the_next_tick_retries(self) -> None:
         """Not stamping the timer is what makes the skip a retry rather than a loss."""
@@ -70,7 +81,7 @@ class TestStuckSweepTransientFailure:
         state = OrchestratorState()
         before = state.last_stuck_sweep_at
 
-        gatherer._run_stuck_sweep_if_due(state, now=SWEEP_DUE_AT)
+        gatherer.gather_tech_lead_facts(state, now=SWEEP_DUE_AT)
 
         assert state.last_stuck_sweep_at == before
         assert stuck_sweep_due(_sweep_config(), state, SWEEP_DUE_AT) is True
@@ -82,7 +93,7 @@ class TestStuckSweepTransientFailure:
         gatherer = _gatherer(host)
 
         with pytest.raises(ValueError, match="a real bug"):
-            gatherer._run_stuck_sweep_if_due(OrchestratorState(), now=SWEEP_DUE_AT)
+            gatherer.gather_tech_lead_facts(OrchestratorState(), now=SWEEP_DUE_AT)
 
     def test_a_sweep_that_is_not_due_never_touches_the_network(self) -> None:
         host = MagicMock()
@@ -90,6 +101,59 @@ class TestStuckSweepTransientFailure:
         state = OrchestratorState()
         state.last_stuck_sweep_at = SWEEP_DUE_AT
 
-        gatherer._run_stuck_sweep_if_due(state, now=SWEEP_DUE_AT)
+        gatherer.gather_tech_lead_facts(state, now=SWEEP_DUE_AT)
 
         host.list_issues.assert_not_called()
+
+
+class TestCompletenessFailuresStillPropagate:
+    """Review finding 1: an outage is skippable; an unprovable scan is NOT.
+
+    ``stuck_sweep`` passes ``exhaustive=True`` precisely so a truncated read
+    fails loud. Catching every ``RepositoryHostError`` also swallowed those
+    completeness errors, so the sweep would retry forever while never actually
+    running — the opposite of the contract it asked for.
+    """
+
+    def test_page_cap_exhaustion_propagates(self) -> None:
+        host = MagicMock()
+        host.list_issues.side_effect = GitHubScanIncompleteError(
+            "open issues scan exceeded the 1000-item page cap; "
+            "cannot prove the list is complete",
+            method="GET",
+            url="/issues",
+        )
+        gatherer = _gatherer(host)
+
+        with pytest.raises(GitHubScanIncompleteError, match="cannot prove"):
+            gatherer.gather_tech_lead_facts(OrchestratorState(), now=SWEEP_DUE_AT)
+
+    def test_mid_scan_non_200_propagates(self) -> None:
+        host = MagicMock()
+        host.list_issues.side_effect = GitHubScanIncompleteError(
+            "GitHub returned status 502 while paging open issues (page 3); "
+            "refusing to treat the partial open issues as complete",
+            method="GET",
+            url="/issues",
+            status_code=502,
+        )
+        gatherer = _gatherer(host)
+
+        with pytest.raises(GitHubScanIncompleteError, match="refusing to treat"):
+            gatherer.gather_tech_lead_facts(OrchestratorState(), now=SWEEP_DUE_AT)
+
+    def test_completeness_error_is_a_repository_host_error(self) -> None:
+        """It must stay catchable by generic handlers while defeating the skip."""
+        err = GitHubScanIncompleteError("truncated")
+        assert isinstance(err, RepositoryHostError)
+        assert isinstance(err, RepositoryScanIncompleteError)
+        # Still an HTTP error, so existing adapter-level handlers keep working.
+        assert isinstance(err, GitHubHttpError)
+
+    def test_the_outage_case_is_still_skipped(self) -> None:
+        """The transient half of the classification must not regress."""
+        host = MagicMock()
+        host.list_issues.side_effect = DNS_DROP
+        gatherer = _gatherer(host)
+
+        gatherer.gather_tech_lead_facts(OrchestratorState(), now=SWEEP_DUE_AT)

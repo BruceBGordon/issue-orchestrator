@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional, Protocol
 
+from ..domain.pause_state import PauseActor
 from ..domain.repository_launch_selection import (
     RepositoryConfigurationIdentity,
     RepositoryLaunchSelection,
@@ -86,7 +87,9 @@ async def _passthrough_api_call(
 ) -> ActionResult:
     base_url = f"http://127.0.0.1:{port}"
     api = OrchestratorAsyncHttpApi(
-        base_url_provider=lambda: base_url, timeout_seconds=10.0
+        base_url_provider=lambda: base_url,
+        timeout_seconds=10.0,
+        pause_actor=PauseActor.CONTROL_CENTER,
     )
     try:
         if op == "pause":

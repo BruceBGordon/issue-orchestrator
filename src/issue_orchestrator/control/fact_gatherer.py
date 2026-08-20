@@ -29,7 +29,11 @@ from typing import Any, Callable, Optional, TYPE_CHECKING
 
 from ..infra.config import Config
 from ..events import EventName
-from ..ports.repository_host import RepositoryHost, RepositoryHostError
+from ..ports.repository_host import (
+    RepositoryHost,
+    RepositoryHostError,
+    RepositoryScanIncompleteError,
+)
 from ..ports import EventSink,  make_trace_event
 from .provider_launch_readiness import ProviderLaunchReadiness
 from .health_review_trigger import (
@@ -538,6 +542,14 @@ class FactGatherer:
                 open_proposal_targets=self._open_proposal_targets(),
                 provider_circuit_open=self.provider_circuit_open,
             )
+        except RepositoryScanIncompleteError:
+            # NOT skippable. The scan reached GitHub and discovered it could not
+            # prove completeness (page cap exhausted, mid-scan non-200, malformed
+            # page). `stuck_sweep` passes `exhaustive=True` precisely so a
+            # truncated read fails loud instead of silently starving older stuck
+            # issues; swallowing it here would retry forever while the
+            # authoritative sweep never actually ran.
+            raise
         except RepositoryHostError as error:
             # The sweep issues its own exhaustive `list_issues` read, OUTSIDE the
             # resilience guard that wraps the queue fetch. So a transient network
@@ -547,7 +559,7 @@ class FactGatherer:
             # halted the engine. Observed repeatedly: a DNS drop during host
             # sleep paused a healthy orchestrator for days.
             #
-            # Swallowing every RepositoryHostError here is safe because the
+            # Swallowing the remaining RepositoryHostErrors here is safe because the
             # sweep is not the system's auth detector: the queue fetch runs the
             # same credentials through IssueFetchResilience every cycle, and a
             # genuinely permanent auth/not-found failure still shuts the engine

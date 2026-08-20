@@ -24,7 +24,13 @@ from collections.abc import Callable
 from typing import Protocol
 from datetime import datetime, timedelta, timezone
 
-from ..domain.pause_state import PauseActor, PauseReason, PauseState, PauseTransition
+from ..domain.pause_state import (
+    PauseActor,
+    PauseReason,
+    PauseState,
+    PauseTransition,
+    PauseTransitionOutcome,
+)
 from ..events.catalog import EventName
 from ..events.context import EventContext
 from ..ports.event_sink import EventSink, make_trace_event
@@ -63,6 +69,10 @@ class PauseStateStore(Protocol):
 # climb the ladder rather than oscillating at the first rung forever.
 _AUTO_RESUME_BACKOFF_SECONDS: tuple[float, ...] = (60.0, 300.0, 900.0, 3600.0)
 
+# Consecutive failing ticks before the breaker trips. One blip is noise; three
+# in a row means the engine cannot make progress.
+_TICK_ERROR_LIMIT = 3
+
 
 class PauseController:
     """Owns pause/resume transitions and their observability fan-out.
@@ -95,6 +105,7 @@ class PauseController:
         self._lock = threading.Lock()
         self._auto_resume_at: datetime | None = None
         self._incident_streak = 0
+        self._consecutive_tick_errors = 0
 
     @property
     def state(self) -> PauseState:
@@ -112,11 +123,13 @@ class PauseController:
         actor: PauseActor,
         detail: str = "",
         emit_event: bool = True,
-    ) -> PauseState:
+    ) -> PauseTransitionOutcome:
         """Pause the engine, recording why and who.
 
-        Returns the resulting state. When already paused this is a no-op that
-        preserves the existing provenance — see the class docstring.
+        Returns an outcome whose ``committed`` flag says whether THIS call
+        performed the transition. When already paused this is a no-op that
+        preserves the existing provenance — see the class docstring — and the
+        outcome reports the stored actor, not the requested one.
         """
         now = self._clock()
         with self._lock:
@@ -128,7 +141,9 @@ class PauseController:
                     reason,
                     actor,
                 )
-                return current
+                return PauseTransitionOutcome(
+                    committed=False, state=current, requested_actor=actor
+                )
             new_state = PauseState.paused_now(
                 reason=reason, actor=actor, detail=detail, now=now
             )
@@ -165,18 +180,81 @@ class PauseController:
                     self._event_context.enrich(new_state.to_payload(now)),
                 )
             )
-        return new_state
+        return PauseTransitionOutcome(
+            committed=True, state=new_state, requested_actor=actor
+        )
 
-    def resume(self, *, actor: PauseActor, detail: str = "") -> PauseState:
+    def resume(
+        self, *, actor: PauseActor, detail: str = ""
+    ) -> PauseTransitionOutcome:
         """Resume the engine, recording who resumed it and what it was paused for."""
         now = self._clock()
         with self._lock:
-            previous = self._store.pause_state
-            if not previous.paused:
+            previous = self._claim_resume_locked()
+            if previous is None:
                 logger.debug("[PAUSE] Already running; ignoring resume from %s", actor)
-                return previous
-            self._store.pause_state = PauseState.running()
-            self._auto_resume_at = None
+                return PauseTransitionOutcome(
+                    committed=False,
+                    state=self._store.pause_state,
+                    requested_actor=actor,
+                )
+        return self._announce_resume(previous, actor=actor, detail=detail, now=now)
+
+    def resume_if_due(
+        self, *, actor: PauseActor, detail: str = ""
+    ) -> PauseTransitionOutcome:
+        """Atomically resume ONLY IF a half-open incident pause is still due.
+
+        The check and the transition must be one operation. Split apart, the
+        tick thread can observe an incident as due, an operator can resume and
+        then deliberately re-pause on another thread, and the tick's stale
+        decision then lifts that deliberate pause — silently restarting an
+        engine a human just stopped. Re-reading the deadline under the same lock
+        that performs the swap makes that interleaving impossible.
+        """
+        now = self._clock()
+        with self._lock:
+            if not self._is_auto_resume_due_locked(now):
+                return PauseTransitionOutcome(
+                    committed=False,
+                    state=self._store.pause_state,
+                    requested_actor=actor,
+                )
+            previous = self._claim_resume_locked()
+            if previous is None:  # pragma: no cover - implied by the due check
+                return PauseTransitionOutcome(
+                    committed=False,
+                    state=self._store.pause_state,
+                    requested_actor=actor,
+                )
+        logger.info("[PAUSE] Incident pause backoff elapsed (%s) — retrying",
+                    previous.describe(now))
+        return self._announce_resume(previous, actor=actor, detail=detail, now=now)
+
+    def _claim_resume_locked(self) -> PauseState | None:
+        """Swap paused -> running under the caller's lock.
+
+        Returns the previous paused state, or None if it was already running.
+        """
+        previous = self._store.pause_state
+        if not previous.paused:
+            return None
+        self._store.pause_state = PauseState.running()
+        self._auto_resume_at = None
+        # A resume restarts the error budget: the next trip must earn its own
+        # three failures rather than inheriting the ones that caused this pause.
+        self._consecutive_tick_errors = 0
+        return previous
+
+    def _announce_resume(
+        self,
+        previous: PauseState,
+        *,
+        actor: PauseActor,
+        detail: str,
+        now: datetime,
+    ) -> PauseTransitionOutcome:
+        """Log, journal, and publish a resume that has already been committed."""
 
         held = previous.held_seconds(now)
         logger.info(
@@ -202,16 +280,18 @@ class PauseController:
                 self._event_context.enrich(
                     {
                         "resumed_by": str(actor),
-                        "previous_pause_reason": (
-                            str(previous.reason) if previous.reason is not None else None
-                        ),
+                        # Non-null by construction: only a committed resume gets
+                        # here, and a paused state always carries a reason.
+                        "previous_pause_reason": str(previous.reason),
                         "paused_held_seconds": held,
                         "detail": detail,
                     }
                 ),
             )
         )
-        return self._store.pause_state
+        return PauseTransitionOutcome(
+            committed=True, state=self._store.pause_state, requested_actor=actor
+        )
 
     def due_for_auto_resume(self, now: datetime | None = None) -> bool:
         """Whether a half-open incident pause has waited out its backoff.
@@ -221,17 +301,52 @@ class PauseController:
         """
         moment = now if now is not None else self._clock()
         with self._lock:
-            if not self._store.pause_state.paused or self._auto_resume_at is None:
-                return False
-            return moment >= self._auto_resume_at
+            return self._is_auto_resume_due_locked(moment)
+
+    def _is_auto_resume_due_locked(self, now: datetime) -> bool:
+        """Due-ness predicate; assumes the caller holds the lock."""
+        if not self._store.pause_state.paused or self._auto_resume_at is None:
+            return False
+        return now >= self._auto_resume_at
+
+    def note_tick_failure(self, error: Exception) -> PauseTransitionOutcome | None:
+        """Count a failing tick and trip the breaker once they run consecutive.
+
+        The count lives here rather than on the engine because it IS pause
+        policy: it decides when a pause happens, exactly as the backoff ladder
+        beside it decides when one lifts. Returns the pause outcome when this
+        failure tripped the breaker, else None.
+        """
+        with self._lock:
+            self._consecutive_tick_errors += 1
+            count = self._consecutive_tick_errors
+            already_paused = self._store.pause_state.paused
+        if count < _TICK_ERROR_LIMIT or already_paused:
+            return None
+        return self.pause(
+            reason=PauseReason.LOOP_ERROR_THRESHOLD,
+            actor=PauseActor.SYSTEM,
+            detail=(
+                f"{count} consecutive tick errors; "
+                f"last: {type(error).__name__}: {error}"
+            ),
+        )
+
+    @property
+    def consecutive_tick_errors(self) -> int:
+        """How many ticks have failed back-to-back (for event payloads)."""
+        with self._lock:
+            return self._consecutive_tick_errors
 
     def note_healthy_tick(self) -> None:
         """Record that the engine completed a tick cleanly.
 
-        Resets the incident backoff ladder, so an engine that recovers is not
-        punished by the escalation earned during an earlier bad patch.
+        Clears the consecutive-error count and the incident backoff ladder, so
+        an engine that recovers is not punished by escalation earned during an
+        earlier bad patch.
         """
         with self._lock:
+            self._consecutive_tick_errors = 0
             if self._store.pause_state.paused or self._incident_streak == 0:
                 return
             self._incident_streak = 0

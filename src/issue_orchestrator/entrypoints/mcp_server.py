@@ -37,6 +37,7 @@ from typing import Any, Awaitable, Callable, cast
 import inspect
 from mcp.server.fastmcp import FastMCP
 
+from ..domain.pause_state import PauseActor
 from ..contracts.mcp import McpUiHintPayload
 from ..contracts.repository_engine import RepositoryEngineStartPayload
 from ..infra import supervisor
@@ -278,6 +279,7 @@ class McpApp:
         self._api = OrchestratorAsyncHttpApi(
             self._client.api_base_url,
             refresh_base_url=self._client.refresh_api_base_url,
+            pause_actor=PauseActor.MCP,
         )
 
     def close(self) -> None:

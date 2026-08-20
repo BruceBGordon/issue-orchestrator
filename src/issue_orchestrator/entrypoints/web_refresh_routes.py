@@ -9,7 +9,8 @@ import time
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
-from ..domain.pause_state import PauseActor, PauseReason
+from ..domain.pause_state import PauseActor, PauseReason, PauseTransitionStatus
+from .pause_response import transition_response
 from ..control.queue_cache import QueueCache, QueueMutationStatus, clear_issue_refresh, record_issue_refreshes
 from ..control.session_history import (
     CLOSED_ISSUE_HISTORY_STATUS_REASON,
@@ -33,8 +34,8 @@ async def pause(orchestrator: WebOrchestratorDependency) -> JSONResponse:
     """Pause the orchestrator."""
     if orchestrator is None:
         return JSONResponse({"error": "Orchestrator not running"}, status_code=503)
-    orchestrator.pause(reason=PauseReason.OPERATOR, actor=PauseActor.WEB_API)
-    return JSONResponse({"status": "paused"})
+    outcome = orchestrator.pause(reason=PauseReason.OPERATOR, actor=PauseActor.WEB_API)
+    return transition_response(PauseTransitionStatus.PAUSED, outcome)
 
 
 @web_refresh_router.post("/api/resume")
@@ -42,8 +43,8 @@ async def resume(orchestrator: WebOrchestratorDependency) -> JSONResponse:
     """Resume the orchestrator."""
     if orchestrator is None:
         return JSONResponse({"error": "Orchestrator not running"}, status_code=503)
-    orchestrator.resume(actor=PauseActor.WEB_API)
-    return JSONResponse({"status": "resumed"})
+    outcome = orchestrator.resume(actor=PauseActor.WEB_API)
+    return transition_response(PauseTransitionStatus.RESUMED, outcome)
 
 
 @web_refresh_router.post("/api/refresh")

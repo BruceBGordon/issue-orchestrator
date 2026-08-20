@@ -10,6 +10,7 @@ from typing import Any
 from unittest.mock import MagicMock, patch, Mock, AsyncMock
 from fastapi.testclient import TestClient
 
+from tests.conftest import attach_real_pause_controller
 from issue_orchestrator.entrypoints.web import (
     app,
     get_orchestrator,
@@ -195,6 +196,8 @@ def create_mock_orchestrator():
     mock_orch.repository_host.get_issue.return_value = None
     mock_orch.repository_host.update_label_cache = MagicMock()
 
+
+    attach_real_pause_controller(mock_orch)
     return mock_orch
 
 

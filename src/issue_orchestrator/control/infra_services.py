@@ -17,6 +17,7 @@ from ..ports.provider_readiness import (
 )
 
 if TYPE_CHECKING:
+    from ..ports.pause_journal import PauseJournal
     from ..ports.label_store import LabelStore
     from ..ports.queue_cache_store import QueueCacheStore
     from ..ports.goal_pilot_store import GoalPilotStore
@@ -75,6 +76,14 @@ class InfraServices:
     # different owners (#6858 round 1 A2). Production picks SQLite; bounded
     # compositions pick ``in_memory_run_activity()`` and say so.
     tech_lead_run_activity: "TechLeadRunActivity"
+    # Durable pause/resume history. REQUIRED for the same reason
+    # ``tech_lead_run_activity`` is: the orchestrator facade must not pick and
+    # construct a concrete filesystem adapter itself (bootstrap is the only
+    # composition root), and a default would make "durable audit trail" and
+    # "writes nothing" indistinguishable at the seam — while quietly pointing
+    # test pauses at a production path. Production picks ``JsonlPauseJournal``;
+    # bounded compositions pick ``NullPauseJournal`` and say so.
+    pause_journal: "PauseJournal"
     # The typed provider-readiness/auth-failure boundary (#6999). Shared by the
     # launch gate and the live-session observer so both consume one probe (and
     # one short-lived result cache) rather than each spawning their own.

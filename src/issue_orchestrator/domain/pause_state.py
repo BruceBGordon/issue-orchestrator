@@ -76,6 +76,9 @@ class PauseActor(StrEnum):
     WEB_API = "web_api"
     CONTROL_API = "control_api"
     MCP = "mcp"
+    # The Control Center reaches the engine over the SAME HTTP route as MCP, so
+    # without its own identity every Control Center pause was journaled as `mcp`.
+    CONTROL_CENTER = "control_center"
     DASHBOARD = "dashboard"
     CLI = "cli"
     SYSTEM = "system"
@@ -102,10 +105,19 @@ class PauseState:
                 "A paused PauseState requires reason, actor, and since — "
                 "an unexplained pause is the bug this type exists to prevent."
             )
-        if not self.paused and (self.reason is not None or self.actor is not None):
+        if not self.paused and (
+            self.reason is not None
+            or self.actor is not None
+            or self.since is not None
+            or self.detail
+        ):
             raise ValueError(
-                "A running PauseState carries no reason or actor; "
-                f"got reason={self.reason!r} actor={self.actor!r}."
+                "A running PauseState carries no pause provenance; got "
+                f"reason={self.reason!r} actor={self.actor!r} "
+                f"since={self.since!r} detail={self.detail!r}. "
+                "The invariant is symmetric: every paused-only field is set "
+                "exactly when paused is True, so a running state can never "
+                "serialize a stale paused_since."
             )
 
     @classmethod
@@ -171,6 +183,37 @@ class PauseState:
             "paused_held_seconds": self.held_seconds(now),
             "pause_is_incident": bool(self.reason is not None and self.reason.is_incident),
         }
+
+
+@dataclass(frozen=True)
+class PauseTransitionOutcome:
+    """What a pause/resume request actually did.
+
+    Transitions are idempotent, so "the request succeeded" and "the request
+    changed anything" are different facts. Without this distinction an HTTP
+    surface answering from its own *request* reports the actor it asked for
+    even when the engine was already paused by someone else, and no event or
+    journal row was written — a response that claims a transition that never
+    happened.
+
+    ``committed`` is True only when this call performed the transition.
+    ``state`` is the engine's state afterwards, and ``recorded_actor`` /
+    ``recorded_reason`` are what is actually stored — which, for a rejected
+    duplicate, is the ORIGINAL caller's provenance, not this one's.
+    """
+
+    committed: bool
+    state: "PauseState"
+    requested_actor: "PauseActor"
+
+    @property
+    def recorded_actor(self) -> "PauseActor | None":
+        """The actor stored against the current pause (None when running)."""
+        return self.state.actor
+
+    @property
+    def recorded_reason(self) -> "PauseReason | None":
+        return self.state.reason
 
 
 @dataclass(frozen=True)

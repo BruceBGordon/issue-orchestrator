@@ -244,8 +244,30 @@ class TestPauseEndpoint:
         response = client.post("/api/pause")
 
         assert response.status_code == 200
-        assert response.json() == {"status": "paused", "actor": "control_api"}
+        # The response reports what the OWNER committed, not what was requested:
+        # a duplicate pause must not claim a transition that never happened.
+        assert response.json() == {
+            "status": "paused",
+            "committed": True,
+            "requested_actor": "control_api",
+            "actor": "control_api",
+            "reason": "operator",
+        }
         mock_orch.pause.assert_called_once()
+
+    def test_pause_response_reports_the_original_actor_when_already_paused(
+        self, client_with_orchestrator
+    ):
+        """A second pause is not committed and reports who actually paused it."""
+        client, mock_orch = client_with_orchestrator
+
+        client.post("/api/pause", json={"actor": "dashboard"})
+        response = client.post("/api/pause", json={"actor": "mcp"})
+
+        body = response.json()
+        assert body["committed"] is False
+        assert body["requested_actor"] == "mcp"
+        assert body["actor"] == "dashboard"
 
     def test_pause_is_idempotent(self, client_with_orchestrator):
         """Pausing twice calls pause() twice (orchestrator handles idempotency)."""
@@ -267,7 +289,11 @@ class TestResumeEndpoint:
         response = client.post("/api/resume")
 
         assert response.status_code == 200
-        assert response.json() == {"status": "resumed", "actor": "control_api"}
+        # Nothing was paused, so nothing was committed.
+        body = response.json()
+        assert body["status"] == "resumed"
+        assert body["committed"] is False
+        assert body["requested_actor"] == "control_api"
         mock_orch.resume.assert_called_once()
 
     def test_resume_is_idempotent(self, client_with_orchestrator):

@@ -8,6 +8,7 @@ import pytest
 from issue_orchestrator.control.tech_lead_run_ownership import (
     TechLeadRunOwnership,
 )
+from issue_orchestrator.ports.pause_journal import NullPauseJournal
 from issue_orchestrator.ports.run_ledger_store import (
     SingleInstanceRunLedgerStore,
 )
@@ -1050,6 +1051,9 @@ def build_test_orchestrator_deps(
     readiness_probe = provider_readiness_probe or NO_PROVIDER_READINESS_PROBE
 
     infra_services = InfraServices(
+        # Explicitly null: a test that pauses must never write through a
+        # production filesystem adapter.
+        pause_journal=NullPauseJournal(),
         label_manager=label_manager,
         label_store=label_store,
         queue_cache_store=_build_null_queue_cache_store(),
@@ -1577,3 +1581,33 @@ def operator_paused_state():
     return PauseState.paused_now(
         reason=PauseReason.OPERATOR, actor=PauseActor.CONTROL_API
     )
+
+
+def attach_real_pause_controller(mock_orchestrator):
+    """Give a MagicMock orchestrator REAL pause/resume behaviour.
+
+    The HTTP routes now build their response from the owner's
+    ``PauseTransitionOutcome`` — deliberately, so a response can never claim a
+    transition that did not happen. A bare MagicMock returns a MagicMock, which
+    is neither JSON-serializable nor able to express "already paused". Backing
+    the mock with a real ``PauseController`` over its real ``state`` keeps the
+    route tests exercising the actual contract, including idempotency.
+    """
+    from issue_orchestrator.control.pause_controller import PauseController
+    from issue_orchestrator.events.context import EventContext
+    from issue_orchestrator.ports.pause_journal import NullPauseJournal
+
+    class _NullSink:
+        def publish(self, event) -> None:  # noqa: ANN001
+            return None
+
+    controller = PauseController(
+        events=_NullSink(),
+        event_context=EventContext(),
+        store=mock_orchestrator.state,
+        journal=NullPauseJournal(),
+    )
+    mock_orchestrator.pause_controller = controller
+    mock_orchestrator.pause.side_effect = lambda **kw: controller.pause(**kw)
+    mock_orchestrator.resume.side_effect = lambda **kw: controller.resume(**kw)
+    return mock_orchestrator

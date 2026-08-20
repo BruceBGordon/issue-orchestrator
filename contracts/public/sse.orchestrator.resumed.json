@@ -1,6 +1,6 @@
 {
   "additionalProperties": true,
-  "description": "Who resumed the engine, and what it had been paused for.",
+  "description": "Who resumed the engine, and what it had been paused for.\n\nRequired for the same reason as the paused payload: the resume producer\nalways knows the actor, the reason being lifted, and how long it held.",
   "properties": {
     "detail": {
       "default": "",
@@ -8,42 +8,23 @@
       "type": "string"
     },
     "paused_held_seconds": {
-      "anyOf": [
-        {
-          "type": "number"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "default": null,
-      "title": "Paused Held Seconds"
+      "title": "Paused Held Seconds",
+      "type": "number"
     },
     "previous_pause_reason": {
-      "anyOf": [
-        {
-          "type": "string"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "default": null,
-      "title": "Previous Pause Reason"
+      "title": "Previous Pause Reason",
+      "type": "string"
     },
     "resumed_by": {
-      "anyOf": [
-        {
-          "type": "string"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "default": null,
-      "title": "Resumed By"
+      "title": "Resumed By",
+      "type": "string"
     }
   },
+  "required": [
+    "resumed_by",
+    "previous_pause_reason",
+    "paused_held_seconds"
+  ],
   "title": "OrchestratorResumedPayload",
   "type": "object"
 }

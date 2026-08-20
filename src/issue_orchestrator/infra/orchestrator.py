@@ -38,7 +38,7 @@ from ..domain.models import Session, SessionStatus, OrchestratorState, PendingRe
 from ..observation.observer import SessionObserver
 from ..control.scheduler import Scheduler
 from ..control.pause_controller import PauseController
-from ..domain.pause_state import PauseActor, PauseReason
+from ..domain.pause_state import PauseActor, PauseReason, PauseTransitionOutcome
 from ..domain.state_machines.issue_machine import IssueStateMachine
 from ..domain.state_machines.session_machine import SessionStateMachine
 from ..domain.state_machines.review_machine import ReviewStateMachine
@@ -123,8 +123,6 @@ class Orchestrator:
     _loop_iteration: int = field(default=0, init=False)
     _ui_update_interval: int = field(default=30, init=False)
     _event_context: EventContext = field(default_factory=EventContext, init=False)
-    _loop_error_count: int = field(default=0, init=False)
-    _loop_error_limit: int = field(default=3, init=False)
     _last_tick_time: float = field(default=0.0, init=False)
     # The serialization boundary for every state-mutating transition: the tick,
     # the control API, and the dashboard's tech-lead command surface all take it,
@@ -150,20 +148,15 @@ class Orchestrator:
     def pause_controller(self) -> PauseController:
         """The single owner of pause/resume transitions.
 
-        Exposed as a collaborator rather than kept private so the control API,
-        the dashboard, and tests all speak to the same owner instead of
-        assigning ``state.paused`` behind its back.
+        Public so the control API, the dashboard, and tests all speak to the
+        same owner instead of assigning ``state.paused`` behind its back. The
+        journal arrives through ``deps`` — see ``InfraServices.pause_journal``.
         """
-        from ..infra.pause_journal import PAUSE_JOURNAL_FILENAME, JsonlPauseJournal
-        from ..infra.repo_identity import state_dir
-
         return PauseController(
             events=self.deps.events,
             event_context=self._event_context,
             store=self.state,
-            journal=JsonlPauseJournal(
-                state_dir(self.config.repo_root) / PAUSE_JOURNAL_FILENAME
-            ),
+            journal=self.deps.services.pause_journal,
         )
 
     @property
@@ -829,50 +822,32 @@ class Orchestrator:
             )
 
     def _auto_resume_if_due(self) -> None:
-        """Lift a half-open incident pause whose backoff has expired.
+        """Lift a half-open incident pause whose backoff expired.
 
-        Only incident pauses expire — an operator or tech-lead pause is never
-        lifted here. See ``_AUTO_RESUME_BACKOFF_SECONDS`` for why this exists:
-        a transient DNS or disk fault used to halt the engine permanently.
+        Only incident pauses expire; see ``_AUTO_RESUME_BACKOFF_SECONDS``.
         """
-        if not self.pause_controller.due_for_auto_resume():
-            return
-        logger.info(
-            "[PAUSE] Incident pause backoff elapsed (%s) — retrying",
-            self.pause_controller.describe(),
-        )
-        self.resume(
-            actor=PauseActor.SYSTEM,
-            detail="auto-resume: incident backoff elapsed, retrying",
-        )
+        with self.state_lock:
+            self.pause_controller.resume_if_due(
+                actor=PauseActor.SYSTEM,
+                detail="auto-resume: incident backoff elapsed, retrying",
+            )
 
     def _handle_loop_error(self, error: Exception) -> None:
-        """Record a tick error and pause after too many consecutive failures."""
-        self._loop_error_count += 1
+        """Log a tick error; the pause owner decides whether it trips the breaker."""
         logger.exception("[LOOP] Error in iteration %d: %s", self._loop_iteration, error)
+        with self.state_lock:
+            outcome = self.pause_controller.note_tick_failure(error)
         self.deps.events.publish(TraceEvent(
             EventName.APPLY_FAILED,
             self._event_context.enrich({
                 "step_type": "tick",
                 "iteration": self._loop_iteration,
                 "error": str(error),
-                "error_count": self._loop_error_count,
+                "error_count": self.pause_controller.consecutive_tick_errors,
             }),
         ))
-        if self._loop_error_count >= self._loop_error_limit and not self.state.paused:
-            logger.warning(
-                "[LOOP] Pausing orchestrator after %d consecutive errors; "
-                "last error: %s: %s",
-                self._loop_error_count,
-                type(error).__name__,
-                error,
-            )
-            self.pause(
-                reason=PauseReason.LOOP_ERROR_THRESHOLD,
-                actor=PauseActor.SYSTEM,
-                detail=f"{self._loop_error_count} consecutive tick errors; "
-                       f"last: {type(error).__name__}: {error}",
-            )
+        if outcome is not None and outcome.committed:
+            logger.warning("[LOOP] Breaker tripped — %s", outcome.state.describe())
 
     async def run_loop(self) -> None:
         logger.info("Starting orchestration loop")
@@ -908,7 +883,6 @@ class Orchestrator:
                 # Run tick in thread pool to avoid blocking the event loop
                 # during long-running operations like git push with hooks
                 should_continue = await asyncio.to_thread(self.tick)
-                self._loop_error_count = 0
                 self.pause_controller.note_healthy_tick()
                 if not should_continue:
                     break
@@ -1043,13 +1017,19 @@ class Orchestrator:
     def pause(
         self,
         *,
-        reason: PauseReason = PauseReason.OPERATOR,
-        actor: PauseActor = PauseActor.CONTROL_API,
+        reason: PauseReason,
+        actor: PauseActor,
         detail: str = "",
-    ) -> None:
-        """Pause the engine. Every caller must say why and on whose behalf."""
+    ) -> PauseTransitionOutcome:
+        """Pause the engine. Every caller must say why and on whose behalf.
+
+        ``reason``/``actor`` are required with no defaults: a default would let
+        a call site silently invent provenance. Returns what was committed.
+        """
         with self.state_lock:
-            self.pause_controller.pause(reason=reason, actor=actor, detail=detail)
+            return self.pause_controller.pause(
+                reason=reason, actor=actor, detail=detail
+            )
 
     def set_start_paused(self, *, actor: PauseActor = PauseActor.CLI) -> None:
         """Set initial paused state and request dashboard read-model hydration.
@@ -1069,11 +1049,12 @@ class Orchestrator:
             )
             self.state.queue_refresh_requested = True
 
-    def resume(self, *, actor: PauseActor = PauseActor.CONTROL_API, detail: str = "") -> None:
-        """Resume the engine, recording who resumed it and what it was paused for."""
+    def resume(
+        self, *, actor: PauseActor, detail: str = ""
+    ) -> PauseTransitionOutcome:
+        """Resume the engine, recording who lifted it and what it was paused for."""
         with self.state_lock:
-            self.pause_controller.resume(actor=actor, detail=detail)
-        self._loop_error_count = 0
+            return self.pause_controller.resume(actor=actor, detail=detail)
 
     def get_failure_diagnosis(self, issue_number: int) -> dict:
         """Get failure diagnosis for a session.

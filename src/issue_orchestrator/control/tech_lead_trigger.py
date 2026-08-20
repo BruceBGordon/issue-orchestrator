@@ -43,7 +43,7 @@ from enum import Enum
 from typing import TYPE_CHECKING, Protocol
 
 from ..domain.models import PendingTechLeadReview
-from ..domain.pause_state import PauseActor, PauseReason
+from ..domain.pause_state import PauseActor, PauseReason, PauseTransitionOutcome
 from ..domain.tech_lead_run import (
     GlobalHealthReviewScope,
     IssueInvestigationScope,
@@ -96,10 +96,10 @@ class TechLeadDispatchHost(Protocol):
     def pause(
         self,
         *,
-        reason: "PauseReason" = ...,
-        actor: "PauseActor" = ...,
-        detail: str = ...,
-    ) -> None: ...
+        reason: "PauseReason",
+        actor: "PauseActor",
+        detail: str = "",
+    ) -> "PauseTransitionOutcome": ...
 
     def tick(self) -> bool: ...
 

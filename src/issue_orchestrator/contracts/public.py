@@ -226,31 +226,39 @@ class SessionCompletedPayload(ContractBase):
 class OrchestratorPausedPayload(ContractBase):
     """Why the engine paused, who paused it, and when.
 
-    Previously an empty payload, which is why a paused engine could not explain
-    itself to the UI. Fields are optional so a consumer written against the old
-    empty shape keeps parsing.
+    Every producer-guaranteed field is REQUIRED. Optional/defaulted fields would
+    let ``model_validate({})`` succeed — i.e. the contract would still accept the
+    exact empty payload this work exists to eliminate, and a producer that
+    regressed to ``{}`` would keep the tests green.
     """
 
-    paused: bool = True
+    # Literal, not bool: a "paused" event that says paused=False is incoherent.
+    paused: Literal[True]
     # PauseReason: operator | startup | loop_error_threshold |
     # tech_lead_investigation | tech_lead_health_review
-    pause_reason: Optional[str] = None
-    # PauseActor: web_api | control_api | mcp | dashboard | cli | system
-    pause_actor: Optional[str] = None
-    pause_detail: str = ""
-    paused_since: Optional[str] = None
-    paused_held_seconds: Optional[float] = None
+    pause_reason: str
+    # PauseActor: web_api | control_api | mcp | control_center | dashboard |
+    # cli | system
+    pause_actor: str
+    paused_since: str
+    paused_held_seconds: float
     # True when the pause is a fault (the loop-error breaker) rather than an
     # intent — the distinction an operator needs first.
-    pause_is_incident: bool = False
+    pause_is_incident: bool
+    # Free-text; genuinely may be empty for a bare operator pause.
+    pause_detail: str = ""
 
 
 class OrchestratorResumedPayload(ContractBase):
-    """Who resumed the engine, and what it had been paused for."""
+    """Who resumed the engine, and what it had been paused for.
 
-    resumed_by: Optional[str] = None
-    previous_pause_reason: Optional[str] = None
-    paused_held_seconds: Optional[float] = None
+    Required for the same reason as the paused payload: the resume producer
+    always knows the actor, the reason being lifted, and how long it held.
+    """
+
+    resumed_by: str
+    previous_pause_reason: str
+    paused_held_seconds: float
     detail: str = ""
 
 

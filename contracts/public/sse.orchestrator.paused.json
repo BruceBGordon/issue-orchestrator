@@ -1,18 +1,10 @@
 {
   "additionalProperties": true,
-  "description": "Why the engine paused, who paused it, and when.\n\nPreviously an empty payload, which is why a paused engine could not explain\nitself to the UI. Fields are optional so a consumer written against the old\nempty shape keeps parsing.",
+  "description": "Why the engine paused, who paused it, and when.\n\nEvery producer-guaranteed field is REQUIRED. Optional/defaulted fields would\nlet ``model_validate({})`` succeed \u2014 i.e. the contract would still accept the\nexact empty payload this work exists to eliminate, and a producer that\nregressed to ``{}`` would keep the tests green.",
   "properties": {
     "pause_actor": {
-      "anyOf": [
-        {
-          "type": "string"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "default": null,
-      "title": "Pause Actor"
+      "title": "Pause Actor",
+      "type": "string"
     },
     "pause_detail": {
       "default": "",
@@ -20,52 +12,35 @@
       "type": "string"
     },
     "pause_is_incident": {
-      "default": false,
       "title": "Pause Is Incident",
       "type": "boolean"
     },
     "pause_reason": {
-      "anyOf": [
-        {
-          "type": "string"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "default": null,
-      "title": "Pause Reason"
+      "title": "Pause Reason",
+      "type": "string"
     },
     "paused": {
-      "default": true,
+      "const": true,
       "title": "Paused",
       "type": "boolean"
     },
     "paused_held_seconds": {
-      "anyOf": [
-        {
-          "type": "number"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "default": null,
-      "title": "Paused Held Seconds"
+      "title": "Paused Held Seconds",
+      "type": "number"
     },
     "paused_since": {
-      "anyOf": [
-        {
-          "type": "string"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "default": null,
-      "title": "Paused Since"
+      "title": "Paused Since",
+      "type": "string"
     }
   },
+  "required": [
+    "paused",
+    "pause_reason",
+    "pause_actor",
+    "paused_since",
+    "paused_held_seconds",
+    "pause_is_incident"
+  ],
   "title": "OrchestratorPausedPayload",
   "type": "object"
 }

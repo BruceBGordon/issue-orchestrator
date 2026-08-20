@@ -20,7 +20,7 @@ from .auth import (
     build_github_auth,
     build_github_token_provider,
 )
-from .errors import GitHubAuthError, GitHubHttpError, GitHubTransportError
+from .errors import GitHubAuthError, GitHubHttpError, GitHubScanIncompleteError, GitHubTransportError
 from .tokens import (
     KEYRING_SERVICE,
     KEYRING_USERNAME,
@@ -925,8 +925,10 @@ class GitHubHttpClient:
 
         The SINGLE exhaustive-pagination contract shared by the all-labels scan
         and the open-issue anchor scan: a pre-response failure raises
-        ``GitHubTransportError``, a later-page non-200 raises ``GitHubHttpError``,
-        and exceeding ``page_cap`` full pages raises ``GitHubHttpError``.
+        ``GitHubTransportError``; every completeness failure — a later-page non-200,
+        a non-list body, or exceeding ``page_cap`` — raises
+        ``GitHubScanIncompleteError``, which callers must never treat as a
+        skippable outage.
         Iteration stops only on the first empty/short/non-list page — the true
         final page — so no caller can mistake a truncated read for a complete
         one. ``params`` must carry ``per_page`` (the short-page threshold); later
@@ -949,7 +951,7 @@ class GitHubHttpClient:
                     original=exc,
                 ) from exc
             if response.status_code != 200:
-                raise GitHubHttpError(
+                raise GitHubScanIncompleteError(
                     f"GitHub returned status {response.status_code} while paging"
                     f" {what} (page {page}); refusing to treat the partial"
                     f" {what} as complete",
@@ -965,7 +967,7 @@ class GitHubHttpClient:
                 # caller a silently truncated result under a method that
                 # promises completeness — the exact failure this pager exists to
                 # make impossible. Only an empty list is valid exhaustion.
-                raise GitHubHttpError(
+                raise GitHubScanIncompleteError(
                     f"GitHub returned a non-list body while paging {what}"
                     f" (page {page}); refusing to treat it as an exhausted list",
                     method="GET",
@@ -980,7 +982,7 @@ class GitHubHttpClient:
                 return
             page += 1
             if page > page_cap:
-                raise GitHubHttpError(
+                raise GitHubScanIncompleteError(
                     f"{what} scan exceeded the {page_cap * per_page}-item page"
                     " cap; cannot prove the list is complete",
                     method="GET",
