@@ -6,8 +6,7 @@ per-instance operator approval. This module is the single policy owner for
 the whole gated lifecycle:
 
 * **Composition** — :func:`build_tech_lead_proposal_issue_action` turns an
-  act-level decision proposal (propose-authority ``reset_retry``; every
-  ``kill_hung_session`` until its direct tier ships) into a
+  act-level decision proposal under ``propose`` authority into a
   :class:`CreateTechLeadProposalIssueAction` carrying the typed
   :class:`StoredTechLeadOp`. The issue body is human documentation ONLY.
 * **Creation boundary** —
@@ -260,8 +259,7 @@ def build_op_ledger(
     ledger enforces one open proposal per (op, target) without a GitHub read.
     """
     return {
-        (op.op_type, op.target_issue_number): issue_number
-        for issue_number, op in ops
+        (op.op_type, op.target_issue_number): issue_number for issue_number, op in ops
     }
 
 
@@ -351,9 +349,7 @@ def reconcile_tech_lead_proposals(
             )
             continue
         remaining.append(issue)
-    absent = tuple(
-        sorted(number for number in ops if number not in open_numbers)
-    )
+    absent = tuple(sorted(number for number in ops if number not in open_numbers))
     return ReconciledTechLeadProposals(
         anchor_candidate_issues=remaining,
         approved=tuple(approved),
@@ -531,12 +527,11 @@ def finalize_tech_lead_op_execution(
     if not proposal_issue:
         return result
     op_type = (
-        "reset_retry" if isinstance(action, ResetRetryIssueAction)
+        "reset_retry"
+        if isinstance(action, ResetRetryIssueAction)
         else "kill_hung_session"
     )
-    comment = _terminal_outcome_comment(
-        result, action, op_type, action.issue_number
-    )
+    comment = _terminal_outcome_comment(result, action, op_type, action.issue_number)
     if comment is None:
         return result  # loud failure: keep the op, retry next tick
     if repository_host is None or ops is None:
@@ -551,7 +546,9 @@ def finalize_tech_lead_op_execution(
         ops.discard_op(issue_number=proposal_issue)
     except Exception as e:
         logger.exception(
-            "Failed to finalize tech_lead proposal #%d after %s", proposal_issue, op_type
+            "Failed to finalize tech_lead proposal #%d after %s",
+            proposal_issue,
+            op_type,
         )
         return ActionResult.fail(
             action,
@@ -568,9 +565,7 @@ def finalize_tech_lead_op_execution(
     return result
 
 
-def _approval_confirmed(
-    repository_host: "RepositoryHost", proposal_issue: int
-) -> bool:
+def _approval_confirmed(repository_host: "RepositoryHost", proposal_issue: int) -> bool:
     """Fresh read: True iff the proposal still openly holds operator approval.
 
     Approval STILL STANDS only when a fresh read shows the proposal issue open

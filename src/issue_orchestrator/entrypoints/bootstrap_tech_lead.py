@@ -170,7 +170,9 @@ def _make_provider_circuit_reader(
     from ..control.label_manager import LabelManager
     from ..control.provider_availability import ProviderAvailabilityPolicy
 
-    policy = ProviderAvailabilityPolicy(config, provider_resilience, LabelManager(config))
+    policy = ProviderAvailabilityPolicy(
+        config, provider_resilience, LabelManager(config)
+    )
 
     def is_open(issue: "Issue") -> bool:
         # A circuit-ownership question, not a launch decision: the sweep must
@@ -238,9 +240,7 @@ def create_tech_lead_composition(
     open_issue_corpus_manager = OpenIssueCorpusManager(
         repository_host,
         open_issue_corpus,
-        is_enabled=lambda: (
-            config.tech_lead_enabled and config.tech_lead.dedup.enabled
-        ),
+        is_enabled=lambda: config.tech_lead_enabled and config.tech_lead.dedup.enabled,
     )
     board_publisher = (
         fact_gatherer.board_publisher
@@ -249,8 +249,14 @@ def create_tech_lead_composition(
     )
     if fact_gatherer is None:
         fact_gatherer = create_tech_lead_fact_gatherer(
-            config, repository_host, events, authority, board_publisher,
-            queue_cache_store, provider_resilience, promotion_target,
+            config,
+            repository_host,
+            events,
+            authority,
+            board_publisher,
+            queue_cache_store,
+            provider_resilience,
+            promotion_target,
         )
     return TechLeadComposition(
         authority=authority,
@@ -311,8 +317,8 @@ def _make_session_activity_reader(
     branch ahead of base. Both are best-effort: a missing recording or an
     unreadable/absent worktree degrades that field to its unknown sentinel; the
     builder's backstop maps any unexpected error to ``None``. The health review
-    reads these to corroborate a hang before proposing the GATED
-    ``kill_hung_session`` (which never auto-executes).
+    reads these to corroborate a hang before proposing ``kill_hung_session``;
+    its authority dial decides direct execution versus a gated proposal.
     """
     from ..domain.board_snapshot import SessionActivityFacts
 

@@ -129,7 +129,9 @@ class CreateTechLeadIssueAction(Action):
     # dropped both produced a follow-up that looked like anchor authoring and
     # wrote unguarded. Omitting this field is now a TypeError, not a default.
     origin: "TechLeadCreationOrigin" = field(kw_only=True)
-    action_type: ActionType = field(default=ActionType.CREATE_TECH_LEAD_ISSUE, init=False)
+    action_type: ActionType = field(
+        default=ActionType.CREATE_TECH_LEAD_ISSUE, init=False
+    )
 
     def __post_init__(self) -> None:
         # The other half of the invariant the origin cannot see: a derived
@@ -369,23 +371,24 @@ class ResetRetryIssueAction(Action):
 
 @dataclass(frozen=True)
 class KillHungSessionAction(Action):
-    """Execute an APPROVED ``kill_hung_session`` proposal op (#6778).
+    """Execute a ``kill_hung_session`` proposal op.
 
-    Planned ONLY from an approved gated proposal's :class:`StoredTechLeadOp`
-    (there is no direct execute-authority tier yet — startup rejects
-    ``tech_lead.authority.kill_hung_session: execute``). The applier's owner
-    (``tech_lead_kill_session``) re-validates that the target issue still has an
-    active session and applies the issue-runtime termination boundary — the
-    same ``terminate_issue_runtime`` the reset owner uses, WITHOUT the reset.
-    Stale proposals downgrade with no mutations, mirroring ``reset_retry``.
+    Planned directly when authority is ``execute`` or from an approved gated
+    proposal under ``propose`` (#6778). The applier's owner re-validates that
+    the exact target session generation is still active and applies the
+    issue-runtime termination boundary — the same ``terminate_issue_runtime``
+    the reset owner uses, WITHOUT the reset. Stale proposals downgrade with no
+    mutations, mirroring ``reset_retry``.
     """
 
     issue_number: int = 0  # The issue whose runtime is terminated (op target)
     rationale: str = ""  # The agent's recorded rationale (stored op)
     proposal_id: str = ""  # The decision artifact action id (A<n>)
     finding_ids: tuple[str, ...] = ()
-    anchor_issue_number: int = 0  # Event surface: the proposal issue
-    proposal_issue_number: int = 0  # The gated proposal issue to finalize
+    anchor_issue_number: int = 0  # Event surface: source anchor or gated issue
+    # Set (>0) when consuming an approved gated proposal. 0 means direct
+    # execute-authority and requires no proposal finalization.
+    proposal_issue_number: int = 0
     # The active session run id the proposal bound its consent to (#6779 R1).
     # The applier's kill owner refuses to terminate unless the target issue's
     # LIVE session still matches this id, so a replacement session started
@@ -398,11 +401,8 @@ class KillHungSessionAction(Action):
             raise ValueError("KillHungSessionAction requires a positive issue_number")
         if not self.proposal_id:
             raise ValueError("KillHungSessionAction requires the proposal id")
-        if self.proposal_issue_number <= 0:
-            raise ValueError(
-                "KillHungSessionAction requires the gated proposal issue number"
-                " (there is no direct execute tier for kill_hung_session)"
-            )
+        if self.proposal_issue_number < 0:
+            raise ValueError("proposal_issue_number cannot be negative")
 
     def reconciliation_subject(self) -> int:
         """The issue whose runtime this termination mutates."""

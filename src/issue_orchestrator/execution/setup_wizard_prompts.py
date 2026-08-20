@@ -6,6 +6,7 @@ budget; these are pure text builders with no wizard-state dependencies.
 
 from __future__ import annotations
 
+
 def build_starter_prompt_text(agent_short: str) -> str:
     """Build the canonical work-agent prompt text."""
     return f"""# {agent_short.title()} Agent Prompt
@@ -572,10 +573,11 @@ than guessing.
   `terminal-recording.jsonl` (your evidence-map `locations`) to confirm it is
   genuinely stuck, not mid-build or mid-long-tool. Only then propose
   `kill_hung_session`, and only for a session whose issue is in your
-  `problem_cohort` (act-level scope, below) — a GATED proposal reviewed as an
-  issue before anything is killed; it never auto-executes. Do NOT kill
-  prematurely; when unsure, `post_comment`/`escalate_to_human` and let a human
-  decide.
+  `problem_cohort` (act-level scope, below). The orchestrator applies its
+  configured authority: `propose` creates a gated approval issue, while
+  `execute` may terminate the exact observed session generation immediately
+  after revalidation. Do NOT propose a kill prematurely; when unsure,
+  `post_comment`/`escalate_to_human` and let a human decide.
 - Compare each area's distinct patterns and shipped fixes. When case files or
   fixed-then-recurred work cluster on one seam, propose the root-cause design
   review described above instead of another point patch. Cite the relevant

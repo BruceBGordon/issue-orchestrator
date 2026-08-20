@@ -1,10 +1,9 @@
-"""Execution-time owner for approved tech_lead ``kill_hung_session`` ops (#6778).
+"""Execution-time owner for tech_lead ``kill_hung_session`` ops.
 
-The gated-proposal tier made ``kill_hung_session`` plannable (ADR-0031 §2
-amendment); this module makes executing an APPROVED op safe. Mirrors
-``tech_lead_reset_retry``: the stored op is a stale-checkable fact recorded
-against the board the proposing session observed, so the executor
-re-validates immediately before acting:
+The action may come directly from ``execute`` authority or from an approved
+gated proposal (#6778). It is a stale-checkable fact recorded against the board
+the proposing session observed, so the executor re-validates immediately
+before acting:
 
 1. the target issue must STILL have an active session — the entire point of
    the op is terminating live-but-stuck work, so a session that already
@@ -117,10 +116,14 @@ class TechLeadKillSessionExecutor:
         )
         if stale is not None:
             return self._downgrade(action, stale)
+        authority_source = (
+            f"approved proposal #{action.proposal_issue_number}"
+            if action.proposal_issue_number
+            else f"direct authority on anchor #{action.anchor_issue_number}"
+        )
         outcome = self.run_kill(
             action.issue_number,
-            f"tech_lead kill_hung_session {action.proposal_id}"
-            f" (approved proposal #{action.proposal_issue_number})",
+            f"tech_lead kill_hung_session {action.proposal_id} ({authority_source})",
         )
         if not outcome.success:
             logger.error(
@@ -139,14 +142,19 @@ class TechLeadKillSessionExecutor:
                 issue_number=action.issue_number,
                 proposal_id=action.proposal_id,
             )
-        self.events.publish(make_trace_event(EventName.TECH_LEAD_ACTION_EXECUTED, {
-            "issue_number": action.anchor_issue_number,
-            "action_id": action.proposal_id,
-            "proposal_type": "kill_hung_session",
-            "target_number": action.issue_number,
-            "finding_ids": list(action.finding_ids),
-            "boundary": dict(outcome.details),
-        }))
+        self.events.publish(
+            make_trace_event(
+                EventName.TECH_LEAD_ACTION_EXECUTED,
+                {
+                    "issue_number": action.anchor_issue_number,
+                    "action_id": action.proposal_id,
+                    "proposal_type": "kill_hung_session",
+                    "target_number": action.issue_number,
+                    "finding_ids": list(action.finding_ids),
+                    "boundary": dict(outcome.details),
+                },
+            )
+        )
         logger.info(
             issue_log(
                 action.issue_number,

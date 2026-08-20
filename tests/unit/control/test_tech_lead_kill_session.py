@@ -29,9 +29,7 @@ def _executor(
     outcome: KillSessionRunOutcome | None = None,
 ) -> tuple[TechLeadKillSessionExecutor, MagicMock, MagicMock]:
     events = MagicMock()
-    run_kill = MagicMock(
-        return_value=outcome or KillSessionRunOutcome(success=True)
-    )
+    run_kill = MagicMock(return_value=outcome or KillSessionRunOutcome(success=True))
     executor = TechLeadKillSessionExecutor(
         events=events,
         active_session_run_id=lambda _n: live_session_id,
@@ -87,6 +85,22 @@ def test_executes_termination_and_publishes_executed_event() -> None:
     assert event.data["issue_number"] == 501  # the proposal issue surface
     assert event.data["finding_ids"] == ["T1"]  # R6 provenance
     assert event.data["boundary"] == {"stopped_session_ids": ["issue-14"]}
+
+
+def test_direct_execute_identifies_authority_source_without_proposal_issue() -> None:
+    action = KillHungSessionAction(
+        issue_number=14,
+        rationale="Session hung for 90 minutes.",
+        proposal_id="A3",
+        anchor_issue_number=99,
+        target_session_id="RUN-14",
+    )
+    executor, _, run_kill = _executor(live_session_id="RUN-14")
+
+    result = executor.apply(action)
+
+    assert result.success
+    assert "direct authority on anchor #99" in run_kill.call_args.args[1]
 
 
 def test_stale_downgrade_posts_no_mutations() -> None:
