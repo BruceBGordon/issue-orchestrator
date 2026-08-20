@@ -29,11 +29,7 @@ from typing import Any, Callable, Optional, TYPE_CHECKING
 
 from ..infra.config import Config
 from ..events import EventName
-from ..ports.repository_host import (
-    RepositoryHost,
-    RepositoryHostError,
-    RepositoryScanIncompleteError,
-)
+from ..ports.repository_host import RepositoryHost, RepositoryHostError
 from ..ports import EventSink,  make_trace_event
 from .provider_launch_readiness import ProviderLaunchReadiness
 from .health_review_trigger import (
@@ -512,78 +508,29 @@ class FactGatherer:
     def _run_stuck_sweep_if_due(
         self, state: "OrchestratorState", now: float
     ) -> None:
-        """Run the tech-lead stuck sweep and record what it recovered (#6823).
+        """Arm the tech-lead stuck sweep (#6823).
 
-        All policy lives in the ``stuck_sweep`` owner; this seam only arms it,
-        records the recovered failures through the state owner method, stamps
-        and persists the timer, and emits an observation event. No new control
-        vocabulary enters this module.
+        The cycle — arming, failure classification, recording, stamping,
+        persisting — lives in the ``stuck_sweep`` owner. This seam only supplies
+        the collaborators it cannot reach and routes its two observations.
         """
-        from .label_manager import LabelManager
-        from .stuck_sweep import (
-            persist_stuck_sweep_state,
-            run_stuck_sweep,
-            stuck_sweep_due,
-        )
+        from .stuck_sweep import run_stuck_sweep_cycle
 
-        if not stuck_sweep_due(self.config, state, now):
-            return
-        try:
-            result = run_stuck_sweep(
-                self.config,
-                state,
-                self.repository_host,
-                LabelManager(self.config),
-                now,
-                # Issues with an OPEN gated proposal are owned by the human who must
-                # delabel it — the sweep must not re-investigate them or spend their
-                # budget (stops propose-mode from exhausting a never-remedied issue,
-                # #6824 F1). The ledger rows ARE the open-proposal set.
-                open_proposal_targets=self._open_proposal_targets(),
-                provider_circuit_open=self.provider_circuit_open,
-            )
-        except RepositoryScanIncompleteError:
-            # NOT skippable. The scan reached GitHub and discovered it could not
-            # prove completeness (page cap exhausted, mid-scan non-200, malformed
-            # page). `stuck_sweep` passes `exhaustive=True` precisely so a
-            # truncated read fails loud instead of silently starving older stuck
-            # issues; swallowing it here would retry forever while the
-            # authoritative sweep never actually ran.
-            raise
-        except RepositoryHostError as error:
-            # The sweep issues its own exhaustive `list_issues` read, OUTSIDE the
-            # resilience guard that wraps the queue fetch. So a transient network
-            # blip used to be absorbed by the fetch layer ("keeping cached queue")
-            # and then, in the very same tick, escape from here into the loop
-            # error budget — three of those in a row tripped the breaker and
-            # halted the engine. Observed repeatedly: a DNS drop during host
-            # sleep paused a healthy orchestrator for days.
-            #
-            # Swallowing the remaining RepositoryHostErrors here is safe because the
-            # sweep is not the system's auth detector: the queue fetch runs the
-            # same credentials through IssueFetchResilience every cycle, and a
-            # genuinely permanent auth/not-found failure still shuts the engine
-            # down cleanly from there. Only the duplicate signal is dropped.
-            #
-            # The sweep is best-effort recovery machinery, so a failed scan is
-            # simply skipped. `last_stuck_sweep_at` is deliberately NOT stamped,
-            # leaving the sweep due so the next tick retries it.
-            logger.warning(
-                "[STUCK_SWEEP] Skipping sweep — repository host unavailable: %s. "
-                "Sweep stays due and retries next tick.",
-                error,
-            )
-            return
-        for failure in result.recovered:
-            state.record_discovered_failure(failure)
-        # Escalate to needs-human through the Planner/Applier (authoritative,
-        # label-only). Re-emit the idempotent label for EVERY unacknowledged
-        # escalation (the durable pending set) so a crash/apply failure retries
-        # until it lands (#6824 R1). The durable set itself is persisted below.
-        state.stuck_sweep_escalations = list(state.pending_stuck_sweep_escalations)
-        state.last_stuck_sweep_at = now
-        persist_stuck_sweep_state(state, self.queue_cache_store)
-        self._emit_stuck_sweep(result)
+        run_stuck_sweep_cycle(
+            self.config,
+            state,
+            self.repository_host,
+            now,
+            # Issues with an OPEN gated proposal are owned by the human who must
+            # delabel it — the sweep must not re-investigate them or spend their
+            # budget (stops propose-mode from exhausting a never-remedied issue,
+            # #6824 F1). The ledger rows ARE the open-proposal set.
+            open_proposal_targets=self._open_proposal_targets(),
+            provider_circuit_open=self.provider_circuit_open,
+            queue_cache_store=self.queue_cache_store,
+            on_result=self._emit_stuck_sweep,
+            on_scan_incomplete=self._emit_stuck_sweep_incomplete,
+        )
 
     def _open_proposal_targets(self) -> frozenset[int]:
         """Target issue numbers with an OPEN gated proposal in the ledger (#6824)."""
@@ -591,6 +538,26 @@ class FactGatherer:
             return frozenset()
         return frozenset(
             op.target_issue_number for _, op in self.tech_lead_authority.list_ops()
+        )
+
+    def _emit_stuck_sweep_incomplete(self, error: Exception) -> None:
+        """Surface an unprovable sweep scan as a first-class observation.
+
+        A log line alone repeats every cadence and is easy to miss; the event
+        is what a dashboard or alert can react to.
+        """
+        if self.events is None:
+            return
+        self.events.publish(
+            make_trace_event(
+                EventName.TECH_LEAD_STUCK_SWEEP,
+                {
+                    "recovered": [],
+                    "exhausted": [],
+                    "scan_incomplete": True,
+                    "error": str(error),
+                },
+            )
         )
 
     def _emit_stuck_sweep(self, result: object) -> None:

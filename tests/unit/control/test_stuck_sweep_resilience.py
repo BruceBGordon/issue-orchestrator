@@ -106,41 +106,68 @@ class TestStuckSweepTransientFailure:
         host.list_issues.assert_not_called()
 
 
-class TestCompletenessFailuresStillPropagate:
-    """Review finding 1: an outage is skippable; an unprovable scan is NOT.
+class TestCompletenessFailuresAreLoudButBounded:
+    """An outage is skippable; an unprovable scan is neither skippable nor fatal.
 
     ``stuck_sweep`` passes ``exhaustive=True`` precisely so a truncated read
-    fails loud. Catching every ``RepositoryHostError`` also swallowed those
-    completeness errors, so the sweep would retry forever while never actually
-    running — the opposite of the contract it asked for.
+    fails loud, and swallowing that meant the sweep retried forever while never
+    actually running. But propagating it out of the tick is the opposite
+    mistake: the sweep is one recovery backstop, and a repo with more open
+    issues than the scan cap would raise on EVERY cycle — tripping the breaker
+    and stopping queue fetching, planning and applying, permanently.
+
+    So the contract is: never silently "done", never fatal, always visible.
     """
 
-    def test_page_cap_exhaustion_propagates(self) -> None:
+    def _incomplete_host(self, message: str, **kw) -> MagicMock:
         host = MagicMock()
         host.list_issues.side_effect = GitHubScanIncompleteError(
-            "open issues scan exceeded the 1000-item page cap; "
-            "cannot prove the list is complete",
-            method="GET",
-            url="/issues",
+            message, method="GET", url="/issues", **kw
         )
-        gatherer = _gatherer(host)
+        return host
 
-        with pytest.raises(GitHubScanIncompleteError, match="cannot prove"):
-            gatherer.gather_tech_lead_facts(OrchestratorState(), now=SWEEP_DUE_AT)
-
-    def test_mid_scan_non_200_propagates(self) -> None:
-        host = MagicMock()
-        host.list_issues.side_effect = GitHubScanIncompleteError(
-            "GitHub returned status 502 while paging open issues (page 3); "
-            "refusing to treat the partial open issues as complete",
-            method="GET",
-            url="/issues",
-            status_code=502,
+    def test_an_unprovable_scan_does_not_kill_the_tick(self) -> None:
+        """It must not abort the snapshot the whole engine depends on."""
+        gatherer = _gatherer(
+            self._incomplete_host(
+                "open issues scan exceeded the 1000-item page cap; "
+                "cannot prove the list is complete"
+            )
         )
-        gatherer = _gatherer(host)
 
-        with pytest.raises(GitHubScanIncompleteError, match="refusing to treat"):
-            gatherer.gather_tech_lead_facts(OrchestratorState(), now=SWEEP_DUE_AT)
+        # Must not raise: every other subsystem keeps running.
+        gatherer.gather_tech_lead_facts(OrchestratorState(), now=SWEEP_DUE_AT)
+
+    def test_an_unprovable_scan_never_marks_the_sweep_done(self) -> None:
+        """Not stamping the timer is what stops it counting as a clean sweep."""
+        from issue_orchestrator.control.stuck_sweep import stuck_sweep_due
+
+        gatherer = _gatherer(self._incomplete_host("cannot prove the list is complete"))
+        state = OrchestratorState()
+        before = state.last_stuck_sweep_at
+
+        gatherer.gather_tech_lead_facts(state, now=SWEEP_DUE_AT)
+
+        assert state.last_stuck_sweep_at == before
+        assert stuck_sweep_due(_sweep_config(), state, SWEEP_DUE_AT) is True
+
+    def test_an_unprovable_scan_is_surfaced_as_an_event(self) -> None:
+        """A log line repeats every cadence and is easy to miss; the event is
+        what a dashboard or alert can react to."""
+        events = _RecordingEvents()
+        gatherer = FactGatherer(
+            config=_sweep_config(),
+            repository_host=self._incomplete_host("cannot prove"),
+            events=events,
+        )
+
+        gatherer.gather_tech_lead_facts(OrchestratorState(), now=SWEEP_DUE_AT)
+
+        incomplete = [
+            e for e in events.published if e.data.get("scan_incomplete") is True
+        ]
+        assert len(incomplete) == 1
+        assert incomplete[0].data["recovered"] == []
 
     def test_completeness_error_is_a_repository_host_error(self) -> None:
         """It must stay catchable by generic handlers while defeating the skip."""
@@ -150,10 +177,24 @@ class TestCompletenessFailuresStillPropagate:
         # Still an HTTP error, so existing adapter-level handlers keep working.
         assert isinstance(err, GitHubHttpError)
 
-    def test_the_outage_case_is_still_skipped(self) -> None:
+    def test_the_outage_case_is_still_skipped_and_stays_due(self) -> None:
         """The transient half of the classification must not regress."""
+        from issue_orchestrator.control.stuck_sweep import stuck_sweep_due
+
         host = MagicMock()
         host.list_issues.side_effect = DNS_DROP
         gatherer = _gatherer(host)
+        state = OrchestratorState()
 
-        gatherer.gather_tech_lead_facts(OrchestratorState(), now=SWEEP_DUE_AT)
+        gatherer.gather_tech_lead_facts(state, now=SWEEP_DUE_AT)
+
+        assert state.last_stuck_sweep_at == 0.0
+        assert stuck_sweep_due(_sweep_config(), state, SWEEP_DUE_AT) is True
+
+
+class _RecordingEvents:
+    def __init__(self) -> None:
+        self.published: list = []
+
+    def publish(self, event) -> None:  # noqa: ANN001
+        self.published.append(event)

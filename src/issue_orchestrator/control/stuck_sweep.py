@@ -56,6 +56,10 @@ from typing import TYPE_CHECKING
 
 from ..domain.models import DiscoveredFailure, SessionStatus
 from ..domain.tech_lead_session import PROPOSED_TECH_LEAD_LABEL, TECH_LEAD_OBSERVATION_LABEL
+from ..ports.repository_host import (
+    RepositoryHostError,
+    RepositoryScanIncompleteError,
+)
 from .needs_human_block import NeedsHumanCause
 
 if TYPE_CHECKING:
@@ -520,3 +524,85 @@ def build_stuck_sweep_escalation_actions(
         )
         for issue_number in label_issue_numbers
     ]
+
+
+def run_stuck_sweep_cycle(
+    config: "Config",
+    state: "OrchestratorState",
+    repository_host: "RepositoryHost",
+    now: float,
+    *,
+    open_proposal_targets: frozenset[int],
+    provider_circuit_open: "Callable[[Issue], bool] | None",
+    queue_cache_store: "QueueCacheStore | None",
+    on_result: "Callable[[StuckSweepResult], None]",
+    on_scan_incomplete: "Callable[[Exception], None]",
+) -> None:
+    """Arm the sweep, absorb what it is allowed to absorb, record the rest.
+
+    The whole cycle lives beside the sweep's policy rather than in the general
+    fact gatherer: arming, the two failure classifications, recording recovered
+    failures, stamping the timer, and persisting are one concern, and splitting
+    them across modules is what let the classifications drift apart.
+
+    Three outcomes, deliberately different:
+
+    * **Success** — record, stamp, persist, report.
+    * **Outage** (``RepositoryHostError``) — skip. The sweep issues its own
+      exhaustive read OUTSIDE the resilience guard wrapping the queue fetch, so
+      a transient blip absorbed by that fetch used to escape from here into the
+      tick's error budget; three in a row tripped the breaker. Safe to swallow
+      because the sweep is not the auth detector — the queue fetch runs the same
+      credentials every cycle and still fails fast on a permanent failure.
+    * **Unprovable scan** (``RepositoryScanIncompleteError``) — neither
+      swallowed nor fatal. The timer is NOT stamped (so it stays due) and the
+      caller is told, loudly. Raising instead would abort the whole tick, and a
+      repo with more open issues than ``STUCK_SWEEP_SCAN_LIMIT`` raises every
+      cycle — stopping all orchestration over one recovery backstop.
+
+    In every failure case ``last_stuck_sweep_at`` is left alone, so a failed
+    sweep can never be mistaken for a clean one.
+    """
+    # Local import: label_manager imports back into this package at module
+    # scope, so a top-level import here would close the cycle.
+    from .label_manager import LabelManager
+
+    if not stuck_sweep_due(config, state, now):
+        return
+    try:
+        result = run_stuck_sweep(
+            config,
+            state,
+            repository_host,
+            LabelManager(config),
+            now,
+            open_proposal_targets=open_proposal_targets,
+            provider_circuit_open=provider_circuit_open,
+        )
+    except RepositoryScanIncompleteError as error:
+        logger.error(
+            "[STUCK_SWEEP] Scan could not prove completeness: %s. The sweep is "
+            "SKIPPED and stays due; stuck issues are not being reclaimed. If "
+            "this repeats every cycle the scoped open-issue count likely "
+            "exceeds the sweep's scan cap — narrow filtering.label.",
+            error,
+        )
+        on_scan_incomplete(error)
+        return
+    except RepositoryHostError as error:
+        logger.warning(
+            "[STUCK_SWEEP] Skipping sweep — repository host unavailable: %s. "
+            "Sweep stays due and retries next tick.",
+            error,
+        )
+        return
+    for failure in result.recovered:
+        state.record_discovered_failure(failure)
+    # Escalate to needs-human through the Planner/Applier (authoritative,
+    # label-only). Re-emit the idempotent label for EVERY unacknowledged
+    # escalation (the durable pending set) so a crash/apply failure retries
+    # until it lands (#6824 R1). The durable set itself is persisted below.
+    state.stuck_sweep_escalations = list(state.pending_stuck_sweep_escalations)
+    state.last_stuck_sweep_at = now
+    persist_stuck_sweep_state(state, queue_cache_store)
+    on_result(result)

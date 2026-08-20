@@ -9,9 +9,16 @@ routers one answer shape and one place where the lifecycle vocabulary is typed.
 
 from __future__ import annotations
 
+import json
+
+from fastapi import Request
 from fastapi.responses import JSONResponse
 
-from ..domain.pause_state import PauseTransitionOutcome, PauseTransitionStatus
+from ..domain.pause_state import (
+    PauseActor,
+    PauseTransitionOutcome,
+    PauseTransitionStatus,
+)
 
 
 def transition_response(
@@ -40,3 +47,29 @@ def transition_response(
             ),
         }
     )
+
+
+async def requested_actor(request: Request, default: PauseActor) -> PauseActor:
+    """Read the caller's self-declared actor from an optional JSON body.
+
+    EVERY router that serves ``/api/pause`` must honour this. The Control
+    Center and MCP both post to the repository engine's port, and the engine
+    app registers ``web_refresh_router`` long before it mounts ``control_app``
+    — so the dashboard router wins the path, and an actor honoured only by the
+    control router is silently discarded. That is how a "fix" for Control
+    Center attribution can journal every pause as ``web_api`` and still pass
+    a client-side test.
+
+    An unknown or absent value falls back to ``default`` rather than failing
+    the request: the transition matters more than its label.
+    """
+    try:
+        body = await request.body()
+        if not body:
+            return default
+        data = json.loads(body)
+        if not isinstance(data, dict):
+            return default
+        return PauseActor(str(data.get("actor", "")))
+    except (json.JSONDecodeError, ValueError):
+        return default

@@ -103,6 +103,15 @@ class PauseController:
         self._journal = journal if journal is not None else NullPauseJournal()
         self._clock = clock if clock is not None else lambda: datetime.now(timezone.utc)
         self._lock = threading.Lock()
+        # Ordered handoff for the observability fan-out. Acquired while still
+        # holding ``_lock``, then held across the journal write and publish
+        # after ``_lock`` is released. That keeps announcements in the same
+        # order as the state swaps — without a durable journal recording
+        # "paused" AFTER a later "resumed", or SSE leaving the UI showing a
+        # paused badge on a running engine — while never holding the fast lock
+        # during filesystem I/O. Nothing inside the announce section may
+        # acquire ``_lock``; the ordering is strictly _lock -> _announce_lock.
+        self._announce_lock = threading.Lock()
         self._auto_resume_at: datetime | None = None
         self._incident_streak = 0
         self._consecutive_tick_errors = 0
@@ -158,28 +167,33 @@ class PauseController:
                 # A deliberate pause is held until something deliberately lifts it.
                 self._auto_resume_at = None
                 retry_at = None
+            streak = self._incident_streak
+            self._announce_lock.acquire()
 
-        log = logger.warning if reason.is_incident else logger.info
-        log("[PAUSE] Orchestrator paused — %s", new_state.describe(now))
-        if retry_at is not None:
-            logger.warning(
-                "[PAUSE] Incident pause #%d — will auto-retry at %s. "
-                "Resume sooner with POST /api/resume.",
-                self._incident_streak,
-                retry_at.isoformat(),
-            )
-        self._journal.record(
-            PauseTransition(
-                at=now, paused=True, reason=reason, actor=actor, detail=detail
-            )
-        )
-        if emit_event:
-            self._events.publish(
-                make_trace_event(
-                    EventName.ORCHESTRATOR_PAUSED,
-                    self._event_context.enrich(new_state.to_payload(now)),
+        try:
+            log = logger.warning if reason.is_incident else logger.info
+            log("[PAUSE] Orchestrator paused — %s", new_state.describe(now))
+            if retry_at is not None:
+                logger.warning(
+                    "[PAUSE] Incident pause #%d — will auto-retry at %s. "
+                    "Resume sooner with POST /api/resume.",
+                    streak,
+                    retry_at.isoformat(),
+                )
+            self._journal.record(
+                PauseTransition(
+                    at=now, paused=True, reason=reason, actor=actor, detail=detail
                 )
             )
+            if emit_event:
+                self._events.publish(
+                    make_trace_event(
+                        EventName.ORCHESTRATOR_PAUSED,
+                        self._event_context.enrich(new_state.to_payload(now)),
+                    )
+                )
+        finally:
+            self._announce_lock.release()
         return PauseTransitionOutcome(
             committed=True, state=new_state, requested_actor=actor
         )
@@ -198,6 +212,7 @@ class PauseController:
                     state=self._store.pause_state,
                     requested_actor=actor,
                 )
+            self._announce_lock.acquire()
         return self._announce_resume(previous, actor=actor, detail=detail, now=now)
 
     def resume_if_due(
@@ -227,6 +242,7 @@ class PauseController:
                     state=self._store.pause_state,
                     requested_actor=actor,
                 )
+            self._announce_lock.acquire()
         logger.info("[PAUSE] Incident pause backoff elapsed (%s) — retrying",
                     previous.describe(now))
         return self._announce_resume(previous, actor=actor, detail=detail, now=now)
@@ -254,43 +270,53 @@ class PauseController:
         detail: str,
         now: datetime,
     ) -> PauseTransitionOutcome:
-        """Log, journal, and publish a resume that has already been committed."""
+        """Log, journal, and publish a resume that has already been committed.
 
-        held = previous.held_seconds(now)
-        logger.info(
-            "[PAUSE] Orchestrator resumed by %s after %.0fs paused (was %s)",
-            actor,
-            held,
-            previous.reason,
-        )
-        self._journal.record(
-            PauseTransition(
-                at=now,
-                paused=False,
-                reason=None,
-                actor=actor,
-                detail=detail,
-                previous_reason=previous.reason,
-                held_seconds=held,
+        The caller acquired ``_announce_lock`` while still holding ``_lock``;
+        this method owns releasing it. Nothing here may take ``_lock``.
+        """
+        try:
+            held = previous.held_seconds(now)
+            logger.info(
+                "[PAUSE] Orchestrator resumed by %s after %.0fs paused (was %s)",
+                actor,
+                held,
+                previous.reason,
             )
-        )
-        self._events.publish(
-            make_trace_event(
-                EventName.ORCHESTRATOR_RESUMED,
-                self._event_context.enrich(
-                    {
-                        "resumed_by": str(actor),
-                        # Non-null by construction: only a committed resume gets
-                        # here, and a paused state always carries a reason.
-                        "previous_pause_reason": str(previous.reason),
-                        "paused_held_seconds": held,
-                        "detail": detail,
-                    }
-                ),
+            self._journal.record(
+                PauseTransition(
+                    at=now,
+                    paused=False,
+                    reason=None,
+                    actor=actor,
+                    detail=detail,
+                    previous_reason=previous.reason,
+                    held_seconds=held,
+                )
             )
-        )
+            self._events.publish(
+                make_trace_event(
+                    EventName.ORCHESTRATOR_RESUMED,
+                    self._event_context.enrich(
+                        {
+                            "resumed_by": str(actor),
+                            # Non-null by construction: only a committed resume
+                            # gets here, and a paused state always has a reason.
+                            "previous_pause_reason": str(previous.reason),
+                            "paused_held_seconds": held,
+                            "detail": detail,
+                        }
+                    ),
+                )
+            )
+        finally:
+            self._announce_lock.release()
+        # The state this call COMMITTED, not a re-read of shared state: by now
+        # the lock is released, so another thread may already have paused
+        # again, and re-reading would report "resumed, committed: true" beside
+        # a foreign pause actor and reason.
         return PauseTransitionOutcome(
-            committed=True, state=self._store.pause_state, requested_actor=actor
+            committed=True, state=PauseState.running(), requested_actor=actor
         )
 
     def due_for_auto_resume(self, now: datetime | None = None) -> bool:

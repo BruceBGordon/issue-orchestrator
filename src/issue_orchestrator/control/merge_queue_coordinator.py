@@ -29,7 +29,10 @@ from ..domain.models import (
 from ..events import EventName
 from ..ports import make_trace_event
 from ..ports.pull_request_tracker import MergeQueueRead
-from ..ports.repository_host import RepositoryHostError
+from ..ports.repository_host import (
+    RepositoryHostError,
+    RepositoryScanIncompleteError,
+)
 from .awaiting_merge_post_publish_policy import (
     POST_PUBLISH_VALIDATION_COMMENT_MARKER,
     POST_PUBLISH_VALIDATION_SOURCE,
@@ -280,11 +283,30 @@ class MergeQueueCoordinator:
         )
 
     def _comment_marker_present(self, pr_number: int) -> bool:
-        """Read-only dedupe guard, mirroring the post-publish rework path."""
+        """Read-only dedupe guard, mirroring the post-publish rework path.
+
+        A scan that could not prove completeness must NOT become "marker
+        absent". This is a negative-existence question, so an unprovable answer
+        is indistinguishable from "I saw everything and it wasn't there" — and
+        answering False posts a duplicate comment, exactly what the adapter
+        fails loud to prevent. Assume PRESENT instead: the cost of a missed
+        comment is a delay, the cost of a wrong one is spam a human must clean
+        up. A reachability failure (outage) stays False — no scan was even
+        attempted, and the next tick retries.
+        """
         try:
             return self.repository_host.issue_comment_marker_present(
                 pr_number, POST_PUBLISH_VALIDATION_COMMENT_MARKER
             )
+        except RepositoryScanIncompleteError as exc:
+            logger.warning(
+                "Comment scan for merge-queue PR #%d could not prove "
+                "completeness (%s); assuming the marker IS present so this "
+                "tick cannot post a duplicate.",
+                pr_number,
+                exc,
+            )
+            return True
         except RepositoryHostError as exc:
             logger.warning(
                 "Failed to read comments for merge-queue PR #%d: %s", pr_number, exc

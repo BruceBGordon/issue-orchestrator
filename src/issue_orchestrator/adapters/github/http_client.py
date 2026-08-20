@@ -664,6 +664,19 @@ class GitHubHttpClient:
             use_cache=use_cache,
         )
         if not isinstance(payload, list):
+            # Page 1 must honour the SAME contract as pages 2+ (see
+            # ``_paginate_fresh``): a 2xx carrying a non-list body is a
+            # contract violation, not exhaustion. Returning [] here handed an
+            # exhaustive caller a silently empty "complete" list — the stuck
+            # sweep would then recover nothing and stamp itself done, starving
+            # every stuck issue until the next cadence.
+            if exhaustive:
+                raise GitHubScanIncompleteError(
+                    "GitHub returned a non-list body for the first page of "
+                    "issues; refusing to treat it as a complete list",
+                    method="GET",
+                    url=f"/repos/{self._config.repo}/issues",
+                )
             return []
         issues = [item for item in payload if "pull_request" not in item]
         # Exhaustive discovery (#6779 R4): a single page caps at 100, so a
@@ -1207,7 +1220,7 @@ class GitHubHttpClient:
                 # or malformed GitHub response), not evidence of "no marker".
                 # Fail loud so a dedupe caller never posts a duplicate from a
                 # response we could not actually scan.
-                raise GitHubHttpError(
+                raise GitHubScanIncompleteError(
                     f"Comment listing for #{issue_number} page {page} was not "
                     f"a list ({type(payload).__name__}); cannot confirm marker "
                     f"absence",
@@ -1230,7 +1243,7 @@ class GitHubHttpClient:
                 # The cap exists only to bound a pathological loop, not to
                 # define "marker absent". Fail loud so the dedupe caller never
                 # mistakes a truncated scan for a clean one.
-                raise GitHubHttpError(
+                raise GitHubScanIncompleteError(
                     f"Comment marker scan for #{issue_number} exceeded "
                     f"{_MARKER_SCAN_PAGE_CAP} pages without reaching the final "
                     f"page; cannot confirm marker absence",
@@ -1259,7 +1272,7 @@ class GitHubHttpClient:
                 use_cache=False,
             )
             if not isinstance(payload, list):
-                raise GitHubHttpError(
+                raise GitHubScanIncompleteError(
                     f"Event listing for #{issue_number} page {page} was not a "
                     f"list ({type(payload).__name__}); cannot confirm close-"
                     f"event absence",
@@ -1279,7 +1292,7 @@ class GitHubHttpClient:
                 return False
             page += 1
             if page > _MARKER_SCAN_PAGE_CAP:
-                raise GitHubHttpError(
+                raise GitHubScanIncompleteError(
                     f"Issue event scan for #{issue_number} exceeded "
                     f"{_MARKER_SCAN_PAGE_CAP} pages without reaching the final "
                     f"page; cannot confirm close-event absence",

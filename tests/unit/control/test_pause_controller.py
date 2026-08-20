@@ -478,3 +478,120 @@ class TestBreakerCountingIsOwnedPolicy:
 
         assert len([e for e in events.events
                     if e.name == EventName.ORCHESTRATOR_PAUSED]) == 1
+
+
+class TestTransitionFanOutIsOrdered:
+    """Findings 5 and 6: what a transition REPORTS and RECORDS must match it."""
+
+    def test_a_committed_resume_never_reports_a_foreign_state(self) -> None:
+        """The resume outcome used to re-read shared state after the lock.
+
+        A pause landing in that window made the reply say "resumed,
+        committed: true" while reporting the new pauser's actor and reason —
+        a response claiming a transition that never happened, which is exactly
+        what the outcome type exists to prevent.
+        """
+        import threading
+
+        store = FakeStore()
+        clock = FakeClock()
+        journal_entered = threading.Event()
+        release_journal = threading.Event()
+
+        class SlowJournal:
+            def record(self, transition) -> None:  # noqa: ANN001
+                if not transition.paused:
+                    journal_entered.set()
+                    release_journal.wait(timeout=2.0)
+
+            def recent(self, limit: int = 20) -> list:
+                return []
+
+        controller = PauseController(
+            events=CollectingEventSink(),
+            event_context=EventContext(),
+            store=store,
+            journal=SlowJournal(),
+            clock=clock,
+        )
+        controller.pause(reason=PauseReason.OPERATOR, actor=PauseActor.WEB_API)
+
+        outcome: list = []
+        resumer = threading.Thread(
+            target=lambda: outcome.append(controller.resume(actor=PauseActor.WEB_API))
+        )
+        resumer.start()
+        assert journal_entered.wait(timeout=2.0)
+
+        # A foreign pause lands while the resume is still announcing.
+        intruder = threading.Thread(
+            target=lambda: controller.pause(
+                reason=PauseReason.OPERATOR, actor=PauseActor.DASHBOARD
+            )
+        )
+        intruder.start()
+        release_journal.set()
+        resumer.join(timeout=3.0)
+        intruder.join(timeout=3.0)
+
+        assert outcome[0].committed is True
+        # It reports the state IT committed, not whatever is current now.
+        assert outcome[0].state.paused is False
+        assert outcome[0].recorded_actor is None
+        assert outcome[0].recorded_reason is None
+
+    def test_journal_and_events_are_ordered_with_the_transitions(self) -> None:
+        """A durable journal that records the transitions backwards is useless.
+
+        The swap was serialized but the fan-out was not, so a resume landing
+        inside a pause's journal write produced rows in reverse order — and an
+        SSE stream whose last event said `paused` on a running engine.
+        """
+        import threading
+
+        store = FakeStore()
+        clock = FakeClock()
+        rows: list = []
+        pause_entered = threading.Event()
+        release_pause = threading.Event()
+
+        class BlockingJournal:
+            def record(self, transition) -> None:  # noqa: ANN001
+                if transition.paused:
+                    pause_entered.set()
+                    release_pause.wait(timeout=2.0)
+                rows.append("paused" if transition.paused else "resumed")
+
+            def recent(self, limit: int = 20) -> list:
+                return []
+
+        events = CollectingEventSink()
+        controller = PauseController(
+            events=events,
+            event_context=EventContext(),
+            store=store,
+            journal=BlockingJournal(),
+            clock=clock,
+        )
+
+        pauser = threading.Thread(
+            target=lambda: controller.pause(
+                reason=PauseReason.OPERATOR, actor=PauseActor.WEB_API
+            )
+        )
+        pauser.start()
+        assert pause_entered.wait(timeout=2.0)
+
+        resumer = threading.Thread(
+            target=lambda: controller.resume(actor=PauseActor.DASHBOARD)
+        )
+        resumer.start()
+        release_pause.set()
+        pauser.join(timeout=3.0)
+        resumer.join(timeout=3.0)
+
+        assert rows == ["paused", "resumed"], rows
+        names = [str(e.name) for e in events.events]
+        assert names == ["orchestrator.paused", "orchestrator.resumed"], names
+        # And the last thing recorded agrees with reality.
+        assert store.pause_state.paused is False

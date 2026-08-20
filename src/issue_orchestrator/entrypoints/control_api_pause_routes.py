@@ -8,36 +8,13 @@ rather than a one-line delegation.
 
 from __future__ import annotations
 
-import json
-
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
 from ..domain.pause_state import PauseActor, PauseReason, PauseTransitionStatus
-from .pause_response import transition_response
+from .pause_response import requested_actor, transition_response
 
 control_pause_router = APIRouter()
-
-
-async def requested_actor(request: Request, default: PauseActor) -> PauseActor:
-    """Read the caller's self-declared actor from an optional JSON body.
-
-    Every remote surface (MCP, the Control Center) reaches the engine through
-    the same HTTP route, so without a declared actor they would all be recorded
-    identically and the pause journal could not tell them apart. An unknown or
-    absent value falls back to ``default`` rather than failing the request — the
-    transition matters more than its label.
-    """
-    try:
-        body = await request.body()
-        if not body:
-            return default
-        data = json.loads(body)
-        if not isinstance(data, dict):
-            return default
-        return PauseActor(str(data.get("actor", "")))
-    except (json.JSONDecodeError, ValueError):
-        return default
 
 
 @control_pause_router.post("/api/pause")

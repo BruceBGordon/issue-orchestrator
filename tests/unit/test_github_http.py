@@ -24,6 +24,7 @@ from issue_orchestrator.adapters.github.http_client import (
     GitHubHttpClient,
     GitHubHttpConfig,
     GitHubHttpError,
+    GitHubScanIncompleteError,
     GitHubTransportError,
     describe_github_token_sources,
     resolve_github_token,
@@ -749,7 +750,7 @@ def test_list_issues_exhaustive_cap_exhaustion_fails_loud() -> None:
         return httpx.Response(200, json=full_page)  # always a full page
 
     client = _client_with_transport(httpx.MockTransport(handler))
-    with pytest.raises(GitHubHttpError):
+    with pytest.raises(GitHubScanIncompleteError):
         client.list_issues(labels=["tech-lead-agent"], limit=2000, exhaustive=True)
 
 
@@ -931,7 +932,10 @@ def test_issue_comment_marker_present_fails_loud_at_page_cap() -> None:
 
     client = _client_with_transport(httpx.MockTransport(handler))
 
-    with pytest.raises(GitHubHttpError):
+    # Typed as a completeness failure, not a generic HTTP error: consumers that
+    # answer a negative-existence question must be able to tell "I scanned
+    # everything and it wasn't there" from "I could not finish scanning".
+    with pytest.raises(GitHubScanIncompleteError):
         client.issue_comment_marker_present(318, _TEST_MARKER)
     # The scan walked every page up to the cap before failing loud (it did not
     # bail out early treating a full page as the end).

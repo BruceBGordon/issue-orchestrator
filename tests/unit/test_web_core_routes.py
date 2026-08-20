@@ -7,6 +7,7 @@ from collections import Counter
 from tests.unit import test_web as _support
 from tests.unit.route_helpers import route_path_counts
 from tests.unit.test_web import *  # noqa: F403
+from issue_orchestrator.domain.pause_state import PauseActor, PauseReason
 from tests.conftest import operator_paused_state
 
 globals().update(
@@ -262,6 +263,52 @@ class TestPauseResumeEndpoints:
         assert response.status_code == 200
         assert response.json()["status"] == "paused"
         mock_orch.pause.assert_called_once()
+
+    def test_pause_endpoint_honours_a_declared_actor(self):
+        """The ENGINE app must record the actor the caller declared.
+
+        Regression for a fix that was entirely inert: the Control Center and
+        MCP both post to the engine port, where ``web_refresh_router`` is
+        included long before ``control_app`` is mounted — so this router serves
+        /api/pause, and an actor honoured only by the control router was
+        silently dropped. Every remote pause was journaled as ``web_api`` while
+        a client-side test asserted the body was "sent" and passed.
+
+        This asserts the RECEIVER, which is what decides the journal row.
+        """
+        mock_orch = create_mock_orchestrator()
+        set_orchestrator(mock_orch)
+
+        client = TestClient(app)
+        response = client.post("/api/pause", json={"actor": "control_center"})
+
+        assert response.status_code == 200
+        assert response.json()["actor"] == "control_center", (
+            "the engine recorded a different actor than the caller declared"
+        )
+        assert mock_orch.pause.call_args.kwargs["actor"] == PauseActor.CONTROL_CENTER
+
+    def test_pause_endpoint_defaults_to_web_api_without_a_declared_actor(self):
+        """A dashboard click sends no body and must stay attributed to the UI."""
+        mock_orch = create_mock_orchestrator()
+        set_orchestrator(mock_orch)
+
+        client = TestClient(app)
+        response = client.post("/api/pause")
+
+        assert response.json()["actor"] == "web_api"
+
+    def test_resume_endpoint_honours_a_declared_actor(self):
+        mock_orch = create_mock_orchestrator()
+        mock_orch.pause(reason=PauseReason.OPERATOR, actor=PauseActor.DASHBOARD)
+        set_orchestrator(mock_orch)
+
+        client = TestClient(app)
+        response = client.post("/api/resume", json={"actor": "control_center"})
+
+        assert response.status_code == 200
+        assert response.json()["committed"] is True
+        assert mock_orch.resume.call_args.kwargs["actor"] == PauseActor.CONTROL_CENTER
 
     def test_resume_endpoint(self):
         """Test resume endpoint calls orchestrator.resume()."""
