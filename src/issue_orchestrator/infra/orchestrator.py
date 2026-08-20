@@ -160,6 +160,7 @@ class Orchestrator:
         return PauseController(
             events=self.deps.events,
             event_context=self._event_context,
+            store=self.state,
             journal=JsonlPauseJournal(
                 state_dir(self.config.repo_root) / PAUSE_JOURNAL_FILENAME
             ),
@@ -1048,9 +1049,7 @@ class Orchestrator:
     ) -> None:
         """Pause the engine. Every caller must say why and on whose behalf."""
         with self.state_lock:
-            self.state.pause_state = self.pause_controller.pause(
-                reason=reason, actor=actor, detail=detail
-            )
+            self.pause_controller.pause(reason=reason, actor=actor, detail=detail)
 
     def set_start_paused(self, *, actor: PauseActor = PauseActor.CLI) -> None:
         """Set initial paused state and request dashboard read-model hydration.
@@ -1062,7 +1061,7 @@ class Orchestrator:
         with self.state_lock:
             # Event suppressed here: run_loop publishes the startup pause once
             # the event context is live, so emitting now would double-count it.
-            self.state.pause_state = self.pause_controller.pause(
+            self.pause_controller.pause(
                 reason=PauseReason.STARTUP,
                 actor=actor,
                 detail="started in paused mode",
@@ -1073,7 +1072,7 @@ class Orchestrator:
     def resume(self, *, actor: PauseActor = PauseActor.CONTROL_API, detail: str = "") -> None:
         """Resume the engine, recording who resumed it and what it was paused for."""
         with self.state_lock:
-            self.state.pause_state = self.pause_controller.resume(actor=actor, detail=detail)
+            self.pause_controller.resume(actor=actor, detail=detail)
         self._loop_error_count = 0
 
     def get_failure_diagnosis(self, issue_number: int) -> dict:

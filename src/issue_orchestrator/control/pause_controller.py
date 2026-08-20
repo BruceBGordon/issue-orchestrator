@@ -21,6 +21,7 @@ from __future__ import annotations
 import logging
 import threading
 from collections.abc import Callable
+from typing import Protocol
 from datetime import datetime, timedelta, timezone
 
 from ..domain.pause_state import PauseActor, PauseReason, PauseState, PauseTransition
@@ -30,6 +31,18 @@ from ..ports.event_sink import EventSink, TraceEvent
 from ..ports.pause_journal import NullPauseJournal, PauseJournal
 
 logger = logging.getLogger(__name__)
+
+
+class PauseStateStore(Protocol):
+    """Where the pause state actually lives.
+
+    ``OrchestratorState`` satisfies this via its ``pause_state`` field. Depending
+    on the one-attribute shape rather than the whole state object keeps the
+    controller testable and stops it reaching into unrelated orchestrator state.
+    """
+
+    pause_state: PauseState
+
 
 # Half-open retry schedule for INCIDENT pauses (the loop-error breaker).
 #
@@ -61,23 +74,27 @@ class PauseController:
         *,
         events: EventSink,
         event_context: EventContext,
+        store: "PauseStateStore",
         journal: PauseJournal | None = None,
         clock: Callable[[], datetime] | None = None,
     ):
         self._events = events
         self._event_context = event_context
+        # The pause state is stored in ONE place — the orchestrator state object
+        # every view model and planner already reads. Keeping a second copy here
+        # would let the owner and its readers disagree, which is the same class
+        # of bug this controller exists to remove.
+        self._store = store
         self._journal = journal if journal is not None else NullPauseJournal()
         self._clock = clock if clock is not None else lambda: datetime.now(timezone.utc)
         self._lock = threading.Lock()
-        self._state = PauseState.running()
         self._auto_resume_at: datetime | None = None
         self._incident_streak = 0
 
     @property
     def state(self) -> PauseState:
         """The current pause state (immutable snapshot)."""
-        with self._lock:
-            return self._state
+        return self._store.pause_state
 
     @property
     def paused(self) -> bool:
@@ -98,18 +115,19 @@ class PauseController:
         """
         now = self._clock()
         with self._lock:
-            if self._state.paused:
+            current = self._store.pause_state
+            if current.paused:
                 logger.debug(
                     "[PAUSE] Already paused (%s); ignoring %s pause from %s",
-                    self._state.describe(now),
+                    current.describe(now),
                     reason,
                     actor,
                 )
-                return self._state
-            self._state = PauseState.paused_now(
+                return current
+            new_state = PauseState.paused_now(
                 reason=reason, actor=actor, detail=detail, now=now
             )
-            new_state = self._state
+            self._store.pause_state = new_state
             if reason.is_incident:
                 index = min(self._incident_streak, len(_AUTO_RESUME_BACKOFF_SECONDS) - 1)
                 backoff = _AUTO_RESUME_BACKOFF_SECONDS[index]
@@ -148,11 +166,11 @@ class PauseController:
         """Resume the engine, recording who resumed it and what it was paused for."""
         now = self._clock()
         with self._lock:
-            if not self._state.paused:
+            previous = self._store.pause_state
+            if not previous.paused:
                 logger.debug("[PAUSE] Already running; ignoring resume from %s", actor)
-                return self._state
-            previous = self._state
-            self._state = PauseState.running()
+                return previous
+            self._store.pause_state = PauseState.running()
             self._auto_resume_at = None
 
         held = previous.held_seconds(now)
@@ -188,7 +206,7 @@ class PauseController:
                 ),
             )
         )
-        return self._state
+        return self._store.pause_state
 
     def due_for_auto_resume(self, now: datetime | None = None) -> bool:
         """Whether a half-open incident pause has waited out its backoff.
@@ -198,7 +216,7 @@ class PauseController:
         """
         moment = now if now is not None else self._clock()
         with self._lock:
-            if not self._state.paused or self._auto_resume_at is None:
+            if not self._store.pause_state.paused or self._auto_resume_at is None:
                 return False
             return moment >= self._auto_resume_at
 
@@ -209,7 +227,7 @@ class PauseController:
         punished by the escalation earned during an earlier bad patch.
         """
         with self._lock:
-            if self._state.paused or self._incident_streak == 0:
+            if self._store.pause_state.paused or self._incident_streak == 0:
                 return
             self._incident_streak = 0
 

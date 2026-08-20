@@ -11,6 +11,7 @@ These cover the two defects that motivated the module:
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -49,14 +50,22 @@ class FakeClock:
         self.now = self.now + timedelta(seconds=seconds)
 
 
+@dataclass
+class FakeStore:
+    """The one place the pause state lives — ``OrchestratorState``'s shape."""
+
+    pause_state: PauseState = field(default_factory=PauseState.running)
+
+
 def _controller(
-    clock: FakeClock | None = None, journal=None
+    clock: FakeClock | None = None, journal=None, store: FakeStore | None = None
 ) -> tuple[PauseController, CollectingEventSink, FakeClock]:
     events = CollectingEventSink()
     the_clock = clock or FakeClock()
     controller = PauseController(
         events=events,
         event_context=EventContext(),
+        store=store or FakeStore(),
         journal=journal,
         clock=the_clock,
     )

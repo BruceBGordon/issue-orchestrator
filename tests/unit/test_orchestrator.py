@@ -10,6 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch, call, AsyncMock, PropertyMock
 from tests.conftest import MockSessionRunner
+from tests.conftest import operator_paused_state
 from issue_orchestrator.infra.orchestrator import Orchestrator, run_orchestrator
 from issue_orchestrator.domain.models import (
     Issue,
@@ -122,7 +123,7 @@ def test_pause_emits_event(sample_config):
 
 def test_resume_emits_event(sample_config):
     orchestrator = create_test_orchestrator(sample_config)
-    orchestrator.state.paused = True
+    orchestrator.state.pause_state = operator_paused_state()
 
     orchestrator.resume()
 
@@ -378,7 +379,7 @@ def test_composed_one_shot_timeout_terminates_via_real_driver_and_facade(
 
     orchestrator.launch_tech_lead_session = _launch
     orchestrator.tick = lambda: True  # never drains the session -> forces timeout
-    orchestrator.pause = lambda: None
+    orchestrator.pause = lambda **kwargs: None
 
     # deadline, then the poll checks; the tail stays past the deadline so the
     # drive loop terminates deterministically however often it samples.
@@ -1646,7 +1647,7 @@ class TestRunLoop:
         mock_repository_host.issues = []
 
         orchestrator = create_test_orchestrator(sample_config, mock_repository_host)
-        orchestrator.state.paused = True
+        orchestrator.state.pause_state = operator_paused_state()
 
         await run_loop_one_tick(orchestrator)
 
@@ -2108,7 +2109,7 @@ class TestControlMethods:
     def test_resume_clears_paused_flag(self, sample_config):
         """Test that resume() clears the paused flag."""
         orchestrator = create_test_orchestrator(sample_config)
-        orchestrator.state.paused = True
+        orchestrator.state.pause_state = operator_paused_state()
 
         orchestrator.resume()
 
@@ -2920,7 +2921,7 @@ class TestPauseBehavior:
             launch_count += 1
             # Pause after first launch
             if launch_count == 1:
-                orchestrator.state.paused = True
+                orchestrator.state.pause_state = operator_paused_state()
                 orchestrator.request_shutdown()
             return create_session(issue)
 

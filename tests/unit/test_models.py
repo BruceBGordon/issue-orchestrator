@@ -3,6 +3,7 @@
 import pytest
 from datetime import datetime, timedelta
 from pathlib import Path
+from issue_orchestrator.domain.pause_state import PauseActor, PauseReason, PauseState
 from issue_orchestrator.domain.models import (
     Issue,
     Session,
@@ -17,6 +18,7 @@ from issue_orchestrator.domain.models import (
 from issue_orchestrator.domain.issue_key import FakeIssueKey
 from issue_orchestrator.domain.session_key import SessionKey, TaskKind
 from tests.unit.session_run_helpers import make_session_run_assets
+from tests.conftest import operator_paused_state
 
 
 def _make_session_key(issue_number: int = 1, task: TaskKind = TaskKind.CODE) -> SessionKey:
@@ -847,7 +849,7 @@ class TestOrchestratorState:
         state = OrchestratorState(
             active_sessions=[session1],
             completed_today=[1, 2, 3],
-            paused=True,
+            pause_state=operator_paused_state(),
             priority_queue=[4, 5],
         )
 
@@ -858,15 +860,28 @@ class TestOrchestratorState:
         assert state.priority_queue == [4, 5]
 
     def test_orchestrator_state_pause_toggle(self):
-        """Test toggling paused state."""
+        """``paused`` projects ``pause_state`` and cannot be written directly."""
         state = OrchestratorState()
         assert state.paused is False
 
-        state.paused = True
+        state.pause_state = PauseState.paused_now(
+            reason=PauseReason.OPERATOR, actor=PauseActor.CONTROL_API
+        )
         assert state.paused is True
 
-        state.paused = False
+        state.pause_state = PauseState.running()
         assert state.paused is False
+
+    def test_paused_cannot_be_assigned_directly(self):
+        """The write path that used to skip the event, log, and journal.
+
+        Two entrypoints set ``state.paused = True`` straight onto the dataclass,
+        which recorded the pause nowhere. Writes must fail loudly so they are
+        routed through PauseController instead.
+        """
+        state = OrchestratorState()
+        with pytest.raises(AttributeError, match="no setter"):
+            state.paused = True
 
 
 class TestPendingValidationRetry:

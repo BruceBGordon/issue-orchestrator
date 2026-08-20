@@ -9,10 +9,12 @@ from issue_orchestrator.ports.provider_resilience import (
     NO_PROVIDER_CIRCUIT_STATUS,
     ProviderCircuitStatusReader,
 )
+from issue_orchestrator.domain.pause_state import PauseState
 from issue_orchestrator.ports.tech_lead_run_record_store import (
     NO_TECH_LEAD_RUN_HISTORY,
     TechLeadRunHistoryReader,
 )
+from tests.conftest import operator_paused_state
 
 
 class MockOrchestratorForWeb:
@@ -81,10 +83,10 @@ class MockOrchestratorForWeb:
         return config
 
     def pause(self) -> None:
-        self.state.paused = True
+        self.state.pause_state = operator_paused_state()
 
     def resume(self) -> None:
-        self.state.paused = False
+        self.state.pause_state = PauseState.running()
 
     def request_shutdown(self, force: bool = False) -> None:
         _ = force

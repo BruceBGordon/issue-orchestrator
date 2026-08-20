@@ -7,6 +7,7 @@ from collections import Counter
 from tests.unit import test_web as _support
 from tests.unit.route_helpers import route_path_counts
 from tests.unit.test_web import *  # noqa: F403
+from tests.conftest import operator_paused_state
 
 globals().update(
     {name: value for name, value in vars(_support).items() if not name.startswith("__")}
@@ -134,7 +135,7 @@ class TestDashboardEndpoint:
         """Test dashboard shows paused state."""
         from issue_orchestrator.entrypoints import web
         mock_orch = create_mock_orchestrator()
-        mock_orch.state.paused = True
+        mock_orch.state.pause_state = operator_paused_state()
 
         set_orchestrator(mock_orch)
         try:

@@ -74,6 +74,7 @@ from issue_orchestrator.timeline import (
 )
 from issue_orchestrator.events import EventName
 from tests.unit.session_run_helpers import make_session_run_assets
+from issue_orchestrator.domain.pause_state import PauseState
 
 _TEST_RUN_DIR_BY_ISSUE: dict[int, str] = {}
 
@@ -170,7 +171,7 @@ def create_mock_orchestrator():
         active_sessions=[],
         session_history=[],
         completed_today=[],
-        paused=False,
+        pause_state=PauseState.running(),
         priority_queue=[],
         startup_status="complete",  # Required for dashboard to show issues
     )
