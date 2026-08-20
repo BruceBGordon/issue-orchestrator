@@ -9,6 +9,10 @@ from issue_orchestrator.ports.provider_resilience import (
     NO_PROVIDER_CIRCUIT_STATUS,
     ProviderCircuitStatusReader,
 )
+from issue_orchestrator.ports.tech_lead_run_record_store import (
+    NO_TECH_LEAD_RUN_HISTORY,
+    TechLeadRunHistoryReader,
+)
 
 
 class MockOrchestratorForWeb:
@@ -19,6 +23,12 @@ class MockOrchestratorForWeb:
     # silently defaulted would let missing wiring read as a healthy provider
     # fleet (issue #5980 F2/A1). Override per test to simulate an outage.
     provider_circuit: ProviderCircuitStatusReader = NO_PROVIDER_CIRCUIT_STATUS
+
+    # Same rule for the local tech-lead run history the dashboard reads (ADR-0033
+    # / #6858): the route goes through the engine's required facade property, so
+    # a mock without one makes ``GET /`` raise instead of rendering. Override per
+    # test to publish runs.
+    tech_lead_run_history: TechLeadRunHistoryReader = NO_TECH_LEAD_RUN_HISTORY
 
     def __init__(self) -> None:
         self.state = OrchestratorState(

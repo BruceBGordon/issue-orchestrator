@@ -16,6 +16,13 @@ from ..domain.review_artifacts import (
     REVIEW_REPORT_FILENAME,
 )
 from ..domain.run_manifest import RunManifest
+from ..domain.tech_lead_artifacts import (
+    TECH_LEAD_DECISION_ARTIFACT,
+    TECH_LEAD_DECISION_FILENAME,
+    TECH_LEAD_REPORT_ARTIFACT,
+    TECH_LEAD_REPORT_FILENAME,
+)
+from ..domain.tech_lead_run_artifacts import TECH_LEAD_DATA_DIRNAME
 from .session_output_adapter import (
     CLAUDE_SESSION_LOG_NAME,
     RETRY_PROMPT_NAME,
@@ -60,12 +67,77 @@ class ArtifactNotFoundError(FileNotFoundError):
     """Raised when a run-scoped artifact cannot be resolved."""
 
 
-def _review_artifact_filename(artifact_type: str) -> str:
-    if artifact_type == REVIEW_REPORT_ARTIFACT:
-        return REVIEW_REPORT_FILENAME
-    if artifact_type == REVIEW_DECISION_ARTIFACT:
-        return REVIEW_DECISION_FILENAME
-    raise ArtifactNotFoundError(f"unsupported review artifact type: {artifact_type}")
+@dataclass(frozen=True)
+class _ArtifactPolicy:
+    """Where one artifact type may live inside a run, and how it reads.
+
+    One table entry per type, so "is this path a real persisted artifact?" has a
+    single answer per type instead of a branch chain that grew a new leg each
+    time a surface needed a new artifact (#6858 F4).
+    """
+
+    # Run-relative directory the artifact must sit directly inside.
+    parent_parts: tuple[str, ...]
+    filename: str
+    # What a refused path is told it is not. Per-type prose, so the diagnostic
+    # names the artifact family the caller actually asked for.
+    refusal: str
+    # Review-exchange turn artifacts are written with a per-turn prefix, so the
+    # canonical name is a SUFFIX there and an exact match everywhere else.
+    prefixed: bool
+    content_type: str
+    require_json: bool
+
+    def accepts_name(self, name: str) -> bool:
+        if self.prefixed:
+            return name.endswith(f".{self.filename}")
+        return name == self.filename
+
+
+_REVIEW_TURNS_PARTS = ("review-exchange", "turns")
+_TECH_LEAD_DATA_PARTS = (TECH_LEAD_DATA_DIRNAME,)
+
+_ARTIFACT_POLICIES: dict[str, _ArtifactPolicy] = {
+    REVIEW_REPORT_ARTIFACT: _ArtifactPolicy(
+        parent_parts=_REVIEW_TURNS_PARTS,
+        filename=REVIEW_REPORT_FILENAME,
+        refusal="not a persisted review turn artifact",
+        prefixed=True,
+        content_type="text/markdown",
+        require_json=False,
+    ),
+    REVIEW_DECISION_ARTIFACT: _ArtifactPolicy(
+        parent_parts=_REVIEW_TURNS_PARTS,
+        filename=REVIEW_DECISION_FILENAME,
+        refusal="not a persisted review turn artifact",
+        prefixed=True,
+        content_type="application/json",
+        require_json=True,
+    ),
+    TECH_LEAD_REPORT_ARTIFACT: _ArtifactPolicy(
+        parent_parts=_TECH_LEAD_DATA_PARTS,
+        filename=TECH_LEAD_REPORT_FILENAME,
+        refusal="not a persisted tech-lead artifact",
+        prefixed=False,
+        content_type="text/markdown",
+        require_json=False,
+    ),
+    TECH_LEAD_DECISION_ARTIFACT: _ArtifactPolicy(
+        parent_parts=_TECH_LEAD_DATA_PARTS,
+        filename=TECH_LEAD_DECISION_FILENAME,
+        refusal="not a persisted tech-lead artifact",
+        prefixed=False,
+        content_type="application/json",
+        require_json=True,
+    ),
+}
+
+
+def _artifact_policy(artifact_type: str) -> _ArtifactPolicy:
+    policy = _ARTIFACT_POLICIES.get(artifact_type)
+    if policy is None:
+        raise ArtifactNotFoundError(f"unsupported review artifact type: {artifact_type}")
+    return policy
 
 
 def _worktree_path_from_run_dir(run_dir: Path) -> Path | None:
@@ -278,9 +350,35 @@ class ManifestAccessor:
         artifact_path: str,
         artifact_type: str,
     ) -> ArtifactStream:
-        """Return a review report/decision artifact scoped to this run."""
+        """Return one agent-authored report/decision artifact scoped to this run.
+
+        Serves the reviewer's pair and the tech lead's pair (#6858 F4). Each type
+        declares WHERE it is allowed to live in ``_ARTIFACT_POLICIES``, so a
+        caller-supplied path is checked against that one table rather than
+        against a rule this method re-decides per type.
+        """
+        policy = _artifact_policy(artifact_type)
         run_dir = self.run_identity.run_dir.resolve()
         self._require_run_dir_exists(run_dir)
+        resolved = self._contained_artifact_path(run_dir, artifact_path)
+        expected_parent = run_dir.joinpath(*policy.parent_parts).resolve()
+        if resolved.parent != expected_parent or not policy.accepts_name(resolved.name):
+            raise ArtifactNotFoundError(
+                f"artifact path is {policy.refusal}: {resolved}"
+            )
+        if not resolved.exists() or not resolved.is_file():
+            raise ArtifactNotFoundError(f"{artifact_type} not found: {resolved}")
+        self._require_non_empty(resolved, artifact_name=artifact_type)
+        if policy.require_json:
+            self._require_valid_json(resolved, artifact_name=artifact_type)
+        return self._artifact_stream(
+            artifact_type,
+            resolved,
+            content_type=policy.content_type,
+        )
+
+    def _contained_artifact_path(self, run_dir: Path, artifact_path: str) -> Path:
+        """Resolve ``artifact_path`` and refuse anything outside ``run_dir``."""
         candidate = Path(artifact_path)
         if not candidate.is_absolute():
             candidate = run_dir / candidate
@@ -289,30 +387,9 @@ class ManifestAccessor:
             resolved.relative_to(run_dir)
         except (OSError, ValueError) as exc:
             raise ArtifactNotFoundError(
-                f"review artifact path escapes run_dir: {candidate}"
+                f"run artifact path escapes run_dir: {candidate}"
             ) from exc
-        turns_dir = (run_dir / "review-exchange" / "turns").resolve()
-        expected_filename = _review_artifact_filename(artifact_type)
-        if resolved.parent != turns_dir or not resolved.name.endswith(f".{expected_filename}"):
-            raise ArtifactNotFoundError(
-                "review artifact path is not a persisted review turn artifact: "
-                f"{resolved}"
-            )
-        if not resolved.exists() or not resolved.is_file():
-            raise ArtifactNotFoundError(f"review artifact not found: {resolved}")
-        self._require_non_empty(resolved, artifact_name="review artifact")
-        if artifact_type == REVIEW_DECISION_ARTIFACT:
-            self._require_valid_json(resolved, artifact_name="review decision")
-            content_type = "application/json"
-        elif artifact_type == REVIEW_REPORT_ARTIFACT:
-            content_type = "text/markdown"
-        else:
-            raise ArtifactNotFoundError(f"unsupported review artifact type: {artifact_type}")
-        return self._artifact_stream(
-            artifact_type,
-            resolved,
-            content_type=content_type,
-        )
+        return resolved
 
     def get_session_prompt(self) -> ArtifactStream:
         """Return the run-scoped launch prompt for this run.

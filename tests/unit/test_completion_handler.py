@@ -193,6 +193,9 @@ def make_handler(
         else InMemoryTechLeadAuthorityStore()
     )
     from issue_orchestrator.control.open_issue_corpus import OpenIssueCorpusManager
+    from issue_orchestrator.control.tech_lead_run_activity import (
+        in_memory_run_activity,
+    )
 
     resolved_repository_host = repository_host or make_repository_host()
     return CompletionHandler(
@@ -212,6 +215,7 @@ def make_handler(
             is_enabled=lambda: config.tech_lead.dedup.enabled,
         ),
         provider_availability=make_provider_availability(config),
+        tech_lead_run_activity=in_memory_run_activity(),
     )
 
 

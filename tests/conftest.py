@@ -1010,6 +1010,9 @@ def build_test_orchestrator_deps(
 
     from issue_orchestrator.control.label_manager import LabelManager
     from issue_orchestrator.control.infra_services import InfraServices
+    from issue_orchestrator.control.tech_lead_run_activity import (
+        in_memory_run_activity,
+    )
     from issue_orchestrator.control.publish_recovery import PublishRecoveryService
     from issue_orchestrator.entrypoints.bootstrap import create_attempt_store
     from issue_orchestrator.execution.label_store import LabelStore
@@ -1059,6 +1062,9 @@ def build_test_orchestrator_deps(
         attempt_store=attempt_store,
         tech_lead_authority=tech_lead_authority,
         open_issue_corpus=open_issue_corpus,
+        # An EXPLICIT choice: this bounded composition keeps no durable history
+        # and preserves no run artifacts (#6858 A2).
+        tech_lead_run_activity=in_memory_run_activity(),
     )
 
     from issue_orchestrator.execution.json_publish_retry_locator_store import (
@@ -1157,6 +1163,7 @@ def build_test_orchestrator_deps(
             repository_host=repo_host,
             session_output=session_output,
             tech_lead_authority=tech_lead_authority,
+            tech_lead_run_activity=infra_services.tech_lead_run_activity,
             open_issue_corpus=open_issue_corpus,
             label_manager=label_manager,
             provider_resilience=provider_resilience,

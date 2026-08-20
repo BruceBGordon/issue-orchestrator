@@ -35,6 +35,7 @@ if TYPE_CHECKING:
     from .label_manager import LabelManager
     from .provider_launch_readiness import ProviderLaunchReadinessSampler
     from .provider_resilience import ProviderResilienceManager
+    from .tech_lead_run_activity import TechLeadRunActivity
 
 
 def _noop_health_check() -> None:
@@ -63,6 +64,17 @@ class InfraServices:
     tech_lead_authority: "TechLeadAuthorityStore"
     # Rebuildable GitHub open-issue corpus owner (#6881).
     open_issue_corpus: "OpenIssueCorpusManager"
+    # The LOCAL half of ADR-0033: what tech-lead runs this engine executed and
+    # what they concluded. Paired with ``tech_lead_authority`` (the trust
+    # boundary) but deliberately a different owner — this one decides nothing
+    # and is never read by a peer engine (#6858).
+    #
+    # REQUIRED, with no default factory. A default made "durable history" and
+    # "an in-memory stub the operator never sees" indistinguishable at the
+    # composition seam, and let launch and completion silently bind to two
+    # different owners (#6858 round 1 A2). Production picks SQLite; bounded
+    # compositions pick ``in_memory_run_activity()`` and say so.
+    tech_lead_run_activity: "TechLeadRunActivity"
     # The typed provider-readiness/auth-failure boundary (#6999). Shared by the
     # launch gate and the live-session observer so both consume one probe (and
     # one short-lived result cache) rather than each spawning their own.

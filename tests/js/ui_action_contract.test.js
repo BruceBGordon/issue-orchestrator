@@ -129,6 +129,20 @@ test('buildReviewArtifactRequest returns canonical endpoint and query params', (
     assert.equal(req.method, 'GET');
 });
 
+test('buildReviewArtifactRequest serves the tech-lead artifact pair too', () => {
+    // #6858 F4: the tech lead's report/decision pair is read through the same
+    // authenticated run-scoped endpoint the reviewer's pair uses.
+    const req = uiActionContract.buildReviewArtifactRequest(
+        900,
+        '/repo/.issue-orchestrator/state/tech-lead-runs/run-900__tech-lead-900',
+        'tech-lead-data/tech-lead-report.md',
+        'tech_lead_report',
+    );
+    assert.ok(req.endpoint.startsWith('/api/session/review-artifact/900?'));
+    assert.ok(req.endpoint.includes('artifact_type=tech_lead_report'));
+    assert.equal(req.method, 'GET');
+});
+
 test('buildReviewArtifactRequest rejects unsupported artifact type', () => {
     assert.throws(
         () => uiActionContract.buildReviewArtifactRequest(4057, '/tmp/run', '/tmp/run/x.txt', 'text'),

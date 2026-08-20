@@ -43,6 +43,7 @@ if TYPE_CHECKING:
     from ..execution.persistent_exchange_pair_registry_inmemory import (
         InMemoryPersistentExchangePairRegistry,
     )
+    from ..control.tech_lead_run_activity import TechLeadRunActivity
     from ..ports.tech_lead_authority import TechLeadAuthorityStore
 
 
@@ -109,6 +110,11 @@ def create_completion_components(
     # NEEDS_HUMAN completion outcome routes through it, and the label adapter
     # below refuses that label by value, so the two halves cannot disagree.
     needs_human_block: "SharedNeedsHumanBlock",
+    # ADR-0033's local run history (#6858). REQUIRED: this seam manufactured its
+    # own fallback owner, which could silently split launch and completion across
+    # two different in-memory histories while the facade claimed broken wiring
+    # fails loudly (#6858 round 1 A2). The caller passes the ONE owner it built.
+    tech_lead_run_activity: "TechLeadRunActivity",
     coder_prompt_addendum: CoderPromptAddendumProvider = NO_CODER_PROMPT_ADDENDUM,
 ) -> tuple[
     "CompletionProcessor | None",
@@ -215,6 +221,7 @@ def create_completion_components(
             repository_host=repository_host,
             session_output=session_output,
             tech_lead_authority=tech_lead_authority,
+            tech_lead_run_activity=tech_lead_run_activity,
             open_issue_corpus=open_issue_corpus,
             label_manager=label_manager,
             provider_resilience=provider_resilience,
@@ -239,6 +246,7 @@ def build_completion_handler_factory(
     repository_host: "RepositoryHost",
     session_output: "SessionOutput",
     tech_lead_authority: "TechLeadAuthorityStore",
+    tech_lead_run_activity: "TechLeadRunActivity",
     open_issue_corpus: "OpenIssueCorpusManager",
     label_manager: "LabelManager",
     provider_resilience: ProviderResilienceManager,
@@ -270,6 +278,7 @@ def build_completion_handler_factory(
             tech_lead_authority,
             open_issue_corpus,
             provider_availability,
+            tech_lead_run_activity,
             remove_session_machine_fn=state_machines.remove_session_machine,
             label_manager=label_manager,
         )

@@ -24,6 +24,10 @@ from issue_orchestrator.domain.models import (
 )
 from issue_orchestrator.domain.session_key import SessionKey, TaskKind
 from issue_orchestrator.infra.config import Config
+from issue_orchestrator.ports.tech_lead_run_record_store import (
+    NO_TECH_LEAD_RUN_HISTORY,
+    TechLeadRunHistoryReader,
+)
 from issue_orchestrator.ports.provider_resilience import (
     NO_PROVIDER_CIRCUIT_STATUS,
     ProviderCircuitStatusReader,
@@ -53,13 +57,15 @@ class _OrchestratorStub:
 class _RouteOrchestratorStub(_OrchestratorStub):
     """Stub for tests that go through the HTTP route rather than the builder.
 
-    ``provider_circuit`` is required with no default, mirroring the real
-    orchestrator facade: the route resolves the circuit reader from it, and a
-    stub that forgot to supply one must fail rather than read as a healthy
-    provider fleet (issue #5980 F2/A1).
+    ``provider_circuit`` and ``tech_lead_run_history`` are required with no
+    default, mirroring the real orchestrator facade: the route resolves both
+    readers from it, and a stub that forgot to supply one must fail rather than
+    read as a healthy provider fleet (issue #5980 F2/A1) or as a tech lead that
+    has simply never run (ADR-0033 / #6858).
     """
 
     provider_circuit: ProviderCircuitStatusReader
+    tech_lead_run_history: TechLeadRunHistoryReader
 
 
 def _make_config() -> Config:
@@ -107,6 +113,7 @@ def test_view_model_active_session_and_dashboard_data():
     view_model = build_dashboard_view_model(
         orchestrator,
         provider_circuit=NO_PROVIDER_CIRCUIT_STATUS,
+        tech_lead_history=NO_TECH_LEAD_RUN_HISTORY,
         queue_page=1,
         active_tab="flow",
         e2e_page=1,
@@ -148,6 +155,7 @@ def test_validation_configured_false_when_no_validation_command():
     view_model = build_dashboard_view_model(
         orchestrator,
         provider_circuit=NO_PROVIDER_CIRCUIT_STATUS,
+        tech_lead_history=NO_TECH_LEAD_RUN_HISTORY,
         e2e_status_provider=lambda _: {"enabled": False, "running": False},
     )
 
@@ -168,6 +176,7 @@ def test_validation_configured_true_when_validation_command_set():
     view_model = build_dashboard_view_model(
         orchestrator,
         provider_circuit=NO_PROVIDER_CIRCUIT_STATUS,
+        tech_lead_history=NO_TECH_LEAD_RUN_HISTORY,
         e2e_status_provider=lambda _: {"enabled": False, "running": False},
     )
 
@@ -183,6 +192,7 @@ def test_dashboard_data_exposes_e2e_failure_evidence_for_live_badge_updates():
     view_model = build_dashboard_view_model(
         orchestrator,
         provider_circuit=NO_PROVIDER_CIRCUIT_STATUS,
+        tech_lead_history=NO_TECH_LEAD_RUN_HISTORY,
         e2e_status_provider=lambda _: {
             "enabled": True,
             "running": False,
@@ -237,6 +247,7 @@ def test_running_flow_card_uses_latest_timeline_snapshot():
     view_model = build_dashboard_view_model(
         orchestrator,
         provider_circuit=NO_PROVIDER_CIRCUIT_STATUS,
+        tech_lead_history=NO_TECH_LEAD_RUN_HISTORY,
         queue_page=1,
         active_tab="flow",
         e2e_page=1,
@@ -306,6 +317,7 @@ def test_active_item_prefers_canonical_issue_title_over_rework_title():
     view_model = build_dashboard_view_model(
         orchestrator,
         provider_circuit=NO_PROVIDER_CIRCUIT_STATUS,
+        tech_lead_history=NO_TECH_LEAD_RUN_HISTORY,
         queue_page=1,
         active_tab="flow",
         e2e_page=1,
@@ -363,6 +375,7 @@ def test_view_model_queue_and_blocked_items():
     view_model = build_dashboard_view_model(
         orchestrator,
         provider_circuit=NO_PROVIDER_CIRCUIT_STATUS,
+        tech_lead_history=NO_TECH_LEAD_RUN_HISTORY,
         queue_page=1,
         active_tab="flow",
         e2e_page=1,
@@ -409,6 +422,7 @@ def test_tech_lead_observation_is_blocked_without_consuming_queue_position():
         e2e_page=1,
         e2e_status_provider=lambda _: {"enabled": False, "running": False},
         provider_circuit=NO_PROVIDER_CIRCUIT_STATUS,
+        tech_lead_history=NO_TECH_LEAD_RUN_HISTORY,
     )
 
     assert [item["issue_number"] for item in view_model.queue_items] == [45]
@@ -431,6 +445,7 @@ def test_large_queue_counts_use_full_queue_not_preview_page():
     first_page = build_dashboard_view_model(
         orchestrator,
         provider_circuit=NO_PROVIDER_CIRCUIT_STATUS,
+        tech_lead_history=NO_TECH_LEAD_RUN_HISTORY,
         queue_page=1,
         active_tab="kanban",
         e2e_page=1,
@@ -439,6 +454,7 @@ def test_large_queue_counts_use_full_queue_not_preview_page():
     second_page = build_dashboard_view_model(
         orchestrator,
         provider_circuit=NO_PROVIDER_CIRCUIT_STATUS,
+        tech_lead_history=NO_TECH_LEAD_RUN_HISTORY,
         queue_page=2,
         active_tab="kanban",
         e2e_page=1,
@@ -478,6 +494,7 @@ def test_queue_preview_pages_follow_cached_queue_order_before_sorting():
     view_model = build_dashboard_view_model(
         orchestrator,
         provider_circuit=NO_PROVIDER_CIRCUIT_STATUS,
+        tech_lead_history=NO_TECH_LEAD_RUN_HISTORY,
         queue_page=2,
         active_tab="kanban",
         e2e_page=1,
@@ -503,6 +520,7 @@ def test_view_model_includes_refresh_freshness_metadata():
     view_model = build_dashboard_view_model(
         orchestrator,
         provider_circuit=NO_PROVIDER_CIRCUIT_STATUS,
+        tech_lead_history=NO_TECH_LEAD_RUN_HISTORY,
         queue_page=1,
         active_tab="flow",
         e2e_page=1,
@@ -572,6 +590,7 @@ def test_stale_reason_blames_orchestrator_stall_when_tick_is_overdue(monkeypatch
     view_model = build_dashboard_view_model(
         orchestrator,
         provider_circuit=NO_PROVIDER_CIRCUIT_STATUS,
+        tech_lead_history=NO_TECH_LEAD_RUN_HISTORY,
         queue_page=1,
         active_tab="flow",
         e2e_page=1,
@@ -607,6 +626,7 @@ def test_stale_reason_uses_threshold_text_when_tick_is_healthy(monkeypatch):
     view_model = build_dashboard_view_model(
         orchestrator,
         provider_circuit=NO_PROVIDER_CIRCUIT_STATUS,
+        tech_lead_history=NO_TECH_LEAD_RUN_HISTORY,
         queue_page=1,
         active_tab="flow",
         e2e_page=1,
@@ -640,6 +660,7 @@ def test_stale_reason_respects_configured_stall_threshold(monkeypatch):
     view_model = build_dashboard_view_model(
         orchestrator,
         provider_circuit=NO_PROVIDER_CIRCUIT_STATUS,
+        tech_lead_history=NO_TECH_LEAD_RUN_HISTORY,
         queue_page=1,
         active_tab="flow",
         e2e_page=1,
@@ -672,6 +693,7 @@ def test_pr_pending_issue_not_shown_in_queued_flow_column():
     view_model = build_dashboard_view_model(
         orchestrator,
         provider_circuit=NO_PROVIDER_CIRCUIT_STATUS,
+        tech_lead_history=NO_TECH_LEAD_RUN_HISTORY,
         queue_page=1,
         active_tab="flow",
         e2e_page=1,
@@ -723,6 +745,7 @@ def test_pr_pending_issue_queued_for_rework_leaves_merge_lane_with_reason():
     view_model = build_dashboard_view_model(
         orchestrator,
         provider_circuit=NO_PROVIDER_CIRCUIT_STATUS,
+        tech_lead_history=NO_TECH_LEAD_RUN_HISTORY,
         queue_page=1,
         active_tab="flow",
         e2e_page=1,
@@ -793,6 +816,7 @@ def test_queued_rework_issue_with_completed_history_pr_stays_queued_not_awaiting
     view_model = build_dashboard_view_model(
         orchestrator,
         provider_circuit=NO_PROVIDER_CIRCUIT_STATUS,
+        tech_lead_history=NO_TECH_LEAD_RUN_HISTORY,
         queue_page=1,
         active_tab="flow",
         e2e_page=1,
@@ -838,6 +862,7 @@ def test_pr_closed_blocked_issue_is_blocked_not_awaiting_merge():
     view_model = build_dashboard_view_model(
         orchestrator,
         provider_circuit=NO_PROVIDER_CIRCUIT_STATUS,
+        tech_lead_history=NO_TECH_LEAD_RUN_HISTORY,
         queue_page=1,
         active_tab="flow",
         e2e_page=1,
@@ -873,6 +898,7 @@ def test_completed_history_with_pr_url_routes_to_awaiting_merge_not_completed():
     view_model = build_dashboard_view_model(
         orchestrator,
         provider_circuit=NO_PROVIDER_CIRCUIT_STATUS,
+        tech_lead_history=NO_TECH_LEAD_RUN_HISTORY,
         queue_page=1,
         active_tab="kanban",
         e2e_page=1,
@@ -930,6 +956,7 @@ def test_awaiting_merge_history_card_retains_stack_gate_payload():
     view_model = build_dashboard_view_model(
         orchestrator,
         provider_circuit=NO_PROVIDER_CIRCUIT_STATUS,
+        tech_lead_history=NO_TECH_LEAD_RUN_HISTORY,
         queue_page=1,
         active_tab="flow",
         e2e_page=1,
@@ -993,6 +1020,7 @@ def test_label_blocked_card_retains_stack_gate_payload():
     view_model = build_dashboard_view_model(
         orchestrator,
         provider_circuit=NO_PROVIDER_CIRCUIT_STATUS,
+        tech_lead_history=NO_TECH_LEAD_RUN_HISTORY,
         queue_page=1,
         active_tab="flow",
         e2e_page=1,
@@ -1036,6 +1064,7 @@ def test_pending_validation_retry_card_retains_stack_gate_payload():
     view_model = build_dashboard_view_model(
         orchestrator,
         provider_circuit=NO_PROVIDER_CIRCUIT_STATUS,
+        tech_lead_history=NO_TECH_LEAD_RUN_HISTORY,
         queue_page=1,
         active_tab="flow",
         e2e_page=1,
@@ -1072,6 +1101,7 @@ def test_merged_history_with_pr_url_routes_to_completed_not_awaiting_merge():
     view_model = build_dashboard_view_model(
         orchestrator,
         provider_circuit=NO_PROVIDER_CIRCUIT_STATUS,
+        tech_lead_history=NO_TECH_LEAD_RUN_HISTORY,
         queue_page=1,
         active_tab="flow",
         e2e_page=1,
@@ -1126,6 +1156,7 @@ def test_history_completed_at_normalizes_naive_datetimes_to_utc_timestamp():
     view_model = build_dashboard_view_model(
         orchestrator,
         provider_circuit=NO_PROVIDER_CIRCUIT_STATUS,
+        tech_lead_history=NO_TECH_LEAD_RUN_HISTORY,
         queue_page=1,
         active_tab="flow",
         e2e_page=1,
@@ -1162,6 +1193,7 @@ def test_closed_history_with_pr_url_routes_to_completed_not_awaiting_merge():
     view_model = build_dashboard_view_model(
         orchestrator,
         provider_circuit=NO_PROVIDER_CIRCUIT_STATUS,
+        tech_lead_history=NO_TECH_LEAD_RUN_HISTORY,
         queue_page=1,
         active_tab="flow",
         e2e_page=1,
@@ -1216,6 +1248,7 @@ def test_validation_failed_history_routes_to_blocked_lane():
     view_model = build_dashboard_view_model(
         orchestrator,
         provider_circuit=NO_PROVIDER_CIRCUIT_STATUS,
+        tech_lead_history=NO_TECH_LEAD_RUN_HISTORY,
         queue_page=1,
         active_tab="flow",
         e2e_page=1,
@@ -1260,6 +1293,7 @@ def test_pending_validation_retry_routes_to_blocked_lane_and_suppresses_queue_du
     view_model = build_dashboard_view_model(
         orchestrator,
         provider_circuit=NO_PROVIDER_CIRCUIT_STATUS,
+        tech_lead_history=NO_TECH_LEAD_RUN_HISTORY,
         queue_page=1,
         active_tab="flow",
         e2e_page=1,
@@ -1313,6 +1347,7 @@ def test_pending_validation_retry_takes_precedence_over_validation_failed_histor
     view_model = build_dashboard_view_model(
         orchestrator,
         provider_circuit=NO_PROVIDER_CIRCUIT_STATUS,
+        tech_lead_history=NO_TECH_LEAD_RUN_HISTORY,
         queue_page=1,
         active_tab="flow",
         e2e_page=1,
@@ -1384,6 +1419,7 @@ def test_awaiting_merge_dedupes_queue_and_history_preferring_pr_link():
     view_model = build_dashboard_view_model(
         orchestrator,
         provider_circuit=NO_PROVIDER_CIRCUIT_STATUS,
+        tech_lead_history=NO_TECH_LEAD_RUN_HISTORY,
         queue_page=1,
         active_tab="awaiting-merge",
         e2e_page=1,
@@ -1436,6 +1472,7 @@ def test_completed_history_without_pr_url_does_not_enter_completed_lane():
     view_model = build_dashboard_view_model(
         orchestrator,
         provider_circuit=NO_PROVIDER_CIRCUIT_STATUS,
+        tech_lead_history=NO_TECH_LEAD_RUN_HISTORY,
         queue_page=1,
         active_tab="kanban",
         e2e_page=1,
@@ -1455,6 +1492,7 @@ def test_queue_item_shows_textual_wait_reason():
     view_model = build_dashboard_view_model(
         orchestrator,
         provider_circuit=NO_PROVIDER_CIRCUIT_STATUS,
+        tech_lead_history=NO_TECH_LEAD_RUN_HISTORY,
         queue_page=1,
         active_tab="kanban",
         e2e_page=1,
@@ -1502,6 +1540,7 @@ def test_queue_wait_reason_counts_only_runnable_items_ahead():
     view_model = build_dashboard_view_model(
         orchestrator,
         provider_circuit=NO_PROVIDER_CIRCUIT_STATUS,
+        tech_lead_history=NO_TECH_LEAD_RUN_HISTORY,
         queue_page=1,
         active_tab="kanban",
         e2e_page=1,
@@ -1524,6 +1563,7 @@ def test_publish_failed_issue_routes_to_blocked_lane():
     view_model = build_dashboard_view_model(
         orchestrator,
         provider_circuit=NO_PROVIDER_CIRCUIT_STATUS,
+        tech_lead_history=NO_TECH_LEAD_RUN_HISTORY,
         queue_page=1,
         active_tab="flow",
         e2e_page=1,
@@ -1549,6 +1589,7 @@ def test_publish_failed_scope_issue_survives_blocked_lane_without_queue_entry():
     view_model = build_dashboard_view_model(
         orchestrator,
         provider_circuit=NO_PROVIDER_CIRCUIT_STATUS,
+        tech_lead_history=NO_TECH_LEAD_RUN_HISTORY,
         queue_page=1,
         active_tab="flow",
         e2e_page=1,
@@ -1581,6 +1622,7 @@ def test_blocked_column_reports_items_omitted_from_compact_preview():
     view_model = build_dashboard_view_model(
         orchestrator,
         provider_circuit=NO_PROVIDER_CIRCUIT_STATUS,
+        tech_lead_history=NO_TECH_LEAD_RUN_HISTORY,
         queue_page=1,
         active_tab="flow",
         e2e_page=1,
@@ -1616,6 +1658,7 @@ def test_review_stage_queue_item_does_not_get_queue_wait_reason():
     view_model = build_dashboard_view_model(
         orchestrator,
         provider_circuit=NO_PROVIDER_CIRCUIT_STATUS,
+        tech_lead_history=NO_TECH_LEAD_RUN_HISTORY,
         queue_page=1,
         active_tab="kanban",
         e2e_page=1,
@@ -1644,6 +1687,7 @@ def test_view_model_includes_refresh_staleness_meta():
     view_model = build_dashboard_view_model(
         orchestrator,
         provider_circuit=NO_PROVIDER_CIRCUIT_STATUS,
+        tech_lead_history=NO_TECH_LEAD_RUN_HISTORY,
         queue_page=1,
         active_tab="flow",
         e2e_page=1,
@@ -1673,6 +1717,7 @@ def test_view_model_includes_refresh_staleness_meta():
     view_model = build_dashboard_view_model(
         orchestrator,
         provider_circuit=NO_PROVIDER_CIRCUIT_STATUS,
+        tech_lead_history=NO_TECH_LEAD_RUN_HISTORY,
         queue_page=1,
         active_tab="flow",
         e2e_page=1,
@@ -1711,6 +1756,7 @@ def test_view_model_history_routing():
     view_model = build_dashboard_view_model(
         orchestrator,
         provider_circuit=NO_PROVIDER_CIRCUIT_STATUS,
+        tech_lead_history=NO_TECH_LEAD_RUN_HISTORY,
         queue_page=1,
         active_tab="history",
         e2e_page=1,
@@ -1745,6 +1791,7 @@ def test_history_items_expose_completed_at_as_timestamp_source():
     view_model = build_dashboard_view_model(
         orchestrator,
         provider_circuit=NO_PROVIDER_CIRCUIT_STATUS,
+        tech_lead_history=NO_TECH_LEAD_RUN_HISTORY,
         queue_page=1,
         active_tab="completed",
         e2e_page=1,
@@ -1784,6 +1831,7 @@ def test_awaiting_merge_history_item_is_not_stale_when_startup_recovery_seeded_f
     view_model = build_dashboard_view_model(
         orchestrator,
         provider_circuit=NO_PROVIDER_CIRCUIT_STATUS,
+        tech_lead_history=NO_TECH_LEAD_RUN_HISTORY,
         queue_page=1,
         active_tab="flow",
         e2e_page=1,
@@ -1824,6 +1872,7 @@ def test_completed_history_keeps_stale_fact_but_hides_stale_badge():
     view_model = build_dashboard_view_model(
         orchestrator,
         provider_circuit=NO_PROVIDER_CIRCUIT_STATUS,
+        tech_lead_history=NO_TECH_LEAD_RUN_HISTORY,
         queue_page=1,
         active_tab="flow",
         e2e_page=1,
@@ -1876,6 +1925,7 @@ def test_awaiting_merge_history_stale_fact_shows_stale_badge():
     view_model = build_dashboard_view_model(
         orchestrator,
         provider_circuit=NO_PROVIDER_CIRCUIT_STATUS,
+        tech_lead_history=NO_TECH_LEAD_RUN_HISTORY,
         queue_page=1,
         active_tab="flow",
         e2e_page=1,
@@ -1990,6 +2040,7 @@ def test_view_model_history_dedupes_latest_per_issue():
     view_model = build_dashboard_view_model(
         orchestrator,
         provider_circuit=NO_PROVIDER_CIRCUIT_STATUS,
+        tech_lead_history=NO_TECH_LEAD_RUN_HISTORY,
         queue_page=1,
         active_tab="history",
         e2e_page=1,
@@ -2037,6 +2088,7 @@ def test_completed_excludes_issues_visible_in_running_lane():
     view_model = build_dashboard_view_model(
         orchestrator,
         provider_circuit=NO_PROVIDER_CIRCUIT_STATUS,
+        tech_lead_history=NO_TECH_LEAD_RUN_HISTORY,
         queue_page=1,
         active_tab="kanban",
         e2e_page=1,
@@ -2072,6 +2124,7 @@ def test_view_model_e2e_items_from_provider():
     view_model = build_dashboard_view_model(
         orchestrator,
         provider_circuit=NO_PROVIDER_CIRCUIT_STATUS,
+        tech_lead_history=NO_TECH_LEAD_RUN_HISTORY,
         queue_page=1,
         active_tab="e2e",
         e2e_page=1,
@@ -2101,7 +2154,10 @@ def test_view_model_api_endpoint():
     config = _make_config()
     state = OrchestratorState(startup_status="complete")
     orchestrator = _RouteOrchestratorStub(
-        state=state, config=config, provider_circuit=NO_PROVIDER_CIRCUIT_STATUS
+        state=state,
+        config=config,
+        provider_circuit=NO_PROVIDER_CIRCUIT_STATUS,
+        tech_lead_run_history=NO_TECH_LEAD_RUN_HISTORY,
     )
 
     original = get_orchestrator()
@@ -2125,6 +2181,7 @@ def test_view_model_matches_public_contract():
     view_model = build_dashboard_view_model(
         orchestrator,
         provider_circuit=NO_PROVIDER_CIRCUIT_STATUS,
+        tech_lead_history=NO_TECH_LEAD_RUN_HISTORY,
         queue_page=1,
         active_tab="flow",
         e2e_page=1,
@@ -2379,6 +2436,7 @@ def test_queue_card_embeds_producer_stack_gate_view():
     view_model = build_dashboard_view_model(
         orchestrator,
         provider_circuit=NO_PROVIDER_CIRCUIT_STATUS,
+        tech_lead_history=NO_TECH_LEAD_RUN_HISTORY,
         queue_page=1,
         active_tab="flow",
         e2e_page=1,

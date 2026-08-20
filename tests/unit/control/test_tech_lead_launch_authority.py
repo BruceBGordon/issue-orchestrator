@@ -14,11 +14,16 @@ start?" is a fact, not an inference.
 
 from __future__ import annotations
 
+from datetime import datetime
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Optional
 
 from issue_orchestrator.control.tech_lead_launch_authority import (
     TechLeadLaunchAuthority,
+)
+from issue_orchestrator.control.tech_lead_run_activity import (
+    in_memory_run_activity,
 )
 from issue_orchestrator.domain.models import (
     DiscoveredFailure,
@@ -107,6 +112,16 @@ class FakeSession:
         self.tech_lead_scope = (
             TechLeadLaunchScope(flavor=flavor) if flavor is not None else None
         )
+        self.terminal_id = f"tech-lead-{issue_number}"
+        self.key = SimpleNamespace(stable_id=lambda: f"tech_lead:{issue_number}")
+        # The launch authority opens the run's LOCAL record from these
+        # (ADR-0033 / #6858).
+        self.started_at = datetime(2026, 8, 9, 12, 0, 0)
+        self.run_dir = Path(f"/tmp/run-{issue_number}")
+        self.run_assets = SimpleNamespace(
+            run_id=f"run-{issue_number}",
+            session_name=f"tech-lead-{issue_number}",
+        )
 
 
 def _config() -> Config:
@@ -162,12 +177,13 @@ class _Harness:
         )
         self.launched: list[PendingTechLeadReview] = []
         self._launch_fails = launch_fails
+        self.activity = in_memory_run_activity()
 
     def _launch(self, tech_lead: PendingTechLeadReview):
         self.launched.append(tech_lead)
         if self._launch_fails:
             return None
-        return SimpleNamespace(key=SimpleNamespace(stable_id=lambda: "tech_lead:x"))
+        return FakeSession(tech_lead.issue_number, tech_lead.flavor)
 
     def authority(self) -> TechLeadLaunchAuthority:
         return TechLeadLaunchAuthority(
@@ -180,6 +196,7 @@ class _Harness:
             ),
             events=self.events,  # type: ignore[arg-type]
             launch=self._launch,
+            activity=self.activity,
         )
 
     def launch(self, tech_lead: PendingTechLeadReview):

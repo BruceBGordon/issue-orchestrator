@@ -661,7 +661,8 @@ function _renderReviewMarkdown(content) {
 function _renderReviewArtifactContent(data, artifactType, renderMode) {
     const content = String((data && data.content) || '');
     const mode = String(renderMode || data?.content_type || '').toLowerCase();
-    if (artifactType === 'review_decision' || mode.includes('json')) {
+    const isDecision = String(artifactType || '').endsWith('_decision');
+    if (isDecision || mode.includes('json')) {
         let pretty = content;
         try {
             pretty = JSON.stringify(JSON.parse(content), null, 2);
@@ -674,14 +675,26 @@ function _renderReviewArtifactContent(data, artifactType, renderMode) {
     return _renderReviewMarkdown(content);
 }
 
+// Pure: what the viewer calls this artifact. A table rather than a ternary
+// because the endpoint now serves the tech lead's report/decision pair too
+// (#6858 F4), and a two-way ternary would have titled a tech-lead report
+// "Review report" — the wrong agent's name on the wrong artifact.
+function _reviewArtifactTitleName(artifactType) {
+    const titles = {
+        review_report: 'Review report',
+        review_decision: 'Decision JSON',
+        tech_lead_report: 'Tech lead report',
+        tech_lead_decision: 'Tech lead decision',
+    };
+    return titles[String(artifactType || '')] || 'Run artifact';
+}
+
 async function openReviewArtifact(issueNumber, runDir, artifactPath, artifactType, renderMode = null) {
     if (!runDir || !artifactPath || !artifactType) {
         showToast('Review artifact is missing run context.', 'error');
         return;
     }
-    const title = artifactType === 'review_decision'
-        ? `Decision JSON #${issueNumber}`
-        : `Review report #${issueNumber}`;
+    const title = `${_reviewArtifactTitleName(artifactType)} #${issueNumber}`;
     openModal(title, '<div class="timeline-loading">Loading review artifact...</div>');
     const modalEl = modalOverlay.querySelector('.modal');
     if (modalEl) modalEl.classList.add('review-artifact-modal');
