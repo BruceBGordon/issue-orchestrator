@@ -2006,6 +2006,13 @@ class OrchestratorState:
     # bounds re-injection so an unrecoverable issue escalates instead of looping
     # forever. Both are hydrated at startup from the queue-cache meta store.
     last_stuck_sweep_at: float = 0.0
+    # When the sweep last FAILED, kept separate from the last-success stamp
+    # above. A failed sweep must still read as "not successfully swept", so it
+    # cannot touch `last_stuck_sweep_at` — but without its own deadline the
+    # tick loop retries a deterministic failure every 10 seconds forever.
+    # In-memory only: this bounds rescans within a run, and a restart
+    # legitimately gets one fresh attempt, so it needs no store schema.
+    last_stuck_sweep_failure_at: float = 0.0
     recovery_attempts: dict[int, int] = field(default_factory=dict)
     # DURABLE set of issues whose recovery budget is exhausted and whose
     # needs-human escalation has NOT yet been acknowledged (the label observed

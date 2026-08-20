@@ -86,6 +86,19 @@ logger = logging.getLogger(__name__)
 # ``stuck_sweep_due`` so a disabled/not-due sweep makes ZERO GitHub calls.
 STUCK_SWEEP_SCAN_LIMIT = 1000
 
+# How long a FAILED sweep waits before trying again.
+#
+# A failure must not stamp the last-success timestamp — the sweep genuinely did
+# not run — but `stuck_sweep_due` reads only that stamp, and the engine ticks
+# every ~10s. A deterministic failure (a repo whose scoped open issues exceed
+# STUCK_SWEEP_SCAN_LIMIT fails on every attempt) would therefore walk up to ten
+# issue pages roughly 360 times an hour, forever: thousands of GitHub calls for
+# a scan that cannot succeed, crowding out the orchestration traffic that can.
+#
+# Well under the normal interval so a transient outage still recovers quickly,
+# far above the tick so a permanent failure is loud without being a hammer.
+STUCK_SWEEP_FAILURE_RETRY_SECONDS = 15 * 60
+
 
 @dataclass(frozen=True)
 class StuckSweepResult:
@@ -139,7 +152,17 @@ def stuck_sweep_due(config: "Config", state: "OrchestratorState", now: float) ->
         # already rejects interval_minutes < 1 when enabled (#6823), but a
         # 0/negative interval reaching here must NOT be treated as "always due".
         return False
-    return now - state.last_stuck_sweep_at >= interval_seconds
+    # Due at the LATER of the success cadence and the failure backoff. Two
+    # deadlines, because a failed sweep must not stamp the success timestamp —
+    # it genuinely did not sweep — yet without a deadline of its own that
+    # silently means "rescan on every tick", i.e. hundreds of full scans an
+    # hour for a failure that cannot clear. See
+    # STUCK_SWEEP_FAILURE_RETRY_SECONDS.
+    due_at = max(
+        state.last_stuck_sweep_at + interval_seconds,
+        state.last_stuck_sweep_failure_at + STUCK_SWEEP_FAILURE_RETRY_SECONDS,
+    )
+    return now >= due_at
 
 
 def run_stuck_sweep(
@@ -587,14 +610,16 @@ def run_stuck_sweep_cycle(
             "exceeds the sweep's scan cap — narrow filtering.label.",
             error,
         )
+        state.last_stuck_sweep_failure_at = now
         on_scan_incomplete(error)
         return
     except RepositoryHostError as error:
         logger.warning(
             "[STUCK_SWEEP] Skipping sweep — repository host unavailable: %s. "
-            "Sweep stays due and retries next tick.",
+            "Sweep retries after the failure backoff.",
             error,
         )
+        state.last_stuck_sweep_failure_at = now
         return
     for failure in result.recovered:
         state.record_discovered_failure(failure)
@@ -604,5 +629,6 @@ def run_stuck_sweep_cycle(
     # until it lands (#6824 R1). The durable set itself is persisted below.
     state.stuck_sweep_escalations = list(state.pending_stuck_sweep_escalations)
     state.last_stuck_sweep_at = now
+    state.last_stuck_sweep_failure_at = 0.0
     persist_stuck_sweep_state(state, queue_cache_store)
     on_result(result)

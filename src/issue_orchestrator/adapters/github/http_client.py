@@ -904,7 +904,21 @@ class GitHubHttpClient:
             params={"per_page": 100},
             caller="list_labels",
         )
-        labels = payload if isinstance(payload, list) else []
+        if not isinstance(payload, list):
+            # Same page-1 hole just closed for exhaustive issue scans. This
+            # method promises the COMPLETE label set, and its callers make
+            # negative-existence decisions on it — notably refusing gated
+            # tech-lead proposal creation when `proposed-tech-lead` is absent.
+            # An empty list is not valid exhaustion for a 2xx carrying a
+            # non-list body; it is a contract violation that would prove every
+            # label absent.
+            raise GitHubScanIncompleteError(
+                "GitHub returned a non-list body for the first page of labels; "
+                "refusing to treat it as a complete label set",
+                method="GET",
+                url=f"/repos/{self._config.repo}/labels",
+            )
+        labels = payload
         # The port promises ALL labels (#6779 R8): page 1 keeps its ETag cache
         # for the common (<=100 labels) case, but a FULL first page means more
         # may exist, so continue paging. Without this a gate label sorted onto a

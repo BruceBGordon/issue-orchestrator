@@ -71,9 +71,16 @@ class TestStuckSweepTransientFailure:
         # Must not raise.
         gatherer.gather_tech_lead_facts(state, now=SWEEP_DUE_AT)
 
-    def test_failed_sweep_stays_due_so_the_next_tick_retries(self) -> None:
-        """Not stamping the timer is what makes the skip a retry rather than a loss."""
-        from issue_orchestrator.control.stuck_sweep import stuck_sweep_due
+    def test_failed_sweep_is_never_recorded_as_swept(self) -> None:
+        """Not stamping the SUCCESS timer is what makes the skip a retry.
+
+        It becomes due again after the failure backoff rather than on the very
+        next tick — see TestFailedSweepBacksOffInsteadOfHammeringGitHub.
+        """
+        from issue_orchestrator.control.stuck_sweep import (
+            STUCK_SWEEP_FAILURE_RETRY_SECONDS,
+            stuck_sweep_due,
+        )
 
         host = MagicMock()
         host.list_issues.side_effect = DNS_DROP
@@ -84,7 +91,11 @@ class TestStuckSweepTransientFailure:
         gatherer.gather_tech_lead_facts(state, now=SWEEP_DUE_AT)
 
         assert state.last_stuck_sweep_at == before
-        assert stuck_sweep_due(_sweep_config(), state, SWEEP_DUE_AT) is True
+        assert stuck_sweep_due(
+            _sweep_config(),
+            state,
+            SWEEP_DUE_AT + STUCK_SWEEP_FAILURE_RETRY_SECONDS + 1,
+        ) is True
 
     def test_a_real_bug_still_propagates(self) -> None:
         """Only repository-host failures are absorbed; genuine defects must not be."""
@@ -139,9 +150,7 @@ class TestCompletenessFailuresAreLoudButBounded:
         gatherer.gather_tech_lead_facts(OrchestratorState(), now=SWEEP_DUE_AT)
 
     def test_an_unprovable_scan_never_marks_the_sweep_done(self) -> None:
-        """Not stamping the timer is what stops it counting as a clean sweep."""
-        from issue_orchestrator.control.stuck_sweep import stuck_sweep_due
-
+        """Not stamping the success timer is what stops it counting as swept."""
         gatherer = _gatherer(self._incomplete_host("cannot prove the list is complete"))
         state = OrchestratorState()
         before = state.last_stuck_sweep_at
@@ -149,7 +158,6 @@ class TestCompletenessFailuresAreLoudButBounded:
         gatherer.gather_tech_lead_facts(state, now=SWEEP_DUE_AT)
 
         assert state.last_stuck_sweep_at == before
-        assert stuck_sweep_due(_sweep_config(), state, SWEEP_DUE_AT) is True
 
     def test_an_unprovable_scan_is_surfaced_as_an_event(self) -> None:
         """A log line repeats every cadence and is easy to miss; the event is
@@ -177,9 +185,12 @@ class TestCompletenessFailuresAreLoudButBounded:
         # Still an HTTP error, so existing adapter-level handlers keep working.
         assert isinstance(err, GitHubHttpError)
 
-    def test_the_outage_case_is_still_skipped_and_stays_due(self) -> None:
+    def test_the_outage_case_is_still_skipped_and_retried_later(self) -> None:
         """The transient half of the classification must not regress."""
-        from issue_orchestrator.control.stuck_sweep import stuck_sweep_due
+        from issue_orchestrator.control.stuck_sweep import (
+            STUCK_SWEEP_FAILURE_RETRY_SECONDS,
+            stuck_sweep_due,
+        )
 
         host = MagicMock()
         host.list_issues.side_effect = DNS_DROP
@@ -189,7 +200,11 @@ class TestCompletenessFailuresAreLoudButBounded:
         gatherer.gather_tech_lead_facts(state, now=SWEEP_DUE_AT)
 
         assert state.last_stuck_sweep_at == 0.0
-        assert stuck_sweep_due(_sweep_config(), state, SWEEP_DUE_AT) is True
+        assert stuck_sweep_due(
+            _sweep_config(),
+            state,
+            SWEEP_DUE_AT + STUCK_SWEEP_FAILURE_RETRY_SECONDS + 1,
+        ) is True
 
 
 class _RecordingEvents:
@@ -198,3 +213,114 @@ class _RecordingEvents:
 
     def publish(self, event) -> None:  # noqa: ANN001
         self.published.append(event)
+
+
+class TestFailedSweepBacksOffInsteadOfHammeringGitHub:
+    """A failed sweep must stay "not swept" WITHOUT rescanning every tick.
+
+    Both failure branches deliberately leave ``last_stuck_sweep_at`` alone, and
+    ``stuck_sweep_due`` reads only that stamp — so with the engine ticking every
+    ~10s, a deterministic page-cap failure would walk ten issue pages roughly
+    360 times an hour, forever. Correct on paper, a rate-limit incident in
+    practice, and a direct violation of the repo's GitHub API discipline.
+    """
+
+    def _failing_host(self, error: Exception) -> MagicMock:
+        host = MagicMock()
+        host.list_issues.side_effect = error
+        return host
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            GitHubScanIncompleteError("cannot prove the list is complete"),
+            DNS_DROP,
+        ],
+        ids=["unprovable_scan", "outage"],
+    )
+    def test_a_failed_sweep_is_not_retried_on_the_very_next_tick(
+        self, error: Exception
+    ) -> None:
+        host = self._failing_host(error)
+        gatherer = _gatherer(host)
+        state = OrchestratorState()
+
+        gatherer.gather_tech_lead_facts(state, now=SWEEP_DUE_AT)
+        assert host.list_issues.call_count == 1
+
+        # The next tick, ~10 seconds later.
+        gatherer.gather_tech_lead_facts(state, now=SWEEP_DUE_AT + 10)
+        assert host.list_issues.call_count == 1, (
+            "the sweep rescanned on the next tick; a permanent failure would "
+            "hammer GitHub every 10 seconds"
+        )
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            GitHubScanIncompleteError("cannot prove the list is complete"),
+            DNS_DROP,
+        ],
+        ids=["unprovable_scan", "outage"],
+    )
+    def test_many_consecutive_ticks_produce_one_scan_per_backoff_window(
+        self, error: Exception
+    ) -> None:
+        """The failure case that motivated this: a permanent, every-tick loop."""
+        from issue_orchestrator.control.stuck_sweep import (
+            STUCK_SWEEP_FAILURE_RETRY_SECONDS,
+        )
+
+        host = self._failing_host(error)
+        gatherer = _gatherer(host)
+        state = OrchestratorState()
+
+        # An hour of ticks at 10s each.
+        for i in range(360):
+            gatherer.gather_tech_lead_facts(state, now=SWEEP_DUE_AT + i * 10)
+
+        expected = 1 + (3600 // STUCK_SWEEP_FAILURE_RETRY_SECONDS)
+        assert host.list_issues.call_count <= expected, (
+            f"{host.list_issues.call_count} scans in an hour of ticks; "
+            f"the backoff should permit at most {expected}"
+        )
+
+    def test_the_sweep_retries_once_the_backoff_elapses(self) -> None:
+        """Backing off must not become never trying again."""
+        from issue_orchestrator.control.stuck_sweep import (
+            STUCK_SWEEP_FAILURE_RETRY_SECONDS,
+        )
+
+        host = self._failing_host(DNS_DROP)
+        gatherer = _gatherer(host)
+        state = OrchestratorState()
+
+        gatherer.gather_tech_lead_facts(state, now=SWEEP_DUE_AT)
+        gatherer.gather_tech_lead_facts(
+            state, now=SWEEP_DUE_AT + STUCK_SWEEP_FAILURE_RETRY_SECONDS + 1
+        )
+
+        assert host.list_issues.call_count == 2
+
+    def test_a_failed_sweep_still_reads_as_not_successfully_swept(self) -> None:
+        """The backoff must not be implemented by faking success."""
+        host = self._failing_host(DNS_DROP)
+        gatherer = _gatherer(host)
+        state = OrchestratorState()
+
+        gatherer.gather_tech_lead_facts(state, now=SWEEP_DUE_AT)
+
+        assert state.last_stuck_sweep_at == 0.0
+        assert state.last_stuck_sweep_failure_at == SWEEP_DUE_AT
+
+    def test_a_successful_sweep_clears_the_failure_backoff(self) -> None:
+        host = MagicMock()
+        host.list_issues.return_value = []
+        gatherer = _gatherer(host)
+        state = OrchestratorState()
+        state.last_stuck_sweep_failure_at = SWEEP_DUE_AT - 1
+
+        gatherer.gather_tech_lead_facts(state, now=SWEEP_DUE_AT + 10_000)
+
+        assert state.last_stuck_sweep_failure_at == 0.0
+        assert state.last_stuck_sweep_at == SWEEP_DUE_AT + 10_000

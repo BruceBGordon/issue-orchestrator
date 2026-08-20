@@ -285,14 +285,22 @@ class MergeQueueCoordinator:
     def _comment_marker_present(self, pr_number: int) -> bool:
         """Read-only dedupe guard, mirroring the post-publish rework path.
 
-        A scan that could not prove completeness must NOT become "marker
-        absent". This is a negative-existence question, so an unprovable answer
-        is indistinguishable from "I saw everything and it wasn't there" — and
-        answering False posts a duplicate comment, exactly what the adapter
-        fails loud to prevent. Assume PRESENT instead: the cost of a missed
-        comment is a delay, the cost of a wrong one is spam a human must clean
-        up. A reachability failure (outage) stays False — no scan was even
-        attempted, and the next tick retries.
+        This answers a NEGATIVE-EXISTENCE question, and the answer is consumed
+        with no retry: it lands in ``DiscoveredRework.feedback_comment_already_posted``
+        and the planner immediately emits (or suppresses) an ``AddCommentAction``
+        on that value alone. So "I could not read the comments" must never be
+        reported as "the marker is absent" — for either failure shape:
+
+        * an **unprovable scan** (page cap, malformed page) saw only part of the
+          list, and
+        * an **outage** (transient 500/timeout on page 1) saw none of it.
+
+        Neither is evidence of absence, and both used to produce False for at
+        least one shape, posting the duplicate comment this guard exists to
+        prevent. Both now report PRESENT, which suppresses the comment for this
+        tick; discovery re-runs and the comment lands once the read succeeds.
+        The asymmetry is deliberate — a delayed comment costs a cycle, a
+        duplicate costs a human a cleanup.
         """
         try:
             return self.repository_host.issue_comment_marker_present(
@@ -309,9 +317,13 @@ class MergeQueueCoordinator:
             return True
         except RepositoryHostError as exc:
             logger.warning(
-                "Failed to read comments for merge-queue PR #%d: %s", pr_number, exc
+                "Could not read comments for merge-queue PR #%d (%s); assuming "
+                "the marker IS present so this tick cannot post a duplicate. "
+                "The comment is re-evaluated once the read succeeds.",
+                pr_number,
+                exc,
             )
-            return False
+            return True
 
     @staticmethod
     def _merge_queue_failure_feedback(pr: "PRInfo", reason: str) -> str:

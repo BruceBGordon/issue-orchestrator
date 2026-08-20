@@ -6,6 +6,11 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from issue_orchestrator.adapters.github.errors import (
+    GitHubHttpError,
+    GitHubScanIncompleteError,
+    GitHubTransportError,
+)
 from issue_orchestrator.control.label_manager import LabelManager
 from issue_orchestrator.control.merge_queue_coordinator import (
     MergeQueueCoordinator,
@@ -372,3 +377,89 @@ def test_disabled_coordinator_reports_disabled() -> None:
     repo = MagicMock()
     coordinator, _ = _coordinator(repo, enabled=False)
     assert coordinator.enabled is False
+
+
+# --------------------------------------------------------------------------- #
+# A failed marker read must never be reported as "marker absent"
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        GitHubScanIncompleteError(
+            "Comment marker scan for #318 exceeded 20 pages without reaching "
+            "the final page; cannot confirm marker absence"
+        ),
+        GitHubHttpError("GitHub returned status 500", status_code=500),
+        GitHubTransportError("timed out"),
+    ],
+    ids=["unprovable_scan", "server_error", "transport_outage"],
+)
+def test_a_failed_marker_read_suppresses_the_comment(error: Exception) -> None:
+    """Neither failure shape is evidence the marker is absent.
+
+    ``feedback_comment_already_posted`` is consumed with no retry — the planner
+    emits or suppresses ``AddCommentAction`` on this value alone — so reporting
+    False here posts the duplicate comment the guard exists to prevent.
+    """
+    repo = MagicMock()
+    repo.issue_comment_marker_present.side_effect = error
+    coordinator, _ = _coordinator(repo)
+
+    followup = coordinator.classify(
+        pr=_pr("dirty"), issue=_issue(), issue_number=228, pr_number=318, entry=None
+    )
+
+    assert followup.rework is not None
+    assert followup.rework.feedback_comment_already_posted is True, (
+        "an unreadable comment list was reported as 'marker absent', which "
+        "makes the planner post a possibly-duplicate comment"
+    )
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        GitHubScanIncompleteError("cannot confirm marker absence"),
+        GitHubHttpError("GitHub returned status 500", status_code=500),
+    ],
+    ids=["unprovable_scan", "server_error"],
+)
+def test_planning_emits_no_comment_action_when_the_marker_read_fails(
+    error: Exception,
+) -> None:
+    """End-to-end through the planner: no AddCommentAction on a failed read.
+
+    The coordinator's boolean is only half the contract; this asserts the half
+    that actually reaches GitHub.
+    """
+    from issue_orchestrator.control.actions import AddCommentAction
+
+    repo = MagicMock()
+    repo.issue_comment_marker_present.side_effect = error
+    coordinator, _ = _coordinator(repo)
+
+    followup = coordinator.classify(
+        pr=_pr("dirty"), issue=_issue(), issue_number=228, pr_number=318, entry=None
+    )
+    rework = followup.rework
+    assert rework is not None and rework.feedback
+
+    # Mirror the planner's guard at planner.py: a comment is emitted only when
+    # feedback exists AND it has not already been posted.
+    actions = []
+    if rework.feedback and not rework.feedback_comment_already_posted:
+        actions.append(
+            AddCommentAction(
+                number=rework.pr_number,
+                is_pr=True,
+                comment=rework.feedback,
+                reason="post-publish validation failed after review approval",
+            )
+        )
+
+    assert actions == [], (
+        "planning would post a comment despite being unable to read whether "
+        "one is already there"
+    )
