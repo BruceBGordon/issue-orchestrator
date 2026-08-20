@@ -168,7 +168,7 @@ class PauseState:
             "pause_actor": str(self.actor) if self.actor is not None else None,
             "pause_detail": self.detail,
             "paused_since": self.since.isoformat() if self.since is not None else None,
-            "paused_held_seconds": self.held_seconds(now) if now is not None else None,
+            "paused_held_seconds": self.held_seconds(now),
             "pause_is_incident": bool(self.reason is not None and self.reason.is_incident),
         }
 
