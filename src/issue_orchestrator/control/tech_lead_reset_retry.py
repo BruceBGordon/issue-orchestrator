@@ -125,8 +125,9 @@ def publish_proposal_surfaced(
         "finding_ids": list(finding_ids),
         "mode": mode,
     }
-    if stale_reason is not None:
-        payload["stale_reason"] = stale_reason
+    candidate = stale_reason
+    if _is_present(candidate):
+        payload["stale_reason"] = candidate
     event_name = (
         EventName.TECH_LEAD_DECISION_REJECTED
         if mode == "rejected"
@@ -141,6 +142,11 @@ def publish_proposal_surfaced(
         proposal_type,
         action_id,
     )
+
+
+def _is_present(value: object | None) -> bool:
+    """Return whether an optional payload value is present."""
+    return value is not None
 
 
 def apply_surface_tech_lead_proposal(

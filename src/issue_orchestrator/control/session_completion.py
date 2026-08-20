@@ -64,8 +64,7 @@ def _validation_issue_key(session: Session, config: Config) -> IssueKey | None:
         return GitHubIssueKey(repo=repo, external_id=str(session.issue.number))
     if config.is_validation_enabled():
         logger.info(
-            "[COMPLETION] Validation attempt identity unavailable: repo is unset "
-            "for issue %s",
+            "[COMPLETION] Validation attempt identity unavailable: repo is unset for issue %s",
             session.issue.number,
         )
     return None
@@ -161,9 +160,7 @@ def _queue_rework_after_retrospective_changes(
             issue_number=issue_number,
             pr_number=session.pr_number,
             source="retrospective_review",
-            feedback=str(
-                detail.get("review_issues") or detail.get("review_summary") or ""
-            ),
+            feedback=str(detail.get("review_issues") or detail.get("review_summary") or ""),
         )
     )
     if not queued:
@@ -201,13 +198,8 @@ def _failure_artifact_hints(
         candidates.append(Path(diagnostic_path))
     if claude_log_path is not None:
         candidates.append(claude_log_path)
-    candidates.extend(
-        run_dir / name
-        for name in (MANIFEST_FILENAME, ANALYSIS_FILENAME, TERMINAL_RECORDING_FILENAME)
-    )
-    resolved = (
-        path if path.is_absolute() else worktree_path / path for path in candidates
-    )
+    candidates.extend(run_dir / name for name in (MANIFEST_FILENAME, ANALYSIS_FILENAME, TERMINAL_RECORDING_FILENAME))
+    resolved = (path if path.is_absolute() else worktree_path / path for path in candidates)
     return tuple(str(path) for path in resolved if path.exists())
 
 
@@ -281,15 +273,7 @@ def handle_session_completion(  # noqa: C901, PLR0912 - handles validation, acti
     from ..domain.models import DiscoveredReview, PendingValidationRetry
 
     name = session.terminal_id
-    entity = (
-        "retrospective-review"
-        if is_retrospective_review_session(session)
-        else "review"
-        if name.startswith("review-")
-        else "rework"
-        if name.startswith("rework-")
-        else "issue"
-    )
+    entity = "retrospective-review" if is_retrospective_review_session(session) else "review" if name.startswith("review-") else "rework" if name.startswith("rework-") else "issue"
     log_transition(
         entity,
         session.issue.number,
@@ -299,9 +283,7 @@ def handle_session_completion(  # noqa: C901, PLR0912 - handles validation, acti
     )
 
     # Remove by session name, NOT issue number - multiple sessions can share an issue number
-    state.active_sessions = [
-        s for s in state.active_sessions if s.terminal_id != session.terminal_id
-    ]
+    state.drop_active_session(session.terminal_id)
 
     # Settle the claim this session took off a pending queue at launch (#6999
     # F2/A1). One typed outcome for every terminal path: a session stopped by
@@ -339,12 +321,7 @@ def handle_session_completion(  # noqa: C901, PLR0912 - handles validation, acti
             source_task=session.key.task,
             validation_cmd=config.validation.quick.cmd,
         )
-        state.pending_validation_retries = [
-            retry
-            for retry in state.pending_validation_retries
-            if retry.issue_number != session.issue.number
-        ]
-        state.pending_validation_retries.append(pending_retry)
+        state.replace_pending_validation_retry(pending_retry)
         # Kill the terminal session but don't cleanup worktree (agent will continue there)
         kill_session_fn(session.terminal_id)
         return  # Skip normal completion processing
@@ -407,18 +384,14 @@ def handle_session_completion(  # noqa: C901, PLR0912 - handles validation, acti
         required_act_level_outcome_after_apply,
     )
 
-    applied_results, apply_error = apply_completion_actions_gated(
-        action_applier, result.actions, issue_number=session.issue.number
-    )
+    applied_results, apply_error = apply_completion_actions_gated(action_applier, result.actions, issue_number=session.issue.number)
 
     # The required-act-level outcome is the single authoritative terminal-status
     # policy for the whole post-apply phase (ADR-0031 §2, #6764 F2, #6777): a
     # mandated reset that FAILED — or an apply that RAISED — makes the EFFECTIVE
     # status FAILED regardless of the agent's intent, so every consumer below
     # routes through `effective_status` and an aborted apply is never a success.
-    required_act_outcome = required_act_level_outcome_after_apply(
-        applied_results, apply_error
-    )
+    required_act_outcome = required_act_level_outcome_after_apply(applied_results, apply_error)
     effective_status = effective_terminal_status(status, required_act_outcome)
 
     # Finalize BOTH terminal-outcome commits — the ONE trace event and the cached
@@ -487,7 +460,7 @@ def handle_session_completion(  # noqa: C901, PLR0912 - handles validation, acti
     CompletionCleanupStateOwner(state).record(result.cleanup, session, effective_status)
 
     if result.should_queue_review and result.pr_url and result.pr_number:
-        state.discovered_reviews.append(
+        state.record_discovered_review(
             DiscoveredReview(
                 session.issue.number,
                 result.pr_number,
@@ -502,9 +475,7 @@ def handle_session_completion(  # noqa: C901, PLR0912 - handles validation, acti
         session=session,
         tech_lead_agent=config.tech_lead_review_agent,
         blocking_label=blocked_label or "",
-        artifact_hints=lambda: _failure_artifact_hints(
-            session.worktree_path, run_dir, diagnostic_path, claude_log_path
-        ),
+        artifact_hints=lambda: _failure_artifact_hints(session.worktree_path, run_dir, diagnostic_path, claude_log_path),
         record=state.record_discovered_failure,
         provider_error_type=provider_error_type,
     )
@@ -670,9 +641,7 @@ def _completion_decider(
     work and may run off-thread.
     """
     issue_key = _validation_issue_key(session, config)
-    retry_prompt_template = (
-        session.agent_config.retry_prompt_template or config.retry.retry_prompt_template
-    )
+    retry_prompt_template = session.agent_config.retry_prompt_template or config.retry.retry_prompt_template
 
     def decide() -> "SessionDecision":
         return session_controller.decide_outcome(
@@ -738,8 +707,7 @@ def _apply_completed_decision(
     session = completed.session
     if decision.status == SessionStatus.RUNNING:
         logger.info(
-            "[COMPLETION] Session remains active after completion decision: "
-            "session=%s issue=%s reason=%s",
+            "[COMPLETION] Session remains active after completion decision: session=%s issue=%s reason=%s",
             session.terminal_id,
             session.issue.number,
             decision.reason,
@@ -779,9 +747,7 @@ def _apply_completed_decision(
         processing_errors=processing_errors,
         diagnostic_path=diagnostic_path,
         validation_error=validation_error,
-        validation_error_file=str(validation_error_file)
-        if validation_error_file
-        else None,
+        validation_error_file=str(validation_error_file) if validation_error_file else None,
         review_exchange_completed=review_exchange_completed,
         review_exchange_halted=review_exchange_halted,
         blocked_label=decision.blocked_label,

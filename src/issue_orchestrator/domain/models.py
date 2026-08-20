@@ -2093,6 +2093,19 @@ class OrchestratorState:
         self.pending_validation_retries.extend([retry])
         return True
 
+    def replace_pending_validation_retry(self, retry: "PendingValidationRetry") -> None:
+        """Replace the queued validation retry for one issue (owner boundary)."""
+        self.pending_validation_retries[:] = [
+            existing
+            for existing in self.pending_validation_retries
+            if existing.issue_number != retry.issue_number
+        ]
+        self.pending_validation_retries.extend([retry])
+
+    def record_discovered_review(self, review: DiscoveredReview) -> None:
+        """Record a completion-discovered review for Planner consumption."""
+        self.discovered_reviews.extend([review])
+
     def record_discovered_failure(self, failure: DiscoveredFailure) -> None:
         """Record a session-failure fact for the Planner (owner boundary).
 
