@@ -47,8 +47,8 @@ Every flavor also receives a snapshot of orchestrator state, taken at launch:
 cat "$ISSUE_ORCHESTRATOR_RUN_DIR/tech-lead-data/board-snapshot.json"
 ```
 
-It contains active sessions (type/state/age, plus `idle_minutes`/`commits_ahead`
-hung-evidence), pending queues with reasons,
+It contains active sessions (type/state/age, exact `terminal_id`/`run_id`
+generation, plus `idle_minutes`/`commits_ahead` hung-evidence), pending queues with reasons,
 blocked issues, `recent_failures` (context), `problem_cohort` (the issue
 numbers a health review owns act-level authority over, empty otherwise), open
 pattern case files, per-area distinct patterns plus shipped-fix counts, a
@@ -370,8 +370,9 @@ Compact `tech-lead-decision.json` example:
   issues carrying the `proposed-tech-lead` label; a human approves one by
   removing that label, and the orchestrator re-checks the target's state
   before executing — stale proposals are closed with a comment, not
-  executed. `reset_retry` under `tech_lead.authority.reset_retry: execute`
-  runs directly with the same execution-time re-check. Never propose or
+  executed. `reset_retry` under `tech_lead.authority.reset_retry: execute` and
+  `kill_hung_session` under `tech_lead.authority.kill_hung_session: execute`
+  run directly with their execution-time re-checks. Never propose or
   touch the `proposed-tech-lead` label yourself; it is orchestrator-owned and
   rejected like other workflow labels.
 - A completed session missing either artifact — or violating any rule

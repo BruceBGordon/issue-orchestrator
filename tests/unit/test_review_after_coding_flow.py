@@ -96,7 +96,6 @@ def make_completion_handler(config: Config, repository_host) -> CompletionHandle
             InMemoryOpenIssueCorpusStore(),
             is_enabled=lambda: config.tech_lead.dedup.enabled,
         ),
-        active_session_run_id=lambda _n: None,
         provider_availability=make_provider_availability(config),
     )
 
@@ -195,9 +194,7 @@ class TestReviewAfterCodingFlow:
         assert state.discovered_reviews[0].pr_number == 456
         assert state.discovered_reviews[0].issue_number == 123
 
-    def test_auto_mode_fallback_queues_review(
-        self, sample_session
-    ):
+    def test_auto_mode_fallback_queues_review(self, sample_session):
         """Auto mode should still queue review when exchange doesn't run."""
         config = make_config(code_review_agent="agent:reviewer")
         config.review_exchange_mode = "auto"
@@ -206,7 +203,11 @@ class TestReviewAfterCodingFlow:
         state.active_sessions = [sample_session]
 
         repository_host = make_repository_host(
-            prs=[MagicMock(url="https://github.com/test/repo/pull/456", number=456, labels=[])]
+            prs=[
+                MagicMock(
+                    url="https://github.com/test/repo/pull/456", number=456, labels=[]
+                )
+            ]
         )
         completion_handler = make_completion_handler(config, repository_host)
 
@@ -239,9 +240,7 @@ class TestReviewAfterCodingFlow:
         plan = planner.plan(snapshot)
         assert any(isinstance(a, QueueReviewAction) for a in plan.actions)
 
-    def test_exchange_completed_skips_review_queue(
-        self, sample_session
-    ):
+    def test_exchange_completed_skips_review_queue(self, sample_session):
         """Exchange-completed PRs should not enqueue review actions."""
         config = make_config(code_review_agent="agent:reviewer")
         config.review_exchange_mode = "via-mcp"
@@ -250,7 +249,11 @@ class TestReviewAfterCodingFlow:
         state.active_sessions = [sample_session]
 
         repository_host = make_repository_host(
-            prs=[MagicMock(url="https://github.com/test/repo/pull/456", number=456, labels=[])]
+            prs=[
+                MagicMock(
+                    url="https://github.com/test/repo/pull/456", number=456, labels=[]
+                )
+            ]
         )
         completion_handler = make_completion_handler(config, repository_host)
 
@@ -270,6 +273,7 @@ class TestReviewAfterCodingFlow:
         )
 
         assert len(state.discovered_reviews) == 0
+
     def test_planner_generates_queue_review_action_from_discovered_reviews(self):
         """Planner produces QueueReviewAction from discovered_reviews.
 
@@ -319,7 +323,9 @@ class TestReviewAfterCodingFlow:
         After QueueReviewAction is applied, the review moves to pending_reviews.
         On the next planning cycle, the planner should launch the review session.
         """
-        config = make_config(code_review_agent="agent:reviewer", max_concurrent_sessions=3)
+        config = make_config(
+            code_review_agent="agent:reviewer", max_concurrent_sessions=3
+        )
         scheduler = Scheduler(config)
 
         pending = PendingReview(
@@ -359,8 +365,10 @@ class TestReviewAfterCodingFlow:
 
         # Should have LaunchSessionAction for review
         launch_actions = [
-            a for a in plan.actions
-            if isinstance(a, LaunchSessionAction) and a.session_type == SessionType.REVIEW
+            a
+            for a in plan.actions
+            if isinstance(a, LaunchSessionAction)
+            and a.session_type == SessionType.REVIEW
         ]
         assert len(launch_actions) == 1, (
             "Planner must generate LaunchSessionAction for pending reviews"

@@ -69,7 +69,10 @@ from ..domain.tech_lead_artifacts import (
     TechLeadDecision,
 )
 from ..domain.tech_lead_findings import PatternClassificationConflictError
-from ..domain.tech_lead_session import TechLeadCreationOrigin
+from ..domain.tech_lead_session import (
+    TechLeadCreationOrigin,
+    TechLeadSessionGeneration,
+)
 from ..ports.issue import Issue
 from .actions import (
     Action,
@@ -271,7 +274,7 @@ def plan_tech_lead_decision_actions(
     source_run_id: str,
     source_session_name: str,
     observed_at: str,
-    active_session_run_id: Callable[[int], str | None],
+    observed_session_generation: Callable[[int], TechLeadSessionGeneration | None],
     dedup_corpus: OpenIssueCorpus,
     dedup_grant: DuplicateTargetGrant,
 ) -> list[Action]:
@@ -287,9 +290,9 @@ def plan_tech_lead_decision_actions(
     evidence onto the existing issue. ``source_run_id``/
     ``source_session_name`` are the proposing session's identity, recorded
     on each :class:`StoredTechLeadOp` and in each case-file observation.
-    ``active_session_run_id`` resolves the target issue's live session run id
-    so a ``kill_hung_session`` proposal binds approval to that exact
-    generation (#6779 R1).
+    ``observed_session_generation`` resolves only the trusted worker generation
+    retained in launch authority from the immutable board input. It never reads
+    live state at completion, so a replacement cannot be rebound silently.
     """
     planner = _DecisionActionPlanner(
         config=config,
@@ -302,7 +305,7 @@ def plan_tech_lead_decision_actions(
         source_run_id=source_run_id,
         source_session_name=source_session_name,
         observed_at=observed_at,
-        active_session_run_id=active_session_run_id,
+        observed_session_generation=observed_session_generation,
         dedup_corpus=dedup_corpus,
         dedup_grant=dedup_grant,
     )
@@ -350,7 +353,7 @@ class _DecisionActionPlanner:
     source_run_id: str
     source_session_name: str
     observed_at: str
-    active_session_run_id: Callable[[int], str | None]
+    observed_session_generation: Callable[[int], TechLeadSessionGeneration | None]
     # Trusted dedup facts (#6878), REQUIRED — never a silent empty default, which
     # would disable the safety mechanism invisibly. The corpus carries an explicit
     # Ready/Unavailable state; the grant is the launch-authority-derived set a
@@ -451,10 +454,10 @@ class _DecisionActionPlanner:
         self._planned_ops.add(key)
         # kill_hung_session binds approval to the target's live session
         # generation (#6779 R1); reset_retry carries no generation binding.
-        target_session_id = (
-            self.active_session_run_id(proposed.target_number) or ""
+        target_session = (
+            self.observed_session_generation(proposed.target_number)
             if proposed.action_type == "kill_hung_session"
-            else ""
+            else None
         )
         self.actions.append(
             build_tech_lead_proposal_issue_action(
@@ -464,7 +467,7 @@ class _DecisionActionPlanner:
                 source_run_id=self.source_run_id,
                 source_session_name=self.source_session_name,
                 expected=self.expected,
-                target_session_id=target_session_id,
+                target_session=target_session,
             )
         )
 
@@ -494,6 +497,7 @@ class _DecisionActionPlanner:
             )
             return
         assert proposed.action_type == "kill_hung_session"
+        target_session = self.observed_session_generation(proposed.target_number)
         self.actions.append(
             KillHungSessionAction(
                 issue_number=proposed.target_number,
@@ -501,8 +505,12 @@ class _DecisionActionPlanner:
                 proposal_id=proposed.id,
                 finding_ids=proposed.finding_ids,
                 anchor_issue_number=self._anchor_number,
-                target_session_id=(
-                    self.active_session_run_id(proposed.target_number) or ""
+                target_session_id=target_session.run_id if target_session else "",
+                target_terminal_id=(
+                    target_session.terminal_id if target_session else ""
+                ),
+                target_session_type=(
+                    target_session.task_kind.value if target_session else ""
                 ),
                 reason=(
                     f"tech_lead decision action {proposed.id}: terminate hung session"

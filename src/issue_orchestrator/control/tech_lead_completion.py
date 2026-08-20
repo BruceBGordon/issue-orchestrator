@@ -59,7 +59,7 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING
 
 from ..domain.models import Session
 from ..domain.board_snapshot import BOARD_SNAPSHOT_FILENAME, BoardSnapshot
@@ -216,7 +216,9 @@ def resolve_tech_lead_launch_authority(
         )
     if authority.flavor is TechLeadSessionFlavor.BATCH_REVIEW:
         manifest = read_tech_lead_manifest(run_dir)
-        worktree_prs = frozenset(pr.number for pr in manifest.prs) if manifest else frozenset()
+        worktree_prs = (
+            frozenset(pr.number for pr in manifest.prs) if manifest else frozenset()
+        )
         if worktree_prs != frozenset(authority.manifest_pr_numbers):
             return authority, (
                 f"worktree manifest PR set {sorted(worktree_prs)} does not"
@@ -421,14 +423,16 @@ def tech_lead_decision_processing_error(
     return f"{ERROR_PREFIX_TECH_LEAD_DECISION}: {failure}: {result.detail}"
 
 
-_TECH_LEAD_ERROR_PREFIXES = (ERROR_PREFIX_TECH_LEAD_DECISION, ERROR_PREFIX_TECH_LEAD_AUTHORITY)
+_TECH_LEAD_ERROR_PREFIXES = (
+    ERROR_PREFIX_TECH_LEAD_DECISION,
+    ERROR_PREFIX_TECH_LEAD_AUTHORITY,
+)
 
 
 def has_tech_lead_decision_errors(processing_errors: list[str] | None) -> bool:
     """True when processing errors include a rejected pair or tampered scope."""
     return any(
-        error.startswith(_TECH_LEAD_ERROR_PREFIXES)
-        for error in processing_errors or ()
+        error.startswith(_TECH_LEAD_ERROR_PREFIXES) for error in processing_errors or ()
     )
 
 
@@ -438,7 +442,7 @@ def _split_tech_lead_decision_error(processing_errors: list[str]) -> tuple[str, 
         for prefix in _TECH_LEAD_ERROR_PREFIXES:
             if not error.startswith(prefix):
                 continue
-            remainder = error[len(prefix):].lstrip(": ")
+            remainder = error[len(prefix) :].lstrip(": ")
             failure, sep, detail = remainder.partition(": ")
             return (failure or "unknown", detail if sep else "")
     return ("unknown", "")
@@ -484,7 +488,9 @@ def discard_tech_lead_authority_after_completion(
     intersect it with live pending/active tech_lead work, so dropping it here is
     what releases the cohort's held run artifacts for cleanup.
     """
-    if not is_tech_lead_session(config.tech_lead_review_agent, session.issue.agent_type):
+    if not is_tech_lead_session(
+        config.tech_lead_review_agent, session.issue.agent_type
+    ):
         return
     if is_publish_failure(processing_errors):
         return
@@ -541,7 +547,6 @@ def generate_tech_lead_completion_actions(
     labels: LabelManager,
     tech_lead_authority: "TechLeadAuthorityStore",
     open_issue_corpus: "OpenIssueCorpusManager",
-    active_session_run_id: "Callable[[int], str | None]",
 ) -> list[Action]:
     """Plan all completion effects for a tech_lead session (see module docstring).
 
@@ -552,7 +557,9 @@ def generate_tech_lead_completion_actions(
     """
     actions: list[Action] = []
 
-    if not is_tech_lead_session(config.tech_lead_review_agent, session.issue.agent_type):
+    if not is_tech_lead_session(
+        config.tech_lead_review_agent, session.issue.agent_type
+    ):
         return actions
 
     authority, tamper = _resolve_launch_authority_for_session(
@@ -614,7 +621,7 @@ def generate_tech_lead_completion_actions(
                 source_run_id=session.run_assets.run_id,
                 source_session_name=session.run_assets.session_name,
                 observed_at=session.run_assets.started_at,
-                active_session_run_id=active_session_run_id,
+                observed_session_generation=authority.observed_kill_target,
                 dedup_corpus=open_issue_corpus.load(),
                 dedup_grant=DuplicateTargetGrant.of(authority.allowed_targets()),
             )
@@ -667,6 +674,7 @@ def generate_tech_lead_completion_actions(
         )
     return actions
 
+
 def generate_tech_lead_decision_failure_actions(
     config: "Config",
     session: Session,
@@ -694,10 +702,7 @@ def generate_tech_lead_decision_failure_actions(
     authority, _tamper = _resolve_launch_authority_for_session(
         tech_lead_authority, session
     )
-    if (
-        authority is not None
-        and authority.flavor is TechLeadSessionFlavor.BATCH_REVIEW
-    ):
+    if authority is not None and authority.flavor is TechLeadSessionFlavor.BATCH_REVIEW:
         actions.extend(
             _manifest_label_actions(config, authority, expected, success=False)
         )
@@ -764,7 +769,9 @@ def generate_tech_lead_failure_actions(
     produces nothing (the session already failed; closing or labeling from
     untrusted worktree copies would hand the agent authority).
     """
-    if not is_tech_lead_session(config.tech_lead_review_agent, session.issue.agent_type):
+    if not is_tech_lead_session(
+        config.tech_lead_review_agent, session.issue.agent_type
+    ):
         return []
     authority, _tamper = _resolve_launch_authority_for_session(
         tech_lead_authority, session

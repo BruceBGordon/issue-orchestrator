@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from issue_orchestrator.domain.models import DiscoveredFailure
+from issue_orchestrator.domain.session_key import TaskKind
 from issue_orchestrator.domain.tech_lead_findings import (
     PatternClassificationConflictError,
     PendingCaseFile,
@@ -14,6 +15,7 @@ from issue_orchestrator.domain.tech_lead_findings import (
 from issue_orchestrator.domain.tech_lead_session import (
     StoredTechLeadOp,
     TechLeadLaunchAuthority,
+    TechLeadSessionGeneration,
     TechLeadSessionFlavor,
 )
 from issue_orchestrator.infra.repo_identity import state_dir
@@ -166,6 +168,43 @@ def test_allowed_act_level_targets_are_issue_only() -> None:
     )
     assert health.allowed_act_level_targets() == frozenset({12, 14})
     assert 9 not in health.allowed_act_level_targets()
+
+
+def test_observed_session_generation_round_trips_and_resolves_unambiguously() -> None:
+    generation = TechLeadSessionGeneration(
+        issue_number=14,
+        task_kind=TaskKind.CODE,
+        terminal_id="issue-14",
+        run_id="RUN-14",
+    )
+    authority = TechLeadLaunchAuthority(
+        flavor=TechLeadSessionFlavor.HEALTH_REVIEW,
+        anchor_issue_number=9,
+        problem_issue_numbers=(14,),
+        observed_session_generations=(generation,),
+    )
+
+    restored = TechLeadLaunchAuthority.from_dict(authority.to_dict())
+
+    assert restored == authority
+    assert restored.observed_kill_target(14) == generation
+    assert restored.observed_kill_target(99) is None
+
+    ambiguous = TechLeadLaunchAuthority(
+        flavor=TechLeadSessionFlavor.HEALTH_REVIEW,
+        anchor_issue_number=9,
+        problem_issue_numbers=(14,),
+        observed_session_generations=(
+            generation,
+            TechLeadSessionGeneration(
+                issue_number=14,
+                task_kind=TaskKind.REWORK,
+                terminal_id="rework-14",
+                run_id="RUN-R",
+            ),
+        ),
+    )
+    assert ambiguous.observed_kill_target(14) is None
 
 
 def test_health_problem_cohort_round_trips_and_is_validated() -> None:
@@ -390,10 +429,10 @@ def test_record_pattern_conflicting_issue_fails_loudly(
 
     with pytest.raises(TechLeadPatternConflictError):
         store.record_pattern(
-        signature="db-timeout",
-        issue_number=601,
-        observation_id="run-1:sess:db-timeout",
-    )
+            signature="db-timeout",
+            issue_number=601,
+            observation_id="run-1:sess:db-timeout",
+        )
 
     assert store.lookup_pattern(signature="db-timeout") == 600
 
@@ -523,7 +562,9 @@ def test_observation_identities_survive_reopen(tmp_path: Path) -> None:
 
     reopened = SqliteTechLeadAuthorityStore.for_repo(tmp_path)
 
-    assert not reopened.note_pattern_observation(signature="s", observation_id="r2:s:A1")
+    assert not reopened.note_pattern_observation(
+        signature="s", observation_id="r2:s:A1"
+    )
     [evidence] = reopened.list_pattern_evidence()
     assert evidence.observation_count == 2
 

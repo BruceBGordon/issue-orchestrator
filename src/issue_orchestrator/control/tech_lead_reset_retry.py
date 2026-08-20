@@ -37,10 +37,10 @@ failure discovery, retry gating, cleanup reason, operator surface, and
 history all agree, never split between the agent's reported status and this
 verdict (#6764 re-review F2). :func:`finalize_required_act_level_history`
 keeps the persisted history row consistent with that status, and
-:func:`build_required_act_level_failure_actions` routes a failed mandated
-reset to a durable needs-human label + comment so the FAILED terminal is not
-merely in-memory. A failed mandated reset can therefore never be recorded as
-a clean success.
+:func:`build_required_act_level_failure_actions` routes any failed mandated
+act-level mutation to a durable needs-human label + comment on its target so
+the FAILED terminal is not merely in-memory. A failed mandated action can
+therefore never be recorded as a clean success.
 
 The reset itself is NOT reimplemented here: ``run_reset`` is the injected
 production boundary — the same ``reset_and_retry_issue`` pipeline the
@@ -70,6 +70,7 @@ from .actions import (
     ActionResultType,
     AddCommentAction,
     AddLabelAction,
+    KillHungSessionAction,
     ResetRetryIssueAction,
     SurfaceTechLeadProposalAction,
 )
@@ -133,8 +134,12 @@ def publish_proposal_surfaced(
     )
     events.publish(make_trace_event(event_name, payload))
     logger.info(
-        issue_log(issue_number, "Tech Lead proposal surfaced: mode=%s type=%s action_id=%s"),
-        mode, proposal_type, action_id,
+        issue_log(
+            issue_number, "Tech Lead proposal surfaced: mode=%s type=%s action_id=%s"
+        ),
+        mode,
+        proposal_type,
+        action_id,
     )
 
 
@@ -253,14 +258,19 @@ class TechLeadResetRetryExecutor:
                 issue_number=action.issue_number,
                 proposal_id=action.proposal_id,
             )
-        self.events.publish(make_trace_event(EventName.TECH_LEAD_ACTION_EXECUTED, {
-            "issue_number": action.anchor_issue_number,
-            "action_id": action.proposal_id,
-            "proposal_type": "reset_retry",
-            "target_number": action.issue_number,
-            "finding_ids": list(action.finding_ids),
-            "boundary": dict(outcome.details),
-        }))
+        self.events.publish(
+            make_trace_event(
+                EventName.TECH_LEAD_ACTION_EXECUTED,
+                {
+                    "issue_number": action.anchor_issue_number,
+                    "action_id": action.proposal_id,
+                    "proposal_type": "reset_retry",
+                    "target_number": action.issue_number,
+                    "finding_ids": list(action.finding_ids),
+                    "boundary": dict(outcome.details),
+                },
+            )
+        )
         logger.info(
             issue_log(
                 action.issue_number,
@@ -354,13 +364,14 @@ class RequiredActLevelOutcome:
 
     committed: bool
     failures: tuple[str, ...] = ()
+    failed_actions: tuple[Action, ...] = ()
 
     @property
     def failed(self) -> bool:
         return not self.committed
 
     def failure_summary(self) -> str:
-        return "; ".join(self.failures) or "reset owner did not commit"
+        return "; ".join(self.failures) or "act-level owner did not commit"
 
 
 def is_required_act_level_action(action: Action) -> bool:
@@ -371,9 +382,9 @@ def is_required_act_level_action(action: Action) -> bool:
     success-only effects) and the terminal VERDICT
     (:func:`evaluate_required_act_level_outcome`), so authority and the effects it
     gates classify the same actions and cannot drift (#6779 R13). A
-    ``ResetRetryIssueAction`` is the only wired act-level mutation today.
+    Both wired act-level mutations are mandatory completion gates.
     """
-    return isinstance(action, ResetRetryIssueAction)
+    return isinstance(action, (ResetRetryIssueAction, KillHungSessionAction))
 
 
 def partition_required_act_level_actions(
@@ -401,13 +412,20 @@ def evaluate_required_act_level_outcome(
     act-level failure, shared by the completion terminalization path so a
     failed reset can never be recorded as a clean success (#6764 re-review F2).
     """
-    failures = tuple(
-        result.error or "reset owner failed"
+    failed_results = tuple(
+        result
         for result in applied
         if is_required_act_level_action(result.action)
         and result.result_type is ActionResultType.FAILURE
     )
-    return RequiredActLevelOutcome(committed=not failures, failures=failures)
+    failures = tuple(
+        result.error or "act-level owner failed" for result in failed_results
+    )
+    return RequiredActLevelOutcome(
+        committed=not failures,
+        failures=failures,
+        failed_actions=tuple(result.action for result in failed_results),
+    )
 
 
 def apply_completion_actions_gated(
@@ -432,11 +450,18 @@ def apply_completion_actions_gated(
     applied, error = _apply_completion_action_batch(
         action_applier, mandated or list(actions), issue_number
     )
-    if not mandated or error is not None or evaluate_required_act_level_outcome(applied).failed:
+    if (
+        not mandated
+        or error is not None
+        or evaluate_required_act_level_outcome(applied).failed
+    ):
         if mandated and remainder:
             logger.warning(
-                issue_log(issue_number, "Mandated act-level action did not commit; "
-                          "withholding %d success-only completion effect(s)"),
+                issue_log(
+                    issue_number,
+                    "Mandated act-level action did not commit; "
+                    "withholding %d success-only completion effect(s)",
+                ),
                 len(remainder),
             )
         return applied, error
@@ -469,8 +494,11 @@ def _apply_completion_action_batch(
         return list(action_applier.apply_all(list(actions)) or []), None
     except Exception as exc:
         logger.warning(
-            issue_log(issue_number, "Completion-action apply raised; finalizing "
-                      "terminal FAILED before re-raising: %s"),
+            issue_log(
+                issue_number,
+                "Completion-action apply raised; finalizing "
+                "terminal FAILED before re-raising: %s",
+            ),
             exc,
         )
         return [], exc
@@ -556,7 +584,7 @@ def build_required_act_level_failure_actions(
 ) -> list[Action]:
     """Durable, crash-safe operator surface for a failed mandated act-level action.
 
-    A failed mandated reset terminalizes the completion as FAILED
+    A failed mandated act-level mutation terminalizes the completion as FAILED
     (:func:`effective_terminal_status`), but that terminal record is in-memory
     only — a crash between it and the next tick would lose the signal. This
     routes the failure to GitHub through the SAME label/comment action owners the
@@ -569,29 +597,86 @@ def build_required_act_level_failure_actions(
     """
     if outcome.committed:
         return []
-    comment = (
-        "**Reset & Retry Did Not Complete**\n\n"
-        "The tech_lead decision mandated a scratch reset for this issue, but the "
-        "reset owner failed at apply time. The orchestrator recorded the session "
-        "as FAILED instead of accepting the agent's completed intent, so the "
-        "issue is not silently left as a partial reset.\n\n"
-        f"- Failure: {outcome.failure_summary()}\n"
-        f"- Session: `{session_id}`\n"
-        f"- Runtime: {runtime_minutes:.1f} minutes\n\n"
-        f"This issue has been marked as `{needs_human_label}` because the "
-        "orchestrator could not safely apply the mandated reset.\n"
-        "Remove the label after correcting or re-running the reset."
+
+    grouped: dict[int, list[tuple[str, str, str]]] = {}
+    failures = outcome.failures or ("act-level owner did not commit",)
+    for index, error in enumerate(failures):
+        action = (
+            outcome.failed_actions[index]
+            if index < len(outcome.failed_actions)
+            else None
+        )
+        target_issue, action_name, target_description = _failure_surface_identity(
+            action, fallback_issue_number=issue_number
+        )
+        grouped.setdefault(target_issue, []).append(
+            (action_name, target_description, error)
+        )
+
+    actions: list[Action] = []
+    for target_issue, target_failures in grouped.items():
+        details = "\n".join(
+            f"- Action: `{action_name}`\n"
+            f"- Target: {target_description}\n"
+            f"- Failure: {error}"
+            for action_name, target_description, error in target_failures
+        )
+        comment = (
+            "**Required Tech Lead Action Did Not Complete**\n\n"
+            "The tech_lead decision mandated an act-level mutation, but its "
+            "execution owner failed at apply time. The orchestrator recorded "
+            "the tech_lead session as FAILED instead of accepting its completed "
+            "intent, so the target is not silently left partially mutated.\n\n"
+            f"{details}\n"
+            f"- Tech lead session: `{session_id}`\n"
+            f"- Runtime: {runtime_minutes:.1f} minutes\n\n"
+            f"Issue #{target_issue} has been marked as `{needs_human_label}` "
+            "because the orchestrator could not safely apply the required "
+            "action. Inspect the failure above, then remove the label after "
+            "correcting or re-running that action."
+        )
+        actions.extend(
+            (
+                AddLabelAction(
+                    issue_number=target_issue,
+                    label=needs_human_label,
+                    reason=(
+                        "mandated tech_lead act-level action did not commit; "
+                        "routing target to needs-human"
+                    ),
+                    needs_human_cause=NeedsHumanCause.SESSION_LIFECYCLE,
+                ),
+                AddCommentAction(
+                    number=target_issue,
+                    comment=comment,
+                    reason=(
+                        "notify target operator that a mandated tech_lead action "
+                        "failed at apply time"
+                    ),
+                ),
+            )
+        )
+    return actions
+
+
+def _failure_surface_identity(
+    action: Action | None, *, fallback_issue_number: int
+) -> tuple[int, str, str]:
+    """Return the truthful action name and mutation target for operator routing."""
+    if isinstance(action, KillHungSessionAction):
+        target = (
+            f"issue #{action.issue_number}, {action.target_session_type} terminal "
+            f"`{action.target_terminal_id}`, run `{action.target_session_id}`"
+        )
+        return action.issue_number, "kill_hung_session", target
+    if isinstance(action, ResetRetryIssueAction):
+        return (
+            action.issue_number,
+            "reset_retry",
+            f"issue #{action.issue_number}",
+        )
+    return (
+        fallback_issue_number,
+        "tech_lead_act_level",
+        f"issue #{fallback_issue_number}",
     )
-    return [
-        AddLabelAction(
-            issue_number=issue_number,
-            label=needs_human_label,
-            reason="mandated reset_retry did not commit; routing to needs-human",
-            needs_human_cause=NeedsHumanCause.SESSION_LIFECYCLE,
-        ),
-        AddCommentAction(
-            number=issue_number,
-            comment=comment,
-            reason="notify operator that the mandated reset failed at apply time",
-        ),
-    ]

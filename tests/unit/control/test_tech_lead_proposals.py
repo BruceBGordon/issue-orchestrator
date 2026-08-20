@@ -74,6 +74,8 @@ def _op(
         source_action_id="A2",
         created_at="2026-07-11T00:00:00+00:00",
         target_session_id=target_session_id,
+        target_terminal_id=(f"issue-{target}" if target_session_id else ""),
+        target_session_type=("code" if target_session_id else ""),
         finding_ids=finding_ids,
     )
 
@@ -1258,7 +1260,6 @@ def test_applier_kill_op_invokes_termination_owner_under_stale_policy() -> None:
     applier = _applier(host, ops)
     applier.tech_lead_kill_session = TechLeadKillSessionExecutor(
         events=MagicMock(),
-        active_session_run_id=lambda n: "RUN-14" if n == 14 else None,
         run_kill=run_kill,
     )
     [action] = plan_approved_tech_lead_op_executions(
@@ -1269,7 +1270,7 @@ def test_applier_kill_op_invokes_termination_owner_under_stale_policy() -> None:
 
     assert result.success
     run_kill.assert_called_once()
-    assert run_kill.call_args[0][0] == 14
+    assert run_kill.call_args[0][0].issue_number == 14
     host.update_issue_state.assert_called_once_with(501, "closed")
     assert ops.load_op(issue_number=501) is None
 
@@ -1279,11 +1280,15 @@ def test_applier_kill_op_stale_when_session_already_gone() -> None:
     ops = InMemoryTechLeadAuthorityStore()
     op = _kill_op(14, session_id="RUN-14")
     ops.record_op(issue_number=501, op=op)
-    run_kill = MagicMock()
+    run_kill = MagicMock(
+        return_value=KillSessionRunOutcome(
+            success=False,
+            stale_reason="issue #14 has no active killable session",
+        )
+    )
     applier = _applier(host, ops)
     applier.tech_lead_kill_session = TechLeadKillSessionExecutor(
         events=MagicMock(),
-        active_session_run_id=lambda _n: None,
         run_kill=run_kill,
     )
     [action] = plan_approved_tech_lead_op_executions(
@@ -1293,7 +1298,7 @@ def test_applier_kill_op_stale_when_session_already_gone() -> None:
     result = applier.apply(action)
 
     assert not result.success
-    run_kill.assert_not_called()
+    run_kill.assert_called_once()
     (number, comment), _ = host.add_comment.call_args
     assert number == 501 and "Preconditions no longer hold" in comment
     assert ops.load_op(issue_number=501) is None
@@ -1336,7 +1341,6 @@ def _wired_kill_applier(
     applier = _applier(host, ops)
     applier.tech_lead_kill_session = TechLeadKillSessionExecutor(
         events=MagicMock(),
-        active_session_run_id=lambda n: "RUN-14" if n == 14 else None,
         run_kill=run_kill,
     )
     return applier
@@ -1353,6 +1357,8 @@ def test_applier_direct_kill_executes_without_proposal_consent_round_trip() -> N
         proposal_id="A8",
         anchor_issue_number=99,
         target_session_id="RUN-14",
+        target_terminal_id="issue-14",
+        target_session_type="code",
         expected=EXPECTED,
     )
 
@@ -1539,7 +1545,7 @@ def test_end_to_end_gated_reset_proposal_executes_once() -> None:
         source_run_id="run-1",
         source_session_name="issue-99",
         observed_at="2026-07-11T00:00:00+00:00",
-        active_session_run_id=lambda _n: None,
+        observed_session_generation=lambda _n: None,
         dedup_corpus=OpenIssueCorpus.disabled(),
         dedup_grant=DuplicateTargetGrant.none(),
     )
@@ -1564,7 +1570,7 @@ def test_end_to_end_gated_reset_proposal_executes_once() -> None:
         source_run_id="run-2",
         source_session_name="issue-99",
         observed_at="2026-07-11T01:00:00+00:00",
-        active_session_run_id=lambda _n: None,
+        observed_session_generation=lambda _n: None,
         dedup_corpus=OpenIssueCorpus.disabled(),
         dedup_grant=DuplicateTargetGrant.none(),
     )

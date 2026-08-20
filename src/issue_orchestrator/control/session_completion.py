@@ -35,7 +35,10 @@ from .completion_dispatcher import (
     CompletionDispatcher,
     SynchronousCompletionDispatcher,
 )
-from .session_completion_diagnostics import run_session_analysis, surface_failure_context
+from .session_completion_diagnostics import (
+    run_session_analysis,
+    surface_failure_context,
+)
 from .session_run_resolution import resolve_session_run_dir
 from .transition_log import log_transition
 from .tech_lead_reaction import record_completed_session_problem
@@ -68,14 +71,16 @@ def _validation_issue_key(session: Session, config: Config) -> IssueKey | None:
     return None
 
 
-_RUNTIME_TERMINAL_STATUSES = frozenset({
-    SessionStatus.COMPLETED,
-    SessionStatus.BLOCKED,
-    SessionStatus.NEEDS_HUMAN,
-    SessionStatus.FAILED,
-    SessionStatus.TIMED_OUT,
-    SessionStatus.VALIDATION_FAILED,
-})
+_RUNTIME_TERMINAL_STATUSES = frozenset(
+    {
+        SessionStatus.COMPLETED,
+        SessionStatus.BLOCKED,
+        SessionStatus.NEEDS_HUMAN,
+        SessionStatus.FAILED,
+        SessionStatus.TIMED_OUT,
+        SessionStatus.VALIDATION_FAILED,
+    }
+)
 
 _SESSION_ALREADY_GONE_MARKERS = (
     "not found",
@@ -156,7 +161,9 @@ def _queue_rework_after_retrospective_changes(
             issue_number=issue_number,
             pr_number=session.pr_number,
             source="retrospective_review",
-            feedback=str(detail.get("review_issues") or detail.get("review_summary") or ""),
+            feedback=str(
+                detail.get("review_issues") or detail.get("review_summary") or ""
+            ),
         )
     )
     if not queued:
@@ -212,10 +219,10 @@ def _surface_required_act_level_failure(
 ) -> None:
     """Apply the durable operator surface for a failed mandated act-level action.
 
-    Routes a failed decision-mandated reset to a needs-human label + comment via
-    the existing action owners so the FAILED terminal is not merely in-memory
-    (#6764 F2). The builder returns [] for a committed/genuine-failure outcome, so
-    this applies nothing on those paths.
+    Routes each failed decision-mandated act-level mutation to a needs-human label
+    + comment on its actual target via the existing action owners, so the FAILED
+    terminal is not merely in-memory (#6764 F2). The builder returns [] for a
+    committed/genuine-failure outcome, so this applies nothing on those paths.
     """
     from .tech_lead_reset_retry import build_required_act_level_failure_actions
 
@@ -283,10 +290,18 @@ def handle_session_completion(  # noqa: C901, PLR0912 - handles validation, acti
         if name.startswith("rework-")
         else "issue"
     )
-    log_transition(entity, session.issue.number, "ACTIVE", status.value.upper(), f"runtime={session.runtime_minutes}min")
+    log_transition(
+        entity,
+        session.issue.number,
+        "ACTIVE",
+        status.value.upper(),
+        f"runtime={session.runtime_minutes}min",
+    )
 
     # Remove by session name, NOT issue number - multiple sessions can share an issue number
-    state.active_sessions = [s for s in state.active_sessions if s.terminal_id != session.terminal_id]
+    state.active_sessions = [
+        s for s in state.active_sessions if s.terminal_id != session.terminal_id
+    ]
 
     # Settle the claim this session took off a pending queue at launch (#6999
     # F2/A1). One typed outcome for every terminal path: a session stopped by
@@ -325,7 +340,8 @@ def handle_session_completion(  # noqa: C901, PLR0912 - handles validation, acti
             validation_cmd=config.validation.quick.cmd,
         )
         state.pending_validation_retries = [
-            retry for retry in state.pending_validation_retries
+            retry
+            for retry in state.pending_validation_retries
             if retry.issue_number != session.issue.number
         ]
         state.pending_validation_retries.append(pending_retry)
@@ -340,7 +356,9 @@ def handle_session_completion(  # noqa: C901, PLR0912 - handles validation, acti
     # RAISES — cannot leave a false SESSION_COMPLETED or a completed cached machine.
     try:
         result = completion_handler.process_completion(
-            session, status, pr_url_hint=pr_url_hint,
+            session,
+            status,
+            pr_url_hint=pr_url_hint,
             processing_errors=processing_errors,
             diagnostic_path=diagnostic_path,
             review_exchange_completed=review_exchange_completed,
@@ -388,6 +406,7 @@ def handle_session_completion(  # noqa: C901, PLR0912 - handles validation, acti
         finalize_required_act_level_history,
         required_act_level_outcome_after_apply,
     )
+
     applied_results, apply_error = apply_completion_actions_gated(
         action_applier, result.actions, issue_number=session.issue.number
     )
@@ -438,14 +457,16 @@ def handle_session_completion(  # noqa: C901, PLR0912 - handles validation, acti
                 session.lease_id,
             )
             if events:
-                events.publish(make_trace_event(
-                    EventName.CLAIM_RELEASED,
-                    {
-                        "issue_number": session.issue.number,
-                        "lease_id": session.lease_id,
-                        "status": effective_status.value,
-                    },
-                ))
+                events.publish(
+                    make_trace_event(
+                        EventName.CLAIM_RELEASED,
+                        {
+                            "issue_number": session.issue.number,
+                            "lease_id": session.lease_id,
+                            "status": effective_status.value,
+                        },
+                    )
+                )
         except Exception as e:
             logger.warning(
                 "[COMPLETION] Failed to release claim for issue #%d: %s",
@@ -466,11 +487,16 @@ def handle_session_completion(  # noqa: C901, PLR0912 - handles validation, acti
     CompletionCleanupStateOwner(state).record(result.cleanup, session, effective_status)
 
     if result.should_queue_review and result.pr_url and result.pr_number:
-        state.discovered_reviews.append(DiscoveredReview(
-            session.issue.number, result.pr_number, result.pr_url, session.branch_name,
-            agent_label=session.agent_label,
-            issue_key=session.issue.key.stable_id(),
-        ))
+        state.discovered_reviews.append(
+            DiscoveredReview(
+                session.issue.number,
+                result.pr_number,
+                result.pr_url,
+                session.branch_name,
+                agent_label=session.agent_label,
+                issue_key=session.issue.key.stable_id(),
+            )
+        )
     record_completed_session_problem(
         status=effective_status,
         session=session,
@@ -499,7 +525,9 @@ def handle_session_completion(  # noqa: C901, PLR0912 - handles validation, acti
         # nothing: a second GitHub write right after a reconciliation/claim raise
         # would re-fail and mask the re-raise (the terminal is already FAILED).
         _surface_required_act_level_failure(
-            action_applier, config, session,
+            action_applier,
+            config,
+            session,
             evaluate_required_act_level_outcome(applied_results),
         )
 
@@ -648,8 +676,12 @@ def _completion_decider(
 
     def decide() -> "SessionDecision":
         return session_controller.decide_outcome(
-            obs, session.worktree_path, session.issue.number,
-            session.issue.title, session.terminal_id, session.completion_path,
+            obs,
+            session.worktree_path,
+            session.issue.number,
+            session.issue.title,
+            session.terminal_id,
+            session.completion_path,
             validation_retry_count=session.validation_retry_count,
             original_prompt=session.original_prompt,
             retry_prompt_template=retry_prompt_template,
@@ -733,13 +765,23 @@ def _apply_completed_decision(
         review_exchange_halted = decision.processing_result.review_exchange_halted
     diagnostic_path = decision.diagnostic_path or diagnostic_path
     handle_session_completion(
-        session, decision.status, state, completion_handler, action_applier,
-        observer, worktree_manager, kill_session_fn, config,
+        session,
+        decision.status,
+        state,
+        completion_handler,
+        action_applier,
+        observer,
+        worktree_manager,
+        kill_session_fn,
+        config,
         session_output=session_output,
-        pr_url_hint=pr_url_hint, processing_errors=processing_errors,
+        pr_url_hint=pr_url_hint,
+        processing_errors=processing_errors,
         diagnostic_path=diagnostic_path,
         validation_error=validation_error,
-        validation_error_file=str(validation_error_file) if validation_error_file else None,
+        validation_error_file=str(validation_error_file)
+        if validation_error_file
+        else None,
         review_exchange_completed=review_exchange_completed,
         review_exchange_halted=review_exchange_halted,
         blocked_label=decision.blocked_label,

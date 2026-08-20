@@ -28,14 +28,14 @@ from typing import Any, TypedDict
 
 logger = logging.getLogger(__name__)
 
-BOARD_SNAPSHOT_SCHEMA_VERSION = 5
+BOARD_SNAPSHOT_SCHEMA_VERSION = 6
 
 # --- Hung-session evidence projection ---------------------------------------
 # The health review must judge a session HUNG from EVIDENCE (idle with no
 # progress), NOT from age alone: a long-running session still emitting output
 # or landing commits is working, not hung. These two best-effort signals ride
 # on each active session so the review can tell the two apart before proposing
-# the GATED ``kill_hung_session`` (never an auto-execute).
+# ``kill_hung_session`` under the repository's configured authority.
 
 # Sentinel for an unknown idle reading (the terminal recording's mtime could
 # not be read, or the activity-probe returned nothing). Kept an int — the field
@@ -96,6 +96,7 @@ class BoardSessionInfoDict(TypedDict):
     started_at: str
     age_minutes: int
     terminal_id: str
+    run_id: str
     idle_minutes: int
     commits_ahead: int
     last_activity_at: str | None
@@ -271,6 +272,9 @@ class BoardSessionInfo:
     started_at: str  # ISO timestamp
     age_minutes: int
     terminal_id: str
+    # Per-launch generation identity. Unlike the reusable terminal id, this
+    # changes every time the same session slot is relaunched.
+    run_id: str = ""
     idle_minutes: int = IDLE_MINUTES_UNKNOWN
     commits_ahead: int = COMMITS_AHEAD_UNKNOWN
     last_activity_at: str | None = None
@@ -335,6 +339,7 @@ class BoardTimelineExtract:
 @dataclass
 class BoardCaseFile:
     """An open signature-keyed pattern evidence ledger (#6781)."""
+
     issue_number: int
     title: str
     comment_count: int
@@ -345,6 +350,7 @@ class BoardCaseFile:
 @dataclass
 class BoardAreaSignal:
     """Step-back evidence for one component/seam (#6781 amendment)."""
+
     area: str
     distinct_patterns: int
     shipped_fixes: int
@@ -353,6 +359,7 @@ class BoardAreaSignal:
 @dataclass
 class BoardShippedFix:
     """Restart-safe patch evidence for an area-tagged merged issue."""
+
     issue_number: int
     title: str
     pr_url: str
@@ -514,7 +521,9 @@ class BoardE2EHealth:
             quarantine_count=quarantine_count,
             last_run=last_run,
             recent_runs=board_runs,
-            chronic_failures=_project_e2e_chronic(chronic_failures, max_chronic_failures),
+            chronic_failures=_project_e2e_chronic(
+                chronic_failures, max_chronic_failures
+            ),
         )
 
     def to_dict(self) -> BoardE2EHealthDict:
@@ -727,6 +736,7 @@ class BoardSnapshot:
                     "started_at": s.started_at,
                     "age_minutes": s.age_minutes,
                     "terminal_id": s.terminal_id,
+                    "run_id": s.run_id,
                     "idle_minutes": s.idle_minutes,
                     "commits_ahead": s.commits_ahead,
                     "last_activity_at": s.last_activity_at,
@@ -832,6 +842,7 @@ class BoardSnapshot:
                     started_at=s["started_at"],
                     age_minutes=s["age_minutes"],
                     terminal_id=s["terminal_id"],
+                    run_id=s["run_id"],
                     idle_minutes=s["idle_minutes"],
                     commits_ahead=s["commits_ahead"],
                     last_activity_at=s["last_activity_at"],

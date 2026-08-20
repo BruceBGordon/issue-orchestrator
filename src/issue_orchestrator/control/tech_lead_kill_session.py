@@ -2,8 +2,8 @@
 
 The action may come directly from ``execute`` authority or from an approved
 gated proposal (#6778). It is a stale-checkable fact recorded against the board
-the proposing session observed, so the executor re-validates immediately
-before acting:
+the proposing session observed. The injected termination owner re-validates
+and mutates that same typed generation in one boundary:
 
 1. the target issue must STILL have an active session — the entire point of
    the op is terminating live-but-stuck work, so a session that already
@@ -17,11 +17,10 @@ hold" comment). On success a ``TECH_LEAD_ACTION_EXECUTED`` event records the
 termination boundary effects. Kill-owner failures fail the action loudly.
 
 The termination itself is NOT reimplemented here: ``run_kill`` is the
-injected production boundary — ``terminate_issue_runtime`` via
-``Orchestrator.terminate_issue_runtime_for_issue``, the same issue-terminal
-boundary the reset owner applies, WITHOUT the reset (no PR superseding, no
-label/history clearing, no relaunch). Production wiring lives in
-``entrypoints/tech_lead_reset_retry_wiring.py``.
+generation-aware production boundary. It conditionally stops the exact
+terminal/run pair and tears down its issue-scoped hidden owners, WITHOUT the
+reset (no PR superseding, label/history clearing, or relaunch). Production
+wiring lives in ``entrypoints/tech_lead_reset_retry_wiring.py``.
 """
 
 from __future__ import annotations
@@ -31,6 +30,8 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping
 
 from ..events import EventName
+from ..domain.session_key import TaskKind
+from ..domain.tech_lead_session import TechLeadSessionGeneration
 from ..infra.logging_config import issue_log
 from ..ports import EventSink, make_trace_event
 from .actions import ActionResult, KillHungSessionAction
@@ -52,44 +53,38 @@ class KillSessionRunOutcome:
 
     success: bool
     error: str | None = None
+    stale_reason: str | None = None
     details: Mapping[str, Any] = field(default_factory=dict)
 
 
-# The production boundary: (issue_number, reason) -> outcome.
-RunKillFn = Callable[[int, str], KillSessionRunOutcome]
+# The production boundary: (exact observed generation, reason) -> outcome.
+RunKillFn = Callable[[TechLeadSessionGeneration, str], KillSessionRunOutcome]
 
 
 def kill_hung_session_stale_reason(
     *,
     issue_number: int,
-    active_session_id: str | None,
-    approved_session_id: str,
+    target_session_id: str,
+    target_terminal_id: str,
+    target_session_type: str,
 ) -> str | None:
-    """Why the op's preconditions no longer hold, or None when valid.
-
-    Approval is bound to the exact session generation the proposal diagnosed
-    (#6779 R1): ``approved_session_id`` is the target's active session run id
-    captured when the proposal was filed, and ``active_session_id`` is the
-    run id of the target's live session right now (``None`` when none runs).
-    The op is stale unless they still match — otherwise the diagnosed session
-    exited and a replacement started, which the approver never consented to
-    terminating.
-    """
-    if active_session_id is None:
+    """Why an action has no complete trusted generation, or ``None``."""
+    if not target_session_id or not target_terminal_id or not target_session_type:
         return (
-            f"issue #{issue_number} has no active session; the session the"
-            " proposal diagnosed as hung is already gone"
+            f"the proposal recorded no complete session generation for issue"
+            f" #{issue_number}; refusing to kill an unverified runtime"
         )
-    if not approved_session_id:
+    try:
+        task_kind = TaskKind(target_session_type)
+    except ValueError:
         return (
-            f"the proposal recorded no session identity for issue"
-            f" #{issue_number}; refusing to kill an unverified session"
+            f"the proposal recorded unsupported session type"
+            f" {target_session_type!r} for issue #{issue_number}"
         )
-    if active_session_id != approved_session_id:
+    if task_kind not in {TaskKind.CODE, TaskKind.REWORK}:
         return (
-            f"issue #{issue_number}'s live session (run {active_session_id})"
-            f" is not the one approved (run {approved_session_id}); a"
-            " replacement session started before approval"
+            f"the proposal targeted non-killable {task_kind.value!r} work"
+            f" for issue #{issue_number}"
         )
     return None
 
@@ -98,33 +93,40 @@ def kill_hung_session_stale_reason(
 class TechLeadKillSessionExecutor:
     """Applies :class:`KillHungSessionAction` with execution-time re-validation.
 
-    All collaborators are injected: ``active_session_run_id`` reads the run id
-    of the target issue's live session (``None`` when none runs) and
-    ``run_kill`` is the reused issue-runtime termination boundary. The
-    executor owns only the validate/downgrade/execute/surface policy.
+    ``run_kill`` owns the live revalidation and exact termination atomically.
+    This executor validates the stored identity envelope and owns only the
+    downgrade/execute/surface policy.
     """
 
     events: EventSink
-    active_session_run_id: Callable[[int], str | None]
     run_kill: RunKillFn
 
     def apply(self, action: KillHungSessionAction) -> ActionResult:
         stale = kill_hung_session_stale_reason(
             issue_number=action.issue_number,
-            active_session_id=self.active_session_run_id(action.issue_number),
-            approved_session_id=action.target_session_id,
+            target_session_id=action.target_session_id,
+            target_terminal_id=action.target_terminal_id,
+            target_session_type=action.target_session_type,
         )
         if stale is not None:
             return self._downgrade(action, stale)
+        target = TechLeadSessionGeneration(
+            issue_number=action.issue_number,
+            task_kind=TaskKind(action.target_session_type),
+            terminal_id=action.target_terminal_id,
+            run_id=action.target_session_id,
+        )
         authority_source = (
             f"approved proposal #{action.proposal_issue_number}"
             if action.proposal_issue_number
             else f"direct authority on anchor #{action.anchor_issue_number}"
         )
         outcome = self.run_kill(
-            action.issue_number,
+            target,
             f"tech_lead kill_hung_session {action.proposal_id} ({authority_source})",
         )
+        if outcome.stale_reason is not None:
+            return self._downgrade(action, outcome.stale_reason)
         if not outcome.success:
             logger.error(
                 issue_log(

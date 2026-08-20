@@ -25,6 +25,7 @@ from issue_orchestrator.control.tech_lead_decision_actions import (
     plan_tech_lead_decision_actions,
 )
 from issue_orchestrator.domain.models import Issue
+from issue_orchestrator.domain.session_key import TaskKind
 from issue_orchestrator.domain.tech_lead_artifacts import (
     ProposedTechLeadAction,
     TechLeadDecision,
@@ -34,6 +35,7 @@ from issue_orchestrator.domain.tech_lead_findings import PatternEvidence
 from issue_orchestrator.domain.tech_lead_session import (
     PROPOSED_TECH_LEAD_LABEL,
     TECH_LEAD_OBSERVATION_LABEL,
+    TechLeadSessionGeneration,
 )
 from issue_orchestrator.infra.config import Config
 
@@ -114,7 +116,7 @@ def _plan(
     config: Config | None = None,
     anchor: Issue | None = None,
     op_ledger: dict[tuple[str, int], int] | None = None,
-    active_session_run_id=lambda _n: None,
+    observed_session_generation=lambda _n: None,
     pattern_ledger: dict[str, PatternEvidence] | None = None,
     dedup_corpus: OpenIssueCorpus | None = None,
     dedup_grant: DuplicateTargetGrant | None = None,
@@ -127,7 +129,7 @@ def _plan(
         anchor_issue=anchor or _anchor(),
         expected=EXPECTED,
         op_ledger=op_ledger or {},
-        active_session_run_id=active_session_run_id,
+        observed_session_generation=observed_session_generation,
         pattern_ledger=pattern_ledger or {},
         dedup_corpus=dedup_corpus or OpenIssueCorpus.disabled(),
         dedup_grant=dedup_grant or DuplicateTargetGrant.none(),
@@ -1159,7 +1161,16 @@ def test_kill_hung_session_execute_plans_generation_bound_kill_action() -> None:
     [planned] = _plan(
         _decision(action),
         config,
-        active_session_run_id=lambda number: "RUN-13" if number == 13 else None,
+        observed_session_generation=lambda number: (
+            TechLeadSessionGeneration(
+                issue_number=13,
+                task_kind=TaskKind.CODE,
+                terminal_id="issue-13",
+                run_id="RUN-13",
+            )
+            if number == 13
+            else None
+        ),
     )
 
     assert isinstance(planned, KillHungSessionAction)
@@ -1168,6 +1179,8 @@ def test_kill_hung_session_execute_plans_generation_bound_kill_action() -> None:
     assert planned.proposal_issue_number == 0
     assert planned.proposal_id == "A8"
     assert planned.target_session_id == "RUN-13"
+    assert planned.target_terminal_id == "issue-13"
+    assert planned.target_session_type == "code"
     assert planned.expected is EXPECTED
 
 

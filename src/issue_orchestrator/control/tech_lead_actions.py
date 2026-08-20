@@ -389,11 +389,12 @@ class KillHungSessionAction(Action):
     # Set (>0) when consuming an approved gated proposal. 0 means direct
     # execute-authority and requires no proposal finalization.
     proposal_issue_number: int = 0
-    # The active session run id the proposal bound its consent to (#6779 R1).
-    # The applier's kill owner refuses to terminate unless the target issue's
-    # LIVE session still matches this id, so a replacement session started
-    # before approval is never killed.
+    # The complete typed generation observed at tech-lead launch. The reusable
+    # terminal slot, task kind, and per-launch run id travel together into the
+    # atomic termination owner; partial/legacy identities fail closed.
     target_session_id: str = ""
+    target_terminal_id: str = ""
+    target_session_type: str = ""
     action_type: ActionType = field(default=ActionType.KILL_HUNG_SESSION, init=False)
 
     def __post_init__(self) -> None:

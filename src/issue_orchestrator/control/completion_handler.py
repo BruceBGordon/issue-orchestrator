@@ -38,7 +38,7 @@ from ..domain.models import (
     session_history_status_from_session_status,
 )
 from ..domain.session_key import TaskKind
-from ..ports import EventSink,  make_trace_event, RepositoryHost, Issue
+from ..ports import EventSink, make_trace_event, RepositoryHost, Issue
 from ..ports.session_output import SessionOutput
 from .actions import (
     Action,
@@ -139,7 +139,6 @@ class CompletionHandler:
         session_output: SessionOutput,
         tech_lead_authority: "TechLeadAuthorityStore",
         open_issue_corpus: "OpenIssueCorpusManager",
-        active_session_run_id: Callable[[int], str | None],
         provider_availability: "ProviderAvailabilityPolicy",
         remove_session_machine_fn: Callable[[str], None] | None = None,
         label_manager: "LabelManager | None" = None,
@@ -155,11 +154,16 @@ class CompletionHandler:
         self._remove_session_machine = remove_session_machine_fn
         if label_manager is None:
             from .label_manager import LabelManager
+
             label_manager = LabelManager(config)
         self._lm = label_manager
         self._action_planner = CompletionActionPlanner(
-            config, repository_host, label_manager, tech_lead_authority,
-            open_issue_corpus, active_session_run_id, provider_availability,
+            config,
+            repository_host,
+            label_manager,
+            tech_lead_authority,
+            open_issue_corpus,
+            provider_availability,
         )
 
     def mark_session_retry(self, session: Session, reason: str) -> None:
@@ -177,7 +181,7 @@ class CompletionHandler:
                 session.terminal_id,
                 reason,
             )
-            session_machine.fail(data={'reason': reason})  # type: ignore[attr-defined]
+            session_machine.fail(data={"reason": reason})  # type: ignore[attr-defined]
         if self._remove_session_machine is not None:
             self._remove_session_machine(session.terminal_id)
 
@@ -215,10 +219,14 @@ class CompletionHandler:
             extra=log_context(issue_key=issue_key, session_id=session.terminal_id),
         )
 
-        review_exchange_halted = review_exchange_halted or has_review_exchange_errors(processing_errors)
+        review_exchange_halted = review_exchange_halted or has_review_exchange_errors(
+            processing_errors
+        )
 
         # Fetch PR info if completed (or use hint from completion processor)
-        pr_url, pr_number, pr_infos = self._fetch_pr_info(session, status, pr_url_hint=pr_url_hint)
+        pr_url, pr_number, pr_infos = self._fetch_pr_info(
+            session, status, pr_url_hint=pr_url_hint
+        )
         if pr_infos:
             self._emit_pr_view_changed(
                 pr_infos[0],
@@ -253,13 +261,18 @@ class CompletionHandler:
         # the caller finalizes post-apply from the EFFECTIVE status (#6777). Default
         # commits both here from history_status, exactly as before.
         if finalize_terminal:
-            self.emit_trace_events(session, history_status, pr_url, pr_number, blocked_reason=blocked_reason, completion_detail=completion_detail)
+            self.emit_trace_events(
+                session,
+                history_status,
+                pr_url,
+                pr_number,
+                blocked_reason=blocked_reason,
+                completion_detail=completion_detail,
+            )
             self._update_state_machines(session, history_status, pr_url)
 
         # Determine cleanup strategy
-        cleanup = self._determine_cleanup_strategy(
-            session, status, pr_url, pr_number
-        )
+        cleanup = self._determine_cleanup_strategy(session, status, pr_url, pr_number)
 
         # Determine if we should queue code review
         should_queue_review = self._should_queue_review(
@@ -304,12 +317,16 @@ class CompletionHandler:
         )
         completion_actions = tuple(completion_actions)
 
-        if status in (
-            SessionStatus.FAILED,
-            SessionStatus.TIMED_OUT,
-            SessionStatus.BLOCKED,
-            SessionStatus.NEEDS_HUMAN,
-        ) or processing_errors:
+        if (
+            status
+            in (
+                SessionStatus.FAILED,
+                SessionStatus.TIMED_OUT,
+                SessionStatus.BLOCKED,
+                SessionStatus.NEEDS_HUMAN,
+            )
+            or processing_errors
+        ):
             log_path = get_repo_log_path(self.config.repo_root)
             run_dir = self._resolve_session_run_dir(session)
             self._session_output.write_orchestrator_tail(
@@ -333,7 +350,9 @@ class CompletionHandler:
         # Retention (#6769 F3): completion finalization is this run's terminal
         # seam; publish-stage failures keep the row for Retry Publish.
         discard_tech_lead_authority_after_completion(
-            self.config, self._tech_lead_authority, session,
+            self.config,
+            self._tech_lead_authority,
+            session,
             processing_errors=processing_errors,
         )
 
@@ -386,8 +405,12 @@ class CompletionHandler:
                 run_dir,
                 issue_labels=labels,
                 trigger_source=trigger.value,
-                trigger_label=self._lm.run_audit_requested if trigger is RunAuditTrigger.LABEL else None,
-                completion_label=self._lm.run_audit_completed if trigger is RunAuditTrigger.LABEL else None,
+                trigger_label=self._lm.run_audit_requested
+                if trigger is RunAuditTrigger.LABEL
+                else None,
+                completion_label=self._lm.run_audit_completed
+                if trigger is RunAuditTrigger.LABEL
+                else None,
                 trigger_threshold_minutes=(
                     self.config.review_run_audit_min_runtime_minutes
                     if trigger is RunAuditTrigger.RUNTIME_THRESHOLD
@@ -395,7 +418,9 @@ class CompletionHandler:
                 ),
                 processing_errors=processing_errors,
             )
-            self._session_output.update_manifest(run_dir, {"run_audit_path": str(audit.path)})
+            self._session_output.update_manifest(
+                run_dir, {"run_audit_path": str(audit.path)}
+            )
         except Exception:
             logger.warning(
                 "[RUN_AUDIT] Failed for issue #%d run_dir=%s",
@@ -456,7 +481,10 @@ class CompletionHandler:
         ):
             return RunAuditTrigger.LABEL
 
-        if status is SessionStatus.TIMED_OUT and self.config.review_run_audit_on_timeout:
+        if (
+            status is SessionStatus.TIMED_OUT
+            and self.config.review_run_audit_on_timeout
+        ):
             return RunAuditTrigger.TIMEOUT
 
         threshold_minutes = self.config.review_run_audit_min_runtime_minutes
@@ -541,7 +569,9 @@ class CompletionHandler:
             "[PR_HINT] Using PR from completion processor: %s (number=%s)",
             pr_url,
             pr_number,
-            extra=log_context(issue_key=session.key.issue.stable_id(), session_id=session.terminal_id),
+            extra=log_context(
+                issue_key=session.key.issue.stable_id(), session_id=session.terminal_id
+            ),
         )
         return pr_url, pr_number, prs
 
@@ -558,7 +588,9 @@ class CompletionHandler:
             duration,
             session.branch_name,
             len(pr_infos),
-            extra=log_context(issue_key=session.key.issue.stable_id(), session_id=session.terminal_id),
+            extra=log_context(
+                issue_key=session.key.issue.stable_id(), session_id=session.terminal_id
+            ),
         )
         if pr_infos:
             return pr_infos[0].url, pr_infos[0].number, list(pr_infos)
@@ -639,8 +671,12 @@ class CompletionHandler:
         never a false COMPLETED neither consumer can retract (#6777).
         """
         self.emit_trace_events(
-            session, effective_status, pr_url, pr_number,
-            blocked_reason=blocked_reason, completion_detail=completion_detail,
+            session,
+            effective_status,
+            pr_url,
+            pr_number,
+            blocked_reason=blocked_reason,
+            completion_detail=completion_detail,
         )
         self._update_state_machines(session, effective_status, pr_url)
 
@@ -697,26 +733,42 @@ class CompletionHandler:
             "runtime_minutes": session.runtime_minutes,
         }
         completion_path_absolute = detail.get("completion_path_absolute")
-        if isinstance(completion_path_absolute, str) and completion_path_absolute.strip():
+        if (
+            isinstance(completion_path_absolute, str)
+            and completion_path_absolute.strip()
+        ):
             payload["completion_path_absolute"] = completion_path_absolute
         else:
-            payload["completion_path_absolute"] = str((session.worktree_path / session.completion_path).resolve())
+            payload["completion_path_absolute"] = str(
+                (session.worktree_path / session.completion_path).resolve()
+            )
         run_dir = self._resolve_session_run_dir(session)
         payload["run_dir"] = str(run_dir)
-        for key in ("implementation", "problems", "review_summary", "review_issues", "risk_level"):
+        for key in (
+            "implementation",
+            "problems",
+            "review_summary",
+            "review_issues",
+            "risk_level",
+        ):
             if detail.get(key):
                 payload[key] = detail[key]
         self.events.publish(make_trace_event(EventName.SESSION_COMPLETED, payload))
 
         if pr_url and pr_number is not None:
-            self.events.publish(make_trace_event(EventName.ISSUE_PR_CREATED, {
-                "issue_number": session.issue.number,
-                "pr_url": pr_url,
-                "pr_number": pr_number,
-                "agent": agent,
-                "task": task,
-                "rework_cycle": rework_cycle,
-            }))
+            self.events.publish(
+                make_trace_event(
+                    EventName.ISSUE_PR_CREATED,
+                    {
+                        "issue_number": session.issue.number,
+                        "pr_url": pr_url,
+                        "pr_number": pr_number,
+                        "agent": agent,
+                        "task": task,
+                        "rework_cycle": rework_cycle,
+                    },
+                )
+            )
 
     def _emit_failure_event(
         self,
@@ -738,7 +790,9 @@ class CompletionHandler:
             "rework_cycle": session.rework_cycle,
             "error": reason,
             "runtime_minutes": session.runtime_minutes,
-            "timeout_minutes": session.agent_config.timeout_minutes if session.agent_config else None,
+            "timeout_minutes": session.agent_config.timeout_minutes
+            if session.agent_config
+            else None,
         }
         payload.update(invalid_record_event_fields(detail))
         run_dir = self._resolve_session_run_dir(session)
@@ -797,7 +851,9 @@ class CompletionHandler:
             SessionStatus.FAILED: "Session ended without PR or status update",
         }.get(status, "Unknown")
 
-        logger.debug(f"[STATE_MACHINE] Triggering transitions for session {session.terminal_id}")
+        logger.debug(
+            f"[STATE_MACHINE] Triggering transitions for session {session.terminal_id}"
+        )
 
         # 1. Update session state machine
         self._update_session_machine(session, status, status_reason)
@@ -822,24 +878,38 @@ class CompletionHandler:
         """Update the session state machine."""
         session_machine = self._get_session_machine(session.terminal_id)
         if session_machine:
-            logger.debug(f"[STATE_MACHINE] Found session machine for {session.terminal_id}")
+            logger.debug(
+                f"[STATE_MACHINE] Found session machine for {session.terminal_id}"
+            )
             if status == SessionStatus.COMPLETED:
-                logger.info(f"[STATE_MACHINE] Session {session.terminal_id}: RUNNING -> COMPLETED")
+                logger.info(
+                    f"[STATE_MACHINE] Session {session.terminal_id}: RUNNING -> COMPLETED"
+                )
                 session_machine.complete()  # type: ignore[attr-defined]
             elif status == SessionStatus.FAILED:
-                logger.info(f"[STATE_MACHINE] Session {session.terminal_id}: RUNNING -> FAILED (reason: {status_reason})")
-                session_machine.fail(data={'reason': status_reason})  # type: ignore[attr-defined]
+                logger.info(
+                    f"[STATE_MACHINE] Session {session.terminal_id}: RUNNING -> FAILED (reason: {status_reason})"
+                )
+                session_machine.fail(data={"reason": status_reason})  # type: ignore[attr-defined]
             elif status == SessionStatus.TIMED_OUT:
-                logger.info(f"[STATE_MACHINE] Session {session.terminal_id}: RUNNING -> TIMED_OUT")
+                logger.info(
+                    f"[STATE_MACHINE] Session {session.terminal_id}: RUNNING -> TIMED_OUT"
+                )
                 session_machine.timeout()  # type: ignore[attr-defined]
             elif status == SessionStatus.BLOCKED:
-                logger.info(f"[STATE_MACHINE] Session {session.terminal_id}: RUNNING -> BLOCKED")
+                logger.info(
+                    f"[STATE_MACHINE] Session {session.terminal_id}: RUNNING -> BLOCKED"
+                )
                 session_machine.block()  # type: ignore[attr-defined]
             elif status == SessionStatus.NEEDS_HUMAN:
-                logger.info(f"[STATE_MACHINE] Session {session.terminal_id}: RUNNING -> NEEDS_HUMAN")
+                logger.info(
+                    f"[STATE_MACHINE] Session {session.terminal_id}: RUNNING -> NEEDS_HUMAN"
+                )
                 session_machine.needs_human()  # type: ignore[attr-defined]
         else:
-            logger.debug(f"[STATE_MACHINE] No session machine found for {session.terminal_id} (may be restored session)")
+            logger.debug(
+                f"[STATE_MACHINE] No session machine found for {session.terminal_id} (may be restored session)"
+            )
 
     def _update_issue_machine(
         self,
@@ -850,7 +920,9 @@ class CompletionHandler:
         """Update the issue state machine."""
         issue_machine = self._get_issue_machine(session.issue)
         if issue_machine:
-            logger.debug(f"[STATE_MACHINE] Found issue machine for issue #{session.issue.number}")
+            logger.debug(
+                f"[STATE_MACHINE] Found issue machine for issue #{session.issue.number}"
+            )
             # Only trigger pr_created for issue sessions (not review/rework sessions)
             # Review/rework sessions work on issues that already have PRs
             is_issue_session = session.terminal_id.startswith("issue-")
@@ -861,7 +933,7 @@ class CompletionHandler:
                         session.issue.number,
                         pr_url,
                     )
-                    issue_machine.pr_created(data={'pr_url': pr_url})  # type: ignore[attr-defined]
+                    issue_machine.pr_created(data={"pr_url": pr_url})  # type: ignore[attr-defined]
                 else:
                     logger.warning(
                         "[STATE_MACHINE] Issue #%d pr_created ignored (state=%s)",
@@ -869,13 +941,19 @@ class CompletionHandler:
                         issue_machine.get_state().value,
                     )
             elif status == SessionStatus.BLOCKED:
-                logger.info(f"[STATE_MACHINE] Issue #{session.issue.number}: IN_PROGRESS -> BLOCKED")
+                logger.info(
+                    f"[STATE_MACHINE] Issue #{session.issue.number}: IN_PROGRESS -> BLOCKED"
+                )
                 issue_machine.block()  # type: ignore[attr-defined]
             elif status == SessionStatus.NEEDS_HUMAN:
-                logger.info(f"[STATE_MACHINE] Issue #{session.issue.number}: IN_PROGRESS -> NEEDS_HUMAN")
+                logger.info(
+                    f"[STATE_MACHINE] Issue #{session.issue.number}: IN_PROGRESS -> NEEDS_HUMAN"
+                )
                 issue_machine.needs_human()  # type: ignore[attr-defined]
         else:
-            logger.debug(f"[STATE_MACHINE] No issue machine found for issue #{session.issue.number} (may be restored session)")
+            logger.debug(
+                f"[STATE_MACHINE] No issue machine found for issue #{session.issue.number} (may be restored session)"
+            )
 
     def _update_review_machine(self, session: Session) -> None:
         """Update the review state machine for a completed review session."""
@@ -886,23 +964,36 @@ class CompletionHandler:
         pr_number_review = int(match.group(1))
         review_machine = self._get_review_machine(pr_number_review)
         if not review_machine:
-            logger.debug(f"[STATE_MACHINE] No review machine found for PR #{pr_number_review}")
+            logger.debug(
+                f"[STATE_MACHINE] No review machine found for PR #{pr_number_review}"
+            )
             return
 
         logger.debug(f"[STATE_MACHINE] Found review machine for PR #{pr_number_review}")
         try:
             pr_info = self.repository_host.get_pr(pr_number_review)
             if pr_info:
-                self._emit_pr_view_changed(pr_info, issue_key=session.key.issue.stable_id(), issue_number=session.issue.number)
+                self._emit_pr_view_changed(
+                    pr_info,
+                    issue_key=session.key.issue.stable_id(),
+                    issue_number=session.issue.number,
+                )
                 self._process_review_outcome(pr_info, pr_number_review, review_machine)
                 # Publish review outcome events from state machine transitions
                 self._publish_review_outcome(review_machine, session, pr_number_review)
         except Exception as e:
             logger.warning(f"Failed to check PR labels for review outcome: {e}")
-            self.events.publish(make_trace_event(EventName.APPLY_FAILED, {
-                "step_type": "review_outcome_check", "pr_number": pr_number_review,
-                "issue_number": session.issue.number, "error": str(e),
-            }))
+            self.events.publish(
+                make_trace_event(
+                    EventName.APPLY_FAILED,
+                    {
+                        "step_type": "review_outcome_check",
+                        "pr_number": pr_number_review,
+                        "issue_number": session.issue.number,
+                        "error": str(e),
+                    },
+                )
+            )
 
     def _complete_rework_review_machine(self, session: Session) -> None:
         """Advance the review state machine after a rework session completes.
@@ -912,20 +1003,32 @@ class CompletionHandler:
         """
         pr_number = session.pr_number
         if not pr_number:
-            logger.debug("[STATE_MACHINE] Rework session %s has no pr_number, skipping review machine update", session.terminal_id)
+            logger.debug(
+                "[STATE_MACHINE] Rework session %s has no pr_number, skipping review machine update",
+                session.terminal_id,
+            )
             return
 
         review_machine = self._get_review_machine(pr_number)
         if not review_machine:
-            logger.debug("[STATE_MACHINE] No review machine found for PR #%d (rework session %s)", pr_number, session.terminal_id)
+            logger.debug(
+                "[STATE_MACHINE] No review machine found for PR #%d (rework session %s)",
+                pr_number,
+                session.terminal_id,
+            )
             return
 
         # Transition through start_rework and complete_rework
         if review_machine.can_transition("start_rework"):
-            logger.info("[STATE_MACHINE] PR #%d: REWORK_PENDING -> REWORK_IN_PROGRESS", pr_number)
+            logger.info(
+                "[STATE_MACHINE] PR #%d: REWORK_PENDING -> REWORK_IN_PROGRESS",
+                pr_number,
+            )
             review_machine.start_rework()  # type: ignore[attr-defined]
         if review_machine.can_transition("complete_rework"):
-            logger.info("[STATE_MACHINE] PR #%d: REWORK_IN_PROGRESS -> IN_REVIEW", pr_number)
+            logger.info(
+                "[STATE_MACHINE] PR #%d: REWORK_IN_PROGRESS -> IN_REVIEW", pr_number
+            )
             review_machine.complete_rework()  # type: ignore[attr-defined]
 
     def _publish_review_outcome(
@@ -956,15 +1059,22 @@ class CompletionHandler:
         }
         self.events.publish(make_trace_event(EventName(tr.event_name), payload))
 
-    def _process_review_outcome(self, pr_info: Any, pr_number: int, review_machine: Any) -> None:
+    def _process_review_outcome(
+        self, pr_info: Any, pr_number: int, review_machine: Any
+    ) -> None:
         """Process review outcome based on PR labels."""
         labels = pr_info.labels
-        if self.config.code_reviewed_label and self.config.code_reviewed_label in labels:
+        if (
+            self.config.code_reviewed_label
+            and self.config.code_reviewed_label in labels
+        ):
             self._handle_review_approved(pr_info, pr_number, review_machine)
         elif self._lm.needs_rework in labels:
             self._handle_changes_requested(pr_number, review_machine)
 
-    def _handle_review_approved(self, pr_info: Any, pr_number: int, review_machine: Any) -> None:
+    def _handle_review_approved(
+        self, pr_info: Any, pr_number: int, review_machine: Any
+    ) -> None:
         """Handle approved review outcome."""
         logger.info(f"[STATE_MACHINE] PR #{pr_number}: IN_REVIEW -> APPROVED")
         if getattr(pr_info, "draft", None) is True:
@@ -972,7 +1082,9 @@ class CompletionHandler:
                 self.repository_host.set_pr_draft(pr_number, False)
                 logger.info("[STATE_MACHINE] PR #%d marked ready for review", pr_number)
             except Exception as e:
-                logger.warning("Failed to mark PR #%d ready for review: %s", pr_number, e)
+                logger.warning(
+                    "Failed to mark PR #%d ready for review: %s", pr_number, e
+                )
         self._try_transition(review_machine, "approve", pr_number)
 
     def _handle_changes_requested(self, pr_number: int, review_machine: Any) -> None:
@@ -980,17 +1092,28 @@ class CompletionHandler:
         logger.info(f"[STATE_MACHINE] PR #{pr_number}: IN_REVIEW -> CHANGES_REQUESTED")
         self._try_transition(review_machine, "request_changes", pr_number)
         if review_machine.can_transition("queue_rework"):
-            logger.info(f"[STATE_MACHINE] PR #{pr_number}: CHANGES_REQUESTED -> REWORK_PENDING")
+            logger.info(
+                f"[STATE_MACHINE] PR #{pr_number}: CHANGES_REQUESTED -> REWORK_PENDING"
+            )
             review_machine.queue_rework()  # type: ignore[attr-defined]
         else:
-            logger.warning("[STATE_MACHINE] PR #%d queue_rework ignored (state=%s)", pr_number, review_machine.get_state().value)
+            logger.warning(
+                "[STATE_MACHINE] PR #%d queue_rework ignored (state=%s)",
+                pr_number,
+                review_machine.get_state().value,
+            )
 
     def _try_transition(self, machine: Any, transition: str, pr_number: int) -> None:
         """Try to perform a state machine transition."""
         if machine.can_transition(transition):
             getattr(machine, transition)()
         else:
-            logger.warning("[STATE_MACHINE] PR #%d %s ignored (state=%s)", pr_number, transition, machine.get_state().value)
+            logger.warning(
+                "[STATE_MACHINE] PR #%d %s ignored (state=%s)",
+                pr_number,
+                transition,
+                machine.get_state().value,
+            )
 
     def _emit_pr_view_changed(
         self,
@@ -999,7 +1122,8 @@ class CompletionHandler:
         issue_number: int | None,
     ) -> None:
         payload = {
-            "pr_number": pr_info.number, "pr_url": getattr(pr_info, "url", None),
+            "pr_number": pr_info.number,
+            "pr_url": getattr(pr_info, "url", None),
             "labels": list(getattr(pr_info, "labels", []) or []),
         }
         if issue_key is not None:
@@ -1016,8 +1140,11 @@ class CompletionHandler:
         issue_number: int,
     ) -> None:
         payload = {
-            "pr_number": pr_number, "labels": [], "pr_url": pr_url,
-            "issue_key": issue_key, "issue_number": issue_number,
+            "pr_number": pr_number,
+            "labels": [],
+            "pr_url": pr_url,
+            "issue_key": issue_key,
+            "issue_number": issue_number,
         }
         self.events.publish(make_trace_event(EventName.PR_VIEW_CHANGED, payload))
 
@@ -1055,7 +1182,9 @@ class CompletionHandler:
                 terminal_id=session.terminal_id,
                 worktree_path=session.worktree_path,
             )
-            logger.info(f"[CLEANUP] Deferred cleanup for #{session.issue.number} until review completes")
+            logger.info(
+                f"[CLEANUP] Deferred cleanup for #{session.issue.number} until review completes"
+            )
             return CleanupDecision.deferred(pending_cleanup)
 
         return CleanupDecision.immediate()
@@ -1111,15 +1240,25 @@ class CompletionHandler:
                 "[REVIEW] Review exchange halted - skipping PR review queue",
             )
         elif should_queue:
-            logger.info(f"[REVIEW] Session #{session.issue.number} completed with PR, queuing code review")
+            logger.info(
+                f"[REVIEW] Session #{session.issue.number} completed with PR, queuing code review"
+            )
         elif pr_url and is_review_session:
-            logger.info(f"[REVIEW] Review session {session.terminal_id} completed - no re-queue needed")
+            logger.info(
+                f"[REVIEW] Review session {session.terminal_id} completed - no re-queue needed"
+            )
         elif pr_url and not self.config.code_review_agent:
-            logger.info(f"[REVIEW] Session #{session.issue.number} completed but code review not configured")
+            logger.info(
+                f"[REVIEW] Session #{session.issue.number} completed but code review not configured"
+            )
         elif pr_url and session.agent_config.skip_review:
-            logger.info(f"[REVIEW] Session #{session.issue.number} skipping review (skip_review=true)")
+            logger.info(
+                f"[REVIEW] Session #{session.issue.number} skipping review (skip_review=true)"
+            )
         elif not pr_url:
-            logger.info(f"[REVIEW] Session #{session.issue.number} completed but no PR found")
+            logger.info(
+                f"[REVIEW] Session #{session.issue.number} completed but no PR found"
+            )
 
         return should_queue
 
@@ -1161,7 +1300,8 @@ class CompletionHandler:
             manifest = RunManifest.load(run_dir)
         except Exception as exc:
             logger.warning(
-                "[MANIFEST] Failed to load manifest for runtime enrichment: %s", exc,
+                "[MANIFEST] Failed to load manifest for runtime enrichment: %s",
+                exc,
             )
             return
 
@@ -1192,8 +1332,10 @@ class CompletionHandler:
         """Resolve run_dir for events/diagnostics."""
         return resolve_session_run_dir(self._session_output, session)
 
+
 def launch_review_by_number(
-    n: int, pending_reviews: list["PendingReview"],
+    n: int,
+    pending_reviews: list["PendingReview"],
     launch_review_session_fn: Callable[["PendingReview"], Optional["Session"]],
 ) -> Optional["Session"]:
     """Launch review session by number - moved per method table."""
@@ -1202,7 +1344,8 @@ def launch_review_by_number(
 
 
 def launch_rework_by_number(
-    n: int, pending_reworks: list["PendingRework"],
+    n: int,
+    pending_reworks: list["PendingRework"],
     launch_rework_session_fn: Callable[["PendingRework"], Optional["Session"]],
 ) -> Optional["Session"]:
     """Launch rework session by number - moved per method table."""
@@ -1210,14 +1353,19 @@ def launch_rework_by_number(
     return launch_rework_session_fn(r) if r else None
 
 
-def get_review_machine(pr: int, issue: int, state_machines: "StateMachineManager") -> Optional["ReviewStateMachine"]:
+def get_review_machine(
+    pr: int, issue: int, state_machines: "StateMachineManager"
+) -> Optional["ReviewStateMachine"]:
     """Get review state machine - moved per method table."""
     return state_machines.get_review_machine(pr, issue)
 
 
 def launch_tech_lead_by_number(
-    n: int, pending_tech_lead_reviews: list["PendingTechLeadReview"],
-    launch_tech_lead_session_fn: Callable[["PendingTechLeadReview"], Optional["Session"]],
+    n: int,
+    pending_tech_lead_reviews: list["PendingTechLeadReview"],
+    launch_tech_lead_session_fn: Callable[
+        ["PendingTechLeadReview"], Optional["Session"]
+    ],
 ) -> Optional["Session"]:
     """Launch tech_lead session by number - moved per method table.
 

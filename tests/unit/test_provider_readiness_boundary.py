@@ -469,7 +469,9 @@ class TestClaudeExpiredLoginPreflight:
         # The gate really ran (not skipped by an earlier precondition) and let
         # the launch through.
         assert probe.launch_calls == ["claude-code"]
-        assert EventName.SESSION_LAUNCH_BLOCKED_PROVIDER.value not in harness.event_names()
+        assert (
+            EventName.SESSION_LAUNCH_BLOCKED_PROVIDER.value not in harness.event_names()
+        )
 
     def test_default_policy_never_claims_a_provider_is_authenticated(self) -> None:
         """With no probe wired, readiness is UNKNOWN — not READY, not blocked."""
@@ -574,7 +576,9 @@ class _LauncherHarness:
                 name, n, timeout_minutes=timeout
             ),
             get_review_machine=lambda pr, issue: ReviewStateMachine(pr, issue),
-            provider_resilience=manager if manager is not None else _manager(self.events),
+            provider_resilience=manager
+            if manager is not None
+            else _manager(self.events),
             board_snapshot_provider=NullBoardSnapshotProvider(),
             agent_callback_endpoint=ready_callback_endpoint(),
             provider_readiness_probe=probe,
@@ -618,8 +622,7 @@ class TestSingleClassificationTable:
         """No provider keeps a private copy: both route to the same function."""
         for provider in (ClaudeCodeProvider(), CodexProvider()):
             assert (
-                provider.classify_output(EXPIRED_LOGIN_BANNER)
-                is ProviderErrorType.AUTH
+                provider.classify_output(EXPIRED_LOGIN_BANNER) is ProviderErrorType.AUTH
             )
 
     def test_timeout_no_longer_masks_an_auth_failure(self) -> None:
@@ -684,39 +687,39 @@ class TestSingleClassificationTable:
         [
             (
                 "token table",
-                '''
+                """
                 _MY_OWN_MARKERS = ("please re-login now", "handshake rejected")
 
 
                 def looks_dead(output: str) -> bool:
                     return any(m in output.lower() for m in _MY_OWN_MARKERS)
-                ''',
+                """,
             ),
             (
                 "direct literal",
-                '''
+                """
                 def looks_dead(output: str) -> bool:
                     return "please re-login now" in output.lower()
-                ''',
+                """,
             ),
             (
                 "token table behind a normalized local",
-                '''
+                """
                 _MY_OWN_MARKERS = ("please re-login now", "handshake rejected")
 
 
                 def looks_dead(output: str) -> bool:
                     lowered = output.lower()
                     return any(m in lowered for m in _MY_OWN_MARKERS)
-                ''',
+                """,
             ),
             (
                 "casefold instead of lower",
-                '''
+                """
                 def looks_dead(output: str) -> bool:
                     folded = output.casefold()
                     return "please re-login now" in folded
-                ''',
+                """,
             ),
         ],
     )
@@ -755,7 +758,7 @@ class TestSingleClassificationTable:
         module = _synthetic_package_module(
             tmp_path,
             "infra/hooks/_ai_gate.py",
-            '''
+            """
             _CLAUDE_AUTH_FAILURE_MARKERS = ("session gone", "creds stale")
 
 
@@ -767,7 +770,7 @@ class TestSingleClassificationTable:
             def _is_claude_auth_failure(output: str) -> bool:
                 lowered = output.lower()
                 return any(m in lowered for m in _CLAUDE_AUTH_FAILURE_MARKERS)
-            ''',
+            """,
         )
         checker = _arch_guardrails()
 
@@ -787,13 +790,13 @@ class TestSingleClassificationTable:
         module = _synthetic_package_module(
             tmp_path,
             "observation/watcher.py",
-            '''
+            """
             _KNOWN_STALLS = ("login expired", "disk full")
 
 
             def describe(index: int) -> str:
                 return _KNOWN_STALLS[index]
-            ''',
+            """,
         )
         checker = _arch_guardrails()
 
@@ -817,13 +820,13 @@ class TestSingleClassificationTable:
         module = _synthetic_package_module(
             tmp_path,
             "infra/hooks/_ai_gate.py",
-            '''
+            """
             def _detect_blocked_from_output(output: str) -> bool:
                 output_lower = output.lower()
                 return any(
                     ind in output_lower for ind in ("blocked", "login expired")
                 )
-            ''',
+            """,
         )
         checker = _arch_guardrails()
 
@@ -847,13 +850,13 @@ class TestSingleClassificationTable:
         module = _synthetic_package_module(
             tmp_path,
             "execution/agent_runner_providers/newcli.py",
-            '''
+            """
             _BANNERS = ("login expired", "please run /login")
 
 
             def looks_dead(output: str) -> bool:
                 return any(b in output.lower() for b in _BANNERS)
-            ''',
+            """,
         )
         checker = _arch_guardrails()
 
@@ -1558,9 +1561,7 @@ def _sample_and_plan(config, manager, probe, workflows, snapshot):
 
     sampler = ProviderLaunchReadinessSampler(
         config=config,
-        policy=ProviderAvailabilityPolicy(
-            config, manager, readiness_probe=probe
-        ),
+        policy=ProviderAvailabilityPolicy(config, manager, readiness_probe=probe),
     )
     planner = Planner(
         config=config,
@@ -1626,9 +1627,7 @@ class TestPlanningReleasesTheAuthOutage:
         assert manager.is_open(PROVIDER)
         applied_events = RecordingEvents()
         assert _apply_impact_actions(plan.actions, applied_events) == [7]
-        assert (
-            applied_events.names().count(EventName.PROVIDER_ISSUE_BLOCKED.value) == 1
-        )
+        assert applied_events.names().count(EventName.PROVIDER_ISSUE_BLOCKED.value) == 1
 
     def test_a_ready_probe_reopens_the_queue_before_the_cooldown(
         self, queue, tmp_path
@@ -1670,9 +1669,7 @@ def test_planning_never_probes_or_writes_the_circuit(tmp_path: Path) -> None:
     config = _recovery_config(tmp_path)
     events = RecordingEvents()
     manager = _manager(events)
-    probe = _RecordingProbe(
-        ProviderReadiness.auth_expired(PROVIDER, "not logged in")
-    )
+    probe = _RecordingProbe(ProviderReadiness.auth_expired(PROVIDER, "not logged in"))
     snapshot, workflows = _queue_snapshot("coding")
     planner = Planner(
         config=config,
@@ -1731,7 +1728,9 @@ class _StepClock:
         self.now += seconds
 
 
-def _logged_out_probe(clock: _StepClock) -> tuple[CLIProviderReadinessProbe, FakeCommandRunner]:
+def _logged_out_probe(
+    clock: _StepClock,
+) -> tuple[CLIProviderReadinessProbe, FakeCommandRunner]:
     runner = FakeCommandRunner(
         CommandResult(returncode=0, stdout='{"loggedIn": false}', stderr="")
     )
@@ -1930,9 +1929,7 @@ class TestIndependentOutageCauses:
         events = RecordingEvents()
         manager = _manager(events)
         start = datetime(2026, 8, 4, 22, 0, tzinfo=timezone.utc)
-        manager.record_transient_failure(
-            "claude-code", error_summary="503", now=start
-        )
+        manager.record_transient_failure("claude-code", error_summary="503", now=start)
         transient_state = manager.get_state("claude-code")
         assert transient_state is not None
         transient_deadline = transient_state.transient_open_until
@@ -2026,9 +2023,7 @@ class TestIndependentOutageCauses:
         events = RecordingEvents()
         manager = _manager(events)
         start = datetime(2026, 8, 4, 22, 0, tzinfo=timezone.utc)
-        manager.record_transient_failure(
-            "claude-code", error_summary="503", now=start
-        )
+        manager.record_transient_failure("claude-code", error_summary="503", now=start)
         manager.record_auth_failure(
             "claude-code",
             error_summary="not logged in",
@@ -2091,9 +2086,7 @@ class TestIndependentOutageCauses:
         events = RecordingEvents()
         manager = _manager(events)
         start = datetime(2026, 8, 4, 22, 0, tzinfo=timezone.utc)
-        manager.record_transient_failure(
-            "claude-code", error_summary="503", now=start
-        )
+        manager.record_transient_failure("claude-code", error_summary="503", now=start)
 
         manager.record_success("claude-code", now=start + timedelta(seconds=1))
 
@@ -2321,7 +2314,6 @@ class TestLiveAuthFailureRoutesThroughTheImpactOwner:
             OpenIssueCorpusManager(
                 host, InMemoryOpenIssueCorpusStore(), is_enabled=lambda: False
             ),
-            lambda _n: None,
             ProviderAvailabilityPolicy(config, manager, LabelManager(config)),
         )
 
@@ -2335,9 +2327,7 @@ class TestLiveAuthFailureRoutesThroughTheImpactOwner:
         session.terminal_id = terminal_id
         return session
 
-    @pytest.mark.parametrize(
-        "terminal_id", ["issue-123", "review-123", "rework-123"]
-    )
+    @pytest.mark.parametrize("terminal_id", ["issue-123", "review-123", "rework-123"])
     def test_every_session_kind_records_the_provider_impact(
         self, sample_config, make_session, terminal_id
     ) -> None:
@@ -2383,9 +2373,7 @@ class TestLiveAuthFailureRoutesThroughTheImpactOwner:
             provider_error_type=ProviderErrorType.AUTH,
         )
 
-        removed = {
-            a.label for a in actions if isinstance(a, RemoveLabelAction)
-        }
+        removed = {a.label for a in actions if isinstance(a, RemoveLabelAction)}
         assert LabelManager(sample_config).in_progress in removed
 
     def test_a_transient_provider_block_takes_the_same_route(
@@ -2464,18 +2452,14 @@ class TestLiveAuthFailureRoutesThroughTheImpactOwner:
         )
 
         assert result.success
-        assert applied == [
-            (123, LabelManager(sample_config).provider_unavailable)
-        ]
+        assert applied == [(123, LabelManager(sample_config).provider_unavailable)]
         assert EventName.PROVIDER_ISSUE_BLOCKED.value in events.names()
 
 
 class TestLiveAuthEventIsToldOnce:
     """Two publishers meant the same failure appeared twice, worded wrongly."""
 
-    def test_the_observer_publishes_nothing(
-        self, sample_config, make_session
-    ) -> None:
+    def test_the_observer_publishes_nothing(self, sample_config, make_session) -> None:
         from issue_orchestrator.infra.config import AgentConfig
         from issue_orchestrator.infra.terminal_recording import (
             TERMINAL_RECORDING_FILENAME,
@@ -3188,8 +3172,11 @@ def _route(queue: str, state, harness, restorer=None):
         )
     if queue == "retrospective_review":
         return session_routing.orchestrator_launch_retrospective_review_session(
-            state.pending_retrospective_reviews[0], state, harness.launcher,
-            restorer, claims,
+            state.pending_retrospective_reviews[0],
+            state,
+            harness.launcher,
+            restorer,
+            claims,
         )
     if queue == "rework":
         return session_routing.orchestrator_launch_rework_session(
@@ -3197,8 +3184,11 @@ def _route(queue: str, state, harness, restorer=None):
         )
     if queue == "validation_retry":
         return session_routing.orchestrator_launch_validation_retry_session(
-            state.pending_validation_retries[0], state, harness.launcher,
-            restorer, claims,
+            state.pending_validation_retries[0],
+            state,
+            harness.launcher,
+            restorer,
+            claims,
         )
     if queue == "tech_lead":
         return session_routing.orchestrator_launch_tech_lead_session(
@@ -3270,9 +3260,7 @@ class TestAProviderRefusalNeverConsumesPendingWork:
         _route(queue, state, harness)
 
         assert (
-            harness.event_names().count(
-                EventName.SESSION_LAUNCH_BLOCKED_PROVIDER.value
-            )
+            harness.event_names().count(EventName.SESSION_LAUNCH_BLOCKED_PROVIDER.value)
             == 1
         )
 
@@ -3505,13 +3493,15 @@ def _launch_work(queue: str, state, tmp_path: Path):
     """The launch-spanning claim owner the routing functions build (#6999 A2)."""
     from issue_orchestrator.control.launch_transaction import PendingWorkLaunchClaim
 
-    return PendingWorkLaunchClaim(
-        claim=_claim(queue, state), claims=_claims(tmp_path)
-    )
+    return PendingWorkLaunchClaim(claim=_claim(queue, state), claims=_claims(tmp_path))
 
 
 def _unrestorable_subject(
-    run_key: str, started_at: str, *, session_name: str = "issue-7", issue_number: int = 7
+    run_key: str,
+    started_at: str,
+    *,
+    session_name: str = "issue-7",
+    issue_number: int = 7,
 ):
     """A live run whose session assets could not be rebuilt (#6999 F14)."""
     return QuarantineSubject(
@@ -3904,7 +3894,9 @@ def test_completion_control_returns_the_work_on_a_provider_block(
     assert session is not None
     assert state.pending_tech_lead_reviews == []
 
-    _complete_session(session, state, harness.claims, provider_error_type=ProviderErrorType.AUTH)
+    _complete_session(
+        session, state, harness.claims, provider_error_type=ProviderErrorType.AUTH
+    )
 
     assert len(state.pending_tech_lead_reviews) == 1
     assert state.pending_tech_lead_reviews[0].failure is not None
@@ -4058,9 +4050,7 @@ class TestAnAuthBannerPastTheHeadOfTheLog:
 
         assert result.observation is SessionObservation.PROVIDER_AUTH_FAILED
 
-    def test_the_scan_window_stays_bounded(
-        self, sample_config, make_session
-    ) -> None:
+    def test_the_scan_window_stays_bounded(self, sample_config, make_session) -> None:
         """Bounded at both ends, not "read the whole log".
 
         An unbounded read is O(session length) on every observation of every
@@ -4080,7 +4070,9 @@ class TestAnAuthBannerPastTheHeadOfTheLog:
         observer.observe_session(session)
 
         assert probe.seen
-        assert len(probe.seen[0].encode("utf-8")) <= 2 * PROVIDER_AUTH_CHECK_MAX_BYTES + 1
+        assert (
+            len(probe.seen[0].encode("utf-8")) <= 2 * PROVIDER_AUTH_CHECK_MAX_BYTES + 1
+        )
 
     def test_an_unconfirmed_late_banner_leaves_the_session_running(
         self, sample_config, make_session
@@ -4128,9 +4120,7 @@ def _restart(state, session, harness):
     repo_host.issues[session.issue.number] = session.issue
     working_copy = MockWorkingCopy()
     working_copy.branches[session.worktree_path] = session.branch_name or "branch"
-    restorer = SessionRestorer(
-        harness.launcher.config, repo_host, working_copy
-    )
+    restorer = SessionRestorer(harness.launcher.config, repo_host, working_copy)
     discovered = [
         DiscoveredSession(
             issue_number=session.issue.number,
@@ -4254,15 +4244,18 @@ def test_a_restart_leaves_a_claimless_terminal_alone(tmp_path: Path) -> None:
 
     harness = _ready_harness(tmp_path)
     result = harness.launcher.launch_issue_session(
-        Issue(number=123, title="Test Issue", labels=["agent:backend"], repo="test/repo"),
+        Issue(
+            number=123, title="Test Issue", labels=["agent:backend"], repo="test/repo"
+        ),
         [],
     )
     assert result.session is not None
     restarted, restored = _restart(OrchestratorState(), result.session, harness)
 
-    assert InFlightWorkLedger(restarted, harness.claims).holds(
-        restored.terminal_id
-    ) is None
+    assert (
+        InFlightWorkLedger(restarted, harness.claims).holds(restored.terminal_id)
+        is None
+    )
     assert restarted.in_flight_work == []
 
 
@@ -4278,7 +4271,9 @@ def test_a_settled_claim_does_not_come_back_after_a_restart(
     state = _pending_state("tech_lead")
     session = _route("tech_lead", state, harness)
     assert session is not None
-    _terminate_on_provider(state, session, None, harness)  # a real terminal work outcome
+    _terminate_on_provider(
+        state, session, None, harness
+    )  # a real terminal work outcome
 
     restarted, restored = _restart(state, session, harness)
     _terminate_on_provider(restarted, restored, ProviderErrorType.AUTH, harness)
@@ -4474,7 +4469,9 @@ def test_consuming_a_claim_is_idempotent(tmp_path: Path) -> None:
     run = _run(tmp_path)
 
     store.consume_pending_work_claim(run)  # nothing to consume
-    store.hold_pending_work_claim(run, issue_number=7, claim=_claim("review", _pending_state("review")))
+    store.hold_pending_work_claim(
+        run, issue_number=7, claim=_claim("review", _pending_state("review"))
+    )
     store.consume_pending_work_claim(run)
     store.consume_pending_work_claim(run)
 
@@ -4509,7 +4506,9 @@ def test_a_conflicting_authoritative_write_fails_loudly(tmp_path: Path) -> None:
     store.hold_pending_work_claim(run, issue_number=7, claim=first)
 
     with pytest.raises(ConflictingPendingWorkClaimError, match="already holds"):
-        store.hold_pending_work_claim(run, issue_number=7, claim=_claim("review", _pending_state("review")))
+        store.hold_pending_work_claim(
+            run, issue_number=7, claim=_claim("review", _pending_state("review"))
+        )
 
     restored = store.look_up_pending_work_claim(run).held
     assert restored is not None
@@ -4545,7 +4544,7 @@ def test_a_rewritten_run_identity_is_refused_rather_than_read_as_absent(
 
 
 def test_an_undecodable_claim_is_never_read_as_absent(tmp_path: Path) -> None:
-    """"No claim" and "a claim I cannot rebuild" are different facts.
+    """ "No claim" and "a claim I cannot rebuild" are different facts.
 
     Returning None for the second would drop the only record of the work while
     looking like a clean restart.
@@ -4560,7 +4559,9 @@ def test_an_undecodable_claim_is_never_read_as_absent(tmp_path: Path) -> None:
 
     store = _claims(tmp_path)
     run = _run(tmp_path)
-    store.hold_pending_work_claim(run, issue_number=7, claim=_claim("review", _pending_state("review")))
+    store.hold_pending_work_claim(
+        run, issue_number=7, claim=_claim("review", _pending_state("review"))
+    )
     corrupt = sqlite3.connect(state_dir(tmp_path) / STORE_FILENAME)
     corrupt.execute(
         "UPDATE pending_work_claim SET payload = ? WHERE run_key = ?",
@@ -4598,7 +4599,9 @@ def test_the_authoritative_claim_is_not_written_into_the_agent_worktree(
     planted = [p.name for p in run_dir.rglob("*") if "claim" in p.name.lower()]
     assert planted == []
     # And it really was recorded - just somewhere the agent cannot reach.
-    assert harness.claims.look_up_pending_work_claim(session.run_assets).held is not None
+    assert (
+        harness.claims.look_up_pending_work_claim(session.run_assets).held is not None
+    )
 
 
 def test_a_worktree_side_claim_file_cannot_change_what_is_restored(
@@ -4683,7 +4686,9 @@ def _restore_pair(state, sessions, harness):
         _quarantine(harness),
     )
     quarantined = [
-        e for e in harness.event_names() if e == EventName.SESSION_CLAIM_UNREADABLE.value
+        e
+        for e in harness.event_names()
+        if e == EventName.SESSION_CLAIM_UNREADABLE.value
     ]
     return restarted, added, quarantined
 
@@ -4704,9 +4709,7 @@ def test_an_unreadable_claim_quarantines_only_its_own_terminal(
     assert healthy is not None and corrupt is not None
     _corrupt_stored_claim(tmp_path, corrupt.run_assets)
 
-    restarted, added, quarantined = _restore_pair(
-        None, [healthy, corrupt], harness
-    )
+    restarted, added, quarantined = _restore_pair(None, [healthy, corrupt], harness)
 
     assert [s.terminal_id for s in added] == [healthy.terminal_id]
     assert len(quarantined) == 1  # announced exactly once, for the corrupt one
@@ -4856,7 +4859,9 @@ def test_recovery_leaves_live_work_alone(tmp_path: Path) -> None:
     InFlightWorkLedger(state, harness.claims).recover_unresolved(_quarantine(harness))
 
     assert state.pending_tech_lead_reviews == []
-    assert harness.claims.look_up_pending_work_claim(session.run_assets).held is not None
+    assert (
+        harness.claims.look_up_pending_work_claim(session.run_assets).held is not None
+    )
 
 
 def test_recovered_work_is_not_recovered_twice(tmp_path: Path) -> None:
@@ -4917,7 +4922,9 @@ def test_a_rewritten_started_at_is_refused(tmp_path: Path) -> None:
 
     store = _claims(tmp_path)
     run = _run(tmp_path)
-    store.hold_pending_work_claim(run, issue_number=7, claim=_claim("tech_lead", _pending_state("tech_lead")))
+    store.hold_pending_work_claim(
+        run, issue_number=7, claim=_claim("tech_lead", _pending_state("tech_lead"))
+    )
     retimed = dc_replace(
         run, identity=dc_replace(run.identity, started_at="1999-01-01T00:00:00+00:00")
     )
@@ -4940,7 +4947,9 @@ def test_the_run_key_is_not_recomputed_through_symlinks(tmp_path: Path) -> None:
 
     store = _claims(tmp_path)
     run = _run(tmp_path)
-    store.hold_pending_work_claim(run, issue_number=7, claim=_claim("review", _pending_state("review")))
+    store.hold_pending_work_claim(
+        run, issue_number=7, claim=_claim("review", _pending_state("review"))
+    )
     decoy = make_session_run_assets(
         run.worktree_path, session_name="issue-9", run_id="run-2"
     )
@@ -4994,9 +5003,7 @@ def test_a_repeated_orphan_scan_quarantines_once(tmp_path: Path) -> None:
         a for a in harness.quarantine_actions if isinstance(a, AddCommentAction)
     ]
     assert len(comments) == 1  # told a human exactly once
-    assert (
-        harness.event_names().count(EventName.SESSION_CLAIM_UNREADABLE.value) == 1
-    )
+    assert harness.event_names().count(EventName.SESSION_CLAIM_UNREADABLE.value) == 1
     # The LABEL is reasserted on every scan on purpose: it is shared with owners
     # that remove it when a session for the issue looks active, and a
     # quarantined terminal is deliberately not one of those (#6999 F12).
@@ -5010,11 +5017,15 @@ def test_a_quarantine_survives_a_restart_without_re_commenting(
     """The marker is durable, so a fresh process does not re-announce it."""
     harness = _ready_harness(tmp_path)
     quarantined = _quarantined(harness, tmp_path)
-    _quarantine_with(harness).quarantine(QuarantineSubject.live_run_with_unreadable_claim(quarantined))
+    _quarantine_with(harness).quarantine(
+        QuarantineSubject.live_run_with_unreadable_claim(quarantined)
+    )
     harness.quarantine_actions.clear()
 
     # A brand-new owner over the SAME durable store, as after a restart.
-    _quarantine_with(harness).quarantine(QuarantineSubject.live_run_with_unreadable_claim(quarantined))
+    _quarantine_with(harness).quarantine(
+        QuarantineSubject.live_run_with_unreadable_claim(quarantined)
+    )
     assert [
         a for a in harness.quarantine_actions if isinstance(a, AddCommentAction)
     ] == []  # not re-announced
@@ -5033,10 +5044,14 @@ def test_a_failed_durable_escalation_is_retried_and_publishes_nothing(
     harness = _ready_harness(tmp_path)
     quarantined = _quarantined(harness, tmp_path)
 
-    _quarantine_with(harness, applies=False).quarantine(QuarantineSubject.live_run_with_unreadable_claim(quarantined))
+    _quarantine_with(harness, applies=False).quarantine(
+        QuarantineSubject.live_run_with_unreadable_claim(quarantined)
+    )
     assert EventName.SESSION_CLAIM_UNREADABLE.value not in harness.event_names()
     harness.quarantine_actions.clear()
-    _quarantine_with(harness).quarantine(QuarantineSubject.live_run_with_unreadable_claim(quarantined))  # next sweep
+    _quarantine_with(harness).quarantine(
+        QuarantineSubject.live_run_with_unreadable_claim(quarantined)
+    )  # next sweep
     assert len(harness.quarantine_actions) == 2  # really retried
     assert EventName.SESSION_CLAIM_UNREADABLE.value in harness.event_names()
 
@@ -5057,11 +5072,15 @@ def test_a_quarantine_does_not_reach_through_the_tech_lead_lifecycle(
 
     harness = _ready_harness(tmp_path)
     launcher_escalations: list = []
-    harness.launcher.escalate_issue_needs_human = (
-        lambda **kwargs: launcher_escalations.append(kwargs) or True
+    harness.launcher.escalate_issue_needs_human = lambda **kwargs: (
+        launcher_escalations.append(kwargs) or True
     )
 
-    _quarantine_with(harness).quarantine(QuarantineSubject.live_run_with_unreadable_claim(_quarantined(harness, tmp_path)))
+    _quarantine_with(harness).quarantine(
+        QuarantineSubject.live_run_with_unreadable_claim(
+            _quarantined(harness, tmp_path)
+        )
+    )
     assert launcher_escalations == []  # its own owner, not that one
     labels = [a for a in harness.quarantine_actions if isinstance(a, AddLabelAction)]
     comments = [
@@ -5094,9 +5113,7 @@ def test_two_runs_of_one_issue_quarantine_independently(tmp_path: Path) -> None:
 
     owner.quarantine(QuarantineSubject.live_run_with_unreadable_claim(first))
     owner.quarantine(QuarantineSubject.live_run_with_unreadable_claim(second))
-    assert (
-        harness.event_names().count(EventName.SESSION_CLAIM_UNREADABLE.value) == 2
-    )
+    assert harness.event_names().count(EventName.SESSION_CLAIM_UNREADABLE.value) == 2
 
 
 # ---------------------------------------------------------------------------
@@ -5282,13 +5299,17 @@ def test_an_unmigratable_row_fails_startup_and_keeps_the_old_table(
 
     # Nothing was renamed, created or dropped: the original authority is intact
     # and still holds BOTH rows for a human to work with.
-    survivors = sqlite3.connect(db_path).execute(
-        "SELECT run_key FROM pending_work_claim ORDER BY run_key"
-    ).fetchall()
+    survivors = (
+        sqlite3.connect(db_path)
+        .execute("SELECT run_key FROM pending_work_claim ORDER BY run_key")
+        .fetchall()
+    )
     assert [row[0] for row in survivors] == ["/runs/a", "/runs/broken"]
-    tables = sqlite3.connect(db_path).execute(
-        "SELECT name FROM sqlite_master WHERE type = 'table'"
-    ).fetchall()
+    tables = (
+        sqlite3.connect(db_path)
+        .execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        .fetchall()
+    )
     assert [t[0] for t in tables] == ["pending_work_claim"]
 
 
@@ -5395,9 +5416,7 @@ def test_a_still_discovered_run_whose_claim_is_deferred_is_not_admitted(
     restoration = InFlightWorkLedger(state, harness.claims).rehydrate([session])
 
     assert restoration.admitted == ()
-    assert [s.session.terminal_id for s in restoration.stale] == [
-        session.terminal_id
-    ]
+    assert [s.session.terminal_id for s in restoration.stale] == [session.terminal_id]
 
 
 # ---------------------------------------------------------------------------
@@ -5497,9 +5516,10 @@ def test_an_unresolved_claim_quarantine_is_idempotent_across_sweeps(
     owner.quarantine(QuarantineSubject.ended_run_with_unreadable_claim(unreadable))
     owner.quarantine(QuarantineSubject.ended_run_with_unreadable_claim(unreadable))
 
-    assert len(
-        [a for a in harness.quarantine_actions if isinstance(a, AddCommentAction)]
-    ) == 1
+    assert (
+        len([a for a in harness.quarantine_actions if isinstance(a, AddCommentAction)])
+        == 1
+    )
 
 
 def test_a_released_quarantine_stops_holding_the_issue_open(
@@ -5608,7 +5628,6 @@ def test_a_release_leaves_another_quarantines_block_alone(tmp_path: Path) -> Non
     ] == []
 
 
-
 def test_a_replacement_run_reusing_the_directory_quarantines_independently(
     tmp_path: Path,
 ) -> None:
@@ -5636,7 +5655,9 @@ def test_a_replacement_run_reusing_the_directory_quarantines_independently(
         harness.claims.quarantine_key_for(session.run_assets),
     )
     owner = _quarantine_with(harness)
-    owner.quarantine(QuarantineSubject.live_run_with_unreadable_claim(first))  # The first run finishes and its row goes; a replacement lands on the SAME
+    owner.quarantine(
+        QuarantineSubject.live_run_with_unreadable_claim(first)
+    )  # The first run finishes and its row goes; a replacement lands on the SAME
     # directory with its own start instant.
     harness.claims.consume_pending_work_claim(session.run_assets)
     replacement_assets = dc_replace(
@@ -5665,9 +5686,7 @@ def test_a_replacement_run_reusing_the_directory_quarantines_independently(
         a for a in harness.quarantine_actions if isinstance(a, AddCommentAction)
     ]
     assert len(comments) == 2  # each generation told a human on its own account
-    assert (
-        harness.event_names().count(EventName.SESSION_CLAIM_UNREADABLE.value) == 2
-    )
+    assert harness.event_names().count(EventName.SESSION_CLAIM_UNREADABLE.value) == 2
     recorded = [
         q for q in harness.claims.list_quarantines() if q.run_key == first.run_key
     ]
@@ -5744,11 +5763,11 @@ def test_a_landed_label_with_a_failed_comment_is_retried_not_stranded(
     assert EventName.SESSION_CLAIM_UNREADABLE.value not in harness.event_names()
 
     harness.quarantine_actions.clear()
-    _quarantine_with(harness).quarantine(QuarantineSubject.live_run_with_unreadable_claim(quarantined))  # the next sweep
+    _quarantine_with(harness).quarantine(
+        QuarantineSubject.live_run_with_unreadable_claim(quarantined)
+    )  # the next sweep
 
-    assert [
-        a for a in harness.quarantine_actions if isinstance(a, AddCommentAction)
-    ]
+    assert [a for a in harness.quarantine_actions if isinstance(a, AddCommentAction)]
     assert EventName.SESSION_CLAIM_UNREADABLE.value in harness.event_names()
 
 
@@ -5765,7 +5784,10 @@ def test_a_failed_block_removal_is_retried_by_the_next_reconciliation(
 
     harness = _ready_harness(tmp_path)
     quarantined = _quarantined(harness, tmp_path)
-    _quarantine_with(harness).quarantine(QuarantineSubject.live_run_with_unreadable_claim(quarantined))
+    _quarantine_with(harness).quarantine(
+        QuarantineSubject.live_run_with_unreadable_claim(quarantined)
+    )
+
     class _RemovalFails(_RecordingLabels):
         def release_block(self, issue_number: int) -> bool:
             super().release_block(issue_number)
@@ -5782,9 +5804,7 @@ def test_a_failed_block_removal_is_retried_by_the_next_reconciliation(
 
     _quarantine_with(harness).reconcile_released(frozenset())
 
-    assert [
-        a for a in harness.quarantine_actions if isinstance(a, RemoveLabelAction)
-    ]
+    assert [a for a in harness.quarantine_actions if isinstance(a, RemoveLabelAction)]
     assert harness.claims.read_quarantine(quarantined.quarantine_key) is None
 
 
@@ -5846,7 +5866,9 @@ def test_a_second_quarantine_on_one_issue_does_not_strand_the_block(
     needs_human = LabelManager(_routing_config(tmp_path)).needs_human
     for key, run in (("/runs/a@t1", "/runs/a"), ("/runs/b@t2", "/runs/b")):
         owner.quarantine(_unrestorable_subject(run, key.split("@", 1)[1]))
-    states = {q.quarantine_key: q.label_state for q in harness.claims.list_quarantines()}
+    states = {
+        q.quarantine_key: q.label_state for q in harness.claims.list_quarantines()
+    }
     assert states["/runs/a@t1"] is QuarantineLabelState.ACQUIRED
     assert states["/runs/b@t2"] is QuarantineLabelState.PREEXISTING
     assert needs_human in applier.live[7]
@@ -6220,7 +6242,9 @@ def test_a_half_swapped_database_refuses_to_start(tmp_path: Path) -> None:
 
     # ...and it said so without touching the rows a human still needs.
     conn = sqlite3.connect(db_path)
-    assert conn.execute("SELECT COUNT(*) FROM pending_work_claim_old").fetchone()[0] == 1
+    assert (
+        conn.execute("SELECT COUNT(*) FROM pending_work_claim_old").fetchone()[0] == 1
+    )
     conn.close()
 
 
@@ -6260,9 +6284,7 @@ def test_an_unverifiable_live_run_with_an_unreadable_claim_fails_fast(
         SessionConfigurationIdentityVerificationError,
         match="Cannot verify configuration identity",
     ):
-        _restore_with_raw_discovery(
-            harness, [_discovered(session, is_review=False)]
-        )
+        _restore_with_raw_discovery(harness, [_discovered(session, is_review=False)])
 
     assert harness.quarantine_actions == []
     assert not harness.claims.list_quarantines()
@@ -6331,9 +6353,7 @@ def _quarantine_narratives(harness) -> list[str]:
 
 def _comment_texts(harness) -> list[str]:
     return [
-        a.comment
-        for a in harness.quarantine_actions
-        if isinstance(a, AddCommentAction)
+        a.comment for a in harness.quarantine_actions if isinstance(a, AddCommentAction)
     ]
 
 
@@ -6430,9 +6450,7 @@ def test_the_two_quarantine_causes_do_not_borrow_each_others_story(
     owner.quarantine(_unrestorable_subject("/runs/a", "t1"))
 
     comment = next(
-        a.comment
-        for a in harness.quarantine_actions
-        if isinstance(a, AddCommentAction)
+        a.comment for a in harness.quarantine_actions if isinstance(a, AddCommentAction)
     )
     assert "could not be rebuilt" in comment
     assert "Do not re-queue it by hand" in comment
@@ -6542,7 +6560,9 @@ def test_the_claim_is_already_durable_when_the_terminal_spawns(
         tmp_path,
         create_session=lambda name, cmd, wd, title: (
             at_spawn.append(
-                tuple(u.claim.kind.value for u in harness.claims.list_unresolved_claims())
+                tuple(
+                    u.claim.kind.value for u in harness.claims.list_unresolved_claims()
+                )
             )
             or True
         ),
@@ -6573,9 +6593,7 @@ _LAUNCH_TRIGGER_LABELS = frozenset({"needs-rework", "review-first"})
 
 
 @pytest.mark.parametrize("queue", _PENDING_QUEUES)
-def test_a_launch_that_never_spawns_hands_the_work_back(
-    queue, tmp_path: Path
-) -> None:
+def test_a_launch_that_never_spawns_hands_the_work_back(queue, tmp_path: Path) -> None:
     """Compensation, not a stranded row - on every queue (#6999 F5/A2).
 
     ``review`` and ``rework`` used to be exempt from this, because they reported
@@ -6628,9 +6646,7 @@ def test_a_launch_that_never_spawns_hands_the_work_back(
 
 
 def _failing_spawn_harness(tmp_path: Path):
-    return _ready_harness(
-        tmp_path, create_session=lambda name, cmd, wd, title: False
-    )
+    return _ready_harness(tmp_path, create_session=lambda name, cmd, wd, title: False)
 
 
 def test_a_permanently_dropped_request_is_not_resurrected_by_a_restart(
@@ -6744,9 +6760,7 @@ def test_a_claim_store_that_cannot_record_stops_the_launch(tmp_path: Path) -> No
     harness = _ready_harness(tmp_path)
     store = _RefusingStore(harness.claims)
     state = _pending_state("tech_lead")
-    work = PendingWorkLaunchClaim(
-        claim=_claim("tech_lead", state), claims=store
-    )
+    work = PendingWorkLaunchClaim(claim=_claim("tech_lead", state), claims=store)
 
     result = harness.launcher.launch_issue_session(
         Issue(7, "Investigate: session failed", ["agent:tech-lead"]),
@@ -6784,8 +6798,15 @@ def _die() -> None:
     raise _Interrupted("process died")
 
 
-def _settlement_over(queue: str, state, harness, *, remove, plan_retry=None,
-                     drop_on_permanent_failure: bool = True):
+def _settlement_over(
+    queue: str,
+    state,
+    harness,
+    *,
+    remove,
+    plan_retry=None,
+    drop_on_permanent_failure: bool = True,
+):
     """A settlement over the harness's own store, so the ledger is the real one."""
     from issue_orchestrator.control.launch_transaction import (
         LaunchSettlement,
@@ -6794,9 +6815,7 @@ def _settlement_over(queue: str, state, harness, *, remove, plan_retry=None,
     )
 
     return LaunchSettlement(
-        work=PendingWorkLaunchClaim(
-            claim=_claim(queue, state), claims=harness.claims
-        ),
+        work=PendingWorkLaunchClaim(claim=_claim(queue, state), claims=harness.claims),
         remove=remove,
         plan_retry=plan_retry or unbounded_retry,
         drop_on_permanent_failure=drop_on_permanent_failure,
