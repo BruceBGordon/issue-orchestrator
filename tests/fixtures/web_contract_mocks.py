@@ -37,7 +37,7 @@ class MockOrchestratorForWeb:
             active_sessions=[],
             session_history=[],
             completed_today=[],
-            paused=False,
+            pause_state=PauseState.running(),
             priority_queue=[],
             startup_status="complete",
             startup_message="",
