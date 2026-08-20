@@ -35,5 +35,27 @@ if [ -z "$PYTHON_BIN" ]; then
   exit 1
 fi
 
+if ! "$PYTHON_BIN" -c "import issue_orchestrator" >/dev/null 2>&1; then
+  echo >&2 "verify-pr: interpreter cannot import issue_orchestrator: $PYTHON_BIN"
+  "$PYTHON_BIN" - >&2 <<'PROBE' || true
+import pathlib
+import sysconfig
+
+site = pathlib.Path(sysconfig.get_paths()["purelib"])
+pointers = sorted(site.glob("*issue_orchestrator*.pth"))
+if not pointers:
+    print("  no issue_orchestrator editable pointer found in", site)
+for pointer in pointers:
+    target = pointer.read_text().strip()
+    state = "exists" if pathlib.Path(target).exists() else "MISSING"
+    print("  " + pointer.name + " -> " + target + " [" + state + "]")
+PROBE
+  echo >&2 "verify-pr: a MISSING target means that checkout was deleted while"
+  echo >&2 "verify-pr: this venv still pointed at it. Repair with:"
+  echo >&2 "verify-pr:   cd <issue-orchestrator repo> && uv pip install --python .venv/bin/python -e . --no-deps"
+  echo >&2 "verify-pr: or export $PYTHON_ENV_NAME to an interpreter that has it."
+  exit 1
+fi
+
 echo "verify-pr: running cache-aware pre-push validation"
 "$PYTHON_BIN" -m issue_orchestrator.entrypoints.cli_tools.prepush_check -v

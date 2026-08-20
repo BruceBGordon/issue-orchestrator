@@ -281,3 +281,69 @@ def check_agents(
         checks.append(template_check)
 
     return checks
+
+
+def check_python_environment(repo_root: Path) -> Check:
+    """Report whether this repo's venv resolves ``issue_orchestrator`` to itself.
+
+    The orchestrator links the base repo's venv into every worktree it creates
+    (``_link_repo_venv_into_worktree``). Anything that then runs ``uv sync`` or
+    ``pip install -e .`` through that link reinstalls the *worktree's* project
+    into the *shared* venv, rewriting the editable pointer. The venv keeps
+    working until that worktree is deleted, at which point every import dangles
+    -- including in unrelated repositories whose pre-push gate falls through to
+    this interpreter.
+
+    ``make`` refuses those mutations now (``scripts/venv_guard.sh``), but a venv
+    poisoned before that guard existed, or by a tool outside make, stays broken
+    until someone repoints it. Report it here so it is visible without starting
+    the Control Center.
+    """
+    venv_python = repo_root / ".venv" / "bin" / "python"
+    if not venv_python.exists():
+        return Check(
+            name="Python environment",
+            status="info",
+            detail=f"No .venv in {repo_root}; using the ambient interpreter",
+        )
+
+    pointers = sorted((repo_root / ".venv").glob("lib/*/site-packages/*issue_orchestrator*.pth"))
+    repair = (
+        f"cd {repo_root} && uv pip install --python .venv/bin/python -e . --no-deps"
+    )
+    for pointer in pointers:
+        try:
+            target = Path(pointer.read_text().strip())
+        except OSError as exc:
+            return Check(
+                name="Python environment",
+                status="warning",
+                detail=f"Could not read editable pointer {pointer.name}: {exc}",
+            )
+        if not target.exists():
+            return Check(
+                name="Python environment",
+                status="error",
+                detail=(
+                    f"Editable install points at a MISSING path: {target}. "
+                    f"That checkout was deleted while this venv still pointed at "
+                    f"it, so every import fails. Repair: {repair}"
+                ),
+                expandable={"pointer": str(pointer), "target": str(target), "repair": repair},
+            )
+        if not target.is_relative_to(repo_root):
+            return Check(
+                name="Python environment",
+                status="error",
+                detail=(
+                    f"Editable install points OUTSIDE this repo: {target}. "
+                    f"Imports here silently resolve to another checkout's "
+                    f"source. Repair: {repair}"
+                ),
+                expandable={"pointer": str(pointer), "target": str(target), "repair": repair},
+            )
+    return Check(
+        name="Python environment",
+        status="ok",
+        detail=f"venv resolves issue_orchestrator to {repo_root}",
+    )

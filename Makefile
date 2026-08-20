@@ -94,6 +94,9 @@ ensure-uv:
 
 venv: ensure-uv
 	@mkdir -p $$(dirname $(SETUP_LOG))
+	@# Destructive: this target rm -rf's .venv. Refuse outright on a shared venv
+	@# rather than quietly converting a worktree from shared to private.
+	@scripts/venv_guard.sh || { echo "make venv: refusing to recreate a shared .venv." >&2; exit 1; }
 	@if [ -d .venv ]; then \
 		echo "Removing existing .venv..."; \
 		rm -rf .venv; \
@@ -123,9 +126,11 @@ venv-fast: ensure-uv
 		t0=$$(date +%s); \
 		t1=$$(date +%s); \
 	fi; \
-	$(UV) sync --frozen --all-extras; \
+	if scripts/venv_guard.sh; then \
+		$(UV) sync --frozen --all-extras; \
+		touch .venv/.deps-synced; \
+	fi; \
 	t2=$$(date +%s); \
-	touch .venv/.deps-synced; \
 	echo "venv-fast pid=$$$$ ts=$$(date -Iseconds) pwd=$$(pwd) uv_venv=$$((t1-t0))s uv_sync=$$((t2-t1))s total=$$((t2-t0))s" >> $(SETUP_LOG)
 	@$(GMAKE) --no-print-directory semgrep-venv
 	@echo ""
@@ -144,6 +149,7 @@ semgrep-venv: ensure-uv
 # Legacy pip-based venv for systems without uv
 venv-pip:
 	@mkdir -p $$(dirname $(SETUP_LOG))
+	@scripts/venv_guard.sh || { echo "make venv-pip: refusing to recreate a shared .venv." >&2; exit 1; }
 	@if [ -d .venv ]; then \
 		echo "Removing existing .venv..."; \
 		rm -rf .venv; \
@@ -192,9 +198,8 @@ worktree-setup: venv-fast
 
 # Install/reinstall dependencies
 install: ensure-uv
-	$(UV) sync --frozen --all-extras
+	@if scripts/venv_guard.sh; then $(UV) sync --frozen --all-extras && touch .venv/.deps-synced; fi
 	@$(GMAKE) --no-print-directory semgrep-venv
-	@touch .venv/.deps-synced
 
 preview-readme:
 	$(SYSTEM_PYTHON) scripts/preview_markdown.py README.md --output .preview/README.html
@@ -211,9 +216,8 @@ else
 	$(UV) lock
 endif
 	@echo "Syncing dependencies..."
-	$(UV) sync --frozen --all-extras
+	@if scripts/venv_guard.sh; then $(UV) sync --frozen --all-extras && touch .venv/.deps-synced; fi
 	@$(GMAKE) --no-print-directory semgrep-venv
-	@touch .venv/.deps-synced
 	@echo ""
 	@echo "Done! Commit uv.lock with your changes."
 
@@ -259,9 +263,8 @@ else
 	cd packages/vscode && npm update
 endif
 	@echo "==> Syncing Python environment..."
-	$(UV) sync --frozen --all-extras
+	@if scripts/venv_guard.sh; then $(UV) sync --frozen --all-extras && touch .venv/.deps-synced; fi
 	@$(GMAKE) --no-print-directory semgrep-venv
-	@touch .venv/.deps-synced
 	@echo ""
 	@echo "==> Verifying with the full required suite (agent lane + test-vscode)..."
 	@# validate-pr-raw, not validate: `validate` stops at _validate-impl and omits
@@ -388,8 +391,12 @@ sync-deps:
 			echo "ERROR: uv not found. Run: curl -LsSf https://astral.sh/uv/install.sh | sh"; \
 			exit 1; \
 		fi; \
-		$(UV) sync --frozen --all-extras && touch $(DEPS_MARKER) && \
-		echo "[sync-deps] Done. Continuing with original command..."; \
+		if scripts/venv_guard.sh; then \
+			$(UV) sync --frozen --all-extras && touch $(DEPS_MARKER); \
+			echo "[sync-deps] Done. Continuing with original command..."; \
+		else \
+			echo "[sync-deps] Shared .venv - skipped; see message above."; \
+		fi; \
 		echo ""; \
 	fi
 
