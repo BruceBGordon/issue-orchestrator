@@ -47,7 +47,6 @@ import json
 import logging
 import os
 import time
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Mapping
 
@@ -56,7 +55,7 @@ from fastapi.responses import JSONResponse, HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 from sse_starlette.sse import EventSourceResponse
 
-from ..domain.pause_state import PauseActor, PauseReason
+from .control_api_pause_routes import control_pause_router
 from ..infra import gh_audit
 from ..execution.repository_engine_supervisor import build_default_supervisor_ops
 from ..ports.repository_engine_supervisor import SupervisorOps
@@ -676,49 +675,6 @@ async def refresh(request: Request) -> JSONResponse:
     return JSONResponse({"status": "refresh_requested"})
 
 
-async def _requested_actor(request: Request, default: PauseActor) -> PauseActor:
-    """Read the caller's self-declared actor from an optional JSON body.
-
-    Every remote surface (MCP, the Control Center) reaches the engine through
-    this one HTTP route, so without a declared actor they would all be recorded
-    identically and the audit trail could not tell them apart. An unknown or
-    absent value falls back to ``default`` rather than failing the pause — the
-    transition matters more than its label.
-    """
-    try:
-        body = await request.body()
-        if not body:
-            return default
-        data = json.loads(body)
-        if not isinstance(data, dict):
-            return default
-        return PauseActor(str(data.get("actor", "")))
-    except (json.JSONDecodeError, ValueError):
-        return default
-
-
-@control_app.post("/api/pause")
-async def pause(request: Request) -> JSONResponse:
-    """Pause the orchestrator - stop launching new sessions."""
-    if _orchestrator is None:
-        return JSONResponse({"error": "Orchestrator not initialized"}, status_code=503)
-
-    actor = await _requested_actor(request, PauseActor.CONTROL_API)
-    _orchestrator.pause(reason=PauseReason.OPERATOR, actor=actor)
-    return JSONResponse({"status": "paused", "actor": str(actor)})
-
-
-@control_app.post("/api/resume")
-async def resume(request: Request) -> JSONResponse:
-    """Resume the orchestrator - allow launching new sessions."""
-    if _orchestrator is None:
-        return JSONResponse({"error": "Orchestrator not initialized"}, status_code=503)
-
-    actor = await _requested_actor(request, PauseActor.CONTROL_API)
-    _orchestrator.resume(actor=actor)
-    return JSONResponse({"status": "resumed", "actor": str(actor)})
-
-
 def _active_session_status_payload(session: Any) -> dict[str, Any]:
     runtime_minutes = session.runtime_minutes
     timeout_minutes = session.agent_config.timeout_minutes
@@ -745,8 +701,7 @@ async def status() -> JSONResponse:
     ]
     return JSONResponse(
         {
-            "paused": state.paused,
-            **state.pause_state.to_payload(datetime.now(timezone.utc)),
+            **state.pause_state.to_payload(),
             "active_sessions": len(state.active_sessions),
             "sessions": sessions,
             "pending_reviews": len(state.pending_reviews),
@@ -906,8 +861,7 @@ async def health() -> JSONResponse:
 
     health_data["orchestrator"] = {
         "status": "running",
-        "paused": _orchestrator.state.paused,
-        **_orchestrator.state.pause_state.to_payload(datetime.now(timezone.utc)),
+        **_orchestrator.state.pause_state.to_payload(),
         "active_sessions": len(_orchestrator.state.active_sessions),
     }
 
@@ -1207,6 +1161,7 @@ install_control_api_setup_dependencies(
         validation_detector=RepositorySetupValidationDetectorAdapter(),
     ),
 )
+control_app.include_router(control_pause_router)
 control_app.include_router(control_orchestrator_router)
 control_app.include_router(control_shutdown_router)
 control_app.include_router(control_goal_pilot_router)

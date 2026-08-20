@@ -27,7 +27,7 @@ from datetime import datetime, timedelta, timezone
 from ..domain.pause_state import PauseActor, PauseReason, PauseState, PauseTransition
 from ..events.catalog import EventName
 from ..events.context import EventContext
-from ..ports.event_sink import EventSink, TraceEvent
+from ..ports.event_sink import EventSink, make_trace_event
 from ..ports.pause_journal import NullPauseJournal, PauseJournal
 
 logger = logging.getLogger(__name__)
@@ -39,6 +39,11 @@ class PauseStateStore(Protocol):
     ``OrchestratorState`` satisfies this via its ``pause_state`` field. Depending
     on the one-attribute shape rather than the whole state object keeps the
     controller testable and stops it reaching into unrelated orchestrator state.
+
+    The controller holds this store by reference for its lifetime, which also
+    carries the incident backoff ladder. ``Orchestrator.state`` is therefore
+    bound once and never reassigned; rebinding it would strand the owner on a
+    detached object and silently disable auto-resume.
     """
 
     pause_state: PauseState
@@ -155,7 +160,7 @@ class PauseController:
         )
         if emit_event:
             self._events.publish(
-                TraceEvent(
+                make_trace_event(
                     EventName.ORCHESTRATOR_PAUSED,
                     self._event_context.enrich(new_state.to_payload(now)),
                 )
@@ -192,7 +197,7 @@ class PauseController:
             )
         )
         self._events.publish(
-            TraceEvent(
+            make_trace_event(
                 EventName.ORCHESTRATOR_RESUMED,
                 self._event_context.enrich(
                     {

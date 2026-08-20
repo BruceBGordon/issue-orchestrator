@@ -54,6 +54,17 @@ class PauseReason(StrEnum):
         return self is PauseReason.LOOP_ERROR_THRESHOLD
 
 
+class PauseTransitionStatus(StrEnum):
+    """The outcome an operator surface reports back after a transition.
+
+    Typed rather than a bare ``"paused"``/``"resumed"`` literal at each route,
+    so the lifecycle vocabulary has one definition instead of one per caller.
+    """
+
+    PAUSED = "paused"
+    RESUMED = "resumed"
+
+
 class PauseActor(StrEnum):
     """Which surface requested the transition.
 
@@ -144,7 +155,13 @@ class PauseState:
         return " ".join(parts)
 
     def to_payload(self, now: datetime | None = None) -> dict[str, Any]:
-        """Serialize for event payloads, status routes, and view models."""
+        """Serialize for event payloads, status routes, and view models.
+
+        ``now`` defaults to the current time so a status route can spread this
+        directly; pass an explicit clock when the caller already has one (an
+        event that must share the transition's timestamp) or in tests.
+        """
+        now = now if now is not None else datetime.now(timezone.utc)
         return {
             "paused": self.paused,
             "pause_reason": str(self.reason) if self.reason is not None else None,

@@ -29,8 +29,9 @@ class PauseJournal(Protocol):
 class NullPauseJournal:
     """No-op journal for tests and disabled configurations."""
 
-    def record(self, transition: PauseTransition) -> None:  # noqa: ARG002
-        return None
+    def record(self, transition: PauseTransition) -> None:
+        del transition
 
-    def recent(self, limit: int = 20) -> list[PauseTransition]:  # noqa: ARG002
+    def recent(self, limit: int = 20) -> list[PauseTransition]:
+        del limit
         return []
