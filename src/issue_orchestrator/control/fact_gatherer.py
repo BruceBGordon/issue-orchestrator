@@ -524,19 +524,44 @@ class FactGatherer:
 
         if not stuck_sweep_due(self.config, state, now):
             return
-        result = run_stuck_sweep(
-            self.config,
-            state,
-            self.repository_host,
-            LabelManager(self.config),
-            now,
-            # Issues with an OPEN gated proposal are owned by the human who must
-            # delabel it — the sweep must not re-investigate them or spend their
-            # budget (stops propose-mode from exhausting a never-remedied issue,
-            # #6824 F1). The ledger rows ARE the open-proposal set.
-            open_proposal_targets=self._open_proposal_targets(),
-            provider_circuit_open=self.provider_circuit_open,
-        )
+        try:
+            result = run_stuck_sweep(
+                self.config,
+                state,
+                self.repository_host,
+                LabelManager(self.config),
+                now,
+                # Issues with an OPEN gated proposal are owned by the human who must
+                # delabel it — the sweep must not re-investigate them or spend their
+                # budget (stops propose-mode from exhausting a never-remedied issue,
+                # #6824 F1). The ledger rows ARE the open-proposal set.
+                open_proposal_targets=self._open_proposal_targets(),
+                provider_circuit_open=self.provider_circuit_open,
+            )
+        except RepositoryHostError as error:
+            # The sweep issues its own exhaustive `list_issues` read, OUTSIDE the
+            # resilience guard that wraps the queue fetch. So a transient network
+            # blip used to be absorbed by the fetch layer ("keeping cached queue")
+            # and then, in the very same tick, escape from here into the loop
+            # error budget — three of those in a row tripped the breaker and
+            # halted the engine. Observed repeatedly: a DNS drop during host
+            # sleep paused a healthy orchestrator for days.
+            #
+            # Swallowing every RepositoryHostError here is safe because the
+            # sweep is not the system's auth detector: the queue fetch runs the
+            # same credentials through IssueFetchResilience every cycle, and a
+            # genuinely permanent auth/not-found failure still shuts the engine
+            # down cleanly from there. Only the duplicate signal is dropped.
+            #
+            # The sweep is best-effort recovery machinery, so a failed scan is
+            # simply skipped. `last_stuck_sweep_at` is deliberately NOT stamped,
+            # leaving the sweep due so the next tick retries it.
+            logger.warning(
+                "[STUCK_SWEEP] Skipping sweep — repository host unavailable: %s. "
+                "Sweep stays due and retries next tick.",
+                error,
+            )
+            return
         for failure in result.recovered:
             state.record_discovered_failure(failure)
         # Escalate to needs-human through the Planner/Applier (authoritative,

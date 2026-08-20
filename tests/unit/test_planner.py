@@ -5,6 +5,8 @@ The planner decides "should we?" - no mocks for tmux/GitHub needed.
 """
 
 import pytest
+
+from tests.conftest import operator_paused_state
 import logging
 from pathlib import Path
 from unittest.mock import Mock, MagicMock
@@ -4218,7 +4220,7 @@ class TestSnapshotFromState:
         issue = make_issue(1)
         session = make_session(issue)
         state.active_sessions = [session]
-        state.paused = True
+        state.pause_state = operator_paused_state()
         state.priority_queue = [1, 2, 3]
         state.issues_started_count = 5
 

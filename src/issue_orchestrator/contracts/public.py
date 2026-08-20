@@ -224,11 +224,34 @@ class SessionCompletedPayload(ContractBase):
 
 
 class OrchestratorPausedPayload(ContractBase):
-    pass
+    """Why the engine paused, who paused it, and when.
+
+    Previously an empty payload, which is why a paused engine could not explain
+    itself to the UI. Fields are optional so a consumer written against the old
+    empty shape keeps parsing.
+    """
+
+    paused: bool = True
+    # PauseReason: operator | startup | loop_error_threshold |
+    # tech_lead_investigation | tech_lead_health_review
+    pause_reason: Optional[str] = None
+    # PauseActor: web_api | control_api | mcp | dashboard | cli | system
+    pause_actor: Optional[str] = None
+    pause_detail: str = ""
+    paused_since: Optional[str] = None
+    paused_held_seconds: Optional[float] = None
+    # True when the pause is a fault (the loop-error breaker) rather than an
+    # intent — the distinction an operator needs first.
+    pause_is_incident: bool = False
 
 
 class OrchestratorResumedPayload(ContractBase):
-    pass
+    """Who resumed the engine, and what it had been paused for."""
+
+    resumed_by: Optional[str] = None
+    previous_pause_reason: Optional[str] = None
+    paused_held_seconds: Optional[float] = None
+    detail: str = ""
 
 
 class QueueChangedPayload(ContractBase):

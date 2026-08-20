@@ -11,6 +11,8 @@ from textual.widgets import Static, DataTable, Footer
 from textual.binding import Binding
 from rich.text import Text
 
+from ..domain.pause_state import PauseActor, PauseReason
+
 if TYPE_CHECKING:
     from ..infra.orchestrator import Orchestrator
 
@@ -231,7 +233,9 @@ class DashboardApp(App):
         if self._on_pause:
             await self._on_pause()
         else:
-            self.orchestrator.state.paused = True
+            self.orchestrator.pause(
+                reason=PauseReason.OPERATOR, actor=PauseActor.DASHBOARD
+            )
         self.notify("Orchestrator paused")
 
     async def action_resume(self) -> None:
@@ -239,7 +243,7 @@ class DashboardApp(App):
         if self._on_resume:
             await self._on_resume()
         else:
-            self.orchestrator.state.paused = False
+            self.orchestrator.resume(actor=PauseActor.DASHBOARD)
         self.notify("Orchestrator resumed")
 
     async def action_next(self) -> None:
@@ -328,11 +332,11 @@ class Dashboard:
 
     async def _handle_pause(self) -> None:
         """Handle pause from dashboard."""
-        self.orchestrator.state.paused = True
+        self.orchestrator.pause(reason=PauseReason.OPERATOR, actor=PauseActor.DASHBOARD)
 
     async def _handle_resume(self) -> None:
         """Handle resume from dashboard."""
-        self.orchestrator.state.paused = False
+        self.orchestrator.resume(actor=PauseActor.DASHBOARD)
 
     def stop(self) -> None:
         """Stop the dashboard."""

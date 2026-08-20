@@ -43,6 +43,7 @@ from enum import Enum
 from typing import TYPE_CHECKING, Protocol
 
 from ..domain.models import PendingTechLeadReview
+from ..domain.pause_state import PauseActor, PauseReason
 from ..domain.tech_lead_run import (
     GlobalHealthReviewScope,
     IssueInvestigationScope,
@@ -92,7 +93,13 @@ class TechLeadDispatchHost(Protocol):
         self, request: "TechLeadRunRequest"
     ) -> "TechLeadRunAdmission": ...
 
-    def pause(self) -> None: ...
+    def pause(
+        self,
+        *,
+        reason: "PauseReason" = ...,
+        actor: "PauseActor" = ...,
+        detail: str = ...,
+    ) -> None: ...
 
     def tick(self) -> bool: ...
 
@@ -271,7 +278,12 @@ def run_targeted_investigations(
         )
         for issue_number in issue_numbers
     ]
-    orchestrator.pause()
+    orchestrator.pause(
+        reason=PauseReason.TECH_LEAD_INVESTIGATION,
+        actor=PauseActor.CLI,
+        detail=f"on-demand investigation of {len(issue_numbers)} issue(s): "
+               f"{', '.join(f'#{n}' for n in issue_numbers)}",
+    )
     logger.info(
         "[TECH_LEAD_TRIGGER] planner paused for %d on-demand investigation(s) (#6823)",
         len(issue_numbers),
@@ -341,7 +353,11 @@ def run_health_review(
             scope=GlobalHealthReviewScope(), trigger=TechLeadRunTrigger.CLI
         )
     )
-    orchestrator.pause()
+    orchestrator.pause(
+        reason=PauseReason.TECH_LEAD_HEALTH_REVIEW,
+        actor=PauseActor.CLI,
+        detail="on-demand whole-board health review",
+    )
     logger.info("[TECH_LEAD_TRIGGER] planner paused for an on-demand health review")
     tech_lead = _admitted_queue_item(orchestrator, admission)
     if tech_lead is None:

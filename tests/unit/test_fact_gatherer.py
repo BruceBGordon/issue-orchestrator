@@ -1,6 +1,9 @@
 """Unit tests for FactGatherer."""
 
 import pytest
+
+from issue_orchestrator.domain.pause_state import PauseState
+from tests.conftest import operator_paused_state
 from unittest.mock import MagicMock, Mock, call
 from pathlib import Path
 
@@ -253,7 +256,7 @@ class TestFactGathererCreateSnapshot:
         self, fact_gatherer, sample_state, sample_issues
     ):
         """Test snapshot reflects paused state."""
-        sample_state.paused = True
+        sample_state.pause_state = operator_paused_state()
 
         snapshot = fact_gatherer.create_snapshot(sample_state, sample_issues)
 
@@ -1680,14 +1683,14 @@ class TestClearDiscoveredFacts:
         from issue_orchestrator.control.fact_gatherer import clear_discovered_facts
 
         resumed_mid_tick = self._state_with_cohort()
-        resumed_mid_tick.paused = False
+        resumed_mid_tick.pause_state = PauseState.running()
         clear_discovered_facts(resumed_mid_tick, self._config(), tick_paused=True)
         assert [
             f.issue_number for f in resumed_mid_tick.discovered_failures
         ] == [41, 42, 43]
 
         paused_mid_apply = self._state_with_cohort()
-        paused_mid_apply.paused = True
+        paused_mid_apply.pause_state = operator_paused_state()
         clear_discovered_facts(paused_mid_apply, self._config(), tick_paused=False)
         assert paused_mid_apply.discovered_failures == []
 

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
+from issue_orchestrator.domain.pause_state import PauseActor, PauseReason, PauseState
 from issue_orchestrator.domain.models import (
     DiscoveredFailure,
     OrchestratorState,
@@ -70,6 +71,12 @@ def _config(agent: Optional[str] = TECH_LEAD_AGENT) -> Config:
 
 def _state(**kwargs: Any) -> OrchestratorState:
     state = OrchestratorState()
+    # ``paused`` is a read-only projection of ``pause_state`` (its owner is
+    # PauseController), so translate the ergonomic test kwarg into the record.
+    if kwargs.pop("paused", False):
+        state.pause_state = PauseState.paused_now(
+            reason=PauseReason.OPERATOR, actor=PauseActor.CONTROL_API
+        )
     for key, value in kwargs.items():
         setattr(state, key, value)
     return state

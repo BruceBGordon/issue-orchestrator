@@ -11,6 +11,18 @@ from issue_orchestrator.domain.session_key import SessionKey, TaskKind
 from issue_orchestrator.infra.config import Config
 from issue_orchestrator.ports.pull_request_tracker import PRInfo
 from tests.unit.session_run_helpers import make_session_run_assets
+from issue_orchestrator.domain.pause_state import (
+    PauseActor,
+    PauseReason,
+    PauseState,
+)
+
+
+def _paused_state() -> PauseState:
+    """An operator-paused state — the pause_state equivalent of the old ``paused=True``."""
+    return PauseState.paused_now(
+        reason=PauseReason.OPERATOR, actor=PauseActor.CONTROL_API
+    )
 
 
 # =============================================================================
@@ -110,7 +122,7 @@ class TestBuildSnapshotBasic:
 
     def test_build_snapshot_paused_state(self, builder, mock_repository_host):
         """Paused state is reflected in snapshot."""
-        state = OrchestratorState(paused=True)
+        state = OrchestratorState(pause_state=_paused_state())
 
         snapshot = builder.build_snapshot(state=state, snapshot_id=1, last_tick_id=None)
 

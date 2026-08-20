@@ -1563,3 +1563,17 @@ def make_provider_availability(config, provider_resilience=None):
     return ProviderAvailabilityPolicy(
         config, provider_resilience, LabelManager(config)
     )
+
+
+def operator_paused_state():
+    """An operator-paused ``PauseState`` for tests.
+
+    ``OrchestratorState.paused`` is a read-only projection whose owner is
+    ``PauseController``, so tests set ``pause_state`` instead of assigning the
+    old ``paused`` bool. This keeps that one-liner in a single place.
+    """
+    from issue_orchestrator.domain.pause_state import PauseActor, PauseReason, PauseState
+
+    return PauseState.paused_now(
+        reason=PauseReason.OPERATOR, actor=PauseActor.CONTROL_API
+    )

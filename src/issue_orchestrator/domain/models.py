@@ -19,6 +19,7 @@ from .sandbox_scope import (
     SandboxUnsupportedError,
     compute_session_scope,
 )
+from .pause_state import PauseState
 from .session_run import SessionRunAssets
 from .tech_lead_findings import PromotionUpdate, PromotableFinding, SettledPromotion
 from .tech_lead_session import (
@@ -1874,7 +1875,12 @@ class OrchestratorState:
     active_sessions: list[Session] = field(default_factory=list)
     completed_today: list[int] = field(default_factory=list)  # issue numbers (to migrate: set[IssueKey])
     failed_this_cycle: set[int] = field(default_factory=set)  # issues that failed since last refresh (prevent immediate retry)
-    paused: bool = False
+    # Owned by control.pause_controller.PauseController — never assign this
+    # directly. The bare ``paused`` bool it replaces was mutated from four
+    # modules, which is why pauses used to carry no reason, actor, or
+    # timestamp. ``paused`` below is a read-only projection of this record,
+    # so the ~20 existing readers keep working while writes have one owner.
+    pause_state: PauseState = field(default_factory=PauseState.running)
     priority_queue: list[int] = field(default_factory=list)  # manual priority overrides (to migrate: list[IssueKey])
     # Expedite lane bookkeeping (#6870), owned by RetryHistoryState. Both are
     # in-memory (like priority_queue itself): GitHub labels stay the crash-safe
@@ -2010,6 +2016,19 @@ class OrchestratorState:
     # escalation gets an idempotent, retry-safe needs-human label (the
     # authoritative, label-only escalation, #6824 R1).
     stuck_sweep_escalations: list[int] = field(default_factory=list)
+
+    @property
+    def paused(self) -> bool:
+        """Whether the engine is paused. READ-ONLY projection of ``pause_state``.
+
+        Deliberately has no setter. Assigning ``state.paused = True`` used to be
+        how two entrypoints paused the engine, which silently skipped the event,
+        the log line, and the durable record. Those writes now fail loudly and
+        route through ``PauseController`` instead, which cannot pause without a
+        reason and an actor.
+        """
+        return self.pause_state.paused
+
     def retrospective_review_in_flight_issue_numbers(self) -> set[int]:
         """Issues already queued, discovered, or actively under retrospective review."""
 

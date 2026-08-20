@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from datetime import datetime, timezone
 
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse
@@ -63,6 +64,10 @@ async def get_status(orchestrator: WebOrchestratorDependency) -> JSONResponse:
 
     return JSONResponse({
         "paused": state.paused,
+        # Pause provenance: why, who, since when. Without these the UI can only
+        # show that the engine is stopped, never why — the gap that left a
+        # breaker-tripped engine looking indistinguishable from a deliberate pause.
+        **state.pause_state.to_payload(datetime.now(timezone.utc)),
         "shutdown_requested": orchestrator.shutdown_requested,
         # Exposed so the Control Center's server-to-server probe (in
         # control_center_repo_status._apply_internal_runtime_state) can

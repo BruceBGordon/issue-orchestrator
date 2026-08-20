@@ -9,6 +9,7 @@ import time
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
+from ..domain.pause_state import PauseActor, PauseReason
 from ..control.queue_cache import QueueCache, QueueMutationStatus, clear_issue_refresh, record_issue_refreshes
 from ..control.session_history import (
     CLOSED_ISSUE_HISTORY_STATUS_REASON,
@@ -32,7 +33,7 @@ async def pause(orchestrator: WebOrchestratorDependency) -> JSONResponse:
     """Pause the orchestrator."""
     if orchestrator is None:
         return JSONResponse({"error": "Orchestrator not running"}, status_code=503)
-    orchestrator.pause()
+    orchestrator.pause(reason=PauseReason.OPERATOR, actor=PauseActor.WEB_API)
     return JSONResponse({"status": "paused"})
 
 
@@ -41,7 +42,7 @@ async def resume(orchestrator: WebOrchestratorDependency) -> JSONResponse:
     """Resume the orchestrator."""
     if orchestrator is None:
         return JSONResponse({"error": "Orchestrator not running"}, status_code=503)
-    orchestrator.resume()
+    orchestrator.resume(actor=PauseActor.WEB_API)
     return JSONResponse({"status": "resumed"})
 
 

@@ -2,6 +2,7 @@
 
 import asyncio, logging, os, signal, threading, time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from functools import cached_property
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar, Optional, cast
@@ -36,6 +37,8 @@ from ..ports.issue import Issue
 from ..domain.models import Session, SessionStatus, OrchestratorState, PendingRetrospectiveReview, PendingReview, PendingRework, PendingTechLeadReview, AgentConfig, ORCHESTRATOR_PR_MARKER
 from ..observation.observer import SessionObserver
 from ..control.scheduler import Scheduler
+from ..control.pause_controller import PauseController
+from ..domain.pause_state import PauseActor, PauseReason
 from ..domain.state_machines.issue_machine import IssueStateMachine
 from ..domain.state_machines.session_machine import SessionStateMachine
 from ..domain.state_machines.review_machine import ReviewStateMachine
@@ -142,6 +145,25 @@ class Orchestrator:
         # All validation is done by OrchestratorDeps being a frozen dataclass with no Optional fields.
         # If deps is constructed, all dependencies are present.
         init_orchestrator_components(self)
+
+    @cached_property
+    def pause_controller(self) -> PauseController:
+        """The single owner of pause/resume transitions.
+
+        Exposed as a collaborator rather than kept private so the control API,
+        the dashboard, and tests all speak to the same owner instead of
+        assigning ``state.paused`` behind its back.
+        """
+        from ..infra.pause_journal import PAUSE_JOURNAL_FILENAME, JsonlPauseJournal
+        from ..infra.repo_identity import state_dir
+
+        return PauseController(
+            events=self.deps.events,
+            event_context=self._event_context,
+            journal=JsonlPauseJournal(
+                state_dir(self.config.repo_root) / PAUSE_JOURNAL_FILENAME
+            ),
+        )
 
     @property
     def event_hub(self) -> EventHub:
@@ -805,6 +827,24 @@ class Orchestrator:
                 "unavailable: %s", error,
             )
 
+    def _auto_resume_if_due(self) -> None:
+        """Lift a half-open incident pause whose backoff has expired.
+
+        Only incident pauses expire — an operator or tech-lead pause is never
+        lifted here. See ``_AUTO_RESUME_BACKOFF_SECONDS`` for why this exists:
+        a transient DNS or disk fault used to halt the engine permanently.
+        """
+        if not self.pause_controller.due_for_auto_resume():
+            return
+        logger.info(
+            "[PAUSE] Incident pause backoff elapsed (%s) — retrying",
+            self.pause_controller.describe(),
+        )
+        self.resume(
+            actor=PauseActor.SYSTEM,
+            detail="auto-resume: incident backoff elapsed, retrying",
+        )
+
     def _handle_loop_error(self, error: Exception) -> None:
         """Record a tick error and pause after too many consecutive failures."""
         self._loop_error_count += 1
@@ -819,18 +859,19 @@ class Orchestrator:
             }),
         ))
         if self._loop_error_count >= self._loop_error_limit and not self.state.paused:
-            self.state.paused = True
             logger.warning(
-                "[LOOP] Pausing orchestrator after %d consecutive errors",
+                "[LOOP] Pausing orchestrator after %d consecutive errors; "
+                "last error: %s: %s",
                 self._loop_error_count,
+                type(error).__name__,
+                error,
             )
-            self.deps.events.publish(TraceEvent(
-                EventName.ORCHESTRATOR_PAUSED,
-                self._event_context.enrich({
-                    "reason": "loop_error_threshold",
-                    "error_count": self._loop_error_count,
-                }),
-            ))
+            self.pause(
+                reason=PauseReason.LOOP_ERROR_THRESHOLD,
+                actor=PauseActor.SYSTEM,
+                detail=f"{self._loop_error_count} consecutive tick errors; "
+                       f"last: {type(error).__name__}: {error}",
+            )
 
     async def run_loop(self) -> None:
         logger.info("Starting orchestration loop")
@@ -849,18 +890,25 @@ class Orchestrator:
             if self.state.paused:
                 self.deps.events.publish(TraceEvent(
                     EventName.ORCHESTRATOR_PAUSED,
-                    self._event_context.enrich({"reason": "startup"}),
+                    self._event_context.enrich(
+                        self.state.pause_state.to_payload(datetime.now(timezone.utc))
+                    ),
                 ))
+                logger.info(
+                    "[PAUSE] Engine starting paused — %s", self.pause_controller.describe()
+                )
 
         self._reconcile_orphaned_labels_at_startup()
         self._last_network_sync, self._last_ui_update, self._loop_iteration = 0.0, time.time(), 0
 
         while not self._shutdown_requested:
+            self._auto_resume_if_due()
             try:
                 # Run tick in thread pool to avoid blocking the event loop
                 # during long-running operations like git push with hooks
                 should_continue = await asyncio.to_thread(self.tick)
                 self._loop_error_count = 0
+                self.pause_controller.note_healthy_tick()
                 if not should_continue:
                     break
             except PermanentIssueFetchError as e:
@@ -991,16 +1039,20 @@ class Orchestrator:
                 self._INFLIGHT_TTL_SECONDS,
             )
 
-    def pause(self) -> None:
+    def pause(
+        self,
+        *,
+        reason: PauseReason = PauseReason.OPERATOR,
+        actor: PauseActor = PauseActor.CONTROL_API,
+        detail: str = "",
+    ) -> None:
+        """Pause the engine. Every caller must say why and on whose behalf."""
         with self.state_lock:
-            self.state.paused = True
-        logger.info("Orchestrator paused")
-        self.deps.events.publish(TraceEvent(
-            EventName.ORCHESTRATOR_PAUSED,
-            self._event_context.enrich({}),
-        ))
+            self.state.pause_state = self.pause_controller.pause(
+                reason=reason, actor=actor, detail=detail
+            )
 
-    def set_start_paused(self) -> None:
+    def set_start_paused(self, *, actor: PauseActor = PauseActor.CLI) -> None:
         """Set initial paused state and request dashboard read-model hydration.
 
         Runtime ``pause()`` only stops future execution. Startup-pause also
@@ -1008,18 +1060,21 @@ class Orchestrator:
         the dashboard first renders.
         """
         with self.state_lock:
-            self.state.paused = True
+            # Event suppressed here: run_loop publishes the startup pause once
+            # the event context is live, so emitting now would double-count it.
+            self.state.pause_state = self.pause_controller.pause(
+                reason=PauseReason.STARTUP,
+                actor=actor,
+                detail="started in paused mode",
+                emit_event=False,
+            )
             self.state.queue_refresh_requested = True
-        logger.info("Orchestrator marked paused for startup")
 
-    def resume(self) -> None:
+    def resume(self, *, actor: PauseActor = PauseActor.CONTROL_API, detail: str = "") -> None:
+        """Resume the engine, recording who resumed it and what it was paused for."""
         with self.state_lock:
-            self.state.paused = False
-        logger.info("Orchestrator resumed")
-        self.deps.events.publish(TraceEvent(
-            EventName.ORCHESTRATOR_RESUMED,
-            self._event_context.enrich({}),
-        ))
+            self.state.pause_state = self.pause_controller.resume(actor=actor, detail=detail)
+        self._loop_error_count = 0
 
     def get_failure_diagnosis(self, issue_number: int) -> dict:
         """Get failure diagnosis for a session.

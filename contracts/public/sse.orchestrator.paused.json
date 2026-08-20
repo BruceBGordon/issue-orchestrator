@@ -1,6 +1,71 @@
 {
   "additionalProperties": true,
-  "properties": {},
+  "description": "Why the engine paused, who paused it, and when.\n\nPreviously an empty payload, which is why a paused engine could not explain\nitself to the UI. Fields are optional so a consumer written against the old\nempty shape keeps parsing.",
+  "properties": {
+    "pause_actor": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Pause Actor"
+    },
+    "pause_detail": {
+      "default": "",
+      "title": "Pause Detail",
+      "type": "string"
+    },
+    "pause_is_incident": {
+      "default": false,
+      "title": "Pause Is Incident",
+      "type": "boolean"
+    },
+    "pause_reason": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Pause Reason"
+    },
+    "paused": {
+      "default": true,
+      "title": "Paused",
+      "type": "boolean"
+    },
+    "paused_held_seconds": {
+      "anyOf": [
+        {
+          "type": "number"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Paused Held Seconds"
+    },
+    "paused_since": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Paused Since"
+    }
+  },
   "title": "OrchestratorPausedPayload",
   "type": "object"
 }

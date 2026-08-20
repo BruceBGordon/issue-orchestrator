@@ -8,6 +8,7 @@ import threading
 
 import httpx
 
+from ..domain.pause_state import PauseActor
 from ..ports.orchestrator_api import OrchestratorApi
 
 
@@ -262,10 +263,16 @@ class OrchestratorAsyncHttpApi:
         return await self._request("GET", "/api/history")
 
     async def pause(self) -> dict[str, Any]:
-        return await self._request("POST", "/api/pause")
+        # Declare the actor so a Control-Center/MCP pause is distinguishable
+        # from a direct control-API one in the pause journal.
+        return await self._request(
+            "POST", "/api/pause", json_body={"actor": str(PauseActor.MCP)}
+        )
 
     async def resume(self) -> dict[str, Any]:
-        return await self._request("POST", "/api/resume")
+        return await self._request(
+            "POST", "/api/resume", json_body={"actor": str(PauseActor.MCP)}
+        )
 
     async def refresh(self, inflight_stable_ids: list[str]) -> dict[str, Any]:
         return await self._request("POST", "/api/refresh", json_body={"inflight_stable_ids": inflight_stable_ids})

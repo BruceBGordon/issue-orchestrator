@@ -1,6 +1,49 @@
 {
   "additionalProperties": true,
-  "properties": {},
+  "description": "Who resumed the engine, and what it had been paused for.",
+  "properties": {
+    "detail": {
+      "default": "",
+      "title": "Detail",
+      "type": "string"
+    },
+    "paused_held_seconds": {
+      "anyOf": [
+        {
+          "type": "number"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Paused Held Seconds"
+    },
+    "previous_pause_reason": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Previous Pause Reason"
+    },
+    "resumed_by": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Resumed By"
+    }
+  },
   "title": "OrchestratorResumedPayload",
   "type": "object"
 }
