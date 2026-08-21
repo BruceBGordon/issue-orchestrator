@@ -5,27 +5,38 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-REVIEW_PHASE_LOG_TIMELINE_EVENTS: frozenset[str] = frozenset({
-    "review_exchange.round_started",
-    "review_exchange.round_completed",
-    "review.rework_started",
-    "review.rework_completed",
+from ..events import EventName
+
+_REVIEW_PHASE_LOG_EVENTS = frozenset({
+    EventName.REVIEW_EXCHANGE_ROUND_STARTED,
+    EventName.REVIEW_EXCHANGE_ROUND_COMPLETED,
+    EventName.REVIEW_REWORK_STARTED,
+    EventName.REVIEW_REWORK_COMPLETED,
 })
 
-RUN_SCOPED_TIMELINE_EVENTS: frozenset[str] = frozenset({
-    "session.started",
-    "session.processing_completed",
-    "session.validation_passed",
-    "session.validation_retry_needed",
-    "session.validation_failed",
-    "session.invalid_completion_record",
-    "review.started",
-    "rework.started",
-}) | REVIEW_PHASE_LOG_TIMELINE_EVENTS
+_RUN_SCOPED_EVENTS = frozenset({
+    EventName.SESSION_STARTED,
+    EventName.SESSION_PROCESSING_COMPLETED,
+    EventName.SESSION_VALIDATION_PASSED,
+    EventName.SESSION_VALIDATION_RETRY_NEEDED,
+    EventName.SESSION_VALIDATION_FAILED,
+    EventName.SESSION_INVALID_COMPLETION_RECORD,
+    EventName.REVIEW_STARTED,
+    EventName.REWORK_STARTED,
+}) | _REVIEW_PHASE_LOG_EVENTS
 
-_EXISTING_PATH_REQUIREMENTS: dict[str, tuple[str, str]] = {
-    "session.completed": ("completion_path_absolute", "missing_path"),
-    "session.invalid_completion_record": (
+# SQLite and persisted Timeline payloads use strings. Derive those wire values
+# from the typed policy set rather than maintaining a second string taxonomy.
+REVIEW_PHASE_LOG_TIMELINE_EVENTS: frozenset[str] = frozenset(
+    event.value for event in _REVIEW_PHASE_LOG_EVENTS
+)
+RUN_SCOPED_TIMELINE_EVENTS: frozenset[str] = frozenset(
+    event.value for event in _RUN_SCOPED_EVENTS
+)
+
+_EXISTING_PATH_REQUIREMENTS: dict[EventName, tuple[str, str]] = {
+    EventName.SESSION_COMPLETED: ("completion_path_absolute", "missing_path"),
+    EventName.SESSION_INVALID_COMPLETION_RECORD: (
         "completion_path_absolute",
         "missing_completion_record",
     ),
@@ -34,7 +45,8 @@ _EXISTING_PATH_REQUIREMENTS: dict[str, tuple[str, str]] = {
 
 def event_requires_run_dir(event_name: str) -> bool:
     """Return True if this event must carry run_dir."""
-    return event_name in RUN_SCOPED_TIMELINE_EVENTS
+    event = _known_event_name(event_name)
+    return event in _RUN_SCOPED_EVENTS if event is not None else False
 
 
 def validate_event_artifact_expectations(event_name: str, payload: dict[str, Any]) -> None:
@@ -43,22 +55,34 @@ def validate_event_artifact_expectations(event_name: str, payload: dict[str, Any
     This enforces workflow-level invariants. Resolver classes (e.g. ManifestAccessor)
     should not decide policy; they only resolve artifacts.
     """
-    if event_requires_run_dir(event_name):
+    event = _known_event_name(event_name)
+    if event in _RUN_SCOPED_EVENTS:
         _require_non_empty_field(event_name, payload, "run_dir")
 
-    if event_name in {"session.started", "review.started", "rework.started"}:
+    if event in {
+        EventName.SESSION_STARTED,
+        EventName.REVIEW_STARTED,
+        EventName.REWORK_STARTED,
+    }:
         _require_run_dir_with_session_artifact(event_name, payload)
         return
 
-    path_requirement = _EXISTING_PATH_REQUIREMENTS.get(event_name)
+    path_requirement = _EXISTING_PATH_REQUIREMENTS.get(event) if event is not None else None
     if path_requirement is not None:
         field, missing_label = path_requirement
         _require_existing_path(event_name, payload, field, missing_label)
         return
 
-    if event_name == "review.comment_added":
+    if event is EventName.REVIEW_COMMENT_ADDED:
         _require_review_feedback_reference(event_name, payload)
         return
+
+
+def _known_event_name(event_name: str) -> EventName | None:
+    try:
+        return EventName(event_name)
+    except ValueError:
+        return None
 
 
 def _require_run_dir_with_session_artifact(event_name: str, payload: dict[str, Any]) -> None:

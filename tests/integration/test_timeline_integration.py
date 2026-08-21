@@ -853,6 +853,15 @@ def test_issue_detail_local_loop_review_rounds_split_into_distinct_cycles(
     run_dir_review = _start_run_with_artifacts(
         sample_config.repo_root, issue_number=issue_number, session_name="review-4057-exchange"
     )
+    review_exchange_dir = Path(run_dir_review) / "review-exchange"
+    for round_index, role in ((1, "reviewer"), (1, "coder"), (2, "reviewer")):
+        _write_terminal_recording(
+            review_exchange_dir
+            / f"round-{round_index:03d}"
+            / role
+            / "terminal-recording.jsonl",
+            f"round {round_index} {role} output\n",
+        )
 
     timeline_writer.record(TraceEvent(EventName.SESSION_STARTED, {
         "issue_number": issue_number,

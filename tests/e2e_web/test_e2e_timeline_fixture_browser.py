@@ -44,6 +44,11 @@ from issue_orchestrator.view_models.lifecycle_semantics import (
     DashboardTimelineContainer,
     E2ESuiteTimelineContainer,
 )
+from tests.fixtures.timeline_run_artifacts import (
+    TimelineFixturePathField,
+    rewrite_timeline_fixture_path,
+    write_available_timeline_run_manifest,
+)
 from tests.fixtures.web_contract_mocks import MockOrchestratorForWeb
 
 
@@ -63,11 +68,6 @@ TEST_CLICK_ISSUE_LABEL = "inflight-discovery"
 TEST_CLICK_ISSUE_NUMBER_2 = 5724
 TEST_CLICK_ISSUE_LABEL_2 = "ui-surface-provider-cir\u2026"
 _INVALID_TIME_TEXTS = {"", "-", "n/a", "na", "unknown"}
-FIXTURE_RUN_DIR_REWRITTEN_PATH_KEYS = (
-    "worktree_path",
-    "session_prompt_path",
-    "completion_path_absolute",
-)
 FIXTURE_REVIEW_PHASE_RECORDING_ROLES = {
     "review_exchange.round_started": "reviewer",
     "review_exchange.round_completed": "reviewer",
@@ -147,6 +147,10 @@ def _materialize_synthetic_session_dir(session_dir: Path) -> None:
     recording.write_text(
         "\n".join(json.dumps(e, sort_keys=True) for e in events) + "\n",
     )
+    write_available_timeline_run_manifest(
+        run_dir=session_dir,
+        terminal_recording=recording,
+    )
 
 
 def _write_review_phase_terminal_recording(
@@ -224,12 +228,17 @@ def _wire_event_to_session_dir(
         data = json.loads(row["data_json"]) if row["data_json"] else {}
         if isinstance(data, dict):
             data["run_dir"] = run_dir_str
-            for key in FIXTURE_RUN_DIR_REWRITTEN_PATH_KEYS:
-                if key in data and isinstance(data[key], str):
-                    if key == "worktree_path":
-                        data[key] = str(session_dir.parent)
-                    else:
-                        data[key] = run_dir_str + "/" + Path(data[key]).name
+            for field in TimelineFixturePathField:
+                value = data.get(field.value)
+                if not isinstance(value, str):
+                    continue
+                data[field.value] = str(
+                    rewrite_timeline_fixture_path(
+                        field=field,
+                        run_dir=session_dir,
+                        original_value=value,
+                    )
+                )
         conn.execute(
             "UPDATE timeline_events SET run_dir = ?, data_json = ? WHERE sequence = ?",
             (run_dir_str, json.dumps(data), row["sequence"]),
@@ -275,14 +284,17 @@ def _materialize_fixture_run_dirs(worktree_db: Path, run_dir_root: Path) -> None
                         round_index=round_index,
                         role=role,
                     )
-                for key in FIXTURE_RUN_DIR_REWRITTEN_PATH_KEYS:
-                    value = data.get(key)
+                for field in TimelineFixturePathField:
+                    value = data.get(field.value)
                     if not isinstance(value, str):
                         continue
-                    if key == "worktree_path":
-                        data[key] = str(synthetic_run_dir.parent)
-                    else:
-                        data[key] = str(synthetic_run_dir / Path(value).name)
+                    data[field.value] = str(
+                        rewrite_timeline_fixture_path(
+                            field=field,
+                            run_dir=synthetic_run_dir,
+                            original_value=value,
+                        )
+                    )
             conn.execute(
                 "UPDATE timeline_events SET run_dir = ?, data_json = ? WHERE sequence = ?",
                 (str(synthetic_run_dir), json.dumps(data), sequence),

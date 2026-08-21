@@ -1226,6 +1226,7 @@ class TestE2ERunDetailEndpoint:
         from unittest.mock import MagicMock
         from fastapi.testclient import TestClient
         from issue_orchestrator.entrypoints.web import app, set_orchestrator
+        from issue_orchestrator.execution.session_output_adapter import FileSystemSessionOutput
         from issue_orchestrator.execution.timeline_store import SqliteTimelineStore
         from issue_orchestrator.infra.e2e_db import E2EDB
 
@@ -1362,6 +1363,7 @@ class TestE2ERunDetailEndpoint:
         from unittest.mock import MagicMock
         from fastapi.testclient import TestClient
         from issue_orchestrator.entrypoints.web import app, set_orchestrator
+        from issue_orchestrator.execution.session_output_adapter import FileSystemSessionOutput
         from issue_orchestrator.execution.timeline_store import SqliteTimelineStore
         from issue_orchestrator.infra.e2e_db import E2EDB
 
@@ -1573,6 +1575,7 @@ class TestE2ERunDetailEndpoint:
         from unittest.mock import MagicMock
         from fastapi.testclient import TestClient
         from issue_orchestrator.entrypoints.web import app, set_orchestrator
+        from issue_orchestrator.execution.session_output_adapter import FileSystemSessionOutput
         from issue_orchestrator.execution.timeline_store import SqliteTimelineStore
         from issue_orchestrator.infra.e2e_db import E2EDB
 
@@ -1580,8 +1583,13 @@ class TestE2ERunDetailEndpoint:
         (repo_root / ".issue-orchestrator").mkdir(parents=True)
         wt_state = tmp_path / "repo-e2e-worktree" / ".issue-orchestrator" / "state"
         wt_state.mkdir(parents=True)
-        run_dir = tmp_path / "agent-run"
-        run_dir.mkdir()
+        worktree = tmp_path / "agent-worktree"
+        worktree.mkdir()
+        run_dir = FileSystemSessionOutput().start_run(
+            worktree,
+            "review-1",
+            issue_number=42,
+        ).run_dir
         (run_dir / "terminal-recording.jsonl").write_text("{}\n", encoding="utf-8")
         turns = run_dir / "review-exchange" / "turns"
         turns.mkdir(parents=True)

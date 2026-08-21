@@ -238,6 +238,9 @@ class TestApiTimelineEndpoint:
         session_output = FileSystemSessionOutput()
         worktree = tmp_path / "wt-timeline-returns-events"
         worktree.mkdir(parents=True)
+        completion_path = worktree / ".issue-orchestrator" / "completion.json"
+        completion_path.parent.mkdir(parents=True)
+        completion_path.write_text('{"status":"completed"}\n', encoding="utf-8")
         run = session_output.start_run(worktree, "issue-123", issue_number=123)
         (run.run_dir / "ui-session.log").write_text("agent output\n", encoding="utf-8")
         claude_log = run.run_dir / "claude.jsonl"
@@ -262,9 +265,7 @@ class TestApiTimelineEndpoint:
                     parent_key="session:issue-123",
                     run_id="20260206-000000Z",
                     run_dir=str(run.run_dir),
-                    artifacts=[
-                        TimelineArtifact("worktree", "Worktree", "/tmp/worktree")
-                    ],
+                    artifacts=[TimelineArtifact("worktree", "Worktree", str(worktree))],
                     timeline_schema_version=TIMELINE_SCHEMA_VERSION,
                     event_intent="coding",
                     logical_run=1,
@@ -293,7 +294,7 @@ class TestApiTimelineEndpoint:
                         TimelineArtifact(
                             "completion_record",
                             "Completion",
-                            "/tmp/worktree/completion.json",
+                            str(completion_path),
                         ),
                     ],
                     timeline_schema_version=TIMELINE_SCHEMA_VERSION,
@@ -1785,8 +1786,8 @@ class TestApiTimelineEndpoint:
         finally:
             set_orchestrator(None)
 
-    def test_issue_detail_survives_action_decoration_failure(self):
-        """A single bad event artifact must not break issue-detail rendering."""
+    def test_issue_detail_omits_file_actions_for_a_missing_run(self):
+        """A deleted worktree expires file actions without deleting Timeline facts."""
         mock_orch = create_mock_orchestrator()
         mock_orch.deps.timeline_reader.read.return_value = TimelineStream(
             issue_number=123,
@@ -1821,8 +1822,8 @@ class TestApiTimelineEndpoint:
                 for action in (payload["events"][0].get("actions") or [])
                 if isinstance(action, dict)
             }
-            assert "show_actions_error" in action_types
-            assert "actions_error" in payload["events"][0]
+            assert action_types == {"open_orchestrator_log"}
+            assert "actions_error" not in payload["events"][0]
             assert payload["events"][1]["event"] == "issue.pr_created"
         finally:
             set_orchestrator(None)

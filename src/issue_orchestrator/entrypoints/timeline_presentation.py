@@ -28,20 +28,20 @@ from ..execution.manifest_accessor import (
 from ..execution.timeline_artifact_expectations import event_requires_run_dir
 from ..timeline import MIN_SUPPORTED_TIMELINE_SCHEMA_VERSION, TIMELINE_SCHEMA_VERSION
 from ..view_models.timestamp_values import DETAIL_VALUE_KINDS_KEY, timeline_detail_value_kinds
+from .timeline_action_capabilities import (
+    AvailableRunArtifacts,
+    MissingRunArtifacts,
+    TimelineRunArtifacts,
+    available_run_artifacts,
+    classify_timeline_run_artifacts,
+    require_existing_timeline_artifact,
+    review_feedback_event_name,
+    timeline_local_artifact_kind,
+)
 
 logger = logging.getLogger(__name__)
 
 _NOISY_TIMELINE_EVENTS = frozenset({"issue.labels_changed"})
-_TIMELINE_ARTIFACT_PATH_TYPES = frozenset({
-    "chapter_sidecar",
-    "completion_record",
-    "diagnostic",
-    "prompt",
-    "review_response",
-    "run_dir",
-    "validation",
-    "worktree",
-})
 _REVIEW_ARTIFACT_TYPES = frozenset({"review_report", "review_decision"})
 _TIMELINE_START_EVENTS = frozenset({"session.started", "review.started", "rework.started"})
 _TIMELINE_FAILURE_EVENTS = frozenset({
@@ -259,60 +259,9 @@ def _decorate_timeline_events(events: list[dict[str, Any]], issue_number: int) -
         event_with_actions = dict(event)
         if detail_value_kinds := timeline_detail_value_kinds(event):
             event_with_actions[DETAIL_VALUE_KINDS_KEY] = detail_value_kinds
-        try:
-            event_with_actions["actions"] = _timeline_event_actions(event, issue_number)
-        except Exception as exc:
-            logger.warning(
-                "Timeline action decoration failed (issue=%s event=%s run_dir=%s): %s",
-                issue_number,
-                event.get("event"),
-                event.get("run_dir"),
-                exc,
-            )
-            error_message = str(exc)
-            fallback_actions = _timeline_event_fallback_actions(event, issue_number)
-            fallback_actions.append(
-                {
-                    "type": "show_actions_error",
-                    "label": "What is missing?",
-                    "issue_number": issue_number,
-                    # Keep the single-message field for legacy callers; the
-                    # dashboard uses the list form below.
-                    "error_message": error_message,
-                    "error_messages": [error_message],
-                }
-            )
-            event_with_actions["actions"] = fallback_actions
-            event_with_actions["actions_error"] = error_message
+        event_with_actions["actions"] = _timeline_event_actions(event, issue_number)
         decorated.append(event_with_actions)
     return decorated
-
-def _timeline_event_fallback_actions(event: dict[str, Any], issue_number: int) -> list[dict[str, Any]]:
-    """Build safe fallback actions when strict run-scoped decoration fails."""
-    actions: list[dict[str, Any]] = []
-    seen: set[tuple[str, str]] = set()
-
-    def _add_action(action: dict[str, Any], dedupe_value: str) -> None:
-        action_type = str(action.get("type") or "")
-        key = (action_type, dedupe_value)
-        if key in seen:
-            return
-        seen.add(key)
-        actions.append(action)
-
-    _timeline_event_artifact_actions(
-        event=event,
-        issue_number=issue_number,
-        add_action=_add_action,
-    )
-    _timeline_event_default_actions(
-        event=event,
-        event_name=str(event.get("event") or ""),
-        issue_number=issue_number,
-        include_run_scoped=False,
-        add_action=_add_action,
-    )
-    return actions
 
 
 def _timeline_event_recommended_actions(
@@ -320,18 +269,55 @@ def _timeline_event_recommended_actions(
     event: dict[str, Any],
     event_name: str,
     issue_number: int,
+    run_artifacts: TimelineRunArtifacts,
     agent_log_label: str = "View Session Recording",
     add_action: Callable[[dict[str, Any], str], None],
 ) -> None:
     """Add event-specific suggested actions."""
-    review_report_action = _review_artifact_action_for_event(
-        event=event,
-        issue_number=issue_number,
-        artifact_type="review_report",
-    )
-    if review_report_action is not None:
-        action, dedupe = review_report_action
-        add_action(action, dedupe)
+    available_run = available_run_artifacts(run_artifacts)
+    if available_run is not None:
+        review_report_action = _review_artifact_action_for_event(
+            event=event,
+            issue_number=issue_number,
+            artifact_type="review_report",
+        )
+        if review_report_action is not None:
+            action, dedupe = review_report_action
+            add_action(action, dedupe)
+        transcript_action = _review_transcript_action_for_event(
+            event=event,
+            event_name=event_name,
+            issue_number=issue_number,
+            run_artifacts=available_run,
+        )
+        if transcript_action is not None:
+            action, dedupe = transcript_action
+            add_action(action, dedupe)
+        if event_name in _TIMELINE_START_EVENTS:
+            session_action = _preferred_run_scoped_session_action(
+                event=event,
+                event_name=event_name,
+                issue_number=issue_number,
+                agent_log_label=agent_log_label,
+                run_artifacts=available_run,
+            )
+            if session_action is not None:
+                action, dedupe = session_action
+                add_action(action, dedupe)
+            add_action(
+                {"type": "view_claude_log", "label": "View Claude Session Log", "issue_number": issue_number},
+                f"claude:{issue_number}",
+            )
+        if event_name in _VALIDATION_DETAIL_EVENTS:
+            add_action(
+                {
+                    "type": "open_validation_failure",
+                    "label": "Validation Details",
+                    "issue_number": issue_number,
+                },
+                f"validation-details:{issue_number}",
+            )
+
     feedback_action = _review_feedback_action_for_event(
         event=event,
         event_name=event_name,
@@ -340,37 +326,6 @@ def _timeline_event_recommended_actions(
     if feedback_action is not None:
         action, dedupe = feedback_action
         add_action(action, dedupe)
-    transcript_action = _review_transcript_action_for_event(
-        event=event,
-        event_name=event_name,
-        issue_number=issue_number,
-    )
-    if transcript_action is not None:
-        action, dedupe = transcript_action
-        add_action(action, dedupe)
-    if event_name in _TIMELINE_START_EVENTS:
-        session_action = _preferred_run_scoped_session_action(
-            event=event,
-            event_name=event_name,
-            issue_number=issue_number,
-            agent_log_label=agent_log_label,
-        )
-        if session_action is not None:
-            action, dedupe = session_action
-            add_action(action, dedupe)
-        add_action(
-            {"type": "view_claude_log", "label": "View Claude Session Log", "issue_number": issue_number},
-            f"claude:{issue_number}",
-        )
-    if event_name in _VALIDATION_DETAIL_EVENTS:
-        add_action(
-            {
-                "type": "open_validation_failure",
-                "label": "Validation Details",
-                "issue_number": issue_number,
-            },
-            f"validation-details:{issue_number}",
-        )
     if event_name.startswith("validation."):
         add_action(
             {
@@ -380,7 +335,9 @@ def _timeline_event_recommended_actions(
             },
             f"orchestrator:{issue_number}",
         )
-    if event_name in _TIMELINE_FAILURE_EVENTS:
+    if event_name in _TIMELINE_FAILURE_EVENTS and not isinstance(
+        run_artifacts, MissingRunArtifacts
+    ):
         add_action(
             {
                 "type": "open_session_diagnostics",
@@ -398,32 +355,30 @@ def _review_feedback_action_for_event(
     issue_number: int,
 ) -> tuple[dict[str, Any], str] | None:
     """Return a feedback action only for timeline rows with event-specific review content."""
+    feedback_event = review_feedback_event_name(
+        event_name,
+        reviewer_response_text=event.get("reviewer_response_text"),
+    )
+    if feedback_event is None:
+        return None
     timestamp = str(event.get("timestamp") or "").strip()
     round_index = event.get("round_index")
     base_action: dict[str, Any] = {
         "type": "open_review_feedback",
         "label": "View Review Feedback",
         "issue_number": issue_number,
-        "feedback_event": event_name,
+        "feedback_event": feedback_event.value,
     }
     if timestamp:
         base_action["event_timestamp"] = timestamp
     if isinstance(round_index, int):
         base_action["round_index"] = round_index
 
-    if event_name == "review_exchange.round_completed" and str(event.get("reviewer_response_text") or "").strip():
-        dedupe = f"review-feedback:{issue_number}:{event_name}:{timestamp or round_index}"
-        return base_action, dedupe
-
-    if event_name in {
-        "review.approved",
-        "review.changes_requested",
-        "review.comment_added",
-    }:
-        dedupe = f"review-feedback:{issue_number}:{event_name}:{timestamp or 'event'}"
-        return base_action, dedupe
-
-    return None
+    identity = timestamp or round_index or "event"
+    return (
+        base_action,
+        f"review-feedback:{issue_number}:{feedback_event.value}:{identity}",
+    )
 
 
 def _review_artifact_action_for_event(
@@ -457,9 +412,11 @@ def _timeline_event_artifact_actions(
     *,
     event: dict[str, Any],
     issue_number: int,
+    run_artifacts: TimelineRunArtifacts,
     add_action: Callable[[dict[str, Any], str], None],
 ) -> None:
     """Add actions derived from timeline event artifacts and run directory."""
+    available_run = available_run_artifacts(run_artifacts)
     for artifact in event.get("artifacts", []):
         if not isinstance(artifact, dict):
             continue
@@ -474,6 +431,8 @@ def _timeline_event_artifact_actions(
                 value,
             )
             continue
+        if available_run is None:
+            continue
         if artifact_type in _REVIEW_ARTIFACT_TYPES:
             action = {
                 "type": "open_review_artifact",
@@ -487,14 +446,20 @@ def _timeline_event_artifact_actions(
                 action["primary"] = True
             add_action(action, f"review-artifact:{artifact_type}:{value}")
             continue
-        if artifact_type in _TIMELINE_ARTIFACT_PATH_TYPES:
+        local_artifact_kind = timeline_local_artifact_kind(artifact_type)
+        if local_artifact_kind is not None:
+            require_existing_timeline_artifact(
+                artifact_path=Path(value),
+                artifact_kind=local_artifact_kind,
+                issue_number=issue_number,
+            )
             add_action(
                 {"type": "open_path", "label": f"Open {label}", "path": value},
                 value,
             )
 
-    run_dir = event.get("run_dir")
-    if isinstance(run_dir, str) and run_dir:
+    if available_run is not None:
+        run_dir = str(available_run.run_dir)
         add_action(
             {"type": "open_path", "label": "Open Run Dir", "path": run_dir},
             run_dir,
@@ -506,17 +471,20 @@ def _timeline_event_default_actions(
     event: dict[str, Any],
     event_name: str,
     issue_number: int,
+    run_artifacts: TimelineRunArtifacts,
     agent_log_label: str = "View Session Recording",
     include_run_scoped: bool = True,
     add_action: Callable[[dict[str, Any], str], None],
 ) -> None:
     """Add default diagnostics and log actions shown for every timeline event."""
-    if include_run_scoped:
+    available_run = available_run_artifacts(run_artifacts)
+    if include_run_scoped and available_run is not None:
         session_action = _preferred_run_scoped_session_action(
             event=event,
             event_name=event_name,
             issue_number=issue_number,
             agent_log_label=agent_log_label,
+            run_artifacts=available_run,
         )
         if session_action is not None:
             action, dedupe = session_action
@@ -533,43 +501,33 @@ def _timeline_event_default_actions(
         },
         f"orchestrator:{issue_number}",
     )
-    add_action(
-        {
-            "type": "open_session_diagnostics",
-            "label": "Diagnostics…",
-            "issue_number": issue_number,
-        },
-        f"diagnostics:{issue_number}",
-    )
+    if not isinstance(run_artifacts, MissingRunArtifacts):
+        add_action(
+            {
+                "type": "open_session_diagnostics",
+                "label": "Diagnostics…",
+                "issue_number": issue_number,
+            },
+            f"diagnostics:{issue_number}",
+        )
 
 
-def _agent_log_is_usable(log_path: Path, *, event_name: str) -> bool:
+def _agent_log_is_usable(log_path: Path) -> bool:
     """Return True when run-scoped agent log should be exposed in timeline actions."""
-    try:
-        if not log_path.exists():
-            return False
-        return True
-    except OSError:
-        return False
+    return log_path.exists()
 
 
 def _validate_timeline_event_requirements(
     *,
-    event: dict[str, Any],
     issue_number: int,
     event_name: str,
     timeline_schema_version: int,
-    event_run_dir: str,
 ) -> None:
     if timeline_schema_version < MIN_SUPPORTED_TIMELINE_SCHEMA_VERSION:
         raise RuntimeError(
             "timeline event has unsupported schema version: "
             f"issue={issue_number} event={event_name} version={timeline_schema_version} "
             f"min_supported={MIN_SUPPORTED_TIMELINE_SCHEMA_VERSION}"
-        )
-    if _timeline_event_requires_run_dir(event) and not event_run_dir:
-        raise RuntimeError(
-            f"timeline event missing required run_dir: issue={issue_number} event={event_name}"
         )
 
 
@@ -578,7 +536,7 @@ def _validated_run_scoped_artifact(
     action: dict[str, Any],
     issue_number: int,
     event_name: str,
-    event_run_dir: str,
+    run_artifacts: AvailableRunArtifacts,
     run_scoped_validated: set[tuple[str, int | None, str | None]],
 ) -> str | None:
     action_type = str(action.get("type") or "")
@@ -589,11 +547,10 @@ def _validated_run_scoped_artifact(
     validation_key = (action_type, round_index, validation_scope)
     if validation_key in run_scoped_validated:
         return None
-    if not event_run_dir:
-        raise RuntimeError(
-            f"timeline run-scoped action requires run_dir: issue={issue_number} event={event_name} action={action_type}"
-        )
-    accessor = ManifestAccessor(RunIdentity(issue_number=issue_number, run_dir=Path(event_run_dir)))
+    event_run_dir = str(run_artifacts.run_dir)
+    accessor = ManifestAccessor(
+        RunIdentity(issue_number=issue_number, run_dir=run_artifacts.run_dir)
+    )
     if action_type == "open_agent_log":
         if round_index is not None and session_role:
             artifact = accessor.get_review_exchange_phase_terminal_recording(
@@ -603,7 +560,7 @@ def _validated_run_scoped_artifact(
             )
         else:
             artifact = accessor.get_agent_log(allow_empty=True)
-        if not _agent_log_is_usable(artifact.path, event_name=event_name):
+        if not _agent_log_is_usable(artifact.path):
             raise RuntimeError(
                 f"run-scoped agent log is empty/unusable: issue={issue_number} event={event_name} run_dir={event_run_dir}"
             )
@@ -630,89 +587,90 @@ def _validated_run_scoped_artifact(
     return None
 
 
-def _decorate_timeline_action_with_run_dir(action: dict[str, Any], event_run_dir: str) -> dict[str, Any]:
-    if not event_run_dir:
-        return action
-    if str(action.get("type") or "") in {
+def _timeline_event_actions(event: dict[str, Any], issue_number: int) -> list[dict[str, Any]]:
+    actions: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    event_name = str(event.get("event") or "")
+    agent_log_label = _agent_log_label_for_event(event)
+    timeline_schema_version_raw = event.get("timeline_schema_version")
+    timeline_schema_version = timeline_schema_version_raw if isinstance(timeline_schema_version_raw, int) else 0
+    _validate_timeline_event_requirements(
+        issue_number=issue_number,
+        event_name=event_name,
+        timeline_schema_version=timeline_schema_version,
+    )
+    run_artifacts = classify_timeline_run_artifacts(
+        raw_run_dir=event.get("run_dir"),
+        issue_number=issue_number,
+        event_name=event_name,
+    )
+    available_run = available_run_artifacts(run_artifacts)
+    run_directory_action_types = {
         "open_agent_log",
         "open_review_artifact",
         "open_review_transcript",
         "open_validation_failure",
         "view_claude_log",
-        "open_orchestrator_log",
-        "open_session_diagnostics",
-    }:
-        return {**action, "run_dir": event_run_dir}
-    return action
-
-
-def _timeline_event_actions(event: dict[str, Any], issue_number: int) -> list[dict[str, Any]]:
-    actions: list[dict[str, Any]] = []
-    seen: set[tuple[str, str]] = set()
-    action_warnings: list[str] = []
-    event_name = str(event.get("event") or "")
-    agent_log_label = _agent_log_label_for_event(event)
-    event_run_dir = str(event.get("run_dir") or "")
-    timeline_schema_version_raw = event.get("timeline_schema_version")
-    timeline_schema_version = timeline_schema_version_raw if isinstance(timeline_schema_version_raw, int) else 0
-    run_scoped_action_types = {
-        "open_agent_log",
-        "open_review_artifact",
-        "open_review_transcript",
-        "view_claude_log",
+    }
+    manifest_artifact_action_types = run_directory_action_types - {
+        "open_validation_failure"
     }
     run_scoped_validated: set[tuple[str, int | None, str | None]] = set()
 
     def _add_action(action: dict[str, Any], dedupe_value: str) -> None:
         action_type = str(action.get("type") or "")
-        if action_type in run_scoped_action_types and not event_run_dir:
-            raise RuntimeError(
-                f"timeline run-scoped action missing run_dir: issue={issue_number} event={event_name} action={action_type}"
-            )
-        if action_type in run_scoped_action_types:
+        run_for_action: AvailableRunArtifacts | None = None
+        if action_type in run_directory_action_types:
+            if available_run is None:
+                raise RuntimeError(
+                    f"timeline run-scoped action lacks available artifacts: "
+                    f"issue={issue_number} event={event_name} action={action_type}"
+                )
+            run_for_action = available_run
+        if action_type in manifest_artifact_action_types:
+            if run_for_action is None:
+                raise AssertionError(
+                    f"manifest action {action_type!r} lacks its run capability"
+                )
             try:
                 _validated_run_scoped_artifact(
                     action=action,
                     issue_number=issue_number,
                     event_name=event_name,
-                    event_run_dir=event_run_dir,
+                    run_artifacts=run_for_action,
                     run_scoped_validated=run_scoped_validated,
                 )
-            except Exception as exc:
-                if action_type == "view_claude_log":
-                    if isinstance(exc, ArtifactNotFoundError) and (
-                        str(exc).strip() == "manifest missing claude_log_path"
-                        or str(exc).strip() == "manifest missing claude log candidates"
-                    ):
-                        return
-                    action_warnings.append(f"{action_type} unavailable: {exc}")
+            except ArtifactNotFoundError as exc:
+                if action_type == "view_claude_log" and str(exc).strip() in {
+                    "manifest missing claude_log_path",
+                    "manifest missing claude log candidates",
+                }:
                     return
                 raise
-        action = _decorate_timeline_action_with_run_dir(action, event_run_dir)
+        if available_run is not None and action_type in {
+            *run_directory_action_types,
+            "open_orchestrator_log",
+            "open_session_diagnostics",
+        }:
+            action = {**action, "run_dir": str(available_run.run_dir)}
         key = (action_type, dedupe_value)
         if key in seen:
             return
         seen.add(key)
         actions.append(action)
 
-    _validate_timeline_event_requirements(
-        event=event,
-        issue_number=issue_number,
-        event_name=event_name,
-        timeline_schema_version=timeline_schema_version,
-        event_run_dir=event_run_dir,
-    )
-
     _timeline_event_recommended_actions(
         event=event,
         event_name=event_name,
         issue_number=issue_number,
+        run_artifacts=run_artifacts,
         agent_log_label=agent_log_label,
         add_action=_add_action,
     )
     _timeline_event_artifact_actions(
         event=event,
         issue_number=issue_number,
+        run_artifacts=run_artifacts,
         add_action=_add_action,
     )
     is_agent_event = _is_agent_scoped_event(event, event_name)
@@ -720,25 +678,11 @@ def _timeline_event_actions(event: dict[str, Any], issue_number: int) -> list[di
         event=event,
         event_name=event_name,
         issue_number=issue_number,
+        run_artifacts=run_artifacts,
         agent_log_label=agent_log_label,
-        include_run_scoped=bool(event_run_dir) and is_agent_event,
+        include_run_scoped=available_run is not None and is_agent_event,
         add_action=_add_action,
     )
-    if action_warnings:
-        joined = " | ".join(action_warnings)
-        _add_action(
-            {
-                "type": "show_actions_error",
-                "label": "What is missing?",
-                "issue_number": issue_number,
-                # Keep the single-message field for legacy callers; the
-                # dashboard uses the list form so multi-error actions do not
-                # have to parse a joined display string.
-                "error_message": joined,
-                "error_messages": action_warnings,
-            },
-            f"missing:{issue_number}:{joined}",
-        )
     return actions
 
 
@@ -829,12 +773,14 @@ def _review_transcript_action_for_event(
     event: dict[str, Any],
     event_name: str,
     issue_number: int,
+    run_artifacts: AvailableRunArtifacts,
 ) -> tuple[dict[str, Any], str] | None:
     """Expose the structured exchange transcript as secondary review context."""
-    run_dir = str(event.get("run_dir") or "").strip()
-    if not run_dir or not _event_supports_review_transcript(event, event_name):
+    if not _event_supports_review_transcript(event, event_name):
         return None
-    accessor = ManifestAccessor(RunIdentity(issue_number=issue_number, run_dir=Path(run_dir)))
+    accessor = ManifestAccessor(
+        RunIdentity(issue_number=issue_number, run_dir=run_artifacts.run_dir)
+    )
     try:
         accessor.get_review_exchange_transcript(allow_empty=True)
     except (ArtifactNotFoundError, FileNotFoundError):
@@ -861,11 +807,10 @@ def _preferred_run_scoped_session_action(
     event_name: str,
     issue_number: int,
     agent_log_label: str,
+    run_artifacts: AvailableRunArtifacts,
 ) -> tuple[dict[str, Any], str] | None:
     """Resolve the truthful primary run-scoped session artifact for an event."""
-    run_dir = str(event.get("run_dir") or "").strip()
-    if not run_dir:
-        return None
+    run_dir = str(run_artifacts.run_dir)
     action: dict[str, Any] = {
         "type": "open_agent_log",
         "label": agent_log_label,
@@ -875,7 +820,9 @@ def _preferred_run_scoped_session_action(
     if not context and _is_review_exchange_aggregate_event(event, event_name):
         return None
     if context:
-        accessor = ManifestAccessor(RunIdentity(issue_number=issue_number, run_dir=Path(run_dir)))
+        accessor = ManifestAccessor(
+            RunIdentity(issue_number=issue_number, run_dir=run_artifacts.run_dir)
+        )
         try:
             accessor.get_review_exchange_phase_terminal_recording(
                 round_index=int(context["round_index"]),
@@ -886,24 +833,11 @@ def _preferred_run_scoped_session_action(
             if event_requires_run_dir(event_name):
                 role = str(context["session_role"])
                 round_index = int(context["round_index"])
-                label = _missing_recording_label(role)
-                message = (
-                    f"{label}: issue={issue_number} event={event_name} "
+                raise RuntimeError(
+                    "required Timeline phase recording is missing: "
+                    f"issue={issue_number} event={event_name} "
                     f"run_dir={run_dir} round_index={round_index} role={role}; {exc}"
-                )
-                return (
-                    {
-                        "type": "show_actions_error",
-                        "label": label,
-                        "issue_number": issue_number,
-                        # Legacy single-message field; new consumers use
-                        # ``error_messages`` even when there is only one.
-                        "error_message": message,
-                        "error_messages": [message],
-                        "primary": True,
-                    },
-                    f"missing-agent:{issue_number}:{event_name}:{round_index}:{role}",
-                )
+                ) from exc
             return None
         action.update(context)
     dedupe_parts = ["agent", str(issue_number)]
@@ -914,14 +848,6 @@ def _preferred_run_scoped_session_action(
     if isinstance(session_role, str) and session_role:
         dedupe_parts.append(session_role)
     return action, ":".join(dedupe_parts)
-
-
-def _missing_recording_label(role: str) -> str:
-    if role == "reviewer":
-        return "Reviewer Recording unavailable"
-    if role == "coder":
-        return "Coding Recording unavailable"
-    return "Session Recording unavailable"
 
 
 def _is_review_exchange_aggregate_event(event: dict[str, Any], event_name: str) -> bool:

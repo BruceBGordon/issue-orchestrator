@@ -53,13 +53,13 @@ from issue_orchestrator.entrypoints.control_api import (
 )
 from issue_orchestrator.entrypoints.web import app, set_orchestrator
 from issue_orchestrator.execution.timeline_store import SqliteTimelineStore
+from tests.fixtures.timeline_run_artifacts import (
+    TimelineFixturePathField,
+    rewrite_timeline_fixture_path,
+    write_available_timeline_run_manifest,
+)
 
 FIXTURE_DIR = Path(__file__).parent.parent / "fixtures" / "e2e_runs"
-FIXTURE_RUN_DIR_REWRITTEN_PATH_KEYS = (
-    "worktree_path",
-    "session_prompt_path",
-    "completion_path_absolute",
-)
 FIXTURE_REVIEW_PHASE_RECORDING_ROLES = {
     "review_exchange.round_started": "reviewer",
     "review_exchange.round_completed": "reviewer",
@@ -151,14 +151,16 @@ def _materialize_fixture_run_dirs(worktree_db: Path, run_dir_root: Path) -> None
                         round_index=round_index,
                         role=role,
                     )
-                for key in FIXTURE_RUN_DIR_REWRITTEN_PATH_KEYS:
-                    value = data.get(key)
+                for field in TimelineFixturePathField:
+                    value = data.get(field.value)
                     if not isinstance(value, str):
                         continue
-                    if key == "worktree_path":
-                        data[key] = str(synthetic_run_dir.parent)
-                    else:
-                        data[key] = str(synthetic_run_dir / Path(value).name)
+                    rewritten_path = rewrite_timeline_fixture_path(
+                        field=field,
+                        run_dir=synthetic_run_dir,
+                        original_value=value,
+                    )
+                    data[field.value] = str(rewritten_path)
             conn.execute(
                 "UPDATE timeline_events SET run_dir = ?, data_json = ? WHERE sequence = ?",
                 (str(synthetic_run_dir), json.dumps(data), sequence),
@@ -168,8 +170,9 @@ def _materialize_fixture_run_dirs(worktree_db: Path, run_dir_root: Path) -> None
 
 def _write_minimal_terminal_recording(run_dir: Path) -> None:
     run_dir.mkdir(parents=True, exist_ok=True)
+    recording_path = run_dir / "terminal-recording.jsonl"
     payload = base64.b64encode(b"integration fixture session\n").decode("ascii")
-    (run_dir / "terminal-recording.jsonl").write_text(
+    recording_path.write_text(
         json.dumps(
             {
                 "event_type": "output",
@@ -180,6 +183,10 @@ def _write_minimal_terminal_recording(run_dir: Path) -> None:
         )
         + "\n",
         encoding="utf-8",
+    )
+    write_available_timeline_run_manifest(
+        run_dir=run_dir,
+        terminal_recording=recording_path,
     )
 
 
