@@ -5,7 +5,9 @@
 2026-07-14: §4 reaction model, #6780; accepted 2026-07-23: the model shipped —
 typed decision artifact, board-snapshot observation surface, periodic + storm
 health-review triggers, and per-action graduated authority are live, with the
-``reset_retry`` executor wired (#6764) and act-level ``execute`` startup-guarded)
+``reset_retry`` executor wired (#6764) and act-level ``execute`` startup-guarded;
+amended 2026-08-19: direct ``kill_hung_session`` authority wired with exact
+session-generation revalidation)
 **Milestone:** P1
 **Tracks:** Issues #6760, #6761, #6762, #6763, #6764, #6778, #6780
 
@@ -99,7 +101,7 @@ was given) and **typed proposed actions**:
 | `escalate_to_human` | Route to the needs-human surface | `execute` (floor: cannot be disabled) |
 | `flag_pattern` | Open/append a durable pattern case-file issue for a cross-job pattern (amended by #6781); requires a `pattern_signature` | `execute` |
 | `reset_retry` | Reset-and-retry an issue from scratch (executor wired — #6764 first slice) | `propose` |
-| `kill_hung_session` | Terminate a stuck session (executor not wired yet — #6764) | `propose` |
+| `kill_hung_session` | Terminate the exact observed stuck session generation (executor wired) | `propose` |
 
 The orchestrator parses the decision on session completion, applies the
 authority filter (§2), executes allowed actions through the existing
@@ -133,8 +135,8 @@ Semantics:
 - **Gated issues (amended by #6778).** Consequential proposals surface as
   *gated GitHub issues* instead of shadow records: `create_issue` proposals
   under `propose` authority are created carrying the `proposed-tech-lead` label,
-  and act-level proposals (`reset_retry` under `propose`;
-  `kill_hung_session` always, until its direct tier is wired) become gated
+  and act-level proposals (`reset_retry`/`kill_hung_session` under `propose`)
+  become gated
   proposal issues. **Removing `proposed-tech-lead` is per-instance approval**:
   a proposed work issue flows into normal scheduling; an act-level proposal
   triggers execution of the **stored op** recorded orchestrator-side at
@@ -166,8 +168,8 @@ Semantics:
 - Fail-safe: anything that mutates orchestrator runtime state defaults to
   `propose`. Setting `execute` on an action type whose executor is not yet
   wired (§5) is a **startup configuration error**, never a silent no-op.
-  (`reset_retry` is wired — the #6764 first slice — so `execute` on it is
-  honored; `kill_hung_session` remains startup-rejected.)
+  (Both current act-level actions are wired, so `execute` is honored with
+  operation-specific execution-time revalidation.)
 - Execution-time re-validation: act-level proposals are executed only if their
   recorded preconditions still hold (the board may have moved since the agent
   wrote the decision); otherwise they downgrade to surfaced proposals with an

@@ -1333,14 +1333,15 @@ class ReviewSettings(BaseModel):
         description="Act-level: terminate a stuck session",
         json_schema_extra={
             "enum": list(TECH_LEAD_AUTHORITY_MODES),
-            "doc_examples": ["propose"],
+            "doc_examples": ["propose", "execute"],
             "doc_notes": (
                 "propose (default) files each proposal as a gated GitHub issue "
                 "carrying the proposed-tech-lead label; removing the label is "
                 "per-instance approval and executes the stored op after "
                 "re-validating the target session is still active (#6778). "
-                "Direct execute is not wired yet (#6764) and remains a startup "
-                "configuration error. Allowed values: execute, propose."
+                "execute terminates the exact session generation that was active "
+                "when the decision was planned, after re-validating that it is "
+                "still active. Allowed values: execute, propose."
             ),
             "section": _TECH_LEAD_SECTION,
             "config_attr": "tech_lead.authority.kill_hung_session",

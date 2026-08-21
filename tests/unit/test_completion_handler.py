@@ -40,10 +40,25 @@ from issue_orchestrator.control.actions import (
 from issue_orchestrator.domain.issue_key import FakeIssueKey
 from issue_orchestrator.domain.session_key import SessionKey, TaskKind
 from issue_orchestrator.domain.session_run import SessionRunAssets
-from issue_orchestrator.domain.state_machines.issue_machine import IssueStateMachine, IssueState
-from issue_orchestrator.domain.state_machines.session_machine import SessionStateMachine, SessionState
-from issue_orchestrator.domain.state_machines.review_machine import ReviewStateMachine, ReviewState
-from issue_orchestrator.domain.models import AgentConfig, Issue, Session, SessionStatus, PendingCleanup
+from issue_orchestrator.domain.state_machines.issue_machine import (
+    IssueStateMachine,
+    IssueState,
+)
+from issue_orchestrator.domain.state_machines.session_machine import (
+    SessionStateMachine,
+    SessionState,
+)
+from issue_orchestrator.domain.state_machines.review_machine import (
+    ReviewStateMachine,
+    ReviewState,
+)
+from issue_orchestrator.domain.models import (
+    AgentConfig,
+    Issue,
+    Session,
+    SessionStatus,
+    PendingCleanup,
+)
 from issue_orchestrator.ports import NullEventSink, InMemoryEventSink, TraceEvent
 from issue_orchestrator.ports.session_output import SessionOutput
 from issue_orchestrator.events import EventName
@@ -83,7 +98,12 @@ def agent_config(tmp_path: Path) -> AgentConfig:
     )
 
 
-def make_issue(number: int = 1, title: str = "Test issue", labels: list[str] | None = None, repo: str = "owner/repo") -> Issue:
+def make_issue(
+    number: int = 1,
+    title: str = "Test issue",
+    labels: list[str] | None = None,
+    repo: str = "owner/repo",
+) -> Issue:
     """Create a test issue."""
     return Issue(
         number=number,
@@ -134,7 +154,9 @@ def make_repository_host(
         get_prs_for_branch=lambda _branch: prs or [],
         get_pr=lambda _pr_number: pr_info,
         get_issue=lambda _issue_number: issue_value,
-        get_issue_labels_fresh=lambda _issue_number: [str(label) for label in getattr(issue_value, "labels", [])],
+        get_issue_labels_fresh=lambda _issue_number: [
+            str(label) for label in getattr(issue_value, "labels", [])
+        ],
         set_pr_draft=Mock(),
     )
 
@@ -183,14 +205,15 @@ def make_handler(
         get_issue_machine_fn=lambda _issue: issue_machine,
         get_session_machine_fn=lambda _terminal_id: session_machine,
         get_review_machine_fn=lambda _pr_number: review_machine,
-        session_output=session_output if session_output is not None else default_session_output,
+        session_output=session_output
+        if session_output is not None
+        else default_session_output,
         tech_lead_authority=tech_lead_authority,
         open_issue_corpus=OpenIssueCorpusManager(
             resolved_repository_host,
             InMemoryOpenIssueCorpusStore(),
             is_enabled=lambda: config.tech_lead.dedup.enabled,
         ),
-        active_session_run_id=lambda _n: None,
         provider_availability=make_provider_availability(config),
         tech_lead_run_activity=in_memory_run_activity(),
     )
@@ -312,13 +335,18 @@ class TestHistoryEntryCreation:
 
         # History should show FAILED, not COMPLETED
         assert result.history_entry.status == "failed"
-        assert "push" in result.history_entry.status_reason.lower() or "pr" in result.history_entry.status_reason.lower()
+        assert (
+            "push" in result.history_entry.status_reason.lower()
+            or "pr" in result.history_entry.status_reason.lower()
+        )
 
     def test_completed_with_publish_blocked_error_records_failed_status(
         self, config: Config, agent_config: AgentConfig, tmp_worktree: Path
     ) -> None:
         """Publish-blocked finalize failures (dirty-tree gate) should be FAILED in history."""
-        from issue_orchestrator.control.completion_processor import ERROR_PREFIX_PUBLISH_BLOCKED
+        from issue_orchestrator.control.completion_processor import (
+            ERROR_PREFIX_PUBLISH_BLOCKED,
+        )
 
         issue = make_issue()
         session = create_test_session(issue, agent_config, tmp_worktree)
@@ -335,7 +363,10 @@ class TestHistoryEntryCreation:
         )
 
         assert result.history_entry.status == "failed"
-        assert "push" in result.history_entry.status_reason.lower() or "pr" in result.history_entry.status_reason.lower()
+        assert (
+            "push" in result.history_entry.status_reason.lower()
+            or "pr" in result.history_entry.status_reason.lower()
+        )
 
     def test_completed_without_errors_records_completed_status(
         self, config: Config, agent_config: AgentConfig, tmp_worktree: Path
@@ -359,7 +390,9 @@ class TestHistoryEntryCreation:
         self, config: Config, agent_config: AgentConfig, tmp_worktree: Path
     ) -> None:
         """A create_pr error is non-critical if a PR exists by reconciliation time."""
-        from issue_orchestrator.control.completion_processor import ERROR_PREFIX_CREATE_PR
+        from issue_orchestrator.control.completion_processor import (
+            ERROR_PREFIX_CREATE_PR,
+        )
 
         issue = make_issue()
         session = create_test_session(issue, agent_config, tmp_worktree)
@@ -562,7 +595,9 @@ class TestStateMachineTransitions:
         """Issue session with PR transitions issue state to PR_PENDING."""
         issue = make_issue()
         issue_machine = IssueStateMachine(issue, initial_state=IssueState.IN_PROGRESS)
-        session = create_test_session(issue, agent_config, tmp_worktree, terminal_id="issue-1")
+        session = create_test_session(
+            issue, agent_config, tmp_worktree, terminal_id="issue-1"
+        )
 
         repository_host = make_repository_host(
             prs=[SimpleNamespace(url="http://pr", number=42, labels=[])]
@@ -581,7 +616,9 @@ class TestStateMachineTransitions:
         """Duplicate pr_created transitions are ignored for issue sessions."""
         issue = make_issue()
         issue_machine = IssueStateMachine(issue, initial_state=IssueState.PR_PENDING)
-        session = create_test_session(issue, agent_config, tmp_worktree, terminal_id="issue-1")
+        session = create_test_session(
+            issue, agent_config, tmp_worktree, terminal_id="issue-1"
+        )
 
         repository_host = make_repository_host(
             prs=[SimpleNamespace(url="http://pr", number=42, labels=[])]
@@ -602,7 +639,9 @@ class TestStateMachineTransitions:
         issue = make_issue()
         issue_machine = IssueStateMachine(issue, initial_state=IssueState.IN_PROGRESS)
         session = create_test_session(
-            issue, agent_config, tmp_worktree,
+            issue,
+            agent_config,
+            tmp_worktree,
             terminal_id="review-42",
             task_kind=TaskKind.REVIEW,
         )
@@ -652,7 +691,9 @@ class TestStateMachineTransitions:
     ) -> None:
         """Session state machine transitions to COMPLETED on success."""
         issue = make_issue()
-        session = create_test_session(issue, agent_config, tmp_worktree, terminal_id="issue-1")
+        session = create_test_session(
+            issue, agent_config, tmp_worktree, terminal_id="issue-1"
+        )
         session_machine = SessionStateMachine(
             session_id="issue-1",
             issue_number=issue.number,
@@ -670,7 +711,9 @@ class TestStateMachineTransitions:
     ) -> None:
         """Session state machine transitions to FAILED on failure."""
         issue = make_issue()
-        session = create_test_session(issue, agent_config, tmp_worktree, terminal_id="issue-1")
+        session = create_test_session(
+            issue, agent_config, tmp_worktree, terminal_id="issue-1"
+        )
         session_machine = SessionStateMachine(
             session_id="issue-1",
             issue_number=issue.number,
@@ -688,7 +731,9 @@ class TestStateMachineTransitions:
     ) -> None:
         """Session state machine transitions to TIMED_OUT on timeout."""
         issue = make_issue()
-        session = create_test_session(issue, agent_config, tmp_worktree, terminal_id="issue-1")
+        session = create_test_session(
+            issue, agent_config, tmp_worktree, terminal_id="issue-1"
+        )
         session_machine = SessionStateMachine(
             session_id="issue-1",
             issue_number=issue.number,
@@ -717,7 +762,9 @@ class TestReviewMachineTransitions:
         config.code_reviewed_label = "code-reviewed"
         issue = make_issue()
         session = create_test_session(
-            issue, agent_config, tmp_worktree,
+            issue,
+            agent_config,
+            tmp_worktree,
             terminal_id="review-42",
             task_kind=TaskKind.REVIEW,
         )
@@ -727,7 +774,9 @@ class TestReviewMachineTransitions:
             initial_state=ReviewState.IN_REVIEW,
         )
 
-        pr_info = SimpleNamespace(number=42, labels=["code-reviewed"], url="http://pr", draft=True)
+        pr_info = SimpleNamespace(
+            number=42, labels=["code-reviewed"], url="http://pr", draft=True
+        )
         repository_host = make_repository_host(
             prs=[pr_info],
             pr_info=pr_info,
@@ -750,7 +799,9 @@ class TestReviewMachineTransitions:
         config.label_needs_rework = "needs-rework"
         issue = make_issue()
         session = create_test_session(
-            issue, agent_config, tmp_worktree,
+            issue,
+            agent_config,
+            tmp_worktree,
             terminal_id="review-42",
             task_kind=TaskKind.REVIEW,
         )
@@ -783,7 +834,9 @@ class TestReviewMachineTransitions:
         config.code_reviewed_label = "code-reviewed"
         issue = make_issue()
         session = create_test_session(
-            issue, agent_config, tmp_worktree,
+            issue,
+            agent_config,
+            tmp_worktree,
             terminal_id="review-42",
             task_kind=TaskKind.REVIEW,
         )
@@ -867,10 +920,12 @@ class TestPRDetection:
         issue = make_issue()
         session = create_test_session(issue, agent_config, tmp_worktree)
 
-        repository_host = make_repository_host(prs=[
-            SimpleNamespace(url="http://pr/1", number=1, labels=[]),
-            SimpleNamespace(url="http://pr/2", number=2, labels=[]),
-        ])
+        repository_host = make_repository_host(
+            prs=[
+                SimpleNamespace(url="http://pr/1", number=1, labels=[]),
+                SimpleNamespace(url="http://pr/2", number=2, labels=[]),
+            ]
+        )
         handler = make_handler(config, repository_host=repository_host)
 
         result = handler.process_completion(session, SessionStatus.COMPLETED)
@@ -890,9 +945,7 @@ class TestCleanupStrategy:
     @pytest.mark.parametrize(
         ("close_tabs", "remove_worktrees", "expected_disposition"),
         [
-            pytest.param(
-                True, True, CleanupDisposition.DEFERRED, id="both-actions"
-            ),
+            pytest.param(True, True, CleanupDisposition.DEFERRED, id="both-actions"),
             pytest.param(
                 True, False, CleanupDisposition.DEFERRED, id="close-tabs-only"
             ),
@@ -916,7 +969,9 @@ class TestCleanupStrategy:
         config.cleanup.with_tech_lead.close_ai_session_tabs = close_tabs
         config.cleanup.with_tech_lead.remove_worktrees = remove_worktrees
         issue = make_issue()
-        session = create_test_session(issue, agent_config, tmp_worktree, terminal_id="issue-1")
+        session = create_test_session(
+            issue, agent_config, tmp_worktree, terminal_id="issue-1"
+        )
 
         repository_host = make_repository_host(
             prs=[SimpleNamespace(url="http://pr", number=42, labels=[])]
@@ -938,35 +993,59 @@ class TestCleanupStrategy:
         ),
         [
             pytest.param(
-                True, True, True, CleanupDisposition.DEFERRED,
+                True,
+                True,
+                True,
+                CleanupDisposition.DEFERRED,
                 id="wait-both-actions",
             ),
             pytest.param(
-                True, True, False, CleanupDisposition.DEFERRED,
+                True,
+                True,
+                False,
+                CleanupDisposition.DEFERRED,
                 id="wait-close-tabs-only",
             ),
             pytest.param(
-                True, False, True, CleanupDisposition.DEFERRED,
+                True,
+                False,
+                True,
+                CleanupDisposition.DEFERRED,
                 id="wait-remove-worktree-only",
             ),
             pytest.param(
-                True, False, False, CleanupDisposition.NONE,
+                True,
+                False,
+                False,
+                CleanupDisposition.NONE,
                 id="wait-no-actions",
             ),
             pytest.param(
-                False, True, True, CleanupDisposition.IMMEDIATE,
+                False,
+                True,
+                True,
+                CleanupDisposition.IMMEDIATE,
                 id="immediate-both-actions",
             ),
             pytest.param(
-                False, True, False, CleanupDisposition.IMMEDIATE,
+                False,
+                True,
+                False,
+                CleanupDisposition.IMMEDIATE,
                 id="immediate-close-tabs-only",
             ),
             pytest.param(
-                False, False, True, CleanupDisposition.IMMEDIATE,
+                False,
+                False,
+                True,
+                CleanupDisposition.IMMEDIATE,
                 id="immediate-remove-worktree-only",
             ),
             pytest.param(
-                False, False, False, CleanupDisposition.NONE,
+                False,
+                False,
+                False,
+                CleanupDisposition.NONE,
                 id="immediate-no-actions",
             ),
         ],
@@ -988,7 +1067,9 @@ class TestCleanupStrategy:
         config.cleanup.without_tech_lead.close_ai_session_tabs = close_tabs
         config.cleanup.without_tech_lead.remove_worktrees = remove_worktrees
         issue = make_issue()
-        session = create_test_session(issue, agent_config, tmp_worktree, terminal_id="issue-1")
+        session = create_test_session(
+            issue, agent_config, tmp_worktree, terminal_id="issue-1"
+        )
 
         repository_host = make_repository_host(
             prs=[SimpleNamespace(url="http://pr", number=42, labels=[])]
@@ -1029,7 +1110,9 @@ class TestCleanupStrategy:
         config.tech_lead_review_agent = "agent:tech-lead"
         issue = make_issue()
         session = create_test_session(
-            issue, agent_config, tmp_worktree,
+            issue,
+            agent_config,
+            tmp_worktree,
             terminal_id="review-42",
             task_kind=TaskKind.REVIEW,
         )
@@ -1051,7 +1134,9 @@ class TestCleanupStrategy:
         config.tech_lead_review_agent = "agent:tech-lead"
         issue = make_issue()
         session = create_test_session(
-            issue, agent_config, tmp_worktree,
+            issue,
+            agent_config,
+            tmp_worktree,
             terminal_id="rework-42",
             task_kind=TaskKind.REWORK,
         )
@@ -1085,7 +1170,9 @@ class TestCleanupStrategy:
         config.cleanup.with_tech_lead.close_ai_session_tabs = False
         config.cleanup.with_tech_lead.remove_worktrees = False
         issue = make_issue()
-        session = create_test_session(issue, agent_config, tmp_worktree, terminal_id="issue-1")
+        session = create_test_session(
+            issue, agent_config, tmp_worktree, terminal_id="issue-1"
+        )
 
         handler = make_handler(config)
 
@@ -1102,7 +1189,9 @@ class TestCleanupStrategy:
         config.cleanup.with_tech_lead.close_ai_session_tabs = True
         issue = make_issue(number=123)
         session = create_test_session(
-            issue, agent_config, tmp_worktree,
+            issue,
+            agent_config,
+            tmp_worktree,
             terminal_id="issue-123",
         )
 
@@ -1137,7 +1226,9 @@ class TestReviewQueueDecision:
         """Session with PR and code_review_agent configured queues review."""
         config.code_review_agent = "agent:reviewer"
         issue = make_issue()
-        session = create_test_session(issue, agent_config, tmp_worktree, terminal_id="issue-1")
+        session = create_test_session(
+            issue, agent_config, tmp_worktree, terminal_id="issue-1"
+        )
 
         repository_host = make_repository_host(
             prs=[SimpleNamespace(url="http://pr", number=42, labels=[])]
@@ -1154,7 +1245,9 @@ class TestReviewQueueDecision:
         """Session without code_review_agent does not queue review."""
         config.code_review_agent = None
         issue = make_issue()
-        session = create_test_session(issue, agent_config, tmp_worktree, terminal_id="issue-1")
+        session = create_test_session(
+            issue, agent_config, tmp_worktree, terminal_id="issue-1"
+        )
 
         repository_host = make_repository_host(
             prs=[SimpleNamespace(url="http://pr", number=42, labels=[])]
@@ -1172,7 +1265,9 @@ class TestReviewQueueDecision:
         config.code_review_agent = "agent:reviewer"
         agent_config.skip_review = True
         issue = make_issue()
-        session = create_test_session(issue, agent_config, tmp_worktree, terminal_id="issue-1")
+        session = create_test_session(
+            issue, agent_config, tmp_worktree, terminal_id="issue-1"
+        )
 
         repository_host = make_repository_host(
             prs=[SimpleNamespace(url="http://pr", number=42, labels=[])]
@@ -1190,7 +1285,9 @@ class TestReviewQueueDecision:
         config.code_review_agent = "agent:reviewer"
         issue = make_issue()
         session = create_test_session(
-            issue, agent_config, tmp_worktree,
+            issue,
+            agent_config,
+            tmp_worktree,
             terminal_id="review-42",
             task_kind=TaskKind.REVIEW,
         )
@@ -1210,7 +1307,9 @@ class TestReviewQueueDecision:
         """Session completed without PR does not queue review."""
         config.code_review_agent = "agent:reviewer"
         issue = make_issue()
-        session = create_test_session(issue, agent_config, tmp_worktree, terminal_id="issue-1")
+        session = create_test_session(
+            issue, agent_config, tmp_worktree, terminal_id="issue-1"
+        )
 
         repository_host = make_repository_host(prs=[])
         handler = make_handler(config, repository_host=repository_host)
@@ -1227,7 +1326,9 @@ class TestReviewQueueDecision:
         config.code_review_agent = "agent:reviewer"
         config.review_exchange_mode = mode
         issue = make_issue()
-        session = create_test_session(issue, agent_config, tmp_worktree, terminal_id="issue-1")
+        session = create_test_session(
+            issue, agent_config, tmp_worktree, terminal_id="issue-1"
+        )
 
         repository_host = make_repository_host(
             prs=[SimpleNamespace(url="http://pr", number=42, labels=[])]
@@ -1248,7 +1349,9 @@ class TestReviewQueueDecision:
         """Halted review exchange must not enqueue another review."""
         config.code_review_agent = "agent:reviewer"
         issue = make_issue(number=123)
-        session = create_test_session(issue, agent_config, tmp_worktree, terminal_id="issue-123")
+        session = create_test_session(
+            issue, agent_config, tmp_worktree, terminal_id="issue-123"
+        )
 
         repository_host = make_repository_host(
             prs=[SimpleNamespace(url="http://pr", number=42, labels=[])]
@@ -1258,7 +1361,9 @@ class TestReviewQueueDecision:
         result = handler.process_completion(
             session,
             SessionStatus.COMPLETED,
-            processing_errors=["review_exchange: stopped (reviewer_reports_no_progress)"],
+            processing_errors=[
+                "review_exchange: stopped (reviewer_reports_no_progress)"
+            ],
         )
 
         assert result.should_queue_review is False
@@ -1269,7 +1374,9 @@ class TestReviewQueueDecision:
         """Halted review exchange must place issue on hold (blocked-failed) and release claim."""
         config.code_review_agent = "agent:reviewer"
         issue = make_issue(number=123, labels=["agent:test", "in-progress"])
-        session = create_test_session(issue, agent_config, tmp_worktree, terminal_id="issue-123")
+        session = create_test_session(
+            issue, agent_config, tmp_worktree, terminal_id="issue-123"
+        )
 
         repository_host = make_repository_host(
             prs=[SimpleNamespace(url="http://pr", number=42, labels=[])]
@@ -1279,7 +1386,9 @@ class TestReviewQueueDecision:
         result = handler.process_completion(
             session,
             SessionStatus.COMPLETED,
-            processing_errors=["review_exchange: stopped (reviewer_reports_no_progress)"],
+            processing_errors=[
+                "review_exchange: stopped (reviewer_reports_no_progress)"
+            ],
         )
 
         add_labels = [a for a in result.actions if isinstance(a, AddLabelAction)]
@@ -1294,7 +1403,9 @@ class TestReviewQueueDecision:
     ) -> None:
         """Halted review exchange should not emit completed/pr-created timeline events."""
         issue = make_issue(number=123)
-        session = create_test_session(issue, agent_config, tmp_worktree, terminal_id="issue-123")
+        session = create_test_session(
+            issue, agent_config, tmp_worktree, terminal_id="issue-123"
+        )
 
         repository_host = make_repository_host(
             prs=[SimpleNamespace(url="http://pr", number=42, labels=[])]
@@ -1305,7 +1416,9 @@ class TestReviewQueueDecision:
         result = handler.process_completion(
             session,
             SessionStatus.COMPLETED,
-            processing_errors=["review_exchange: stopped (reviewer_reports_no_progress)"],
+            processing_errors=[
+                "review_exchange: stopped (reviewer_reports_no_progress)"
+            ],
         )
 
         assert result.history_entry.status == SessionStatus.FAILED.value
@@ -1328,7 +1441,9 @@ class TestLabelActionGeneration:
         """Review exchange completion should add pr-pending when PR exists."""
         config.code_review_agent = "agent:reviewer"
         issue = make_issue(number=123)
-        session = create_test_session(issue, agent_config, tmp_worktree, terminal_id="issue-123")
+        session = create_test_session(
+            issue, agent_config, tmp_worktree, terminal_id="issue-123"
+        )
 
         repository_host = make_repository_host(
             prs=[SimpleNamespace(url="http://pr", number=42, labels=[])]
@@ -1408,7 +1523,9 @@ class TestLabelActionGeneration:
 
         removed = [a.label for a in result.actions if isinstance(a, RemoveLabelAction)]
         added = [a.label for a in result.actions if isinstance(a, AddLabelAction)]
-        state_actions = [a for a in result.actions if isinstance(a, SetIssueStateAction)]
+        state_actions = [
+            a for a in result.actions if isinstance(a, SetIssueStateAction)
+        ]
         assert "lack-of-review-redo" in removed
         assert "retrospective-reviewed" in removed
         assert "needs-rework" in removed
@@ -1445,12 +1562,19 @@ class TestLabelActionGeneration:
 
         added = [a.label for a in result.actions if isinstance(a, AddLabelAction)]
         removed = [a.label for a in result.actions if isinstance(a, RemoveLabelAction)]
-        comments = [a.comment for a in result.actions if isinstance(a, AddCommentAction)]
-        state_actions = [a for a in result.actions if isinstance(a, SetIssueStateAction)]
+        comments = [
+            a.comment for a in result.actions if isinstance(a, AddCommentAction)
+        ]
+        state_actions = [
+            a for a in result.actions if isinstance(a, SetIssueStateAction)
+        ]
         assert "needs-rework" in removed
         assert "retrospective-changes-requested" in added
         assert "needs-human" in added
-        assert any("could not resolve a coder `agent:*` label" in comment for comment in comments)
+        assert any(
+            "could not resolve a coder `agent:*` label" in comment
+            for comment in comments
+        )
         assert len(state_actions) == 1
         assert state_actions[0].state == "open"
 
@@ -1519,7 +1643,9 @@ class TestLabelActionGeneration:
 
         removed = [a.label for a in result.actions if isinstance(a, RemoveLabelAction)]
         added = [a.label for a in result.actions if isinstance(a, AddLabelAction)]
-        state_actions = [a for a in result.actions if isinstance(a, SetIssueStateAction)]
+        state_actions = [
+            a for a in result.actions if isinstance(a, SetIssueStateAction)
+        ]
         # Changes-requested reopens for rework and must not leave the issue blocked.
         assert "blocked" in removed
         assert "retrospective-changes-requested" in added
@@ -1589,8 +1715,13 @@ class TestLabelActionGeneration:
         repository_host = SimpleNamespace(
             get_prs_for_branch=lambda _branch: [],
             get_pr=lambda _pr_number: None,
-            get_issue=lambda _issue_number: SimpleNamespace(labels=["agent:test", "needs-run-audit"]),
-            get_issue_labels_fresh=lambda _issue_number: ["agent:test", "needs-run-audit"],
+            get_issue=lambda _issue_number: SimpleNamespace(
+                labels=["agent:test", "needs-run-audit"]
+            ),
+            get_issue_labels_fresh=lambda _issue_number: [
+                "agent:test",
+                "needs-run-audit",
+            ],
             set_pr_draft=Mock(),
         )
         handler = make_handler(
@@ -1601,7 +1732,9 @@ class TestLabelActionGeneration:
 
         result = handler.process_completion(session, SessionStatus.COMPLETED)
 
-        remove_labels = [a.label for a in result.actions if isinstance(a, RemoveLabelAction)]
+        remove_labels = [
+            a.label for a in result.actions if isinstance(a, RemoveLabelAction)
+        ]
         add_labels = [a.label for a in result.actions if isinstance(a, AddLabelAction)]
         assert "needs-run-audit" in remove_labels
         assert "run-audit-complete" in add_labels
@@ -1625,8 +1758,12 @@ class TestLabelActionGeneration:
             tmp_worktree,
             run_assets=run,
         )
-        session.started_at = (datetime.now() - timedelta(minutes=24)).replace(microsecond=0)
-        session_output.update_manifest(run.run_dir, {"outcome": "completed", "ended_at": "2026-03-14T23:55:16Z"})
+        session.started_at = (datetime.now() - timedelta(minutes=24)).replace(
+            microsecond=0
+        )
+        session_output.update_manifest(
+            run.run_dir, {"outcome": "completed", "ended_at": "2026-03-14T23:55:16Z"}
+        )
 
         repository_host = SimpleNamespace(
             get_prs_for_branch=lambda _branch: [],
@@ -1653,7 +1790,7 @@ class TestLabelActionGeneration:
         assert manifest is not None
         audit_path = Path(manifest["run_audit_path"])
         payload = audit_path.read_text()
-        assert "\"trigger_source\": \"runtime-threshold\"" in payload
+        assert '"trigger_source": "runtime-threshold"' in payload
 
     def test_runtime_below_threshold_does_not_write_automatic_run_audit(
         self, config: Config, agent_config: AgentConfig, tmp_worktree: Path
@@ -1667,8 +1804,12 @@ class TestLabelActionGeneration:
             tmp_worktree,
             run_assets=run,
         )
-        session.started_at = (datetime.now() - timedelta(minutes=12)).replace(microsecond=0)
-        session_output.update_manifest(run.run_dir, {"outcome": "completed", "ended_at": "2026-03-14T23:55:16Z"})
+        session.started_at = (datetime.now() - timedelta(minutes=12)).replace(
+            microsecond=0
+        )
+        session_output.update_manifest(
+            run.run_dir, {"outcome": "completed", "ended_at": "2026-03-14T23:55:16Z"}
+        )
 
         repository_host = SimpleNamespace(
             get_prs_for_branch=lambda _branch: [],
@@ -1689,7 +1830,9 @@ class TestLabelActionGeneration:
         assert manifest is not None
         assert "run_audit_path" not in manifest
 
-    def test_timeout_writes_automatic_run_audit(self, config: Config, agent_config: AgentConfig, tmp_worktree: Path) -> None:
+    def test_timeout_writes_automatic_run_audit(
+        self, config: Config, agent_config: AgentConfig, tmp_worktree: Path
+    ) -> None:
         issue = make_issue(number=123, labels=["agent:test"])
         session_output = FileSystemSessionOutput()
         run = session_output.start_run(tmp_worktree, "issue-1", issue_number=123)
@@ -1699,8 +1842,12 @@ class TestLabelActionGeneration:
             tmp_worktree,
             run_assets=run,
         )
-        session.started_at = (datetime.now() - timedelta(minutes=5)).replace(microsecond=0)
-        session_output.update_manifest(run.run_dir, {"outcome": "timed_out", "ended_at": "2026-03-14T23:55:16Z"})
+        session.started_at = (datetime.now() - timedelta(minutes=5)).replace(
+            microsecond=0
+        )
+        session_output.update_manifest(
+            run.run_dir, {"outcome": "timed_out", "ended_at": "2026-03-14T23:55:16Z"}
+        )
 
         repository_host = SimpleNamespace(
             get_prs_for_branch=lambda _branch: [],
@@ -1721,7 +1868,7 @@ class TestLabelActionGeneration:
         assert manifest is not None
         audit_path = Path(manifest["run_audit_path"])
         payload = audit_path.read_text()
-        assert "\"trigger_source\": \"timeout\"" in payload
+        assert '"trigger_source": "timeout"' in payload
 
     def test_timeout_enriches_recorded_run_manifest_before_audit(
         self, config: Config, agent_config: AgentConfig, tmp_worktree: Path
@@ -1737,7 +1884,9 @@ class TestLabelActionGeneration:
             terminal_id="issue-123",
             run_assets=run,
         )
-        session.started_at = (datetime.now() - timedelta(minutes=91)).replace(microsecond=0)
+        session.started_at = (datetime.now() - timedelta(minutes=91)).replace(
+            microsecond=0
+        )
 
         repository_host = SimpleNamespace(
             get_prs_for_branch=lambda _branch: [],
@@ -1761,9 +1910,11 @@ class TestLabelActionGeneration:
         assert manifest["timeout_minutes"] == 90
         assert "ended_at" in manifest
         audit_payload = Path(manifest["run_audit_path"]).read_text()
-        assert "\"outcome\": \"timed_out\"" in audit_payload
+        assert '"outcome": "timed_out"' in audit_payload
 
-    def test_timeout_audit_can_be_disabled(self, config: Config, agent_config: AgentConfig, tmp_worktree: Path) -> None:
+    def test_timeout_audit_can_be_disabled(
+        self, config: Config, agent_config: AgentConfig, tmp_worktree: Path
+    ) -> None:
         config.review_run_audit_on_timeout = False
         config.review_run_audit_min_runtime_minutes = 20
         issue = make_issue(number=123, labels=["agent:test"])
@@ -1775,8 +1926,12 @@ class TestLabelActionGeneration:
             tmp_worktree,
             run_assets=run,
         )
-        session.started_at = (datetime.now() - timedelta(minutes=5)).replace(microsecond=0)
-        session_output.update_manifest(run.run_dir, {"outcome": "timed_out", "ended_at": "2026-03-14T23:55:16Z"})
+        session.started_at = (datetime.now() - timedelta(minutes=5)).replace(
+            microsecond=0
+        )
+        session_output.update_manifest(
+            run.run_dir, {"outcome": "timed_out", "ended_at": "2026-03-14T23:55:16Z"}
+        )
 
         repository_host = SimpleNamespace(
             get_prs_for_branch=lambda _branch: [],
@@ -1814,7 +1969,9 @@ class TestLabelActionGeneration:
         # Find each action type
         add_label = next((a for a in actions if isinstance(a, AddLabelAction)), None)
         comment = next((a for a in actions if isinstance(a, AddCommentAction)), None)
-        remove_label = next((a for a in actions if isinstance(a, RemoveLabelAction)), None)
+        remove_label = next(
+            (a for a in actions if isinstance(a, RemoveLabelAction)), None
+        )
 
         assert add_label is not None
         assert add_label.label == "blocked-failed"
@@ -1831,7 +1988,9 @@ class TestLabelActionGeneration:
         self, config: Config, agent_config: AgentConfig, tmp_worktree: Path
     ) -> None:
         """Completed+publish-blocked should yield publish-failed + comment + release claim."""
-        from issue_orchestrator.control.completion_processor import ERROR_PREFIX_PUBLISH_BLOCKED
+        from issue_orchestrator.control.completion_processor import (
+            ERROR_PREFIX_PUBLISH_BLOCKED,
+        )
 
         issue = make_issue(number=321)
         session = create_test_session(issue, agent_config, tmp_worktree)
@@ -1846,8 +2005,15 @@ class TestLabelActionGeneration:
         )
 
         actions = result.actions
-        assert any(isinstance(a, AddLabelAction) and a.label == "publish-failed" for a in actions)
-        assert any(isinstance(a, RemoveLabelAction) and a.label == config.get_label_in_progress() for a in actions)
+        assert any(
+            isinstance(a, AddLabelAction) and a.label == "publish-failed"
+            for a in actions
+        )
+        assert any(
+            isinstance(a, RemoveLabelAction)
+            and a.label == config.get_label_in_progress()
+            for a in actions
+        )
         assert any(
             isinstance(a, AddCommentAction) and "Publishing Failed" in a.comment
             for a in actions
@@ -1857,7 +2023,9 @@ class TestLabelActionGeneration:
         self, config: Config, agent_config: AgentConfig, tmp_worktree: Path
     ) -> None:
         """Publish failure should remove needs-rework to prevent re-queuing loop."""
-        from issue_orchestrator.control.completion_processor import ERROR_PREFIX_PUBLISH_BLOCKED
+        from issue_orchestrator.control.completion_processor import (
+            ERROR_PREFIX_PUBLISH_BLOCKED,
+        )
 
         issue = make_issue(number=321)
         session = create_test_session(issue, agent_config, tmp_worktree)
@@ -1866,14 +2034,13 @@ class TestLabelActionGeneration:
         result = handler.process_completion(
             session,
             SessionStatus.COMPLETED,
-            processing_errors=[
-                f"{ERROR_PREFIX_PUBLISH_BLOCKED}: push failed"
-            ],
+            processing_errors=[f"{ERROR_PREFIX_PUBLISH_BLOCKED}: push failed"],
         )
 
         actions = result.actions
         remove_rework = [
-            a for a in actions
+            a
+            for a in actions
             if isinstance(a, RemoveLabelAction) and a.label == "needs-rework"
         ]
         assert len(remove_rework) == 1, "Should remove needs-rework on publish failure"
@@ -1882,7 +2049,9 @@ class TestLabelActionGeneration:
         self, config: Config, agent_config: AgentConfig, tmp_worktree: Path
     ) -> None:
         """Recovered create_pr errors should not mark the issue publish-failed."""
-        from issue_orchestrator.control.completion_processor import ERROR_PREFIX_CREATE_PR
+        from issue_orchestrator.control.completion_processor import (
+            ERROR_PREFIX_CREATE_PR,
+        )
 
         issue = make_issue(number=321)
         session = create_test_session(issue, agent_config, tmp_worktree)
@@ -1912,7 +2081,9 @@ class TestLabelActionGeneration:
         self, config: Config, agent_config: AgentConfig, tmp_worktree: Path
     ) -> None:
         """First publish failure should add publish-fail-count-1 label."""
-        from issue_orchestrator.control.completion_processor import ERROR_PREFIX_PUBLISH_BLOCKED
+        from issue_orchestrator.control.completion_processor import (
+            ERROR_PREFIX_PUBLISH_BLOCKED,
+        )
 
         issue = make_issue(number=321)
         session = create_test_session(issue, agent_config, tmp_worktree)
@@ -1934,7 +2105,9 @@ class TestLabelActionGeneration:
         self, config: Config, agent_config: AgentConfig, tmp_worktree: Path
     ) -> None:
         """Second publish failure should replace count-1 with count-2."""
-        from issue_orchestrator.control.completion_processor import ERROR_PREFIX_PUBLISH_BLOCKED
+        from issue_orchestrator.control.completion_processor import (
+            ERROR_PREFIX_PUBLISH_BLOCKED,
+        )
 
         issue = make_issue(number=321, labels=["agent:test", "publish-fail-count-1"])
         session = create_test_session(issue, agent_config, tmp_worktree)
@@ -1960,7 +2133,9 @@ class TestLabelActionGeneration:
         self, config: Config, agent_config: AgentConfig, tmp_worktree: Path
     ) -> None:
         """After max consecutive publish failures, escalate to needs-human."""
-        from issue_orchestrator.control.completion_processor import ERROR_PREFIX_PUBLISH_BLOCKED
+        from issue_orchestrator.control.completion_processor import (
+            ERROR_PREFIX_PUBLISH_BLOCKED,
+        )
 
         config.max_consecutive_publish_failures = 3
         # Issue already has count-2 (two previous failures)
@@ -1977,8 +2152,7 @@ class TestLabelActionGeneration:
         actions = result.actions
         # Should escalate to needs-human, NOT publish-failed
         assert any(
-            isinstance(a, AddLabelAction) and a.label == "needs-human"
-            for a in actions
+            isinstance(a, AddLabelAction) and a.label == "needs-human" for a in actions
         ), "Should escalate to needs-human after max failures"
         assert not any(
             isinstance(a, AddLabelAction) and a.label == "publish-failed"
@@ -2004,13 +2178,17 @@ class TestLabelActionGeneration:
 
         add_label = next((a for a in actions if isinstance(a, AddLabelAction)), None)
         comment = next((a for a in actions if isinstance(a, AddCommentAction)), None)
-        remove_label = next((a for a in actions if isinstance(a, RemoveLabelAction)), None)
+        remove_label = next(
+            (a for a in actions if isinstance(a, RemoveLabelAction)), None
+        )
 
         assert add_label is not None
         assert add_label.label == "needs-human"  # Needs human investigation
 
         assert comment is not None
-        assert "Investigation" in comment.comment  # Explains coding-done/reviewer-done was not called
+        assert (
+            "Investigation" in comment.comment
+        )  # Explains coding-done/reviewer-done was not called
 
         assert remove_label is not None
         assert remove_label.label == config.get_label_in_progress()
@@ -2022,8 +2200,16 @@ class TestLabelActionGeneration:
         config.retry.interrupted_sessions.enabled = False
         issue = make_issue(number=456)
         session = create_test_session(issue, agent_config, tmp_worktree)
-        completion_path = tmp_worktree / ".issue-orchestrator" / "completion-agent_backend.json"
-        diagnostic_path = tmp_worktree / ".issue-orchestrator" / "sessions" / "run" / "invalid-completion-1.json"
+        completion_path = (
+            tmp_worktree / ".issue-orchestrator" / "completion-agent_backend.json"
+        )
+        diagnostic_path = (
+            tmp_worktree
+            / ".issue-orchestrator"
+            / "sessions"
+            / "run"
+            / "invalid-completion-1.json"
+        )
         detail = {
             "failure_kind": "invalid_completion_record",
             "failure_reason": (
@@ -2057,7 +2243,9 @@ class TestLabelActionGeneration:
 
         add_label = next(a for a in result.actions if isinstance(a, AddLabelAction))
         assert add_label.label == "needs-human"
-        remove_label = next(a for a in result.actions if isinstance(a, RemoveLabelAction))
+        remove_label = next(
+            a for a in result.actions if isinstance(a, RemoveLabelAction)
+        )
         assert remove_label.label == config.get_label_in_progress()
 
         failed_events = events.get_events(str(EventName.SESSION_FAILED))
@@ -2075,7 +2263,9 @@ class TestLabelActionGeneration:
         """Malformed JSON is treated like interrupted output for retry policy."""
         config.retry.interrupted_sessions.enabled = True
         issue = make_issue(number=456)
-        session = create_test_session(issue, agent_config, tmp_worktree, terminal_id="issue-456")
+        session = create_test_session(
+            issue, agent_config, tmp_worktree, terminal_id="issue-456"
+        )
         repository_host = make_repository_host(
             issue_info=SimpleNamespace(labels=["agent:test"])
         )
@@ -2107,7 +2297,9 @@ class TestLabelActionGeneration:
         """Schema-invalid records surface for human repair instead of auto-retry."""
         config.retry.interrupted_sessions.enabled = True
         issue = make_issue(number=456)
-        session = create_test_session(issue, agent_config, tmp_worktree, terminal_id="issue-456")
+        session = create_test_session(
+            issue, agent_config, tmp_worktree, terminal_id="issue-456"
+        )
         repository_host = make_repository_host(
             issue_info=SimpleNamespace(labels=["agent:test"])
         )
@@ -2142,7 +2334,9 @@ class TestLabelActionGeneration:
         """Unreadable completion files are not described as validation rejects."""
         config.retry.interrupted_sessions.enabled = False
         issue = make_issue(number=456)
-        session = create_test_session(issue, agent_config, tmp_worktree, terminal_id="issue-456")
+        session = create_test_session(
+            issue, agent_config, tmp_worktree, terminal_id="issue-456"
+        )
         handler = make_handler(config)
         detail = {
             "failure_kind": "invalid_completion_record",
@@ -2192,7 +2386,9 @@ class TestLabelActionGeneration:
         """Interrupted issue session auto-retries once when enabled."""
         config.retry.interrupted_sessions.enabled = True
         issue = make_issue(number=456)
-        session = create_test_session(issue, agent_config, tmp_worktree, terminal_id="issue-456")
+        session = create_test_session(
+            issue, agent_config, tmp_worktree, terminal_id="issue-456"
+        )
         repository_host = make_repository_host(
             issue_info=SimpleNamespace(labels=["agent:test"])
         )
@@ -2200,9 +2396,15 @@ class TestLabelActionGeneration:
 
         result = handler.process_completion(session, SessionStatus.FAILED)
 
-        add_label = next((a for a in result.actions if isinstance(a, AddLabelAction)), None)
-        comment = next((a for a in result.actions if isinstance(a, AddCommentAction)), None)
-        remove_label = next((a for a in result.actions if isinstance(a, RemoveLabelAction)), None)
+        add_label = next(
+            (a for a in result.actions if isinstance(a, AddLabelAction)), None
+        )
+        comment = next(
+            (a for a in result.actions if isinstance(a, AddCommentAction)), None
+        )
+        remove_label = next(
+            (a for a in result.actions if isinstance(a, RemoveLabelAction)), None
+        )
 
         assert add_label is not None
         assert add_label.label == config.retry.interrupted_sessions.coding_guard_label
@@ -2222,7 +2424,9 @@ class TestLabelActionGeneration:
         config.retry.interrupted_sessions.enabled = True
         guard = config.retry.interrupted_sessions.coding_guard_label
         issue = make_issue(number=456)
-        session = create_test_session(issue, agent_config, tmp_worktree, terminal_id="issue-456")
+        session = create_test_session(
+            issue, agent_config, tmp_worktree, terminal_id="issue-456"
+        )
         repository_host = make_repository_host(
             issue_info=SimpleNamespace(labels=["agent:test", guard])
         )
@@ -2254,8 +2458,12 @@ class TestLabelActionGeneration:
 
         result = handler.process_completion(session, SessionStatus.FAILED)
 
-        add_label = next((a for a in result.actions if isinstance(a, AddLabelAction)), None)
-        comment = next((a for a in result.actions if isinstance(a, AddCommentAction)), None)
+        add_label = next(
+            (a for a in result.actions if isinstance(a, AddLabelAction)), None
+        )
+        comment = next(
+            (a for a in result.actions if isinstance(a, AddCommentAction)), None
+        )
 
         assert add_label is not None
         assert add_label.label == config.retry.interrupted_sessions.review_guard_label
@@ -2476,7 +2684,9 @@ class TestStatusSessionTypeMatrix:
         session = create_test_session(
             make_issue(), agent_config, tmp_worktree, terminal_id="issue-1"
         )
-        result = make_handler(config).process_completion(session, SessionStatus.COMPLETED)
+        result = make_handler(config).process_completion(
+            session, SessionStatus.COMPLETED
+        )
 
         assert len(result.actions) == 1
         assert isinstance(result.actions[0], RemoveLabelAction)
@@ -2489,7 +2699,9 @@ class TestStatusSessionTypeMatrix:
         session = create_test_session(
             make_issue(), agent_config, tmp_worktree, terminal_id="review-1"
         )
-        result = make_handler(config).process_completion(session, SessionStatus.COMPLETED)
+        result = make_handler(config).process_completion(
+            session, SessionStatus.COMPLETED
+        )
 
         # Review sessions don't have in-progress to remove, but the action is still generated
         assert len(result.actions) == 1
@@ -2502,7 +2714,9 @@ class TestStatusSessionTypeMatrix:
         session = create_test_session(
             make_issue(), agent_config, tmp_worktree, terminal_id="rework-1"
         )
-        result = make_handler(config).process_completion(session, SessionStatus.COMPLETED)
+        result = make_handler(config).process_completion(
+            session, SessionStatus.COMPLETED
+        )
 
         assert len(result.actions) == 1
         assert isinstance(result.actions[0], RemoveLabelAction)
@@ -2562,7 +2776,9 @@ class TestStatusSessionTypeMatrix:
         session = create_test_session(
             make_issue(), agent_config, tmp_worktree, terminal_id="issue-1"
         )
-        result = make_handler(config).process_completion(session, SessionStatus.NEEDS_HUMAN)
+        result = make_handler(config).process_completion(
+            session, SessionStatus.NEEDS_HUMAN
+        )
 
         assert len(result.actions) == 0
 
@@ -2573,7 +2789,9 @@ class TestStatusSessionTypeMatrix:
         session = create_test_session(
             make_issue(), agent_config, tmp_worktree, terminal_id="review-1"
         )
-        result = make_handler(config).process_completion(session, SessionStatus.NEEDS_HUMAN)
+        result = make_handler(config).process_completion(
+            session, SessionStatus.NEEDS_HUMAN
+        )
 
         assert len(result.actions) == 0
 
@@ -2584,7 +2802,9 @@ class TestStatusSessionTypeMatrix:
         session = create_test_session(
             make_issue(), agent_config, tmp_worktree, terminal_id="rework-1"
         )
-        result = make_handler(config).process_completion(session, SessionStatus.NEEDS_HUMAN)
+        result = make_handler(config).process_completion(
+            session, SessionStatus.NEEDS_HUMAN
+        )
 
         assert len(result.actions) == 0
 
@@ -2607,7 +2827,9 @@ class TestStatusSessionTypeMatrix:
         comment = next(a for a in result.actions if isinstance(a, AddCommentAction))
         assert "Investigation" in comment.comment
 
-        remove_label = next(a for a in result.actions if isinstance(a, RemoveLabelAction))
+        remove_label = next(
+            a for a in result.actions if isinstance(a, RemoveLabelAction)
+        )
         assert remove_label.label == config.get_label_in_progress()
 
     def test_failed_review_session_adds_comment_only(
@@ -2649,7 +2871,9 @@ class TestStatusSessionTypeMatrix:
         session = create_test_session(
             make_issue(), agent_config, tmp_worktree, terminal_id="issue-1"
         )
-        result = make_handler(config).process_completion(session, SessionStatus.TIMED_OUT)
+        result = make_handler(config).process_completion(
+            session, SessionStatus.TIMED_OUT
+        )
 
         assert len(result.actions) == 3
         add_label = next(a for a in result.actions if isinstance(a, AddLabelAction))
@@ -2658,7 +2882,9 @@ class TestStatusSessionTypeMatrix:
         comment = next(a for a in result.actions if isinstance(a, AddCommentAction))
         assert "Timed Out" in comment.comment
 
-        remove_label = next(a for a in result.actions if isinstance(a, RemoveLabelAction))
+        remove_label = next(
+            a for a in result.actions if isinstance(a, RemoveLabelAction)
+        )
         assert remove_label.label == config.get_label_in_progress()
 
     def test_timed_out_review_session_adds_comment_only(
@@ -2668,7 +2894,9 @@ class TestStatusSessionTypeMatrix:
         session = create_test_session(
             make_issue(), agent_config, tmp_worktree, terminal_id="review-1"
         )
-        result = make_handler(config).process_completion(session, SessionStatus.TIMED_OUT)
+        result = make_handler(config).process_completion(
+            session, SessionStatus.TIMED_OUT
+        )
 
         assert len(result.actions) == 1
         assert isinstance(result.actions[0], AddCommentAction)
@@ -2682,7 +2910,9 @@ class TestStatusSessionTypeMatrix:
         session = create_test_session(
             make_issue(), agent_config, tmp_worktree, terminal_id="rework-1"
         )
-        result = make_handler(config).process_completion(session, SessionStatus.TIMED_OUT)
+        result = make_handler(config).process_completion(
+            session, SessionStatus.TIMED_OUT
+        )
 
         assert len(result.actions) == 1
         assert isinstance(result.actions[0], AddCommentAction)
@@ -2720,7 +2950,9 @@ class TestEdgeCases:
         config.code_reviewed_label = "code-reviewed"
         issue = make_issue()
         session = create_test_session(
-            issue, agent_config, tmp_worktree,
+            issue,
+            agent_config,
+            tmp_worktree,
             terminal_id="review-42",
             task_kind=TaskKind.REVIEW,
         )
@@ -2744,7 +2976,9 @@ class TestEdgeCases:
         """Terminal IDs that don't match review pattern are handled."""
         issue = make_issue()
         session = create_test_session(
-            issue, agent_config, tmp_worktree,
+            issue,
+            agent_config,
+            tmp_worktree,
             terminal_id="some-other-pattern",
         )
 
@@ -2797,7 +3031,9 @@ class TestIntegrationBehaviors:
         events = InMemoryEventSink()
         issue = make_issue()
         issue_machine = IssueStateMachine(issue, initial_state=IssueState.IN_PROGRESS)
-        session = create_test_session(issue, agent_config, tmp_worktree, terminal_id="issue-1")
+        session = create_test_session(
+            issue, agent_config, tmp_worktree, terminal_id="issue-1"
+        )
         session_machine = SessionStateMachine(
             session_id="issue-1",
             issue_number=issue.number,
@@ -2842,7 +3078,9 @@ class TestIntegrationBehaviors:
         events = InMemoryEventSink()
         issue = make_issue()
         issue_machine = IssueStateMachine(issue, initial_state=IssueState.IN_PROGRESS)
-        session = create_test_session(issue, agent_config, tmp_worktree, terminal_id="issue-1")
+        session = create_test_session(
+            issue, agent_config, tmp_worktree, terminal_id="issue-1"
+        )
         session_machine = SessionStateMachine(
             session_id="issue-1",
             issue_number=issue.number,
@@ -2865,7 +3103,9 @@ class TestIntegrationBehaviors:
         assert events.has_event(str(EventName.SESSION_FAILED))
 
         # Actions include needs-human label (for investigation) and comment
-        add_label = next((a for a in result.actions if isinstance(a, AddLabelAction)), None)
+        add_label = next(
+            (a for a in result.actions if isinstance(a, AddLabelAction)), None
+        )
         assert add_label is not None
         assert add_label.label == "needs-human"
 
@@ -2887,8 +3127,13 @@ class TestReworkCyclePropagation:
     ) -> None:
         """SESSION_COMPLETED event payload includes rework_cycle."""
         issue = make_issue()
-        session = create_test_session(issue, agent_config, tmp_worktree,
-                                      terminal_id="rework-1", task_kind=TaskKind.REWORK)
+        session = create_test_session(
+            issue,
+            agent_config,
+            tmp_worktree,
+            terminal_id="rework-1",
+            task_kind=TaskKind.REWORK,
+        )
         session.rework_cycle = 2
         session.agent_label = "agent:backend"
 
@@ -3020,8 +3265,13 @@ class TestReviewOutcomeEventEmission:
         """review.approved event emitted when reviewer approves."""
         config.code_reviewed_label = "code-reviewed"
         issue = make_issue()
-        session = create_test_session(issue, agent_config, tmp_worktree,
-                                      terminal_id="review-42", task_kind=TaskKind.REVIEW)
+        session = create_test_session(
+            issue,
+            agent_config,
+            tmp_worktree,
+            terminal_id="review-42",
+            task_kind=TaskKind.REVIEW,
+        )
         session.agent_label = "agent:reviewer"
         session.pr_number = 42
 
@@ -3035,12 +3285,14 @@ class TestReviewOutcomeEventEmission:
         repository_host = make_repository_host(pr_info=pr_info)
 
         # Set up review machine in IN_REVIEW state
-        review_machine = ReviewStateMachine(pr_number=42, issue_number=1,
-                                            initial_state=ReviewState.IN_REVIEW)
+        review_machine = ReviewStateMachine(
+            pr_number=42, issue_number=1, initial_state=ReviewState.IN_REVIEW
+        )
 
         events = InMemoryEventSink()
         handler = make_handler(
-            config, events=events,
+            config,
+            events=events,
             repository_host=repository_host,
             review_machine=review_machine,
         )
@@ -3060,8 +3312,13 @@ class TestReviewOutcomeEventEmission:
         """review.changes_requested event emitted when reviewer requests changes."""
         config.code_reviewed_label = "code-reviewed"
         issue = make_issue()
-        session = create_test_session(issue, agent_config, tmp_worktree,
-                                      terminal_id="review-42", task_kind=TaskKind.REVIEW)
+        session = create_test_session(
+            issue,
+            agent_config,
+            tmp_worktree,
+            terminal_id="review-42",
+            task_kind=TaskKind.REVIEW,
+        )
         session.agent_label = "agent:reviewer"
         session.pr_number = 42
         session.rework_cycle = 1
@@ -3076,13 +3333,17 @@ class TestReviewOutcomeEventEmission:
         repository_host = make_repository_host(pr_info=pr_info)
 
         # Set up review machine in IN_REVIEW state
-        review_machine = ReviewStateMachine(pr_number=42, issue_number=1,
-                                            initial_state=ReviewState.IN_REVIEW,
-                                            max_rework_cycles=5)
+        review_machine = ReviewStateMachine(
+            pr_number=42,
+            issue_number=1,
+            initial_state=ReviewState.IN_REVIEW,
+            max_rework_cycles=5,
+        )
 
         events = InMemoryEventSink()
         handler = make_handler(
-            config, events=events,
+            config,
+            events=events,
             repository_host=repository_host,
             review_machine=review_machine,
         )
@@ -3292,10 +3553,10 @@ class TestTechLeadAuthorityRetention:
     # Reuse the arm/plant helpers without inheriting (and re-collecting)
     # the transition tests themselves.
     _helpers = TestTechLeadDecisionFailureTransition()
-    _make_tech_lead_session = _helpers._make_tech_lead_session
-    _plant_assignment = _helpers._plant_assignment
+    _make_tech_lead_session = _helpers._make_tech_lead_session  # noqa: SLF001
+    _plant_assignment = _helpers._plant_assignment  # noqa: SLF001
     _record_authority = staticmethod(
-        TestTechLeadDecisionFailureTransition._record_authority
+        TestTechLeadDecisionFailureTransition._record_authority  # noqa: SLF001
     )
     TECH_LEAD_ERROR = TestTechLeadDecisionFailureTransition.TECH_LEAD_ERROR
 

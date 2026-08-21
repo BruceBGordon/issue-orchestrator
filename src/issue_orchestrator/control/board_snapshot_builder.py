@@ -47,7 +47,10 @@ from ..domain.models import (
     PendingRework,
     Session,
 )
-from ..domain.tech_lead_session import TechLeadCaseFileSummary, TechLeadShippedFixSummary
+from ..domain.tech_lead_session import (
+    TechLeadCaseFileSummary,
+    TechLeadShippedFixSummary,
+)
 from ..ports.timeline_store import TimelineRecord
 
 logger = logging.getLogger(__name__)
@@ -151,9 +154,9 @@ class BoardSnapshotBuilder:
         """
         now = self._clock()
         case_files = tuple(self._case_file_reader())[:MAX_LIST_ENTRIES]
-        shipped_fixes = tuple(
-            self._shipped_fix_reader(MAX_LIST_ENTRIES)
-        )[:MAX_LIST_ENTRIES]
+        shipped_fixes = tuple(self._shipped_fix_reader(MAX_LIST_ENTRIES))[
+            :MAX_LIST_ENTRIES
+        ]
         return BoardSnapshot(
             generated_at=now.isoformat(),
             orchestrator_paused=state.paused,
@@ -169,7 +172,9 @@ class BoardSnapshotBuilder:
                     summary=problem.summary,
                     blocked_by=list(problem.blocked_by),
                 )
-                for problem in list(state.dependency_problems.values())[:MAX_LIST_ENTRIES]
+                for problem in list(state.dependency_problems.values())[
+                    :MAX_LIST_ENTRIES
+                ]
             ],
             recent_failures=[
                 BoardFailure(
@@ -210,7 +215,9 @@ class BoardSnapshotBuilder:
             ),
             log_tail=[
                 line[:MAX_LINE_CHARS]
-                for line in list(self._log_tail_provider(log_tail_lines))[:log_tail_lines]
+                for line in list(self._log_tail_provider(log_tail_lines))[
+                    :log_tail_lines
+                ]
             ],
             e2e_health=self._read_e2e_health(now),
         )
@@ -255,6 +262,7 @@ class BoardSnapshotBuilder:
             started_at=session.started_at.isoformat(),
             age_minutes=age_minutes,
             terminal_id=session.terminal_id,
+            run_id=session.run_assets.run_id,
             idle_minutes=project_idle_minutes(last_activity_at, now),
             commits_ahead=activity.commits_ahead if activity else COMMITS_AHEAD_UNKNOWN,
             last_activity_at=last_activity_at,
@@ -290,7 +298,9 @@ class BoardSnapshotBuilder:
                 BoardQueueEntry(
                     queue="pending_reviews",
                     issue_number=review.issue_number,
-                    detail=_clip(f"PR #{review.pr_number} awaiting review ({review.pr_url})"),
+                    detail=_clip(
+                        f"PR #{review.pr_number} awaiting review ({review.pr_url})"
+                    ),
                 )
             )
         for retro in state.pending_retrospective_reviews:
@@ -368,7 +378,9 @@ class BoardSnapshotBuilder:
                         "event": record.event,
                         "data": record.data,
                     }
-                    for record in list(self._timeline_reader(issue_number, limit))[:limit]
+                    for record in list(self._timeline_reader(issue_number, limit))[
+                        :limit
+                    ]
                 ],
             )
             for issue_number in selected
@@ -438,7 +450,9 @@ def _merge_failure_sources(state: OrchestratorState) -> tuple[DiscoveredFailure,
     queued: list[DiscoveredFailure] = []
     for tech_lead in state.pending_tech_lead_reviews:
         candidates = (
-            (tech_lead.failure,) if tech_lead.failure is not None else tech_lead.problem_cohort
+            (tech_lead.failure,)
+            if tech_lead.failure is not None
+            else tech_lead.problem_cohort
         )
         for failure in candidates:
             if failure.issue_number in seen:

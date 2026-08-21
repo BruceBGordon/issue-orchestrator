@@ -7,8 +7,10 @@ import pytest
 
 from issue_orchestrator.control.action_applier import ActionApplier
 from issue_orchestrator.control.actions import (
+    Action,
     ActionResultType,
     AddLabelAction,
+    KillHungSessionAction,
     ResetRetryIssueAction,
 )
 from issue_orchestrator.control.claim_gate import ClaimLostError
@@ -31,6 +33,10 @@ from issue_orchestrator.control.tech_lead_reset_retry import (
     TechLeadResetRetryExecutor,
     preserve_reset_retry_eligibility,
     reset_retry_stale_reason,
+)
+from issue_orchestrator.control.tech_lead_kill_session import (
+    KillSessionRunOutcome,
+    TechLeadKillSessionExecutor,
 )
 from issue_orchestrator.domain.issue_key import FakeIssueKey
 from issue_orchestrator.domain.models import (
@@ -198,7 +204,15 @@ class TestExecutorApply:
         [
             {"active_session": True},
             {"issue": None},
-            {"issue": Issue(number=17, title="t", labels=["agent:test"], state="closed", repo="o/r")},
+            {
+                "issue": Issue(
+                    number=17,
+                    title="t",
+                    labels=["agent:test"],
+                    state="closed",
+                    repo="o/r",
+                )
+            },
             {"issue": Issue(number=17, title="t", labels=["agent:test"], repo="o/r")},
         ],
         ids=["active-session", "unreadable", "closed", "no-blocking-label"],
@@ -278,9 +292,7 @@ class TestPreserveEligibility:
         ok = executor.apply(make_action(issue_number=17))
         make_retryable = MagicMock()
 
-        cleared = preserve_reset_retry_eligibility(
-            [ok], make_retryable=make_retryable
-        )
+        cleared = preserve_reset_retry_eligibility([ok], make_retryable=make_retryable)
 
         assert cleared == [17]
         make_retryable.assert_called_once_with(17)
@@ -439,9 +451,7 @@ class TestCompletionPipelineEligibility:
         ``failed_this_cycle`` and so passed even though the failed-reset path
         never routed anything."""
         executor, _events, run_reset = make_executor(
-            outcome=ResetRetryRunOutcome(
-                success=False, error="branch delete exploded"
-            )
+            outcome=ResetRetryRunOutcome(success=False, error="branch delete exploded")
         )
         observer = MagicMock()
         repository_host = MagicMock()
@@ -493,7 +503,8 @@ class TestCompletionPipelineEligibility:
         assert repository_host.add_comment.call_count == 1
         comment_number, comment_body = repository_host.add_comment.call_args.args
         assert comment_number == 17
-        assert "Reset & Retry Did Not Complete" in comment_body
+        assert "Required Tech Lead Action Did Not Complete" in comment_body
+        assert "`reset_retry`" in comment_body
         assert "branch delete exploded" in comment_body
 
         # No success effect survived: the reset-success side effect (making the
@@ -517,7 +528,9 @@ class TestCompletionPipelineEligibility:
         labels = MagicMock()
         labels.has_label.return_value = False  # would let any add proceed
         success_effect = AddLabelAction(
-            issue_number=17, label="tech-lead-done", reason="success-only completion label"
+            issue_number=17,
+            label="tech-lead-done",
+            reason="success-only completion label",
         )
 
         state, run = self._arrange(
@@ -574,7 +587,7 @@ def _terminal_outcome_session(tmp_path, *, tech_lead_scope=None) -> Session:
 def _terminal_outcome_handler(
     events: InMemoryEventSink,
     *,
-    mandated_action: ResetRetryIssueAction | None,
+    mandated_action: Action | None,
     session_machine: SessionStateMachine | None = None,
     run_activity=None,
 ) -> CompletionHandler:
@@ -602,11 +615,10 @@ def _terminal_outcome_handler(
             InMemoryOpenIssueCorpusStore(),
             is_enabled=lambda: config.tech_lead.dedup.enabled,
         ),
-        active_session_run_id=lambda _issue_number: None,
         provider_availability=make_provider_availability(config),
         tech_lead_run_activity=(
-        run_activity if run_activity is not None else in_memory_run_activity()
-    ),
+            run_activity if run_activity is not None else in_memory_run_activity()
+        ),
         mandated_action=mandated_action,
     )
 
@@ -618,9 +630,7 @@ class _HandlerWithMandatedReset(CompletionHandler):
     decides whether the reset commits (#6764 re-review F3). With no mandated
     action it is a plain completion."""
 
-    def __init__(
-        self, *args, mandated_action: ResetRetryIssueAction | None = None, **kwargs
-    ) -> None:
+    def __init__(self, *args, mandated_action: Action | None = None, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._mandated_action = mandated_action
 
@@ -648,7 +658,7 @@ class TestEffectiveTerminalOutcomeEvents:
         self,
         events: InMemoryEventSink,
         *,
-        mandated_action: ResetRetryIssueAction | None,
+        mandated_action: Action | None,
         session_machine: SessionStateMachine | None = None,
     ) -> CompletionHandler:
         return _terminal_outcome_handler(
@@ -663,7 +673,7 @@ class TestEffectiveTerminalOutcomeEvents:
         *,
         events: InMemoryEventSink,
         executor=None,
-        mandated_action: ResetRetryIssueAction | None,
+        mandated_action: Action | None,
         session_machine: SessionStateMachine | None = None,
         action_applier=None,
         state: OrchestratorState | None = None,
@@ -729,6 +739,63 @@ class TestEffectiveTerminalOutcomeEvents:
         # The CLAIM_RELEASED machine payload reports the effective failure:
         [claim] = events.get_events(EventName.CLAIM_RELEASED.value)
         assert claim.data["status"] == "failed"
+
+    def test_failed_mandated_kill_publishes_only_session_failed(self, tmp_path):
+        """A direct kill is the same completion gate as reset_retry.
+
+        The termination owner failure must withhold ordinary completion effects
+        and terminalize FAILED; it may never emit a false successful history.
+        """
+        events = InMemoryEventSink()
+        run_kill = MagicMock(
+            return_value=KillSessionRunOutcome(
+                success=False, error="terminal adapter refused the stop"
+            )
+        )
+        labels = MagicMock()
+        labels.has_label.return_value = False
+        repository_host = MagicMock()
+        action_applier = ActionApplier(
+            labels=labels,
+            sessions=MagicMock(),
+            events=MagicMock(),
+            repository_host=repository_host,
+        )
+        action_applier.tech_lead_kill_session = TechLeadKillSessionExecutor(
+            events=MagicMock(), run_kill=run_kill
+        )
+        mandated_kill = KillHungSessionAction(
+            issue_number=23,
+            rationale="Corroborated hang",
+            proposal_id="A3",
+            anchor_issue_number=17,
+            target_session_id="RUN-23",
+            target_terminal_id="issue-23",
+            target_session_type="code",
+        )
+
+        state = self._run(
+            tmp_path,
+            events=events,
+            mandated_action=mandated_kill,
+            action_applier=action_applier,
+        )
+
+        run_kill.assert_called_once()
+        assert events.get_events(EventName.SESSION_COMPLETED.value) == []
+        assert len(events.get_events(EventName.SESSION_FAILED.value)) == 1
+        assert 17 not in state.completed_today
+        [entry] = state.session_history
+        assert entry.status == "failed"
+        labels.add_label.assert_any_call(23, "needs-human")
+        repository_host.add_comment.assert_called_once()
+        comment_number, comment_body = repository_host.add_comment.call_args.args
+        assert comment_number == 23
+        assert "Required Tech Lead Action Did Not Complete" in comment_body
+        assert "`kill_hung_session`" in comment_body
+        assert "issue #23, code terminal `issue-23`, run `RUN-23`" in comment_body
+        assert "terminal adapter refused the stop" in comment_body
+        assert "reset" not in comment_body.lower()
 
     def test_committed_reset_publishes_only_session_completed(self, tmp_path):
         events = InMemoryEventSink()

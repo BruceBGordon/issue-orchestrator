@@ -19,21 +19,19 @@ emits the orchestrator's action vocabulary:
   the signature -> issue row create-once); a known signature plans an
   evidence ``AddCommentAction`` on the existing case file. Under
   ``propose`` authority it stays a shadow record like any other proposal.
-- ``reset_retry`` with ``execute`` authority -> a typed
-  :class:`ResetRetryIssueAction`; the applier's owner re-validates the
-  proposal's preconditions at execution time and downgrades stale proposals
-  to a surfaced record (#6764, ADR-0031 §2).
-- Act-level proposals otherwise (``reset_retry`` under ``propose``;
-  ``kill_hung_session`` always, until its direct execute tier ships) ->
+- Act-level proposals with ``execute`` authority -> typed
+  :class:`ResetRetryIssueAction` / :class:`KillHungSessionAction` commands;
+  each applier owner re-validates the proposal's preconditions at execution
+  time and downgrades stale proposals to a surfaced record (#6764, ADR-0031
+  §2).
+- Act-level proposals under ``propose`` ->
   GATED PROPOSAL ISSUES (#6778): a
   :class:`~.actions.CreateTechLeadProposalIssueAction` whose applier creates
   the issue AND records the executable :class:`StoredTechLeadOp` create-once.
   Removing the gate label is per-instance approval; the fact gatherer's
   label scan then triggers execution of the STORED op. Dedup is
   ledger-based: one open proposal per (op, target) — a re-proposal plans an
-  ``AddCommentAction`` on the existing proposal issue instead. Never trust
-  config for ``kill_hung_session``: startup rejects ``execute`` for it, and
-  this planner treats ANY mode as propose.
+  ``AddCommentAction`` on the existing proposal issue instead.
 
 Shadow proposals additionally plan ONE durable would-have-done digest
 comment on the tech_lead session's anchor issue. The trace event alone is not
@@ -54,9 +52,9 @@ Escalation note: tech_lead escalation deliberately does NOT reuse
 ``EscalateToHumanAction``. That action's applier terminates the target
 issue's runtime ("escalation kills issue automation, full stop"), which
 would let the always-execute ``escalate_to_human`` floor reach the same
-effect as ``kill_hung_session`` — an act-level intent whose direct
-``execute`` is unwired (#6764), so it runs only via gated per-instance
-approval (#6778). Tech Lead escalation is strictly a routing
+effect as ``kill_hung_session`` while bypassing that action's explicit
+authority dial and exact-session-generation revalidation. Tech Lead escalation
+is strictly a routing
 surface: needs-human label + explanatory comment on the target; nothing
 is stopped and no other labels are touched.
 """
@@ -71,13 +69,17 @@ from ..domain.tech_lead_artifacts import (
     TechLeadDecision,
 )
 from ..domain.tech_lead_findings import PatternClassificationConflictError
-from ..domain.tech_lead_session import TechLeadCreationOrigin
+from ..domain.tech_lead_session import (
+    TechLeadCreationOrigin,
+    TechLeadSessionGeneration,
+)
 from ..ports.issue import Issue
 from .actions import (
     Action,
     AddCommentAction,
     AddLabelAction,
     CreateTechLeadIssueAction,
+    KillHungSessionAction,
     ResetRetryIssueAction,
     SurfaceTechLeadProposalAction,
 )
@@ -272,7 +274,7 @@ def plan_tech_lead_decision_actions(
     source_run_id: str,
     source_session_name: str,
     observed_at: str,
-    active_session_run_id: Callable[[int], str | None],
+    observed_session_generation: Callable[[int], TechLeadSessionGeneration | None],
     dedup_corpus: OpenIssueCorpus,
     dedup_grant: DuplicateTargetGrant,
 ) -> list[Action]:
@@ -288,9 +290,9 @@ def plan_tech_lead_decision_actions(
     evidence onto the existing issue. ``source_run_id``/
     ``source_session_name`` are the proposing session's identity, recorded
     on each :class:`StoredTechLeadOp` and in each case-file observation.
-    ``active_session_run_id`` resolves the target issue's live session run id
-    so a ``kill_hung_session`` proposal binds approval to that exact
-    generation (#6779 R1).
+    ``observed_session_generation`` resolves only the trusted worker generation
+    retained in launch authority from the immutable board input. It never reads
+    live state at completion, so a replacement cannot be rebound silently.
     """
     planner = _DecisionActionPlanner(
         config=config,
@@ -303,7 +305,7 @@ def plan_tech_lead_decision_actions(
         source_run_id=source_run_id,
         source_session_name=source_session_name,
         observed_at=observed_at,
-        active_session_run_id=active_session_run_id,
+        observed_session_generation=observed_session_generation,
         dedup_corpus=dedup_corpus,
         dedup_grant=dedup_grant,
     )
@@ -351,7 +353,7 @@ class _DecisionActionPlanner:
     source_run_id: str
     source_session_name: str
     observed_at: str
-    active_session_run_id: Callable[[int], str | None]
+    observed_session_generation: Callable[[int], TechLeadSessionGeneration | None]
     # Trusted dedup facts (#6878), REQUIRED — never a silent empty default, which
     # would disable the safety mechanism invisibly. The corpus carries an explicit
     # Ready/Unavailable state; the grant is the launch-authority-derived set a
@@ -452,10 +454,10 @@ class _DecisionActionPlanner:
         self._planned_ops.add(key)
         # kill_hung_session binds approval to the target's live session
         # generation (#6779 R1); reset_retry carries no generation binding.
-        target_session_id = (
-            self.active_session_run_id(proposed.target_number) or ""
+        target_session = (
+            self.observed_session_generation(proposed.target_number)
             if proposed.action_type == "kill_hung_session"
-            else ""
+            else None
         )
         self.actions.append(
             build_tech_lead_proposal_issue_action(
@@ -465,22 +467,20 @@ class _DecisionActionPlanner:
                 source_run_id=self.source_run_id,
                 source_session_name=self.source_session_name,
                 expected=self.expected,
-                target_session_id=target_session_id,
+                target_session=target_session,
             )
         )
 
     def _plan_act_level(self, proposed: ProposedTechLeadAction) -> None:
-        # reset_retry is wired (#6764, first slice): execute authority plans
-        # the typed action whose applier re-validates the preconditions at
-        # execution time. Everything else act-level becomes a GATED PROPOSAL
-        # ISSUE (#6778) — including kill_hung_session under any configured
-        # mode: startup rejects "execute" for it until its direct tier
-        # ships, but never trust config.
-        if (
-            proposed.action_type == "reset_retry"
-            and self.config.tech_lead.authority.mode_for("reset_retry") == "execute"
-        ):
-            assert proposed.target_number is not None  # enforced by validate()
+        # Execute authority plans typed commands whose owners revalidate their
+        # operation-specific preconditions at apply time. Propose authority
+        # remains the per-instance gated issue path (#6778).
+        if self.config.tech_lead.authority.mode_for(proposed.action_type) != "execute":
+            self._plan_gated_op(proposed)
+            return
+
+        assert proposed.target_number is not None  # enforced by validate()
+        if proposed.action_type == "reset_retry":
             self.actions.append(
                 ResetRetryIssueAction(
                     issue_number=proposed.target_number,
@@ -496,7 +496,28 @@ class _DecisionActionPlanner:
                 )
             )
             return
-        self._plan_gated_op(proposed)
+        assert proposed.action_type == "kill_hung_session"
+        target_session = self.observed_session_generation(proposed.target_number)
+        self.actions.append(
+            KillHungSessionAction(
+                issue_number=proposed.target_number,
+                rationale=proposed.body or "",
+                proposal_id=proposed.id,
+                finding_ids=proposed.finding_ids,
+                anchor_issue_number=self._anchor_number,
+                target_session_id=target_session.run_id if target_session else "",
+                target_terminal_id=(
+                    target_session.terminal_id if target_session else ""
+                ),
+                target_session_type=(
+                    target_session.task_kind.value if target_session else ""
+                ),
+                reason=(
+                    f"tech_lead decision action {proposed.id}: terminate hung session"
+                ),
+                expected=self.expected,
+            )
+        )
 
     def _dedup_authority(self) -> DedupAuthority:
         authority = self.config.tech_lead.authority
@@ -521,9 +542,7 @@ class _DecisionActionPlanner:
                 f" duplicate.\n\n{note}"
             ),
             is_pr=False,
-            reason=(
-                f"tech_lead decision action {proposed.id}: dedup onto #{existing}"
-            ),
+            reason=(f"tech_lead decision action {proposed.id}: dedup onto #{existing}"),
             expected=self.expected,
         )
 
@@ -617,8 +636,7 @@ class _DecisionActionPlanner:
         # issue flows into normal scheduling. Everything else propose -> shadow
         # record. create_issue additionally routes through the dedup gate.
         execute = (
-            self.config.tech_lead.authority.mode_for(proposed.action_type)
-            == "execute"
+            self.config.tech_lead.authority.mode_for(proposed.action_type) == "execute"
         )
         if not execute and proposed.action_type != "create_issue":
             self._surface_shadow(proposed)
@@ -653,7 +671,9 @@ def _shadow_digest_comment(
     for item in shadow:
         target = f"#{item.target_number}" if item.target_number else "n/a"
         title = f" — {item.title}" if item.title else ""
-        lines.append(f"- **{item.action_id}** `{item.proposal_type}` (target: {target}){title}")
+        lines.append(
+            f"- **{item.action_id}** `{item.proposal_type}` (target: {target}){title}"
+        )
         if item.body_preview:
             lines.append(f"  > {item.body_preview}")
         if item.finding_ids:
@@ -667,8 +687,7 @@ def _shadow_digest_comment(
     lines.append("")
     knobs = ", ".join(f"`tech_lead.authority.{name}`" for name in knob_types)
     lines.append(
-        f"*Flip {knobs} to `execute` to let the orchestrator perform"
-        " these next time.*"
+        f"*Flip {knobs} to `execute` to let the orchestrator perform these next time.*"
     )
     return AddCommentAction(
         number=anchor_issue_number,

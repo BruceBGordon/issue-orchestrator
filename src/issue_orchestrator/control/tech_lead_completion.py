@@ -59,7 +59,7 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING
 
 from ..domain.models import Session
 from ..domain.board_snapshot import BOARD_SNAPSHOT_FILENAME, BoardSnapshot
@@ -154,9 +154,7 @@ def read_tech_lead_manifest(run_dir: Path) -> TechLeadManifest | None:
         return None
 
 
-def _health_snapshot_scope_error(
-    run_dir: Path, authority: TechLeadLaunchAuthority
-) -> str | None:
+def _health_snapshot_scope_error(run_dir: Path, authority: TechLeadLaunchAuthority) -> str | None:
     """Return snapshot/cohort tamper detail for a health-review authority."""
     snapshot_path = run_dir / "tech-lead-data" / BOARD_SNAPSHOT_FILENAME
     if not snapshot_path.exists():
@@ -168,11 +166,7 @@ def _health_snapshot_scope_error(
     worktree_problems = worktree_snapshot.problem_issue_numbers()
     authority_problems = frozenset(authority.problem_issue_numbers)
     if worktree_problems != authority_problems:
-        return (
-            f"worktree board-snapshot problem set {sorted(worktree_problems)}"
-            " does not match the launch authority cohort "
-            f"{sorted(authority_problems)}"
-        )
+        return f"worktree board-snapshot problem set {sorted(worktree_problems)} does not match the launch authority cohort {sorted(authority_problems)}"
     return None
 
 
@@ -193,59 +187,33 @@ def resolve_tech_lead_launch_authority(
     """
     authority = tech_lead_authority.load(run_id=run_id, session_name=session_name)
     if authority is None:
-        return None, (
-            "no orchestrator launch-authority record for run"
-            f" {run_id}/{session_name}; the worktree tech_lead inputs cannot"
-            " be trusted"
-        )
+        return None, (f"no orchestrator launch-authority record for run {run_id}/{session_name}; the worktree tech_lead inputs cannot be trusted")
     try:
         assignment = read_tech_lead_assignment(run_dir)
     except ValueError as exc:
         return authority, f"worktree tech-lead-assignment.json is malformed: {exc}"
     if assignment is None:
-        return authority, (
-            "worktree tech-lead-assignment.json is missing (deleted after launch)"
-        )
+        return authority, ("worktree tech-lead-assignment.json is missing (deleted after launch)")
     if not authority.matches_assignment(assignment):
-        return authority, (
-            "worktree tech-lead-assignment.json"
-            f" (flavor={assignment.flavor.value},"
-            f" focus={assignment.focus_issue_number}) does not match the"
-            f" launch authority (flavor={authority.flavor.value},"
-            f" focus={authority.focus_issue_number})"
-        )
+        return authority, (f"worktree tech-lead-assignment.json (flavor={assignment.flavor.value}, focus={assignment.focus_issue_number}) does not match the launch authority (flavor={authority.flavor.value}, focus={authority.focus_issue_number})")
     if authority.flavor is TechLeadSessionFlavor.BATCH_REVIEW:
         manifest = read_tech_lead_manifest(run_dir)
         worktree_prs = frozenset(pr.number for pr in manifest.prs) if manifest else frozenset()
         if worktree_prs != frozenset(authority.manifest_pr_numbers):
-            return authority, (
-                f"worktree manifest PR set {sorted(worktree_prs)} does not"
-                " match the launch authority set"
-                f" {sorted(authority.manifest_pr_numbers)}"
-            )
+            return authority, (f"worktree manifest PR set {sorted(worktree_prs)} does not match the launch authority set {sorted(authority.manifest_pr_numbers)}")
     if authority.flavor is TechLeadSessionFlavor.HEALTH_REVIEW:
         if error := _health_snapshot_scope_error(run_dir, authority):
             return authority, error
     return authority, None
 
 
-def _launch_scope_description(
-    authority: TechLeadLaunchAuthority, allowed: frozenset[int]
-) -> str:
+def _launch_scope_description(authority: TechLeadLaunchAuthority, allowed: frozenset[int]) -> str:
     """Human-readable launch scope for out-of-scope violation messages."""
     if authority.flavor is TechLeadSessionFlavor.FAILURE_INVESTIGATION:
         return f"the originating issue #{authority.focus_issue_number}"
     if authority.flavor is TechLeadSessionFlavor.HEALTH_REVIEW:
-        return (
-            f"the health-review anchor issue #{authority.anchor_issue_number}"
-            " (board-wide comments/escalations belong on the anchor; act-level"
-            " proposals instead use the cohort this review owns, published as"
-            " problem_cohort in board-snapshot.json)"
-        )
-    return (
-        "the audited manifest PRs and the tracking issue"
-        f" ({', '.join(f'#{n}' for n in sorted(allowed))})"
-    )
+        return f"the health-review anchor issue #{authority.anchor_issue_number} (board-wide comments/escalations belong on the anchor; act-level proposals instead use the cohort this review owns, published as problem_cohort in board-snapshot.json)"
+    return f"the audited manifest PRs and the tracking issue ({', '.join(f'#{n}' for n in sorted(allowed))})"
 
 
 def _act_level_scope_description(authority: TechLeadLaunchAuthority) -> str:
@@ -254,23 +222,11 @@ def _act_level_scope_description(authority: TechLeadLaunchAuthority) -> str:
         return f"the originating work issue #{authority.focus_issue_number}"
     if authority.flavor is TechLeadSessionFlavor.HEALTH_REVIEW:
         cohort = ", ".join(f"#{n}" for n in authority.problem_issue_numbers)
-        return (
-            "the health review's immutable problem cohort, published as"
-            " problem_cohort in board-snapshot.json"
-            f" ({cohort or 'empty — a periodic review owns no act-level target'})"
-        )
-    return (
-        "no work issue is in scope for an act-level reset/kill from this"
-        " session — that intent applies only to a failure investigation's"
-        " focus issue; batch manifest entries are PRs and tech_lead anchors are"
-        " bookkeeping issues, so route board findings through the scope-free"
-        " create_issue/flag_pattern proposals instead"
-    )
+        return f"the health review's immutable problem cohort, published as problem_cohort in board-snapshot.json ({cohort or 'empty — a periodic review owns no act-level target'})"
+    return "no work issue is in scope for an act-level reset/kill from this session — that intent applies only to a failure investigation's focus issue; batch manifest entries are PRs and tech_lead anchors are bookkeeping issues, so route board findings through the scope-free create_issue/flag_pattern proposals instead"
 
 
-def _target_scope_violation(
-    decision: "TechLeadDecision", authority: TechLeadLaunchAuthority
-) -> str | None:
+def _target_scope_violation(decision: "TechLeadDecision", authority: TechLeadLaunchAuthority) -> str | None:
     """Out-of-scope target detail for any targeted proposal, or None.
 
     Two scopes (#6764 re-review F1): comment/routing proposals may target the
@@ -283,21 +239,12 @@ def _target_scope_violation(
     for action in decision.proposed_actions:
         if action.action_type in ACT_LEVEL_TECH_LEAD_ACTIONS:
             if action.target_number not in act_allowed:
-                return (
-                    f"proposed action {action.id} ({action.action_type}) targets"
-                    f" #{action.target_number}, outside this session's launch"
-                    f" scope for an act-level reset/kill:"
-                    f" {_act_level_scope_description(authority)}"
-                )
+                return f"proposed action {action.id} ({action.action_type}) targets #{action.target_number}, outside this session's launch scope for an act-level reset/kill: {_act_level_scope_description(authority)}"
             continue
         if action.action_type not in _TARGET_SCOPED_ACTION_TYPES:
             continue
         if action.target_number not in allowed:
-            return (
-                f"proposed action {action.id} ({action.action_type}) targets"
-                f" #{action.target_number}, outside this session's launch"
-                f" scope: {_launch_scope_description(authority, allowed)}"
-            )
+            return f"proposed action {action.id} ({action.action_type}) targets #{action.target_number}, outside this session's launch scope: {_launch_scope_description(authority, allowed)}"
     return None
 
 
@@ -334,28 +281,15 @@ def validate_decision_for_authority(
         return target_violation
     if authority.flavor is TechLeadSessionFlavor.FAILURE_INVESTIGATION:
         focus = authority.focus_issue_number
-        has_focus_comment = any(
-            action.action_type == "post_comment" and action.target_number == focus
-            for action in decision.proposed_actions
-        )
+        has_focus_comment = any(action.action_type == "post_comment" and action.target_number == focus for action in decision.proposed_actions)
         if not has_focus_comment:
-            return (
-                "failure investigation decision must propose at least one"
-                f" post_comment targeting the originating issue #{focus}"
-                " (the diagnosis has no channel otherwise)"
-            )
+            return f"failure investigation decision must propose at least one post_comment targeting the originating issue #{focus} (the diagnosis has no channel otherwise)"
     for action in decision.proposed_actions:
         if action.action_type != "create_issue":
             continue
-        violations = protected_tech_lead_label_violations(
-            action.labels, config=config, labels=labels
-        )
+        violations = protected_tech_lead_label_violations(action.labels, config=config, labels=labels)
         if violations:
-            return (
-                f"proposed action {action.id} (create_issue) carries protected"
-                f" workflow labels: {', '.join(violations)}; agent-proposed"
-                " labels may not touch orchestrator label truth"
-            )
+            return f"proposed action {action.id} (create_issue) carries protected workflow labels: {', '.join(violations)}; agent-proposed labels may not touch orchestrator label truth"
     return None
 
 
@@ -374,9 +308,7 @@ def load_validated_tech_lead_pair(
     result = load_tech_lead_artifact_pair_for_run(run_dir)
     if not result.ok or result.decision is None:
         return result
-    detail = validate_decision_for_authority(
-        result.decision, authority, config=config, labels=labels
-    )
+    detail = validate_decision_for_authority(result.decision, authority, config=config, labels=labels)
     if detail is not None:
         logger.error("Tech Lead decision contract violation in %s: %s", run_dir, detail)
         return TechLeadArtifactLoadResult(
@@ -405,31 +337,27 @@ def tech_lead_decision_processing_error(
     classifies the error critical so history records FAILED and the failure
     labeling path fires.
     """
-    authority, tamper = resolve_tech_lead_launch_authority(
-        tech_lead_authority, run_dir=run_dir, run_id=run_id, session_name=session_name
-    )
+    authority, tamper = resolve_tech_lead_launch_authority(tech_lead_authority, run_dir=run_dir, run_id=run_id, session_name=session_name)
     if authority is None:
         return f"{ERROR_PREFIX_TECH_LEAD_AUTHORITY}: missing_authority: {tamper}"
     if tamper is not None:
         return f"{ERROR_PREFIX_TECH_LEAD_AUTHORITY}: scope_tampered: {tamper}"
-    result = load_validated_tech_lead_pair(
-        run_dir, authority, config=config, labels=LabelManager(config)
-    )
+    result = load_validated_tech_lead_pair(run_dir, authority, config=config, labels=LabelManager(config))
     if result.ok:
         return None
     failure = result.failure.value if result.failure else "unknown"
     return f"{ERROR_PREFIX_TECH_LEAD_DECISION}: {failure}: {result.detail}"
 
 
-_TECH_LEAD_ERROR_PREFIXES = (ERROR_PREFIX_TECH_LEAD_DECISION, ERROR_PREFIX_TECH_LEAD_AUTHORITY)
+_TECH_LEAD_ERROR_PREFIXES = (
+    ERROR_PREFIX_TECH_LEAD_DECISION,
+    ERROR_PREFIX_TECH_LEAD_AUTHORITY,
+)
 
 
 def has_tech_lead_decision_errors(processing_errors: list[str] | None) -> bool:
     """True when processing errors include a rejected pair or tampered scope."""
-    return any(
-        error.startswith(_TECH_LEAD_ERROR_PREFIXES)
-        for error in processing_errors or ()
-    )
+    return any(error.startswith(_TECH_LEAD_ERROR_PREFIXES) for error in processing_errors or ())
 
 
 def _split_tech_lead_decision_error(processing_errors: list[str]) -> tuple[str, str]:
@@ -438,15 +366,13 @@ def _split_tech_lead_decision_error(processing_errors: list[str]) -> tuple[str, 
         for prefix in _TECH_LEAD_ERROR_PREFIXES:
             if not error.startswith(prefix):
                 continue
-            remainder = error[len(prefix):].lstrip(": ")
+            remainder = error[len(prefix) :].lstrip(": ")
             failure, sep, detail = remainder.partition(": ")
             return (failure or "unknown", detail if sep else "")
     return ("unknown", "")
 
 
-def _resolve_launch_authority_for_session(
-    tech_lead_authority: "TechLeadAuthorityStore", session: Session
-) -> tuple[TechLeadLaunchAuthority | None, str | None]:
+def _resolve_launch_authority_for_session(tech_lead_authority: "TechLeadAuthorityStore", session: Session) -> tuple[TechLeadLaunchAuthority | None, str | None]:
     return resolve_tech_lead_launch_authority(
         tech_lead_authority,
         run_dir=session.run_dir,
@@ -541,7 +467,6 @@ def generate_tech_lead_completion_actions(
     labels: LabelManager,
     tech_lead_authority: "TechLeadAuthorityStore",
     open_issue_corpus: "OpenIssueCorpusManager",
-    active_session_run_id: "Callable[[int], str | None]",
 ) -> list[Action]:
     """Plan all completion effects for a tech_lead session (see module docstring).
 
@@ -555,9 +480,7 @@ def generate_tech_lead_completion_actions(
     if not is_tech_lead_session(config.tech_lead_review_agent, session.issue.agent_type):
         return actions
 
-    authority, tamper = _resolve_launch_authority_for_session(
-        tech_lead_authority, session
-    )
+    authority, tamper = _resolve_launch_authority_for_session(tech_lead_authority, session)
     if authority is None or tamper is not None:
         # Belt-and-braces: the processing path classifies this critical
         # BEFORE status recording, so completions normally take the failure
@@ -579,19 +502,11 @@ def generate_tech_lead_completion_actions(
         )
         return actions
 
-    load_result = (
-        load_validated_tech_lead_pair(
-            session.run_dir, authority, config=config, labels=labels
-        )
-        if completed_ok
-        else None
-    )
+    load_result = load_validated_tech_lead_pair(session.run_dir, authority, config=config, labels=labels) if completed_ok else None
     succeeded = load_result is not None and load_result.ok
 
     if authority.flavor is TechLeadSessionFlavor.BATCH_REVIEW:
-        actions.extend(
-            _manifest_label_actions(config, authority, expected, success=succeeded)
-        )
+        actions.extend(_manifest_label_actions(config, authority, expected, success=succeeded))
 
     if load_result is None:
         return actions
@@ -608,13 +523,11 @@ def generate_tech_lead_completion_actions(
                 anchor_issue=session.issue,
                 expected=expected,
                 op_ledger=build_op_ledger(tech_lead_authority.list_ops()),
-                pattern_ledger=build_pattern_ledger(
-                    tech_lead_authority.list_pattern_evidence()
-                ),
+                pattern_ledger=build_pattern_ledger(tech_lead_authority.list_pattern_evidence()),
                 source_run_id=session.run_assets.run_id,
                 source_session_name=session.run_assets.session_name,
                 observed_at=session.run_assets.started_at,
-                active_session_run_id=active_session_run_id,
+                observed_session_generation=authority.observed_kill_target,
                 dedup_corpus=open_issue_corpus.load(),
                 dedup_grant=DuplicateTargetGrant.of(authority.allowed_targets()),
             )
@@ -660,12 +573,12 @@ def generate_tech_lead_completion_actions(
         actions.append(
             CloseIssueAction(
                 issue_number=session.issue.number,
-                reason="Health review completed with a valid decision pair"
-                " - closing anchor issue",
+                reason="Health review completed with a valid decision pair - closing anchor issue",
                 expected=expected,
             )
         )
     return actions
+
 
 def generate_tech_lead_decision_failure_actions(
     config: "Config",
@@ -691,16 +604,9 @@ def generate_tech_lead_decision_failure_actions(
     """
     failure, detail = _split_tech_lead_decision_error(processing_errors)
     actions: list[Action] = []
-    authority, _tamper = _resolve_launch_authority_for_session(
-        tech_lead_authority, session
-    )
-    if (
-        authority is not None
-        and authority.flavor is TechLeadSessionFlavor.BATCH_REVIEW
-    ):
-        actions.extend(
-            _manifest_label_actions(config, authority, expected, success=False)
-        )
+    authority, _tamper = _resolve_launch_authority_for_session(tech_lead_authority, session)
+    if authority is not None and authority.flavor is TechLeadSessionFlavor.BATCH_REVIEW:
+        actions.extend(_manifest_label_actions(config, authority, expected, success=False))
     actions.append(
         plan_tech_lead_rejection_action(
             anchor_issue_number=session.issue.number,
@@ -719,16 +625,7 @@ def generate_tech_lead_decision_failure_actions(
             ),
             AddCommentAction(
                 number=session.issue.number,
-                comment=(
-                    "## ❌ Tech Lead completion rejected\n\n"
-                    "The tech_lead session completed, but its output was"
-                    f" rejected (`{failure}`):\n\n"
-                    f"> {detail_text}\n\n"
-                    f"- Session: `{session.terminal_id}`\n"
-                    f"- Runtime: {session.runtime_minutes:.1f} minutes\n\n"
-                    f"The session is recorded as failed and `{labels.blocked_failed}`"
-                    " was added. Remove the label to allow reprocessing."
-                ),
+                comment=(f"## ❌ Tech Lead completion rejected\n\nThe tech_lead session completed, but its output was rejected (`{failure}`):\n\n> {detail_text}\n\n- Session: `{session.terminal_id}`\n- Runtime: {session.runtime_minutes:.1f} minutes\n\nThe session is recorded as failed and `{labels.blocked_failed}` was added. Remove the label to allow reprocessing."),
                 reason="Durable operator record of the rejected tech_lead completion",
                 expected=expected,
             ),
@@ -766,13 +663,10 @@ def generate_tech_lead_failure_actions(
     """
     if not is_tech_lead_session(config.tech_lead_review_agent, session.issue.agent_type):
         return []
-    authority, _tamper = _resolve_launch_authority_for_session(
-        tech_lead_authority, session
-    )
+    authority, _tamper = _resolve_launch_authority_for_session(tech_lead_authority, session)
     if authority is None:
         logger.warning(
-            "[tech_lead] No launch authority for session %s; "
-            "skipping terminal tech_lead effects",
+            "[tech_lead] No launch authority for session %s; skipping terminal tech_lead effects",
             session.terminal_id,
         )
         return []
@@ -782,8 +676,7 @@ def generate_tech_lead_failure_actions(
         return [
             CloseIssueAction(
                 issue_number=session.issue.number,
-                reason="Health review session failed - closing anchor issue "
-                "(the next interval re-fires a fresh review)",
+                reason="Health review session failed - closing anchor issue (the next interval re-fires a fresh review)",
                 expected=expected,
             )
         ]
@@ -791,8 +684,7 @@ def generate_tech_lead_failure_actions(
     actions.append(
         CloseIssueAction(
             issue_number=session.issue.number,
-            reason="Batch tech_lead review failed - closing tracking issue "
-            "(manifest PRs carry tech-lead-failed)",
+            reason="Batch tech_lead review failed - closing tracking issue (manifest PRs carry tech-lead-failed)",
             expected=expected,
         )
     )

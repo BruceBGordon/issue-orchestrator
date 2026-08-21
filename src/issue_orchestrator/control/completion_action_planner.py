@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Optional
 
 from ..domain.models import RETROSPECTIVE_REVIEW_TERMINAL_PREFIX, Session, SessionStatus
 from ..infra.config import Config
@@ -107,7 +107,6 @@ class CompletionActionPlanner:
         label_manager: LabelManager,
         tech_lead_authority: TechLeadAuthorityStore,
         open_issue_corpus: OpenIssueCorpusManager,
-        active_session_run_id: Callable[[int], str | None],
         provider_availability: "ProviderAvailabilityPolicy",
     ) -> None:
         self.config = config
@@ -119,15 +118,12 @@ class CompletionActionPlanner:
         # label: through the owner command that carries the durable
         # issue-scoped record with it (#5980 F1 / #6999 F5/A2).
         self._provider_availability = provider_availability
-        # Resolves the target issue's live session run id so a gated
-        # kill_hung_session proposal binds approval to that generation (#6779 R1).
-        self._active_session_run_id = active_session_run_id
 
     def _interrupted_retry_mode(self, session: Session) -> str | None:
         """Map session type to interrupted-retry mode."""
-        if session.terminal_id.startswith(
-            "issue-"
-        ) or session.terminal_id.startswith("rework-"):
+        if session.terminal_id.startswith("issue-") or session.terminal_id.startswith(
+            "rework-"
+        ):
             return "coding"
         if session.terminal_id.startswith(
             ("review-", RETROSPECTIVE_REVIEW_TERMINAL_PREFIX)
@@ -243,7 +239,6 @@ class CompletionActionPlanner:
             labels=self._lm,
             tech_lead_authority=self._tech_lead_authority,
             open_issue_corpus=self._open_issue_corpus,
-            active_session_run_id=self._active_session_run_id,
         )
 
     def _generate_tech_lead_failure_actions(
@@ -251,7 +246,10 @@ class CompletionActionPlanner:
     ) -> list[Action]:
         """Delegate batch failure/timeout terminal effects to the owner module."""
         return generate_tech_lead_failure_actions(
-            self.config, session, expected, tech_lead_authority=self._tech_lead_authority
+            self.config,
+            session,
+            expected,
+            tech_lead_authority=self._tech_lead_authority,
         )
 
     def _generate_completed_with_critical_actions(
@@ -336,11 +334,15 @@ class CompletionActionPlanner:
                 "[COMPLETION] Review exchange halted - generating blocked-failed actions: issue=%d",
                 session.issue.number,
             )
-            return tuple(self._generate_review_exchange_halted_actions(session, expected))
+            return tuple(
+                self._generate_review_exchange_halted_actions(session, expected)
+            )
 
         if status == SessionStatus.TIMED_OUT:
             timeout_actions = self._generate_timeout_actions(session, expected)
-            timeout_actions.extend(self._generate_tech_lead_failure_actions(session, expected))
+            timeout_actions.extend(
+                self._generate_tech_lead_failure_actions(session, expected)
+            )
             return tuple(timeout_actions)
 
         if status == SessionStatus.FAILED:
@@ -362,10 +364,14 @@ class CompletionActionPlanner:
                 return tuple(invalid_actions)
             # Interrupted auto-retry relaunches the session: not terminal, so
             # no tech_lead failure effects (the retry re-audits the same PRs).
-            if retry_actions := self._generate_interrupted_retry_actions(session, expected):
+            if retry_actions := self._generate_interrupted_retry_actions(
+                session, expected
+            ):
                 return tuple(retry_actions)
             failure_actions = self._generate_failure_actions(session, expected)
-            failure_actions.extend(self._generate_tech_lead_failure_actions(session, expected))
+            failure_actions.extend(
+                self._generate_tech_lead_failure_actions(session, expected)
+            )
             return tuple(failure_actions)
 
         if status == SessionStatus.BLOCKED:
@@ -592,7 +598,11 @@ class CompletionActionPlanner:
     ) -> list[Action] | None:
         """Return relaunch actions when malformed output matches interruption policy."""
         allowed = invalid_record_allows_interrupted_retry(detail)
-        return self._generate_interrupted_retry_actions(session, expected) if allowed else None
+        return (
+            self._generate_interrupted_retry_actions(session, expected)
+            if allowed
+            else None
+        )
 
     def _generate_failure_actions(
         self,

@@ -1757,11 +1757,7 @@ review:
     ):
         config_file = tmp_path / ".issue-orchestrator.yaml"
         config_file.write_text(
-            "worktrees:\n"
-            "  base: /tmp\n"
-            "review:\n"
-            "  internal:\n"
-            f"    {internal_yaml}\n",
+            f"worktrees:\n  base: /tmp\nreview:\n  internal:\n    {internal_yaml}\n",
             encoding="utf-8",
         )
 
@@ -1785,9 +1781,7 @@ review:
 
         config = Config.load(config_file)
 
-        assert not any(
-            "review.internal" in error for error in config.validate()
-        )
+        assert not any("review.internal" in error for error in config.validate())
         assert config.internal_review_instructions == ".io/internal-review.md"
 
     def test_retrospective_review_validates_non_empty_labels(self, tmp_path):
@@ -3795,26 +3789,15 @@ tech_lead:
         with pytest.raises(ValueError, match="tech_lead.authority.post_comment"):
             Config.load(config_file)
 
-    @pytest.mark.parametrize("key", ["kill_hung_session"])
-    def test_tech_lead_authority_unwired_act_level_execute_is_startup_error(self, key):
-        """Unwired act-level 'execute' must fail startup validation, never no-op."""
+    @pytest.mark.parametrize("key", ["reset_retry", "kill_hung_session"])
+    def test_tech_lead_authority_act_level_execute_is_valid_at_startup(self, key):
+        """Both current act-level actions have direct executors."""
         config = Config()
         setattr(config.tech_lead.authority, key, "execute")
 
         errors = config.validate()
 
-        assert any(
-            f"tech_lead.authority.{key}" in e and "#6764" in e for e in errors
-        ), errors
-
-    def test_tech_lead_authority_reset_retry_execute_is_valid_at_startup(self):
-        """reset_retry is wired (#6764 first slice): execute passes validation."""
-        config = Config()
-        config.tech_lead.authority.reset_retry = "execute"
-
-        errors = config.validate()
-
-        assert not any("tech_lead.authority.reset_retry" in e for e in errors), errors
+        assert not any(f"tech_lead.authority.{key}" in e for e in errors), errors
 
     def test_tech_lead_authority_mode_for_floor_and_unknown(self):
         """escalate_to_human always executes; unknown action types raise."""
