@@ -906,29 +906,38 @@ def verify_release_metadata_ready(
 
 
 def require_owned_venv(root: Path) -> None:
-    """Refuse to install this project into a venv another checkout owns.
+    """Refuse to install this project into a venv it does not exclusively own.
 
-    Routed through scripts/venv_guard.sh, the single mutation-authorization
-    owner, rather than re-deriving the rule here. A release installs the
-    project and then verifies the installed package metadata, so a shared venv
-    is not merely unsafe to write -- the verification would also be reading
-    another checkout's install. Releases run from the owning checkout.
+    Routed through the same authority every other caller uses, resolved from
+    this project's own tree rather than re-derived here. Fails CLOSED: a guard
+    that is missing, unreadable, or non-executable is not evidence of
+    ownership, and an unrunnable one must surface as this module's declared
+    error rather than a raw OSError.
     """
-    guard = root / "scripts" / "venv_guard.sh"
-    # Fail CLOSED: a missing guard is not evidence of ownership.
-    outcome = (
-        subprocess.run([str(guard)], cwd=root).returncode
-        if guard.exists()
-        else 3
-    )
+    guard = root / "src" / "issue_orchestrator" / "resources" / "venv_guard.sh"
+    try:
+        completed = subprocess.run(
+            [str(guard), "decide", "--quiet", "--checkout", str(root)],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        outcome = completed.returncode
+    except OSError as exc:
+        raise ReleasePrepError(
+            f"Cannot consult the venv mutation authority at {guard}: {exc}"
+        ) from exc
+
     if outcome == 0:
         return
     reasons = {
-        1: "its .venv is shared from another checkout",
-        2: "its .venv is a dangling symlink",
+        1: "its venv is shared from another checkout",
+        2: "its venv is a dangling symlink",
+        3: "its venv is external and not bound to this checkout",
     }
     reason = reasons.get(
-        outcome, f"the venv guard was unavailable or returned {outcome}"
+        outcome, f"the venv mutation authority returned {outcome}"
     )
     raise ReleasePrepError(
         f"Refusing to sync the environment for {root}: {reason}. "

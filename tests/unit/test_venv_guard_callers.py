@@ -133,11 +133,14 @@ def _release_guard_outcome(tmp_path: Path, guard_exit: int | None):
     root = tmp_path / "repo"
     root.mkdir(parents=True)
     if guard_exit is not None:
-        _guard_stub(root / "scripts" / "venv_guard.sh", guard_exit)
+        _guard_stub(
+            root / "src" / "issue_orchestrator" / "resources" / "venv_guard.sh",
+            guard_exit,
+        )
     return module, root
 
 
-@pytest.mark.parametrize("guard_exit", [1, 2, 7, None])
+@pytest.mark.parametrize("guard_exit", [1, 2, 3, 7, None])
 def test_release_refuses_every_non_owned_outcome(guard_exit, tmp_path: Path) -> None:
     module, root = _release_guard_outcome(tmp_path, guard_exit)
 
@@ -151,40 +154,11 @@ def test_release_proceeds_when_the_venv_is_owned(tmp_path: Path) -> None:
     module.require_owned_venv(root)  # must not raise
 
 
-# ------------------------------------------------------------ e2e worktree
+def test_release_maps_a_non_executable_guard_to_its_domain_error(tmp_path: Path) -> None:
+    """Path.exists() is not "runnable"; a mode-0644 guard raised OSError."""
+    module, root = _release_guard_outcome(tmp_path, 0)
+    guard = root / "src" / "issue_orchestrator" / "resources" / "venv_guard.sh"
+    guard.chmod(0o644)
 
-
-def test_e2e_worktree_refuses_to_sync_a_shared_venv(tmp_path: Path) -> None:
-    """E2E worktrees are orchestrator worktrees, so .venv is symlinked at base."""
-    from issue_orchestrator.infra.e2e_worktree import (
-        VenvMutationRefused,
-        _require_owned_venv,
-    )
-
-    worktree = tmp_path / "wt"
-    _guard_stub(worktree / "scripts" / "venv_guard.sh", 1)
-
-    with pytest.raises(VenvMutationRefused, match="shared"):
-        _require_owned_venv(worktree)
-
-
-def test_e2e_worktree_fails_closed_without_a_guard(tmp_path: Path) -> None:
-    from issue_orchestrator.infra.e2e_worktree import (
-        VenvMutationRefused,
-        _require_owned_venv,
-    )
-
-    worktree = tmp_path / "wt"
-    worktree.mkdir()
-
-    with pytest.raises(VenvMutationRefused):
-        _require_owned_venv(worktree)
-
-
-def test_e2e_worktree_proceeds_when_owned(tmp_path: Path) -> None:
-    from issue_orchestrator.infra.e2e_worktree import _require_owned_venv
-
-    worktree = tmp_path / "wt"
-    _guard_stub(worktree / "scripts" / "venv_guard.sh", 0)
-
-    _require_owned_venv(worktree)  # must not raise
+    with pytest.raises(module.ReleasePrepError):
+        module.require_owned_venv(root)

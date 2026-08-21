@@ -92,26 +92,32 @@ ensure-uv:
 		curl -LsSf https://astral.sh/uv/install.sh | sh; \
 	fi
 
-# Mutation policy for this repo's Python environment. scripts/venv_guard.sh is
-# the single authorization owner (see its header); these variables are the one
-# place its three outcomes are turned into shell.
+# Mutation policy for this repo's Python environment.
 #
-#   OWNED  -> full sync, project included
-#   SHARED -> dependency-only sync; never reinstall this project into another
-#             checkout's venv. The postcondition ("dependencies for this
-#             checkout are present") still holds, so callers must NOT silently
-#             skip and report success against a knowingly stale environment.
-#   BROKEN -> dangling symlink; fail, never continue.
+# scripts/venv_guard.sh is the single authorization owner. ONE execution yields
+# both the outcome and the exact arguments permitted for it -- they must never
+# be fetched separately, because a failed second call expands to nothing and
+# turns a restricted dependency sync into a full project install.
+#
+#   owned(0)     -> full sync, project included
+#   shared(1)    -> dependency-only sync; never reinstall this project into
+#                   another checkout's venv
+#   broken(2)    -> dangling symlink; fail
+#   unclaimed(3) -> external and not bound to this checkout; fail
+#   anything else, including an unrunnable guard -> fail
+#
+# Every uv invocation is bound to the authorized environment with
+# UV_PROJECT_ENVIRONMENT. uv honours that variable, so an inherited value would
+# redirect the mutation to an environment nobody authorized, and UV_VENV_CLEAR
+# would let `uv venv` delete and rebuild the target through a symlink.
 VENV_GUARD := scripts/venv_guard.sh
-VENV_SYNC_SHARED_ARGS = $$($(VENV_GUARD) --explain sync)
+VENV_TARGET = $(CURDIR)/.venv
 
-# $(call venv_guard_required,<caller>) - refuse to proceed unless the
-# authorization owner is actually runnable.
+# $(call venv_guard_required,<caller>) - the owner must be runnable.
 #
-# This CANNOT be folded into the exit-code classification below. Under `set -e`,
+# This CANNOT be folded into the exit-code classification: under `set -e`,
 # /bin/sh surfaces a missing command through `||` as status 1, which is exactly
-# the guard's SHARED code -- so an absent guard would be read as "shared venv"
-# and quietly downgraded to a dependency-only sync rather than failing.
+# the guard's `shared` code, so an absent guard would read as "shared venv".
 define venv_guard_required
 if [ ! -x "$(VENV_GUARD)" ]; then \
 	echo "$(1): venv guard $(VENV_GUARD) is missing or not executable; refusing to mutate the environment." >&2; \
@@ -119,32 +125,47 @@ if [ ! -x "$(VENV_GUARD)" ]; then \
 fi;
 endef
 
+# $(call venv_decide,<caller>) - one execution; sets _outcome and _sync_args.
+define venv_decide
+$(call venv_guard_required,$(1)) \
+_decision="$$($(VENV_GUARD) decide --quiet --venv "$(VENV_TARGET)" 2>/dev/null)"; _g=$$?; \
+_outcome="$$(printf '%s\n' "$$_decision" | sed -n 's/^outcome=//p')"; \
+_sync_args="$$(printf '%s\n' "$$_decision" | sed -n 's/^sync_args=//p')"; \
+if [ "$$_outcome" != "owned" ] && [ "$$_outcome" != "shared" ]; then \
+	echo "$(1): refusing to mutate $(VENV_TARGET) (outcome='$$_outcome' exit=$$_g)." >&2; \
+	printf '%s\n' "$$_decision" | sed -n 's/^reason=/  reason: /p' >&2; \
+	exit 1; \
+fi; \
+if [ -z "$$_sync_args" ]; then \
+	echo "$(1): the guard authorized $(VENV_TARGET) but supplied no arguments; refusing rather than guessing." >&2; \
+	exit 1; \
+fi;
+endef
+
+# $(call venv_uv_sync) - run uv bound to the authorized environment.
+define venv_uv_sync
+UV_PROJECT_ENVIRONMENT="$(VENV_TARGET)" $(UV) sync $$_sync_args
+endef
+
 # $(call venv_sync,<target-name>) - the guarded sync for a recipe.
 define venv_sync
-$(call venv_guard_required,$(1)) \
-_g=0; $(VENV_GUARD) || _g=$$?; \
-if [ $$_g -eq 0 ]; then \
-	$(UV) sync --frozen --all-extras && touch .venv/.deps-synced; \
-elif [ $$_g -eq 1 ]; then \
-	echo "$(1): shared .venv - syncing dependencies only."; \
-	$(UV) sync $(VENV_SYNC_SHARED_ARGS); \
-elif [ $$_g -eq 2 ]; then \
-	echo "$(1): .venv is a dangling symlink; refusing to continue." >&2; \
+$(call venv_decide,$(1)) \
+if [ ! -x "$(UV)" ]; then \
+	echo "$(1): uv not found. Run: curl -LsSf https://astral.sh/uv/install.sh | sh" >&2; \
 	exit 1; \
-else \
-	echo "$(1): venv guard unavailable or returned $$_g; refusing to mutate the environment." >&2; \
-	exit 1; \
-fi
+fi; \
+$(call venv_uv_sync) || exit $$?; \
+if [ "$$_outcome" = "owned" ]; then touch .venv/.deps-synced; fi
 endef
 
 # $(call venv_require_owned,<target-name>) - destructive targets that recreate
-# .venv. Neither SHARED nor BROKEN may proceed.
+# .venv. Only an owned environment may be destroyed and rebuilt.
 define venv_require_owned
-$(call venv_guard_required,$(1)) \
-$(VENV_GUARD) || { \
+$(call venv_decide,$(1)) \
+if [ "$$_outcome" != "owned" ]; then \
 	echo "$(1): refusing to recreate a .venv this checkout does not own." >&2; \
 	exit 1; \
-}
+fi;
 endef
 
 venv: ensure-uv
@@ -171,31 +192,20 @@ venv: ensure-uv
 # Fast, reliable venv setup: reuse if present, otherwise create
 venv-fast: ensure-uv
 	@mkdir -p $$(dirname $(SETUP_LOG))
-	@set -e; \
-	$(call venv_guard_required,make venv-fast) \
-	_g=0; $(VENV_GUARD) || _g=$$?; \
-	if [ $$_g -eq 2 ]; then \
-		echo "make venv-fast: .venv is a dangling symlink; refusing to continue." >&2; \
-		exit 1; \
-	elif [ $$_g -gt 2 ]; then \
-		echo "make venv-fast: venv guard unavailable or returned $$_g; refusing to mutate." >&2; \
-		exit 1; \
-	fi; \
+	@$(call venv_decide,make venv-fast) \
 	t0=$$(date +%s); \
-	if [ $$_g -eq 0 ] && [ ! -d .venv ]; then \
+	if [ "$$_outcome" = "owned" ] && [ ! -d .venv ]; then \
 		echo "Creating venv with $(SYSTEM_PYTHON) and installing dependencies..."; \
-		$(UV) venv .venv --python $(SYSTEM_PYTHON); \
+		UV_PROJECT_ENVIRONMENT="$(VENV_TARGET)" $(UV) venv .venv --python $(SYSTEM_PYTHON); \
 	else \
 		echo "Reusing existing .venv; syncing dependencies..."; \
 	fi; \
 	t1=$$(date +%s); \
-	if [ $$_g -eq 1 ]; then \
+	if [ "$$_outcome" = "shared" ]; then \
 		echo "make venv-fast: shared .venv - syncing dependencies only."; \
-		$(UV) sync $(VENV_SYNC_SHARED_ARGS); \
-	else \
-		$(UV) sync --frozen --all-extras; \
-		touch .venv/.deps-synced; \
 	fi; \
+	$(call venv_uv_sync) || exit $$?; \
+	if [ "$$_outcome" = "owned" ]; then touch .venv/.deps-synced; fi; \
 	t2=$$(date +%s); \
 	echo "venv-fast pid=$$$$ ts=$$(date -Iseconds) pwd=$$(pwd) uv_venv=$$((t1-t0))s uv_sync=$$((t2-t1))s total=$$((t2-t0))s" >> $(SETUP_LOG)
 	@$(GMAKE) --no-print-directory semgrep-venv
@@ -451,32 +461,22 @@ DEPS_MARKER ?= .venv/.deps-synced
 # Auto-sync dependencies if pyproject.toml or uv.lock is newer than last sync
 # This prevents cryptic errors like "unrecognized arguments: -n" when pytest-xdist is missing
 sync-deps:
-	@$(call venv_guard_required,[sync-deps]) \
-	_g=0; $(VENV_GUARD) || _g=$$?; \
-	if [ $$_g -eq 2 ]; then \
-		echo "[sync-deps] .venv is a dangling symlink; refusing to run against a broken environment." >&2; \
-		exit 1; \
-	elif [ $$_g -gt 2 ]; then \
-		echo "[sync-deps] venv guard unavailable or returned $$_g; refusing to mutate." >&2; \
-		exit 1; \
+	@$(call venv_decide,[sync-deps]) \
+	if [ "$$_outcome" = "owned" ] && [ -f $(DEPS_MARKER) ] && \
+	   [ ! pyproject.toml -nt $(DEPS_MARKER) ] && [ ! uv.lock -nt $(DEPS_MARKER) ]; then \
+		exit 0; \
 	fi; \
 	if [ ! -x "$(UV)" ]; then \
-		echo "ERROR: uv not found. Run: curl -LsSf https://astral.sh/uv/install.sh | sh"; \
+		echo "ERROR: uv not found. Run: curl -LsSf https://astral.sh/uv/install.sh | sh" >&2; \
 		exit 1; \
 	fi; \
-	if [ $$_g -eq 1 ]; then \
+	if [ "$$_outcome" = "shared" ]; then \
 		echo "[sync-deps] Shared .venv - dependency-only sync; the marker belongs to another checkout so it is neither read nor stamped."; \
-		$(UV) sync $(VENV_SYNC_SHARED_ARGS); \
-	elif [ ! -f $(DEPS_MARKER) ] || [ pyproject.toml -nt $(DEPS_MARKER) ] || [ uv.lock -nt $(DEPS_MARKER) ]; then \
-		echo ""; \
-		echo "================================================================"; \
-		echo "[sync-deps] Dependencies changed since last install"; \
-		echo "[sync-deps] Auto-syncing dependencies on your behalf..."; \
-		echo "================================================================"; \
-		$(UV) sync --frozen --all-extras && touch $(DEPS_MARKER); \
-		echo "[sync-deps] Done. Continuing with original command..."; \
-		echo ""; \
-	fi
+	else \
+		echo "[sync-deps] Dependencies changed since last install; auto-syncing..."; \
+	fi; \
+	$(call venv_uv_sync) || exit $$?; \
+	if [ "$$_outcome" = "owned" ]; then touch $(DEPS_MARKER); fi
 
 test-unit: sync-deps
 ifeq ($(UNIT_PARALLEL),0)

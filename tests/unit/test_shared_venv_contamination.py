@@ -92,11 +92,12 @@ def test_guard_reports_a_dangling_symlink_distinctly_from_sharing(tmp_path: Path
     assert _run_guard(worktree) == 2
 
 
-def test_guard_allows_a_standalone_environment_no_checkout_owns(tmp_path: Path) -> None:
-    """An operator-chosen environment (CC_VENV_PATH, a system env) is not shared.
+def test_guard_refuses_an_unclaimed_external_environment(tmp_path: Path) -> None:
+    """An external venv is refused until ownership is explicitly bound.
 
-    Nothing else resolves its project through it, so installing there cannot
-    repoint another checkout's editable pointer.
+    A parent that is not a checkout proves only that. Two checkouts can point
+    CC_VENV_PATH at one environment, and telling both they own it recreates the
+    original bug.
     """
     standalone = tmp_path / "envs" / "control-center"
     standalone.mkdir(parents=True)
@@ -106,7 +107,23 @@ def test_guard_allows_a_standalone_environment_no_checkout_owns(tmp_path: Path) 
         [str(GUARD), "--quiet", "--venv", str(standalone)], cwd=checkout
     )
 
-    assert result.returncode == 0
+    assert result.returncode == 3
+
+
+def test_claiming_an_external_environment_makes_it_owned(tmp_path: Path) -> None:
+    standalone = tmp_path / "envs" / "control-center"
+    standalone.mkdir(parents=True)
+    checkout = _checkout(tmp_path, "worktree")
+
+    claim = subprocess.run(
+        [str(GUARD), "claim", "--quiet", "--venv", str(standalone)], cwd=checkout
+    )
+    assert claim.returncode == 0
+
+    decide = subprocess.run(
+        [str(GUARD), "--quiet", "--venv", str(standalone)], cwd=checkout
+    )
+    assert decide.returncode == 0
 
 
 def test_guard_targets_an_explicit_venv_path(tmp_path: Path) -> None:
@@ -121,18 +138,31 @@ def test_guard_targets_an_explicit_venv_path(tmp_path: Path) -> None:
     assert result.returncode == 1
 
 
-def test_guard_publishes_the_dependency_only_sync_arguments() -> None:
-    """Callers must not re-derive the safe argument set; the owner publishes it."""
+def test_guard_returns_the_decision_and_its_arguments_in_one_execution(
+    tmp_path: Path,
+) -> None:
+    """Outcome and permitted arguments must not be fetchable separately.
+
+    Two executions let a failed second call expand to nothing, turning a
+    restricted dependency sync into an unrestricted project install.
+    """
+    owner = _owning_checkout(tmp_path, "base")
+    worktree = _checkout(tmp_path, "worktree")
+    (worktree / ".venv").symlink_to(owner / ".venv", target_is_directory=True)
+
     result = subprocess.run(
-        [str(GUARD), "--explain", "sync"], capture_output=True, text=True
+        [str(GUARD), "decide", "--quiet"], cwd=worktree, capture_output=True, text=True
     )
 
-    assert result.returncode == 0
-    # --no-install-project is load-bearing: it is what keeps a dependency sync
-    # from rewriting the editable pointer.
-    assert "--no-install-project" in result.stdout
-    # --inexact stops one checkout's sync removing packages another still needs.
-    assert "--inexact" in result.stdout
+    assert result.returncode == 1
+    record = dict(
+        line.split("=", 1) for line in result.stdout.splitlines() if "=" in line
+    )
+    assert record["outcome"] == "shared"
+    # --no-install-project keeps a dependency sync from rewriting the pointer;
+    # --inexact stops it removing packages another user still needs.
+    assert "--no-install-project" in record["sync_args"]
+    assert "--inexact" in record["sync_args"]
 
 
 def test_guard_names_the_owning_checkout_and_the_repair(tmp_path: Path) -> None:
@@ -143,7 +173,7 @@ def test_guard_names_the_owning_checkout_and_the_repair(tmp_path: Path) -> None:
     result = subprocess.run([str(GUARD)], cwd=worktree, capture_output=True, text=True)
 
     assert str(owner) in result.stderr
-    assert "make -C" in result.stderr
+    assert "dependency-only" in result.stderr
 
 
 # ------------------------------------------------------- verify-pr interpreter

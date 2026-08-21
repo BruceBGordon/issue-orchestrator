@@ -33,45 +33,89 @@ class MakeRun:
     def output(self) -> str:
         return self.stdout
 
+    @property
+    def _args(self) -> tuple[str, ...]:
+        return tuple(call.split("|", 1)[1] for call in self.uv_calls if "|" in call)
+
+    @property
+    def targets(self) -> tuple[str, ...]:
+        return tuple(call.split("|", 1)[0] for call in self.uv_calls if "|" in call)
+
+    @property
+    def project_targets(self) -> tuple[str, ...]:
+        """Environments used for THIS project's operations.
+
+        `--project` invocations steer an isolated tool environment (the pinned
+        semgrep venv) and legitimately target a different path.
+        """
+        return tuple(
+            call.split("|", 1)[0]
+            for call in self.uv_calls
+            if "|" in call and "--project" not in call.split("|", 1)[1]
+        )
+
     def synced_project(self) -> bool:
         """Did any uv sync install this checkout's project into the venv?"""
         return any(
-            call.startswith("sync") and "--no-install-project" not in call
-            for call in self.uv_calls
+            a.startswith("sync") and "--no-install-project" not in a for a in self._args
         )
 
     def synced_dependencies_only(self) -> bool:
         return any(
-            call.startswith("sync") and "--no-install-project" in call
-            for call in self.uv_calls
+            a.startswith("sync") and "--no-install-project" in a for a in self._args
         )
+
+    def ran_uv(self) -> bool:
+        return bool(self._args)
+
+
+def _install_guard(checkout: Path) -> None:
+    """Install the wrapper and the package resource it execs."""
+    (checkout / "scripts").mkdir(parents=True, exist_ok=True)
+    resource_dir = checkout / "src" / "issue_orchestrator" / "resources"
+    resource_dir.mkdir(parents=True, exist_ok=True)
+    for source, target in (
+        (REPO_ROOT / "scripts" / "venv_guard.sh", checkout / "scripts" / "venv_guard.sh"),
+        (
+            REPO_ROOT / "src" / "issue_orchestrator" / "resources" / "venv_guard.sh",
+            resource_dir / "venv_guard.sh",
+        ),
+    ):
+        shutil.copy2(source, target)
+        target.chmod(0o755)
 
 
 def _make_checkout(tmp_path: Path, name: str = "checkout") -> Path:
     checkout = tmp_path / name
     (checkout / "scripts").mkdir(parents=True)
     shutil.copy2(REPO_ROOT / "Makefile", checkout / "Makefile")
-    shutil.copy2(REPO_ROOT / "scripts" / "venv_guard.sh", checkout / "scripts" / "venv_guard.sh")
-    (checkout / "scripts" / "venv_guard.sh").chmod(0o755)
+    _install_guard(checkout)
     (checkout / "pyproject.toml").write_text("[project]\nname='x'\n")
     (checkout / "uv.lock").write_text("# lock\n")
     return checkout
 
 
 def _fake_uv(tmp_path: Path) -> tuple[Path, Path]:
+    """A uv that records the environment it was pointed at, then its arguments.
+
+    The target matters as much as the arguments: uv honours
+    UV_PROJECT_ENVIRONMENT, so a mutation can be authorized for one environment
+    and executed against another.
+    """
     tmp_path.mkdir(parents=True, exist_ok=True)
     log = tmp_path / "uv-calls.log"
     fake = tmp_path / "fake-uv"
     fake.write_text(
         "#!/usr/bin/env bash\n"
-        f'printf "%s\\n" "$*" >> {log}\n'
-        # `uv venv .venv` must behave like the real thing: it fails when .venv
-        # already exists as a symlink, which is the condition B2 mishandled.
+        f'printf "%s|%s\\n" "${{UV_PROJECT_ENVIRONMENT:-none}}" "$*" >> {log}\n'
+        # `uv venv .venv` fails when .venv already exists as a symlink, which is
+        # the state a dangling link presents.
         'if [ "${1:-}" = "venv" ] && [ -L .venv ]; then exit 1; fi\n'
         'if [ "${1:-}" = "venv" ]; then mkdir -p .venv; fi\n'
-        # Sub-environments (the semgrep tool venv) are steered by
-        # UV_PROJECT_ENVIRONMENT; create them so unrelated recipe steps succeed.
-        'if [ "${1:-}" = "sync" ] && [ -n "${UV_PROJECT_ENVIRONMENT:-}" ]; then\n'
+        # The isolated semgrep tool env is a separate project; satisfy it so
+        # unrelated recipe steps do not fail the run.
+        'if [ "${1:-}" = "sync" ] && [ "${2:-}" = "--project" ] \\\n'
+        '   && [ -n "${UV_PROJECT_ENVIRONMENT:-}" ]; then\n'
         '  mkdir -p "$UV_PROJECT_ENVIRONMENT/bin"\n'
         '  : > "$UV_PROJECT_ENVIRONMENT/bin/semgrep"\n'
         '  chmod +x "$UV_PROJECT_ENVIRONMENT/bin/semgrep"\n'
@@ -82,20 +126,27 @@ def _fake_uv(tmp_path: Path) -> tuple[Path, Path]:
     return fake, log
 
 
-def _run_make(checkout: Path, target: str, tmp_path: Path) -> MakeRun:
+def _run_make(
+    checkout: Path,
+    target: str,
+    tmp_path: Path,
+    *,
+    extra_env: dict[str, str] | None = None,
+    uv: Path | None = None,
+) -> MakeRun:
     fake_uv, log = _fake_uv(tmp_path)
     assert MAKE is not None
     proc = subprocess.run(
         [
             MAKE,
             target,
-            f"UV={fake_uv}",
+            f"UV={uv or fake_uv}",
             f"SETUP_LOG={tmp_path / 'setup.log'}",
         ],
         cwd=checkout,
         capture_output=True,
         text=True,
-        env={**os.environ, "HOME": str(tmp_path)},
+        env={**os.environ, "HOME": str(tmp_path), **(extra_env or {})},
     )
     calls = tuple(log.read_text().splitlines()) if log.exists() else ()
     return MakeRun(proc.returncode, proc.stdout + proc.stderr, calls)
@@ -195,7 +246,7 @@ def test_venv_fast_on_a_fresh_checkout_creates_and_fully_syncs(tmp_path: Path) -
     run = _run_make(checkout, "venv-fast", tmp_path)
 
     assert run.returncode == 0, run.output
-    assert any(call.startswith("venv") for call in run.uv_calls), run.uv_calls
+    assert any(a.startswith("venv") for a in run._args), run.uv_calls
     assert run.synced_project(), run.uv_calls
 
 
@@ -284,3 +335,116 @@ def test_targets_fail_closed_on_an_unexpected_guard_outcome(
 
     assert run.returncode != 0, run.output
     assert not run.synced_project(), run.uv_calls
+
+
+# ================= the follow-up review's adversarial reproductions =========
+
+
+def _guard_stub(checkout: Path, body: str) -> None:
+    """Replace the wrapper with a stub, keeping the path callers use."""
+    guard = checkout / "scripts" / "venv_guard.sh"
+    guard.write_text("#!/usr/bin/env bash\n" + body)
+    guard.chmod(0o755)
+
+
+# ---- A1: decision and permitted arguments must arrive together -------------
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        # classification succeeds, but the record carries no arguments
+        'echo "outcome=shared"; exit 1\n',
+        # empty output entirely
+        "exit 1\n",
+        # malformed record
+        'echo "garbage"; exit 1\n',
+        # arguments line present but empty
+        'echo "outcome=shared"; echo "sync_args="; exit 1\n',
+    ],
+)
+@pytest.mark.parametrize("target", ["sync-deps", "venv-fast", "install"])
+def test_no_uv_runs_when_the_decision_lacks_arguments(
+    body: str, target: str, tmp_path: Path
+) -> None:
+    """A decision without its arguments must never degrade to a plain sync.
+
+    Fetching the outcome and the argument set in separate executions let a
+    failed second call expand to nothing, turning a restricted dependency sync
+    into an unrestricted project install.
+    """
+    checkout = _make_checkout(tmp_path)
+    _guard_stub(checkout, body)
+
+    run = _run_make(checkout, target, tmp_path)
+
+    assert run.returncode != 0, run.output
+    assert not run.ran_uv(), run.uv_calls
+
+
+# ---- A2: the authorized target must bind the mutation ----------------------
+
+
+@pytest.mark.parametrize("target", ["sync-deps", "venv-fast", "install"])
+def test_ambient_project_environment_cannot_redirect_the_mutation(
+    target: str, tmp_path: Path
+) -> None:
+    """uv honours UV_PROJECT_ENVIRONMENT; inheriting it moves the mutation.
+
+    The local venv is authorized, then the install lands somewhere nobody
+    authorized.
+    """
+    checkout = _make_checkout(tmp_path)
+    (checkout / ".venv").mkdir()
+    foreign = tmp_path / "foreign-owner" / ".venv"
+    foreign.mkdir(parents=True)
+
+    run = _run_make(
+        checkout,
+        target,
+        tmp_path,
+        extra_env={"UV_PROJECT_ENVIRONMENT": str(foreign)},
+    )
+
+    assert run.returncode == 0, run.output
+    assert run.project_targets, run.uv_calls
+    for used in run.project_targets:
+        assert used == str(checkout / ".venv"), (
+            f"uv was pointed at {used}, not the authorized {checkout / '.venv'}"
+        )
+
+
+# ---- A6: uv is required only where it actually syncs -----------------------
+
+
+def test_sync_deps_succeeds_without_uv_when_owned_and_fresh(tmp_path: Path) -> None:
+    """venv-pip supports systems with no uv and stamps the marker itself.
+
+    Requiring uv before the freshness test broke `make test-unit` on exactly
+    the fallback the Makefile advertises.
+    """
+    checkout = _make_checkout(tmp_path)
+    (checkout / ".venv").mkdir()
+    marker = checkout / ".venv" / ".deps-synced"
+    marker.write_text("")
+    import os as _os
+    future = marker.stat().st_mtime + 1000
+    _os.utime(marker, (future, future))
+
+    run = _run_make(
+        checkout, "sync-deps", tmp_path, uv=Path("/definitely/missing/uv")
+    )
+
+    assert run.returncode == 0, run.output
+
+
+def test_sync_deps_still_requires_uv_when_it_must_sync(tmp_path: Path) -> None:
+    checkout = _make_checkout(tmp_path)
+    (checkout / ".venv").mkdir()
+
+    run = _run_make(
+        checkout, "sync-deps", tmp_path, uv=Path("/definitely/missing/uv")
+    )
+
+    assert run.returncode != 0, run.output
+    assert "uv not found" in run.output

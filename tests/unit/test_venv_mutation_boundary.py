@@ -25,34 +25,45 @@ GUARD_REFERENCES = (
     "venv_require_owned",  # Makefile macro -> guard
     "require_owned_venv",  # prepare_release.py helper -> guard
     "venv_mutation_outcome",  # start_control_center.sh helper -> guard
+    "venv_decide",         # Makefile macro -> guard
+    "authority.authorize", # VenvMutationAuthority -> guard
+    "venv_guard_check",    # test double for the scanner's own tests
+    ".authorize(",         # any call into VenvMutationAuthority
 )
 
-# An executed command that installs this project or rewrites the environment.
-MUTATION = re.compile(
+# An executed command that creates or rewrites a Python environment.
+#
+# Matched per language, because the two express commands differently and the
+# difference is what separates a call from prose. Python builds argv as
+# separate string elements (`["uv", "sync", ...]`), so requiring that form
+# never matches a sentence like f"uv sync failed for {venv}", while still
+# catching the variable form `[uv, "sync", ...]`.
+SHELL_MUTATION = re.compile(
     r"""(
         uv \s+ sync
       | \$\(UV\) \s+ sync
-      | \{uv\} \s+ sync
+      | uv \s+ venv
+      | \$\(UV\) \s+ venv
       | uv \s+ pip \s+ install
       | pip \s+ install \s+ -e
       | -m \s+ pip \s+ install
-      | "sync" \s* ,
     )""",
     re.VERBOSE,
 )
 
-# Occurrences that only *mention* a command: comments, help text, and messages
-# printed for the user to copy. These cannot mutate anything.
+PY_MUTATION = re.compile(
+    r"""(
+        ["']?\buv\b["']? \s* , \s* ["'](sync|venv)["']
+      | ["']?\buv\b["']? \s* , \s* ["']pip["'] \s* , \s* ["']install["']
+      | ["']-m["'] \s* , \s* ["']pip["'] \s* , \s* ["']install["']
+      | ["']pip["'] \s* , \s* ["']install["'] \s* , \s* ["']-e["']
+    )""",
+    re.VERBOSE,
+)
+
+# Occurrences that only *mention* a command: comments and help text.
 NON_EXECUTING = re.compile(
-    r"""
-      (^\s*\#)          # comment
-    | (^\s*[\"\'])       # a bare string literal: a message, not a command
-    | (\becho\b)
-    | (\bprintf\b)
-    | (\bprint\()
-    | (\bhelp\s*=)
-    | (doc_examples)
-    """,
+    r"""(^\s*\#) | (\becho\b) | (\bprintf\b) | (\bhelp\s*=) | (doc_examples)""",
     re.VERBOSE,
 )
 
@@ -109,10 +120,11 @@ def _string_literal_lines(path: Path) -> frozenset[int]:
 
 
 def _executing_mutation_sites(path: Path) -> list[Site]:
+    pattern = PY_MUTATION if path.suffix == ".py" else SHELL_MUTATION
     literals = _string_literal_lines(path)
     sites: list[Site] = []
     for index, line in enumerate(path.read_text().splitlines(), start=1):
-        if not MUTATION.search(line) or NON_EXECUTING.search(line):
+        if not pattern.search(line) or NON_EXECUTING.search(line):
             continue
         if index in literals:
             continue
@@ -139,6 +151,43 @@ def _shell_block(lines: list[str], line_no: int) -> str:
     while end < len(lines) and not re.match(r"^\}", lines[end]):
         end += 1
     return "\n".join(lines[start : end + 1])
+
+
+def _authorization_dominates(path: Path, line_no: int) -> bool:
+    """Does authorization run before this mutation on EVERY path to it?
+
+    A guard reference anywhere in the function is not proof for every branch:
+    the E2E sync authorized inside ``if pyproject.exists()`` while the
+    no-pyproject fallback below it mutated the same environment unguarded, and
+    the scanner still reported the function authorized.
+
+    The check is deliberately strict: authorization must appear at the
+    function's top level (so it cannot be skipped by a branch) and before the
+    mutation line.
+    """
+    if path.suffix != ".py":
+        return False
+    tree = ast.parse(path.read_text())
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if not (node.lineno <= line_no <= (node.end_lineno or node.lineno)):
+            continue
+        for statement in node.body:
+            if (statement.end_lineno or statement.lineno) >= line_no:
+                break
+            # Only statements that execute unconditionally can dominate.
+            # Unparsing an `if` would include its branches, so a guard call
+            # inside ONE branch would count for a sibling branch too -- exactly
+            # the hole this check exists to close.
+            if not isinstance(
+                statement, (ast.Expr, ast.Assign, ast.AnnAssign, ast.AugAssign)
+            ):
+                continue
+            text = ast.unparse(statement)
+            if any(reference in text for reference in GUARD_REFERENCES):
+                return True
+    return False
 
 
 def _python_block(path: Path, line_no: int) -> str:
@@ -186,10 +235,51 @@ def _unauthorized(paths: list[Path]) -> list[str]:
         for site in _executing_mutation_sites(path):
             if _is_exempt(site):
                 continue
-            if any(ref in _enclosing_block(site) for ref in GUARD_REFERENCES):
+            if path.suffix == ".py":
+                # Python is checked structurally: authorization must dominate
+                # the mutation, not merely appear somewhere in the function.
+                if _authorization_dominates(path, site.line_no):
+                    continue
+            elif any(ref in _enclosing_block(site) for ref in GUARD_REFERENCES):
                 continue
             findings.append(str(site))
     return findings
+
+
+def test_scanner_rejects_authorization_that_only_covers_one_branch(tmp_path: Path) -> None:
+    """One guarded branch is not proof for a sibling branch that also mutates."""
+    module = tmp_path / "branchy.py"
+    module.write_text(
+        "import subprocess\n\n\n"
+        "def sync(path):\n"
+        "    if path.exists():\n"
+        "        venv_guard_check()\n"
+        '        subprocess.run(["uv", "sync", "--frozen"])\n'
+        "        return\n"
+        '    subprocess.run(["uv", "venv", ".venv"])\n'
+        '    subprocess.run(["uv", "pip", "install", "pytest"])\n'
+    )
+
+    sites = _executing_mutation_sites(module)
+    unguarded = [s for s in sites if not _authorization_dominates(module, s.line_no)]
+
+    assert len(unguarded) >= 2, "the fallback branch mutates unauthorized"
+
+
+def test_scanner_accepts_authorization_above_the_branches(tmp_path: Path) -> None:
+    module = tmp_path / "hoisted.py"
+    module.write_text(
+        "import subprocess\n\n\n"
+        "def sync(path):\n"
+        "    decision = venv_guard_check()\n"
+        "    if path.exists():\n"
+        '        subprocess.run(["uv", "sync", "--frozen"])\n'
+        "        return\n"
+        '    subprocess.run(["uv", "venv", ".venv"])\n'
+    )
+
+    for site in _executing_mutation_sites(module):
+        assert _authorization_dominates(module, site.line_no), site
 
 
 def test_scanner_flags_an_unguarded_mutation(tmp_path: Path) -> None:

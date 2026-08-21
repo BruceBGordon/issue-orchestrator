@@ -19,8 +19,18 @@ def _install_venv_guard(repo: Path) -> Path:
     """Copy the real guard into the fake checkout so it classifies honestly."""
     guard = repo / "scripts" / "venv_guard.sh"
     guard.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(REPO_ROOT / "scripts" / "venv_guard.sh", guard)
-    guard.chmod(0o755)
+    resource = repo / "src" / "issue_orchestrator" / "resources" / "venv_guard.sh"
+    resource.parent.mkdir(parents=True, exist_ok=True)
+    # The wrapper execs the package resource, so a fake checkout needs both.
+    for source, target in (
+        (REPO_ROOT / "scripts" / "venv_guard.sh", guard),
+        (
+            REPO_ROOT / "src" / "issue_orchestrator" / "resources" / "venv_guard.sh",
+            resource,
+        ),
+    ):
+        shutil.copy2(source, target)
+        target.chmod(0o755)
     return guard
 
 
