@@ -161,7 +161,9 @@ class Orchestrator:
         Public so the control API, the dashboard, and tests all speak to the
         same owner instead of assigning ``state.paused`` behind its back.
         """
-        return _build_pause_controller(self)
+        return _build_pause_controller(
+            deps=self.deps, event_context=self._event_context, state=self.state
+        )
 
     @property
     def event_hub(self) -> EventHub:

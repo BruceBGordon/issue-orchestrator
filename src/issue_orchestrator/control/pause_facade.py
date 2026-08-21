@@ -19,20 +19,30 @@ from ..domain.pause_state import PauseActor, PauseReason, PauseTransitionOutcome
 from .pause_controller import PauseController
 
 if TYPE_CHECKING:
+    from ..domain.models import OrchestratorState
+    from ..events.context import EventContext
     from ..infra.orchestrator import Orchestrator
+    from .orchestrator_deps import OrchestratorDeps
 
 
-def build_pause_controller(orch: "Orchestrator") -> PauseController:
+def build_pause_controller(
+    *,
+    deps: "OrchestratorDeps",
+    event_context: "EventContext",
+    state: "OrchestratorState",
+) -> PauseController:
     """The single owner of pause/resume transitions.
 
+    Takes the three collaborators it needs rather than the orchestrator, so it
+    reaches into nothing private and is constructible in a test without one.
     The journal arrives through ``deps`` — this selects no concrete adapter;
     see ``InfraServices.pause_journal``.
     """
     return PauseController(
-        events=orch.deps.events,
-        event_context=orch._event_context,
-        store=orch.state,
-        journal=orch.deps.services.pause_journal,
+        events=deps.events,
+        event_context=event_context,
+        store=state,
+        journal=deps.services.pause_journal,
     )
 
 
