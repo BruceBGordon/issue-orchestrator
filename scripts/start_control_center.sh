@@ -276,6 +276,8 @@ install_mode() {
 # Routed through scripts/venv_guard.sh -- the single mutation-authorization
 # owner -- which is pure shell precisely so it can be consulted here, before
 # the package is importable.
+VENV_DECISION=""
+
 venv_mutation_outcome() {
   local guard="${ROOT_DIR}/scripts/venv_guard.sh"
   # Fail CLOSED. A missing or non-executable guard is not evidence of
@@ -286,7 +288,14 @@ venv_mutation_outcome() {
   fi
   # VENV_PATH honours CC_VENV_PATH and may differ from ${ROOT_DIR}/.venv.
   # Guarding one path while mutating another guards nothing.
-  (cd "${ROOT_DIR}" && "${guard}" --venv "${VENV_PATH}")
+  # Capture the whole decision: the remedy travels with it, and every caller
+  # passes --quiet, so a fix written only to the guard's stderr is unreachable.
+  VENV_DECISION="$(cd "${ROOT_DIR}" && "${guard}" decide --quiet --venv "${VENV_PATH}" 2>/dev/null)"
+  return $?
+}
+
+venv_decision_remedy() {
+  printf '%s\n' "${VENV_DECISION}" | sed -n 's/^remedy=//p'
 }
 
 sync_deps() {
@@ -302,17 +311,20 @@ sync_deps() {
     1)
       echo "ERROR: ${VENV_PATH} is shared from another checkout." >&2
       echo "Refusing to install this checkout's project into it; that is what" >&2
-      echo "repoints the shared editable install. Start the Control Center from" >&2
-      echo "the checkout that owns the venv, or give this one its own venv." >&2
+      echo "repoints the shared editable install." >&2
+      echo "  To fix: $(venv_decision_remedy)" >&2
       return 1
       ;;
     2)
       echo "ERROR: ${VENV_PATH} is a dangling symlink; cannot sync." >&2
+      echo "  To fix: $(venv_decision_remedy)" >&2
       return 1
       ;;
     *)
       echo "ERROR: venv guard unavailable or returned ${guard_outcome}." >&2
       echo "Refusing to mutate ${VENV_PATH} without an authorization decision." >&2
+      remedy="$(venv_decision_remedy)"
+      [[ -n "${remedy}" ]] && echo "  To fix: ${remedy}" >&2
       return 1
       ;;
   esac

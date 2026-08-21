@@ -50,6 +50,7 @@ class VenvMutationDecision:
     venv: Path
     sync_args: tuple[str, ...]
     reason: str
+    remedy: str = ""
 
     @property
     def may_install_project(self) -> bool:
@@ -101,8 +102,14 @@ class VenvMutationAuthority:
             ) from None
 
         if outcome in (VenvOutcome.BROKEN, VenvOutcome.UNCLAIMED):
+            # The remedy travels with the decision. Callers pass --quiet, so a
+            # fix written only to the guard's stderr never reaches anyone.
             raise VenvMutationRefused(
-                f"Refusing to mutate {target}: {record.get('reason', outcome.value)}"
+                _refusal_message(
+                    target,
+                    record.get("reason", outcome.value),
+                    record.get("remedy", ""),
+                )
             )
 
         sync_args = tuple(record.get("sync_args", "").split())
@@ -119,6 +126,7 @@ class VenvMutationAuthority:
             venv=Path(record.get("venv", str(target))),
             sync_args=sync_args,
             reason=record.get("reason", ""),
+            remedy=record.get("remedy", ""),
         )
 
     def sync(
@@ -158,6 +166,13 @@ class VenvMutationAuthority:
         # `uv venv` honours this and would delete and rebuild the target.
         env.pop("UV_VENV_CLEAR", None)
         return env
+
+
+def _refusal_message(target: Path, reason: str, remedy: str) -> str:
+    message = f"Refusing to mutate {target}: {reason}."
+    if remedy:
+        message += f"\n  To fix: {remedy}"
+    return message
 
 
 def _parse_decision(stdout: str) -> dict[str, str]:

@@ -216,3 +216,102 @@ def test_e2e_refuses_the_no_pyproject_fallback_on_a_shared_venv(tmp_path: Path) 
 
     with pytest.raises(VenvMutationRefused):
         _sync_venv(worktree, _Refusing())
+
+
+# ---- a refusal must carry its own fix --------------------------------------
+#
+# Every caller invokes the guard with --quiet, so guidance written only to the
+# guard's stderr is unreachable in practice. A refusal that reaches an operator
+# or an agent as a bare "external and unclaimed" gives them nothing to act on,
+# so the remedy is part of the decision record and every caller relays it.
+
+
+def _decision_record(checkout: Path, venv: Path) -> dict[str, str]:
+    result = subprocess.run(
+        [str(GUARD_RESOURCE), "decide", "--quiet", "--checkout", str(checkout),
+         "--venv", str(venv)],
+        capture_output=True,
+        text=True,
+    )
+    return dict(
+        line.split("=", 1) for line in result.stdout.splitlines() if "=" in line
+    )
+
+
+def test_an_unclaimed_external_venv_states_the_exact_command_to_run(
+    tmp_path: Path,
+) -> None:
+    checkout = _checkout(tmp_path, "repo")
+    (checkout / "scripts").mkdir()
+    wrapper = checkout / "scripts" / "venv_guard.sh"
+    wrapper.write_text("#!/usr/bin/env bash\n")
+    wrapper.chmod(0o755)
+    external = tmp_path / "envs" / "cc"
+    external.mkdir(parents=True)
+
+    remedy = _decision_record(checkout, external)["remedy"]
+
+    assert "claim" in remedy
+    assert str(external) in remedy
+    # It must name a path the caller can actually run, not this file's
+    # internal location.
+    assert str(wrapper) in remedy
+    # And the alternative, so claiming is a choice rather than the only exit.
+    assert "make venv-fast" in remedy
+
+
+def test_a_dangling_venv_states_how_to_rebuild(tmp_path: Path) -> None:
+    checkout = _checkout(tmp_path, "repo")
+    (checkout / ".venv").symlink_to(tmp_path / "gone", target_is_directory=True)
+
+    record = _decision_record(checkout, checkout / ".venv")
+
+    assert record["outcome"] == "broken"
+    assert "rm " in record["remedy"] and "make venv-fast" in record["remedy"]
+
+
+def test_a_shared_venv_states_where_to_install_the_project(tmp_path: Path) -> None:
+    owner = _checkout(tmp_path, "owner")
+    (owner / ".venv").mkdir()
+    worktree = _checkout(tmp_path, "wt")
+    (worktree / ".venv").symlink_to(owner / ".venv", target_is_directory=True)
+
+    record = _decision_record(worktree, worktree / ".venv")
+
+    assert record["outcome"] == "shared"
+    assert str(owner) in record["remedy"]
+
+
+@pytest.mark.parametrize("outcome", ["broken", "unclaimed", "shared"])
+def test_every_non_owned_outcome_carries_a_remedy(outcome: str, tmp_path: Path) -> None:
+    """A refusal or restriction without a fix is a dead end."""
+    checkout = _checkout(tmp_path, "repo")
+    if outcome == "broken":
+        target = checkout / ".venv"
+        target.symlink_to(tmp_path / "gone", target_is_directory=True)
+    elif outcome == "unclaimed":
+        target = tmp_path / "envs" / "cc"
+        target.mkdir(parents=True)
+    else:
+        owner = _checkout(tmp_path, "owner")
+        (owner / ".venv").mkdir()
+        target = checkout / ".venv"
+        target.symlink_to(owner / ".venv", target_is_directory=True)
+
+    record = _decision_record(checkout, target)
+
+    assert record["outcome"] == outcome
+    assert record.get("remedy", "").strip(), f"{outcome} gives no way forward"
+
+
+def test_the_raised_error_carries_the_remedy(tmp_path: Path) -> None:
+    """An agent sees the exception text, not the guard's stderr."""
+    checkout = _checkout(tmp_path, "repo")
+    external = tmp_path / "envs" / "cc"
+    external.mkdir(parents=True)
+
+    with pytest.raises(VenvMutationRefused) as raised:
+        _authority().authorize(checkout=checkout, venv=external)
+
+    assert "To fix:" in str(raised.value)
+    assert "claim" in str(raised.value)

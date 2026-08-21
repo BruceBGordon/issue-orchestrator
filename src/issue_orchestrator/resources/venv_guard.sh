@@ -79,12 +79,30 @@ checkout="$(cd "$checkout" 2>/dev/null && pwd -P)" || {
 ARGS_OWNED="--frozen --all-extras"
 ARGS_SHARED="--frozen --all-extras --no-install-project --inexact"
 
-emit() {  # emit <outcome> <args> <reason>
+# The command a caller should surface verbatim. Resolve the wrapper when it
+# exists, because that is the path a human or agent already knows; fall back to
+# this file otherwise.
+self_path() {
+  if [ -x "$checkout/scripts/venv_guard.sh" ]; then
+    printf '%s' "$checkout/scripts/venv_guard.sh"
+  else
+    printf '%s' "$0"
+  fi
+}
+
+# emit <outcome> <args> <reason> [remedy]
+#
+# `remedy` is part of the decision, not decoration. Every caller passes
+# --quiet, so anything written only to stderr is unreachable in practice: a
+# refusal that does not carry its own fix reaches the operator as a bare
+# "external and unclaimed" with nothing to act on.
+emit() {
   if [ "$command" = "decide" ]; then
     printf 'outcome=%s\n' "$1"
     printf 'sync_args=%s\n' "$2"
     printf 'venv=%s\n' "$venv_path"
     printf 'reason=%s\n' "$3"
+    printf 'remedy=%s\n' "${4:-}"
   fi
 }
 
@@ -93,7 +111,8 @@ note() { [ "$quiet" -eq 0 ] && printf 'venv-guard: %s\n' "$1" >&2 || true; }
 # --- broken: a dangling link cannot be used, and creating over it writes into
 # --- a dead path.
 if [ -L "$venv_path" ] && [ ! -e "$venv_path" ]; then
-  emit broken "" "dangling symlink -> $(readlink "$venv_path")"
+  emit broken "" "dangling symlink -> $(readlink "$venv_path")" \
+    "the checkout that owned it was deleted; remove the dead link and rebuild: rm $venv_path && make venv-fast"
   note "$venv_path is a DANGLING symlink -> $(readlink "$venv_path"). Remove it and rebuild."
   exit "$BROKEN"
 fi
@@ -120,7 +139,8 @@ owner_dir="${resolved%/*}"
 
 # --- owned by another checkout.
 if [ -e "$owner_dir/pyproject.toml" ] || [ -e "$owner_dir/.git" ]; then
-  emit shared "$ARGS_SHARED" "owned by checkout $owner_dir"
+  emit shared "$ARGS_SHARED" "owned by checkout $owner_dir" \
+    "dependencies are synced; to install THIS project run it where the venv lives: make -C $owner_dir install (or give this checkout its own: rm $venv_path && make venv-fast)"
   note "$venv_path is SHARED from $owner_dir; dependency-only operations only."
   exit "$SHARED"
 fi
@@ -143,14 +163,17 @@ if [ -f "$marker" ]; then
     emit owned "$ARGS_OWNED" "claimed by this checkout"
     exit "$OWNED"
   fi
-  emit shared "$ARGS_SHARED" "claimed by $claimed"
+  emit shared "$ARGS_SHARED" "claimed by $claimed" \
+    "$claimed claimed this environment; run from there, or point this checkout at its own venv"
   note "$venv_path is claimed by $claimed; dependency-only operations only."
   exit "$SHARED"
 fi
 
-emit unclaimed "" "external and unclaimed"
+emit unclaimed "" "external and unclaimed" \
+  "this venv is outside every checkout, so nothing proves another one is not also using it. If this checkout is its only user, bind it once: $(self_path) claim --venv $venv_path -- otherwise point this checkout at its own venv: unset the override and run make venv-fast"
 note "$venv_path is outside any checkout and not bound to one.
   Refusing to mutate it: nothing proves another checkout is not using it too.
-  Bind it explicitly first:
-    $0 claim --venv $venv_path"
+  If this checkout is its only user, bind it once:
+    $(self_path) claim --venv $venv_path
+  Otherwise point this checkout at its own venv instead."
 exit "$UNCLAIMED"

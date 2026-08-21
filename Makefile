@@ -134,6 +134,7 @@ _sync_args="$$(printf '%s\n' "$$_decision" | sed -n 's/^sync_args=//p')"; \
 if [ "$$_outcome" != "owned" ] && [ "$$_outcome" != "shared" ]; then \
 	echo "$(1): refusing to mutate $(VENV_TARGET) (outcome='$$_outcome' exit=$$_g)." >&2; \
 	printf '%s\n' "$$_decision" | sed -n 's/^reason=/  reason: /p' >&2; \
+	printf '%s\n' "$$_decision" | sed -n 's/^remedy=/  to fix: /p' >&2; \
 	exit 1; \
 fi; \
 if [ -z "$$_sync_args" ]; then \
@@ -472,6 +473,7 @@ sync-deps:
 	fi; \
 	if [ "$$_outcome" = "shared" ]; then \
 		echo "[sync-deps] Shared .venv - dependency-only sync; the marker belongs to another checkout so it is neither read nor stamped."; \
+		printf '%s\n' "$$_decision" | sed -n 's/^remedy=/[sync-deps] to install this project: /p'; \
 	else \
 		echo "[sync-deps] Dependencies changed since last install; auto-syncing..."; \
 	fi; \

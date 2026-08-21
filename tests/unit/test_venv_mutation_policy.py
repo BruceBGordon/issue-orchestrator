@@ -133,6 +133,7 @@ def _run_make(
     *,
     extra_env: dict[str, str] | None = None,
     uv: Path | None = None,
+    make_args: list[str] | None = None,
 ) -> MakeRun:
     fake_uv, log = _fake_uv(tmp_path)
     assert MAKE is not None
@@ -142,6 +143,7 @@ def _run_make(
             target,
             f"UV={uv or fake_uv}",
             f"SETUP_LOG={tmp_path / 'setup.log'}",
+            *(make_args or []),
         ],
         cwd=checkout,
         capture_output=True,
@@ -448,3 +450,27 @@ def test_sync_deps_still_requires_uv_when_it_must_sync(tmp_path: Path) -> None:
 
     assert run.returncode != 0, run.output
     assert "uv not found" in run.output
+
+
+# ---- the refusal a caller prints must be actionable ------------------------
+
+
+def test_make_refusal_tells_the_operator_how_to_fix_it(tmp_path: Path) -> None:
+    """Every caller passes --quiet, so the guard's stderr guidance is unreachable.
+
+    The remedy must arrive through the decision and be printed by the caller,
+    or a refusal reads as a dead end.
+    """
+    checkout = _make_checkout(tmp_path)
+    external = tmp_path / "envs" / "cc"
+    external.mkdir(parents=True)
+
+    run = _run_make(
+        checkout, "sync-deps", tmp_path, extra_env={"MAKEFLAGS": ""},
+        make_args=[f"VENV_TARGET={external}"],
+    )
+
+    assert run.returncode != 0, run.output
+    assert "to fix:" in run.output.lower(), run.output
+    assert "claim --venv" in run.output, run.output
+    assert str(external) in run.output

@@ -924,6 +924,10 @@ def require_owned_venv(root: Path) -> None:
             timeout=30,
         )
         outcome = completed.returncode
+        remedy = ""
+        for line in completed.stdout.splitlines():
+            if line.startswith("remedy="):
+                remedy = line.partition("=")[2].strip()
     except OSError as exc:
         raise ReleasePrepError(
             f"Cannot consult the venv mutation authority at {guard}: {exc}"
@@ -939,11 +943,10 @@ def require_owned_venv(root: Path) -> None:
     reason = reasons.get(
         outcome, f"the venv mutation authority returned {outcome}"
     )
-    raise ReleasePrepError(
-        f"Refusing to sync the environment for {root}: {reason}. "
-        "Run the release from the checkout that owns the venv, or give this "
-        "checkout its own with `rm .venv && make venv-fast`."
-    )
+    message = f"Refusing to sync the environment for {root}: {reason}."
+    if remedy:
+        message += f"\n  To fix: {remedy}"
+    raise ReleasePrepError(message)
 
 
 def sync_environment_if_requested(
