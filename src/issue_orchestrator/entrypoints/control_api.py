@@ -55,6 +55,7 @@ from fastapi.responses import JSONResponse, HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 from sse_starlette.sse import EventSourceResponse
 
+from .control_api_pause_routes import control_pause_router
 from ..infra import gh_audit
 from ..execution.repository_engine_supervisor import build_default_supervisor_ops
 from ..ports.repository_engine_supervisor import SupervisorOps
@@ -674,26 +675,6 @@ async def refresh(request: Request) -> JSONResponse:
     return JSONResponse({"status": "refresh_requested"})
 
 
-@control_app.post("/api/pause")
-async def pause() -> JSONResponse:
-    """Pause the orchestrator - stop launching new sessions."""
-    if _orchestrator is None:
-        return JSONResponse({"error": "Orchestrator not initialized"}, status_code=503)
-
-    _orchestrator.pause()
-    return JSONResponse({"status": "paused"})
-
-
-@control_app.post("/api/resume")
-async def resume() -> JSONResponse:
-    """Resume the orchestrator - allow launching new sessions."""
-    if _orchestrator is None:
-        return JSONResponse({"error": "Orchestrator not initialized"}, status_code=503)
-
-    _orchestrator.resume()
-    return JSONResponse({"status": "resumed"})
-
-
 def _active_session_status_payload(session: Any) -> dict[str, Any]:
     runtime_minutes = session.runtime_minutes
     timeout_minutes = session.agent_config.timeout_minutes
@@ -720,7 +701,7 @@ async def status() -> JSONResponse:
     ]
     return JSONResponse(
         {
-            "paused": state.paused,
+            **state.pause_state.to_payload(),
             "active_sessions": len(state.active_sessions),
             "sessions": sessions,
             "pending_reviews": len(state.pending_reviews),
@@ -880,7 +861,7 @@ async def health() -> JSONResponse:
 
     health_data["orchestrator"] = {
         "status": "running",
-        "paused": _orchestrator.state.paused,
+        **_orchestrator.state.pause_state.to_payload(),
         "active_sessions": len(_orchestrator.state.active_sessions),
     }
 
@@ -1180,6 +1161,7 @@ install_control_api_setup_dependencies(
         validation_detector=RepositorySetupValidationDetectorAdapter(),
     ),
 )
+control_app.include_router(control_pause_router)
 control_app.include_router(control_orchestrator_router)
 control_app.include_router(control_shutdown_router)
 control_app.include_router(control_goal_pilot_router)

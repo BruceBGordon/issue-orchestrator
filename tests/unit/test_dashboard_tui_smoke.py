@@ -18,6 +18,7 @@ import pytest
 from rich.console import Console
 from rich.table import Table
 
+from tests.conftest import operator_paused_state
 from issue_orchestrator.entrypoints.dashboard import (
     DashboardApp,
     QueueTable,
@@ -45,7 +46,7 @@ class TestTextualRuntimeSmoke:
     @pytest.mark.asyncio
     async def test_status_bar_renders_orchestrator_state(self) -> None:
         orchestrator = create_orchestrator()
-        orchestrator.state.paused = True
+        orchestrator.state.pause_state = operator_paused_state()
 
         app = DashboardApp(orchestrator)
         async with app.run_test() as pilot:

@@ -2,7 +2,11 @@
 
 from typing import Any
 
-from ...ports.repository_host import RepositoryHostError, RepositoryHostErrorKind
+from ...ports.repository_host import (
+    RepositoryHostError,
+    RepositoryHostErrorKind,
+    RepositoryScanIncompleteError,
+)
 
 
 class GitHubHttpError(RepositoryHostError):
@@ -67,8 +71,18 @@ class GitHubAuthError(GitHubHttpError):
     """Raised when GitHub auth cannot be resolved."""
 
 
+class GitHubScanIncompleteError(GitHubHttpError, RepositoryScanIncompleteError):
+    """An exhaustive GitHub scan could not prove completeness.
+
+    Subclasses ``GitHubHttpError`` so existing adapter-level handlers keep
+    catching it, and the port-level marker so control policy can refuse to
+    treat it as a skippable outage.
+    """
+
+
 __all__ = [
     "GitHubAuthError",
     "GitHubHttpError",
+    "GitHubScanIncompleteError",
     "GitHubTransportError",
 ]

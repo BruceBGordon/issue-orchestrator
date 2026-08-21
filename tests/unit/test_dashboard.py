@@ -27,6 +27,9 @@ Notes:
 
 import asyncio
 import pytest
+
+from issue_orchestrator.domain.pause_state import PauseActor, PauseReason, PauseState
+from tests.conftest import operator_paused_state
 from pathlib import Path
 from unittest.mock import MagicMock, patch, AsyncMock
 from tests.unit.threading_helpers import wait_for_async_event
@@ -125,7 +128,7 @@ class TestStatusBar:
     def test_render_content_running(self):
         """Test rendering content when orchestrator is running."""
         orchestrator = create_orchestrator()
-        orchestrator.state.paused = False
+        orchestrator.state.pause_state = PauseState.running()
         orchestrator.state.active_sessions = []
         orchestrator.state.completed_today = []
 
@@ -142,7 +145,7 @@ class TestStatusBar:
     def test_render_content_paused(self):
         """Test rendering content when orchestrator is paused."""
         orchestrator = create_orchestrator()
-        orchestrator.state.paused = True
+        orchestrator.state.pause_state = operator_paused_state()
 
         status_bar = StatusBar(orchestrator)
         with patch.object(status_bar, 'update') as mock_update:
@@ -444,14 +447,19 @@ class TestDashboardApp:
     async def test_action_pause_without_callback(self):
         """Test pause action without custom callback."""
         orchestrator = create_orchestrator()
-        orchestrator.state.paused = False
+        orchestrator.state.pause_state = PauseState.running()
 
         app = DashboardApp(orchestrator)
 
         with patch.object(app, 'notify') as mock_notify:
             await app.action_pause()
 
-            assert orchestrator.state.paused is True
+            # The dashboard no longer writes ``state.paused`` behind the owner's
+            # back — that path recorded no event, no log line, and no journal
+            # row. It now delegates, naming itself as the actor.
+            orchestrator.pause.assert_called_once_with(
+                reason=PauseReason.OPERATOR, actor=PauseActor.DASHBOARD
+            )
             mock_notify.assert_called_once()
 
     @pytest.mark.asyncio
@@ -472,14 +480,14 @@ class TestDashboardApp:
     async def test_action_resume_without_callback(self):
         """Test resume action without custom callback."""
         orchestrator = create_orchestrator()
-        orchestrator.state.paused = True
+        orchestrator.state.pause_state = operator_paused_state()
 
         app = DashboardApp(orchestrator)
 
         with patch.object(app, 'notify') as mock_notify:
             await app.action_resume()
 
-            assert orchestrator.state.paused is False
+            orchestrator.resume.assert_called_once_with(actor=PauseActor.DASHBOARD)
             mock_notify.assert_called_once()
 
     @pytest.mark.asyncio
@@ -623,25 +631,27 @@ class TestDashboard:
     async def test_handle_pause(self):
         """Test pause handler."""
         orchestrator = create_orchestrator()
-        orchestrator.state.paused = False
+        orchestrator.state.pause_state = PauseState.running()
 
         dashboard = Dashboard(orchestrator)
         # noqa: SLF001 - testing internal handler that manages orchestrator state
         await dashboard._handle_pause()  # noqa: SLF001
 
-        assert orchestrator.state.paused is True
+        orchestrator.pause.assert_called_once_with(
+            reason=PauseReason.OPERATOR, actor=PauseActor.DASHBOARD
+        )
 
     @pytest.mark.asyncio
     async def test_handle_resume(self):
         """Test resume handler."""
         orchestrator = create_orchestrator()
-        orchestrator.state.paused = True
+        orchestrator.state.pause_state = operator_paused_state()
 
         dashboard = Dashboard(orchestrator)
         # noqa: SLF001 - testing internal handler that manages orchestrator state
         await dashboard._handle_resume()  # noqa: SLF001
 
-        assert orchestrator.state.paused is False
+        orchestrator.resume.assert_called_once_with(actor=PauseActor.DASHBOARD)
 
     @pytest.mark.asyncio
     async def test_handle_attach_tmux_mode(self):

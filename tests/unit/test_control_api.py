@@ -25,6 +25,7 @@ from unittest.mock import MagicMock, patch, AsyncMock
 import pytest
 from fastapi.testclient import TestClient
 
+from tests.conftest import attach_real_pause_controller
 from issue_orchestrator.entrypoints.control_api import (
     control_app,
     get_supervisor,
@@ -177,6 +178,8 @@ def create_mock_orchestrator():
     mock.event_context = MagicMock()
     mock.event_context.tick_id = 0
 
+
+    attach_real_pause_controller(mock)
     return mock
 
 

@@ -44,6 +44,8 @@ from issue_orchestrator.execution.session_output_adapter import (
 from issue_orchestrator.ports.run_ledger_store import (
     SingleInstanceRunLedgerStore,
 )
+from issue_orchestrator.domain.pause_state import PauseState
+from tests.conftest import operator_paused_state
 from tests.e2e_web.conftest import (
     FlowWebMockOrchestrator,
     UvicornTestServer,
@@ -463,7 +465,7 @@ def test_a_paused_engine_disables_the_action_but_keeps_its_reason_reachable(
 ) -> None:
     orchestrator = tech_lead_server["orchestrator"]
     _reset(orchestrator)
-    orchestrator.state.paused = True
+    orchestrator.state.pause_state = operator_paused_state()
     try:
         _open(page, tech_lead_server)
         page.click("#settingsMenuBtn")
@@ -474,7 +476,7 @@ def test_a_paused_engine_disables_the_action_but_keeps_its_reason_reachable(
         assert "paused" in (a11y["describedText"] or "").lower()
         assert a11y["remedyPresent"] is False, "a pause is not a Settings problem"
     finally:
-        orchestrator.state.paused = False
+        orchestrator.state.pause_state = PauseState.running()
 
 
 def test_a_queued_BATCH_review_still_lets_the_operator_request_a_health_review(

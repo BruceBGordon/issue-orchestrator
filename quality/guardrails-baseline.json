@@ -192,6 +192,14 @@
       "rule_id": "control_policy_branch_sites",
       "value": 5
     },
+    "control_policy_branch_sites:src/issue_orchestrator/control/pause_controller.py": {
+      "detail": "4 branch site(s) mention lifecycle/control terms",
+      "kind": "control_policy_branch_sites",
+      "metric_id": "src/issue_orchestrator/control/pause_controller.py",
+      "path": "src/issue_orchestrator/control/pause_controller.py",
+      "rule_id": "control_policy_branch_sites",
+      "value": 4
+    },
     "control_policy_branch_sites:src/issue_orchestrator/control/planner.py": {
       "detail": "11 branch site(s) mention lifecycle/control terms",
       "kind": "control_policy_branch_sites",

@@ -82,6 +82,8 @@ from tests.unit.session_run_helpers import make_session_run_assets
 from issue_orchestrator.events import EventName
 from issue_orchestrator.ports import TraceEvent
 from issue_orchestrator.infra.config import Config
+from issue_orchestrator.domain.pause_state import PauseState
+from tests.conftest import operator_paused_state
 
 
 # =============================================================================
@@ -125,7 +127,7 @@ def sample_orchestrator_state():
     """Create a sample OrchestratorState for testing."""
     return OrchestratorState(
         active_sessions=[],
-        paused=False,
+        pause_state=PauseState.running(),
         pending_reviews=[],
         pending_reworks=[],
         pending_tech_lead_reviews=[],
@@ -1230,7 +1232,7 @@ class TestClearDiscoveredFacts:
     def test_preserves_non_discovered_state(self, sample_orchestrator_state):
         """clear_discovered_facts does not affect other state fields."""
         # Set up some non-discovered state
-        sample_orchestrator_state.paused = True
+        sample_orchestrator_state.pause_state = operator_paused_state()
         sample_orchestrator_state.issues_started_count = 5
         sample_orchestrator_state.pending_reviews = [
             PendingReview(
@@ -1486,7 +1488,7 @@ class TestOrchestratorSupportApplyPlan:
             nonlocal apply_count
             apply_count += 1
             if apply_count == 1:
-                sample_orchestrator_state.paused = True
+                sample_orchestrator_state.pause_state = operator_paused_state()
             result = MagicMock()
             result.success = True
             result.details = {}
@@ -2368,7 +2370,7 @@ class TestUpdateStateAfterAction:
         from issue_orchestrator.control.fact_gatherer import clear_discovered_facts
 
         config = self._storm_config()
-        support_with_state.state.paused = True
+        support_with_state.state.pause_state = operator_paused_state()
         plan = self._plan_storm_tick(support_with_state, config)
 
         assert plan.actions == ()
@@ -2392,13 +2394,13 @@ class TestUpdateStateAfterAction:
         and wipes a cohort nothing recorded.
         """
         config = self._storm_config()
-        support_with_state.state.paused = True
+        support_with_state.state.pause_state = operator_paused_state()
         plan = self._plan_storm_tick(support_with_state, config)
         tick = self._tick_snapshot(support_with_state)
         assert plan.actions == ()
         assert tick.paused is True
 
-        support_with_state.state.paused = False
+        support_with_state.state.pause_state = PauseState.running()
 
         support_with_state.clear_discovered_facts(tick)
 
@@ -2425,7 +2427,7 @@ class TestUpdateStateAfterAction:
         assert tick.paused is False
         self._apply_via_plan(support_with_state, list(plan.actions), issue_number=999)
 
-        support_with_state.state.paused = True
+        support_with_state.state.pause_state = operator_paused_state()
 
         support_with_state.clear_discovered_facts(tick)
 
@@ -2745,7 +2747,7 @@ class TestRunTick:
     ):
         """run_tick allows a pending queue refresh while keeping paused planning safe."""
         inflight = {}
-        sample_orchestrator_state.paused = True
+        sample_orchestrator_state.pause_state = operator_paused_state()
         sample_orchestrator_state.queue_refresh_requested = True
         planning_fn = Mock()
 

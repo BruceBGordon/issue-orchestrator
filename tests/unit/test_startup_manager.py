@@ -27,6 +27,7 @@ from issue_orchestrator.domain.models import (
     ORCHESTRATOR_PR_MARKER,
 )
 from issue_orchestrator.domain.tech_lead_session import TechLeadSessionFlavor
+from tests.conftest import operator_paused_state
 
 
 def _startup_worktree_reconciler() -> MagicMock:
@@ -1306,7 +1307,7 @@ class TestStartupManagerResumePartialWork:
         mock_label_store,
     ):
         """Start-paused recovery must not launch fresh sessions for partial work."""
-        sample_state.paused = True
+        sample_state.pause_state = operator_paused_state()
         mock_issue_branches_fn.return_value = {1: "1-feature"}
         mock_config.agents = {"agent:web": MagicMock()}
 

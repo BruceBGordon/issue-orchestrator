@@ -120,13 +120,17 @@ class _FakeHost:
         # overridden by tests that inject a failed/leaked cleanup.
         self._termination = termination or TechLeadTerminationOutcome()
         self.pause_calls = 0
+        self.pause_reasons: list = []
         self.tick_count = 0
         self.launched: list = []
         self.killed: list[str] = []
         self._session: _Session | None = None
 
-    def pause(self) -> None:
+    def pause(self, *, reason=None, actor=None, detail: str = "") -> None:
         self.pause_calls += 1
+        # Recorded so tests can assert the dispatch host names WHY it paused
+        # the planner, not merely that it did.
+        self.pause_reasons.append(reason)
 
     def request_tech_lead_run(self, request):
         return self._coordinator.admit(request)
@@ -301,14 +305,18 @@ class _FakeHealthHost:
         self._ticks_to_complete = ticks_to_complete
         self._termination = termination or TechLeadTerminationOutcome()
         self.pause_calls = 0
+        self.pause_reasons: list = []
         self.ensure_calls = 0
         self.launched: list = []
         self.killed: list[str] = []
         self.tick_count = 0
         self._session: _Session | None = None
 
-    def pause(self) -> None:
+    def pause(self, *, reason=None, actor=None, detail: str = "") -> None:
         self.pause_calls += 1
+        # Recorded so tests can assert the dispatch host names WHY it paused
+        # the planner, not merely that it did.
+        self.pause_reasons.append(reason)
 
     def request_tech_lead_run(self, request):
         return self._coordinator.admit(request)

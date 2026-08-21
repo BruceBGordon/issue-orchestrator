@@ -53,6 +53,54 @@ Use them in this order:
 2. Issue audit when a specific run failed or timed out.
 3. Session diagnostics when you need exact run-scoped files and replay paths.
 
+## "Why is the orchestrator paused?"
+
+A paused engine keeps ticking and logging, so it looks alive while doing nothing.
+Answer this in one step — the pause journal is durable and survives restarts:
+
+```bash
+# Newest transition last: why, who, when, and how long the last pause held.
+tail -5 .issue-orchestrator/state/pause-journal.jsonl | jq
+```
+
+Or ask the running engine, which reports the same provenance:
+
+```bash
+curl -s http://localhost:8080/api/status | jq '{paused, pause_reason, pause_actor,
+  paused_since, paused_held_seconds, pause_is_incident, pause_detail}'
+```
+
+The log tail also carries it — every `[LOOP]` line names the reason while paused:
+
+```
+[LOOP] Iteration 11169 - active=0 paused=True [reason=loop_error_threshold by=system
+  since=2026-08-17T09:37:19+00:00 held=196255s detail=3 consecutive tick errors; ...]
+```
+
+**Reading the reason:**
+
+| `pause_reason` | Meaning | Clears itself? |
+|---|---|---|
+| `operator` | Someone clicked Pause (`pause_actor` says which surface) | No — resume it |
+| `startup` | Started with `--start-paused` | No — resume it |
+| `tech_lead_investigation` / `tech_lead_health_review` | The planner is halted for the length of a tech-lead run | Yes, when the run ends |
+| `loop_error_threshold` | **Incident.** Three consecutive tick errors tripped the breaker | Yes — half-open retry on a 60s/5m/15m/1h ladder |
+
+Only `loop_error_threshold` is a fault (`pause_is_incident: true`). Its
+`pause_detail` carries the last exception, which is usually the whole answer —
+`GitHubAuthError: [Errno 8] nodename nor servname provided` means DNS was gone,
+typically because the host slept.
+
+Resume sooner than the backoff with:
+
+```bash
+curl -s -X POST http://localhost:8080/api/resume | jq
+```
+
+An incident pause that keeps recurring is the signal to chase — the ladder only
+resets after a healthy tick, so a climbing backoff means the fault is real and
+not a blip.
+
 ## Session Output Directory
 
 All session artifacts are centralized in a run directory per session:

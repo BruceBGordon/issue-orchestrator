@@ -18,6 +18,8 @@ from typing import Any, Optional
 
 import pytest
 
+from tests.conftest import operator_paused_state
+
 from issue_orchestrator.control.tech_lead_launch_planning import (
     TechLeadLaunchGate,
     plan_tech_lead_launch_gate,
@@ -241,6 +243,8 @@ def _config(
 
 def _state(**kwargs: Any) -> OrchestratorState:
     state = OrchestratorState()
+    if kwargs.pop("paused", False):
+        state.pause_state = operator_paused_state()
     for key, value in kwargs.items():
         setattr(state, key, value)
     return state

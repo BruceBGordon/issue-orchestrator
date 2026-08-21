@@ -6,6 +6,7 @@ The Orchestrator delegates to this class for support operations.
 
 import logging
 import time
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Optional, Callable, cast
 
@@ -1295,11 +1296,21 @@ def run_tick(
     if expired:
         logger.debug("[INFLIGHT] Pruned %d expired IDs: %s", len(expired), expired)
 
+    # A paused engine repeats this line every 10s for as long as the pause
+    # holds — for days, in the incidents that motivated this. Carrying the
+    # reason inline means the tail of the log answers "why is it paused?"
+    # without scrolling back to the transition that caused it.
+    pause_note = (
+        f" [{state.pause_state.describe(datetime.now(timezone.utc))}]"
+        if state.paused
+        else ""
+    )
     logger.info(
-        "[LOOP] Iteration %d - active=%d paused=%s pending_reviews=%d pending_reworks=%d pending_tech_lead=%d inflight=%d",
+        "[LOOP] Iteration %d - active=%d paused=%s%s pending_reviews=%d pending_reworks=%d pending_tech_lead=%d inflight=%d",
         loop_iteration,
         len(state.active_sessions),
         state.paused,
+        pause_note,
         len(state.pending_reviews),
         len(state.pending_reworks),
         len(state.pending_tech_lead_reviews),
