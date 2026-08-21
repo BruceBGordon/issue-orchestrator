@@ -848,7 +848,8 @@ class Orchestrator:
         except RepositoryHostError as error:
             logger.warning("[LOOP] Skipping startup orphan-label reconcile — repository host unavailable: %s", error)
 
-    def _auto_resume_if_due(self) -> None: _auto_resume_if_due(self)
+    def _auto_resume_if_due(self) -> None:
+        _auto_resume_if_due(self.pause_controller, self.state_lock)
 
     def _handle_loop_error(self, error: Exception) -> None:
         """Log a tick error; the pause owner decides whether it trips the breaker."""
@@ -1017,17 +1018,17 @@ class Orchestrator:
         self, *, reason: PauseReason, actor: PauseActor, detail: str = ""
     ) -> PauseTransitionOutcome:
         """Pause the engine. Every caller must say why and on whose behalf."""
-        return _pause(self, reason=reason, actor=actor, detail=detail)
+        return _pause(self.pause_controller, self.state_lock, reason=reason, actor=actor, detail=detail)
 
     def set_start_paused(self, *, actor: PauseActor = PauseActor.CLI) -> None:
         """Start paused and request one read-only dashboard hydration."""
-        _set_start_paused(self, actor=actor)
+        _set_start_paused(self.pause_controller, self.state_lock, self.state, actor=actor)
 
     def resume(
         self, *, actor: PauseActor, detail: str = ""
     ) -> PauseTransitionOutcome:
         """Resume the engine, recording who lifted it and what it was paused for."""
-        return _resume(self, actor=actor, detail=detail)
+        return _resume(self.pause_controller, self.state_lock, actor=actor, detail=detail)
 
     def get_failure_diagnosis(self, issue_number: int) -> dict:
         """Get failure diagnosis for a session.
