@@ -69,18 +69,26 @@ class SettlementOutcome(Enum):
     ) -> "SettlementOutcome":
         """Classify a terminal completion by its typed provider verdict.
 
-        A typed provider verdict — AUTH (a dead credential) or TRANSIENT (the
-        provider itself was unreachable after its own retries) — means the
-        session never got to attempt the work, so its claim is deferred rather
-        than spent. Anything else, including an agent that reported BLOCKED on
-        the substance of the work, consumes the claim.
+        A typed provider verdict — a human-fixable outage (a dead credential,
+        an exhausted balance) or TRANSIENT (the provider itself was unreachable
+        after its own retries) — means the session never got to attempt the
+        work, so its claim is deferred rather than spent. Anything else,
+        including an agent that reported BLOCKED on the substance of the work,
+        consumes the claim.
+
+        The human-fixable arm is asked as a policy question rather than named
+        as AUTH: an account that ran out of credits attempted exactly as little
+        work as one whose login expired, and burning the claim for it would
+        retire a request nobody ever worked on (#7096).
 
         ``None`` is the overwhelmingly common case and maps to CONSUMED, so this
         classifier keeps today's behaviour for every non-provider outcome.
         """
-        if provider_error_type in (
-            ProviderErrorType.AUTH,
-            ProviderErrorType.TRANSIENT,
+        if provider_error_type is None:
+            return cls.CONSUMED
+        if (
+            provider_error_type is ProviderErrorType.TRANSIENT
+            or provider_error_type.requires_human_intervention
         ):
             return cls.PROVIDER_DEFERRED
         return cls.CONSUMED

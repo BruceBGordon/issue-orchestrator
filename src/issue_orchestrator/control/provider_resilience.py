@@ -122,6 +122,12 @@ class ProviderResilienceManager:
             updated_at=now,
             consecutive_auth_failures=state.consecutive_auth_failures if state else 0,
             last_auth_sample_id=state.last_auth_sample_id if state else "",
+            # Untouched for the same reason as the auth dimension: a service
+            # outage says nothing about the account balance.
+            quota_open_until=state.quota_open_until if state else None,
+            consecutive_quota_failures=(
+                state.consecutive_quota_failures if state else 0
+            ),
         )
         self.store.save(new_state)
 
@@ -219,6 +225,12 @@ class ProviderResilienceManager:
             updated_at=now,
             consecutive_auth_failures=consecutive_auth,
             last_auth_sample_id=sample_id,
+            # A renewed login does not buy credits, and an expired one does not
+            # spend them: the quota dimension is orthogonal and survives here.
+            quota_open_until=state.quota_open_until if state else None,
+            consecutive_quota_failures=(
+                state.consecutive_quota_failures if state else 0
+            ),
         )
         self.store.save(new_state)
 
@@ -239,6 +251,80 @@ class ProviderResilienceManager:
                 {
                     "provider": provider,
                     "open_until": auth_open_until.isoformat(),
+                    "consecutive_outages": new_state.consecutive_outages,
+                    "error_summary": error_summary,
+                },
+            ))
+
+        return new_state
+
+    def record_quota_failure(
+        self,
+        provider: str | None,
+        *,
+        error_summary: str,
+        now: datetime | None = None,
+    ) -> ProviderCircuitState | None:
+        """Record an exhausted balance or usage allowance for ``provider``.
+
+        Trips on the **first** observation, unlike the auth ladder. An auth
+        verdict comes from one cached probe sample that gates every launch in a
+        tick, which is why a threshold above one is meaningful there. A quota
+        verdict has no probe behind it: it is read from a session that really
+        ran and really failed, so waiting for a second observation means
+        deliberately burning a second session to learn what the first already
+        proved (#7096).
+
+        Shares :attr:`auth_cooldown_seconds`. Both causes are outages only a
+        person can end, and that window exists to keep the fleet off the
+        transient ladder; the property that matters is "long", and a second
+        knob would carry no information the first does not.
+
+        Recovery is by elapsed deadline through :meth:`close_expired`. There is
+        deliberately no probe-driven clear to mirror
+        :meth:`clear_auth_failures`: no provider CLI reports a balance, so such
+        a method could have no caller able to prove what it asserted.
+        """
+        if not provider:
+            return None
+
+        now = now or _now()
+        state = self.store.get(provider)
+        consecutive_quota = (state.consecutive_quota_failures + 1) if state else 1
+        quota_open_until = now + timedelta(
+            seconds=self.config.circuit_breaker.auth_cooldown_seconds
+        )
+        was_open = self._is_open_state(state, now)
+
+        new_state = ProviderCircuitState(
+            provider=provider,
+            transient_open_until=state.transient_open_until if state else None,
+            auth_open_until=state.auth_open_until if state else None,
+            consecutive_outages=state.consecutive_outages if state else 0,
+            last_error_summary=error_summary,
+            updated_at=now,
+            consecutive_auth_failures=state.consecutive_auth_failures if state else 0,
+            last_auth_sample_id=state.last_auth_sample_id if state else "",
+            quota_open_until=quota_open_until,
+            consecutive_quota_failures=consecutive_quota,
+        )
+        self.store.save(new_state)
+
+        self.events.publish(make_trace_event(
+            EventName.PROVIDER_QUOTA_EXHAUSTED,
+            {
+                "provider": provider,
+                "consecutive_quota_failures": consecutive_quota,
+                "error_summary": error_summary,
+            },
+        ))
+
+        if not was_open:
+            self.events.publish(make_trace_event(
+                EventName.PROVIDER_OUTAGE_ENTERED,
+                {
+                    "provider": provider,
+                    "open_until": quota_open_until.isoformat(),
                     "consecutive_outages": new_state.consecutive_outages,
                     "error_summary": error_summary,
                 },
@@ -285,6 +371,11 @@ class ProviderResilienceManager:
             updated_at=now,
             consecutive_auth_failures=0,
             last_auth_sample_id="",
+            # A READY credential probe is evidence about credentials alone. It
+            # cannot see the balance — no provider CLI exposes one — so a quota
+            # outage keeps its deadline and the provider stays closed on it.
+            quota_open_until=state.quota_open_until,
+            consecutive_quota_failures=state.consecutive_quota_failures,
         )
         self.store.save(updated)
 
@@ -346,11 +437,20 @@ class ProviderResilienceManager:
             updated_at=now,
             consecutive_auth_failures=state.consecutive_auth_failures,
             last_auth_sample_id=state.last_auth_sample_id,
+            # Survives for the same reason the auth dimension does, and it
+            # matters more here: quota has no READY-probe equivalent to retire
+            # it, so if a success deleted the row the outage would be forgotten
+            # outright rather than merely retired early.
+            quota_open_until=state.quota_open_until,
+            consecutive_quota_failures=state.consecutive_quota_failures,
         )
-        auth_cause_remains = (
-            state.auth_open_until is not None or state.consecutive_auth_failures > 0
+        human_fixable_cause_remains = (
+            state.auth_open_until is not None
+            or state.consecutive_auth_failures > 0
+            or state.quota_open_until is not None
+            or state.consecutive_quota_failures > 0
         )
-        if auth_cause_remains:
+        if human_fixable_cause_remains:
             self.store.save(updated)
         else:
             # Nothing is left to remember, and a healthy circuit has no row.
@@ -389,6 +489,12 @@ class ProviderResilienceManager:
                 updated_at=now,
                 consecutive_auth_failures=state.consecutive_auth_failures,
                 last_auth_sample_id=state.last_auth_sample_id,
+                # Quota has no probe-driven recovery, so this elapsed-deadline
+                # path is its only way back. Retiring the counter with the
+                # deadline means the next exhaustion starts a fresh escalation
+                # rather than tripping instantly on a stale count.
+                quota_open_until=None,
+                consecutive_quota_failures=0,
             )
             self.store.save(updated)
             closed.append(updated)

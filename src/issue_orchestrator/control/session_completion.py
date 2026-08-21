@@ -35,6 +35,7 @@ from .completion_dispatcher import (
     CompletionDispatcher,
     SynchronousCompletionDispatcher,
 )
+from .provider_circuit_effects import record_provider_resilience_effects
 from .session_completion_diagnostics import (
     run_session_analysis,
     surface_failure_context,
@@ -704,7 +705,7 @@ def _apply_completed_decision(
         raise completed.error
     decision = completed.decision
     assert decision is not None  # error is None => decision is set
-    _record_provider_resilience_effects(decision, provider_resilience)
+    record_provider_resilience_effects(decision, provider_resilience)
     session = completed.session
     if decision.status == SessionStatus.RUNNING:
         logger.info(
@@ -768,29 +769,3 @@ def _apply_completed_decision(
         )
 
 
-def _record_provider_resilience_effects(
-    decision: "SessionDecision",
-    provider_resilience: "ProviderResilienceManager | None",
-) -> None:
-    """Apply provider-circuit effects on the tick thread."""
-    if provider_resilience is None:
-        return
-    if decision.provider_success:
-        provider_resilience.record_success(decision.provider_success)
-    if decision.provider_transient_failure:
-        failure = decision.provider_transient_failure
-        provider_resilience.record_transient_failure(
-            failure.provider,
-            error_summary=failure.error_summary,
-            attempts=failure.attempts,
-        )
-    if decision.provider_auth_failure:
-        auth_failure = decision.provider_auth_failure
-        provider_resilience.record_auth_failure(
-            auth_failure.provider,
-            error_summary=auth_failure.error_summary,
-            # The credential sample this verdict was confirmed against. Sharing
-            # it with the launch-side check means one physical observation is
-            # counted once, not once per consumer (#6999 F2).
-            sample_id=auth_failure.sample_id,
-        )

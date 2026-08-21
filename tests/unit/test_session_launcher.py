@@ -27,9 +27,11 @@ from issue_orchestrator.control.launch_transaction import PendingWorkLaunchClaim
 from issue_orchestrator.domain.repository_launch_selection import (
     RepositoryLaunchSelection,
 )
+from issue_orchestrator.control.provider_circuit_effects import (
+    record_provider_resilience_effects,
+)
 from issue_orchestrator.control.session_completion import (
     _apply_completed_decisions,
-    _record_provider_resilience_effects,
     _terminate_finished_session,
     handle_session_completion,
     process_active_sessions,
@@ -5777,7 +5779,7 @@ class TestProcessActiveSessions:
             if completed.error is not None:
                 raise completed.error
             assert completed.decision is not None
-            _record_provider_resilience_effects(
+            record_provider_resilience_effects(
                 completed.decision,
                 provider_resilience,
             )
@@ -5792,14 +5794,14 @@ class TestProcessActiveSessions:
         """Provider-circuit mutations happen when the drained decision is applied."""
         provider_resilience = MagicMock()
 
-        _record_provider_resilience_effects(
+        record_provider_resilience_effects(
             SessionDecision(
                 status=SessionStatus.RUNNING,
                 provider_success="codex",
             ),
             provider_resilience,
         )
-        _record_provider_resilience_effects(
+        record_provider_resilience_effects(
             SessionDecision(
                 status=SessionStatus.BLOCKED,
                 provider_transient_failure=ProviderTransientFailureDecision(

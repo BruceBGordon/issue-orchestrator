@@ -12,7 +12,22 @@ class ProviderErrorType(str, Enum):
     TRANSIENT = "transient"
     RATE_LIMIT = "rate_limit"
     AUTH = "auth"
+    QUOTA = "quota"
     FATAL = "fatal"
+
+    @property
+    def requires_human_intervention(self) -> bool:
+        """Whether waiting can never clear this failure.
+
+        The distinction the retry ladder and the circuit both turn on. A
+        transient outage and a rate limit heal on a timer; an expired
+        credential and an exhausted balance heal only when a person acts.
+        Call sites that mean "a human must fix this" branch on this predicate
+        rather than on ``is AUTH``, so adding a second human-fixable cause
+        does not silently reinstate the retry-until-the-wall-clock behaviour
+        that AUTH was given its own window to prevent (#6999).
+        """
+        return self in (ProviderErrorType.AUTH, ProviderErrorType.QUOTA)
 
 
 @dataclass(frozen=True)
@@ -23,7 +38,9 @@ class ProviderCircuitState:
     provider, and each has its own validity window. Collapsing them into a
     single ``open_until`` meant retiring one silently released the other: a
     ``READY`` credential probe says nothing about a 429/5xx outage, but would
-    have re-opened launches into it (#6999 F3). Both dimensions are stored, and
+    have re-opened launches into it (#6999 F3). An exhausted balance is a third
+    such fact, independent of both: credits are not restored by a service
+    recovering, nor by a login being renewed. Every dimension is stored, and
     "is the circuit open" is *derived* from them.
     """
 
@@ -46,6 +63,13 @@ class ProviderCircuitState:
     # exactly once so a configured threshold > 1 still means "more than one
     # observation" (#6999 F2).
     last_auth_sample_id: str = ""
+    # Deadline for an exhausted balance or usage allowance. A third dimension
+    # rather than a reuse of the auth window, because the two recover on
+    # different signals: a readiness probe confirming a valid login proves
+    # nothing about restored credits, so clearing the auth window must not
+    # release a quota outage.
+    quota_open_until: datetime | None = None
+    consecutive_quota_failures: int = 0
 
     @property
     def open_until(self) -> datetime | None:
@@ -56,7 +80,11 @@ class ProviderCircuitState:
         """
         deadlines = [
             deadline
-            for deadline in (self.transient_open_until, self.auth_open_until)
+            for deadline in (
+                self.transient_open_until,
+                self.auth_open_until,
+                self.quota_open_until,
+            )
             if deadline is not None
         ]
         return max(deadlines) if deadlines else None

@@ -473,6 +473,12 @@
     "status": "started",
     "step": "provider.outage_exited"
   },
+  "provider.quota_exhausted": {
+    "level": "detail",
+    "phase": "system",
+    "status": "completed",
+    "step": "provider.quota_exhausted"
+  },
   "provider.retry_attempted": {
     "level": "detail",
     "phase": "system",

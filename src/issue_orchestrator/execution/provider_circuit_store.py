@@ -21,19 +21,23 @@ CREATE TABLE IF NOT EXISTS provider_circuit (
     updated_at TEXT NOT NULL,
     consecutive_auth_failures INTEGER NOT NULL DEFAULT 0,
     auth_open_until TEXT,
-    last_auth_sample_id TEXT NOT NULL DEFAULT ''
+    last_auth_sample_id TEXT NOT NULL DEFAULT '',
+    quota_open_until TEXT,
+    consecutive_quota_failures INTEGER NOT NULL DEFAULT 0
 );
 """
 
 _SELECT_ONE = """
 SELECT provider, transient_open_until, consecutive_outages, last_error_summary,
-       updated_at, consecutive_auth_failures, auth_open_until, last_auth_sample_id
+       updated_at, consecutive_auth_failures, auth_open_until,
+       last_auth_sample_id, quota_open_until, consecutive_quota_failures
 FROM provider_circuit WHERE provider = ?
 """
 
 _SELECT_ALL = """
 SELECT provider, transient_open_until, consecutive_outages, last_error_summary,
-       updated_at, consecutive_auth_failures, auth_open_until, last_auth_sample_id
+       updated_at, consecutive_auth_failures, auth_open_until,
+       last_auth_sample_id, quota_open_until, consecutive_quota_failures
 FROM provider_circuit
 """
 
@@ -95,6 +99,15 @@ class SQLiteProviderCircuitStore:
                 "ALTER TABLE provider_circuit "
                 "ADD COLUMN last_auth_sample_id TEXT NOT NULL DEFAULT ''"
             )
+        if "quota_open_until" not in columns:
+            migrations.append(
+                "ALTER TABLE provider_circuit ADD COLUMN quota_open_until TEXT"
+            )
+        if "consecutive_quota_failures" not in columns:
+            migrations.append(
+                "ALTER TABLE provider_circuit "
+                "ADD COLUMN consecutive_quota_failures INTEGER NOT NULL DEFAULT 0"
+            )
         if not migrations:
             return
         for statement in migrations:
@@ -130,6 +143,8 @@ class SQLiteProviderCircuitStore:
             updated_at=_parse_dt(row["updated_at"]) or datetime.now(timezone.utc),
             consecutive_auth_failures=int(row["consecutive_auth_failures"] or 0),
             last_auth_sample_id=row["last_auth_sample_id"] or "",
+            quota_open_until=_parse_dt(row["quota_open_until"]),
+            consecutive_quota_failures=int(row["consecutive_quota_failures"] or 0),
         )
 
     def get(self, provider: str) -> ProviderCircuitState | None:
@@ -151,8 +166,9 @@ class SQLiteProviderCircuitStore:
                 INSERT INTO provider_circuit (
                     provider, transient_open_until, consecutive_outages,
                     last_error_summary, updated_at, consecutive_auth_failures,
-                    auth_open_until, last_auth_sample_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    auth_open_until, last_auth_sample_id, quota_open_until,
+                    consecutive_quota_failures
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(provider) DO UPDATE SET
                     transient_open_until=excluded.transient_open_until,
                     consecutive_outages=excluded.consecutive_outages,
@@ -160,7 +176,11 @@ class SQLiteProviderCircuitStore:
                     updated_at=excluded.updated_at,
                     consecutive_auth_failures=excluded.consecutive_auth_failures,
                     auth_open_until=excluded.auth_open_until,
-                    last_auth_sample_id=excluded.last_auth_sample_id
+                    last_auth_sample_id=excluded.last_auth_sample_id,
+                    quota_open_until=excluded.quota_open_until,
+                    consecutive_quota_failures=(
+                        excluded.consecutive_quota_failures
+                    )
                 """,
                 (
                     state.provider,
@@ -175,6 +195,10 @@ class SQLiteProviderCircuitStore:
                     if state.auth_open_until
                     else None,
                     state.last_auth_sample_id,
+                    state.quota_open_until.isoformat()
+                    if state.quota_open_until
+                    else None,
+                    int(state.consecutive_quota_failures),
                 ),
             )
 

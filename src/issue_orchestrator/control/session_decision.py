@@ -44,6 +44,25 @@ class ProviderAuthFailureDecision:
 
 
 @dataclass(frozen=True)
+class ProviderQuotaFailureDecision:
+    """Provider-circuit QUOTA effect to apply on the tick thread (#7096).
+
+    Its own type for the same reason AUTH has one: exhaustion has its own
+    cooldown dimension, and a caller must not be able to smuggle it into the
+    transient ladder, whose premise — that waiting helps — is false here.
+
+    Unlike AUTH there is no ``sample_id``. No launch-time probe can observe an
+    exhausted balance: ``claude auth status`` and ``codex login status`` both
+    report on the credential, which is valid. Exhaustion is only ever learned
+    from what a session printed, so every verdict is its own observation and
+    there is no shared sample to de-duplicate against.
+    """
+
+    provider: str
+    error_summary: str
+
+
+@dataclass(frozen=True)
 class ProviderAuthOutcome:
     """What an auth-dead session means, in one place (#6999).
 
@@ -155,6 +174,7 @@ class SessionDecision:
     provider_success: str | None = None
     provider_transient_failure: ProviderTransientFailureDecision | None = None
     provider_auth_failure: ProviderAuthFailureDecision | None = None
+    provider_quota_failure: ProviderQuotaFailureDecision | None = None
     # The typed provider verdict this session ended on, when there was one.
     # Downstream owners (notably the tech-lead reaction model) branch on this
     # rather than re-reading labels or log text: an AUTH outcome says nothing
