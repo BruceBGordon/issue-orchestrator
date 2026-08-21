@@ -266,11 +266,41 @@ install_mode() {
   fi
 }
 
+# Refuse to install this project into a venv another checkout owns.
+#
+# ensure_deps deliberately REPOINTS a stale editable install (#6912). That is
+# correct from the checkout that owns the venv and is exactly the contamination
+# this repo fixed when run from a worktree whose .venv is symlinked at the base
+# venv: it would "repair" the shared venv by aiming it at the worktree.
+#
+# Routed through scripts/venv_guard.sh -- the single mutation-authorization
+# owner -- which is pure shell precisely so it can be consulted here, before
+# the package is importable.
+venv_mutation_outcome() {
+  local guard="${ROOT_DIR}/scripts/venv_guard.sh"
+  [[ -x "${guard}" ]] || return 0
+  (cd "${ROOT_DIR}" && "${guard}")
+}
+
 sync_deps() {
   local uv_bin
   local mode
+  local guard_outcome=0
   uv_bin="$(uv_bin_path || true)"
   mode="$(install_mode)"
+
+  venv_mutation_outcome || guard_outcome=$?
+  if (( guard_outcome == 2 )); then
+    echo "ERROR: ${ROOT_DIR}/.venv is a dangling symlink; cannot sync." >&2
+    return 1
+  fi
+  if (( guard_outcome == 1 )); then
+    echo "ERROR: ${ROOT_DIR}/.venv is shared from another checkout." >&2
+    echo "Refusing to install this checkout's project into it; that is what" >&2
+    echo "repoints the shared editable install. Start the Control Center from" >&2
+    echo "the checkout that owns the venv, or give this one its own venv." >&2
+    return 1
+  fi
 
   if [[ "${mode}" == "uv-frozen-extra-dev" ]]; then
     echo "Syncing Python dependencies from ${ROOT_DIR} with uv..."

@@ -1,6 +1,7 @@
 """Workspace and agent checks for doctor."""
 
 import shutil
+from typing import Any
 from pathlib import Path
 
 from ..types import Check
@@ -283,23 +284,28 @@ def check_agents(
     return checks
 
 
-def check_python_environment(repo_root: Path) -> Check:
+def check_python_environment(
+    repo_root: Path,
+    runner: CommandRunner | None = None,
+) -> Check:
     """Report whether this repo's venv resolves ``issue_orchestrator`` to itself.
 
     The orchestrator links the base repo's venv into every worktree it creates
-    (``_link_repo_venv_into_worktree``). Anything that then runs ``uv sync`` or
-    ``pip install -e .`` through that link reinstalls the *worktree's* project
-    into the *shared* venv, rewriting the editable pointer. The venv keeps
-    working until that worktree is deleted, at which point every import dangles
-    -- including in unrelated repositories whose pre-push gate falls through to
-    this interpreter.
+    (``_link_repo_venv_into_worktree``). Anything that then installs this
+    project through that link rewrites the shared venv's editable pointer, so
+    imports resolve to whichever checkout last ran setup and dangle entirely
+    once it is removed. ``scripts/venv_guard.sh`` blocks those writes now, but
+    an environment poisoned before the guard existed -- or by a tool outside it
+    -- stays broken until someone repoints it.
 
-    ``make`` refuses those mutations now (``scripts/venv_guard.sh``), but a venv
-    poisoned before that guard existed, or by a tool outside make, stays broken
-    until someone repoints it. Report it here so it is visible without starting
-    the Control Center.
+    The authoritative question is what the interpreter actually imports, not
+    what a ``.pth`` file says. Probing it covers a missing or corrupt install
+    that leaves no pointer at all, and does not mis-report a perfectly valid
+    non-editable install merely because it has no ``.pth``.
     """
     venv_python = repo_root / ".venv" / "bin" / "python"
+    repair = f"cd {repo_root} && uv pip install --python .venv/bin/python -e . --no-deps"
+
     if not venv_python.exists():
         return Check(
             name="Python environment",
@@ -307,43 +313,69 @@ def check_python_environment(repo_root: Path) -> Check:
             detail=f"No .venv in {repo_root}; using the ambient interpreter",
         )
 
-    pointers = sorted((repo_root / ".venv").glob("lib/*/site-packages/*issue_orchestrator*.pth"))
-    repair = (
-        f"cd {repo_root} && uv pip install --python .venv/bin/python -e . --no-deps"
+    pointers = {
+        pointer.name: pointer.read_text().strip()
+        for pointer in sorted(
+            (repo_root / ".venv").glob("lib/*/site-packages/*issue_orchestrator*.pth")
+        )
+    }
+
+    if runner is None:
+        return Check(
+            name="Python environment",
+            status="info",
+            detail="Interpreter probe unavailable (no command runner)",
+            expandable={"pointers": pointers} if pointers else None,
+        )
+
+    probe = (
+        "import issue_orchestrator, pathlib, sys; "
+        "sys.stdout.write(str(pathlib.Path(issue_orchestrator.__file__).resolve().parent))"
     )
-    for pointer in pointers:
-        try:
-            target = Path(pointer.read_text().strip())
-        except OSError as exc:
-            return Check(
-                name="Python environment",
-                status="warning",
-                detail=f"Could not read editable pointer {pointer.name}: {exc}",
-            )
-        if not target.exists():
-            return Check(
-                name="Python environment",
-                status="error",
-                detail=(
-                    f"Editable install points at a MISSING path: {target}. "
-                    f"That checkout was deleted while this venv still pointed at "
-                    f"it, so every import fails. Repair: {repair}"
-                ),
-                expandable={"pointer": str(pointer), "target": str(target), "repair": repair},
-            )
-        if not target.is_relative_to(repo_root):
-            return Check(
-                name="Python environment",
-                status="error",
-                detail=(
-                    f"Editable install points OUTSIDE this repo: {target}. "
-                    f"Imports here silently resolve to another checkout's "
-                    f"source. Repair: {repair}"
-                ),
-                expandable={"pointer": str(pointer), "target": str(target), "repair": repair},
-            )
+    result = runner.run(
+        [str(venv_python), "-c", probe], cwd=repo_root, timeout_seconds=30
+    )
+
+    details: dict[str, Any] = {"repair": repair, "interpreter": str(venv_python)}
+    if pointers:
+        details["pointers"] = pointers
+
+    if result.returncode != 0:
+        missing = {
+            name: target
+            for name, target in pointers.items()
+            if not Path(target).exists()
+        }
+        cause = (
+            f" Its editable pointer targets a MISSING path: {sorted(missing.values())}."
+            if missing
+            else ""
+        )
+        return Check(
+            name="Python environment",
+            status="error",
+            detail=(
+                f"The venv interpreter cannot import issue_orchestrator.{cause} "
+                f"Repair: {repair}"
+            ),
+            expandable={**details, "stderr": result.stderr.strip()[:500]},
+        )
+
+    resolved = Path(result.stdout.strip())
+    if not resolved.is_relative_to(repo_root):
+        return Check(
+            name="Python environment",
+            status="error",
+            detail=(
+                f"The venv imports issue_orchestrator from OUTSIDE this repo: "
+                f"{resolved}. Imports here silently resolve to another "
+                f"checkout's source. Repair: {repair}"
+            ),
+            expandable={**details, "resolved": str(resolved)},
+        )
+
     return Check(
         name="Python environment",
         status="ok",
-        detail=f"venv resolves issue_orchestrator to {repo_root}",
+        detail=f"venv imports issue_orchestrator from {resolved}",
     )

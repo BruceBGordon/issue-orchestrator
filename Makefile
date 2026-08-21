@@ -92,11 +92,47 @@ ensure-uv:
 		curl -LsSf https://astral.sh/uv/install.sh | sh; \
 	fi
 
+# Mutation policy for this repo's Python environment. scripts/venv_guard.sh is
+# the single authorization owner (see its header); these variables are the one
+# place its three outcomes are turned into shell.
+#
+#   OWNED  -> full sync, project included
+#   SHARED -> dependency-only sync; never reinstall this project into another
+#             checkout's venv. The postcondition ("dependencies for this
+#             checkout are present") still holds, so callers must NOT silently
+#             skip and report success against a knowingly stale environment.
+#   BROKEN -> dangling symlink; fail, never continue.
+VENV_GUARD := scripts/venv_guard.sh
+VENV_SYNC_SHARED_ARGS = $$($(VENV_GUARD) --explain sync)
+
+# $(call venv_sync,<target-name>) - the guarded sync for a recipe.
+define venv_sync
+_g=0; $(VENV_GUARD) || _g=$$?; \
+if [ $$_g -eq 2 ]; then \
+	echo "$(1): .venv is a dangling symlink; refusing to continue." >&2; \
+	exit 1; \
+elif [ $$_g -eq 1 ]; then \
+	echo "$(1): shared .venv - syncing dependencies only."; \
+	$(UV) sync $(VENV_SYNC_SHARED_ARGS) && touch .venv/.deps-synced; \
+else \
+	$(UV) sync --frozen --all-extras && touch .venv/.deps-synced; \
+fi
+endef
+
+# $(call venv_require_owned,<target-name>) - destructive targets that recreate
+# .venv. Neither SHARED nor BROKEN may proceed.
+define venv_require_owned
+$(VENV_GUARD) || { \
+	echo "$(1): refusing to recreate a .venv this checkout does not own." >&2; \
+	exit 1; \
+}
+endef
+
 venv: ensure-uv
 	@mkdir -p $$(dirname $(SETUP_LOG))
 	@# Destructive: this target rm -rf's .venv. Refuse outright on a shared venv
 	@# rather than quietly converting a worktree from shared to private.
-	@scripts/venv_guard.sh || { echo "make venv: refusing to recreate a shared .venv." >&2; exit 1; }
+	@$(call venv_require_owned,make venv)
 	@if [ -d .venv ]; then \
 		echo "Removing existing .venv..."; \
 		rm -rf .venv; \
@@ -116,20 +152,27 @@ venv: ensure-uv
 # Fast, reliable venv setup: reuse if present, otherwise create
 venv-fast: ensure-uv
 	@mkdir -p $$(dirname $(SETUP_LOG))
-	@if [ ! -d .venv ]; then \
+	@set -e; \
+	_g=0; $(VENV_GUARD) || _g=$$?; \
+	if [ $$_g -eq 2 ]; then \
+		echo "make venv-fast: .venv is a dangling symlink; refusing to continue." >&2; \
+		exit 1; \
+	fi; \
+	t0=$$(date +%s); \
+	if [ $$_g -eq 0 ] && [ ! -d .venv ]; then \
 		echo "Creating venv with $(SYSTEM_PYTHON) and installing dependencies..."; \
-		t0=$$(date +%s); \
 		$(UV) venv .venv --python $(SYSTEM_PYTHON); \
-		t1=$$(date +%s); \
 	else \
 		echo "Reusing existing .venv; syncing dependencies..."; \
-		t0=$$(date +%s); \
-		t1=$$(date +%s); \
 	fi; \
-	if scripts/venv_guard.sh; then \
+	t1=$$(date +%s); \
+	if [ $$_g -eq 1 ]; then \
+		echo "make venv-fast: shared .venv - syncing dependencies only."; \
+		$(UV) sync $(VENV_SYNC_SHARED_ARGS); \
+	else \
 		$(UV) sync --frozen --all-extras; \
-		touch .venv/.deps-synced; \
 	fi; \
+	touch .venv/.deps-synced; \
 	t2=$$(date +%s); \
 	echo "venv-fast pid=$$$$ ts=$$(date -Iseconds) pwd=$$(pwd) uv_venv=$$((t1-t0))s uv_sync=$$((t2-t1))s total=$$((t2-t0))s" >> $(SETUP_LOG)
 	@$(GMAKE) --no-print-directory semgrep-venv
@@ -137,6 +180,10 @@ venv-fast: ensure-uv
 	@echo "Done! Activate with: source .venv/bin/activate"
 
 semgrep-venv: ensure-uv
+	@# venv-guard: exempt - this syncs the isolated Semgrep tool environment, not
+	@# this project. It pins UV_PROJECT_ENVIRONMENT to $(SEMGREP_VENV) and passes
+	@# --no-install-project, so it cannot reach this project's .venv or rewrite
+	@# its editable install.
 	@if [ ! -f $(SEMGREP_DEPS_MARKER) ] || \
 		[ ! -x $(SEMGREP_VENV)/bin/semgrep ] || \
 		[ $(SEMGREP_PROJECT)/pyproject.toml -nt $(SEMGREP_DEPS_MARKER) ] || \
@@ -149,7 +196,7 @@ semgrep-venv: ensure-uv
 # Legacy pip-based venv for systems without uv
 venv-pip:
 	@mkdir -p $$(dirname $(SETUP_LOG))
-	@scripts/venv_guard.sh || { echo "make venv-pip: refusing to recreate a shared .venv." >&2; exit 1; }
+	@$(call venv_require_owned,make venv-pip)
 	@if [ -d .venv ]; then \
 		echo "Removing existing .venv..."; \
 		rm -rf .venv; \
@@ -198,7 +245,7 @@ worktree-setup: venv-fast
 
 # Install/reinstall dependencies
 install: ensure-uv
-	@if scripts/venv_guard.sh; then $(UV) sync --frozen --all-extras && touch .venv/.deps-synced; fi
+	@$(call venv_sync,make install)
 	@$(GMAKE) --no-print-directory semgrep-venv
 
 preview-readme:
@@ -216,7 +263,7 @@ else
 	$(UV) lock
 endif
 	@echo "Syncing dependencies..."
-	@if scripts/venv_guard.sh; then $(UV) sync --frozen --all-extras && touch .venv/.deps-synced; fi
+	@$(call venv_sync,make upgrade-deps)
 	@$(GMAKE) --no-print-directory semgrep-venv
 	@echo ""
 	@echo "Done! Commit uv.lock with your changes."
@@ -263,7 +310,7 @@ else
 	cd packages/vscode && npm update
 endif
 	@echo "==> Syncing Python environment..."
-	@if scripts/venv_guard.sh; then $(UV) sync --frozen --all-extras && touch .venv/.deps-synced; fi
+	@$(call venv_sync,make deps-batch)
 	@$(GMAKE) --no-print-directory semgrep-venv
 	@echo ""
 	@echo "==> Verifying with the full required suite (agent lane + test-vscode)..."
@@ -391,12 +438,17 @@ sync-deps:
 			echo "ERROR: uv not found. Run: curl -LsSf https://astral.sh/uv/install.sh | sh"; \
 			exit 1; \
 		fi; \
-		if scripts/venv_guard.sh; then \
-			$(UV) sync --frozen --all-extras && touch $(DEPS_MARKER); \
-			echo "[sync-deps] Done. Continuing with original command..."; \
+		_g=0; $(VENV_GUARD) || _g=$$?; \
+		if [ $$_g -eq 2 ]; then \
+			echo "[sync-deps] .venv is a dangling symlink; refusing to run against a broken environment." >&2; \
+			exit 1; \
+		elif [ $$_g -eq 1 ]; then \
+			echo "[sync-deps] Shared .venv - syncing dependencies only (project install untouched)."; \
+			$(UV) sync $(VENV_SYNC_SHARED_ARGS) && touch $(DEPS_MARKER); \
 		else \
-			echo "[sync-deps] Shared .venv - skipped; see message above."; \
+			$(UV) sync --frozen --all-extras && touch $(DEPS_MARKER); \
 		fi; \
+		echo "[sync-deps] Done. Continuing with original command..."; \
 		echo ""; \
 	fi
 

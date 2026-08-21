@@ -1,53 +1,87 @@
 #!/usr/bin/env bash
 #
-# Is this checkout's .venv safe for THIS checkout's tooling to mutate?
+# THE mutation-authorization owner for this repo's Python environment.
 #
+# Every path that installs this project or syncs its dependencies asks this one
+# question first: what may this checkout's tooling do to the .venv it can see?
+# Shell callers exec it; Python callers shell out to it (it deliberately has no
+# Python dependency, because Control Center startup consults it *before* the
+# package is importable).
+#
+# WHY THIS EXISTS
 # The orchestrator links the base repo's venv into every worktree it creates
 # (adapters/worktree/_worktree_runtime.py::_link_repo_venv_into_worktree) so
-# validation commands work there without building a venv per worktree. That
-# sharing is intentional. What is not intentional is a worktree then running
-# `uv sync` / `pip install -e .` against that link: uv resolves `.venv` through
-# the symlink to the BASE venv and reinstalls THIS worktree's project as
-# editable into it, rewriting `_editable_impl_issue_orchestrator.pth` to point
-# at this worktree's `src`.
+# validation works there without building a venv per worktree. That sharing is
+# intentional. What is not is a worktree then running `uv sync` or
+# `pip install -e .` through the link: uv resolves `.venv` to the BASE venv and
+# reinstalls THIS checkout's project as editable into it, rewriting
+# `_editable_impl_issue_orchestrator.pth`. Imports then resolve to whichever
+# checkout last ran setup, and dangle entirely once it is deleted.
 #
-# The base venv's `issue_orchestrator` then resolves to whichever worktree most
-# recently ran setup. While that worktree lives, imports silently pick up
-# another checkout's half-written source; once the orchestrator removes it,
-# every import dangles with a bare ModuleNotFoundError that names neither the
-# .pth nor the deleted directory.
+# OUTCOMES (exit codes)
+#   0  OWNED     .venv belongs to this checkout (or is absent). Mutate freely.
+#   1  SHARED    .venv is another checkout's. Never install THIS project into
+#                it. Dependency-only syncs are still permitted and are how
+#                callers keep their postcondition -- see --explain sync.
+#   2  BROKEN    .venv is a dangling symlink. The environment cannot be used or
+#                safely created over. Callers must FAIL rather than continue.
 #
-# Exit 0  -> .venv belongs to this checkout; mutate freely.
-# Exit 1  -> .venv is shared from another checkout; do not mutate.
-#
-# Callers decide the consequence. Targets the orchestrator invokes on every
-# worktree setup (venv-fast, install, sync-deps) SKIP the sync and carry on —
-# the shared venv is already synced by whoever owns it, and failing there would
-# break agent session launches. Explicitly destructive, human-typed targets
-# (venv, venv-pip, which `rm -rf .venv`) FAIL instead of silently converting a
-# shared venv into a private one.
+# Callers must distinguish 1 from 2. Treating "not zero" as "skip" is what let
+# a dangling venv report success.
 
 set -uo pipefail
 
 quiet=0
-[ "${1:-}" = "--quiet" ] && quiet=1
+explain=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --quiet) quiet=1 ;;
+    --explain) explain="${2:-}"; shift ;;
+    *) echo "venv-guard: unknown argument: $1" >&2; exit 64 ;;
+  esac
+  shift
+done
 
-# Not a symlink (or absent) => private to this checkout => safe.
-[ -L .venv ] || exit 0
+OWNED=0
+SHARED=1
+BROKEN=2
+
+if [ "$explain" = "sync" ]; then
+  # The dependency-only sync a SHARED caller may run. --no-install-project is
+  # the load-bearing flag: it updates dependencies without reinstalling this
+  # project, so the editable pointer is never rewritten. --inexact stops the
+  # sync removing packages other users of the shared venv still need.
+  echo "--frozen --all-extras --no-install-project --inexact"
+  exit 0
+fi
+
+# Absent or a real directory => private to this checkout => fully owned.
+if [ ! -L .venv ]; then
+  exit "$OWNED"
+fi
 
 here="$(pwd -P)"
-target="$(cd .venv 2>/dev/null && pwd -P)" || {
-  # Dangling symlink: the venv it pointed at is gone. Not shared-and-live, but
-  # not usable either. Report it as shared so callers do not sync into a void.
+link_target="$(readlink .venv)"
+
+if ! target="$(cd .venv 2>/dev/null && pwd -P)"; then
   if [ "$quiet" -eq 0 ]; then
-    echo "venv-guard: .venv is a DANGLING symlink -> $(readlink .venv)" >&2
-    echo "venv-guard: remove it and re-run, or repair the checkout it pointed at." >&2
+    cat >&2 <<MSG
+venv-guard: .venv is a DANGLING symlink.
+  this checkout : $here
+  .venv points  : $link_target  (does not exist)
+
+The checkout that owned this venv was deleted. Nothing here can use it, and
+creating a venv over the link would silently write into the dead path.
+
+Remove the link and build a private environment:
+  rm .venv && make venv-fast
+MSG
   fi
-  exit 1
-}
+  exit "$BROKEN"
+fi
 
 case "$target" in
-  "$here"/*) exit 0 ;;
+  "$here"/*) exit "$OWNED" ;;
 esac
 
 if [ "$quiet" -eq 0 ]; then
@@ -58,15 +92,16 @@ venv-guard: .venv here is SHARED from another checkout.
   .venv resolves: $target
   owned by      : $owner
 
-Skipping the dependency sync. Syncing would rewrite that shared venv's editable
-install to point at THIS checkout's src, which silently breaks every other user
-of it (and dangles entirely once this checkout is removed).
+This checkout's project will NOT be installed into it: doing so rewrites that
+venv's editable install to point at THIS checkout's src, which silently breaks
+every other user of it and dangles once this checkout is removed.
 
-To sync dependencies, do it where the venv lives:
+Dependencies are still synced, without touching the project install.
+
+To install the project itself, do it where the venv lives:
   make -C "$owner" install
-
-To give this checkout its own venv instead:
+To give this checkout its own environment instead:
   rm .venv && make venv-fast
 MSG
 fi
-exit 1
+exit "$SHARED"

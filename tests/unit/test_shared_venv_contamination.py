@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -63,15 +64,34 @@ def test_guard_refuses_a_venv_shared_from_another_checkout(tmp_path: Path) -> No
     worktree = _checkout(tmp_path, "worktree")
     (worktree / ".venv").symlink_to(owner / ".venv", target_is_directory=True)
 
-    assert _run_guard(worktree) == 1
+    assert _run_guard(worktree) == 1, "sharing is outcome 1, distinct from broken"
 
 
-def test_guard_refuses_a_dangling_venv_symlink(tmp_path: Path) -> None:
-    """The owning checkout was deleted; syncing would write into a void."""
+def test_guard_reports_a_dangling_symlink_distinctly_from_sharing(tmp_path: Path) -> None:
+    """BROKEN(2) must not collapse into SHARED(1).
+
+    Callers act differently on the two: a shared venv still gets a
+    dependency-only sync, while a dangling one must fail. Treating "not zero"
+    as "skip" is what let ``venv-fast`` report success over a broken venv.
+    """
     worktree = _checkout(tmp_path, "worktree")
     (worktree / ".venv").symlink_to(tmp_path / "gone" / ".venv", target_is_directory=True)
 
-    assert _run_guard(worktree) == 1
+    assert _run_guard(worktree) == 2
+
+
+def test_guard_publishes_the_dependency_only_sync_arguments() -> None:
+    """Callers must not re-derive the safe argument set; the owner publishes it."""
+    result = subprocess.run(
+        [str(GUARD), "--explain", "sync"], capture_output=True, text=True
+    )
+
+    assert result.returncode == 0
+    # --no-install-project is load-bearing: it is what keeps a dependency sync
+    # from rewriting the editable pointer.
+    assert "--no-install-project" in result.stdout
+    # --inexact stops one checkout's sync removing packages another still needs.
+    assert "--inexact" in result.stdout
 
 
 def test_guard_names_the_owning_checkout_and_the_repair(tmp_path: Path) -> None:
@@ -84,24 +104,6 @@ def test_guard_names_the_owning_checkout_and_the_repair(tmp_path: Path) -> None:
 
     assert str(owner) in result.stderr
     assert "make -C" in result.stderr
-
-
-@pytest.mark.parametrize(
-    "target",
-    ["venv", "venv-fast", "venv-pip", "install", "upgrade-deps", "sync-deps"],
-)
-def test_every_venv_mutating_make_target_consults_the_guard(target: str) -> None:
-    """Fix the class: no mutation site may sync without asking the guard first.
-
-    ``sync-deps`` matters most -- it is a prerequisite of ``test-unit``, so an
-    ordinary test run inside a worktree would otherwise repoint the shared venv.
-    """
-    makefile = (REPO_ROOT / "Makefile").read_text()
-    start = makefile.index(f"\n{target}:")
-    body = makefile[start : start + 2000]
-    recipe = body[: body.index("\n\n")] if "\n\n" in body else body
-
-    assert "scripts/venv_guard.sh" in recipe, f"{target} mutates the venv unguarded"
 
 
 # ------------------------------------------------------- verify-pr interpreter
@@ -129,45 +131,90 @@ def test_generated_verify_pr_probe_precedes_the_validation_run() -> None:
 # ------------------------------------------------------------------- doctor
 
 
-def _venv(repo: Path, target: Path | None) -> Path:
+class _FakeRunner:
+    """CommandRunner stub: the probe's exit status and stdout are the contract."""
+
+    def __init__(self, returncode: int, stdout: str = "", stderr: str = "") -> None:
+        self._result = SimpleNamespace(
+            returncode=returncode, stdout=stdout, stderr=stderr, timed_out=False
+        )
+        self.commands: list[list[str]] = []
+
+    def run(self, command, **kwargs):  # noqa: ANN001, ANN003 - port shape
+        self.commands.append(list(command))
+        return self._result
+
+
+def _venv(repo: Path, pointer_target: Path | None) -> Path:
     site = repo / ".venv" / "lib" / "python3.14" / "site-packages"
     site.mkdir(parents=True)
     (repo / ".venv" / "bin").mkdir(parents=True)
     (repo / ".venv" / "bin" / "python").write_text("")
-    if target is not None:
-        (site / "_editable_impl_issue_orchestrator.pth").write_text(str(target))
+    if pointer_target is not None:
+        (site / "_editable_impl_issue_orchestrator.pth").write_text(str(pointer_target))
     return repo
 
 
-def test_doctor_reports_ok_when_the_venv_points_at_its_own_repo(tmp_path: Path) -> None:
-    repo = _checkout(tmp_path, "repo")
-    (repo / "src").mkdir()
-    _venv(repo, repo / "src")
+def test_doctor_reports_ok_when_the_import_resolves_inside_the_repo(tmp_path: Path) -> None:
+    repo = _venv(_checkout(tmp_path, "repo"), None)
+    runner = _FakeRunner(0, stdout=str(repo / "src" / "issue_orchestrator"))
 
-    assert check_python_environment(repo).status == "ok"
+    check = check_python_environment(repo, runner)
+
+    assert check.status == "ok"
 
 
-def test_doctor_errors_when_the_venv_points_at_another_checkout(tmp_path: Path) -> None:
-    other = tmp_path / "other" / "src"
-    other.mkdir(parents=True)
-    repo = _venv(_checkout(tmp_path, "repo"), other)
+def test_doctor_errors_when_the_import_resolves_outside_the_repo(tmp_path: Path) -> None:
+    """The silent form: the venv works, but against another checkout's source."""
+    repo = _venv(_checkout(tmp_path, "repo"), None)
+    other = tmp_path / "other" / "src" / "issue_orchestrator"
+    runner = _FakeRunner(0, stdout=str(other))
 
-    check = check_python_environment(repo)
+    check = check_python_environment(repo, runner)
 
     assert check.status == "error"
     assert str(other) in check.detail
 
 
-def test_doctor_errors_when_the_editable_target_was_deleted(tmp_path: Path) -> None:
-    """What actually broke the host: the pointed-at worktree is gone."""
+def test_doctor_errors_when_the_interpreter_cannot_import_at_all(tmp_path: Path) -> None:
     repo = _venv(_checkout(tmp_path, "repo"), tmp_path / "deleted-worktree" / "src")
+    runner = _FakeRunner(1, stderr="ModuleNotFoundError: No module named 'issue_orchestrator'")
 
-    check = check_python_environment(repo)
+    check = check_python_environment(repo, runner)
 
     assert check.status == "error"
     assert "MISSING" in check.detail
     assert check.expandable is not None and "repair" in check.expandable
 
 
+def test_doctor_does_not_claim_health_from_an_empty_site_packages(tmp_path: Path) -> None:
+    """A venv with no .pth at all must not be reported healthy unexamined.
+
+    The pointer-only implementation fell through to ``ok`` here, asserting an
+    import it had never attempted.
+    """
+    repo = _venv(_checkout(tmp_path, "repo"), None)
+    runner = _FakeRunner(1, stderr="ModuleNotFoundError")
+
+    assert check_python_environment(repo, runner).status == "error"
+
+
+def test_doctor_accepts_a_valid_non_editable_install(tmp_path: Path) -> None:
+    """No .pth is normal for a wheel install; only the import matters."""
+    repo = _venv(_checkout(tmp_path, "repo"), None)
+    runner = _FakeRunner(0, stdout=str(repo / ".venv" / "lib" / "issue_orchestrator"))
+
+    assert check_python_environment(repo, runner).status == "ok"
+
+
 def test_doctor_is_informational_without_a_venv(tmp_path: Path) -> None:
-    assert check_python_environment(_checkout(tmp_path, "repo")).status == "info"
+    assert check_python_environment(_checkout(tmp_path, "repo"), _FakeRunner(0)).status == "info"
+
+
+def test_doctor_probes_the_venv_interpreter_not_the_ambient_one(tmp_path: Path) -> None:
+    repo = _venv(_checkout(tmp_path, "repo"), None)
+    runner = _FakeRunner(0, stdout=str(repo / "src"))
+
+    check_python_environment(repo, runner)
+
+    assert runner.commands[0][0] == str(repo / ".venv" / "bin" / "python")

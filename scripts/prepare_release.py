@@ -905,6 +905,33 @@ def verify_release_metadata_ready(
     print(f"Version {target_version} already present in pyproject.toml and uv.lock.")
 
 
+def require_owned_venv(root: Path) -> None:
+    """Refuse to install this project into a venv another checkout owns.
+
+    Routed through scripts/venv_guard.sh, the single mutation-authorization
+    owner, rather than re-deriving the rule here. A release installs the
+    project and then verifies the installed package metadata, so a shared venv
+    is not merely unsafe to write -- the verification would also be reading
+    another checkout's install. Releases run from the owning checkout.
+    """
+    guard = root / "scripts" / "venv_guard.sh"
+    if not guard.exists():
+        return
+    outcome = subprocess.run([str(guard)], cwd=root).returncode
+    if outcome == 0:
+        return
+    reason = (
+        "its .venv is a dangling symlink"
+        if outcome == 2
+        else "its .venv is shared from another checkout"
+    )
+    raise ReleasePrepError(
+        f"Refusing to sync the environment for {root}: {reason}. "
+        "Run the release from the checkout that owns the venv, or give this "
+        "checkout its own with `rm .venv && make venv-fast`."
+    )
+
+
 def sync_environment_if_requested(
     *,
     paths: ReleasePaths,
@@ -919,6 +946,7 @@ def sync_environment_if_requested(
         )
         return
 
+    require_owned_venv(paths.root)
     uv = find_uv(uv_executable)
     run_command([uv, "sync", "--frozen", "--all-extras"], cwd=paths.root)
     verify_installed_package_version(paths, expected_version)
