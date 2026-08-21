@@ -6,8 +6,7 @@ per-instance operator approval. This module is the single policy owner for
 the whole gated lifecycle:
 
 * **Composition** — :func:`build_tech_lead_proposal_issue_action` turns an
-  act-level decision proposal (propose-authority ``reset_retry``; every
-  ``kill_hung_session`` until its direct tier ships) into a
+  act-level decision proposal under ``propose`` authority into a
   :class:`CreateTechLeadProposalIssueAction` carrying the typed
   :class:`StoredTechLeadOp`. The issue body is human documentation ONLY.
 * **Creation boundary** —
@@ -58,6 +57,7 @@ from ..domain.tech_lead_session import (
     ApprovedTechLeadOp,
     StoredTechLeadOp,
     TechLeadCreationOrigin,
+    TechLeadSessionGeneration,
     is_proposed_tech_lead_gate,
 )
 from .actions import (
@@ -136,14 +136,14 @@ def build_stored_tech_lead_op(
     *,
     source_run_id: str,
     source_session_name: str,
-    target_session_id: str = "",
+    target_session: TechLeadSessionGeneration | None = None,
     now_iso: str | None = None,
 ) -> StoredTechLeadOp:
     """The orchestrator-side executable payload for an act-level proposal.
 
-    ``target_session_id`` binds a ``kill_hung_session`` op to the exact
-    generation of the target issue's live session at proposal time (#6779
-    R1); it stays empty for ``reset_retry`` (label/no-session stale-checked).
+    ``target_session`` binds a ``kill_hung_session`` op to the exact trusted
+    generation observed at tech-lead launch (#6779 R1); it stays absent for
+    ``reset_retry`` (label/no-session stale-checked).
     ``proposed.finding_ids`` are persisted so execution correlates to the
     findings the approver saw (#6779 R6).
     """
@@ -156,7 +156,9 @@ def build_stored_tech_lead_op(
         source_session_name=source_session_name,
         source_action_id=proposed.id,
         created_at=now_iso or _utc_now_iso(),
-        target_session_id=target_session_id,
+        target_session_id=target_session.run_id if target_session else "",
+        target_terminal_id=target_session.terminal_id if target_session else "",
+        target_session_type=(target_session.task_kind.value if target_session else ""),
         finding_ids=tuple(proposed.finding_ids),
     )
 
@@ -169,8 +171,9 @@ def _proposal_issue_body(
     # R1): show the run id the operator is consenting to terminate so an
     # execution that no-ops on a replacement is auditable against this body.
     session_row = (
-        f"| Target session | run `{op.target_session_id}` (approval kills only"
-        " this generation) |\n"
+        f"| Target session | `{op.target_session_type}` terminal"
+        f" `{op.target_terminal_id}`, run `{op.target_session_id}`"
+        " (approval kills only this generation) |\n"
         if op.op_type == "kill_hung_session"
         else ""
     )
@@ -214,20 +217,19 @@ def build_tech_lead_proposal_issue_action(
     source_run_id: str,
     source_session_name: str,
     expected: "ExpectedState",
-    target_session_id: str = "",
+    target_session: TechLeadSessionGeneration | None = None,
     now_iso: str | None = None,
 ) -> CreateTechLeadProposalIssueAction:
     """Compose the gated proposal issue creation for an act-level proposal.
 
-    ``target_session_id`` is the target issue's live session run id at
-    proposal time (#6779 R1), captured by the planner and bound onto the
-    stored op so kill approval consents to exactly that generation.
+    ``target_session`` is the trusted target generation observed at launch,
+    bound onto the stored op so kill approval consents to that exact runtime.
     """
     op = build_stored_tech_lead_op(
         proposed,
         source_run_id=source_run_id,
         source_session_name=source_session_name,
-        target_session_id=target_session_id,
+        target_session=target_session,
         now_iso=now_iso,
     )
     title_detail = _OP_TITLES[op.op_type].format(target=op.target_issue_number)
@@ -260,8 +262,7 @@ def build_op_ledger(
     ledger enforces one open proposal per (op, target) without a GitHub read.
     """
     return {
-        (op.op_type, op.target_issue_number): issue_number
-        for issue_number, op in ops
+        (op.op_type, op.target_issue_number): issue_number for issue_number, op in ops
     }
 
 
@@ -351,9 +352,7 @@ def reconcile_tech_lead_proposals(
             )
             continue
         remaining.append(issue)
-    absent = tuple(
-        sorted(number for number in ops if number not in open_numbers)
-    )
+    absent = tuple(sorted(number for number in ops if number not in open_numbers))
     return ReconciledTechLeadProposals(
         anchor_candidate_issues=remaining,
         approved=tuple(approved),
@@ -461,6 +460,8 @@ def plan_approved_tech_lead_op_executions(
                     anchor_issue_number=item.proposal_issue_number,
                     proposal_issue_number=item.proposal_issue_number,
                     target_session_id=op.target_session_id,
+                    target_terminal_id=op.target_terminal_id,
+                    target_session_type=op.target_session_type,
                     reason=reason,
                     expected=build_expected_for_mutation(),
                 )
@@ -531,12 +532,11 @@ def finalize_tech_lead_op_execution(
     if not proposal_issue:
         return result
     op_type = (
-        "reset_retry" if isinstance(action, ResetRetryIssueAction)
+        "reset_retry"
+        if isinstance(action, ResetRetryIssueAction)
         else "kill_hung_session"
     )
-    comment = _terminal_outcome_comment(
-        result, action, op_type, action.issue_number
-    )
+    comment = _terminal_outcome_comment(result, action, op_type, action.issue_number)
     if comment is None:
         return result  # loud failure: keep the op, retry next tick
     if repository_host is None or ops is None:
@@ -551,7 +551,9 @@ def finalize_tech_lead_op_execution(
         ops.discard_op(issue_number=proposal_issue)
     except Exception as e:
         logger.exception(
-            "Failed to finalize tech_lead proposal #%d after %s", proposal_issue, op_type
+            "Failed to finalize tech_lead proposal #%d after %s",
+            proposal_issue,
+            op_type,
         )
         return ActionResult.fail(
             action,
@@ -568,9 +570,7 @@ def finalize_tech_lead_op_execution(
     return result
 
 
-def _approval_confirmed(
-    repository_host: "RepositoryHost", proposal_issue: int
-) -> bool:
+def _approval_confirmed(repository_host: "RepositoryHost", proposal_issue: int) -> bool:
     """Fresh read: True iff the proposal still openly holds operator approval.
 
     Approval STILL STANDS only when a fresh read shows the proposal issue open

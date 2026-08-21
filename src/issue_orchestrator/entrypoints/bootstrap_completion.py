@@ -185,7 +185,9 @@ def create_completion_components(
         ),
         event_bus=None,
         label_config=label_manager.to_label_config_dict(),
-        pre_publish_gate=PrePublishGate(command_runner) if config.enforce_hooks else None,
+        pre_publish_gate=PrePublishGate(command_runner)
+        if config.enforce_hooks
+        else None,
         config=config,
         background_job_supervisor=background_job_supervisor,
         agent_callback_endpoint=agent_callback_endpoint,
@@ -264,9 +266,7 @@ def build_completion_handler_factory(
         config, provider_resilience, label_manager
     )
 
-    def factory(*, state_machines, active_sessions):
-        from ..control.active_sessions import active_session_run_id
-
+    def factory(*, state_machines):
         return CompletionHandler(
             config,
             events,
@@ -277,7 +277,6 @@ def build_completion_handler_factory(
             session_output,
             tech_lead_authority,
             open_issue_corpus,
-            lambda n: active_session_run_id(active_sessions(), n),
             provider_availability,
             tech_lead_run_activity,
             remove_session_machine_fn=state_machines.remove_session_machine,

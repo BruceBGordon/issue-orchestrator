@@ -8,11 +8,10 @@ FROM SCRATCH). Nothing about the reset boundary (runtime termination, PR
 superseding, branch deletion, label/history/timeline clearing,
 pending-label relaunch marking, queue re-insertion) is reimplemented here.
 
-The kill executor's ``run_kill`` (#6778) reuses
-``Orchestrator.terminate_issue_runtime_for_issue`` — the SAME
-``terminate_issue_runtime`` boundary the reset owner applies (sessions, the
-persistent exchange pair, supervised jobs, publish retries), WITHOUT the
-reset that follows it.
+The kill executor's ``run_kill`` (#6778) uses the generation-bound lifecycle
+owner: it verifies and stops the exact typed terminal/run pair observed at
+tech-lead launch, then tears down the issue's hidden exchange/publish owners,
+WITHOUT the reset that follows it.
 
 Lives outside ``bootstrap`` so the composition root stays wiring-only; the
 closures read live orchestrator state at EXECUTION time, which is why these
@@ -34,6 +33,7 @@ from ..control.tech_lead_reset_retry import (
 )
 
 if TYPE_CHECKING:
+    from ..domain.tech_lead_session import TechLeadSessionGeneration
     from ..infra.orchestrator import Orchestrator
     from ..ports.issue import Issue
 
@@ -42,33 +42,26 @@ if TYPE_CHECKING:
 TECH_LEAD_RESET_RETRY_EVENT_SOURCE = "tech_lead.reset_retry"
 
 
-def _active_session_run_id_fn(orchestrator: "Orchestrator"):
-    """Run id of an issue's live session, or None (#6779 R1).
-
-    The kill owner binds approval to this exact generation; a replacement
-    session for the same issue reports a different run id, so the executor
-    can tell the diagnosed session from its successor.
-    """
-    from ..control.active_sessions import active_session_run_id
-
-    def _active_session_run_id(issue_number: int) -> str | None:
-        return active_session_run_id(orchestrator.state.active_sessions, issue_number)
-
-    return _active_session_run_id
-
-
 def build_tech_lead_kill_session_executor(
     orchestrator: "Orchestrator",
 ) -> TechLeadKillSessionExecutor:
     """Build the production kill_hung_session executor (#6778)."""
 
-    def _run_kill(issue_number: int, reason: str) -> KillSessionRunOutcome:
+    def _run_kill(
+        target: "TechLeadSessionGeneration", reason: str
+    ) -> KillSessionRunOutcome:
         try:
-            termination = orchestrator.terminate_issue_runtime_for_issue(
-                issue_number, reason=reason
+            result = orchestrator.terminate_issue_session_generation(
+                target, reason=reason
             )
         except Exception as e:  # loud failure -> ActionResult.fail upstream
             return KillSessionRunOutcome(success=False, error=str(e))
+        if result.stale_reason is not None:
+            return KillSessionRunOutcome(
+                success=False, stale_reason=result.stale_reason
+            )
+        assert result.termination is not None
+        termination = result.termination
         return KillSessionRunOutcome(
             success=True,
             details={
@@ -82,7 +75,6 @@ def build_tech_lead_kill_session_executor(
 
     return TechLeadKillSessionExecutor(
         events=orchestrator.deps.events,
-        active_session_run_id=_active_session_run_id_fn(orchestrator),
         run_kill=_run_kill,
     )
 

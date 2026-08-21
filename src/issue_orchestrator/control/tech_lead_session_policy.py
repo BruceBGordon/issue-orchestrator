@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from ..domain.models import RequestedAction
+from ..domain.session_key import TaskKind
 from ..domain.tech_lead_manifest import TechLeadManifest
 from ..domain.board_snapshot import BOARD_SNAPSHOT_FILENAME, BoardSnapshot
 from ..domain.tech_lead_session import (
@@ -32,6 +33,7 @@ from ..domain.tech_lead_session import (
     TechLeadAssignment,
     TechLeadLaunchAuthority,
     TechLeadLaunchScope,
+    TechLeadSessionGeneration,
     TechLeadSessionFlavor,
 )
 from .completion_pr_collision import NoCommitsBetweenError
@@ -308,7 +310,11 @@ def prepare_tech_lead_session_data(
         if tech_lead_manifest:
             # Store manifest path in session for completion handling
             ctx.update_manifest(
-                {"tech_lead_manifest": str(run_dir / "tech-lead-data" / "manifest.json")}
+                {
+                    "tech_lead_manifest": str(
+                        run_dir / "tech-lead-data" / "manifest.json"
+                    )
+                }
             )
     focused = flavor is TechLeadSessionFlavor.FAILURE_INVESTIGATION
     assignment = TechLeadAssignment(
@@ -330,6 +336,21 @@ def prepare_tech_lead_session_data(
     board_snapshot = board_snapshot_provider.snapshot(
         focus_issue, problem_issue_numbers
     )
+    observed_session_generations = tuple(
+        sorted(
+            (
+                TechLeadSessionGeneration(
+                    issue_number=session.issue_number,
+                    task_kind=TaskKind(session.session_type),
+                    terminal_id=session.terminal_id,
+                    run_id=session.run_id,
+                )
+                for session in board_snapshot.sessions
+                if session.session_type in {TaskKind.CODE.value, TaskKind.REWORK.value}
+            ),
+            key=TechLeadSessionGeneration.sort_key,
+        )
+    )
     tech_lead_authority.record(
         run_id=ctx.run.run_id,
         session_name=ctx.run.session_name,
@@ -341,6 +362,7 @@ def prepare_tech_lead_session_data(
             if tech_lead_manifest
             else (),
             problem_issue_numbers=problem_issue_numbers,
+            observed_session_generations=observed_session_generations,
         ),
     )
     logger.info("[tech_lead] Wrote %s assignment: %s", flavor.value, assignment_path)

@@ -56,11 +56,11 @@ class TechLeadAuthorityConfig:
     ``escalate_to_human`` is intentionally not a field: it is the
     non-configurable floor and always executes. Act-level actions
     (``reset_retry``, ``kill_hung_session``) default to ``propose``.
-    ``reset_retry: execute`` is honored — it is wired to the
-    reset+retry-from-scratch owner with execution-time re-validation
-    (#6764, first slice). ``kill_hung_session: execute`` remains a startup
-    error: its DIRECT tier is not wired yet — it ships as gated proposal
-    issues (#6778) — see ``Config.validate``.
+    Both act-level actions honor ``execute`` with execution-time
+    re-validation: ``reset_retry`` uses the reset+retry-from-scratch owner;
+    ``kill_hung_session`` terminates only the exact session generation that
+    was active when the decision was planned. Under ``propose`` they ship as
+    gated proposal issues (#6778).
     """
 
     post_comment: str = "execute"
@@ -107,13 +107,10 @@ class TechLeadAuthorityConfig:
     def startup_errors(self) -> list[str]:
         """Startup configuration errors for this authority block (ADR-0031).
 
-        ``execute`` on an act-level action whose DIRECT executor is not
-        wired yet must be a startup configuration error, never a silent
-        no-op (#6764). ``reset_retry`` is wired and no longer rejected; the
-        unwired set lives in ``UNWIRED_ACT_LEVEL_TECH_LEAD_ACTIONS``. The
-        rejection is deliberate even though ``kill_hung_session`` ships as
-        GATED PROPOSAL ISSUES under ``propose`` (#6778): the gated tier is
-        the point — per-instance approval, not config-level trust.
+        ``execute`` on an act-level action whose DIRECT executor is not wired
+        must be a startup configuration error, never a silent no-op (#6764).
+        Both current act-level actions are wired; the unwired set remains the
+        fail-closed extension point for future actions.
         """
         errors: list[str] = []
         for key in TECH_LEAD_AUTHORITY_CONFIGURABLE_ACTIONS:

@@ -9,6 +9,7 @@ from issue_orchestrator.control.actions import (
     CreateTechLeadCaseFileIssueAction,
     CreateTechLeadIssueAction,
     CreateTechLeadProposalIssueAction,
+    KillHungSessionAction,
     ResetRetryIssueAction,
     SurfaceTechLeadProposalAction,
     TechLeadMilestoneIntent,
@@ -24,6 +25,7 @@ from issue_orchestrator.control.tech_lead_decision_actions import (
     plan_tech_lead_decision_actions,
 )
 from issue_orchestrator.domain.models import Issue
+from issue_orchestrator.domain.session_key import TaskKind
 from issue_orchestrator.domain.tech_lead_artifacts import (
     ProposedTechLeadAction,
     TechLeadDecision,
@@ -33,6 +35,7 @@ from issue_orchestrator.domain.tech_lead_findings import PatternEvidence
 from issue_orchestrator.domain.tech_lead_session import (
     PROPOSED_TECH_LEAD_LABEL,
     TECH_LEAD_OBSERVATION_LABEL,
+    TechLeadSessionGeneration,
 )
 from issue_orchestrator.infra.config import Config
 
@@ -113,7 +116,7 @@ def _plan(
     config: Config | None = None,
     anchor: Issue | None = None,
     op_ledger: dict[tuple[str, int], int] | None = None,
-    active_session_run_id=lambda _n: None,
+    observed_session_generation=lambda _n: None,
     pattern_ledger: dict[str, PatternEvidence] | None = None,
     dedup_corpus: OpenIssueCorpus | None = None,
     dedup_grant: DuplicateTargetGrant | None = None,
@@ -126,7 +129,7 @@ def _plan(
         anchor_issue=anchor or _anchor(),
         expected=EXPECTED,
         op_ledger=op_ledger or {},
-        active_session_run_id=active_session_run_id,
+        observed_session_generation=observed_session_generation,
         pattern_ledger=pattern_ledger or {},
         dedup_corpus=dedup_corpus or OpenIssueCorpus.disabled(),
         dedup_grant=dedup_grant or DuplicateTargetGrant.none(),
@@ -138,8 +141,7 @@ def _shadow_digests(actions) -> list[AddCommentAction]:
     return [
         action
         for action in actions
-        if isinstance(action, AddCommentAction)
-        and "shadow mode" in action.comment
+        if isinstance(action, AddCommentAction) and "shadow mode" in action.comment
     ]
 
 
@@ -478,7 +480,9 @@ class TestCreateIssueDedup:
 class TestDecisionIssuePolicy:
     """Decision-created issues route through the tech_lead: config owner (F4)."""
 
-    def _issue_action(self, labels: tuple[str, ...] = ("bug",)) -> ProposedTechLeadAction:
+    def _issue_action(
+        self, labels: tuple[str, ...] = ("bug",)
+    ) -> ProposedTechLeadAction:
         return ProposedTechLeadAction(
             id="A1",
             action_type="create_issue",
@@ -530,8 +534,12 @@ class TestDecisionIssuePolicy:
 
     def test_root_cause_issue_carries_area_seam_label(self) -> None:
         action = ProposedTechLeadAction(
-            id="A1", action_type="create_issue", title="Review DB seam",
-            body="Repeated patching has not held.", labels=("design-review",), area="db",
+            id="A1",
+            action_type="create_issue",
+            title="Review DB seam",
+            body="Repeated patching has not held.",
+            labels=("design-review",),
+            area="db",
         )
         [planned] = _plan(_decision(action))
         assert isinstance(planned, CreateTechLeadIssueAction)
@@ -756,9 +764,7 @@ def test_two_same_signature_observations_open_one_case_file() -> None:
 
     planned = _plan(_decision(first, second))
 
-    creations = [
-        a for a in planned if isinstance(a, CreateTechLeadCaseFileIssueAction)
-    ]
+    creations = [a for a in planned if isinstance(a, CreateTechLeadCaseFileIssueAction)]
     assert len(creations) == 1
     assert creations[0].pattern_signature == "sig-x"
     assert len(creations[0].additional_observations) == 1
@@ -821,9 +827,7 @@ def test_same_decision_conflicting_classification_rejects_the_decision() -> None
 
     planned = _plan(_decision(first, second))
 
-    assert not any(
-        isinstance(a, CreateTechLeadCaseFileIssueAction) for a in planned
-    )
+    assert not any(isinstance(a, CreateTechLeadCaseFileIssueAction) for a in planned)
     [rejection] = planned
     assert isinstance(rejection, SurfaceTechLeadProposalAction)
     assert rejection.mode == "rejected"
@@ -849,9 +853,9 @@ def test_same_decision_conflicting_area_rejects_the_decision() -> None:
 
     planned = _plan(_decision(first, second))
 
-    assert [a.mode for a in planned if isinstance(a, SurfaceTechLeadProposalAction)] == [
-        "rejected"
-    ]
+    assert [
+        a.mode for a in planned if isinstance(a, SurfaceTechLeadProposalAction)
+    ] == ["rejected"]
 
 
 class TestClassificationConflictWithAnEarlierDecision:
@@ -883,18 +887,14 @@ class TestClassificationConflictWithAnEarlierDecision:
         )
 
     def test_fix_class_conflict_produces_only_a_rejection(self) -> None:
-        planned = self._plan_against(
-            {"fix_class": "human"}, {"fix_class": "code"}
-        )
+        planned = self._plan_against({"fix_class": "human"}, {"fix_class": "code"})
 
         [rejection] = planned
         assert isinstance(rejection, SurfaceTechLeadProposalAction)
         assert rejection.mode == "rejected"
         assert "pattern_classification_conflict" in rejection.reason
         # Nothing that would touch the case file was planned...
-        assert not any(
-            isinstance(a, AppendPatternObservationAction) for a in planned
-        )
+        assert not any(isinstance(a, AppendPatternObservationAction) for a in planned)
         assert not any(isinstance(a, AddCommentAction) for a in planned)
 
     def test_area_conflict_produces_only_a_rejection(self) -> None:
@@ -945,9 +945,7 @@ class TestClassificationConflictWithAnEarlierDecision:
             {"fix_class": "code", "area": "db"}, {"fix_class": "code"}
         )
 
-        [append] = [
-            a for a in planned if isinstance(a, AppendPatternObservationAction)
-        ]
+        [append] = [a for a in planned if isinstance(a, AppendPatternObservationAction)]
         assert append.issue_number == 777
         # It carries the MERGED classification, so the store sees an upgrade or
         # a no-op — never a conflict discovered mid-write.
@@ -956,17 +954,13 @@ class TestClassificationConflictWithAnEarlierDecision:
     def test_an_unclassified_observation_inherits_the_recorded_values(self) -> None:
         planned = self._plan_against({"fix_class": "code", "area": "db"}, {})
 
-        [append] = [
-            a for a in planned if isinstance(a, AppendPatternObservationAction)
-        ]
+        [append] = [a for a in planned if isinstance(a, AppendPatternObservationAction)]
         assert (append.fix_class, append.area) == ("code", "db")
 
     def test_a_later_observation_upgrades_an_unclassified_row(self) -> None:
         planned = self._plan_against({}, {"fix_class": "code", "area": "db"})
 
-        [append] = [
-            a for a in planned if isinstance(a, AppendPatternObservationAction)
-        ]
+        [append] = [a for a in planned if isinstance(a, AppendPatternObservationAction)]
         assert (append.fix_class, append.area) == ("code", "db")
 
     def test_two_same_decision_observations_conflict_with_each_other(self) -> None:
@@ -993,9 +987,7 @@ def test_different_signatures_open_distinct_case_files() -> None:
 
     planned = _plan(_decision(first, second))
 
-    creations = [
-        a for a in planned if isinstance(a, CreateTechLeadCaseFileIssueAction)
-    ]
+    creations = [a for a in planned if isinstance(a, CreateTechLeadCaseFileIssueAction)]
     assert {c.pattern_signature for c in creations} == {"sig-a", "sig-b"}
 
 
@@ -1029,9 +1021,7 @@ def test_flag_pattern_propose_surfaces_as_shadow_and_opens_no_case_file() -> Non
     assert surfaced.mode == "shadow"
     assert surfaced.proposal_type == "flag_pattern"
     assert len(_shadow_digests(planned)) == 1
-    assert not any(
-        isinstance(a, CreateTechLeadCaseFileIssueAction) for a in planned
-    )
+    assert not any(isinstance(a, CreateTechLeadCaseFileIssueAction) for a in planned)
 
 
 @pytest.mark.parametrize("act_type", ["reset_retry", "kill_hung_session"])
@@ -1077,9 +1067,7 @@ def test_duplicate_open_proposal_comments_instead_of_second_issue(
         id="A5", action_type=act_type, target_number=13, body="Again."
     )
 
-    [planned] = _plan(
-        _decision(action), op_ledger={(act_type, 13): 321}
-    )
+    [planned] = _plan(_decision(action), op_ledger={(act_type, 13): 321})
 
     assert isinstance(planned, AddCommentAction)
     assert planned.number == 321
@@ -1109,9 +1097,7 @@ def test_ledger_for_other_target_does_not_dedup() -> None:
         id="A5", action_type="reset_retry", target_number=13, body="r"
     )
 
-    [planned] = _plan(
-        _decision(action), op_ledger={("reset_retry", 14): 321}
-    )
+    [planned] = _plan(_decision(action), op_ledger={("reset_retry", 14): 321})
 
     assert isinstance(planned, CreateTechLeadProposalIssueAction)
 
@@ -1162,10 +1148,8 @@ def test_reset_retry_execute_plans_typed_reset_action() -> None:
     assert not any(isinstance(a, SurfaceTechLeadProposalAction) for a in [planned])
 
 
-def test_kill_hung_session_stays_gated_even_if_execute_sneaks_past_startup() -> None:
-    """The planner never trusts config validation for kill_hung_session:
-    it is a GATED PROPOSAL ISSUE even under 'execute' (its direct tier is
-    not wired; startup rejects the mode, #6778)."""
+def test_kill_hung_session_execute_plans_generation_bound_kill_action() -> None:
+    """Execute authority plans a direct kill bound to the observed session."""
     config = _config(kill_hung_session="execute")
     action = ProposedTechLeadAction(
         id="A8",
@@ -1174,11 +1158,30 @@ def test_kill_hung_session_stays_gated_even_if_execute_sneaks_past_startup() -> 
         body="Session looks hung.",
     )
 
-    [planned] = _plan(_decision(action), config)
+    [planned] = _plan(
+        _decision(action),
+        config,
+        observed_session_generation=lambda number: (
+            TechLeadSessionGeneration(
+                issue_number=13,
+                task_kind=TaskKind.CODE,
+                terminal_id="issue-13",
+                run_id="RUN-13",
+            )
+            if number == 13
+            else None
+        ),
+    )
 
-    assert isinstance(planned, CreateTechLeadProposalIssueAction)
-    assert planned.op.op_type == "kill_hung_session"
-    assert not isinstance(planned, ResetRetryIssueAction)
+    assert isinstance(planned, KillHungSessionAction)
+    assert planned.issue_number == 13
+    assert planned.anchor_issue_number == 99
+    assert planned.proposal_issue_number == 0
+    assert planned.proposal_id == "A8"
+    assert planned.target_session_id == "RUN-13"
+    assert planned.target_terminal_id == "issue-13"
+    assert planned.target_session_type == "code"
+    assert planned.expected is EXPECTED
 
 
 def test_mixed_decision_preserves_order_and_authority() -> None:

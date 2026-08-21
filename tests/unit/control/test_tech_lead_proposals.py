@@ -20,7 +20,9 @@ from issue_orchestrator.control.proposal_dedup_gate import (
     OpenIssueCorpus,
 )
 from issue_orchestrator.control.reconciliation import build_expected_for_mutation
-from issue_orchestrator.control.tech_lead_issue_creation import apply_create_tech_lead_issue
+from issue_orchestrator.control.tech_lead_issue_creation import (
+    apply_create_tech_lead_issue,
+)
 from issue_orchestrator.control.tech_lead_kill_session import (
     KillSessionRunOutcome,
     TechLeadKillSessionExecutor,
@@ -72,6 +74,8 @@ def _op(
         source_action_id="A2",
         created_at="2026-07-11T00:00:00+00:00",
         target_session_id=target_session_id,
+        target_terminal_id=(f"issue-{target}" if target_session_id else ""),
+        target_session_type=("code" if target_session_id else ""),
         finding_ids=finding_ids,
     )
 
@@ -80,7 +84,9 @@ def _kill_op(target: int = 14, *, session_id: str = "RUN-14") -> StoredTechLeadO
     return _op(target, op_type="kill_hung_session", target_session_id=session_id)
 
 
-def _proposed(act_type: str = "reset_retry", target: int = 13) -> ProposedTechLeadAction:
+def _proposed(
+    act_type: str = "reset_retry", target: int = 13
+) -> ProposedTechLeadAction:
     return ProposedTechLeadAction(
         id="A2",
         action_type=act_type,
@@ -175,7 +181,9 @@ def test_op_ledger_projects_rows_by_op_and_target() -> None:
 def test_split_classifies_open_approved_and_anchors() -> None:
     gated = _issue(500, ["tech-lead-agent", PROPOSED_TECH_LEAD_LABEL])
     approved = _issue(501, ["tech-lead-agent"])
-    anchor = _issue(7, ["tech-lead-agent"], title="Tech Lead Batch Review: 3 PRs pending")
+    anchor = _issue(
+        7, ["tech-lead-agent"], title="Tech Lead Batch Review: 3 PRs pending"
+    )
     ops = {500: _op(13), 501: _kill_op(14)}
 
     reconciled = reconcile_tech_lead_proposals([gated, approved, anchor], ops=ops)
@@ -320,7 +328,7 @@ def test_discard_owner_never_deletes_live_op_on_truncated_scan() -> None:
     closed one. The confirm read discards only the closed op and preserves the
     live one — a partial scan can never delete a live op."""
     ops = InMemoryTechLeadAuthorityStore()
-    ops.record_op(issue_number=600, op=_op(20))     # genuinely closed
+    ops.record_op(issue_number=600, op=_op(20))  # genuinely closed
     ops.record_op(issue_number=601, op=_kill_op(21))  # live, dropped by truncation
     tracker = _FakeTracker({600: "closed", 601: "open"})
     action = DiscardTerminalTechLeadProposalOpsAction(
@@ -332,7 +340,7 @@ def test_discard_owner_never_deletes_live_op_on_truncated_scan() -> None:
     )
 
     assert result.success
-    assert ops.load_op(issue_number=600) is None      # confirmed closed -> discarded
+    assert ops.load_op(issue_number=600) is None  # confirmed closed -> discarded
     assert ops.load_op(issue_number=601) is not None  # live -> preserved
     assert result.details["discarded_op_count"] == 1
     assert result.details["preserved_op_count"] == 1
@@ -353,7 +361,11 @@ def test_discard_owner_fails_loudly_without_tracker_or_store() -> None:
 
 def test_approved_reset_op_plans_reset_action_with_proposal_linkage() -> None:
     [action] = plan_approved_tech_lead_op_executions(
-        (ApprovedTechLeadOp(proposal_issue_number=500, op=_op(13, finding_ids=("T1", "T2"))),)
+        (
+            ApprovedTechLeadOp(
+                proposal_issue_number=500, op=_op(13, finding_ids=("T1", "T2"))
+            ),
+        )
     )
 
     assert isinstance(action, ResetRetryIssueAction)
@@ -467,9 +479,7 @@ def _case_file_action(
             observation_id=f"{prefix}:obs-1", comment="first observation"
         ),
         *(
-            PatternObservation(
-                observation_id=f"{prefix}:obs-{index}", comment=comment
-            )
+            PatternObservation(observation_id=f"{prefix}:obs-{index}", comment=comment)
             for index, comment in enumerate(additional_comments, start=2)
         ),
     )
@@ -656,7 +666,8 @@ def test_apply_case_file_rechecks_ledger_and_comments_inflight_duplicate() -> No
     assert result.details["deduplicated"] is True
     host.create_issue.assert_not_called()
     assert host.add_comment.call_args_list == [
-        call(600, "first observation"), call(600, "follow-up")
+        call(600, "first observation"),
+        call(600, "follow-up"),
     ]
     # Two distinct observations landed on the pre-existing case file.
     [evidence] = ops.list_pattern_evidence()
@@ -711,9 +722,7 @@ def test_replay_after_ledger_creation_does_not_recount_its_observations() -> Non
 
 def test_replay_after_one_additional_comment_counts_only_what_is_missing() -> None:
     """Crash between two additional comments: only the unposted one is added."""
-    action = _case_file_action(
-        "db-timeout", additional_comments=("second", "third")
-    )
+    action = _case_file_action("db-timeout", additional_comments=("second", "third"))
     ops = InMemoryTechLeadAuthorityStore()
     host = _host(600)
     # Fail while posting the SECOND additional comment (the third observation
@@ -736,7 +745,7 @@ def test_replay_after_one_additional_comment_counts_only_what_is_missing() -> No
     assert replay_host.add_comment.call_args_list == [call(600, "third")]
 
 
-def test_replay_after_a_lost_comment_repeats_it_rather_than_losing_evidence()  -> None:
+def test_replay_after_a_lost_comment_repeats_it_rather_than_losing_evidence() -> None:
     """The comment is posted BEFORE its count, so a crash between them repeats
     the comment (cosmetic) instead of counting evidence nobody can read."""
     action = _case_file_action("db-timeout", additional_comments=("second",))
@@ -1007,7 +1016,7 @@ def test_recovery_is_attempted_only_when_the_ledger_has_no_row() -> None:
 
 
 def test_a_failed_recovery_lookup_never_files_a_duplicate() -> None:
-    """"Unknown" must not be mistaken for "no case file exists"."""
+    """ "Unknown" must not be mistaken for "no case file exists"."""
     host = _host(601)
     host.find_issue_by_marker.side_effect = RuntimeError("GitHub unreachable")
 
@@ -1068,7 +1077,11 @@ def test_body_tamper_has_zero_effect_on_execution() -> None:
 
     # Attacker edits the issue body to point at another issue. The scan sees
     # the edited issue (gate removed = approved); the stored op is unchanged.
-    tampered_issue = _issue(500, ["tech-lead-agent"], title="Tech Lead proposal: reset & retry issue #6666 from scratch")
+    tampered_issue = _issue(
+        500,
+        ["tech-lead-agent"],
+        title="Tech Lead proposal: reset & retry issue #6666 from scratch",
+    )
     approved_ops = reconcile_tech_lead_proposals(
         [tampered_issue], ops=dict(ops.list_ops())
     ).approved
@@ -1100,9 +1113,7 @@ def test_finalize_success_comments_closes_and_discards() -> None:
     action = _reset_action()
     result = ActionResult.ok(action, issue_number=13)
 
-    out = finalize_tech_lead_op_execution(
-        result, action, repository_host=host, ops=ops
-    )
+    out = finalize_tech_lead_op_execution(result, action, repository_host=host, ops=ops)
 
     assert out is result
     (number, comment), _ = host.add_comment.call_args
@@ -1120,9 +1131,7 @@ def test_finalize_stale_comments_preconditions_no_longer_hold() -> None:
         action, "stale precondition: gone", mode="stale_downgrade"
     )
 
-    out = finalize_tech_lead_op_execution(
-        result, action, repository_host=host, ops=ops
-    )
+    out = finalize_tech_lead_op_execution(result, action, repository_host=host, ops=ops)
 
     assert out is result
     (number, comment), _ = host.add_comment.call_args
@@ -1140,9 +1149,7 @@ def test_finalize_failure_keeps_op_for_retry() -> None:
     action = _reset_action()
     result = ActionResult.fail(action, "reset owner failed")
 
-    out = finalize_tech_lead_op_execution(
-        result, action, repository_host=host, ops=ops
-    )
+    out = finalize_tech_lead_op_execution(result, action, repository_host=host, ops=ops)
 
     assert out is result
     host.add_comment.assert_not_called()
@@ -1253,7 +1260,6 @@ def test_applier_kill_op_invokes_termination_owner_under_stale_policy() -> None:
     applier = _applier(host, ops)
     applier.tech_lead_kill_session = TechLeadKillSessionExecutor(
         events=MagicMock(),
-        active_session_run_id=lambda n: "RUN-14" if n == 14 else None,
         run_kill=run_kill,
     )
     [action] = plan_approved_tech_lead_op_executions(
@@ -1264,7 +1270,7 @@ def test_applier_kill_op_invokes_termination_owner_under_stale_policy() -> None:
 
     assert result.success
     run_kill.assert_called_once()
-    assert run_kill.call_args[0][0] == 14
+    assert run_kill.call_args[0][0].issue_number == 14
     host.update_issue_state.assert_called_once_with(501, "closed")
     assert ops.load_op(issue_number=501) is None
 
@@ -1274,11 +1280,15 @@ def test_applier_kill_op_stale_when_session_already_gone() -> None:
     ops = InMemoryTechLeadAuthorityStore()
     op = _kill_op(14, session_id="RUN-14")
     ops.record_op(issue_number=501, op=op)
-    run_kill = MagicMock()
+    run_kill = MagicMock(
+        return_value=KillSessionRunOutcome(
+            success=False,
+            stale_reason="issue #14 has no active killable session",
+        )
+    )
     applier = _applier(host, ops)
     applier.tech_lead_kill_session = TechLeadKillSessionExecutor(
         events=MagicMock(),
-        active_session_run_id=lambda _n: None,
         run_kill=run_kill,
     )
     [action] = plan_approved_tech_lead_op_executions(
@@ -1288,7 +1298,7 @@ def test_applier_kill_op_stale_when_session_already_gone() -> None:
     result = applier.apply(action)
 
     assert not result.success
-    run_kill.assert_not_called()
+    run_kill.assert_called_once()
     (number, comment), _ = host.add_comment.call_args
     assert number == 501 and "Preconditions no longer hold" in comment
     assert ops.load_op(issue_number=501) is None
@@ -1331,10 +1341,33 @@ def _wired_kill_applier(
     applier = _applier(host, ops)
     applier.tech_lead_kill_session = TechLeadKillSessionExecutor(
         events=MagicMock(),
-        active_session_run_id=lambda n: "RUN-14" if n == 14 else None,
         run_kill=run_kill,
     )
     return applier
+
+
+def test_applier_direct_kill_executes_without_proposal_consent_round_trip() -> None:
+    host = MagicMock()
+    ops = InMemoryTechLeadAuthorityStore()
+    run_kill = MagicMock(return_value=KillSessionRunOutcome(success=True))
+    applier = _wired_kill_applier(host, ops, run_kill)
+    action = KillHungSessionAction(
+        issue_number=14,
+        rationale="Session is corroborated as hung.",
+        proposal_id="A8",
+        anchor_issue_number=99,
+        target_session_id="RUN-14",
+        target_terminal_id="issue-14",
+        target_session_type="code",
+        expected=EXPECTED,
+    )
+
+    result = applier.apply(action)
+
+    assert result.success
+    run_kill.assert_called_once()
+    host.update_issue_state.assert_not_called()
+    assert ops.list_ops() == ()
 
 
 def test_applier_reset_op_preserved_inert_when_gate_readded_before_apply() -> None:
@@ -1348,7 +1381,9 @@ def test_applier_reset_op_preserved_inert_when_gate_readded_before_apply() -> No
     run_reset = MagicMock(return_value=ResetRetryRunOutcome(success=True))
     applier = _wired_reset_applier(host, ops, run_reset)
     # The operator re-added the gate between plan and apply.
-    host.get_issue.side_effect = lambda n: _issue(n, ["tech-lead-agent", PROPOSED_TECH_LEAD_LABEL])
+    host.get_issue.side_effect = lambda n: _issue(
+        n, ["tech-lead-agent", PROPOSED_TECH_LEAD_LABEL]
+    )
 
     result = applier.apply(_reset_execution())
 
@@ -1367,7 +1402,9 @@ def test_applier_kill_op_preserved_inert_when_gate_readded_before_apply() -> Non
     ops.record_op(issue_number=501, op=op)
     run_kill = MagicMock(return_value=KillSessionRunOutcome(success=True))
     applier = _wired_kill_applier(host, ops, run_kill)
-    host.get_issue.side_effect = lambda n: _issue(n, ["tech-lead-agent", PROPOSED_TECH_LEAD_LABEL])
+    host.get_issue.side_effect = lambda n: _issue(
+        n, ["tech-lead-agent", PROPOSED_TECH_LEAD_LABEL]
+    )
 
     result = applier.apply(_kill_execution())
 
@@ -1385,7 +1422,9 @@ def test_applier_gate_readded_case_variant_still_withholds() -> None:
     ops.record_op(issue_number=500, op=_op())
     run_reset = MagicMock(return_value=ResetRetryRunOutcome(success=True))
     applier = _wired_reset_applier(host, ops, run_reset)
-    host.get_issue.side_effect = lambda n: _issue(n, ["tech-lead-agent", "Proposed-Tech-Lead"])
+    host.get_issue.side_effect = lambda n: _issue(
+        n, ["tech-lead-agent", "Proposed-Tech-Lead"]
+    )
 
     result = applier.apply(_reset_execution())
 
@@ -1422,7 +1461,11 @@ def test_applier_closed_proposal_preserves_op_without_executing() -> None:
     run_reset = MagicMock(return_value=ResetRetryRunOutcome(success=True))
     applier = _wired_reset_applier(host, ops, run_reset)
     host.get_issue.side_effect = lambda n: Issue(
-        number=n, title="t", labels=["tech-lead-agent"], state="closed", repo="owner/repo"
+        number=n,
+        title="t",
+        labels=["tech-lead-agent"],
+        state="closed",
+        repo="owner/repo",
     )
 
     result = applier.apply(_reset_execution())
@@ -1502,7 +1545,7 @@ def test_end_to_end_gated_reset_proposal_executes_once() -> None:
         source_run_id="run-1",
         source_session_name="issue-99",
         observed_at="2026-07-11T00:00:00+00:00",
-        active_session_run_id=lambda _n: None,
+        observed_session_generation=lambda _n: None,
         dedup_corpus=OpenIssueCorpus.disabled(),
         dedup_grant=DuplicateTargetGrant.none(),
     )
@@ -1527,15 +1570,13 @@ def test_end_to_end_gated_reset_proposal_executes_once() -> None:
         source_run_id="run-2",
         source_session_name="issue-99",
         observed_at="2026-07-11T01:00:00+00:00",
-        active_session_run_id=lambda _n: None,
+        observed_session_generation=lambda _n: None,
         dedup_corpus=OpenIssueCorpus.disabled(),
         dedup_grant=DuplicateTargetGrant.none(),
     )
     [dedup_comment] = [a for a in replanned if isinstance(a, AddCommentAction)]
     assert dedup_comment.number == 500
-    assert not any(
-        isinstance(a, CreateTechLeadProposalIssueAction) for a in replanned
-    )
+    assert not any(isinstance(a, CreateTechLeadProposalIssueAction) for a in replanned)
 
     # 3. Simulate operator approval: the scan shows #500 without the gate.
     approved_issue = _issue(500, ["tech-lead-agent"])

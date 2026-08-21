@@ -61,14 +61,14 @@ VALID_TECH_LEAD_ACTION_TYPES: frozenset[str] = frozenset(
 )
 _VALID_CLASSIFICATIONS = frozenset(("infra", "task", "agent", "systemic"))
 
-# Act-level intents mutate orchestrator runtime state. reset_retry is wired to
-# the reset+retry-from-scratch owner (#6764, first slice) and may be granted
-# "execute"; the UNWIRED subset has no executor yet — config validation must
-# reject authority "execute" for those until they are wired, never no-op.
+# Act-level intents mutate orchestrator runtime state. Both are wired to owners
+# that revalidate their preconditions immediately before acting, so either may
+# be granted direct ``execute`` authority. Keep the explicit unwired set as the
+# fail-closed extension point for future act-level actions.
 ACT_LEVEL_TECH_LEAD_ACTIONS: frozenset[str] = frozenset(
     ("reset_retry", "kill_hung_session")
 )
-UNWIRED_ACT_LEVEL_TECH_LEAD_ACTIONS: frozenset[str] = frozenset(("kill_hung_session",))
+UNWIRED_ACT_LEVEL_TECH_LEAD_ACTIONS: frozenset[str] = frozenset()
 
 # Canonical id forms (see module docstring). Leading zeros are rejected so
 # every id has exactly one canonical spelling; the forms are disjoint, which
@@ -123,7 +123,9 @@ class TechLeadFinding:
     @classmethod
     def from_mapping(cls, data: Any, *, index: int) -> "TechLeadFinding":
         if not isinstance(data, dict):
-            raise ValueError(f"finding #{index} must be an object, got {type(data).__name__}")
+            raise ValueError(
+                f"finding #{index} must be an object, got {type(data).__name__}"
+            )
         finding_id = _required_str(data, "id", f"finding #{index}")
         _validate_finding_id(finding_id)
         title = _required_str(data, "title", f"finding {finding_id}")
@@ -133,7 +135,9 @@ class TechLeadFinding:
                 f"finding {finding_id} has invalid classification: {classification!r}"
                 f" (expected one of {sorted(_VALID_CLASSIFICATIONS)})"
             )
-        evidence = _evidence_tuple(data.get("evidence"), context=f"finding {finding_id}")
+        evidence = _evidence_tuple(
+            data.get("evidence"), context=f"finding {finding_id}"
+        )
         if len(evidence) > MAX_EVIDENCE_REFS:
             raise ValueError(
                 f"finding {finding_id} has {len(evidence)} evidence refs"
@@ -184,8 +188,9 @@ class ProposedTechLeadAction:
       (the rationale); act-level, gated by ``tech_lead.authority``. Under
       ``propose`` the op is filed as a gated proposal that runs on operator
       approval (#6778); ``reset_retry`` is also wired for direct ``execute``
-      (#6764, first slice), while ``kill_hung_session``'s direct ``execute`` is
-      unwired and rejected at startup — it runs only via gated approval.
+      (#6764, first slice); ``kill_hung_session`` is also wired for direct
+      ``execute`` with an exact-session-generation safety check. Under
+      ``propose``, either action runs only via gated approval.
     """
 
     id: str
@@ -227,7 +232,9 @@ class ProposedTechLeadAction:
     @classmethod
     def from_mapping(cls, data: Any, *, index: int) -> "ProposedTechLeadAction":
         if not isinstance(data, dict):
-            raise ValueError(f"proposed action #{index} must be an object, got {type(data).__name__}")
+            raise ValueError(
+                f"proposed action #{index} must be an object, got {type(data).__name__}"
+            )
         action_id = _required_str(data, "id", f"proposed action #{index}")
         action_type = data.get("action_type")
         if action_type not in VALID_TECH_LEAD_ACTION_TYPES:
@@ -368,13 +375,17 @@ class ProposedTechLeadAction:
     def _validate_required_fields(self, context: str) -> None:
         """Per-action-type required fields (see the class docstring)."""
         if self.action_type == "post_comment":
-            _require(self.target_number is not None, f"{context} requires target_number")
+            _require(
+                self.target_number is not None, f"{context} requires target_number"
+            )
             _require(bool(self.body), f"{context} requires body")
         elif self.action_type == "create_issue":
             _require(bool(self.title), f"{context} requires title")
             _require(bool(self.body), f"{context} requires body")
         elif self.action_type == "escalate_to_human":
-            _require(self.target_number is not None, f"{context} requires target_number")
+            _require(
+                self.target_number is not None, f"{context} requires target_number"
+            )
             _require(bool(self.body), f"{context} requires body")
         elif self.action_type == "flag_pattern":
             _require(bool(self.body), f"{context} requires body")
@@ -386,7 +397,9 @@ class ProposedTechLeadAction:
                 " ledger key, #6781)",
             )
         elif self.action_type in ACT_LEVEL_TECH_LEAD_ACTIONS:
-            _require(self.target_number is not None, f"{context} requires target_number")
+            _require(
+                self.target_number is not None, f"{context} requires target_number"
+            )
             _require(bool(self.body), f"{context} requires body (rationale)")
 
     def to_dict(self) -> dict[str, Any]:
@@ -444,7 +457,9 @@ class TechLeadDecision:
         data = decision_section if isinstance(decision_section, dict) else payload
         schema_version = data.get("schema_version", 1)
         if schema_version != 1:
-            raise ValueError(f"unsupported tech_lead decision schema_version: {schema_version!r}")
+            raise ValueError(
+                f"unsupported tech_lead decision schema_version: {schema_version!r}"
+            )
         summary = _required_str(data, "summary", "tech_lead decision")
         raw_findings = data.get("findings", [])
         if not isinstance(raw_findings, list):
@@ -501,7 +516,9 @@ class TechLeadDecision:
         action_ids = [action.id for action in self.proposed_actions]
         duplicates = _duplicates(action_ids)
         if duplicates:
-            raise ValueError(f"duplicate proposed action ids: {', '.join(sorted(duplicates))}")
+            raise ValueError(
+                f"duplicate proposed action ids: {', '.join(sorted(duplicates))}"
+            )
         # Combined-namespace uniqueness. The canonical T<n>/A<n> forms make a
         # cross-namespace collision structurally impossible for parsed input,
         # but directly-constructed decisions must not bypass the invariant.
@@ -543,7 +560,9 @@ class TechLeadDecision:
         return payload
 
 
-def validate_tech_lead_report_links(decision: TechLeadDecision, report_text: str) -> None:
+def validate_tech_lead_report_links(
+    decision: TechLeadDecision, report_text: str
+) -> None:
     """Every decision finding/action id must appear in tech-lead-report.md.
 
     Matching is exact-token (word-boundary): ``T1`` is NOT satisfied by a
@@ -555,8 +574,7 @@ def validate_tech_lead_report_links(decision: TechLeadDecision, report_text: str
             *(finding.id for finding in decision.findings),
             *(action.id for action in decision.proposed_actions),
         )
-        if item_id
-        and re.search(rf"\b{re.escape(item_id)}\b", report_text) is None
+        if item_id and re.search(rf"\b{re.escape(item_id)}\b", report_text) is None
     ]
     if missing:
         raise ValueError(
@@ -566,9 +584,11 @@ def validate_tech_lead_report_links(decision: TechLeadDecision, report_text: str
 
 
 def _LABEL_ALLOWED(label: str) -> bool:
-    return bool(label) and all(
-        ch.isalnum() or ch in "-_:. " for ch in label
-    ) and len(label) <= MAX_LABEL_CHARS
+    return (
+        bool(label)
+        and all(ch.isalnum() or ch in "-_:. " for ch in label)
+        and len(label) <= MAX_LABEL_CHARS
+    )
 
 
 def _validate_finding_id(finding_id: str) -> None:
@@ -604,8 +624,7 @@ def _evidence_tuple(value: Any, *, context: str) -> tuple[str, ...]:
     for index, item in enumerate(value, start=1):
         if not isinstance(item, str) or not item.strip():
             raise ValueError(
-                f"{context} evidence #{index} must be a non-empty string,"
-                f" got {item!r}"
+                f"{context} evidence #{index} must be a non-empty string, got {item!r}"
             )
         items.append(item.strip())
     return tuple(items)
