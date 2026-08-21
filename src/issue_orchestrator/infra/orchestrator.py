@@ -49,6 +49,13 @@ from ..domain.models import (
 from ..observation.observer import SessionObserver
 from ..control.scheduler import Scheduler
 from ..control.pause_controller import PauseController
+from ..control.pause_facade import (
+    auto_resume_if_due as _auto_resume_if_due,
+    build_pause_controller as _build_pause_controller,
+    pause as _pause,
+    resume as _resume,
+    set_start_paused as _set_start_paused,
+)
 from ..domain.pause_state import PauseActor, PauseReason, PauseTransitionOutcome
 from ..domain.state_machines.issue_machine import IssueStateMachine
 from ..domain.state_machines.session_machine import SessionStateMachine
@@ -152,15 +159,9 @@ class Orchestrator:
         """The single owner of pause/resume transitions.
 
         Public so the control API, the dashboard, and tests all speak to the
-        same owner instead of assigning ``state.paused`` behind its back. The
-        journal arrives through ``deps`` — see ``InfraServices.pause_journal``.
+        same owner instead of assigning ``state.paused`` behind its back.
         """
-        return PauseController(
-            events=self.deps.events,
-            event_context=self._event_context,
-            store=self.state,
-            journal=self.deps.services.pause_journal,
-        )
+        return _build_pause_controller(self)
 
     @property
     def event_hub(self) -> EventHub:
@@ -845,16 +846,7 @@ class Orchestrator:
         except RepositoryHostError as error:
             logger.warning("[LOOP] Skipping startup orphan-label reconcile — repository host unavailable: %s", error)
 
-    def _auto_resume_if_due(self) -> None:
-        """Lift a half-open incident pause whose backoff expired.
-
-        Only incident pauses expire; see ``_AUTO_RESUME_BACKOFF_SECONDS``.
-        """
-        with self.state_lock:
-            self.pause_controller.resume_if_due(
-                actor=PauseActor.SYSTEM,
-                detail="auto-resume: incident backoff elapsed, retrying",
-            )
+    def _auto_resume_if_due(self) -> None: _auto_resume_if_due(self)
 
     def _handle_loop_error(self, error: Exception) -> None:
         """Log a tick error; the pause owner decides whether it trips the breaker."""
@@ -1020,46 +1012,20 @@ class Orchestrator:
             self._plan_applier.request_refresh(inflight_stable_ids, self._inflight_stable_ids, self._INFLIGHT_TTL_SECONDS)
 
     def pause(
-        self,
-        *,
-        reason: PauseReason,
-        actor: PauseActor,
-        detail: str = "",
+        self, *, reason: PauseReason, actor: PauseActor, detail: str = ""
     ) -> PauseTransitionOutcome:
-        """Pause the engine. Every caller must say why and on whose behalf.
-
-        ``reason``/``actor`` are required with no defaults: a default would let
-        a call site silently invent provenance. Returns what was committed.
-        """
-        with self.state_lock:
-            return self.pause_controller.pause(
-                reason=reason, actor=actor, detail=detail
-            )
+        """Pause the engine. Every caller must say why and on whose behalf."""
+        return _pause(self, reason=reason, actor=actor, detail=detail)
 
     def set_start_paused(self, *, actor: PauseActor = PauseActor.CLI) -> None:
-        """Set initial paused state and request dashboard read-model hydration.
-
-        Runtime ``pause()`` only stops future execution. Startup-pause also
-        needs one read-only refresh because warm cache state may be stale before
-        the dashboard first renders.
-        """
-        with self.state_lock:
-            # Event suppressed here: run_loop publishes the startup pause once
-            # the event context is live, so emitting now would double-count it.
-            self.pause_controller.pause(
-                reason=PauseReason.STARTUP,
-                actor=actor,
-                detail="started in paused mode",
-                emit_event=False,
-            )
-            self.state.queue_refresh_requested = True
+        """Start paused and request one read-only dashboard hydration."""
+        _set_start_paused(self, actor=actor)
 
     def resume(
         self, *, actor: PauseActor, detail: str = ""
     ) -> PauseTransitionOutcome:
         """Resume the engine, recording who lifted it and what it was paused for."""
-        with self.state_lock:
-            return self.pause_controller.resume(actor=actor, detail=detail)
+        return _resume(self, actor=actor, detail=detail)
 
     def get_failure_diagnosis(self, issue_number: int) -> dict:
         """Get failure diagnosis for a session.
