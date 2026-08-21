@@ -36,6 +36,19 @@ def _checkout(tmp_path: Path, name: str) -> Path:
     return path
 
 
+def _owning_checkout(tmp_path: Path, name: str) -> Path:
+    """A checkout that owns a venv.
+
+    The pyproject.toml is what makes it a *checkout*: a venv under a directory
+    that owns no project is a standalone environment, which no checkout can be
+    contaminated through.
+    """
+    path = _checkout(tmp_path, name)
+    (path / ".venv").mkdir()
+    (path / "pyproject.toml").write_text("[project]\nname='owner'\n")
+    return path
+
+
 # --------------------------------------------------------------------- guard
 
 
@@ -59,8 +72,7 @@ def test_guard_allows_a_symlink_that_stays_inside_the_checkout(tmp_path: Path) -
 
 def test_guard_refuses_a_venv_shared_from_another_checkout(tmp_path: Path) -> None:
     """The live bug: worktree .venv -> base .venv, then `uv sync` repoints base."""
-    owner = _checkout(tmp_path, "base")
-    (owner / ".venv").mkdir()
+    owner = _owning_checkout(tmp_path, "base")
     worktree = _checkout(tmp_path, "worktree")
     (worktree / ".venv").symlink_to(owner / ".venv", target_is_directory=True)
 
@@ -80,6 +92,35 @@ def test_guard_reports_a_dangling_symlink_distinctly_from_sharing(tmp_path: Path
     assert _run_guard(worktree) == 2
 
 
+def test_guard_allows_a_standalone_environment_no_checkout_owns(tmp_path: Path) -> None:
+    """An operator-chosen environment (CC_VENV_PATH, a system env) is not shared.
+
+    Nothing else resolves its project through it, so installing there cannot
+    repoint another checkout's editable pointer.
+    """
+    standalone = tmp_path / "envs" / "control-center"
+    standalone.mkdir(parents=True)
+    checkout = _checkout(tmp_path, "worktree")
+
+    result = subprocess.run(
+        [str(GUARD), "--quiet", "--venv", str(standalone)], cwd=checkout
+    )
+
+    assert result.returncode == 0
+
+
+def test_guard_targets_an_explicit_venv_path(tmp_path: Path) -> None:
+    """Control Center mutates ${VENV_PATH}; guarding ./.venv would guard nothing."""
+    owner = _owning_checkout(tmp_path, "base")
+    checkout = _checkout(tmp_path, "worktree")
+
+    result = subprocess.run(
+        [str(GUARD), "--quiet", "--venv", str(owner / ".venv")], cwd=checkout
+    )
+
+    assert result.returncode == 1
+
+
 def test_guard_publishes_the_dependency_only_sync_arguments() -> None:
     """Callers must not re-derive the safe argument set; the owner publishes it."""
     result = subprocess.run(
@@ -95,8 +136,7 @@ def test_guard_publishes_the_dependency_only_sync_arguments() -> None:
 
 
 def test_guard_names_the_owning_checkout_and_the_repair(tmp_path: Path) -> None:
-    owner = _checkout(tmp_path, "base")
-    (owner / ".venv").mkdir()
+    owner = _owning_checkout(tmp_path, "base")
     worktree = _checkout(tmp_path, "worktree")
     (worktree / ".venv").symlink_to(owner / ".venv", target_is_directory=True)
 
@@ -218,3 +258,36 @@ def test_doctor_probes_the_venv_interpreter_not_the_ambient_one(tmp_path: Path) 
     check_python_environment(repo, runner)
 
     assert runner.commands[0][0] == str(repo / ".venv" / "bin" / "python")
+
+
+def test_doctor_reports_a_dangling_venv_as_broken_not_absent(tmp_path: Path) -> None:
+    """A dangling .venv and an absent one both fail exists(); only one is benign.
+
+    Reporting "No .venv ... using the ambient interpreter" contradicted the
+    guard's BROKEN state and let startup proceed past a broken environment.
+    """
+    repo = _checkout(tmp_path, "repo")
+    (repo / ".venv").symlink_to(tmp_path / "deleted-checkout" / ".venv", target_is_directory=True)
+
+    check = check_python_environment(repo, _FakeRunner(0))
+
+    assert check.status == "error"
+    assert "dangling" in check.detail
+
+
+def test_doctor_turns_an_unreadable_pointer_into_a_check(tmp_path: Path) -> None:
+    """An unreadable .pth is a diagnosis, not a crash.
+
+    Raising here took the whole doctor run down instead of reporting the
+    broken install it was asked to look for.
+    """
+    repo = _venv(_checkout(tmp_path, "repo"), tmp_path / "somewhere" / "src")
+    pointer = next((repo / ".venv").glob("lib/*/site-packages/*.pth"))
+    pointer.chmod(0o000)
+    try:
+        check = check_python_environment(repo, _FakeRunner(0, stdout=str(repo / "src")))
+    finally:
+        pointer.chmod(0o644)
+
+    assert check.status == "error"
+    assert "Could not read" in check.detail

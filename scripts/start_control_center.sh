@@ -278,8 +278,15 @@ install_mode() {
 # the package is importable.
 venv_mutation_outcome() {
   local guard="${ROOT_DIR}/scripts/venv_guard.sh"
-  [[ -x "${guard}" ]] || return 0
-  (cd "${ROOT_DIR}" && "${guard}")
+  # Fail CLOSED. A missing or non-executable guard is not evidence of
+  # ownership; treating it as such turned "guard absent" into "full project
+  # sync", the exact mutation this exists to prevent.
+  if [[ ! -x "${guard}" ]]; then
+    return 3
+  fi
+  # VENV_PATH honours CC_VENV_PATH and may differ from ${ROOT_DIR}/.venv.
+  # Guarding one path while mutating another guards nothing.
+  (cd "${ROOT_DIR}" && "${guard}" --venv "${VENV_PATH}")
 }
 
 sync_deps() {
@@ -290,17 +297,25 @@ sync_deps() {
   mode="$(install_mode)"
 
   venv_mutation_outcome || guard_outcome=$?
-  if (( guard_outcome == 2 )); then
-    echo "ERROR: ${ROOT_DIR}/.venv is a dangling symlink; cannot sync." >&2
-    return 1
-  fi
-  if (( guard_outcome == 1 )); then
-    echo "ERROR: ${ROOT_DIR}/.venv is shared from another checkout." >&2
-    echo "Refusing to install this checkout's project into it; that is what" >&2
-    echo "repoints the shared editable install. Start the Control Center from" >&2
-    echo "the checkout that owns the venv, or give this one its own venv." >&2
-    return 1
-  fi
+  case "${guard_outcome}" in
+    0) ;;
+    1)
+      echo "ERROR: ${VENV_PATH} is shared from another checkout." >&2
+      echo "Refusing to install this checkout's project into it; that is what" >&2
+      echo "repoints the shared editable install. Start the Control Center from" >&2
+      echo "the checkout that owns the venv, or give this one its own venv." >&2
+      return 1
+      ;;
+    2)
+      echo "ERROR: ${VENV_PATH} is a dangling symlink; cannot sync." >&2
+      return 1
+      ;;
+    *)
+      echo "ERROR: venv guard unavailable or returned ${guard_outcome}." >&2
+      echo "Refusing to mutate ${VENV_PATH} without an authorization decision." >&2
+      return 1
+      ;;
+  esac
 
   if [[ "${mode}" == "uv-frozen-extra-dev" ]]; then
     echo "Syncing Python dependencies from ${ROOT_DIR} with uv..."

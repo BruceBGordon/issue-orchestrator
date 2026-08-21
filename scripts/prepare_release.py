@@ -915,15 +915,20 @@ def require_owned_venv(root: Path) -> None:
     another checkout's install. Releases run from the owning checkout.
     """
     guard = root / "scripts" / "venv_guard.sh"
-    if not guard.exists():
-        return
-    outcome = subprocess.run([str(guard)], cwd=root).returncode
+    # Fail CLOSED: a missing guard is not evidence of ownership.
+    outcome = (
+        subprocess.run([str(guard)], cwd=root).returncode
+        if guard.exists()
+        else 3
+    )
     if outcome == 0:
         return
-    reason = (
-        "its .venv is a dangling symlink"
-        if outcome == 2
-        else "its .venv is shared from another checkout"
+    reasons = {
+        1: "its .venv is shared from another checkout",
+        2: "its .venv is a dangling symlink",
+    }
+    reason = reasons.get(
+        outcome, f"the venv guard was unavailable or returned {outcome}"
     )
     raise ReleasePrepError(
         f"Refusing to sync the environment for {root}: {reason}. "

@@ -19,24 +19,36 @@
 # checkout last ran setup, and dangle entirely once it is deleted.
 #
 # OUTCOMES (exit codes)
-#   0  OWNED     .venv belongs to this checkout (or is absent). Mutate freely.
-#   1  SHARED    .venv is another checkout's. Never install THIS project into
-#                it. Dependency-only syncs are still permitted and are how
-#                callers keep their postcondition -- see --explain sync.
-#   2  BROKEN    .venv is a dangling symlink. The environment cannot be used or
-#                safely created over. Callers must FAIL rather than continue.
+#   0  OWNED     the venv belongs to this checkout, is absent, or is a
+#                standalone environment no checkout owns. Mutate freely.
+#   1  SHARED    the venv belongs to ANOTHER checkout. Never install THIS
+#                project into it. Dependency-only syncs are still permitted and
+#                are how callers keep their postcondition -- see --explain sync.
+#   2  BROKEN    the venv is a dangling symlink. It cannot be used, and creating
+#                over it writes into a dead path. Callers must FAIL.
+#  64  USAGE     bad arguments.
 #
-# Callers must distinguish 1 from 2. Treating "not zero" as "skip" is what let
-# a dangling venv report success.
+# Callers must classify ALL outcomes exhaustively and FAIL CLOSED on anything
+# they do not recognise -- including this script being missing or
+# non-executable. Two failure shapes have already been caught here:
+#   - treating "not zero" as "skip" let a dangling venv report success;
+#   - routing "any other code" to the else branch turned a missing guard into a
+#     full project sync, which is the exact mutation the guard exists to stop.
+#
+# --venv PATH targets an environment other than ./.venv (Control Center honours
+# CC_VENV_PATH, and guarding ./.venv while mutating a different path guards
+# nothing).
 
 set -uo pipefail
 
 quiet=0
 explain=""
+venv_path=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --quiet) quiet=1 ;;
     --explain) explain="${2:-}"; shift ;;
+    --venv) venv_path="${2:-}"; shift ;;
     *) echo "venv-guard: unknown argument: $1" >&2; exit 64 ;;
   esac
   shift
@@ -55,20 +67,23 @@ if [ "$explain" = "sync" ]; then
   exit 0
 fi
 
-# Absent or a real directory => private to this checkout => fully owned.
-if [ ! -L .venv ]; then
+here="$(pwd -P)"
+[ -n "$venv_path" ] || venv_path=".venv"
+
+# Absent => nothing to protect.
+if [ ! -e "$venv_path" ] && [ ! -L "$venv_path" ]; then
   exit "$OWNED"
 fi
 
-here="$(pwd -P)"
-link_target="$(readlink .venv)"
+link_target="$(readlink "$venv_path" 2>/dev/null || printf '%s' "$venv_path")"
 
-if ! target="$(cd .venv 2>/dev/null && pwd -P)"; then
+if ! target="$(cd "$venv_path" 2>/dev/null && pwd -P)"; then
   if [ "$quiet" -eq 0 ]; then
     cat >&2 <<MSG
-venv-guard: .venv is a DANGLING symlink.
+venv-guard: the target venv is a DANGLING symlink.
   this checkout : $here
-  .venv points  : $link_target  (does not exist)
+  venv          : $venv_path
+  points at     : $link_target  (does not exist)
 
 The checkout that owned this venv was deleted. Nothing here can use it, and
 creating a venv over the link would silently write into the dead path.
@@ -84,12 +99,20 @@ case "$target" in
   "$here"/*) exit "$OWNED" ;;
 esac
 
+# The venv resolves outside this checkout. That is only a hazard when ANOTHER
+# checkout owns it -- installing this project would rewrite that checkout's
+# editable pointer. A standalone environment (an operator-chosen CC_VENV_PATH,
+# a system env) is owned by nobody, so mutating it harms no other checkout.
+owner="${target%/*}"
+if [ ! -e "$owner/pyproject.toml" ] && [ ! -e "$owner/.git" ]; then
+  exit "$OWNED"
+fi
+
 if [ "$quiet" -eq 0 ]; then
-  owner="${target%/.venv}"
   cat >&2 <<MSG
-venv-guard: .venv here is SHARED from another checkout.
+venv-guard: the target venv is SHARED from another checkout.
   this checkout : $here
-  .venv resolves: $target
+  venv resolves : $target
   owned by      : $owner
 
 This checkout's project will NOT be installed into it: doing so rewrites that

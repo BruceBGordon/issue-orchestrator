@@ -58,10 +58,15 @@ NON_EXECUTING = re.compile(
 
 EXEMPTION = re.compile(r"venv-guard:\s*exempt\s*[-—:]\s*(?P<reason>.+)")
 
+# Discovery must cover every place a mutation can be *executed*, not just the
+# build and script layers. Source code runs these commands too: the E2E worktree
+# manager syncs a worktree venv, and orchestrator worktrees have .venv symlinked
+# at the base venv, so that path is a first-class contamination vector.
 SCANNED = [
     REPO_ROOT / "Makefile",
-    *sorted((REPO_ROOT / "scripts").glob("*.sh")),
-    *sorted((REPO_ROOT / "scripts").glob("*.py")),
+    *sorted((REPO_ROOT / "scripts").rglob("*.sh")),
+    *sorted((REPO_ROOT / "scripts").rglob("*.py")),
+    *sorted((REPO_ROOT / "src").rglob("*.py")),
 ]
 
 
@@ -76,10 +81,40 @@ class Site:
         return f"{rel}:{self.line_no}: {self.line.strip()[:100]}"
 
 
+def _string_literal_lines(path: Path) -> frozenset[int]:
+    """Line numbers inside Python string literals (docstrings included).
+
+    Prose that merely *names* a command cannot mutate anything. Deciding that
+    from the text of a single line fails on continuation lines of a docstring,
+    so the literals are located structurally instead.
+    """
+    if path.suffix != ".py":
+        return frozenset()
+    try:
+        tree = ast.parse(path.read_text())
+    except SyntaxError:
+        return frozenset()
+    covered: set[int] = set()
+    for node in ast.walk(tree):
+        # Only PROSE: a docstring or a bare string expression statement. Not
+        # every string constant -- `subprocess.run(["uv", "sync"])` is a real
+        # call whose command lives in string literals, and skipping those lines
+        # would hide exactly what this scanner exists to find.
+        if isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant):
+            if isinstance(node.value.value, str):
+                covered.update(
+                    range(node.lineno, (node.end_lineno or node.lineno) + 1)
+                )
+    return frozenset(covered)
+
+
 def _executing_mutation_sites(path: Path) -> list[Site]:
+    literals = _string_literal_lines(path)
     sites: list[Site] = []
     for index, line in enumerate(path.read_text().splitlines(), start=1):
         if not MUTATION.search(line) or NON_EXECUTING.search(line):
+            continue
+        if index in literals:
             continue
         sites.append(Site(path, index, line))
     return sites
@@ -191,6 +226,29 @@ def test_scanner_honours_a_justified_exemption(tmp_path: Path) -> None:
     site = _executing_mutation_sites(exempt)[0]
 
     assert _is_exempt(site) == "pinned to an isolated tool env"
+
+
+def test_scanner_ignores_commands_named_inside_docstrings(tmp_path: Path) -> None:
+    """Prose that names a command cannot run it, even across continuation lines."""
+    doc = tmp_path / "doc.py"
+    doc.write_text(
+        '"""Module.\n\nThe orchestrator is installed editable\n'
+        '(``pip install -e .``) so imports resolve.\n"""\n'
+    )
+
+    assert _executing_mutation_sites(doc) == []
+
+
+def test_scanner_still_sees_a_real_call_in_a_documented_module(tmp_path: Path) -> None:
+    real = tmp_path / "real.py"
+    real.write_text(
+        '"""Docs mentioning uv sync."""\n'
+        "import subprocess\n\n\n"
+        "def go():\n"
+        '    subprocess.run(["uv", "sync", "--frozen"])\n'
+    )
+
+    assert len(_executing_mutation_sites(real)) == 1
 
 
 def test_the_scanner_finds_the_known_mutation_sites() -> None:

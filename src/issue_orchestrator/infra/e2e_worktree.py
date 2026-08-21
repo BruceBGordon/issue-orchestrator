@@ -86,6 +86,44 @@ def _update_worktree(repo_root: Path, worktree_path: Path) -> None:
     )
 
 
+class VenvMutationRefused(RuntimeError):
+    """Raised when the guard will not authorize mutating a worktree venv."""
+
+
+def _require_owned_venv(worktree_path: Path) -> None:
+    """Refuse to install this worktree's project into a venv it does not own.
+
+    The E2E worktree is created by the orchestrator, and orchestrator worktrees
+    have their ``.venv`` symlinked at the base repo's venv
+    (``_link_repo_venv_into_worktree``). Syncing through that link reinstalls
+    this worktree's project into the shared venv and rewrites its editable
+    pointer, so this path is a first-class contamination vector, not an
+    incidental one.
+
+    Routed through ``scripts/venv_guard.sh`` -- the single mutation
+    authorization owner -- rather than re-deriving the rule. Fails CLOSED: a
+    missing guard or an unrecognised outcome is not evidence of ownership.
+    """
+    guard = worktree_path / "scripts" / "venv_guard.sh"
+    outcome = (
+        subprocess.run(
+            [str(guard), "--quiet"], cwd=worktree_path, capture_output=True, timeout=30
+        ).returncode
+        if guard.exists()
+        else 3
+    )
+    if outcome == 0:
+        return
+    reasons = {
+        1: "its .venv is shared from another checkout",
+        2: "its .venv is a dangling symlink",
+    }
+    raise VenvMutationRefused(
+        f"Refusing to sync the E2E worktree venv at {worktree_path}: "
+        + reasons.get(outcome, f"the venv guard was unavailable or returned {outcome}")
+    )
+
+
 def _sync_venv(worktree_path: Path) -> None:
     """Ensure the worktree venv is up-to-date (fast when deps unchanged)."""
     pyproject = worktree_path / "pyproject.toml"
@@ -93,6 +131,7 @@ def _sync_venv(worktree_path: Path) -> None:
     venv_python = worktree_path / ".venv" / "bin" / "python"
 
     if pyproject.exists():
+        _require_owned_venv(worktree_path)
         logger.info("Syncing project venv in E2E worktree")
         sync_cmd = ["uv", "sync", "--all-extras"]
         if uv_lock.exists():

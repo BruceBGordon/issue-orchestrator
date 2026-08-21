@@ -1,5 +1,6 @@
 """Workspace and agent checks for doctor."""
 
+import os
 import shutil
 from typing import Any
 from pathlib import Path
@@ -303,8 +304,26 @@ def check_python_environment(
     that leaves no pointer at all, and does not mis-report a perfectly valid
     non-editable install merely because it has no ``.pth``.
     """
-    venv_python = repo_root / ".venv" / "bin" / "python"
+    venv_dir = repo_root / ".venv"
+    venv_python = venv_dir / "bin" / "python"
     repair = f"cd {repo_root} && uv pip install --python .venv/bin/python -e . --no-deps"
+
+    # A dangling .venv must not be reported as an absent one. Both fail
+    # ``exists()``, but "no venv, using the ambient interpreter" is benign while
+    # a dangling link is the guard's BROKEN state: the environment is unusable
+    # and anything creating over the link writes into a dead path.
+    if venv_dir.is_symlink() and not venv_dir.exists():
+        return Check(
+            name="Python environment",
+            status="error",
+            detail=(
+                f"{venv_dir} is a dangling symlink pointing at "
+                f"{os.readlink(venv_dir)}, which no longer exists. The checkout "
+                f"that owned this venv was deleted. Remove the link and rebuild: "
+                f"rm {venv_dir} && make venv-fast"
+            ),
+            expandable={"venv": str(venv_dir), "points_at": os.readlink(venv_dir)},
+        )
 
     if not venv_python.exists():
         return Check(
@@ -313,12 +332,24 @@ def check_python_environment(
             detail=f"No .venv in {repo_root}; using the ambient interpreter",
         )
 
-    pointers = {
-        pointer.name: pointer.read_text().strip()
+    pointers: dict[str, str] = {}
+    try:
         for pointer in sorted(
-            (repo_root / ".venv").glob("lib/*/site-packages/*issue_orchestrator*.pth")
+            venv_dir.glob("lib/*/site-packages/*issue_orchestrator*.pth")
+        ):
+            pointers[pointer.name] = pointer.read_text().strip()
+    except OSError as exc:
+        # An unreadable pointer is a diagnosis, not a crash. Raising here took
+        # the whole doctor run down instead of reporting the broken install.
+        return Check(
+            name="Python environment",
+            status="error",
+            detail=(
+                f"Could not read the editable pointer in {venv_dir}: {exc}. "
+                f"Repair: {repair}"
+            ),
+            expandable={"repair": repair, "error": str(exc)},
         )
-    }
 
     if runner is None:
         return Check(

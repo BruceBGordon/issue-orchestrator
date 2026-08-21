@@ -3,6 +3,7 @@
 import subprocess
 
 import pytest
+import shutil
 from pathlib import Path
 from unittest.mock import patch
 
@@ -50,6 +51,21 @@ def _make_mock_run(extra_side_effect=None):
         return subprocess.CompletedProcess(cmd, 0)
 
     return side_effect
+
+
+
+def _install_venv_guard(worktree_path: Path) -> None:
+    """Give the fake worktree the real mutation-authorization owner.
+
+    ``_sync_venv`` fails closed without it, and a real worktree is a checkout of
+    this repo, so it always carries the guard. Refusal paths are covered in
+    tests/unit/test_venv_guard_callers.py.
+    """
+    repo_root = Path(__file__).resolve().parents[3]
+    guard = worktree_path / "scripts" / "venv_guard.sh"
+    guard.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(repo_root / "scripts" / "venv_guard.sh", guard)
+    guard.chmod(0o755)
 
 
 class TestEnsureE2EWorktree:
@@ -198,6 +214,7 @@ class TestEnsureE2EWorktree:
         worktree_path = get_e2e_worktree_path(repo_root)
         worktree_path.mkdir()
         (worktree_path / "pyproject.toml").write_text("[project]\nname = \"example\"\n")
+        _install_venv_guard(worktree_path)
         (worktree_path / "uv.lock").write_text("version = 1\n")
 
         ensure_e2e_worktree(repo_root)
@@ -217,6 +234,7 @@ class TestEnsureE2EWorktree:
         worktree_path = get_e2e_worktree_path(repo_root)
         worktree_path.mkdir()
         (worktree_path / "pyproject.toml").write_text("[project]\nname = \"example\"\n")
+        _install_venv_guard(worktree_path)
 
         ensure_e2e_worktree(repo_root)
 
@@ -233,6 +251,7 @@ class TestEnsureE2EWorktree:
         worktree_path = get_e2e_worktree_path(repo_root)
         worktree_path.mkdir()
         (worktree_path / "pyproject.toml").write_text("[project]\nname = \"example\"\n")
+        _install_venv_guard(worktree_path)
 
         def side_effect(cmd, **kwargs):
             if cmd[:2] == ["git", "rev-parse"] and "HEAD" in cmd:

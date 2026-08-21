@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 import venv
@@ -12,6 +13,15 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = REPO_ROOT / "scripts" / "start_control_center.sh"
+
+
+def _install_venv_guard(repo: Path) -> Path:
+    """Copy the real guard into the fake checkout so it classifies honestly."""
+    guard = repo / "scripts" / "venv_guard.sh"
+    guard.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(REPO_ROOT / "scripts" / "venv_guard.sh", guard)
+    guard.chmod(0o755)
+    return guard
 
 
 def _write_fake_python(venv_path: Path) -> Path:
@@ -131,6 +141,11 @@ def _make_fake_repo(
     package_path.joinpath("__init__.py").write_text("", encoding="utf-8")
     venv_path = repo / ("custom-venv" if custom_venv else ".venv")
     _write_fake_python(venv_path)
+    # A real checkout always carries the mutation-authorization owner, and
+    # sync_deps now fails closed without it. Omitting it here made every test in
+    # this module bypass authorization rather than exercise it; the dedicated
+    # refusal cases live in tests/unit/test_venv_guard_callers.py.
+    _install_venv_guard(repo)
     install_log = repo / "install.log"
     tools_path = tmp_path / "tools"
     tools_path.mkdir()
@@ -207,6 +222,10 @@ def _write_importable_package(repo: Path) -> None:
         encoding="utf-8",
     )
     repo.joinpath("uv.lock").write_text("# deterministic fake lock\n", encoding="utf-8")
+    # sync_deps fails closed without the mutation-authorization owner, and a
+    # real checkout always has it. These fixtures must classify honestly rather
+    # than sidestep authorization.
+    _install_venv_guard(repo)
 
 
 def _site_packages(venv_path: Path) -> Path:

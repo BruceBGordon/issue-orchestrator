@@ -59,6 +59,7 @@ def _make_checkout(tmp_path: Path, name: str = "checkout") -> Path:
 
 
 def _fake_uv(tmp_path: Path) -> tuple[Path, Path]:
+    tmp_path.mkdir(parents=True, exist_ok=True)
     log = tmp_path / "uv-calls.log"
     fake = tmp_path / "fake-uv"
     fake.write_text(
@@ -101,8 +102,15 @@ def _run_make(checkout: Path, target: str, tmp_path: Path) -> MakeRun:
 
 
 def _share_venv_from(owner_root: Path, checkout: Path) -> None:
+    """Link this checkout's .venv at another *checkout's* venv.
+
+    The owner is given a pyproject.toml because that is what makes it a
+    checkout. A venv under a directory that owns no project is a standalone
+    environment nobody can be contaminated through.
+    """
     owner_venv = owner_root / ".venv"
     owner_venv.mkdir(parents=True, exist_ok=True)
+    (owner_root / "pyproject.toml").write_text("[project]\nname='owner'\n")
     (checkout / ".venv").symlink_to(owner_venv, target_is_directory=True)
 
 
@@ -203,3 +211,76 @@ def test_destructive_targets_refuse_a_shared_venv(target: str, tmp_path: Path) -
 
     assert run.returncode != 0, run.output
     assert (tmp_path / "owner" / ".venv").exists(), "the shared venv was destroyed"
+
+
+# ------------------------------------------------- R1: shared freshness state
+
+
+def test_one_checkout_sync_does_not_make_another_look_fresh(tmp_path: Path) -> None:
+    """DEPS_MARKER lives in the venv, so on a shared venv it is another
+    checkout's state. Reading it let B skip its sync because A had just
+    stamped it -- with a different lock and freshly changed versions.
+    """
+    owner = tmp_path / "owner"
+    (owner / ".venv").mkdir(parents=True)
+    a = _make_checkout(tmp_path, "a")
+    b = _make_checkout(tmp_path, "b")
+    _share_venv_from(owner, a)
+    _share_venv_from(owner, b)
+
+    first = _run_make(a, "sync-deps", tmp_path / "a-run")
+    assert first.returncode == 0, first.output
+    assert first.synced_dependencies_only(), first.uv_calls
+
+    # B's lock predates the marker A just touched. It must still sync.
+    second = _run_make(b, "sync-deps", tmp_path / "b-run")
+
+    assert second.returncode == 0, second.output
+    assert second.uv_calls, "B skipped its sync because A stamped the shared marker"
+    assert second.synced_dependencies_only(), second.uv_calls
+
+
+def test_shared_sync_does_not_stamp_the_owners_marker(tmp_path: Path) -> None:
+    owner = tmp_path / "owner"
+    (owner / ".venv").mkdir(parents=True)
+    checkout = _make_checkout(tmp_path, "a")
+    _share_venv_from(owner, checkout)
+
+    _run_make(checkout, "sync-deps", tmp_path / "run")
+
+    assert not (owner / ".venv" / ".deps-synced").exists(), (
+        "a non-owning checkout stamped the shared freshness marker"
+    )
+
+
+# --------------------------------------------------------- R2: fail closed
+
+
+@pytest.mark.parametrize("target", ["sync-deps", "venv-fast", "install"])
+def test_targets_fail_closed_when_the_guard_is_missing(target: str, tmp_path: Path) -> None:
+    """A guard that cannot run is not evidence of ownership.
+
+    Routing "any other exit code" to the else branch turned a missing guard
+    into a full `uv sync --frozen --all-extras`.
+    """
+    checkout = _make_checkout(tmp_path)
+    (checkout / "scripts" / "venv_guard.sh").unlink()
+
+    run = _run_make(checkout, target, tmp_path)
+
+    assert run.returncode != 0, run.output
+    assert not run.synced_project(), run.uv_calls
+
+
+@pytest.mark.parametrize("target", ["sync-deps", "venv-fast", "install"])
+def test_targets_fail_closed_on_an_unexpected_guard_outcome(
+    target: str, tmp_path: Path
+) -> None:
+    checkout = _make_checkout(tmp_path)
+    (checkout / "scripts" / "venv_guard.sh").write_text("#!/usr/bin/env bash\nexit 7\n")
+    (checkout / "scripts" / "venv_guard.sh").chmod(0o755)
+
+    run = _run_make(checkout, target, tmp_path)
+
+    assert run.returncode != 0, run.output
+    assert not run.synced_project(), run.uv_calls

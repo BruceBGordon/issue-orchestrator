@@ -105,23 +105,42 @@ ensure-uv:
 VENV_GUARD := scripts/venv_guard.sh
 VENV_SYNC_SHARED_ARGS = $$($(VENV_GUARD) --explain sync)
 
+# $(call venv_guard_required,<caller>) - refuse to proceed unless the
+# authorization owner is actually runnable.
+#
+# This CANNOT be folded into the exit-code classification below. Under `set -e`,
+# /bin/sh surfaces a missing command through `||` as status 1, which is exactly
+# the guard's SHARED code -- so an absent guard would be read as "shared venv"
+# and quietly downgraded to a dependency-only sync rather than failing.
+define venv_guard_required
+if [ ! -x "$(VENV_GUARD)" ]; then \
+	echo "$(1): venv guard $(VENV_GUARD) is missing or not executable; refusing to mutate the environment." >&2; \
+	exit 1; \
+fi;
+endef
+
 # $(call venv_sync,<target-name>) - the guarded sync for a recipe.
 define venv_sync
+$(call venv_guard_required,$(1)) \
 _g=0; $(VENV_GUARD) || _g=$$?; \
-if [ $$_g -eq 2 ]; then \
-	echo "$(1): .venv is a dangling symlink; refusing to continue." >&2; \
-	exit 1; \
+if [ $$_g -eq 0 ]; then \
+	$(UV) sync --frozen --all-extras && touch .venv/.deps-synced; \
 elif [ $$_g -eq 1 ]; then \
 	echo "$(1): shared .venv - syncing dependencies only."; \
-	$(UV) sync $(VENV_SYNC_SHARED_ARGS) && touch .venv/.deps-synced; \
+	$(UV) sync $(VENV_SYNC_SHARED_ARGS); \
+elif [ $$_g -eq 2 ]; then \
+	echo "$(1): .venv is a dangling symlink; refusing to continue." >&2; \
+	exit 1; \
 else \
-	$(UV) sync --frozen --all-extras && touch .venv/.deps-synced; \
+	echo "$(1): venv guard unavailable or returned $$_g; refusing to mutate the environment." >&2; \
+	exit 1; \
 fi
 endef
 
 # $(call venv_require_owned,<target-name>) - destructive targets that recreate
 # .venv. Neither SHARED nor BROKEN may proceed.
 define venv_require_owned
+$(call venv_guard_required,$(1)) \
 $(VENV_GUARD) || { \
 	echo "$(1): refusing to recreate a .venv this checkout does not own." >&2; \
 	exit 1; \
@@ -153,9 +172,13 @@ venv: ensure-uv
 venv-fast: ensure-uv
 	@mkdir -p $$(dirname $(SETUP_LOG))
 	@set -e; \
+	$(call venv_guard_required,make venv-fast) \
 	_g=0; $(VENV_GUARD) || _g=$$?; \
 	if [ $$_g -eq 2 ]; then \
 		echo "make venv-fast: .venv is a dangling symlink; refusing to continue." >&2; \
+		exit 1; \
+	elif [ $$_g -gt 2 ]; then \
+		echo "make venv-fast: venv guard unavailable or returned $$_g; refusing to mutate." >&2; \
 		exit 1; \
 	fi; \
 	t0=$$(date +%s); \
@@ -171,8 +194,8 @@ venv-fast: ensure-uv
 		$(UV) sync $(VENV_SYNC_SHARED_ARGS); \
 	else \
 		$(UV) sync --frozen --all-extras; \
+		touch .venv/.deps-synced; \
 	fi; \
-	touch .venv/.deps-synced; \
 	t2=$$(date +%s); \
 	echo "venv-fast pid=$$$$ ts=$$(date -Iseconds) pwd=$$(pwd) uv_venv=$$((t1-t0))s uv_sync=$$((t2-t1))s total=$$((t2-t0))s" >> $(SETUP_LOG)
 	@$(GMAKE) --no-print-directory semgrep-venv
@@ -428,26 +451,29 @@ DEPS_MARKER ?= .venv/.deps-synced
 # Auto-sync dependencies if pyproject.toml or uv.lock is newer than last sync
 # This prevents cryptic errors like "unrecognized arguments: -n" when pytest-xdist is missing
 sync-deps:
-	@if [ ! -f $(DEPS_MARKER) ] || [ pyproject.toml -nt $(DEPS_MARKER) ] || [ uv.lock -nt $(DEPS_MARKER) ]; then \
+	@$(call venv_guard_required,[sync-deps]) \
+	_g=0; $(VENV_GUARD) || _g=$$?; \
+	if [ $$_g -eq 2 ]; then \
+		echo "[sync-deps] .venv is a dangling symlink; refusing to run against a broken environment." >&2; \
+		exit 1; \
+	elif [ $$_g -gt 2 ]; then \
+		echo "[sync-deps] venv guard unavailable or returned $$_g; refusing to mutate." >&2; \
+		exit 1; \
+	fi; \
+	if [ ! -x "$(UV)" ]; then \
+		echo "ERROR: uv not found. Run: curl -LsSf https://astral.sh/uv/install.sh | sh"; \
+		exit 1; \
+	fi; \
+	if [ $$_g -eq 1 ]; then \
+		echo "[sync-deps] Shared .venv - dependency-only sync; the marker belongs to another checkout so it is neither read nor stamped."; \
+		$(UV) sync $(VENV_SYNC_SHARED_ARGS); \
+	elif [ ! -f $(DEPS_MARKER) ] || [ pyproject.toml -nt $(DEPS_MARKER) ] || [ uv.lock -nt $(DEPS_MARKER) ]; then \
 		echo ""; \
 		echo "================================================================"; \
 		echo "[sync-deps] Dependencies changed since last install"; \
 		echo "[sync-deps] Auto-syncing dependencies on your behalf..."; \
 		echo "================================================================"; \
-		if [ ! -x "$(UV)" ]; then \
-			echo "ERROR: uv not found. Run: curl -LsSf https://astral.sh/uv/install.sh | sh"; \
-			exit 1; \
-		fi; \
-		_g=0; $(VENV_GUARD) || _g=$$?; \
-		if [ $$_g -eq 2 ]; then \
-			echo "[sync-deps] .venv is a dangling symlink; refusing to run against a broken environment." >&2; \
-			exit 1; \
-		elif [ $$_g -eq 1 ]; then \
-			echo "[sync-deps] Shared .venv - syncing dependencies only (project install untouched)."; \
-			$(UV) sync $(VENV_SYNC_SHARED_ARGS) && touch $(DEPS_MARKER); \
-		else \
-			$(UV) sync --frozen --all-extras && touch $(DEPS_MARKER); \
-		fi; \
+		$(UV) sync --frozen --all-extras && touch $(DEPS_MARKER); \
 		echo "[sync-deps] Done. Continuing with original command..."; \
 		echo ""; \
 	fi
