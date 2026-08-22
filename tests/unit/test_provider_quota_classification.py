@@ -112,6 +112,35 @@ class TestQuotaClassification:
         assert classify_provider_output("Reading files, running tests...") is None
 
 
+# Text an AGENT plausibly writes while working on billing or rate-limit code.
+# This matters because the table is matched against the whole PTY transcript,
+# which includes everything the agent itself produced — and this repository's
+# own agents work on exactly this subject matter.
+AGENT_PROSE_ABOUT_QUOTA = (
+    "I will add a usage limit check to the billing module",
+    "The spend limit should be configurable per workspace",
+    "Consider showing purchase more credits in the empty state",
+    # Gemini's /stats output on a healthy session, which the bare phrase
+    # "usage limit" would otherwise have matched.
+    "Usage limit: 1,000",
+    "Usage limits span all sessions and reset daily.",
+)
+
+
+class TestQuotaTokensDoNotFireOnAgentProse:
+    """A false positive here costs the full cooldown, so the bar is high.
+
+    Quota trips on the first observation and has no early-retirement path —
+    unlike auth, which a READY probe clears the moment credentials are fixed.
+    So a phrase common enough to appear in an agent's own reasoning must not
+    be in the table, however plausible it looks as a provider banner.
+    """
+
+    @pytest.mark.parametrize("output", AGENT_PROSE_ABOUT_QUOTA)
+    def test_discussing_quota_is_not_hitting_one(self, output: str) -> None:
+        assert classify_provider_output(output) is None
+
+
 class TestHumanInterventionPolicy:
     """Cause and policy are separable, and call sites branch on policy."""
 

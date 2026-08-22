@@ -69,15 +69,23 @@ _RATE_LIMIT_TOKENS = (
 # that already had a working classification is a separate question from
 # covering strings that had none.
 _QUOTA_TOKENS = (
-    "usage limit",
+    # Typed codes and code-shaped fragments. `usage_limit` covers both
+    # `usage_limit_exceeded` and `workspace_owner_usage_limit_reached`.
     "usage_limit",
-    "out of credits",
     "credits_depleted",
-    "purchase more credits",
     "insufficient_quota",
-    "spend limit",
-    "spending limit",
-    "spend cap",
+    # Distinctive prose. Deliberately NOT the bare phrases "usage limit",
+    # "spend limit" or "purchase more credits": this table is matched against
+    # the whole PTY transcript, which includes everything the AGENT wrote, and
+    # an agent working on billing or rate-limit code emits those words in
+    # ordinary reasoning. A false positive here is expensive — quota trips on
+    # the first observation and has no early-retirement path, so it parks the
+    # provider for the full cooldown. Each phrase below is long enough that an
+    # agent discussing the topic is unlikely to reproduce it verbatim.
+    "hit your usage limit",
+    "out of credits",
+    "spend limit reached",
+    "reached your spending limit",
 )
 
 # HTTP-flavoured tokens (one-shot API failures) *and* the interactive TUI
