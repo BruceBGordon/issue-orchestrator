@@ -232,11 +232,11 @@ def find_uv(explicit_uv: str | None = None) -> str:
     )
 
 
-def run_command(command: Sequence[str], *, cwd: Path) -> None:
+def run_command(command: Sequence[str], *, cwd: Path, env: dict[str, str] | None = None) -> None:
     """Run a command and fail loudly on non-zero exit."""
     printable = " ".join(shlex.quote(part) for part in command)
     print(f"+ {printable}")
-    result = subprocess.run(command, cwd=cwd, check=False)  # noqa: S603
+    result = subprocess.run(command, cwd=cwd, env=env, check=False)  # noqa: S603
     if result.returncode != 0:
         raise ReleasePrepError(
             f"Command failed with exit code {result.returncode}: {printable}"
@@ -905,45 +905,70 @@ def verify_release_metadata_ready(
     print(f"Version {target_version} already present in pyproject.toml and uv.lock.")
 
 
-def require_owned_venv(root: Path) -> None:
-    """Refuse to install this project into a venv it does not exclusively own.
+def require_owned_venv(root: Path) -> Path:
+    """Authorize installing THIS project into ``root``'s venv.
 
-    Routed through the same authority every other caller uses, resolved from
-    this project's own tree rather than re-derived here. Fails CLOSED: a guard
-    that is missing, unreadable, or non-executable is not evidence of
-    ownership, and an unrunnable one must surface as this module's declared
-    error rather than a raw OSError.
+    Returns the authorized environment so the caller can bind uv to it. Fails
+    CLOSED: a guard that is missing, unreadable, non-executable, timed out, or
+    whose record contradicts its exit status is not evidence of ownership.
     """
     guard = root / "src" / "issue_orchestrator" / "resources" / "venv_guard.sh"
+    target = (root / ".venv").resolve()
     try:
         completed = subprocess.run(
-            [str(guard), "decide", "--quiet", "--checkout", str(root)],
+            [
+                str(guard), "decide", "--quiet",
+                "--checkout", str(root),
+                "--venv", str(target),
+                "--operation", "install-project",
+            ],
             cwd=root,
             capture_output=True,
             text=True,
             timeout=30,
         )
-        outcome = completed.returncode
-        remedy = ""
-        for line in completed.stdout.splitlines():
-            if line.startswith("remedy="):
-                remedy = line.partition("=")[2].strip()
     except OSError as exc:
         raise ReleasePrepError(
             f"Cannot consult the venv mutation authority at {guard}: {exc}"
         ) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise ReleasePrepError(
+            f"The venv mutation authority timed out deciding {target}"
+        ) from exc
 
-    if outcome == 0:
-        return
+    record = {}
+    for line in completed.stdout.splitlines():
+        key, separator, value = line.partition("=")
+        if separator:
+            record[key.strip()] = value.strip()
+
+    expected = {"owned": 0, "shared": 1, "broken": 2, "unclaimed": 3}
+    outcome = record.get("outcome", "")
+    remedy = record.get("remedy", "")
+
+    if outcome not in expected or completed.returncode != expected[outcome]:
+        raise ReleasePrepError(
+            f"Refusing to sync the environment for {root}: the venv mutation "
+            f"authority returned an inconsistent decision "
+            f"(outcome={outcome!r}, exit={completed.returncode})."
+        )
+    if record.get("venv") != str(target):
+        raise ReleasePrepError(
+            f"Refusing to sync the environment for {root}: the authority "
+            f"answered about {record.get('venv')!r}, not {target}."
+        )
+    if record.get("allowed") == "yes":
+        return target
+
     reasons = {
-        1: "its venv is shared from another checkout",
-        2: "its venv is a dangling symlink",
-        3: "its venv is external and not bound to this checkout",
+        "shared": "its venv is shared from another checkout",
+        "broken": "its venv is a dangling symlink",
+        "unclaimed": "its venv is external and not bound to this checkout",
     }
-    reason = reasons.get(
-        outcome, f"the venv mutation authority returned {outcome}"
+    message = (
+        f"Refusing to sync the environment for {root}: "
+        f"{reasons.get(outcome, f'the authority returned {outcome!r}')}."
     )
-    message = f"Refusing to sync the environment for {root}: {reason}."
     if remedy:
         message += f"\n  To fix: {remedy}"
     raise ReleasePrepError(message)
@@ -963,9 +988,14 @@ def sync_environment_if_requested(
         )
         return
 
-    require_owned_venv(paths.root)
+    authorized = require_owned_venv(paths.root)
     uv = find_uv(uv_executable)
-    run_command([uv, "sync", "--frozen", "--all-extras"], cwd=paths.root)
+    # Bind uv to the environment that was authorized. Inheriting an ambient
+    # UV_PROJECT_ENVIRONMENT let the sync mutate a venv nobody authorized while
+    # this function reported success.
+    environment = {**os.environ, "UV_PROJECT_ENVIRONMENT": str(authorized)}
+    environment.pop("UV_VENV_CLEAR", None)
+    run_command([uv, "sync", "--frozen", "--all-extras"], cwd=paths.root, env=environment)
     verify_installed_package_version(paths, expected_version)
 
 

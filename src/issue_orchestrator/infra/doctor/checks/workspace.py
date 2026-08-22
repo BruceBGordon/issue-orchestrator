@@ -325,11 +325,26 @@ def check_python_environment(
             expandable={"venv": str(venv_dir), "points_at": os.readlink(venv_dir)},
         )
 
-    if not venv_python.exists():
+    if not venv_dir.exists():
         return Check(
             name="Python environment",
             status="info",
             detail=f"No .venv in {repo_root}; using the ambient interpreter",
+        )
+
+    if not venv_python.exists():
+        # A .venv that exists but has no interpreter is incomplete or corrupt.
+        # Reporting "no .venv, using the ambient interpreter" is both factually
+        # wrong and hides the broken environment.
+        return Check(
+            name="Python environment",
+            status="error",
+            detail=(
+                f"{venv_dir} exists but has no interpreter at "
+                f"{venv_python}; the environment is incomplete. "
+                f"Rebuild it: rm -rf {venv_dir} && make venv-fast"
+            ),
+            expandable={"venv": str(venv_dir), "missing": str(venv_python)},
         )
 
     pointers: dict[str, str] = {}

@@ -14,10 +14,13 @@ from pathlib import Path
 import pytest
 
 from issue_orchestrator.execution.command_runner import LocalCommandRunner
+from types import SimpleNamespace
+
 from issue_orchestrator.infra.venv_mutation import (
     GUARD_RESOURCE,
     VenvMutationAuthority,
     VenvMutationRefused,
+    VenvOperation,
     VenvOutcome,
 )
 
@@ -51,7 +54,7 @@ def test_authority_works_against_a_repo_that_does_not_carry_the_guard(
     (foreign / ".venv").mkdir()
     assert not (foreign / "scripts").exists()
 
-    decision = _authority().authorize(checkout=foreign)
+    decision = _authority().authorize(operation=VenvOperation.SYNC_DEPENDENCIES, checkout=foreign)
 
     assert decision.outcome is VenvOutcome.OWNED
     assert decision.sync_args
@@ -68,7 +71,7 @@ def test_authority_still_refuses_a_shared_venv_in_a_foreign_repo(tmp_path: Path)
     foreign = _checkout(tmp_path, "someones-app")
     (foreign / ".venv").symlink_to(owner / ".venv", target_is_directory=True)
 
-    decision = _authority().authorize(checkout=foreign)
+    decision = _authority().authorize(operation=VenvOperation.SYNC_DEPENDENCIES, checkout=foreign)
 
     assert decision.outcome is VenvOutcome.SHARED
     assert not decision.may_install_project
@@ -85,7 +88,7 @@ def test_authority_raises_its_domain_error_for_a_non_executable_guard(
     authority = VenvMutationAuthority(LocalCommandRunner(), guard_path=guard)
 
     with pytest.raises(VenvMutationRefused):
-        authority.authorize(checkout=_checkout(tmp_path, "repo"))
+        authority.authorize(operation=VenvOperation.SYNC_DEPENDENCIES, checkout=_checkout(tmp_path, "repo"))
 
 
 def test_authority_raises_its_domain_error_for_a_missing_guard(tmp_path: Path) -> None:
@@ -94,7 +97,7 @@ def test_authority_raises_its_domain_error_for_a_missing_guard(tmp_path: Path) -
     )
 
     with pytest.raises(VenvMutationRefused):
-        authority.authorize(checkout=_checkout(tmp_path, "repo"))
+        authority.authorize(operation=VenvOperation.SYNC_DEPENDENCIES, checkout=_checkout(tmp_path, "repo"))
 
 
 # ---- A1: a decision without arguments is not a licence --------------------
@@ -113,7 +116,7 @@ def test_authority_refuses_an_authorized_outcome_with_no_arguments(
     authority = VenvMutationAuthority(LocalCommandRunner(), guard_path=guard)
 
     with pytest.raises(VenvMutationRefused):
-        authority.authorize(checkout=_checkout(tmp_path, "repo"))
+        authority.authorize(operation=VenvOperation.SYNC_DEPENDENCIES, checkout=_checkout(tmp_path, "repo"))
 
 
 # ---- A2: the decision binds the target ------------------------------------
@@ -122,7 +125,7 @@ def test_authority_refuses_an_authorized_outcome_with_no_arguments(
 def test_pinned_env_binds_uv_to_the_authorized_environment(tmp_path: Path) -> None:
     checkout = _checkout(tmp_path, "repo")
     (checkout / ".venv").mkdir()
-    decision = _authority().authorize(checkout=checkout)
+    decision = _authority().authorize(operation=VenvOperation.SYNC_DEPENDENCIES, checkout=checkout)
 
     env = VenvMutationAuthority.pinned_env(decision)
 
@@ -133,7 +136,7 @@ def test_pinned_env_drops_a_destructive_clear_override(tmp_path: Path) -> None:
     """UV_VENV_CLEAR makes `uv venv` delete and rebuild the target."""
     checkout = _checkout(tmp_path, "repo")
     (checkout / ".venv").mkdir()
-    decision = _authority().authorize(checkout=checkout)
+    decision = _authority().authorize(operation=VenvOperation.SYNC_DEPENDENCIES, checkout=checkout)
 
     os.environ["UV_VENV_CLEAR"] = "1"
     try:
@@ -311,7 +314,214 @@ def test_the_raised_error_carries_the_remedy(tmp_path: Path) -> None:
     external.mkdir(parents=True)
 
     with pytest.raises(VenvMutationRefused) as raised:
-        _authority().authorize(checkout=checkout, venv=external)
+        _authority().authorize(operation=VenvOperation.SYNC_DEPENDENCIES, checkout=checkout, venv=external)
 
     assert "To fix:" in str(raised.value)
     assert "claim" in str(raised.value)
+
+
+# ================= follow-up review D1-D5 reproductions ====================
+
+
+class _RealGuardRunner:
+    """Executes the guard for real, so decisions under test are genuine.
+
+    The weak version of the D1 test used a fake returning `broken`, so
+    `authorize()` raised before the branch under test was ever reached. A
+    reproduction has to drive the real `shared` decision.
+    """
+
+    def __init__(self) -> None:
+        import subprocess as _sp
+
+        self._run = _sp.run
+
+    def run(self, command, *, cwd=None, env=None, timeout_seconds=None, **kwargs):
+        completed = self._run(command, cwd=cwd, env=env, capture_output=True, text=True)
+        return SimpleNamespace(
+            returncode=completed.returncode,
+            stdout=completed.stdout,
+            stderr=completed.stderr,
+            timed_out=False,
+        )
+
+
+def test_d1_shared_venv_without_pyproject_recreates_nothing(tmp_path: Path) -> None:
+    """`shared` permits dependency work, never recreation.
+
+    Authorizing the target alone accepted `shared` and then let the
+    no-pyproject branch run `uv venv`, rebuilding the owning checkout's
+    environment through the symlink.
+    """
+    import subprocess as _sp
+    from unittest.mock import patch
+
+    from issue_orchestrator.infra.e2e_worktree import _sync_venv
+
+    owner = _checkout(tmp_path, "owner")
+    (owner / ".venv").mkdir()
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    (worktree / ".venv").symlink_to(owner / ".venv", target_is_directory=True)
+    assert not (worktree / "pyproject.toml").exists()
+
+    calls: list[tuple] = []
+    # Build the runner BEFORE patching, so it holds the real subprocess.run and
+    # the decision under test is genuine rather than mocked away.
+    runner = _RealGuardRunner()
+    with patch("issue_orchestrator.infra.e2e_worktree.subprocess.run") as mocked:
+        mocked.side_effect = lambda *a, **k: (
+            calls.append(tuple(a[0])),
+            _sp.CompletedProcess(a[0], 0),
+        )[1]
+        with pytest.raises(VenvMutationRefused, match="recreate"):
+            _sync_venv(worktree, runner)
+
+    assert calls == [], f"a mutation ran against the owner's venv: {calls}"
+
+
+def test_recreate_is_permitted_on_an_owned_venv(tmp_path: Path) -> None:
+    """The restriction must not break the ordinary case."""
+    checkout = _checkout(tmp_path, "repo")
+
+    decision = _authority().authorize(
+        checkout=checkout, operation=VenvOperation.RECREATE
+    )
+
+    assert decision.outcome is VenvOutcome.OWNED
+
+
+def test_shared_still_permits_a_dependency_sync(tmp_path: Path) -> None:
+    owner = _checkout(tmp_path, "owner")
+    (owner / ".venv").mkdir()
+    worktree = _checkout(tmp_path, "wt")
+    (worktree / ".venv").symlink_to(owner / ".venv", target_is_directory=True)
+
+    decision = _authority().authorize(
+        checkout=worktree, operation=VenvOperation.SYNC_DEPENDENCIES
+    )
+
+    assert decision.outcome is VenvOutcome.SHARED
+    assert "--no-install-project" in decision.sync_args
+
+
+def test_shared_forbids_installing_this_project(tmp_path: Path) -> None:
+    owner = _checkout(tmp_path, "owner")
+    (owner / ".venv").mkdir()
+    worktree = _checkout(tmp_path, "wt")
+    (worktree / ".venv").symlink_to(owner / ".venv", target_is_directory=True)
+
+    with pytest.raises(VenvMutationRefused, match="install-project"):
+        _authority().authorize(
+            checkout=worktree, operation=VenvOperation.INSTALL_PROJECT
+        )
+
+
+# ---- D3: a claim must not be stealable ------------------------------------
+
+
+def test_d3_a_second_checkout_cannot_steal_a_claim(tmp_path: Path) -> None:
+    """Both checkouts reporting ownership defeats the exclusivity the marker proves."""
+    external = tmp_path / "envs" / "shared"
+    external.mkdir(parents=True)
+    first = _checkout(tmp_path, "first")
+    second = _checkout(tmp_path, "second")
+
+    assert _guard(first, external, "claim").returncode == 0
+    assert _guard(second, external, "claim").returncode == 1, "B stole A's claim"
+
+    assert _guard(first, external).returncode == 0
+    assert _guard(second, external).returncode == 1
+
+
+def test_reclaiming_your_own_environment_is_idempotent(tmp_path: Path) -> None:
+    external = tmp_path / "envs" / "mine"
+    external.mkdir(parents=True)
+    checkout = _checkout(tmp_path, "repo")
+
+    assert _guard(checkout, external, "claim").returncode == 0
+    assert _guard(checkout, external, "claim").returncode == 0
+
+
+def test_a_refused_claim_names_the_holder(tmp_path: Path) -> None:
+    external = tmp_path / "envs" / "shared"
+    external.mkdir(parents=True)
+    first = _checkout(tmp_path, "first")
+    second = _checkout(tmp_path, "second")
+    _guard(first, external, "claim")
+
+    result = _guard(second, external, "claim")
+
+    assert str(first) in result.stdout
+
+
+# ---- D4: contradictory or partial records are not authorization ------------
+
+
+@pytest.mark.parametrize(
+    "body,reason",
+    [
+        # outcome says owned, status says otherwise
+        ('echo "outcome=owned"; echo "sync_args=--frozen"; echo "operation=sync-dependencies";'
+         ' echo "allowed=yes"; echo "venv=$5"; exit 7\n', "contradict"),
+        # a shared outcome delivered with an owned exit code
+        ('echo "outcome=shared"; echo "sync_args=--frozen --no-install-project";'
+         ' echo "operation=sync-dependencies"; echo "allowed=yes"; echo "venv=$5"; exit 0\n',
+         "contradict"),
+        # answers about a different environment
+        ('echo "outcome=owned"; echo "sync_args=--frozen"; echo "operation=sync-dependencies";'
+         ' echo "allowed=yes"; echo "venv=/somewhere/else"; exit 0\n', "different environment"),
+        # answers about a different operation
+        ('echo "outcome=owned"; echo "sync_args=--frozen"; echo "operation=recreate";'
+         ' echo "allowed=yes"; echo "venv=$5"; exit 0\n', "not the requested"),
+        # required fields missing
+        ('echo "outcome=owned"; exit 0\n', "incomplete"),
+    ],
+)
+def test_d4_contradictory_records_are_refused(
+    body: str, reason: str, tmp_path: Path
+) -> None:
+    guard = tmp_path / "guard.sh"
+    guard.write_text("#!/usr/bin/env bash\n" + body)
+    guard.chmod(0o755)
+    authority = VenvMutationAuthority(LocalCommandRunner(), guard_path=guard)
+
+    with pytest.raises(VenvMutationRefused, match=reason):
+        authority.authorize(
+            checkout=_checkout(tmp_path, "repo"),
+            operation=VenvOperation.SYNC_DEPENDENCIES,
+        )
+
+
+def test_d4_a_timed_out_decision_is_refused(tmp_path: Path) -> None:
+    class _TimedOut:
+        def run(self, command, **kwargs):
+            return SimpleNamespace(
+                returncode=0, stdout="outcome=owned\n", stderr="", timed_out=True
+            )
+
+    authority = VenvMutationAuthority(_TimedOut())
+
+    with pytest.raises(VenvMutationRefused, match="timed out"):
+        authority.authorize(
+            checkout=_checkout(tmp_path, "repo"),
+            operation=VenvOperation.SYNC_DEPENDENCIES,
+        )
+
+
+# ---- F3: a relative target would weaken the pin ---------------------------
+
+
+def test_a_relative_target_is_canonicalised_before_pinning(tmp_path: Path) -> None:
+    """UV_PROJECT_ENVIRONMENT is resolved against uv's cwd, not the caller's."""
+    checkout = _checkout(tmp_path, "repo")
+    (checkout / ".venv").mkdir()
+
+    decision = _authority().authorize(
+        checkout=checkout,
+        operation=VenvOperation.SYNC_DEPENDENCIES,
+        venv=Path(".venv"),
+    )
+
+    assert decision.venv.is_absolute()
+    assert VenvMutationAuthority.pinned_env(decision)["UV_PROJECT_ENVIRONMENT"].startswith("/")

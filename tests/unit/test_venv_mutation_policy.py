@@ -387,7 +387,7 @@ def test_no_uv_runs_when_the_decision_lacks_arguments(
 # ---- A2: the authorized target must bind the mutation ----------------------
 
 
-@pytest.mark.parametrize("target", ["sync-deps", "venv-fast", "install"])
+@pytest.mark.parametrize("target", ["sync-deps", "venv-fast", "install", "venv"])
 def test_ambient_project_environment_cannot_redirect_the_mutation(
     target: str, tmp_path: Path
 ) -> None:
@@ -474,3 +474,21 @@ def test_make_refusal_tells_the_operator_how_to_fix_it(tmp_path: Path) -> None:
     assert "to fix:" in run.output.lower(), run.output
     assert "claim --venv" in run.output, run.output
     assert str(external) in run.output
+
+
+def test_venv_target_checks_that_creation_succeeded(tmp_path: Path) -> None:
+    """Dropping `set -e` left a failed `uv venv` followed by a sync anyway."""
+    checkout = _make_checkout(tmp_path)
+    failing = tmp_path / "failing-uv"
+    failing.write_text(
+        "#!/usr/bin/env bash\n"
+        'if [ "${1:-}" = "venv" ]; then exit 3; fi\n'
+        f'printf "%s|%s\\n" "${{UV_PROJECT_ENVIRONMENT:-none}}" "$*" >> {tmp_path / "uv-calls.log"}\n'
+        "exit 0\n"
+    )
+    failing.chmod(0o755)
+
+    run = _run_make(checkout, "venv", tmp_path, uv=failing)
+
+    assert run.returncode != 0, run.output
+    assert not run.synced_project(), "synced into a venv that was never created"

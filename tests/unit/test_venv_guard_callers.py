@@ -22,9 +22,36 @@ BASH = shutil.which("bash")
 pytestmark = pytest.mark.skipif(BASH is None, reason="bash is unavailable")
 
 
+_OUTCOME_FOR_EXIT = {0: "owned", 1: "shared", 2: "broken", 3: "unclaimed"}
+
+
 def _guard_stub(path: Path, exit_code: int) -> None:
+    """A stub that answers the FULL contract, not just an exit code.
+
+    Callers now require a complete, self-consistent record: the outcome must
+    match the status, name the requested target and operation, and state
+    whether the operation is permitted. A stub that returns a bare status would
+    be refused by every caller, which would prove nothing about the outcome
+    under test.
+    """
+    outcome = _OUTCOME_FOR_EXIT.get(exit_code, "unknown")
+    allowed = "yes" if outcome == "owned" else "no"
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(f"#!/usr/bin/env bash\nexit {exit_code}\n")
+    path.write_text(
+        "#!/usr/bin/env bash\n"
+        "venv=\"\"; operation=\"\"\n"
+        'while [ $# -gt 0 ]; do\n'
+        '  case "$1" in --venv) venv="$2"; shift ;; --operation) operation="$2"; shift ;; esac\n'
+        "  shift\n"
+        "done\n"
+        f'echo "outcome={outcome}"\n'
+        'echo "sync_args=--frozen --all-extras"\n'
+        'echo "venv=$venv"\n'
+        'echo "operation=$operation"\n'
+        f'echo "allowed={allowed}"\n'
+        'echo "reason=stub"\n'
+        f"exit {exit_code}\n"
+    )
     path.chmod(0o755)
 
 

@@ -290,7 +290,7 @@ venv_mutation_outcome() {
   # Guarding one path while mutating another guards nothing.
   # Capture the whole decision: the remedy travels with it, and every caller
   # passes --quiet, so a fix written only to the guard's stderr is unreachable.
-  VENV_DECISION="$(cd "${ROOT_DIR}" && "${guard}" decide --quiet --venv "${VENV_PATH}" 2>/dev/null)"
+  VENV_DECISION="$(cd "${ROOT_DIR}" && "${guard}" decide --quiet --venv "${VENV_PATH}" --operation install-project 2>/dev/null)"
   return $?
 }
 
@@ -306,6 +306,24 @@ sync_deps() {
   mode="$(install_mode)"
 
   venv_mutation_outcome || guard_outcome=$?
+
+  # Exit 0 alone is not authorization. The record must exist and agree with the
+  # status, or the decision is not a decision.
+  local decided expected_exit
+  decided="$(printf '%s\n' "${VENV_DECISION}" | sed -n 's/^outcome=//p')"
+  case "${decided}" in
+    owned) expected_exit=0 ;;
+    shared) expected_exit=1 ;;
+    broken) expected_exit=2 ;;
+    unclaimed) expected_exit=3 ;;
+    *) expected_exit="" ;;
+  esac
+  if [[ -z "${expected_exit}" || "${guard_outcome}" -ne "${expected_exit}" ]]; then
+    echo "ERROR: the venv guard returned an inconsistent decision for ${VENV_PATH}" >&2
+    echo "  (outcome='${decided}' exit=${guard_outcome}); refusing to mutate it." >&2
+    return 1
+  fi
+
   case "${guard_outcome}" in
     0) ;;
     1)

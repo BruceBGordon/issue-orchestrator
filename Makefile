@@ -131,6 +131,23 @@ $(call venv_guard_required,$(1)) \
 _decision="$$($(VENV_GUARD) decide --quiet --venv "$(VENV_TARGET)" 2>/dev/null)"; _g=$$?; \
 _outcome="$$(printf '%s\n' "$$_decision" | sed -n 's/^outcome=//p')"; \
 _sync_args="$$(printf '%s\n' "$$_decision" | sed -n 's/^sync_args=//p')"; \
+case "$$_outcome" in \
+	owned) _expected=0 ;; \
+	shared) _expected=1 ;; \
+	broken) _expected=2 ;; \
+	unclaimed) _expected=3 ;; \
+	*) _expected=-1 ;; \
+esac; \
+if [ "$$_expected" -ge 0 ] && [ "$$_g" -ne "$$_expected" ]; then \
+	echo "$(1): the guard contradicted itself for $(VENV_TARGET) (outcome=$$_outcome exit=$$_g, expected $$_expected); refusing." >&2; \
+	exit 1; \
+fi; \
+_allowed="$$(printf '%s\n' "$$_decision" | sed -n 's/^allowed=//p')"; \
+if [ "$$_allowed" != "yes" ]; then \
+	echo "$(1): the guard did not permit this operation on $(VENV_TARGET) (outcome=$$_outcome)." >&2; \
+	printf '%s\n' "$$_decision" | sed -n 's/^remedy=/  to fix: /p' >&2; \
+	exit 1; \
+fi; \
 if [ "$$_outcome" != "owned" ] && [ "$$_outcome" != "shared" ]; then \
 	echo "$(1): refusing to mutate $(VENV_TARGET) (outcome='$$_outcome' exit=$$_g)." >&2; \
 	printf '%s\n' "$$_decision" | sed -n 's/^reason=/  reason: /p' >&2; \
@@ -141,6 +158,14 @@ if [ -z "$$_sync_args" ]; then \
 	echo "$(1): the guard authorized $(VENV_TARGET) but supplied no arguments; refusing rather than guessing." >&2; \
 	exit 1; \
 fi;
+endef
+
+# $(call venv_uv_create) - create the environment, bound to the authorized
+# target. Its exit status must be checked: dropping `set -e` from these recipes
+# left a failed `uv venv` followed by a sync against an environment that was
+# never created.
+define venv_uv_create
+UV_PROJECT_ENVIRONMENT="$(VENV_TARGET)" $(UV) venv .venv --python $(SYSTEM_PYTHON)
 endef
 
 # $(call venv_uv_sync) - run uv bound to the authorized environment.
@@ -173,18 +198,18 @@ venv: ensure-uv
 	@mkdir -p $$(dirname $(SETUP_LOG))
 	@# Destructive: this target rm -rf's .venv. Refuse outright on a shared venv
 	@# rather than quietly converting a worktree from shared to private.
-	@$(call venv_require_owned,make venv)
-	@if [ -d .venv ]; then \
+	@$(call venv_require_owned,make venv) \
+	if [ -d .venv ]; then \
 		echo "Removing existing .venv..."; \
 		rm -rf .venv; \
-	fi
-	@echo "Creating venv with $(SYSTEM_PYTHON) and installing dependencies..."
-	@t0=$$(date +%s); \
-	$(UV) venv .venv --python $(SYSTEM_PYTHON); \
+	fi; \
+	echo "Creating venv with $(SYSTEM_PYTHON) and installing dependencies..."; \
+	t0=$$(date +%s); \
+	$(call venv_uv_create) || exit $$?; \
 	t1=$$(date +%s); \
-	$(UV) sync --frozen --all-extras; \
-	t2=$$(date +%s); \
+	$(call venv_uv_sync) || exit $$?; \
 	touch .venv/.deps-synced; \
+	t2=$$(date +%s); \
 	echo "venv pid=$$$$ ts=$$(date -Iseconds) pwd=$$(pwd) uv_venv=$$((t1-t0))s uv_sync=$$((t2-t1))s total=$$((t2-t0))s" >> $(SETUP_LOG)
 	@$(GMAKE) --no-print-directory semgrep-venv
 	@echo ""
@@ -197,7 +222,7 @@ venv-fast: ensure-uv
 	t0=$$(date +%s); \
 	if [ "$$_outcome" = "owned" ] && [ ! -d .venv ]; then \
 		echo "Creating venv with $(SYSTEM_PYTHON) and installing dependencies..."; \
-		UV_PROJECT_ENVIRONMENT="$(VENV_TARGET)" $(UV) venv .venv --python $(SYSTEM_PYTHON); \
+		$(call venv_uv_create) || exit $$?; \
 	else \
 		echo "Reusing existing .venv; syncing dependencies..."; \
 	fi; \

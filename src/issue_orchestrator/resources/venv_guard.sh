@@ -25,6 +25,16 @@
 #   decide   emit a decision record and exit with the outcome code
 #   claim    bind an external venv to this checkout (writes the owner marker)
 #
+# OPERATIONS (--operation, default sync-dependencies)
+#   sync-dependencies  update dependencies only; permitted for owned and shared
+#   install-project    install THIS checkout's project; owned only
+#   recreate           create or rebuild the environment; owned only
+#
+# The operation is part of the question. Asking only "who owns this?" leaves
+# each caller to decide whether `shared` permits a dependency sync, a project
+# install, or a full recreate -- and they answered differently, which is how a
+# shared venv still got rebuilt by `uv venv`.
+#
 # OUTCOMES (exit codes)
 #   0  owned      mutate freely, project install included
 #   1  shared     another checkout owns it; dependency-only operations only
@@ -56,11 +66,13 @@ esac
 quiet=0
 venv_path=""
 checkout=""
+operation="sync-dependencies"
 while [ $# -gt 0 ]; do
   case "$1" in
     --quiet) quiet=1 ;;
     --venv) venv_path="${2:-}"; shift ;;
     --checkout) checkout="${2:-}"; shift ;;
+    --operation) operation="${2:-}"; shift ;;
     *) echo "venv-guard: unknown argument: $1" >&2; exit "$USAGE" ;;
   esac
   shift
@@ -71,6 +83,19 @@ checkout="$(cd "$checkout" 2>/dev/null && pwd -P)" || {
   echo "venv-guard: checkout does not exist" >&2; exit "$USAGE"
 }
 [ -n "$venv_path" ] || venv_path="$checkout/.venv"
+
+case "$operation" in
+  sync-dependencies|install-project|recreate) ;;
+  *) echo "venv-guard: unknown operation: $operation" >&2; exit "$USAGE" ;;
+esac
+
+# Canonicalise the target. A relative path would be echoed back verbatim and
+# then used to pin UV_PROJECT_ENVIRONMENT, which uv resolves against ITS cwd --
+# so the pin would name a different environment than the one authorized.
+case "$venv_path" in
+  /*) ;;
+  *) venv_path="$checkout/$venv_path" ;;
+esac
 
 # Dependency-only arguments. --no-install-project is the load-bearing flag: it
 # updates dependencies without reinstalling the project, so the editable
@@ -90,6 +115,15 @@ self_path() {
   fi
 }
 
+# operation_allowed <outcome> -> 0 when this outcome permits $operation
+operation_allowed() {
+  case "$operation" in
+    sync-dependencies) [ "$1" = "owned" ] || [ "$1" = "shared" ] ;;
+    install-project|recreate) [ "$1" = "owned" ] ;;
+    *) return 1 ;;
+  esac
+}
+
 # emit <outcome> <args> <reason> [remedy]
 #
 # `remedy` is part of the decision, not decoration. Every caller passes
@@ -97,12 +131,20 @@ self_path() {
 # refusal that does not carry its own fix reaches the operator as a bare
 # "external and unclaimed" with nothing to act on.
 emit() {
-  if [ "$command" = "decide" ]; then
+  # `claim` reports a decision as much as `decide` does -- a refused claim has
+  # to name the holder, or the caller cannot tell why it lost.
+  if [ "$command" = "decide" ] || [ "$command" = "claim" ]; then
     printf 'outcome=%s\n' "$1"
     printf 'sync_args=%s\n' "$2"
     printf 'venv=%s\n' "$venv_path"
     printf 'reason=%s\n' "$3"
     printf 'remedy=%s\n' "${4:-}"
+    printf 'operation=%s\n' "$operation"
+    if operation_allowed "$1"; then
+      printf 'allowed=yes\n'
+    else
+      printf 'allowed=no\n'
+    fi
   fi
 }
 
@@ -151,10 +193,24 @@ fi
 marker="$resolved/$OWNER_MARKER"
 if [ "$command" = "claim" ]; then
   mkdir -p "$resolved" || { note "cannot create $resolved"; exit "$USAGE"; }
-  printf '%s\n' "$checkout" > "$marker" || { note "cannot write $marker"; exit "$USAGE"; }
-  emit owned "$ARGS_OWNED" "claimed by this checkout"
-  note "claimed $resolved for $checkout"
-  exit "$OWNED"
+  # Atomic no-clobber create. Two checkouts claiming concurrently must not both
+  # be told they own it: `set -C` makes the redirect fail if the marker already
+  # exists, so exactly one creator wins and the loser is told who holds it.
+  if (set -C; printf '%s\n' "$checkout" > "$marker") 2>/dev/null; then
+    emit owned "$ARGS_OWNED" "claimed by this checkout"
+    note "claimed $resolved for $checkout"
+    exit "$OWNED"
+  fi
+  existing="$(head -n 1 "$marker" 2>/dev/null || true)"
+  if [ "$existing" = "$checkout" ]; then
+    # Re-claiming your own environment is idempotent, not a conflict.
+    emit owned "$ARGS_OWNED" "already claimed by this checkout"
+    exit "$OWNED"
+  fi
+  emit shared "$ARGS_SHARED" "already claimed by $existing" \
+    "$existing holds this environment; it may be mutating it now. Use its checkout, or give this one its own venv. To take it over deliberately, remove $marker by hand first."
+  note "refusing to steal a claim held by $existing"
+  exit "$SHARED"
 fi
 
 if [ -f "$marker" ]; then

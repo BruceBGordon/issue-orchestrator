@@ -70,12 +70,16 @@ def _install_venv_guard(worktree_path: Path) -> None:
 
 
 class _DecisionRunner:
-    """CommandRunner stub returning one authority decision.
+    """CommandRunner stub returning one complete authority decision.
 
     The suite patches ``subprocess.run`` module-wide, so a real runner would be
-    intercepted too. Injecting the port keeps the authority's contract visible
-    in the test rather than mocked away.
+    intercepted. The record must satisfy the full contract -- outcome, target,
+    operation, permission, and an exit status that agrees with the outcome --
+    because a double that answers loosely would let a caller pass tests the
+    real authority would refuse.
     """
+
+    _EXIT = {"owned": 0, "shared": 1, "broken": 2, "unclaimed": 3}
 
     def __init__(self, outcome: str = "owned", sync_args: str = "--frozen --all-extras"):
         self._outcome = outcome
@@ -84,16 +88,22 @@ class _DecisionRunner:
     def run(self, command, **kwargs):
         from types import SimpleNamespace
 
-        venv = ""
-        if "--venv" in command:
-            venv = command[command.index("--venv") + 1]
+        venv = command[command.index("--venv") + 1] if "--venv" in command else ""
+        operation = (
+            command[command.index("--operation") + 1] if "--operation" in command else ""
+        )
+        allowed = "yes" if self._outcome == "owned" else "no"
         stdout = (
             f"outcome={self._outcome}\n"
             f"sync_args={self._sync_args}\n"
             f"venv={venv}\n"
+            f"operation={operation}\n"
+            f"allowed={allowed}\n"
             "reason=test\n"
         )
-        return SimpleNamespace(returncode=0, stdout=stdout, stderr="", timed_out=False)
+        return SimpleNamespace(
+            returncode=self._EXIT[self._outcome], stdout=stdout, stderr="", timed_out=False
+        )
 
 
 class TestEnsureE2EWorktree:

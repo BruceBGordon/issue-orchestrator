@@ -11,7 +11,7 @@ import subprocess
 from pathlib import Path
 
 from ..ports.command_runner import CommandRunner, CommandResult
-from .venv_mutation import VenvMutationAuthority
+from .venv_mutation import VenvMutationAuthority, VenvOperation
 
 logger = logging.getLogger(__name__)
 
@@ -142,10 +142,15 @@ def _sync_venv(worktree_path: Path, runner: CommandRunner | None = None) -> None
     venv_python = worktree_path / ".venv" / "bin" / "python"
 
     authority = VenvMutationAuthority(runner or _SubprocessCommandRunner())
-    decision = authority.authorize(checkout=worktree_path)
-    # Bind every uv invocation below to the environment that was authorized;
-    # an inherited UV_PROJECT_ENVIRONMENT would otherwise redirect them, and
-    # UV_VENV_CLEAR would let `uv venv` delete and rebuild the target.
+
+    # The OPERATION is authorized, not merely the target. Authorizing the venv
+    # alone accepted `shared` and then let the no-project branch below run
+    # `uv venv`, rebuilding the owning checkout's environment through the
+    # symlink: a shared venv permits dependency work, never recreation.
+    operation = (
+        VenvOperation.SYNC_DEPENDENCIES if pyproject.exists() else VenvOperation.RECREATE
+    )
+    decision = authority.authorize(checkout=worktree_path, operation=operation)
     uv_env = VenvMutationAuthority.pinned_env(decision)
 
     if pyproject.exists():

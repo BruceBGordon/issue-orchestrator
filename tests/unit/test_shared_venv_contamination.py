@@ -321,3 +321,26 @@ def test_doctor_turns_an_unreadable_pointer_into_a_check(tmp_path: Path) -> None
 
     assert check.status == "error"
     assert "Could not read" in check.detail
+
+
+def test_doctor_flags_a_venv_directory_with_no_interpreter(tmp_path: Path) -> None:
+    """A present-but-unusable .venv is not an absent one.
+
+    Reporting "No .venv ... using the ambient interpreter" was factually wrong
+    and hid an incomplete or corrupt environment.
+    """
+    repo = _checkout(tmp_path, "repo")
+    (repo / ".venv").mkdir()
+
+    check = check_python_environment(repo, _FakeRunner(0))
+
+    assert check.status == "error"
+    assert "no interpreter" in check.detail
+
+
+def test_doctor_is_informational_only_when_the_venv_is_truly_absent(
+    tmp_path: Path,
+) -> None:
+    repo = _checkout(tmp_path, "repo")
+
+    assert check_python_environment(repo, _FakeRunner(0)).status == "info"

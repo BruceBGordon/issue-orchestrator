@@ -1,27 +1,29 @@
 """Behavior-level authority over Python-environment mutation.
 
-One owner receives the actual target and the operation, and returns or executes
-a single validated decision. Callers do not interpret exit codes, re-derive
-permitted arguments, choose the target, or map errors -- each of those, done
-independently at each call site, is what produced the defects this replaces:
+The owner receives the target AND the operation, and returns or executes one
+validated decision. Asking only "who owns this venv?" left each caller to
+decide whether ``shared`` permitted a dependency sync, a project install, or a
+full recreate -- and they answered differently. That drift is what let a shared
+environment be rebuilt by ``uv venv``, let two project syncs be redirected by
+an ambient ``UV_PROJECT_ENVIRONMENT`` after authorizing a different venv, and
+let contradictory authority records be accepted as authorization.
 
-* the decision and its permitted arguments were fetched in two executions, so a
-  failed second call silently degraded to an unrestricted project install;
-* ``UV_PROJECT_ENVIRONMENT`` was inherited, so uv mutated a different
-  environment than the one that had been authorized;
-* the authority was resolved from the *target* checkout, so preparing an
-  arbitrary repository failed merely because it does not carry this project's
-  internal script;
-* ``Path.exists()`` stood in for "runnable", so a non-executable authority
-  raised a raw ``PermissionError`` instead of the declared domain error.
+Everything a caller could get wrong is therefore decided here once:
 
-The decision engine itself is the shell script in ``resources/`` rather than
-Python, because Control Center must consult it before this package is
-importable. This class is the single Python entry point to it.
+* which operations an outcome permits;
+* that the record is internally consistent -- not timed out, exit code matching
+  the outcome, the returned target equal to the canonical requested target, and
+  all required fields present;
+* that execution is bound to the authorized environment.
+
+The decision engine is the shell script in ``resources/`` because Control
+Center must consult it before this package is importable; this class is the
+single Python entry point to it.
 """
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -42,11 +44,30 @@ class VenvOutcome(str, Enum):
     UNCLAIMED = "unclaimed"
 
 
+class VenvOperation(str, Enum):
+    """What the caller intends to do, not merely which venv it touches."""
+
+    SYNC_DEPENDENCIES = "sync-dependencies"
+    INSTALL_PROJECT = "install-project"
+    RECREATE = "recreate"
+
+
+# The exit code each outcome must arrive with. A record whose text and status
+# disagree is not a weaker authorization -- it is not an authorization.
+_EXPECTED_EXIT = {
+    VenvOutcome.OWNED: 0,
+    VenvOutcome.SHARED: 1,
+    VenvOutcome.BROKEN: 2,
+    VenvOutcome.UNCLAIMED: 3,
+}
+
+_REQUIRED_FIELDS = ("outcome", "venv", "operation", "allowed")
+
+
 @dataclass(frozen=True, slots=True)
 class VenvMutationDecision:
-    """One validated decision: what may happen, and with exactly which arguments."""
-
     outcome: VenvOutcome
+    operation: VenvOperation
     venv: Path
     sync_args: tuple[str, ...]
     reason: str
@@ -58,21 +79,26 @@ class VenvMutationDecision:
 
 
 class VenvMutationAuthority:
-    """Resolve, invoke, and enforce the mutation decision for one environment."""
+    """Resolve, validate, and execute environment mutation for one target."""
 
-    def __init__(
-        self,
-        runner: CommandRunner,
-        *,
-        guard_path: Path | None = None,
-    ) -> None:
+    def __init__(self, runner: CommandRunner, *, guard_path: Path | None = None) -> None:
         self._runner = runner
         # Resolved from THIS installation, never from the target checkout.
         self._guard = guard_path or GUARD_RESOURCE
 
-    def authorize(self, *, checkout: Path, venv: Path | None = None) -> VenvMutationDecision:
-        """Return the decision for ``venv``, or raise ``VenvMutationRefused``."""
-        target = venv or (checkout / ".venv")
+    # ---------------------------------------------------------------- decide
+
+    def authorize(
+        self,
+        *,
+        checkout: Path,
+        operation: VenvOperation,
+        venv: Path | None = None,
+    ) -> VenvMutationDecision:
+        """Return the decision for ``operation`` on ``venv``, or refuse."""
+        target = (venv or (checkout / ".venv")).expanduser()
+        if not target.is_absolute():
+            target = (checkout / target).resolve()
         command = [
             str(self._guard),
             "decide",
@@ -81,53 +107,107 @@ class VenvMutationAuthority:
             str(checkout),
             "--venv",
             str(target),
+            "--operation",
+            operation.value,
         ]
         try:
             result = self._runner.run(command, cwd=checkout, timeout_seconds=30)
         except OSError as exc:
-            # A missing or non-executable authority is not evidence of
-            # ownership. Fail closed, in the declared domain error.
             raise VenvMutationRefused(
                 f"Cannot consult the venv mutation authority at {self._guard}: {exc}"
             ) from exc
 
+        return self._validated(result, target=target, operation=operation)
+
+    def _validated(self, result, *, target: Path, operation: VenvOperation):
+        if getattr(result, "timed_out", False):
+            raise VenvMutationRefused(
+                f"The venv mutation authority timed out deciding {target}; "
+                f"refusing rather than assuming an outcome"
+            )
+
         record = _parse_decision(result.stdout)
-        outcome_text = record.get("outcome", "")
+        missing = [field for field in _REQUIRED_FIELDS if field not in record]
+        if missing:
+            raise VenvMutationRefused(
+                f"The venv mutation authority returned an incomplete decision for "
+                f"{target} (missing {', '.join(missing)}; exit={result.returncode})"
+            )
+
         try:
-            outcome = VenvOutcome(outcome_text)
+            outcome = VenvOutcome(record["outcome"])
         except ValueError:
             raise VenvMutationRefused(
-                f"The venv mutation authority returned no usable decision for "
-                f"{target} (exit={result.returncode}, output={result.stdout!r})"
+                f"The venv mutation authority returned an unknown outcome "
+                f"{record['outcome']!r} for {target}"
             ) from None
 
-        if outcome in (VenvOutcome.BROKEN, VenvOutcome.UNCLAIMED):
-            # The remedy travels with the decision. Callers pass --quiet, so a
-            # fix written only to the guard's stderr never reaches anyone.
+        if result.returncode != _EXPECTED_EXIT[outcome]:
             raise VenvMutationRefused(
-                _refusal_message(
-                    target,
-                    record.get("reason", outcome.value),
-                    record.get("remedy", ""),
-                )
+                f"The venv mutation authority contradicted itself for {target}: "
+                f"outcome={outcome.value} but exit={result.returncode} "
+                f"(expected {_EXPECTED_EXIT[outcome]}); refusing"
+            )
+
+        if record.get("operation") != operation.value:
+            raise VenvMutationRefused(
+                f"The venv mutation authority answered about "
+                f"{record.get('operation')!r}, not the requested {operation.value!r}"
+            )
+
+        returned = Path(record["venv"])
+        if returned != target:
+            raise VenvMutationRefused(
+                f"The venv mutation authority answered about {returned}, not the "
+                f"requested {target}; refusing to act on a decision about a "
+                f"different environment"
+            )
+
+        if record.get("allowed") != "yes":
+            raise VenvMutationRefused(
+                _refusal_message(target, operation, record.get("reason", outcome.value),
+                                 record.get("remedy", ""))
             )
 
         sync_args = tuple(record.get("sync_args", "").split())
-        if not sync_args:
-            # The decision and its arguments arrive together; an authorized
-            # outcome with no arguments is a malformed record, not a licence to
-            # run an unrestricted sync.
+        if operation is not VenvOperation.RECREATE and not sync_args:
             raise VenvMutationRefused(
-                f"The venv mutation authority authorized {target} but supplied "
-                f"no arguments; refusing rather than guessing them"
+                f"The venv mutation authority authorized {operation.value} on "
+                f"{target} but supplied no arguments; refusing rather than guessing"
             )
         return VenvMutationDecision(
             outcome=outcome,
-            venv=Path(record.get("venv", str(target))),
+            operation=operation,
+            venv=returned,
             sync_args=sync_args,
             reason=record.get("reason", ""),
             remedy=record.get("remedy", ""),
         )
+
+    # --------------------------------------------------------------- execute
+
+    def run_uv(
+        self,
+        decision: VenvMutationDecision,
+        argv: list[str],
+        *,
+        cwd: Path,
+        timeout_seconds: int = 600,
+    ):
+        """Run one uv command bound to the authorized environment.
+
+        Pinning lives here so no caller can authorize one venv and mutate
+        another through an inherited ``UV_PROJECT_ENVIRONMENT``.
+        """
+        result = self._runner.run(
+            argv, cwd=cwd, env=self.pinned_env(decision), timeout_seconds=timeout_seconds
+        )
+        if result.returncode != 0:
+            raise VenvMutationRefused(
+                f"{' '.join(argv[:2])} failed for {decision.venv}: "
+                f"{(result.stderr or '').strip()[:400]}"
+            )
+        return result
 
     def sync(
         self,
@@ -136,40 +216,32 @@ class VenvMutationAuthority:
         venv: Path | None = None,
         uv: str = "uv",
         extra_args: tuple[str, ...] = (),
+        operation: VenvOperation = VenvOperation.SYNC_DEPENDENCIES,
     ) -> VenvMutationDecision:
-        """Authorize, then run ``uv sync`` bound to the authorized environment."""
-        decision = self.authorize(checkout=checkout, venv=venv)
-        result = self._runner.run(
-            [uv, "sync", *decision.sync_args, *extra_args],
-            cwd=checkout,
-            env=self.pinned_env(decision),
-            timeout_seconds=600,
-        )
-        if result.returncode != 0:
-            raise VenvMutationRefused(
-                f"uv sync failed for {decision.venv}: {result.stderr.strip()[:400]}"
-            )
+        """Authorize and run ``uv sync`` bound to the authorized environment."""
+        decision = self.authorize(checkout=checkout, operation=operation, venv=venv)
+        self.run_uv(decision, [uv, "sync", *decision.sync_args, *extra_args], cwd=checkout)
         return decision
 
     @staticmethod
     def pinned_env(decision: VenvMutationDecision) -> dict[str, str]:
-        """Environment that binds uv to the authorized target.
+        """Environment binding uv to the authorized target.
 
         uv honours ``UV_PROJECT_ENVIRONMENT``; inheriting it lets an ambient
-        value redirect the mutation to an environment nobody authorized, so the
-        authorized path is pinned explicitly on every invocation.
+        value redirect the mutation to an environment nobody authorized.
+        ``UV_VENV_CLEAR`` is dropped because it makes ``uv venv`` delete and
+        rebuild the target.
         """
-        import os
-
         env = dict(os.environ)
         env["UV_PROJECT_ENVIRONMENT"] = str(decision.venv)
-        # `uv venv` honours this and would delete and rebuild the target.
         env.pop("UV_VENV_CLEAR", None)
         return env
 
 
-def _refusal_message(target: Path, reason: str, remedy: str) -> str:
-    message = f"Refusing to mutate {target}: {reason}."
+def _refusal_message(
+    target: Path, operation: VenvOperation, reason: str, remedy: str
+) -> str:
+    message = f"Refusing to {operation.value} on {target}: {reason}."
     if remedy:
         message += f"\n  To fix: {remedy}"
     return message
@@ -189,5 +261,6 @@ __all__ = [
     "VenvMutationAuthority",
     "VenvMutationDecision",
     "VenvMutationRefused",
+    "VenvOperation",
     "VenvOutcome",
 ]
