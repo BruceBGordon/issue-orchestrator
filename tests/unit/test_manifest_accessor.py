@@ -354,12 +354,12 @@ def test_get_claude_log_reads_manifest_path(tmp_path: Path) -> None:
     assert artifact.path == claude
 
 
-def test_get_claude_log_falls_back_to_manifest_log_dir(tmp_path: Path) -> None:
+def test_get_claude_log_does_not_discover_later_file_for_unbound_run(
+    tmp_path: Path,
+) -> None:
     accessor, _worktree, run_dir = _build_accessor(tmp_path)
     claude_dir = tmp_path / "claude"
     claude_dir.mkdir(parents=True, exist_ok=True)
-    claude = claude_dir / "latest.jsonl"
-    claude.write_text('{"type":"assistant","message":{"content":[{"type":"text","text":"ok"}]}}\n', encoding="utf-8")
     (run_dir / "manifest.json").write_text(
         json.dumps(
             {
@@ -371,10 +371,18 @@ def test_get_claude_log_falls_back_to_manifest_log_dir(tmp_path: Path) -> None:
         ),
         encoding="utf-8",
     )
+    manifest_path = run_dir / "manifest.json"
+    manifest_before = manifest_path.read_bytes()
+    later = claude_dir / "later.jsonl"
+    later.write_text(
+        '{"type":"assistant","message":{"content":[{"type":"text","text":"later"}]}}\n',
+        encoding="utf-8",
+    )
 
-    artifact = accessor.get_claude_log()
-    assert artifact.descriptor.artifact_type == "claude_log"
-    assert artifact.path == claude
+    with pytest.raises(ArtifactNotFoundError, match="manifest missing claude_log_path"):
+        accessor.get_claude_log()
+
+    assert manifest_path.read_bytes() == manifest_before
 
 
 def test_get_completion_record_uses_worktree_relative_manifest_path(tmp_path: Path) -> None:

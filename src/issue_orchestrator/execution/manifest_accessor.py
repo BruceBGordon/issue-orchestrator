@@ -24,7 +24,6 @@ from ..domain.tech_lead_artifacts import (
 )
 from ..domain.tech_lead_run_artifacts import TECH_LEAD_DATA_DIRNAME
 from .session_output_adapter import (
-    CLAUDE_SESSION_LOG_NAME,
     RETRY_PROMPT_NAME,
     SESSION_PROMPT_NAME,
 )
@@ -288,51 +287,28 @@ class ManifestAccessor:
         if not run_dir.exists():
             raise ArtifactNotFoundError(f"run_dir does not exist: {run_dir}")
 
-    def _claude_log_candidates(self, run_dir: Path, manifest: dict[str, Any]) -> list[Path]:
-        """Return potential Claude log files for the run."""
-        candidates: list[Path] = []
+    def _recorded_claude_log_path(
+        self,
+        run_dir: Path,
+        manifest: dict[str, Any],
+    ) -> Path:
+        """Return only the Claude log explicitly bound to this recorded run."""
         log_path = manifest.get("claude_log_path")
-        if log_path:
-            candidate = Path(log_path)
-            if not candidate.is_absolute():
-                candidate = run_dir / log_path
-            # A recorded exact-run binding is authoritative. If that file has
-            # disappeared, do not silently replace its history with a newer
-            # transcript discovered from the directory or convenience link.
-            return [candidate]
-
-        log_dir = manifest.get("claude_log_dir")
-        if log_dir:
-            candidate_dir = Path(log_dir)
-            if not candidate_dir.is_absolute():
-                candidate_dir = run_dir / log_dir
-            if candidate_dir.exists():
-                jsonl_files = sorted(
-                    candidate_dir.glob("*.jsonl"),
-                    key=lambda path: path.stat().st_mtime,
-                    reverse=True,
-                )
-                candidates.extend(jsonl_files)
-
-        claude_symlink = run_dir / CLAUDE_SESSION_LOG_NAME
-        if claude_symlink.exists():
-            candidates.append(claude_symlink)
-
-        return candidates
+        if not isinstance(log_path, str) or not log_path:
+            raise ArtifactNotFoundError("manifest missing claude_log_path")
+        candidate = Path(log_path)
+        return candidate if candidate.is_absolute() else run_dir / candidate
 
     def get_claude_log(self) -> ArtifactStream:
-        """Return the run-scoped Claude transcript stream."""
+        """Return the Claude transcript explicitly recorded for this run."""
         manifest = self._load_manifest()
-        candidates = self._claude_log_candidates(self.run_identity.run_dir, manifest.to_dict())
-        if not candidates:
-            raise ArtifactNotFoundError("manifest missing claude log candidates")
-        for path in candidates:
-            if path.exists() and path.stat().st_size > 0:
-                return self._artifact_stream("claude_log", path)
-        raise ArtifactNotFoundError(
-            "claude log not found: "
-            + ", ".join(str(path) for path in candidates)
+        path = self._recorded_claude_log_path(
+            self.run_identity.run_dir,
+            manifest.to_dict(),
         )
+        if path.exists() and path.stat().st_size > 0:
+            return self._artifact_stream("claude_log", path)
+        raise ArtifactNotFoundError(f"claude log not found: {path}")
 
     def get_review_exchange_transcript(self, *, allow_empty: bool = False) -> ArtifactStream:
         """Return the dedicated review-exchange transcript for this run."""
