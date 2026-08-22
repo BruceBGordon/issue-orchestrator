@@ -93,11 +93,15 @@ def test_exact_recorded_run_resolves_only_the_manifest_owned_issue(tmp_path):
 
     result = resolve_exact_recorded_run(str(run.run_dir), issue_number=123)
 
-    assert result == ExactRecordedRun(
-        run_dir=run.run_dir.resolve(),
-        worktree_path=tmp_path.resolve(),
-        session_name="coding-123",
-    )
+    assert isinstance(result, ExactRecordedRun)
+    assert result.issue_number == 123
+    assert result.run_assets == run
+    assert result.manifest.issue_number == 123
+    assert result.run_dir == run.run_dir.resolve()
+    assert result.worktree_path == tmp_path.resolve()
+    assert result.session_name == "coding-123"
+    assert result.artifacts.run_identity.issue_number == 123
+    assert result.artifacts.run_identity.run_dir == run.run_dir.resolve()
 
 
 def test_exact_recorded_run_rejects_issue_mismatch(tmp_path):

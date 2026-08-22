@@ -24,7 +24,7 @@ def _is_run_scoped_event_expr(node: ast.expr) -> bool:
 
 
 def test_production_code_uses_make_run_scoped_event_for_run_scoped_events() -> None:
-    """Run-scoped events must be created by the typed helper, not raw TraceEvent."""
+    """Run-scoped events must not use either untyped event constructor."""
     repo_root = Path(__file__).resolve().parents[2]
     src_root = repo_root / "src" / "issue_orchestrator"
     violations: list[str] = []
@@ -34,7 +34,10 @@ def test_production_code_uses_make_run_scoped_event_for_run_scoped_events() -> N
         for node in ast.walk(module):
             if not isinstance(node, ast.Call):
                 continue
-            if not isinstance(node.func, ast.Name) or node.func.id != "TraceEvent":
+            if (
+                not isinstance(node.func, ast.Name)
+                or node.func.id not in {"TraceEvent", "make_trace_event"}
+            ):
                 continue
             if not node.args:
                 continue
@@ -44,6 +47,6 @@ def test_production_code_uses_make_run_scoped_event_for_run_scoped_events() -> N
             violations.append(f"{rel}:{node.lineno}")
 
     assert not violations, (
-        "Run-scoped events must use make_run_scoped_event(...). Violations:\n"
+        "Run-scoped events must use a typed run-scoped builder. Violations:\n"
         + "\n".join(violations)
     )

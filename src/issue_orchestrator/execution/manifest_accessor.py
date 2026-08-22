@@ -296,7 +296,10 @@ class ManifestAccessor:
             candidate = Path(log_path)
             if not candidate.is_absolute():
                 candidate = run_dir / log_path
-            candidates.append(candidate)
+            # A recorded exact-run binding is authoritative. If that file has
+            # disappeared, do not silently replace its history with a newer
+            # transcript discovered from the directory or convenience link.
+            return [candidate]
 
         log_dir = manifest.get("claude_log_dir")
         if log_dir:

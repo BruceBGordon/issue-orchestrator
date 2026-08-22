@@ -27,10 +27,16 @@ from playwright.sync_api import Page, expect
 pytestmark = pytest.mark.usefixtures("web_server")
 
 
-def _stub_terminal_recording(page: Page, payload: dict) -> None:
+def _stub_terminal_recording(
+    page: Page,
+    payload: dict,
+    requested_urls: list[str] | None = None,
+) -> None:
     """Route all terminal-recording fetches to a deterministic payload."""
 
     def _handler(route) -> None:
+        if requested_urls is not None:
+            requested_urls.append(route.request.url)
         route.fulfill(
             status=200,
             content_type="application/json",
@@ -73,6 +79,7 @@ def _open_session_replay_modal(page: Page, url: str) -> None:
 def test_codex_payload_renders_transcript_and_disables_replay_controls(
     page: Page, web_server: dict
 ) -> None:
+    requested_urls: list[str] = []
     _stub_terminal_recording(
         page,
         {
@@ -87,8 +94,16 @@ def test_codex_payload_renders_transcript_and_disables_replay_controls(
             ],
             "transcript_hash": "deadbeef",
         },
+        requested_urls,
     )
     _open_session_replay_modal(page, web_server["url"])
+
+    assert requested_urls
+    assert all(
+        "/api/session/terminal-recording/408?" in url
+        and "run_dir=%2Ftmp%2Ffake-run-dir" in url
+        for url in requested_urls
+    )
 
     transcript = page.locator(".session-replay-transcript")
     expect(transcript).to_be_visible(timeout=5000)

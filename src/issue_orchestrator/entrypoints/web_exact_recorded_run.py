@@ -19,11 +19,19 @@ ExactRecordedRunResponse: TypeAlias = ExactRecordedRun | JSONResponse
 
 
 def exact_recorded_run_response(
-    raw_run_dir: str,
+    raw_run_dir: str | None,
     *,
     issue_number: int,
 ) -> ExactRecordedRunResponse:
     """Resolve the exact requested run and translate closed failures to HTTP."""
+    if not raw_run_dir:
+        return JSONResponse(
+            {
+                "error": "run_dir is required",
+                "hint": "Open terminal recordings from a run-scoped timeline action.",
+            },
+            status_code=400,
+        )
     result = resolve_exact_recorded_run(raw_run_dir, issue_number=issue_number)
     match result:
         case ExactRecordedRun():

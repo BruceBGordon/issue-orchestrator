@@ -20,11 +20,7 @@ from ..domain.event_taxonomy import (
     is_review_event_name,
     is_session_event_name,
 )
-from ..execution.manifest_accessor import (
-    ArtifactNotFoundError,
-    ManifestAccessor,
-    RunIdentity,
-)
+from ..execution.manifest_accessor import ArtifactNotFoundError
 from ..execution.timeline_action_capabilities import (
     AvailableRunArtifacts,
     TimelineRunArtifacts,
@@ -555,9 +551,7 @@ def _validated_run_scoped_artifact(
     if validation_key in run_scoped_validated:
         return None
     event_run_dir = str(run_artifacts.run_dir)
-    accessor = ManifestAccessor(
-        RunIdentity(issue_number=issue_number, run_dir=run_artifacts.run_dir)
-    )
+    accessor = run_artifacts.recorded_run.artifacts
     if action_type == "open_agent_log":
         if round_index is not None and session_role:
             artifact = accessor.get_review_exchange_phase_terminal_recording(
@@ -785,9 +779,7 @@ def _review_transcript_action_for_event(
     """Expose the structured exchange transcript as secondary review context."""
     if not _event_supports_review_transcript(event, event_name):
         return None
-    accessor = ManifestAccessor(
-        RunIdentity(issue_number=issue_number, run_dir=run_artifacts.run_dir)
-    )
+    accessor = run_artifacts.recorded_run.artifacts
     try:
         accessor.get_review_exchange_transcript(allow_empty=True)
     except (ArtifactNotFoundError, FileNotFoundError):
@@ -827,9 +819,7 @@ def _preferred_run_scoped_session_action(
     if not context and _is_review_exchange_aggregate_event(event, event_name):
         return None
     if context:
-        accessor = ManifestAccessor(
-            RunIdentity(issue_number=issue_number, run_dir=run_artifacts.run_dir)
-        )
+        accessor = run_artifacts.recorded_run.artifacts
         try:
             accessor.get_review_exchange_phase_terminal_recording(
                 round_index=int(context["round_index"]),

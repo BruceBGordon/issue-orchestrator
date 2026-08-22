@@ -2509,7 +2509,8 @@ class TestControlIssueDetailEndpoint:
         wt_store.append(99, TimelineRecord(
             event_id="e1", timestamp="2026-01-01T00:00:00Z",
             event="session.completed",
-            data={"logical_run": 1, "logical_cycle": 1, "logical_phase": "coding",
+            data={"run_dir": str(tmp_path / "deleted-run-99"),
+                  "logical_run": 1, "logical_cycle": 1, "logical_phase": "coding",
                   "timeline_schema_version": 4, "views": ["user", "ops", "debug"]},
             source_event="session.completed",
         ))
@@ -2556,6 +2557,7 @@ class TestControlIssueDetailEndpoint:
                     timestamp="2026-01-01T00:00:00Z",
                     event="session.completed",
                     data={
+                        "run_dir": str(tmp_path / "deleted-run-42"),
                         "logical_run": 1,
                         "logical_cycle": 1,
                         "logical_phase": "coding",

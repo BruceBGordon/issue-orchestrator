@@ -441,8 +441,18 @@ class TestApiTimelineEndpoint:
 
     def test_review_artifact_endpoint_serves_run_scoped_report(self, tmp_path: Path):
         """The review artifact endpoint returns only validated run-scoped artifacts."""
+        from issue_orchestrator.execution.session_output_adapter import (
+            FileSystemSessionOutput,
+        )
+
         mock_orch = create_mock_orchestrator()
-        run_dir = tmp_path / "run"
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        run_dir = FileSystemSessionOutput().start_run(
+            worktree,
+            "review-123",
+            issue_number=123,
+        ).run_dir
         turns = run_dir / "review-exchange" / "turns"
         turns.mkdir(parents=True)
         report = turns / "round-001.reviewer.attempt-001.review-report.md"
@@ -613,7 +623,13 @@ class TestApiTimelineEndpoint:
             },
         )
         payload = fetch_issue_detail_payload(
-            [build_timeline_event("session.started", summary="started")],
+            [
+                build_timeline_event(
+                    "session.started",
+                    summary="started",
+                    run_dir=_ensure_test_run_dir(42),
+                )
+            ],
             issue_number=42,
             dependency_gate_snapshot=snapshot,
         )

@@ -357,9 +357,10 @@ def test_status_explanation_blocked_invalid_completion_survives_terminal_failed_
             TraceEvent(
                 EventName.SESSION_FAILED,
                 {
-                    "issue_number": issue_number,
-                    "task": "code",
-                    "reason": reason,
+                        "issue_number": issue_number,
+                        "task": "code",
+                        "run_dir": str(run_dir),
+                        "reason": reason,
                     "failure_kind": "invalid_completion_record",
                     "completion_parse_error": "invalid JSON: line 1",
                 },

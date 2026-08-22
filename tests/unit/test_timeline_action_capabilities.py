@@ -4,6 +4,11 @@ from pathlib import Path
 
 import pytest
 
+from issue_orchestrator.domain.session_run import SessionRunAssets
+from issue_orchestrator.execution.recorded_session_runs import (
+    ExactRecordedRun,
+    resolve_exact_recorded_run,
+)
 from issue_orchestrator.execution.timeline_action_capabilities import (
     AvailableRunArtifacts,
     MissingRunArtifacts,
@@ -18,6 +23,28 @@ from issue_orchestrator.execution.timeline_action_capabilities import (
 )
 from issue_orchestrator.execution.session_output_adapter import FileSystemSessionOutput
 from issue_orchestrator.events import EventName
+
+
+def _available_run(
+    tmp_path: Path,
+    *,
+    worktree_name: str = "worktree",
+    session_name: str = "selected",
+    issue_number: int = 42,
+) -> tuple[AvailableRunArtifacts, SessionRunAssets]:
+    worktree = tmp_path / worktree_name
+    worktree.mkdir()
+    run = FileSystemSessionOutput().start_run(
+        worktree,
+        session_name,
+        issue_number=issue_number,
+    )
+    exact_run = resolve_exact_recorded_run(
+        str(run.run_dir),
+        issue_number=issue_number,
+    )
+    assert isinstance(exact_run, ExactRecordedRun)
+    return AvailableRunArtifacts(recorded_run=exact_run), run
 
 
 def test_required_event_without_run_dir_fails_fast() -> None:
@@ -52,16 +79,26 @@ def test_deleted_run_has_explicit_missing_capability(tmp_path: Path) -> None:
 
 
 def test_existing_run_has_available_capability(tmp_path: Path) -> None:
-    run_dir = tmp_path / "run"
-    run_dir.mkdir()
+    expected, run = _available_run(tmp_path)
 
     state = classify_timeline_run_artifacts(
-        raw_run_dir=str(run_dir),
+        raw_run_dir=str(run.run_dir),
         issue_number=42,
         event_name=EventName.SESSION_STARTED.value,
     )
 
-    assert state == AvailableRunArtifacts(run_dir=run_dir)
+    assert state == expected
+
+
+def test_existing_run_owned_by_another_issue_fails_fast(tmp_path: Path) -> None:
+    _, run = _available_run(tmp_path, issue_number=123)
+
+    with pytest.raises(RuntimeError, match="belongs to another issue"):
+        classify_timeline_run_artifacts(
+            raw_run_dir=str(run.run_dir),
+            issue_number=42,
+            event_name=EventName.SESSION_STARTED.value,
+        )
 
 
 def test_file_cannot_masquerade_as_run_directory(tmp_path: Path) -> None:
@@ -123,24 +160,24 @@ def test_local_artifact_kind_is_closed() -> None:
 
 
 def test_local_artifact_type_must_match_kind(tmp_path: Path) -> None:
-    run_dir = tmp_path / "run"
-    run_dir.mkdir()
+    available, _ = _available_run(tmp_path)
     directory_claimed_as_file = tmp_path / "completion-record"
     directory_claimed_as_file.mkdir()
 
     with pytest.raises(RuntimeError, match="local artifact has wrong type"):
         require_existing_timeline_artifact(
-            run_artifacts=AvailableRunArtifacts(run_dir=run_dir),
+            run_artifacts=available,
             artifact_path=directory_claimed_as_file,
             artifact_kind=TimelineLocalArtifactKind.COMPLETION_RECORD,
             issue_number=42,
         )
 
 
-def test_relative_local_artifact_path_is_rejected() -> None:
+def test_relative_local_artifact_path_is_rejected(tmp_path: Path) -> None:
+    available, _ = _available_run(tmp_path)
     with pytest.raises(RuntimeError, match="artifact path is not absolute"):
         require_existing_timeline_artifact(
-            run_artifacts=AvailableRunArtifacts(run_dir=Path("/tmp/run")),
+            run_artifacts=available,
             artifact_path=Path("relative/completion-record.json"),
             artifact_kind=TimelineLocalArtifactKind.COMPLETION_RECORD,
             issue_number=42,
@@ -148,31 +185,35 @@ def test_relative_local_artifact_path_is_rejected() -> None:
 
 
 def test_run_directory_artifact_must_equal_selected_run(tmp_path: Path) -> None:
-    selected_run = tmp_path / "selected-run"
-    claimed_run = tmp_path / "claimed-run"
-    selected_run.mkdir()
-    claimed_run.mkdir()
+    available, _ = _available_run(tmp_path)
+    _, claimed_run = _available_run(
+        tmp_path,
+        worktree_name="other-worktree",
+        session_name="claimed",
+    )
 
     with pytest.raises(RuntimeError, match="does not belong to selected run"):
         require_existing_timeline_artifact(
-            run_artifacts=AvailableRunArtifacts(run_dir=selected_run),
-            artifact_path=claimed_run,
+            run_artifacts=available,
+            artifact_path=claimed_run.run_dir,
             artifact_kind=TimelineLocalArtifactKind.RUN_DIR,
             issue_number=42,
         )
 
 
 def test_run_local_artifact_cannot_point_into_another_run(tmp_path: Path) -> None:
-    selected_run = tmp_path / "selected-run"
-    other_run = tmp_path / "other-run"
-    selected_run.mkdir()
-    other_run.mkdir()
-    other_prompt = other_run / "prompt.txt"
+    available, _ = _available_run(tmp_path)
+    _, other_run = _available_run(
+        tmp_path,
+        worktree_name="other-worktree",
+        session_name="other",
+    )
+    other_prompt = other_run.run_dir / "prompt.txt"
     other_prompt.write_text("wrong run\n", encoding="utf-8")
 
     with pytest.raises(RuntimeError, match="escapes selected run"):
         require_existing_timeline_artifact(
-            run_artifacts=AvailableRunArtifacts(run_dir=selected_run),
+            run_artifacts=available,
             artifact_path=other_prompt,
             artifact_kind=TimelineLocalArtifactKind.PROMPT,
             issue_number=42,
@@ -180,16 +221,15 @@ def test_run_local_artifact_cannot_point_into_another_run(tmp_path: Path) -> Non
 
 
 def test_symlink_cannot_escape_selected_run(tmp_path: Path) -> None:
-    selected_run = tmp_path / "selected-run"
-    selected_run.mkdir()
+    available, selected_run = _available_run(tmp_path)
     outside = tmp_path / "outside.txt"
     outside.write_text("secret\n", encoding="utf-8")
-    escaped_link = selected_run / "prompt.txt"
+    escaped_link = selected_run.run_dir / "prompt.txt"
     escaped_link.symlink_to(outside)
 
     with pytest.raises(RuntimeError, match="escapes selected run"):
         require_existing_timeline_artifact(
-            run_artifacts=AvailableRunArtifacts(run_dir=selected_run),
+            run_artifacts=available,
             artifact_path=escaped_link,
             artifact_kind=TimelineLocalArtifactKind.PROMPT,
             issue_number=42,
@@ -214,10 +254,15 @@ def test_run_local_artifact_must_match_selected_run(tmp_path: Path) -> None:
         other_run.run_dir,
         {"completion_path": str(other_completion)},
     )
+    exact_run = resolve_exact_recorded_run(
+        str(selected_run.run_dir),
+        issue_number=42,
+    )
+    assert isinstance(exact_run, ExactRecordedRun)
 
     with pytest.raises(RuntimeError, match="escapes selected run"):
         require_existing_timeline_artifact(
-            run_artifacts=AvailableRunArtifacts(run_dir=selected_run.run_dir),
+            run_artifacts=AvailableRunArtifacts(recorded_run=exact_run),
             artifact_path=other_completion,
             artifact_kind=TimelineLocalArtifactKind.COMPLETION_RECORD,
             issue_number=42,
@@ -225,21 +270,20 @@ def test_run_local_artifact_must_match_selected_run(tmp_path: Path) -> None:
 
 
 def test_selected_run_can_own_multiple_completion_artifacts(tmp_path: Path) -> None:
-    selected_run = tmp_path / "selected-run"
-    selected_run.mkdir()
-    launch_completion = selected_run / "completion-agent.json"
-    copied_completion = selected_run / "completion-record.json"
+    available, selected_run = _available_run(tmp_path)
+    launch_completion = selected_run.run_dir / "completion-agent.json"
+    copied_completion = selected_run.run_dir / "completion-record.json"
     launch_completion.write_text('{"outcome":"completed"}\n', encoding="utf-8")
     copied_completion.write_text('{"outcome":"completed"}\n', encoding="utf-8")
 
     assert require_existing_timeline_artifact(
-        run_artifacts=AvailableRunArtifacts(run_dir=selected_run),
+        run_artifacts=available,
         artifact_path=launch_completion,
         artifact_kind=TimelineLocalArtifactKind.COMPLETION_RECORD,
         issue_number=42,
     ) == launch_completion
     assert require_existing_timeline_artifact(
-        run_artifacts=AvailableRunArtifacts(run_dir=selected_run),
+        run_artifacts=available,
         artifact_path=copied_completion,
         artifact_kind=TimelineLocalArtifactKind.COMPLETION_RECORD,
         issue_number=42,

@@ -10,7 +10,7 @@ This is the key abstraction that keeps pluggy out of the core.
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from functools import lru_cache
-from typing import Any, Literal, NotRequired, overload, Protocol, TYPE_CHECKING, TypedDict
+from typing import Any, cast, Literal, NotRequired, overload, Protocol, TYPE_CHECKING, TypedDict
 
 from ..domain.review_artifacts import (
     AbstractionReviewStatus,
@@ -22,6 +22,8 @@ if TYPE_CHECKING:
     from issue_orchestrator.events.catalog import EventName
     RunScopedEventName = Literal[
         EventName.SESSION_STARTED,
+        EventName.SESSION_COMPLETED,
+        EventName.SESSION_FAILED,
         EventName.SESSION_ARTIFACT_LOOKUP,
         EventName.SESSION_PROCESSING_COMPLETED,
         EventName.SESSION_VALIDATION_PASSED,
@@ -30,11 +32,15 @@ if TYPE_CHECKING:
         EventName.SESSION_INVALID_COMPLETION_RECORD,
         EventName.REVIEW_STARTED,
         EventName.REWORK_STARTED,
+        EventName.REVIEW_EXCHANGE_STARTED,
         EventName.REVIEW_EXCHANGE_ROUND_STARTED,
         EventName.REVIEW_EXCHANGE_ROUND_COMPLETED,
+        EventName.REVIEW_EXCHANGE_COMPLETED,
+        EventName.REVIEW_EXCHANGE_FAILED,
         EventName.REVIEW_EXCHANGE_ROLE_PROMPTED,
         EventName.REVIEW_EXCHANGE_ROLE_FEEDBACK,
         EventName.REVIEW_EXCHANGE_ROLE_TIMEOUT,
+        EventName.REVIEW_EXCHANGE_CHAPTER_RECORDED,
         EventName.REVIEW_REWORK_STARTED,
         EventName.REVIEW_REWORK_COMPLETED,
     ]
@@ -105,6 +111,14 @@ class SessionStartedEventPayload(RunScopedEventPayload):
     """Payload for ``session.started`` events."""
 
 
+class SessionCompletedEventPayload(RunScopedEventPayload):
+    """Payload for ``session.completed`` events."""
+
+
+class SessionFailedEventPayload(RunScopedEventPayload):
+    """Payload for ``session.failed`` events."""
+
+
 class SessionArtifactLookupEventPayload(RunScopedEventPayload):
     """Payload for ``session.artifact_lookup`` events."""
 
@@ -149,10 +163,12 @@ class ReviewExchangeRoundCompletedEventPayload(
     detail: NotRequired[str]
 
 
-class ReviewExchangeCompletedEventPayload(ReviewExchangeDecisionEventFields):
+class ReviewExchangeCompletedEventPayload(
+    RunIdentityEventPayload,
+    ReviewExchangeDecisionEventFields,
+):
     """Payload for ``review_exchange.completed`` events."""
 
-    issue_number: int
     session_name: str
     rounds: int
     status: Literal["ok", "stopped", "error"]
@@ -165,7 +181,12 @@ def make_trace_event(
     event_type: "EventName",
     data: dict[str, Any],
 ) -> "TraceEvent":
-    """Build a trace event through a central constructor."""
+    """Build an event while applying the central runtime run-scope policy."""
+    if event_type in run_scoped_event_names():
+        return make_run_scoped_event(
+            cast(RunScopedEventName, event_type),
+            cast(RunScopedEventPayload, data),
+        )
     return TraceEvent(event_type, dict(data))
 
 
@@ -178,6 +199,13 @@ def make_run_scoped_event(
 
 @overload
 def make_run_scoped_event(
+    event_type: Literal[EventName.REVIEW_EXCHANGE_COMPLETED],
+    data: ReviewExchangeCompletedEventPayload,
+) -> "TraceEvent": ...
+
+
+@overload
+def make_run_scoped_event(
     event_type: RunScopedEventName,
     data: RunScopedEventPayload,
 ) -> "TraceEvent": ...
@@ -185,7 +213,11 @@ def make_run_scoped_event(
 
 def make_run_scoped_event(
     event_type: RunScopedEventName,
-    data: RunScopedEventPayload | ReviewExchangeRoundCompletedEventPayload,
+    data: (
+        RunScopedEventPayload
+        | ReviewExchangeRoundCompletedEventPayload
+        | ReviewExchangeCompletedEventPayload
+    ),
 ) -> "TraceEvent":
     """Build a run-scoped event with typed payload requiring run_dir."""
     return TraceEvent(event_type, dict(data))
@@ -196,6 +228,22 @@ def make_session_started_event(data: SessionStartedEventPayload) -> "TraceEvent"
     from issue_orchestrator.events import EventName
 
     return make_run_scoped_event(EventName.SESSION_STARTED, data)
+
+
+def make_session_completed_event(
+    data: SessionCompletedEventPayload,
+) -> "TraceEvent":
+    """Build a typed ``session.completed`` event."""
+    from issue_orchestrator.events import EventName
+
+    return make_run_scoped_event(EventName.SESSION_COMPLETED, data)
+
+
+def make_session_failed_event(data: SessionFailedEventPayload) -> "TraceEvent":
+    """Build a typed ``session.failed`` event."""
+    from issue_orchestrator.events import EventName
+
+    return make_run_scoped_event(EventName.SESSION_FAILED, data)
 
 
 def make_session_artifact_lookup_event(data: SessionArtifactLookupEventPayload) -> "TraceEvent":
@@ -250,6 +298,8 @@ def run_scoped_event_names() -> frozenset["EventName"]:
     return frozenset(
         {
             EventName.SESSION_STARTED,
+            EventName.SESSION_COMPLETED,
+            EventName.SESSION_FAILED,
             EventName.SESSION_ARTIFACT_LOOKUP,
             EventName.SESSION_PROCESSING_COMPLETED,
             EventName.SESSION_VALIDATION_PASSED,
@@ -258,11 +308,15 @@ def run_scoped_event_names() -> frozenset["EventName"]:
             EventName.SESSION_INVALID_COMPLETION_RECORD,
             EventName.REVIEW_STARTED,
             EventName.REWORK_STARTED,
+            EventName.REVIEW_EXCHANGE_STARTED,
             EventName.REVIEW_EXCHANGE_ROUND_STARTED,
             EventName.REVIEW_EXCHANGE_ROUND_COMPLETED,
+            EventName.REVIEW_EXCHANGE_COMPLETED,
+            EventName.REVIEW_EXCHANGE_FAILED,
             EventName.REVIEW_EXCHANGE_ROLE_PROMPTED,
             EventName.REVIEW_EXCHANGE_ROLE_FEEDBACK,
             EventName.REVIEW_EXCHANGE_ROLE_TIMEOUT,
+            EventName.REVIEW_EXCHANGE_CHAPTER_RECORDED,
             EventName.REVIEW_REWORK_STARTED,
             EventName.REVIEW_REWORK_COMPLETED,
         }
@@ -275,7 +329,7 @@ def make_review_exchange_completed_event(
     """Build a typed ``review_exchange.completed`` event."""
     from issue_orchestrator.events import EventName
 
-    return make_trace_event(EventName.REVIEW_EXCHANGE_COMPLETED, dict(data))
+    return make_run_scoped_event(EventName.REVIEW_EXCHANGE_COMPLETED, data)
 
 
 @dataclass(frozen=True)

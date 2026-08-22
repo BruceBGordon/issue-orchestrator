@@ -11,14 +11,26 @@ from urllib.parse import urlsplit
 
 from ..events import EventName
 from .manifest_accessor import worktree_path_from_run_dir
+from .recorded_session_runs import (
+    ExactRecordedRun,
+    InvalidRecordedRunReference,
+    RecordedRunIssueMismatch,
+    RecordedRunNotFound,
+    RecordedRunUnreadable,
+    resolve_exact_recorded_run,
+)
 from .timeline_artifact_expectations import event_requires_run_dir
 
 
 @dataclass(frozen=True, slots=True)
 class AvailableRunArtifacts:
-    """The recorded run directory still exists."""
+    """A manifest-validated recorded run is available."""
 
-    run_dir: Path
+    recorded_run: ExactRecordedRun
+
+    @property
+    def run_dir(self) -> Path:
+        return self.recorded_run.run_dir
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,7 +129,45 @@ def classify_timeline_run_artifacts(
             "timeline event run_dir is not a directory: "
             f"issue={issue_number} event={event_name} run_dir={run_dir}"
         )
-    return AvailableRunArtifacts(run_dir=run_dir)
+    return _validated_available_run(
+        run_dir=run_dir,
+        issue_number=issue_number,
+        event_name=event_name,
+    )
+
+
+def _validated_available_run(
+    *,
+    run_dir: Path,
+    issue_number: int,
+    event_name: str,
+) -> AvailableRunArtifacts:
+    """Convert exact-run lookup results into the Timeline fail-fast policy."""
+    exact_run = resolve_exact_recorded_run(
+        str(run_dir),
+        issue_number=issue_number,
+    )
+    match exact_run:
+        case ExactRecordedRun():
+            return AvailableRunArtifacts(recorded_run=exact_run)
+        case RecordedRunNotFound(detail=detail):
+            raise RuntimeError(
+                "timeline event references an existing run without a readable manifest: "
+                f"issue={issue_number} event={event_name} run_dir={run_dir}; {detail}"
+            )
+        case RecordedRunIssueMismatch(actual_issue_number=actual):
+            raise RuntimeError(
+                "timeline event run_dir belongs to another issue: "
+                f"issue={issue_number} actual_issue={actual} "
+                f"event={event_name} run_dir={run_dir}"
+            )
+        case InvalidRecordedRunReference(detail=detail) | RecordedRunUnreadable(detail=detail):
+            raise RuntimeError(
+                "timeline event has an untrusted run_dir: "
+                f"issue={issue_number} event={event_name} run_dir={run_dir}; {detail}"
+            )
+        case _:
+            assert_never(exact_run)
 
 
 def available_run_artifacts(

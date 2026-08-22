@@ -1567,6 +1567,145 @@ class TestIssueLogEndpointsUseLatestHistory:
         finally:
             set_orchestrator(None)
 
+    @pytest.mark.parametrize(
+        ("route", "extra_params"),
+        (
+            ("/api/log/local/999", {}),
+            ("/api/session/terminal-recording/999", {}),
+            ("/api/session/claude-log/999", {}),
+            ("/api/session/review-transcript/999", {}),
+            ("/api/session/prompt/999", {}),
+            ("/api/session/manifest/999", {}),
+            ("/api/dialog/session-diagnostics/999", {}),
+            ("/api/dialog/validation-failure/999", {}),
+            ("/api/session/orchestrator-log/999", {}),
+            (
+                "/api/session/review-artifact/999",
+                {
+                    "artifact_type": "review_report",
+                    "artifact_path_key": "review_report",
+                },
+            ),
+        ),
+    )
+    def test_exact_run_routes_reject_cross_issue_artifact_access(
+        self,
+        tmp_path: Path,
+        route: str,
+        extra_params: dict[str, str],
+    ) -> None:
+        """Every exact-run endpoint validates manifest issue ownership first."""
+        from issue_orchestrator.execution.session_output_adapter import (
+            FileSystemSessionOutput,
+        )
+
+        mock_orch = create_mock_orchestrator()
+        worktree = tmp_path / "wt-cross-issue-run"
+        worktree.mkdir()
+        session_output = FileSystemSessionOutput()
+        run = session_output.start_run(worktree, "issue-123", issue_number=123)
+        self._write_terminal_recording(run.run_dir, "private terminal marker\n")
+        claude_log = run.run_dir / "bound-claude.jsonl"
+        claude_log.write_text(
+            '{"type":"assistant","content":"private claude marker"}\n',
+            encoding="utf-8",
+        )
+        transcript = run.run_dir / "review-exchange" / "transcript.log"
+        transcript.parent.mkdir(parents=True)
+        transcript.write_text("private review marker\n", encoding="utf-8")
+        prompt = run.run_dir / "session-prompt.txt"
+        prompt.write_text("private prompt marker\n", encoding="utf-8")
+        turns = run.run_dir / "review-exchange" / "turns"
+        turns.mkdir(parents=True)
+        review_report = turns / "round-001.reviewer.attempt-001.review-report.md"
+        review_report.write_text("private report marker\n", encoding="utf-8")
+        session_output.update_manifest(
+            run.run_dir,
+            {
+                "claude_log_path": str(claude_log),
+                "review_exchange_transcript_path": str(transcript),
+                "session_prompt_path": str(prompt),
+            },
+        )
+
+        params = {"run_dir": str(run.run_dir)}
+        artifact_path_key = extra_params.get("artifact_path_key")
+        if artifact_path_key == "review_report":
+            params["artifact_path"] = str(review_report)
+        params.update(
+            {
+                key: value
+                for key, value in extra_params.items()
+                if key != "artifact_path_key"
+            }
+        )
+
+        set_orchestrator(mock_orch)
+        try:
+            response = TestClient(app).get(route, params=params)
+            assert response.status_code == 404
+            assert response.json()["error"] == (
+                "Requested run does not belong to issue #999"
+            )
+            assert "private" not in response.text
+        finally:
+            set_orchestrator(None)
+
+    def test_exact_historical_diagnostics_does_not_rebind_missing_claude_log(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Reading an exact historical run must leave its manifest immutable."""
+        from issue_orchestrator.execution.session_output_adapter import (
+            FileSystemSessionOutput,
+        )
+
+        mock_orch = create_mock_orchestrator()
+        worktree = tmp_path / "wt-read-only-diagnostics"
+        worktree.mkdir()
+        session_output = FileSystemSessionOutput()
+        run = session_output.start_run(worktree, "issue-123", issue_number=123)
+        claude_dir = tmp_path / "claude-project"
+        claude_dir.mkdir()
+        recorded_log = claude_dir / "recorded.jsonl"
+        recorded_log.write_text('{"content":"recorded"}\n', encoding="utf-8")
+        session_output.update_manifest(
+            run.run_dir,
+            {
+                "claude_log_dir": str(claude_dir),
+                "claude_log_path": str(recorded_log),
+            },
+        )
+        recorded_log.unlink()
+        later_log = claude_dir / "later.jsonl"
+        later_log.write_text(
+            '{"content":"must-not-be-attached"}\n',
+            encoding="utf-8",
+        )
+        manifest_path = run.run_dir / "manifest.json"
+        manifest_before = manifest_path.read_bytes()
+
+        set_orchestrator(mock_orch)
+        try:
+            diagnostics = TestClient(app).get(
+                "/api/dialog/session-diagnostics/123",
+                params={"run_dir": str(run.run_dir)},
+            )
+            assert diagnostics.status_code == 200
+            assert manifest_path.read_bytes() == manifest_before
+            assert str(later_log) not in diagnostics.text
+
+            claude = TestClient(app).get(
+                "/api/session/claude-log/123",
+                params={"run_dir": str(run.run_dir)},
+            )
+            assert claude.status_code == 404
+            assert str(recorded_log) in claude.text
+            assert str(later_log) not in claude.text
+            assert manifest_path.read_bytes() == manifest_before
+        finally:
+            set_orchestrator(None)
+
 
     def test_orchestrator_log_rejects_stale_explicit_run_without_fallback(
         self, tmp_path: Path

@@ -12,17 +12,37 @@ from typing import TypeAlias
 from ..domain.run_manifest import RunManifest
 from ..domain.session_run import SessionRunAssets
 from ..ports.session_output import SessionOutput
+from .manifest_accessor import ManifestAccessor, RunIdentity
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
 class ExactRecordedRun:
-    """Manifest-backed identity for one explicitly requested local run."""
+    """Validated capability for one explicitly requested local run.
 
-    run_dir: Path
-    worktree_path: Path
-    session_name: str
+    Consumers receive the manifest, typed run assets, and semantic artifact
+    accessor from this owner instead of rebuilding a ``RunIdentity`` from URL
+    input. Construction is centralized in ``resolve_exact_recorded_run`` so
+    issue ownership is checked exactly once.
+    """
+
+    issue_number: int
+    manifest: RunManifest
+    run_assets: SessionRunAssets
+    artifacts: ManifestAccessor
+
+    @property
+    def run_dir(self) -> Path:
+        return self.run_assets.run_dir
+
+    @property
+    def worktree_path(self) -> Path:
+        return self.run_assets.worktree_path
+
+    @property
+    def session_name(self) -> str:
+        return self.run_assets.session_name
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,10 +120,14 @@ def resolve_exact_recorded_run(
             actual_issue_number=manifest.issue_number,
         )
     assets = manifest_result.assets
+    run_dir = assets.run_dir.resolve()
     return ExactRecordedRun(
-        run_dir=assets.run_dir.resolve(),
-        worktree_path=assets.worktree_path.resolve(),
-        session_name=assets.session_name,
+        issue_number=issue_number,
+        manifest=manifest,
+        run_assets=assets,
+        artifacts=ManifestAccessor(
+            RunIdentity(issue_number=issue_number, run_dir=run_dir)
+        ),
     )
 
 

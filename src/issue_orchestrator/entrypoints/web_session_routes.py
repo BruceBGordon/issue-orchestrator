@@ -394,17 +394,11 @@ def serve_terminal_recording(
     since_hash: str | None = None,
 ) -> JSONResponse:
     """Shared implementation for terminal recording endpoints."""
-    if not run_dir:
-        return JSONResponse(
-            {
-                "error": "run_dir is required",
-                "hint": "Open terminal recordings from a run-scoped timeline action.",
-            },
-            status_code=400,
-        )
-
-    run_identity = RunIdentity(issue_number=issue_number, run_dir=Path(run_dir))
-    accessor = ManifestAccessor(run_identity)
+    exact_run = exact_recorded_run_response(run_dir, issue_number=issue_number)
+    if isinstance(exact_run, JSONResponse):
+        return exact_run
+    accessor = exact_run.artifacts
+    run_identity = accessor.run_identity
     scope = _resolve_phase_scope(round_index, session_role)
     if isinstance(scope, JSONResponse):
         return scope
@@ -501,7 +495,6 @@ def serve_terminal_recording(
         )
     except Exception as exc:
         return JSONResponse({"error": f"Failed to read terminal recording: {exc}"}, status_code=500)
-
 
 @web_session_router.get("/api/session/terminal-recording/{issue_number}")
 async def get_terminal_recording(
@@ -816,9 +809,6 @@ def session_manifest_response(
         exact_run = exact_recorded_run_response(run_dir, issue_number=issue_number)
         if isinstance(exact_run, JSONResponse):
             return exact_run
-        from ..execution.session_output_adapter import FileSystemSessionOutput
-
-        FileSystemSessionOutput().attach_claude_log(exact_run.run_dir)
         return _manifest_response(
             exact_run.run_dir,
             exact_run.session_name,
@@ -1094,8 +1084,11 @@ async def get_claude_log_content(
             status_code=400,
         )
 
-    run_identity = RunIdentity(issue_number=issue_number, run_dir=Path(run_dir))
-    accessor = ManifestAccessor(run_identity)
+    exact_run = exact_recorded_run_response(run_dir, issue_number=issue_number)
+    if isinstance(exact_run, JSONResponse):
+        return exact_run
+    run_identity = exact_run.artifacts.run_identity
+    accessor = exact_run.artifacts
     try:
         artifact = accessor.get_claude_log()
     except ArtifactNotFoundError as exc:
@@ -1156,8 +1149,11 @@ async def get_review_transcript_content(
             status_code=400,
         )
 
-    run_identity = RunIdentity(issue_number=issue_number, run_dir=Path(run_dir))
-    accessor = ManifestAccessor(run_identity)
+    exact_run = exact_recorded_run_response(run_dir, issue_number=issue_number)
+    if isinstance(exact_run, JSONResponse):
+        return exact_run
+    run_identity = exact_run.artifacts.run_identity
+    accessor = exact_run.artifacts
     try:
         artifact = accessor.get_review_exchange_transcript(allow_empty=True)
     except ArtifactNotFoundError as exc:
@@ -1229,12 +1225,14 @@ async def get_review_artifact_content(
             status_code=400,
         )
 
-    run_identity = RunIdentity(issue_number=issue_number, run_dir=Path(run_dir))
+    exact_run = exact_recorded_run_response(run_dir, issue_number=issue_number)
+    if isinstance(exact_run, JSONResponse):
+        return exact_run
     try:
         artifact = review_artifact_reader.read_review_artifact(
             ReviewArtifactReadCommand(
                 issue_number=issue_number,
-                run_dir=run_identity.run_dir,
+                run_dir=exact_run.run_dir,
                 artifact_path=artifact_path,
                 artifact_type=artifact_type,
             )
@@ -1243,7 +1241,7 @@ async def get_review_artifact_content(
         return JSONResponse(
             {
                 "error": "Review artifact not found",
-                "run_dir": str(run_identity.run_dir),
+                "run_dir": str(exact_run.run_dir),
                 "detail": str(exc),
             },
             status_code=404,
@@ -1251,7 +1249,7 @@ async def get_review_artifact_content(
     return JSONResponse(
         {
             "issue_number": issue_number,
-            "run_dir": str(run_identity.run_dir),
+            "run_dir": str(exact_run.run_dir),
             "artifact_path": str(artifact.artifact_path),
             "artifact_type": artifact.artifact_type,
             "content_type": artifact.content_type,
@@ -1283,8 +1281,11 @@ async def get_session_prompt_content(
             status_code=400,
         )
 
-    run_identity = RunIdentity(issue_number=issue_number, run_dir=Path(run_dir))
-    accessor = ManifestAccessor(run_identity)
+    exact_run = exact_recorded_run_response(run_dir, issue_number=issue_number)
+    if isinstance(exact_run, JSONResponse):
+        return exact_run
+    run_identity = exact_run.artifacts.run_identity
+    accessor = exact_run.artifacts
     try:
         artifact = accessor.get_session_prompt()
     except ArtifactNotFoundError as exc:

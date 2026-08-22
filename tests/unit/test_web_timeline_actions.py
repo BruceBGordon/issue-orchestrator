@@ -465,6 +465,9 @@ class TestTimelineActionWiring:
     ) -> None:
         from issue_orchestrator.entrypoints.web import _timeline_event_actions
         from issue_orchestrator.execution.session_output_adapter import FileSystemSessionOutput
+        from issue_orchestrator.ports.event_sink import (
+            make_review_exchange_completed_event,
+        )
 
         session_output = FileSystemSessionOutput()
         worktree = tmp_path / "wt-review-exchange-aggregate"
@@ -482,19 +485,34 @@ class TestTimelineActionWiring:
             {"review_exchange_transcript_path": str(transcript)},
         )
 
-        completed_actions = _timeline_event_actions(
+        completed_event = make_review_exchange_completed_event(
             {
-                "event": "review_exchange.completed",
                 "issue_number": 4057,
                 "run_dir": str(run.run_dir),
-                "timeline_schema_version": TIMELINE_SCHEMA_VERSION,
+                "session_name": "review-aggregate",
                 "rounds": 1,
+                "status": "ok",
+                "reason": "reviewer_ok",
+            }
+        )
+        completed_actions = _timeline_event_actions(
+            {
+                "event": completed_event.name,
+                **completed_event.data,
+                "timeline_schema_version": TIMELINE_SCHEMA_VERSION,
             },
             4057,
         )
         completed_types = {action.get("type") for action in completed_actions}
         assert "open_review_transcript" in completed_types
         assert "open_agent_log" not in completed_types
+        transcript_action = next(
+            action
+            for action in completed_actions
+            if action.get("type") == "open_review_transcript"
+        )
+        assert transcript_action["issue_number"] == 4057
+        assert transcript_action["run_dir"] == str(run.run_dir)
 
         started_actions = _timeline_event_actions(
             {
