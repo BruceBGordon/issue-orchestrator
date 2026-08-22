@@ -138,39 +138,11 @@ endef
 define venv_decide
 $(call venv_guard_required,$(1)) \
 _decision="$$($(VENV_GUARD) decide --quiet --venv "$(VENV_TARGET)" --operation $(2) 2>/dev/null)"; _g=$$?; \
-_outcome="$$(printf '%s\n' "$$_decision" | sed -n 's/^outcome=//p')"; \
-_sync_args="$$(printf '%s\n' "$$_decision" | sed -n 's/^sync_args=//p')"; \
-_allowed="$$(printf '%s\n' "$$_decision" | sed -n 's/^allowed=//p')"; \
-_answer_venv="$$(printf '%s\n' "$$_decision" | sed -n 's/^venv=//p')"; \
-_answer_op="$$(printf '%s\n' "$$_decision" | sed -n 's/^operation=//p')"; \
-case "$$_outcome" in \
-	owned) _expected=0 ;; \
-	shared) _expected=1 ;; \
-	broken) _expected=2 ;; \
-	unclaimed) _expected=3 ;; \
-	*) _expected=-1 ;; \
-esac; \
-if [ "$$_expected" -lt 0 ] || [ "$$_g" -ne "$$_expected" ]; then \
-	echo "$(1): the guard contradicted itself for $(VENV_TARGET) (outcome='$$_outcome' exit=$$_g); refusing." >&2; \
+_sync_args="$$(printf '%s\n' "$$_decision" | $(VENV_GUARD) check --venv "$(VENV_TARGET)" --operation $(2) --exit $$_g)" || { \
+	echo "$(1): refusing to $(2) on $(VENV_TARGET)." >&2; \
 	exit 1; \
-fi; \
-if [ "$$_answer_venv" != "$(VENV_TARGET)" ]; then \
-	echo "$(1): the guard answered about '$$_answer_venv', not $(VENV_TARGET); refusing." >&2; \
-	exit 1; \
-fi; \
-if [ "$$_answer_op" != "$(2)" ]; then \
-	echo "$(1): the guard answered about operation '$$_answer_op', not $(2); refusing." >&2; \
-	exit 1; \
-fi; \
-if [ "$$_allowed" != "yes" ]; then \
-	echo "$(1): $(2) is not permitted on $(VENV_TARGET) (outcome=$$_outcome)." >&2; \
-	printf '%s\n' "$$_decision" | sed -n 's/^remedy=/  to fix: /p' >&2; \
-	exit 1; \
-fi; \
-if [ -z "$$_sync_args" ] && [ "$(2)" != "recreate" ]; then \
-	echo "$(1): the guard authorized $(VENV_TARGET) but supplied no arguments; refusing rather than guessing." >&2; \
-	exit 1; \
-fi;
+}; \
+_outcome="$$(printf '%s\n' "$$_decision" | sed -n 's/^outcome=//p')";
 endef
 
 # $(call venv_uv_create) - create the environment, bound to the authorized

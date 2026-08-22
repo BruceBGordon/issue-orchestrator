@@ -525,3 +525,59 @@ def test_a_relative_target_is_canonicalised_before_pinning(tmp_path: Path) -> No
 
     assert decision.venv.is_absolute()
     assert VenvMutationAuthority.pinned_env(decision)["UV_PROJECT_ENVIRONMENT"].startswith("/")
+
+
+# ---- the shared validator is the only validator ---------------------------
+
+
+def _check(record: str, *, venv: str, operation: str, exit_code: int):
+    return subprocess.run(
+        [str(GUARD_RESOURCE), "check", "--quiet", "--venv", venv,
+         "--operation", operation, "--exit", str(exit_code)],
+        input=record, capture_output=True, text=True,
+    )
+
+
+def _record(**fields) -> str:
+    base = {
+        "outcome": "owned", "sync_args": "--frozen --all-extras",
+        "venv": "/x", "operation": "sync-dependencies", "allowed": "yes",
+    }
+    base.update(fields)
+    return "".join(f"{k}={v}\n" for k, v in base.items())
+
+
+def test_check_refuses_a_field_stated_twice() -> None:
+    """"First occurrence wins" would let a record contradict itself."""
+    record = _record() + "outcome=shared\n"
+
+    assert _check(record, venv="/x", operation="sync-dependencies", exit_code=0).returncode != 0
+
+
+def test_check_refuses_owned_but_not_permitted() -> None:
+    """Echoing the outcome code made owned+allowed=no exit 0."""
+    record = _record(allowed="no")
+
+    assert _check(record, venv="/x", operation="sync-dependencies", exit_code=0).returncode != 0
+
+
+@pytest.mark.parametrize(
+    "fields,exit_code",
+    [
+        ({"venv": "/elsewhere"}, 0),
+        ({"operation": "recreate"}, 0),
+        ({"outcome": "shared"}, 0),
+        ({}, 7),
+    ],
+)
+def test_check_refuses_records_that_disagree_with_the_request(fields, exit_code) -> None:
+    assert _check(_record(**fields), venv="/x", operation="sync-dependencies",
+                  exit_code=exit_code).returncode != 0
+
+
+def test_check_echoes_the_validated_arguments() -> None:
+    """Callers must take the arguments from the validated record, not re-derive."""
+    result = _check(_record(), venv="/x", operation="sync-dependencies", exit_code=0)
+
+    assert result.returncode == 0
+    assert result.stdout.strip() == "--frozen --all-extras"

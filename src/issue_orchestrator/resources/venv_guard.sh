@@ -23,7 +23,14 @@
 #
 # SUBCOMMANDS
 #   decide   emit a decision record and exit with the outcome code
+#   check    validate a decision record (on stdin) against what was requested
 #   claim    bind an external venv to this checkout (writes the owner marker)
+#
+# `check` exists so the non-Python callers share ONE validator instead of each
+# implementing a partial copy. Three entry points previously verified different
+# subsets -- one skipped the target, another the operation, another the
+# permission field -- and a record that disagreed with the request was accepted
+# by whichever caller happened not to check that field.
 #
 # OPERATIONS (--operation, default sync-dependencies)
 #   sync-dependencies  update dependencies only; permitted for owned and shared
@@ -60,19 +67,21 @@ OWNER_MARKER=".issue-orchestrator-venv-owner"
 
 command="decide"
 case "${1:-}" in
-  decide|claim) command="$1"; shift ;;
+  decide|claim|check) command="$1"; shift ;;
 esac
 
 quiet=0
 venv_path=""
 checkout=""
 operation="sync-dependencies"
+observed_exit=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --quiet) quiet=1 ;;
     --venv) venv_path="${2:-}"; shift ;;
     --checkout) checkout="${2:-}"; shift ;;
     --operation) operation="${2:-}"; shift ;;
+    --exit) observed_exit="${2:-}"; shift ;;
     *) echo "venv-guard: unknown argument: $1" >&2; exit "$USAGE" ;;
   esac
   shift
@@ -85,7 +94,7 @@ checkout="$(cd "$checkout" 2>/dev/null && pwd -P)" || {
 [ -n "$venv_path" ] || venv_path="$checkout/.venv"
 
 case "$operation" in
-  sync-dependencies|install-project|recreate) ;;
+  sync-dependencies|install-project|recreate|claim) ;;
   *) echo "venv-guard: unknown operation: $operation" >&2; exit "$USAGE" ;;
 esac
 
@@ -120,6 +129,10 @@ operation_allowed() {
   case "$operation" in
     sync-dependencies) [ "$1" = "owned" ] || [ "$1" = "shared" ] ;;
     install-project|recreate) [ "$1" = "owned" ] ;;
+    # A claim is granted only when this checkout ends up owning the target; a
+    # losing claim previously reported allowed=yes because it reused the
+    # default operation's permissions.
+    claim) [ "$1" = "owned" ] ;;
     *) return 1 ;;
   esac
 }
@@ -149,6 +162,67 @@ emit() {
 }
 
 note() { [ "$quiet" -eq 0 ] && printf 'venv-guard: %s\n' "$1" >&2 || true; }
+
+# ---------------------------------------------------------------- check ----
+if [ "$command" = "check" ]; then
+  record="$(cat)"
+  field() { printf '%s\n' "$record" | sed -n "s/^$1=//p" | head -n 1; }
+
+  # A field stated twice is a contradiction, not a value to pick from. Taking
+  # the first occurrence would let `outcome=owned` followed by `outcome=shared`
+  # pass as owned.
+  for required in outcome venv operation allowed; do
+    if [ "$(printf '%s\n' "$record" | grep -c "^$required=")" -gt 1 ]; then
+      note "decision record states '$required' more than once; refusing"
+      exit "$USAGE"
+    fi
+  done
+
+  got_outcome="$(field outcome)"
+  got_venv="$(field venv)"
+  got_operation="$(field operation)"
+  got_allowed="$(field allowed)"
+  got_args="$(field sync_args)"
+
+  case "$got_outcome" in
+    owned) want_exit=0 ;;
+    shared) want_exit=1 ;;
+    broken) want_exit=2 ;;
+    unclaimed) want_exit=3 ;;
+    *) note "decision record has no usable outcome"; exit "$USAGE" ;;
+  esac
+
+  if [ -n "$observed_exit" ] && [ "$observed_exit" != "$want_exit" ]; then
+    note "the decision contradicts its status (outcome=$got_outcome exit=$observed_exit, expected $want_exit)"
+    exit "$USAGE"
+  fi
+  if [ "$got_venv" != "$venv_path" ]; then
+    note "the decision is about '$got_venv', not the requested $venv_path"
+    exit "$USAGE"
+  fi
+  if [ "$got_operation" != "$operation" ]; then
+    note "the decision is about operation '$got_operation', not the requested $operation"
+    exit "$USAGE"
+  fi
+  if [ "$got_allowed" != "yes" ]; then
+    printf '%s\n' "$record" | sed -n 's/^reason=/venv-guard: refused: /p' >&2
+    printf '%s\n' "$record" | sed -n 's/^remedy=/venv-guard: to fix: /p' >&2
+    # A refusal must ALWAYS be non-zero. Echoing the outcome code here made
+    # `owned` + `allowed=no` exit 0, so a record that refused itself was read
+    # as authorization.
+    if [ "$want_exit" -ne 0 ]; then
+      exit "$want_exit"
+    fi
+    exit 1
+  fi
+  if [ -z "$got_args" ] && [ "$operation" != "recreate" ] && [ "$operation" != "claim" ]; then
+    note "authorized with no arguments; refusing rather than guessing"
+    exit "$USAGE"
+  fi
+  # Echo the validated arguments so callers never re-derive them.
+  printf '%s\n' "$got_args"
+  exit 0
+fi
 
 # --- broken: a dangling link cannot be used, and creating over it writes into
 # --- a dead path.
@@ -192,6 +266,7 @@ fi
 # --- otherwise be told they own it. Require an explicit binding.
 marker="$resolved/$OWNER_MARKER"
 if [ "$command" = "claim" ]; then
+  operation="claim"
   mkdir -p "$resolved" || { note "cannot create $resolved"; exit "$USAGE"; }
   # Atomic no-clobber create. Two checkouts claiming concurrently must not both
   # be told they own it: `set -C` makes the redirect fail if the marker already

@@ -497,9 +497,22 @@ def test_venv_target_checks_that_creation_succeeded(tmp_path: Path) -> None:
 # ---- the contract must be identical on every path -------------------------
 
 
+GUARD_RESOURCE = REPO_ROOT / "src" / "issue_orchestrator" / "resources" / "venv_guard.sh"
+
+
 def _answering_guard(checkout: Path, body: str) -> None:
+    """A stub that lies in `decide` but delegates `check` to the real validator.
+
+    `check` is the shared contract validator; stubbing it out too would test a
+    caller against a validator that does not exist, rather than against the one
+    that actually ships.
+    """
     guard = checkout / "scripts" / "venv_guard.sh"
-    guard.write_text("#!/usr/bin/env bash\n" + body)
+    guard.write_text(
+        "#!/usr/bin/env bash\n"
+        f'if [ "${{1:-}}" = "check" ]; then exec {GUARD_RESOURCE} "$@"; fi\n'
+        + body
+    )
     guard.chmod(0o755)
 
 

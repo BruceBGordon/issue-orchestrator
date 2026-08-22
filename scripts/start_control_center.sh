@@ -307,34 +307,16 @@ sync_deps() {
 
   venv_mutation_outcome || guard_outcome=$?
 
-  # Exit 0 alone is not authorization. The record must exist and agree with the
-  # status, or the decision is not a decision.
-  local decided expected_exit
-  decided="$(printf '%s\n' "${VENV_DECISION}" | sed -n 's/^outcome=//p')"
-  case "${decided}" in
-    owned) expected_exit=0 ;;
-    shared) expected_exit=1 ;;
-    broken) expected_exit=2 ;;
-    unclaimed) expected_exit=3 ;;
-    *) expected_exit="" ;;
-  esac
-  if [[ -z "${expected_exit}" || "${guard_outcome}" -ne "${expected_exit}" ]]; then
-    echo "ERROR: the venv guard returned an inconsistent decision for ${VENV_PATH}" >&2
-    echo "  (outcome='${decided}' exit=${guard_outcome}); refusing to mutate it." >&2
-    return 1
-  fi
-
-  # The same contract the Python owner enforces: the answer must be about the
-  # environment and the operation that were asked about.
-  local answered_venv answered_op
-  answered_venv="$(printf '%s\n' "${VENV_DECISION}" | sed -n 's/^venv=//p')"
-  answered_op="$(printf '%s\n' "${VENV_DECISION}" | sed -n 's/^operation=//p')"
-  if [[ "${answered_venv}" != "${VENV_PATH}" ]]; then
-    echo "ERROR: the venv guard answered about '${answered_venv}', not ${VENV_PATH}; refusing." >&2
-    return 1
-  fi
-  if [[ "${answered_op}" != "install-project" ]]; then
-    echo "ERROR: the venv guard answered about operation '${answered_op}', not install-project; refusing." >&2
+  # One validator, shared with Make and release prep. Each entry point used to
+  # verify a different subset of the record, so a decision that disagreed with
+  # the request was accepted by whichever caller happened not to check it.
+  local guard_bin="${ROOT_DIR}/scripts/venv_guard.sh"
+  if ! printf '%s\n' "${VENV_DECISION}" | "${guard_bin}" check \
+        --venv "${VENV_PATH}" --operation install-project --exit "${guard_outcome}" \
+        >/dev/null; then
+    echo "ERROR: refusing to install this checkout's project into ${VENV_PATH}." >&2
+    remedy="$(venv_decision_remedy)"
+    [[ -n "${remedy}" ]] && echo "  To fix: ${remedy}" >&2
     return 1
   fi
 

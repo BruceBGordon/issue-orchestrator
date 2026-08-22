@@ -913,7 +913,11 @@ def require_owned_venv(root: Path) -> Path:
     whose record contradicts its exit status is not evidence of ownership.
     """
     guard = root / "src" / "issue_orchestrator" / "resources" / "venv_guard.sh"
-    target = (root / ".venv").resolve()
+    # Absolute, but WITHOUT resolving the final component: the guard's
+    # broken-link branch inspects the symlink itself, and resolving it discards
+    # exactly the identity it needs -- a dangling .venv then looks like an
+    # absent, owned path and the sync recreates through the dead link.
+    target = root.resolve() / ".venv"
     try:
         completed = subprocess.run(
             [
@@ -936,38 +940,37 @@ def require_owned_venv(root: Path) -> Path:
             f"The venv mutation authority timed out deciding {target}"
         ) from exc
 
-    record = {}
-    for line in completed.stdout.splitlines():
-        key, separator, value = line.partition("=")
-        if separator:
-            record[key.strip()] = value.strip()
-
-    expected = {"owned": 0, "shared": 1, "broken": 2, "unclaimed": 3}
-    outcome = record.get("outcome", "")
-    remedy = record.get("remedy", "")
-
-    if outcome not in expected or completed.returncode != expected[outcome]:
-        raise ReleasePrepError(
-            f"Refusing to sync the environment for {root}: the venv mutation "
-            f"authority returned an inconsistent decision "
-            f"(outcome={outcome!r}, exit={completed.returncode})."
-        )
-    if record.get("venv") != str(target):
-        raise ReleasePrepError(
-            f"Refusing to sync the environment for {root}: the authority "
-            f"answered about {record.get('venv')!r}, not {target}."
-        )
-    if record.get("allowed") == "yes":
+    # Validate through the same `check` implementation Make and Control Center
+    # use. Three private copies of this validation each checked a different
+    # subset, so a record that disagreed with the request was accepted by
+    # whichever caller happened not to inspect that field.
+    verdict = subprocess.run(
+        [
+            str(guard), "check", "--quiet",
+            "--venv", str(target),
+            "--operation", "install-project",
+            "--exit", str(completed.returncode),
+        ],
+        cwd=root,
+        input=completed.stdout,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if verdict.returncode == 0:
         return target
 
-    reasons = {
-        "shared": "its venv is shared from another checkout",
-        "broken": "its venv is a dangling symlink",
-        "unclaimed": "its venv is external and not bound to this checkout",
-    }
+    remedy = ""
+    for line in completed.stdout.splitlines():
+        if line.startswith("remedy="):
+            remedy = line.partition("=")[2].strip()
+    reason = ""
+    for line in completed.stdout.splitlines():
+        if line.startswith("reason="):
+            reason = line.partition("=")[2].strip()
     message = (
         f"Refusing to sync the environment for {root}: "
-        f"{reasons.get(outcome, f'the authority returned {outcome!r}')}."
+        f"{reason or verdict.stderr.strip() or 'the decision was not authorized'}."
     )
     if remedy:
         message += f"\n  To fix: {remedy}"

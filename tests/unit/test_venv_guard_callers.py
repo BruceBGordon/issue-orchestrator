@@ -15,6 +15,9 @@ from pathlib import Path
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+GUARD_RESOURCE = (
+    REPO_ROOT / "src" / "issue_orchestrator" / "resources" / "venv_guard.sh"
+)
 CC_SCRIPT = REPO_ROOT / "scripts" / "start_control_center.sh"
 GUARD = REPO_ROOT / "scripts" / "venv_guard.sh"
 BASH = shutil.which("bash")
@@ -189,3 +192,108 @@ def test_release_maps_a_non_executable_guard_to_its_domain_error(tmp_path: Path)
 
     with pytest.raises(module.ReleasePrepError):
         module.require_owned_venv(root)
+
+
+# ================= E1/E2: one contract, enforced identically ===============
+#
+# Each entry point used to verify a different subset of the record, so a record
+# that disagreed with the request was accepted by whichever caller happened not
+# to check that field. The stubs below are deliberately INCONSISTENT -- an
+# internally consistent stub cannot exercise a bypass.
+
+
+def _lying_guard(path: Path, *, outcome="owned", exit_code=0, venv="/somewhere/else",
+                 operation="sync-dependencies", allowed="yes") -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "#!/usr/bin/env bash\n"
+        # The real script is still needed for `check`; only `decide` lies.
+        'if [ "${1:-}" = "check" ]; then exec ' + str(GUARD) + ' "$@"; fi\n'
+        f'echo "outcome={outcome}"\n'
+        'echo "sync_args=--frozen --all-extras"\n'
+        f'echo "venv={venv}"\n'
+        f'echo "operation={operation}"\n'
+        f'echo "allowed={allowed}"\n'
+        'echo "reason=stub"\n'
+        f"exit {exit_code}\n"
+    )
+    path.chmod(0o755)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"venv": "/somewhere/else"},                       # wrong target
+        {"operation": "sync-dependencies"},                # wrong operation
+        {"allowed": "no"},                                 # not permitted
+        {"outcome": "shared", "exit_code": 0},             # outcome vs status
+    ],
+)
+def test_control_center_refuses_every_inconsistent_record(kwargs, tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    (root / ".venv").mkdir(parents=True)
+    defaults = {"operation": "install-project", "venv": str(root / ".venv")}
+    defaults.update(kwargs)
+    _lying_guard(root / "scripts" / "venv_guard.sh", **defaults)
+
+    result = _run_cc_sync(root, root / ".venv")
+
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "INSTALL-RAN" not in result.stdout
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"operation": "sync-dependencies"},                # wrong operation
+        {"venv": "/somewhere/else"},                       # wrong target
+        {"allowed": "no"},                                 # not permitted
+        {"outcome": "shared", "exit_code": 0},             # outcome vs status
+    ],
+)
+def test_release_refuses_every_inconsistent_record(kwargs, tmp_path: Path) -> None:
+    module, root = _release_guard_outcome(tmp_path, None)
+    defaults = {"operation": "install-project", "venv": str(root.resolve() / ".venv")}
+    defaults.update(kwargs)
+    _lying_guard(
+        root / "src" / "issue_orchestrator" / "resources" / "venv_guard.sh", **defaults
+    )
+
+    with pytest.raises(module.ReleasePrepError):
+        module.require_owned_venv(root)
+
+
+def test_release_refuses_a_dangling_venv_link(tmp_path: Path) -> None:
+    """`.venv.resolve()` discarded the symlink identity the guard inspects.
+
+    A dangling link then looked like an absent, owned path and the sync would
+    recreate through the dead link.
+    """
+    module, root = _release_guard_outcome(tmp_path, None)
+    resources = root / "src" / "issue_orchestrator" / "resources"
+    resources.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(GUARD_RESOURCE, resources / "venv_guard.sh")
+    (resources / "venv_guard.sh").chmod(0o755)
+    (root / ".venv").symlink_to(root / "missing-env", target_is_directory=True)
+
+    with pytest.raises(module.ReleasePrepError, match="dangling"):
+        module.require_owned_venv(root)
+
+
+def test_a_losing_claim_does_not_report_itself_authorized(tmp_path: Path) -> None:
+    """Claim reused the default operation's permissions, so a refused claim
+    still emitted allowed=yes -- a record that contradicts its own outcome."""
+    external = tmp_path / "envs" / "shared"
+    external.mkdir(parents=True)
+    first = tmp_path / "first"; first.mkdir()
+    second = tmp_path / "second"; second.mkdir()
+
+    subprocess.run([str(GUARD_RESOURCE), "claim", "--quiet", "--checkout", str(first),
+                    "--venv", str(external)], capture_output=True, text=True)
+    losing = subprocess.run([str(GUARD_RESOURCE), "claim", "--quiet", "--checkout", str(second),
+                             "--venv", str(external)], capture_output=True, text=True)
+
+    record = dict(l.split("=", 1) for l in losing.stdout.splitlines() if "=" in l)
+    assert losing.returncode != 0
+    assert record["allowed"] == "no"
+    assert record["operation"] == "claim"
