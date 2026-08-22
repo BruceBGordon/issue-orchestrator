@@ -114,7 +114,13 @@ tech_lead:
   inherit_labels: ["io-e2e-test-data", "test-data"]
 
 goal_pilot:
-  enabled: true
+  # Disabled until the first Codespaces run is proven (#7100). Every other
+  # agent in this config is claude-code; goal-pilot is the only Codex one,
+  # and Codex sandboxes with bubblewrap, which fails inside a container
+  # without SYS_ADMIN/SYS_CHROOT capabilities that Codespaces may not
+  # honour. Keeping it off means the first run exercises exactly one
+  # provider, so a failure names its own cause.
+  enabled: false
   agent: agent:goal-pilot
 
 e2e:

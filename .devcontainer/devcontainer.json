@@ -25,7 +25,22 @@
       "protocol": "http"
     }
   },
-  "postCreateCommand": "make worktree-setup && npm install -g @openai/codex@0.114.0",
+
+  "//lifecycle": [
+    "Split deliberately (#7100). A prebuild bakes onCreateCommand and",
+    "updateContentCommand but NOT postCreateCommand, so leaving the expensive",
+    "setup in postCreateCommand is why enabling prebuilds appears to do nothing.",
+    "onCreate: toolchain that does not depend on repo content.",
+    "updateContent: lockfile-driven sync — baked by the prebuild AND re-run on",
+    "create, which is what closes the drift between a stale prebuild and HEAD.",
+    "Both `uv sync --frozen` and `npm ci` converge from any starting state, so",
+    "re-running them against a baked tree is cheap and safe.",
+    "postStart runs on EVERY resume — keep it near-empty."
+  ],
+  "onCreateCommand": "npm install -g @openai/codex@0.148.0",
+  "updateContentCommand": "make worktree-setup",
+  "postCreateCommand": ".devcontainer/seed-agent-onboarding.sh",
+
   "hostRequirements": {
     "cpus": 4,
     "memory": "8gb",
