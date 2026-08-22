@@ -10,8 +10,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from ..ports.command_runner import CommandRunner
-from ..execution.command_runner import LocalCommandRunner
+from ..ports.command_runner import CommandRunner, CommandResult
 from .venv_mutation import VenvMutationAuthority
 
 logger = logging.getLogger(__name__)
@@ -90,6 +89,44 @@ def _update_worktree(repo_root: Path, worktree_path: Path) -> None:
     )
 
 
+class _SubprocessCommandRunner:
+    """Minimal ``CommandRunner`` for this module's own use.
+
+    This module manages external processes directly (it is a worktree/venv
+    provisioner), so it already owns subprocess calls. It depends on the
+    *port* rather than importing ``execution``'s adapter, because
+    ``infra.orchestrator`` reaches this module and the layering contract
+    forbids orchestrator -> execution. Callers and tests inject their own
+    runner; this is only the default when none is supplied.
+    """
+
+    def run(
+        self,
+        command,
+        *,
+        cwd=None,
+        env=None,
+        timeout_seconds=None,
+        shell=False,
+        newlines=None,
+    ) -> CommandResult:
+        completed = subprocess.run(
+            command,
+            cwd=cwd,
+            env=env,
+            timeout=timeout_seconds,
+            shell=shell,
+            capture_output=True,
+            text=True,
+        )
+        return CommandResult(
+            returncode=completed.returncode,
+            stdout=completed.stdout or "",
+            stderr=completed.stderr or "",
+            timed_out=False,
+        )
+
+
 def _sync_venv(worktree_path: Path, runner: CommandRunner | None = None) -> None:
     """Ensure the worktree venv is up-to-date (fast when deps unchanged).
 
@@ -104,7 +141,7 @@ def _sync_venv(worktree_path: Path, runner: CommandRunner | None = None) -> None
     uv_lock = worktree_path / "uv.lock"
     venv_python = worktree_path / ".venv" / "bin" / "python"
 
-    authority = VenvMutationAuthority(runner or LocalCommandRunner())
+    authority = VenvMutationAuthority(runner or _SubprocessCommandRunner())
     decision = authority.authorize(checkout=worktree_path)
     # Bind every uv invocation below to the environment that was authorized;
     # an inherited UV_PROJECT_ENVIRONMENT would otherwise redirect them, and
