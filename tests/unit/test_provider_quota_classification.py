@@ -70,8 +70,8 @@ CODEX_REFRESH_FAILURES = (
 # limits — but neither phrase contained a rate-limit token either, so both
 # also classified as ``None``.
 CLAUDE_WINDOW_LIMITS = (
-    "You've hit your session limit. Your limit resets at 3pm.",
-    "You've hit your weekly limit.",
+    "You've hit your session limit",
+    "You've hit your weekly limit",
 )
 
 
