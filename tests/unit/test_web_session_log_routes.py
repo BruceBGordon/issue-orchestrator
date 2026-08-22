@@ -1568,6 +1568,79 @@ class TestIssueLogEndpointsUseLatestHistory:
             set_orchestrator(None)
 
 
+    def test_orchestrator_log_rejects_stale_explicit_run_without_fallback(
+        self, tmp_path: Path
+    ) -> None:
+        from issue_orchestrator.execution.session_output_adapter import FileSystemSessionOutput
+
+        mock_orch = create_mock_orchestrator()
+        worktree = tmp_path / "wt-orchestrator-log-exact-run"
+        worktree.mkdir()
+        current_run = FileSystemSessionOutput().start_run(
+            worktree,
+            "current",
+            issue_number=123,
+        )
+        mock_orch.state.session_history = [
+            SessionHistoryEntry(
+                issue_number=123,
+                title="Issue 123",
+                agent_type="agent:web",
+                status="completed",
+                runtime_minutes=1,
+                worktree_path=worktree,
+            ),
+        ]
+        stale_run = worktree / ".issue-orchestrator" / "sessions" / "deleted-run"
+
+        set_orchestrator(mock_orch)
+        try:
+            response = TestClient(app).get(
+                f"/api/session/orchestrator-log/123?run_dir={stale_run}"
+            )
+            assert response.status_code == 404
+            assert "Requested run directory not found" in response.json()["error"]
+            assert str(current_run.run_dir) not in response.text
+        finally:
+            set_orchestrator(None)
+
+    def test_session_diagnostics_rejects_stale_explicit_run_without_fallback(
+        self, tmp_path: Path
+    ) -> None:
+        from issue_orchestrator.execution.session_output_adapter import FileSystemSessionOutput
+
+        mock_orch = create_mock_orchestrator()
+        worktree = tmp_path / "wt-diagnostics-exact-run"
+        worktree.mkdir()
+        current_run = FileSystemSessionOutput().start_run(
+            worktree,
+            "current",
+            issue_number=123,
+        )
+        mock_orch.state.session_history = [
+            SessionHistoryEntry(
+                issue_number=123,
+                title="Issue 123",
+                agent_type="agent:web",
+                status="completed",
+                runtime_minutes=1,
+                worktree_path=worktree,
+            ),
+        ]
+        stale_run = worktree / ".issue-orchestrator" / "sessions" / "deleted-run"
+
+        set_orchestrator(mock_orch)
+        try:
+            response = TestClient(app).get(
+                f"/api/dialog/session-diagnostics/123?run_dir={stale_run}"
+            )
+            assert response.status_code == 404
+            assert "Requested run directory not found" in response.json()["error"]
+            assert str(current_run.run_dir) not in response.text
+        finally:
+            set_orchestrator(None)
+
+
 class TestIssueSessionContextIsolation:
     def test_resolve_context_does_not_scan_sibling_worktrees(self, tmp_path: Path):
         """Session context must not pick runs from sibling worktrees/repos."""

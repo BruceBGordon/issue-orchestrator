@@ -9,6 +9,7 @@ from issue_orchestrator.execution.manifest_accessor import (
     ArtifactNotFoundError,
     ManifestAccessor,
     RunIdentity,
+    worktree_path_from_run_dir,
 )
 from issue_orchestrator.execution.session_output_adapter import FileSystemSessionOutput
 
@@ -20,6 +21,18 @@ def _build_accessor(tmp_path: Path, *, issue_number: int = 123) -> tuple[Manifes
     run = session_output.start_run(worktree, f"issue-{issue_number}", issue_number=issue_number)
     identity = RunIdentity(issue_number=issue_number, run_dir=run.run_dir)
     return ManifestAccessor(identity), worktree, run.run_dir
+
+
+def test_worktree_path_from_run_dir_requires_canonical_session_namespace(
+    tmp_path: Path,
+) -> None:
+    canonical_run = tmp_path / ".issue-orchestrator" / "sessions" / "run"
+    canonical_run.mkdir(parents=True)
+    lookalike_run = tmp_path / ".issue-orchestrator" / "not-sessions" / "run"
+    lookalike_run.mkdir(parents=True)
+
+    assert worktree_path_from_run_dir(canonical_run) == tmp_path
+    assert worktree_path_from_run_dir(lookalike_run) is None
 
 
 def test_get_agent_log_returns_run_scoped_log(tmp_path: Path) -> None:

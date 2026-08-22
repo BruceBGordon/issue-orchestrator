@@ -6,24 +6,19 @@ from pathlib import Path
 from typing import Any
 
 from ..events import EventName
+from ..ports.event_sink import run_scoped_event_names
 
 _REVIEW_PHASE_LOG_EVENTS = frozenset({
     EventName.REVIEW_EXCHANGE_ROUND_STARTED,
     EventName.REVIEW_EXCHANGE_ROUND_COMPLETED,
+    EventName.REVIEW_EXCHANGE_ROLE_PROMPTED,
+    EventName.REVIEW_EXCHANGE_ROLE_FEEDBACK,
+    EventName.REVIEW_EXCHANGE_ROLE_TIMEOUT,
     EventName.REVIEW_REWORK_STARTED,
     EventName.REVIEW_REWORK_COMPLETED,
 })
 
-_RUN_SCOPED_EVENTS = frozenset({
-    EventName.SESSION_STARTED,
-    EventName.SESSION_PROCESSING_COMPLETED,
-    EventName.SESSION_VALIDATION_PASSED,
-    EventName.SESSION_VALIDATION_RETRY_NEEDED,
-    EventName.SESSION_VALIDATION_FAILED,
-    EventName.SESSION_INVALID_COMPLETION_RECORD,
-    EventName.REVIEW_STARTED,
-    EventName.REWORK_STARTED,
-}) | _REVIEW_PHASE_LOG_EVENTS
+_RUN_SCOPED_EVENTS = run_scoped_event_names()
 
 # SQLite and persisted Timeline payloads use strings. Derive those wire values
 # from the typed policy set rather than maintaining a second string taxonomy.

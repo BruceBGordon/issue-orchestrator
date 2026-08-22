@@ -238,15 +238,18 @@ class TestApiTimelineEndpoint:
         session_output = FileSystemSessionOutput()
         worktree = tmp_path / "wt-timeline-returns-events"
         worktree.mkdir(parents=True)
-        completion_path = worktree / ".issue-orchestrator" / "completion.json"
-        completion_path.parent.mkdir(parents=True)
-        completion_path.write_text('{"status":"completed"}\n', encoding="utf-8")
         run = session_output.start_run(worktree, "issue-123", issue_number=123)
+        completion_path = run.run_dir / "completion.json"
+        completion_path.write_text('{"status":"completed"}\n', encoding="utf-8")
         (run.run_dir / "ui-session.log").write_text("agent output\n", encoding="utf-8")
         claude_log = run.run_dir / "claude.jsonl"
         claude_log.write_text('{"type":"assistant","content":"ok"}\n', encoding="utf-8")
         session_output.update_manifest(
-            run.run_dir, {"claude_log_path": str(claude_log)}
+            run.run_dir,
+            {
+                "claude_log_path": str(claude_log),
+                "completion_path": str(completion_path),
+            },
         )
 
         stream = TimelineStream(
@@ -1822,7 +1825,7 @@ class TestApiTimelineEndpoint:
                 for action in (payload["events"][0].get("actions") or [])
                 if isinstance(action, dict)
             }
-            assert action_types == {"open_orchestrator_log"}
+            assert action_types == set()
             assert "actions_error" not in payload["events"][0]
             assert payload["events"][1]["event"] == "issue.pr_created"
         finally:

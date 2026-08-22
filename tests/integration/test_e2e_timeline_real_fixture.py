@@ -115,31 +115,52 @@ def _materialize_fixture_run_dirs(worktree_db: Path, run_dir_root: Path) -> None
     """
     import sqlite3
 
-    rows: list[tuple[int, str, str, str]] = []
+    rows: list[tuple[int, int, str, str, str]] = []
     with sqlite3.connect(str(worktree_db)) as conn:
-        for sequence, event_name, run_dir, data_json in conn.execute(
+        for sequence, issue_number, event_name, run_dir, data_json in conn.execute(
             """
-            SELECT sequence, event, run_dir, data_json
+            SELECT sequence, issue_number, event, run_dir, data_json
             FROM timeline_events
             WHERE run_dir != ''
             ORDER BY sequence ASC
             """
         ):
             rows.append(
-                (int(sequence), str(event_name), str(run_dir), str(data_json or "{}"))
+                (
+                    int(sequence),
+                    int(issue_number),
+                    str(event_name),
+                    str(run_dir),
+                    str(data_json or "{}"),
+                )
             )
 
-        replacements: dict[str, Path] = {}
-        for _sequence, _event_name, original_run_dir, _data_json in rows:
+        replacements: dict[str, tuple[Path, int]] = {}
+        for _sequence, issue_number, _event_name, original_run_dir, _data_json in rows:
             if original_run_dir not in replacements:
-                synthetic_run_dir = run_dir_root / f"session-{len(replacements) + 1}"
-                _write_minimal_terminal_recording(synthetic_run_dir)
-                replacements[original_run_dir] = synthetic_run_dir
+                run_index = len(replacements) + 1
+                synthetic_run_dir = (
+                    run_dir_root
+                    / f"worktree-{run_index}"
+                    / ".issue-orchestrator"
+                    / "sessions"
+                    / f"fixture-{run_index}__session-{run_index}"
+                )
+                _write_minimal_terminal_recording(
+                    synthetic_run_dir,
+                    issue_number=issue_number,
+                )
+                replacements[original_run_dir] = (synthetic_run_dir, issue_number)
+            elif replacements[original_run_dir][1] != issue_number:
+                raise ValueError(
+                    "Captured Timeline run belongs to multiple issues: "
+                    f"run_dir={original_run_dir}"
+                )
 
         # Rows are materialized before UPDATE so this loop does not mutate a
         # cursor while iterating over it.
-        for sequence, event_name, original_run_dir, data_json in rows:
-            synthetic_run_dir = replacements[original_run_dir]
+        for sequence, _issue_number, event_name, original_run_dir, data_json in rows:
+            synthetic_run_dir = replacements[original_run_dir][0]
             data = json.loads(data_json)
             if isinstance(data, dict):
                 data["run_dir"] = str(synthetic_run_dir)
@@ -168,7 +189,11 @@ def _materialize_fixture_run_dirs(worktree_db: Path, run_dir_root: Path) -> None
         conn.commit()
 
 
-def _write_minimal_terminal_recording(run_dir: Path) -> None:
+def _write_minimal_terminal_recording(
+    run_dir: Path,
+    *,
+    issue_number: int,
+) -> None:
     run_dir.mkdir(parents=True, exist_ok=True)
     recording_path = run_dir / "terminal-recording.jsonl"
     payload = base64.b64encode(b"integration fixture session\n").decode("ascii")
@@ -187,6 +212,7 @@ def _write_minimal_terminal_recording(run_dir: Path) -> None:
     write_available_timeline_run_manifest(
         run_dir=run_dir,
         terminal_recording=recording_path,
+        issue_number=issue_number,
     )
 
 

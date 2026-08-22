@@ -304,13 +304,20 @@ class TestTimelineActionWiring:
         claude_log.write_text('{"type":"assistant","content":"ok"}\n', encoding="utf-8")
         session_output.update_manifest(run.run_dir, {"claude_log_path": str(claude_log)})
 
-        completion_path = worktree / ".issue-orchestrator" / "completion.json"
-        completion_path.parent.mkdir(parents=True, exist_ok=True)
+        completion_path = run.run_dir / "completion.json"
         completion_path.write_text('{"status":"completed"}\n', encoding="utf-8")
-        validation_path = worktree / ".issue-orchestrator" / "validation.json"
+        validation_path = run.run_dir / "validation.json"
         validation_path.write_text('{"ok":true}\n', encoding="utf-8")
         diagnostic_path = run.run_dir / "invalid-completion-1.json"
         diagnostic_path.write_text('{"kind":"invalid-completion-record"}\n', encoding="utf-8")
+        session_output.update_manifest(
+            run.run_dir,
+            {
+                "completion_path": str(completion_path),
+                "validation_record_path": str(validation_path),
+                "diagnostic_path": str(diagnostic_path),
+            },
+        )
 
         event = {
             "event": "review.comment_added",
@@ -980,8 +987,6 @@ class TestTimelineActionWiring:
         non_run_scoped_types = [action.get("type") for action in actions_without_run_dir]
         assert non_run_scoped_types == [
             "open_review_feedback",
-            "open_orchestrator_log",
-            "open_session_diagnostics",
         ]
 
         session_output = FileSystemSessionOutput()
@@ -1011,6 +1016,9 @@ class TestTimelineActionWiring:
         (
             "review_exchange.round_started",
             "review_exchange.round_completed",
+            "review_exchange.role_prompted",
+            "review_exchange.role_feedback",
+            "review_exchange.role_timeout",
             "review.rework_started",
             "review.rework_completed",
         ),
@@ -1203,10 +1211,40 @@ class TestPerRoundLogActions:
         )
 
         assert {action["type"] for action in actions} == {
-            "open_orchestrator_log",
             "open_review_feedback",
             "open_url",
         }
+
+
+    def test_local_artifact_type_cannot_disguise_url_as_durable(self, tmp_path: Path) -> None:
+        from issue_orchestrator.entrypoints.web import _timeline_event_actions
+        from issue_orchestrator.execution.session_output_adapter import FileSystemSessionOutput
+
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        run = FileSystemSessionOutput().start_run(
+            worktree,
+            "issue-1",
+            issue_number=1,
+        )
+
+        with pytest.raises(RuntimeError, match="local artifact path is not absolute"):
+            _timeline_event_actions(
+                {
+                    "event": "issue.unblocked",
+                    "issue_number": 1,
+                    "run_dir": str(run.run_dir),
+                    "timeline_schema_version": TIMELINE_SCHEMA_VERSION,
+                    "artifacts": [
+                        {
+                            "type": "completion_record",
+                            "label": "Completion",
+                            "value": "https://example.com/not-a-completion-record",
+                        }
+                    ],
+                },
+                1,
+            )
 
 
 class TestIsAgentScopedEvent:

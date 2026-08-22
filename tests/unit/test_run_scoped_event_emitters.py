@@ -5,25 +5,10 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
-RUN_SCOPED_EVENT_ENUM_NAMES = {
-    "SESSION_STARTED",
-    "SESSION_PROCESSING_COMPLETED",
-    "SESSION_VALIDATION_PASSED",
-    "SESSION_VALIDATION_RETRY_NEEDED",
-    "SESSION_VALIDATION_FAILED",
-    "REVIEW_STARTED",
-    "REWORK_STARTED",
-}
+from issue_orchestrator.ports.event_sink import run_scoped_event_names
 
-RUN_SCOPED_EVENT_STRING_NAMES = {
-    "session.started",
-    "session.processing_completed",
-    "session.validation_passed",
-    "session.validation_retry_needed",
-    "session.validation_failed",
-    "review.started",
-    "rework.started",
-}
+RUN_SCOPED_EVENT_ENUM_NAMES = {event.name for event in run_scoped_event_names()}
+RUN_SCOPED_EVENT_STRING_NAMES = {event.value for event in run_scoped_event_names()}
 
 
 def _is_run_scoped_event_expr(node: ast.expr) -> bool:

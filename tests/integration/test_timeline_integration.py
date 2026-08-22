@@ -83,7 +83,13 @@ def _start_run_with_artifacts(
     claude_log.write_text('{"type":"assistant","content":"ok"}\n', encoding="utf-8")
     completion_record = run.run_dir / "completion-agent_backend.json"
     completion_record.write_text('{"outcome":"completed"}\n', encoding="utf-8")
-    session_output.update_manifest(run.run_dir, {"claude_log_path": str(claude_log)})
+    session_output.update_manifest(
+        run.run_dir,
+        {
+            "claude_log_path": str(claude_log),
+            "completion_path": str(completion_record),
+        },
+    )
     return str(run.run_dir)
 
 

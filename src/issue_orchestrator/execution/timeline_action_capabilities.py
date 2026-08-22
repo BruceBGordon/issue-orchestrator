@@ -1,4 +1,4 @@
-"""Typed capability policy for worktree-scoped Timeline actions."""
+"""Typed filesystem capabilities for worktree-scoped Timeline actions."""
 
 from __future__ import annotations
 
@@ -7,9 +7,11 @@ from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from typing import TypeAlias, assert_never
+from urllib.parse import urlsplit
 
 from ..events import EventName
-from ..execution.timeline_artifact_expectations import event_requires_run_dir
+from .manifest_accessor import worktree_path_from_run_dir
+from .timeline_artifact_expectations import event_requires_run_dir
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,6 +49,13 @@ class TimelineLocalArtifactKind(StrEnum):
     WORKTREE = "worktree"
 
 
+class TimelineUrlArtifactKind(StrEnum):
+    """Artifact kinds whose value is an external URL, never a local path."""
+
+    PULL_REQUEST = "pull_request"
+    REVIEW_COMMENT = "review_comment"
+
+
 _REVIEW_FEEDBACK_EVENTS = frozenset(
     {
         EventName.REVIEW_EXCHANGE_ROUND_COMPLETED,
@@ -78,7 +87,11 @@ def classify_timeline_run_artifacts(
                 f"issue={issue_number} event={event_name}"
             )
         return UnscopedTimelineEvent()
-    if not isinstance(raw_run_dir, str) or not raw_run_dir.strip():
+    if (
+        not isinstance(raw_run_dir, str)
+        or not raw_run_dir.strip()
+        or raw_run_dir != raw_run_dir.strip()
+    ):
         raise RuntimeError(
             "timeline event has invalid run_dir: "
             f"issue={issue_number} event={event_name}"
@@ -92,8 +105,13 @@ def classify_timeline_run_artifacts(
         )
     try:
         mode = run_dir.stat().st_mode
-    except (FileNotFoundError, NotADirectoryError):
+    except FileNotFoundError:
         return MissingRunArtifacts(run_dir=run_dir)
+    except NotADirectoryError as exc:
+        raise RuntimeError(
+            "timeline event run_dir has a non-directory parent: "
+            f"issue={issue_number} event={event_name} run_dir={run_dir}"
+        ) from exc
     if not stat.S_ISDIR(mode):
         raise RuntimeError(
             "timeline event run_dir is not a directory: "
@@ -141,20 +159,72 @@ def timeline_local_artifact_kind(value: str) -> TimelineLocalArtifactKind | None
         return None
 
 
+def timeline_url_artifact_kind(value: str) -> TimelineUrlArtifactKind | None:
+    """Parse a wire artifact name into the external-URL vocabulary."""
+    try:
+        return TimelineUrlArtifactKind(value)
+    except ValueError:
+        return None
+
+
+def require_external_timeline_url(
+    *,
+    value: str,
+    artifact_kind: TimelineUrlArtifactKind,
+    issue_number: int,
+) -> str:
+    """Return a canonical HTTP(S) URL or reject the typed URL claim."""
+    if value != value.strip() or not value:
+        raise RuntimeError(
+            "timeline event has invalid external artifact URL: "
+            f"issue={issue_number} type={artifact_kind.value}"
+        )
+    parsed = urlsplit(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise RuntimeError(
+            "timeline event external artifact is not an HTTP(S) URL: "
+            f"issue={issue_number} type={artifact_kind.value} value={value}"
+        )
+    return value
+
+
 def require_existing_timeline_artifact(
     *,
+    run_artifacts: AvailableRunArtifacts,
     artifact_path: Path,
     artifact_kind: TimelineLocalArtifactKind,
     issue_number: int,
-) -> None:
-    """Reject a local artifact claim that contradicts an available run."""
+) -> Path:
+    """Return the canonical path only when the selected run owns the artifact."""
+    resolved_artifact = _resolve_existing_artifact(
+        artifact_path,
+        artifact_kind=artifact_kind,
+        issue_number=issue_number,
+    )
+    resolved_run_dir = run_artifacts.run_dir.resolve(strict=True)
+    _require_artifact_ownership(
+        resolved_artifact,
+        run_dir=resolved_run_dir,
+        artifact_kind=artifact_kind,
+        issue_number=issue_number,
+    )
+    return resolved_artifact
+
+
+def _resolve_existing_artifact(
+    artifact_path: Path,
+    *,
+    artifact_kind: TimelineLocalArtifactKind,
+    issue_number: int,
+) -> Path:
     if not artifact_path.is_absolute():
         raise RuntimeError(
             "timeline event local artifact path is not absolute: "
             f"issue={issue_number} type={artifact_kind.value} path={artifact_path}"
         )
     try:
-        mode = artifact_path.stat().st_mode
+        resolved_artifact = artifact_path.resolve(strict=True)
+        mode = resolved_artifact.stat().st_mode
     except (FileNotFoundError, NotADirectoryError) as exc:
         raise RuntimeError(
             "timeline event references missing local artifact: "
@@ -173,3 +243,78 @@ def require_existing_timeline_artifact(
             f"issue={issue_number} type={artifact_kind.value} "
             f"expected={expected} path={artifact_path}"
         )
+    return resolved_artifact
+
+
+def _require_artifact_ownership(
+    artifact_path: Path,
+    *,
+    run_dir: Path,
+    artifact_kind: TimelineLocalArtifactKind,
+    issue_number: int,
+) -> None:
+    match artifact_kind:
+        case TimelineLocalArtifactKind.RUN_DIR:
+            expected_path = run_dir
+        case TimelineLocalArtifactKind.WORKTREE:
+            expected_path = worktree_path_from_run_dir(run_dir)
+            if expected_path is None:
+                raise RuntimeError(
+                    "timeline run directory has no owning worktree boundary: "
+                    f"issue={issue_number} run_dir={run_dir}"
+                )
+        case (
+            TimelineLocalArtifactKind.COMPLETION_RECORD
+            | TimelineLocalArtifactKind.VALIDATION
+            | TimelineLocalArtifactKind.DIAGNOSTIC
+            | TimelineLocalArtifactKind.CHAPTER_SIDECAR
+            | TimelineLocalArtifactKind.PROMPT
+            | TimelineLocalArtifactKind.REVIEW_RESPONSE
+        ):
+            _require_within_run(
+                artifact_path,
+                run_dir,
+                issue_number=issue_number,
+                artifact_kind=artifact_kind,
+            )
+            return
+        case _:
+            assert_never(artifact_kind)
+    _require_same_path(
+        artifact_path,
+        expected_path,
+        issue_number=issue_number,
+        artifact_kind=artifact_kind,
+    )
+
+
+def _require_same_path(
+    actual: Path,
+    expected: Path,
+    *,
+    issue_number: int,
+    artifact_kind: TimelineLocalArtifactKind,
+) -> None:
+    if actual != expected:
+        raise RuntimeError(
+            "timeline event local artifact does not belong to selected run: "
+            f"issue={issue_number} type={artifact_kind.value} "
+            f"expected={expected} actual={actual}"
+        )
+
+
+def _require_within_run(
+    artifact_path: Path,
+    run_dir: Path,
+    *,
+    issue_number: int,
+    artifact_kind: TimelineLocalArtifactKind,
+) -> None:
+    try:
+        artifact_path.relative_to(run_dir)
+    except ValueError as exc:
+        raise RuntimeError(
+            "timeline event local artifact escapes selected run: "
+            f"issue={issue_number} type={artifact_kind.value} "
+            f"run_dir={run_dir} path={artifact_path}"
+        ) from exc

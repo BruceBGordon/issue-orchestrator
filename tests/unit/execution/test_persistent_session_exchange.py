@@ -713,6 +713,7 @@ class TestPersistentSessionExchangeHappyPath:
         ]
         assert len(round_completed) == 1
         assert len(completed) == 1
+        assert round_completed[0].data["run_dir"] == str(outcome.run_assets.run_dir)
         assert round_completed[0].data["review_decision_verdict"] == "approved"
         assert round_completed[0].data["review_nit_policy"] == "surface"
         assert round_completed[0].data["review_abstraction_status"] == "no_issues"

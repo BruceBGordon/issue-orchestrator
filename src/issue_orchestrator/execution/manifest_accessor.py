@@ -140,15 +140,17 @@ def _artifact_policy(artifact_type: str) -> _ArtifactPolicy:
     return policy
 
 
-def _worktree_path_from_run_dir(run_dir: Path) -> Path | None:
-    """Infer worktree root from a run directory path."""
-    parts = run_dir.resolve().parts
-    if ".issue-orchestrator" not in parts:
+def worktree_path_from_run_dir(run_dir: Path) -> Path | None:
+    """Return the worktree owning a canonical session-run directory."""
+    resolved_run_dir = run_dir.resolve()
+    sessions_dir = resolved_run_dir.parent
+    orchestrator_dir = sessions_dir.parent
+    if sessions_dir.name != "sessions" or orchestrator_dir.name != ".issue-orchestrator":
         return None
-    idx = parts.index(".issue-orchestrator")
-    if idx <= 0:
+    worktree_path = orchestrator_dir.parent
+    if worktree_path == orchestrator_dir:
         return None
-    return Path(*parts[:idx])
+    return worktree_path
 
 
 @dataclass(frozen=True)
@@ -499,7 +501,7 @@ class ManifestAccessor:
             raise ArtifactNotFoundError("manifest missing completion_path")
         path = Path(completion_path)
         if not path.is_absolute():
-            worktree = _worktree_path_from_run_dir(self.run_identity.run_dir)
+            worktree = worktree_path_from_run_dir(self.run_identity.run_dir)
             if not worktree:
                 raise ArtifactNotFoundError("failed to infer worktree for completion path")
             path = worktree / path
@@ -528,6 +530,25 @@ class ManifestAccessor:
         self._require_valid_json(path, artifact_name="validation record")
         return self._artifact_stream(
             "validation_record",
+            path,
+            content_type="application/json",
+        )
+
+    def get_diagnostic(self) -> ArtifactStream:
+        """Return the diagnostic file recorded by this exact run."""
+        manifest = self._load_manifest()
+        diagnostic_path = manifest.diagnostic_path
+        if not diagnostic_path:
+            raise ArtifactNotFoundError("manifest missing diagnostic_path")
+        path = Path(diagnostic_path)
+        if not path.is_absolute():
+            path = self.run_identity.run_dir / path
+        if not path.exists():
+            raise ArtifactNotFoundError(f"diagnostic not found: {path}")
+        self._require_non_empty(path, artifact_name="diagnostic")
+        self._require_valid_json(path, artifact_name="diagnostic")
+        return self._artifact_stream(
+            "diagnostic",
             path,
             content_type="application/json",
         )

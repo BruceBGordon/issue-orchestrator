@@ -25,19 +25,20 @@ from ..execution.manifest_accessor import (
     ManifestAccessor,
     RunIdentity,
 )
-from ..execution.timeline_artifact_expectations import event_requires_run_dir
-from ..timeline import MIN_SUPPORTED_TIMELINE_SCHEMA_VERSION, TIMELINE_SCHEMA_VERSION
-from ..view_models.timestamp_values import DETAIL_VALUE_KINDS_KEY, timeline_detail_value_kinds
-from .timeline_action_capabilities import (
+from ..execution.timeline_action_capabilities import (
     AvailableRunArtifacts,
-    MissingRunArtifacts,
     TimelineRunArtifacts,
     available_run_artifacts,
     classify_timeline_run_artifacts,
+    require_external_timeline_url,
     require_existing_timeline_artifact,
     review_feedback_event_name,
     timeline_local_artifact_kind,
+    timeline_url_artifact_kind,
 )
+from ..execution.timeline_artifact_expectations import event_requires_run_dir
+from ..timeline import MIN_SUPPORTED_TIMELINE_SCHEMA_VERSION, TIMELINE_SCHEMA_VERSION
+from ..view_models.timestamp_values import DETAIL_VALUE_KINDS_KEY, timeline_detail_value_kinds
 
 logger = logging.getLogger(__name__)
 
@@ -326,7 +327,7 @@ def _timeline_event_recommended_actions(
     if feedback_action is not None:
         action, dedupe = feedback_action
         add_action(action, dedupe)
-    if event_name.startswith("validation."):
+    if available_run is not None and event_name.startswith("validation."):
         add_action(
             {
                 "type": "open_orchestrator_log",
@@ -335,9 +336,7 @@ def _timeline_event_recommended_actions(
             },
             f"orchestrator:{issue_number}",
         )
-    if event_name in _TIMELINE_FAILURE_EVENTS and not isinstance(
-        run_artifacts, MissingRunArtifacts
-    ):
+    if available_run is not None and event_name in _TIMELINE_FAILURE_EVENTS:
         add_action(
             {
                 "type": "open_session_diagnostics",
@@ -425,10 +424,16 @@ def _timeline_event_artifact_actions(
         value = str(artifact.get("value") or "")
         if not value:
             continue
-        if value.startswith("http://") or value.startswith("https://"):
+        url_artifact_kind = timeline_url_artifact_kind(artifact_type)
+        if url_artifact_kind is not None:
+            url = require_external_timeline_url(
+                value=value,
+                artifact_kind=url_artifact_kind,
+                issue_number=issue_number,
+            )
             add_action(
-                {"type": "open_url", "label": f"Open {label} ↗", "url": value},
-                value,
+                {"type": "open_url", "label": f"Open {label} ↗", "url": url},
+                url,
             )
             continue
         if available_run is None:
@@ -448,14 +453,15 @@ def _timeline_event_artifact_actions(
             continue
         local_artifact_kind = timeline_local_artifact_kind(artifact_type)
         if local_artifact_kind is not None:
-            require_existing_timeline_artifact(
+            artifact_path = require_existing_timeline_artifact(
+                run_artifacts=available_run,
                 artifact_path=Path(value),
                 artifact_kind=local_artifact_kind,
                 issue_number=issue_number,
             )
             add_action(
-                {"type": "open_path", "label": f"Open {label}", "path": value},
-                value,
+                {"type": "open_path", "label": f"Open {label}", "path": str(artifact_path)},
+                str(artifact_path),
             )
 
     if available_run is not None:
@@ -478,7 +484,9 @@ def _timeline_event_default_actions(
 ) -> None:
     """Add default diagnostics and log actions shown for every timeline event."""
     available_run = available_run_artifacts(run_artifacts)
-    if include_run_scoped and available_run is not None:
+    if available_run is None:
+        return
+    if include_run_scoped:
         session_action = _preferred_run_scoped_session_action(
             event=event,
             event_name=event_name,
@@ -501,15 +509,14 @@ def _timeline_event_default_actions(
         },
         f"orchestrator:{issue_number}",
     )
-    if not isinstance(run_artifacts, MissingRunArtifacts):
-        add_action(
-            {
-                "type": "open_session_diagnostics",
-                "label": "Diagnostics…",
-                "issue_number": issue_number,
-            },
-            f"diagnostics:{issue_number}",
-        )
+    add_action(
+        {
+            "type": "open_session_diagnostics",
+            "label": "Diagnostics…",
+            "issue_number": issue_number,
+        },
+        f"diagnostics:{issue_number}",
+    )
 
 
 def _agent_log_is_usable(log_path: Path) -> bool:

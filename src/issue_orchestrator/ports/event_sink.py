@@ -9,7 +9,8 @@ This is the key abstraction that keeps pluggy out of the core.
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Literal, NotRequired, Protocol, TYPE_CHECKING, TypedDict
+from functools import lru_cache
+from typing import Any, Literal, NotRequired, overload, Protocol, TYPE_CHECKING, TypedDict
 
 from ..domain.review_artifacts import (
     AbstractionReviewStatus,
@@ -26,16 +27,31 @@ if TYPE_CHECKING:
         EventName.SESSION_VALIDATION_PASSED,
         EventName.SESSION_VALIDATION_RETRY_NEEDED,
         EventName.SESSION_VALIDATION_FAILED,
+        EventName.SESSION_INVALID_COMPLETION_RECORD,
         EventName.REVIEW_STARTED,
         EventName.REWORK_STARTED,
+        EventName.REVIEW_EXCHANGE_ROUND_STARTED,
+        EventName.REVIEW_EXCHANGE_ROUND_COMPLETED,
+        EventName.REVIEW_EXCHANGE_ROLE_PROMPTED,
+        EventName.REVIEW_EXCHANGE_ROLE_FEEDBACK,
+        EventName.REVIEW_EXCHANGE_ROLE_TIMEOUT,
+        EventName.REVIEW_REWORK_STARTED,
+        EventName.REVIEW_REWORK_COMPLETED,
     ]
 else:
     RunScopedEventName = Any
 
 
-class RunScopedEventPayload(TypedDict):
+class RunIdentityEventPayload(TypedDict):
+    """Fields every issue-scoped run event must carry."""
+
     issue_number: int
     run_dir: str
+
+
+class RunScopedEventPayload(RunIdentityEventPayload):
+    """Shared optional fields for general run-scoped lifecycle events."""
+
     session_name: NotRequired[str]
     session_id: NotRequired[str]
     pr_number: NotRequired[int]
@@ -117,10 +133,12 @@ class ReviewExchangeDecisionEventFields(TypedDict):
     review_abstraction_status: NotRequired[AbstractionReviewStatus]
 
 
-class ReviewExchangeRoundCompletedEventPayload(ReviewExchangeDecisionEventFields):
+class ReviewExchangeRoundCompletedEventPayload(
+    RunIdentityEventPayload,
+    ReviewExchangeDecisionEventFields,
+):
     """Payload for ``review_exchange.round_completed`` events."""
 
-    issue_number: int
     session_name: str
     round_index: int
     reviewer_response_type: str | None
@@ -151,9 +169,23 @@ def make_trace_event(
     return TraceEvent(event_type, dict(data))
 
 
+@overload
+def make_run_scoped_event(
+    event_type: Literal[EventName.REVIEW_EXCHANGE_ROUND_COMPLETED],
+    data: ReviewExchangeRoundCompletedEventPayload,
+) -> "TraceEvent": ...
+
+
+@overload
 def make_run_scoped_event(
     event_type: RunScopedEventName,
     data: RunScopedEventPayload,
+) -> "TraceEvent": ...
+
+
+def make_run_scoped_event(
+    event_type: RunScopedEventName,
+    data: RunScopedEventPayload | ReviewExchangeRoundCompletedEventPayload,
 ) -> "TraceEvent":
     """Build a run-scoped event with typed payload requiring run_dir."""
     return TraceEvent(event_type, dict(data))
@@ -207,7 +239,34 @@ def make_review_exchange_round_completed_event(
     """Build a typed ``review_exchange.round_completed`` event."""
     from issue_orchestrator.events import EventName
 
-    return make_trace_event(EventName.REVIEW_EXCHANGE_ROUND_COMPLETED, dict(data))
+    return make_run_scoped_event(EventName.REVIEW_EXCHANGE_ROUND_COMPLETED, data)
+
+
+@lru_cache(maxsize=1)
+def run_scoped_event_names() -> frozenset["EventName"]:
+    """Return the single event-name policy that requires an exact run_dir."""
+    from issue_orchestrator.events import EventName
+
+    return frozenset(
+        {
+            EventName.SESSION_STARTED,
+            EventName.SESSION_ARTIFACT_LOOKUP,
+            EventName.SESSION_PROCESSING_COMPLETED,
+            EventName.SESSION_VALIDATION_PASSED,
+            EventName.SESSION_VALIDATION_RETRY_NEEDED,
+            EventName.SESSION_VALIDATION_FAILED,
+            EventName.SESSION_INVALID_COMPLETION_RECORD,
+            EventName.REVIEW_STARTED,
+            EventName.REWORK_STARTED,
+            EventName.REVIEW_EXCHANGE_ROUND_STARTED,
+            EventName.REVIEW_EXCHANGE_ROUND_COMPLETED,
+            EventName.REVIEW_EXCHANGE_ROLE_PROMPTED,
+            EventName.REVIEW_EXCHANGE_ROLE_FEEDBACK,
+            EventName.REVIEW_EXCHANGE_ROLE_TIMEOUT,
+            EventName.REVIEW_REWORK_STARTED,
+            EventName.REVIEW_REWORK_COMPLETED,
+        }
+    )
 
 
 def make_review_exchange_completed_event(
@@ -239,27 +298,9 @@ class TraceEvent:
     timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     event_id: int | None = None
 
-    _RUN_DIR_REQUIRED_EVENTS: frozenset[str] = field(
-        default=frozenset(
-            {
-                "session.started",
-                "session.artifact_lookup",
-                "session.processing_completed",
-                "session.validation_passed",
-                "session.validation_retry_needed",
-                "session.validation_failed",
-                "review.started",
-                "rework.started",
-            }
-        ),
-        init=False,
-        repr=False,
-        compare=False,
-    )
-
     def __post_init__(self) -> None:
         """Validate strict event invariants at construction time."""
-        if self.name not in self._RUN_DIR_REQUIRED_EVENTS:
+        if self.event_type not in run_scoped_event_names():
             return
         # Some non-issue-scoped helpers emit generic session events without issue_number.
         # Enforce run_dir only for issue-scoped timeline events.
