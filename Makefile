@@ -125,12 +125,24 @@ if [ ! -x "$(VENV_GUARD)" ]; then \
 fi;
 endef
 
-# $(call venv_decide,<caller>) - one execution; sets _outcome and _sync_args.
+# $(call venv_decide,<caller>,<operation>) - one execution; sets _outcome and
+# _sync_args, and validates the whole contract.
+#
+# The OPERATION is part of the question. Asking only "who owns this?" made
+# `allowed` meaningless here -- every Make decision defaulted to
+# sync-dependencies even for targets that recreate the environment -- and left
+# safety resting on a separate outcome check, which is two mechanisms for one
+# rule. The answer is also checked against the requested target and operation,
+# so this path enforces the same contract as the Python owner rather than a
+# looser variant of it.
 define venv_decide
 $(call venv_guard_required,$(1)) \
-_decision="$$($(VENV_GUARD) decide --quiet --venv "$(VENV_TARGET)" 2>/dev/null)"; _g=$$?; \
+_decision="$$($(VENV_GUARD) decide --quiet --venv "$(VENV_TARGET)" --operation $(2) 2>/dev/null)"; _g=$$?; \
 _outcome="$$(printf '%s\n' "$$_decision" | sed -n 's/^outcome=//p')"; \
 _sync_args="$$(printf '%s\n' "$$_decision" | sed -n 's/^sync_args=//p')"; \
+_allowed="$$(printf '%s\n' "$$_decision" | sed -n 's/^allowed=//p')"; \
+_answer_venv="$$(printf '%s\n' "$$_decision" | sed -n 's/^venv=//p')"; \
+_answer_op="$$(printf '%s\n' "$$_decision" | sed -n 's/^operation=//p')"; \
 case "$$_outcome" in \
 	owned) _expected=0 ;; \
 	shared) _expected=1 ;; \
@@ -138,23 +150,24 @@ case "$$_outcome" in \
 	unclaimed) _expected=3 ;; \
 	*) _expected=-1 ;; \
 esac; \
-if [ "$$_expected" -ge 0 ] && [ "$$_g" -ne "$$_expected" ]; then \
-	echo "$(1): the guard contradicted itself for $(VENV_TARGET) (outcome=$$_outcome exit=$$_g, expected $$_expected); refusing." >&2; \
+if [ "$$_expected" -lt 0 ] || [ "$$_g" -ne "$$_expected" ]; then \
+	echo "$(1): the guard contradicted itself for $(VENV_TARGET) (outcome='$$_outcome' exit=$$_g); refusing." >&2; \
 	exit 1; \
 fi; \
-_allowed="$$(printf '%s\n' "$$_decision" | sed -n 's/^allowed=//p')"; \
+if [ "$$_answer_venv" != "$(VENV_TARGET)" ]; then \
+	echo "$(1): the guard answered about '$$_answer_venv', not $(VENV_TARGET); refusing." >&2; \
+	exit 1; \
+fi; \
+if [ "$$_answer_op" != "$(2)" ]; then \
+	echo "$(1): the guard answered about operation '$$_answer_op', not $(2); refusing." >&2; \
+	exit 1; \
+fi; \
 if [ "$$_allowed" != "yes" ]; then \
-	echo "$(1): the guard did not permit this operation on $(VENV_TARGET) (outcome=$$_outcome)." >&2; \
+	echo "$(1): $(2) is not permitted on $(VENV_TARGET) (outcome=$$_outcome)." >&2; \
 	printf '%s\n' "$$_decision" | sed -n 's/^remedy=/  to fix: /p' >&2; \
 	exit 1; \
 fi; \
-if [ "$$_outcome" != "owned" ] && [ "$$_outcome" != "shared" ]; then \
-	echo "$(1): refusing to mutate $(VENV_TARGET) (outcome='$$_outcome' exit=$$_g)." >&2; \
-	printf '%s\n' "$$_decision" | sed -n 's/^reason=/  reason: /p' >&2; \
-	printf '%s\n' "$$_decision" | sed -n 's/^remedy=/  to fix: /p' >&2; \
-	exit 1; \
-fi; \
-if [ -z "$$_sync_args" ]; then \
+if [ -z "$$_sync_args" ] && [ "$(2)" != "recreate" ]; then \
 	echo "$(1): the guard authorized $(VENV_TARGET) but supplied no arguments; refusing rather than guessing." >&2; \
 	exit 1; \
 fi;
@@ -173,9 +186,9 @@ define venv_uv_sync
 UV_PROJECT_ENVIRONMENT="$(VENV_TARGET)" $(UV) sync $$_sync_args
 endef
 
-# $(call venv_sync,<target-name>) - the guarded sync for a recipe.
+# $(call venv_sync,<target-name>,<operation>) - the guarded sync for a recipe.
 define venv_sync
-$(call venv_decide,$(1)) \
+$(call venv_decide,$(1),$(2)) \
 if [ ! -x "$(UV)" ]; then \
 	echo "$(1): uv not found. Run: curl -LsSf https://astral.sh/uv/install.sh | sh" >&2; \
 	exit 1; \
@@ -184,10 +197,10 @@ $(call venv_uv_sync) || exit $$?; \
 if [ "$$_outcome" = "owned" ]; then touch .venv/.deps-synced; fi
 endef
 
-# $(call venv_require_owned,<target-name>) - destructive targets that recreate
+# $(call venv_require_owned,<target-name>,<operation>) - destructive targets that recreate
 # .venv. Only an owned environment may be destroyed and rebuilt.
 define venv_require_owned
-$(call venv_decide,$(1)) \
+$(call venv_decide,$(1),$(2)) \
 if [ "$$_outcome" != "owned" ]; then \
 	echo "$(1): refusing to recreate a .venv this checkout does not own." >&2; \
 	exit 1; \
@@ -198,7 +211,7 @@ venv: ensure-uv
 	@mkdir -p $$(dirname $(SETUP_LOG))
 	@# Destructive: this target rm -rf's .venv. Refuse outright on a shared venv
 	@# rather than quietly converting a worktree from shared to private.
-	@$(call venv_require_owned,make venv) \
+	@$(call venv_require_owned,make venv,recreate) \
 	if [ -d .venv ]; then \
 		echo "Removing existing .venv..."; \
 		rm -rf .venv; \
@@ -218,7 +231,7 @@ venv: ensure-uv
 # Fast, reliable venv setup: reuse if present, otherwise create
 venv-fast: ensure-uv
 	@mkdir -p $$(dirname $(SETUP_LOG))
-	@$(call venv_decide,make venv-fast) \
+	@$(call venv_decide,make venv-fast,sync-dependencies) \
 	t0=$$(date +%s); \
 	if [ "$$_outcome" = "owned" ] && [ ! -d .venv ]; then \
 		echo "Creating venv with $(SYSTEM_PYTHON) and installing dependencies..."; \
@@ -255,7 +268,7 @@ semgrep-venv: ensure-uv
 # Legacy pip-based venv for systems without uv
 venv-pip:
 	@mkdir -p $$(dirname $(SETUP_LOG))
-	@$(call venv_require_owned,make venv-pip)
+	@$(call venv_require_owned,make venv-pip,recreate)
 	@if [ -d .venv ]; then \
 		echo "Removing existing .venv..."; \
 		rm -rf .venv; \
@@ -304,7 +317,7 @@ worktree-setup: venv-fast
 
 # Install/reinstall dependencies
 install: ensure-uv
-	@$(call venv_sync,make install)
+	@$(call venv_sync,make install,sync-dependencies)
 	@$(GMAKE) --no-print-directory semgrep-venv
 
 preview-readme:
@@ -322,7 +335,7 @@ else
 	$(UV) lock
 endif
 	@echo "Syncing dependencies..."
-	@$(call venv_sync,make upgrade-deps)
+	@$(call venv_sync,make upgrade-deps,sync-dependencies)
 	@$(GMAKE) --no-print-directory semgrep-venv
 	@echo ""
 	@echo "Done! Commit uv.lock with your changes."
@@ -369,7 +382,7 @@ else
 	cd packages/vscode && npm update
 endif
 	@echo "==> Syncing Python environment..."
-	@$(call venv_sync,make deps-batch)
+	@$(call venv_sync,make deps-batch,sync-dependencies)
 	@$(GMAKE) --no-print-directory semgrep-venv
 	@echo ""
 	@echo "==> Verifying with the full required suite (agent lane + test-vscode)..."
@@ -487,7 +500,7 @@ DEPS_MARKER ?= .venv/.deps-synced
 # Auto-sync dependencies if pyproject.toml or uv.lock is newer than last sync
 # This prevents cryptic errors like "unrecognized arguments: -n" when pytest-xdist is missing
 sync-deps:
-	@$(call venv_decide,[sync-deps]) \
+	@$(call venv_decide,[sync-deps],sync-dependencies) \
 	if [ "$$_outcome" = "owned" ] && [ -f $(DEPS_MARKER) ] && \
 	   [ ! pyproject.toml -nt $(DEPS_MARKER) ] && [ ! uv.lock -nt $(DEPS_MARKER) ]; then \
 		exit 0; \

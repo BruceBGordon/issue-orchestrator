@@ -324,6 +324,20 @@ sync_deps() {
     return 1
   fi
 
+  # The same contract the Python owner enforces: the answer must be about the
+  # environment and the operation that were asked about.
+  local answered_venv answered_op
+  answered_venv="$(printf '%s\n' "${VENV_DECISION}" | sed -n 's/^venv=//p')"
+  answered_op="$(printf '%s\n' "${VENV_DECISION}" | sed -n 's/^operation=//p')"
+  if [[ "${answered_venv}" != "${VENV_PATH}" ]]; then
+    echo "ERROR: the venv guard answered about '${answered_venv}', not ${VENV_PATH}; refusing." >&2
+    return 1
+  fi
+  if [[ "${answered_op}" != "install-project" ]]; then
+    echo "ERROR: the venv guard answered about operation '${answered_op}', not install-project; refusing." >&2
+    return 1
+  fi
+
   case "${guard_outcome}" in
     0) ;;
     1)

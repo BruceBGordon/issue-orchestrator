@@ -492,3 +492,97 @@ def test_venv_target_checks_that_creation_succeeded(tmp_path: Path) -> None:
 
     assert run.returncode != 0, run.output
     assert not run.synced_project(), "synced into a venv that was never created"
+
+
+# ---- the contract must be identical on every path -------------------------
+
+
+def _answering_guard(checkout: Path, body: str) -> None:
+    guard = checkout / "scripts" / "venv_guard.sh"
+    guard.write_text("#!/usr/bin/env bash\n" + body)
+    guard.chmod(0o755)
+
+
+@pytest.mark.parametrize(
+    "target,operation",
+    [("venv", "recreate"), ("venv-pip", "recreate"),
+     ("sync-deps", "sync-dependencies"), ("install", "sync-dependencies")],
+)
+def test_each_target_declares_the_operation_it_performs(
+    target: str, operation: str, tmp_path: Path
+) -> None:
+    """`allowed` is meaningless if every caller asks the same generic question.
+
+    Every Make decision defaulted to sync-dependencies, including targets that
+    destroy and rebuild the environment, leaving safety to rest on a separate
+    outcome check instead.
+    """
+    checkout = _make_checkout(tmp_path)
+    log = tmp_path / "asked.log"
+    _answering_guard(
+        checkout,
+        f'printf "%s\\n" "$*" >> {log}\n'
+        'venv=""; operation=""\n'
+        'while [ $# -gt 0 ]; do case "$1" in --venv) venv="$2"; shift ;; '
+        '--operation) operation="$2"; shift ;; esac; shift; done\n'
+        'echo "outcome=owned"; echo "sync_args=--frozen --all-extras"\n'
+        'echo "venv=$venv"; echo "operation=$operation"; echo "allowed=yes"\n'
+        "exit 0\n",
+    )
+
+    _run_make(checkout, target, tmp_path)
+
+    asked = log.read_text() if log.exists() else ""
+    assert f"--operation {operation}" in asked, asked
+
+
+@pytest.mark.parametrize("target", ["sync-deps", "venv-fast", "install"])
+def test_make_refuses_an_answer_about_a_different_environment(
+    target: str, tmp_path: Path
+) -> None:
+    """The returned target must equal the requested one, on every path."""
+    checkout = _make_checkout(tmp_path)
+    _answering_guard(
+        checkout,
+        'echo "outcome=owned"; echo "sync_args=--frozen --all-extras"\n'
+        'echo "venv=/somewhere/else"; echo "operation=sync-dependencies"\n'
+        'echo "allowed=yes"\nexit 0\n',
+    )
+
+    run = _run_make(checkout, target, tmp_path)
+
+    assert run.returncode != 0, run.output
+    assert not run.ran_uv(), run.uv_calls
+
+
+@pytest.mark.parametrize("target", ["sync-deps", "venv-fast", "install"])
+def test_make_refuses_an_answer_about_a_different_operation(
+    target: str, tmp_path: Path
+) -> None:
+    checkout = _make_checkout(tmp_path)
+    _answering_guard(
+        checkout,
+        'venv=""\nwhile [ $# -gt 0 ]; do case "$1" in --venv) venv="$2"; shift ;; esac; shift; done\n'
+        'echo "outcome=owned"; echo "sync_args=--frozen --all-extras"\n'
+        'echo "venv=$venv"; echo "operation=recreate"; echo "allowed=yes"\nexit 0\n',
+    )
+
+    run = _run_make(checkout, target, tmp_path)
+
+    assert run.returncode != 0, run.output
+    assert not run.ran_uv(), run.uv_calls
+
+
+def test_make_refuses_when_the_operation_is_not_permitted(tmp_path: Path) -> None:
+    """A shared venv may not be recreated, and the refusal must be actionable."""
+    owner = tmp_path / "owner"
+    (owner / ".venv").mkdir(parents=True)
+    (owner / "pyproject.toml").write_text("[project]\nname='o'\n")
+    checkout = _make_checkout(tmp_path)
+    (checkout / ".venv").symlink_to(owner / ".venv", target_is_directory=True)
+
+    run = _run_make(checkout, "venv", tmp_path)
+
+    assert run.returncode != 0, run.output
+    assert not run.ran_uv(), run.uv_calls
+    assert (owner / ".venv").exists(), "the owner's environment was destroyed"
