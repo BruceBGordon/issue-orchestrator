@@ -1741,9 +1741,10 @@ class SessionController:
 
 1. Run `git status --short`.
 2. Commit files that belong to the requested fix.
-3. Remove, revert, or stash unrelated/generated files that should not be part of this issue.
-4. Run `prepush-check --dirty-only -v`; it must pass before `coding-done`.
-5. Run `coding-done completed --implementation "describe what you fixed" --problems "any remaining issues"`.
+3. Remove, revert, or `.gitignore` unrelated/generated files that should not be part of this issue.
+4. Do not `git stash` - a stash is invisible to the orchestrator, and it leaves HEAD on the commit you are about to replace.
+5. Run `prepush-check --dirty-only -v`; it must pass before `coding-done`.
+6. Run `coding-done completed --implementation "describe what you fixed" --problems "any remaining issues"`.
 
 Runtime note: orchestrator-managed metadata under `.issue-orchestrator/` and `.claude/` is ignored by the orchestrator dirty guard. Tracked project files, generated sources, lock files, schemas, and other repo changes must still be committed or removed.
 

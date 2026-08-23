@@ -41,6 +41,17 @@ def find_worktree_root() -> Path:
 DIRTY_CHECK_MODES = {"tracked", "unstaged", "all", "off"}
 DIRTY_FILE_LIST_LIMIT = 20
 
+# Why "commit", never "stash": the publish gate records its result against HEAD,
+# and the git pre-push hook reuses that record only when it matches the commit
+# being pushed. Stashing hides the change without moving HEAD, so the gate would
+# certify a SHA that is about to be replaced -- and a stashed change never
+# reaches the push at all.
+DIRTY_GUARD_COMMIT_FIRST_HINT = (
+    "Do not stash: the publish gate records its result against HEAD, which "
+    "the pre-push hook reuses. Commit first so the recorded result matches "
+    "the commit that gets pushed."
+)
+
 
 @dataclass(frozen=True)
 class PrepushValidationOutcome:
@@ -125,15 +136,16 @@ def _run_dirty_guard(worktree: Path, mode: str, verbose: bool) -> Optional[int]:
             if mode == "all":
                 print(
                     "Working tree is dirty (tracked or untracked files); "
-                    "commit, add, or stash before pushing. "
+                    "commit them before running this gate. "
                     "Override with validation.publish.dirty_check."
                 )
             else:
                 print(
-                    "Tracked files are dirty; commit or stash before pushing. "
-                    "Ignored files are allowed. "
+                    "Tracked files are dirty; commit them before running this "
+                    "gate. Ignored files are allowed. "
                     "Override with validation.publish.dirty_check."
                 )
+            print(DIRTY_GUARD_COMMIT_FIRST_HINT)
             _print_dirty_files(dirty_files)
         return 1
     return None

@@ -29,10 +29,11 @@ You implement the solution locally and report completion via `coding-done`. The 
 
 ```
 My mandatory checklist before I can exit:
-[ ] 1. Verify my changes work (run validation)
+[ ] 1. Verify my changes work (make validate)
 [ ] 2. Commit my changes (git add + git commit)
-[ ] 3. Call `coding-done` with implementation summary
-[ ] 4. Exit only AFTER coding-done succeeds
+[ ] 3. Run `make validate-pr` AT that commit (never before it)
+[ ] 4. Call `coding-done` with implementation summary
+[ ] 5. Exit only AFTER coding-done succeeds
 ```
 
 Then, as you complete each step, update the checklist in your response. **Do NOT skip any step.**
@@ -114,20 +115,18 @@ Write tests that verify **behavior**, not implementation details. Ask: "Would a 
 
 See `tests/AGENTS.md` for the project's testing principles.
 
-### 4. Validate Your Changes
+### 4. Validate Your Changes (fast loop)
 
-**This is the most critical step. Do NOT skip it.**
+**Do NOT skip validation.** Steps 4-6 are what stand between your work and a
+wasted retry.
 
 ```bash
-make validate  # Runs tests, type checks, linting
+make validate-quick  # typecheck + unit tests - your inner loop
+make validate        # tests, type checks, linting
 ```
 
-For a full local PR/pre-push gate, run `make validate-pr`, not
-`make validate-pr-raw`. `make validate-pr` is the cache-aware entrypoint: it
-records the successful `HEAD` + raw publish command result that the later
-pre-push hook reuses. `make validate-pr-raw` is the underlying uncached command
-used inside that gate; running it manually can make the real pre-push hook run
-the same expensive suite again.
+These are the cheap, uncached commands. Iterate on them freely while you work.
+The expensive PR gate comes *after* you commit — see step 6.
 
 If validation fails:
 1. **Read the error output carefully** — identify the root cause, not just the first error
@@ -158,6 +157,38 @@ When that happens, decide for each dirty file:
 
 **Do not** `git stash` — your work belongs in a commit or in `.gitignore`, not
 in a stash the orchestrator can't see. Re-run `coding-done` after fixing.
+
+### 6. Run the Full PR Gate — AT the Commit, Never Before It
+
+Once your work is committed, run the required local publish gate **once**, at
+that commit:
+
+```bash
+make validate-pr
+```
+
+**Order matters, and it is not a style preference.** `make validate-pr` is the
+cache-aware entrypoint (`scripts/verify-pr.sh` → `prepush-check -v`). It records
+the green result against the current `HEAD` SHA, and the git pre-push hook reuses
+that record when the branch is pushed. Run it before committing and you get
+neither:
+
+- The dirty-tree guard runs **first**, so on an uncommitted tree `make
+  validate-pr` exits non-zero without validating anything.
+- Commit after a green run and the record points at the *parent* commit, so the
+  pre-push hook misses and re-runs the entire suite — routinely 5-20 minutes,
+  long enough to burn the session's wall-clock budget and strand finished work.
+
+If the gate fails: fix it, **commit the fix**, then re-run `make validate-pr`.
+The green must land on the commit that actually gets pushed.
+
+Do **not** run `make validate-pr-raw` by hand. It is the uncached command that
+runs *inside* the gate; invoking it directly validates without recording
+anything, so the pre-push hook runs the same expensive suite over again.
+
+Never `git stash` to satisfy the dirty guard — stashing leaves `HEAD` on the
+commit you are about to replace, so you would seed a record for a SHA that is
+already stale.
 
 ---
 

@@ -353,7 +353,7 @@ class TestHistoryEntryCreation:
         handler = make_handler(config)
 
         processing_errors = [
-            f"{ERROR_PREFIX_PUBLISH_BLOCKED}: Working tree is dirty; commit/add/stash before pushing."
+            f"{ERROR_PREFIX_PUBLISH_BLOCKED}: Working tree is dirty; commit before pushing (stashing leaves HEAD stale)."
         ]
 
         result = handler.process_completion(
@@ -2000,7 +2000,7 @@ class TestLabelActionGeneration:
             session,
             SessionStatus.COMPLETED,
             processing_errors=[
-                f"{ERROR_PREFIX_PUBLISH_BLOCKED}: Working tree is dirty; commit/add/stash before pushing."
+                f"{ERROR_PREFIX_PUBLISH_BLOCKED}: Working tree is dirty; commit before pushing (stashing leaves HEAD stale)."
             ],
         )
 

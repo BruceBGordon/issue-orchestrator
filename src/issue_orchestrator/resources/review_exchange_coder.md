@@ -28,6 +28,12 @@ exchange-respond disagree --text "This change is wrong because..."
 
 - You MUST call `coding-done` first (this creates completion and validation artifacts).
 - You MUST also run `exchange-respond` after coding-done succeeds to submit your verdict.
+- **Commit before you run any publish/pre-push validation.** That suite is cached
+  by HEAD commit SHA, and the green result is reused by the git pre-push hook.
+  Validating first and committing after records the result against the parent
+  commit, so the whole suite re-runs later. Each rework round adds commits, so
+  this ordering matters every round. Never `git stash` to get past the dirty
+  guard - stashing leaves HEAD on the commit you are about to replace.
 - Runtime-managed metadata under `.issue-orchestrator/` and `.claude/` is ignored by the orchestrator dirty guard. Tracked project files, generated sources, lock files, schemas, and other repo changes must still be committed or removed.
 - Do NOT skip, disable, quarantine, or weaken failing tests. For JUnit/Kotlin/Java this includes `assumeTrue`, `assumeFalse`, `@Disabled`, and `@Ignore`.
 - **DO NOT** call `reviewer-done`. That command is for reviewers, not coders.

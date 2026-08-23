@@ -21,6 +21,36 @@ If you genuinely cannot commit certain files (e.g., they shouldn't be tracked), 
 
 ---
 
+## IMPORTANT: Commit First, THEN Run the Publish Gate
+
+The publish validation suite is cached by **HEAD commit SHA**. A green result is
+reused by the git pre-push hook that actually publishes your branch — and by any
+later re-run of the gate itself — but only if it was recorded at the *exact
+commit that gets pushed*.
+
+So the order is:
+
+1. Iterate with the fast/quick validation command while you work.
+2. **Commit** once you believe the change is done.
+3. **Then** run the full publish gate: `prepush-check -v` (or this repo's
+   cache-aware wrapper around it, if it has one).
+4. If it fails: fix, **commit again**, and re-run `prepush-check -v`.
+
+Running the publish gate before committing is wasted work, twice over:
+
+- The dirty-tree guard runs **first**, so on an uncommitted tree the gate exits
+  non-zero without validating anything at all.
+- If you commit after a green run, the result is recorded against the *parent*
+  commit. Every later consumer misses the cache and re-runs the whole suite,
+  which on a large repo can exceed the session's time budget and strand your
+  work.
+
+**Do not `git stash` to get past the dirty guard.** Stashing leaves HEAD on the
+parent commit, so the gate records a result for a SHA you are about to
+invalidate. Commit instead.
+
+---
+
 ## IMPORTANT: Do Not Skip Tests
 
 Do not disable, skip, quarantine, or weaken failing tests to make validation pass.

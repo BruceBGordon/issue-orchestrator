@@ -157,6 +157,24 @@ pytest tests/unit/ -v          # unit test suite
 pytest tests/e2e/ -v           # Live e2e tests (requires gh auth)
 ```
 
+**Commit before you run `make validate-pr`:**
+```bash
+make validate-quick            # inner loop - cheap, uncached
+git add -A && git commit -m "..."
+make validate-pr               # required gate - run it AT the commit
+```
+
+`make validate-pr` records its green result against the current `HEAD` SHA, and
+the git pre-push hook reuses that record on push, so the ordering is what makes
+the cache work:
+
+- On an uncommitted tree the dirty guard rejects the gate before it validates anything.
+- Committing *after* a green run records it against the parent commit, so every
+  later consumer misses and re-runs the full suite (5-20 min) at push time.
+- If the gate fails: fix, **commit the fix**, re-run `make validate-pr`.
+- Never `git stash` to get past the dirty guard — it leaves `HEAD` on the commit
+  you are about to replace. Never run `make validate-pr-raw` by hand; it records nothing.
+
 ## Async E2E Runner
 
 The orchestrator includes an async E2E test runner. See [docs/user/e2e.md](docs/user/e2e.md) for details.

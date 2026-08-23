@@ -86,11 +86,12 @@ pytest tests/e2e/ -v               # E2E tests (requires gh auth)
 
 ## Submitting changes
 
-1. Run `make validate-pr` before pushing for the required local publish gate; it is cache-aware and seeds the pre-push validation record
-2. CI mirrors `make validate-pr` by splitting the fast validate job and the agent-backed simulated/integration slices across separate required jobs
-3. Use `make validate-pr-raw` when you intentionally need to force the full uncached local suite at the same HEAD
-4. Tests must pass. If tests fail, fix them — don't defer.
-5. [CONTRIBUTING.md](../../CONTRIBUTING.md) covers running tests from forks
+1. **Commit first, then run `make validate-pr`.** The gate records its green result against the current `HEAD` SHA, and the git pre-push hook reuses that record on push. Validate on an uncommitted tree and the dirty guard rejects it outright; commit *after* a green run and the record points at the parent commit, so the whole suite re-runs at push time
+2. If the gate fails, fix it, commit the fix, and re-run `make validate-pr` — the green must land on the commit that actually gets pushed. Never `git stash` to satisfy the dirty guard; stashing leaves `HEAD` on the commit you are about to replace
+3. CI mirrors `make validate-pr` by splitting the fast validate job and the agent-backed simulated/integration slices across separate required jobs
+4. Use `make validate-pr-raw` only when you intentionally need to force the full uncached local suite at the same HEAD; it records nothing, so the pre-push hook will re-run the same suite
+5. Tests must pass. If tests fail, fix them — don't defer.
+6. [CONTRIBUTING.md](../../CONTRIBUTING.md) covers running tests from forks
 
 ## Development docs reference
 

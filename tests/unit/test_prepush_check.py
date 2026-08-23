@@ -754,6 +754,72 @@ validation:
         finally:
             os.chdir(orig_cwd)
 
+    def test_dirty_guard_tells_agents_to_commit_not_stash(self, temp_worktree, capsys):
+        """The dirty guard must not offer stashing as a way past it.
+
+        The gate records its result against HEAD, and both the orchestrator's
+        publish gate and the git pre-push hook reuse that record only when it
+        matches the commit being pushed. Stashing hides the change without
+        moving HEAD, so it would certify a SHA that is about to be replaced.
+        """
+
+        config_dir = temp_worktree / ".issue-orchestrator" / "config" / "modes" / "default"
+        config_dir.mkdir(parents=True)
+        config_path = config_dir / "default.yaml"
+        config_path.write_text("""
+validation:
+  publish:
+    cmd: "echo 'ok'"
+    dirty_check: "tracked"
+""")
+
+        (temp_worktree / "README.md").write_text("dirty")
+
+        orig_cwd = os.getcwd()
+        try:
+            os.chdir(temp_worktree)
+            result = run_prepush_check(verbose=True)
+            captured = capsys.readouterr()
+        finally:
+            os.chdir(orig_cwd)
+
+        assert result == 1
+        assert "commit them before running this gate" in captured.out
+        assert "Do not stash" in captured.out
+        assert "matches the commit that gets pushed" in captured.out
+        # No wording anywhere may present stashing as an acceptable remedy.
+        assert "or stash" not in captured.out
+
+    def test_dirty_guard_all_mode_also_tells_agents_to_commit(
+        self, temp_worktree, capsys
+    ):
+        """The commit-first hint applies to every enforcing dirty_check mode."""
+
+        config_dir = temp_worktree / ".issue-orchestrator" / "config" / "modes" / "default"
+        config_dir.mkdir(parents=True)
+        config_path = config_dir / "default.yaml"
+        config_path.write_text("""
+validation:
+  publish:
+    cmd: "echo 'ok'"
+    dirty_check: "all"
+""")
+
+        (temp_worktree / "untracked.txt").write_text("x")
+
+        orig_cwd = os.getcwd()
+        try:
+            os.chdir(temp_worktree)
+            result = run_prepush_check(verbose=True)
+            captured = capsys.readouterr()
+        finally:
+            os.chdir(orig_cwd)
+
+        assert result == 1
+        assert "commit them before running this gate" in captured.out
+        assert "Do not stash" in captured.out
+        assert "or stash" not in captured.out
+
     def test_verbose_output_clips_dirty_file_list(self, temp_worktree, capsys):
         """Dirty file listing should be clipped with ellipsis for long lists."""
 
