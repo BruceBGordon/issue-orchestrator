@@ -113,6 +113,15 @@ venv: ensure-uv
 # Fast, reliable venv setup: reuse if present, otherwise create
 venv-fast: ensure-uv
 	@mkdir -p $$(dirname $(SETUP_LOG))
+	@# A .venv symlinked at another checkout's venv is a pre-change artifact.
+	@# Syncing through it would reinstall THIS checkout's project into that
+	@# environment and rewrite its editable pointer, so replace it with a
+	@# private venv. Nothing creates these any more; this retires the ones that
+	@# already exist.
+	@if [ -L .venv ] && [ "$$(cd .venv 2>/dev/null && pwd -P)" != "$(CURDIR)/.venv" ]; then \
+		echo "Replacing a .venv symlinked from another checkout with a private venv..."; \
+		rm -f .venv; \
+	fi
 	@if [ ! -d .venv ]; then \
 		echo "Creating venv with $(SYSTEM_PYTHON) and installing dependencies..."; \
 		t0=$$(date +%s); \

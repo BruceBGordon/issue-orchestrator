@@ -87,8 +87,10 @@ class TestApplyProducesRunnableWorktree:
 
         assert (worktree_path / ".claude" / "settings.json").exists()
         assert (worktree_path / WORKTREE_ID_MARKER).read_text() == state.worktree_id
-        assert (worktree_path / ".venv").is_symlink()
-        assert (worktree_path / ".venv").resolve() == (repo_root / ".venv").resolve()
+        # A worktree owns its environment: runtime setup must not plant a
+        # venv symlinked at the repo's, which is how the editable pointer
+        # used to be rewritten by whichever checkout synced last.
+        assert not (worktree_path / ".venv").exists()
         assert state.synced_cli_tool_paths
         for relative in state.synced_cli_tool_paths:
             assert (worktree_path / relative).exists()
