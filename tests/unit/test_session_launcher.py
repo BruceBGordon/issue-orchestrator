@@ -7588,3 +7588,81 @@ def _test_claim_store(tmp_path=None):
     return SqlitePendingWorkClaimStore.for_repo(
         _Path(tmp_path) if tmp_path is not None else _Path(tempfile.mkdtemp())
     )
+
+
+class TestSetupRunsExactlyOncePerLaunch:
+    """Setup must run once per launch, from the acquisition owner only.
+
+    Structural tests are not enough here: the AST guardrails passed while a
+    validation retry executed every configured setup command twice, because
+    the second caller *delegated* to the owner rather than reimplementing it.
+    Only counting executions catches that. For this repository a duplicate
+    means `make worktree-setup` twice per retry; for others, setup commands
+    are not guaranteed to be idempotent or cheap.
+    """
+
+    @staticmethod
+    def _setup_runs(runner) -> list[str]:
+        return [
+            call["command"]
+            for call in runner.run_calls
+            if call["command"] == "echo provision"
+        ]
+
+    def test_issue_launch_runs_setup_once(
+        self, launcher_bundle, sample_issue, mock_command_runner
+    ):
+        launcher_bundle.launcher.config.setup_worktree = ["echo provision"]
+
+        result = launcher_bundle.launcher.launch_issue_session(
+            sample_issue, active_sessions=[]
+        )
+
+        assert result.success is True, result.reason
+        assert self._setup_runs(mock_command_runner) == ["echo provision"]
+
+    def test_validation_retry_runs_setup_once(
+        self, launcher_bundle, mock_command_runner
+    ):
+        """The regression: acquisition provisioned, then the retry did it again.
+
+        Reusing a worktree is not a second trigger -- the acquisition owner
+        already provisioned that worktree during this same launch.
+        """
+        launcher_bundle.launcher.config.setup_worktree = ["echo provision"]
+        retry = PendingValidationRetry(
+            issue_number=123,
+            issue_title="Fix checkout",
+            agent_label="agent:web",
+            worktree_path="/tmp/worktree-123",
+            branch_name="123-fix-checkout",
+            original_prompt="Work on issue #123: Fix checkout",
+            validation_error="dirty worktree",
+            validation_error_file="/tmp/validation-errors.txt",
+            retry_count=1,
+            source_task=TaskKind.CODE,
+            validation_cmd="make test",
+        )
+
+        result = launcher_bundle.launcher.launch_validation_retry_session(
+            retry, active_sessions=[]
+        )
+
+        assert result.success is True, result.reason
+        assert self._setup_runs(mock_command_runner) == ["echo provision"], (
+            "validation retry must not re-provision a worktree acquisition "
+            "already provisioned in this launch"
+        )
+
+    def test_setup_runs_even_with_no_commands_configured(
+        self, launcher_bundle, sample_issue, mock_command_runner
+    ):
+        """The empty case must stay a no-op, not an error or a stray command."""
+        launcher_bundle.launcher.config.setup_worktree = []
+
+        result = launcher_bundle.launcher.launch_issue_session(
+            sample_issue, active_sessions=[]
+        )
+
+        assert result.success is True, result.reason
+        assert self._setup_runs(mock_command_runner) == []

@@ -53,7 +53,7 @@ from ..domain.coder_prompt import (
 )
 from ..domain.session_run import SessionRunAssets
 from .worktree import WorktreeSetupError
-from .worktree_context import WorktreeContext, prepare_worktree_environment
+from .worktree_context import WorktreeContext
 from ..infra.validation_state import DEFAULT_RETRY_TEMPLATE, _truncate_with_tail
 from ..domain.tech_lead_session import TechLeadLaunchScope
 from .tech_lead_session_policy import (
@@ -1287,9 +1287,6 @@ class SessionLauncher:
                 "validation_error_file": retry.validation_error_file,
             })
 
-            if setup_failure := self._run_validation_retry_setup(issue, worktree_path, claim):
-                return setup_failure
-
             self._clear_launch_retry_guards(
                 issue_number=issue.number,
                 mode="coding",
@@ -1403,29 +1400,6 @@ class SessionLauncher:
             }))
             self._trigger_issue_session_state_transitions(issue, session_name, agent_config.timeout_minutes)
             return LaunchResult(session, True)
-
-    def _run_validation_retry_setup(
-        self,
-        issue: Issue,
-        worktree_path: Path,
-        claim: ClaimAcquisitionResult,
-    ) -> LaunchResult | None:
-        """Run setup commands before retrying preserved work.
-
-        Validation retries intentionally keep the existing worktree, so
-        configured setup commands must be idempotent and non-destructive.
-        """
-        try:
-            # No empty-list guard here: the owner already returns early when
-            # the repository configures no setup commands, and a second reader
-            # of the config is how the two paths drifted apart before.
-            self._run_setup_commands(worktree_path)
-        except Exception as e:
-            log_transition("issue", issue.number, "LAUNCHING", "FAILED", "setup commands failed")
-            logger.error(issue_log(issue.number, "FAILED: setup commands failed: %s"), e)
-            self._release_claim_if_held(issue.number, claim)
-            return LaunchResult(None, False, f"Setup commands failed: {e}")
-        return None
 
     def _resolve_validation_retry_issue(
         self, retry: PendingValidationRetry
@@ -2153,20 +2127,6 @@ class SessionLauncher:
         )
         return launch_rework_flow(
             rework, active_sessions, deps, work_claim=work_claim
-        )
-
-    def _run_setup_commands(self, worktree_path: Path) -> None:
-        """Re-run the repository's worktree setup commands.
-
-        Acquisition (``WorktreeContext.create``) provisions every worktree, so
-        this exists only for the validation-retry trigger, which deliberately
-        keeps an existing worktree and re-provisions it. It delegates to the
-        same owner rather than carrying a second implementation.
-        """
-        prepare_worktree_environment(
-            config=self.config,
-            command_runner=self._command_runner,
-            worktree_path=worktree_path,
         )
 
     def _persist_session_prompt(self, run_dir: Path, prompt_text: str) -> str:
