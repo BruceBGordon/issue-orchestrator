@@ -10,16 +10,22 @@
 #      ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN does not skip it. Seeding
 #      hasCompletedOnboarding is the documented community workaround for an
 #      issue that has been open since 2025-10.
-#   2. `~/.claude.json` lives OUTSIDE `~/.claude`. Persisting only the directory
-#      is the single most common container auth failure.
+#   2. By default, `~/.claude.json` lives OUTSIDE `~/.claude`. When
+#      CLAUDE_CONFIG_DIR is set, Claude relocates the state file into that
+#      directory instead. Seeding the wrong layout leaves onboarding active.
 #
 # Idempotent: never overwrites an existing value, so a real login is preserved.
 set -euo pipefail
 
-config="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+if [[ -n "${CLAUDE_CONFIG_DIR:-}" ]]; then
+    config="$CLAUDE_CONFIG_DIR"
+    state="$config/.claude.json"
+else
+    config="$HOME/.claude"
+    state="$HOME/.claude.json"
+fi
 mkdir -p "$config"
 
-state="$HOME/.claude.json"
 python3 - "$state" <<'PY'
 import json
 import pathlib

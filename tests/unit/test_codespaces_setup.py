@@ -15,10 +15,16 @@ IMAGE_PREPARATION = REPO_ROOT / ".devcontainer" / "prepare-image.sh"
 ONBOARDING_SEED = REPO_ROOT / ".devcontainer" / "seed-agent-onboarding.sh"
 
 
-def _run_onboarding_seed(home: Path) -> subprocess.CompletedProcess[str]:
+def _run_onboarding_seed(
+    home: Path,
+    *,
+    claude_config_dir: Path | None = None,
+) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
     env["HOME"] = str(home)
-    env["CLAUDE_CONFIG_DIR"] = str(home / ".claude")
+    env.pop("CLAUDE_CONFIG_DIR", None)
+    if claude_config_dir is not None:
+        env["CLAUDE_CONFIG_DIR"] = str(claude_config_dir)
     return subprocess.run(
         [str(ONBOARDING_SEED)],
         env=env,
@@ -144,6 +150,18 @@ def test_agent_onboarding_seed_creates_only_required_fresh_state(tmp_path: Path)
     assert json.loads((tmp_path / ".claude.json").read_text()) == {
         "hasCompletedOnboarding": True
     }
+
+
+def test_agent_onboarding_seed_honors_claude_config_dir(tmp_path: Path) -> None:
+    config_dir = tmp_path / "custom-claude"
+
+    result = _run_onboarding_seed(tmp_path, claude_config_dir=config_dir)
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads((config_dir / ".claude.json").read_text()) == {
+        "hasCompletedOnboarding": True
+    }
+    assert not (tmp_path / ".claude.json").exists()
 
 
 def test_agent_onboarding_seed_preserves_existing_state_on_rerun(tmp_path: Path) -> None:
