@@ -217,7 +217,7 @@ class TestWriterFanOut:
         assert record.source_event == "claim.renewed"
         assert record.data["views"] == ["debug"]
 
-    def test_enrichment_uses_source_event_from_previous(self):
+    def test_enrichment_uses_source_event_from_previous(self, tmp_path):
         """Verify enrichment reads source_event, not event, from previous record."""
         store = self._make_store()
         prev = TimelineRecord(
@@ -230,7 +230,12 @@ class TestWriterFanOut:
         store.read.return_value = [prev]
         writer = DefaultTimelineWriter(store)
 
-        writer.record(self._make_event("session.failed"))
+        writer.record(
+            self._make_event(
+                "session.failed",
+                run_dir=str(tmp_path / "deleted-run"),
+            )
+        )
         assert store.append.called
 
     def test_phase_override_from_registry(self, tmp_path):
@@ -244,6 +249,7 @@ class TestWriterFanOut:
             {
                 "issue_number": 42,
                 "task": "code",
+                "run_dir": str(tmp_path / "deleted-run"),
                 "completion_path_absolute": str(completion),
             },
         )

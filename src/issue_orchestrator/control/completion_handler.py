@@ -39,7 +39,14 @@ from ..domain.models import (
     session_history_status_from_session_status,
 )
 from ..domain.session_key import TaskKind
-from ..ports import EventSink, make_trace_event, RepositoryHost, Issue
+from ..ports import (
+    EventSink,
+    Issue,
+    RepositoryHost,
+    make_session_completed_event,
+    make_session_failed_event,
+    make_trace_event,
+)
 from ..ports.session_output import SessionOutput
 from .actions import (
     Action,
@@ -631,7 +638,7 @@ class CompletionHandler:
         for key in ("implementation", "problems", "review_summary", "review_issues", "risk_level"):
             if detail.get(key):
                 payload[key] = detail[key]
-        self.events.publish(make_trace_event(EventName.SESSION_COMPLETED, payload))
+        self.events.publish(make_session_completed_event(payload))
 
         if pr_url and pr_number is not None:
             self.events.publish(
@@ -670,7 +677,7 @@ class CompletionHandler:
         payload.update(invalid_record_event_fields(detail))
         run_dir = self._resolve_session_run_dir(session)
         payload["run_dir"] = str(run_dir)
-        self.events.publish(make_trace_event(EventName.SESSION_FAILED, payload))
+        self.events.publish(make_session_failed_event(payload))
 
     def _emit_blocked_event(
         self, session: Session, blocked_reason: Optional[str], detail: dict[str, Any]

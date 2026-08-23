@@ -83,7 +83,13 @@ def _start_run_with_artifacts(
     claude_log.write_text('{"type":"assistant","content":"ok"}\n', encoding="utf-8")
     completion_record = run.run_dir / "completion-agent_backend.json"
     completion_record.write_text('{"outcome":"completed"}\n', encoding="utf-8")
-    session_output.update_manifest(run.run_dir, {"claude_log_path": str(claude_log)})
+    session_output.update_manifest(
+        run.run_dir,
+        {
+            "claude_log_path": str(claude_log),
+            "completion_path": str(completion_record),
+        },
+    )
     return str(run.run_dir)
 
 
@@ -853,6 +859,15 @@ def test_issue_detail_local_loop_review_rounds_split_into_distinct_cycles(
     run_dir_review = _start_run_with_artifacts(
         sample_config.repo_root, issue_number=issue_number, session_name="review-4057-exchange"
     )
+    review_exchange_dir = Path(run_dir_review) / "review-exchange"
+    for round_index, role in ((1, "reviewer"), (1, "coder"), (2, "reviewer")):
+        _write_terminal_recording(
+            review_exchange_dir
+            / f"round-{round_index:03d}"
+            / role
+            / "terminal-recording.jsonl",
+            f"round {round_index} {role} output\n",
+        )
 
     timeline_writer.record(TraceEvent(EventName.SESSION_STARTED, {
         "issue_number": issue_number,

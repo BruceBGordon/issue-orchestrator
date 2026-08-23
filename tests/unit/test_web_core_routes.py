@@ -615,22 +615,13 @@ class TestHostOpenPathEndpoint:
         assert response.status_code == 403
         assert response.json()["error"] == "Cannot open files outside safe directories"
 
-    def test_open_host_path_falls_back_to_host_repo_session_mirror(
+    def test_open_host_path_does_not_guess_a_replacement_for_a_deleted_run(
         self, tmp_path: Path
     ):
-        """Bug 1 regression: agent worktrees are deleted after PR merge,
-        but the SESSION_COMPLETED event payloads still carry absolute
-        paths rooted at the now-deleted worktree. The same files survive
-        in the host repo's session mirror under the same suffix
-        (``.issue-orchestrator/sessions/<session>/<file>``).
-
-        When the menu's ``open_path`` action sends one of these stale
-        absolute paths, the endpoint must re-anchor it against the
-        host repo and open the surviving copy instead of returning 404.
-        """
+        """A stale worktree path is expired, even if a similar suffix exists."""
         from issue_orchestrator.entrypoints import web
 
-        # Create a host repo with a session-mirror file.
+        # Create a different host-repo file with the same relative suffix.
         host_repo = tmp_path / "tixmeup-362"
         session_dir = host_repo / ".issue-orchestrator" / "sessions" / "coding-1"
         session_dir.mkdir(parents=True)
@@ -665,11 +656,9 @@ class TestHostOpenPathEndpoint:
             json={"path": stale_agent_worktree_path},
         )
 
-        assert response.status_code == 200, response.json()
-        # The endpoint resolved against the host mirror — the file that
-        # actually got opened is the one in the host repo, not the
-        # stale agent-worktree path.
-        assert response.json()["path"] == str(completion_record)
+        assert response.status_code == 404, response.json()
+        assert response.json() == {"error": "File not found"}
+        assert completion_record.exists()
 
     def test_open_host_path_rejects_path_traversal_via_dotdot_in_suffix(
         self, tmp_path: Path

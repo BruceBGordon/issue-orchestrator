@@ -346,8 +346,10 @@ observability:
   session_no_output_max_bytes: 10000
   session_no_output_repeat_seconds: 120
   session_output_retention_runs: 7
+  # These two values annotate artifacts while the worktree exists. Cleanup
+  # deletes the worktree and its artifacts; no archive is created.
   session_output_retention_days: 7
-  session_output_retention_tier: "hot"  # hot | cold
+  session_output_retention_tier: "hot"  # metadata tag: hot | cold
   stale_escalation_ticks: 0
   comment_headings:
     implementation: "## Implementation"

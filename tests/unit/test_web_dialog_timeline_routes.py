@@ -239,11 +239,17 @@ class TestApiTimelineEndpoint:
         worktree = tmp_path / "wt-timeline-returns-events"
         worktree.mkdir(parents=True)
         run = session_output.start_run(worktree, "issue-123", issue_number=123)
+        completion_path = run.run_dir / "completion.json"
+        completion_path.write_text('{"status":"completed"}\n', encoding="utf-8")
         (run.run_dir / "ui-session.log").write_text("agent output\n", encoding="utf-8")
         claude_log = run.run_dir / "claude.jsonl"
         claude_log.write_text('{"type":"assistant","content":"ok"}\n', encoding="utf-8")
         session_output.update_manifest(
-            run.run_dir, {"claude_log_path": str(claude_log)}
+            run.run_dir,
+            {
+                "claude_log_path": str(claude_log),
+                "completion_path": str(completion_path),
+            },
         )
 
         stream = TimelineStream(
@@ -262,9 +268,7 @@ class TestApiTimelineEndpoint:
                     parent_key="session:issue-123",
                     run_id="20260206-000000Z",
                     run_dir=str(run.run_dir),
-                    artifacts=[
-                        TimelineArtifact("worktree", "Worktree", "/tmp/worktree")
-                    ],
+                    artifacts=[TimelineArtifact("worktree", "Worktree", str(worktree))],
                     timeline_schema_version=TIMELINE_SCHEMA_VERSION,
                     event_intent="coding",
                     logical_run=1,
@@ -293,7 +297,7 @@ class TestApiTimelineEndpoint:
                         TimelineArtifact(
                             "completion_record",
                             "Completion",
-                            "/tmp/worktree/completion.json",
+                            str(completion_path),
                         ),
                     ],
                     timeline_schema_version=TIMELINE_SCHEMA_VERSION,
@@ -437,8 +441,18 @@ class TestApiTimelineEndpoint:
 
     def test_review_artifact_endpoint_serves_run_scoped_report(self, tmp_path: Path):
         """The review artifact endpoint returns only validated run-scoped artifacts."""
+        from issue_orchestrator.execution.session_output_adapter import (
+            FileSystemSessionOutput,
+        )
+
         mock_orch = create_mock_orchestrator()
-        run_dir = tmp_path / "run"
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        run_dir = FileSystemSessionOutput().start_run(
+            worktree,
+            "review-123",
+            issue_number=123,
+        ).run_dir
         turns = run_dir / "review-exchange" / "turns"
         turns.mkdir(parents=True)
         report = turns / "round-001.reviewer.attempt-001.review-report.md"
@@ -609,7 +623,13 @@ class TestApiTimelineEndpoint:
             },
         )
         payload = fetch_issue_detail_payload(
-            [build_timeline_event("session.started", summary="started")],
+            [
+                build_timeline_event(
+                    "session.started",
+                    summary="started",
+                    run_dir=_ensure_test_run_dir(42),
+                )
+            ],
             issue_number=42,
             dependency_gate_snapshot=snapshot,
         )
@@ -1785,8 +1805,8 @@ class TestApiTimelineEndpoint:
         finally:
             set_orchestrator(None)
 
-    def test_issue_detail_survives_action_decoration_failure(self):
-        """A single bad event artifact must not break issue-detail rendering."""
+    def test_issue_detail_omits_file_actions_for_a_missing_run(self):
+        """A deleted worktree expires file actions without deleting Timeline facts."""
         mock_orch = create_mock_orchestrator()
         mock_orch.deps.timeline_reader.read.return_value = TimelineStream(
             issue_number=123,
@@ -1821,8 +1841,8 @@ class TestApiTimelineEndpoint:
                 for action in (payload["events"][0].get("actions") or [])
                 if isinstance(action, dict)
             }
-            assert "show_actions_error" in action_types
-            assert "actions_error" in payload["events"][0]
+            assert action_types == set()
+            assert "actions_error" not in payload["events"][0]
             assert payload["events"][1]["event"] == "issue.pr_created"
         finally:
             set_orchestrator(None)

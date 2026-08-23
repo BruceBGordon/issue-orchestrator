@@ -165,8 +165,8 @@ class Config(ConfigLaunchIdentity, RuntimeConfigReferenceOwner, TechLeadActivati
     # Logging
     log_retention_days: int = 7  # Days to keep rotated log files
     session_output_retention_runs: int = 7  # Runs to keep per worktree
-    session_output_retention_days: int = 7  # Days to retain session run artifacts
-    session_output_retention_tier: str = "hot"  # Retention tier tag stored in run manifest
+    session_output_retention_days: int = 7  # Worktree-local retention metadata
+    session_output_retention_tier: str = "hot"  # Worktree-local classification tag
 
     # UI mode: "web" (default, browser dashboard)
     ui_mode: str = "web"

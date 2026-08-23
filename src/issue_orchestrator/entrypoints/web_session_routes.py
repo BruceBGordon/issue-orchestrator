@@ -32,11 +32,12 @@ from ..infra.session_log_prettify import (
 from ..ports.review_artifact_reader import ReviewArtifactReadCommand
 from ..infra.terminal_recording import first_terminal_geometry, iter_terminal_recording
 from .timeline_presentation import _format_phase_name, _phase_status_icon, _positive_int
+from .web_exact_recorded_run import exact_recorded_run_response
 from .web_session_context import (
+    IssueSessionContext,
     ReviewArtifactReaderDependency,
     WebOrchestratorDependency,
     resolve_issue_session_context,
-    worktree_path_from_run_dir,
 )
 
 logger = logging.getLogger(__name__)
@@ -393,17 +394,11 @@ def serve_terminal_recording(
     since_hash: str | None = None,
 ) -> JSONResponse:
     """Shared implementation for terminal recording endpoints."""
-    if not run_dir:
-        return JSONResponse(
-            {
-                "error": "run_dir is required",
-                "hint": "Open terminal recordings from a run-scoped timeline action.",
-            },
-            status_code=400,
-        )
-
-    run_identity = RunIdentity(issue_number=issue_number, run_dir=Path(run_dir))
-    accessor = ManifestAccessor(run_identity)
+    exact_run = exact_recorded_run_response(run_dir, issue_number=issue_number)
+    if isinstance(exact_run, JSONResponse):
+        return exact_run
+    accessor = exact_run.artifacts
+    run_identity = accessor.run_identity
     scope = _resolve_phase_scope(round_index, session_role)
     if isinstance(scope, JSONResponse):
         return scope
@@ -500,7 +495,6 @@ def serve_terminal_recording(
         )
     except Exception as exc:
         return JSONResponse({"error": f"Failed to read terminal recording: {exc}"}, status_code=500)
-
 
 @web_session_router.get("/api/session/terminal-recording/{issue_number}")
 async def get_terminal_recording(
@@ -755,11 +749,8 @@ def _manifest_response(
         manifest = RunManifest.load(run_dir)
     except FileNotFoundError:
         return JSONResponse(
-            {
-                "run_dir": str(run_dir),
-                "session_name": session_name,
-                "manifest": None,
-            }
+            {"error": f"Session manifest not found for run: {run_dir}"},
+            status_code=404,
         )
     except Exception as exc:
         return JSONResponse({"error": f"Failed to read manifest: {exc}"}, status_code=500)
@@ -804,7 +795,7 @@ def session_manifest_response(
     run_dir: str | None = None,
     *,
     include_passed_validation: bool = False,
-) -> JSONResponse:  # noqa: C901, PLR0912
+) -> JSONResponse:
     """Build the session manifest response for an issue.
 
     Pass ``include_passed_validation=True`` from the validation dialog
@@ -814,16 +805,21 @@ def session_manifest_response(
     if orchestrator is None:
         return JSONResponse({"error": "Orchestrator not running"}, status_code=503)
 
-    requested_run_dir = run_dir
+    if run_dir is not None:
+        exact_run = exact_recorded_run_response(run_dir, issue_number=issue_number)
+        if isinstance(exact_run, JSONResponse):
+            return exact_run
+        return _manifest_response(
+            exact_run.run_dir,
+            exact_run.session_name,
+            config=orchestrator.config,
+            include_passed_validation=include_passed_validation,
+        )
+
     context = resolve_issue_session_context(orchestrator, issue_number)
     worktree_path = context.worktree_path
     session_name = context.session_name
     resolved_run_dir = context.run_dir
-
-    if requested_run_dir:
-        candidate = Path(requested_run_dir)
-        if candidate.exists():
-            resolved_run_dir = candidate
 
     if resolved_run_dir:
         from ..execution.session_output_adapter import FileSystemSessionOutput
@@ -883,7 +879,7 @@ async def get_session_manifest(
 async def get_session_worktree(
     issue_number: int,
     orchestrator: WebOrchestratorDependency,
-) -> JSONResponse:  # noqa: C901
+) -> JSONResponse:
     """Get the worktree path for a session (active or history)."""
     if not orchestrator:
         return JSONResponse({"error": "Orchestrator not running"}, status_code=503)
@@ -907,7 +903,7 @@ async def get_session_worktree(
 def session_phases_response(
     issue_number: int,
     orchestrator: WebOrchestratorDependency,
-) -> JSONResponse:  # noqa: C901
+) -> JSONResponse:
     """Build the linear phase history response for an issue."""
     if not orchestrator:
         return JSONResponse({"error": "Orchestrator not running"}, status_code=503)
@@ -966,8 +962,30 @@ async def get_session_phases(
     return session_phases_response(issue_number, orchestrator)
 
 
+def _orchestrator_log_session_context(
+    issue_number: int,
+    orchestrator: WebOrchestratorDependency,
+    raw_run_dir: str | None,
+) -> IssueSessionContext | JSONResponse:
+    """Resolve the selected log run without substituting another run."""
+    if raw_run_dir is None:
+        return resolve_issue_session_context(orchestrator, issue_number)
+
+    exact_run = exact_recorded_run_response(
+        raw_run_dir,
+        issue_number=issue_number,
+    )
+    if isinstance(exact_run, JSONResponse):
+        return exact_run
+    return IssueSessionContext(
+        worktree_path=exact_run.worktree_path,
+        session_name=exact_run.session_name,
+        run_dir=exact_run.run_dir,
+    )
+
+
 @web_session_router.get("/api/session/orchestrator-log/{issue_number}")
-async def get_filtered_orchestrator_log(  # noqa: C901, PLR0912
+async def get_filtered_orchestrator_log(
     issue_number: int,
     orchestrator: WebOrchestratorDependency,
     run_dir: str | None = None,
@@ -980,18 +998,12 @@ async def get_filtered_orchestrator_log(  # noqa: C901, PLR0912
     from ..infra.logging_config import get_repo_log_path
 
     session_output = FileSystemSessionOutput()
-    context = resolve_issue_session_context(orchestrator, issue_number)
+    context = _orchestrator_log_session_context(issue_number, orchestrator, run_dir)
+    if isinstance(context, JSONResponse):
+        return context
     worktree_path = context.worktree_path
     session_name = context.session_name
     resolved_run_dir = context.run_dir
-    if run_dir:
-        candidate = Path(run_dir)
-        if candidate.exists():
-            resolved_run_dir = candidate
-            inferred_worktree = worktree_path_from_run_dir(candidate)
-            if inferred_worktree:
-                worktree_path = inferred_worktree
-            session_name = session_output.session_name_from_path(str(candidate))
 
     if not worktree_path:
         return JSONResponse({"error": f"No worktree found for issue #{issue_number}"}, status_code=404)
@@ -1059,7 +1071,7 @@ async def get_claude_log_content(
     orchestrator: WebOrchestratorDependency,
     limit: int = 200,
     run_dir: str | None = None,
-) -> JSONResponse:  # noqa: C901, PLR0912
+) -> JSONResponse:
     """Fetch and parse Claude session log for viewing in the dashboard."""
     if not orchestrator:
         return JSONResponse({"error": "Orchestrator not running"}, status_code=503)
@@ -1072,8 +1084,11 @@ async def get_claude_log_content(
             status_code=400,
         )
 
-    run_identity = RunIdentity(issue_number=issue_number, run_dir=Path(run_dir))
-    accessor = ManifestAccessor(run_identity)
+    exact_run = exact_recorded_run_response(run_dir, issue_number=issue_number)
+    if isinstance(exact_run, JSONResponse):
+        return exact_run
+    run_identity = exact_run.artifacts.run_identity
+    accessor = exact_run.artifacts
     try:
         artifact = accessor.get_claude_log()
     except ArtifactNotFoundError as exc:
@@ -1134,8 +1149,11 @@ async def get_review_transcript_content(
             status_code=400,
         )
 
-    run_identity = RunIdentity(issue_number=issue_number, run_dir=Path(run_dir))
-    accessor = ManifestAccessor(run_identity)
+    exact_run = exact_recorded_run_response(run_dir, issue_number=issue_number)
+    if isinstance(exact_run, JSONResponse):
+        return exact_run
+    run_identity = exact_run.artifacts.run_identity
+    accessor = exact_run.artifacts
     try:
         artifact = accessor.get_review_exchange_transcript(allow_empty=True)
     except ArtifactNotFoundError as exc:
@@ -1207,12 +1225,14 @@ async def get_review_artifact_content(
             status_code=400,
         )
 
-    run_identity = RunIdentity(issue_number=issue_number, run_dir=Path(run_dir))
+    exact_run = exact_recorded_run_response(run_dir, issue_number=issue_number)
+    if isinstance(exact_run, JSONResponse):
+        return exact_run
     try:
         artifact = review_artifact_reader.read_review_artifact(
             ReviewArtifactReadCommand(
                 issue_number=issue_number,
-                run_dir=run_identity.run_dir,
+                run_dir=exact_run.run_dir,
                 artifact_path=artifact_path,
                 artifact_type=artifact_type,
             )
@@ -1221,7 +1241,7 @@ async def get_review_artifact_content(
         return JSONResponse(
             {
                 "error": "Review artifact not found",
-                "run_dir": str(run_identity.run_dir),
+                "run_dir": str(exact_run.run_dir),
                 "detail": str(exc),
             },
             status_code=404,
@@ -1229,7 +1249,7 @@ async def get_review_artifact_content(
     return JSONResponse(
         {
             "issue_number": issue_number,
-            "run_dir": str(run_identity.run_dir),
+            "run_dir": str(exact_run.run_dir),
             "artifact_path": str(artifact.artifact_path),
             "artifact_type": artifact.artifact_type,
             "content_type": artifact.content_type,
@@ -1261,8 +1281,11 @@ async def get_session_prompt_content(
             status_code=400,
         )
 
-    run_identity = RunIdentity(issue_number=issue_number, run_dir=Path(run_dir))
-    accessor = ManifestAccessor(run_identity)
+    exact_run = exact_recorded_run_response(run_dir, issue_number=issue_number)
+    if isinstance(exact_run, JSONResponse):
+        return exact_run
+    run_identity = exact_run.artifacts.run_identity
+    accessor = exact_run.artifacts
     try:
         artifact = accessor.get_session_prompt()
     except ArtifactNotFoundError as exc:

@@ -2145,6 +2145,19 @@ def test_session_diagnostics_actions_use_primary_plus_visible_secondary_actions(
     assert "openSessionManifest(action.issue_number, action.run_dir || null)" in js
 
 
+def test_timeline_exact_run_actions_forward_issue_and_run_identity_together() -> None:
+    """The UI must never reconstruct an exact-run action from only one field."""
+    body = _function_body(_read(DASHBOARD_JS), "runTimelineEventAction")
+    assert "openValidationFailure(action.issue_number, action.run_dir || null" in body
+    assert "openReviewTranscript(action.issue_number, action.run_dir || null" in body
+    assert "openReviewArtifact(\n            action.issue_number,\n            action.run_dir || null" in body
+    assert "openAgentLogAction(action.issue_number, action.run_dir || null" in body
+    assert "copyAgentLogAction(action.issue_number, action.run_dir || null)" in body
+    assert "viewClaudeLog(action.issue_number, action.run_dir || null)" in body
+    assert "openFilteredOrchestratorLog(action.issue_number, action.run_dir || null)" in body
+    assert "openSessionManifest(action.issue_number, action.run_dir || null)" in body
+
+
 def test_diagnostics_action_errors_render_inline_in_modal() -> None:
     js = _read(DASHBOARD_JS)
     body = _function_body(js, "openSessionManifest")

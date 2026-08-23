@@ -2069,6 +2069,7 @@ def _drive_rounds(command: _DriveRoundsCommand) -> ReviewExchangeOutcome:
             make_review_exchange_round_completed_event(
                 {
                     "issue_number": issue_number,
+                    "run_dir": str(run_dir),
                     "session_name": session_name,
                     "round_index": round_index,
                     "reviewer_response_type": reviewer.response_type,
@@ -2093,6 +2094,7 @@ def _drive_rounds(command: _DriveRoundsCommand) -> ReviewExchangeOutcome:
     )
     _emit_built_event(emit, make_review_exchange_completed_event({
         "issue_number": issue_number,
+        "run_dir": str(run_assets.run_dir),
         "session_name": session_name,
         "rounds": max_rounds,
         "status": ReviewExchangeStatus.STOPPED.value,
@@ -2712,6 +2714,7 @@ def _complete_with_reviewer_ok(
     )
     _emit_built_event(emit, make_review_exchange_round_completed_event({
         "issue_number": issue_number,
+        "run_dir": str(run_assets.run_dir),
         "session_name": session_name,
         "round_index": round_index,
         "reviewer_response_type": reviewer.response_type,
@@ -2724,6 +2727,7 @@ def _complete_with_reviewer_ok(
     }))
     _emit_built_event(emit, make_review_exchange_completed_event({
         "issue_number": issue_number,
+        "run_dir": str(run_assets.run_dir),
         "session_name": session_name,
         "rounds": round_index,
         "status": ReviewExchangeStatus.OK.value,
@@ -2766,6 +2770,7 @@ def _stop_for_no_progress(
     )
     _emit_built_event(emit, make_review_exchange_round_completed_event({
         "issue_number": issue_number,
+        "run_dir": str(run_assets.run_dir),
         "session_name": session_name,
         "round_index": round_index,
         "reviewer_response_type": reviewer.response_type,
@@ -2778,6 +2783,7 @@ def _stop_for_no_progress(
     }))
     _emit_built_event(emit, make_review_exchange_completed_event({
         "issue_number": issue_number,
+        "run_dir": str(run_assets.run_dir),
         "session_name": session_name,
         "rounds": round_index,
         "status": ReviewExchangeStatus.STOPPED.value,
@@ -2820,6 +2826,7 @@ def _build_outcome_for_reviewer_decision_error(
     )
     _emit_built_event(emit, make_review_exchange_round_completed_event({
         "issue_number": issue_number,
+        "run_dir": str(run_assets.run_dir),
         "session_name": session_name,
         "round_index": round_index,
         "reviewer_response_type": reviewer.response_type,
@@ -2829,6 +2836,7 @@ def _build_outcome_for_reviewer_decision_error(
     }))
     _emit_built_event(emit, make_review_exchange_completed_event({
         "issue_number": issue_number,
+        "run_dir": str(run_assets.run_dir),
         "session_name": session_name,
         "rounds": round_index,
         "status": ReviewExchangeStatus.ERROR.value,
@@ -2868,6 +2876,7 @@ def _build_outcome_for_role_timeout(
     )
     _emit_built_event(emit, make_review_exchange_completed_event({
         "issue_number": issue_number,
+        "run_dir": str(run_assets.run_dir),
         "session_name": session_name,
         "rounds": round_index,
         "status": ReviewExchangeStatus.ERROR.value,
@@ -2919,6 +2928,7 @@ def _build_outcome_for_protocol_error(
     )
     _emit_built_event(emit, make_review_exchange_round_completed_event({
         "issue_number": issue_number,
+        "run_dir": str(run_assets.run_dir),
         "session_name": session_name,
         "round_index": round_index,
         "reviewer_response_type": last_reviewer.response_type if last_reviewer else None,
@@ -2929,6 +2939,7 @@ def _build_outcome_for_protocol_error(
     }))
     _emit_built_event(emit, make_review_exchange_completed_event({
         "issue_number": issue_number,
+        "run_dir": str(run_assets.run_dir),
         "session_name": session_name,
         "rounds": round_index,
         "status": ReviewExchangeStatus.ERROR.value,

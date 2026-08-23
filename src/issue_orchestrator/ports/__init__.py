@@ -30,6 +30,8 @@ _EXPORTS = {
     "InMemoryEventSink": (".event_sink", "InMemoryEventSink"),
     "make_trace_event": (".event_sink", "make_trace_event"),
     "make_run_scoped_event": (".event_sink", "make_run_scoped_event"),
+    "make_session_completed_event": (".event_sink", "make_session_completed_event"),
+    "make_session_failed_event": (".event_sink", "make_session_failed_event"),
     "make_review_exchange_round_completed_event": (
         ".event_sink", "make_review_exchange_round_completed_event",
     ),
@@ -164,6 +166,8 @@ __all__ = (
     "InMemoryEventSink",
     "make_trace_event",
     "make_run_scoped_event",
+    "make_session_completed_event",
+    "make_session_failed_event",
     "make_review_exchange_round_completed_event",
     "make_review_exchange_completed_event",
     "SessionRunner",

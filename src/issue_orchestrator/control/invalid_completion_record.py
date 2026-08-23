@@ -11,7 +11,7 @@ from typing import Any
 
 from ..events import EventName
 from ..infra.logging_config import issue_log
-from ..ports import EventSink, make_trace_event
+from ..ports import EventSink, make_run_scoped_event
 from ..ports.session_output import SessionOutput
 from .completion_record_validation import CompletionRecordLoadResult
 from ..observation.observation import SessionObservationResult
@@ -80,7 +80,9 @@ def report_invalid_completion_record(
                 "value": diagnostic_value,
             }
         ]
-    events.publish(make_trace_event(EventName.SESSION_INVALID_COMPLETION_RECORD, payload))
+    events.publish(
+        make_run_scoped_event(EventName.SESSION_INVALID_COMPLETION_RECORD, payload)
+    )
     logger.error(
         issue_log(
             issue_number,

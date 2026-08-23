@@ -36,12 +36,8 @@ class WebOperatorDependencies:
     get_client_host: Callable[[], ClientHost]
     broadcast_event: Callable[[str, dict | None], Awaitable[None]]
     trigger_server_shutdown: Callable[[], None]
-    # Optional accessor for the orchestrator's host repo root. Used by
-    # ``_open_host_path`` to resolve archived session-mirror paths
-    # (``.issue-orchestrator/sessions/<session>/...``) when the
-    # original agent worktree they were written against has been
-    # cleaned up post-merge. Returning ``None`` is fine — the endpoint
-    # falls back to the legacy "file not found" response.
+    # Optional accessor for the orchestrator's host repo root. Used to verify
+    # that requested paths belong to this repository or one of its worktrees.
     get_host_repo_root: Callable[[], "Path | None"] = lambda: None
     # Optional accessor for the configured worktree base. Timeline actions
     # can point at an issue worktree root (for example ``../repo-360``), which
@@ -588,56 +584,6 @@ async def bulk_cancel_queued(
     return JSONResponse({"cancelled": cancelled, "failed": failed})
 
 
-def _resolve_archived_session_path(
-    file_path: str, host_repo_root: "Path | None"
-) -> "Path | None":
-    """Re-anchor an archived session-mirror path against the host repo.
-
-    Many "open file" actions in the dashboard menu carry an absolute
-    path that was correct at the time the SESSION_COMPLETED event was
-    emitted — typically rooted at the agent worktree
-    (``/.../tixmeup-362-coding-1/.issue-orchestrator/sessions/coding-1/
-    completion-record.json``). When the agent worktree is cleaned up
-    post-merge, that absolute path no longer resolves, but the file
-    still exists at the host repo's session mirror
-    (``/.../tixmeup-362/.issue-orchestrator/sessions/coding-1/
-    completion-record.json``) — same suffix, different root.
-
-    This helper recognises any path with an ``.issue-orchestrator/
-    sessions/...`` suffix, strips the worktree-specific prefix, and
-    re-anchors it against the host repo root. Returns the resolved
-    Path if it exists, ``None`` otherwise.
-
-    The ``RepoRelativeSessionPath`` invariant we're enforcing here
-    (informally for now): paths inside ``.issue-orchestrator/sessions/``
-    are session-mirror artifacts that survive worktree cleanup; their
-    canonical anchor is the host repo, not whichever worktree wrote them.
-    """
-    if host_repo_root is None:
-        return None
-    parts = Path(file_path).parts
-    try:
-        idx = parts.index(".issue-orchestrator")
-    except ValueError:
-        return None
-    if idx + 1 >= len(parts) or parts[idx + 1] != "sessions":
-        return None
-    suffix = Path(*parts[idx:])
-    # Containment check: resolve any `..` segments and verify the
-    # final path is still inside ``host_repo_root``. Without this,
-    # a request like ``.issue-orchestrator/sessions/x/../../../etc/
-    # passwd`` would escape the repo root via the OS path resolver.
-    # The endpoint is local-network-only but the resolver is framed
-    # as a path policy and the policy must be airtight.
-    candidate = (host_repo_root / suffix).resolve()
-    host_root_resolved = host_repo_root.resolve()
-    try:
-        candidate.relative_to(host_root_resolved)
-    except ValueError:
-        return None
-    return candidate if candidate.exists() else None
-
-
 def _is_generated_worktree_path(
     file_path: str,
     *,
@@ -700,16 +646,7 @@ async def _open_host_path(request: Request, operator_deps: WebOperatorDependenci
 
     resolved_path = Path(file_path)
     if not resolved_path.exists():
-        # Fallback: agent worktrees are deleted after PR merge, leaving
-        # SESSION_COMPLETED event payloads with absolute paths that no
-        # longer resolve. The same files survive in the host repo's
-        # session mirror under the same suffix — try that.
-        archived = _resolve_archived_session_path(
-            file_path, operator_deps.get_host_repo_root(),
-        )
-        if archived is None:
-            return JSONResponse({"error": "File not found"}, status_code=404)
-        resolved_path = archived
+        return JSONResponse({"error": "File not found"}, status_code=404)
 
     try:
         result = operator_deps.get_client_host().open_path(resolved_path)
