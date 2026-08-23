@@ -8,6 +8,7 @@ This repo can run in GitHub Codespaces without changing the normal local
 The repo includes:
 
 - `.devcontainer/devcontainer.json`
+- `.devcontainer/prepare-image.sh`
 - `.devcontainer/seed-agent-onboarding.sh`
 - `.issue-orchestrator/config/modes/default/z-codespaces.yaml`
 
@@ -29,13 +30,18 @@ prebuild bakes `onCreateCommand` and `updateContentCommand` but **not**
 
 | Hook | What runs | Baked by a prebuild? |
 |------|-----------|----------------------|
-| `onCreateCommand` | Codex CLI install | Yes |
+| `onCreateCommand` | Image prerequisite repair and Codex CLI install | Yes |
 | `updateContentCommand` | `make worktree-setup` (uv sync, npm ci, Playwright) | Yes, and re-run on create |
 | `postCreateCommand` | `seed-agent-onboarding.sh` | No — runs per codespace |
 | `postStartCommand` | nothing | No — would run on every resume |
 
 Leaving dependency installation in `postCreateCommand` is the most common
 reason enabling prebuilds appears to change nothing.
+
+The image preparation also removes an unusable Yarn apt source inherited from
+the Python devcontainer image. Yarn is already installed and this repository
+uses npm, but the stale source otherwise makes Playwright's Linux host-library
+installation fail during `make worktree-setup`.
 
 `updateContentCommand` is re-run when a codespace is created from a prebuild,
 which is what closes the drift between a stale prebuild and current `HEAD`.
@@ -74,7 +80,8 @@ Set **one** of:
   revocable on demand, and unambiguously permitted for automation.
 - `CLAUDE_CODE_OAUTH_TOKEN` — produced by running `claude setup-token` **on a
   machine with a browser** (once). It is a one-year token and is explicitly
-  portable. This rides your subscription.
+  portable. This rides your subscription and is the prompt-free credential
+  path for an unattended Claude Code run.
 
 Anthropic documents this exact pattern for Codespaces, and notes that
 `~/.claude` persists across stop/start but is cleared on rebuild — which is why
@@ -90,7 +97,11 @@ Two behaviours matter because the orchestrator drives `claude` as an
 **interactive PTY session**, not `claude -p`:
 
 - With `ANTHROPIC_API_KEY` set, interactive mode shows a one-time key-approval
-  prompt. Non-interactive mode does not.
+  prompt. Non-interactive mode does not. Because issue-orchestrator starts the
+  interactive mode, the following preflight is mandatory after creating or
+  rebuilding a Codespace with this credential: run `claude`, approve the API
+  key when prompted, then enter `/exit`. Do not start the engine before this
+  succeeds.
 - The onboarding wizard can still block even with a valid token.
   `seed-agent-onboarding.sh` pre-seeds `hasCompletedOnboarding` in
   `~/.claude.json` to prevent that. Note that this file lives *outside*
@@ -98,24 +109,25 @@ Two behaviours matter because the orchestrator drives `claude` as an
 
 ### Codex
 
-> **`OPENAI_API_KEY` does not authenticate the Codex CLI.** The credential
-> chain is `CODEX_API_KEY` (for `codex exec` only), then an ephemeral store,
-> then `CODEX_ACCESS_TOKEN`, then a persisted `auth.json`. Setting
-> `OPENAI_API_KEY` alone leaves you logged out.
+> **Setting `OPENAI_API_KEY` alone does not authenticate the Codex CLI.**
+> issue-orchestrator's readiness check requires a persisted Codex login.
 
-Pick one:
+For API-key automation, set `OPENAI_API_KEY` as a Codespaces secret. Then run
+this mandatory bootstrap after creating or rebuilding the Codespace and before
+starting the engine:
 
-- `CODEX_API_KEY`, referenced per invocation — the recommended path for
-  automation. Prefer injecting it per command rather than as a job-wide
-  environment variable.
-- `printenv OPENAI_API_KEY | codex login --with-api-key` — reads your shell
-  variable as a *source*; Codex is not consuming the variable itself.
-- `codex login` — interactive; needs a browser.
+```bash
+printenv OPENAI_API_KEY | codex login --with-api-key
+codex login status
+```
 
-`codex login --api-key <key>` is no longer supported and exits 1.
+The first command copies the secret into Codex's persisted credential store;
+the second must exit 0. `codex login --api-key <key>` is not supported.
 
-Verify with `codex login status`, which prints `Logged in using ChatGPT` and
-exits 0, or `Not logged in` and exits 1.
+For ChatGPT-account auth instead, run `codex login --device-auth` and complete
+the browser flow, then require `codex login status` to exit 0 before starting
+the engine. Either bootstrap satisfies issue-orchestrator's readiness check;
+an environment variable by itself does not.
 
 Two cautions for unattended use. Codex refresh tokens are **single-use and
 rotate**, and the CLI takes no cross-process lock, so a shared `auth.json`

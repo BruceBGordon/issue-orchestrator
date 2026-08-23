@@ -28,15 +28,16 @@ import sys
 path = pathlib.Path(sys.argv[1])
 try:
     data = json.loads(path.read_text())
-    if not isinstance(data, dict):
-        raise ValueError("not an object")
-except (FileNotFoundError, ValueError, json.JSONDecodeError):
+except FileNotFoundError:
     data = {}
+
+if not isinstance(data, dict):
+    raise ValueError(f"{path} must contain a JSON object")
 
 # Only fill in what is absent. A codespace resumed after a real interactive
 # login must keep that login's account and trust state untouched.
 changed = False
-for key, value in (("hasCompletedOnboarding", True), ("numStartups", 2)):
+for key, value in (("hasCompletedOnboarding", True),):
     if key not in data:
         data[key] = value
         changed = True
@@ -53,4 +54,6 @@ echo
 echo "Credentials are NOT set here. Set them as Codespaces secrets:"
 echo "  ISSUE_ORCH_GITHUB_TOKEN   (required)"
 echo "  ANTHROPIC_API_KEY  or  CLAUDE_CODE_OAUTH_TOKEN   (one of these)"
+echo "If using ANTHROPIC_API_KEY, run claude once and approve the key before"
+echo "starting the engine. CLAUDE_CODE_OAUTH_TOKEN needs no approval preflight."
 echo "See docs/user/codespaces.md."
