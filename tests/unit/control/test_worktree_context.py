@@ -15,6 +15,25 @@ from issue_orchestrator.control.worktree import WorktreePreparationError
 from issue_orchestrator.ports.worktree_manager import WorktreeInfo, WorktreeReuseOptions
 
 
+
+class _NoSetupRunner:
+    """CommandRunner stub for contexts whose config declares no setup commands.
+
+    Acquisition provisions the worktree environment now, so every context needs
+    a runner. These tests configure no setup commands, so it is never invoked;
+    a test that DOES configure them asserts on the commands instead.
+    """
+
+    def __init__(self) -> None:
+        self.commands: list[str] = []
+
+    def run(self, command, **kwargs):
+        from types import SimpleNamespace
+
+        self.commands.append(command)
+        return SimpleNamespace(returncode=0, stdout="", stderr="", timed_out=False)
+
+
 class TestEscapeClaudeProjectPath:
     """Tests for the _escape_claude_project_path function."""
 
@@ -96,6 +115,7 @@ class TestWorktreeContextCreate:
             mock_worktree_cls.return_value = mock_worktree
 
             ctx = WorktreeContext.create(
+                command_runner=_NoSetupRunner(),
                 worktree_manager=mock_worktree_manager,
                 config=mock_config,
                 events=mock_events,
@@ -131,6 +151,7 @@ class TestWorktreeContextCreate:
             mock_worktree_cls.return_value = mock_worktree
 
             ctx = WorktreeContext.create(
+                command_runner=_NoSetupRunner(),
                 worktree_manager=mock_worktree_manager,
                 config=mock_config,
                 events=mock_events,
@@ -152,6 +173,7 @@ class TestWorktreeContextCreate:
         mock_config.worktree_base = tmp_path
 
         ctx = WorktreeContext.create(
+            command_runner=_NoSetupRunner(),
             worktree_manager=mock_worktree_manager,
             config=mock_config,
             events=mock_events,
@@ -192,6 +214,7 @@ class TestWorktreeContextCreate:
             mock_worktree_cls.return_value = mock_worktree
 
             WorktreeContext.create(
+                command_runner=_NoSetupRunner(),
                 worktree_manager=mock_worktree_manager,
                 config=mock_config,
                 events=mock_events,
@@ -219,6 +242,7 @@ class TestWorktreeContextCreate:
             mock_worktree_cls.return_value = mock_worktree
 
             ctx = WorktreeContext.create(
+                command_runner=_NoSetupRunner(),
                 worktree_manager=mock_worktree_manager,
                 config=mock_config,
                 events=mock_events,
@@ -245,6 +269,7 @@ class TestWorktreeContextCreate:
             mock_worktree_cls.return_value = mock_worktree
 
             ctx = WorktreeContext.create(
+                command_runner=_NoSetupRunner(),
                 worktree_manager=mock_worktree_manager,
                 config=mock_config,
                 events=mock_events,
@@ -279,6 +304,7 @@ class TestWorktreeContextCreate:
             mock_worktree_cls.return_value = MagicMock()
 
             WorktreeContext.create(
+                command_runner=_NoSetupRunner(),
                 worktree_manager=mock_worktree_manager,
                 config=mock_config,
                 events=mock_events,
@@ -312,6 +338,7 @@ class TestWorktreeContextCreate:
             mock_worktree_cls.return_value = MagicMock()
 
             WorktreeContext.create(
+                command_runner=_NoSetupRunner(),
                 worktree_manager=mock_worktree_manager,
                 config=mock_config,
                 events=mock_events,
@@ -345,6 +372,7 @@ class TestWorktreeContextCreate:
             mock_worktree_cls.return_value = MagicMock()
 
             WorktreeContext.create(
+                command_runner=_NoSetupRunner(),
                 worktree_manager=mock_worktree_manager,
                 config=mock_config,
                 events=mock_events,
@@ -370,6 +398,7 @@ class TestWorktreeContextCreate:
             mock_worktree_cls.return_value = mock_worktree
 
             WorktreeContext.create(
+                command_runner=_NoSetupRunner(),
                 worktree_manager=mock_worktree_manager,
                 config=mock_config,
                 events=mock_events,

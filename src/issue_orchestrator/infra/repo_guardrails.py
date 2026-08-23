@@ -439,6 +439,44 @@ def _should_render_portable_verify_script(repo_root: Path) -> bool:
     ).exists() and (repo_root / "hooks" / "pre-push").exists()
 
 
+# Interpreter self-check injected into every managed verify-pr script.
+#
+# The interpreter is chosen by fallthrough (ORCHESTRATOR_PYTHON -> repo .venv ->
+# whatever `python3` resolves to), so a target repo with no venv of its own can
+# silently land on another repository's interpreter. This block verifies the
+# claim the script has always made but never checked: that the chosen
+# interpreter can actually import issue_orchestrator. A shared venv whose
+# editable install points at a deleted worktree otherwise fails deep inside
+# prepush_check with a bare ModuleNotFoundError naming neither the pointer file
+# nor the missing directory.
+#
+# Kept as a module constant, not inline in the f-string template below, so its
+# shell and Python braces are literal rather than format fields.
+_VERIFY_INTERPRETER_PROBE = """\
+if ! "$PYTHON_BIN" -c "import issue_orchestrator" >/dev/null 2>&1; then
+  echo >&2 "verify-pr: interpreter cannot import issue_orchestrator: $PYTHON_BIN"
+  "$PYTHON_BIN" - >&2 <<'PROBE' || true
+import pathlib
+import sysconfig
+
+site = pathlib.Path(sysconfig.get_paths()["purelib"])
+pointers = sorted(site.glob("*issue_orchestrator*.pth"))
+if not pointers:
+    print("  no issue_orchestrator editable pointer found in", site)
+for pointer in pointers:
+    target = pointer.read_text().strip()
+    state = "exists" if pathlib.Path(target).exists() else "MISSING"
+    print("  " + pointer.name + " -> " + target + " [" + state + "]")
+PROBE
+  echo >&2 "verify-pr: a MISSING target means that checkout was deleted while"
+  echo >&2 "verify-pr: this venv still pointed at it. Repair with:"
+  echo >&2 "verify-pr:   cd <issue-orchestrator repo> && uv pip install --python .venv/bin/python -e . --no-deps"
+  echo >&2 "verify-pr: or export $PYTHON_ENV_NAME to an interpreter that has it."
+  exit 1
+fi
+"""
+
+
 def _render_verify_pr_script(
     validation_cmd: str,
     *,
@@ -509,6 +547,7 @@ if [ -z "$PYTHON_BIN" ]; then
   exit 1
 fi
 
+{_VERIFY_INTERPRETER_PROBE}
 echo "verify-pr: running cache-aware pre-push validation"
 "$PYTHON_BIN" -m issue_orchestrator.entrypoints.cli_tools.prepush_check -v
 """

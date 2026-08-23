@@ -25,6 +25,16 @@ class WorktreePreparationError(Exception):
         super().__init__(message)
 
 
+class WorktreeSetupError(WorktreePreparationError):
+    """The repository's configured setup commands failed for this worktree.
+
+    Distinguished from other preparation failures because the worktree was
+    created successfully and must be cleaned up, and because operators recognise
+    it by a different message. Acquisition raises it so every launch path gets
+    the same treatment; the launcher decides the cleanup and claim policy.
+    """
+
+
 class Worktree:
     """Cleans stale session artifacts from a worktree.
 

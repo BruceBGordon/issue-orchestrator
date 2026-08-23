@@ -82,7 +82,6 @@ __all__ = [
     "_hide_runtime_artifacts_from_git_status",
     "install_worktree_identity",
     "read_reviewer_head_ownership",
-    "_link_repo_venv_into_worktree",
     "install_claude_settings",
     "sync_cli_tools",
 ]
@@ -108,33 +107,6 @@ def _configure_no_verify_dry_run(worktree_path: Path, allow: bool) -> None:
         raise WorktreeError(
             f"Failed to {action} no-verify dry-run flag at {flag_path}: {exc}"
         ) from exc
-
-
-def _link_repo_venv_into_worktree(repo_root: Path, worktree_path: Path) -> None:
-    """Expose the repo venv inside a worktree so validation commands work there too."""
-    source_venv = repo_root / ".venv"
-    if not source_venv.exists():
-        return
-
-    target_venv = worktree_path / ".venv"
-    if target_venv.is_symlink():
-        try:
-            if target_venv.resolve() == source_venv.resolve():
-                return
-        except OSError:
-            pass
-        target_venv.unlink()
-    elif target_venv.exists():
-        logger.warning(
-            "Worktree already has a real .venv directory; leaving it in place: %s",
-            target_venv,
-        )
-        return
-
-    target_venv.symlink_to(source_venv, target_is_directory=True)
-    logger.info(
-        "Linked shared repo venv into worktree: %s -> %s", target_venv, source_venv
-    )
 
 
 def sync_cli_tools(worktree_path: Path) -> list[Path]:

@@ -52,6 +52,7 @@ from ..domain.coder_prompt import (
     PreparedCoderPromptAddendum,
 )
 from ..domain.session_run import SessionRunAssets
+from .worktree import WorktreeSetupError
 from .worktree_context import WorktreeContext
 from ..infra.validation_state import DEFAULT_RETRY_TEMPLATE, _truncate_with_tail
 from ..domain.tech_lead_session import TechLeadLaunchScope
@@ -118,7 +119,6 @@ from .session_worktree_diagnostics import (
     write_worktree_diagnostic,
 )
 from .transition_log import log_transition
-from .isolation import build_runtime_tool_env
 from .launch_dependency_gate import LaunchDependencyGate
 from .launch_guards import (
     callback_endpoint_not_ready,
@@ -782,6 +782,7 @@ class SessionLauncher:
         )
         is_scratch_investigation = investigation_scratch is not None
         ctx = WorktreeContext.create(
+            command_runner=self._command_runner,
             worktree_manager=self._worktree_manager,
             config=self.config,
             events=self.events,
@@ -807,6 +808,30 @@ class SessionLauncher:
             stack_base_branch=freshness.stack_base_branch,
             scratch=investigation_scratch,
         )
+
+        if isinstance(ctx.error, WorktreeSetupError):
+            # The worktree was created before setup failed, so it must not be
+            # left behind. Acquisition owns RUNNING setup for every launch path;
+            # the launcher still owns cleanup and claim policy.
+            log_transition("issue", issue.number, "LAUNCHING", "FAILED", "setup commands failed")
+            logger.error(issue_log(issue.number, "FAILED: %s"), ctx.error)
+            self.events.publish(make_trace_event(
+                EventName.SESSION_START_FAILED,
+                {
+                    "issue_number": issue.number,
+                    "session_name": session_name,
+                    "reason": "setup_commands_failed",
+                    "error": str(ctx.error),
+                },
+            ))
+            self._cleanup_pre_active_launch_worktree(
+                issue.number,
+                ctx.worktree_path,
+                disposable=is_scratch_investigation,
+                failure_stage="setup failure",
+            )
+            self._release_claim_if_held(issue.number, claim)
+            return LaunchResult(None, False, str(ctx.error))
 
         if ctx.error:
             log_transition("issue", issue.number, "LAUNCHING", "BLOCKED", "worktree preparation failed")
@@ -919,31 +944,6 @@ class SessionLauncher:
                 issue_log(issue.number, "Worktree ready: path=%s branch=%s rebase_status=%s time=%.1fs"),
                 worktree_path, branch_name, "CONFLICT" if worktree_info.rebase_failed else "ok", worktree_time
             )
-
-            # Run setup commands
-            if self.config.setup_worktree:
-                try:
-                    self._run_setup_commands(worktree_path)
-                except Exception as e:
-                    log_transition("issue", issue.number, "LAUNCHING", "FAILED", "setup commands failed")
-                    logger.error(issue_log(issue.number, "FAILED: setup commands failed: %s"), e)
-                    self.events.publish(make_trace_event(
-                        EventName.SESSION_START_FAILED,
-                        {
-                            "issue_number": issue.number,
-                            "session_name": session_name,
-                            "reason": "setup_commands_failed",
-                            "error": str(e),
-                        },
-                    ))
-                    self._cleanup_pre_active_launch_worktree(
-                        issue.number,
-                        worktree_path,
-                        disposable=is_scratch_investigation,
-                        failure_stage="setup failure",
-                    )
-                    self._release_claim_if_held(issue.number, claim)
-                    return LaunchResult(None, False, f"Setup commands failed: {e}")
 
             # New coding attempt starts now; clear interrupted retry guard.
             self._clear_launch_retry_guards(
@@ -1224,6 +1224,7 @@ class SessionLauncher:
 
         phase_name = f"coding-{retry_count + 1}"
         ctx = WorktreeContext.create(
+            command_runner=self._command_runner,
             worktree_manager=self._worktree_manager,
             config=self.config,
             events=self.events,
@@ -1285,9 +1286,6 @@ class SessionLauncher:
                 "validation_error": retry.validation_error,
                 "validation_error_file": retry.validation_error_file,
             })
-
-            if setup_failure := self._run_validation_retry_setup(issue, worktree_path, claim):
-                return setup_failure
 
             self._clear_launch_retry_guards(
                 issue_number=issue.number,
@@ -1402,28 +1400,6 @@ class SessionLauncher:
             }))
             self._trigger_issue_session_state_transitions(issue, session_name, agent_config.timeout_minutes)
             return LaunchResult(session, True)
-
-    def _run_validation_retry_setup(
-        self,
-        issue: Issue,
-        worktree_path: Path,
-        claim: ClaimAcquisitionResult,
-    ) -> LaunchResult | None:
-        """Run setup commands before retrying preserved work.
-
-        Validation retries intentionally keep the existing worktree, so
-        configured setup commands must be idempotent and non-destructive.
-        """
-        if not self.config.setup_worktree:
-            return None
-        try:
-            self._run_setup_commands(worktree_path)
-        except Exception as e:
-            log_transition("issue", issue.number, "LAUNCHING", "FAILED", "setup commands failed")
-            logger.error(issue_log(issue.number, "FAILED: setup commands failed: %s"), e)
-            self._release_claim_if_held(issue.number, claim)
-            return LaunchResult(None, False, f"Setup commands failed: {e}")
-        return None
 
     def _resolve_validation_retry_issue(
         self, retry: PendingValidationRetry
@@ -1613,6 +1589,7 @@ class SessionLauncher:
 
         # Create and prepare worktree using WorktreeContext
         ctx = WorktreeContext.create(
+            command_runner=self._command_runner,
             worktree_manager=self._worktree_manager,
             config=self.config,
             events=self.events,
@@ -1910,6 +1887,7 @@ class SessionLauncher:
         )
 
         ctx = WorktreeContext.create(
+            command_runner=self._command_runner,
             worktree_manager=self._worktree_manager,
             config=self.config,
             events=self.events,
@@ -2125,6 +2103,7 @@ class SessionLauncher:
         if result := callback_endpoint_not_ready(self._agent_callback_endpoint):
             return result
         deps = ReworkLaunchDependencies(
+            command_runner=self._command_runner,
             config=self.config,
             events=self.events,
             repository_host=self.repository_host,
@@ -2149,30 +2128,6 @@ class SessionLauncher:
         return launch_rework_flow(
             rework, active_sessions, deps, work_claim=work_claim
         )
-
-    def _run_setup_commands(self, worktree_path: Path) -> None:
-        """Run setup commands in worktree."""
-        step_start = time.time()
-        for cmd in self.config.setup_worktree:
-            logger.debug("Running setup command: %s", cmd)
-            logger.info("[launch] Running setup: %s", cmd)
-            result = self._command_runner.run(
-                cmd,
-                shell=True,
-                cwd=worktree_path,
-                env=build_runtime_tool_env(worktree_path),
-            )
-            if result.timed_out:
-                logger.error("[launch] Setup command timed out: %s", cmd)
-                raise RuntimeError(f"setup command timed out: {cmd}")
-            if result.returncode != 0:
-                stderr = result.stderr.strip() or "no stderr captured"
-                logger.error("Setup command failed: %s\n%s", cmd, stderr)
-                raise RuntimeError(
-                    f"setup command failed: {cmd} (exit_code={result.returncode}): {stderr}"
-                )
-        setup_time = time.time() - step_start
-        logger.info("[launch] Setup completed in %.1fs", setup_time)
 
     def _persist_session_prompt(self, run_dir: Path, prompt_text: str) -> str:
         """Persist rendered launch prompt into run-scoped artifacts."""
