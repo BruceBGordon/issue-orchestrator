@@ -30,6 +30,7 @@ from ..ports import EventSink, RepositoryHost
 from ..ports.event_sink import make_run_scoped_event, make_trace_event
 from ..ports.session_output import SessionOutput
 from ..ports.coder_prompt import CoderPromptAddendumProvider
+from ..ports.command_runner import CommandRunner
 from ..ports.worktree_manager import WorktreeManager, WorktreeReuseOptions
 from .actions import Action, AddCommentAction, AddLabelAction, RemoveLabelAction
 from .launch_transaction import (
@@ -136,6 +137,7 @@ class ReworkLaunchDependencies:
     events: EventSink
     repository_host: RepositoryHost
     worktree_manager: WorktreeManager
+    command_runner: CommandRunner
     session_output: SessionOutput
     label_manager: LabelManager
     session_exists: SessionExistsFn
@@ -322,6 +324,7 @@ def launch_rework_session(
     coding_attempt = rework.rework_cycle + 1
     phase_name = f"coding-{coding_attempt}"
     ctx = WorktreeContext.create(
+        command_runner=deps.command_runner,
         worktree_manager=deps.worktree_manager,
         config=deps.config,
         events=deps.events,

@@ -15,6 +15,15 @@ from issue_orchestrator.infra.doctor.checks.workspace import check_python_enviro
 
 
 def _checkout(tmp_path: Path, name: str) -> Path:
+    """A source checkout of THIS project, which is what the check is scoped to."""
+    path = tmp_path / name
+    (path / "src" / "issue_orchestrator").mkdir(parents=True)
+    (path / "src" / "issue_orchestrator" / "__init__.py").write_text("")
+    return path
+
+
+def _foreign_repo(tmp_path: Path, name: str) -> Path:
+    """Somebody else's Python project: no issue_orchestrator source in it."""
     path = tmp_path / name
     path.mkdir(parents=True)
     return path
@@ -166,3 +175,33 @@ def test_doctor_is_informational_only_when_the_venv_is_truly_absent(
     repo = _checkout(tmp_path, "repo")
 
     assert check_python_environment(repo, _FakeRunner(0)).status == "info"
+
+
+# ---- B1: the target repository is usually not this project -----------------
+
+
+def test_a_foreign_python_repo_with_its_own_venv_is_not_an_error(tmp_path: Path) -> None:
+    """The startup preflight must not block a normal Python target repo.
+
+    Requiring the target's venv to import issue_orchestrator only makes sense
+    when the target IS this project; for anyone else it reports a healthy
+    environment as broken and suggests installing their project as this one.
+    """
+    repo = _foreign_repo(tmp_path, "someones-django-app")
+    (repo / ".venv" / "bin").mkdir(parents=True)
+    (repo / ".venv" / "bin" / "python").write_text("")
+
+    check = check_python_environment(repo, _FakeRunner(1, stderr="ModuleNotFoundError"))
+
+    assert check.status == "info"
+    assert "not an issue-orchestrator source checkout" in check.detail
+
+
+def test_an_orchestrator_source_checkout_is_still_diagnosed(tmp_path: Path) -> None:
+    repo = _checkout(tmp_path, "issue-orchestrator")
+    (repo / ".venv" / "bin").mkdir(parents=True)
+    (repo / ".venv" / "bin" / "python").write_text("")
+
+    check = check_python_environment(repo, _FakeRunner(1, stderr="ModuleNotFoundError"))
+
+    assert check.status == "error"
