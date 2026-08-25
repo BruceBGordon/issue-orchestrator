@@ -31,7 +31,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Literal, cast
+from typing import Literal, Protocol, cast
 
 from issue_orchestrator.domain.executor import (
     ExecutorFairnessGroup,
@@ -249,6 +249,22 @@ class ValidateProfileConfiguration:
 
 
 @dataclass(frozen=True, slots=True)
+class ProfileMeasurementRequest:
+    """Complete non-null input to one disposable profiling session."""
+
+    repo_root: Path
+    make_bin: str
+    jobs: int
+    dry_run: bool
+    targets: tuple[str, ...]
+    executor_pool_dir: Path
+    aggressiveness: ProfileAggressiveness
+    artifacts: ProfileArtifactStore
+    profiled_commit_sha: str
+    configuration: ValidateProfileConfiguration
+
+
+@dataclass(frozen=True, slots=True)
 class ValidateProfileSummary:
     """Derived bottleneck measurements for one profile."""
 
@@ -269,6 +285,7 @@ class ProfileStage(StrEnum):
     COLD_AGGREGATE = "cold-aggregate"
     TARGET = "target"
     LEARNED_AGGREGATE = "learned-aggregate"
+    PROFILE_SESSION_CLEANUP = "profile-session-cleanup"
 
 
 class ProfileCleanupOperation(StrEnum):
@@ -276,6 +293,7 @@ class ProfileCleanupOperation(StrEnum):
 
     WORKTREE_REMOVE = "worktree-remove"
     TEMPORARY_ROOT_REMOVE = "temporary-root-remove"
+    PROFILE_SESSION_ROOT_REMOVE = "profile-session-root-remove"
 
 
 @dataclass(frozen=True, slots=True)
@@ -396,6 +414,32 @@ class ProfileStageFailed(RuntimeError):
         )
 
 
+class ProfileDirectoryRemover(Protocol):
+    """Remove one profiler-owned directory or raise its filesystem error."""
+
+    def remove(self, directory: Path) -> None: ...
+
+
+class ShutilProfileDirectoryRemover:
+    """Production directory-removal adapter for profiler lifecycle ownership."""
+
+    def remove(self, directory: Path) -> None:
+        shutil.rmtree(directory)
+
+
+class ProfileSessionCleanupError(RuntimeError):
+    """Cleanup failure retained while propagating an unexpected profiler bug."""
+
+    def __init__(self, failures: tuple[ProfileCleanupFailure, ...]) -> None:
+        if not failures:
+            raise ValueError("ProfileSessionCleanupError requires cleanup failures")
+        self.failures = failures
+        super().__init__(
+            "profile session cleanup failed during an unexpected profiler error: "
+            f"{len(failures)} failure(s)"
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class ValidateProfileReport:
     """Versioned JSON report written by the profiler."""
@@ -445,11 +489,26 @@ class LearnedAggregateFailureReport:
     failure: ProfileFailure
 
 
+@dataclass(frozen=True, slots=True)
+class ProfileSessionCleanupFailureReport:
+    """Complete measurements retained when final session cleanup fails."""
+
+    schema_version: Literal[6]
+    outcome: Literal["failed"]
+    config: ValidateProfileConfiguration
+    cold_validate_pr_raw_run: ProfileAggregateRun
+    target_runs: tuple[CommandResult, ...]
+    learned_validate_pr_raw_run: ProfileAggregateRun
+    summary: ValidateProfileSummary
+    failure: ProfileFailure
+
+
 ValidateProfileArtifact = (
     ValidateProfileReport
     | ColdAggregateFailureReport
     | TargetFailureReport
     | LearnedAggregateFailureReport
+    | ProfileSessionCleanupFailureReport
 )
 
 
@@ -746,6 +805,7 @@ def write_profile_artifact(
         ColdAggregateFailureReport,
         TargetFailureReport,
         LearnedAggregateFailureReport,
+        ProfileSessionCleanupFailureReport,
     )
     if type(artifact) not in supported:
         raise ValueError("write_profile_artifact requires a profile report variant")
@@ -754,6 +814,115 @@ def write_profile_artifact(
         encoding="utf-8",
     )
     print(f"report: {output_path}")
+
+
+def remove_profile_session_root(
+    profile_root: Path,
+    directory_remover: ProfileDirectoryRemover,
+) -> tuple[ProfileCleanupFailure, ...]:
+    """Return typed terminal cleanup evidence instead of raising it."""
+    try:
+        directory_remover.remove(profile_root)
+    except OSError as exc:
+        return (
+            ProfileCleanupFilesystemFailure(
+                ProfileCleanupOperation.PROFILE_SESSION_ROOT_REMOVE,
+                type(exc).__name__,
+                str(exc),
+            ),
+        )
+    return ()
+
+
+def _extend_profile_failure(
+    failure: ProfileFailure,
+    cleanup_failures: tuple[ProfileCleanupFailure, ...],
+) -> ProfileFailure:
+    return ProfileFailure(
+        failure.stage,
+        failure.command_result,
+        (*failure.cleanup_failures, *cleanup_failures),
+    )
+
+
+def _retain_profile_session_cleanup(
+    artifact: ValidateProfileArtifact,
+    cleanup_failures: tuple[ProfileCleanupFailure, ...],
+) -> ValidateProfileArtifact:
+    if not cleanup_failures:
+        return artifact
+    if type(artifact) is ValidateProfileReport:
+        return ProfileSessionCleanupFailureReport(
+            schema_version=6,
+            outcome="failed",
+            config=artifact.config,
+            cold_validate_pr_raw_run=artifact.cold_validate_pr_raw_run,
+            target_runs=artifact.target_runs,
+            learned_validate_pr_raw_run=artifact.learned_validate_pr_raw_run,
+            summary=artifact.summary,
+            failure=ProfileFailure(
+                ProfileStage.PROFILE_SESSION_CLEANUP,
+                artifact.learned_validate_pr_raw_run.command_result,
+                cleanup_failures,
+            ),
+        )
+    if type(artifact) is ColdAggregateFailureReport:
+        return ColdAggregateFailureReport(
+            schema_version=6,
+            outcome="failed",
+            config=artifact.config,
+            failed_aggregate=artifact.failed_aggregate,
+            failure=_extend_profile_failure(artifact.failure, cleanup_failures),
+        )
+    if type(artifact) is TargetFailureReport:
+        return TargetFailureReport(
+            schema_version=6,
+            outcome="failed",
+            config=artifact.config,
+            cold_validate_pr_raw_run=artifact.cold_validate_pr_raw_run,
+            completed_target_runs=artifact.completed_target_runs,
+            failure=_extend_profile_failure(artifact.failure, cleanup_failures),
+        )
+    if type(artifact) is LearnedAggregateFailureReport:
+        return LearnedAggregateFailureReport(
+            schema_version=6,
+            outcome="failed",
+            config=artifact.config,
+            cold_validate_pr_raw_run=artifact.cold_validate_pr_raw_run,
+            target_runs=artifact.target_runs,
+            failed_aggregate=artifact.failed_aggregate,
+            failure=_extend_profile_failure(artifact.failure, cleanup_failures),
+        )
+    if type(artifact) is ProfileSessionCleanupFailureReport:
+        raise ValueError("profile session cleanup can only be finalized once")
+    raise AssertionError("ValidateProfileArtifact is a closed union")
+
+
+def _profile_artifact_exit_code(artifact: ValidateProfileArtifact) -> int:
+    if type(artifact) is ValidateProfileReport:
+        return 0
+    if type(artifact) in (
+        ColdAggregateFailureReport,
+        TargetFailureReport,
+        LearnedAggregateFailureReport,
+        ProfileSessionCleanupFailureReport,
+    ):
+        return artifact.failure.exit_code
+    raise AssertionError("ValidateProfileArtifact is a closed union")
+
+
+def finalize_profile_session(
+    *,
+    output_path: Path,
+    profile_root: Path,
+    artifact: ValidateProfileArtifact,
+    directory_remover: ProfileDirectoryRemover,
+) -> int:
+    """Remove the transient session, retain its outcome, and write one report."""
+    cleanup_failures = remove_profile_session_root(profile_root, directory_remover)
+    final_artifact = _retain_profile_session_cleanup(artifact, cleanup_failures)
+    write_profile_artifact(output_path, final_artifact)
+    return _profile_artifact_exit_code(final_artifact)
 
 
 def summarize(
@@ -1197,6 +1366,120 @@ def profile_fairness_group(
     )
 
 
+def measure_profile(request: ProfileMeasurementRequest) -> ValidateProfileArtifact:
+    """Run every measurement and return the complete or first-failure artifact."""
+    cold_aggregate = run_profile_aggregate(
+        repo_root=request.repo_root,
+        make_bin=request.make_bin,
+        name=f"cold-aggregate:{AGGREGATE_TARGET}",
+        dry_run=request.dry_run,
+        jobs=request.jobs,
+        executor_pool_dir=request.executor_pool_dir,
+        aggressiveness=request.aggressiveness,
+        artifacts=request.artifacts,
+        profiled_commit_sha=request.profiled_commit_sha,
+        fairness_group=profile_fairness_group(request.profiled_commit_sha, "cold"),
+    )
+    try:
+        require_stage_success(
+            ProfileStage.COLD_AGGREGATE,
+            cold_aggregate.command_result,
+            cold_aggregate.cleanup_failures,
+        )
+    except ProfileStageFailed as failed:
+        print(f"[profile] {failed}", file=sys.stderr)
+        return ColdAggregateFailureReport(
+            schema_version=6,
+            outcome="failed",
+            config=request.configuration,
+            failed_aggregate=cold_aggregate,
+            failure=failed.failure,
+        )
+
+    completed_targets: list[CommandResult] = []
+    for target in request.targets:
+        target_run = run_in_isolated_worktree(
+            repo_root=request.repo_root,
+            make_bin=request.make_bin,
+            name=f"target:{target}",
+            make_target=target,
+            dry_run=request.dry_run,
+            jobs=None,
+            executor_pool_dir=request.executor_pool_dir,
+            executor_aggressiveness_percent=request.aggressiveness.percent,
+            artifacts=request.artifacts,
+            profiled_commit_sha=request.profiled_commit_sha,
+            fairness_group=profile_fairness_group(
+                request.profiled_commit_sha,
+                f"target:{target}",
+            ),
+        )
+        try:
+            require_stage_success(
+                ProfileStage.TARGET,
+                target_run.command_result,
+                target_run.cleanup_failures,
+            )
+        except ProfileStageFailed as failed:
+            print(f"[profile] {failed}", file=sys.stderr)
+            return TargetFailureReport(
+                schema_version=6,
+                outcome="failed",
+                config=request.configuration,
+                cold_validate_pr_raw_run=cold_aggregate,
+                completed_target_runs=tuple(completed_targets),
+                failure=failed.failure,
+            )
+        completed_targets.append(target_run.command_result)
+    target_results = tuple(completed_targets)
+
+    learned_aggregate = run_profile_aggregate(
+        repo_root=request.repo_root,
+        make_bin=request.make_bin,
+        name=f"learned-aggregate:{AGGREGATE_TARGET}",
+        dry_run=request.dry_run,
+        jobs=request.jobs,
+        executor_pool_dir=request.executor_pool_dir,
+        aggressiveness=request.aggressiveness,
+        artifacts=request.artifacts,
+        profiled_commit_sha=request.profiled_commit_sha,
+        fairness_group=profile_fairness_group(request.profiled_commit_sha, "learned"),
+    )
+    try:
+        require_stage_success(
+            ProfileStage.LEARNED_AGGREGATE,
+            learned_aggregate.command_result,
+            learned_aggregate.cleanup_failures,
+        )
+    except ProfileStageFailed as failed:
+        print(f"[profile] {failed}", file=sys.stderr)
+        return LearnedAggregateFailureReport(
+            schema_version=6,
+            outcome="failed",
+            config=request.configuration,
+            cold_validate_pr_raw_run=cold_aggregate,
+            target_runs=target_results,
+            failed_aggregate=learned_aggregate,
+            failure=failed.failure,
+        )
+
+    summary = summarize(
+        target_results=target_results,
+        cold_validate_pr_raw_result=cold_aggregate.command_result,
+        learned_validate_pr_raw_result=learned_aggregate.command_result,
+        jobs=request.jobs,
+    )
+    return ValidateProfileReport(
+        schema_version=6,
+        outcome="complete",
+        config=request.configuration,
+        cold_validate_pr_raw_run=cold_aggregate,
+        target_runs=target_results,
+        learned_validate_pr_raw_run=learned_aggregate,
+        summary=summary,
+    )
+
+
 def main() -> int:
     arguments = parse_args()
     repo_root = arguments.repo_root.resolve()
@@ -1236,135 +1519,36 @@ def main() -> int:
     )
     profile_root = Path(tempfile.mkdtemp(prefix="io-validate-profile-session-"))
     executor_pool_dir = profile_root / "executor-pool"
+    directory_remover = ShutilProfileDirectoryRemover()
     try:
-        cold_aggregate = run_profile_aggregate(
-            repo_root=repo_root,
-            make_bin=arguments.make_bin,
-            name=f"cold-aggregate:{AGGREGATE_TARGET}",
-            dry_run=arguments.dry_run,
-            jobs=arguments.jobs,
-            executor_pool_dir=executor_pool_dir,
-            aggressiveness=aggressiveness,
-            artifacts=artifacts,
-            profiled_commit_sha=profiled_commit_sha,
-            fairness_group=profile_fairness_group(profiled_commit_sha, "cold"),
-        )
-        try:
-            require_stage_success(
-                ProfileStage.COLD_AGGREGATE,
-                cold_aggregate.command_result,
-                cold_aggregate.cleanup_failures,
-            )
-        except ProfileStageFailed as failed:
-            write_profile_artifact(
-                output_path,
-                ColdAggregateFailureReport(
-                    schema_version=6,
-                    outcome="failed",
-                    config=configuration,
-                    failed_aggregate=cold_aggregate,
-                    failure=failed.failure,
-                ),
-            )
-            print(f"[profile] {failed}", file=sys.stderr)
-            return failed.failure.exit_code
-
-        completed_targets: list[CommandResult] = []
-        for target in targets:
-            target_run = run_in_isolated_worktree(
+        artifact = measure_profile(
+            ProfileMeasurementRequest(
                 repo_root=repo_root,
                 make_bin=arguments.make_bin,
-                name=f"target:{target}",
-                make_target=target,
+                jobs=arguments.jobs,
                 dry_run=arguments.dry_run,
-                jobs=None,
+                targets=targets,
                 executor_pool_dir=executor_pool_dir,
-                executor_aggressiveness_percent=aggressiveness.percent,
+                aggressiveness=aggressiveness,
                 artifacts=artifacts,
                 profiled_commit_sha=profiled_commit_sha,
-                fairness_group=profile_fairness_group(
-                    profiled_commit_sha,
-                    f"target:{target}",
-                ),
+                configuration=configuration,
             )
-            try:
-                require_stage_success(
-                    ProfileStage.TARGET,
-                    target_run.command_result,
-                    target_run.cleanup_failures,
-                )
-            except ProfileStageFailed as failed:
-                write_profile_artifact(
-                    output_path,
-                    TargetFailureReport(
-                        schema_version=6,
-                        outcome="failed",
-                        config=configuration,
-                        cold_validate_pr_raw_run=cold_aggregate,
-                        completed_target_runs=tuple(completed_targets),
-                        failure=failed.failure,
-                    ),
-                )
-                print(f"[profile] {failed}", file=sys.stderr)
-                return failed.failure.exit_code
-            completed_targets.append(target_run.command_result)
-        target_results = tuple(completed_targets)
-
-        learned_aggregate = run_profile_aggregate(
-            repo_root=repo_root,
-            make_bin=arguments.make_bin,
-            name=f"learned-aggregate:{AGGREGATE_TARGET}",
-            dry_run=arguments.dry_run,
-            jobs=arguments.jobs,
-            executor_pool_dir=executor_pool_dir,
-            aggressiveness=aggressiveness,
-            artifacts=artifacts,
-            profiled_commit_sha=profiled_commit_sha,
-            fairness_group=profile_fairness_group(
-                profiled_commit_sha,
-                "learned",
-            ),
         )
-        try:
-            require_stage_success(
-                ProfileStage.LEARNED_AGGREGATE,
-                learned_aggregate.command_result,
-                learned_aggregate.cleanup_failures,
-            )
-        except ProfileStageFailed as failed:
-            write_profile_artifact(
-                output_path,
-                LearnedAggregateFailureReport(
-                    schema_version=6,
-                    outcome="failed",
-                    config=configuration,
-                    cold_validate_pr_raw_run=cold_aggregate,
-                    target_runs=target_results,
-                    failed_aggregate=learned_aggregate,
-                    failure=failed.failure,
-                ),
-            )
-            print(f"[profile] {failed}", file=sys.stderr)
-            return failed.failure.exit_code
-    finally:
-        shutil.rmtree(profile_root)
-    summary = summarize(
-        target_results=target_results,
-        cold_validate_pr_raw_result=cold_aggregate.command_result,
-        learned_validate_pr_raw_result=learned_aggregate.command_result,
-        jobs=arguments.jobs,
+    except BaseException as exc:
+        cleanup_failures = remove_profile_session_root(
+            profile_root,
+            directory_remover,
+        )
+        if cleanup_failures:
+            raise ProfileSessionCleanupError(cleanup_failures) from exc
+        raise
+    return finalize_profile_session(
+        output_path=output_path,
+        profile_root=profile_root,
+        artifact=artifact,
+        directory_remover=directory_remover,
     )
-    report = ValidateProfileReport(
-        schema_version=6,
-        outcome="complete",
-        config=configuration,
-        cold_validate_pr_raw_run=cold_aggregate,
-        target_runs=target_results,
-        learned_validate_pr_raw_run=learned_aggregate,
-        summary=summary,
-    )
-    write_profile_artifact(output_path, report)
-    return 0
 
 
 if __name__ == "__main__":

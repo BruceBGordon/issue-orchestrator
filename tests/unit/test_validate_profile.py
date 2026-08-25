@@ -432,6 +432,158 @@ def test_profile_retains_worktree_cleanup_failure_in_typed_partial_report(
         assert report["completed_target_runs"] == []
 
 
+def _complete_profile_artifact(
+    profile: ModuleType,
+    tmp_path: Path,
+) -> object:
+    command_result = profile.CommandResult(
+        "aggregate",
+        ("make", "validate-pr-raw"),
+        85.0,
+        0,
+        None,
+        str(tmp_path / "aggregate.log"),
+    )
+    executor_status = profile.ProfileExecutorStatus(
+        18,
+        125,
+        "environment",
+        "0" * 64,
+        0,
+        (),
+    )
+    aggregate = profile.ProfileAggregateRun(
+        command_result,
+        executor_status,
+        executor_status,
+        profile.ProfileExecutorEventCapture(1000, 0, False, ()),
+        (),
+    )
+    configuration = profile.ValidateProfileConfiguration(
+        "make",
+        str(tmp_path),
+        18,
+        False,
+        ("unit",),
+        "validate-pr-raw",
+        profile.PROFILE_METHOD,
+        "0" * 40,
+        False,
+        profile.ProfileHost("host", "Darwin", "1", "arm64", 18, 64),
+        profile.ProfileAggressiveness(125, "command-line"),
+        "test learning",
+        "preserved",
+        str(tmp_path / "artifacts"),
+    )
+    summary = profile.ValidateProfileSummary(
+        "2026-08-25T00:00:00+00:00",
+        18,
+        90.0,
+        85.0,
+        -5.0,
+        85.0,
+        85.0,
+        0.0,
+        (command_result,),
+    )
+    return profile.ValidateProfileReport(
+        6,
+        "complete",
+        configuration,
+        aggregate,
+        (command_result,),
+        aggregate,
+        summary,
+    )
+
+
+class _FailingProfileDirectoryRemover:
+    def __init__(self, expected_directory: Path) -> None:
+        self._expected_directory = expected_directory
+
+    def remove(self, directory: Path) -> None:
+        assert directory == self._expected_directory
+        raise PermissionError("profile root is busy")
+
+
+def test_complete_profile_retains_measurements_when_session_cleanup_fails(
+    tmp_path: Path,
+) -> None:
+    profile = _load_profile_module()
+    profile_root = tmp_path / "complete-profile-root"
+    profile_root.mkdir()
+    output_path = tmp_path / "complete-cleanup-failure.json"
+
+    exit_code = profile.finalize_profile_session(
+        output_path=output_path,
+        profile_root=profile_root,
+        artifact=_complete_profile_artifact(profile, tmp_path),
+        directory_remover=_FailingProfileDirectoryRemover(profile_root),
+    )
+
+    assert exit_code == 1
+    report = json.loads(output_path.read_text(encoding="utf-8"))
+    assert report["outcome"] == "failed"
+    assert report["summary"]["learned_validate_pr_raw_seconds"] == 85.0
+    assert report["failure"]["stage"] == "profile-session-cleanup"
+    [cleanup_failure] = report["failure"]["cleanup_failures"]
+    assert cleanup_failure == {
+        "operation": "profile-session-root-remove",
+        "error_type": "PermissionError",
+        "error_message": "profile root is busy",
+    }
+
+
+def test_stage_failure_retains_primary_and_session_cleanup_failures(
+    tmp_path: Path,
+) -> None:
+    profile = _load_profile_module()
+    profile_root = tmp_path / "failed-profile-root"
+    profile_root.mkdir()
+    output_path = tmp_path / "stage-and-cleanup-failure.json"
+    complete = _complete_profile_artifact(profile, tmp_path)
+    failed_command = profile.CommandResult(
+        "cold-aggregate",
+        ("make", "validate-pr-raw"),
+        2.0,
+        7,
+        None,
+        str(tmp_path / "cold.log"),
+    )
+    failed_aggregate = profile.ProfileAggregateRun(
+        failed_command,
+        complete.cold_validate_pr_raw_run.executor_before,
+        complete.cold_validate_pr_raw_run.executor_after,
+        complete.cold_validate_pr_raw_run.executor_events,
+        (),
+    )
+    artifact = profile.ColdAggregateFailureReport(
+        6,
+        "failed",
+        complete.config,
+        failed_aggregate,
+        profile.ProfileFailure(
+            profile.ProfileStage.COLD_AGGREGATE,
+            failed_command,
+            (),
+        ),
+    )
+
+    exit_code = profile.finalize_profile_session(
+        output_path=output_path,
+        profile_root=profile_root,
+        artifact=artifact,
+        directory_remover=_FailingProfileDirectoryRemover(profile_root),
+    )
+
+    assert exit_code == 7
+    report = json.loads(output_path.read_text(encoding="utf-8"))
+    assert report["failure"]["stage"] == "cold-aggregate"
+    assert report["failure"]["command_result"]["exit_code"] == 7
+    [cleanup_failure] = report["failure"]["cleanup_failures"]
+    assert cleanup_failure["operation"] == "profile-session-root-remove"
+
+
 def test_discovery_profiles_static_once_as_an_aggregate_execution_lane() -> None:
     profile = _load_profile_module()
 
