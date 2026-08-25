@@ -34,6 +34,9 @@ from issue_orchestrator.execution.host_executor import (
 from issue_orchestrator.execution.process_group_terminator import (
     PosixProcessGroupTerminator,
 )
+from issue_orchestrator.execution.executor_history_lock import (
+    PosixExecutorHistoryRetentionLock,
+)
 
 
 ADMISSION_ATTEMPT_FD_ENV = "ISSUE_ORCHESTRATOR_TEST_ADMISSION_ATTEMPT_FD"
@@ -110,8 +113,9 @@ def main() -> int:
             if raw_attempt_fd is None
             else PipeAdmissionAttemptSignal(int(raw_attempt_fd))
         )
+        pool_dir = Path(os.environ["ISSUE_ORCHESTRATOR_EXECUTOR_POOL_DIR"])
         executor = HostExecutor(
-            pool_dir=Path(os.environ["ISSUE_ORCHESTRATOR_EXECUTOR_POOL_DIR"]),
+            pool_dir=pool_dir,
             host_cpu_slots=args.host_cpu_slots,
             admission_policy=ExecutorAdmissionPolicy(
                 ExecutorSaturationPolicy(maximum_busy_percent=95)
@@ -138,6 +142,9 @@ def main() -> int:
                     graceful_shutdown_seconds=2.0,
                     forceful_shutdown_seconds=2.0,
                 )
+            ),
+            history_retention_lock=PosixExecutorHistoryRetentionLock(
+                (pool_dir / "work-history" / "retention.lock").resolve()
             ),
             history_retention_policy=ExecutorHistoryRetentionPolicy(2048, 24),
             queue_settle_seconds=0.02,

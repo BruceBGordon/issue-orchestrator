@@ -210,6 +210,8 @@ class ResourceObservationRecord(ExecutorStrictRecord):
     concurrency: int = Field(ge=1)
     wall_seconds: float = Field(gt=0)
     cpu_seconds: float = Field(ge=0)
+    # Schema v1 compatibility: this wire key stores the executor process's
+    # exited-child lifetime RSS high-water mark, not a per-command measurement.
     max_rss_bytes: int = Field(ge=0)
     input_blocks: int = Field(ge=0)
     output_blocks: int = Field(ge=0)
@@ -226,7 +228,7 @@ class ResourceObservationRecord(ExecutorStrictRecord):
             concurrency=resources.concurrency,
             wall_seconds=resources.wall_seconds,
             cpu_seconds=resources.cpu_seconds,
-            max_rss_bytes=resources.max_rss_bytes,
+            max_rss_bytes=(resources.executor_process_lifetime_children_max_rss_bytes),
             input_blocks=resources.input_blocks,
             output_blocks=resources.output_blocks,
             exit_code=observation.exit_code,
@@ -239,7 +241,7 @@ class ResourceObservationRecord(ExecutorStrictRecord):
                 concurrency=self.concurrency,
                 wall_seconds=self.wall_seconds,
                 cpu_seconds=self.cpu_seconds,
-                max_rss_bytes=self.max_rss_bytes,
+                executor_process_lifetime_children_max_rss_bytes=(self.max_rss_bytes),
                 input_blocks=self.input_blocks,
                 output_blocks=self.output_blocks,
             ),

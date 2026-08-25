@@ -57,6 +57,9 @@ from issue_orchestrator.execution.host_executor import (
 from issue_orchestrator.execution.process_group_terminator import (
     PosixProcessGroupTerminator,
 )
+from issue_orchestrator.execution.executor_history_lock import (
+    PosixExecutorHistoryRetentionLock,
+)
 from issue_orchestrator.domain.agent_phase_execution import (
     AgentPhaseOuterWatchdogPolicy,
 )
@@ -130,6 +133,12 @@ def _demand_estimator() -> ExecutorWorkDemandEstimator:
     )
 
 
+def _history_lock(pool_dir: Path) -> PosixExecutorHistoryRetentionLock:
+    return PosixExecutorHistoryRetentionLock(
+        (pool_dir / "work-history" / "retention.lock").resolve()
+    )
+
+
 def _deterministic_host_executor(
     pool_dir: Path,
     *,
@@ -157,6 +166,7 @@ def _deterministic_host_executor(
                 forceful_shutdown_seconds=2.0,
             )
         ),
+        history_retention_lock=_history_lock(pool_dir),
         history_retention_policy=ExecutorHistoryRetentionPolicy(2048, 24),
         queue_settle_seconds=0.01,
         queue_poll_seconds=0.01,
@@ -323,6 +333,7 @@ def test_launch_owner_classifies_every_phase_provider_before_wrapping(
     )
     assert scheduled_config.timeout_minutes == 92
 
+
 def test_scheduler_renders_one_shell_safe_internal_invocation() -> None:
     specification = AgentPhaseRunSpecification.from_timeout_minutes(
         work_key=ExecutorWorkKey("agent-phase:agent:web:code"),
@@ -479,10 +490,10 @@ def test_internal_phase_client_terminates_at_active_deadline_and_releases_lease(
         specification,
         ExecutorCommand(
             (
-            sys.executable,
-            "-c",
-            "import signal; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
-            "signal.pause()",
+                sys.executable,
+                "-c",
+                "import signal; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                "signal.pause()",
             ),
             ExecutorBoundedDeadline(0.05, 1.0),
         ),
@@ -600,6 +611,7 @@ def test_admission_deadline_fails_before_command_and_is_durable(
                 forceful_shutdown_seconds=2.0,
             )
         ),
+        history_retention_lock=_history_lock(pool_dir),
         history_retention_policy=ExecutorHistoryRetentionPolicy(2048, 24),
         queue_settle_seconds=0.01,
         queue_poll_seconds=0.01,
@@ -633,6 +645,7 @@ def test_admission_deadline_fails_before_command_and_is_durable(
         1,
         _demand_estimator(),
         ExecutorHistoryRetentionPolicy(2048, 24),
+        _history_lock(pool_dir),
     ).recent_events(ExecutorRecentEventsQuery(20))
     [deadline_event] = [
         event
@@ -682,6 +695,7 @@ def test_deadline_expiring_after_admission_records_terminal_events_without_spawn
                 forceful_shutdown_seconds=2.0,
             )
         ),
+        history_retention_lock=_history_lock(pool_dir),
         history_retention_policy=ExecutorHistoryRetentionPolicy(2048, 24),
         queue_settle_seconds=0.01,
         queue_poll_seconds=0.01,
@@ -712,6 +726,7 @@ def test_deadline_expiring_after_admission_records_terminal_events_without_spawn
         1,
         _demand_estimator(),
         ExecutorHistoryRetentionPolicy(2048, 24),
+        _history_lock(pool_dir),
     ).recent_events(ExecutorRecentEventsQuery(20))
     assert any(isinstance(event, ExecutorWorkAdmitted) for event in timeline.events)
     [deadline_event] = [

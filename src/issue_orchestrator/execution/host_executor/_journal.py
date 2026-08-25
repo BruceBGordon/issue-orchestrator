@@ -136,9 +136,7 @@ class AdmissionDeadlineExceededEventRecord(_EventRecord):
     repository_label: str = Field(min_length=1)
     work_key: str = Field(min_length=1)
     fairness_group: str = Field(min_length=1)
-    reason: Literal[ExecutorDeadlineReason.ABSOLUTE] = (
-        ExecutorDeadlineReason.ABSOLUTE
-    )
+    reason: Literal[ExecutorDeadlineReason.ABSOLUTE] = ExecutorDeadlineReason.ABSOLUTE
     active_timeout_seconds: float = Field(gt=0)
     absolute_timeout_seconds: float = Field(gt=0)
     elapsed_seconds: float = Field(ge=0)
@@ -629,7 +627,9 @@ def _to_domain_event(record: StoredExecutorEvent) -> ExecutorEvent:
             resources=ExecutorResourceUsage(
                 wall_seconds=record.observation.wall_seconds,
                 cpu_seconds=record.observation.cpu_seconds,
-                max_rss_bytes=record.observation.max_rss_bytes,
+                executor_process_lifetime_children_max_rss_bytes=(
+                    record.observation.max_rss_bytes
+                ),
                 input_blocks=record.observation.input_blocks,
                 output_blocks=record.observation.output_blocks,
             ),

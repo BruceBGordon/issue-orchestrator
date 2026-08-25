@@ -15,9 +15,18 @@ from ...domain.executor_monitoring import (
 from ...domain.executor import ExecutorHistoryRetentionPolicy
 from ...control.executor_admission import ExecutorWorkDemandEstimator
 from ...ports.executor_monitor import ExecutorMonitor
+from ...ports.executor_history_lock import ExecutorHistoryRetentionLock
 from ._journal import ExecutorEventStore
 from ._history import ExecutorWorkHistoryStore
 from .host_policy import ExecutorPolicyStore
+
+
+def _require_history_retention_lock(value: object) -> None:
+    if not isinstance(value, ExecutorHistoryRetentionLock):
+        raise ValueError(
+            "HostExecutorMonitor.history_retention_lock must implement "
+            "ExecutorHistoryRetentionLock"
+        )
 
 
 class HostExecutorMonitor(ExecutorMonitor):
@@ -29,12 +38,16 @@ class HostExecutorMonitor(ExecutorMonitor):
         host_cpu_slots: int,
         demand_estimator: ExecutorWorkDemandEstimator,
         history_retention_policy: ExecutorHistoryRetentionPolicy,
+        history_retention_lock: ExecutorHistoryRetentionLock,
     ) -> None:
         if type(host_cpu_slots) is not int or host_cpu_slots < 1:
             raise ValueError("HostExecutorMonitor.host_cpu_slots must be positive")
+        _require_history_retention_lock(history_retention_lock)
         self._event_store = ExecutorEventStore(pool_dir)
         self._history = ExecutorWorkHistoryStore(
-            pool_dir / "work-history", history_retention_policy
+            pool_dir / "work-history",
+            history_retention_policy,
+            history_retention_lock,
         )
         self._policy_store = ExecutorPolicyStore(pool_dir)
         self._host_cpu_slots = host_cpu_slots

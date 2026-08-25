@@ -225,6 +225,7 @@ class ProfileAggregateRun:
     executor_before: ProfileExecutorStatus
     executor_after: ProfileExecutorStatus
     executor_events: ProfileExecutorEventCapture
+    cleanup_failures: tuple[ProfileCleanupFailure, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -270,12 +271,115 @@ class ProfileStage(StrEnum):
     LEARNED_AGGREGATE = "learned-aggregate"
 
 
+class ProfileCleanupOperation(StrEnum):
+    """Cleanup boundary whose failure remains part of stage evidence."""
+
+    WORKTREE_REMOVE = "worktree-remove"
+    TEMPORARY_ROOT_REMOVE = "temporary-root-remove"
+
+
+@dataclass(frozen=True, slots=True)
+class ProfileCleanupCommandFailure:
+    """Failed cleanup command with its complete retained command evidence."""
+
+    operation: ProfileCleanupOperation
+    command_result: CommandResult
+
+    def __post_init__(self) -> None:
+        if type(self.operation) is not ProfileCleanupOperation:
+            raise ValueError(
+                "ProfileCleanupCommandFailure.operation must be ProfileCleanupOperation"
+            )
+        if type(self.command_result) is not CommandResult:
+            raise ValueError(
+                "ProfileCleanupCommandFailure.command_result must be CommandResult"
+            )
+        if self.command_result.exit_code == 0:
+            raise ValueError(
+                "ProfileCleanupCommandFailure.command_result must have failed"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class ProfileCleanupFilesystemFailure:
+    """Failed local cleanup operation that did not execute a command."""
+
+    operation: ProfileCleanupOperation
+    error_type: str
+    error_message: str
+
+    def __post_init__(self) -> None:
+        if type(self.operation) is not ProfileCleanupOperation:
+            raise ValueError(
+                "ProfileCleanupFilesystemFailure.operation must be "
+                "ProfileCleanupOperation"
+            )
+        if type(self.error_type) is not str or not self.error_type:
+            raise ValueError(
+                "ProfileCleanupFilesystemFailure.error_type must not be empty"
+            )
+        if type(self.error_message) is not str or not self.error_message:
+            raise ValueError(
+                "ProfileCleanupFilesystemFailure.error_message must not be empty"
+            )
+
+
+ProfileCleanupFailure = ProfileCleanupCommandFailure | ProfileCleanupFilesystemFailure
+
+
+@dataclass(frozen=True, slots=True)
+class IsolatedWorktreeRun:
+    """Primary command plus every cleanup outcome for one isolated worktree."""
+
+    command_result: CommandResult
+    cleanup_failures: tuple[ProfileCleanupFailure, ...]
+
+    def __post_init__(self) -> None:
+        if type(self.command_result) is not CommandResult:
+            raise ValueError("IsolatedWorktreeRun.command_result must be CommandResult")
+        if type(self.cleanup_failures) is not tuple or any(
+            type(failure)
+            not in (ProfileCleanupCommandFailure, ProfileCleanupFilesystemFailure)
+            for failure in self.cleanup_failures
+        ):
+            raise ValueError(
+                "IsolatedWorktreeRun.cleanup_failures must contain typed failures"
+            )
+
+
 @dataclass(frozen=True, slots=True)
 class ProfileFailure:
     """Typed failed result retained without manufacturing comparisons."""
 
     stage: ProfileStage
     command_result: CommandResult
+    cleanup_failures: tuple[ProfileCleanupFailure, ...]
+
+    def __post_init__(self) -> None:
+        if type(self.stage) is not ProfileStage:
+            raise ValueError("ProfileFailure.stage must be ProfileStage")
+        if type(self.command_result) is not CommandResult:
+            raise ValueError("ProfileFailure.command_result must be CommandResult")
+        if type(self.cleanup_failures) is not tuple or any(
+            type(failure)
+            not in (ProfileCleanupCommandFailure, ProfileCleanupFilesystemFailure)
+            for failure in self.cleanup_failures
+        ):
+            raise ValueError(
+                "ProfileFailure.cleanup_failures must contain typed failures"
+            )
+        if self.command_result.exit_code == 0 and not self.cleanup_failures:
+            raise ValueError("ProfileFailure requires a command or cleanup failure")
+
+    @property
+    def exit_code(self) -> int:
+        """Return the primary failure status without hiding cleanup failures."""
+        if self.command_result.exit_code != 0:
+            return self.command_result.exit_code
+        first_cleanup = self.cleanup_failures[0]
+        if type(first_cleanup) is ProfileCleanupCommandFailure:
+            return first_cleanup.command_result.exit_code
+        return 1
 
 
 class ProfileStageFailed(RuntimeError):
@@ -287,7 +391,8 @@ class ProfileStageFailed(RuntimeError):
         self.failure = failure
         super().__init__(
             f"{failure.stage.value} failed: {failure.command_result.name} "
-            f"exit={failure.command_result.exit_code}"
+            f"exit={failure.exit_code} cleanup_failures="
+            f"{len(failure.cleanup_failures)}"
         )
 
 
@@ -295,7 +400,7 @@ class ProfileStageFailed(RuntimeError):
 class ValidateProfileReport:
     """Versioned JSON report written by the profiler."""
 
-    schema_version: Literal[5]
+    schema_version: Literal[6]
     outcome: Literal["complete"]
     config: ValidateProfileConfiguration
     cold_validate_pr_raw_run: ProfileAggregateRun
@@ -308,7 +413,7 @@ class ValidateProfileReport:
 class ColdAggregateFailureReport:
     """Partial report when the first aggregate fails."""
 
-    schema_version: Literal[5]
+    schema_version: Literal[6]
     outcome: Literal["failed"]
     config: ValidateProfileConfiguration
     failed_aggregate: ProfileAggregateRun
@@ -319,7 +424,7 @@ class ColdAggregateFailureReport:
 class TargetFailureReport:
     """Partial report when one isolated target fails."""
 
-    schema_version: Literal[5]
+    schema_version: Literal[6]
     outcome: Literal["failed"]
     config: ValidateProfileConfiguration
     cold_validate_pr_raw_run: ProfileAggregateRun
@@ -331,7 +436,7 @@ class TargetFailureReport:
 class LearnedAggregateFailureReport:
     """Partial report when the final aggregate fails."""
 
-    schema_version: Literal[5]
+    schema_version: Literal[6]
     outcome: Literal["failed"]
     config: ValidateProfileConfiguration
     cold_validate_pr_raw_run: ProfileAggregateRun
@@ -401,9 +506,7 @@ def run_command(
     started = time.monotonic()
     with output_log.open("x", encoding="utf-8") as log_handle:
         log_handle.write(f"[profile-command] name={name}\n")
-        log_handle.write(
-            "[profile-command] argv=" + json.dumps(command) + "\n"
-        )
+        log_handle.write("[profile-command] argv=" + json.dumps(command) + "\n")
         log_handle.write(f"[profile-command] cwd={cwd}\n")
         log_handle.write(f"[profile-command] started_at={started_at}\n")
         if environment is not None:
@@ -413,22 +516,28 @@ def run_command(
             ):
                 if variable in environment:
                     log_handle.write(
-                        f"[profile-command] env.{variable}="
-                        f"{environment[variable]}\n"
+                        f"[profile-command] env.{variable}={environment[variable]}\n"
                     )
         log_handle.flush()
         if dry_run:
             exit_code = 0
         else:
-            completed = subprocess.run(
-                command,
-                check=False,
-                cwd=cwd,
-                env=environment,
-                stdout=log_handle,
-                stderr=subprocess.STDOUT,
-            )
-            exit_code = completed.returncode
+            try:
+                completed = subprocess.run(
+                    command,
+                    check=False,
+                    cwd=cwd,
+                    env=environment,
+                    stdout=log_handle,
+                    stderr=subprocess.STDOUT,
+                )
+            except OSError as exc:
+                exit_code = 127
+                log_handle.write(
+                    f"[profile-command] start_error={type(exc).__name__}: {exc}\n"
+                )
+            else:
+                exit_code = completed.returncode
         wall_seconds = time.monotonic() - started
         log_handle.write(
             f"[profile-command] exit={exit_code} elapsed={wall_seconds:.6f}s "
@@ -475,9 +584,7 @@ def discover_validate_targets(repo_root: Path, make_bin: str) -> tuple[str, ...]
         raise RuntimeError(
             f"GNU make did not declare {AGGREGATE_LANE_VARIABLE} targets"
         )
-    return tuple(
-        dict.fromkeys(("_validate-static-lane", *lane_targets, "test-vscode"))
-    )
+    return tuple(dict.fromkeys(("_validate-static-lane", *lane_targets, "test-vscode")))
 
 
 def discover_validate_targets_at_commit(
@@ -613,14 +720,20 @@ def default_output_path(repo_root: Path) -> Path:
     )
 
 
-def require_stage_success(stage: ProfileStage, result: CommandResult) -> None:
+def require_stage_success(
+    stage: ProfileStage,
+    result: CommandResult,
+    cleanup_failures: tuple[ProfileCleanupFailure, ...],
+) -> None:
     """Stop the profile at its first failed measurement stage."""
     if type(stage) is not ProfileStage:
         raise ValueError("require_stage_success requires ProfileStage")
     if type(result) is not CommandResult:
         raise ValueError("require_stage_success requires CommandResult")
-    if result.exit_code != 0:
-        raise ProfileStageFailed(ProfileFailure(stage, result))
+    if type(cleanup_failures) is not tuple:
+        raise ValueError("require_stage_success requires a cleanup failure tuple")
+    if result.exit_code != 0 or cleanup_failures:
+        raise ProfileStageFailed(ProfileFailure(stage, result, cleanup_failures))
 
 
 def write_profile_artifact(
@@ -720,41 +833,39 @@ def run_in_isolated_worktree(
     artifacts: ProfileArtifactStore,
     profiled_commit_sha: str,
     fairness_group: ExecutorFairnessGroup,
-) -> CommandResult:
+) -> IsolatedWorktreeRun:
     """Provision, measure, and remove one isolated detached worktree."""
     temporary_root = Path(tempfile.mkdtemp(prefix="io-validate-profile-"))
     worktree = temporary_root / "wt"
-    add_succeeded = False
-    try:
-        add_command = (
-            "git",
-            "-C",
-            str(repo_root),
-            "worktree",
-            "add",
-            "--detach",
-            str(worktree),
-            profiled_commit_sha,
-        )
-        add_result = run_command(
-            name=f"{name}:worktree-add",
+    add_command = (
+        "git",
+        "-C",
+        str(repo_root),
+        "worktree",
+        "add",
+        "--detach",
+        str(worktree),
+        profiled_commit_sha,
+    )
+    add_result = run_command(
+        name=f"{name}:worktree-add",
+        command=add_command,
+        dry_run=dry_run,
+        cwd=None,
+        worktree_path=None,
+        artifacts=artifacts,
+    )
+    add_succeeded = add_result.exit_code == 0
+    if not add_succeeded:
+        command_result = CommandResult(
+            name=name,
             command=add_command,
-            dry_run=dry_run,
-            cwd=None,
-            worktree_path=None,
-            artifacts=artifacts,
+            wall_seconds=add_result.wall_seconds,
+            exit_code=add_result.exit_code,
+            worktree_path=str(worktree),
+            output_log_path=add_result.output_log_path,
         )
-        if add_result.exit_code != 0:
-            return CommandResult(
-                name=name,
-                command=add_command,
-                wall_seconds=add_result.wall_seconds,
-                exit_code=add_result.exit_code,
-                worktree_path=str(worktree),
-                output_log_path=add_result.output_log_path,
-            )
-        add_succeeded = True
-
+    else:
         setup_result = prepare_worktree(
             make_bin=make_bin,
             name=name,
@@ -763,7 +874,7 @@ def run_in_isolated_worktree(
             artifacts=artifacts,
         )
         if setup_result.exit_code != 0:
-            return CommandResult(
+            command_result = CommandResult(
                 name=name,
                 command=setup_result.command,
                 wall_seconds=setup_result.wall_seconds,
@@ -771,54 +882,69 @@ def run_in_isolated_worktree(
                 worktree_path=str(worktree),
                 output_log_path=setup_result.output_log_path,
             )
-
-        make_arguments = [make_bin]
-        if jobs is not None:
-            make_arguments.extend(
-                (
-                    f"-j{jobs}",
-                    "--output-sync=target",
-                    f"VALIDATE_LANE_JOBS={jobs}",
+        else:
+            make_arguments = [make_bin]
+            if jobs is not None:
+                make_arguments.extend(
+                    (
+                        f"-j{jobs}",
+                        "--output-sync=target",
+                        f"VALIDATE_LANE_JOBS={jobs}",
+                    )
                 )
+            make_arguments.append(make_target)
+            environment = os.environ.copy()
+            environment[EXECUTOR_POOL_DIR_ENV] = str(executor_pool_dir)
+            environment[EXECUTOR_AGGRESSIVENESS_ENV] = str(
+                executor_aggressiveness_percent
             )
-        make_arguments.append(make_target)
-        environment = os.environ.copy()
-        environment[EXECUTOR_POOL_DIR_ENV] = str(executor_pool_dir)
-        environment[EXECUTOR_AGGRESSIVENESS_ENV] = str(executor_aggressiveness_percent)
-        environment[EXECUTOR_GROUP_ENV] = fairness_group.value
-        return run_command(
-            name=name,
-            command=tuple(make_arguments),
-            dry_run=dry_run,
-            cwd=worktree,
-            worktree_path=str(worktree),
-            artifacts=artifacts,
-            environment=environment,
-        )
-    finally:
-        if add_succeeded:
-            removal = run_command(
-                name=f"{name}:worktree-remove",
-                command=(
-                    "git",
-                    "-C",
-                    str(repo_root),
-                    "worktree",
-                    "remove",
-                    "--force",
-                    str(worktree),
-                ),
+            environment[EXECUTOR_GROUP_ENV] = fairness_group.value
+            command_result = run_command(
+                name=name,
+                command=tuple(make_arguments),
                 dry_run=dry_run,
-                cwd=None,
-                worktree_path=None,
+                cwd=worktree,
+                worktree_path=str(worktree),
                 artifacts=artifacts,
+                environment=environment,
             )
-            if removal.exit_code != 0:
-                raise RuntimeError(
-                    f"failed to remove profiler worktree {worktree}: "
-                    f"exit={removal.exit_code}"
+
+    cleanup_failures: list[ProfileCleanupFailure] = []
+    if add_succeeded:
+        removal = run_command(
+            name=f"{name}:worktree-remove",
+            command=(
+                "git",
+                "-C",
+                str(repo_root),
+                "worktree",
+                "remove",
+                "--force",
+                str(worktree),
+            ),
+            dry_run=dry_run,
+            cwd=None,
+            worktree_path=None,
+            artifacts=artifacts,
+        )
+        if removal.exit_code != 0:
+            cleanup_failures.append(
+                ProfileCleanupCommandFailure(
+                    ProfileCleanupOperation.WORKTREE_REMOVE,
+                    removal,
                 )
+            )
+    try:
         shutil.rmtree(temporary_root)
+    except OSError as exc:
+        cleanup_failures.append(
+            ProfileCleanupFilesystemFailure(
+                ProfileCleanupOperation.TEMPORARY_ROOT_REMOVE,
+                type(exc).__name__,
+                str(exc),
+            )
+        )
+    return IsolatedWorktreeRun(command_result, tuple(cleanup_failures))
 
 
 def resolve_output_path(arguments: ProfileArguments, repo_root: Path) -> Path:
@@ -856,8 +982,7 @@ def source_worktree_is_dirty(repo_root: Path) -> bool:
     )
     if completed.returncode != 0:
         raise RuntimeError(
-            "cannot inspect profiler source worktree: "
-            f"{completed.stderr.strip()}"
+            f"cannot inspect profiler source worktree: {completed.stderr.strip()}"
         )
     return bool(completed.stdout)
 
@@ -921,9 +1046,7 @@ def profiled_executor_monitor(
     previous_pool = os.environ.get(EXECUTOR_POOL_DIR_ENV)
     previous_aggressiveness = os.environ.get(EXECUTOR_AGGRESSIVENESS_ENV)
     os.environ[EXECUTOR_POOL_DIR_ENV] = str(executor_pool_dir)
-    os.environ[EXECUTOR_AGGRESSIVENESS_ENV] = str(
-        selected_aggressiveness.percent
-    )
+    os.environ[EXECUTOR_AGGRESSIVENESS_ENV] = str(selected_aggressiveness.percent)
     try:
         yield build_executor_monitor()
     finally:
@@ -1004,19 +1127,13 @@ def project_executor_status(status: ExecutorStatus) -> ProfileExecutorStatus:
         aggressiveness_percent=status.policy.aggressiveness.percent,
         policy_source=status.policy.source.value,
         learning_fingerprint_sha256=status.learning.fingerprint_sha256,
-        successful_observation_count=(
-            status.learning.successful_observation_count
-        ),
+        successful_observation_count=(status.learning.successful_observation_count),
         learned_work=tuple(
             ProfileLearnedWork(
                 repository_label=item.repository.label,
                 work_key=item.work_key.value,
-                successful_observation_count=(
-                    item.successful_observation_count
-                ),
-                estimated_cores_per_concurrency=(
-                    item.estimated_cores_per_concurrency
-                ),
+                successful_observation_count=(item.successful_observation_count),
+                estimated_cores_per_concurrency=(item.estimated_cores_per_concurrency),
             )
             for item in status.learning.learned_work
         ),
@@ -1038,7 +1155,7 @@ def run_profile_aggregate(
 ) -> ProfileAggregateRun:
     """Measure one aggregate with learning provenance on both boundaries."""
     before = capture_executor_status(executor_pool_dir, aggressiveness)
-    command_result = run_in_isolated_worktree(
+    isolated_run = run_in_isolated_worktree(
         repo_root=repo_root,
         make_bin=make_bin,
         name=name,
@@ -1057,7 +1174,13 @@ def run_profile_aggregate(
         aggressiveness,
         fairness_group=fairness_group,
     )
-    return ProfileAggregateRun(command_result, before, after, events)
+    return ProfileAggregateRun(
+        isolated_run.command_result,
+        before,
+        after,
+        events,
+        isolated_run.cleanup_failures,
+    )
 
 
 def profile_fairness_group(
@@ -1130,12 +1253,13 @@ def main() -> int:
             require_stage_success(
                 ProfileStage.COLD_AGGREGATE,
                 cold_aggregate.command_result,
+                cold_aggregate.cleanup_failures,
             )
         except ProfileStageFailed as failed:
             write_profile_artifact(
                 output_path,
                 ColdAggregateFailureReport(
-                    schema_version=5,
+                    schema_version=6,
                     outcome="failed",
                     config=configuration,
                     failed_aggregate=cold_aggregate,
@@ -1143,11 +1267,11 @@ def main() -> int:
                 ),
             )
             print(f"[profile] {failed}", file=sys.stderr)
-            return failed.failure.command_result.exit_code
+            return failed.failure.exit_code
 
         completed_targets: list[CommandResult] = []
         for target in targets:
-            target_result = run_in_isolated_worktree(
+            target_run = run_in_isolated_worktree(
                 repo_root=repo_root,
                 make_bin=arguments.make_bin,
                 name=f"target:{target}",
@@ -1164,12 +1288,16 @@ def main() -> int:
                 ),
             )
             try:
-                require_stage_success(ProfileStage.TARGET, target_result)
+                require_stage_success(
+                    ProfileStage.TARGET,
+                    target_run.command_result,
+                    target_run.cleanup_failures,
+                )
             except ProfileStageFailed as failed:
                 write_profile_artifact(
                     output_path,
                     TargetFailureReport(
-                        schema_version=5,
+                        schema_version=6,
                         outcome="failed",
                         config=configuration,
                         cold_validate_pr_raw_run=cold_aggregate,
@@ -1178,8 +1306,8 @@ def main() -> int:
                     ),
                 )
                 print(f"[profile] {failed}", file=sys.stderr)
-                return failed.failure.command_result.exit_code
-            completed_targets.append(target_result)
+                return failed.failure.exit_code
+            completed_targets.append(target_run.command_result)
         target_results = tuple(completed_targets)
 
         learned_aggregate = run_profile_aggregate(
@@ -1201,12 +1329,13 @@ def main() -> int:
             require_stage_success(
                 ProfileStage.LEARNED_AGGREGATE,
                 learned_aggregate.command_result,
+                learned_aggregate.cleanup_failures,
             )
         except ProfileStageFailed as failed:
             write_profile_artifact(
                 output_path,
                 LearnedAggregateFailureReport(
-                    schema_version=5,
+                    schema_version=6,
                     outcome="failed",
                     config=configuration,
                     cold_validate_pr_raw_run=cold_aggregate,
@@ -1216,7 +1345,7 @@ def main() -> int:
                 ),
             )
             print(f"[profile] {failed}", file=sys.stderr)
-            return failed.failure.command_result.exit_code
+            return failed.failure.exit_code
     finally:
         shutil.rmtree(profile_root)
     summary = summarize(
@@ -1226,7 +1355,7 @@ def main() -> int:
         jobs=arguments.jobs,
     )
     report = ValidateProfileReport(
-        schema_version=5,
+        schema_version=6,
         outcome="complete",
         config=configuration,
         cold_validate_pr_raw_run=cold_aggregate,

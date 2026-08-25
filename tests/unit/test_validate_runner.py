@@ -10,6 +10,7 @@ import shlex
 import subprocess
 import sys
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -24,6 +25,7 @@ from issue_orchestrator.entrypoints.cli_tools.validate_runner import (
     ValidationRunnerClock,
     run_validation,
 )
+from issue_orchestrator.entrypoints.bootstrap import build_process_group_terminator
 
 
 def _with_repo_on_pythonpath(env: dict[str, str]) -> dict[str, str]:
@@ -359,7 +361,16 @@ class TestValidateRunner:
         }
 
         with pytest.raises(ValueError, match="duplicate START marker"):
-            run_validation(command, output_dir, fake_git_repo)
+            run_validation(
+                command,
+                output_dir,
+                fake_git_repo,
+                clock=ValidationRunnerClock(
+                    lambda: datetime.now(timezone.utc),
+                    time.monotonic,
+                ),
+                process_group_terminator=build_process_group_terminator(),
+            )
 
         child_pid = int(child_pid_path.read_text(encoding="utf-8"))
         with pytest.raises(ProcessLookupError):
@@ -474,6 +485,7 @@ class TestValidateRunner:
             tmp_path / "output",
             fake_git_repo,
             clock=ValidationRunnerClock(wall_now, monotonic_now),
+            process_group_terminator=build_process_group_terminator(),
         )
 
         assert result == 0

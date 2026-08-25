@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import os
 import uuid
@@ -23,6 +22,7 @@ from ...domain.executor_monitoring import (
     ExecutorRepositoryReference,
     ExecutorStatusQuery,
 )
+from ...ports.executor_history_lock import ExecutorHistoryRetentionLock
 from ._contracts import ResourceObservationRecord, WorkHistoryRecord
 from ._types import ExecutorWorkIdentity, RecordedExecutorObservation
 
@@ -34,6 +34,7 @@ class ExecutorWorkHistoryStore:
         self,
         history_dir: Path,
         retention_policy: ExecutorHistoryRetentionPolicy,
+        retention_lock: ExecutorHistoryRetentionLock,
     ) -> None:
         if type(retention_policy) is not ExecutorHistoryRetentionPolicy:
             raise ValueError(
@@ -42,6 +43,7 @@ class ExecutorWorkHistoryStore:
             )
         self._history_dir = history_dir
         self._retention_policy = retention_policy
+        self._retention_lock = retention_lock
 
     def successful_resources(
         self,
@@ -49,9 +51,7 @@ class ExecutorWorkHistoryStore:
     ) -> tuple[ExecutorResourceObservation, ...]:
         """Return successful resource observations in recording order."""
         self._history_dir.mkdir(parents=True, exist_ok=True)
-        lock_path = self._history_dir / "retention.lock"
-        with lock_path.open("a+b") as lock_handle:
-            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_SH)
+        with self._retention_lock.shared():
             return tuple(
                 observation.resources
                 for observation in self._observations_unlocked(identity)
@@ -70,9 +70,7 @@ class ExecutorWorkHistoryStore:
             )
         self._history_dir.mkdir(parents=True, exist_ok=True)
         path = self._profile_path(identity)
-        lock_path = self._history_dir / "retention.lock"
-        with lock_path.open("a+b") as lock_handle:
-            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        with self._retention_lock.exclusive():
             existing = tuple(
                 item
                 for item in self._observations_unlocked(identity)
@@ -103,9 +101,7 @@ class ExecutorWorkHistoryStore:
                 "ExecutorWorkHistoryStore.snapshot requires ExecutorStatusQuery"
             )
         self._history_dir.mkdir(parents=True, exist_ok=True)
-        lock_path = self._history_dir / "retention.lock"
-        with lock_path.open("a+b") as lock_handle:
-            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_SH)
+        with self._retention_lock.shared():
             records = tuple(
                 self._read_record(path)
                 for path in sorted(self._history_dir.glob("*.json"))

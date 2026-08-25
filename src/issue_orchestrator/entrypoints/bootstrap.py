@@ -37,10 +37,11 @@ from .bootstrap_environment import (
 )
 from .bootstrap_claims import ClaimComponents, assemble_claim_components, lease_config_from
 from .bootstrap_dependencies import Dependencies as Dependencies
-from ..execution.executor_composition import (
+from .bootstrap_executor import (
     build_agent_phase_command_scheduler,
-    build_executor as build_executor,
     build_executor_monitor as build_executor_monitor,
+    build_process_group_terminator as build_process_group_terminator,
+    compose_executor,
 )
 from .bootstrap_pair_registry import build_pair_registry_with_worktree_hook
 from .bootstrap_pending_work import (
@@ -62,6 +63,7 @@ from .bootstrap_completion import (
 from ..infra.config import Config
 from ..infra.env import ENV_PREFIX
 from ..adapters.github.repo import GitRepoError, get_repo_from_git
+from ..adapters.host_cpu_utilization import SystemHostCpuUtilizationObserver
 from ..ports.event_sink import EventSink, NullEventSink
 from ..ports.issue_tracker import IssueTracker
 from ..ports.session_runner import SessionRunner, NullSessionRunner
@@ -138,6 +140,7 @@ from ..control.tech_lead_run_ownership import TechLeadRunOwnership
 from ..ports.claim_manager import ClaimManager, NullClaimManager
 from ..ports.run_ledger_store import SingleInstanceRunLedgerStore
 from ..domain.lease_config import LeaseConfig
+from ..ports.executor import Executor
 
 if TYPE_CHECKING:
     from ..ports.label_set import LabelSet
@@ -150,6 +153,13 @@ if TYPE_CHECKING:
     from ..ports.tech_lead_authority import TechLeadAuthorityStore
 
 logger = logging.getLogger(__name__)
+
+
+def build_executor() -> Executor:
+    """Choose the system CPU observer at the sole adapter-aware root."""
+    return compose_executor(SystemHostCpuUtilizationObserver())
+
+
 _AGENT_PHASE_COMMAND_SCHEDULER = build_agent_phase_command_scheduler()
 
 

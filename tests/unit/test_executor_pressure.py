@@ -23,6 +23,9 @@ from issue_orchestrator.domain.executor_monitoring import (
     ExecutorWaitReason,
 )
 from issue_orchestrator.execution.host_executor import HostExecutorMonitor
+from issue_orchestrator.execution.executor_history_lock import (
+    PosixExecutorHistoryRetentionLock,
+)
 from tests.unit.executor_pressure_dsl import PressureJob, PressureRig, PressureWork
 
 
@@ -38,6 +41,9 @@ def _monitor(pool_dir: Path, host_cpu_slots: int) -> HostExecutorMonitor:
             )
         ),
         ExecutorHistoryRetentionPolicy(2048, 24),
+        PosixExecutorHistoryRetentionLock(
+            (pool_dir / "work-history" / "retention.lock").resolve()
+        ),
     )
 
 

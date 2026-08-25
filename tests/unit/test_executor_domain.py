@@ -73,7 +73,7 @@ def test_learning_contract_rejects_integer_where_float_is_required() -> None:
             concurrency=1,
             wall_seconds=cast(float, 1),
             cpu_seconds=0.5,
-            max_rss_bytes=0,
+            executor_process_lifetime_children_max_rss_bytes=0,
             input_blocks=0,
             output_blocks=0,
         )

@@ -1,4 +1,4 @@
-"""Composition provider for the host executor and bounded agent phases."""
+"""Entry-point composition owner for host execution and agent phases."""
 
 from __future__ import annotations
 
@@ -20,12 +20,15 @@ from ..domain.executor import (
     ExecutorProcessTerminationPolicy,
 )
 from ..domain.terminal_launch import TerminalShell
+from ..execution.agent_phase_command_scheduler import HostAgentPhaseCommandScheduler
+from ..execution.executor_history_lock import PosixExecutorHistoryRetentionLock
+from ..execution.process_group_terminator import PosixProcessGroupTerminator
 from ..ports.agent_phase_command_scheduler import AgentPhaseCommandScheduler
 from ..ports.executor import Executor
+from ..ports.executor_history_lock import ExecutorHistoryRetentionLock
 from ..ports.executor_monitor import ExecutorMonitor
+from ..ports.host_cpu_utilization import HostCpuUtilizationObserver
 from ..ports.process_group_terminator import ProcessGroupTerminator
-from .agent_phase_command_scheduler import HostAgentPhaseCommandScheduler
-from .process_group_terminator import PosixProcessGroupTerminator
 
 
 _PROCESS_TERMINATION = ExecutorProcessTerminationPolicy(
@@ -51,14 +54,11 @@ def build_agent_phase_command_scheduler() -> AgentPhaseCommandScheduler:
     )
 
 
-def build_executor() -> Executor:
-    """Compose the machine-wide command executor behind its public port."""
+def compose_executor(host_cpu_observer: HostCpuUtilizationObserver) -> Executor:
+    """Compose host execution after the root chooses its system observer."""
     _require_posix_executor()
     try:
-        from ..adapters.host_cpu_utilization import (
-            SystemHostCpuUtilizationObserver,
-        )
-        from .host_executor import (
+        from ..execution.host_executor import (
             ExecutorRequestIdentityFactory,
             HostExecutor,
             default_executor_pool_dir,
@@ -67,14 +67,15 @@ def build_executor() -> Executor:
     except ModuleNotFoundError as exc:
         _raise_missing_posix_executor_dependency(exc)
         raise AssertionError("unreachable after missing executor dependency")
+    pool_dir = default_executor_pool_dir()
     return HostExecutor(
-        pool_dir=default_executor_pool_dir(),
+        pool_dir=pool_dir,
         host_cpu_slots=detected_executor_cpu_count(),
         admission_policy=ExecutorAdmissionPolicy(
             ExecutorSaturationPolicy(maximum_busy_percent=95)
         ),
         demand_estimator=_build_demand_estimator(),
-        host_cpu_observer=SystemHostCpuUtilizationObserver(),
+        host_cpu_observer=host_cpu_observer,
         request_identity_factory=ExecutorRequestIdentityFactory(
             wall_time_nanoseconds=time.time_ns,
             monotonic_nanoseconds=time.monotonic_ns,
@@ -82,6 +83,7 @@ def build_executor() -> Executor:
             request_nonce=lambda: uuid4().hex,
         ),
         process_group_terminator=build_process_group_terminator(),
+        history_retention_lock=_build_history_retention_lock(pool_dir),
         history_retention_policy=_HISTORY_RETENTION,
         queue_settle_seconds=0.1,
         queue_poll_seconds=0.05,
@@ -98,7 +100,7 @@ def build_executor_monitor() -> ExecutorMonitor:
     """Compose the read-only executor activity monitor."""
     _require_posix_executor()
     try:
-        from .host_executor import (
+        from ..execution.host_executor import (
             HostExecutorMonitor,
             default_executor_pool_dir,
             detected_executor_cpu_count,
@@ -106,16 +108,26 @@ def build_executor_monitor() -> ExecutorMonitor:
     except ModuleNotFoundError as exc:
         _raise_missing_posix_executor_dependency(exc)
         raise AssertionError("unreachable after missing executor dependency")
+    pool_dir = default_executor_pool_dir()
     return HostExecutorMonitor(
-        default_executor_pool_dir(),
+        pool_dir,
         detected_executor_cpu_count(),
         _build_demand_estimator(),
         _HISTORY_RETENTION,
+        _build_history_retention_lock(pool_dir),
+    )
+
+
+def _build_history_retention_lock(
+    pool_dir: Path,
+) -> ExecutorHistoryRetentionLock:
+    """Own the one lock identity shared by executor writers and monitors."""
+    return PosixExecutorHistoryRetentionLock(
+        (pool_dir / "work-history" / "retention.lock").resolve()
     )
 
 
 def _build_demand_estimator() -> ExecutorWorkDemandEstimator:
-    """Construct the one learning policy shared by executor and monitor."""
     return ExecutorWorkDemandEstimator(
         ExecutorLearningPolicy(
             cold_start_cores_per_concurrency=1.0,
@@ -126,7 +138,6 @@ def _build_demand_estimator() -> ExecutorWorkDemandEstimator:
 
 
 def _require_posix_executor() -> None:
-    """Reject pooled execution where POSIX advisory locks are unavailable."""
     if os.name != "posix":
         raise RuntimeError(
             "the pooled host executor requires POSIX advisory locks; "
@@ -135,7 +146,6 @@ def _require_posix_executor() -> None:
 
 
 def _require_posix_process_groups() -> None:
-    """Reject process containment where the required kernel contract is absent."""
     if os.name != "posix" or not hasattr(os, "killpg") or not hasattr(os, "waitid"):
         raise RuntimeError(
             "process-tree containment requires POSIX os.killpg and os.waitid"
@@ -143,7 +153,6 @@ def _require_posix_process_groups() -> None:
 
 
 def _raise_missing_posix_executor_dependency(exc: ModuleNotFoundError) -> None:
-    """Translate known missing POSIX modules without hiding import defects."""
     if exc.name not in {"fcntl", "resource"}:
         raise exc
     raise RuntimeError(

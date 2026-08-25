@@ -196,7 +196,7 @@ def test_profile_jobs_control_outer_make_and_inner_lane_limit(
     assert report["config"]["executor_learning"] == (
         "one fresh pool: cold aggregate, lane training, learned aggregate"
     )
-    assert report["schema_version"] == 5
+    assert report["schema_version"] == 6
     assert report["outcome"] == "complete"
     assert len(report["config"]["profiled_commit_sha"]) == 40
     profiled_commit_sha = report["config"]["profiled_commit_sha"]
@@ -208,8 +208,9 @@ def test_profile_jobs_control_outer_make_and_inner_lane_limit(
     assert cold_aggregate["executor_before"]["policy_source"] == "environment"
     assert cold_aggregate["executor_before"]["successful_observation_count"] == 0
     assert learned_aggregate["executor_after"]["successful_observation_count"] == 0
-    assert cold_aggregate["executor_before"]["learning_fingerprint_sha256"] == (
-        learned_aggregate["executor_after"]["learning_fingerprint_sha256"]
+    assert (
+        cold_aggregate["executor_before"]["learning_fingerprint_sha256"]
+        == (learned_aggregate["executor_after"]["learning_fingerprint_sha256"])
     )
     assert report["config"]["external_caches"] == "preserved"
     artifact_directory = Path(report["config"]["artifact_directory"])
@@ -238,6 +239,7 @@ def test_profile_jobs_control_outer_make_and_inner_lane_limit(
         assert "env.ISSUE_ORCHESTRATOR_EXECUTOR_POOL_DIR=" in output
         assert "[profile-command] exit=0" in output
     for aggregate in (cold_aggregate, learned_aggregate):
+        assert aggregate["cleanup_failures"] == []
         assert aggregate["executor_events"] == {
             "query_limit": 1000,
             "total_matching_event_count": 0,
@@ -314,10 +316,11 @@ def test_profile_stops_at_first_failure_and_writes_typed_partial_report(
 
     assert completed.returncode == expected_exit, completed.stderr
     report = json.loads(output_path.read_text(encoding="utf-8"))
-    assert report["schema_version"] == 5
+    assert report["schema_version"] == 6
     assert report["outcome"] == "failed"
     assert report["failure"]["stage"] == failure_stage
     assert report["failure"]["command_result"]["exit_code"] == expected_exit
+    assert report["failure"]["cleanup_failures"] == []
     assert "summary" not in report
     artifact_directory = Path(report["config"]["artifact_directory"])
     if failure_stage == "cold-aggregate":
@@ -330,6 +333,103 @@ def test_profile_stops_at_first_failure_and_writes_typed_partial_report(
     else:
         assert len(report["target_runs"]) == 2
         assert report["failed_aggregate"]["command_result"]["exit_code"] == 2
+
+
+def _git_wrapper_failing_worktree_removal(
+    tmp_path: Path,
+    *,
+    removal_number: int,
+) -> Path:
+    real_git = shutil.which("git")
+    if real_git is None:
+        pytest.fail("git is required to validate profiler cleanup")
+    wrapper_directory = tmp_path / f"git-wrapper-{removal_number}"
+    wrapper_directory.mkdir()
+    counter_path = wrapper_directory / "remove-count"
+    wrapper_path = wrapper_directory / "git"
+    wrapper_path.write_text(
+        f"""#!/usr/bin/env python3
+import os
+from pathlib import Path
+import sys
+
+arguments = sys.argv[1:]
+counter_path = Path({str(counter_path)!r})
+is_worktree_remove = len(arguments) >= 4 and arguments[2:4] == ["worktree", "remove"]
+if is_worktree_remove:
+    previous = int(counter_path.read_text()) if counter_path.exists() else 0
+    current = previous + 1
+    counter_path.write_text(str(current))
+    if current == {removal_number}:
+        raise SystemExit(23)
+os.execv({real_git!r}, [{real_git!r}, *arguments])
+""",
+        encoding="utf-8",
+    )
+    wrapper_path.chmod(0o755)
+    return wrapper_directory
+
+
+@pytest.mark.parametrize(
+    ("removal_number", "expected_stage"),
+    ((1, "cold-aggregate"), (2, "target")),
+)
+def test_profile_retains_worktree_cleanup_failure_in_typed_partial_report(
+    tmp_path: Path,
+    removal_number: int,
+    expected_stage: str,
+) -> None:
+    repository = _profile_repository(tmp_path)
+    output_path = tmp_path / f"cleanup-{expected_stage}.json"
+    wrapper_directory = _git_wrapper_failing_worktree_removal(
+        tmp_path,
+        removal_number=removal_number,
+    )
+    environment = os.environ.copy()
+    environment["PATH"] = str(wrapper_directory) + os.pathsep + environment["PATH"]
+
+    completed = subprocess.run(
+        (
+            sys.executable,
+            str(PROFILE_SCRIPT),
+            "--repo-root",
+            str(repository),
+            "--make-bin",
+            _gnu_make(),
+            "--targets",
+            "smoke",
+            "--jobs",
+            "11",
+            "--aggressiveness",
+            "125",
+            "--output",
+            str(output_path),
+        ),
+        cwd=REPO_ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+
+    assert completed.returncode == 23, completed.stderr
+    report = json.loads(output_path.read_text(encoding="utf-8"))
+    assert report["schema_version"] == 6
+    assert report["outcome"] == "failed"
+    assert report["failure"]["stage"] == expected_stage
+    assert report["failure"]["command_result"]["exit_code"] == 0
+    [cleanup_failure] = report["failure"]["cleanup_failures"]
+    assert cleanup_failure["operation"] == "worktree-remove"
+    assert cleanup_failure["command_result"]["exit_code"] == 23
+    if expected_stage == "cold-aggregate":
+        assert report["failed_aggregate"]["cleanup_failures"] == [cleanup_failure]
+        assert not (
+            Path(report["config"]["artifact_directory"]) / "target-smoke.log"
+        ).exists()
+    else:
+        assert report["cold_validate_pr_raw_run"]["cleanup_failures"] == []
+        assert report["completed_target_runs"] == []
 
 
 def test_discovery_profiles_static_once_as_an_aggregate_execution_lane() -> None:
@@ -384,9 +484,7 @@ def test_summary_counts_each_execution_lane_exactly_once() -> None:
         profile.CommandResult(
             "static", ("make", "static"), 30.0, 0, None, "/tmp/static.log"
         ),
-        profile.CommandResult(
-            "unit", ("make", "unit"), 45.0, 0, None, "/tmp/unit.log"
-        ),
+        profile.CommandResult("unit", ("make", "unit"), 45.0, 0, None, "/tmp/unit.log"),
         profile.CommandResult(
             "codex", ("make", "codex"), 70.0, 0, None, "/tmp/codex.log"
         ),

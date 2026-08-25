@@ -157,11 +157,11 @@ class ExecutorCpuSlotState:
 
 @dataclass(frozen=True, slots=True)
 class ExecutorResourceUsage:
-    """Measured child-process resources retained for diagnosis and learning."""
+    """Child-process resource evidence retained for diagnosis and learning."""
 
     wall_seconds: float
     cpu_seconds: float
-    max_rss_bytes: int
+    executor_process_lifetime_children_max_rss_bytes: int
     input_blocks: int
     output_blocks: int
 
@@ -183,7 +183,10 @@ class ExecutorResourceUsage:
                 "ExecutorResourceUsage.cpu_seconds must be finite and non-negative"
             )
         for field_name, value in (
-            ("max_rss_bytes", self.max_rss_bytes),
+            (
+                "executor_process_lifetime_children_max_rss_bytes",
+                self.executor_process_lifetime_children_max_rss_bytes,
+            ),
             ("input_blocks", self.input_blocks),
             ("output_blocks", self.output_blocks),
         ):

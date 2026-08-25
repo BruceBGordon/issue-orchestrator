@@ -8,6 +8,7 @@ import os
 import resource
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -35,6 +36,7 @@ from ...domain.executor import (
 )
 from ...domain.process_group import OwnedProcessGroupLeader
 from ...ports.executor import Executor
+from ...ports.executor_history_lock import ExecutorHistoryRetentionLock
 from ...ports.host_cpu_utilization import HostCpuUtilizationObserver
 from ...ports.process_group_terminator import ProcessGroupTerminator
 from ._history import ExecutorWorkHistoryStore
@@ -57,13 +59,13 @@ from .request_identity import ExecutorRequestIdentityFactory
 
 
 EXECUTOR_CONCURRENCY_ENV = "ISSUE_ORCHESTRATOR_EXECUTOR_CONCURRENCY"
+_PROCESS_CHILD_RESOURCE_USAGE_LOCK = threading.Lock()
 
 
 def _require_host_cpu_observer(value: object) -> None:
     if not isinstance(value, HostCpuUtilizationObserver):
         raise ValueError(
-            "HostExecutor.host_cpu_observer must implement "
-            "HostCpuUtilizationObserver"
+            "HostExecutor.host_cpu_observer must implement HostCpuUtilizationObserver"
         )
 
 
@@ -72,6 +74,14 @@ def _require_process_group_terminator(value: object) -> None:
         raise ValueError(
             "HostExecutor.process_group_terminator must implement "
             "ProcessGroupTerminator"
+        )
+
+
+def _require_history_retention_lock(value: object) -> None:
+    if not isinstance(value, ExecutorHistoryRetentionLock):
+        raise ValueError(
+            "HostExecutor.history_retention_lock must implement "
+            "ExecutorHistoryRetentionLock"
         )
 
 
@@ -88,6 +98,7 @@ class HostExecutor(Executor):
         host_cpu_observer: HostCpuUtilizationObserver,
         request_identity_factory: ExecutorRequestIdentityFactory,
         process_group_terminator: ProcessGroupTerminator,
+        history_retention_lock: ExecutorHistoryRetentionLock,
         history_retention_policy: ExecutorHistoryRetentionPolicy,
         queue_settle_seconds: float,
         queue_poll_seconds: float,
@@ -128,11 +139,14 @@ class HostExecutor(Executor):
                 "HostExecutor.history_retention_policy must be an "
                 "ExecutorHistoryRetentionPolicy"
             )
+        _require_history_retention_lock(history_retention_lock)
         self._queue_settle_seconds = queue_settle_seconds
         self._queue_poll_seconds = queue_poll_seconds
         self._state = HostExecutorState(pool_dir, host_cpu_slots)
         self._history = ExecutorWorkHistoryStore(
-            pool_dir / "work-history", history_retention_policy
+            pool_dir / "work-history",
+            history_retention_policy,
+            history_retention_lock,
         )
         self._policy_store = ExecutorPolicyStore(pool_dir)
         self._events = ExecutorEventStore(pool_dir)
@@ -155,6 +169,22 @@ class HostExecutor(Executor):
         command: ExecutorCommand,
     ) -> ExecutorRunResult:
         """Run one complete public specification under shared host policy."""
+        if not _PROCESS_CHILD_RESOURCE_USAGE_LOCK.acquire(blocking=False):
+            raise RuntimeError(
+                "HostExecutor.run requires one invocation per Python process so "
+                "process-global child resource counters remain attributable"
+            )
+        try:
+            return self._run_process_exclusive(specification, command)
+        finally:
+            _PROCESS_CHILD_RESOURCE_USAGE_LOCK.release()
+
+    def _run_process_exclusive(
+        self,
+        specification: ExecutorRunSpecification,
+        command: ExecutorCommand,
+    ) -> ExecutorRunResult:
+        """Execute while owning this Python process's child-resource counters."""
         submitted_at_monotonic = time.monotonic()
         self._state.configure_capacity()
         repository = self._repository_resolver.resolve(Path.cwd())
@@ -196,8 +226,7 @@ class HostExecutor(Executor):
                 deadline = command.deadline
                 if not isinstance(deadline, ExecutorBoundedDeadline):
                     raise AssertionError(
-                        "an unbounded executor command cannot exceed admission "
-                        "deadline"
+                        "an unbounded executor command cannot exceed admission deadline"
                     ) from exc
                 elapsed = time.monotonic() - submitted_at_monotonic
                 self._events.admission_deadline_exceeded(
@@ -412,7 +441,9 @@ class HostExecutor(Executor):
             wall_seconds=elapsed,
             cpu_seconds=(usage_after.ru_utime - usage_before.ru_utime)
             + (usage_after.ru_stime - usage_before.ru_stime),
-            max_rss_bytes=self._max_rss_bytes(usage_after.ru_maxrss),
+            executor_process_lifetime_children_max_rss_bytes=(
+                self._max_rss_bytes(usage_after.ru_maxrss)
+            ),
             input_blocks=max(0, usage_after.ru_inblock - usage_before.ru_inblock),
             output_blocks=max(0, usage_after.ru_oublock - usage_before.ru_oublock),
         )
@@ -521,7 +552,8 @@ class HostExecutor(Executor):
             f"exit={result.exit_code} "
             f"wall={result.resources.wall_seconds:.3f}s "
             f"child_cpu={result.resources.cpu_seconds:.3f}s "
-            f"max_rss={result.resources.max_rss_bytes}",
+            "executor_process_lifetime_children_max_rss="
+            f"{result.resources.executor_process_lifetime_children_max_rss_bytes}",
             file=sys.stderr,
             flush=True,
         )

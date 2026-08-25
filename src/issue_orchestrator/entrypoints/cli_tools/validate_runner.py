@@ -29,7 +29,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TextIO
 
-from ...execution.executor_composition import build_process_group_terminator
 from ...domain.process_group import OwnedProcessGroupLeader
 from ...infra.env import get_env
 from ...infra.validation_timings import (
@@ -432,7 +431,8 @@ def run_validation(
     output_dir: Path,
     worktree: Path,
     *,
-    clock: ValidationRunnerClock = SYSTEM_VALIDATION_RUNNER_CLOCK,
+    clock: ValidationRunnerClock,
+    process_group_terminator: ProcessGroupTerminator,
 ) -> int:
     """Run validation command and capture output.
 
@@ -469,7 +469,7 @@ def run_validation(
         wall_started_at=wall_start,
         monotonic_started_at=start,
         clock=clock,
-        process_group_terminator=build_process_group_terminator(),
+        process_group_terminator=process_group_terminator,
     )
     sampler_started = False
     result = capture.snapshot()
@@ -493,9 +493,7 @@ def run_validation(
 
     print()
     if result.exit_code == 0:
-        print(
-            f"Validation PASSED (exit code 0) in {result.duration_seconds:.1f}s"
-        )
+        print(f"Validation PASSED (exit code 0) in {result.duration_seconds:.1f}s")
         print(f"Full output saved to: {output_file}")
     else:
         print("=" * 60)
@@ -548,7 +546,15 @@ def main() -> None:
         )
         sys.exit(2)
 
-    exit_code = run_validation(command, output_dir, worktree)
+    from ..bootstrap import build_process_group_terminator
+
+    exit_code = run_validation(
+        command,
+        output_dir,
+        worktree,
+        clock=SYSTEM_VALIDATION_RUNNER_CLOCK,
+        process_group_terminator=build_process_group_terminator(),
+    )
     sys.exit(exit_code)
 
 

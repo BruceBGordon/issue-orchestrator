@@ -95,7 +95,7 @@ def test_estimator_learns_cpu_occupancy_per_concurrency_unit() -> None:
             concurrency=4,
             wall_seconds=10.0,
             cpu_seconds=20.0,
-            max_rss_bytes=100,
+            executor_process_lifetime_children_max_rss_bytes=100,
             input_blocks=0,
             output_blocks=0,
         ),
@@ -103,7 +103,7 @@ def test_estimator_learns_cpu_occupancy_per_concurrency_unit() -> None:
             concurrency=2,
             wall_seconds=10.0,
             cpu_seconds=2.0,
-            max_rss_bytes=100,
+            executor_process_lifetime_children_max_rss_bytes=100,
             input_blocks=0,
             output_blocks=0,
         ),
@@ -244,6 +244,53 @@ def test_admission_does_not_reserve_for_mutually_exclusive_queued_work() -> None
         leased_cpu_slots_before=0,
         available_cpu_slots_before=10,
         reserved_cpu_slots_for_queued_peers=0,
+    )
+
+
+def test_admission_reserves_only_one_slot_cohort_for_exclusive_peers() -> None:
+    browser = ExecutorExclusiveResource("browser")
+    current = _work(
+        "current",
+        1,
+        "validation-a",
+        ExecutorConcurrencyRange(2, 16),
+        learned_cores=1.0,
+        aggressiveness_percent=100,
+        resources=(),
+    )
+    browser_peers = tuple(
+        _work(
+            f"browser-{index}",
+            index + 2,
+            f"validation-{index + 2}",
+            ExecutorConcurrencyRange(2, 2),
+            learned_cores=1.0,
+            aggressiveness_percent=100,
+            resources=(browser,),
+        )
+        for index in range(3)
+    )
+
+    decision = _policy().decide(
+        current,
+        _snapshot(
+            16,
+            (current, *browser_peers),
+            (),
+            (
+                ("validation-a", 0),
+                ("validation-2", 0),
+                ("validation-3", 0),
+                ("validation-4", 0),
+            ),
+        ),
+    )
+
+    assert decision == ExecutorAdmissionGranted(
+        grant=ExecutorAdmissionGrant(concurrency=14, cpu_slots=14),
+        leased_cpu_slots_before=0,
+        available_cpu_slots_before=16,
+        reserved_cpu_slots_for_queued_peers=2,
     )
 
 

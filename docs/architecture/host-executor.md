@@ -97,9 +97,14 @@ until the host recovers; it records that exact observation and rationale. The
 threshold is an internal safety mechanism, not another operator dial.
 
 Load averages remain diagnostic evidence because they lag both starts and
-finishes. They do not change a grant. Memory is observed per command but is not
-an admission dimension today. The coalescing and polling intervals are also
-internal mechanisms. Minimum reservation makes a declared range meaningful:
+finishes. They do not change a grant. CPU time and block-I/O counters are deltas
+for the single invocation owned by the executor CLI process. RSS comes from
+POSIX `RUSAGE_CHILDREN.ru_maxrss` and is explicitly reported as the executor
+process's exited-child lifetime high-water mark, not as a per-command
+measurement. RSS is diagnostic only and never participates in admission or
+learning. The pooled adapter fails fast if two calls try to share one Python
+process's global child-resource counters. The coalescing and polling intervals
+are also internal mechanisms. Minimum reservation makes a declared range meaningful:
 the minimum is useful service protected across a visible burst, while the
 maximum is opportunistic expansion.
 

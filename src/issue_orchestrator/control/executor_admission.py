@@ -53,7 +53,7 @@ class ExecutorResourceObservation:
     concurrency: int
     wall_seconds: float
     cpu_seconds: float
-    max_rss_bytes: int
+    executor_process_lifetime_children_max_rss_bytes: int
     input_blocks: int
     output_blocks: int
 
@@ -63,7 +63,10 @@ class ExecutorResourceObservation:
         _require_finite_positive(owner, "wall_seconds", self.wall_seconds)
         _require_finite_non_negative(owner, "cpu_seconds", self.cpu_seconds)
         for field_name, value in (
-            ("max_rss_bytes", self.max_rss_bytes),
+            (
+                "executor_process_lifetime_children_max_rss_bytes",
+                self.executor_process_lifetime_children_max_rss_bytes,
+            ),
             ("input_blocks", self.input_blocks),
             ("output_blocks", self.output_blocks),
         ):
@@ -497,11 +500,14 @@ class ExecutorAdmissionPolicy:
                 leased,
                 available,
             )
+        compatible_peers = self._select_compatible_peer_cohort(
+            current,
+            resource_eligible,
+            snapshot.group_service,
+        )
         peer_reservation = sum(
             self._smallest_grant(peer, snapshot.host_cpu_slots).cpu_slots
-            for peer in resource_eligible
-            if peer.request_id != current.request_id
-            and set(peer.exclusive_resources).isdisjoint(current.exclusive_resources)
+            for peer in compatible_peers
         )
         grant_budget = max(
             minimum_grant.cpu_slots,
@@ -520,6 +526,32 @@ class ExecutorAdmissionPolicy:
             available,
             min(peer_reservation, available - minimum_grant.cpu_slots),
         )
+
+    @staticmethod
+    def _select_compatible_peer_cohort(
+        current: QueuedExecutorWork,
+        eligible: tuple[QueuedExecutorWork, ...],
+        service: tuple[ExecutorGroupService, ...],
+    ) -> tuple[QueuedExecutorWork, ...]:
+        """Choose the deterministic peer set that could coexist with current."""
+        service_by_group = {item.fairness_group: item.cpu_slots for item in service}
+        ordered_peers = sorted(
+            (peer for peer in eligible if peer.request_id != current.request_id),
+            key=lambda peer: (
+                service_by_group[peer.fairness_group],
+                peer.sequence,
+                peer.request_id.value,
+            ),
+        )
+        reserved_resources = set(current.exclusive_resources)
+        compatible: list[QueuedExecutorWork] = []
+        for peer in ordered_peers:
+            peer_resources = set(peer.exclusive_resources)
+            if not reserved_resources.isdisjoint(peer_resources):
+                continue
+            compatible.append(peer)
+            reserved_resources.update(peer_resources)
+        return tuple(compatible)
 
     @staticmethod
     def _select_fair_request(
