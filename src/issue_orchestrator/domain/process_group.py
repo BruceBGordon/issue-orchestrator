@@ -83,4 +83,20 @@ class ProcessGroupTimedOut:
             )
 
 
-ProcessGroupSupervision = ProcessGroupCompleted | ProcessGroupTimedOut
+@dataclass(frozen=True, slots=True)
+class ProcessGroupInterrupted:
+    """Caller-requested whole-group containment and leader reaping."""
+
+    termination: ProcessGroupTermination
+
+    def __post_init__(self) -> None:
+        if type(self.termination) is not ProcessGroupTermination:
+            raise ValueError(
+                "ProcessGroupInterrupted.termination must be "
+                "ProcessGroupTermination"
+            )
+
+
+ProcessGroupSupervision = (
+    ProcessGroupCompleted | ProcessGroupTimedOut | ProcessGroupInterrupted
+)

@@ -29,14 +29,21 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TextIO
 
-from ...domain.process_group import (
-    OwnedProcessGroupLeader,
-    ProcessGroupCompleted,
-    ProcessGroupUnboundedWait,
-)
-from ...domain.validation_timing import (
-    ValidationProcessGroupCleanup,
-    ValidationRunLifecycle,
+from ...domain.contained_command import (
+    ContainedCommandCaptureAborted,
+    ContainedCommandCaptureFailed,
+    ContainedCommandCleanupError,
+    ContainedCommandCleanupFailed,
+    ContainedCommandCleanupNotStarted,
+    ContainedCommandCompleted,
+    ContainedCommandExited,
+    ContainedCommandExitUnknown,
+    ContainedCommandFailure,
+    ContainedCommandMetrics,
+    ContainedCommandNotStarted,
+    ContainedCommandResult,
+    ContainedCommandStarted,
+    ContainedCommandSupervised,
 )
 from ...infra.env import get_env
 from ...infra.validation_timings import (
@@ -45,7 +52,12 @@ from ...infra.validation_timings import (
     ValidationResourceSample,
     ValidationSwapUsage,
 )
-from ...ports.process_group_supervisor import ProcessGroupSupervisor
+from ...ports.contained_command import (
+    ContainedCommandCapture,
+    ContainedCommandLineObserver,
+    ContainedCommandOutput,
+    ContainedShellCommand,
+)
 
 _MEMORY_FREE_RE = re.compile(r"System-wide memory free percentage:\s*(?P<percent>\d+)%")
 _SWAP_RE = re.compile(
@@ -264,229 +276,170 @@ class ResourceSampler:
 
 
 @dataclass(frozen=True, slots=True)
-class _ValidationCommandCompleted:
-    """Successful capture lifecycle with the contained child's real status."""
+class _TimedValidationCommandResult:
+    """One contained terminal fact paired with monotonic/wall-clock evidence."""
 
-    child_exit_code: int
-    duration_seconds: float
-    wall_ended_at: datetime
-    monotonic_ended_at: float
-
-    @property
-    def validation_exit_code(self) -> int:
-        return self.child_exit_code
-
-    @property
-    def lifecycle(self) -> ValidationRunLifecycle:
-        return ValidationRunLifecycle.COMPLETED
-
-    @property
-    def process_group_cleanup(self) -> ValidationProcessGroupCleanup:
-        return ValidationProcessGroupCleanup.SUPERVISED
-
-
-@dataclass(frozen=True, slots=True)
-class _ValidationCaptureFailed:
-    """Incomplete capture retained separately from the child's terminal facts."""
-
-    child_exit_code: int
-    process_group_cleanup: ValidationProcessGroupCleanup
-    capture_error_type: str
-    capture_error_message: str
+    command_result: ContainedCommandResult
     duration_seconds: float
     wall_ended_at: datetime
     monotonic_ended_at: float
 
     def __post_init__(self) -> None:
-        if not self.capture_error_type or not self.capture_error_message:
-            raise ValueError("validation capture failure requires error evidence")
-        if type(self.process_group_cleanup) is not ValidationProcessGroupCleanup:
+        if type(self.command_result) not in (
+            ContainedCommandCompleted,
+            ContainedCommandCaptureFailed,
+            ContainedCommandCleanupFailed,
+        ):
             raise ValueError(
-                "validation capture failure requires typed process cleanup"
+                "timed validation result requires a closed contained-command result"
+            )
+        if type(self.duration_seconds) is not float or self.duration_seconds < 0.0:
+            raise ValueError(
+                "timed validation result duration must be a non-negative float"
             )
 
     @property
     def validation_exit_code(self) -> int:
+        if type(self.command_result) is ContainedCommandCompleted:
+            return self.command_result.child.exit_code
         return 1
-
-    @property
-    def lifecycle(self) -> ValidationRunLifecycle:
-        return ValidationRunLifecycle.CAPTURE_FAILED
-
-
-_ValidationCommandResult = _ValidationCommandCompleted | _ValidationCaptureFailed
 
 
 @dataclass(slots=True)
-class _ValidationCommandCapture:
-    """Own one shell command, its output stream, and its process-group cleanup."""
+class _ValidationCommandOutput(ContainedCommandOutput):
+    """Validation-specific terminal/file adapter for raw contained output."""
 
-    command: str
-    worktree: Path
-    output_file: Path
-    timing_recorder: ValidateTimingRecorder
+    output_handle: TextIO
     is_orchestrated_run: bool
-    wall_started_at: datetime
-    monotonic_started_at: float
-    clock: ValidationRunnerClock
-    process_group_supervisor: ProcessGroupSupervisor
-    process: subprocess.Popen[str] | None = field(default=None, init=False)
-    line_count: int = field(default=0, init=False)
-    byte_count: int = field(default=0, init=False)
-    _execution_entered: bool = field(default=False, init=False)
-    _finished: bool = field(default=False, init=False)
 
     def __post_init__(self) -> None:
-        if not self.command:
-            raise ValueError("validation capture command must not be empty")
         if type(self.is_orchestrated_run) is not bool:
-            raise ValueError("validation capture orchestration flag must be boolean")
+            raise ValueError("validation output orchestration flag must be boolean")
 
-    def execute(self) -> None:
-        """Start, stream, and normally wait for the owned command."""
-        if self._execution_entered:
-            raise RuntimeError("validation command capture cannot execute twice")
-        self._execution_entered = True
-        with open(self.output_file, "w", buffering=1) as output_handle:
-            output_handle.write(
-                f"[validate_runner] start pid={os.getpid()} cwd={self.worktree} "
-                f"command={self.command}\n"
-            )
-            output_handle.flush()
-            self.process = subprocess.Popen(
-                self.command,
-                shell=True,
-                cwd=self.worktree,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-                start_new_session=os.name == "posix",
-            )
-            self._emit_to_terminal_and_file(
-                f"[validate_runner] child_started pid={self.process.pid}\n",
-                output_handle,
-            )
-            self._stream_output(output_handle)
-            self._emit_to_terminal_and_file(
-                f"[validate_runner] stdout_eof pid={self.process.pid} "
-                f"lines={self.line_count} bytes={self.byte_count} "
-                f"elapsed={self._monotonic_elapsed_seconds():.1f}s\n",
-                output_handle,
-            )
-            self._supervise_exit(output_handle)
-
-    def finish_completed(self) -> _ValidationCommandCompleted:
-        """Finalize a fully captured command after normal group supervision."""
-        if self._finished:
-            raise RuntimeError("validation command capture cannot finish twice")
-        self._finished = True
-        if self.process is None or self.process.returncode is None:
-            raise RuntimeError(
-                "completed validation capture requires a supervised child result"
-            )
-        wall_end = self.clock.wall_now()
-        monotonic_end = self.clock.monotonic_now()
-        result = _ValidationCommandCompleted(
-            child_exit_code=self.process.returncode,
-            duration_seconds=monotonic_end - self.monotonic_started_at,
-            wall_ended_at=wall_end,
-            monotonic_ended_at=monotonic_end,
-        )
-        self._record_terminal_marker(result)
-        return result
-
-    def finish_capture_failed(
-        self,
-        capture_error: BaseException,
-    ) -> _ValidationCaptureFailed:
-        """Abort incomplete capture and retain failure separately from child exit."""
-        if self._finished:
-            raise RuntimeError("validation command capture cannot finish twice")
-        self._finished = True
-        child_exit_code = 127
-        process_group_cleanup = ValidationProcessGroupCleanup.NOT_STARTED
-        if self.process is not None:
-            if self.process.returncode is None:
-                termination = self.process_group_supervisor.abort(
-                    OwnedProcessGroupLeader(self.process.pid)
-                )
-                self.process.returncode = termination.leader_exit_code
-                process_group_cleanup = (
-                    ValidationProcessGroupCleanup.CAPTURE_ABORTED
-                )
-            else:
-                process_group_cleanup = ValidationProcessGroupCleanup.SUPERVISED
-            child_exit_code = self.process.returncode
-        wall_end = self.clock.wall_now()
-        monotonic_end = self.clock.monotonic_now()
-        result = _ValidationCaptureFailed(
-            child_exit_code=child_exit_code,
-            process_group_cleanup=process_group_cleanup,
-            capture_error_type=type(capture_error).__name__,
-            capture_error_message=str(capture_error),
-            duration_seconds=monotonic_end - self.monotonic_started_at,
-            wall_ended_at=wall_end,
-            monotonic_ended_at=monotonic_end,
-        )
-        self._record_terminal_marker(result)
-        return result
-
-    def _record_terminal_marker(self, result: _ValidationCommandResult) -> None:
-        if self.process is not None:
-            marker = (
-                f"[validate_runner] child_exited pid={self.process.pid} "
-                f"child_exit_code={result.child_exit_code} "
-                f"validation_exit_code={result.validation_exit_code} "
-                f"lifecycle={result.lifecycle.value} "
-                f"process_group_cleanup={result.process_group_cleanup.value} "
-                f"elapsed={result.duration_seconds:.1f}s "
-                f"lines={self.line_count} bytes={self.byte_count}\n"
-            )
-            with open(self.output_file, "a", encoding="utf-8") as output_handle:
-                output_handle.write(marker)
-            sys.stdout.write(marker)
-            sys.stdout.flush()
-
-    def _stream_output(self, output_handle: TextIO) -> None:
-        if self.process is None or self.process.stdout is None:
-            raise RuntimeError("validation command did not expose stdout")
-        for line in self.process.stdout:
-            self.line_count += 1
-            self.byte_count += len(line.encode("utf-8", errors="replace"))
-            self.timing_recorder.process_line(line)
-            if not self.is_orchestrated_run:
-                sys.stdout.write(line)
-                sys.stdout.flush()
-            output_handle.write(line)
-            output_handle.flush()
-
-    def _supervise_exit(self, output_handle: TextIO) -> None:
-        if self.process is None:
-            raise RuntimeError("validation command was not started")
+    def child_started(self, started: ContainedCommandStarted) -> None:
+        if type(started) is not ContainedCommandStarted:
+            raise ValueError("validation output requires ContainedCommandStarted")
         self._emit_to_terminal_and_file(
-            f"[validate_runner] supervising_process_group pid={self.process.pid} "
-            f"elapsed={self._monotonic_elapsed_seconds():.1f}s "
-            "after_stdout_eof\n",
-            output_handle,
+            f"[validate_runner] child_started pid={started.process_id}\n"
         )
-        supervision = self.process_group_supervisor.supervise(
-            OwnedProcessGroupLeader(self.process.pid),
-            ProcessGroupUnboundedWait(),
-        )
-        if type(supervision) is not ProcessGroupCompleted:
-            raise AssertionError("an unbounded process-group wait cannot time out")
-        self.process.returncode = supervision.termination.leader_exit_code
 
-    @staticmethod
-    def _emit_to_terminal_and_file(marker: str, output_handle: TextIO) -> None:
+    def write_line(self, line: str) -> None:
+        if type(line) is not str:
+            raise ValueError("validation output line must be text")
+        if not self.is_orchestrated_run:
+            sys.stdout.write(line)
+            sys.stdout.flush()
+        self.output_handle.write(line)
+        self.output_handle.flush()
+
+    def _emit_to_terminal_and_file(self, marker: str) -> None:
         sys.stdout.write(marker)
         sys.stdout.flush()
-        output_handle.write(marker)
-        output_handle.flush()
+        self.output_handle.write(marker)
+        self.output_handle.flush()
 
-    def _monotonic_elapsed_seconds(self) -> float:
-        return self.clock.monotonic_now() - self.monotonic_started_at
+
+@dataclass(frozen=True, slots=True)
+class _ValidationTimingLineObserver(ContainedCommandLineObserver):
+    recorder: ValidateTimingRecorder
+
+    def __post_init__(self) -> None:
+        if type(self.recorder) is not ValidateTimingRecorder:
+            raise ValueError(
+                "validation line observer requires ValidateTimingRecorder"
+            )
+
+    def observe_line(self, line: str) -> None:
+        self.recorder.process_line(line)
+
+
+def _command_result_cleanup(result: ContainedCommandResult) -> str:
+    if type(result) is ContainedCommandCompleted:
+        return "supervised"
+    if type(result) is ContainedCommandCleanupFailed:
+        return "cleanup-failed"
+    if type(result) is ContainedCommandCaptureFailed:
+        if type(result.cleanup) is ContainedCommandSupervised:
+            return "supervised"
+        if type(result.cleanup) is ContainedCommandCaptureAborted:
+            return "capture-aborted"
+        if type(result.cleanup) is ContainedCommandCleanupNotStarted:
+            return "not-started"
+    raise AssertionError("closed command result has unknown cleanup fact")
+
+
+def _command_result_child_exit(result: ContainedCommandResult) -> str:
+    child = result.child
+    if type(child) is ContainedCommandExited:
+        return str(child.exit_code)
+    if type(child) is ContainedCommandNotStarted:
+        return "not-started"
+    if type(child) is ContainedCommandExitUnknown:
+        return "unknown"
+    raise AssertionError("closed command result has unknown child fact")
+
+
+def _command_result_process_id(result: ContainedCommandResult) -> str:
+    child = result.child
+    if type(child) is ContainedCommandNotStarted:
+        return "not-started"
+    if type(child) is ContainedCommandExited:
+        return str(child.process_id)
+    if type(child) is ContainedCommandExitUnknown:
+        return str(child.process_id)
+    raise AssertionError("closed command result has unknown child identity")
+
+
+def _record_terminal_marker(
+    output_file: Path,
+    result: _TimedValidationCommandResult,
+) -> None:
+    command_result = result.command_result
+    lifecycle = (
+        "completed"
+        if type(command_result) is ContainedCommandCompleted
+        else "capture-failed"
+    )
+    terminal_marker = (
+        "child_exited"
+        if type(command_result.child) is ContainedCommandExited
+        else "command_terminal"
+    )
+    marker = (
+        f"[validate_runner] {terminal_marker} "
+        f"pid={_command_result_process_id(command_result)} "
+        f"child_exit_code={_command_result_child_exit(command_result)} "
+        f"validation_exit_code={result.validation_exit_code} "
+        f"lifecycle={lifecycle} "
+        f"process_group_cleanup={_command_result_cleanup(command_result)} "
+        f"elapsed={result.duration_seconds:.1f}s "
+        f"lines={command_result.metrics.line_count} "
+        f"bytes={command_result.metrics.byte_count}\n"
+    )
+    eof_marker = (
+        "[validate_runner] stdout_eof "
+        f"pid={_command_result_process_id(command_result)} "
+        f"lines={command_result.metrics.line_count} "
+        f"bytes={command_result.metrics.byte_count} "
+        f"elapsed={result.duration_seconds:.1f}s\n"
+    )
+    with open(output_file, "a", encoding="utf-8") as output_handle:
+        output_handle.write(eof_marker)
+        output_handle.write(marker)
+    sys.stdout.write(eof_marker)
+    sys.stdout.write(marker)
+    sys.stdout.flush()
+
+
+def _not_started_capture_failure(
+    error: BaseException,
+) -> ContainedCommandCaptureFailed:
+    return ContainedCommandCaptureFailed(
+        child=ContainedCommandNotStarted(),
+        cleanup=ContainedCommandCleanupNotStarted(),
+        failure=ContainedCommandFailure(error),
+        metrics=ContainedCommandMetrics(line_count=0, byte_count=0),
+    )
 
 
 def _finalize_validation_evidence(
@@ -494,7 +447,7 @@ def _finalize_validation_evidence(
     sampler: ResourceSampler,
     sampler_started: bool,
     recorder: ValidateTimingRecorder,
-    result: _ValidationCommandResult,
+    result: _TimedValidationCommandResult,
     wall_started_at: datetime,
     monotonic_started_at: float,
 ) -> None:
@@ -503,10 +456,7 @@ def _finalize_validation_evidence(
             sampler.stop()
     finally:
         recorder.finalize(
-            lifecycle=result.lifecycle,
-            process_group_cleanup=result.process_group_cleanup,
-            exit_code=result.validation_exit_code,
-            child_exit_code=result.child_exit_code,
+            command_result=result.command_result,
             total_elapsed_seconds=result.duration_seconds,
             wall_started_at=wall_started_at,
             monotonic_started_at=monotonic_started_at,
@@ -521,7 +471,7 @@ def run_validation(
     worktree: Path,
     *,
     clock: ValidationRunnerClock,
-    process_group_supervisor: ProcessGroupSupervisor,
+    contained_command_capture: ContainedCommandCapture,
 ) -> int:
     """Run validation command and capture output.
 
@@ -549,43 +499,53 @@ def run_validation(
 
     wall_start = clock.wall_now()
     start = clock.monotonic_now()
-    capture = _ValidationCommandCapture(
-        command=command,
-        worktree=worktree,
-        output_file=output_file,
-        timing_recorder=timing_recorder,
-        is_orchestrated_run=is_orchestrated_run,
+    sampler_started = False
+    with open(output_file, "w", buffering=1) as output_handle:
+        output_handle.write(
+            f"[validate_runner] start pid={os.getpid()} cwd={worktree} "
+            f"command={command}\n"
+        )
+        output_handle.flush()
+        try:
+            resource_sampler.start()
+        except BaseException as sampler_start_error:
+            command_result: ContainedCommandResult = _not_started_capture_failure(
+                sampler_start_error
+            )
+        else:
+            sampler_started = True
+            command_result = contained_command_capture.capture(
+                ContainedShellCommand(command=command, working_directory=worktree),
+                _ValidationCommandOutput(
+                    output_handle=output_handle,
+                    is_orchestrated_run=is_orchestrated_run,
+                ),
+                _ValidationTimingLineObserver(timing_recorder),
+            )
+
+    wall_end = clock.wall_now()
+    monotonic_end = clock.monotonic_now()
+    result = _TimedValidationCommandResult(
+        command_result=command_result,
+        duration_seconds=monotonic_end - start,
+        wall_ended_at=wall_end,
+        monotonic_ended_at=monotonic_end,
+    )
+    _finalize_validation_evidence(
+        sampler=resource_sampler,
+        sampler_started=sampler_started,
+        recorder=timing_recorder,
+        result=result,
         wall_started_at=wall_start,
         monotonic_started_at=start,
-        clock=clock,
-        process_group_supervisor=process_group_supervisor,
     )
-    sampler_started = False
-    try:
-        resource_sampler.start()
-        sampler_started = True
-        capture.execute()
-    except BaseException as capture_error:
-        result = capture.finish_capture_failed(capture_error)
-        _finalize_validation_evidence(
-            sampler=resource_sampler,
-            sampler_started=sampler_started,
-            recorder=timing_recorder,
-            result=result,
-            wall_started_at=wall_start,
-            monotonic_started_at=start,
-        )
-        raise
-    else:
-        result = capture.finish_completed()
-        _finalize_validation_evidence(
-            sampler=resource_sampler,
-            sampler_started=sampler_started,
-            recorder=timing_recorder,
-            result=result,
-            wall_started_at=wall_start,
-            monotonic_started_at=start,
-        )
+    _record_terminal_marker(output_file, result)
+
+    if type(command_result) is ContainedCommandCaptureFailed:
+        raise command_result.failure.error
+    if type(command_result) is ContainedCommandCleanupFailed:
+        cleanup_error = ContainedCommandCleanupError(command_result)
+        raise cleanup_error from command_result.cleanup_failure.error
 
     print()
     if result.validation_exit_code == 0:
@@ -642,14 +602,14 @@ def main() -> None:
         )
         sys.exit(2)
 
-    from ..bootstrap import build_process_group_supervisor
+    from ..bootstrap import build_contained_command_capture
 
     exit_code = run_validation(
         command,
         output_dir,
         worktree,
         clock=SYSTEM_VALIDATION_RUNNER_CLOCK,
-        process_group_supervisor=build_process_group_supervisor(),
+        contained_command_capture=build_contained_command_capture(),
     )
     sys.exit(exit_code)
 

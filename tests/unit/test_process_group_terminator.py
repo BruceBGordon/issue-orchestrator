@@ -15,6 +15,7 @@ from issue_orchestrator.domain.process_group import (
     ProcessGroupUnboundedWait,
 )
 from issue_orchestrator.execution.process_group_supervisor import (
+    NeverInterruptProcessGroup,
     PosixProcessGroupSupervisor,
 )
 from issue_orchestrator.execution.process_group_terminator import (
@@ -131,6 +132,7 @@ def test_natural_leader_exit_contains_descendant_before_reaping() -> None:
         supervision = supervisor.supervise(
             OwnedProcessGroupLeader(process.pid),
             ProcessGroupUnboundedWait(),
+            NeverInterruptProcessGroup(),
         )
         process.returncode = supervision.termination.leader_exit_code
         assert type(supervision) is ProcessGroupCompleted

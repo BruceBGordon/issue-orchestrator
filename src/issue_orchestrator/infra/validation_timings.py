@@ -22,10 +22,8 @@ from ..domain.validation_timing import (
     ValidationHostContext,
     ValidationResourceSample,
     ValidationResourceTiming,
-    ValidationProcessGroupCleanup,
     ValidationRunTimingContext,
     ValidationRunTimingSummary,
-    ValidationRunLifecycle,
     ValidationSwapUsage,
     ValidationTargetTiming,
     ValidationTimingEnvelope,
@@ -33,6 +31,7 @@ from ..domain.validation_timing import (
     ValidationTimingScalar,
     merge_validation_timing_fields,
 )
+from ..domain.contained_command import ContainedCommandResult
 
 
 _CONFIG_FIELD_PATTERN = r"[A-Za-z_][A-Za-z0-9_]*=\S+"
@@ -395,10 +394,7 @@ class ValidateTimingRecorder:
     def finalize(
         self,
         *,
-        lifecycle: ValidationRunLifecycle,
-        process_group_cleanup: ValidationProcessGroupCleanup,
-        exit_code: int,
-        child_exit_code: int,
+        command_result: ContainedCommandResult,
         total_elapsed_seconds: float,
         wall_started_at: datetime,
         monotonic_started_at: float,
@@ -409,10 +405,7 @@ class ValidateTimingRecorder:
         summary = ValidationRunTimingSummary(
             context=self.context,
             configuration=self.configuration,
-            lifecycle=lifecycle,
-            process_group_cleanup=process_group_cleanup,
-            exit_code=exit_code,
-            child_exit_code=child_exit_code,
+            command_result=command_result,
             total_elapsed_seconds=round(total_elapsed_seconds, 3),
             recorded_at=datetime.now(timezone.utc).isoformat(),
             envelope=build_timing_envelope(

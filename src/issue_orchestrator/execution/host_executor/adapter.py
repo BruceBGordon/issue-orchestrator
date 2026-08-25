@@ -46,6 +46,7 @@ from ...ports.atomic_path_replacement import AtomicPathReplacement
 from ...ports.executor_history_lock import ExecutorHistoryRetentionLock
 from ...ports.host_cpu_utilization import HostCpuUtilizationObserver
 from ...ports.process_group_supervisor import ProcessGroupSupervisor
+from ..process_group_supervisor import NeverInterruptProcessGroup
 from ._history import ExecutorWorkHistoryStore
 from ._host_observation import observe_host_load
 from ._journal import ExecutorEventStore
@@ -438,6 +439,7 @@ class HostExecutor(Executor):
                         ProcessGroupUnboundedWait()
                         if command_budget is None
                         else ProcessGroupBoundedWait(command_budget.timeout_seconds),
+                        NeverInterruptProcessGroup(),
                     )
                     process.returncode = supervision.termination.leader_exit_code
                     if type(supervision) is ProcessGroupCompleted:

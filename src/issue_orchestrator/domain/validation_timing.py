@@ -10,6 +10,21 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Protocol, TypeAlias, runtime_checkable
 
+from .contained_command import (
+    ContainedCommandCaptureAborted,
+    ContainedCommandCaptureFailed,
+    ContainedCommandCaptureInterrupted,
+    ContainedCommandCaptureSucceeded,
+    ContainedCommandCleanupFailed,
+    ContainedCommandCleanupNotStarted,
+    ContainedCommandCompleted,
+    ContainedCommandExited,
+    ContainedCommandExitUnknown,
+    ContainedCommandNotStarted,
+    ContainedCommandResult,
+    ContainedCommandSupervised,
+)
+
 
 ValidationTimingScalar: TypeAlias = str | int | float | bool | None
 SerializedValidationTiming: TypeAlias = dict[str, ValidationTimingScalar]
@@ -331,6 +346,127 @@ class ValidationProcessGroupCleanup(StrEnum):
     SUPERVISED = "supervised"
     CAPTURE_ABORTED = "capture-aborted"
     NOT_STARTED = "not-started"
+    CLEANUP_FAILED = "cleanup-failed"
+
+
+class ValidationChildOutcome(StrEnum):
+    """Whether a real child status exists in a validation terminal result."""
+
+    EXITED = "exited"
+    NOT_STARTED = "not-started"
+    EXIT_UNKNOWN = "exit-unknown"
+
+
+class ValidationCaptureStatus(StrEnum):
+    """Whether output capture itself completed before process cleanup."""
+
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+
+
+def _validation_child_fields(
+    child: ContainedCommandExited
+    | ContainedCommandNotStarted
+    | ContainedCommandExitUnknown,
+) -> SerializedValidationTiming:
+    if type(child) is ContainedCommandExited:
+        return {
+            "child_process_id": child.process_id,
+            "child_outcome": ValidationChildOutcome.EXITED.value,
+            "child_exit_code": child.exit_code,
+        }
+    if type(child) is ContainedCommandNotStarted:
+        return {
+            "child_process_id": None,
+            "child_outcome": ValidationChildOutcome.NOT_STARTED.value,
+            "child_exit_code": None,
+        }
+    if type(child) is ContainedCommandExitUnknown:
+        return {
+            "child_process_id": child.process_id,
+            "child_outcome": ValidationChildOutcome.EXIT_UNKNOWN.value,
+            "child_exit_code": None,
+        }
+    raise ValueError("validation child fields require a typed child fact")
+
+
+def _validation_cleanup_value(
+    cleanup: ContainedCommandSupervised
+    | ContainedCommandCaptureAborted
+    | ContainedCommandCleanupNotStarted,
+) -> str:
+    if type(cleanup) is ContainedCommandSupervised:
+        return ValidationProcessGroupCleanup.SUPERVISED.value
+    if type(cleanup) is ContainedCommandCaptureAborted:
+        return ValidationProcessGroupCleanup.CAPTURE_ABORTED.value
+    if type(cleanup) is ContainedCommandCleanupNotStarted:
+        return ValidationProcessGroupCleanup.NOT_STARTED.value
+    raise ValueError("validation cleanup fields require a typed cleanup fact")
+
+
+def _validation_command_fields(
+    result: ContainedCommandResult,
+) -> SerializedValidationTiming:
+    if type(result) is ContainedCommandCompleted:
+        return merge_validation_timing_fields(
+            {
+                "lifecycle": ValidationRunLifecycle.COMPLETED.value,
+                "exit_code": result.child.exit_code,
+                "process_group_cleanup": (
+                    ValidationProcessGroupCleanup.SUPERVISED.value
+                ),
+                "capture_status": ValidationCaptureStatus.SUCCEEDED.value,
+                "capture_error_type": None,
+                "capture_error_repr": None,
+                "cleanup_error_type": None,
+                "cleanup_error_repr": None,
+            },
+            _validation_child_fields(result.child),
+        )
+    if type(result) is ContainedCommandCaptureFailed:
+        return merge_validation_timing_fields(
+            {
+                "lifecycle": ValidationRunLifecycle.CAPTURE_FAILED.value,
+                "exit_code": 1,
+                "process_group_cleanup": _validation_cleanup_value(result.cleanup),
+                "capture_status": ValidationCaptureStatus.FAILED.value,
+                "capture_error_type": result.failure.error_type,
+                "capture_error_repr": result.failure.error_repr,
+                "cleanup_error_type": None,
+                "cleanup_error_repr": None,
+            },
+            _validation_child_fields(result.child),
+        )
+    if type(result) is ContainedCommandCleanupFailed:
+        capture_fields: SerializedValidationTiming
+        if type(result.capture) is ContainedCommandCaptureSucceeded:
+            capture_fields = {
+                "capture_status": ValidationCaptureStatus.SUCCEEDED.value,
+                "capture_error_type": None,
+                "capture_error_repr": None,
+            }
+        elif type(result.capture) is ContainedCommandCaptureInterrupted:
+            capture_fields = {
+                "capture_status": ValidationCaptureStatus.FAILED.value,
+                "capture_error_type": result.capture.failure.error_type,
+                "capture_error_repr": result.capture.failure.error_repr,
+            }
+        else:
+            raise ValueError("cleanup failure requires a typed capture fact")
+        return merge_validation_timing_fields(
+            {
+                "lifecycle": ValidationRunLifecycle.CAPTURE_FAILED.value,
+                "exit_code": 1,
+                "process_group_cleanup": (
+                    ValidationProcessGroupCleanup.CLEANUP_FAILED.value
+                ),
+                "cleanup_error_type": result.cleanup_failure.error_type,
+                "cleanup_error_repr": result.cleanup_failure.error_repr,
+            },
+            capture_fields,
+            _validation_child_fields(result.child),
+        )
+    raise ValueError("validation command fields require a closed command result")
 
 
 @dataclass(frozen=True, slots=True)
@@ -339,10 +475,7 @@ class ValidationRunTimingSummary:
 
     context: ValidationRunTimingContext
     configuration: ValidationConfiguration
-    lifecycle: ValidationRunLifecycle
-    process_group_cleanup: ValidationProcessGroupCleanup
-    exit_code: int
-    child_exit_code: int
+    command_result: ContainedCommandResult
     total_elapsed_seconds: float
     recorded_at: str
     envelope: ValidationTimingEnvelope
@@ -356,40 +489,15 @@ class ValidationRunTimingSummary:
             self.configuration,
             ValidationConfiguration,
         )
-        _require_exact(owner, "lifecycle", self.lifecycle, ValidationRunLifecycle)
-        _require_exact(
-            owner,
-            "process_group_cleanup",
-            self.process_group_cleanup,
-            ValidationProcessGroupCleanup,
-        )
-        if (
-            self.lifecycle is ValidationRunLifecycle.COMPLETED
-            and self.process_group_cleanup
-            is not ValidationProcessGroupCleanup.SUPERVISED
+        if type(self.command_result) not in (
+            ContainedCommandCompleted,
+            ContainedCommandCaptureFailed,
+            ContainedCommandCleanupFailed,
         ):
             raise ValueError(
-                "completed validation lifecycle requires supervised cleanup"
+                "ValidationRunTimingSummary.command_result must be a closed "
+                "contained-command result"
             )
-        _require_integer(owner, "exit_code", self.exit_code, minimum=-(2**63))
-        _require_integer(
-            owner,
-            "child_exit_code",
-            self.child_exit_code,
-            minimum=-(2**63),
-        )
-        if (
-            self.lifecycle is ValidationRunLifecycle.COMPLETED
-            and self.exit_code != self.child_exit_code
-        ):
-            raise ValueError(
-                "completed validation lifecycle must preserve the child exit code"
-            )
-        if (
-            self.lifecycle is ValidationRunLifecycle.CAPTURE_FAILED
-            and self.exit_code == 0
-        ):
-            raise ValueError("failed validation capture cannot record exit code zero")
         _require_float(
             owner,
             "total_elapsed_seconds",
@@ -403,11 +511,8 @@ class ValidationRunTimingSummary:
         return merge_validation_timing_fields(
             {"kind": "run_summary"},
             self.context,
+            _validation_command_fields(self.command_result),
             {
-                "exit_code": self.exit_code,
-                "child_exit_code": self.child_exit_code,
-                "lifecycle": self.lifecycle.value,
-                "process_group_cleanup": self.process_group_cleanup.value,
                 "total_elapsed_seconds": self.total_elapsed_seconds,
                 "recorded_at": self.recorded_at,
             },

@@ -6,6 +6,7 @@ so agents can find failure details without re-running tests.
 
 import json
 import os
+import signal
 import shlex
 import subprocess
 import sys
@@ -16,6 +17,16 @@ from pathlib import Path
 
 import pytest
 
+from issue_orchestrator.domain.contained_command import ContainedCommandCleanupError
+from issue_orchestrator.domain.process_group import (
+    OwnedProcessGroupLeader,
+    ProcessGroupSupervision,
+    ProcessGroupTermination,
+    ProcessGroupWait,
+)
+from issue_orchestrator.execution.contained_command_capture import (
+    PosixContainedCommandCapture,
+)
 from issue_orchestrator.infra.validation_timings import (
     ValidateTimingRecorder,
     ValidationConfiguration,
@@ -25,7 +36,15 @@ from issue_orchestrator.entrypoints.cli_tools.validate_runner import (
     ValidationRunnerClock,
     run_validation,
 )
-from issue_orchestrator.entrypoints.bootstrap import build_process_group_supervisor
+from issue_orchestrator.entrypoints.bootstrap import (
+    build_contained_command_capture,
+    build_process_group_supervisor,
+)
+from issue_orchestrator.ports.process_group_supervisor import (
+    ProcessGroupInterruption,
+    ProcessGroupSupervisor,
+)
+from tests.unit.threading_helpers import run_in_thread
 
 
 def _with_repo_on_pythonpath(env: dict[str, str]) -> dict[str, str]:
@@ -34,6 +53,30 @@ def _with_repo_on_pythonpath(env: dict[str, str]) -> dict[str, str]:
     env = dict(env)
     env["PYTHONPATH"] = str(repo_root / "src") + (os.pathsep + pythonpath if pythonpath else "")
     return env
+
+
+class _ContainThenReportCleanupFailureSupervisor(ProcessGroupSupervisor):
+    """Port fake that proves evidence survives a failing cleanup report."""
+
+    def __init__(self, delegate: ProcessGroupSupervisor) -> None:
+        if not isinstance(delegate, ProcessGroupSupervisor):
+            raise ValueError("cleanup-failure supervisor requires a delegate")
+        self._delegate = delegate
+
+    def supervise(
+        self,
+        leader: OwnedProcessGroupLeader,
+        wait: ProcessGroupWait,
+        interruption: ProcessGroupInterruption,
+    ) -> ProcessGroupSupervision:
+        del leader, wait
+        if not interruption.wait_for_request(5.0):
+            raise AssertionError("capture interruption was not requested")
+        raise RuntimeError("injected supervision failure")
+
+    def abort(self, leader: OwnedProcessGroupLeader) -> ProcessGroupTermination:
+        self._delegate.abort(leader)
+        raise RuntimeError("injected cleanup failure")
 
 
 class TestValidateRunner:
@@ -369,7 +412,7 @@ class TestValidateRunner:
                     lambda: datetime.now(timezone.utc),
                     time.monotonic,
                 ),
-                process_group_supervisor=build_process_group_supervisor(),
+                contained_command_capture=build_contained_command_capture(),
             )
 
         child_pid = int(child_pid_path.read_text(encoding="utf-8"))
@@ -397,6 +440,89 @@ class TestValidateRunner:
         assert summary["process_group_cleanup"] == "capture-aborted"
         assert summary["exit_code"] == 1
         assert summary["child_exit_code"] == 0
+
+    @pytest.mark.skipif(os.name != "posix", reason="asserts POSIX process cleanup")
+    def test_cleanup_failure_retains_both_errors_stops_sampler_and_finalizes(
+        self,
+        fake_git_repo: Path,
+        tmp_path: Path,
+    ) -> None:
+        output_dir = tmp_path / "output"
+        child_pid_path = tmp_path / "cleanup-failure-child.pid"
+        resistant_child = (
+            "import signal, time; "
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)"
+        )
+        cooperative_leader = (
+            "import signal, subprocess, sys; "
+            f"child = subprocess.Popen([sys.executable, '-c', {resistant_child!r}], "
+            "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, "
+            "stderr=subprocess.DEVNULL); "
+            f"open({str(child_pid_path)!r}, 'w').write(str(child.pid)); "
+            "signal.signal(signal.SIGTERM, lambda *_args: sys.exit(0)); "
+            "print('[validate-timing] START target=duplicate at=one', flush=True); "
+            "print('[validate-timing] START target=duplicate at=two', flush=True); "
+            "signal.pause()"
+        )
+        command = (
+            f"exec {shlex.quote(sys.executable)} -c "
+            f"{shlex.quote(cooperative_leader)}"
+        )
+        sampler_threads_before = {
+            thread.ident
+            for thread in threading.enumerate()
+            if thread.name == "validate-resource-sampler"
+        }
+        supervisor = _ContainThenReportCleanupFailureSupervisor(
+            build_process_group_supervisor()
+        )
+
+        with pytest.raises(
+            ContainedCommandCleanupError,
+            match="injected cleanup failure",
+        ):
+            run_validation(
+                command,
+                output_dir,
+                fake_git_repo,
+                clock=ValidationRunnerClock(
+                    lambda: datetime.now(timezone.utc),
+                    time.monotonic,
+                ),
+                contained_command_capture=PosixContainedCommandCapture(supervisor),
+            )
+
+        child_pid = int(child_pid_path.read_text(encoding="utf-8"))
+        with pytest.raises(ProcessLookupError):
+            os.kill(child_pid, 0)
+        sampler_threads_after = {
+            thread.ident
+            for thread in threading.enumerate()
+            if thread.name == "validate-resource-sampler"
+        }
+        assert sampler_threads_after == sampler_threads_before
+        records = [
+            json.loads(line)
+            for line in (
+                fake_git_repo
+                / ".git"
+                / "issue-orchestrator"
+                / "validate-timings.jsonl"
+            )
+            .read_text(encoding="utf-8")
+            .splitlines()
+        ]
+        summary = next(record for record in records if record["kind"] == "run_summary")
+        assert summary["lifecycle"] == "capture-failed"
+        assert summary["process_group_cleanup"] == "cleanup-failed"
+        assert summary["capture_status"] == "failed"
+        assert summary["capture_error_type"] == "ValueError"
+        assert "duplicate START marker" in summary["capture_error_repr"]
+        assert summary["cleanup_error_type"] == "RuntimeError"
+        assert "injected cleanup failure" in summary["cleanup_error_repr"]
+        assert summary["child_outcome"] == "exit-unknown"
+        assert summary["child_exit_code"] is None
+        assert isinstance(summary["child_process_id"], int)
 
     def test_appends_run_summary_record_to_shared_git_dir(self, fake_git_repo: Path):
         """Each validate run should append a run summary record."""
@@ -453,13 +579,13 @@ class TestValidateRunner:
         natural_leader = (
             "import subprocess, sys; "
             f"child = subprocess.Popen([sys.executable, '-c', {resistant_child!r}], "
-            "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, "
-            "stderr=subprocess.DEVNULL); "
+            "stdin=subprocess.DEVNULL); "
             f"open({str(descendant_pid_path)!r}, 'w').write(str(child.pid))"
         )
         command = f"exec {shlex.quote(sys.executable)} -c {shlex.quote(natural_leader)}"
 
-        result = run_validation(
+        validation_thread, validation_result = run_in_thread(
+            run_validation,
             command,
             tmp_path / "output",
             fake_git_repo,
@@ -467,11 +593,17 @@ class TestValidateRunner:
                 lambda: datetime.now(timezone.utc),
                 time.monotonic,
             ),
-            process_group_supervisor=build_process_group_supervisor(),
+            contained_command_capture=build_contained_command_capture(),
         )
-
-        assert result == 0
+        validation_thread.join(timeout=5.0)
+        completed_before_descendant_release = not validation_thread.is_alive()
         descendant_pid = int(descendant_pid_path.read_text(encoding="utf-8"))
+        if not completed_before_descendant_release:
+            os.kill(descendant_pid, signal.SIGKILL)
+            validation_thread.join(timeout=5.0)
+
+        assert completed_before_descendant_release
+        assert validation_result.unwrap() == 0
         with pytest.raises(ProcessLookupError):
             os.kill(descendant_pid, 0)
 
@@ -527,7 +659,7 @@ class TestValidateRunner:
             tmp_path / "output",
             fake_git_repo,
             clock=ValidationRunnerClock(wall_now, monotonic_now),
-            process_group_supervisor=build_process_group_supervisor(),
+            contained_command_capture=build_contained_command_capture(),
         )
 
         assert result == 0

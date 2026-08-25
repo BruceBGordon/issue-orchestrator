@@ -39,6 +39,7 @@ from .bootstrap_claims import ClaimComponents, assemble_claim_components, lease_
 from .bootstrap_dependencies import Dependencies as Dependencies
 from .bootstrap_executor import (
     build_agent_phase_command_scheduler,
+    build_contained_command_capture as build_contained_command_capture,
     build_executor_monitor as build_executor_monitor,
     build_process_group_supervisor as build_process_group_supervisor,
     compose_executor,

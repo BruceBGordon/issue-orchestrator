@@ -22,6 +22,7 @@ from ..domain.executor import (
 from ..domain.terminal_launch import TerminalShell
 from ..execution.agent_phase_command_scheduler import HostAgentPhaseCommandScheduler
 from ..ports.agent_phase_command_scheduler import AgentPhaseCommandScheduler
+from ..ports.contained_command import ContainedCommandCapture
 from ..ports.executor import Executor
 from ..ports.executor_history_lock import ExecutorHistoryRetentionLock
 from ..ports.executor_monitor import ExecutorMonitor
@@ -99,6 +100,14 @@ def build_process_group_supervisor() -> ProcessGroupSupervisor:
     return PosixProcessGroupSupervisor(
         PosixProcessGroupTerminator(_PROCESS_TERMINATION)
     )
+
+
+def build_contained_command_capture() -> ContainedCommandCapture:
+    """Compose streamed command capture behind one process-lifecycle owner."""
+    _require_posix_process_groups()
+    from ..execution.contained_command_capture import PosixContainedCommandCapture
+
+    return PosixContainedCommandCapture(build_process_group_supervisor())
 
 
 def build_executor_monitor() -> ExecutorMonitor:
