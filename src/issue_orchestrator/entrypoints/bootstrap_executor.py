@@ -19,11 +19,13 @@ from ..domain.executor import (
     ExecutorHistoryRetentionPolicy,
     ExecutorProcessTerminationPolicy,
 )
+from ..domain.executor_guardian import ExecutorGuardianTerminationPolicy
 from ..domain.terminal_launch import TerminalShell
 from ..execution.agent_phase_command_scheduler import HostAgentPhaseCommandScheduler
 from ..ports.agent_phase_command_scheduler import AgentPhaseCommandScheduler
 from ..ports.contained_command import ContainedCommandCapture
 from ..ports.executor import Executor
+from ..ports.executor_command_guardian import ExecutorCommandGuardian
 from ..ports.executor_history_lock import ExecutorHistoryRetentionLock
 from ..ports.executor_monitor import ExecutorMonitor
 from ..ports.host_cpu_utilization import HostCpuUtilizationObserver
@@ -82,7 +84,7 @@ def compose_executor(host_cpu_observer: HostCpuUtilizationObserver) -> Executor:
             process_id=os.getpid,
             request_nonce=lambda: uuid4().hex,
         ),
-        process_group_supervisor=build_process_group_supervisor(),
+        command_guardian=build_executor_command_guardian(),
         atomic_path_replacement=OsAtomicPathReplacement(),
         history_retention_lock=_build_history_retention_lock(pool_dir),
         history_retention_policy=_HISTORY_RETENTION,
@@ -108,6 +110,29 @@ def build_contained_command_capture() -> ContainedCommandCapture:
     from ..execution.contained_command_capture import PosixContainedCommandCapture
 
     return PosixContainedCommandCapture(build_process_group_supervisor())
+
+
+def build_executor_command_guardian() -> ExecutorCommandGuardian:
+    """Compose the child-side lease, deadline, and process-group owner."""
+    _require_posix_process_groups()
+    from ..execution.host_executor.guardian_launcher import (
+        ExecutorGuardianProgram,
+        PosixExecutorCommandGuardian,
+    )
+
+    return PosixExecutorCommandGuardian(
+        ExecutorGuardianProgram(
+            (
+                str(Path(sys.executable)),
+                "-m",
+                "issue_orchestrator.execution.host_executor.guardian",
+            )
+        ),
+        build_process_group_supervisor(),
+        ExecutorGuardianTerminationPolicy(
+            _PROCESS_TERMINATION.graceful_shutdown_seconds
+        ),
+    )
 
 
 def build_executor_monitor() -> ExecutorMonitor:

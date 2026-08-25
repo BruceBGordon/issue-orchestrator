@@ -27,7 +27,14 @@ from issue_orchestrator.execution.atomic_record_store import OsAtomicPathReplace
 from issue_orchestrator.execution.executor_history_lock import (
     PosixExecutorHistoryRetentionLock,
 )
-from tests.unit.executor_pressure_dsl import PressureJob, PressureRig, PressureWork
+from tests.unit.executor_pressure_dsl import (
+    BoundedPressureDeadline,
+    CloseFdsTreePressureCommand,
+    HungPressureCommand,
+    PressureJob,
+    PressureRig,
+    PressureWork,
+)
 
 
 def _monitor(pool_dir: Path, host_cpu_slots: int) -> HostExecutorMonitor:
@@ -192,7 +199,7 @@ def test_pressure_new_same_group_work_cannot_starve_an_old_wide_request(
         rig.drain(narrow)
 
 
-def test_pressure_child_retains_capacity_after_executor_parent_crash(
+def test_pressure_guardian_retains_capacity_for_live_child_after_outer_crash(
     tmp_path: Path,
 ) -> None:
     """Killing the wrapper cannot release slots still used by its child."""
@@ -204,6 +211,61 @@ def test_pressure_child_retains_capacity_after_executor_parent_crash(
 
         rig.release_orphaned_child(crashed_parent)
         rig.require_started(follower)
+        rig.release(follower)
+
+
+def test_pressure_guardian_retains_capacity_until_close_fds_tree_is_contained(
+    tmp_path: Path,
+) -> None:
+    """A disposable outer cannot orphan uncharged close-fds descendants."""
+    pool_dir = tmp_path / "pool"
+    tree = CloseFdsTreePressureCommand(
+        guardian_pid_path=(tmp_path / "tree-guardian.pid").resolve(),
+        descendant_pid_path=(tmp_path / "tree-descendant.pid").resolve(),
+    )
+    with PressureRig(pool_dir, host_cpu_slots=1) as rig:
+        crashed_parent = rig.admit(
+            PressureWork(
+                "CLOSE-FDS-TREE",
+                "pressure-guardian-crash",
+                command=tree,
+            )
+        )
+        rig.crash_parent(crashed_parent)
+        tree.request_guardian_termination()
+        follower = rig.defer(PressureWork("FOLLOWER", "pressure-follower"))
+        rig.require_none_started((follower,))
+
+        rig.release_orphaned_child(crashed_parent)
+        rig.require_started(follower)
+        tree.require_descendant_contained()
+        rig.release(follower)
+
+
+def test_pressure_guardian_enforces_deadline_after_executor_parent_crash(
+    tmp_path: Path,
+) -> None:
+    """A bounded guardian releases capacity without its disposable outer."""
+    pool_dir = tmp_path / "pool"
+    hung = HungPressureCommand(
+        guardian_pid_path=(tmp_path / "hung-guardian.pid").resolve(),
+        command_pid_path=(tmp_path / "hung-command.pid").resolve(),
+    )
+    with PressureRig(pool_dir, host_cpu_slots=1) as rig:
+        crashed_parent = rig.admit(
+            PressureWork(
+                "HUNG-COMMAND",
+                "pressure-guardian-timeout",
+                command=hung,
+                deadline=BoundedPressureDeadline(1.0, 5.0),
+            )
+        )
+        rig.crash_parent(crashed_parent)
+        follower = rig.defer(PressureWork("FOLLOWER", "pressure-follower"))
+        rig.require_none_started((follower,))
+
+        rig.require_started(follower)
+        hung.require_command_contained()
         rig.release(follower)
 
 

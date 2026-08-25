@@ -1,9 +1,10 @@
 # Host Executor
 
 The host executor is a deep module for coordinating local commands across every
-repository, worktree, and issue session owned by one OS user. It is processless:
+repository, worktree, and issue session owned by one OS user. It is daemonless:
 each invocation coordinates through strict state records and advisory file
-locks, so no orchestrator daemon has to be running.
+locks and starts only a transient per-command guardian, so no orchestrator
+service has to be running.
 
 ## Public contract
 
@@ -43,7 +44,8 @@ safety bound.
   grant selection.
 - `execution/host_executor/` is the deep adapter. It hides Git identity,
   Pydantic persistence contracts, queue transactions, file descriptors,
-  process supervision, resource measurement, and typed event collection.
+  crash-resilient command guardians, process supervision, resource
+  measurement, and typed event collection.
 - `entrypoints/bootstrap.py` remains the sole composition root. Executor CLI
   handlers import its builders lazily, so unrelated commands do not load the
   POSIX adapter and remain portable.
@@ -108,12 +110,14 @@ are also internal mechanisms. Minimum reservation makes a declared range meaning
 the minimum is useful service protected across a visible burst, while the
 maximum is opportunistic expansion.
 
-An opaque running subprocess is not resized or suspended. Its inherited lease
-file descriptors are part of crash safety, so closing only the supervisor's
-copy or sending an OS stop signal would create false capacity. Command
-completion is therefore the current safe cooperative yield boundary. Native
-pressure feedback attenuates additional admissions while existing commands
-drain.
+An opaque running subprocess is not resized or suspended. A dedicated guardian
+owns its lease file descriptors and exact post-admission deadline; the opaque
+command receives neither the leases nor their implementation details. The
+guardian remains the process-group leader until it has recorded a typed
+terminal result and sent unconditional group cleanup. Only then can its lease
+copies close. Command completion is therefore the current safe cooperative
+yield boundary. Native pressure feedback attenuates additional admissions while
+existing commands drain.
 
 Issue-orchestrator uses that boundary directly. Code, validation-retry, rework,
 review, and retrospective-review terminal sessions are complete application
@@ -149,9 +153,14 @@ executor's valid queue or execution budget.
 
 The queue transaction and resource leases are separate ownership objects. A
 queued record is removed on every exit from admission. Capacity, exclusive, and
-lease-record file descriptors are inherited by the child, so a killed executor
-parent cannot release resources while its command still runs. A later
-invocation prunes a record only after its ownership lock is no longer held.
+lease-record file descriptors transfer to a dedicated child guardian, so a
+killed executor parent cannot release resources while its command tree still
+runs. The opaque command is spawned with closed nonstandard descriptors. The
+guardian owns the exact remaining active/absolute deadline and retains the
+process-group identity through final TERM/KILL containment, including when a
+descendant used `close_fds`. Missing or malformed terminal records fail loudly;
+they never become fabricated success or exit 124. A later invocation prunes a
+record only after its ownership lock is no longer held.
 Capacity discovery/reconfiguration and admission share one cross-process guard,
 so a migrated pool can adopt a new machine's CPU count only while every old
 capacity lease is idle.
@@ -166,9 +175,10 @@ human-readable repository and work names.
 
 The bounded typed executor event store records enqueue facts, the coalescing
 interval, wait-reason transitions, grants, minimum reservations, policy
-changes, command observations, learned-demand changes, successful sample
-counts, native CPU samples, decision reasons, admission/command deadline
-expirations, and host load. `executor-events` queries it through the read-only
+changes, command observations and lifecycle failures, learned-demand changes,
+successful sample counts, native CPU samples, decision reasons,
+admission/command deadline expirations, and host load. `executor-events` queries
+it through the read-only
 `ExecutorMonitor` port; the CLI does not parse persistence or executor locks.
 `executor-status` projects current policy, global successful/excluded sample
 counts, the exact global learning fingerprint, and a filtered, paginated page
@@ -196,8 +206,10 @@ waiting for rare production timing:
 - The real-process pressure DSL drives independent executor processes and
   controlled child lifetimes. It proves cross-group round-robin fairness,
   exclusive-resource serialization, old-wide-request drainage, opposite lock
-  order progress, simultaneous history writers, queued-parent death, and the
-  invariant that a child retains its lease after its executor parent crashes.
+  order progress, simultaneous history writers, queued-parent death, and
+  guardian invariants: a killed outer cannot release capacity around either a
+  live direct child or a TERM-resistant `close_fds` descendant, and a
+  guardian-owned deadline still expires after outer death.
 - The virtual-time workload DSL drives the pure production admission policy.
   Its dials cover machine size, aggressiveness, arrival schedule, lane demand,
   decision cadence, external CPU windows, and either run-to-completion or

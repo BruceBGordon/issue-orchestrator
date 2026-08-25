@@ -16,6 +16,7 @@ from issue_orchestrator.control.executor_admission import (
     ExecutorWorkDemandEstimator,
 )
 from issue_orchestrator.domain.executor import (
+    ExecutorBoundedDeadline,
     ExecutorCommand,
     ExecutorConcurrencyRange,
     ExecutorExclusiveResource,
@@ -23,21 +24,17 @@ from issue_orchestrator.domain.executor import (
     ExecutorHistoryRetentionPolicy,
     ExecutorRunSpecification,
     ExecutorWorkKey,
-    ExecutorProcessTerminationPolicy,
     ExecutorUnboundedDeadline,
 )
 from issue_orchestrator.domain.executor_host import ExecutorHostCpuUtilization
+from issue_orchestrator.entrypoints.bootstrap_executor import (
+    build_executor_command_guardian,
+)
 from issue_orchestrator.execution.host_executor import (
     ExecutorRequestIdentityFactory,
     HostExecutor,
 )
 from issue_orchestrator.execution.atomic_record_store import OsAtomicPathReplacement
-from issue_orchestrator.execution.process_group_terminator import (
-    PosixProcessGroupTerminator,
-)
-from issue_orchestrator.execution.process_group_supervisor import (
-    PosixProcessGroupSupervisor,
-)
 from issue_orchestrator.execution.executor_history_lock import (
     PosixExecutorHistoryRetentionLock,
 )
@@ -105,6 +102,8 @@ def main() -> int:
     parser.add_argument("--work-key", required=True)
     parser.add_argument("--group", required=True)
     parser.add_argument("--exclusive", action="append", default=[])
+    parser.add_argument("--active-timeout-seconds", type=float)
+    parser.add_argument("--absolute-timeout-seconds", type=float)
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     command = tuple(args.command)
@@ -141,14 +140,7 @@ def main() -> int:
                 process_id=os.getpid,
                 request_nonce=lambda: uuid4().hex,
             ),
-            process_group_supervisor=PosixProcessGroupSupervisor(
-                PosixProcessGroupTerminator(
-                    ExecutorProcessTerminationPolicy(
-                        graceful_shutdown_seconds=2.0,
-                        forceful_shutdown_seconds=2.0,
-                    )
-                )
-            ),
+            command_guardian=build_executor_command_guardian(),
             atomic_path_replacement=OsAtomicPathReplacement(),
             history_retention_lock=PosixExecutorHistoryRetentionLock(
                 (pool_dir / "work-history" / "retention.lock").resolve()
@@ -156,6 +148,20 @@ def main() -> int:
             history_retention_policy=ExecutorHistoryRetentionPolicy(2048, 24),
             queue_settle_seconds=0.02,
             queue_poll_seconds=0.01,
+        )
+        if (args.active_timeout_seconds is None) != (
+            args.absolute_timeout_seconds is None
+        ):
+            raise ValueError(
+                "active and absolute executor timeouts must be supplied together"
+            )
+        deadline = (
+            ExecutorUnboundedDeadline()
+            if args.active_timeout_seconds is None
+            else ExecutorBoundedDeadline(
+                args.active_timeout_seconds,
+                args.absolute_timeout_seconds,
+            )
         )
         result = executor.run(
             ExecutorRunSpecification(
@@ -169,7 +175,7 @@ def main() -> int:
                     ExecutorExclusiveResource(resource) for resource in args.exclusive
                 ),
             ),
-            ExecutorCommand(command, ExecutorUnboundedDeadline()),
+            ExecutorCommand(command, deadline),
         )
     except (FileNotFoundError, OSError, RuntimeError, ValueError) as exc:
         print(f"executor-run failed: {exc}")

@@ -191,6 +191,41 @@ def test_failed_commands_remain_diagnostic_but_do_not_enter_learning_history(
     assert "successful_samples=1" in succeeding_completion
 
 
+def test_command_lifecycle_failure_is_durable_and_human_traceable(
+    tmp_path: Path,
+) -> None:
+    pool_dir = tmp_path / "pool"
+    missing_executable = "/definitely/missing/executor-command"
+    failed = _run_cli(
+        pool_dir,
+        "executor-run",
+        "--work-key",
+        "io:guardian-failure-evidence",
+        "--min-concurrency",
+        "1",
+        "--max-concurrency",
+        "1",
+        "--group",
+        "io-validation-guardian-failed",
+        "--",
+        missing_executable,
+    )
+
+    assert failed.returncode == 2
+    events = _run_cli(pool_dir, "executor-events", "--limit", "10")
+
+    assert events.returncode == 0
+    failure = next(
+        line
+        for line in events.stdout.splitlines()
+        if " command-lifecycle-failed " in line
+    )
+    assert "work=io:guardian-failure-evidence" in failure
+    assert "group=io-validation-guardian-failed" in failure
+    assert "ExecutorGuardianCommandStartError" in failure
+    assert missing_executable in failure
+
+
 def test_status_cli_exposes_policy_and_human_learning_identity(
     tmp_path: Path,
 ) -> None:
@@ -433,7 +468,9 @@ raise SystemExit(main())
     assert "usage:" in completed.stdout
 
 
-def test_bootstrap_import_is_safe_and_executor_failure_is_explicit_without_posix() -> None:
+def test_bootstrap_import_is_safe_and_executor_failure_is_explicit_without_posix() -> (
+    None
+):
     import_blocker = """
 import builtins
 

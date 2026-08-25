@@ -30,7 +30,7 @@ from ...domain.executor_host import ExecutorHostCpuUtilization
 from ...domain.executor_monitoring import (
     ExecutorAdmissionDeadlineExceeded,
     ExecutorCommandDeadlineExceeded,
-    ExecutorCommandStartFailed,
+    ExecutorCommandLifecycleFailed,
     ExecutorCpuSlotState,
     ExecutorEvent,
     ExecutorEventMetadata,
@@ -117,8 +117,8 @@ class AdmittedEventRecord(_EventRecord):
     host_cpu_utilization: HostCpuUtilizationRecord
 
 
-class CommandStartFailedEventRecord(_EventRecord):
-    event: Literal["command-start-failed"] = "command-start-failed"
+class CommandLifecycleFailedEventRecord(_EventRecord):
+    event: Literal["command-lifecycle-failed"] = "command-lifecycle-failed"
     request_id: str = Field(min_length=1)
     repository_key: str = Field(min_length=1)
     repository_label: str = Field(min_length=1)
@@ -183,7 +183,7 @@ StoredExecutorEvent = (
     EnqueuedEventRecord
     | WaitingEventRecord
     | AdmittedEventRecord
-    | CommandStartFailedEventRecord
+    | CommandLifecycleFailedEventRecord
     | AdmissionDeadlineExceededEventRecord
     | CommandDeadlineExceededEventRecord
     | CompletedEventRecord
@@ -300,15 +300,15 @@ class ExecutorEventStore:
             )
         )
 
-    def command_start_failed(
+    def command_lifecycle_failed(
         self,
         identity: ExecutorWorkIdentity,
         work: QueuedExecutorWork,
         grant: ExecutorAdmissionGrant,
-        error: OSError,
+        error: BaseException,
     ) -> None:
         self.append(
-            CommandStartFailedEventRecord(
+            CommandLifecycleFailedEventRecord(
                 request_id=work.request_id.value,
                 repository_key=identity.repository.key,
                 repository_label=identity.repository.label,
@@ -565,8 +565,8 @@ def _to_domain_event(record: StoredExecutorEvent) -> ExecutorEvent:
             host_load=_host_load(record.host_load),
             host_cpu_utilization=record.host_cpu_utilization.to_domain(),
         )
-    if isinstance(record, CommandStartFailedEventRecord):
-        return ExecutorCommandStartFailed(
+    if isinstance(record, CommandLifecycleFailedEventRecord):
+        return ExecutorCommandLifecycleFailed(
             metadata=_event_metadata(record),
             work=_monitored_work(
                 request_id=record.request_id,

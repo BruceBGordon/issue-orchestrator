@@ -55,12 +55,6 @@ from issue_orchestrator.execution.host_executor import (
     HostExecutor,
     HostExecutorMonitor,
 )
-from issue_orchestrator.execution.process_group_terminator import (
-    PosixProcessGroupTerminator,
-)
-from issue_orchestrator.execution.process_group_supervisor import (
-    PosixProcessGroupSupervisor,
-)
 from issue_orchestrator.execution.executor_history_lock import (
     PosixExecutorHistoryRetentionLock,
 )
@@ -76,6 +70,7 @@ from issue_orchestrator.domain.session_run import SessionRunAssets
 from issue_orchestrator.domain.session_watchdog import ScheduledSessionWatchdog
 from issue_orchestrator.ports.host_cpu_utilization import HostCpuUtilizationObserver
 from tests.unit.session_run_helpers import make_session_run_assets
+from tests.unit.executor_guardian_helpers import executor_command_guardian
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -180,12 +175,10 @@ def _deterministic_host_executor(
             process_id=os.getpid,
             request_nonce=lambda: request_nonce,
         ),
-        process_group_supervisor=PosixProcessGroupSupervisor(
-            PosixProcessGroupTerminator(
-                ExecutorProcessTerminationPolicy(
-                    graceful_shutdown_seconds=2.0,
-                    forceful_shutdown_seconds=2.0,
-                )
+        command_guardian=executor_command_guardian(
+            ExecutorProcessTerminationPolicy(
+                graceful_shutdown_seconds=2.0,
+                forceful_shutdown_seconds=2.0,
             )
         ),
         atomic_path_replacement=OsAtomicPathReplacement(),
@@ -675,12 +668,10 @@ def test_admission_deadline_fails_before_command_and_is_durable(
             process_id=os.getpid,
             request_nonce=lambda: "c" * 32,
         ),
-        process_group_supervisor=PosixProcessGroupSupervisor(
-            PosixProcessGroupTerminator(
-                ExecutorProcessTerminationPolicy(
-                    graceful_shutdown_seconds=2.0,
-                    forceful_shutdown_seconds=2.0,
-                )
+        command_guardian=executor_command_guardian(
+            ExecutorProcessTerminationPolicy(
+                graceful_shutdown_seconds=2.0,
+                forceful_shutdown_seconds=2.0,
             )
         ),
         atomic_path_replacement=OsAtomicPathReplacement(),
@@ -763,12 +754,10 @@ def test_deadline_expiring_after_admission_records_terminal_events_without_spawn
             process_id=os.getpid,
             request_nonce=lambda: "d" * 32,
         ),
-        process_group_supervisor=PosixProcessGroupSupervisor(
-            PosixProcessGroupTerminator(
-                ExecutorProcessTerminationPolicy(
-                    graceful_shutdown_seconds=2.0,
-                    forceful_shutdown_seconds=2.0,
-                )
+        command_guardian=executor_command_guardian(
+            ExecutorProcessTerminationPolicy(
+                graceful_shutdown_seconds=2.0,
+                forceful_shutdown_seconds=2.0,
             )
         ),
         atomic_path_replacement=OsAtomicPathReplacement(),

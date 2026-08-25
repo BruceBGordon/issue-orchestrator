@@ -348,7 +348,9 @@ class ExecutorWorkAdmitted:
 
 
 @dataclass(frozen=True, slots=True)
-class ExecutorCommandStartFailed:
+class ExecutorCommandLifecycleFailed:
+    """An admitted command could not reach a trustworthy terminal outcome."""
+
     metadata: ExecutorEventMetadata
     work: ExecutorMonitoredWork
     concurrency: int
@@ -364,10 +366,12 @@ class ExecutorCommandStartFailed:
         )
         _require_positive_integer(type(self).__name__, "concurrency", self.concurrency)
         if type(self.error_type) is not str or not self.error_type:
-            raise ValueError("ExecutorCommandStartFailed.error_type must not be empty")
+            raise ValueError(
+                "ExecutorCommandLifecycleFailed.error_type must not be empty"
+            )
         if type(self.error_message) is not str or not self.error_message:
             raise ValueError(
-                "ExecutorCommandStartFailed.error_message must not be empty"
+                "ExecutorCommandLifecycleFailed.error_message must not be empty"
             )
 
 
@@ -526,7 +530,7 @@ ExecutorEvent = (
     ExecutorWorkEnqueued
     | ExecutorWorkWaiting
     | ExecutorWorkAdmitted
-    | ExecutorCommandStartFailed
+    | ExecutorCommandLifecycleFailed
     | ExecutorAdmissionDeadlineExceeded
     | ExecutorCommandDeadlineExceeded
     | ExecutorWorkCompleted
@@ -557,7 +561,7 @@ class ExecutorEventTimeline:
             ExecutorWorkEnqueued,
             ExecutorWorkWaiting,
             ExecutorWorkAdmitted,
-            ExecutorCommandStartFailed,
+            ExecutorCommandLifecycleFailed,
             ExecutorAdmissionDeadlineExceeded,
             ExecutorCommandDeadlineExceeded,
             ExecutorWorkCompleted,

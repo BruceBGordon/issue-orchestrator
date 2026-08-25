@@ -197,8 +197,9 @@ the policy command reports when it overrides the saved value.
 Repeated `--exclusive NAME` declarations serialize correctness-sensitive host
 resources such as one provider CLI identity, browser fixture, emulator, or
 future repository mutation boundary. These locks are independent of work-key
-names. CPU and exclusive leases survive in the child process and are recovered
-after parent crashes.
+names. CPU and exclusive leases transfer to a transient guardian and survive an
+executor-wrapper crash until the complete opaque command group is contained.
+The command itself receives no lease descriptors.
 
 There are no new YAML settings. Capacity is machine policy in the environment;
 work specifications belong to repository commands. The orchestrator does not
@@ -225,11 +226,11 @@ fairness group.
 The executor writes a bounded typed event store at
 `<pool>/executor-events-v4.jsonl`; on macOS the default pool is under
 `~/Library/Application Support/issue-orchestrator/executor-pools/host-v2`.
-Enqueue, changing wait reasons, grants, policy source, command observations,
-learned-demand changes, successful learning-sample counts, native CPU busy
-samples and their intervals, admission/command watchdog expirations, and host
-load averages are recorded with human work and repository names. Inspect recent
-activity without reading that persistence directly:
+Enqueue, changing wait reasons, grants, policy source, command observations and
+lifecycle failures, learned-demand changes, successful learning-sample counts,
+native CPU busy samples and their intervals, admission/command watchdog
+expirations, and host load averages are recorded with human work and repository
+names. Inspect recent activity without reading that persistence directly:
 
 ```bash
 issue-orchestrator executor-events --limit 50

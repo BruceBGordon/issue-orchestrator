@@ -42,12 +42,6 @@ from issue_orchestrator.execution.host_executor import (
     HostExecutorMonitor,
 )
 from issue_orchestrator.execution.atomic_record_store import OsAtomicPathReplacement
-from issue_orchestrator.execution.process_group_terminator import (
-    PosixProcessGroupTerminator,
-)
-from issue_orchestrator.execution.process_group_supervisor import (
-    PosixProcessGroupSupervisor,
-)
 from issue_orchestrator.execution.executor_history_lock import (
     PosixExecutorHistoryRetentionLock,
 )
@@ -55,6 +49,7 @@ from issue_orchestrator.ports.executor_history_lock import (
     ExecutorHistoryRetentionLock,
 )
 from issue_orchestrator.ports.atomic_path_replacement import AtomicPathReplacement
+from tests.unit.executor_guardian_helpers import executor_command_guardian
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -100,12 +95,10 @@ def _executor(
             process_id=os.getpid,
             request_nonce=lambda: request_nonce,
         ),
-        process_group_supervisor=PosixProcessGroupSupervisor(
-            PosixProcessGroupTerminator(
-                ExecutorProcessTerminationPolicy(
-                    graceful_shutdown_seconds=0.1,
-                    forceful_shutdown_seconds=0.1,
-                )
+        command_guardian=executor_command_guardian(
+            ExecutorProcessTerminationPolicy(
+                graceful_shutdown_seconds=0.1,
+                forceful_shutdown_seconds=0.1,
             )
         ),
         atomic_path_replacement=atomic_path_replacement,
@@ -351,12 +344,10 @@ def test_history_prunes_old_profiles_and_bounds_samples_per_profile(
             process_id=os.getpid,
             request_nonce=lambda: "a" * 32,
         ),
-        process_group_supervisor=PosixProcessGroupSupervisor(
-            PosixProcessGroupTerminator(
-                ExecutorProcessTerminationPolicy(
-                    graceful_shutdown_seconds=0.1,
-                    forceful_shutdown_seconds=0.1,
-                )
+        command_guardian=executor_command_guardian(
+            ExecutorProcessTerminationPolicy(
+                graceful_shutdown_seconds=0.1,
+                forceful_shutdown_seconds=0.1,
             )
         ),
         atomic_path_replacement=OsAtomicPathReplacement(),

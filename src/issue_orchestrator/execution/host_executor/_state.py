@@ -73,7 +73,7 @@ class OwnedQueuedRequest:
 
 
 class HostExecutorLease:
-    """Live CPU/resource locks inherited by the admitted child process."""
+    """Live CPU/resource locks transferred to the admitted command guardian."""
 
     def __init__(
         self,
@@ -88,9 +88,9 @@ class HostExecutorLease:
         self._handles = handles
         self._released = False
 
-    def child_file_descriptors(self) -> tuple[int, ...]:
+    def guardian_file_descriptors(self) -> tuple[int, ...]:
         if self._released:
-            raise RuntimeError("cannot inherit a released host executor lease")
+            raise RuntimeError("cannot transfer a released host executor lease")
         return tuple(handle.fileno() for handle in self._handles)
 
     def release(self) -> None:
@@ -447,6 +447,7 @@ class HostExecutorState:
         handle.truncate()
         handle.write((record.model_dump_json() + "\n").encode("utf-8"))
         handle.flush()
+
 
 def _try_lock(path: Path) -> BinaryIO | None:
     handle = path.open("a+b")

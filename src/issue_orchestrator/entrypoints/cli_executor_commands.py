@@ -21,7 +21,7 @@ from ..domain.executor_monitoring import (
     ExecutorAllRepositories,
     ExecutorAdmissionDeadlineExceeded,
     ExecutorCommandDeadlineExceeded,
-    ExecutorCommandStartFailed,
+    ExecutorCommandLifecycleFailed,
     ExecutorEvent,
     ExecutorPolicyChanged,
     ExecutorRecentEventsQuery,
@@ -244,9 +244,9 @@ def _format_executor_event(event: ExecutorEvent) -> str:
             f"sample={event.host_cpu_utilization.observation_seconds:.3f}s "
             f"{_format_host_load(event.host_load)}"
         )
-    if isinstance(event, ExecutorCommandStartFailed):
+    if isinstance(event, ExecutorCommandLifecycleFailed):
         return (
-            f"{prefix} command-start-failed concurrency={event.concurrency} "
+            f"{prefix} command-lifecycle-failed concurrency={event.concurrency} "
             f"error={event.error_type}: {event.error_message}"
         )
     if isinstance(event, ExecutorAdmissionDeadlineExceeded):

@@ -7,6 +7,7 @@ import selectors
 import signal
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -25,6 +26,174 @@ REQUIRED_POST_HOLDER_ATTEMPTS = 2
 
 
 @dataclass(frozen=True, slots=True)
+class HeldPressureCommand:
+    """A coarse-grained command released through its inherited stdin pipe."""
+
+    def arguments(self, label: str) -> tuple[str, ...]:
+        return (
+            sys.executable,
+            "-u",
+            "-c",
+            f"import sys; print({label!r}, flush=True); sys.stdin.readline()",
+        )
+
+    def cleanup(self) -> None:
+        pass
+
+
+@dataclass(frozen=True, slots=True)
+class CloseFdsTreePressureCommand:
+    """A releasable leader with one TERM-resistant close-fds descendant."""
+
+    guardian_pid_path: Path
+    descendant_pid_path: Path
+
+    def __post_init__(self) -> None:
+        for field_name, value in (
+            ("guardian_pid_path", self.guardian_pid_path),
+            ("descendant_pid_path", self.descendant_pid_path),
+        ):
+            if not isinstance(value, Path) or not value.is_absolute():
+                raise ValueError(
+                    f"CloseFdsTreePressureCommand.{field_name} must be absolute"
+                )
+
+    def arguments(self, label: str) -> tuple[str, ...]:
+        source = (
+            "import os, pathlib, signal, subprocess, sys\n"
+            f"pathlib.Path({str(self.guardian_pid_path)!r}).write_text("
+            "str(os.getppid()))\n"
+            "descendant = subprocess.Popen(\n"
+            "    [sys.executable, '-c', "
+            "'import signal, time; signal.signal(signal.SIGTERM, "
+            "signal.SIG_IGN); time.sleep(30)'],\n"
+            "    close_fds=True,\n"
+            "    stdin=subprocess.DEVNULL,\n"
+            "    stdout=subprocess.DEVNULL,\n"
+            "    stderr=subprocess.DEVNULL,\n"
+            ")\n"
+            f"pathlib.Path({str(self.descendant_pid_path)!r}).write_text("
+            "str(descendant.pid))\n"
+            f"print({label!r}, flush=True)\n"
+            "sys.stdin.readline()\n"
+        )
+        return (sys.executable, "-u", "-c", source)
+
+    def require_descendant_contained(self) -> None:
+        _require_process_exited(self.descendant_pid_path)
+
+    def request_guardian_termination(self) -> None:
+        os.kill(_recorded_process_id(self.guardian_pid_path), signal.SIGTERM)
+
+    def cleanup(self) -> None:
+        _contain_recorded_guardian(self.guardian_pid_path)
+
+
+@dataclass(frozen=True, slots=True)
+class HungPressureCommand:
+    """A TERM-resistant leader used to prove guardian-owned deadlines."""
+
+    guardian_pid_path: Path
+    command_pid_path: Path
+
+    def __post_init__(self) -> None:
+        for field_name, value in (
+            ("guardian_pid_path", self.guardian_pid_path),
+            ("command_pid_path", self.command_pid_path),
+        ):
+            if not isinstance(value, Path) or not value.is_absolute():
+                raise ValueError(f"HungPressureCommand.{field_name} must be absolute")
+
+    def arguments(self, label: str) -> tuple[str, ...]:
+        source = (
+            "import os, pathlib, signal\n"
+            f"pathlib.Path({str(self.guardian_pid_path)!r}).write_text("
+            "str(os.getppid()))\n"
+            f"pathlib.Path({str(self.command_pid_path)!r}).write_text("
+            "str(os.getpid()))\n"
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            f"print({label!r}, flush=True)\n"
+            "signal.pause()\n"
+        )
+        return (sys.executable, "-u", "-c", source)
+
+    def require_command_contained(self) -> None:
+        _require_process_exited(self.command_pid_path)
+
+    def cleanup(self) -> None:
+        _contain_recorded_guardian(self.guardian_pid_path)
+
+
+PressureCommand = (
+    HeldPressureCommand | CloseFdsTreePressureCommand | HungPressureCommand
+)
+
+
+@dataclass(frozen=True, slots=True)
+class UnboundedPressureDeadline:
+    """Explicitly permit a pressure command to run until natural completion."""
+
+
+@dataclass(frozen=True, slots=True)
+class BoundedPressureDeadline:
+    """Exact active and absolute bounds forwarded through the process runner."""
+
+    active_timeout_seconds: float
+    absolute_timeout_seconds: float
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.active_timeout_seconds) is not float
+            or self.active_timeout_seconds <= 0.0
+        ):
+            raise ValueError("pressure active timeout must be positive")
+        if (
+            type(self.absolute_timeout_seconds) is not float
+            or self.absolute_timeout_seconds < self.active_timeout_seconds
+        ):
+            raise ValueError(
+                "pressure absolute timeout must be at least the active timeout"
+            )
+
+
+PressureDeadline = UnboundedPressureDeadline | BoundedPressureDeadline
+
+
+def _require_process_exited(pid_path: Path) -> None:
+    pid = _recorded_process_id(pid_path)
+    deadline = time.monotonic() + PROCESS_TRANSITION_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(0.01)
+    raise AssertionError(f"process {pid} remained live after guardian containment")
+
+
+def _recorded_process_id(pid_path: Path) -> int:
+    process_id = int(pid_path.read_text(encoding="utf-8"))
+    if process_id <= 1:
+        raise AssertionError(f"invalid recorded process id {process_id}")
+    return process_id
+
+
+def _contain_recorded_guardian(pid_path: Path) -> None:
+    if not pid_path.exists():
+        return
+    guardian_pid = _recorded_process_id(pid_path)
+    try:
+        process_group_id = os.getpgid(guardian_pid)
+    except ProcessLookupError:
+        return
+    if process_group_id != guardian_pid:
+        raise AssertionError(
+            f"recorded guardian {guardian_pid} does not own its process group"
+        )
+    os.killpg(process_group_id, signal.SIGKILL)
+
+
+@dataclass(frozen=True, slots=True)
 class PressureWork:
     """One explicitly controlled command submitted by a pressure scenario."""
 
@@ -32,6 +201,8 @@ class PressureWork:
     group: str
     concurrency_range: ExecutorConcurrencyRange = ExecutorConcurrencyRange(1, 1)
     exclusive_resources: tuple[str, ...] = ()
+    command: PressureCommand = HeldPressureCommand()
+    deadline: PressureDeadline = UnboundedPressureDeadline()
 
     def __post_init__(self) -> None:
         if type(self.label) is not str or not self.label:
@@ -49,6 +220,17 @@ class PressureWork:
             raise ValueError(
                 "PressureWork.exclusive_resources must contain non-empty strings"
             )
+        if type(self.command) not in (
+            HeldPressureCommand,
+            CloseFdsTreePressureCommand,
+            HungPressureCommand,
+        ):
+            raise ValueError("PressureWork.command must be a typed pressure command")
+        if type(self.deadline) not in (
+            UnboundedPressureDeadline,
+            BoundedPressureDeadline,
+        ):
+            raise ValueError("PressureWork.deadline must be a typed pressure deadline")
 
     def command_line(self, host_cpu_slots: int) -> list[str]:
         command = [
@@ -67,13 +249,19 @@ class PressureWork:
         ]
         for resource in self.exclusive_resources:
             command.extend(("--exclusive", resource))
+        if type(self.deadline) is BoundedPressureDeadline:
+            command.extend(
+                (
+                    "--active-timeout-seconds",
+                    str(self.deadline.active_timeout_seconds),
+                    "--absolute-timeout-seconds",
+                    str(self.deadline.absolute_timeout_seconds),
+                )
+            )
         return [
             *command,
             "--",
-            sys.executable,
-            "-u",
-            "-c",
-            (f"import sys; print({self.label!r}, flush=True); sys.stdin.readline()"),
+            *self.command.arguments(self.label),
         ]
 
 
@@ -236,6 +424,7 @@ class _ControlledPressureProcess:
             pass
         if self._process.poll() is None:
             self._process.wait(timeout=PROCESS_TRANSITION_TIMEOUT_SECONDS)
+        self.work.command.cleanup()
         os.close(self._admission_attempt_fd)
 
     def _readline(self, stream: TextIO, *, transition: str) -> str:
@@ -336,10 +525,7 @@ class PressureRig:
 
     def set_host_cpu_busy_percent(self, busy_percent: float) -> None:
         """Set the exact whole-host CPU input observed by subsequent decisions."""
-        if (
-            type(busy_percent) is not float
-            or not 0 <= busy_percent <= 100
-        ):
+        if type(busy_percent) is not float or not 0 <= busy_percent <= 100:
             raise ValueError("pressure host CPU busy percent must be in [0, 100]")
         self._host_cpu_busy_file.parent.mkdir(parents=True, exist_ok=True)
         temporary = self._host_cpu_busy_file.with_suffix(".next")
@@ -419,8 +605,7 @@ class PressureRig:
                 process.discard_admission_attempt_signals()
                 process.register_pressure_signals(selector, job)
             while any(
-                count < REQUIRED_POST_HOLDER_ATTEMPTS
-                for count in attempts.values()
+                count < REQUIRED_POST_HOLDER_ATTEMPTS for count in attempts.values()
             ):
                 ready = selector.select(timeout=PROCESS_TRANSITION_TIMEOUT_SECONDS)
                 assert ready, (
@@ -436,12 +621,8 @@ class PressureRig:
                             f"{signal.job.work.label} started while its holder "
                             "remained active"
                         )
-                    attempts[signal.job] += (
-                        process.consume_admission_attempt_signals()
-                    )
-            assert all(
-                not self._process(job).started_signal_is_ready() for job in jobs
-            )
+                    attempts[signal.job] += process.consume_admission_attempt_signals()
+            assert all(not self._process(job).started_signal_is_ready() for job in jobs)
         finally:
             selector.close()
 
@@ -458,11 +639,11 @@ class PressureRig:
             self._process(job).wait_until_clean_exit()
 
     def crash_parent(self, job: PressureJob) -> None:
-        """Kill a job's executor parent while its child retains the lease."""
+        """Kill a job's executor parent while its guardian retains the lease."""
         self._process(job).kill_parent()
 
     def release_orphaned_child(self, job: PressureJob) -> None:
-        """Release a child whose executor parent was explicitly killed."""
+        """Release a command whose executor parent was explicitly killed."""
         self._process(job).release_orphaned_child()
 
     def drain(self, jobs: tuple[PressureJob, ...]) -> None:

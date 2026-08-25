@@ -6,7 +6,6 @@ from __future__ import annotations
 import math
 import os
 import resource
-import subprocess
 import sys
 import threading
 import time
@@ -34,19 +33,26 @@ from ...domain.executor import (
     ExecutorRunSpecification,
     ExecutorUnboundedDeadline,
 )
-from ...domain.process_group import OwnedProcessGroupLeader
-from ...domain.process_group import (
-    ProcessGroupBoundedWait,
-    ProcessGroupCompleted,
-    ProcessGroupTimedOut,
-    ProcessGroupUnboundedWait,
+from ...domain.executor_guardian import (
+    ExecutorGuardianBoundedBudget,
+    ExecutorGuardianBudget,
+    ExecutorGuardianCommandCompleted,
+    ExecutorGuardianCommandStartError,
+    ExecutorGuardianCommandStartFailed,
+    ExecutorGuardianCommandTimedOut,
+    ExecutorGuardianInternalError,
+    ExecutorGuardianInternalFailed,
+    ExecutorGuardianTerminal,
+    ExecutorGuardianUnboundedBudget,
 )
 from ...ports.executor import Executor
+from ...ports.executor_command_guardian import (
+    ExecutorCommandGuardian,
+    ExecutorGuardianRequest,
+)
 from ...ports.atomic_path_replacement import AtomicPathReplacement
 from ...ports.executor_history_lock import ExecutorHistoryRetentionLock
 from ...ports.host_cpu_utilization import HostCpuUtilizationObserver
-from ...ports.process_group_supervisor import ProcessGroupSupervisor
-from ..process_group_supervisor import NeverInterruptProcessGroup
 from ._history import ExecutorWorkHistoryStore
 from ._host_observation import observe_host_load
 from ._journal import ExecutorEventStore
@@ -78,11 +84,10 @@ def _require_host_cpu_observer(value: object) -> None:
         )
 
 
-def _require_process_group_supervisor(value: object) -> None:
-    if not isinstance(value, ProcessGroupSupervisor):
+def _require_command_guardian(value: object) -> None:
+    if not isinstance(value, ExecutorCommandGuardian):
         raise ValueError(
-            "HostExecutor.process_group_supervisor must implement "
-            "ProcessGroupSupervisor"
+            "HostExecutor.command_guardian must implement ExecutorCommandGuardian"
         )
 
 
@@ -97,8 +102,7 @@ def _require_history_retention_lock(value: object) -> None:
 def _require_atomic_path_replacement(value: object) -> None:
     if not isinstance(value, AtomicPathReplacement):
         raise ValueError(
-            "HostExecutor.atomic_path_replacement must implement "
-            "AtomicPathReplacement"
+            "HostExecutor.atomic_path_replacement must implement AtomicPathReplacement"
         )
 
 
@@ -114,7 +118,7 @@ class HostExecutor(Executor):
         demand_estimator: ExecutorWorkDemandEstimator,
         host_cpu_observer: HostCpuUtilizationObserver,
         request_identity_factory: ExecutorRequestIdentityFactory,
-        process_group_supervisor: ProcessGroupSupervisor,
+        command_guardian: ExecutorCommandGuardian,
         atomic_path_replacement: AtomicPathReplacement,
         history_retention_lock: ExecutorHistoryRetentionLock,
         history_retention_policy: ExecutorHistoryRetentionPolicy,
@@ -150,8 +154,8 @@ class HostExecutor(Executor):
         self._demand_estimator = demand_estimator
         self._host_cpu_observer = host_cpu_observer
         self._request_identity_factory = request_identity_factory
-        _require_process_group_supervisor(process_group_supervisor)
-        self._process_group_supervisor = process_group_supervisor
+        _require_command_guardian(command_guardian)
+        self._command_guardian = command_guardian
         if type(history_retention_policy) is not ExecutorHistoryRetentionPolicy:
             raise ValueError(
                 "HostExecutor.history_retention_policy must be an "
@@ -418,60 +422,40 @@ class HostExecutor(Executor):
                 )
                 return_code = 124
             else:
-                try:
-                    process = subprocess.Popen(
-                        list(command.arguments),
-                        env=child_env,
-                        pass_fds=lease.child_file_descriptors(),
-                        start_new_session=True,
+                guardian_budget = (
+                    ExecutorGuardianUnboundedBudget()
+                    if command_budget is None
+                    else ExecutorGuardianBoundedBudget(
+                        command_budget.timeout_seconds,
+                        command_budget.reason,
                     )
-                except OSError as exc:
-                    self._events.command_start_failed(
+                )
+                try:
+                    terminal = self._command_guardian.run(
+                        ExecutorGuardianRequest(
+                            arguments=command.arguments,
+                            environment=child_env,
+                            lease_file_descriptors=(lease.guardian_file_descriptors()),
+                            budget=guardian_budget,
+                        )
+                    )
+                except BaseException as exc:
+                    self._events.command_lifecycle_failed(
                         identity,
                         work,
                         lease.grant,
                         exc,
                     )
                     raise
-                try:
-                    supervision = self._process_group_supervisor.supervise(
-                        OwnedProcessGroupLeader(process.pid),
-                        ProcessGroupUnboundedWait()
-                        if command_budget is None
-                        else ProcessGroupBoundedWait(command_budget.timeout_seconds),
-                        NeverInterruptProcessGroup(),
-                    )
-                    process.returncode = supervision.termination.leader_exit_code
-                    if type(supervision) is ProcessGroupCompleted:
-                        return_code = supervision.termination.leader_exit_code
-                    elif type(supervision) is ProcessGroupTimedOut:
-                        if command_budget is None:
-                            raise AssertionError(
-                                "an unbounded executor command cannot time out"
-                            )
-                        if not isinstance(command.deadline, ExecutorBoundedDeadline):
-                            raise AssertionError(
-                                "a timed-out executor command must have a bounded "
-                                "deadline"
-                            )
-                        return_code = 124
-                        self._record_command_deadline(
-                            identity,
-                            work,
-                            lease,
-                            command.deadline,
-                            command_budget.reason,
-                            time.monotonic() - started,
-                        )
-                    else:
-                        raise AssertionError(
-                            "ProcessGroupSupervision is a closed union"
-                        )
-                except BaseException:
-                    # The supervision owner is the only component allowed to
-                    # reap. Any error here must propagate rather than falling
-                    # back to Popen.wait() and releasing false capacity.
-                    raise
+                return_code = self._interpret_guardian_terminal(
+                    identity=identity,
+                    work=work,
+                    lease=lease,
+                    command=command,
+                    guardian_budget=guardian_budget,
+                    terminal=terminal,
+                    started_at_monotonic=started,
+                )
         finally:
             elapsed = time.monotonic() - started
             usage_after = resource.getrusage(resource.RUSAGE_CHILDREN)
@@ -488,6 +472,50 @@ class HostExecutor(Executor):
             output_blocks=max(0, usage_after.ru_oublock - usage_before.ru_oublock),
         )
         return ExecutedExecutorCommand(return_code, lease.grant, observation)
+
+    def _interpret_guardian_terminal(
+        self,
+        *,
+        identity: ExecutorWorkIdentity,
+        work: QueuedExecutorWork,
+        lease: HostExecutorLease,
+        command: ExecutorCommand,
+        guardian_budget: ExecutorGuardianBudget,
+        terminal: ExecutorGuardianTerminal,
+        started_at_monotonic: float,
+    ) -> int:
+        """Translate one contained guardian outcome into executor semantics."""
+        if type(terminal) is ExecutorGuardianCommandCompleted:
+            return terminal.exit_code
+        if type(terminal) is ExecutorGuardianCommandTimedOut:
+            if type(guardian_budget) is not ExecutorGuardianBoundedBudget:
+                raise AssertionError("an unbounded executor command cannot time out")
+            if not isinstance(command.deadline, ExecutorBoundedDeadline):
+                raise AssertionError(
+                    "a timed-out executor command must have a bounded deadline"
+                )
+            self._record_command_deadline(
+                identity,
+                work,
+                lease,
+                command.deadline,
+                terminal.reason,
+                time.monotonic() - started_at_monotonic,
+            )
+            return 124
+        if type(terminal) is ExecutorGuardianCommandStartFailed:
+            error: RuntimeError = ExecutorGuardianCommandStartError(terminal)
+        elif type(terminal) is ExecutorGuardianInternalFailed:
+            error = ExecutorGuardianInternalError(terminal)
+        else:
+            raise AssertionError("ExecutorGuardianTerminal is a closed union")
+        self._events.command_lifecycle_failed(
+            identity,
+            work,
+            lease.grant,
+            error,
+        )
+        raise error
 
     def _record_command_deadline(
         self,
