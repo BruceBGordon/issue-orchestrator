@@ -17,9 +17,10 @@ class ProcessGroupTerminationError(RuntimeError):
 class PosixProcessGroupTerminator:
     """Terminate every member of one owned POSIX process group.
 
-    The caller must have spawned the leader with ``start_new_session=True``.
-    Its pid is therefore the process-group id.  The leader is deliberately
-    kept unreaped through the unconditional SIGKILL so the group id cannot be
+    The caller must have spawned the leader as the leader of a new process
+    group, either in a new session or the caller's existing terminal session.
+    Its pid is therefore the process-group id. The leader is deliberately kept
+    unreaped through the unconditional SIGKILL so the group id cannot be
     recycled between the courtesy signal and the containment signal.
     """
 

@@ -10,9 +10,11 @@ from rich.console import Console
 
 from ..domain.executor import (
     ExecutorCommand,
+    ExecutorCommandLifecycle,
     ExecutorConcurrencyRange,
     ExecutorExclusiveResource,
     ExecutorFairnessGroup,
+    ExecutorNoCommandCancellation,
     ExecutorRunSpecification,
     ExecutorWorkKey,
     ExecutorUnboundedDeadline,
@@ -68,7 +70,12 @@ def cmd_executor_run(args: argparse.Namespace) -> int:
         )
         result = build_executor().run(
             specification,
-            ExecutorCommand(command_arguments, ExecutorUnboundedDeadline()),
+            ExecutorCommand(
+                command_arguments,
+                ExecutorUnboundedDeadline(),
+                ExecutorCommandLifecycle.DETACHED,
+                ExecutorNoCommandCancellation(),
+            ),
         )
     except (FileNotFoundError, OSError, RuntimeError, ValueError) as exc:
         console.print(f"[red]executor-run failed: {exc}[/red]")

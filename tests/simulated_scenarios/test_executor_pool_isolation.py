@@ -15,6 +15,7 @@ from issue_orchestrator.domain.agent_phase_execution import (
 )
 from issue_orchestrator.domain.executor import (
     ExecutorFairnessGroup,
+    ExecutorInteractiveSessionCancellation,
     ExecutorWorkKey,
 )
 from issue_orchestrator.domain.terminal_launch import TerminalInteractionIntent
@@ -57,6 +58,9 @@ def test_spawned_agent_phase_uses_worker_local_executor_pool(
         active_timeout_minutes=1,
         interaction_intent=TerminalInteractionIntent.NONE,
         shell_command=shlex.join((sys.executable, "-c", "pass")),
+        cancellation=ExecutorInteractiveSessionCancellation.for_run_dir(
+            tmp_path.resolve()
+        ),
     )
     scheduled = host_agent_phase_command_scheduler().schedule(specification)
     completed = subprocess.run(

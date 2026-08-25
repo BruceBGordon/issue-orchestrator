@@ -2,6 +2,8 @@
 
 from pathlib import Path
 
+import pytest
+
 from issue_orchestrator.control.executor_admission import (
     ExecutorLearningPolicy,
     ExecutorWorkDemandEstimator,
@@ -35,6 +37,11 @@ from tests.unit.executor_pressure_dsl import (
     PressureRig,
     PressureWork,
 )
+
+
+# One outer escape hatch diagnoses a broken scenario protocol. Individual
+# transitions are synchronized exclusively by pipes and process completion.
+pytestmark = pytest.mark.timeout(180)
 
 
 def _monitor(pool_dir: Path, host_cpu_slots: int) -> HostExecutorMonitor:
@@ -283,6 +290,28 @@ def test_pressure_killed_queued_parent_does_not_leave_a_phantom_request(
         rig.release(blocker)
         rig.require_started(follower)
         rig.release(follower)
+
+
+def test_pressure_returning_fairness_group_starts_a_new_live_epoch(
+    tmp_path: Path,
+) -> None:
+    """Completed service cannot penalize a group that later becomes live again."""
+    pool_dir = tmp_path / "pool"
+    with PressureRig(pool_dir, host_cpu_slots=1) as rig:
+        for index in range(3):
+            prior = rig.admit(PressureWork(f"PRIOR-{index}", "returning"))
+            rig.release(prior)
+
+        blocker = rig.admit(PressureWork("BLOCKER", "blocker"))
+        returning = rig.defer(PressureWork("RETURNING", "returning"))
+        fresh = rig.defer(PressureWork("FRESH", "fresh"))
+
+        rig.release(blocker)
+        rig.require_started(returning)
+        rig.require_none_started((fresh,))
+        rig.release(returning)
+        rig.require_started(fresh)
+        rig.release(fresh)
 
 
 def test_pressure_opposite_exclusive_orders_make_progress_without_overlap(

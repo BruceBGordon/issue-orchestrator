@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from .executor import (
     ExecutorBoundedDeadline,
     ExecutorFairnessGroup,
+    ExecutorInteractiveSessionCancellation,
     ExecutorProcessTerminationPolicy,
     ExecutorWorkKey,
 )
@@ -71,15 +72,15 @@ class AgentPhaseLaunchRequest:
             ("agent_label", self.agent_label),
         ):
             if type(value) is not str or not value:
-                raise ValueError(f"AgentPhaseLaunchRequest.{field_name} must not be empty")
+                raise ValueError(
+                    f"AgentPhaseLaunchRequest.{field_name} must not be empty"
+                )
         if type(self.agent_config) is not AgentConfig:
             raise ValueError(
                 "AgentPhaseLaunchRequest.agent_config must be an AgentConfig"
             )
         if type(self.run) is not SessionRunAssets:
-            raise ValueError(
-                "AgentPhaseLaunchRequest.run must be SessionRunAssets"
-            )
+            raise ValueError("AgentPhaseLaunchRequest.run must be SessionRunAssets")
         if type(self.task_kind) is not TaskKind:
             raise ValueError("AgentPhaseLaunchRequest.task_kind must be TaskKind")
         if type(self.provider_arguments) is not ProviderInvocationArguments:
@@ -138,6 +139,7 @@ class AgentPhaseRunSpecification:
     deadline: ExecutorBoundedDeadline
     interaction_intent: TerminalInteractionIntent
     shell_command: str
+    cancellation: ExecutorInteractiveSessionCancellation
 
     def __post_init__(self) -> None:
         if type(self.work_key) is not ExecutorWorkKey:
@@ -162,6 +164,11 @@ class AgentPhaseRunSpecification:
             raise ValueError(
                 "AgentPhaseRunSpecification.shell_command must not be empty"
             )
+        if type(self.cancellation) is not ExecutorInteractiveSessionCancellation:
+            raise ValueError(
+                "AgentPhaseRunSpecification.cancellation must be an "
+                "ExecutorInteractiveSessionCancellation"
+            )
 
     @classmethod
     def from_timeout_minutes(
@@ -172,6 +179,7 @@ class AgentPhaseRunSpecification:
         active_timeout_minutes: int,
         interaction_intent: TerminalInteractionIntent,
         shell_command: str,
+        cancellation: ExecutorInteractiveSessionCancellation,
     ) -> AgentPhaseRunSpecification:
         if type(active_timeout_minutes) is not int or active_timeout_minutes < 1:
             raise ValueError("active_timeout_minutes must be a positive integer")
@@ -185,6 +193,7 @@ class AgentPhaseRunSpecification:
             ),
             interaction_intent=interaction_intent,
             shell_command=shell_command,
+            cancellation=cancellation,
         )
 
 

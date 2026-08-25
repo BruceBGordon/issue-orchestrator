@@ -22,9 +22,11 @@ from issue_orchestrator.control.executor_admission import (
 from issue_orchestrator.domain.executor import (
     ExecutorAggressiveness,
     ExecutorCommand,
+    ExecutorCommandLifecycle,
     ExecutorConcurrencyRange,
     ExecutorFairnessGroup,
     ExecutorHistoryRetentionPolicy,
+    ExecutorNoCommandCancellation,
     ExecutorProcessTerminationPolicy,
     ExecutorRunResult,
     ExecutorRunSpecification,
@@ -120,6 +122,8 @@ def _run_work(executor: HostExecutor, work_key: str) -> ExecutorRunResult:
         ExecutorCommand(
             (sys.executable, "-c", "pass"),
             ExecutorUnboundedDeadline(),
+            ExecutorCommandLifecycle.DETACHED,
+            ExecutorNoCommandCancellation(),
         ),
     )
 
@@ -171,9 +175,7 @@ def test_executor_prunes_only_recognizable_atomic_crash_remnants(
     executor = _executor(
         pool_dir,
         ExecutorHistoryRetentionPolicy(3, 2),
-        PosixExecutorHistoryRetentionLock(
-            (history_dir / "retention.lock").resolve()
-        ),
+        PosixExecutorHistoryRetentionLock((history_dir / "retention.lock").resolve()),
         request_nonce="f" * 32,
         atomic_path_replacement=OsAtomicPathReplacement(),
     )
@@ -373,6 +375,8 @@ def test_history_prunes_old_profiles_and_bounds_samples_per_profile(
                 ExecutorCommand(
                     (sys.executable, "-c", "pass"),
                     ExecutorUnboundedDeadline(),
+                    ExecutorCommandLifecycle.DETACHED,
+                    ExecutorNoCommandCancellation(),
                 ),
             )
             assert result.exit_code == 0

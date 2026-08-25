@@ -12,6 +12,7 @@ from types import FrameType
 
 from pydantic import ValidationError
 
+from ...domain.executor import ExecutorCommandLifecycle
 from ...domain.executor_guardian import (
     ExecutorGuardianBoundedBudget,
     ExecutorGuardianBudget,
@@ -24,6 +25,7 @@ from ...domain.executor_guardian import (
     ExecutorGuardianUnboundedBudget,
 )
 from ._guardian_contracts import (
+    GUARDIAN_START_SIGNAL,
     GuardianInvocationRecord,
     guardian_terminal_record,
 )
@@ -38,6 +40,18 @@ def _retain_lease_until_contained(
 ) -> None:
     """Keep TERM from destroying the sole lease owner before containment."""
     del signal_number, frame
+
+
+def _await_start(start_file_descriptor: int) -> None:
+    """Do not spawn opaque work before the launcher establishes ownership."""
+    if type(start_file_descriptor) is not int or start_file_descriptor < 0:
+        raise ValueError("guardian start descriptor must be non-negative")
+    try:
+        signal_byte = os.read(start_file_descriptor, 1)
+    finally:
+        os.close(start_file_descriptor)
+    if signal_byte != GUARDIAN_START_SIGNAL:
+        raise RuntimeError("executor guardian start gate closed without a grant")
 
 
 @dataclass(slots=True)
@@ -86,13 +100,21 @@ class PosixExecutorGuardianChild:
         arguments: tuple[str, ...],
         budget: ExecutorGuardianBudget,
         result_writer: _GuardianResultWriter,
+        lifecycle: ExecutorCommandLifecycle,
     ) -> int:
         """Run the command; started-command paths end by killing this group."""
-        self._require_request(arguments, budget, result_writer)
+        self._require_request(arguments, budget, result_writer, lifecycle)
         # A caught disposition resets to default across exec, unlike SIG_IGN.
         # The guardian therefore survives TERM while its opaque child retains
         # the normal TERM behavior expected by command cleanup.
         signal.signal(signal.SIGTERM, _retain_lease_until_contained)
+        if lifecycle is ExecutorCommandLifecycle.INTERACTIVE_SESSION:
+            # Exiting a PTY session leader sends SIGHUP to its foreground group.
+            # Interactive guardians and their opaque commands must outlive an
+            # accidental outer-wrapper crash; deliberate stop uses SIGTERM.
+            signal.signal(signal.SIGHUP, signal.SIG_IGN)
+        elif lifecycle is not ExecutorCommandLifecycle.DETACHED:
+            raise AssertionError("ExecutorCommandLifecycle is a closed enum")
         try:
             process = subprocess.Popen(list(arguments), close_fds=True)
         except OSError as error:
@@ -121,6 +143,7 @@ class PosixExecutorGuardianChild:
         arguments: tuple[str, ...],
         budget: ExecutorGuardianBudget,
         result_writer: _GuardianResultWriter,
+        lifecycle: ExecutorCommandLifecycle,
     ) -> None:
         if type(arguments) is not tuple or not arguments:
             raise ValueError("executor guardian arguments must be a non-empty tuple")
@@ -133,6 +156,8 @@ class PosixExecutorGuardianChild:
             raise ValueError("executor guardian requires an explicit budget")
         if type(result_writer) is not _GuardianResultWriter:
             raise ValueError("executor guardian requires its typed result writer")
+        if type(lifecycle) is not ExecutorCommandLifecycle:
+            raise ValueError("executor guardian requires a typed command lifecycle")
 
     @staticmethod
     def _wait_for_terminal(
@@ -187,10 +212,19 @@ def main() -> int:
     parser.add_argument("--request-json", required=True)
     arguments = parser.parse_args()
     invocation = _parse_invocation(arguments.request_json)
+    result_writer = _GuardianResultWriter(invocation.result_file_descriptor)
+    try:
+        _await_start(invocation.start_file_descriptor)
+    except BaseException as error:
+        result_writer.write(
+            ExecutorGuardianInternalFailed(type(error).__name__, repr(error))
+        )
+        return 1
     return PosixExecutorGuardianChild(invocation.termination_policy()).run(
         invocation.arguments,
         invocation.domain_budget(),
-        _GuardianResultWriter(invocation.result_file_descriptor),
+        result_writer,
+        invocation.lifecycle,
     )
 
 

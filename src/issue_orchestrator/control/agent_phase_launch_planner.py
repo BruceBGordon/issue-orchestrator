@@ -11,7 +11,11 @@ from ..domain.agent_phase_execution import (
     AgentPhaseLaunchRequest,
     AgentPhaseRunSpecification,
 )
-from ..domain.executor import ExecutorFairnessGroup, ExecutorWorkKey
+from ..domain.executor import (
+    ExecutorFairnessGroup,
+    ExecutorInteractiveSessionCancellation,
+    ExecutorWorkKey,
+)
 from ..domain.models import AgentConfig
 from ..domain.session_watchdog import ScheduledSessionWatchdog
 from ..domain.terminal_launch import TerminalInteractionIntent, TerminalLaunch
@@ -70,6 +74,9 @@ class AgentPhaseLaunchPlanner:
             interaction_intent=interaction_intent,
             shell_command=(
                 f"{request.environment_exports} && {wrapped_provider_command}"
+            ),
+            cancellation=ExecutorInteractiveSessionCancellation.for_run_dir(
+                request.run.run_dir.resolve()
             ),
         )
         scheduled = self._scheduler.schedule(specification)

@@ -29,11 +29,14 @@ from issue_orchestrator.control.agent_phase_launch_planner import (
 from issue_orchestrator.domain.executor import (
     ExecutorBoundedDeadline,
     ExecutorCommand,
+    ExecutorCommandLifecycle,
     ExecutorConcurrencyRange,
     ExecutorDeadlineExceededError,
     ExecutorDeadlineReason,
     ExecutorFairnessGroup,
     ExecutorHistoryRetentionPolicy,
+    ExecutorInteractiveSessionCancellation,
+    ExecutorNoCommandCancellation,
     ExecutorProcessTerminationPolicy,
     ExecutorRunSpecification,
     ExecutorWorkKey,
@@ -210,6 +213,8 @@ def _phase_cli(
             active_timeout_seconds,
             "--absolute-timeout-seconds",
             absolute_timeout_seconds,
+            "--cancellation-record",
+            str(pool_dir.resolve() / "executor-guardian-cancellation.json"),
             "--",
             *command,
         ),
@@ -255,13 +260,18 @@ def _pid_has_exited(pid: int, *, deadline_seconds: float = 5.0) -> bool:
     return False
 
 
-def test_phase_specification_converts_active_timeout_to_fixed_absolute_bound() -> None:
+def test_phase_specification_converts_active_timeout_to_fixed_absolute_bound(
+    tmp_path: Path,
+) -> None:
     specification = AgentPhaseRunSpecification.from_timeout_minutes(
         work_key=ExecutorWorkKey("agent-phase:agent:web:code"),
         fairness_group=ExecutorFairnessGroup("agent:run-1:coding-1"),
         active_timeout_minutes=45,
         interaction_intent=TerminalInteractionIntent.NONE,
         shell_command="run-agent --issue 42",
+        cancellation=ExecutorInteractiveSessionCancellation.for_run_dir(
+            tmp_path.resolve()
+        ),
     )
 
     assert specification.deadline.active_timeout_seconds == 2700.0
@@ -355,13 +365,58 @@ def test_launch_owner_classifies_every_phase_provider_before_wrapping(
     ]
 
 
-def test_scheduler_renders_one_shell_safe_internal_invocation() -> None:
+def test_launch_owner_preserves_unrestricted_agent_label_in_executor_identity(
+    tmp_path: Path,
+) -> None:
+    scheduler = HostAgentPhaseCommandScheduler(
+        python_executable=Path(sys.executable),
+        application_shell=TerminalShell.BASH,
+        outer_watchdog_policy=AgentPhaseOuterWatchdogPolicy(
+            executor_termination=ExecutorProcessTerminationPolicy(
+                graceful_shutdown_seconds=2.0,
+                forceful_shutdown_seconds=2.0,
+            ),
+            observer_margin_seconds=58.0,
+        ),
+    )
+    planner = AgentPhaseLaunchPlanner(
+        scheduler,
+        _OpaqueProviderCommandWrapper(),
+        _RecordingScheduledWatchdogStore(),
+    )
+    run = make_session_run_assets(tmp_path, session_name="unicode-label")
+
+    launch, _scheduled_config = planner.schedule(
+        AgentPhaseLaunchRequest(
+            provider_command="custom-agent 'do work'",
+            environment_exports="export PHASE_TEST=1",
+            agent_config=AgentConfig(
+                prompt_path=tmp_path / "prompt.md",
+                timeout_minutes=45,
+            ),
+            run=run,
+            agent_label="agent:backend team · β",
+            task_kind=TaskKind.CODE,
+            provider_arguments=ProviderInvocationArguments.from_mapping({}),
+        )
+    )
+
+    arguments = shlex.split(launch.shell_command)
+    assert arguments[arguments.index("--work-key") + 1] == (
+        "agent-phase:agent:backend team · β:code"
+    )
+
+
+def test_scheduler_renders_one_shell_safe_internal_invocation(tmp_path: Path) -> None:
     specification = AgentPhaseRunSpecification.from_timeout_minutes(
         work_key=ExecutorWorkKey("agent-phase:agent:web:code"),
         fairness_group=ExecutorFairnessGroup("agent:run-1:coding-1"),
         active_timeout_minutes=45,
         interaction_intent=TerminalInteractionIntent.NONE,
         shell_command="printf '%s\\n' 'human readable'",
+        cancellation=ExecutorInteractiveSessionCancellation.for_run_dir(
+            tmp_path.resolve()
+        ),
     )
     scheduler = HostAgentPhaseCommandScheduler(
         python_executable=Path(sys.executable),
@@ -392,6 +447,9 @@ def test_scheduler_renders_one_shell_safe_internal_invocation() -> None:
         "-lc",
         specification.shell_command,
     ]
+    assert arguments[arguments.index("--cancellation-record") + 1] == str(
+        specification.cancellation.record_path
+    )
     assert scheduled.terminal_launch.shell is TerminalShell.BASH
 
 
@@ -409,6 +467,7 @@ def test_scheduler_renders_one_shell_safe_internal_invocation() -> None:
     ],
 )
 def test_scheduler_preserves_interaction_intent_hidden_by_executor_wrapper(
+    tmp_path: Path,
     command: str,
     expected_intent: TerminalInteractionIntent,
 ) -> None:
@@ -418,6 +477,9 @@ def test_scheduler_preserves_interaction_intent_hidden_by_executor_wrapper(
         active_timeout_minutes=45,
         interaction_intent=expected_intent,
         shell_command=command,
+        cancellation=ExecutorInteractiveSessionCancellation.for_run_dir(
+            tmp_path.resolve()
+        ),
     )
 
     scheduled = HostAgentPhaseCommandScheduler(
@@ -448,6 +510,9 @@ def test_scheduled_phase_executes_bash_language_without_shell_drift(
         active_timeout_minutes=1,
         interaction_intent=TerminalInteractionIntent.NONE,
         shell_command="values=(alpha beta); [[ ${values[1]} == beta ]]",
+        cancellation=ExecutorInteractiveSessionCancellation.for_run_dir(
+            tmp_path.resolve()
+        ),
     )
     scheduled = HostAgentPhaseCommandScheduler(
         python_executable=Path(sys.executable),
@@ -494,6 +559,8 @@ def test_internal_phase_client_runs_a_plain_command_without_orchestrator(
             "2",
             "--absolute-timeout-seconds",
             "4",
+            "--cancellation-record",
+            str(tmp_path / "executor-guardian-cancellation.json"),
             "--",
             sys.executable,
             "-c",
@@ -532,6 +599,8 @@ def test_internal_phase_client_terminates_at_active_deadline_and_releases_lease(
                 "signal.pause()",
             ),
             ExecutorBoundedDeadline(0.05, 1.0),
+            ExecutorCommandLifecycle.DETACHED,
+            ExecutorNoCommandCancellation(),
         ),
     )
     recovered = executor.run(
@@ -539,6 +608,8 @@ def test_internal_phase_client_terminates_at_active_deadline_and_releases_lease(
         ExecutorCommand(
             (sys.executable, "-c", "print('RECOVERED')"),
             ExecutorBoundedDeadline(2.0, 4.0),
+            ExecutorCommandLifecycle.DETACHED,
+            ExecutorNoCommandCancellation(),
         ),
     )
     events = _executor_events(pool_dir)
@@ -590,6 +661,8 @@ def test_descendant_is_gone_before_timed_out_phase_releases_lease(
         ExecutorCommand(
             (sys.executable, "-c", leader_script),
             ExecutorBoundedDeadline(1.0, 2.0),
+            ExecutorCommandLifecycle.DETACHED,
+            ExecutorNoCommandCancellation(),
         ),
     )
 
@@ -603,6 +676,8 @@ def test_descendant_is_gone_before_timed_out_phase_releases_lease(
         ExecutorCommand(
             (sys.executable, "-c", "print('LEASE-RECOVERED')"),
             ExecutorBoundedDeadline(2.0, 4.0),
+            ExecutorCommandLifecycle.DETACHED,
+            ExecutorNoCommandCancellation(),
         ),
     )
     assert recovered.exit_code == 0
@@ -641,6 +716,8 @@ def test_natural_phase_completion_contains_descendant_before_lease_release(
         ExecutorCommand(
             (sys.executable, "-c", leader_script),
             ExecutorBoundedDeadline(5.0, 5.0),
+            ExecutorCommandLifecycle.DETACHED,
+            ExecutorNoCommandCancellation(),
         ),
     )
 
@@ -715,6 +792,8 @@ def test_admission_deadline_fails_before_command_and_is_durable(
                     active_timeout_seconds=0.01,
                     absolute_timeout_seconds=0.05,
                 ),
+                ExecutorCommandLifecycle.DETACHED,
+                ExecutorNoCommandCancellation(),
             ),
         )
 
@@ -797,6 +876,8 @@ def test_deadline_expiring_after_admission_records_terminal_events_without_spawn
                 f"from pathlib import Path; Path({str(marker)!r}).touch()",
             ),
             ExecutorBoundedDeadline(0.5, 0.5),
+            ExecutorCommandLifecycle.DETACHED,
+            ExecutorNoCommandCancellation(),
         ),
     )
 

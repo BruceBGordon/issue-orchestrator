@@ -155,11 +155,20 @@ class HostExecutorState:
         """Create and exclusively own one durable queue record."""
         path = self._pool_dir / "requests" / f"{work.request_id.value}.json"
         with self._queue_guard():
+            self._reset_inactive_group_service_before_enqueue()
             path.parent.mkdir(parents=True, exist_ok=True)
             handle = path.open("x+b")
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
             self._write_locked(handle, QueuedWorkRecord.from_domain(work))
         return OwnedQueuedRequest(work, path, handle)
+
+    def _reset_inactive_group_service_before_enqueue(self) -> None:
+        """End service epochs before a new request can make a group live."""
+        existing_requests = self._live_request_records()
+        existing_leases = self._live_leases()
+        self._write_group_service(
+            self._reconciled_group_service(existing_requests, existing_leases)
+        )
 
     def attempt_admission(
         self,
@@ -261,15 +270,29 @@ class HostExecutorState:
         self,
         current: OwnedQueuedRequest,
     ) -> tuple[QueuedExecutorWork, ...]:
-        requests = [current.work]
+        other_paths = tuple(
+            path for path in self._request_record_paths() if path != current.path
+        )
+        return (current.work, *self._read_live_request_paths(other_paths))
+
+    def _live_request_records(self) -> tuple[QueuedExecutorWork, ...]:
+        return self._read_live_request_paths(self._request_record_paths())
+
+    def _request_record_paths(self) -> tuple[Path, ...]:
         requests_dir = self._pool_dir / "requests"
-        if requests_dir.exists():
-            for path in sorted(requests_dir.glob("*.json")):
-                if path == current.path:
-                    continue
-                record = self._read_live_record(path, QueuedWorkRecord)
-                if record is not None:
-                    requests.append(record.to_domain())
+        if not requests_dir.exists():
+            return ()
+        return tuple(sorted(requests_dir.glob("*.json")))
+
+    def _read_live_request_paths(
+        self,
+        paths: tuple[Path, ...],
+    ) -> tuple[QueuedExecutorWork, ...]:
+        requests: list[QueuedExecutorWork] = []
+        for path in paths:
+            record = self._read_live_record(path, QueuedWorkRecord)
+            if record is not None:
+                requests.append(record.to_domain())
         return tuple(requests)
 
     def _live_leases(self) -> tuple[ActiveExecutorLease, ...]:

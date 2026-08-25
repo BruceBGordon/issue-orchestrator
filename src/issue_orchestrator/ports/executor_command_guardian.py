@@ -13,6 +13,10 @@ from ..domain.executor_guardian import (
     ExecutorGuardianTerminal,
     ExecutorGuardianUnboundedBudget,
 )
+from ..domain.executor import (
+    ExecutorCommandCancellation,
+    ExecutorCommandLifecycle,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -23,6 +27,8 @@ class ExecutorGuardianRequest:
     environment: Mapping[str, str]
     lease_file_descriptors: tuple[int, ...]
     budget: ExecutorGuardianBudget
+    lifecycle: ExecutorCommandLifecycle
+    cancellation: ExecutorCommandCancellation
 
     def __post_init__(self) -> None:
         owner = type(self).__name__
@@ -72,6 +78,9 @@ class ExecutorGuardianRequest:
             ExecutorGuardianBoundedBudget,
         ):
             raise ValueError(f"{owner}.budget must be an explicit guardian budget")
+        if type(self.lifecycle) is not ExecutorCommandLifecycle:
+            raise ValueError(f"{owner}.lifecycle must be an ExecutorCommandLifecycle")
+        self.lifecycle.require_cancellation_contract(self.cancellation, owner)
 
 
 @runtime_checkable

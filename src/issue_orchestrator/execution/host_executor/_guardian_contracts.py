@@ -7,7 +7,7 @@ from typing import Annotated, Literal
 
 from pydantic import Field, TypeAdapter
 
-from ...domain.executor import ExecutorDeadlineReason
+from ...domain.executor import ExecutorCommandLifecycle, ExecutorDeadlineReason
 from ...domain.executor_guardian import (
     ExecutorGuardianBoundedBudget,
     ExecutorGuardianBudget,
@@ -20,6 +20,9 @@ from ...domain.executor_guardian import (
     ExecutorGuardianUnboundedBudget,
 )
 from ._contracts import ExecutorStrictRecord
+
+
+GUARDIAN_START_SIGNAL = b"S"
 
 
 class GuardianUnboundedBudgetRecord(ExecutorStrictRecord):
@@ -59,6 +62,8 @@ class GuardianInvocationRecord(ExecutorStrictRecord):
     schema_version: Literal[1] = 1
     arguments: tuple[str, ...]
     result_file_descriptor: int = Field(ge=0)
+    start_file_descriptor: int = Field(ge=0)
+    lifecycle: ExecutorCommandLifecycle
     budget: GuardianBudgetRecord
     graceful_shutdown_seconds: float = Field(gt=0)
 
@@ -68,12 +73,16 @@ class GuardianInvocationRecord(ExecutorStrictRecord):
         *,
         arguments: tuple[str, ...],
         result_file_descriptor: int,
+        start_file_descriptor: int,
+        lifecycle: ExecutorCommandLifecycle,
         budget: ExecutorGuardianBudget,
         termination_policy: ExecutorGuardianTerminationPolicy,
     ) -> GuardianInvocationRecord:
         return cls(
             arguments=arguments,
             result_file_descriptor=result_file_descriptor,
+            start_file_descriptor=start_file_descriptor,
+            lifecycle=lifecycle,
             budget=guardian_budget_record(budget),
             graceful_shutdown_seconds=(termination_policy.graceful_shutdown_seconds),
         )

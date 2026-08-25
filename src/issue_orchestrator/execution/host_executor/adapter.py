@@ -437,6 +437,8 @@ class HostExecutor(Executor):
                             environment=child_env,
                             lease_file_descriptors=(lease.guardian_file_descriptors()),
                             budget=guardian_budget,
+                            lifecycle=command.lifecycle,
+                            cancellation=command.cancellation,
                         )
                     )
                 except BaseException as exc:

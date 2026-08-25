@@ -12,12 +12,13 @@ import math
 import re
 from dataclasses import dataclass
 from enum import StrEnum
+from pathlib import Path
 
 
 MIN_EXECUTOR_AGGRESSIVENESS_PERCENT = 25
 MAX_EXECUTOR_AGGRESSIVENESS_PERCENT = 400
+EXECUTOR_SESSION_CANCELLATION_FILENAME = "executor-guardian-cancellation.json"
 
-_WORK_KEY_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,159}$")
 _GROUP_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$")
 _RESOURCE_PATTERN = re.compile(r"^[a-z][a-z0-9-]*$")
 
@@ -40,10 +41,14 @@ class ExecutorWorkKey:
 
     def __post_init__(self) -> None:
         _require_exact_type(type(self).__name__, "value", self.value, str)
-        if not _WORK_KEY_PATTERN.fullmatch(self.value):
+        if (
+            not 1 <= len(self.value) <= 160
+            or not self.value.isprintable()
+            or not self.value.strip()
+        ):
             raise ValueError(
-                "ExecutorWorkKey.value must match "
-                "[A-Za-z0-9][A-Za-z0-9._:/-]{0,159}"
+                "ExecutorWorkKey.value must contain 1 through 160 printable "
+                "Unicode characters and must not be whitespace-only"
             )
 
     def __str__(self) -> str:
@@ -158,9 +163,7 @@ class ExecutorDeadlineExceededError(RuntimeError):
                 "ExecutorDeadlineExceededError.reason must be ExecutorDeadlineReason"
             )
         if type(detail) is not str or not detail:
-            raise ValueError(
-                "ExecutorDeadlineExceededError.detail must not be empty"
-            )
+            raise ValueError("ExecutorDeadlineExceededError.detail must not be empty")
         self.reason = reason
         super().__init__(detail)
 
@@ -349,12 +352,8 @@ class ExecutorBoundedDeadline:
         submitted_at_monotonic: float,
         observed_at_monotonic: float,
     ) -> float:
-        cls._require_monotonic_instant(
-            "submitted_at_monotonic", submitted_at_monotonic
-        )
-        cls._require_monotonic_instant(
-            "observed_at_monotonic", observed_at_monotonic
-        )
+        cls._require_monotonic_instant("submitted_at_monotonic", submitted_at_monotonic)
+        cls._require_monotonic_instant("observed_at_monotonic", observed_at_monotonic)
         if observed_at_monotonic < submitted_at_monotonic:
             raise ValueError(
                 "observed_at_monotonic must not precede submitted_at_monotonic"
@@ -365,12 +364,69 @@ class ExecutorBoundedDeadline:
 ExecutorDeadline = ExecutorUnboundedDeadline | ExecutorBoundedDeadline
 
 
+class ExecutorCommandLifecycle(StrEnum):
+    """How an invocation relates to its submitting process and terminal."""
+
+    DETACHED = "detached"
+    INTERACTIVE_SESSION = "interactive-session"
+
+    def require_cancellation_contract(self, cancellation: object, owner: str) -> None:
+        """Enforce the one valid cancellation contract for this lifecycle."""
+        if type(cancellation) not in (
+            ExecutorNoCommandCancellation,
+            ExecutorInteractiveSessionCancellation,
+        ):
+            raise ValueError(f"{owner}.cancellation must be an explicit typed contract")
+        expected_type = (
+            ExecutorNoCommandCancellation
+            if self is ExecutorCommandLifecycle.DETACHED
+            else ExecutorInteractiveSessionCancellation
+        )
+        if type(cancellation) is not expected_type:
+            raise ValueError(f"{owner}.lifecycle and cancellation contract disagree")
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutorNoCommandCancellation:
+    """Explicit lifecycle contract for a command with no session endpoint."""
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutorInteractiveSessionCancellation:
+    """Typed run-scoped location through which a terminal can stop a guardian."""
+
+    record_path: Path
+
+    def __post_init__(self) -> None:
+        if not self.record_path.is_absolute():
+            raise ValueError(
+                "ExecutorInteractiveSessionCancellation.record_path must be an "
+                "absolute Path"
+            )
+
+    @classmethod
+    def for_run_dir(cls, run_dir: Path) -> ExecutorInteractiveSessionCancellation:
+        if not run_dir.is_absolute():
+            raise ValueError(
+                "ExecutorInteractiveSessionCancellation.run_dir must be an "
+                "absolute Path"
+            )
+        return cls(run_dir / EXECUTOR_SESSION_CANCELLATION_FILENAME)
+
+
+ExecutorCommandCancellation = (
+    ExecutorNoCommandCancellation | ExecutorInteractiveSessionCancellation
+)
+
+
 @dataclass(frozen=True, slots=True)
 class ExecutorCommand:
     """Exact argument vector executed after admission."""
 
     arguments: tuple[str, ...]
     deadline: ExecutorDeadline
+    lifecycle: ExecutorCommandLifecycle
+    cancellation: ExecutorCommandCancellation
 
     def __post_init__(self) -> None:
         _require_exact_type(type(self).__name__, "arguments", self.arguments, tuple)
@@ -387,6 +443,16 @@ class ExecutorCommand:
             raise ValueError(
                 "ExecutorCommand.deadline must be an explicit ExecutorDeadline"
             )
+        _require_exact_type(
+            type(self).__name__,
+            "lifecycle",
+            self.lifecycle,
+            ExecutorCommandLifecycle,
+        )
+        self.lifecycle.require_cancellation_contract(
+            self.cancellation,
+            type(self).__name__,
+        )
 
 
 @dataclass(frozen=True, slots=True)

@@ -69,6 +69,8 @@ class HostAgentPhaseCommandScheduler(AgentPhaseCommandScheduler):
                         str(specification.deadline.active_timeout_seconds),
                         "--absolute-timeout-seconds",
                         str(specification.deadline.absolute_timeout_seconds),
+                        "--cancellation-record",
+                        str(specification.cancellation.record_path),
                         "--",
                         self._application_shell.value,
                         "-lc",

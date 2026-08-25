@@ -14,7 +14,6 @@ import json
 import logging
 import os
 import re
-import signal
 import sqlite3
 import threading
 from dataclasses import dataclass
@@ -26,11 +25,18 @@ from ..domain.terminal_launch import (
     TerminalLaunch,
     TerminalShell,
 )
+from ..domain.executor import ExecutorInteractiveSessionCancellation
 from .agent_runner import AgentRunner, AgentSession, AgentSpec
 from .session_interactions import (
     SessionInteractionHandler,
     builtin_session_interaction_rules,
 )
+from .session_process_group_terminator import (
+    PosixTerminalSessionProcessGroupTerminator,
+    TerminalSessionProcess,
+    TerminalSessionTerminationPolicy,
+)
+from .executor_guardian_cancellation import ExecutorSessionGuardianCanceller
 from ..infra.env import get_env
 from ..infra.hooks.hookspec import hookimpl
 from ..infra.repo_identity import state_dir
@@ -227,7 +233,9 @@ class _SubprocessRegistry:
     def remove(self, session_name: str) -> None:
         try:
             with self._connect() as conn:
-                conn.execute("DELETE FROM sessions WHERE session_name = ?", (session_name,))
+                conn.execute(
+                    "DELETE FROM sessions WHERE session_name = ?", (session_name,)
+                )
                 conn.commit()
         except sqlite3.DatabaseError:
             self._handle_corrupt_db()
@@ -259,13 +267,24 @@ class SubprocessPlugin:
         self._registry = _SubprocessRegistry(repo_root)
         self._sessions: dict[str, AgentSession] = {}
         self._watcher_threads: dict[str, threading.Thread] = {}
+        self._session_terminator = PosixTerminalSessionProcessGroupTerminator(
+            TerminalSessionTerminationPolicy(
+                graceful_shutdown_seconds=5.0,
+                forceful_shutdown_seconds=5.0,
+            ),
+            ExecutorSessionGuardianCanceller(forceful_shutdown_seconds=5.0),
+        )
         deny_stdin_val = get_env("SUBPROCESS_DENY_STDIN") or ""
         self._allow_stdin = deny_stdin_val.lower() not in {"1", "true", "yes"}
         self._session_interactions_enabled = session_interactions_enabled
-        self._worktree_base = worktree_base.resolve() if worktree_base is not None else None
+        self._worktree_base = (
+            worktree_base.resolve() if worktree_base is not None else None
+        )
         self._warned_missing_worktree_base = False
 
-    def _session_log_path(self, working_dir: Path, session_name: str, command: str | None = None) -> Path:
+    def _session_log_path(
+        self, working_dir: Path, session_name: str, command: str | None = None
+    ) -> Path:
         if command:
             match = _RUN_DIR_ENV_RE.search(command)
             if match:
@@ -281,7 +300,9 @@ class SubprocessPlugin:
     def _build_process_command(self, command: str, working_dir: Path) -> str:
         """Build the full command with path and isolation prefix."""
         path_prefix = build_agent_tool_path(working_dir, os.environ.get("PATH", ""))
-        isolation_prefix = build_isolation_prefix(working_dir, scrub_env=True, isolate_home=False)
+        isolation_prefix = build_isolation_prefix(
+            working_dir, scrub_env=True, isolate_home=False
+        )
         return f'cd "{working_dir}" && export PATH="{path_prefix}" && {isolation_prefix}{command}'
 
     def _start_session_watcher(self, session: AgentSession, session_name: str) -> None:
@@ -385,20 +406,15 @@ class SubprocessPlugin:
         except OSError:
             return False
 
-    def _kill_process(self, pid: int, session_name: str | None = None) -> None:
-        """Kill a process, trying AgentSession first."""
-        session = self._sessions.get(session_name) if session_name else None
-        if session is not None:
-            session.kill()
-            return
-        # Fall back to manual kill for recovered sessions without a handle
-        try:
-            os.killpg(os.getpgid(pid), signal.SIGTERM)
-        except (ProcessLookupError, OSError):
-            try:
-                os.kill(pid, signal.SIGTERM)
-            except (ProcessLookupError, OSError):
-                return
+    def _kill_process(self, record: _SessionRecord) -> None:
+        """Contain a live or recovered session before reporting it stopped."""
+        run_dir = Path(record.log_path).parent.resolve()
+        self._session_terminator.terminate(
+            TerminalSessionProcess(
+                record.pid,
+                ExecutorInteractiveSessionCancellation.for_run_dir(run_dir),
+            )
+        )
 
     @hookimpl
     def create_session(
@@ -486,7 +502,7 @@ class SubprocessPlugin:
         record = records.get(session_name)
         if not record:
             return False
-        self._kill_process(record.pid, session_name)
+        self._kill_process(record)
         self._cleanup_session(session_name)
         self._registry.remove(session_name)
         return True
@@ -497,13 +513,15 @@ class SubprocessPlugin:
         running: list[dict] = []
         for record in records.values():
             if self._process_alive(record.pid, record.session_name):
-                running.append({
-                    "issue_number": record.issue_number,
-                    "tab_name": record.tab_name,
-                    "is_review": record.is_review,
-                    "session_name": record.session_name,
-                    "run_dir": str(Path(record.log_path).parent),
-                })
+                running.append(
+                    {
+                        "issue_number": record.issue_number,
+                        "tab_name": record.tab_name,
+                        "is_review": record.is_review,
+                        "session_name": record.session_name,
+                        "run_dir": str(Path(record.log_path).parent),
+                    }
+                )
             else:
                 self._cleanup_session(record.session_name)
                 self._registry.remove(record.session_name)
@@ -521,7 +539,9 @@ class SubprocessPlugin:
         return cleaned
 
     @hookimpl
-    def get_session_output(self, session_id: int, lines: int, session_name: str) -> str | None:
+    def get_session_output(
+        self, session_id: int, lines: int, session_name: str
+    ) -> str | None:
         record = self._registry.load().get(session_name)
         if not record:
             return None
@@ -536,7 +556,9 @@ class SubprocessPlugin:
         return "\n".join(output_lines[-lines:]) if output_lines else ""
 
     @hookimpl
-    def send_to_session(self, session_id: int, text: str, session_name: str) -> bool | None:
+    def send_to_session(
+        self, session_id: int, text: str, session_name: str
+    ) -> bool | None:
         if not self._allow_stdin:
             return False
         session = self._sessions.get(session_name)
@@ -561,7 +583,7 @@ class SubprocessPlugin:
         records = self._registry.load()
         for record in records.values():
             if self._process_alive(record.pid, record.session_name):
-                self._kill_process(record.pid, record.session_name)
+                self._kill_process(record)
         # Wait for all watcher threads to finish
         for session_name in list(self._watcher_threads.keys()):
             self._wait_for_watcher_thread(session_name, timeout=1.0)

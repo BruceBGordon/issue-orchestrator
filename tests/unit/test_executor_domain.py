@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import cast
 
 import pytest
@@ -19,11 +20,16 @@ from issue_orchestrator.control.executor_admission import (
 from issue_orchestrator.domain.executor import (
     ExecutorAggressiveness,
     ExecutorBoundedDeadline,
+    ExecutorCommand,
+    ExecutorCommandLifecycle,
     ExecutorConcurrencyRange,
     ExecutorDeadlineExceededError,
     ExecutorDeadlineReason,
     ExecutorFairnessGroup,
+    ExecutorInteractiveSessionCancellation,
+    ExecutorNoCommandCancellation,
     ExecutorRunSpecification,
+    ExecutorUnboundedDeadline,
     ExecutorWorkKey,
 )
 from issue_orchestrator.domain.executor_host import ExecutorHostCpuUtilization
@@ -61,6 +67,50 @@ def test_public_run_specification_rejects_a_primitive_in_place_of_identity() -> 
             fairness_group=ExecutorFairnessGroup("validation-1"),
             concurrency_range=ExecutorConcurrencyRange(1, 4),
             exclusive_resources=(),
+        )
+
+
+def test_work_key_preserves_human_readable_spaces_and_unicode() -> None:
+    work_key = ExecutorWorkKey("agent-phase:agent:backend team · β:code")
+
+    assert work_key.value == "agent-phase:agent:backend team · β:code"
+
+
+@pytest.mark.parametrize("value", ("", "   ", "line\nbreak", "x" * 161))
+def test_work_key_rejects_non_human_readable_values(value: str) -> None:
+    with pytest.raises(ValueError, match="printable Unicode"):
+        ExecutorWorkKey(value)
+
+
+def test_interactive_cancellation_requires_an_absolute_record_path() -> None:
+    with pytest.raises(ValueError, match="absolute Path"):
+        ExecutorInteractiveSessionCancellation(Path("relative.json"))
+
+
+@pytest.mark.parametrize(
+    ("lifecycle", "cancellation"),
+    (
+        (
+            ExecutorCommandLifecycle.DETACHED,
+            ExecutorInteractiveSessionCancellation(Path("/tmp/cancellation.json")),
+        ),
+        (
+            ExecutorCommandLifecycle.INTERACTIVE_SESSION,
+            ExecutorNoCommandCancellation(),
+        ),
+    ),
+)
+def test_command_rejects_a_cancellation_contract_for_another_lifecycle(
+    lifecycle: ExecutorCommandLifecycle,
+    cancellation: ExecutorNoCommandCancellation
+    | ExecutorInteractiveSessionCancellation,
+) -> None:
+    with pytest.raises(ValueError, match="lifecycle and cancellation"):
+        ExecutorCommand(
+            ("true",),
+            ExecutorUnboundedDeadline(),
+            lifecycle,
+            cancellation,
         )
 
 

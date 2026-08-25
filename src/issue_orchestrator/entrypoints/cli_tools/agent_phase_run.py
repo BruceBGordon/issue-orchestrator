@@ -5,13 +5,16 @@ from __future__ import annotations
 import argparse
 import math
 from collections.abc import Sequence
+from pathlib import Path
 
 from ...domain.executor import (
     ExecutorBoundedDeadline,
     ExecutorCommand,
+    ExecutorCommandLifecycle,
     ExecutorConcurrencyRange,
     ExecutorDeadlineExceededError,
     ExecutorFairnessGroup,
+    ExecutorInteractiveSessionCancellation,
     ExecutorRunSpecification,
     ExecutorWorkKey,
 )
@@ -42,6 +45,7 @@ def run_agent_phase(
     parser.add_argument(
         "--absolute-timeout-seconds", type=_positive_float, required=True
     )
+    parser.add_argument("--cancellation-record", type=Path, required=True)
     parser.add_argument("command", nargs=argparse.REMAINDER)
     parsed = parser.parse_args(arguments)
     command_arguments = tuple(parsed.command)
@@ -61,6 +65,8 @@ def run_agent_phase(
                     active_timeout_seconds=parsed.active_timeout_seconds,
                     absolute_timeout_seconds=parsed.absolute_timeout_seconds,
                 ),
+                ExecutorCommandLifecycle.INTERACTIVE_SESSION,
+                ExecutorInteractiveSessionCancellation(parsed.cancellation_record),
             ),
         )
     except ExecutorDeadlineExceededError as exc:

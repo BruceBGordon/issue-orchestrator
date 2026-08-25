@@ -141,7 +141,9 @@ issue-orchestrator executor-run \
 
 `--work-key` is required and repository-local. Use a stable name such as
 `io:unit`, not a generated hash: it is the identity under which resource history
-is learned and the name shown in diagnostics. The fairness group is also
+is learned and the name shown in diagnostics. Printable Unicode and embedded
+spaces are valid, so existing human-facing names do not require a lossy alias.
+The fairness group is also
 required, either through `--group` or
 `ISSUE_ORCHESTRATOR_EXECUTOR_GROUP`. Give all commands from one top-level
 validation the same unique group. No global meanings such as "unit",

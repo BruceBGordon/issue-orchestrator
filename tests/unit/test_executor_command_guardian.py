@@ -13,7 +13,11 @@ from typing import Generator
 
 import pytest
 
-from issue_orchestrator.domain.executor import ExecutorDeadlineReason
+from issue_orchestrator.domain.executor import (
+    ExecutorCommandLifecycle,
+    ExecutorDeadlineReason,
+    ExecutorNoCommandCancellation,
+)
 from issue_orchestrator.domain.executor_guardian import (
     ExecutorGuardianBoundedBudget,
     ExecutorGuardianCommandCompleted,
@@ -79,6 +83,8 @@ def _request(
         environment=os.environ.copy(),
         lease_file_descriptors=(lease_fd,),
         budget=budget,
+        lifecycle=ExecutorCommandLifecycle.DETACHED,
+        cancellation=ExecutorNoCommandCancellation(),
     )
 
 

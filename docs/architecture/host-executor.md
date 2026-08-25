@@ -23,6 +23,8 @@ result = executor.run(
     ExecutorCommand(
         ("pytest", "-n", "auto", "tests/unit"),
         ExecutorUnboundedDeadline(),
+        ExecutorCommandLifecycle.DETACHED,
+        ExecutorNoCommandCancellation(),
     ),
 )
 ```
@@ -34,7 +36,14 @@ contract. Required identities are never synthesized: missing work keys or
 fairness groups fail at the boundary. Every command also makes its termination
 contract explicit: `ExecutorUnboundedDeadline` means the application owns it;
 `ExecutorBoundedDeadline` supplies an active budget and an independent absolute
-safety bound.
+safety bound. `ExecutorCommandLifecycle.DETACHED` is for ordinary commands;
+`INTERACTIVE_SESSION` preserves the submitting PTY's controlling-terminal
+contract and propagates deliberate terminal-session cancellation through the
+guardian before that session is reported stopped. The matching fourth argument
+is always explicit: detached commands use `ExecutorNoCommandCancellation`, and
+interactive commands use an `ExecutorInteractiveSessionCancellation` whose
+run-scoped record is shared with the terminal-session owner. The executor never
+derives or guesses that endpoint.
 
 ## Boundaries
 
@@ -155,8 +164,17 @@ The queue transaction and resource leases are separate ownership objects. A
 queued record is removed on every exit from admission. Capacity, exclusive, and
 lease-record file descriptors transfer to a dedicated child guardian, so a
 killed executor parent cannot release resources while its command tree still
-runs. The opaque command is spawned with closed nonstandard descriptors. The
-guardian owns the exact remaining active/absolute deadline and retains the
+runs. Interactive guardians ignore the PTY hangup caused by an accidental
+outer-session-leader crash, while the typed interactive lifecycle translates a
+deliberate outer SIGTERM into contained guardian shutdown. The opaque command
+is spawned with closed nonstandard descriptors. For interactive work, a strict
+run-scoped cancellation record and stable advisory lock transfer ownership with
+the guardian. The terminal-session owner can therefore distinguish a crashed
+outer wrapper from a deliberate stop, including after orchestrator recovery,
+and can contain the guardian group before reporting the session stopped. It
+logs whether outer containment was absent, graceful, or forced, plus the
+guardian outcome and exact record path. The guardian owns the exact remaining
+active/absolute deadline and retains the
 process-group identity through final TERM/KILL containment, including when a
 descendant used `close_fds`. Missing or malformed terminal records fail loudly;
 they never become fabricated success or exit 124. A later invocation prunes a
@@ -209,7 +227,11 @@ waiting for rare production timing:
   order progress, simultaneous history writers, queued-parent death, and
   guardian invariants: a killed outer cannot release capacity around either a
   live direct child or a TERM-resistant `close_fds` descendant, and a
-  guardian-owned deadline still expires after outer death.
+  guardian-owned deadline still expires after outer death. It also proves that
+  returning fairness groups begin a fresh live-service epoch.
+- Real PTY/session integration tests prove `/dev/tty` access and input through
+  the interactive guardian, live and recovered session cancellation, and forced
+  cancellation when the outer wrapper is stopped and cannot relay a signal.
 - The virtual-time workload DSL drives the pure production admission policy.
   Its dials cover machine size, aggressiveness, arrival schedule, lane demand,
   decision cadence, external CPU windows, and either run-to-completion or

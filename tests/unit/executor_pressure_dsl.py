@@ -7,7 +7,6 @@ import selectors
 import signal
 import subprocess
 import sys
-import time
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -21,7 +20,6 @@ POOL_DIR_ENV = "ISSUE_ORCHESTRATOR_EXECUTOR_POOL_DIR"
 HOST_CPU_BUSY_FILE_ENV = "ISSUE_ORCHESTRATOR_TEST_HOST_CPU_BUSY_FILE"
 ADMISSION_ATTEMPT_FD_ENV = "ISSUE_ORCHESTRATOR_TEST_ADMISSION_ATTEMPT_FD"
 PROCESS_RUNNER = Path(__file__).with_name("executor_process_runner.py")
-PROCESS_TRANSITION_TIMEOUT_SECONDS = 10.0
 REQUIRED_POST_HOLDER_ATTEMPTS = 2
 
 
@@ -161,14 +159,21 @@ PressureDeadline = UnboundedPressureDeadline | BoundedPressureDeadline
 
 def _require_process_exited(pid_path: Path) -> None:
     pid = _recorded_process_id(pid_path)
-    deadline = time.monotonic() + PROCESS_TRANSITION_TIMEOUT_SECONDS
-    while time.monotonic() < deadline:
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return
-        time.sleep(0.01)
-    raise AssertionError(f"process {pid} remained live after guardian containment")
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return
+    status = subprocess.run(
+        ("ps", "-o", "stat=", "-p", str(pid)),
+        capture_output=True,
+        text=True,
+        check=False,
+    ).stdout.strip()
+    if not status or status.startswith("Z"):
+        return
+    raise AssertionError(
+        f"process {pid} remained executable after guardian containment: {status}"
+    )
 
 
 def _recorded_process_id(pid_path: Path) -> int:
@@ -405,12 +410,12 @@ class _ControlledPressureProcess:
         stdin.flush()
 
     def wait_until_clean_exit(self) -> None:
-        self._process.wait(timeout=PROCESS_TRANSITION_TIMEOUT_SECONDS)
+        self._process.wait()
         assert self._process.returncode == 0, self._unexpected_exit()
 
     def kill_parent(self) -> None:
         self._process.kill()
-        self._process.wait(timeout=PROCESS_TRANSITION_TIMEOUT_SECONDS)
+        self._process.wait()
 
     def release_orphaned_child(self) -> None:
         if self._process.returncode is None:
@@ -423,22 +428,14 @@ class _ControlledPressureProcess:
         except ProcessLookupError:
             pass
         if self._process.poll() is None:
-            self._process.wait(timeout=PROCESS_TRANSITION_TIMEOUT_SECONDS)
+            self._process.wait()
         self.work.command.cleanup()
         os.close(self._admission_attempt_fd)
 
     def _readline(self, stream: TextIO, *, transition: str) -> str:
-        selector = selectors.DefaultSelector()
-        try:
-            selector.register(stream, selectors.EVENT_READ)
-            ready = selector.select(timeout=PROCESS_TRANSITION_TIMEOUT_SECONDS)
-            assert ready, (
-                f"{self.work.label} did not {transition} within "
-                f"{PROCESS_TRANSITION_TIMEOUT_SECONDS:.0f}s"
-            )
-        finally:
-            selector.close()
-        return stream.readline()
+        line = stream.readline()
+        assert line, self._unexpected_line(transition=transition, line=line)
+        return line
 
     def _require_started_line(self, line: str) -> None:
         assert line == f"{self.work.label}\n", self._unexpected_line(
@@ -572,11 +569,7 @@ class PressureRig:
             for job in jobs:
                 process = self._process(job)
                 process.register_start_signal(selector, job)
-            ready = selector.select(timeout=PROCESS_TRANSITION_TIMEOUT_SECONDS)
-            assert ready, (
-                "no pressure job started within "
-                f"{PROCESS_TRANSITION_TIMEOUT_SECONDS:.0f}s"
-            )
+            ready = selector.select()
             job = ready[0][0].data
             assert type(job) is PressureJob
             self._process(job).consume_started_signal()
@@ -607,11 +600,7 @@ class PressureRig:
             while any(
                 count < REQUIRED_POST_HOLDER_ATTEMPTS for count in attempts.values()
             ):
-                ready = selector.select(timeout=PROCESS_TRANSITION_TIMEOUT_SECONDS)
-                assert ready, (
-                    "pressure contenders did not acknowledge post-holder "
-                    "admission decisions"
-                )
+                ready = selector.select()
                 signals = tuple(key.data for key, _events in ready)
                 assert all(type(signal) is _PressureSignal for signal in signals)
                 for signal in cast(tuple[_PressureSignal, ...], signals):

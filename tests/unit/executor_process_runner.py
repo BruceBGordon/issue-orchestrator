@@ -18,10 +18,13 @@ from issue_orchestrator.control.executor_admission import (
 from issue_orchestrator.domain.executor import (
     ExecutorBoundedDeadline,
     ExecutorCommand,
+    ExecutorCommandLifecycle,
     ExecutorConcurrencyRange,
     ExecutorExclusiveResource,
     ExecutorFairnessGroup,
     ExecutorHistoryRetentionPolicy,
+    ExecutorInteractiveSessionCancellation,
+    ExecutorNoCommandCancellation,
     ExecutorRunSpecification,
     ExecutorWorkKey,
     ExecutorUnboundedDeadline,
@@ -104,6 +107,8 @@ def main() -> int:
     parser.add_argument("--exclusive", action="append", default=[])
     parser.add_argument("--active-timeout-seconds", type=float)
     parser.add_argument("--absolute-timeout-seconds", type=float)
+    parser.add_argument("--interactive-session", action="store_true")
+    parser.add_argument("--cancellation-record", type=Path)
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     command = tuple(args.command)
@@ -163,6 +168,20 @@ def main() -> int:
                 args.absolute_timeout_seconds,
             )
         )
+        if args.interactive_session != (args.cancellation_record is not None):
+            raise ValueError(
+                "interactive session and cancellation record must be supplied together"
+            )
+        lifecycle = (
+            ExecutorCommandLifecycle.INTERACTIVE_SESSION
+            if args.interactive_session
+            else ExecutorCommandLifecycle.DETACHED
+        )
+        cancellation = (
+            ExecutorInteractiveSessionCancellation(args.cancellation_record)
+            if args.cancellation_record is not None
+            else ExecutorNoCommandCancellation()
+        )
         result = executor.run(
             ExecutorRunSpecification(
                 work_key=ExecutorWorkKey(args.work_key),
@@ -175,7 +194,12 @@ def main() -> int:
                     ExecutorExclusiveResource(resource) for resource in args.exclusive
                 ),
             ),
-            ExecutorCommand(command, deadline),
+            ExecutorCommand(
+                command,
+                deadline,
+                lifecycle,
+                cancellation,
+            ),
         )
     except (FileNotFoundError, OSError, RuntimeError, ValueError) as exc:
         print(f"executor-run failed: {exc}")
