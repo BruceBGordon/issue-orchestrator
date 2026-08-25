@@ -211,7 +211,10 @@ owners do not configure them. Each complete terminal session is one safe phase.
 When it ends, its lease is released, and any later lifecycle phase re-enters
 the fair host queue. Queue time is excluded from the agent's active timeout,
 while a fixed submission-to-exit deadline prevents unbounded waiting. The
-executor never suspends a live agent at an arbitrary instruction.
+planner persists that exact outer watchdog before terminal creation, and a
+restart requires the persisted value instead of recomputing from current
+configuration. The executor never suspends a live agent at an arbitrary
+instruction.
 
 An agent process launched outside issue-orchestrator is unmanaged work: it has
 no lease, but its CPU use is visible to native host-pressure sampling and can

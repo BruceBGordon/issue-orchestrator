@@ -136,11 +136,14 @@ queued phase early. Wall timestamps are diagnostic only: forward or backward
 wall-clock adjustments cannot change either deadline.
 
 A monotonic instant is meaningful only within the process that observed it. If
-the orchestrator restarts while a terminal session survives, restoration starts
-a fresh conservative outer-observer budget. The already-running executor
-process retains and enforces its original monotonic absolute deadline. Recovery
-can therefore extend observation of a broken wrapper by at most one outer
-budget, but it cannot shorten the executor's valid queue or execution budget.
+the orchestrator restarts while a terminal session survives, restoration
+requires the exact planner-produced outer timeout persisted in that run's
+manifest and starts a fresh monotonic observation window with that value. It
+does not recompute from current repository configuration and has no missing-data
+fallback. The already-running executor process retains and enforces its original
+monotonic absolute deadline. Recovery can therefore extend observation of a
+broken wrapper by at most one persisted outer budget, but it cannot shorten the
+executor's valid queue or execution budget.
 
 ## Crash and data behavior
 
@@ -154,10 +157,12 @@ so a migrated pool can adopt a new machine's CPU count only while every old
 capacity lease is idle.
 
 All persisted records are strict, versioned Pydantic contracts with unknown
-fields rejected. Corrupt state fails loudly. Work-history filenames use an
-internal hash of canonical Git common-directory identity plus the explicit work
-key, while the history record and event store retain human-readable repository and work
-names.
+fields rejected. Corrupt state fails loudly. One atomic-record owner writes,
+syncs, replaces, and prunes recognizable crash remnants under a cross-process
+lock; replacement failures remove their temporary records. Work-history
+filenames use an internal hash of canonical Git common-directory identity plus
+the explicit work key, while the history record and event store retain
+human-readable repository and work names.
 
 The bounded typed executor event store records enqueue facts, the coalescing
 interval, wait-reason transitions, grants, minimum reservations, policy

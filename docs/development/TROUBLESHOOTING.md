@@ -254,6 +254,12 @@ learned demand, rather than the historical accidental single-worker behavior.
 These are the normal-response confirmations for the approximately 85-second
 goal.
 
+After process-group, restart-watchdog, profiler-cleanup, and crash-safe
+persistence hardening, an exact clean committed gate at `4e35b20` passed in
+**85.09s** retained validation time (**85.41s** measured wall time), with zero
+swaps. This is the final post-hardening confirmation rather than an earlier
+cache-only or pre-review measurement.
+
 Timing rows live in the repository's shared Git directory and can therefore
 survive a machine migration. For calibration, select records by the captured
 host name, OS, architecture, CPU count, and physical-memory bytes; a date alone
