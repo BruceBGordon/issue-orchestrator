@@ -31,6 +31,9 @@ from issue_orchestrator.execution.host_executor import (
     ExecutorRequestIdentityFactory,
     HostExecutor,
 )
+from issue_orchestrator.execution.process_group_terminator import (
+    PosixProcessGroupTerminator,
+)
 
 
 ADMISSION_ATTEMPT_FD_ENV = "ISSUE_ORCHESTRATOR_TEST_ADMISSION_ATTEMPT_FD"
@@ -130,7 +133,12 @@ def main() -> int:
                 process_id=os.getpid,
                 request_nonce=lambda: uuid4().hex,
             ),
-            process_termination_policy=ExecutorProcessTerminationPolicy(2.0),
+            process_group_terminator=PosixProcessGroupTerminator(
+                ExecutorProcessTerminationPolicy(
+                    graceful_shutdown_seconds=2.0,
+                    forceful_shutdown_seconds=2.0,
+                )
+            ),
             history_retention_policy=ExecutorHistoryRetentionPolicy(2048, 24),
             queue_settle_seconds=0.02,
             queue_poll_seconds=0.01,

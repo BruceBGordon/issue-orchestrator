@@ -19,7 +19,6 @@ Exit codes:
 
 import os
 import re
-import signal
 import subprocess
 import sys
 import threading
@@ -30,6 +29,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TextIO
 
+from ...execution.executor_composition import build_process_group_terminator
+from ...domain.process_group import OwnedProcessGroupLeader
 from ...infra.env import get_env
 from ...infra.validation_timings import (
     ValidateTimingRecorder,
@@ -37,6 +38,7 @@ from ...infra.validation_timings import (
     ValidationResourceSample,
     ValidationSwapUsage,
 )
+from ...ports.process_group_terminator import ProcessGroupTerminator
 
 _MEMORY_FREE_RE = re.compile(r"System-wide memory free percentage:\s*(?P<percent>\d+)%")
 _SWAP_RE = re.compile(
@@ -172,32 +174,6 @@ def parse_iostat_totals(output: str | None) -> ValidationDiskObservation | None:
     )
 
 
-def _terminate_validation_process(process: subprocess.Popen[str]) -> None:
-    """Stop and reap one validation command tree after runner-side failure."""
-    if process.poll() is not None:
-        return
-    if os.name == "posix":
-        try:
-            os.killpg(process.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-    else:
-        process.terminate()
-    try:
-        process.wait(timeout=5.0)
-        return
-    except subprocess.TimeoutExpired:
-        pass
-    if os.name == "posix":
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-    else:
-        process.kill()
-    process.wait()
-
-
 @dataclass
 class ResourceSampler:
     """Periodic host resource sampler for validate runs."""
@@ -302,6 +278,7 @@ class _ValidationCommandCapture:
     wall_started_at: datetime
     monotonic_started_at: float
     clock: ValidationRunnerClock
+    process_group_terminator: ProcessGroupTerminator
     process: subprocess.Popen[str] | None = field(default=None, init=False)
     line_count: int = field(default=0, init=False)
     byte_count: int = field(default=0, init=False)
@@ -353,8 +330,11 @@ class _ValidationCommandCapture:
         if self._finished:
             raise RuntimeError("validation command capture cannot finish twice")
         self._finished = True
-        if self.process is not None:
-            _terminate_validation_process(self.process)
+        if self.process is not None and self.process.returncode is None:
+            termination = self.process_group_terminator.terminate(
+                OwnedProcessGroupLeader(self.process.pid)
+            )
+            self.process.returncode = termination.leader_exit_code
         result = self.snapshot()
         if self.process is not None:
             elapsed = result.monotonic_ended_at - self.monotonic_started_at
@@ -489,6 +469,7 @@ def run_validation(
         wall_started_at=wall_start,
         monotonic_started_at=start,
         clock=clock,
+        process_group_terminator=build_process_group_terminator(),
     )
     sampler_started = False
     result = capture.snapshot()

@@ -46,6 +46,7 @@ class AgentPhaseOuterWatchdogPolicy:
             )
         cleanup_seconds = (
             self.executor_termination.graceful_shutdown_seconds
+            + self.executor_termination.forceful_shutdown_seconds
             + self.observer_margin_seconds
         )
         return (

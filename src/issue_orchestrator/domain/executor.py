@@ -205,20 +205,21 @@ class ExecutorUnboundedDeadline:
 
 @dataclass(frozen=True, slots=True)
 class ExecutorProcessTerminationPolicy:
-    """Grace allowed between process-group TERM and forced KILL/reap."""
+    """Bounds for process-group courtesy shutdown and forced leader reap."""
 
     graceful_shutdown_seconds: float
+    forceful_shutdown_seconds: float
 
     def __post_init__(self) -> None:
-        if (
-            type(self.graceful_shutdown_seconds) is not float
-            or not math.isfinite(self.graceful_shutdown_seconds)
-            or self.graceful_shutdown_seconds <= 0
+        for field_name, value in (
+            ("graceful_shutdown_seconds", self.graceful_shutdown_seconds),
+            ("forceful_shutdown_seconds", self.forceful_shutdown_seconds),
         ):
-            raise ValueError(
-                "ExecutorProcessTerminationPolicy.graceful_shutdown_seconds "
-                "must be finite and positive"
-            )
+            if type(value) is not float or not math.isfinite(value) or value <= 0:
+                raise ValueError(
+                    f"ExecutorProcessTerminationPolicy.{field_name} must be "
+                    "finite and positive"
+                )
 
 
 @dataclass(frozen=True, slots=True)

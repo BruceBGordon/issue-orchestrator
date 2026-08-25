@@ -24,7 +24,10 @@ def host_agent_phase_command_scheduler() -> HostAgentPhaseCommandScheduler:
         python_executable=Path(sys.executable),
         application_shell=TerminalShell.BASH,
         outer_watchdog_policy=AgentPhaseOuterWatchdogPolicy(
-            executor_termination=ExecutorProcessTerminationPolicy(2.0),
+            executor_termination=ExecutorProcessTerminationPolicy(
+                graceful_shutdown_seconds=2.0,
+                forceful_shutdown_seconds=2.0,
+            ),
             observer_margin_seconds=58.0,
         ),
     )

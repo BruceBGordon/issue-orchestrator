@@ -37,7 +37,7 @@ from .bootstrap_environment import (
 )
 from .bootstrap_claims import ClaimComponents, assemble_claim_components, lease_config_from
 from .bootstrap_dependencies import Dependencies as Dependencies
-from .bootstrap_host_executor import (
+from ..execution.executor_composition import (
     build_agent_phase_command_scheduler,
     build_executor as build_executor,
     build_executor_monitor as build_executor_monitor,

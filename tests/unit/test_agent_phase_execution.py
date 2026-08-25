@@ -48,6 +48,9 @@ from issue_orchestrator.execution.host_executor import (
     HostExecutor,
     HostExecutorMonitor,
 )
+from issue_orchestrator.execution.process_group_terminator import (
+    PosixProcessGroupTerminator,
+)
 from issue_orchestrator.domain.agent_phase_execution import (
     AgentPhaseOuterWatchdogPolicy,
 )
@@ -183,7 +186,10 @@ def test_scheduler_renders_one_shell_safe_internal_invocation() -> None:
         python_executable=Path(sys.executable),
         application_shell=TerminalShell.BASH,
         outer_watchdog_policy=AgentPhaseOuterWatchdogPolicy(
-            executor_termination=ExecutorProcessTerminationPolicy(2.0),
+            executor_termination=ExecutorProcessTerminationPolicy(
+                graceful_shutdown_seconds=2.0,
+                forceful_shutdown_seconds=2.0,
+            ),
             observer_margin_seconds=58.0,
         ),
     )
@@ -237,7 +243,10 @@ def test_scheduler_preserves_interaction_intent_hidden_by_executor_wrapper(
         python_executable=Path(sys.executable),
         application_shell=TerminalShell.BASH,
         outer_watchdog_policy=AgentPhaseOuterWatchdogPolicy(
-            executor_termination=ExecutorProcessTerminationPolicy(2.0),
+            executor_termination=ExecutorProcessTerminationPolicy(
+                graceful_shutdown_seconds=2.0,
+                forceful_shutdown_seconds=2.0,
+            ),
             observer_margin_seconds=58.0,
         ),
     ).schedule(specification)
@@ -263,7 +272,10 @@ def test_scheduled_phase_executes_bash_language_without_shell_drift(
         python_executable=Path(sys.executable),
         application_shell=TerminalShell.BASH,
         outer_watchdog_policy=AgentPhaseOuterWatchdogPolicy(
-            executor_termination=ExecutorProcessTerminationPolicy(2.0),
+            executor_termination=ExecutorProcessTerminationPolicy(
+                graceful_shutdown_seconds=2.0,
+                forceful_shutdown_seconds=2.0,
+            ),
             observer_margin_seconds=58.0,
         ),
     ).schedule(specification)
@@ -371,7 +383,12 @@ def test_admission_deadline_fails_before_command_and_is_durable(
             process_id=os.getpid,
             request_nonce=lambda: "c" * 32,
         ),
-        process_termination_policy=ExecutorProcessTerminationPolicy(2.0),
+        process_group_terminator=PosixProcessGroupTerminator(
+            ExecutorProcessTerminationPolicy(
+                graceful_shutdown_seconds=2.0,
+                forceful_shutdown_seconds=2.0,
+            )
+        ),
         history_retention_policy=ExecutorHistoryRetentionPolicy(2048, 24),
         queue_settle_seconds=0.01,
         queue_poll_seconds=0.01,
@@ -448,7 +465,12 @@ def test_deadline_expiring_after_admission_records_terminal_events_without_spawn
             process_id=os.getpid,
             request_nonce=lambda: "d" * 32,
         ),
-        process_termination_policy=ExecutorProcessTerminationPolicy(2.0),
+        process_group_terminator=PosixProcessGroupTerminator(
+            ExecutorProcessTerminationPolicy(
+                graceful_shutdown_seconds=2.0,
+                forceful_shutdown_seconds=2.0,
+            )
+        ),
         history_retention_policy=ExecutorHistoryRetentionPolicy(2048, 24),
         queue_settle_seconds=0.01,
         queue_poll_seconds=0.01,

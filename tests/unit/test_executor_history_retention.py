@@ -35,6 +35,9 @@ from issue_orchestrator.execution.host_executor import (
     HostExecutor,
     HostExecutorMonitor,
 )
+from issue_orchestrator.execution.process_group_terminator import (
+    PosixProcessGroupTerminator,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -81,7 +84,12 @@ def test_history_prunes_old_profiles_and_bounds_samples_per_profile(
             process_id=os.getpid,
             request_nonce=lambda: "a" * 32,
         ),
-        process_termination_policy=ExecutorProcessTerminationPolicy(0.1),
+        process_group_terminator=PosixProcessGroupTerminator(
+            ExecutorProcessTerminationPolicy(
+                graceful_shutdown_seconds=0.1,
+                forceful_shutdown_seconds=0.1,
+            )
+        ),
         history_retention_policy=retention,
         queue_settle_seconds=0.001,
         queue_poll_seconds=0.001,

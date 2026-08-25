@@ -6,7 +6,6 @@ from __future__ import annotations
 import math
 import os
 import resource
-import signal
 import subprocess
 import sys
 import time
@@ -30,13 +29,14 @@ from ...domain.executor import (
     ExecutorHistoryRetentionPolicy,
     ExecutorPolicy,
     ExecutorPolicyChange,
-    ExecutorProcessTerminationPolicy,
     ExecutorRunResult,
     ExecutorRunSpecification,
     ExecutorUnboundedDeadline,
 )
+from ...domain.process_group import OwnedProcessGroupLeader
 from ...ports.executor import Executor
 from ...ports.host_cpu_utilization import HostCpuUtilizationObserver
+from ...ports.process_group_terminator import ProcessGroupTerminator
 from ._history import ExecutorWorkHistoryStore
 from ._host_observation import observe_host_load
 from ._journal import ExecutorEventStore
@@ -67,6 +67,14 @@ def _require_host_cpu_observer(value: object) -> None:
         )
 
 
+def _require_process_group_terminator(value: object) -> None:
+    if not isinstance(value, ProcessGroupTerminator):
+        raise ValueError(
+            "HostExecutor.process_group_terminator must implement "
+            "ProcessGroupTerminator"
+        )
+
+
 class HostExecutor(Executor):
     """Coordinate, execute, observe, and learn behind one narrow interface."""
 
@@ -79,7 +87,7 @@ class HostExecutor(Executor):
         demand_estimator: ExecutorWorkDemandEstimator,
         host_cpu_observer: HostCpuUtilizationObserver,
         request_identity_factory: ExecutorRequestIdentityFactory,
-        process_termination_policy: ExecutorProcessTerminationPolicy,
+        process_group_terminator: ProcessGroupTerminator,
         history_retention_policy: ExecutorHistoryRetentionPolicy,
         queue_settle_seconds: float,
         queue_poll_seconds: float,
@@ -113,12 +121,8 @@ class HostExecutor(Executor):
         self._demand_estimator = demand_estimator
         self._host_cpu_observer = host_cpu_observer
         self._request_identity_factory = request_identity_factory
-        if type(process_termination_policy) is not ExecutorProcessTerminationPolicy:
-            raise ValueError(
-                "HostExecutor.process_termination_policy must be "
-                "ExecutorProcessTerminationPolicy"
-            )
-        self._process_termination_policy = process_termination_policy
+        _require_process_group_terminator(process_group_terminator)
+        self._process_group_terminator = process_group_terminator
         if type(history_retention_policy) is not ExecutorHistoryRetentionPolicy:
             raise ValueError(
                 "HostExecutor.history_retention_policy must be an "
@@ -386,7 +390,10 @@ class HostExecutor(Executor):
                         raise AssertionError(
                             "a timed-out executor command must have a bounded deadline"
                         )
-                    self._terminate_process_group(process)
+                    termination = self._process_group_terminator.terminate(
+                        OwnedProcessGroupLeader(process.pid)
+                    )
+                    process.returncode = termination.leader_exit_code
                     return_code = 124
                     self._record_command_deadline(
                         identity,
@@ -461,27 +468,6 @@ class HostExecutor(Executor):
             submitted_at_monotonic=submitted_at_monotonic,
             admitted_at_monotonic=time.monotonic(),
         )
-
-    def _terminate_process_group(self, process: subprocess.Popen[bytes]) -> None:
-        """Terminate and reap the entire bounded command tree."""
-        if process.poll() is not None:
-            return
-        try:
-            os.killpg(process.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-        try:
-            process.wait(
-                timeout=self._process_termination_policy.graceful_shutdown_seconds
-            )
-            return
-        except subprocess.TimeoutExpired:
-            pass
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        process.wait()
 
     @staticmethod
     def _report_deadline_exceeded(
