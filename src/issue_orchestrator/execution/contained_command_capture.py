@@ -28,6 +28,7 @@ from ..domain.process_group import (
     OwnedProcessGroupLeader,
     ProcessGroupCompleted,
     ProcessGroupInterrupted,
+    ProcessGroupSupervision,
     ProcessGroupUnboundedWait,
 )
 from ..ports.contained_command import (
@@ -39,6 +40,40 @@ from ..ports.process_group_supervisor import (
     ProcessGroupInterruption,
     ProcessGroupSupervisor,
 )
+
+
+def _combine_failures(
+    primary: ContainedCommandFailure,
+    secondary: ContainedCommandFailure | None,
+    message: str,
+) -> ContainedCommandFailure:
+    if secondary is None:
+        return primary
+    return ContainedCommandFailure(
+        BaseExceptionGroup(message, (primary.error, secondary.error))
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _OutputPumpFinalized:
+    """The pump stopped and its stdout stream closed."""
+
+
+@dataclass(frozen=True, slots=True)
+class _OutputPumpFinalizationFailed:
+    """Pump shutdown failed after the command group was already contained."""
+
+    failure: ContainedCommandFailure
+
+    def __post_init__(self) -> None:
+        if type(self.failure) is not ContainedCommandFailure:
+            raise ValueError(
+                "_OutputPumpFinalizationFailed.failure must be a "
+                "ContainedCommandFailure"
+            )
+
+
+_OutputPumpFinalization = _OutputPumpFinalized | _OutputPumpFinalizationFailed
 
 
 @dataclass(slots=True)
@@ -80,9 +115,36 @@ class _CapturedOutputPump(ProcessGroupInterruption):
             raise ValueError("output interruption wait must be a positive float")
         return self._interruption.wait(timeout_seconds)
 
-    def join_after_containment(self) -> None:
-        self._thread.join()
-        self.stdout.close()
+    def finalize_after_containment(self) -> _OutputPumpFinalization:
+        failure: ContainedCommandFailure | None = None
+        try:
+            self._thread.join()
+        except BaseException as error:
+            failure = ContainedCommandFailure(error)
+            try:
+                self.detach_after_cleanup_failure()
+            except BaseException as detach_error:
+                failure = _combine_failures(
+                    failure,
+                    ContainedCommandFailure(detach_error),
+                    "output pump join and sink detach both failed",
+                )
+        try:
+            self.stdout.close()
+        except BaseException as close_error:
+            close_failure = ContainedCommandFailure(close_error)
+            failure = (
+                close_failure
+                if failure is None
+                else _combine_failures(
+                    failure,
+                    close_failure,
+                    "output pump finalization failed more than once",
+                )
+            )
+        if failure is None:
+            return _OutputPumpFinalized()
+        return _OutputPumpFinalizationFailed(failure)
 
     def detach_after_cleanup_failure(self) -> None:
         """Prevent a still-blocked daemon pump from touching caller-owned sinks."""
@@ -246,26 +308,59 @@ class PosixContainedCommandCapture:
             )
 
         process.returncode = supervision.termination.leader_exit_code
-        pump.join_after_containment()
+        finalization = pump.finalize_after_containment()
         child = ContainedCommandExited(process.pid, process.returncode)
+        return self._closed_result_after_supervision(
+            supervision,
+            child,
+            pump,
+            finalization,
+        )
+
+    @staticmethod
+    def _closed_result_after_supervision(
+        supervision: ProcessGroupSupervision,
+        child: ContainedCommandExited,
+        pump: _CapturedOutputPump,
+        finalization: _OutputPumpFinalization,
+    ) -> ContainedCommandResult:
+        """Interpret terminal supervision and pump evidence after containment."""
         if type(supervision) is ProcessGroupInterrupted:
             if pump.failure is None:
                 raise AssertionError(
                     "process-group interruption requires captured failure evidence"
                 )
+            failure = pump.failure
+            if type(finalization) is _OutputPumpFinalizationFailed:
+                failure = _combine_failures(
+                    failure,
+                    finalization.failure,
+                    "output capture and pump finalization both failed",
+                )
             return ContainedCommandCaptureFailed(
                 child=child,
                 cleanup=ContainedCommandCaptureAborted(),
-                failure=pump.failure,
+                failure=failure,
                 metrics=pump.metrics,
             )
         if type(supervision) is not ProcessGroupCompleted:
             raise AssertionError("an unbounded contained command cannot time out")
-        if pump.failure is not None:
+        failure = pump.failure
+        if type(finalization) is _OutputPumpFinalizationFailed:
+            failure = (
+                finalization.failure
+                if failure is None
+                else _combine_failures(
+                    failure,
+                    finalization.failure,
+                    "output capture and pump finalization both failed",
+                )
+            )
+        if failure is not None:
             return ContainedCommandCaptureFailed(
                 child=child,
                 cleanup=ContainedCommandSupervised(),
-                failure=pump.failure,
+                failure=failure,
                 metrics=pump.metrics,
             )
         return ContainedCommandCompleted(child=child, metrics=pump.metrics)
@@ -283,7 +378,7 @@ class PosixContainedCommandCapture:
             return ContainedCommandCleanupFailed(
                 child=ContainedCommandExitUnknown(process.pid),
                 capture=ContainedCommandCaptureInterrupted(capture_failure),
-                cleanup_failure=self._combine_failures(
+                cleanup_failure=_combine_failures(
                     ContainedCommandFailure(cleanup_error),
                     stdout_close_failure,
                     "contained command group abort and stdout close both failed",
@@ -295,7 +390,7 @@ class PosixContainedCommandCapture:
         return ContainedCommandCaptureFailed(
             child=ContainedCommandExited(process.pid, process.returncode),
             cleanup=ContainedCommandCaptureAborted(),
-            failure=self._combine_failures(
+            failure=_combine_failures(
                 capture_failure,
                 stdout_close_failure,
                 "contained command capture and stdout close both failed",
@@ -315,18 +410,6 @@ class PosixContainedCommandCapture:
         except BaseException as error:
             return ContainedCommandFailure(error)
         return None
-
-    @staticmethod
-    def _combine_failures(
-        primary: ContainedCommandFailure,
-        secondary: ContainedCommandFailure | None,
-        message: str,
-    ) -> ContainedCommandFailure:
-        if secondary is None:
-            return primary
-        return ContainedCommandFailure(
-            BaseExceptionGroup(message, (primary.error, secondary.error))
-        )
 
     def _recover_after_supervision_failure(
         self,
@@ -355,13 +438,19 @@ class PosixContainedCommandCapture:
                 metrics=pump.metrics,
             )
         process.returncode = termination.leader_exit_code
-        pump.join_after_containment()
+        finalization = pump.finalize_after_containment()
         if type(capture) is ContainedCommandCaptureSucceeded:
             failure = supervision_failure
         elif type(capture) is ContainedCommandCaptureInterrupted:
             failure = capture.failure
         else:
             raise AssertionError("supervision recovery requires typed capture fact")
+        if type(finalization) is _OutputPumpFinalizationFailed:
+            failure = _combine_failures(
+                failure,
+                finalization.failure,
+                "command supervision and pump finalization both failed",
+            )
         return ContainedCommandCaptureFailed(
             child=ContainedCommandExited(process.pid, process.returncode),
             cleanup=ContainedCommandCaptureAborted(),

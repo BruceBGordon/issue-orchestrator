@@ -17,7 +17,14 @@ import pytest
 from issue_orchestrator.domain.contained_command import (
     ContainedCommandCaptureAborted,
     ContainedCommandCaptureFailed,
+    ContainedCommandSupervised,
     ContainedCommandStarted,
+)
+from issue_orchestrator.domain.process_group import (
+    OwnedProcessGroupLeader,
+    ProcessGroupSupervision,
+    ProcessGroupTermination,
+    ProcessGroupWait,
 )
 from issue_orchestrator.domain.executor import ExecutorProcessTerminationPolicy
 from issue_orchestrator.execution.contained_command_capture import (
@@ -33,6 +40,10 @@ from issue_orchestrator.ports.contained_command import (
     ContainedCommandLineObserver,
     ContainedCommandOutput,
     ContainedShellCommand,
+)
+from issue_orchestrator.ports.process_group_supervisor import (
+    ProcessGroupInterruption,
+    ProcessGroupSupervisor,
 )
 
 
@@ -55,6 +66,30 @@ class _RejectUnexpectedLine(ContainedCommandLineObserver):
 class _ThreadFailurePoint(StrEnum):
     CONSTRUCTION = "construction"
     START = "start"
+
+
+@dataclass(frozen=True, slots=True)
+class _FailingSupervision(ProcessGroupSupervisor):
+    delegate: ProcessGroupSupervisor
+    failure: RuntimeError
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.delegate, ProcessGroupSupervisor):
+            raise ValueError("_FailingSupervision.delegate must be a supervisor")
+        if type(self.failure) is not RuntimeError:
+            raise ValueError("_FailingSupervision.failure must be a RuntimeError")
+
+    def supervise(
+        self,
+        leader: OwnedProcessGroupLeader,
+        wait: ProcessGroupWait,
+        interruption: ProcessGroupInterruption,
+    ) -> ProcessGroupSupervision:
+        del leader, wait, interruption
+        raise self.failure
+
+    def abort(self, leader: OwnedProcessGroupLeader) -> ProcessGroupTermination:
+        return self.delegate.abort(leader)
 
 
 @pytest.mark.skipif(os.name != "posix", reason="asserts POSIX process containment")
@@ -113,6 +148,65 @@ def test_output_pump_setup_failure_contains_and_reaps_started_group(
     assert type(result) is ContainedCommandCaptureFailed
     assert type(result.cleanup) is ContainedCommandCaptureAborted
     assert result.failure.error is setup_failure
+    process_id = int(process_id_path.read_text(encoding="utf-8"))
+    with pytest.raises(ProcessLookupError):
+        os.kill(process_id, signal.SIGCONT)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="asserts POSIX process containment")
+@pytest.mark.parametrize("recover_from_supervision_failure", (False, True))
+def test_output_pump_join_failure_is_typed_after_group_containment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    recover_from_supervision_failure: bool,
+) -> None:
+    process_id_path = tmp_path / "finalized-process.pid"
+    join_failure = OSError("injected output pump join failure")
+    supervision_failure = RuntimeError("injected command supervision failure")
+
+    def reject_thread_join(_thread: threading.Thread) -> None:
+        raise join_failure
+
+    monkeypatch.setattr(threading.Thread, "join", reject_thread_join)
+    process_group_supervisor = PosixProcessGroupSupervisor(
+        PosixProcessGroupTerminator(
+            ExecutorProcessTerminationPolicy(
+                graceful_shutdown_seconds=0.01,
+                forceful_shutdown_seconds=1.0,
+            )
+        )
+    )
+    capture_supervisor: ProcessGroupSupervisor = (
+        _FailingSupervision(process_group_supervisor, supervision_failure)
+        if recover_from_supervision_failure
+        else process_group_supervisor
+    )
+    child_program = (
+        "import signal; signal.pause()" if recover_from_supervision_failure else "pass"
+    )
+
+    result = PosixContainedCommandCapture(capture_supervisor).capture(
+        ContainedShellCommand(
+            command=(
+                f"exec {shlex.quote(sys.executable)} -c {shlex.quote(child_program)}"
+            ),
+            working_directory=tmp_path,
+        ),
+        _StartedProcessRecorder(process_id_path),
+        _RejectUnexpectedLine(),
+    )
+
+    assert type(result) is ContainedCommandCaptureFailed
+    if recover_from_supervision_failure:
+        assert type(result.cleanup) is ContainedCommandCaptureAborted
+        assert type(result.failure.error) is ExceptionGroup
+        assert result.failure.error.exceptions == (
+            supervision_failure,
+            join_failure,
+        )
+    else:
+        assert type(result.cleanup) is ContainedCommandSupervised
+        assert result.failure.error is join_failure
     process_id = int(process_id_path.read_text(encoding="utf-8"))
     with pytest.raises(ProcessLookupError):
         os.kill(process_id, signal.SIGCONT)
