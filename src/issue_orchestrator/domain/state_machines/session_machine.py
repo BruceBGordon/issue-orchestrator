@@ -17,6 +17,10 @@ from transitions import MachineError, EventData, Machine
 
 from .transition_result import TransitionResult
 from .errors import InvalidStateTransition
+from ..session_watchdog import (
+    SYSTEM_SESSION_WATCHDOG_CLOCK,
+    SessionWatchdogClock,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -82,7 +86,8 @@ class SessionStateMachine:
         session_id: str,
         issue_number: int,
         initial_state: SessionState = SessionState.PENDING,
-        timeout_minutes: Optional[int] = None
+        timeout_minutes: Optional[int] = None,
+        watchdog_clock: SessionWatchdogClock = SYSTEM_SESSION_WATCHDOG_CLOCK,
     ):
         """Initialize the session state machine.
 
@@ -97,8 +102,15 @@ class SessionStateMachine:
         self._model = _Model(initial_state.value)
         self.state = self._model.state
         self.started_at: Optional[datetime] = None
+        self.started_at_monotonic: Optional[float] = None
         self.timeout_minutes = timeout_minutes
         self.last_transition: Optional[TransitionResult] = None
+        if type(watchdog_clock) is not SessionWatchdogClock:
+            raise ValueError(
+                "SessionStateMachine.watchdog_clock must be a "
+                "SessionWatchdogClock"
+            )
+        self._watchdog_clock = watchdog_clock
 
         # Define all possible states
         states = [state.value for state in SessionState]
@@ -199,7 +211,8 @@ class SessionStateMachine:
 
     def _on_started(self, event: EventData) -> None:
         """Callback for started transition."""
-        self.started_at = datetime.now()
+        self.started_at = self._watchdog_clock.wall_now()
+        self.started_at_monotonic = self._watchdog_clock.require_monotonic_now()
         data = event.kwargs.get('data', {})
         transition_data = {**data, 'session_id': self.session_id, 'started_at': self.started_at.isoformat()}
 
@@ -331,10 +344,17 @@ class SessionStateMachine:
         Returns:
             Runtime in minutes, or None if session hasn't started
         """
-        if self.started_at is None:
+        if self.started_at_monotonic is None:
             return None
-        delta = datetime.now() - self.started_at
-        return delta.total_seconds() / 60.0
+        elapsed_seconds = (
+            self._watchdog_clock.require_monotonic_now()
+            - self.started_at_monotonic
+        )
+        if elapsed_seconds < 0:
+            raise RuntimeError(
+                "session watchdog monotonic clock moved backward after start"
+            )
+        return elapsed_seconds / 60.0
 
     def check_timeout(self) -> bool:
         """Check if the session has exceeded its timeout.

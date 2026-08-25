@@ -112,7 +112,10 @@ drain.
 
 Issue-orchestrator uses that boundary directly. Code, validation-retry, rework,
 review, and retrospective-review terminal sessions are complete application
-phases; each is submitted independently through a typed
+phases. Each caller supplies one typed `AgentPhaseLaunchRequest` containing the
+original provider command and its environment; callers cannot supply terminal
+interaction intent. The launch owner derives that intent from the original
+command exactly once, applies any provider wrapper, and submits the resulting
 `AgentPhaseRunSpecification`. Finishing one phase releases its lease. A later
 phase joins the fair queue as new work instead of inheriting a stale grant.
 There is no signal-based pseudo-preemption and no scheduler-selected point
@@ -124,7 +127,15 @@ agent's existing work budget. A fixed absolute timeout of twice that budget
 runs from submission and wins when necessary, preventing a saturated or broken
 queue from extending a session forever. The terminal/session observer receives
 the same absolute bound, so it cannot race the executor and kill a correctly
-queued phase early.
+queued phase early. Wall timestamps are diagnostic only: forward or backward
+wall-clock adjustments cannot change either deadline.
+
+A monotonic instant is meaningful only within the process that observed it. If
+the orchestrator restarts while a terminal session survives, restoration starts
+a fresh conservative outer-observer budget. The already-running executor
+process retains and enforces its original monotonic absolute deadline. Recovery
+can therefore extend observation of a broken wrapper by at most one outer
+budget, but it cannot shorten the executor's valid queue or execution budget.
 
 ## Crash and data behavior
 

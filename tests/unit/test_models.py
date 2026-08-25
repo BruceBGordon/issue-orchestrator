@@ -1,5 +1,7 @@
 """Unit tests for data models."""
 
+import time
+
 import pytest
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -639,6 +641,7 @@ class TestSession:
                 session_name="test-session",
             ),
             started_at=past,
+            watchdog_started_at_monotonic=time.monotonic() - (30 * 60),
         )
 
         # Allow small variance due to test execution time
@@ -663,6 +666,7 @@ class TestSession:
                 session_name="test-session",
             ),
             started_at=recent,
+            watchdog_started_at_monotonic=time.monotonic() - (10 * 60),
         )
 
         assert not session.is_timed_out
@@ -690,6 +694,7 @@ class TestSession:
                 session_name="test-session",
             ),
             started_at=old,
+            watchdog_started_at_monotonic=time.monotonic() - (60 * 60),
         )
 
         assert session.is_timed_out

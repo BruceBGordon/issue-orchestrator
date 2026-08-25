@@ -8,6 +8,7 @@ import shlex
 import subprocess
 import sys
 import time
+from collections.abc import Mapping
 
 import pytest
 
@@ -18,7 +19,12 @@ from issue_orchestrator.control.executor_admission import (
     ExecutorWorkDemandEstimator,
 )
 from issue_orchestrator.domain.agent_phase_execution import (
+    AgentPhaseLaunchRequest,
     AgentPhaseRunSpecification,
+    ProviderInvocationArguments,
+)
+from issue_orchestrator.control.agent_phase_launch_planner import (
+    AgentPhaseLaunchPlanner,
 )
 from issue_orchestrator.domain.executor import (
     ExecutorBoundedDeadline,
@@ -58,6 +64,8 @@ from issue_orchestrator.domain.terminal_launch import (
     TerminalInteractionIntent,
     TerminalShell,
 )
+from issue_orchestrator.domain.models import AgentConfig, TaskKind
+from tests.unit.session_run_helpers import make_session_run_assets
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -91,6 +99,24 @@ class _AdmissionThenExpiredClock:
     def monotonic(self) -> float:
         self._observations += 1
         return 0.0 if self._observations <= 5 else 1.0
+
+
+class _OpaqueProviderCommandWrapper:
+    """Test seam that proves classification precedes opaque wrapping."""
+
+    def __init__(self) -> None:
+        self.received_commands: list[str] = []
+
+    def wrap(
+        self,
+        base_command: str,
+        agent_config: AgentConfig,
+        run_dir: Path,
+        *,
+        extra_provider_args: Mapping[str, str],
+    ) -> str:
+        self.received_commands.append(base_command)
+        return "opaque-provider-runner --command-token hidden"
 
 
 def _demand_estimator() -> ExecutorWorkDemandEstimator:
@@ -154,6 +180,20 @@ def _executor_events(pool_dir: Path) -> subprocess.CompletedProcess[str]:
     )
 
 
+def _pid_has_exited(pid: int, *, deadline_seconds: float = 5.0) -> bool:
+    """Bounded kernel observation for a reparented real subprocess."""
+    deadline = time.monotonic() + deadline_seconds
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        except PermissionError:
+            return False
+        time.sleep(0.01)
+    return False
+
+
 def test_phase_specification_converts_active_timeout_to_fixed_absolute_bound() -> None:
     specification = AgentPhaseRunSpecification.from_timeout_minutes(
         work_key=ExecutorWorkKey("agent-phase:agent:web:code"),
@@ -173,6 +213,81 @@ def test_phase_specification_converts_active_timeout_to_fixed_absolute_bound() -
         is ExecutorDeadlineReason.ABSOLUTE
     )
 
+
+@pytest.mark.parametrize(
+    ("phase_name", "task_kind"),
+    [
+        ("coding", TaskKind.CODE),
+        ("validation-retry", TaskKind.CODE),
+        ("rework", TaskKind.REWORK),
+        ("review", TaskKind.REVIEW),
+        ("retrospective-review", TaskKind.RETROSPECTIVE_REVIEW),
+    ],
+)
+@pytest.mark.parametrize(
+    ("provider_command", "expected_intent"),
+    [
+        (
+            "claude --model sonnet 'do work'",
+            TerminalInteractionIntent.CLAUDE_TRUST_WORKTREE,
+        ),
+        (
+            "codex --model gpt-5.4 'do work'",
+            TerminalInteractionIntent.CODEX_TRUST_WORKTREE,
+        ),
+        ("custom-agent 'do work'", TerminalInteractionIntent.NONE),
+    ],
+)
+def test_launch_owner_classifies_every_phase_provider_before_wrapping(
+    tmp_path: Path,
+    phase_name: str,
+    task_kind: TaskKind,
+    provider_command: str,
+    expected_intent: TerminalInteractionIntent,
+) -> None:
+    wrapper = _OpaqueProviderCommandWrapper()
+    scheduler = HostAgentPhaseCommandScheduler(
+        python_executable=Path(sys.executable),
+        application_shell=TerminalShell.BASH,
+        outer_watchdog_policy=AgentPhaseOuterWatchdogPolicy(
+            executor_termination=ExecutorProcessTerminationPolicy(
+                graceful_shutdown_seconds=2.0,
+                forceful_shutdown_seconds=2.0,
+            ),
+            observer_margin_seconds=58.0,
+        ),
+    )
+    planner = AgentPhaseLaunchPlanner(scheduler, wrapper)
+    run = make_session_run_assets(
+        tmp_path / phase_name,
+        session_name=phase_name,
+    )
+
+    launch, scheduled_config = planner.schedule(
+        AgentPhaseLaunchRequest(
+            provider_command=provider_command,
+            environment_exports="export PHASE_TEST=1",
+            agent_config=AgentConfig(
+                prompt_path=tmp_path / "prompt.md",
+                timeout_minutes=45,
+            ),
+            run=run,
+            agent_label="agent:test",
+            task_kind=task_kind,
+            provider_arguments=ProviderInvocationArguments.from_mapping({}),
+        )
+    )
+
+    arguments = shlex.split(launch.shell_command)
+    assert wrapper.received_commands == [provider_command]
+    assert launch.interaction_intent is expected_intent
+    assert TerminalInteractionIntent.classify(launch.shell_command) is (
+        TerminalInteractionIntent.NONE
+    )
+    assert arguments[arguments.index("--work-key") + 1] == (
+        f"agent-phase:agent:test:{task_kind.value}"
+    )
+    assert scheduled_config.timeout_minutes == 92
 
 def test_scheduler_renders_one_shell_safe_internal_invocation() -> None:
     specification = AgentPhaseRunSpecification.from_timeout_minutes(
@@ -348,6 +463,44 @@ def test_internal_phase_client_terminates_at_active_deadline_and_releases_lease(
     assert "phase=command reason=active" in deadline_line
     assert "active_timeout=0.050s" in deadline_line
     assert "absolute_timeout=1.000s" in deadline_line
+
+
+def test_descendant_is_gone_before_timed_out_phase_releases_lease(
+    tmp_path: Path,
+) -> None:
+    """A cooperative leader cannot release capacity around a resistant child."""
+    pool_dir = tmp_path / "pool"
+    descendant_pid_file = tmp_path / "descendant.pid"
+    leader_script = (
+        "import signal, subprocess, sys; "
+        "descendant = subprocess.Popen([sys.executable, '-c', "
+        "'import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        "time.sleep(300)'], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, "
+        "stderr=subprocess.DEVNULL); "
+        f"open({str(descendant_pid_file)!r}, 'w').write(str(descendant.pid)); "
+        "signal.signal(signal.SIGTERM, lambda *_args: sys.exit(0)); "
+        "signal.pause()"
+    )
+
+    timed_out = _phase_cli(
+        pool_dir,
+        active_timeout_seconds="1",
+        absolute_timeout_seconds="2",
+        command=(sys.executable, "-c", leader_script),
+    )
+
+    assert timed_out.returncode == 124, timed_out.stderr
+    descendant_pid = int(descendant_pid_file.read_text(encoding="utf-8"))
+    assert _pid_has_exited(descendant_pid), (
+        f"descendant {descendant_pid} survived before executor lease release"
+    )
+    recovered = _phase_cli(
+        pool_dir,
+        active_timeout_seconds="2",
+        absolute_timeout_seconds="4",
+        command=(sys.executable, "-c", "print('LEASE-RECOVERED')"),
+    )
+    assert recovered.returncode == 0, recovered.stderr
 
 
 def test_internal_phase_client_rejects_non_finite_deadlines(tmp_path: Path) -> None:

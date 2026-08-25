@@ -7404,13 +7404,13 @@ class TestExtraProviderArgsFromLabels:
         result = SessionLauncher._extra_provider_args_from_labels(["verbose", "priority:high"])  # noqa: SLF001 - unit test targets internal label parser
         assert result == {"verbose": "true"}
 
-    def test_no_verbose_label_returns_none(self):
+    def test_no_verbose_label_returns_empty_arguments(self):
         result = SessionLauncher._extra_provider_args_from_labels(["priority:high", "agent:web"])  # noqa: SLF001 - unit test targets internal label parser
-        assert result is None
+        assert result == {}
 
-    def test_empty_labels_returns_none(self):
+    def test_empty_labels_returns_empty_arguments(self):
         result = SessionLauncher._extra_provider_args_from_labels([])  # noqa: SLF001 - unit test targets internal label parser
-        assert result is None
+        assert result == {}
 
 
 class TestStackRelaunchGate:

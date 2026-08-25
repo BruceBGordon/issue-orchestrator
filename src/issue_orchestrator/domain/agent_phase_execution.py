@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 from .executor import (
@@ -12,6 +13,80 @@ from .executor import (
     ExecutorWorkKey,
 )
 from .terminal_launch import TerminalInteractionIntent, TerminalLaunch
+from .models import AgentConfig, TaskKind
+from .session_run import SessionRunAssets
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderInvocationArgument:
+    """One validated provider argument override supplied by issue policy."""
+
+    name: str
+    value: str
+
+    def __post_init__(self) -> None:
+        if type(self.name) is not str or not self.name:
+            raise ValueError("ProviderInvocationArgument.name must not be empty")
+        if type(self.value) is not str or not self.value:
+            raise ValueError("ProviderInvocationArgument.value must not be empty")
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderInvocationArguments:
+    """Strongly typed, non-null provider argument overrides."""
+
+    entries: tuple[ProviderInvocationArgument, ...]
+
+    @classmethod
+    def from_mapping(cls, values: Mapping[str, str]) -> ProviderInvocationArguments:
+        """Validate one external mapping at the domain boundary."""
+        return cls(
+            tuple(
+                ProviderInvocationArgument(name, value)
+                for name, value in sorted(values.items())
+            )
+        )
+
+    def as_mapping(self) -> dict[str, str]:
+        """Render the provider adapter's keyword-argument input."""
+        return {entry.name: entry.value for entry in self.entries}
+
+
+@dataclass(frozen=True, slots=True)
+class AgentPhaseLaunchRequest:
+    """Complete provider invocation submitted to the phase launch owner."""
+
+    provider_command: str
+    environment_exports: str
+    agent_config: AgentConfig
+    run: SessionRunAssets
+    agent_label: str
+    task_kind: TaskKind
+    provider_arguments: ProviderInvocationArguments
+
+    def __post_init__(self) -> None:
+        for field_name, value in (
+            ("provider_command", self.provider_command),
+            ("environment_exports", self.environment_exports),
+            ("agent_label", self.agent_label),
+        ):
+            if type(value) is not str or not value:
+                raise ValueError(f"AgentPhaseLaunchRequest.{field_name} must not be empty")
+        if type(self.agent_config) is not AgentConfig:
+            raise ValueError(
+                "AgentPhaseLaunchRequest.agent_config must be an AgentConfig"
+            )
+        if type(self.run) is not SessionRunAssets:
+            raise ValueError(
+                "AgentPhaseLaunchRequest.run must be SessionRunAssets"
+            )
+        if type(self.task_kind) is not TaskKind:
+            raise ValueError("AgentPhaseLaunchRequest.task_kind must be TaskKind")
+        if type(self.provider_arguments) is not ProviderInvocationArguments:
+            raise ValueError(
+                "AgentPhaseLaunchRequest.provider_arguments must be "
+                "ProviderInvocationArguments"
+            )
 
 
 @dataclass(frozen=True, slots=True)

@@ -22,6 +22,10 @@ from ..domain.models import (
     TaskKind,
     get_completion_path,
 )
+from ..domain.agent_phase_execution import (
+    AgentPhaseLaunchRequest,
+    ProviderInvocationArguments,
+)
 from ..domain.session_run import SessionRunAssets
 from ..events import EventName
 from ..infra.config import Config
@@ -49,7 +53,6 @@ from .transition_log import log_transition
 from .worktree_context import WorktreeContext
 from .needs_human_block import NeedsHumanCause
 from ..domain.terminal_launch import TerminalLaunch
-from ..domain.terminal_launch import TerminalInteractionIntent
 
 if TYPE_CHECKING:
     from .label_manager import LabelManager
@@ -106,20 +109,10 @@ class PromptPersister(Protocol):
     def __call__(self, run_dir: Path, prompt_text: str) -> str: ...
 
 
-class ProviderCommandWrapper(Protocol):
-    def __call__(self, base_command: str, agent_config: AgentConfig, run_dir: Path, /) -> str: ...
-
-
 class AgentPhaseScheduler(Protocol):
     def __call__(
         self,
-        *,
-        shell_command: str,
-        interaction_intent: TerminalInteractionIntent,
-        agent_config: AgentConfig,
-        run: SessionRunAssets,
-        agent_label: str,
-        task_kind: TaskKind,
+        request: AgentPhaseLaunchRequest,
     ) -> tuple[TerminalLaunch, AgentConfig]: ...
 
 
@@ -164,7 +157,6 @@ class ReworkLaunchDependencies:
     clear_reset_retry_pending_label: GuardLabelClearer
     clear_reset_retry_scratch_pending_label: GuardLabelClearer
     persist_session_prompt: PromptPersister
-    wrap_provider_command: ProviderCommandWrapper
     schedule_agent_phase: AgentPhaseScheduler
     build_session_env: SessionEnvBuilder
     check_provider_ready: ProviderReadinessChecker
@@ -496,8 +488,6 @@ def launch_rework_session(
             pr_number=pr_number,
             task_kind=TaskKind.REWORK.value,
         )
-        interaction_intent = TerminalInteractionIntent.classify(base_command)
-        base_command = deps.wrap_provider_command(base_command, agent_config, run.run_dir)
         completion_path = get_completion_path(rework.agent_type, run_dir=run.run_dir.name)
         deps.session_output.update_manifest(
             run.run_dir,
@@ -515,12 +505,15 @@ def launch_rework_session(
             worktree_path=worktree_path,
         )
         command, session_agent_config = deps.schedule_agent_phase(
-            shell_command=f"{env_exports} && {base_command}",
-            interaction_intent=interaction_intent,
-            agent_config=agent_config,
-            run=run,
-            agent_label=rework.agent_type,
-            task_kind=TaskKind.REWORK,
+            AgentPhaseLaunchRequest(
+                provider_command=base_command,
+                environment_exports=env_exports,
+                agent_config=agent_config,
+                run=run,
+                agent_label=rework.agent_type,
+                task_kind=TaskKind.REWORK,
+                provider_arguments=ProviderInvocationArguments.from_mapping({}),
+            )
         )
         logger.info(
             "[launch] Rework session command: issue=%s pr=%s session=%s worktree=%s completion=%s command=%s",

@@ -333,11 +333,24 @@ class TestValidateRunner:
     ) -> None:
         output_dir = tmp_path / "output"
         child_pid_path = tmp_path / "validation-child.pid"
+        resistant_child = (
+            "import signal, time; "
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)"
+        )
+        cooperative_leader = (
+            "import signal, subprocess, sys; "
+            f"descendant = subprocess.Popen([sys.executable, '-c', {resistant_child!r}], "
+            "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, "
+            "stderr=subprocess.DEVNULL); "
+            f"open({str(child_pid_path)!r}, 'w').write(str(descendant.pid)); "
+            "signal.signal(signal.SIGTERM, lambda *_args: sys.exit(0)); "
+            "print('[validate-timing] START target=duplicate at=one', flush=True); "
+            "print('[validate-timing] START target=duplicate at=two', flush=True); "
+            "signal.pause()"
+        )
         command = (
-            f"printf '%s' \"$$\" > {shlex.quote(str(child_pid_path))}; "
-            "printf '[validate-timing] START target=duplicate at=one\\n'; "
-            "printf '[validate-timing] START target=duplicate at=two\\n'; "
-            "sleep 30"
+            f"exec {shlex.quote(sys.executable)} -c "
+            f"{shlex.quote(cooperative_leader)}"
         )
         sampler_threads_before = {
             thread.ident
@@ -369,7 +382,7 @@ class TestValidateRunner:
             .splitlines()
         ]
         summary = next(record for record in records if record["kind"] == "run_summary")
-        assert summary["exit_code"] == -15
+        assert summary["exit_code"] == 0
 
     def test_appends_run_summary_record_to_shared_git_dir(self, fake_git_repo: Path):
         """Each validate run should append a run summary record."""

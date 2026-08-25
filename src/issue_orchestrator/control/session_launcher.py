@@ -17,7 +17,7 @@ import logging
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional, Callable, Mapping, Sequence
+from typing import TYPE_CHECKING, Optional, Callable, Sequence
 
 if TYPE_CHECKING:
     from ..ports.agent_callback_endpoint import AgentCallbackEndpoint
@@ -48,12 +48,16 @@ from ..domain.models import (
     TaskKind,
     get_completion_path,
 )
+from ..domain.agent_phase_execution import (
+    AgentPhaseLaunchRequest,
+    ProviderInvocationArguments,
+)
 from ..domain.coder_prompt import (
     CoderPromptAddendumUnavailable,
     PreparedCoderPromptAddendum,
 )
 from ..domain.session_run import SessionRunAssets
-from ..domain.terminal_launch import TerminalInteractionIntent, TerminalLaunch
+from ..domain.terminal_launch import TerminalLaunch
 from .agent_phase_launch_planner import AgentPhaseLaunchPlanner
 from .worktree import WorktreeSetupError
 from .worktree_context import WorktreeContext
@@ -206,8 +210,12 @@ class SessionLauncher:
         self._tech_lead_authority = tech_lead_authority
         self._board_snapshot_provider = board_snapshot_provider
         self._agent_callback_endpoint = agent_callback_endpoint
+        self._provider_command_wrapper = ProviderCommandWrapper(
+            self.config.provider_resilience.short_retry
+        )
         self._agent_phase_launch_planner = AgentPhaseLaunchPlanner(
-            agent_phase_command_scheduler
+            agent_phase_command_scheduler,
+            self._provider_command_wrapper,
         )
         self._session_exists = session_exists_fn
         self._create_session = create_session_fn
@@ -234,7 +242,6 @@ class SessionLauncher:
             if provider_resilience
             else None
         )
-        self._provider_command_wrapper: ProviderCommandWrapper | None = None
         self._remove_session_machine = remove_session_machine
         self._send_to_session = send_to_session_fn
         if label_manager is None:
@@ -286,7 +293,7 @@ class SessionLauncher:
         return options
 
     @staticmethod
-    def _extra_provider_args_from_labels(labels: Sequence[str]) -> dict[str, str] | None:
+    def _extra_provider_args_from_labels(labels: Sequence[str]) -> dict[str, str]:
         """Build per-issue provider arg overrides from issue labels.
 
         Currently supports:
@@ -295,7 +302,8 @@ class SessionLauncher:
         args: dict[str, str] = {}
         if "verbose" in labels:
             args["verbose"] = "true"
-        return args or None
+        return args
+
     def _session_identity_launch_metadata(
         self,
         agent_config: "AgentConfig",
@@ -1018,8 +1026,6 @@ class SessionLauncher:
                 evidence_read_roots=evidence_read_roots,
                 extra_provider_args=extra_args,
             )
-            interaction_intent = TerminalInteractionIntent.classify(base_command)
-            base_command = self._wrap_provider_command(base_command, agent_config, run.run_dir, extra_provider_args=extra_args)
             completion_path = get_completion_path(issue.agent_type, run_dir=run.run_dir.name)
             self._session_output.update_manifest(
                 run.run_dir,
@@ -1040,12 +1046,17 @@ class SessionLauncher:
                 labels_str = ",".join(self.config.e2e_pr_labels)
                 env_exports += f" E2E_PR_LABELS='{labels_str}'"
             command, session_agent_config = self._agent_phase_launch_planner.schedule(
-                shell_command=f"{env_exports} && {base_command}",
-                interaction_intent=interaction_intent,
-                agent_config=agent_config,
-                run=run,
-                agent_label=issue.agent_type,
-                task_kind=TaskKind.CODE,
+                AgentPhaseLaunchRequest(
+                    provider_command=base_command,
+                    environment_exports=env_exports,
+                    agent_config=agent_config,
+                    run=run,
+                    agent_label=issue.agent_type,
+                    task_kind=TaskKind.CODE,
+                    provider_arguments=ProviderInvocationArguments.from_mapping(
+                        extra_args
+                    ),
+                )
             )
             logger.info(
                 "[launch] Issue session command: issue=%s session=%s worktree=%s completion=%s command=%s",
@@ -1335,8 +1346,6 @@ class SessionLauncher:
                 task_kind=TaskKind.CODE.value,
                 extra_provider_args=extra_args,
             )
-            interaction_intent = TerminalInteractionIntent.classify(base_command)
-            base_command = self._wrap_provider_command(base_command, agent_config, run.run_dir, extra_provider_args=extra_args)
             completion_path = get_completion_path(agent_label, run_dir=run.run_dir.name)
             self._session_output.update_manifest(
                 run.run_dir,
@@ -1354,12 +1363,17 @@ class SessionLauncher:
                 worktree_path=worktree_path,
             )
             command, session_agent_config = self._agent_phase_launch_planner.schedule(
-                shell_command=f"{env_exports} && {base_command}",
-                interaction_intent=interaction_intent,
-                agent_config=agent_config,
-                run=run,
-                agent_label=agent_label,
-                task_kind=TaskKind.CODE,
+                AgentPhaseLaunchRequest(
+                    provider_command=base_command,
+                    environment_exports=env_exports,
+                    agent_config=agent_config,
+                    run=run,
+                    agent_label=agent_label,
+                    task_kind=TaskKind.CODE,
+                    provider_arguments=ProviderInvocationArguments.from_mapping(
+                        extra_args
+                    ),
+                )
             )
             logger.info(
                 "[launch] Validation retry command: issue=%s session=%s worktree=%s "
@@ -1734,13 +1748,6 @@ class SessionLauncher:
                 task_kind=TaskKind.REVIEW.value,
                 extra_provider_args=extra_args,
             )
-            interaction_intent = TerminalInteractionIntent.classify(base_command)
-            base_command = self._wrap_provider_command(
-                base_command,
-                agent_config,
-                run.run_dir,
-                extra_provider_args=extra_args,
-            )
             completion_path = get_completion_path(agent_label, run_dir=run.run_dir.name)
             self._session_output.update_manifest(
                 run.run_dir,
@@ -1758,12 +1765,17 @@ class SessionLauncher:
                 worktree_path=worktree_path,
             )
             command, session_agent_config = self._agent_phase_launch_planner.schedule(
-                shell_command=f"{env_exports} && {base_command}",
-                interaction_intent=interaction_intent,
-                agent_config=agent_config,
-                run=run,
-                agent_label=agent_label,
-                task_kind=TaskKind.REVIEW,
+                AgentPhaseLaunchRequest(
+                    provider_command=base_command,
+                    environment_exports=env_exports,
+                    agent_config=agent_config,
+                    run=run,
+                    agent_label=agent_label,
+                    task_kind=TaskKind.REVIEW,
+                    provider_arguments=ProviderInvocationArguments.from_mapping(
+                        extra_args
+                    ),
+                )
             )
             logger.info(
                 "[launch] Review session command: issue=%s pr=%s session=%s worktree=%s completion=%s command=%s",
@@ -2035,13 +2047,6 @@ class SessionLauncher:
                 task_kind=TaskKind.RETROSPECTIVE_REVIEW.value,
                 extra_provider_args=extra_args,
             )
-            interaction_intent = TerminalInteractionIntent.classify(base_command)
-            base_command = self._wrap_provider_command(
-                base_command,
-                agent_config,
-                run.run_dir,
-                extra_provider_args=extra_args,
-            )
             completion_path = get_completion_path(agent_label, run_dir=run.run_dir.name)
             self._session_output.update_manifest(
                 run.run_dir,
@@ -2059,12 +2064,17 @@ class SessionLauncher:
                 worktree_path=worktree_path,
             )
             command, session_agent_config = self._agent_phase_launch_planner.schedule(
-                shell_command=f"{env_exports} && {base_command}",
-                interaction_intent=interaction_intent,
-                agent_config=agent_config,
-                run=run,
-                agent_label=agent_label,
-                task_kind=TaskKind.RETROSPECTIVE_REVIEW,
+                AgentPhaseLaunchRequest(
+                    provider_command=base_command,
+                    environment_exports=env_exports,
+                    agent_config=agent_config,
+                    run=run,
+                    agent_label=agent_label,
+                    task_kind=TaskKind.RETROSPECTIVE_REVIEW,
+                    provider_arguments=ProviderInvocationArguments.from_mapping(
+                        extra_args
+                    ),
+                )
             )
             logger.info(
                 "[launch] Retrospective review command: issue=%s session=%s worktree=%s "
@@ -2166,7 +2176,6 @@ class SessionLauncher:
             clear_reset_retry_pending_label=self._clear_reset_retry_pending_label,
             clear_reset_retry_scratch_pending_label=self._clear_reset_retry_scratch_pending_label,
             persist_session_prompt=self._persist_session_prompt,
-            wrap_provider_command=self._wrap_provider_command,
             schedule_agent_phase=self._agent_phase_launch_planner.schedule,
             build_session_env=self._build_session_env,
             check_provider_ready=self._check_provider_ready,
@@ -2197,33 +2206,6 @@ class SessionLauncher:
         msg = f"Read and follow your instructions in {prompt_path}"
         sent = self._send_to_session(session_name, msg)
         logger.info("[launch] Sent initial prompt to interactive session %s: success=%s", session_name, sent)
-
-    def _wrap_provider_command(
-        self,
-        base_command: str,
-        agent_config: "AgentConfig",
-        run_dir: Path,
-        *,
-        extra_provider_args: Mapping[str, object] | None = None,
-    ) -> str:
-        """Wrap provider command with retry/circuit reporting.
-
-        Interactive providers are returned as-is — they manage their own
-        lifecycle and don't use the provider_runner subprocess wrapper.
-        """
-        return self._get_provider_command_wrapper().wrap(
-            base_command,
-            agent_config,
-            run_dir,
-            extra_provider_args=extra_provider_args,
-        )
-
-    def _get_provider_command_wrapper(self) -> ProviderCommandWrapper:
-        if self._provider_command_wrapper is None:
-            self._provider_command_wrapper = ProviderCommandWrapper(
-                self.config.provider_resilience.short_retry
-            )
-        return self._provider_command_wrapper
 
     def _check_provider_ready(self, provider: str | None, issue_number: int) -> Optional["LaunchResult"]:
         """Ask the provider launch gate whether this provider can do work now."""

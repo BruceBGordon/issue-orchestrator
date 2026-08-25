@@ -294,6 +294,11 @@ class SessionRestorer:
         agent_label_val = issue_obj.agent_type or next(
             iter(self.config.agents.keys()), "unknown"
         )
+        # A monotonic instant cannot survive an orchestrator process restart.
+        # Restoration therefore starts a fresh conservative outer watchdog.
+        # The independently running executor retains its original monotonic
+        # absolute deadline, so recovery can extend observation but can never
+        # kill that executor early.
         return Session(
             key=session_key,
             issue=issue_obj,

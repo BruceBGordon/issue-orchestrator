@@ -488,7 +488,11 @@ class TestErrorRecovery:
                 config, MockRepositoryHost(), MockWorkingCopy()
             ).restore_sessions(discovered, already_tracked=[])
 
-    def test_allows_live_session_launched_under_current_mode(self, tmp_path):
+    def test_allows_live_session_launched_under_current_mode(
+        self,
+        tmp_path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
         """Surviving sessions remain restorable after a same-mode relaunch."""
         worktree = tmp_path / "repo-123"
         worktree.mkdir()
@@ -530,11 +534,19 @@ class TestErrorRecovery:
             )
         ]
 
+        monkeypatch.setattr(
+            "issue_orchestrator.domain.models.time.monotonic",
+            lambda: 100.0,
+        )
         restored = SessionRestorer(config, repo_host, working_copy).restore_sessions(
             discovered, already_tracked=[]
         )
 
         assert [session.terminal_id for session in restored] == ["issue-123"]
+        assert restored[0].runtime_minutes == 0, (
+            "a restored session must receive a fresh conservative monotonic "
+            "outer-watchdog budget"
+        )
 
     @pytest.mark.parametrize(
         ("recorded_config", "recorded_fingerprint"),
