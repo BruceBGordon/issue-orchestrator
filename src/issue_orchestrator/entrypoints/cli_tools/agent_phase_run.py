@@ -16,6 +16,7 @@ from ...domain.executor import (
     ExecutorWorkKey,
 )
 from ..bootstrap import build_executor
+from ..command_exit_status import forward_command_exit_status
 
 
 def _positive_float(raw: str) -> float:
@@ -63,7 +64,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
     except (FileNotFoundError, OSError, RuntimeError, ValueError) as exc:
         print(f"agent phase execution failed: {exc}")
         return 2
-    return result.exit_code
+    return forward_command_exit_status(result.exit_code)
 
 
 if __name__ == "__main__":

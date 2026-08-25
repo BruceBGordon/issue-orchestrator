@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 
@@ -189,6 +190,34 @@ def test_failed_commands_remain_diagnostic_but_do_not_enter_learning_history(
     assert "successful_samples=0" in failed_completion
     assert "successful_samples=0" in succeeding_enqueue
     assert "successful_samples=1" in succeeding_completion
+
+
+@pytest.mark.skipif(os.name != "posix", reason="asserts POSIX signal forwarding")
+def test_run_forwards_the_command_termination_signal(tmp_path: Path) -> None:
+    pool_dir = tmp_path / "pool"
+    terminated = _run_cli(
+        pool_dir,
+        "executor-run",
+        "--work-key",
+        "io:signal-status",
+        "--min-concurrency",
+        "1",
+        "--max-concurrency",
+        "1",
+        "--group",
+        "io-validation-signal",
+        "--",
+        sys.executable,
+        "-c",
+        "import os, signal; os.kill(os.getpid(), signal.SIGTERM)",
+    )
+
+    assert terminated.returncode == -signal.SIGTERM
+    events = _run_cli(pool_dir, "executor-events", "--limit", "10")
+    completion = next(
+        line for line in events.stdout.splitlines() if " completed " in line
+    )
+    assert "exit=-15" in completion
 
 
 def test_command_lifecycle_failure_is_durable_and_human_traceable(

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 
@@ -112,6 +113,25 @@ def test_direct_executor_preserves_command_exit_status() -> None:
     )
 
     assert result.returncode == 17
+
+
+def test_direct_executor_preserves_command_termination_signal() -> None:
+    result = _run_direct(
+        "--min-concurrency",
+        "1",
+        "--max-concurrency",
+        "1",
+        "--work-key",
+        "porchpin:tests",
+        "--group",
+        "porchpin-validation-17",
+        "--",
+        sys.executable,
+        "-c",
+        "import os, signal; os.kill(os.getpid(), signal.SIGTERM)",
+    )
+
+    assert result.returncode == -signal.SIGTERM
 
 
 def test_direct_executor_rejects_invalid_contract() -> None:

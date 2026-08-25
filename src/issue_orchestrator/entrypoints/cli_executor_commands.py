@@ -33,6 +33,7 @@ from ..domain.executor_monitoring import (
     ExecutorWorkWaiting,
     ExecutorHostLoad,
 )
+from .command_exit_status import forward_command_exit_status
 
 EXECUTOR_GROUP_ENV = "ISSUE_ORCHESTRATOR_EXECUTOR_GROUP"
 
@@ -72,7 +73,7 @@ def cmd_executor_run(args: argparse.Namespace) -> int:
     except (FileNotFoundError, OSError, RuntimeError, ValueError) as exc:
         console.print(f"[red]executor-run failed: {exc}[/red]")
         return 2
-    return result.exit_code
+    return forward_command_exit_status(result.exit_code)
 
 
 def cmd_executor_policy(args: argparse.Namespace) -> int:

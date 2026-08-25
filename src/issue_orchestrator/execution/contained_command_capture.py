@@ -163,8 +163,7 @@ class PosixContainedCommandCapture:
             )
         if not isinstance(output, ContainedCommandOutput):
             raise ValueError(
-                "PosixContainedCommandCapture.capture requires "
-                "ContainedCommandOutput"
+                "PosixContainedCommandCapture.capture requires ContainedCommandOutput"
             )
         if not isinstance(line_observer, ContainedCommandLineObserver):
             raise ValueError(
@@ -224,7 +223,14 @@ class PosixContainedCommandCapture:
             output,
             line_observer,
         )
-        pump.start()
+        try:
+            pump.start()
+        except BaseException as error:
+            return self._abort_without_pump(
+                process,
+                leader,
+                ContainedCommandFailure(error),
+            )
         try:
             supervision = self._process_group_supervisor.supervise(
                 leader,
@@ -273,18 +279,53 @@ class PosixContainedCommandCapture:
         try:
             termination = self._process_group_supervisor.abort(leader)
         except BaseException as cleanup_error:
+            stdout_close_failure = self._close_unpumped_stdout(process)
             return ContainedCommandCleanupFailed(
                 child=ContainedCommandExitUnknown(process.pid),
                 capture=ContainedCommandCaptureInterrupted(capture_failure),
-                cleanup_failure=ContainedCommandFailure(cleanup_error),
+                cleanup_failure=self._combine_failures(
+                    ContainedCommandFailure(cleanup_error),
+                    stdout_close_failure,
+                    "contained command group abort and stdout close both failed",
+                ),
                 metrics=ContainedCommandMetrics(line_count=0, byte_count=0),
             )
         process.returncode = termination.leader_exit_code
+        stdout_close_failure = self._close_unpumped_stdout(process)
         return ContainedCommandCaptureFailed(
             child=ContainedCommandExited(process.pid, process.returncode),
             cleanup=ContainedCommandCaptureAborted(),
-            failure=capture_failure,
+            failure=self._combine_failures(
+                capture_failure,
+                stdout_close_failure,
+                "contained command capture and stdout close both failed",
+            ),
             metrics=ContainedCommandMetrics(line_count=0, byte_count=0),
+        )
+
+    @staticmethod
+    def _close_unpumped_stdout(
+        process: subprocess.Popen[str],
+    ) -> ContainedCommandFailure | None:
+        stdout = process.stdout
+        if stdout is None:
+            return None
+        try:
+            stdout.close()
+        except BaseException as error:
+            return ContainedCommandFailure(error)
+        return None
+
+    @staticmethod
+    def _combine_failures(
+        primary: ContainedCommandFailure,
+        secondary: ContainedCommandFailure | None,
+        message: str,
+    ) -> ContainedCommandFailure:
+        if secondary is None:
+            return primary
+        return ContainedCommandFailure(
+            BaseExceptionGroup(message, (primary.error, secondary.error))
         )
 
     def _recover_after_supervision_failure(
