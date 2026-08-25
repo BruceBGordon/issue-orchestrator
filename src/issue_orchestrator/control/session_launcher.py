@@ -15,7 +15,6 @@ the orchestrator focused on coordination and main loop logic.
 
 import logging
 import time
-from dataclasses import replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional, Callable, Mapping, Sequence
@@ -54,9 +53,8 @@ from ..domain.coder_prompt import (
     PreparedCoderPromptAddendum,
 )
 from ..domain.session_run import SessionRunAssets
-from ..domain.agent_phase_execution import AgentPhaseRunSpecification
 from ..domain.terminal_launch import TerminalInteractionIntent, TerminalLaunch
-from ..domain.executor import ExecutorFairnessGroup, ExecutorWorkKey
+from .agent_phase_launch_planner import AgentPhaseLaunchPlanner
 from .worktree import WorktreeSetupError
 from .worktree_context import WorktreeContext
 from ..infra.validation_state import DEFAULT_RETRY_TEMPLATE, _truncate_with_tail
@@ -208,7 +206,9 @@ class SessionLauncher:
         self._tech_lead_authority = tech_lead_authority
         self._board_snapshot_provider = board_snapshot_provider
         self._agent_callback_endpoint = agent_callback_endpoint
-        self._agent_phase_command_scheduler = agent_phase_command_scheduler
+        self._agent_phase_launch_planner = AgentPhaseLaunchPlanner(
+            agent_phase_command_scheduler
+        )
         self._session_exists = session_exists_fn
         self._create_session = create_session_fn
         self._get_issue_machine = get_issue_machine
@@ -1018,6 +1018,7 @@ class SessionLauncher:
                 evidence_read_roots=evidence_read_roots,
                 extra_provider_args=extra_args,
             )
+            interaction_intent = TerminalInteractionIntent.classify(base_command)
             base_command = self._wrap_provider_command(base_command, agent_config, run.run_dir, extra_provider_args=extra_args)
             completion_path = get_completion_path(issue.agent_type, run_dir=run.run_dir.name)
             self._session_output.update_manifest(
@@ -1038,8 +1039,9 @@ class SessionLauncher:
             if self.config.e2e_pr_labels:
                 labels_str = ",".join(self.config.e2e_pr_labels)
                 env_exports += f" E2E_PR_LABELS='{labels_str}'"
-            command, session_agent_config = self._schedule_agent_phase(
+            command, session_agent_config = self._agent_phase_launch_planner.schedule(
                 shell_command=f"{env_exports} && {base_command}",
+                interaction_intent=interaction_intent,
                 agent_config=agent_config,
                 run=run,
                 agent_label=issue.agent_type,
@@ -1333,6 +1335,7 @@ class SessionLauncher:
                 task_kind=TaskKind.CODE.value,
                 extra_provider_args=extra_args,
             )
+            interaction_intent = TerminalInteractionIntent.classify(base_command)
             base_command = self._wrap_provider_command(base_command, agent_config, run.run_dir, extra_provider_args=extra_args)
             completion_path = get_completion_path(agent_label, run_dir=run.run_dir.name)
             self._session_output.update_manifest(
@@ -1350,8 +1353,9 @@ class SessionLauncher:
                 run_assets=run,
                 worktree_path=worktree_path,
             )
-            command, session_agent_config = self._schedule_agent_phase(
+            command, session_agent_config = self._agent_phase_launch_planner.schedule(
                 shell_command=f"{env_exports} && {base_command}",
+                interaction_intent=interaction_intent,
                 agent_config=agent_config,
                 run=run,
                 agent_label=agent_label,
@@ -1730,6 +1734,7 @@ class SessionLauncher:
                 task_kind=TaskKind.REVIEW.value,
                 extra_provider_args=extra_args,
             )
+            interaction_intent = TerminalInteractionIntent.classify(base_command)
             base_command = self._wrap_provider_command(
                 base_command,
                 agent_config,
@@ -1752,8 +1757,9 @@ class SessionLauncher:
                 run_assets=run,
                 worktree_path=worktree_path,
             )
-            command, session_agent_config = self._schedule_agent_phase(
+            command, session_agent_config = self._agent_phase_launch_planner.schedule(
                 shell_command=f"{env_exports} && {base_command}",
+                interaction_intent=interaction_intent,
                 agent_config=agent_config,
                 run=run,
                 agent_label=agent_label,
@@ -2029,6 +2035,7 @@ class SessionLauncher:
                 task_kind=TaskKind.RETROSPECTIVE_REVIEW.value,
                 extra_provider_args=extra_args,
             )
+            interaction_intent = TerminalInteractionIntent.classify(base_command)
             base_command = self._wrap_provider_command(
                 base_command,
                 agent_config,
@@ -2051,8 +2058,9 @@ class SessionLauncher:
                 run_assets=run,
                 worktree_path=worktree_path,
             )
-            command, session_agent_config = self._schedule_agent_phase(
+            command, session_agent_config = self._agent_phase_launch_planner.schedule(
                 shell_command=f"{env_exports} && {base_command}",
+                interaction_intent=interaction_intent,
                 agent_config=agent_config,
                 run=run,
                 agent_label=agent_label,
@@ -2159,7 +2167,7 @@ class SessionLauncher:
             clear_reset_retry_scratch_pending_label=self._clear_reset_retry_scratch_pending_label,
             persist_session_prompt=self._persist_session_prompt,
             wrap_provider_command=self._wrap_provider_command,
-            schedule_agent_phase=self._schedule_agent_phase,
+            schedule_agent_phase=self._agent_phase_launch_planner.schedule,
             build_session_env=self._build_session_env,
             check_provider_ready=self._check_provider_ready,
             resolve_stack_decision=self._dependency_gate.stack_base_decision_for_issue,
@@ -2208,36 +2216,6 @@ class SessionLauncher:
             agent_config,
             run_dir,
             extra_provider_args=extra_provider_args,
-        )
-
-    def _schedule_agent_phase(
-        self,
-        *,
-        shell_command: str,
-        agent_config: "AgentConfig",
-        run: SessionRunAssets,
-        agent_label: str,
-        task_kind: TaskKind,
-    ) -> tuple[TerminalLaunch, "AgentConfig"]:
-        """Submit one complete phase and give its session the absolute bound."""
-        specification = AgentPhaseRunSpecification.from_timeout_minutes(
-            work_key=ExecutorWorkKey(
-                f"agent-phase:{agent_label}:{task_kind.value}"
-            ),
-            fairness_group=ExecutorFairnessGroup(
-                f"agent:{run.run_id}:{run.session_name}"
-            ),
-            active_timeout_minutes=agent_config.timeout_minutes,
-            interaction_intent=TerminalInteractionIntent.classify(agent_config.command),
-            shell_command=shell_command,
-        )
-        scheduled = self._agent_phase_command_scheduler.schedule(specification)
-        return (
-            scheduled.terminal_launch,
-            replace(
-                agent_config,
-                timeout_minutes=scheduled.absolute_timeout_minutes,
-            ),
         )
 
     def _get_provider_command_wrapper(self) -> ProviderCommandWrapper:

@@ -17,7 +17,6 @@ if TYPE_CHECKING:
         TechLeadLaunchScope,
         TechLeadSessionGeneration,
     )
-    from ..domain.terminal_launch import TerminalLaunch
     from ..ports.operator_issue_commands import OperatorIssueCommands
     from ..ports.session_runner import DiscoveredSession
 
@@ -85,7 +84,6 @@ from ..control.session_routing import (
     recover_unresolved_work as _recover_unresolved_work,
     restore_running_sessions as _restore_running_sessions,
     parse_session_ref as _parse_session_ref,
-    create_session as _create_session,
     session_exists as _session_exists,
     kill_session as _kill_session,
     orchestrator_launch_session as _launch_session,
@@ -314,7 +312,6 @@ class Orchestrator:
         return self.deps.session_launcher_factory(
             board_snapshot_provider=StateBoardSnapshotProvider(self.deps.board_snapshot_builder, lambda: self.state),
             session_exists_fn=lambda name: _session_exists(name, self.deps.session_manager, self.deps.events),
-            create_session_fn=self._create_session,
             get_issue_machine=self._get_issue_machine,
             get_session_machine=self._get_session_machine,
             get_review_machine=self._get_review_machine,
@@ -399,22 +396,6 @@ class Orchestrator:
 
     def _parse_session_ref(self, session_name: str, operation: str) -> "SessionRef":
         return _parse_session_ref(session_name, operation, self.deps.events)
-
-    def _create_session(
-        self,
-        name: str,
-        launch: "TerminalLaunch",
-        wd: Path,
-        title: str | None = None,
-    ) -> bool:
-        return _create_session(
-            name,
-            launch,
-            wd,
-            title,
-            self.deps.session_manager,
-            self.deps.events,
-        )
 
     def _session_exists(self, name: str) -> bool:
         return _session_exists(name, self.deps.session_manager, self.deps.events)

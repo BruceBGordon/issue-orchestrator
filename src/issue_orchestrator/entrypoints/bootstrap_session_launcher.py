@@ -9,9 +9,9 @@ rather than handing the whole bundle across a layer boundary
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Optional
 
+from ..control.named_session_creator import NamedSessionCreator
 from ..control.needs_human_block import SharedNeedsHumanBlock
 from ..control.session_launcher import SessionLauncher
 from ..ports.coder_prompt import (
@@ -21,7 +21,6 @@ from ..ports.coder_prompt import (
 from ..ports.provider_readiness import ProviderReadinessProbe
 
 if TYPE_CHECKING:
-    from ..domain.terminal_launch import TerminalLaunch
     from ..control.dependency_evaluator import DependencyEvaluator
     from ..domain.state_machines.issue_machine import IssueStateMachine
     from ..domain.state_machines.review_machine import ReviewStateMachine
@@ -58,12 +57,12 @@ def build_session_launcher_factory(
     agent_phase_command_scheduler: "AgentPhaseCommandScheduler",
 ) -> "SessionLauncherFactory":
     """Bind the application dependencies; return the facade-facing factory."""
+    create_session = NamedSessionCreator(session_manager, events)
 
     def _factory(
         *,
         board_snapshot_provider: "BoardSnapshotProvider",
         session_exists_fn: Callable[[str], bool],
-        create_session_fn: Callable[[str, "TerminalLaunch", Path, str | None], bool],
         get_issue_machine: Callable[["IssueProtocol"], Optional["IssueStateMachine"]],
         get_session_machine: Callable[[str, int, int], Optional["SessionStateMachine"]],
         get_review_machine: Callable[[int, int], Optional["ReviewStateMachine"]],
@@ -75,7 +74,7 @@ def build_session_launcher_factory(
             worktree_manager, working_copy, command_runner, session_output,
             manifest_downloader, tech_lead_authority,
             session_exists_fn,
-            create_session_fn, get_issue_machine, get_session_machine,
+            create_session, get_issue_machine, get_session_machine,
             get_review_machine, refresh_issue_fn, dependency_evaluator,
             claim_manager=claim_manager,
             provider_resilience=provider_resilience,

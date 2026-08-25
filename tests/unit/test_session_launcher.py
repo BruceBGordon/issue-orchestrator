@@ -923,6 +923,47 @@ class TestLaunchIssueSession:
             "5400.0"
         )
 
+    @pytest.mark.parametrize(
+        ("provider", "custom_command", "expected_intent"),
+        [
+            (
+                "claude-code",
+                None,
+                TerminalInteractionIntent.CLAUDE_TRUST_WORKTREE,
+            ),
+            (
+                "codex",
+                None,
+                TerminalInteractionIntent.CODEX_TRUST_WORKTREE,
+            ),
+            (None, "custom-agent '{initial_prompt}'", TerminalInteractionIntent.NONE),
+        ],
+    )
+    def test_issue_phase_classifies_the_provider_built_command_before_wrapping(
+        self,
+        launcher_bundle,
+        sample_issue,
+        provider,
+        custom_command,
+        expected_intent,
+    ):
+        agent_config = launcher_bundle.launcher.config.agents["agent:web"]
+        agent_config.provider = provider
+        if custom_command is not None:
+            agent_config.command = custom_command
+
+        result = launcher_bundle.launcher.launch_issue_session(
+            sample_issue,
+            active_sessions=[],
+        )
+
+        assert result.success is True
+        launch = launcher_bundle.create_session_calls[0]["launch"]
+        assert launch.interaction_intent is expected_intent
+        assert TerminalInteractionIntent.classify(launch.shell_command) is (
+            TerminalInteractionIntent.NONE
+        )
+
     def test_internal_review_instructions_reach_initial_coder_command(
         self,
         internal_review_launcher_bundle,

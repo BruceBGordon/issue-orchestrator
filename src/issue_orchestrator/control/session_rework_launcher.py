@@ -49,6 +49,7 @@ from .transition_log import log_transition
 from .worktree_context import WorktreeContext
 from .needs_human_block import NeedsHumanCause
 from ..domain.terminal_launch import TerminalLaunch
+from ..domain.terminal_launch import TerminalInteractionIntent
 
 if TYPE_CHECKING:
     from .label_manager import LabelManager
@@ -114,6 +115,7 @@ class AgentPhaseScheduler(Protocol):
         self,
         *,
         shell_command: str,
+        interaction_intent: TerminalInteractionIntent,
         agent_config: AgentConfig,
         run: SessionRunAssets,
         agent_label: str,
@@ -494,6 +496,7 @@ def launch_rework_session(
             pr_number=pr_number,
             task_kind=TaskKind.REWORK.value,
         )
+        interaction_intent = TerminalInteractionIntent.classify(base_command)
         base_command = deps.wrap_provider_command(base_command, agent_config, run.run_dir)
         completion_path = get_completion_path(rework.agent_type, run_dir=run.run_dir.name)
         deps.session_output.update_manifest(
@@ -513,6 +516,7 @@ def launch_rework_session(
         )
         command, session_agent_config = deps.schedule_agent_phase(
             shell_command=f"{env_exports} && {base_command}",
+            interaction_intent=interaction_intent,
             agent_config=agent_config,
             run=run,
             agent_label=rework.agent_type,

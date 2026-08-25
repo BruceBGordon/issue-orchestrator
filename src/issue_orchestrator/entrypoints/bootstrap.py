@@ -19,9 +19,7 @@ from __future__ import annotations
 
 import logging
 import os
-import sys
 import time
-from pathlib import Path
 from typing import TYPE_CHECKING, cast
 from uuid import uuid4
 
@@ -39,9 +37,10 @@ from .bootstrap_environment import (
 )
 from .bootstrap_claims import ClaimComponents, assemble_claim_components, lease_config_from
 from .bootstrap_dependencies import Dependencies as Dependencies
-from .bootstrap_executor_platform import (
-    raise_missing_posix_executor_dependency,
-    require_posix_executor,
+from .bootstrap_host_executor import (
+    build_agent_phase_command_scheduler,
+    build_executor as build_executor,
+    build_executor_monitor as build_executor_monitor,
 )
 from .bootstrap_pair_registry import build_pair_registry_with_worktree_hook
 from .bootstrap_pending_work import (
@@ -89,15 +88,6 @@ from ..execution import (
     DefaultTimelineWriter,
 )
 from ..execution.gh_guard import install_gh_guard
-from ..execution.agent_phase_command_scheduler import (
-    HostAgentPhaseCommandScheduler,
-)
-from ..domain.agent_phase_execution import AgentPhaseOuterWatchdogPolicy
-from ..domain.executor import (
-    ExecutorHistoryRetentionPolicy,
-    ExecutorProcessTerminationPolicy,
-)
-from ..domain.terminal_launch import TerminalShell
 from ..events import EventHub, SequencedEventSink
 from ..control import (
     Planner,
@@ -150,7 +140,6 @@ from ..ports.run_ledger_store import SingleInstanceRunLedgerStore
 from ..domain.lease_config import LeaseConfig
 
 if TYPE_CHECKING:
-    from ..control.executor_admission import ExecutorWorkDemandEstimator
     from ..ports.label_set import LabelSet
     from ..control.label_manager import LabelManager
     from ..infra.orchestrator import Orchestrator
@@ -159,104 +148,9 @@ if TYPE_CHECKING:
     from ..ports.fresh_issue_reader import FreshIssueReader
     from ..ports.attempt_store import AttemptStore
     from ..ports.tech_lead_authority import TechLeadAuthorityStore
-    from ..ports.executor import Executor
-    from ..ports.executor_monitor import ExecutorMonitor
 
 logger = logging.getLogger(__name__)
-_EXECUTOR_PROCESS_TERMINATION_POLICY = ExecutorProcessTerminationPolicy(
-    graceful_shutdown_seconds=2.0
-)
-_EXECUTOR_HISTORY_RETENTION_POLICY = ExecutorHistoryRetentionPolicy(
-    maximum_profiles=2048,
-    maximum_observations_per_profile=24,
-)
-_AGENT_PHASE_OUTER_WATCHDOG_POLICY = AgentPhaseOuterWatchdogPolicy(
-    executor_termination=_EXECUTOR_PROCESS_TERMINATION_POLICY,
-    observer_margin_seconds=58.0,
-)
-_AGENT_PHASE_COMMAND_SCHEDULER = HostAgentPhaseCommandScheduler(
-    python_executable=Path(sys.executable),
-    application_shell=TerminalShell.BASH,
-    outer_watchdog_policy=_AGENT_PHASE_OUTER_WATCHDOG_POLICY,
-)
-
-
-def build_executor() -> Executor:
-    """Compose the machine-wide command executor behind its public port."""
-    require_posix_executor()
-    from ..control.executor_admission import (
-        ExecutorAdmissionPolicy,
-        ExecutorSaturationPolicy,
-    )
-
-    try:
-        from ..execution.host_executor import (
-            HostExecutor,
-            ExecutorRequestIdentityFactory,
-            default_executor_pool_dir,
-            detected_executor_cpu_count,
-        )
-        from ..adapters.host_cpu_utilization import (
-            SystemHostCpuUtilizationObserver,
-        )
-    except ModuleNotFoundError as exc:
-        raise_missing_posix_executor_dependency(exc)
-        raise AssertionError("unreachable after missing executor dependency")
-    return HostExecutor(
-        pool_dir=default_executor_pool_dir(),
-        host_cpu_slots=detected_executor_cpu_count(),
-        admission_policy=ExecutorAdmissionPolicy(
-            ExecutorSaturationPolicy(maximum_busy_percent=95)
-        ),
-        demand_estimator=_build_executor_demand_estimator(),
-        host_cpu_observer=SystemHostCpuUtilizationObserver(),
-        request_identity_factory=ExecutorRequestIdentityFactory(
-            wall_time_nanoseconds=time.time_ns,
-            monotonic_nanoseconds=time.monotonic_ns,
-            process_id=os.getpid,
-            request_nonce=lambda: uuid4().hex,
-        ),
-        process_termination_policy=_EXECUTOR_PROCESS_TERMINATION_POLICY,
-        history_retention_policy=_EXECUTOR_HISTORY_RETENTION_POLICY,
-        queue_settle_seconds=0.1,
-        queue_poll_seconds=0.05,
-    )
-
-
-def build_executor_monitor() -> ExecutorMonitor:
-    """Compose the read-only executor activity monitor."""
-    require_posix_executor()
-    try:
-        from ..execution.host_executor import (
-            HostExecutorMonitor,
-            default_executor_pool_dir,
-            detected_executor_cpu_count,
-        )
-    except ModuleNotFoundError as exc:
-        raise_missing_posix_executor_dependency(exc)
-        raise AssertionError("unreachable after missing executor dependency")
-    return HostExecutorMonitor(
-        default_executor_pool_dir(),
-        detected_executor_cpu_count(),
-        _build_executor_demand_estimator(),
-        _EXECUTOR_HISTORY_RETENTION_POLICY,
-    )
-
-
-def _build_executor_demand_estimator() -> ExecutorWorkDemandEstimator:
-    """Construct the one learning policy shared by executor and monitor."""
-    from ..control.executor_admission import (
-        ExecutorLearningPolicy,
-        ExecutorWorkDemandEstimator,
-    )
-
-    return ExecutorWorkDemandEstimator(
-        ExecutorLearningPolicy(
-            cold_start_cores_per_concurrency=1.0,
-            minimum_cores_per_concurrency=0.05,
-            recent_observation_weight=0.3,
-        )
-    )
+_AGENT_PHASE_COMMAND_SCHEDULER = build_agent_phase_command_scheduler()
 
 
 def _create_github_auth(repo: str, config: Config) -> GitHubAuth:

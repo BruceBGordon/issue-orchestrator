@@ -114,6 +114,23 @@ class SessionContext:
     working_dir: Path
     title: Optional[str] = None
 
+    @classmethod
+    def for_bash_command(
+        cls,
+        *,
+        ref: SessionRef,
+        shell_command: str,
+        working_dir: Path,
+        title: str | None,
+    ) -> "SessionContext":
+        """Classify one unwrapped Bash command at the context boundary."""
+        return cls(
+            ref=ref,
+            launch=TerminalLaunch.classified(shell_command, TerminalShell.BASH),
+            working_dir=working_dir,
+            title=title,
+        )
+
 
 class SessionManager:
     """Manages terminal session lifecycle.
