@@ -11,7 +11,6 @@ from ..domain.contained_command import (
     ContainedCommandCaptureAborted,
     ContainedCommandCaptureFailed,
     ContainedCommandCaptureInterrupted,
-    ContainedCommandCaptureSucceeded,
     ContainedCommandCleanupFailed,
     ContainedCommandCleanupNotStarted,
     ContainedCommandCompleted,
@@ -418,33 +417,26 @@ class PosixContainedCommandCapture:
         pump: _CapturedOutputPump,
         supervision_failure: ContainedCommandFailure,
     ) -> ContainedCommandResult:
-        capture = (
-            ContainedCommandCaptureSucceeded()
-            if pump.failure is None
-            else ContainedCommandCaptureInterrupted(pump.failure)
-        )
+        if pump.failure is None:
+            failure = supervision_failure
+        else:
+            failure = _combine_failures(
+                pump.failure,
+                supervision_failure,
+                "output capture and command supervision both failed",
+            )
         try:
             termination = self._process_group_supervisor.abort(leader)
         except BaseException as cleanup_error:
             pump.detach_after_cleanup_failure()
             return ContainedCommandCleanupFailed(
                 child=ContainedCommandExitUnknown(process.pid),
-                capture=(
-                    ContainedCommandCaptureInterrupted(supervision_failure)
-                    if type(capture) is ContainedCommandCaptureSucceeded
-                    else capture
-                ),
+                capture=ContainedCommandCaptureInterrupted(failure),
                 cleanup_failure=ContainedCommandFailure(cleanup_error),
                 metrics=pump.metrics,
             )
         process.returncode = termination.leader_exit_code
         finalization = pump.finalize_after_containment()
-        if type(capture) is ContainedCommandCaptureSucceeded:
-            failure = supervision_failure
-        elif type(capture) is ContainedCommandCaptureInterrupted:
-            failure = capture.failure
-        else:
-            raise AssertionError("supervision recovery requires typed capture fact")
         if type(finalization) is _OutputPumpFinalizationFailed:
             failure = _combine_failures(
                 failure,

@@ -516,8 +516,9 @@ class TestValidateRunner:
         assert summary["lifecycle"] == "capture-failed"
         assert summary["process_group_cleanup"] == "cleanup-failed"
         assert summary["capture_status"] == "failed"
-        assert summary["capture_error_type"] == "ValueError"
+        assert summary["capture_error_type"] == "ExceptionGroup"
         assert "duplicate START marker" in summary["capture_error_repr"]
+        assert "injected supervision failure" in summary["capture_error_repr"]
         assert summary["cleanup_error_type"] == "RuntimeError"
         assert "injected cleanup failure" in summary["cleanup_error_repr"]
         assert summary["child_outcome"] == "exit-unknown"
