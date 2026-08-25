@@ -149,16 +149,23 @@ changes, command observations, learned-demand changes, successful sample
 counts, native CPU samples, decision reasons, admission/command deadline
 expirations, and host load. `executor-events` queries it through the read-only
 `ExecutorMonitor` port; the CLI does not parse persistence or executor locks.
-`executor-status` projects current policy, successful learning, explicitly
-excluded failure history, and the exact learning fingerprint through the same
-port. A live status projection and UI remain deferred to #7105.
+`executor-status` projects current policy, global successful/excluded sample
+counts, the exact global learning fingerprint, and a filtered, paginated page
+of human-readable profiles through the same port. Profile retention is bounded
+globally as well as per work identity. A live status projection and UI remain
+deferred to #7105.
 
 The detached validation profiler preserves evidence before deleting its fresh
 worktrees and executor pool. Each command gets a durable combined-output log,
-and each aggregate gets a bounded typed event snapshot whose records carry an
-explicit event discriminator. The snapshot says when its 1,000-event query may
-have truncated the beginning. Thus a slow aggregate remains attributable after
-the disposable execution environment has gone away.
+and each aggregate gets a bounded typed event suffix selected by its exact,
+human-readable fairness-group identity. Unrelated interleaved work cannot enter
+that evidence. Every record carries an explicit event discriminator, and the
+snapshot reports both its query limit and the full matching count so truncation
+of the beginning is explicit. The profiler pins discovery and every worktree to
+one resolved commit SHA, fails at the first unsuccessful stage, and writes a
+typed partial report instead of deriving comparisons from incomplete evidence.
+Thus a slow or failed aggregate remains attributable after the disposable
+execution environment has gone away.
 
 ## Verification model
 

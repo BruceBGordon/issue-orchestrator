@@ -575,6 +575,22 @@ def _register_utility_commands(subparsers, handlers: CLICommandHandlers) -> None
         "executor-status",
         help="Show machine-wide executor policy and learned work profiles",
     )
+    executor_status_parser.add_argument(
+        "--repository",
+        help="Show only profiles with this exact repository label",
+    )
+    executor_status_parser.add_argument(
+        "--offset",
+        type=int,
+        default=0,
+        help="Profile offset after filtering (default: 0)",
+    )
+    executor_status_parser.add_argument(
+        "--limit",
+        type=int,
+        default=20,
+        help="Maximum profiles to show (1-1000; default: 20)",
+    )
     executor_status_parser.set_defaults(func=handlers.executor_status)
 
     events_parser = subparsers.add_parser(

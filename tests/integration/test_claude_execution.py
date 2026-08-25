@@ -22,6 +22,10 @@ from pathlib import Path
 from uuid import uuid4
 
 from issue_orchestrator.infra.env import ENV_PREFIX
+from issue_orchestrator.domain.terminal_launch import (
+    TerminalInteractionIntent,
+    TerminalShell,
+)
 from tests.process_group_run import run_in_process_group
 from tests.unit.session_run_helpers import make_session_run_assets
 
@@ -497,6 +501,8 @@ class TestClaudeViaAdapterPath:
             created = plugin.create_session(
                 session_id=999,
                 command=claude_cmd,
+                interaction_intent=TerminalInteractionIntent.CLAUDE_TRUST_WORKTREE,
+                shell=TerminalShell.BASH,
                 working_dir=str(worktree),
                 title="Claude subprocess integration",
                 session_name=session_name,

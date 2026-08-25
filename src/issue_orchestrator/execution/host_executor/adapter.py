@@ -27,8 +27,10 @@ from ...domain.executor import (
     ExecutorDeadlineExceededError,
     ExecutorDeadlinePhase,
     ExecutorDeadlineReason,
+    ExecutorHistoryRetentionPolicy,
     ExecutorPolicy,
     ExecutorPolicyChange,
+    ExecutorProcessTerminationPolicy,
     ExecutorRunResult,
     ExecutorRunSpecification,
     ExecutorUnboundedDeadline,
@@ -77,6 +79,8 @@ class HostExecutor(Executor):
         demand_estimator: ExecutorWorkDemandEstimator,
         host_cpu_observer: HostCpuUtilizationObserver,
         request_identity_factory: ExecutorRequestIdentityFactory,
+        process_termination_policy: ExecutorProcessTerminationPolicy,
+        history_retention_policy: ExecutorHistoryRetentionPolicy,
         queue_settle_seconds: float,
         queue_poll_seconds: float,
     ) -> None:
@@ -109,10 +113,23 @@ class HostExecutor(Executor):
         self._demand_estimator = demand_estimator
         self._host_cpu_observer = host_cpu_observer
         self._request_identity_factory = request_identity_factory
+        if type(process_termination_policy) is not ExecutorProcessTerminationPolicy:
+            raise ValueError(
+                "HostExecutor.process_termination_policy must be "
+                "ExecutorProcessTerminationPolicy"
+            )
+        self._process_termination_policy = process_termination_policy
+        if type(history_retention_policy) is not ExecutorHistoryRetentionPolicy:
+            raise ValueError(
+                "HostExecutor.history_retention_policy must be an "
+                "ExecutorHistoryRetentionPolicy"
+            )
         self._queue_settle_seconds = queue_settle_seconds
         self._queue_poll_seconds = queue_poll_seconds
         self._state = HostExecutorState(pool_dir, host_cpu_slots)
-        self._history = ExecutorWorkHistoryStore(pool_dir / "work-history")
+        self._history = ExecutorWorkHistoryStore(
+            pool_dir / "work-history", history_retention_policy
+        )
         self._policy_store = ExecutorPolicyStore(pool_dir)
         self._events = ExecutorEventStore(pool_dir)
         self._repository_resolver = ExecutorRepositoryResolver()
@@ -317,59 +334,68 @@ class HostExecutor(Executor):
         usage_before = resource.getrusage(resource.RUSAGE_CHILDREN)
         started = time.monotonic()
         try:
-            command_budget = self._command_budget(
-                command,
-                submitted_at_monotonic,
-            )
             try:
-                process = subprocess.Popen(
-                    list(command.arguments),
-                    env=child_env,
-                    pass_fds=lease.child_file_descriptors(),
-                    start_new_session=True,
+                command_budget = self._command_budget(
+                    command,
+                    submitted_at_monotonic,
                 )
-            except OSError as exc:
-                self._events.command_start_failed(
-                    identity,
-                    work,
-                    lease.grant,
-                    exc,
-                )
-                raise
-            try:
-                return_code = process.wait(
-                    timeout=(
-                        None
-                        if command_budget is None
-                        else command_budget.timeout_seconds
-                    )
-                )
-            except subprocess.TimeoutExpired:
-                if command_budget is None:
-                    raise AssertionError(
-                        "an unbounded executor command cannot time out"
-                    )
+            except ExecutorDeadlineExceededError as exc:
                 if not isinstance(command.deadline, ExecutorBoundedDeadline):
                     raise AssertionError(
-                        "a timed-out executor command must have a bounded deadline"
-                    )
-                self._terminate_process_group(process)
-                return_code = 124
-                self._events.command_deadline_exceeded(
+                        "an expired command budget must have a bounded deadline"
+                    ) from exc
+                self._record_command_deadline(
                     identity,
                     work,
-                    lease.grant,
+                    lease,
                     command.deadline,
-                    command_budget.reason,
+                    exc.reason,
                     time.monotonic() - started,
                 )
-                self._report_deadline_exceeded(
-                    identity=identity,
-                    work=work,
-                    deadline=command.deadline,
-                    reason=command_budget.reason,
-                    phase=ExecutorDeadlinePhase.COMMAND,
-                )
+                return_code = 124
+            else:
+                try:
+                    process = subprocess.Popen(
+                        list(command.arguments),
+                        env=child_env,
+                        pass_fds=lease.child_file_descriptors(),
+                        start_new_session=True,
+                    )
+                except OSError as exc:
+                    self._events.command_start_failed(
+                        identity,
+                        work,
+                        lease.grant,
+                        exc,
+                    )
+                    raise
+                try:
+                    return_code = process.wait(
+                        timeout=(
+                            None
+                            if command_budget is None
+                            else command_budget.timeout_seconds
+                        )
+                    )
+                except subprocess.TimeoutExpired:
+                    if command_budget is None:
+                        raise AssertionError(
+                            "an unbounded executor command cannot time out"
+                        )
+                    if not isinstance(command.deadline, ExecutorBoundedDeadline):
+                        raise AssertionError(
+                            "a timed-out executor command must have a bounded deadline"
+                        )
+                    self._terminate_process_group(process)
+                    return_code = 124
+                    self._record_command_deadline(
+                        identity,
+                        work,
+                        lease,
+                        command.deadline,
+                        command_budget.reason,
+                        time.monotonic() - started,
+                    )
         finally:
             elapsed = time.monotonic() - started
             usage_after = resource.getrusage(resource.RUSAGE_CHILDREN)
@@ -384,6 +410,32 @@ class HostExecutor(Executor):
             output_blocks=max(0, usage_after.ru_oublock - usage_before.ru_oublock),
         )
         return ExecutedExecutorCommand(return_code, lease.grant, observation)
+
+    def _record_command_deadline(
+        self,
+        identity: ExecutorWorkIdentity,
+        work: QueuedExecutorWork,
+        lease: HostExecutorLease,
+        deadline: ExecutorBoundedDeadline,
+        reason: ExecutorDeadlineReason,
+        elapsed_seconds: float,
+    ) -> None:
+        """Publish one terminal command-deadline decision through both seams."""
+        self._events.command_deadline_exceeded(
+            identity,
+            work,
+            lease.grant,
+            deadline,
+            reason,
+            elapsed_seconds,
+        )
+        self._report_deadline_exceeded(
+            identity=identity,
+            work=work,
+            deadline=deadline,
+            reason=reason,
+            phase=ExecutorDeadlinePhase.COMMAND,
+        )
 
     @staticmethod
     def _require_within_absolute_deadline(
@@ -410,8 +462,7 @@ class HostExecutor(Executor):
             admitted_at_monotonic=time.monotonic(),
         )
 
-    @staticmethod
-    def _terminate_process_group(process: subprocess.Popen[bytes]) -> None:
+    def _terminate_process_group(self, process: subprocess.Popen[bytes]) -> None:
         """Terminate and reap the entire bounded command tree."""
         if process.poll() is not None:
             return
@@ -420,7 +471,9 @@ class HostExecutor(Executor):
         except ProcessLookupError:
             pass
         try:
-            process.wait(timeout=2.0)
+            process.wait(
+                timeout=self._process_termination_policy.graceful_shutdown_seconds
+            )
             return
         except subprocess.TimeoutExpired:
             pass

@@ -10,6 +10,8 @@ from typing import Mapping, Optional, TypedDict
 
 import pluggy
 
+from ..domain.terminal_launch import TerminalLaunch
+
 from ..infra.hooks.hookspec import PROJECT_NAME, TerminalSpec, LifecycleSpec
 
 logger = logging.getLogger(__name__)
@@ -150,7 +152,7 @@ class PluginManager:
     def create_session(
         self,
         session_id: int,
-        command: str,
+        launch: TerminalLaunch,
         working_dir: str,
         title: str | None,
         session_name: str,  # Required - caller must provide explicit name
@@ -158,7 +160,9 @@ class PluginManager:
         """Create a terminal session."""
         result = self._pm.hook.create_session(
             session_id=session_id,
-            command=command,
+            command=launch.shell_command,
+            interaction_intent=launch.interaction_intent,
+            shell=launch.shell,
             working_dir=working_dir,
             title=title,
             session_name=session_name,

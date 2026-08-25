@@ -13,7 +13,11 @@ if TYPE_CHECKING:
     from ..control.planner_types import OrchestratorSnapshot, Plan
     from ..control.session_manager import SessionRef, SessionType
     from ..control.tech_lead_trigger import TechLeadTerminationOutcome
-    from ..domain.tech_lead_session import TechLeadLaunchScope, TechLeadSessionGeneration
+    from ..domain.tech_lead_session import (
+        TechLeadLaunchScope,
+        TechLeadSessionGeneration,
+    )
+    from ..domain.terminal_launch import TerminalLaunch
     from ..ports.operator_issue_commands import OperatorIssueCommands
     from ..ports.session_runner import DiscoveredSession
 
@@ -396,8 +400,21 @@ class Orchestrator:
     def _parse_session_ref(self, session_name: str, operation: str) -> "SessionRef":
         return _parse_session_ref(session_name, operation, self.deps.events)
 
-    def _create_session(self, name: str, cmd: str, wd: Path, title: str | None = None) -> bool:
-        return _create_session(name, cmd, wd, title, self.deps.session_manager, self.deps.events)
+    def _create_session(
+        self,
+        name: str,
+        launch: "TerminalLaunch",
+        wd: Path,
+        title: str | None = None,
+    ) -> bool:
+        return _create_session(
+            name,
+            launch,
+            wd,
+            title,
+            self.deps.session_manager,
+            self.deps.events,
+        )
 
     def _session_exists(self, name: str) -> bool:
         return _session_exists(name, self.deps.session_manager, self.deps.events)

@@ -21,6 +21,7 @@ from issue_orchestrator.control.actions import (
 from issue_orchestrator.control.action_applier import ActionApplier
 from issue_orchestrator.control.session_manager import SessionManager, SessionRef, SessionType
 from issue_orchestrator.ports import NullEventSink, TraceEvent
+from issue_orchestrator.domain.terminal_launch import TerminalLaunch
 
 
 class CollectingEventSink:
@@ -66,12 +67,12 @@ class MockSessionRunner:
     def create_session(
         self,
         session_id: int,
-        command: str,
+        launch: TerminalLaunch,
         working_dir: str,
         title: str | None = None,
         session_name: str | None = None,
     ) -> bool:
-        self.sessions[session_id] = {"command": command, "working_dir": working_dir}
+        self.sessions[session_id] = {"launch": launch, "working_dir": working_dir}
         return True
 
     def session_exists(self, session_id: int, session_name: str | None = None) -> bool:

@@ -50,6 +50,7 @@ from .session_manager import SessionManager, SessionRef
 
 if TYPE_CHECKING:
     from ..domain.models import OrchestratorState
+    from ..domain.terminal_launch import TerminalLaunch
     from .claim_quarantine import ClaimQuarantineOwner
     from ..domain.state_machines.session_machine import SessionStateMachine
     from .session_manager import SessionType
@@ -493,7 +494,7 @@ def parse_session_ref(
 
 def create_session(
     name: str,
-    cmd: str,
+    launch: "TerminalLaunch",
     wd: Path,
     title: str | None,
     session_manager: SessionManager,
@@ -504,7 +505,7 @@ def create_session(
 
     ref = parse_session_ref(name, "create", events)
     return session_manager.start(
-        SessionContext(ref=ref, command=cmd, working_dir=wd, title=title)
+        SessionContext(ref=ref, launch=launch, working_dir=wd, title=title)
     )
 
 

@@ -5,7 +5,15 @@ import time
 import base64
 from pathlib import Path
 
-from issue_orchestrator.execution.terminal_subprocess import SubprocessPlugin, _SessionRecord, _SubprocessRegistry
+from issue_orchestrator.domain.terminal_launch import (
+    TerminalInteractionIntent,
+    TerminalShell,
+)
+from issue_orchestrator.execution.terminal_subprocess import (
+    SubprocessPlugin,
+    _SessionRecord,
+    _SubprocessRegistry,
+)
 from issue_orchestrator.infra.env import ENV_PREFIX
 
 
@@ -49,6 +57,8 @@ def test_subprocess_session_writes_log(tmp_path, monkeypatch):
     created = plugin.create_session(
         session_id=123,
         command=command,
+        interaction_intent=TerminalInteractionIntent.NONE,
+        shell=TerminalShell.BASH,
         working_dir=str(worktree),
         title="Test session",
         session_name="issue-123",
@@ -210,6 +220,8 @@ def test_subprocess_session_auto_accepts_claude_trust_prompt(tmp_path, monkeypat
     created = plugin.create_session(
         session_id=123,
         command=command,
+        interaction_intent=TerminalInteractionIntent.CLAUDE_TRUST_WORKTREE,
+        shell=TerminalShell.BASH,
         working_dir=str(worktree),
         title="Trust prompt test",
         session_name="issue-123",

@@ -92,6 +92,12 @@ from ..execution.gh_guard import install_gh_guard
 from ..execution.agent_phase_command_scheduler import (
     HostAgentPhaseCommandScheduler,
 )
+from ..domain.agent_phase_execution import AgentPhaseOuterWatchdogPolicy
+from ..domain.executor import (
+    ExecutorHistoryRetentionPolicy,
+    ExecutorProcessTerminationPolicy,
+)
+from ..domain.terminal_launch import TerminalShell
 from ..events import EventHub, SequencedEventSink
 from ..control import (
     Planner,
@@ -157,9 +163,21 @@ if TYPE_CHECKING:
     from ..ports.executor_monitor import ExecutorMonitor
 
 logger = logging.getLogger(__name__)
+_EXECUTOR_PROCESS_TERMINATION_POLICY = ExecutorProcessTerminationPolicy(
+    graceful_shutdown_seconds=2.0
+)
+_EXECUTOR_HISTORY_RETENTION_POLICY = ExecutorHistoryRetentionPolicy(
+    maximum_profiles=2048,
+    maximum_observations_per_profile=24,
+)
+_AGENT_PHASE_OUTER_WATCHDOG_POLICY = AgentPhaseOuterWatchdogPolicy(
+    executor_termination=_EXECUTOR_PROCESS_TERMINATION_POLICY,
+    observer_margin_seconds=58.0,
+)
 _AGENT_PHASE_COMMAND_SCHEDULER = HostAgentPhaseCommandScheduler(
     python_executable=Path(sys.executable),
-    shell_executable=Path("/bin/sh"),
+    application_shell=TerminalShell.BASH,
+    outer_watchdog_policy=_AGENT_PHASE_OUTER_WATCHDOG_POLICY,
 )
 
 
@@ -198,6 +216,8 @@ def build_executor() -> Executor:
             process_id=os.getpid,
             request_nonce=lambda: uuid4().hex,
         ),
+        process_termination_policy=_EXECUTOR_PROCESS_TERMINATION_POLICY,
+        history_retention_policy=_EXECUTOR_HISTORY_RETENTION_POLICY,
         queue_settle_seconds=0.1,
         queue_poll_seconds=0.05,
     )
@@ -219,6 +239,7 @@ def build_executor_monitor() -> ExecutorMonitor:
         default_executor_pool_dir(),
         detected_executor_cpu_count(),
         _build_executor_demand_estimator(),
+        _EXECUTOR_HISTORY_RETENTION_POLICY,
     )
 
 

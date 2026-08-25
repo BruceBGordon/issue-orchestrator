@@ -204,6 +204,42 @@ class ExecutorUnboundedDeadline:
 
 
 @dataclass(frozen=True, slots=True)
+class ExecutorProcessTerminationPolicy:
+    """Grace allowed between process-group TERM and forced KILL/reap."""
+
+    graceful_shutdown_seconds: float
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.graceful_shutdown_seconds) is not float
+            or not math.isfinite(self.graceful_shutdown_seconds)
+            or self.graceful_shutdown_seconds <= 0
+        ):
+            raise ValueError(
+                "ExecutorProcessTerminationPolicy.graceful_shutdown_seconds "
+                "must be finite and positive"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutorHistoryRetentionPolicy:
+    """Hard storage bounds for machine-wide learned work profiles."""
+
+    maximum_profiles: int
+    maximum_observations_per_profile: int
+
+    def __post_init__(self) -> None:
+        _require_positive_integer(
+            type(self).__name__, "maximum_profiles", self.maximum_profiles
+        )
+        _require_positive_integer(
+            type(self).__name__,
+            "maximum_observations_per_profile",
+            self.maximum_observations_per_profile,
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class ExecutorCommandBudget:
     """Finite post-admission wait and the deadline that limits it."""
 

@@ -16,6 +16,10 @@ import pytest
 pytestmark = pytest.mark.xdist_group("pty")
 
 from issue_orchestrator.execution.terminal_subprocess import SubprocessPlugin
+from issue_orchestrator.domain.terminal_launch import (
+    TerminalInteractionIntent,
+    TerminalShell,
+)
 from issue_orchestrator.infra.env import ENV_PREFIX
 from tests.unit.session_run_helpers import make_session_run_assets
 
@@ -125,6 +129,8 @@ def test_subprocess_session_writes_completion_and_log(tmp_path, monkeypatch):
     created = plugin.create_session(
         session_id=42,
         command=command,
+        interaction_intent=TerminalInteractionIntent.NONE,
+        shell=TerminalShell.BASH,
         working_dir=str(worktree),
         title="Subprocess integration test",
         session_name=session_name,
@@ -168,6 +174,8 @@ def test_subprocess_send_input_writes_to_log(tmp_path, monkeypatch):
     created = plugin.create_session(
         session_id=7,
         command=command,
+        interaction_intent=TerminalInteractionIntent.NONE,
+        shell=TerminalShell.BASH,
         working_dir=str(worktree),
         title="Subprocess input test",
         session_name=session_name,

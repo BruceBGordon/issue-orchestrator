@@ -566,6 +566,46 @@ class ExecutorEventTimeline:
             )
 
 
+@dataclass(frozen=True, slots=True)
+class ExecutorFairnessGroupEventsQuery:
+    """Bounded exact query for events belonging to one fairness group."""
+
+    fairness_group: ExecutorFairnessGroup
+    limit: int
+
+    def __post_init__(self) -> None:
+        _require_exact_type(
+            type(self).__name__,
+            "fairness_group",
+            self.fairness_group,
+            ExecutorFairnessGroup,
+        )
+        if type(self.limit) is not int or not 1 <= self.limit <= 1000:
+            raise ValueError(
+                "ExecutorFairnessGroupEventsQuery.limit must be 1 through 1000"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutorEventPage:
+    """Chronological event suffix with its exact pre-limit match count."""
+
+    total_matching_event_count: int
+    events: tuple[ExecutorEvent, ...]
+
+    def __post_init__(self) -> None:
+        _require_non_negative_integer(
+            type(self).__name__,
+            "total_matching_event_count",
+            self.total_matching_event_count,
+        )
+        timeline = ExecutorEventTimeline(self.events)
+        if len(timeline.events) > self.total_matching_event_count:
+            raise ValueError(
+                "ExecutorEventPage events must not exceed total matching count"
+            )
+
+
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -626,11 +666,58 @@ class ExecutorExcludedLearningHistory:
 
 
 @dataclass(frozen=True, slots=True)
+class ExecutorAllRepositories:
+    """Select retained profiles from every repository."""
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutorRepositoryLabelFilter:
+    """Select retained profiles with one exact human-readable repo label."""
+
+    repository_label: str
+
+    def __post_init__(self) -> None:
+        if type(self.repository_label) is not str or not self.repository_label:
+            raise ValueError(
+                "ExecutorRepositoryLabelFilter.repository_label must not be empty"
+            )
+
+
+ExecutorRepositorySelection = ExecutorAllRepositories | ExecutorRepositoryLabelFilter
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutorStatusQuery:
+    """Explicit filtered page request for executor learning status."""
+
+    repository_selection: ExecutorRepositorySelection
+    offset: int
+    limit: int
+
+    def __post_init__(self) -> None:
+        if type(self.repository_selection) not in (
+            ExecutorAllRepositories,
+            ExecutorRepositoryLabelFilter,
+        ):
+            raise ValueError(
+                "ExecutorStatusQuery.repository_selection must be an explicit "
+                "repository selection"
+            )
+        _require_non_negative_integer(type(self).__name__, "offset", self.offset)
+        if type(self.limit) is not int or not 1 <= self.limit <= 1000:
+            raise ValueError("ExecutorStatusQuery.limit must be 1 through 1000")
+
+
+@dataclass(frozen=True, slots=True)
 class ExecutorLearningSnapshot:
     """Stable evidence describing retained learning and explicit exclusions."""
 
     fingerprint_sha256: str
     successful_observation_count: int
+    failed_observation_count: int
+    total_profile_count: int
+    matching_profile_count: int
+    page_offset: int
     learned_work: tuple[ExecutorLearnedWork, ...]
     excluded_failure_history: tuple[ExecutorExcludedLearningHistory, ...]
 
@@ -646,6 +733,27 @@ class ExecutorLearningSnapshot:
             "successful_observation_count",
             self.successful_observation_count,
         )
+        _require_non_negative_integer(
+            type(self).__name__,
+            "failed_observation_count",
+            self.failed_observation_count,
+        )
+        _require_non_negative_integer(
+            type(self).__name__, "total_profile_count", self.total_profile_count
+        )
+        _require_non_negative_integer(
+            type(self).__name__,
+            "matching_profile_count",
+            self.matching_profile_count,
+        )
+        _require_non_negative_integer(
+            type(self).__name__, "page_offset", self.page_offset
+        )
+        if self.matching_profile_count > self.total_profile_count:
+            raise ValueError(
+                "ExecutorLearningSnapshot.matching_profile_count must not exceed "
+                "total_profile_count"
+            )
         _require_exact_type(
             type(self).__name__, "learned_work", self.learned_work, tuple
         )
@@ -653,13 +761,6 @@ class ExecutorLearningSnapshot:
             raise ValueError(
                 "ExecutorLearningSnapshot.learned_work must contain only "
                 "ExecutorLearnedWork values"
-            )
-        if self.successful_observation_count != sum(
-            item.successful_observation_count for item in self.learned_work
-        ):
-            raise ValueError(
-                "ExecutorLearningSnapshot.successful_observation_count must equal "
-                "the learned-work sample total"
             )
         _require_exact_type(
             type(self).__name__,

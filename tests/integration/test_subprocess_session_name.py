@@ -12,6 +12,10 @@ import sys
 from pathlib import Path
 
 import pluggy
+from issue_orchestrator.domain.terminal_launch import (
+    TerminalInteractionIntent,
+    TerminalShell,
+)
 import pytest
 
 # Run PTY tests sequentially in one worker to avoid Python 3.14 forkpty warning
@@ -79,6 +83,8 @@ class TestSessionNameFlow:
         result = plugin_manager.hook.create_session(
             session_id=3865,
             command=_long_running_command(worktree, "review-3865"),
+            interaction_intent=TerminalInteractionIntent.NONE,
+            shell=TerminalShell.BASH,
             working_dir=str(worktree),
             title="Review PR #3865",
             session_name="review-3865",  # This is the key parameter!
@@ -118,6 +124,8 @@ class TestSessionNameFlow:
         result = plugin_manager.hook.create_session(
             session_id=123,
             command=_long_running_command(worktree, "issue-123"),
+            interaction_intent=TerminalInteractionIntent.NONE,
+            shell=TerminalShell.BASH,
             working_dir=str(worktree),
             title="Issue #123",
             session_name="issue-123",  # Caller computes name

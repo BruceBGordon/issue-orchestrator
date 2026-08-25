@@ -17,6 +17,11 @@ from typing import Optional
 from unittest.mock import MagicMock, PropertyMock, patch
 from fastapi.testclient import TestClient
 from issue_orchestrator.domain.models import AgentConfig, Issue, Session
+from issue_orchestrator.domain.terminal_launch import (
+    TerminalInteractionIntent,
+    TerminalLaunch,
+    TerminalShell,
+)
 from issue_orchestrator.infra.config import Config, DangerousConfig
 from issue_orchestrator.infra.hooks.hookspec import hookimpl
 from issue_orchestrator.ports.pull_request_tracker import (
@@ -589,20 +594,28 @@ class MockTerminalPlugin:
         self,
         session_id: int,
         command: str,
+        interaction_intent: TerminalInteractionIntent,
+        shell: TerminalShell,
         working_dir: str,
         title: str | None,
         session_name: str,  # Required - caller must provide explicit name
     ) -> bool:
         """Track session creation."""
-        self.create_session_calls.append({
-            "session_id": session_id,
-            "session_name": session_name,
-            "command": command,
-            "working_dir": working_dir,
-            "title": title,
-        })
+        self.create_session_calls.append(
+            {
+                "session_id": session_id,
+                "session_name": session_name,
+                "command": command,
+                "interaction_intent": interaction_intent,
+                "shell": shell,
+                "working_dir": working_dir,
+                "title": title,
+            }
+        )
         self.sessions[session_id] = {
             "command": command,
+            "interaction_intent": interaction_intent,
+            "shell": shell,
             "working_dir": working_dir,
             "title": title,
             "session_name": session_name,
@@ -657,14 +670,16 @@ class MockPluginManager:
     def create_session(
         self,
         session_id: int,
-        command: str,
+        launch: TerminalLaunch,
         working_dir: str,
         title: str | None,
         session_name: str,  # Required - caller must provide explicit name
     ) -> bool:
         return self._plugin.create_session(
             session_id=session_id,
-            command=command,
+            command=launch.shell_command,
+            interaction_intent=launch.interaction_intent,
+            shell=launch.shell,
             working_dir=working_dir,
             title=title,
             session_name=session_name,
@@ -731,14 +746,16 @@ class MockSessionRunner:
     def create_session(
         self,
         session_id: int,
-        command: str,
+        launch: TerminalLaunch,
         working_dir: str,
         title: str | None,
         session_name: str,  # Required - caller must provide explicit name
     ) -> bool:
         return self._plugin.create_session(
             session_id=session_id,
-            command=command,
+            command=launch.shell_command,
+            interaction_intent=launch.interaction_intent,
+            shell=launch.shell,
             working_dir=working_dir,
             title=title,
             session_name=session_name,

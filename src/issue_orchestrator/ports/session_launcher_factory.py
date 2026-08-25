@@ -23,6 +23,7 @@ if TYPE_CHECKING:
     from ..domain.state_machines.issue_machine import IssueStateMachine
     from ..domain.state_machines.review_machine import ReviewStateMachine
     from ..domain.state_machines.session_machine import SessionStateMachine
+    from ..domain.terminal_launch import TerminalLaunch
     from .board_snapshot_provider import BoardSnapshotProvider
     from .issue import Issue as IssueProtocol
 
@@ -39,13 +40,9 @@ class SessionLauncherFactory(Protocol):
         *,
         board_snapshot_provider: "BoardSnapshotProvider",
         session_exists_fn: Callable[[str], bool],
-        create_session_fn: Callable[[str, str, Path, str | None], bool],
-        get_issue_machine: Callable[
-            ["IssueProtocol"], Optional["IssueStateMachine"]
-        ],
-        get_session_machine: Callable[
-            [str, int, int], Optional["SessionStateMachine"]
-        ],
+        create_session_fn: Callable[[str, "TerminalLaunch", Path, str | None], bool],
+        get_issue_machine: Callable[["IssueProtocol"], Optional["IssueStateMachine"]],
+        get_session_machine: Callable[[str, int, int], Optional["SessionStateMachine"]],
         get_review_machine: Callable[[int, int], Optional["ReviewStateMachine"]],
         refresh_issue_fn: Optional[
             Callable[[int], Optional["IssueProtocol"]]

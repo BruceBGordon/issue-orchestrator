@@ -6,9 +6,16 @@ from issue_orchestrator.control.executor_admission import (
     ExecutorLearningPolicy,
     ExecutorWorkDemandEstimator,
 )
-from issue_orchestrator.domain.executor import ExecutorConcurrencyRange
+from issue_orchestrator.domain.executor import (
+    ExecutorConcurrencyRange,
+    ExecutorFairnessGroup,
+    ExecutorHistoryRetentionPolicy,
+)
 from issue_orchestrator.domain.executor_monitoring import (
+    ExecutorAllRepositories,
+    ExecutorFairnessGroupEventsQuery,
     ExecutorRecentEventsQuery,
+    ExecutorStatusQuery,
     ExecutorWorkAdmitted,
     ExecutorWorkCompleted,
     ExecutorWorkEnqueued,
@@ -30,6 +37,7 @@ def _monitor(pool_dir: Path, host_cpu_slots: int) -> HostExecutorMonitor:
                 recent_observation_weight=0.3,
             )
         ),
+        ExecutorHistoryRetentionPolicy(2048, 24),
     )
 
 
@@ -86,6 +94,32 @@ def test_pressure_many_groups_are_fair_and_event_history_stays_valid(
         assert len(pressure_completions) == len(queued) + 1
         assert all(event.charged_cpu_slots == 1 for event in pressure_admissions)
         assert all(event.cpu_slots_before.total == 1 for event in pressure_admissions)
+
+
+def test_group_event_query_excludes_interleaved_unrelated_work(
+    tmp_path: Path,
+) -> None:
+    pool_dir = tmp_path / "pool"
+    with PressureRig(pool_dir, host_cpu_slots=2) as rig:
+        first = rig.admit(PressureWork("GROUP-A-1", "group-a"))
+        second = rig.admit(PressureWork("GROUP-B-1", "group-b"))
+        rig.release(second)
+        third = rig.admit(PressureWork("GROUP-A-2", "group-a"))
+        rig.release(first)
+        rig.release(third)
+
+    expected_group = ExecutorFairnessGroup("group-a")
+    page = _monitor(pool_dir, 2).events_for_group(
+        ExecutorFairnessGroupEventsQuery(expected_group, limit=1000)
+    )
+
+    assert page.total_matching_event_count == len(page.events)
+    assert page.total_matching_event_count > 0
+    assert all(event.work.fairness_group == expected_group for event in page.events)
+    assert not any(
+        event.work.fairness_group == ExecutorFairnessGroup("group-b")
+        for event in page.events
+    )
 
 
 def test_pressure_exclusive_resource_remains_single_threaded(
@@ -262,7 +296,9 @@ def test_pressure_simultaneous_completions_preserve_history_and_events(
         assert len(completed) == len(processes) + 1
         assert enqueued[-1].successful_observation_count == len(processes)
         assert completed[-1].successful_observation_count == len(processes) + 1
-        status = _monitor(pool_dir, 4).status()
+        status = _monitor(pool_dir, 4).status(
+            ExecutorStatusQuery(ExecutorAllRepositories(), 0, 20)
+        )
         assert status.host_cpu_slots == 4
         assert status.learning.successful_observation_count == len(processes) + 1
         assert len(status.learning.learned_work) == 1

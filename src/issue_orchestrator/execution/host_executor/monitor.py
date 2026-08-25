@@ -6,9 +6,13 @@ from pathlib import Path
 
 from ...domain.executor_monitoring import (
     ExecutorEventTimeline,
+    ExecutorEventPage,
+    ExecutorFairnessGroupEventsQuery,
     ExecutorRecentEventsQuery,
     ExecutorStatus,
+    ExecutorStatusQuery,
 )
+from ...domain.executor import ExecutorHistoryRetentionPolicy
 from ...control.executor_admission import ExecutorWorkDemandEstimator
 from ...ports.executor_monitor import ExecutorMonitor
 from ._journal import ExecutorEventStore
@@ -24,11 +28,14 @@ class HostExecutorMonitor(ExecutorMonitor):
         pool_dir: Path,
         host_cpu_slots: int,
         demand_estimator: ExecutorWorkDemandEstimator,
+        history_retention_policy: ExecutorHistoryRetentionPolicy,
     ) -> None:
         if type(host_cpu_slots) is not int or host_cpu_slots < 1:
             raise ValueError("HostExecutorMonitor.host_cpu_slots must be positive")
         self._event_store = ExecutorEventStore(pool_dir)
-        self._history = ExecutorWorkHistoryStore(pool_dir / "work-history")
+        self._history = ExecutorWorkHistoryStore(
+            pool_dir / "work-history", history_retention_policy
+        )
         self._policy_store = ExecutorPolicyStore(pool_dir)
         self._host_cpu_slots = host_cpu_slots
         self._demand_estimator = demand_estimator
@@ -39,9 +46,15 @@ class HostExecutorMonitor(ExecutorMonitor):
     ) -> ExecutorEventTimeline:
         return self._event_store.recent_events(query)
 
-    def status(self) -> ExecutorStatus:
+    def events_for_group(
+        self,
+        query: ExecutorFairnessGroupEventsQuery,
+    ) -> ExecutorEventPage:
+        return self._event_store.events_for_group(query)
+
+    def status(self, query: ExecutorStatusQuery) -> ExecutorStatus:
         return ExecutorStatus(
             host_cpu_slots=self._host_cpu_slots,
             policy=self._policy_store.effective(),
-            learning=self._history.snapshot(self._demand_estimator),
+            learning=self._history.snapshot(self._demand_estimator, query),
         )

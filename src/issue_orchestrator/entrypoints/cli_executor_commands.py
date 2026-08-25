@@ -18,12 +18,15 @@ from ..domain.executor import (
     ExecutorUnboundedDeadline,
 )
 from ..domain.executor_monitoring import (
+    ExecutorAllRepositories,
     ExecutorAdmissionDeadlineExceeded,
     ExecutorCommandDeadlineExceeded,
     ExecutorCommandStartFailed,
     ExecutorEvent,
     ExecutorPolicyChanged,
     ExecutorRecentEventsQuery,
+    ExecutorRepositoryLabelFilter,
+    ExecutorStatusQuery,
     ExecutorWorkAdmitted,
     ExecutorWorkCompleted,
     ExecutorWorkEnqueued,
@@ -127,12 +130,22 @@ def cmd_executor_events(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_executor_status(_args: argparse.Namespace) -> int:
+def cmd_executor_status(args: argparse.Namespace) -> int:
     """Render current host policy and retained learning through the monitor."""
     from .bootstrap import build_executor_monitor
 
     try:
-        status = build_executor_monitor().status()
+        repository_selection = (
+            ExecutorAllRepositories()
+            if args.repository is None
+            else ExecutorRepositoryLabelFilter(args.repository)
+        )
+        query = ExecutorStatusQuery(
+            repository_selection=repository_selection,
+            offset=args.offset,
+            limit=args.limit,
+        )
+        status = build_executor_monitor().status(query)
     except (OSError, RuntimeError, ValueError) as exc:
         console.print(f"[red]executor-status failed: {exc}[/red]")
         return 2
@@ -143,8 +156,19 @@ def cmd_executor_status(_args: argparse.Namespace) -> int:
         f"Successful learning samples: "
         f"{status.learning.successful_observation_count}\n"
         f"Excluded historical failure samples: "
-        f"{sum(item.failed_observation_count for item in status.learning.excluded_failure_history)}\n"
+        f"{status.learning.failed_observation_count}\n"
         f"Learning fingerprint: {status.learning.fingerprint_sha256}",
+        markup=False,
+    )
+    shown_profiles = min(
+        max(status.learning.matching_profile_count - status.learning.page_offset, 0),
+        query.limit,
+    )
+    console.print(
+        f"Profile page: offset={status.learning.page_offset} "
+        f"shown={shown_profiles} "
+        f"matching={status.learning.matching_profile_count} "
+        f"total={status.learning.total_profile_count}",
         markup=False,
     )
     for learned in status.learning.learned_work:

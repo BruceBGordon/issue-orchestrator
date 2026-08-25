@@ -26,6 +26,10 @@ import pytest
 
 from issue_orchestrator.adapters.worktree.api import sync_cli_tools
 from issue_orchestrator.domain.models import Issue
+from issue_orchestrator.domain.terminal_launch import (
+    TerminalInteractionIntent,
+    TerminalShell,
+)
 from issue_orchestrator.events import EventName
 from issue_orchestrator.execution.terminal_subprocess import SubprocessPlugin
 from issue_orchestrator.execution.worktree_adapter import GitWorktreeManager
@@ -655,6 +659,8 @@ def test_foreign_repo_real_pty_agent_invocation(
     created = plugin.create_session(
         session_id=81,
         command=command,
+        interaction_intent=TerminalInteractionIntent.NONE,
+        shell=TerminalShell.BASH,
         working_dir=str(wt),
         title="PTY agent test",
         session_name=session_name,

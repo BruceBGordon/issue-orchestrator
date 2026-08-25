@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 from unittest.mock import Mock
 
+from issue_orchestrator.domain.terminal_launch import TerminalInteractionIntent
 from issue_orchestrator.execution.session_interactions import (
     SessionInteractionHandler,
     SessionInteractionRule,
@@ -60,37 +61,68 @@ def test_session_interaction_handler_ignores_ansi_noise() -> None:
 
 
 def test_builtin_session_interaction_rules_are_scoped_to_claude() -> None:
-    assert builtin_session_interaction_rules("claude --model sonnet 'fix it'")
-    assert builtin_session_interaction_rules(
-        "FOO=1 BAR=2 && claude --model sonnet 'fix it'"
+    claude = TerminalInteractionIntent.CLAUDE_TRUST_WORKTREE
+    assert builtin_session_interaction_rules(claude)
+    assert (
+        TerminalInteractionIntent.classify("claude --model sonnet 'fix it'") is claude
     )
     assert (
-        builtin_session_interaction_rules("exec CLAUDE --model sonnet 'fix it'") == ()
+        TerminalInteractionIntent.classify(
+            "FOO=1 BAR=2 && claude --model sonnet 'fix it'"
+        )
+        is claude
     )
-    assert builtin_session_interaction_rules("FOO=1 claude --model sonnet 'fix it'")
-    assert builtin_session_interaction_rules("cat prompt.md | claude --print") == ()
     assert (
-        builtin_session_interaction_rules(
+        TerminalInteractionIntent.classify("exec CLAUDE --model sonnet 'fix it'")
+        is TerminalInteractionIntent.NONE
+    )
+    assert (
+        TerminalInteractionIntent.classify("FOO=1 claude --model sonnet 'fix it'")
+        is claude
+    )
+    assert (
+        TerminalInteractionIntent.classify("cat prompt.md | claude --print")
+        is TerminalInteractionIntent.NONE
+    )
+    assert (
+        TerminalInteractionIntent.classify(
             "python -m provider_runner --command 'claude foo'"
         )
-        == ()
+        is TerminalInteractionIntent.NONE
     )
 
 
 def test_builtin_session_interaction_rules_include_interactive_codex_only() -> None:
-    assert builtin_session_interaction_rules(
-        "codex --ask-for-approval never --model gpt-5-codex "
-        '--sandbox workspace-write "review this"'
+    codex = TerminalInteractionIntent.CODEX_TRUST_WORKTREE
+    assert builtin_session_interaction_rules(codex)
+    assert (
+        TerminalInteractionIntent.classify(
+            "codex --ask-for-approval never --model gpt-5-codex "
+            '--sandbox workspace-write "review this"'
+        )
+        is codex
     )
-    assert builtin_session_interaction_rules(
-        "FOO=1 BAR=2 && codex -m gpt-5-codex -c model_reasoning_effort='xhigh' "
-        "'review this'"
+    assert (
+        TerminalInteractionIntent.classify(
+            "FOO=1 BAR=2 && codex -m gpt-5-codex -c model_reasoning_effort='xhigh' "
+            "'review this'"
+        )
+        is codex
     )
-    assert builtin_session_interaction_rules(
-        "env CODEX_HOME=/tmp/runtime codex --ask-for-approval never 'review this'"
+    assert (
+        TerminalInteractionIntent.classify(
+            "env CODEX_HOME=/tmp/runtime codex --ask-for-approval never 'review this'"
+        )
+        is codex
     )
-    assert builtin_session_interaction_rules("codex exec --full-auto") == ()
-    assert builtin_session_interaction_rules("codex --model gpt-5-codex exec") == ()
+    assert (
+        TerminalInteractionIntent.classify("codex exec --full-auto")
+        is TerminalInteractionIntent.NONE
+    )
+    assert (
+        TerminalInteractionIntent.classify("codex --model gpt-5-codex exec")
+        is TerminalInteractionIntent.NONE
+    )
 
 
 def test_session_interaction_rules_only_support_one_shot_rules() -> None:

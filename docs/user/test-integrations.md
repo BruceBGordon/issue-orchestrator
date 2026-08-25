@@ -233,12 +233,14 @@ issue-orchestrator executor-events --limit 50
 ```
 
 `issue-orchestrator executor-status` shows the detected host CPU slots, the
-effective percentage and its source, the total successful learning samples,
-the number of historical failed observations excluded from learning, the exact
-learning fingerprint, and each human-readable repository/work profile. Failed
-commands remain visible by repository and work key but never teach the demand
-estimator that a prematurely terminated command is cheap. This is the compact
-live view; `executor-events` is the detailed after-the-fact decision trail.
+effective percentage and its source, global successful/excluded sample totals,
+the exact global learning fingerprint, and a bounded page of human-readable
+repository/work profiles. Use `--repository`, `--offset`, and `--limit` to
+navigate retained profiles. Failed commands are recorded in `executor-events`
+by repository and work key but never enter learning history; the status
+failure total exists for valid migrated history that contains explicit failed
+samples. This is the compact view; `executor-events` is the detailed
+after-the-fact decision trail.
 
 The CLI queries the typed `ExecutorMonitor` port used as the future UI seam.
 Accurate live-state projection and a polished UI remain deferred to the

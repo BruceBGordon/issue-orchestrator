@@ -8,6 +8,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Protocol
 
+from ..domain.terminal_launch import TerminalInteractionIntent
 from .session_interactions import (
     SessionInteractionHandler,
     builtin_session_interaction_rules,
@@ -34,7 +35,8 @@ class PersistentInteractionState:
 def persistent_interaction_state(
     command: list[str],
 ) -> PersistentInteractionState | None:
-    rules = builtin_session_interaction_rules(shlex.join(command))
+    intent = TerminalInteractionIntent.classify(shlex.join(command))
+    rules = builtin_session_interaction_rules(intent)
     if not rules:
         return None
     label = command[0].rsplit("/", 1)[-1] if command else "persistent-agent"

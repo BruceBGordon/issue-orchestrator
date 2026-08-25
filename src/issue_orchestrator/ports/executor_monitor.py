@@ -6,8 +6,11 @@ from typing import Protocol
 
 from ..domain.executor_monitoring import (
     ExecutorEventTimeline,
+    ExecutorEventPage,
+    ExecutorFairnessGroupEventsQuery,
     ExecutorRecentEventsQuery,
     ExecutorStatus,
+    ExecutorStatusQuery,
 )
 
 
@@ -21,6 +24,13 @@ class ExecutorMonitor(Protocol):
         """Return the newest durable events in chronological order."""
         ...
 
-    def status(self) -> ExecutorStatus:
+    def events_for_group(
+        self,
+        query: ExecutorFairnessGroupEventsQuery,
+    ) -> ExecutorEventPage:
+        """Return the newest events for one exact fairness identity."""
+        ...
+
+    def status(self, query: ExecutorStatusQuery) -> ExecutorStatus:
         """Return current host policy and retained learning evidence."""
         ...

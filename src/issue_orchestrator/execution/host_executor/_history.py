@@ -13,25 +13,35 @@ from pydantic import ValidationError
 
 from ...control.executor_admission import ExecutorResourceObservation
 from ...control.executor_admission import ExecutorWorkDemandEstimator
-from ...domain.executor import ExecutorWorkKey
+from ...domain.executor import ExecutorHistoryRetentionPolicy, ExecutorWorkKey
 from ...domain.executor_monitoring import (
+    ExecutorAllRepositories,
     ExecutorExcludedLearningHistory,
     ExecutorLearnedWork,
     ExecutorLearningSnapshot,
+    ExecutorRepositoryLabelFilter,
     ExecutorRepositoryReference,
+    ExecutorStatusQuery,
 )
 from ._contracts import ResourceObservationRecord, WorkHistoryRecord
 from ._types import ExecutorWorkIdentity, RecordedExecutorObservation
 
 
-_MAX_OBSERVATIONS = 24
-
-
 class ExecutorWorkHistoryStore:
     """Own strict, bounded observations for each repository work identity."""
 
-    def __init__(self, history_dir: Path) -> None:
+    def __init__(
+        self,
+        history_dir: Path,
+        retention_policy: ExecutorHistoryRetentionPolicy,
+    ) -> None:
+        if type(retention_policy) is not ExecutorHistoryRetentionPolicy:
+            raise ValueError(
+                "ExecutorWorkHistoryStore.retention_policy must be an "
+                "ExecutorHistoryRetentionPolicy"
+            )
         self._history_dir = history_dir
+        self._retention_policy = retention_policy
 
     def successful_resources(
         self,
@@ -56,13 +66,15 @@ class ExecutorWorkHistoryStore:
             )
         self._history_dir.mkdir(parents=True, exist_ok=True)
         path = self._profile_path(identity)
-        lock_path = path.with_suffix(".lock")
+        lock_path = self._history_dir / "retention.lock"
         with lock_path.open("a+b") as lock_handle:
             fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
             existing = tuple(
                 item for item in self._observations(identity) if item.exit_code == 0
             )
-            bounded = (*existing, observation)[-_MAX_OBSERVATIONS:]
+            bounded = (*existing, observation)[
+                -self._retention_policy.maximum_observations_per_profile :
+            ]
             record = WorkHistoryRecord(
                 repository_key=identity.repository.key,
                 repository_label=identity.repository.label,
@@ -72,26 +84,39 @@ class ExecutorWorkHistoryStore:
                 ),
             )
             self._write_record(path, record)
+            self._prune_profiles()
 
     def snapshot(
         self,
         demand_estimator: ExecutorWorkDemandEstimator,
+        query: ExecutorStatusQuery,
     ) -> ExecutorLearningSnapshot:
-        """Return a canonical, fail-fast view of every retained profile."""
-        records = tuple(
-            self._read_record(path) for path in sorted(self._history_dir.glob("*.json"))
-        )
+        """Return a canonical bounded page plus global aggregate evidence."""
+        if type(query) is not ExecutorStatusQuery:
+            raise ValueError(
+                "ExecutorWorkHistoryStore.snapshot requires ExecutorStatusQuery"
+            )
+        self._history_dir.mkdir(parents=True, exist_ok=True)
+        lock_path = self._history_dir / "retention.lock"
+        with lock_path.open("a+b") as lock_handle:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_SH)
+            records = tuple(
+                self._read_record(path)
+                for path in sorted(self._history_dir.glob("*.json"))
+            )
         sorted_records = tuple(
             sorted(records, key=lambda item: (item.repository_key, item.work_key))
         )
+        selected_records = self._select_records(sorted_records, query)
+        page_records = selected_records[query.offset : query.offset + query.limit]
         learned_work = tuple(
             self._learned_work(record, demand_estimator)
-            for record in sorted_records
+            for record in page_records
             if any(observation.exit_code == 0 for observation in record.observations)
         )
         excluded_failure_history = tuple(
             self._excluded_failure_history(record)
-            for record in sorted_records
+            for record in page_records
             if any(observation.exit_code != 0 for observation in record.observations)
         )
         fingerprint_input = "\n".join(
@@ -102,11 +127,47 @@ class ExecutorWorkHistoryStore:
                 fingerprint_input.encode("utf-8")
             ).hexdigest(),
             successful_observation_count=sum(
-                item.successful_observation_count for item in learned_work
+                sum(observation.exit_code == 0 for observation in record.observations)
+                for record in sorted_records
             ),
+            failed_observation_count=sum(
+                sum(observation.exit_code != 0 for observation in record.observations)
+                for record in sorted_records
+            ),
+            total_profile_count=len(sorted_records),
+            matching_profile_count=len(selected_records),
+            page_offset=query.offset,
             learned_work=learned_work,
             excluded_failure_history=excluded_failure_history,
         )
+
+    @staticmethod
+    def _select_records(
+        records: tuple[WorkHistoryRecord, ...],
+        query: ExecutorStatusQuery,
+    ) -> tuple[WorkHistoryRecord, ...]:
+        selection = query.repository_selection
+        if type(selection) is ExecutorAllRepositories:
+            return records
+        if type(selection) is ExecutorRepositoryLabelFilter:
+            return tuple(
+                record
+                for record in records
+                if record.repository_label == selection.repository_label
+            )
+        raise AssertionError("ExecutorStatusQuery repository selection was validated")
+
+    def _prune_profiles(self) -> None:
+        profiles = tuple(self._history_dir.glob("*.json"))
+        excess = len(profiles) - self._retention_policy.maximum_profiles
+        if excess <= 0:
+            return
+        oldest_first = sorted(
+            profiles,
+            key=lambda path: (path.stat().st_mtime_ns, path.name),
+        )
+        for path in oldest_first[:excess]:
+            path.unlink()
 
     def _observations(
         self,

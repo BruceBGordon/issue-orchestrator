@@ -14,6 +14,8 @@ from unittest.mock import MagicMock, Mock, patch, call
 
 import pytest
 
+from issue_orchestrator.domain.terminal_launch import TerminalLaunch, TerminalShell
+
 
 class TestPluggySessionRunner:
     """Tests for PluggySessionRunner which wraps pluggy PluginManager.
@@ -42,7 +44,9 @@ class TestPluggySessionRunner:
         with caplog.at_level(logging.INFO):
             result = session_runner.create_session(
                 session_id=42,
-                command="claude --prompt issue.md",
+                launch=TerminalLaunch.classified(
+                    "claude --prompt issue.md", TerminalShell.BASH
+                ),
                 working_dir="/tmp/worktree",
                 title="Fix the bug",
                 session_name="issue-42",
@@ -52,6 +56,10 @@ class TestPluggySessionRunner:
         mock_plugin_manager.hook.create_session.assert_called_once_with(
             session_id=42,
             command="claude --prompt issue.md",
+            interaction_intent=TerminalLaunch.classified(
+                "claude --prompt issue.md", TerminalShell.BASH
+            ).interaction_intent,
+            shell=TerminalShell.BASH,
             working_dir="/tmp/worktree",
             title="Fix the bug",
             session_name="issue-42",
@@ -65,7 +73,7 @@ class TestPluggySessionRunner:
 
         result = session_runner.create_session(
             session_id=42,
-            command="claude",
+            launch=TerminalLaunch.classified("claude", TerminalShell.BASH),
             working_dir="/tmp/worktree",
             title=None,
             session_name="issue-42",
@@ -79,7 +87,7 @@ class TestPluggySessionRunner:
 
         result = session_runner.create_session(
             session_id=42,
-            command="claude",
+            launch=TerminalLaunch.classified("claude", TerminalShell.BASH),
             working_dir="/tmp/worktree",
             title=None,
             session_name="issue-42",

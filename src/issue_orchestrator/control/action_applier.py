@@ -38,6 +38,7 @@ from ..ports.fresh_issue_reader import FreshIssueReader
 from ..ports.repository_host import RepositoryHost
 from ..ports.worktree_manager import WorktreeManager
 from ..domain.models import RETROSPECTIVE_REVIEW_TERMINAL_PREFIX, Session
+from ..domain.terminal_launch import TerminalLaunch, TerminalShell
 
 if TYPE_CHECKING:
     from .background_job_supervisor import BackgroundJobSupervisor
@@ -1040,7 +1041,7 @@ class ActionApplier:
 
         ctx = SessionContext(
             ref=ref,
-            command=action.command,
+            launch=TerminalLaunch.classified(action.command, TerminalShell.BASH),
             working_dir=Path(action.working_dir),
             title=action.title,
         )

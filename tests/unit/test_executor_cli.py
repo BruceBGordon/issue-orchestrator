@@ -226,6 +226,47 @@ def test_status_cli_exposes_policy_and_human_learning_identity(
     assert "estimated_cores_per_worker=" in status.stdout
 
 
+def test_status_cli_filters_and_pages_profiles_without_dumping_global_history(
+    tmp_path: Path,
+) -> None:
+    pool_dir = tmp_path / "pool"
+    for work_key in ("io:alpha", "io:beta", "io:gamma"):
+        completed = _run_cli(
+            pool_dir,
+            "executor-run",
+            "--work-key",
+            work_key,
+            "--min-concurrency",
+            "1",
+            "--max-concurrency",
+            "1",
+            "--group",
+            f"validation-{work_key}",
+            "--",
+            sys.executable,
+            "-c",
+            "pass",
+        )
+        assert completed.returncode == 0
+
+    status = _run_cli(
+        pool_dir,
+        "executor-status",
+        "--repository",
+        "issue-orchestrator",
+        "--offset",
+        "1",
+        "--limit",
+        "1",
+    )
+
+    assert status.returncode == 0
+    assert "Profile page: offset=1 shown=1 matching=3 total=3" in status.stdout
+    assert "work=io:beta" in status.stdout
+    assert "work=io:alpha" not in status.stdout
+    assert "work=io:gamma" not in status.stdout
+
+
 def test_status_cli_reports_valid_legacy_failures_without_learning_from_them(
     tmp_path: Path,
 ) -> None:

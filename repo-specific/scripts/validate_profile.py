@@ -33,15 +33,20 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Literal, cast
 
-from issue_orchestrator.domain.executor import ExecutorPolicySource
+from issue_orchestrator.domain.executor import (
+    ExecutorFairnessGroup,
+    ExecutorPolicySource,
+)
 from issue_orchestrator.domain.executor_monitoring import (
+    ExecutorAllRepositories,
     ExecutorAdmissionDeadlineExceeded,
     ExecutorCommandDeadlineExceeded,
     ExecutorCommandStartFailed,
     ExecutorEvent,
+    ExecutorFairnessGroupEventsQuery,
     ExecutorPolicyChanged,
-    ExecutorRecentEventsQuery,
     ExecutorStatus,
+    ExecutorStatusQuery,
     ExecutorWorkAdmitted,
     ExecutorWorkCompleted,
     ExecutorWorkEnqueued,
@@ -56,12 +61,11 @@ from issue_orchestrator.ports.executor_monitor import ExecutorMonitor
 
 
 EXECUTOR_POOL_DIR_ENV = "ISSUE_ORCHESTRATOR_EXECUTOR_POOL_DIR"
-EXECUTOR_AGGRESSIVENESS_ENV = (
-    "ISSUE_ORCHESTRATOR_EXECUTOR_AGGRESSIVENESS_PERCENT"
-)
+EXECUTOR_AGGRESSIVENESS_ENV = "ISSUE_ORCHESTRATOR_EXECUTOR_AGGRESSIVENESS_PERCENT"
+EXECUTOR_GROUP_ENV = "ISSUE_ORCHESTRATOR_EXECUTOR_GROUP"
 AGGREGATE_TARGET = "validate-pr-raw"
 AGGREGATE_LANE_VARIABLE = "VALIDATE_PR_LANES"
-PROFILE_METHOD = "cold_then_learned_detached_HEAD_with_warm_external_caches"
+PROFILE_METHOD = "cold_then_learned_pinned_commit_with_warm_external_caches"
 EXECUTOR_EVENT_CAPTURE_LIMIT = 1000
 
 
@@ -185,13 +189,20 @@ class ProfileExecutorEventCapture:
     """Typed executor events retained before the temporary pool is removed."""
 
     query_limit: int
+    total_matching_event_count: int
     possibly_truncated: bool
     events: tuple[ProfileExecutorEventRecord, ...]
 
     def __post_init__(self) -> None:
         if type(self.query_limit) is not int or self.query_limit < 1:
+            raise ValueError("ProfileExecutorEventCapture.query_limit must be positive")
+        if (
+            type(self.total_matching_event_count) is not int
+            or self.total_matching_event_count < 0
+        ):
             raise ValueError(
-                "ProfileExecutorEventCapture.query_limit must be positive"
+                "ProfileExecutorEventCapture.total_matching_event_count must be "
+                "non-negative"
             )
         if type(self.possibly_truncated) is not bool:
             raise ValueError(
@@ -251,16 +262,90 @@ class ValidateProfileSummary:
     top_targets: tuple[CommandResult, ...]
 
 
+class ProfileStage(StrEnum):
+    """Ordered profiler stage whose failure terminates later measurement."""
+
+    COLD_AGGREGATE = "cold-aggregate"
+    TARGET = "target"
+    LEARNED_AGGREGATE = "learned-aggregate"
+
+
+@dataclass(frozen=True, slots=True)
+class ProfileFailure:
+    """Typed failed result retained without manufacturing comparisons."""
+
+    stage: ProfileStage
+    command_result: CommandResult
+
+
+class ProfileStageFailed(RuntimeError):
+    """Fail-fast control signal carrying complete typed stage evidence."""
+
+    def __init__(self, failure: ProfileFailure) -> None:
+        if type(failure) is not ProfileFailure:
+            raise ValueError("ProfileStageFailed requires ProfileFailure")
+        self.failure = failure
+        super().__init__(
+            f"{failure.stage.value} failed: {failure.command_result.name} "
+            f"exit={failure.command_result.exit_code}"
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class ValidateProfileReport:
     """Versioned JSON report written by the profiler."""
 
-    schema_version: Literal[4]
+    schema_version: Literal[5]
+    outcome: Literal["complete"]
     config: ValidateProfileConfiguration
     cold_validate_pr_raw_run: ProfileAggregateRun
     target_runs: tuple[CommandResult, ...]
     learned_validate_pr_raw_run: ProfileAggregateRun
     summary: ValidateProfileSummary
+
+
+@dataclass(frozen=True, slots=True)
+class ColdAggregateFailureReport:
+    """Partial report when the first aggregate fails."""
+
+    schema_version: Literal[5]
+    outcome: Literal["failed"]
+    config: ValidateProfileConfiguration
+    failed_aggregate: ProfileAggregateRun
+    failure: ProfileFailure
+
+
+@dataclass(frozen=True, slots=True)
+class TargetFailureReport:
+    """Partial report when one isolated target fails."""
+
+    schema_version: Literal[5]
+    outcome: Literal["failed"]
+    config: ValidateProfileConfiguration
+    cold_validate_pr_raw_run: ProfileAggregateRun
+    completed_target_runs: tuple[CommandResult, ...]
+    failure: ProfileFailure
+
+
+@dataclass(frozen=True, slots=True)
+class LearnedAggregateFailureReport:
+    """Partial report when the final aggregate fails."""
+
+    schema_version: Literal[5]
+    outcome: Literal["failed"]
+    config: ValidateProfileConfiguration
+    cold_validate_pr_raw_run: ProfileAggregateRun
+    target_runs: tuple[CommandResult, ...]
+    failed_aggregate: ProfileAggregateRun
+    failure: ProfileFailure
+
+
+ValidateProfileArtifact = (
+    ValidateProfileReport
+    | ColdAggregateFailureReport
+    | TargetFailureReport
+    | LearnedAggregateFailureReport
+)
 
 
 def detect_jobs() -> int:
@@ -395,6 +480,60 @@ def discover_validate_targets(repo_root: Path, make_bin: str) -> tuple[str, ...]
     )
 
 
+def discover_validate_targets_at_commit(
+    repo_root: Path,
+    make_bin: str,
+    profiled_commit_sha: str,
+) -> tuple[str, ...]:
+    """Discover lanes from the immutable tree used by every measurement."""
+    temporary_root = Path(tempfile.mkdtemp(prefix="io-validate-profile-discovery-"))
+    worktree = temporary_root / "wt"
+    added = False
+    try:
+        completed = subprocess.run(
+            (
+                "git",
+                "-C",
+                str(repo_root),
+                "worktree",
+                "add",
+                "--detach",
+                str(worktree),
+                profiled_commit_sha,
+            ),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if completed.returncode != 0:
+            raise RuntimeError(
+                f"cannot create pinned discovery worktree: {completed.stderr.strip()}"
+            )
+        added = True
+        return discover_validate_targets(worktree, make_bin)
+    finally:
+        if added:
+            removed = subprocess.run(
+                (
+                    "git",
+                    "-C",
+                    str(repo_root),
+                    "worktree",
+                    "remove",
+                    "--force",
+                    str(worktree),
+                ),
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if removed.returncode != 0:
+                raise RuntimeError(
+                    f"cannot remove pinned discovery worktree: {removed.stderr.strip()}"
+                )
+        shutil.rmtree(temporary_root)
+
+
 def parse_target_override(raw: str | None) -> tuple[str, ...] | None:
     """Parse an optional explicit target list without inventing empty work."""
     if raw is None:
@@ -474,15 +613,34 @@ def default_output_path(repo_root: Path) -> Path:
     )
 
 
-def collect_failures(
-    results: tuple[CommandResult, ...],
-) -> tuple[CommandResult, ...]:
-    failed = tuple(result for result in results if result.exit_code != 0)
-    if failed:
-        print("[profile] failed command(s):", file=sys.stderr)
-        for result in failed:
-            print(f"  - {result.name} (exit={result.exit_code})", file=sys.stderr)
-    return failed
+def require_stage_success(stage: ProfileStage, result: CommandResult) -> None:
+    """Stop the profile at its first failed measurement stage."""
+    if type(stage) is not ProfileStage:
+        raise ValueError("require_stage_success requires ProfileStage")
+    if type(result) is not CommandResult:
+        raise ValueError("require_stage_success requires CommandResult")
+    if result.exit_code != 0:
+        raise ProfileStageFailed(ProfileFailure(stage, result))
+
+
+def write_profile_artifact(
+    output_path: Path,
+    artifact: ValidateProfileArtifact,
+) -> None:
+    """Serialize one closed report variant to the requested durable path."""
+    supported = (
+        ValidateProfileReport,
+        ColdAggregateFailureReport,
+        TargetFailureReport,
+        LearnedAggregateFailureReport,
+    )
+    if type(artifact) not in supported:
+        raise ValueError("write_profile_artifact requires a profile report variant")
+    output_path.write_text(
+        json.dumps(asdict(artifact), indent=2) + "\n",
+        encoding="utf-8",
+    )
+    print(f"report: {output_path}")
 
 
 def summarize(
@@ -560,6 +718,8 @@ def run_in_isolated_worktree(
     executor_pool_dir: Path,
     executor_aggressiveness_percent: int,
     artifacts: ProfileArtifactStore,
+    profiled_commit_sha: str,
+    fairness_group: ExecutorFairnessGroup,
 ) -> CommandResult:
     """Provision, measure, and remove one isolated detached worktree."""
     temporary_root = Path(tempfile.mkdtemp(prefix="io-validate-profile-"))
@@ -574,7 +734,7 @@ def run_in_isolated_worktree(
             "add",
             "--detach",
             str(worktree),
-            "HEAD",
+            profiled_commit_sha,
         )
         add_result = run_command(
             name=f"{name}:worktree-add",
@@ -624,9 +784,8 @@ def run_in_isolated_worktree(
         make_arguments.append(make_target)
         environment = os.environ.copy()
         environment[EXECUTOR_POOL_DIR_ENV] = str(executor_pool_dir)
-        environment[EXECUTOR_AGGRESSIVENESS_ENV] = str(
-            executor_aggressiveness_percent
-        )
+        environment[EXECUTOR_AGGRESSIVENESS_ENV] = str(executor_aggressiveness_percent)
+        environment[EXECUTOR_GROUP_ENV] = fairness_group.value
         return run_command(
             name=name,
             command=tuple(make_arguments),
@@ -749,7 +908,7 @@ def capture_executor_status(
         executor_pool_dir,
         selected_aggressiveness,
     ) as monitor:
-        status = monitor.status()
+        status = monitor.status(ExecutorStatusQuery(ExecutorAllRepositories(), 0, 1000))
     return project_executor_status(status)
 
 
@@ -782,26 +941,28 @@ def capture_executor_events(
     executor_pool_dir: Path,
     selected_aggressiveness: ProfileAggressiveness,
     *,
-    recorded_since_unix: float,
+    fairness_group: ExecutorFairnessGroup,
 ) -> ProfileExecutorEventCapture:
-    """Retain typed events produced during one aggregate measurement."""
-    if type(recorded_since_unix) is not float or recorded_since_unix <= 0:
-        raise ValueError("recorded_since_unix must be a positive float")
+    """Retain typed events for one exact aggregate fairness identity."""
+    if type(fairness_group) is not ExecutorFairnessGroup:
+        raise ValueError("capture_executor_events requires ExecutorFairnessGroup")
     with profiled_executor_monitor(
         executor_pool_dir,
         selected_aggressiveness,
     ) as monitor:
-        unfiltered = monitor.recent_events(
-            ExecutorRecentEventsQuery(EXECUTOR_EVENT_CAPTURE_LIMIT)
+        page = monitor.events_for_group(
+            ExecutorFairnessGroupEventsQuery(
+                fairness_group,
+                EXECUTOR_EVENT_CAPTURE_LIMIT,
+            )
         )
     return ProfileExecutorEventCapture(
         query_limit=EXECUTOR_EVENT_CAPTURE_LIMIT,
-        possibly_truncated=len(unfiltered.events) == EXECUTOR_EVENT_CAPTURE_LIMIT,
-        events=tuple(
-            ProfileExecutorEventRecord(event)
-            for event in unfiltered.events
-            if event.metadata.recorded_at_unix >= recorded_since_unix
+        total_matching_event_count=page.total_matching_event_count,
+        possibly_truncated=(
+            page.total_matching_event_count > EXECUTOR_EVENT_CAPTURE_LIMIT
         ),
+        events=tuple(ProfileExecutorEventRecord(event) for event in page.events),
     )
 
 
@@ -872,9 +1033,10 @@ def run_profile_aggregate(
     executor_pool_dir: Path,
     aggressiveness: ProfileAggressiveness,
     artifacts: ProfileArtifactStore,
+    profiled_commit_sha: str,
+    fairness_group: ExecutorFairnessGroup,
 ) -> ProfileAggregateRun:
     """Measure one aggregate with learning provenance on both boundaries."""
-    recorded_since_unix = time.time()
     before = capture_executor_status(executor_pool_dir, aggressiveness)
     command_result = run_in_isolated_worktree(
         repo_root=repo_root,
@@ -886,14 +1048,30 @@ def run_profile_aggregate(
         executor_pool_dir=executor_pool_dir,
         executor_aggressiveness_percent=aggressiveness.percent,
         artifacts=artifacts,
+        profiled_commit_sha=profiled_commit_sha,
+        fairness_group=fairness_group,
     )
     after = capture_executor_status(executor_pool_dir, aggressiveness)
     events = capture_executor_events(
         executor_pool_dir,
         aggressiveness,
-        recorded_since_unix=recorded_since_unix,
+        fairness_group=fairness_group,
     )
     return ProfileAggregateRun(command_result, before, after, events)
+
+
+def profile_fairness_group(
+    profiled_commit_sha: str,
+    stage_label: str,
+) -> ExecutorFairnessGroup:
+    """Build a human-traceable identity unique to this profiler process."""
+    if type(profiled_commit_sha) is not str or len(profiled_commit_sha) != 40:
+        raise ValueError("profile_fairness_group requires a full commit SHA")
+    if type(stage_label) is not str or not stage_label:
+        raise ValueError("profile_fairness_group.stage_label must not be empty")
+    return ExecutorFairnessGroup(
+        f"validate-profile:{profiled_commit_sha[:12]}:pid-{os.getpid()}:{stage_label}"
+    )
 
 
 def main() -> int:
@@ -910,9 +1088,28 @@ def main() -> int:
     host = profile_host()
     aggressiveness = resolve_aggressiveness(arguments)
 
-    targets = arguments.targets or discover_validate_targets(
+    targets = arguments.targets or discover_validate_targets_at_commit(
         repo_root,
         arguments.make_bin,
+        profiled_commit_sha,
+    )
+    configuration = ValidateProfileConfiguration(
+        make_bin=arguments.make_bin,
+        repo_root=str(repo_root),
+        jobs=arguments.jobs,
+        dry_run=arguments.dry_run,
+        targets=targets,
+        aggregate_target=AGGREGATE_TARGET,
+        method=PROFILE_METHOD,
+        profiled_commit_sha=profiled_commit_sha,
+        source_worktree_dirty=dirty,
+        host=host,
+        aggressiveness=aggressiveness,
+        executor_learning=(
+            "one fresh pool: cold aggregate, lane training, learned aggregate"
+        ),
+        external_caches="preserved",
+        artifact_directory=str(artifacts.root),
     )
     profile_root = Path(tempfile.mkdtemp(prefix="io-validate-profile-session-"))
     executor_pool_dir = profile_root / "executor-pool"
@@ -926,9 +1123,31 @@ def main() -> int:
             executor_pool_dir=executor_pool_dir,
             aggressiveness=aggressiveness,
             artifacts=artifacts,
+            profiled_commit_sha=profiled_commit_sha,
+            fairness_group=profile_fairness_group(profiled_commit_sha, "cold"),
         )
-        target_results = tuple(
-            run_in_isolated_worktree(
+        try:
+            require_stage_success(
+                ProfileStage.COLD_AGGREGATE,
+                cold_aggregate.command_result,
+            )
+        except ProfileStageFailed as failed:
+            write_profile_artifact(
+                output_path,
+                ColdAggregateFailureReport(
+                    schema_version=5,
+                    outcome="failed",
+                    config=configuration,
+                    failed_aggregate=cold_aggregate,
+                    failure=failed.failure,
+                ),
+            )
+            print(f"[profile] {failed}", file=sys.stderr)
+            return failed.failure.command_result.exit_code
+
+        completed_targets: list[CommandResult] = []
+        for target in targets:
+            target_result = run_in_isolated_worktree(
                 repo_root=repo_root,
                 make_bin=arguments.make_bin,
                 name=f"target:{target}",
@@ -938,9 +1157,31 @@ def main() -> int:
                 executor_pool_dir=executor_pool_dir,
                 executor_aggressiveness_percent=aggressiveness.percent,
                 artifacts=artifacts,
+                profiled_commit_sha=profiled_commit_sha,
+                fairness_group=profile_fairness_group(
+                    profiled_commit_sha,
+                    f"target:{target}",
+                ),
             )
-            for target in targets
-        )
+            try:
+                require_stage_success(ProfileStage.TARGET, target_result)
+            except ProfileStageFailed as failed:
+                write_profile_artifact(
+                    output_path,
+                    TargetFailureReport(
+                        schema_version=5,
+                        outcome="failed",
+                        config=configuration,
+                        cold_validate_pr_raw_run=cold_aggregate,
+                        completed_target_runs=tuple(completed_targets),
+                        failure=failed.failure,
+                    ),
+                )
+                print(f"[profile] {failed}", file=sys.stderr)
+                return failed.failure.command_result.exit_code
+            completed_targets.append(target_result)
+        target_results = tuple(completed_targets)
+
         learned_aggregate = run_profile_aggregate(
             repo_root=repo_root,
             make_bin=arguments.make_bin,
@@ -950,7 +1191,32 @@ def main() -> int:
             executor_pool_dir=executor_pool_dir,
             aggressiveness=aggressiveness,
             artifacts=artifacts,
+            profiled_commit_sha=profiled_commit_sha,
+            fairness_group=profile_fairness_group(
+                profiled_commit_sha,
+                "learned",
+            ),
         )
+        try:
+            require_stage_success(
+                ProfileStage.LEARNED_AGGREGATE,
+                learned_aggregate.command_result,
+            )
+        except ProfileStageFailed as failed:
+            write_profile_artifact(
+                output_path,
+                LearnedAggregateFailureReport(
+                    schema_version=5,
+                    outcome="failed",
+                    config=configuration,
+                    cold_validate_pr_raw_run=cold_aggregate,
+                    target_runs=target_results,
+                    failed_aggregate=learned_aggregate,
+                    failure=failed.failure,
+                ),
+            )
+            print(f"[profile] {failed}", file=sys.stderr)
+            return failed.failure.command_result.exit_code
     finally:
         shutil.rmtree(profile_root)
     summary = summarize(
@@ -960,44 +1226,16 @@ def main() -> int:
         jobs=arguments.jobs,
     )
     report = ValidateProfileReport(
-        schema_version=4,
-        config=ValidateProfileConfiguration(
-            make_bin=arguments.make_bin,
-            repo_root=str(repo_root),
-            jobs=arguments.jobs,
-            dry_run=arguments.dry_run,
-            targets=targets,
-            aggregate_target=AGGREGATE_TARGET,
-            method=PROFILE_METHOD,
-            profiled_commit_sha=profiled_commit_sha,
-            source_worktree_dirty=dirty,
-            host=host,
-            aggressiveness=aggressiveness,
-            executor_learning=(
-                "one fresh pool: cold aggregate, lane training, learned aggregate"
-            ),
-            external_caches="preserved",
-            artifact_directory=str(artifacts.root),
-        ),
+        schema_version=5,
+        outcome="complete",
+        config=configuration,
         cold_validate_pr_raw_run=cold_aggregate,
         target_runs=target_results,
         learned_validate_pr_raw_run=learned_aggregate,
         summary=summary,
     )
-    output_path.write_text(
-        json.dumps(asdict(report), indent=2) + "\n",
-        encoding="utf-8",
-    )
-    print(f"report: {output_path}")
-
-    failures = collect_failures(
-        (
-            cold_aggregate.command_result,
-            *target_results,
-            learned_aggregate.command_result,
-        )
-    )
-    return failures[0].exit_code if failures else 0
+    write_profile_artifact(output_path, report)
+    return 0
 
 
 if __name__ == "__main__":

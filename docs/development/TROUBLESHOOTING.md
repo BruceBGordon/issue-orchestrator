@@ -299,18 +299,24 @@ sleeps. "Uncached" here bypasses the validation-result cache only. Normal OS
 filesystem, installed dependency, browser, CLI, and external-service caches
 remain part of the real-world measurement.
 
-`make -f repo-specific/Makefile validate-profile` measures detached fresh
-worktrees against committed `HEAD`. Each profile invocation creates one fresh
-executor-learning pool shared by its cold aggregate, isolated lane training,
-and learned aggregate, while normal external caches remain enabled. Its
+`make -f repo-specific/Makefile validate-profile` resolves one exact commit SHA
+before discovery, then measures detached fresh worktrees pinned to that SHA.
+Moving `HEAD` or dirtying the source worktree during the profile cannot change
+its target inventory or measured code. Each profile invocation creates one
+fresh executor-learning pool shared by its cold aggregate, isolated lane
+training, and learned aggregate, while normal external caches remain enabled. Its
 `VALIDATE_JOBS` value controls both aggregate GNU make fan-out and the inner
 validation-lane fan-out; the JSON report records both facts explicitly. The
 headline serial sum includes the aggregate static lane exactly once; nested
 typecheck, architecture, and quality components are not double-counted as
 independent execution lanes. A sibling `*-artifacts` directory retains one
-combined-output log per command and explicitly discriminated typed executor
-events for each aggregate. Check `possibly_truncated` before treating an event
-window as complete.
+combined-output log per command and the exact fairness-group event suffix for
+each aggregate, serialized as explicitly discriminated typed executor events.
+`total_matching_event_count` says how many events belonged to that aggregate;
+check `possibly_truncated` before treating the retained suffix as complete.
+The profiler stops on its first failed stage and writes a typed partial report
+with the failed command and every completed predecessor. It never prints or
+persists learned/cold comparisons after an incomplete experiment.
 
 Use `issue-orchestrator executor-events --limit 100` to inspect the durable
 typed decision trail after a run. It reports human repository/work identities,

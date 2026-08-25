@@ -21,6 +21,7 @@ from ..ports.coder_prompt import (
 from ..ports.provider_readiness import ProviderReadinessProbe
 
 if TYPE_CHECKING:
+    from ..domain.terminal_launch import TerminalLaunch
     from ..control.dependency_evaluator import DependencyEvaluator
     from ..domain.state_machines.issue_machine import IssueStateMachine
     from ..domain.state_machines.review_machine import ReviewStateMachine
@@ -62,13 +63,9 @@ def build_session_launcher_factory(
         *,
         board_snapshot_provider: "BoardSnapshotProvider",
         session_exists_fn: Callable[[str], bool],
-        create_session_fn: Callable[[str, str, Path, str | None], bool],
-        get_issue_machine: Callable[
-            ["IssueProtocol"], Optional["IssueStateMachine"]
-        ],
-        get_session_machine: Callable[
-            [str, int, int], Optional["SessionStateMachine"]
-        ],
+        create_session_fn: Callable[[str, "TerminalLaunch", Path, str | None], bool],
+        get_issue_machine: Callable[["IssueProtocol"], Optional["IssueStateMachine"]],
+        get_session_machine: Callable[[str, int, int], Optional["SessionStateMachine"]],
         get_review_machine: Callable[[int, int], Optional["ReviewStateMachine"]],
         refresh_issue_fn: Optional[Callable[[int], Optional["IssueProtocol"]]],
         dependency_evaluator: Optional["DependencyEvaluator"],

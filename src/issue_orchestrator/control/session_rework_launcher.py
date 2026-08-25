@@ -48,6 +48,7 @@ from .session_worktree_diagnostics import (
 from .transition_log import log_transition
 from .worktree_context import WorktreeContext
 from .needs_human_block import NeedsHumanCause
+from ..domain.terminal_launch import TerminalLaunch
 
 if TYPE_CHECKING:
     from .label_manager import LabelManager
@@ -67,7 +68,7 @@ class SessionCreatorFn(Protocol):
     def __call__(
         self,
         session_name: str,
-        command: str,
+        command: TerminalLaunch,
         worktree_path: Path,
         title: str | None,
         /,
@@ -117,7 +118,7 @@ class AgentPhaseScheduler(Protocol):
         run: SessionRunAssets,
         agent_label: str,
         task_kind: TaskKind,
-    ) -> tuple[str, AgentConfig]: ...
+    ) -> tuple[TerminalLaunch, AgentConfig]: ...
 
 
 class SessionEnvBuilder(Protocol):

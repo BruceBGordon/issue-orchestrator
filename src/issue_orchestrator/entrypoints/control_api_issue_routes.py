@@ -21,6 +21,7 @@ from ..control.worktree_manager import get_worktree_path
 from ..domain.models import get_completion_path
 from ..domain.review_exchange_verdict import ExchangeVerdict
 from ..domain.session_run import SessionRunAssets
+from ..domain.terminal_launch import TerminalLaunch, TerminalShell
 from ..ports.operator_issue_commands import (
     OperatorCommandIntent,
     OperatorCommandOutcome,
@@ -563,7 +564,7 @@ async def launch_debug_session(  # noqa: C901 - debug session with validation an
     )
     session_created = orchestrator.deps.runner.create_session(
         session_id=issue_number,
-        command=command,
+        launch=TerminalLaunch.classified(command, TerminalShell.BASH),
         working_dir=str(worktree),
         title=f"Debug #{issue_number}",
         session_name=session_name,

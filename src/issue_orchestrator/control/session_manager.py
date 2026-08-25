@@ -24,7 +24,8 @@ from typing import Optional
 
 from ..infra.config import Config
 from ..events import EventName
-from ..ports import EventSink, SessionRunner,  make_trace_event
+from ..ports import EventSink, SessionRunner, make_trace_event
+from ..domain.terminal_launch import TerminalLaunch, TerminalShell
 
 logger = logging.getLogger(__name__)
 
@@ -109,7 +110,7 @@ class SessionContext:
     """
 
     ref: SessionRef
-    command: str
+    launch: TerminalLaunch
     working_dir: Path
     title: Optional[str] = None
 
@@ -180,7 +181,7 @@ class SessionManager:
         """
         success = self.runner.create_session(
             session_id=ctx.ref.number,
-            command=ctx.command,
+            launch=ctx.launch,
             working_dir=str(ctx.working_dir),
             title=ctx.title,
             session_name=ctx.ref.name,
@@ -304,7 +305,7 @@ def issue_session_context(
     """Create a context for launching an issue session."""
     return SessionContext(
         ref=SessionRef.for_issue(issue_number),
-        command=command,
+        launch=TerminalLaunch.classified(command, TerminalShell.BASH),
         working_dir=working_dir,
         title=title or f"Issue #{issue_number}",
     )
@@ -319,7 +320,7 @@ def review_session_context(
     """Create a context for launching a review session."""
     return SessionContext(
         ref=SessionRef.for_review(pr_number),
-        command=command,
+        launch=TerminalLaunch.classified(command, TerminalShell.BASH),
         working_dir=working_dir,
         title=title or f"Review PR #{pr_number}",
     )
@@ -334,7 +335,7 @@ def rework_session_context(
     """Create a context for launching a rework session."""
     return SessionContext(
         ref=SessionRef.for_rework(issue_number),
-        command=command,
+        launch=TerminalLaunch.classified(command, TerminalShell.BASH),
         working_dir=working_dir,
         title=title or f"Rework Issue #{issue_number}",
     )

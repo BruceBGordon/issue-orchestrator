@@ -21,6 +21,10 @@ from typing import Optional, cast
 from unittest.mock import MagicMock, patch
 
 from issue_orchestrator.domain.tech_lead_session import TechLeadCreationOrigin
+from issue_orchestrator.domain.terminal_launch import (
+    TerminalInteractionIntent,
+    TerminalLaunch,
+)
 from issue_orchestrator.domain.claim import ClaimResult
 from issue_orchestrator.control.provider_resilience import ProviderResilienceManager
 from issue_orchestrator.control.launch_transaction import PendingWorkLaunchClaim
@@ -591,10 +595,20 @@ def _build_launcher_bundle(
 
     create_session_override = [None]  # List so tests can replace the callable
 
-    def mock_create_session(name: str, cmd: str, wd: Path, title: str | None) -> bool:
-        create_session_calls.append({"name": name, "cmd": cmd, "wd": wd, "title": title})
+    def mock_create_session(
+        name: str, launch: TerminalLaunch, wd: Path, title: str | None
+    ) -> bool:
+        create_session_calls.append(
+            {
+                "name": name,
+                "launch": launch,
+                "cmd": launch.shell_command,
+                "wd": wd,
+                "title": title,
+            }
+        )
         if create_session_override[0] is not None:
-            return create_session_override[0](name, cmd, wd, title)
+            return create_session_override[0](name, launch, wd, title)
         return True
 
     issue_machines: dict[int, IssueStateMachine] = {}
@@ -877,7 +891,7 @@ class TestLaunchIssueSession:
         assert result.session.key.task == TaskKind.CODE
         assert result.session.run_dir is not None
         assert result.session.run_dir.name.endswith("__coding-1")
-        assert result.session.agent_config.timeout_minutes == 90
+        assert result.session.agent_config.timeout_minutes == 92
 
     def test_issue_phase_has_human_identity_and_run_fairness_group(
         self,
@@ -897,9 +911,14 @@ class TestLaunchIssueSession:
         group = arguments[arguments.index("--group") + 1]
         assert group.startswith("agent:")
         assert group.endswith(":coding-1")
-        assert arguments[arguments.index("--active-timeout-seconds") + 1] == (
-            "2700.0"
+        launch = launcher_bundle.create_session_calls[0]["launch"]
+        assert (
+            launch.interaction_intent is TerminalInteractionIntent.CLAUDE_TRUST_WORKTREE
         )
+        assert TerminalInteractionIntent.classify(launch.shell_command) is (
+            TerminalInteractionIntent.NONE
+        )
+        assert arguments[arguments.index("--active-timeout-seconds") + 1] == ("2700.0")
         assert arguments[arguments.index("--absolute-timeout-seconds") + 1] == (
             "5400.0"
         )
@@ -2000,8 +2019,10 @@ class TestLaunchValidationRetrySession:
         assert result.session.original_prompt == "Work on issue #123: Fix checkout"
         assert result.session.run_dir is not None
         assert result.session.run_dir.name.endswith("__coding-2")
-        assert result.session.agent_config.timeout_minutes == 90
-        assert mock_worktree_manager.create_calls[0]["branch_name"] == "123-fix-checkout"
+        assert result.session.agent_config.timeout_minutes == 92
+        assert (
+            mock_worktree_manager.create_calls[0]["branch_name"] == "123-fix-checkout"
+        )
         command = launcher_bundle.create_session_calls[0]["cmd"]
         assert "Validation Retry" in command
         assert "dirty worktree" in command
@@ -2117,7 +2138,7 @@ class TestLaunchReviewSession:
         assert result.session.key.task == TaskKind.REVIEW
         assert result.session.run_dir is not None
         assert result.session.run_dir.name.endswith("__review-1")
-        assert result.session.agent_config.timeout_minutes == 60
+        assert result.session.agent_config.timeout_minutes == 62
 
     def test_internal_coder_instructions_do_not_change_reviewer_command(
         self,
@@ -2367,7 +2388,7 @@ class TestLaunchRetrospectiveReviewSession:
         assert "RETROSPECTIVE REVIEW MODE" in result.session.original_prompt
         assert "issue #365" in result.session.original_prompt
         assert "Prior orchestrator PR: #512" in result.session.original_prompt
-        assert result.session.agent_config.timeout_minutes == 60
+        assert result.session.agent_config.timeout_minutes == 62
 
         create_call = mock_worktree_manager.create_calls[0]
         assert create_call["issue_number"] == 365
@@ -2604,7 +2625,7 @@ class TestLaunchReworkSession:
         assert result.session.key.task == TaskKind.REWORK
         assert result.session.run_dir is not None
         assert result.session.run_dir.name.endswith("__coding-2")
-        assert result.session.agent_config.timeout_minutes == 90
+        assert result.session.agent_config.timeout_minutes == 92
         started = next(e for e in mock_events.events if str(e.name) == "rework.started")
         assert started.data["agent"] == "agent:web"
         assert started.data["task"] == "rework"

@@ -35,6 +35,8 @@ from ...domain.executor_monitoring import (
     ExecutorEvent,
     ExecutorEventMetadata,
     ExecutorEventTimeline,
+    ExecutorEventPage,
+    ExecutorFairnessGroupEventsQuery,
     ExecutorHostLoad,
     ExecutorMonitoredWork,
     ExecutorPolicyChanged,
@@ -416,6 +418,27 @@ class ExecutorEventStore:
             records = self._read_records()
         return ExecutorEventTimeline(
             tuple(_to_domain_event(record) for record in records[-query.limit :])
+        )
+
+    def events_for_group(
+        self,
+        query: ExecutorFairnessGroupEventsQuery,
+    ) -> ExecutorEventPage:
+        """Read an exact fairness-group suffix without wall-clock slicing."""
+        lock_path = self._pool_dir / "executor-events.lock"
+        self._pool_dir.mkdir(parents=True, exist_ok=True)
+        with lock_path.open("a+b") as lock_handle:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_SH)
+            records = self._read_records()
+        matching = tuple(
+            event
+            for event in (_to_domain_event(record) for record in records)
+            if not isinstance(event, ExecutorPolicyChanged)
+            and event.work.fairness_group == query.fairness_group
+        )
+        return ExecutorEventPage(
+            total_matching_event_count=len(matching),
+            events=matching[-query.limit :],
         )
 
     def _read_records(self) -> tuple[StoredExecutorEvent, ...]:

@@ -21,6 +21,11 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from ..control.isolation import build_agent_tool_path, build_isolation_prefix
+from ..domain.terminal_launch import (
+    TerminalInteractionIntent,
+    TerminalLaunch,
+    TerminalShell,
+)
 from .agent_runner import AgentRunner, AgentSession, AgentSpec
 from .session_interactions import (
     SessionInteractionHandler,
@@ -304,7 +309,7 @@ class SubprocessPlugin:
 
     def _interaction_handler(
         self,
-        command: str,
+        intent: TerminalInteractionIntent,
         session_name: str,
         working_dir: Path,
     ) -> SessionInteractionHandler | None:
@@ -319,23 +324,36 @@ class SubprocessPlugin:
             return None
         if not working_dir.resolve().is_relative_to(self._worktree_base):
             return None
-        rules = builtin_session_interaction_rules(command)
+        rules = builtin_session_interaction_rules(intent)
         if not rules:
             return None
         return SessionInteractionHandler(session_name=session_name, rules=rules)
 
-    def _start_process(self, command: str, working_dir: Path, session_name: str) -> AgentSession:
+    def _start_process(
+        self,
+        launch: TerminalLaunch,
+        working_dir: Path,
+        session_name: str,
+    ) -> AgentSession:
         """Start an agent session via :class:`AgentRunner`.
 
         Builds the full command with isolation prefix, constructs an
         :class:`AgentSpec`, and delegates to ``AgentRunner.start()``.
         """
-        full_cmd = self._build_process_command(command, working_dir)
-        log_path = self._session_log_path(working_dir, session_name, command)
-        interaction_handler = self._interaction_handler(command, session_name, working_dir)
+        full_cmd = self._build_process_command(launch.shell_command, working_dir)
+        log_path = self._session_log_path(
+            working_dir,
+            session_name,
+            launch.shell_command,
+        )
+        interaction_handler = self._interaction_handler(
+            launch.interaction_intent,
+            session_name,
+            working_dir,
+        )
 
         spec = AgentSpec(
-            command=["/bin/bash", "-lc", full_cmd],
+            command=[launch.shell.value, "-lc", full_cmd],
             working_dir=working_dir,
             timeout_seconds=7200,  # Sessions manage their own timeout via provider_runner
             log_path=log_path,
@@ -387,6 +405,8 @@ class SubprocessPlugin:
         self,
         session_id: int,
         command: str,
+        interaction_intent: TerminalInteractionIntent,
+        shell: TerminalShell,
         working_dir: str,
         title: str | None,
         session_name: str,  # Required - caller must provide explicit name
@@ -400,7 +420,8 @@ class SubprocessPlugin:
         if self.session_exists(session_id, session_name):
             return False
 
-        session = self._start_process(command, worktree, session_name)
+        launch = TerminalLaunch(command, shell, interaction_intent)
+        session = self._start_process(launch, worktree, session_name)
         is_review = session_name.startswith("review-")
         tab_name = title or session_name
         if is_review:

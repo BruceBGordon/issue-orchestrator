@@ -20,8 +20,10 @@ from issue_orchestrator.domain.executor import (
     ExecutorConcurrencyRange,
     ExecutorExclusiveResource,
     ExecutorFairnessGroup,
+    ExecutorHistoryRetentionPolicy,
     ExecutorRunSpecification,
     ExecutorWorkKey,
+    ExecutorProcessTerminationPolicy,
     ExecutorUnboundedDeadline,
 )
 from issue_orchestrator.domain.executor_host import ExecutorHostCpuUtilization
@@ -128,6 +130,8 @@ def main() -> int:
                 process_id=os.getpid,
                 request_nonce=lambda: uuid4().hex,
             ),
+            process_termination_policy=ExecutorProcessTerminationPolicy(2.0),
+            history_retention_policy=ExecutorHistoryRetentionPolicy(2048, 24),
             queue_settle_seconds=0.02,
             queue_poll_seconds=0.01,
         )

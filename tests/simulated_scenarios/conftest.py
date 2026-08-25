@@ -13,6 +13,7 @@ import pytest
 
 from issue_orchestrator.domain.models import Issue, AgentConfig
 from issue_orchestrator.domain.review_exchange_run import ReviewExchangeRunAssets
+from issue_orchestrator.domain.terminal_launch import TerminalLaunch
 from issue_orchestrator.execution.agent_runner import AgentRunner, AgentSpec
 from issue_orchestrator.ports.working_copy import (
     BranchPathsResult,
@@ -49,6 +50,47 @@ from issue_orchestrator.control.workflows.retrospective_review_workflow import (
 )
 from issue_orchestrator.control.workflows.review_workflow import ReviewWorkflow
 from issue_orchestrator.control.workflows.rework_workflow import ReworkWorkflow
+
+
+_EXECUTOR_POOL_DIR_ENV = "ISSUE_ORCHESTRATOR_EXECUTOR_POOL_DIR"
+
+
+@dataclass(frozen=True, slots=True)
+class SimulatedExecutorPool:
+    """Worker-local executor state used by spawned simulated agent phases."""
+
+    path: Path
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.path, Path) or not self.path.is_absolute():
+            raise ValueError("SimulatedExecutorPool.path must be an absolute Path")
+
+
+@pytest.fixture(scope="session")
+def simulated_executor_pool(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> SimulatedExecutorPool:
+    """Keep routine scenario subprocesses out of the user's machine pool.
+
+    Under xdist each worker receives its own base temporary directory. Every
+    real agent-phase wrapper spawned by that worker inherits this override, so
+    it cannot recursively contend with the outer pytest lane's host lease or
+    retain synthetic repository profiles after the test session.
+    """
+    return SimulatedExecutorPool(
+        (tmp_path_factory.getbasetemp() / "simulated-host-executor").resolve()
+    )
+
+
+@pytest.fixture(autouse=True)
+def _bind_simulated_executor_pool(
+    monkeypatch: pytest.MonkeyPatch,
+    isolate_orchestrator_env: None,
+    simulated_executor_pool: SimulatedExecutorPool,
+) -> None:
+    """Apply the worker pool after the global environment scrub fixture."""
+    del isolate_orchestrator_env
+    monkeypatch.setenv(_EXECUTOR_POOL_DIR_ENV, str(simulated_executor_pool.path))
 
 
 @pytest.fixture(autouse=True)
@@ -404,17 +446,17 @@ class ScriptSessionRunner:
     def create_session(
         self,
         session_id: int,
-        command: str,
+        launch: TerminalLaunch,
         working_dir: str,
         title: str | None,
         session_name: str,
     ) -> bool:
         python_bin_dir = str(Path(sys.executable).parent)
 
-        run_dir = _scheduled_run_dir(command, working_dir)
+        run_dir = _scheduled_run_dir(launch.shell_command, working_dir)
 
         spec = AgentSpec(
-            command=["bash", "-c", command],
+            command=[launch.shell.value, "-c", launch.shell_command],
             working_dir=Path(working_dir),
             timeout_seconds=120,
             log_path=run_dir / "terminal-recording.jsonl",
@@ -483,20 +525,20 @@ class FastScriptSessionRunner:
     def create_session(
         self,
         session_id: int,
-        command: str,
+        launch: TerminalLaunch,
         working_dir: str,
         title: str | None,
         session_name: str,
     ) -> bool:
         python_bin_dir = str(Path(sys.executable).parent)
 
-        run_dir = _scheduled_run_dir(command, working_dir)
+        run_dir = _scheduled_run_dir(launch.shell_command, working_dir)
         run_dir.mkdir(parents=True, exist_ok=True)
 
         env = dict(os.environ)
         env["PATH"] = f"{python_bin_dir}:{env.get('PATH', '')}"
         result = subprocess.run(
-            ["bash", "-c", command],
+            [launch.shell.value, "-c", launch.shell_command],
             cwd=working_dir,
             env=env,
             capture_output=True,

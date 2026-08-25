@@ -55,6 +55,7 @@ from ..domain.coder_prompt import (
 )
 from ..domain.session_run import SessionRunAssets
 from ..domain.agent_phase_execution import AgentPhaseRunSpecification
+from ..domain.terminal_launch import TerminalInteractionIntent, TerminalLaunch
 from ..domain.executor import ExecutorFairnessGroup, ExecutorWorkKey
 from .worktree import WorktreeSetupError
 from .worktree_context import WorktreeContext
@@ -167,7 +168,7 @@ class SessionLauncher:
         manifest_downloader: ManifestDownloader,
         tech_lead_authority: "TechLeadAuthorityStore",
         session_exists_fn: Callable[[str], bool],
-        create_session_fn: Callable[[str, str, Path, str | None], bool],
+        create_session_fn: Callable[[str, TerminalLaunch, Path, str | None], bool],
         get_issue_machine: Callable[["IssueProtocol"], Optional["IssueStateMachine"]],
         get_session_machine: Callable[[str, int, int], Optional["SessionStateMachine"]],
         get_review_machine: Callable[[int, int], Optional["ReviewStateMachine"]],
@@ -2217,7 +2218,7 @@ class SessionLauncher:
         run: SessionRunAssets,
         agent_label: str,
         task_kind: TaskKind,
-    ) -> tuple[str, "AgentConfig"]:
+    ) -> tuple[TerminalLaunch, "AgentConfig"]:
         """Submit one complete phase and give its session the absolute bound."""
         specification = AgentPhaseRunSpecification.from_timeout_minutes(
             work_key=ExecutorWorkKey(
@@ -2227,11 +2228,12 @@ class SessionLauncher:
                 f"agent:{run.run_id}:{run.session_name}"
             ),
             active_timeout_minutes=agent_config.timeout_minutes,
+            interaction_intent=TerminalInteractionIntent.classify(agent_config.command),
             shell_command=shell_command,
         )
         scheduled = self._agent_phase_command_scheduler.schedule(specification)
         return (
-            scheduled.terminal_command,
+            scheduled.terminal_launch,
             replace(
                 agent_config,
                 timeout_minutes=scheduled.absolute_timeout_minutes,

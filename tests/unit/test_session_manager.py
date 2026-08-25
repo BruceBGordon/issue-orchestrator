@@ -14,6 +14,7 @@ from issue_orchestrator.control.session_manager import (
     rework_session_context,
 )
 from issue_orchestrator.ports import NullEventSink, TraceEvent
+from issue_orchestrator.domain.terminal_launch import TerminalLaunch, TerminalShell
 
 
 class CollectingEventSink:
@@ -37,20 +38,22 @@ class MockSessionRunner:
     def create_session(
         self,
         session_id: int,
-        command: str,
+        launch: TerminalLaunch,
         working_dir: str,
         title: str | None = None,
         session_name: str | None = None,
     ) -> bool:
-        self.create_calls.append({
-            "session_id": session_id,
-            "session_name": session_name,
-            "command": command,
-            "working_dir": working_dir,
-            "title": title,
-        })
+        self.create_calls.append(
+            {
+                "session_id": session_id,
+                "session_name": session_name,
+                "launch": launch,
+                "working_dir": working_dir,
+                "title": title,
+            }
+        )
         self.sessions[session_id] = {
-            "command": command,
+            "launch": launch,
             "working_dir": working_dir,
             "title": title,
             "session_name": session_name,
@@ -214,7 +217,7 @@ class TestSessionManager:
         """Test that start creates a session via runner."""
         ctx = SessionContext(
             ref=SessionRef.for_issue(123),
-            command="claude",
+            launch=TerminalLaunch.classified("claude", TerminalShell.BASH),
             working_dir=Path("/path/to/worktree"),
             title="Issue #123",
         )
@@ -225,7 +228,7 @@ class TestSessionManager:
         assert len(mock_runner.create_calls) == 1
         call = mock_runner.create_calls[0]
         assert call["session_id"] == 123
-        assert call["command"] == "claude"
+        assert call["launch"].shell_command == "claude"
         assert call["working_dir"] == "/path/to/worktree"
         assert call["title"] == "Issue #123"
 
@@ -233,7 +236,7 @@ class TestSessionManager:
         """Test that start emits session.launched event."""
         ctx = SessionContext(
             ref=SessionRef.for_issue(123),
-            command="claude",
+            launch=TerminalLaunch.classified("claude", TerminalShell.BASH),
             working_dir=Path("/path/to/worktree"),
         )
 
@@ -339,7 +342,7 @@ class TestSessionContextFactories:
 
         assert ctx.ref.session_type == SessionType.ISSUE
         assert ctx.ref.number == 123
-        assert ctx.command == "claude"
+        assert ctx.launch.shell_command == "claude"
         assert ctx.working_dir == Path("/path/to/worktree")
         assert ctx.title == "Issue #123"
 
@@ -353,7 +356,7 @@ class TestSessionContextFactories:
 
         assert ctx.ref.session_type == SessionType.REVIEW
         assert ctx.ref.number == 456
-        assert ctx.command == "claude --review"
+        assert ctx.launch.shell_command == "claude --review"
         assert ctx.title == "Review PR #456"
 
     def test_rework_session_context(self):
