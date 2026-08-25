@@ -218,12 +218,12 @@ class PosixContainedCommandCapture:
                 ),
             )
 
-        pump = _CapturedOutputPump(
-            cast(TextIO, process.stdout),
-            output,
-            line_observer,
-        )
         try:
+            pump = _CapturedOutputPump(
+                cast(TextIO, process.stdout),
+                output,
+                line_observer,
+            )
             pump.start()
         except BaseException as error:
             return self._abort_without_pump(
