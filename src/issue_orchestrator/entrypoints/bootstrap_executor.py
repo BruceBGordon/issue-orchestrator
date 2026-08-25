@@ -56,6 +56,7 @@ def compose_executor(host_cpu_observer: HostCpuUtilizationObserver) -> Executor:
     """Compose host execution after the root chooses its system observer."""
     _require_posix_executor()
     try:
+        from ..execution.atomic_record_store import OsAtomicPathReplacement
         from ..execution.host_executor import (
             ExecutorRequestIdentityFactory,
             HostExecutor,
@@ -81,6 +82,7 @@ def compose_executor(host_cpu_observer: HostCpuUtilizationObserver) -> Executor:
             request_nonce=lambda: uuid4().hex,
         ),
         process_group_supervisor=build_process_group_supervisor(),
+        atomic_path_replacement=OsAtomicPathReplacement(),
         history_retention_lock=_build_history_retention_lock(pool_dir),
         history_retention_policy=_HISTORY_RETENTION,
         queue_settle_seconds=0.1,
@@ -103,6 +105,7 @@ def build_executor_monitor() -> ExecutorMonitor:
     """Compose the read-only executor activity monitor."""
     _require_posix_executor()
     try:
+        from ..execution.atomic_record_store import OsAtomicPathReplacement
         from ..execution.host_executor import (
             HostExecutorMonitor,
             default_executor_pool_dir,
@@ -118,6 +121,7 @@ def build_executor_monitor() -> ExecutorMonitor:
         _build_demand_estimator(),
         _HISTORY_RETENTION,
         _build_history_retention_lock(pool_dir),
+        OsAtomicPathReplacement(),
     )
 
 

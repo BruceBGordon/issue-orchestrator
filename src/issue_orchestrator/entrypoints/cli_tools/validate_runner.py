@@ -34,7 +34,10 @@ from ...domain.process_group import (
     ProcessGroupCompleted,
     ProcessGroupUnboundedWait,
 )
-from ...domain.validation_timing import ValidationRunLifecycle
+from ...domain.validation_timing import (
+    ValidationProcessGroupCleanup,
+    ValidationRunLifecycle,
+)
 from ...infra.env import get_env
 from ...infra.validation_timings import (
     ValidateTimingRecorder,
@@ -277,12 +280,17 @@ class _ValidationCommandCompleted:
     def lifecycle(self) -> ValidationRunLifecycle:
         return ValidationRunLifecycle.COMPLETED
 
+    @property
+    def process_group_cleanup(self) -> ValidationProcessGroupCleanup:
+        return ValidationProcessGroupCleanup.SUPERVISED
+
 
 @dataclass(frozen=True, slots=True)
 class _ValidationCaptureFailed:
     """Incomplete capture retained separately from the child's terminal facts."""
 
     child_exit_code: int
+    process_group_cleanup: ValidationProcessGroupCleanup
     capture_error_type: str
     capture_error_message: str
     duration_seconds: float
@@ -292,6 +300,10 @@ class _ValidationCaptureFailed:
     def __post_init__(self) -> None:
         if not self.capture_error_type or not self.capture_error_message:
             raise ValueError("validation capture failure requires error evidence")
+        if type(self.process_group_cleanup) is not ValidationProcessGroupCleanup:
+            raise ValueError(
+                "validation capture failure requires typed process cleanup"
+            )
 
     @property
     def validation_exit_code(self) -> int:
@@ -393,17 +405,24 @@ class _ValidationCommandCapture:
             raise RuntimeError("validation command capture cannot finish twice")
         self._finished = True
         child_exit_code = 127
+        process_group_cleanup = ValidationProcessGroupCleanup.NOT_STARTED
         if self.process is not None:
             if self.process.returncode is None:
                 termination = self.process_group_supervisor.abort(
                     OwnedProcessGroupLeader(self.process.pid)
                 )
                 self.process.returncode = termination.leader_exit_code
+                process_group_cleanup = (
+                    ValidationProcessGroupCleanup.CAPTURE_ABORTED
+                )
+            else:
+                process_group_cleanup = ValidationProcessGroupCleanup.SUPERVISED
             child_exit_code = self.process.returncode
         wall_end = self.clock.wall_now()
         monotonic_end = self.clock.monotonic_now()
         result = _ValidationCaptureFailed(
             child_exit_code=child_exit_code,
+            process_group_cleanup=process_group_cleanup,
             capture_error_type=type(capture_error).__name__,
             capture_error_message=str(capture_error),
             duration_seconds=monotonic_end - self.monotonic_started_at,
@@ -420,6 +439,7 @@ class _ValidationCommandCapture:
                 f"child_exit_code={result.child_exit_code} "
                 f"validation_exit_code={result.validation_exit_code} "
                 f"lifecycle={result.lifecycle.value} "
+                f"process_group_cleanup={result.process_group_cleanup.value} "
                 f"elapsed={result.duration_seconds:.1f}s "
                 f"lines={self.line_count} bytes={self.byte_count}\n"
             )
@@ -484,6 +504,7 @@ def _finalize_validation_evidence(
     finally:
         recorder.finalize(
             lifecycle=result.lifecycle,
+            process_group_cleanup=result.process_group_cleanup,
             exit_code=result.validation_exit_code,
             child_exit_code=result.child_exit_code,
             total_elapsed_seconds=result.duration_seconds,

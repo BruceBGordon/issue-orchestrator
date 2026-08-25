@@ -431,3 +431,63 @@ raise SystemExit(main())
 
     assert completed.returncode == 0, completed.stderr
     assert "usage:" in completed.stdout
+
+
+def test_bootstrap_import_is_safe_and_executor_failure_is_explicit_without_posix() -> None:
+    import_blocker = """
+import builtins
+
+real_import = builtins.__import__
+
+def import_without_posix_executor(name, globals=None, locals=None, fromlist=(), level=0):
+    if name in {"fcntl", "resource"}:
+        raise ModuleNotFoundError(f"No module named {name!r}", name=name)
+    return real_import(name, globals, locals, fromlist, level)
+
+builtins.__import__ = import_without_posix_executor
+"""
+    ordinary_bootstrap = subprocess.run(
+        (
+            sys.executable,
+            "-c",
+            import_blocker
+            + """
+from issue_orchestrator.entrypoints.bootstrap_executor import build_agent_phase_command_scheduler
+build_agent_phase_command_scheduler()
+print("ordinary bootstrap composition succeeded")
+""",
+        ),
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    explicit_executor_failure = subprocess.run(
+        (
+            sys.executable,
+            "-c",
+            import_blocker
+            + """
+from issue_orchestrator.entrypoints.bootstrap_executor import build_executor_monitor
+print("bootstrap_executor import succeeded")
+try:
+    build_executor_monitor()
+except RuntimeError as exc:
+    print(exc)
+else:
+    raise AssertionError("pooled executor unexpectedly composed without POSIX support")
+""",
+        ),
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert ordinary_bootstrap.returncode == 0, ordinary_bootstrap.stderr
+    assert "ordinary bootstrap composition succeeded" in ordinary_bootstrap.stdout
+    assert explicit_executor_failure.returncode == 0, explicit_executor_failure.stderr
+    assert "bootstrap_executor import succeeded" in explicit_executor_failure.stdout
+    assert "requires POSIX fcntl and resource support" in (
+        explicit_executor_failure.stdout
+    )

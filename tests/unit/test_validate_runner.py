@@ -394,6 +394,7 @@ class TestValidateRunner:
         ]
         summary = next(record for record in records if record["kind"] == "run_summary")
         assert summary["lifecycle"] == "capture-failed"
+        assert summary["process_group_cleanup"] == "capture-aborted"
         assert summary["exit_code"] == 1
         assert summary["child_exit_code"] == 0
 
@@ -424,6 +425,7 @@ class TestValidateRunner:
         assert summary_record["exit_code"] == 0
         assert summary_record["child_exit_code"] == 0
         assert summary_record["lifecycle"] == "completed"
+        assert summary_record["process_group_cleanup"] == "supervised"
         assert isinstance(summary_record["total_elapsed_seconds"], float)
         assert isinstance(summary_record["monotonic_elapsed_seconds"], float)
         assert isinstance(summary_record["wall_elapsed_seconds"], float)

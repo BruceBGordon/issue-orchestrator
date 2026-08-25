@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import fcntl
 import os
-import uuid
 from pathlib import Path
 
 from platformdirs import user_state_path
@@ -18,6 +17,7 @@ from ...domain.executor import (
     ExecutorPolicySource,
 )
 from ._contracts import PersistedPolicyRecord
+from ..atomic_record_store import ExecutorAtomicRecordStore
 
 
 EXECUTOR_POOL_DIR_ENV = "ISSUE_ORCHESTRATOR_EXECUTOR_POOL_DIR"
@@ -61,11 +61,17 @@ def default_executor_pool_dir() -> Path:
 class ExecutorPolicyStore:
     """Own the persisted machine policy and its environment override."""
 
-    def __init__(self, pool_dir: Path) -> None:
+    def __init__(
+        self,
+        pool_dir: Path,
+        atomic_records: ExecutorAtomicRecordStore,
+    ) -> None:
         self._pool_dir = pool_dir
         self._path = pool_dir / "policy.json"
+        self._atomic_records = atomic_records
 
     def effective(self) -> ExecutorPolicy:
+        self._atomic_records.prune_crash_remnants()
         environment = os.environ.get(EXECUTOR_AGGRESSIVENESS_ENV)
         if environment is not None:
             percent = _parse_integer_environment(
@@ -94,7 +100,7 @@ class ExecutorPolicyStore:
         lock_path = self._pool_dir / "policy.lock"
         with lock_path.open("a+b") as lock_handle:
             fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
-            self._write_record(record)
+            self._atomic_records.write(self._path, record)
         saved = ExecutorPolicy(aggressiveness, ExecutorPolicySource.PERSISTED)
         return ExecutorPolicyChange(saved=saved, effective=self.effective())
 
@@ -105,10 +111,3 @@ class ExecutorPolicyStore:
             )
         except (OSError, ValidationError) as exc:
             raise RuntimeError(f"invalid host executor policy: {self._path}") from exc
-
-    def _write_record(self, record: PersistedPolicyRecord) -> None:
-        temporary = self._path.with_name(
-            f".{self._path.name}.{os.getpid()}.{uuid.uuid4().hex}"
-        )
-        temporary.write_text(record.model_dump_json() + "\n", encoding="utf-8")
-        os.replace(temporary, self._path)

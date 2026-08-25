@@ -325,6 +325,14 @@ class ValidationRunLifecycle(StrEnum):
     CAPTURE_FAILED = "capture-failed"
 
 
+class ValidationProcessGroupCleanup(StrEnum):
+    """Terminal containment fact kept separate from command/capture outcome."""
+
+    SUPERVISED = "supervised"
+    CAPTURE_ABORTED = "capture-aborted"
+    NOT_STARTED = "not-started"
+
+
 @dataclass(frozen=True, slots=True)
 class ValidationRunTimingSummary:
     """Completed total timing for one validate-runner invocation."""
@@ -332,6 +340,7 @@ class ValidationRunTimingSummary:
     context: ValidationRunTimingContext
     configuration: ValidationConfiguration
     lifecycle: ValidationRunLifecycle
+    process_group_cleanup: ValidationProcessGroupCleanup
     exit_code: int
     child_exit_code: int
     total_elapsed_seconds: float
@@ -348,6 +357,20 @@ class ValidationRunTimingSummary:
             ValidationConfiguration,
         )
         _require_exact(owner, "lifecycle", self.lifecycle, ValidationRunLifecycle)
+        _require_exact(
+            owner,
+            "process_group_cleanup",
+            self.process_group_cleanup,
+            ValidationProcessGroupCleanup,
+        )
+        if (
+            self.lifecycle is ValidationRunLifecycle.COMPLETED
+            and self.process_group_cleanup
+            is not ValidationProcessGroupCleanup.SUPERVISED
+        ):
+            raise ValueError(
+                "completed validation lifecycle requires supervised cleanup"
+            )
         _require_integer(owner, "exit_code", self.exit_code, minimum=-(2**63))
         _require_integer(
             owner,
@@ -384,6 +407,7 @@ class ValidationRunTimingSummary:
                 "exit_code": self.exit_code,
                 "child_exit_code": self.child_exit_code,
                 "lifecycle": self.lifecycle.value,
+                "process_group_cleanup": self.process_group_cleanup.value,
                 "total_elapsed_seconds": self.total_elapsed_seconds,
                 "recorded_at": self.recorded_at,
             },

@@ -31,6 +31,7 @@ from issue_orchestrator.execution.host_executor import (
     ExecutorRequestIdentityFactory,
     HostExecutor,
 )
+from issue_orchestrator.execution.atomic_record_store import OsAtomicPathReplacement
 from issue_orchestrator.execution.process_group_terminator import (
     PosixProcessGroupTerminator,
 )
@@ -148,6 +149,7 @@ def main() -> int:
                     )
                 )
             ),
+            atomic_path_replacement=OsAtomicPathReplacement(),
             history_retention_lock=PosixExecutorHistoryRetentionLock(
                 (pool_dir / "work-history" / "retention.lock").resolve()
             ),

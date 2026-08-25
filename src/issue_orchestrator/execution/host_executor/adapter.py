@@ -42,6 +42,7 @@ from ...domain.process_group import (
     ProcessGroupUnboundedWait,
 )
 from ...ports.executor import Executor
+from ...ports.atomic_path_replacement import AtomicPathReplacement
 from ...ports.executor_history_lock import ExecutorHistoryRetentionLock
 from ...ports.host_cpu_utilization import HostCpuUtilizationObserver
 from ...ports.process_group_supervisor import ProcessGroupSupervisor
@@ -62,6 +63,7 @@ from ._types import (
 )
 from .host_policy import ExecutorPolicyStore
 from .request_identity import ExecutorRequestIdentityFactory
+from ..atomic_record_store import ExecutorAtomicRecordStore
 
 
 EXECUTOR_CONCURRENCY_ENV = "ISSUE_ORCHESTRATOR_EXECUTOR_CONCURRENCY"
@@ -91,6 +93,14 @@ def _require_history_retention_lock(value: object) -> None:
         )
 
 
+def _require_atomic_path_replacement(value: object) -> None:
+    if not isinstance(value, AtomicPathReplacement):
+        raise ValueError(
+            "HostExecutor.atomic_path_replacement must implement "
+            "AtomicPathReplacement"
+        )
+
+
 class HostExecutor(Executor):
     """Coordinate, execute, observe, and learn behind one narrow interface."""
 
@@ -104,6 +114,7 @@ class HostExecutor(Executor):
         host_cpu_observer: HostCpuUtilizationObserver,
         request_identity_factory: ExecutorRequestIdentityFactory,
         process_group_supervisor: ProcessGroupSupervisor,
+        atomic_path_replacement: AtomicPathReplacement,
         history_retention_lock: ExecutorHistoryRetentionLock,
         history_retention_policy: ExecutorHistoryRetentionPolicy,
         queue_settle_seconds: float,
@@ -146,15 +157,28 @@ class HostExecutor(Executor):
                 "ExecutorHistoryRetentionPolicy"
             )
         _require_history_retention_lock(history_retention_lock)
+        _require_atomic_path_replacement(atomic_path_replacement)
         self._queue_settle_seconds = queue_settle_seconds
         self._queue_poll_seconds = queue_poll_seconds
-        self._state = HostExecutorState(pool_dir, host_cpu_slots)
+        pool_records = ExecutorAtomicRecordStore(
+            pool_dir,
+            atomic_path_replacement,
+        )
+        self._state = HostExecutorState(
+            pool_dir,
+            host_cpu_slots,
+            pool_records,
+        )
         self._history = ExecutorWorkHistoryStore(
             pool_dir / "work-history",
             history_retention_policy,
             history_retention_lock,
+            ExecutorAtomicRecordStore(
+                pool_dir / "work-history",
+                atomic_path_replacement,
+            ),
         )
-        self._policy_store = ExecutorPolicyStore(pool_dir)
+        self._policy_store = ExecutorPolicyStore(pool_dir, pool_records)
         self._events = ExecutorEventStore(pool_dir)
         self._repository_resolver = ExecutorRepositoryResolver()
 

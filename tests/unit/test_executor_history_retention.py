@@ -20,6 +20,7 @@ from issue_orchestrator.control.executor_admission import (
     ExecutorWorkDemandEstimator,
 )
 from issue_orchestrator.domain.executor import (
+    ExecutorAggressiveness,
     ExecutorCommand,
     ExecutorConcurrencyRange,
     ExecutorFairnessGroup,
@@ -40,6 +41,7 @@ from issue_orchestrator.execution.host_executor import (
     HostExecutor,
     HostExecutorMonitor,
 )
+from issue_orchestrator.execution.atomic_record_store import OsAtomicPathReplacement
 from issue_orchestrator.execution.process_group_terminator import (
     PosixProcessGroupTerminator,
 )
@@ -52,6 +54,7 @@ from issue_orchestrator.execution.executor_history_lock import (
 from issue_orchestrator.ports.executor_history_lock import (
     ExecutorHistoryRetentionLock,
 )
+from issue_orchestrator.ports.atomic_path_replacement import AtomicPathReplacement
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -81,6 +84,7 @@ def _executor(
     retention_lock: ExecutorHistoryRetentionLock,
     *,
     request_nonce: str,
+    atomic_path_replacement: AtomicPathReplacement,
 ) -> HostExecutor:
     return HostExecutor(
         pool_dir=pool_dir,
@@ -104,6 +108,7 @@ def _executor(
                 )
             )
         ),
+        atomic_path_replacement=atomic_path_replacement,
         history_retention_lock=retention_lock,
         history_retention_policy=retention,
         queue_settle_seconds=0.001,
@@ -124,6 +129,68 @@ def _run_work(executor: HostExecutor, work_key: str) -> ExecutorRunResult:
             ExecutorUnboundedDeadline(),
         ),
     )
+
+
+class _FailingAtomicPathReplacement:
+    """Filesystem-port fake failing after the temporary record is durable."""
+
+    def __init__(self) -> None:
+        self.attempts: list[tuple[Path, Path]] = []
+
+    def replace(self, source: Path, destination: Path) -> None:
+        self.attempts.append((source, destination))
+        raise OSError("simulated atomic replacement failure")
+
+
+def test_atomic_replace_failure_removes_its_temporary_record(tmp_path: Path) -> None:
+    pool_dir = tmp_path / "pool"
+    replacement = _FailingAtomicPathReplacement()
+    executor = _executor(
+        pool_dir,
+        ExecutorHistoryRetentionPolicy(3, 2),
+        PosixExecutorHistoryRetentionLock(
+            (pool_dir / "work-history" / "retention.lock").resolve()
+        ),
+        request_nonce="e" * 32,
+        atomic_path_replacement=replacement,
+    )
+
+    with pytest.raises(OSError, match="simulated atomic replacement failure"):
+        executor.configure_policy(ExecutorAggressiveness(125))
+
+    [attempt] = replacement.attempts
+    assert attempt[1] == pool_dir / "policy.json"
+    assert tuple(pool_dir.glob(".io-executor-atomic-*.tmp")) == ()
+
+
+def test_executor_prunes_only_recognizable_atomic_crash_remnants(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pool_dir = tmp_path / "pool"
+    history_dir = pool_dir / "work-history"
+    history_dir.mkdir(parents=True)
+    pool_remnant = pool_dir / ".io-executor-atomic-abandoned.tmp"
+    history_remnant = history_dir / ".io-executor-atomic-abandoned.tmp"
+    unrelated_hidden_file = pool_dir / ".unrelated.tmp"
+    for path in (pool_remnant, history_remnant, unrelated_hidden_file):
+        path.write_text("crash debris", encoding="utf-8")
+    executor = _executor(
+        pool_dir,
+        ExecutorHistoryRetentionPolicy(3, 2),
+        PosixExecutorHistoryRetentionLock(
+            (history_dir / "retention.lock").resolve()
+        ),
+        request_nonce="f" * 32,
+        atomic_path_replacement=OsAtomicPathReplacement(),
+    )
+    monkeypatch.chdir(REPO_ROOT)
+
+    assert _run_work(executor, "atomic:prune").exit_code == 0
+
+    assert pool_remnant.exists() is False
+    assert history_remnant.exists() is False
+    assert unrelated_hidden_file.exists() is True
 
 
 class _BlockingFirstSharedRetentionLock:
@@ -197,6 +264,7 @@ def test_history_reader_holds_shared_lock_across_read_and_pruning(
         retention,
         PosixExecutorHistoryRetentionLock(lock_path),
         request_nonce="b" * 32,
+        atomic_path_replacement=OsAtomicPathReplacement(),
     )
     assert _run_work(seed_executor, "history:first").exit_code == 0
 
@@ -214,6 +282,7 @@ def test_history_reader_holds_shared_lock_across_read_and_pruning(
             reader_holds_shared,
             release_reader,
         ),
+        OsAtomicPathReplacement(),
     )
     writer_executor = _executor(
         pool_dir,
@@ -224,6 +293,7 @@ def test_history_reader_holds_shared_lock_across_read_and_pruning(
             writer_acquired_exclusive_lock,
         ),
         request_nonce="c" * 32,
+        atomic_path_replacement=OsAtomicPathReplacement(),
     )
 
     with ThreadPoolExecutor(max_workers=2) as workers:
@@ -250,6 +320,7 @@ def test_history_reader_holds_shared_lock_across_read_and_pruning(
         _demand_estimator(),
         retention,
         PosixExecutorHistoryRetentionLock(lock_path),
+        OsAtomicPathReplacement(),
     ).status(ExecutorStatusQuery(ExecutorAllRepositories(), offset=0, limit=10))
     assert tuple(work.work_key.value for work in status.learning.learned_work) == (
         "history:second",
@@ -288,6 +359,7 @@ def test_history_prunes_old_profiles_and_bounds_samples_per_profile(
                 )
             )
         ),
+        atomic_path_replacement=OsAtomicPathReplacement(),
         history_retention_lock=PosixExecutorHistoryRetentionLock(
             (pool_dir / "work-history" / "retention.lock").resolve()
         ),
@@ -322,6 +394,7 @@ def test_history_prunes_old_profiles_and_bounds_samples_per_profile(
         PosixExecutorHistoryRetentionLock(
             (pool_dir / "work-history" / "retention.lock").resolve()
         ),
+        OsAtomicPathReplacement(),
     )
     status = monitor.status(
         ExecutorStatusQuery(ExecutorAllRepositories(), offset=0, limit=10)

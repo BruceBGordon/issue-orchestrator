@@ -4,8 +4,6 @@
 from __future__ import annotations
 
 import fcntl
-import os
-import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -33,6 +31,7 @@ from ._contracts import (
     GroupServiceRecord,
     QueuedWorkRecord,
 )
+from ..atomic_record_store import ExecutorAtomicRecordStore
 
 
 _RecordType = TypeVar("_RecordType", bound=BaseModel)
@@ -121,17 +120,24 @@ HostAdmissionOutcome = HostAdmissionGranted | HostAdmissionDeferred
 class HostExecutorState:
     """Own queue transactions, file locks, leases, and fairness service state."""
 
-    def __init__(self, pool_dir: Path, host_cpu_slots: int) -> None:
+    def __init__(
+        self,
+        pool_dir: Path,
+        host_cpu_slots: int,
+        atomic_records: ExecutorAtomicRecordStore,
+    ) -> None:
         if type(host_cpu_slots) is not int or host_cpu_slots < 1:
             raise ValueError("HostExecutorState capacity must be a positive integer")
         self._pool_dir = pool_dir
         self.host_cpu_slots = host_cpu_slots
+        self._atomic_records = atomic_records
 
     def configure_capacity(self) -> None:
         """Persist capacity, refusing to change it while leases are active."""
         self._pool_dir.mkdir(parents=True, exist_ok=True)
         capacity_path = self._pool_dir / "capacity.json"
         with self._capacity_guard():
+            self._atomic_records.prune_crash_remnants()
             current = self._read_capacity(capacity_path)
             if current is not None and current != self.host_cpu_slots:
                 if not self._all_cpu_slots_are_idle(current):
@@ -140,7 +146,7 @@ class HostExecutorState:
                         f"current={current} requested={self.host_cpu_slots}"
                     )
             if current != self.host_cpu_slots:
-                self._write_atomic(
+                self._atomic_records.write(
                     capacity_path,
                     CapacityRecord(capacity_units=self.host_cpu_slots),
                 )
@@ -340,7 +346,7 @@ class HostExecutorState:
         record = GroupServiceRecord(
             entries=tuple(GroupServiceEntryRecord.from_domain(item) for item in service)
         )
-        self._write_atomic(self._pool_dir / "group-service.json", record)
+        self._atomic_records.write(self._pool_dir / "group-service.json", record)
 
     @staticmethod
     def _add_service(
@@ -441,13 +447,6 @@ class HostExecutorState:
         handle.truncate()
         handle.write((record.model_dump_json() + "\n").encode("utf-8"))
         handle.flush()
-
-    @staticmethod
-    def _write_atomic(path: Path, record: BaseModel) -> None:
-        temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}")
-        temporary.write_text(record.model_dump_json() + "\n", encoding="utf-8")
-        os.replace(temporary, path)
-
 
 def _try_lock(path: Path) -> BinaryIO | None:
     handle = path.open("a+b")

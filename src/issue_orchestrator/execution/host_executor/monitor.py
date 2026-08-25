@@ -16,9 +16,11 @@ from ...domain.executor import ExecutorHistoryRetentionPolicy
 from ...control.executor_admission import ExecutorWorkDemandEstimator
 from ...ports.executor_monitor import ExecutorMonitor
 from ...ports.executor_history_lock import ExecutorHistoryRetentionLock
+from ...ports.atomic_path_replacement import AtomicPathReplacement
 from ._journal import ExecutorEventStore
 from ._history import ExecutorWorkHistoryStore
 from .host_policy import ExecutorPolicyStore
+from ..atomic_record_store import ExecutorAtomicRecordStore
 
 
 def _require_history_retention_lock(value: object) -> None:
@@ -26,6 +28,14 @@ def _require_history_retention_lock(value: object) -> None:
         raise ValueError(
             "HostExecutorMonitor.history_retention_lock must implement "
             "ExecutorHistoryRetentionLock"
+        )
+
+
+def _require_atomic_path_replacement(value: object) -> None:
+    if not isinstance(value, AtomicPathReplacement):
+        raise ValueError(
+            "HostExecutorMonitor.atomic_path_replacement must implement "
+            "AtomicPathReplacement"
         )
 
 
@@ -39,17 +49,27 @@ class HostExecutorMonitor(ExecutorMonitor):
         demand_estimator: ExecutorWorkDemandEstimator,
         history_retention_policy: ExecutorHistoryRetentionPolicy,
         history_retention_lock: ExecutorHistoryRetentionLock,
+        atomic_path_replacement: AtomicPathReplacement,
     ) -> None:
         if type(host_cpu_slots) is not int or host_cpu_slots < 1:
             raise ValueError("HostExecutorMonitor.host_cpu_slots must be positive")
         _require_history_retention_lock(history_retention_lock)
+        _require_atomic_path_replacement(atomic_path_replacement)
+        pool_records = ExecutorAtomicRecordStore(
+            pool_dir,
+            atomic_path_replacement,
+        )
         self._event_store = ExecutorEventStore(pool_dir)
         self._history = ExecutorWorkHistoryStore(
             pool_dir / "work-history",
             history_retention_policy,
             history_retention_lock,
+            ExecutorAtomicRecordStore(
+                pool_dir / "work-history",
+                atomic_path_replacement,
+            ),
         )
-        self._policy_store = ExecutorPolicyStore(pool_dir)
+        self._policy_store = ExecutorPolicyStore(pool_dir, pool_records)
         self._host_cpu_slots = host_cpu_slots
         self._demand_estimator = demand_estimator
 

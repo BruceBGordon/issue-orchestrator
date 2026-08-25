@@ -23,6 +23,7 @@ from issue_orchestrator.domain.executor_monitoring import (
     ExecutorWaitReason,
 )
 from issue_orchestrator.execution.host_executor import HostExecutorMonitor
+from issue_orchestrator.execution.atomic_record_store import OsAtomicPathReplacement
 from issue_orchestrator.execution.executor_history_lock import (
     PosixExecutorHistoryRetentionLock,
 )
@@ -44,6 +45,7 @@ def _monitor(pool_dir: Path, host_cpu_slots: int) -> HostExecutorMonitor:
         PosixExecutorHistoryRetentionLock(
             (pool_dir / "work-history" / "retention.lock").resolve()
         ),
+        OsAtomicPathReplacement(),
     )
 
 

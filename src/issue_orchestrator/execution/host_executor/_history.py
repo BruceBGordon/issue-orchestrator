@@ -4,8 +4,6 @@
 from __future__ import annotations
 
 import hashlib
-import os
-import uuid
 from pathlib import Path
 
 from pydantic import ValidationError
@@ -25,6 +23,7 @@ from ...domain.executor_monitoring import (
 from ...ports.executor_history_lock import ExecutorHistoryRetentionLock
 from ._contracts import ResourceObservationRecord, WorkHistoryRecord
 from ._types import ExecutorWorkIdentity, RecordedExecutorObservation
+from ..atomic_record_store import ExecutorAtomicRecordStore
 
 
 class ExecutorWorkHistoryStore:
@@ -35,6 +34,7 @@ class ExecutorWorkHistoryStore:
         history_dir: Path,
         retention_policy: ExecutorHistoryRetentionPolicy,
         retention_lock: ExecutorHistoryRetentionLock,
+        atomic_records: ExecutorAtomicRecordStore,
     ) -> None:
         if type(retention_policy) is not ExecutorHistoryRetentionPolicy:
             raise ValueError(
@@ -44,6 +44,7 @@ class ExecutorWorkHistoryStore:
         self._history_dir = history_dir
         self._retention_policy = retention_policy
         self._retention_lock = retention_lock
+        self._atomic_records = atomic_records
 
     def successful_resources(
         self,
@@ -52,6 +53,7 @@ class ExecutorWorkHistoryStore:
         """Return successful resource observations in recording order."""
         self._history_dir.mkdir(parents=True, exist_ok=True)
         with self._retention_lock.shared():
+            self._atomic_records.prune_crash_remnants()
             return tuple(
                 observation.resources
                 for observation in self._observations_unlocked(identity)
@@ -87,7 +89,7 @@ class ExecutorWorkHistoryStore:
                     ResourceObservationRecord.from_domain(item) for item in bounded
                 ),
             )
-            self._write_record(path, record)
+            self._atomic_records.write(path, record)
             self._prune_profiles()
 
     def snapshot(
@@ -102,6 +104,7 @@ class ExecutorWorkHistoryStore:
             )
         self._history_dir.mkdir(parents=True, exist_ok=True)
         with self._retention_lock.shared():
+            self._atomic_records.prune_crash_remnants()
             records = tuple(
                 self._read_record(path)
                 for path in sorted(self._history_dir.glob("*.json"))
@@ -238,9 +241,3 @@ class ExecutorWorkHistoryStore:
             )
         except (OSError, ValidationError) as exc:
             raise RuntimeError(f"invalid executor work history: {path}") from exc
-
-    @staticmethod
-    def _write_record(path: Path, record: WorkHistoryRecord) -> None:
-        temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}")
-        temporary.write_text(record.model_dump_json() + "\n", encoding="utf-8")
-        os.replace(temporary, path)

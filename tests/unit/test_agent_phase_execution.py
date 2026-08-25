@@ -49,6 +49,7 @@ from issue_orchestrator.domain.executor_monitoring import (
 from issue_orchestrator.execution.agent_phase_command_scheduler import (
     HostAgentPhaseCommandScheduler,
 )
+from issue_orchestrator.execution.atomic_record_store import OsAtomicPathReplacement
 from issue_orchestrator.execution.host_executor import (
     ExecutorRequestIdentityFactory,
     HostExecutor,
@@ -187,6 +188,7 @@ def _deterministic_host_executor(
                 )
             )
         ),
+        atomic_path_replacement=OsAtomicPathReplacement(),
         history_retention_lock=_history_lock(pool_dir),
         history_retention_policy=ExecutorHistoryRetentionPolicy(2048, 24),
         queue_settle_seconds=0.01,
@@ -681,6 +683,7 @@ def test_admission_deadline_fails_before_command_and_is_durable(
                 )
             )
         ),
+        atomic_path_replacement=OsAtomicPathReplacement(),
         history_retention_lock=_history_lock(pool_dir),
         history_retention_policy=ExecutorHistoryRetentionPolicy(2048, 24),
         queue_settle_seconds=0.01,
@@ -716,6 +719,7 @@ def test_admission_deadline_fails_before_command_and_is_durable(
         _demand_estimator(),
         ExecutorHistoryRetentionPolicy(2048, 24),
         _history_lock(pool_dir),
+        OsAtomicPathReplacement(),
     ).recent_events(ExecutorRecentEventsQuery(20))
     [deadline_event] = [
         event
@@ -767,6 +771,7 @@ def test_deadline_expiring_after_admission_records_terminal_events_without_spawn
                 )
             )
         ),
+        atomic_path_replacement=OsAtomicPathReplacement(),
         history_retention_lock=_history_lock(pool_dir),
         history_retention_policy=ExecutorHistoryRetentionPolicy(2048, 24),
         queue_settle_seconds=0.01,
@@ -799,6 +804,7 @@ def test_deadline_expiring_after_admission_records_terminal_events_without_spawn
         _demand_estimator(),
         ExecutorHistoryRetentionPolicy(2048, 24),
         _history_lock(pool_dir),
+        OsAtomicPathReplacement(),
     ).recent_events(ExecutorRecentEventsQuery(20))
     assert any(isinstance(event, ExecutorWorkAdmitted) for event in timeline.events)
     [deadline_event] = [
