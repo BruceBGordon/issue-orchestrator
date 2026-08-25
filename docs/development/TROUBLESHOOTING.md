@@ -245,13 +245,14 @@ as the variable provider path. That places 125% at the measured knee; more
 parallelism was not a credible further 5% win. Use
 `issue-orchestrator executor-policy --aggressiveness 125` on this host.
 
-An exact clean committed `make validate-pr` at `443ecdd` then passed in
-**83.888s**. Its seven-lane phase took 81s: browser 30s, static 41s, unit 44s,
-local integration 52s, simulated scenarios 55s, Codex 66s, and Claude 81s;
-VS Code took 1s afterwards. The executor granted xdist-aware work between 2 and
-12 workers according to learned demand, rather than the historical accidental
-single-worker behavior. This is the normal-response confirmation for the
-approximately 85-second goal.
+Two exact clean committed `make validate-pr` runs then passed in **83.888s** at
+`443ecdd` and **81.71s** at `5b10693` (82.80s mean). The latter's seven-lane
+phase took 79s: browser 20s, static 38s, simulated scenarios 42s, unit 48s,
+local integration 55s, Codex 55s, and Claude 79s; VS Code took 1s afterwards.
+The executor granted xdist-aware work between 2 and 12 workers according to
+learned demand, rather than the historical accidental single-worker behavior.
+These are the normal-response confirmations for the approximately 85-second
+goal.
 
 Timing rows live in the repository's shared Git directory and can therefore
 survive a machine migration. For calibration, select records by the captured
