@@ -128,12 +128,12 @@ AGENT_PROSE_ABOUT_QUOTA = (
 
 
 class TestQuotaTokensDoNotFireOnAgentProse:
-    """A false positive here costs the full cooldown, so the bar is high.
+    """A false positive here parks work until a success, so the bar is high.
 
-    Quota trips on the first observation and has no early-retirement path —
-    unlike auth, which a READY probe clears the moment credentials are fixed.
-    So a phrase common enough to appear in an agent's own reasoning must not
-    be in the table, however plausible it looks as a provider banner.
+    Quota trips on the first observation, and the next successful provider call
+    may not arrive promptly. A phrase common enough to appear in an agent's own
+    reasoning must not be in the table, however plausible it looks as a provider
+    banner.
     """
 
     @pytest.mark.parametrize("output", AGENT_PROSE_ABOUT_QUOTA)
@@ -258,7 +258,7 @@ def _manager(events, *, auth_cooldown: int = 21600) -> ProviderResilienceManager
 
 
 class TestQuotaCircuit:
-    """Exhaustion gets its own dimension, and nothing else may retire it."""
+    """Exhaustion gets its own dimension and evidence-based recovery."""
 
     def test_one_observation_opens_the_circuit(self) -> None:
         """No threshold ladder: a second observation costs a second session.
@@ -287,22 +287,40 @@ class TestQuotaCircuit:
         statuses = {s.provider: s for s in manager.snapshot()}
         assert statuses["codex"].is_open
 
-    def test_a_successful_call_does_not_forget_the_outage(self) -> None:
-        """Quota has no probe-driven clear, so a delete would lose it outright.
-
-        ``record_success`` deletes the row when no cause is left. Before quota
-        was counted as a cause, one unrelated success would have re-admitted
-        the fleet to an account with no credits.
-        """
-        manager = _manager(RecordingEvents())
+    def test_a_successful_call_retires_the_quota_outage(self) -> None:
+        """A completed call proves the account has usable allowance again."""
+        events = RecordingEvents()
+        manager = _manager(events)
         manager.record_quota_failure("codex", error_summary="out of credits")
+
+        updated = manager.record_success("codex")
+
+        assert updated is None
+        assert manager.store.get("codex") is None
+        assert events.names().count("provider.outage_exited") == 1
+
+    def test_a_success_clears_quota_without_erasing_an_auth_outage(self) -> None:
+        """Success is quota evidence, but only a READY probe can clear auth."""
+        events = RecordingEvents()
+        manager = _manager(events)
+        manager.record_quota_failure("codex", error_summary="out of credits")
+        for sample_id in ("s1", "s2", "s3"):
+            manager.record_auth_failure(
+                "codex",
+                error_summary="not logged in",
+                sample_id=sample_id,
+            )
 
         manager.record_success("codex")
 
         state = manager.store.get("codex")
         assert state is not None
-        assert state.quota_open_until is not None
-        assert state.consecutive_quota_failures == 1
+        assert state.auth_open_until is not None
+        assert state.consecutive_auth_failures == 3
+        assert state.last_auth_sample_id == "s3"
+        assert state.quota_open_until is None
+        assert state.consecutive_quota_failures == 0
+        assert events.names().count("provider.outage_exited") == 0
 
     def test_clearing_auth_leaves_the_quota_outage_standing(self) -> None:
         """A READY credential probe is evidence about credentials alone.

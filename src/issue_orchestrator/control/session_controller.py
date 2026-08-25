@@ -74,9 +74,9 @@ from .invalid_completion_record import report_invalid_completion_record
 from .review_exchange_contracts import ReviewExchangeCanceller
 from .session_decision import (
     ProviderAuthOutcome,
-    ProviderQuotaFailureDecision,
     SessionDecision,
     provider_failure_from_status,
+    provider_quota_failure_from_status,
     provider_success_from_status,
 )
 from .session_run_resolution import resolve_run_assets
@@ -868,7 +868,6 @@ class SessionController:
         if (
             provider_status
             and provider_status.error_type is ProviderErrorType.QUOTA
-            and provider_status.provider
             and not provider_status.succeeded
         ):
             # Tested before the transient branch, and before the TIMED_OUT
@@ -877,18 +876,13 @@ class SessionController:
             # wall clock. Without a typed verdict here the session is recorded
             # as a timeout — the classification under which cleanup is entitled
             # to treat an unpushed worktree as abandoned work (#7096).
-            quota_summary = (
-                provider_status.last_error_summary or "Provider quota exhausted"
-            )
+            quota_failure = provider_quota_failure_from_status(provider_status)
             return SessionDecision(
                 status=SessionStatus.BLOCKED,
                 reason="Provider quota exhausted",
-                blocked_reason=quota_summary,
+                blocked_reason=quota_failure.error_summary,
                 provider_error_type=ProviderErrorType.QUOTA,
-                provider_quota_failure=ProviderQuotaFailureDecision(
-                    provider=provider_status.provider,
-                    error_summary=quota_summary,
-                ),
+                provider_quota_failure=quota_failure,
             )
 
         if (

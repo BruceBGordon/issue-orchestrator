@@ -66,14 +66,14 @@ class ProviderCircuitState:
     # Deadline for an exhausted balance or usage allowance. A third dimension
     # rather than a reuse of the auth window, because the two recover on
     # different signals: a readiness probe confirming a valid login proves
-    # nothing about restored credits, so clearing the auth window must not
-    # release a quota outage.
+    # nothing about restored credits, while a successful provider call does.
+    # Clearing the auth window must therefore not release a quota outage.
     quota_open_until: datetime | None = None
     consecutive_quota_failures: int = 0
 
     @property
     def open_until(self) -> datetime | None:
-        """The latest deadline across both causes, or ``None`` if neither is set.
+        """The latest deadline across all causes, or ``None`` if none are set.
 
         The aggregate the circuit is judged on: a provider is unavailable while
         *any* cause is still within its own window.

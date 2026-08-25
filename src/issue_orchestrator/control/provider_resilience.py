@@ -280,10 +280,11 @@ class ProviderResilienceManager:
         transient ladder; the property that matters is "long", and a second
         knob would carry no information the first does not.
 
-        Recovery is by elapsed deadline through :meth:`close_expired`. There is
-        deliberately no probe-driven clear to mirror
-        :meth:`clear_auth_failures`: no provider CLI reports a balance, so such
-        a method could have no caller able to prove what it asserted.
+        Recovery is proved either by a later successful provider call through
+        :meth:`record_success` or by the elapsed deadline through
+        :meth:`close_expired`. A successful call is direct evidence that the
+        account can do work again; unlike a credential-only READY probe, it is
+        therefore allowed to retire this dimension early.
         """
         if not provider:
             return None
@@ -392,14 +393,19 @@ class ProviderResilienceManager:
     def record_success(
         self, provider: str | None, now: datetime | None = None
     ) -> ProviderCircuitState | None:
-        """Retire the *transient* outage after an ordinary call came back clean.
+        """Retire the *transient* and *quota* outages after a call came back clean.
 
         Cause-specific, for the same reason :meth:`clear_auth_failures` is
-        (#6999 F3). A completed provider call proves the service answered; it
-        does not prove the credential is valid, and it is not the typed READY
-        readiness probe the recovery contract requires. Deleting the whole row
-        here erased the auth deadline, the auth counter and the sample identity
-        that had been recorded by a *different* concurrent session, so:
+        (#6999 F3). A completed provider call proves both that the service
+        answered and that the account had enough allowance to perform work, so
+        it retires transient and quota state. This also bounds the impact of a
+        false-positive quota classification to the next successful call.
+
+        Success does not prove that a concurrently recorded credential outage
+        has recovered, and it is not the typed READY readiness probe the auth
+        recovery contract requires. Deleting the whole row here erased the auth
+        deadline, auth counter and sample identity that had been recorded by a
+        *different* concurrent session, so:
 
         * an in-flight success landing after an auth outage opened re-admitted
           the whole fleet to a provider that would refuse every launch — the
@@ -409,7 +415,7 @@ class ProviderResilienceManager:
         * ``provider.outage_exited`` was announced while the provider was still
           demonstrably closed.
 
-        So the auth dimension survives untouched and only
+        The auth dimension therefore survives untouched and only
         :meth:`clear_auth_failures` — driven by a confirmed READY probe — may
         retire it. The row is deleted only when NO cause is left, which keeps
         "a healthy circuit has no row" true. ``provider.outage_exited`` is
@@ -437,20 +443,15 @@ class ProviderResilienceManager:
             updated_at=now,
             consecutive_auth_failures=state.consecutive_auth_failures,
             last_auth_sample_id=state.last_auth_sample_id,
-            # Survives for the same reason the auth dimension does, and it
-            # matters more here: quota has no READY-probe equivalent to retire
-            # it, so if a success deleted the row the outage would be forgotten
-            # outright rather than merely retired early.
-            quota_open_until=state.quota_open_until,
-            consecutive_quota_failures=state.consecutive_quota_failures,
+            # A call that completed is positive evidence that the account has
+            # usable allowance again, so quota can retire before its deadline.
+            quota_open_until=None,
+            consecutive_quota_failures=0,
         )
-        human_fixable_cause_remains = (
-            state.auth_open_until is not None
-            or state.consecutive_auth_failures > 0
-            or state.quota_open_until is not None
-            or state.consecutive_quota_failures > 0
+        auth_cause_remains = (
+            state.auth_open_until is not None or state.consecutive_auth_failures > 0
         )
-        if human_fixable_cause_remains:
+        if auth_cause_remains:
             self.store.save(updated)
         else:
             # Nothing is left to remember, and a healthy circuit has no row.
@@ -489,10 +490,10 @@ class ProviderResilienceManager:
                 updated_at=now,
                 consecutive_auth_failures=state.consecutive_auth_failures,
                 last_auth_sample_id=state.last_auth_sample_id,
-                # Quota has no probe-driven recovery, so this elapsed-deadline
-                # path is its only way back. Retiring the counter with the
-                # deadline means the next exhaustion starts a fresh escalation
-                # rather than tripping instantly on a stale count.
+                # Quota has no probe-driven recovery, so this elapsed deadline
+                # is the guaranteed way back when no later success arrives.
+                # Retiring the counter with the deadline means the next
+                # exhaustion starts fresh rather than using a stale count.
                 quota_open_until=None,
                 consecutive_quota_failures=0,
             )

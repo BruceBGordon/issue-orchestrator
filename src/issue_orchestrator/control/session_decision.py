@@ -155,6 +155,30 @@ def provider_failure_from_status(
     )
 
 
+def provider_quota_failure_from_status(
+    status: "ProviderStatus",
+) -> ProviderQuotaFailureDecision:
+    """Build a usable QUOTA effect from provider output, or fail loudly.
+
+    A quota verdict without provider identity cannot be recorded by the circuit
+    owner or routed through provider-impact policy. Silently skipping it would
+    manufacture the TIMED_OUT outcome this verdict exists to prevent.
+    """
+    if (
+        status.error_type is not ProviderErrorType.QUOTA
+        or status.succeeded
+        or not status.provider
+    ):
+        raise ValueError(
+            "a failed QUOTA ProviderStatus must carry a named provider; "
+            f"got {status!r}"
+        )
+    return ProviderQuotaFailureDecision(
+        provider=status.provider,
+        error_summary=status.last_error_summary or "Provider quota exhausted",
+    )
+
+
 @dataclass
 class SessionDecision:
     """Decision about a session's outcome."""

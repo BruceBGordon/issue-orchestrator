@@ -389,6 +389,54 @@ class TestSessionControllerTerminated:
         assert decision.provider_transient_failure.error_summary == "provider overloaded"
         assert decision.provider_transient_failure.attempts == 3
 
+    def test_quota_failure_without_provider_identity_fails_fast(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Malformed quota evidence must not silently degrade to TIMED_OUT."""
+        processor = MockCompletionProcessor()
+        processor.completion_record = None
+        session_output = FileSystemSessionOutput()
+        controller = SessionController(
+            completion_processor=processor,
+            events=NullEventSink(),
+            session_output=session_output,
+            working_copy=StubWorkingCopy(),
+        )
+        session_name = "issue-123"
+        worktree = tmp_path / "worktree"
+        run_assets = make_session_run_assets(worktree, session_name, session_output)
+        write_provider_status(
+            run_assets.run_dir,
+            ProviderStatus(
+                provider=None,
+                error_type=ProviderErrorType.QUOTA,
+                attempts=1,
+                succeeded=False,
+                exit_code=1,
+                timed_out=True,
+                last_error_summary="usage_limit_exceeded",
+                last_attempt_at=now_iso(),
+            ),
+        )
+
+        with pytest.raises(
+            ValueError,
+            match="failed QUOTA ProviderStatus must carry a named provider",
+        ):
+            controller.decide_outcome(
+                SessionObservationResult.timed_out(
+                    runtime_minutes=60.0,
+                    timeout_minutes=45,
+                    session_exists=True,
+                ),
+                worktree,
+                123,
+                "Test Issue",
+                session_name,
+                session_run_assets=run_assets,
+            )
+
     def test_terminated_without_completion_record_is_failed(self, tmp_path: Path):
         """Session that exits without completion.json = FAILED."""
         processor = MockCompletionProcessor()

@@ -79,9 +79,10 @@ _QUOTA_TOKENS = (
     # the whole PTY transcript, which includes everything the AGENT wrote, and
     # an agent working on billing or rate-limit code emits those words in
     # ordinary reasoning. A false positive here is expensive — quota trips on
-    # the first observation and has no early-retirement path, so it parks the
-    # provider for the full cooldown. Each phrase below is long enough that an
-    # agent discussing the topic is unlikely to reproduce it verbatim.
+    # the first observation and has no readiness probe, so without another
+    # in-flight success it parks the provider for the full cooldown. Each phrase
+    # below is long enough that an agent discussing the topic is unlikely to
+    # reproduce it verbatim.
     "hit your usage limit",
     "out of credits",
     "spend limit reached",
