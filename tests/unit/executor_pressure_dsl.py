@@ -9,11 +9,18 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from enum import Enum
+from functools import partial
 from pathlib import Path
 from types import TracebackType
 from typing import TextIO, cast
 
 from issue_orchestrator.domain.executor import ExecutorConcurrencyRange
+from tests.process_completion_fixture import (
+    GuardianPidFile,
+    PROCESS_COMPLETION_WATCHDOG,
+    ProcessCleanupPlan,
+    ProcessCleanupStep,
+)
 from tests.process_tree_fixture import ProcessTreeMember, TermResistantChildProgram
 
 
@@ -230,7 +237,13 @@ class PressureWork:
         ):
             raise ValueError("PressureWork.deadline must be a typed pressure deadline")
 
-    def command_line(self, host_cpu_slots: int) -> list[str]:
+    def command_line(
+        self,
+        host_cpu_slots: int,
+        guardian_pid_file: GuardianPidFile,
+    ) -> list[str]:
+        if type(guardian_pid_file) is not GuardianPidFile:
+            raise ValueError("PressureWork.command_line requires GuardianPidFile")
         command = [
             sys.executable,
             str(PROCESS_RUNNER),
@@ -259,7 +272,7 @@ class PressureWork:
         return [
             *command,
             "--",
-            *self.command.arguments(self.label),
+            *guardian_pid_file.recording_arguments(self.command.arguments(self.label)),
         ]
 
 
@@ -298,15 +311,26 @@ class _ControlledPressureProcess:
         pool_dir: Path,
         work: PressureWork,
         *,
+        sequence: int,
         host_cpu_slots: int,
         host_cpu_busy_file: Path,
     ) -> None:
+        if type(sequence) is not int or sequence < 1:
+            raise ValueError("controlled pressure process sequence must be positive")
         self.work = work
+        self._guardian_pid_file = GuardianPidFile(
+            (pool_dir / "fixture-guardians" / f"pressure-{sequence}.pid").resolve()
+        )
+        self._guardian_pid_file.path.parent.mkdir(parents=True, exist_ok=True)
+        self._release_signalled = False
+        self._completion_observed = False
+        self._command_cleanup_attempted = False
+        self._admission_attempt_fd_open = True
         attempt_read_fd, attempt_write_fd = os.pipe()
         os.set_blocking(attempt_read_fd, False)
         try:
             self._process: subprocess.Popen[str] = subprocess.Popen(
-                work.command_line(host_cpu_slots),
+                work.command_line(host_cpu_slots, self._guardian_pid_file),
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -398,32 +422,210 @@ class _ControlledPressureProcess:
         self.wait_until_clean_exit()
 
     def signal_release(self) -> None:
+        if self._release_signalled:
+            return
         stdin = self._stdin()
         stdin.write("\n")
         stdin.flush()
+        self._release_signalled = True
 
     def wait_until_clean_exit(self) -> None:
-        self._process.wait()
+        PROCESS_COMPLETION_WATCHDOG.wait(
+            self._process,
+            operation=f"pressure work {self.work.label}",
+        )
+        self._completion_observed = True
         assert self._process.returncode == 0, self._unexpected_exit()
 
     def kill_parent(self) -> None:
         self._process.kill()
-        self._process.wait()
+        PROCESS_COMPLETION_WATCHDOG.wait(
+            self._process,
+            operation=f"reap crashed pressure parent {self.work.label}",
+        )
+        self._completion_observed = True
 
     def release_orphaned_child(self) -> None:
         if self._process.returncode is None:
             raise RuntimeError("executor parent must be killed before orphan release")
         self.signal_release()
 
-    def cleanup(self) -> None:
+    def cleanup(self, *, abort: bool) -> None:
+        if type(abort) is not bool:
+            raise ValueError("pressure cleanup requires an exact abort policy")
+        if abort:
+            self._abort_cleanup_plan().execute()
+            return
+        if type(self.work.command) is HungPressureCommand:
+            try:
+                self._cleanup_command_once()
+            except BaseException as error:
+                self._abort_cleanup_plan().execute(preceding_error=error)
+                raise AssertionError("abort cleanup must raise")
+        if self._process.poll() is not None:
+            self._cleanup_reaped_process()
+            return
         try:
-            os.killpg(self._process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        if self._process.poll() is None:
-            self._process.wait()
+            PROCESS_COMPLETION_WATCHDOG.wait(
+                self._process,
+                operation=f"clean up pressure work {self.work.label}",
+            )
+        except BaseException as error:
+            self._abort_cleanup_plan().execute(preceding_error=error)
+            raise AssertionError("abort cleanup must raise")
+        if not self._completion_observed:
+            self._completion_observed = True
+            if self._process.returncode != 0:
+                self._abort_cleanup_plan().execute(
+                    preceding_error=AssertionError(self._unexpected_exit())
+                )
+                raise AssertionError("failed completion cleanup must raise")
+        self._close_cleanup_plan().execute()
+
+    def _cleanup_reaped_process(self) -> None:
+        if not self._completion_observed:
+            self._completion_observed = True
+            if self._process.returncode != 0:
+                self._reaped_cleanup_plan().execute(
+                    preceding_error=AssertionError(self._unexpected_exit())
+                )
+                raise AssertionError("failed completion cleanup must raise")
+        self._reaped_cleanup_plan().execute()
+
+    def _abort_cleanup_plan(self) -> ProcessCleanupPlan:
+        return ProcessCleanupPlan(
+            operation=f"abort pressure work {self.work.label}",
+            steps=(
+                ProcessCleanupStep(
+                    "clean up pressure command containment",
+                    self._cleanup_command_once,
+                ),
+                ProcessCleanupStep(
+                    "contain pressure guardian before outer termination",
+                    self._guardian_pid_file.contain_if_recorded,
+                ),
+                ProcessCleanupStep(
+                    "kill pressure outer process group",
+                    self._kill_outer_process_group_if_running,
+                ),
+                ProcessCleanupStep(
+                    "contain pressure guardian after outer termination",
+                    self._guardian_pid_file.contain_if_recorded,
+                ),
+                ProcessCleanupStep(
+                    "reap pressure outer process",
+                    self._reap_outer_process_if_running,
+                ),
+                *self._resource_cleanup_steps(),
+            ),
+        )
+
+    def _reaped_cleanup_plan(self) -> ProcessCleanupPlan:
+        return ProcessCleanupPlan(
+            operation=f"contain completed pressure work {self.work.label}",
+            steps=(
+                ProcessCleanupStep(
+                    "clean up pressure command containment",
+                    self._cleanup_command_once,
+                ),
+                ProcessCleanupStep(
+                    "contain completed pressure guardian",
+                    self._guardian_pid_file.contain_if_recorded,
+                ),
+                *self._resource_cleanup_steps(),
+            ),
+        )
+
+    def _close_cleanup_plan(self) -> ProcessCleanupPlan:
+        return ProcessCleanupPlan(
+            operation=f"close pressure work {self.work.label}",
+            steps=self._resource_cleanup_steps(),
+        )
+
+    def _cleanup_command_once(self) -> None:
+        if self._command_cleanup_attempted:
+            return
+        self._command_cleanup_attempted = True
         self.work.command.cleanup()
+
+    def _kill_outer_process_group_if_running(self) -> None:
+        if self._process.poll() is None:
+            try:
+                os.killpg(self._process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+    def _reap_outer_process_if_running(self) -> None:
+        if self._process.poll() is None:
+            PROCESS_COMPLETION_WATCHDOG.wait(
+                self._process,
+                operation=f"reap aborted pressure work {self.work.label}",
+            )
+
+    def _resource_cleanup_steps(self) -> tuple[ProcessCleanupStep, ...]:
+        return (
+            ProcessCleanupStep("close pressure stdin", self._close_stdin),
+            ProcessCleanupStep("close pressure stdout", self._close_stdout),
+            ProcessCleanupStep("close pressure stderr", self._close_stderr),
+            ProcessCleanupStep(
+                "close pressure admission descriptor",
+                self._close_admission_attempt_fd,
+            ),
+        )
+
+    def _close_stdin(self) -> None:
+        self._close_stream(cast(TextIO | None, self._process.stdin))
+
+    def _close_stdout(self) -> None:
+        self._close_stream(cast(TextIO | None, self._process.stdout))
+
+    def _close_stderr(self) -> None:
+        self._close_stream(cast(TextIO | None, self._process.stderr))
+
+    @staticmethod
+    def _close_stream(stream: TextIO | None) -> None:
+        if stream is not None and not stream.closed:
+            stream.close()
+
+    def _close_admission_attempt_fd(self) -> None:
+        if not self._admission_attempt_fd_open:
+            return
         os.close(self._admission_attempt_fd)
+        self._admission_attempt_fd_open = False
+
+    def signal_cleanup_release(self) -> None:
+        if (
+            type(self.work.command)
+            in (
+                HeldPressureCommand,
+                CloseFdsTreePressureCommand,
+            )
+            and self._process.poll() is None
+        ):
+            try:
+                self.signal_release()
+            except BrokenPipeError:
+                if self._process.poll() is None:
+                    raise
+
+    def require_guardian_contained(self) -> None:
+        self._guardian_pid_file.require_contained()
+
+    def require_cleanup_complete(self) -> None:
+        self.require_guardian_contained()
+        assert self._process.poll() is not None, (
+            f"pressure outer process {self._process.pid} remains live"
+        )
+        assert not self._admission_attempt_fd_open, (
+            "pressure admission descriptor remained open after cleanup"
+        )
+        for name, stream in (
+            ("stdin", self._process.stdin),
+            ("stdout", self._process.stdout),
+            ("stderr", self._process.stderr),
+        ):
+            if stream is not None:
+                assert stream.closed, f"pressure {name} remained open after cleanup"
 
     def _readline(self, stream: TextIO, *, transition: str) -> str:
         line = stream.readline()
@@ -488,9 +690,29 @@ class PressureRig:
         exception: BaseException | None,
         traceback: TracebackType | None,
     ) -> None:
-        del exception_type, exception, traceback
-        for controlled in reversed(tuple(self._processes.values())):
-            controlled.cleanup()
+        del exception_type, traceback
+        processes = tuple(self._processes.values())
+        if not processes:
+            return
+        ProcessCleanupPlan(
+            operation="clean up pressure scenario",
+            steps=(
+                *(
+                    ProcessCleanupStep(
+                        f"signal cleanup release for {controlled.work.label}",
+                        controlled.signal_cleanup_release,
+                    )
+                    for controlled in processes
+                ),
+                *(
+                    ProcessCleanupStep(
+                        f"clean up pressure work {controlled.work.label}",
+                        partial(controlled.cleanup, abort=exception is not None),
+                    )
+                    for controlled in reversed(processes)
+                ),
+            ),
+        ).execute(preceding_error=exception)
 
     def submit(self, work: PressureWork) -> PressureJob:
         """Submit work without assuming its immediate admission outcome."""
@@ -500,6 +722,7 @@ class PressureRig:
         self._processes[job] = _ControlledPressureProcess(
             self._pool_dir,
             work,
+            sequence=job.sequence,
             host_cpu_slots=self._host_cpu_slots,
             host_cpu_busy_file=self._host_cpu_busy_file,
         )
@@ -627,6 +850,14 @@ class PressureRig:
     def release_orphaned_child(self, job: PressureJob) -> None:
         """Release a command whose executor parent was explicitly killed."""
         self._process(job).release_orphaned_child()
+
+    def require_guardian_contained(self, job: PressureJob) -> None:
+        """Require one explicitly admitted job's guardian to be contained."""
+        self._process(job).require_guardian_contained()
+
+    def require_cleanup_complete(self, job: PressureJob) -> None:
+        """Require one admitted job's process and owned resources to be clean."""
+        self._process(job).require_cleanup_complete()
 
     def drain(self, jobs: tuple[PressureJob, ...]) -> None:
         """Start and release a queued cohort until every member completes."""

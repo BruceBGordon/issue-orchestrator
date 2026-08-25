@@ -80,10 +80,19 @@ from tests.process_tree_fixture import (
 )
 from tests.unit.session_run_helpers import make_session_run_assets
 from tests.unit.executor_guardian_helpers import executor_command_guardian
+from tests.process_completion_fixture import (
+    ExecutorGuardianCancellationContainment,
+    NoDescendantProcessContainment,
+    PROCESS_COMPLETION_WATCHDOG,
+    TextProcessInvocation,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 POOL_DIR_ENV = "ISSUE_ORCHESTRATOR_EXECUTOR_POOL_DIR"
+
+
+pytestmark = pytest.mark.timeout(180)
 
 
 class _SaturatedHostCpuObserver:
@@ -205,49 +214,52 @@ def _phase_cli(
     absolute_timeout_seconds: str,
     command: tuple[str, ...],
 ) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        (
-            sys.executable,
-            "-m",
-            "issue_orchestrator.entrypoints.cli_tools.agent_phase_run",
-            "--work-key",
-            "agent-phase:agent:web:code",
-            "--group",
-            "agent:run-1:coding-1",
-            "--active-timeout-seconds",
-            active_timeout_seconds,
-            "--absolute-timeout-seconds",
-            absolute_timeout_seconds,
-            "--cancellation-record",
-            str(pool_dir.resolve() / "executor-guardian-cancellation.json"),
-            "--",
-            *command,
-        ),
-        cwd=REPO_ROOT,
-        env={**os.environ, POOL_DIR_ENV: str(pool_dir)},
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=5,
+    cancellation_record = pool_dir.resolve() / "executor-guardian-cancellation.json"
+    return PROCESS_COMPLETION_WATCHDOG.run_text(
+        TextProcessInvocation(
+            operation="agent phase CLI",
+            arguments=(
+                sys.executable,
+                "-m",
+                "issue_orchestrator.entrypoints.cli_tools.agent_phase_run",
+                "--work-key",
+                "agent-phase:agent:web:code",
+                "--group",
+                "agent:run-1:coding-1",
+                "--active-timeout-seconds",
+                active_timeout_seconds,
+                "--absolute-timeout-seconds",
+                absolute_timeout_seconds,
+                "--cancellation-record",
+                str(cancellation_record),
+                "--",
+                *command,
+            ),
+            working_directory=REPO_ROOT,
+            environment={**os.environ, POOL_DIR_ENV: str(pool_dir)},
+            timeout_containment=ExecutorGuardianCancellationContainment(
+                cancellation_record
+            ),
+        )
     )
 
 
 def _executor_events(pool_dir: Path) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        (
-            sys.executable,
-            "-m",
-            "issue_orchestrator.entrypoints.cli",
-            "executor-events",
-            "--limit",
-            "20",
-        ),
-        cwd=REPO_ROOT,
-        env={**os.environ, POOL_DIR_ENV: str(pool_dir)},
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=5,
+    return PROCESS_COMPLETION_WATCHDOG.run_text(
+        TextProcessInvocation(
+            operation="executor events CLI",
+            arguments=(
+                sys.executable,
+                "-m",
+                "issue_orchestrator.entrypoints.cli",
+                "executor-events",
+                "--limit",
+                "20",
+            ),
+            working_directory=REPO_ROOT,
+            environment={**os.environ, POOL_DIR_ENV: str(pool_dir)},
+            timeout_containment=NoDescendantProcessContainment(),
+        )
     )
 
 

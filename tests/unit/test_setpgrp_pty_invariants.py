@@ -26,11 +26,14 @@ import pty
 import signal
 import subprocess
 import sys
-import time
 
 import pytest
 
+from tests.process_completion_fixture import PROCESS_COMPLETION_WATCHDOG
 from tests.process_tree_fixture import ProcessTreeMember
+
+
+pytestmark = pytest.mark.timeout(180)
 
 
 @pytest.mark.xdist_group("pty")
@@ -46,7 +49,10 @@ class TestSetpgrpPreservesControllingTerminal:
             stderr=subprocess.PIPE,
             preexec_fn=os.setpgrp,
         )
-        out, _ = proc.communicate(timeout=5)
+        out, _ = PROCESS_COMPLETION_WATCHDOG.communicate(
+            proc,
+            operation="setpgrp child stdout",
+        )
         assert b"setpgrp-visible" in out
 
     def test_child_inherits_parent_stdout(self) -> None:
@@ -70,7 +76,10 @@ class TestSetpgrpPreservesControllingTerminal:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
-        out, _ = proc.communicate(timeout=5)
+        out, _ = PROCESS_COMPLETION_WATCHDOG.communicate(
+            proc,
+            operation="inherited setpgrp child stdout",
+        )
         assert b"inherited-output" in out, (
             "setpgrp child should inherit parent's stdout; "
             "if this fails, PTY-based output capture will break"
@@ -83,17 +92,17 @@ class TestSetpgrpCreatesDistinctProcessGroup:
 
     def test_child_pgid_differs_from_parent(self) -> None:
         """The child's process group ID must differ from the parent's."""
-        script = (
-            "import os; "
-            "print(f'{os.getpid()} {os.getpgrp()}')"
-        )
+        script = "import os; print(f'{os.getpid()} {os.getpgrp()}')"
         proc = subprocess.Popen(
             [sys.executable, "-c", script],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             preexec_fn=os.setpgrp,
         )
-        out, _ = proc.communicate(timeout=5)
+        out, _ = PROCESS_COMPLETION_WATCHDOG.communicate(
+            proc,
+            operation="setpgrp child process-group identity",
+        )
         child_pid, child_pgid = out.decode().strip().split()
         # setpgrp makes the child its own process group leader
         assert child_pid == child_pgid, "setpgrp child should be its own group leader"
@@ -107,12 +116,14 @@ class TestSetpgrpCreatesDistinctProcessGroup:
             [sys.executable, "-c", "import time; time.sleep(60)"],
             preexec_fn=os.setpgrp,
         )
-        time.sleep(0.1)
         pgid = os.getpgid(proc.pid)
         assert pgid != os.getpgrp(), "child must be in a different group"
 
         os.killpg(pgid, signal.SIGTERM)
-        exit_code = proc.wait(timeout=5)
+        exit_code = PROCESS_COMPLETION_WATCHDOG.wait(
+            proc,
+            operation="setpgrp child group termination",
+        )
         assert exit_code == -signal.SIGTERM
         # If we reach here, parent survived the killpg
 
@@ -147,7 +158,10 @@ class TestSetsidDisconnectsFromTerminal:
             stdin=subprocess.DEVNULL,
             start_new_session=True,
         )
-        out, _ = proc.communicate(timeout=5)
+        out, _ = PROCESS_COMPLETION_WATCHDOG.communicate(
+            proc,
+            operation="setsid controlling-terminal observation",
+        )
         assert out.decode().strip() == "NONE", (
             "setsid child should not have a controlling terminal on stdin"
         )
@@ -176,7 +190,10 @@ class TestSetsidDisconnectsFromTerminal:
                 stderr=subprocess.PIPE,
                 preexec_fn=os.setpgrp,
             )
-            out, _ = proc.communicate(timeout=5)
+            out, _ = PROCESS_COMPLETION_WATCHDOG.communicate(
+                proc,
+                operation="setpgrp PTY inheritance observation",
+            )
             assert b"HAS_TTY" in out, (
                 "setpgrp child with PTY stdin should retain the terminal; "
                 "if this fails, agent will fall into non-interactive mode"
@@ -214,7 +231,10 @@ class TestSetpgrpKillpgIsolation:
         # Kill the process group
         pgid = os.getpgid(proc.pid)
         os.killpg(pgid, signal.SIGTERM)
-        proc.wait(timeout=5)
+        PROCESS_COMPLETION_WATCHDOG.wait(
+            proc,
+            operation="setpgrp child-tree termination",
+        )
 
         # Grandchild should also be unable to execute user code.
         ProcessTreeMember(grandchild_pid).assert_contained()
@@ -338,7 +358,10 @@ class TestSigttiVulnerabilityProof:
             stdin=subprocess.DEVNULL,
             preexec_fn=_agent_preexec,  # setpgrp + SIG_IGN
         )
-        proc.communicate(timeout=5)
+        PROCESS_COMPLETION_WATCHDOG.communicate(
+            proc,
+            operation="SIGTTIN-protected child completion",
+        )
         # The child should NOT be stopped. It either completed (print('COMPLETED'))
         # or got an OSError from the read (EIO) and exited with a traceback.
         # Either way, it ran to completion instead of being frozen.
@@ -384,7 +407,10 @@ class TestSigttiImmunityWithIgnoredSignals:
             stdin=subprocess.DEVNULL,
             preexec_fn=os.setpgrp,
         )
-        out, _ = proc.communicate(timeout=5)
+        out, _ = PROCESS_COMPLETION_WATCHDOG.communicate(
+            proc,
+            operation="ignored-SIGTTIN child completion",
+        )
         output = out.decode().strip()
         # The process should NOT be stopped (it completed and produced output).
         # It either got EIO or READ_OK — either way, it wasn't stopped.
@@ -422,7 +448,10 @@ class TestSigttiImmunityWithIgnoredSignals:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
-        out, _ = proc.communicate(timeout=5)
+        out, _ = PROCESS_COMPLETION_WATCHDOG.communicate(
+            proc,
+            operation="SIGTTIN-immune child stdout",
+        )
         assert b"sigttin-immune-output" in out, (
             "Output should flow through inherited stdout even with SIGTTIN ignored"
         )
@@ -436,12 +465,14 @@ class TestSigttiImmunityWithIgnoredSignals:
             [sys.executable, "-c", "import time; time.sleep(60)"],
             preexec_fn=_agent_preexec,
         )
-        time.sleep(0.1)
         pgid = os.getpgid(proc.pid)
         assert pgid != os.getpgrp(), "child must be in a different group"
 
         os.killpg(pgid, signal.SIGTERM)
-        exit_code = proc.wait(timeout=5)
+        exit_code = PROCESS_COMPLETION_WATCHDOG.wait(
+            proc,
+            operation="signal-immune child group termination",
+        )
         assert exit_code == -signal.SIGTERM, (
             "SIGTERM should still kill the child despite SIGTTIN being ignored"
         )
@@ -472,12 +503,20 @@ class TestZshResetsInheritedSignals:
     def test_sh_preserves_inherited_sig_ign(self) -> None:
         """/bin/sh preserves inherited SIG_IGN for SIGTTIN (POSIX compliant)."""
         proc = subprocess.Popen(
-            ["/bin/sh", "-c", f"{sys.executable} -c {_shell_quote(self._CHECK_SIGNAL)}"],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            [
+                "/bin/sh",
+                "-c",
+                f"{sys.executable} -c {_shell_quote(self._CHECK_SIGNAL)}",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             stdin=subprocess.DEVNULL,
             preexec_fn=_agent_preexec,
         )
-        out, _ = proc.communicate(timeout=5)
+        out, _ = PROCESS_COMPLETION_WATCHDOG.communicate(
+            proc,
+            operation="sh inherited-signal observation",
+        )
         assert b"SIG_IGN" in out, (
             f"/bin/sh should preserve inherited SIG_IGN; got {out.decode().strip()}"
         )
@@ -485,12 +524,20 @@ class TestZshResetsInheritedSignals:
     def test_bash_preserves_inherited_sig_ign(self) -> None:
         """/bin/bash preserves inherited SIG_IGN for SIGTTIN (POSIX compliant)."""
         proc = subprocess.Popen(
-            ["/bin/bash", "-c", f"{sys.executable} -c {_shell_quote(self._CHECK_SIGNAL)}"],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            [
+                "/bin/bash",
+                "-c",
+                f"{sys.executable} -c {_shell_quote(self._CHECK_SIGNAL)}",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             stdin=subprocess.DEVNULL,
             preexec_fn=_agent_preexec,
         )
-        out, _ = proc.communicate(timeout=5)
+        out, _ = PROCESS_COMPLETION_WATCHDOG.communicate(
+            proc,
+            operation="bash inherited-signal observation",
+        )
         assert b"SIG_IGN" in out, (
             f"/bin/bash should preserve inherited SIG_IGN; got {out.decode().strip()}"
         )
@@ -507,12 +554,20 @@ class TestZshResetsInheritedSignals:
         is resolved at the OS level.
         """
         proc = subprocess.Popen(
-            ["/bin/zsh", "-c", f"{sys.executable} -c {_shell_quote(self._CHECK_SIGNAL)}"],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            [
+                "/bin/zsh",
+                "-c",
+                f"{sys.executable} -c {_shell_quote(self._CHECK_SIGNAL)}",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             stdin=subprocess.DEVNULL,
             preexec_fn=_agent_preexec,
         )
-        out, _ = proc.communicate(timeout=5)
+        out, _ = PROCESS_COMPLETION_WATCHDOG.communicate(
+            proc,
+            operation="zsh inherited-signal observation",
+        )
         # zsh resets SIG_IGN → SIG_DFL. If this starts showing SIG_IGN,
         # zsh fixed the bug and we can simplify provider_runner._build_command.
         assert b"SIG_DFL" in out, (
@@ -525,4 +580,5 @@ class TestZshResetsInheritedSignals:
 def _shell_quote(s: str) -> str:
     """Quote a string for safe use inside shell single quotes."""
     import shlex
+
     return shlex.quote(s)

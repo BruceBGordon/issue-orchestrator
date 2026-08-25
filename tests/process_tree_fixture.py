@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-_CONTAINMENT_WATCHDOG_SECONDS = 30.0
+PROCESS_CONTAINMENT_WATCHDOG_SECONDS = 30.0
 _CONTAINMENT_POLL_SECONDS = 0.05
 _PROCESS_STATE_PROBE_TIMEOUT_SECONDS = 2.0
 
@@ -23,7 +23,7 @@ class TermResistantChildProgram:
     def __post_init__(self) -> None:
         if (
             type(self.lifetime_seconds) is not int
-            or self.lifetime_seconds <= _CONTAINMENT_WATCHDOG_SECONDS
+            or self.lifetime_seconds <= PROCESS_CONTAINMENT_WATCHDOG_SECONDS
         ):
             raise ValueError(
                 "TermResistantChildProgram.lifetime_seconds must exceed the "
@@ -99,13 +99,13 @@ class ProcessTreeMember:
 
     def assert_contained(self) -> None:
         """Wait until this member is absent or unable to execute user code."""
-        watchdog_deadline = time.monotonic() + _CONTAINMENT_WATCHDOG_SECONDS
+        watchdog_deadline = time.monotonic() + PROCESS_CONTAINMENT_WATCHDOG_SECONDS
         while True:
             remaining_seconds = watchdog_deadline - time.monotonic()
             if remaining_seconds <= 0:
                 raise AssertionError(
                     f"fixture process {self.process_id} remained executable "
-                    f"for {_CONTAINMENT_WATCHDOG_SECONDS:.0f} seconds"
+                    f"for {PROCESS_CONTAINMENT_WATCHDOG_SECONDS:.0f} seconds"
                 )
             if not self._is_executable(
                 min(_PROCESS_STATE_PROBE_TIMEOUT_SECONDS, remaining_seconds)

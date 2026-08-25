@@ -52,9 +52,13 @@ from issue_orchestrator.ports.executor_history_lock import (
 )
 from issue_orchestrator.ports.atomic_path_replacement import AtomicPathReplacement
 from tests.unit.executor_guardian_helpers import executor_command_guardian
+from tests.process_completion_fixture import PROCESS_COMPLETION_WATCHDOG
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+pytestmark = pytest.mark.timeout(180)
 
 
 class _IdleHostCpuObserver:
@@ -208,8 +212,10 @@ class _BlockingFirstSharedRetentionLock:
             if self._first_shared:
                 self._first_shared = False
                 self._shared_acquired.set()
-                if not self._release_shared.wait(timeout=5.0):
-                    raise RuntimeError("history reader synchronization timed out")
+                PROCESS_COMPLETION_WATCHDOG.wait_for_event(
+                    self._release_shared,
+                    operation="release the retained-history reader",
+                )
             yield
 
     def exclusive(self) -> AbstractContextManager[None]:
@@ -297,14 +303,28 @@ def test_history_reader_holds_shared_lock_across_read_and_pruning(
             ExecutorStatusQuery(ExecutorAllRepositories(), offset=0, limit=10),
         )
         try:
-            assert reader_holds_shared.wait(timeout=5.0)
+            PROCESS_COMPLETION_WATCHDOG.wait_for_event(
+                reader_holds_shared,
+                operation="history reader to acquire its shared lock",
+            )
             writer = workers.submit(_run_work, writer_executor, "history:second")
-            assert writer_attempting_exclusive_lock.wait(timeout=5.0)
+            PROCESS_COMPLETION_WATCHDOG.wait_for_event(
+                writer_attempting_exclusive_lock,
+                operation="history writer to attempt its exclusive lock",
+            )
             assert not writer_acquired_exclusive_lock.is_set()
         finally:
             release_reader.set()
-        assert reader.result(timeout=5.0).learning.total_profile_count == 1
-        assert writer.result(timeout=5.0).exit_code == 0
+        reader_result = PROCESS_COMPLETION_WATCHDOG.future_result(
+            reader,
+            operation="history reader result",
+        )
+        writer_result = PROCESS_COMPLETION_WATCHDOG.future_result(
+            writer,
+            operation="history writer result",
+        )
+        assert reader_result.learning.total_profile_count == 1
+        assert writer_result.exit_code == 0
 
     # A second success for the retained identity proves the writer reads its
     # current profile inside the existing exclusive transaction without nesting.
