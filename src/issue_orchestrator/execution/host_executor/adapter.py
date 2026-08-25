@@ -35,10 +35,16 @@ from ...domain.executor import (
     ExecutorUnboundedDeadline,
 )
 from ...domain.process_group import OwnedProcessGroupLeader
+from ...domain.process_group import (
+    ProcessGroupBoundedWait,
+    ProcessGroupCompleted,
+    ProcessGroupTimedOut,
+    ProcessGroupUnboundedWait,
+)
 from ...ports.executor import Executor
 from ...ports.executor_history_lock import ExecutorHistoryRetentionLock
 from ...ports.host_cpu_utilization import HostCpuUtilizationObserver
-from ...ports.process_group_terminator import ProcessGroupTerminator
+from ...ports.process_group_supervisor import ProcessGroupSupervisor
 from ._history import ExecutorWorkHistoryStore
 from ._host_observation import observe_host_load
 from ._journal import ExecutorEventStore
@@ -69,11 +75,11 @@ def _require_host_cpu_observer(value: object) -> None:
         )
 
 
-def _require_process_group_terminator(value: object) -> None:
-    if not isinstance(value, ProcessGroupTerminator):
+def _require_process_group_supervisor(value: object) -> None:
+    if not isinstance(value, ProcessGroupSupervisor):
         raise ValueError(
-            "HostExecutor.process_group_terminator must implement "
-            "ProcessGroupTerminator"
+            "HostExecutor.process_group_supervisor must implement "
+            "ProcessGroupSupervisor"
         )
 
 
@@ -97,7 +103,7 @@ class HostExecutor(Executor):
         demand_estimator: ExecutorWorkDemandEstimator,
         host_cpu_observer: HostCpuUtilizationObserver,
         request_identity_factory: ExecutorRequestIdentityFactory,
-        process_group_terminator: ProcessGroupTerminator,
+        process_group_supervisor: ProcessGroupSupervisor,
         history_retention_lock: ExecutorHistoryRetentionLock,
         history_retention_policy: ExecutorHistoryRetentionPolicy,
         queue_settle_seconds: float,
@@ -132,8 +138,8 @@ class HostExecutor(Executor):
         self._demand_estimator = demand_estimator
         self._host_cpu_observer = host_cpu_observer
         self._request_identity_factory = request_identity_factory
-        _require_process_group_terminator(process_group_terminator)
-        self._process_group_terminator = process_group_terminator
+        _require_process_group_supervisor(process_group_supervisor)
+        self._process_group_supervisor = process_group_supervisor
         if type(history_retention_policy) is not ExecutorHistoryRetentionPolicy:
             raise ValueError(
                 "HostExecutor.history_retention_policy must be an "
@@ -403,35 +409,43 @@ class HostExecutor(Executor):
                     )
                     raise
                 try:
-                    return_code = process.wait(
-                        timeout=(
-                            None
-                            if command_budget is None
-                            else command_budget.timeout_seconds
-                        )
+                    supervision = self._process_group_supervisor.supervise(
+                        OwnedProcessGroupLeader(process.pid),
+                        ProcessGroupUnboundedWait()
+                        if command_budget is None
+                        else ProcessGroupBoundedWait(command_budget.timeout_seconds),
                     )
-                except subprocess.TimeoutExpired:
-                    if command_budget is None:
+                    process.returncode = supervision.termination.leader_exit_code
+                    if type(supervision) is ProcessGroupCompleted:
+                        return_code = supervision.termination.leader_exit_code
+                    elif type(supervision) is ProcessGroupTimedOut:
+                        if command_budget is None:
+                            raise AssertionError(
+                                "an unbounded executor command cannot time out"
+                            )
+                        if not isinstance(command.deadline, ExecutorBoundedDeadline):
+                            raise AssertionError(
+                                "a timed-out executor command must have a bounded "
+                                "deadline"
+                            )
+                        return_code = 124
+                        self._record_command_deadline(
+                            identity,
+                            work,
+                            lease,
+                            command.deadline,
+                            command_budget.reason,
+                            time.monotonic() - started,
+                        )
+                    else:
                         raise AssertionError(
-                            "an unbounded executor command cannot time out"
+                            "ProcessGroupSupervision is a closed union"
                         )
-                    if not isinstance(command.deadline, ExecutorBoundedDeadline):
-                        raise AssertionError(
-                            "a timed-out executor command must have a bounded deadline"
-                        )
-                    termination = self._process_group_terminator.terminate(
-                        OwnedProcessGroupLeader(process.pid)
-                    )
-                    process.returncode = termination.leader_exit_code
-                    return_code = 124
-                    self._record_command_deadline(
-                        identity,
-                        work,
-                        lease,
-                        command.deadline,
-                        command_budget.reason,
-                        time.monotonic() - started,
-                    )
+                except BaseException:
+                    # The supervision owner is the only component allowed to
+                    # reap. Any error here must propagate rather than falling
+                    # back to Popen.wait() and releasing false capacity.
+                    raise
         finally:
             elapsed = time.monotonic() - started
             usage_after = resource.getrusage(resource.RUSAGE_CHILDREN)

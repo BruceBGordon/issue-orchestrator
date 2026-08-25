@@ -43,6 +43,9 @@ from issue_orchestrator.execution.host_executor import (
 from issue_orchestrator.execution.process_group_terminator import (
     PosixProcessGroupTerminator,
 )
+from issue_orchestrator.execution.process_group_supervisor import (
+    PosixProcessGroupSupervisor,
+)
 from issue_orchestrator.execution.executor_history_lock import (
     PosixExecutorHistoryRetentionLock,
 )
@@ -93,10 +96,12 @@ def _executor(
             process_id=os.getpid,
             request_nonce=lambda: request_nonce,
         ),
-        process_group_terminator=PosixProcessGroupTerminator(
-            ExecutorProcessTerminationPolicy(
-                graceful_shutdown_seconds=0.1,
-                forceful_shutdown_seconds=0.1,
+        process_group_supervisor=PosixProcessGroupSupervisor(
+            PosixProcessGroupTerminator(
+                ExecutorProcessTerminationPolicy(
+                    graceful_shutdown_seconds=0.1,
+                    forceful_shutdown_seconds=0.1,
+                )
             )
         ),
         history_retention_lock=retention_lock,
@@ -275,10 +280,12 @@ def test_history_prunes_old_profiles_and_bounds_samples_per_profile(
             process_id=os.getpid,
             request_nonce=lambda: "a" * 32,
         ),
-        process_group_terminator=PosixProcessGroupTerminator(
-            ExecutorProcessTerminationPolicy(
-                graceful_shutdown_seconds=0.1,
-                forceful_shutdown_seconds=0.1,
+        process_group_supervisor=PosixProcessGroupSupervisor(
+            PosixProcessGroupTerminator(
+                ExecutorProcessTerminationPolicy(
+                    graceful_shutdown_seconds=0.1,
+                    forceful_shutdown_seconds=0.1,
+                )
             )
         ),
         history_retention_lock=PosixExecutorHistoryRetentionLock(

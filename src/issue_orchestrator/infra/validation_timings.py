@@ -24,6 +24,7 @@ from ..domain.validation_timing import (
     ValidationResourceTiming,
     ValidationRunTimingContext,
     ValidationRunTimingSummary,
+    ValidationRunLifecycle,
     ValidationSwapUsage,
     ValidationTargetTiming,
     ValidationTimingEnvelope,
@@ -183,9 +184,7 @@ def _append_jsonl(path: Path | None, payload: ValidationTimingPayload) -> None:
     if path is None:
         return
     path.parent.mkdir(parents=True, exist_ok=True)
-    line = (json.dumps(payload.timing_fields(), sort_keys=True) + "\n").encode(
-        "utf-8"
-    )
+    line = (json.dumps(payload.timing_fields(), sort_keys=True) + "\n").encode("utf-8")
     descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
     try:
         written = os.write(descriptor, line)
@@ -316,9 +315,7 @@ class ValidateTimingRecorder:
 
     worktree: Path
     command: str
-    run_id: str = field(
-        default_factory=new_validation_run_id
-    )
+    run_id: str = field(default_factory=new_validation_run_id)
     branch: str | None = field(init=False)
     output_path: Path | None = field(init=False)
     host_context: ValidationHostContext = field(init=False)
@@ -397,7 +394,9 @@ class ValidateTimingRecorder:
     def finalize(
         self,
         *,
+        lifecycle: ValidationRunLifecycle,
         exit_code: int,
+        child_exit_code: int,
         total_elapsed_seconds: float,
         wall_started_at: datetime,
         monotonic_started_at: float,
@@ -408,7 +407,9 @@ class ValidateTimingRecorder:
         summary = ValidationRunTimingSummary(
             context=self.context,
             configuration=self.configuration,
+            lifecycle=lifecycle,
             exit_code=exit_code,
+            child_exit_code=child_exit_code,
             total_elapsed_seconds=round(total_elapsed_seconds, 3),
             recorded_at=datetime.now(timezone.utc).isoformat(),
             envelope=build_timing_envelope(

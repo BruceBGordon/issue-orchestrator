@@ -34,6 +34,9 @@ from issue_orchestrator.execution.host_executor import (
 from issue_orchestrator.execution.process_group_terminator import (
     PosixProcessGroupTerminator,
 )
+from issue_orchestrator.execution.process_group_supervisor import (
+    PosixProcessGroupSupervisor,
+)
 from issue_orchestrator.execution.executor_history_lock import (
     PosixExecutorHistoryRetentionLock,
 )
@@ -137,10 +140,12 @@ def main() -> int:
                 process_id=os.getpid,
                 request_nonce=lambda: uuid4().hex,
             ),
-            process_group_terminator=PosixProcessGroupTerminator(
-                ExecutorProcessTerminationPolicy(
-                    graceful_shutdown_seconds=2.0,
-                    forceful_shutdown_seconds=2.0,
+            process_group_supervisor=PosixProcessGroupSupervisor(
+                PosixProcessGroupTerminator(
+                    ExecutorProcessTerminationPolicy(
+                        graceful_shutdown_seconds=2.0,
+                        forceful_shutdown_seconds=2.0,
+                    )
                 )
             ),
             history_retention_lock=PosixExecutorHistoryRetentionLock(

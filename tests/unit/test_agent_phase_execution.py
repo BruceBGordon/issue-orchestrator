@@ -57,6 +57,9 @@ from issue_orchestrator.execution.host_executor import (
 from issue_orchestrator.execution.process_group_terminator import (
     PosixProcessGroupTerminator,
 )
+from issue_orchestrator.execution.process_group_supervisor import (
+    PosixProcessGroupSupervisor,
+)
 from issue_orchestrator.execution.executor_history_lock import (
     PosixExecutorHistoryRetentionLock,
 )
@@ -160,10 +163,12 @@ def _deterministic_host_executor(
             process_id=os.getpid,
             request_nonce=lambda: request_nonce,
         ),
-        process_group_terminator=PosixProcessGroupTerminator(
-            ExecutorProcessTerminationPolicy(
-                graceful_shutdown_seconds=2.0,
-                forceful_shutdown_seconds=2.0,
+        process_group_supervisor=PosixProcessGroupSupervisor(
+            PosixProcessGroupTerminator(
+                ExecutorProcessTerminationPolicy(
+                    graceful_shutdown_seconds=2.0,
+                    forceful_shutdown_seconds=2.0,
+                )
             )
         ),
         history_retention_lock=_history_lock(pool_dir),
@@ -572,6 +577,49 @@ def test_descendant_is_gone_before_timed_out_phase_releases_lease(
     assert recovered.exit_code == 0
 
 
+def test_natural_phase_completion_contains_descendant_before_lease_release(
+    tmp_path: Path,
+) -> None:
+    """A successful leader cannot leave a detached same-group child behind."""
+    pool_dir = tmp_path / "pool"
+    descendant_pid_file = tmp_path / "natural-descendant.pid"
+    resistant_child = (
+        "import signal, time; "
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(300)"
+    )
+    leader_script = (
+        "import subprocess, sys; "
+        f"child = subprocess.Popen([sys.executable, '-c', {resistant_child!r}], "
+        "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, "
+        "stderr=subprocess.DEVNULL); "
+        f"open({str(descendant_pid_file)!r}, 'w').write(str(child.pid))"
+    )
+    executor = _deterministic_host_executor(
+        pool_dir,
+        host_cpu_observer=_IdleHostCpuObserver(),
+        request_nonce="e" * 32,
+    )
+
+    result = executor.run(
+        ExecutorRunSpecification(
+            work_key=ExecutorWorkKey("agent-phase:test:natural-descendant"),
+            fairness_group=ExecutorFairnessGroup("agent:test:natural-descendant"),
+            concurrency_range=ExecutorConcurrencyRange(1, 1),
+            exclusive_resources=(),
+        ),
+        ExecutorCommand(
+            (sys.executable, "-c", leader_script),
+            ExecutorBoundedDeadline(5.0, 5.0),
+        ),
+    )
+
+    assert result.exit_code == 0
+    descendant_pid = int(descendant_pid_file.read_text(encoding="utf-8"))
+    assert _pid_has_exited(descendant_pid), (
+        f"descendant {descendant_pid} survived normal executor completion"
+    )
+
+
 def test_internal_phase_client_rejects_non_finite_deadlines(tmp_path: Path) -> None:
     result = _phase_cli(
         tmp_path / "pool",
@@ -605,10 +653,12 @@ def test_admission_deadline_fails_before_command_and_is_durable(
             process_id=os.getpid,
             request_nonce=lambda: "c" * 32,
         ),
-        process_group_terminator=PosixProcessGroupTerminator(
-            ExecutorProcessTerminationPolicy(
-                graceful_shutdown_seconds=2.0,
-                forceful_shutdown_seconds=2.0,
+        process_group_supervisor=PosixProcessGroupSupervisor(
+            PosixProcessGroupTerminator(
+                ExecutorProcessTerminationPolicy(
+                    graceful_shutdown_seconds=2.0,
+                    forceful_shutdown_seconds=2.0,
+                )
             )
         ),
         history_retention_lock=_history_lock(pool_dir),
@@ -689,10 +739,12 @@ def test_deadline_expiring_after_admission_records_terminal_events_without_spawn
             process_id=os.getpid,
             request_nonce=lambda: "d" * 32,
         ),
-        process_group_terminator=PosixProcessGroupTerminator(
-            ExecutorProcessTerminationPolicy(
-                graceful_shutdown_seconds=2.0,
-                forceful_shutdown_seconds=2.0,
+        process_group_supervisor=PosixProcessGroupSupervisor(
+            PosixProcessGroupTerminator(
+                ExecutorProcessTerminationPolicy(
+                    graceful_shutdown_seconds=2.0,
+                    forceful_shutdown_seconds=2.0,
+                )
             )
         ),
         history_retention_lock=_history_lock(pool_dir),

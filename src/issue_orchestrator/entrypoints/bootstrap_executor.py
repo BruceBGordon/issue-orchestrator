@@ -21,14 +21,12 @@ from ..domain.executor import (
 )
 from ..domain.terminal_launch import TerminalShell
 from ..execution.agent_phase_command_scheduler import HostAgentPhaseCommandScheduler
-from ..execution.executor_history_lock import PosixExecutorHistoryRetentionLock
-from ..execution.process_group_terminator import PosixProcessGroupTerminator
 from ..ports.agent_phase_command_scheduler import AgentPhaseCommandScheduler
 from ..ports.executor import Executor
 from ..ports.executor_history_lock import ExecutorHistoryRetentionLock
 from ..ports.executor_monitor import ExecutorMonitor
 from ..ports.host_cpu_utilization import HostCpuUtilizationObserver
-from ..ports.process_group_terminator import ProcessGroupTerminator
+from ..ports.process_group_supervisor import ProcessGroupSupervisor
 
 
 _PROCESS_TERMINATION = ExecutorProcessTerminationPolicy(
@@ -82,7 +80,7 @@ def compose_executor(host_cpu_observer: HostCpuUtilizationObserver) -> Executor:
             process_id=os.getpid,
             request_nonce=lambda: uuid4().hex,
         ),
-        process_group_terminator=build_process_group_terminator(),
+        process_group_supervisor=build_process_group_supervisor(),
         history_retention_lock=_build_history_retention_lock(pool_dir),
         history_retention_policy=_HISTORY_RETENTION,
         queue_settle_seconds=0.1,
@@ -90,10 +88,15 @@ def compose_executor(host_cpu_observer: HostCpuUtilizationObserver) -> Executor:
     )
 
 
-def build_process_group_terminator() -> ProcessGroupTerminator:
-    """Compose fail-fast containment for a caller-owned process group."""
+def build_process_group_supervisor() -> ProcessGroupSupervisor:
+    """Compose wait, containment, and reaping behind one lifecycle owner."""
     _require_posix_process_groups()
-    return PosixProcessGroupTerminator(_PROCESS_TERMINATION)
+    from ..execution.process_group_supervisor import PosixProcessGroupSupervisor
+    from ..execution.process_group_terminator import PosixProcessGroupTerminator
+
+    return PosixProcessGroupSupervisor(
+        PosixProcessGroupTerminator(_PROCESS_TERMINATION)
+    )
 
 
 def build_executor_monitor() -> ExecutorMonitor:
@@ -122,6 +125,13 @@ def _build_history_retention_lock(
     pool_dir: Path,
 ) -> ExecutorHistoryRetentionLock:
     """Own the one lock identity shared by executor writers and monitors."""
+    try:
+        from ..execution.executor_history_lock import (
+            PosixExecutorHistoryRetentionLock,
+        )
+    except ModuleNotFoundError as exc:
+        _raise_missing_posix_executor_dependency(exc)
+        raise AssertionError("unreachable after missing executor dependency")
     return PosixExecutorHistoryRetentionLock(
         (pool_dir / "work-history" / "retention.lock").resolve()
     )

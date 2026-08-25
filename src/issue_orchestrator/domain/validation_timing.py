@@ -6,6 +6,7 @@ import math
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 from typing import Protocol, TypeAlias, runtime_checkable
 
@@ -216,7 +217,9 @@ class ValidationConfiguration:
     def __post_init__(self) -> None:
         owner = type(self).__name__
         _require_exact(owner, "entries", self.entries, tuple)
-        if any(type(entry) is not ValidationConfigurationEntry for entry in self.entries):
+        if any(
+            type(entry) is not ValidationConfigurationEntry for entry in self.entries
+        ):
             raise ValueError(
                 f"{owner}.entries must contain ValidationConfigurationEntry values"
             )
@@ -315,13 +318,22 @@ class ValidationTargetTiming:
         )
 
 
+class ValidationRunLifecycle(StrEnum):
+    """Terminal meaning of one validate-runner timing summary."""
+
+    COMPLETED = "completed"
+    CAPTURE_FAILED = "capture-failed"
+
+
 @dataclass(frozen=True, slots=True)
 class ValidationRunTimingSummary:
     """Completed total timing for one validate-runner invocation."""
 
     context: ValidationRunTimingContext
     configuration: ValidationConfiguration
+    lifecycle: ValidationRunLifecycle
     exit_code: int
+    child_exit_code: int
     total_elapsed_seconds: float
     recorded_at: str
     envelope: ValidationTimingEnvelope
@@ -335,7 +347,26 @@ class ValidationRunTimingSummary:
             self.configuration,
             ValidationConfiguration,
         )
+        _require_exact(owner, "lifecycle", self.lifecycle, ValidationRunLifecycle)
         _require_integer(owner, "exit_code", self.exit_code, minimum=-(2**63))
+        _require_integer(
+            owner,
+            "child_exit_code",
+            self.child_exit_code,
+            minimum=-(2**63),
+        )
+        if (
+            self.lifecycle is ValidationRunLifecycle.COMPLETED
+            and self.exit_code != self.child_exit_code
+        ):
+            raise ValueError(
+                "completed validation lifecycle must preserve the child exit code"
+            )
+        if (
+            self.lifecycle is ValidationRunLifecycle.CAPTURE_FAILED
+            and self.exit_code == 0
+        ):
+            raise ValueError("failed validation capture cannot record exit code zero")
         _require_float(
             owner,
             "total_elapsed_seconds",
@@ -351,6 +382,8 @@ class ValidationRunTimingSummary:
             self.context,
             {
                 "exit_code": self.exit_code,
+                "child_exit_code": self.child_exit_code,
+                "lifecycle": self.lifecycle.value,
                 "total_elapsed_seconds": self.total_elapsed_seconds,
                 "recorded_at": self.recorded_at,
             },

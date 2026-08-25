@@ -40,7 +40,7 @@ from .bootstrap_dependencies import Dependencies as Dependencies
 from .bootstrap_executor import (
     build_agent_phase_command_scheduler,
     build_executor_monitor as build_executor_monitor,
-    build_process_group_terminator as build_process_group_terminator,
+    build_process_group_supervisor as build_process_group_supervisor,
     compose_executor,
 )
 from .bootstrap_pair_registry import build_pair_registry_with_worktree_hook

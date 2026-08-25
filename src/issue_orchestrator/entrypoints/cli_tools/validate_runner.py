@@ -29,7 +29,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TextIO
 
-from ...domain.process_group import OwnedProcessGroupLeader
+from ...domain.process_group import (
+    OwnedProcessGroupLeader,
+    ProcessGroupCompleted,
+    ProcessGroupUnboundedWait,
+)
+from ...domain.validation_timing import ValidationRunLifecycle
 from ...infra.env import get_env
 from ...infra.validation_timings import (
     ValidateTimingRecorder,
@@ -37,7 +42,7 @@ from ...infra.validation_timings import (
     ValidationResourceSample,
     ValidationSwapUsage,
 )
-from ...ports.process_group_terminator import ProcessGroupTerminator
+from ...ports.process_group_supervisor import ProcessGroupSupervisor
 
 _MEMORY_FREE_RE = re.compile(r"System-wide memory free percentage:\s*(?P<percent>\d+)%")
 _SWAP_RE = re.compile(
@@ -256,13 +261,48 @@ class ResourceSampler:
 
 
 @dataclass(frozen=True, slots=True)
-class _ValidationCommandResult:
-    """Complete process outcome used by reporting and timing persistence."""
+class _ValidationCommandCompleted:
+    """Successful capture lifecycle with the contained child's real status."""
 
-    exit_code: int
+    child_exit_code: int
     duration_seconds: float
     wall_ended_at: datetime
     monotonic_ended_at: float
+
+    @property
+    def validation_exit_code(self) -> int:
+        return self.child_exit_code
+
+    @property
+    def lifecycle(self) -> ValidationRunLifecycle:
+        return ValidationRunLifecycle.COMPLETED
+
+
+@dataclass(frozen=True, slots=True)
+class _ValidationCaptureFailed:
+    """Incomplete capture retained separately from the child's terminal facts."""
+
+    child_exit_code: int
+    capture_error_type: str
+    capture_error_message: str
+    duration_seconds: float
+    wall_ended_at: datetime
+    monotonic_ended_at: float
+
+    def __post_init__(self) -> None:
+        if not self.capture_error_type or not self.capture_error_message:
+            raise ValueError("validation capture failure requires error evidence")
+
+    @property
+    def validation_exit_code(self) -> int:
+        return 1
+
+    @property
+    def lifecycle(self) -> ValidationRunLifecycle:
+        return ValidationRunLifecycle.CAPTURE_FAILED
+
+
+_ValidationCommandResult = _ValidationCommandCompleted | _ValidationCaptureFailed
 
 
 @dataclass(slots=True)
@@ -277,7 +317,7 @@ class _ValidationCommandCapture:
     wall_started_at: datetime
     monotonic_started_at: float
     clock: ValidationRunnerClock
-    process_group_terminator: ProcessGroupTerminator
+    process_group_supervisor: ProcessGroupSupervisor
     process: subprocess.Popen[str] | None = field(default=None, init=False)
     line_count: int = field(default=0, init=False)
     byte_count: int = field(default=0, init=False)
@@ -322,47 +362,71 @@ class _ValidationCommandCapture:
                 f"elapsed={self._monotonic_elapsed_seconds():.1f}s\n",
                 output_handle,
             )
-            self._wait_for_exit(output_handle)
+            self._supervise_exit(output_handle)
 
-    def finish(self) -> _ValidationCommandResult:
-        """Stop any live child, record its terminal marker, and return facts."""
+    def finish_completed(self) -> _ValidationCommandCompleted:
+        """Finalize a fully captured command after normal group supervision."""
         if self._finished:
             raise RuntimeError("validation command capture cannot finish twice")
         self._finished = True
-        if self.process is not None and self.process.returncode is None:
-            termination = self.process_group_terminator.terminate(
-                OwnedProcessGroupLeader(self.process.pid)
+        if self.process is None or self.process.returncode is None:
+            raise RuntimeError(
+                "completed validation capture requires a supervised child result"
             )
-            self.process.returncode = termination.leader_exit_code
-        result = self.snapshot()
+        wall_end = self.clock.wall_now()
+        monotonic_end = self.clock.monotonic_now()
+        result = _ValidationCommandCompleted(
+            child_exit_code=self.process.returncode,
+            duration_seconds=monotonic_end - self.monotonic_started_at,
+            wall_ended_at=wall_end,
+            monotonic_ended_at=monotonic_end,
+        )
+        self._record_terminal_marker(result)
+        return result
+
+    def finish_capture_failed(
+        self,
+        capture_error: BaseException,
+    ) -> _ValidationCaptureFailed:
+        """Abort incomplete capture and retain failure separately from child exit."""
+        if self._finished:
+            raise RuntimeError("validation command capture cannot finish twice")
+        self._finished = True
+        child_exit_code = 127
         if self.process is not None:
-            elapsed = result.monotonic_ended_at - self.monotonic_started_at
+            if self.process.returncode is None:
+                termination = self.process_group_supervisor.abort(
+                    OwnedProcessGroupLeader(self.process.pid)
+                )
+                self.process.returncode = termination.leader_exit_code
+            child_exit_code = self.process.returncode
+        wall_end = self.clock.wall_now()
+        monotonic_end = self.clock.monotonic_now()
+        result = _ValidationCaptureFailed(
+            child_exit_code=child_exit_code,
+            capture_error_type=type(capture_error).__name__,
+            capture_error_message=str(capture_error),
+            duration_seconds=monotonic_end - self.monotonic_started_at,
+            wall_ended_at=wall_end,
+            monotonic_ended_at=monotonic_end,
+        )
+        self._record_terminal_marker(result)
+        return result
+
+    def _record_terminal_marker(self, result: _ValidationCommandResult) -> None:
+        if self.process is not None:
             marker = (
                 f"[validate_runner] child_exited pid={self.process.pid} "
-                f"exit_code={result.exit_code} "
+                f"child_exit_code={result.child_exit_code} "
+                f"validation_exit_code={result.validation_exit_code} "
+                f"lifecycle={result.lifecycle.value} "
                 f"elapsed={result.duration_seconds:.1f}s "
-                f"monotonic_elapsed={elapsed:.1f}s "
                 f"lines={self.line_count} bytes={self.byte_count}\n"
             )
             with open(self.output_file, "a", encoding="utf-8") as output_handle:
                 output_handle.write(marker)
             sys.stdout.write(marker)
             sys.stdout.flush()
-        return result
-
-    def snapshot(self) -> _ValidationCommandResult:
-        """Observe current completion facts without mutating lifecycle state."""
-        wall_end = self.clock.wall_now()
-        monotonic_end = self.clock.monotonic_now()
-        exit_code = 1
-        if self.process is not None and self.process.returncode is not None:
-            exit_code = self.process.returncode
-        return _ValidationCommandResult(
-            exit_code=exit_code,
-            duration_seconds=monotonic_end - self.monotonic_started_at,
-            wall_ended_at=wall_end,
-            monotonic_ended_at=monotonic_end,
-        )
 
     def _stream_output(self, output_handle: TextIO) -> None:
         if self.process is None or self.process.stdout is None:
@@ -377,20 +441,22 @@ class _ValidationCommandCapture:
             output_handle.write(line)
             output_handle.flush()
 
-    def _wait_for_exit(self, output_handle: TextIO) -> None:
+    def _supervise_exit(self, output_handle: TextIO) -> None:
         if self.process is None:
             raise RuntimeError("validation command was not started")
-        while True:
-            try:
-                self.process.wait(timeout=1)
-                return
-            except subprocess.TimeoutExpired:
-                self._emit_to_terminal_and_file(
-                    f"[validate_runner] waiting_for_exit pid={self.process.pid} "
-                    f"elapsed={self._monotonic_elapsed_seconds():.1f}s "
-                    "after_stdout_eof\n",
-                    output_handle,
-                )
+        self._emit_to_terminal_and_file(
+            f"[validate_runner] supervising_process_group pid={self.process.pid} "
+            f"elapsed={self._monotonic_elapsed_seconds():.1f}s "
+            "after_stdout_eof\n",
+            output_handle,
+        )
+        supervision = self.process_group_supervisor.supervise(
+            OwnedProcessGroupLeader(self.process.pid),
+            ProcessGroupUnboundedWait(),
+        )
+        if type(supervision) is not ProcessGroupCompleted:
+            raise AssertionError("an unbounded process-group wait cannot time out")
+        self.process.returncode = supervision.termination.leader_exit_code
 
     @staticmethod
     def _emit_to_terminal_and_file(marker: str, output_handle: TextIO) -> None:
@@ -417,7 +483,9 @@ def _finalize_validation_evidence(
             sampler.stop()
     finally:
         recorder.finalize(
-            exit_code=result.exit_code,
+            lifecycle=result.lifecycle,
+            exit_code=result.validation_exit_code,
+            child_exit_code=result.child_exit_code,
             total_elapsed_seconds=result.duration_seconds,
             wall_started_at=wall_started_at,
             monotonic_started_at=monotonic_started_at,
@@ -432,7 +500,7 @@ def run_validation(
     worktree: Path,
     *,
     clock: ValidationRunnerClock,
-    process_group_terminator: ProcessGroupTerminator,
+    process_group_supervisor: ProcessGroupSupervisor,
 ) -> int:
     """Run validation command and capture output.
 
@@ -469,36 +537,43 @@ def run_validation(
         wall_started_at=wall_start,
         monotonic_started_at=start,
         clock=clock,
-        process_group_terminator=process_group_terminator,
+        process_group_supervisor=process_group_supervisor,
     )
     sampler_started = False
-    result = capture.snapshot()
     try:
         resource_sampler.start()
         sampler_started = True
         capture.execute()
-    finally:
-        try:
-            result = capture.finish()
-        finally:
-            result = capture.snapshot()
-            _finalize_validation_evidence(
-                sampler=resource_sampler,
-                sampler_started=sampler_started,
-                recorder=timing_recorder,
-                result=result,
-                wall_started_at=wall_start,
-                monotonic_started_at=start,
-            )
+    except BaseException as capture_error:
+        result = capture.finish_capture_failed(capture_error)
+        _finalize_validation_evidence(
+            sampler=resource_sampler,
+            sampler_started=sampler_started,
+            recorder=timing_recorder,
+            result=result,
+            wall_started_at=wall_start,
+            monotonic_started_at=start,
+        )
+        raise
+    else:
+        result = capture.finish_completed()
+        _finalize_validation_evidence(
+            sampler=resource_sampler,
+            sampler_started=sampler_started,
+            recorder=timing_recorder,
+            result=result,
+            wall_started_at=wall_start,
+            monotonic_started_at=start,
+        )
 
     print()
-    if result.exit_code == 0:
+    if result.validation_exit_code == 0:
         print(f"Validation PASSED (exit code 0) in {result.duration_seconds:.1f}s")
         print(f"Full output saved to: {output_file}")
     else:
         print("=" * 60)
         print(
-            f"Validation FAILED (exit code {result.exit_code}) in "
+            f"Validation FAILED (exit code {result.validation_exit_code}) in "
             f"{result.duration_seconds:.1f}s"
         )
         print("=" * 60)
@@ -509,7 +584,7 @@ def run_validation(
         print(f"To view: cat {output_file}")
         print("=" * 60)
 
-    return result.exit_code
+    return result.validation_exit_code
 
 
 def main() -> None:
@@ -546,14 +621,14 @@ def main() -> None:
         )
         sys.exit(2)
 
-    from ..bootstrap import build_process_group_terminator
+    from ..bootstrap import build_process_group_supervisor
 
     exit_code = run_validation(
         command,
         output_dir,
         worktree,
         clock=SYSTEM_VALIDATION_RUNNER_CLOCK,
-        process_group_terminator=build_process_group_terminator(),
+        process_group_supervisor=build_process_group_supervisor(),
     )
     sys.exit(exit_code)
 

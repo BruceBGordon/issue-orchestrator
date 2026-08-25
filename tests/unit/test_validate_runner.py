@@ -25,7 +25,7 @@ from issue_orchestrator.entrypoints.cli_tools.validate_runner import (
     ValidationRunnerClock,
     run_validation,
 )
-from issue_orchestrator.entrypoints.bootstrap import build_process_group_terminator
+from issue_orchestrator.entrypoints.bootstrap import build_process_group_supervisor
 
 
 def _with_repo_on_pythonpath(env: dict[str, str]) -> dict[str, str]:
@@ -369,7 +369,7 @@ class TestValidateRunner:
                     lambda: datetime.now(timezone.utc),
                     time.monotonic,
                 ),
-                process_group_terminator=build_process_group_terminator(),
+                process_group_supervisor=build_process_group_supervisor(),
             )
 
         child_pid = int(child_pid_path.read_text(encoding="utf-8"))
@@ -393,7 +393,9 @@ class TestValidateRunner:
             .splitlines()
         ]
         summary = next(record for record in records if record["kind"] == "run_summary")
-        assert summary["exit_code"] == 0
+        assert summary["lifecycle"] == "capture-failed"
+        assert summary["exit_code"] == 1
+        assert summary["child_exit_code"] == 0
 
     def test_appends_run_summary_record_to_shared_git_dir(self, fake_git_repo: Path):
         """Each validate run should append a run summary record."""
@@ -420,6 +422,8 @@ class TestValidateRunner:
         assert summary_record["command"] == "echo ok"
         assert summary_record["worktree"] == str(fake_git_repo)
         assert summary_record["exit_code"] == 0
+        assert summary_record["child_exit_code"] == 0
+        assert summary_record["lifecycle"] == "completed"
         assert isinstance(summary_record["total_elapsed_seconds"], float)
         assert isinstance(summary_record["monotonic_elapsed_seconds"], float)
         assert isinstance(summary_record["wall_elapsed_seconds"], float)
@@ -432,6 +436,42 @@ class TestValidateRunner:
         assert summary_record["host_memory_bytes"] is None or isinstance(
             summary_record["host_memory_bytes"], int
         )
+
+    @pytest.mark.skipif(os.name != "posix", reason="asserts POSIX process cleanup")
+    def test_natural_exit_contains_descendant_before_validation_returns(
+        self,
+        fake_git_repo: Path,
+        tmp_path: Path,
+    ) -> None:
+        descendant_pid_path = tmp_path / "natural-validation-descendant.pid"
+        resistant_child = (
+            "import signal, time; "
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(300)"
+        )
+        natural_leader = (
+            "import subprocess, sys; "
+            f"child = subprocess.Popen([sys.executable, '-c', {resistant_child!r}], "
+            "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, "
+            "stderr=subprocess.DEVNULL); "
+            f"open({str(descendant_pid_path)!r}, 'w').write(str(child.pid))"
+        )
+        command = f"exec {shlex.quote(sys.executable)} -c {shlex.quote(natural_leader)}"
+
+        result = run_validation(
+            command,
+            tmp_path / "output",
+            fake_git_repo,
+            clock=ValidationRunnerClock(
+                lambda: datetime.now(timezone.utc),
+                time.monotonic,
+            ),
+            process_group_supervisor=build_process_group_supervisor(),
+        )
+
+        assert result == 0
+        descendant_pid = int(descendant_pid_path.read_text(encoding="utf-8"))
+        with pytest.raises(ProcessLookupError):
+            os.kill(descendant_pid, 0)
 
     def test_appends_resource_samples_to_shared_git_dir(self, fake_git_repo: Path):
         """Validate runs should persist periodic resource samples."""
@@ -485,7 +525,7 @@ class TestValidateRunner:
             tmp_path / "output",
             fake_git_repo,
             clock=ValidationRunnerClock(wall_now, monotonic_now),
-            process_group_terminator=build_process_group_terminator(),
+            process_group_supervisor=build_process_group_supervisor(),
         )
 
         assert result == 0

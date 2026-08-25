@@ -9,7 +9,14 @@ import sys
 import time
 
 from issue_orchestrator.domain.executor import ExecutorProcessTerminationPolicy
-from issue_orchestrator.domain.process_group import OwnedProcessGroupLeader
+from issue_orchestrator.domain.process_group import (
+    OwnedProcessGroupLeader,
+    ProcessGroupCompleted,
+    ProcessGroupUnboundedWait,
+)
+from issue_orchestrator.execution.process_group_supervisor import (
+    PosixProcessGroupSupervisor,
+)
 from issue_orchestrator.execution.process_group_terminator import (
     PosixProcessGroupTerminator,
 )
@@ -87,3 +94,50 @@ def test_term_resistant_descendant_dies_when_cooperative_leader_exits() -> None:
             except ProcessLookupError:
                 pass
             process.wait(timeout=1.0)
+
+
+def test_natural_leader_exit_contains_descendant_before_reaping() -> None:
+    resistant_child = (
+        "import signal, time; "
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)"
+    )
+    natural_leader = (
+        "import subprocess, sys; "
+        f"child = subprocess.Popen([sys.executable, '-c', {resistant_child!r}], "
+        "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, "
+        "stderr=subprocess.DEVNULL); "
+        "print(child.pid, flush=True)"
+    )
+    process = subprocess.Popen(
+        [sys.executable, "-c", natural_leader],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    if process.stdout is None:
+        raise AssertionError("leader readiness pipe was not created")
+    descendant_pid = int(process.stdout.readline().strip())
+    supervisor = PosixProcessGroupSupervisor(
+        PosixProcessGroupTerminator(
+            ExecutorProcessTerminationPolicy(
+                graceful_shutdown_seconds=0.1,
+                forceful_shutdown_seconds=1.0,
+            )
+        )
+    )
+
+    try:
+        supervision = supervisor.supervise(
+            OwnedProcessGroupLeader(process.pid),
+            ProcessGroupUnboundedWait(),
+        )
+        process.returncode = supervision.termination.leader_exit_code
+        assert type(supervision) is ProcessGroupCompleted
+        assert process.returncode == 0
+        assert _pid_has_exited(descendant_pid)
+    finally:
+        try:
+            os.kill(descendant_pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
