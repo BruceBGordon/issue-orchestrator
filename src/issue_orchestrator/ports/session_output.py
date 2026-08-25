@@ -30,6 +30,7 @@ if TYPE_CHECKING:
     from ..domain.artifact_contracts import ValidationOutcome
     from ..domain.exchange_chapter import ExchangeChapterSidecar
     from ..domain.review_exchange_run import ReviewExchangeRun
+    from ..domain.session_watchdog import ScheduledSessionWatchdog
 
 from ..domain.review_exchange_run import ReviewExchangeRunAssets
 from ..domain.review_exchange_summary import ReviewExchangeSummaryV1
@@ -266,6 +267,14 @@ class SessionOutput(Protocol):
         ``validation_reason`` are how the stale-reason-on-success bug
         slipped in originally; the runtime guard prevents recurrence.
         """
+        ...
+
+    def record_scheduled_watchdog(
+        self,
+        run: SessionRunAssets,
+        watchdog: "ScheduledSessionWatchdog",
+    ) -> None:
+        """Persist the planner-owned outer timeout before terminal creation."""
         ...
 
     def update_validation_outcome(

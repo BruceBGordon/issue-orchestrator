@@ -12,6 +12,8 @@ Tests use mock adapters at port boundaries, not internal patches.
 import json
 import logging
 import re
+import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Optional
 from unittest.mock import MagicMock
@@ -69,6 +71,7 @@ def make_discovered_session(
     is_review: bool = False,
     session_name: str | None = None,
     worktree: Path | None = None,
+    scheduled_watchdog_timeout_minutes: int = 90,
 ) -> DiscoveredSession:
     """Create a DiscoveredSession for testing."""
     if tab_name is None:
@@ -89,7 +92,13 @@ def make_discovered_session(
             tab_name,
             is_review,
         )
-        run_assets = make_session_run_assets(worktree, session_name=asset_session_name)
+        run_assets = make_session_run_assets(
+            worktree,
+            session_name=asset_session_name,
+            scheduled_watchdog_timeout_minutes=(
+                scheduled_watchdog_timeout_minutes
+            ),
+        )
         (run_assets.run_dir / "session-identity.json").write_text(
             json.dumps(
                 {
@@ -244,6 +253,85 @@ class TestRestoreSessionsBasic:
         assert session.worktree_path == worktree
         assert session.branch_name == "123-test-branch"
         assert session.key.task == TaskKind.CODE
+
+    def test_restore_uses_exact_scheduled_watchdog_not_current_active_timeout(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        worktree = tmp_path / "repo-123"
+        worktree.mkdir()
+        prompt = tmp_path / "prompt.md"
+        prompt.write_text("Test prompt", encoding="utf-8")
+        config = make_config(
+            agents={
+                "agent:web": AgentConfig(
+                    prompt_path=prompt,
+                    timeout_minutes=45,
+                )
+            }
+        )
+        repo_host = MockRepositoryHost()
+        repo_host.issues[123] = Issue(
+            number=123,
+            title="Test issue",
+            labels=["agent:web"],
+        )
+        working_copy = MockWorkingCopy()
+        working_copy.branches[worktree] = "123-test-branch"
+
+        [session] = SessionRestorer(
+            config,
+            repo_host,
+            working_copy,
+        ).restore_sessions(
+            [
+                make_discovered_session(
+                    123,
+                    worktree=worktree,
+                    scheduled_watchdog_timeout_minutes=92,
+                )
+            ],
+            already_tracked=[],
+        )
+
+        assert session.agent_config.timeout_minutes == 92
+        observed_now = time.monotonic()
+        session.watchdog_started_at_monotonic = observed_now - (46 * 60)
+        assert session.is_timed_out is False
+        session.watchdog_started_at_monotonic = observed_now - (93 * 60)
+        assert session.is_timed_out is True
+
+    def test_restore_rejects_active_run_without_scheduled_watchdog(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        worktree = tmp_path / "repo-123"
+        worktree.mkdir()
+        config = make_config(agents={"agent:web": make_agent_config(tmp_path)})
+        run_assets = make_session_run_assets(worktree, session_name="issue-123")
+        manifest = json.loads(run_assets.manifest_path.read_text(encoding="utf-8"))
+        del manifest["scheduled_outer_watchdog_timeout_minutes"]
+        run_assets.manifest_path.write_text(
+            json.dumps(manifest) + "\n",
+            encoding="utf-8",
+        )
+        discovered = DiscoveredSession(
+            issue_number=123,
+            tab_name="#123 Some task",
+            is_review=False,
+            session_name="issue-123",
+            run_dir=str(run_assets.run_dir),
+        )
+
+        with pytest.raises(
+            SessionConfigurationIdentityVerificationError,
+            match="missing required scheduled outer watchdog",
+        ):
+            SessionRestorer(
+                config,
+                MockRepositoryHost(),
+                MockWorkingCopy(),
+            ).restore_sessions([discovered], already_tracked=[])
 
     def test_restores_review_session_with_pr_number_from_tab_name(self, tmp_path):
         """A discovered review session extracts PR number from tab name."""
@@ -767,7 +855,10 @@ class TestStateValidation:
 
         # Session restored with fallback agent config
         assert len(restored) == 1
-        assert restored[0].agent_config == agent_config
+        assert restored[0].agent_config == replace(
+            agent_config,
+            timeout_minutes=90,
+        )
 
 
 class TestBranchNameResolution:

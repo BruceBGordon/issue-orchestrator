@@ -216,6 +216,7 @@ class SessionLauncher:
         self._agent_phase_launch_planner = AgentPhaseLaunchPlanner(
             agent_phase_command_scheduler,
             self._provider_command_wrapper,
+            self._session_output,
         )
         self._session_exists = session_exists_fn
         self._create_session = create_session_fn

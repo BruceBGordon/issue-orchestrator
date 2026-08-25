@@ -13,6 +13,7 @@ Called during startup to restore tracking for sessions that survived a restart.
 import json
 import logging
 import re
+from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional, cast
 
@@ -23,7 +24,7 @@ if TYPE_CHECKING:
 from ..domain.issue_key import GitHubIssueKey
 from ..domain.session_key import SessionKey, TaskKind
 from ..domain.models import Issue, RETROSPECTIVE_REVIEW_TERMINAL_PREFIX, Session
-from ..domain.session_run import SessionRunAssets
+from ..domain.session_run import RestoredSessionRun, SessionRunAssets
 from ..ports import RepositoryHost, WorkingCopy
 from ..ports.session_runner import DiscoveredSession
 from .tech_lead_session_policy import recover_tech_lead_launch_scope
@@ -240,7 +241,8 @@ class SessionRestorer:
             logger.info("Session %s already tracked - skipping restore", session_name)
             return None
 
-        run_assets = self._required_run_assets(session_info, session_name)
+        restored_run = self._required_session_run(session_info, session_name)
+        run_assets = restored_run.assets
         self._assert_restored_session_mode(run_assets, session_name)
 
         # Determine session type and session_name
@@ -294,15 +296,18 @@ class SessionRestorer:
         agent_label_val = issue_obj.agent_type or next(
             iter(self.config.agents.keys()), "unknown"
         )
-        # A monotonic instant cannot survive an orchestrator process restart.
-        # Restoration therefore starts a fresh conservative outer watchdog.
-        # The independently running executor retains its original monotonic
-        # absolute deadline, so recovery can extend observation but can never
-        # kill that executor early.
+        # A monotonic instant cannot survive an orchestrator process restart,
+        # but the owner-produced absolute timeout does. Start a fresh monotonic
+        # observation window using that exact durable value; never recompute it
+        # from mutable repository configuration.
+        scheduled_agent_config = replace(
+            agent_config,
+            timeout_minutes=restored_run.watchdog.timeout_minutes,
+        )
         return Session(
             key=session_key,
             issue=issue_obj,
-            agent_config=agent_config,
+            agent_config=scheduled_agent_config,
             terminal_id=session_name,
             worktree_path=worktree_path,
             branch_name=branch_name,
@@ -317,11 +322,11 @@ class SessionRestorer:
             ),
         )
 
-    def _required_run_assets(
+    def _required_session_run(
         self,
         session_info: DiscoveredSession,
         session_name: str,
-    ) -> SessionRunAssets:
+    ) -> RestoredSessionRun:
         raw: object = session_info.get("run_dir")
         if type(raw) is not str or not raw:
             message = (
@@ -341,7 +346,7 @@ class SessionRestorer:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             if not isinstance(manifest, dict):
                 raise ValueError("manifest root must be an object")
-            return SessionRunAssets.from_manifest_payload(
+            return RestoredSessionRun.from_manifest_payload(
                 run_dir=run_dir,
                 manifest=manifest,
             )

@@ -71,6 +71,8 @@ from issue_orchestrator.domain.terminal_launch import (
     TerminalShell,
 )
 from issue_orchestrator.domain.models import AgentConfig, TaskKind
+from issue_orchestrator.domain.session_run import SessionRunAssets
+from issue_orchestrator.domain.session_watchdog import ScheduledSessionWatchdog
 from issue_orchestrator.ports.host_cpu_utilization import HostCpuUtilizationObserver
 from tests.unit.session_run_helpers import make_session_run_assets
 
@@ -124,6 +126,20 @@ class _OpaqueProviderCommandWrapper:
     ) -> str:
         self.received_commands.append(base_command)
         return "opaque-provider-runner --command-token hidden"
+
+
+class _RecordingScheduledWatchdogStore:
+    """Port fake retaining the exact planner-owned watchdog write."""
+
+    def __init__(self) -> None:
+        self.records: list[tuple[SessionRunAssets, ScheduledSessionWatchdog]] = []
+
+    def record_scheduled_watchdog(
+        self,
+        run: SessionRunAssets,
+        watchdog: ScheduledSessionWatchdog,
+    ) -> None:
+        self.records.append((run, watchdog))
 
 
 def _demand_estimator() -> ExecutorWorkDemandEstimator:
@@ -306,7 +322,8 @@ def test_launch_owner_classifies_every_phase_provider_before_wrapping(
             observer_margin_seconds=58.0,
         ),
     )
-    planner = AgentPhaseLaunchPlanner(scheduler, wrapper)
+    watchdog_store = _RecordingScheduledWatchdogStore()
+    planner = AgentPhaseLaunchPlanner(scheduler, wrapper, watchdog_store)
     run = make_session_run_assets(
         tmp_path / phase_name,
         session_name=phase_name,
@@ -337,6 +354,9 @@ def test_launch_owner_classifies_every_phase_provider_before_wrapping(
         f"agent-phase:agent:test:{task_kind.value}"
     )
     assert scheduled_config.timeout_minutes == 92
+    assert watchdog_store.records == [
+        (run, ScheduledSessionWatchdog(timeout_minutes=92))
+    ]
 
 
 def test_scheduler_renders_one_shell_safe_internal_invocation() -> None:

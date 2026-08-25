@@ -13,8 +13,10 @@ from ..domain.agent_phase_execution import (
 )
 from ..domain.executor import ExecutorFairnessGroup, ExecutorWorkKey
 from ..domain.models import AgentConfig
+from ..domain.session_watchdog import ScheduledSessionWatchdog
 from ..domain.terminal_launch import TerminalInteractionIntent, TerminalLaunch
 from ..ports.agent_phase_command_scheduler import AgentPhaseCommandScheduler
+from ..ports.scheduled_session_watchdog_store import ScheduledSessionWatchdogStore
 
 
 class AgentProviderCommandWrapper(Protocol):
@@ -37,9 +39,11 @@ class AgentPhaseLaunchPlanner:
         self,
         scheduler: AgentPhaseCommandScheduler,
         provider_command_wrapper: AgentProviderCommandWrapper,
+        watchdog_store: ScheduledSessionWatchdogStore,
     ) -> None:
         self._scheduler = scheduler
         self._provider_command_wrapper = provider_command_wrapper
+        self._watchdog_store = watchdog_store
 
     def schedule(
         self,
@@ -69,10 +73,17 @@ class AgentPhaseLaunchPlanner:
             ),
         )
         scheduled = self._scheduler.schedule(specification)
+        scheduled_watchdog = ScheduledSessionWatchdog(
+            scheduled.absolute_timeout_minutes
+        )
+        self._watchdog_store.record_scheduled_watchdog(
+            request.run,
+            scheduled_watchdog,
+        )
         return (
             scheduled.terminal_launch,
             replace(
                 request.agent_config,
-                timeout_minutes=scheduled.absolute_timeout_minutes,
+                timeout_minutes=scheduled_watchdog.timeout_minutes,
             ),
         )

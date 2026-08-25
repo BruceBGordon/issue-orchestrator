@@ -33,6 +33,10 @@ from ..domain.review_exchange_manifest import ReviewExchangeManifestHeader
 from ..domain.review_exchange_resume import is_no_completion_reason
 from ..domain.review_exchange_run import ReviewExchangeRun, ReviewExchangeRunAssets
 from ..domain.review_exchange_summary import ReviewExchangeSummaryV1
+from ..domain.session_watchdog import (
+    SCHEDULED_OUTER_WATCHDOG_MANIFEST_FIELD,
+    ScheduledSessionWatchdog,
+)
 from ..domain.exchange_chapter import (
     CHAPTER_SCHEMA_VERSION,
     ChapterSidecarIdentityMismatch,
@@ -398,6 +402,27 @@ class FileSystemSessionOutput(RunDirectoryArtifacts):
                 "three legacy fields atomically and clears stale reasons."
             )
         self._update_manifest_unchecked(run_dir, updates)
+
+    def record_scheduled_watchdog(
+        self,
+        run: SessionRunAssets,
+        watchdog: ScheduledSessionWatchdog,
+    ) -> None:
+        """Durably bind the exact planner timeout to its active session run."""
+        if type(run) is not SessionRunAssets:
+            raise ValueError(
+                "record_scheduled_watchdog.run must be SessionRunAssets"
+            )
+        if type(watchdog) is not ScheduledSessionWatchdog:
+            raise ValueError(
+                "record_scheduled_watchdog.watchdog must be ScheduledSessionWatchdog"
+            )
+        self.update_manifest(
+            run.run_dir,
+            {
+                SCHEDULED_OUTER_WATCHDOG_MANIFEST_FIELD: watchdog.timeout_minutes,
+            },
+        )
 
     def _update_manifest_unchecked(
         self,
