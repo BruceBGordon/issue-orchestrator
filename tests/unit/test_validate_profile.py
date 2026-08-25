@@ -2,15 +2,30 @@
 
 from __future__ import annotations
 
+from dataclasses import asdict
 import json
 import importlib.util
+import os
 import shutil
 import subprocess
 import sys
+import time
 from types import ModuleType
 from pathlib import Path
 
 import pytest
+
+from issue_orchestrator.domain.executor import (
+    ExecutorAggressiveness,
+    ExecutorPolicySource,
+)
+from issue_orchestrator.domain.executor_monitoring import (
+    ExecutorEventMetadata,
+    ExecutorEventTimeline,
+    ExecutorPolicyChanged,
+    ExecutorRecentEventsQuery,
+    ExecutorStatus,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -73,6 +88,8 @@ test-vscode:
 validate-pr-raw:
 \t@test "$(VALIDATE_LANE_JOBS)" = "11"
 \t@test -n "$$ISSUE_ORCHESTRATOR_EXECUTOR_POOL_DIR"
+\t@echo '[validate-timing] START target=fixture at=2026-08-25T00:00:00Z'
+\t@echo '[validate-timing] END target=fixture status=0 elapsed=1s at=2026-08-25T00:00:01Z'
 """,
         encoding="utf-8",
     )
@@ -129,7 +146,7 @@ def test_profile_jobs_control_outer_make_and_inner_lane_limit(
     assert report["config"]["executor_learning"] == (
         "one fresh pool: cold aggregate, lane training, learned aggregate"
     )
-    assert report["schema_version"] == 2
+    assert report["schema_version"] == 3
     assert len(report["config"]["profiled_commit_sha"]) == 40
     assert report["config"]["aggressiveness"] == {
         "percent": 125,
@@ -143,6 +160,25 @@ def test_profile_jobs_control_outer_make_and_inner_lane_limit(
         learned_aggregate["executor_after"]["learning_fingerprint_sha256"]
     )
     assert report["config"]["external_caches"] == "preserved"
+    artifact_directory = Path(report["config"]["artifact_directory"])
+    assert artifact_directory.is_dir()
+    for result in (
+        cold_aggregate["command_result"],
+        learned_aggregate["command_result"],
+    ):
+        output_log = Path(result["output_log_path"])
+        assert output_log.parent == artifact_directory
+        assert output_log.is_file()
+        output = output_log.read_text(encoding="utf-8")
+        assert "[validate-timing] END target=fixture status=0 elapsed=1s" in output
+        assert "env.ISSUE_ORCHESTRATOR_EXECUTOR_POOL_DIR=" in output
+        assert "[profile-command] exit=0" in output
+    for aggregate in (cold_aggregate, learned_aggregate):
+        assert aggregate["executor_events"] == {
+            "query_limit": 1000,
+            "possibly_truncated": False,
+            "timeline": {"events": []},
+        }
     assert not Path(cold_aggregate["command_result"]["worktree_path"]).exists()
     assert not Path(learned_aggregate["command_result"]["worktree_path"]).exists()
 
@@ -187,9 +223,15 @@ def test_discovery_profiles_static_once_as_an_aggregate_execution_lane() -> None
 def test_summary_counts_each_execution_lane_exactly_once() -> None:
     profile = _load_profile_module()
     target_results = (
-        profile.CommandResult("static", ("make", "static"), 30.0, 0, None),
-        profile.CommandResult("unit", ("make", "unit"), 45.0, 0, None),
-        profile.CommandResult("codex", ("make", "codex"), 70.0, 0, None),
+        profile.CommandResult(
+            "static", ("make", "static"), 30.0, 0, None, "/tmp/static.log"
+        ),
+        profile.CommandResult(
+            "unit", ("make", "unit"), 45.0, 0, None, "/tmp/unit.log"
+        ),
+        profile.CommandResult(
+            "codex", ("make", "codex"), 70.0, 0, None, "/tmp/codex.log"
+        ),
     )
     aggregate = profile.CommandResult(
         "aggregate",
@@ -197,6 +239,7 @@ def test_summary_counts_each_execution_lane_exactly_once() -> None:
         82.0,
         0,
         None,
+        "/tmp/aggregate.log",
     )
 
     summary = profile.summarize(
@@ -207,6 +250,7 @@ def test_summary_counts_each_execution_lane_exactly_once() -> None:
             96.0,
             0,
             None,
+            "/tmp/cold.log",
         ),
         learned_validate_pr_raw_result=aggregate,
         jobs=7,
@@ -223,3 +267,53 @@ def test_summary_counts_each_execution_lane_exactly_once() -> None:
         "unit",
         "static",
     )
+
+
+def test_aggregate_event_capture_is_typed_bounded_and_restores_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile = _load_profile_module()
+    recorded_since = time.time()
+    old_event = ExecutorPolicyChanged(
+        ExecutorEventMetadata(recorded_since - 1.0, 100),
+        ExecutorAggressiveness(100),
+        ExecutorAggressiveness(125),
+        ExecutorPolicySource.ENVIRONMENT,
+    )
+    new_event = ExecutorPolicyChanged(
+        ExecutorEventMetadata(recorded_since + 1.0, 101),
+        ExecutorAggressiveness(125),
+        ExecutorAggressiveness(125),
+        ExecutorPolicySource.ENVIRONMENT,
+    )
+    returned_timeline = ExecutorEventTimeline((old_event, *(new_event,) * 999))
+
+    class StaticMonitor:
+        def recent_events(
+            self,
+            query: ExecutorRecentEventsQuery,
+        ) -> ExecutorEventTimeline:
+            assert query.limit == 1000
+            return returned_timeline
+
+        def status(self) -> ExecutorStatus:
+            raise AssertionError("status is outside this event-capture test")
+
+    monkeypatch.setattr(profile, "build_executor_monitor", StaticMonitor)
+    monkeypatch.setenv(profile.EXECUTOR_POOL_DIR_ENV, "original-pool")
+    monkeypatch.setenv(profile.EXECUTOR_AGGRESSIVENESS_ENV, "75")
+
+    capture = profile.capture_executor_events(
+        tmp_path / "profile-pool",
+        profile.ProfileAggressiveness(125, "command-line"),
+        recorded_since_unix=recorded_since,
+    )
+
+    assert capture.query_limit == 1000
+    assert capture.possibly_truncated is True
+    assert capture.timeline.events == (new_event,) * 999
+    assert os.environ[profile.EXECUTOR_POOL_DIR_ENV] == "original-pool"
+    assert os.environ[profile.EXECUTOR_AGGRESSIVENESS_ENV] == "75"
+    serialized = json.dumps(asdict(capture))
+    assert '"effective_source": "environment"' in serialized

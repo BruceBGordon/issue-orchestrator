@@ -17,8 +17,11 @@ validation-lane fan-out.
 from __future__ import annotations
 
 import argparse
+from collections.abc import Iterator
+from contextlib import contextmanager
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -30,12 +33,17 @@ from pathlib import Path
 from typing import Literal, cast
 
 from issue_orchestrator.domain.executor import ExecutorPolicySource
-from issue_orchestrator.domain.executor_monitoring import ExecutorStatus
+from issue_orchestrator.domain.executor_monitoring import (
+    ExecutorEventTimeline,
+    ExecutorRecentEventsQuery,
+    ExecutorStatus,
+)
 from issue_orchestrator.entrypoints.bootstrap import (
     build_executor,
     build_executor_monitor,
 )
 from issue_orchestrator.infra.validation_timings import build_host_context
+from issue_orchestrator.ports.executor_monitor import ExecutorMonitor
 
 
 EXECUTOR_POOL_DIR_ENV = "ISSUE_ORCHESTRATOR_EXECUTOR_POOL_DIR"
@@ -45,6 +53,7 @@ EXECUTOR_AGGRESSIVENESS_ENV = (
 AGGREGATE_TARGET = "validate-pr-raw"
 AGGREGATE_LANE_VARIABLE = "VALIDATE_PR_LANES"
 PROFILE_METHOD = "cold_then_learned_detached_HEAD_with_warm_external_caches"
+EXECUTOR_EVENT_CAPTURE_LIMIT = 1000
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,6 +65,31 @@ class CommandResult:
     wall_seconds: float
     exit_code: int
     worktree_path: str | None
+    output_log_path: str
+
+
+@dataclass(frozen=True, slots=True)
+class ProfileArtifactStore:
+    """Own durable profiler artifacts outside disposable worktrees."""
+
+    root: Path
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.root, Path):
+            raise ValueError("ProfileArtifactStore.root must be a Path")
+
+    def initialize(self) -> None:
+        """Create a new artifact directory without overwriting prior evidence."""
+        self.root.mkdir(parents=True, exist_ok=False)
+
+    def command_log_path(self, command_name: str) -> Path:
+        """Return the deterministic log path for one uniquely named command."""
+        if type(command_name) is not str or not command_name:
+            raise ValueError("profile command name must not be empty")
+        filename = re.sub(r"[^A-Za-z0-9_.-]+", "-", command_name).strip("-")
+        if not filename:
+            raise ValueError("profile command name must contain a filename character")
+        return self.root / f"{filename}.log"
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,12 +148,36 @@ class ProfileExecutorStatus:
 
 
 @dataclass(frozen=True, slots=True)
+class ProfileExecutorEventCapture:
+    """Typed executor events retained before the temporary pool is removed."""
+
+    query_limit: int
+    possibly_truncated: bool
+    timeline: ExecutorEventTimeline
+
+    def __post_init__(self) -> None:
+        if type(self.query_limit) is not int or self.query_limit < 1:
+            raise ValueError(
+                "ProfileExecutorEventCapture.query_limit must be positive"
+            )
+        if type(self.possibly_truncated) is not bool:
+            raise ValueError(
+                "ProfileExecutorEventCapture.possibly_truncated must be a boolean"
+            )
+        if type(self.timeline) is not ExecutorEventTimeline:
+            raise ValueError(
+                "ProfileExecutorEventCapture.timeline must be ExecutorEventTimeline"
+            )
+
+
+@dataclass(frozen=True, slots=True)
 class ProfileAggregateRun:
     """One aggregate result with exact learning state before and after it."""
 
     command_result: CommandResult
     executor_before: ProfileExecutorStatus
     executor_after: ProfileExecutorStatus
+    executor_events: ProfileExecutorEventCapture
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,6 +197,7 @@ class ValidateProfileConfiguration:
     aggressiveness: ProfileAggressiveness
     executor_learning: str
     external_caches: str
+    artifact_directory: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,7 +219,7 @@ class ValidateProfileSummary:
 class ValidateProfileReport:
     """Versioned JSON report written by the profiler."""
 
-    schema_version: Literal[2]
+    schema_version: Literal[3]
     config: ValidateProfileConfiguration
     cold_validate_pr_raw_run: ProfileAggregateRun
     target_runs: tuple[CommandResult, ...]
@@ -210,27 +269,61 @@ def run_command(
     dry_run: bool,
     cwd: Path | None,
     worktree_path: str | None,
+    artifacts: ProfileArtifactStore,
     environment: dict[str, str] | None = None,
 ) -> CommandResult:
-    """Execute and measure one exact argv without invoking a shell."""
+    """Execute and measure one exact argv while retaining combined output."""
     cwd_info = f" (cwd={cwd})" if cwd is not None else ""
     print(f"[profile] {name}: {' '.join(command)}{cwd_info}")
-    if dry_run:
-        return CommandResult(name, command, 0.0, 0, worktree_path)
-
+    output_log = artifacts.command_log_path(name)
+    started_at = datetime.now(tz=UTC).isoformat()
     started = time.monotonic()
-    completed = subprocess.run(
-        command,
-        check=False,
-        cwd=cwd,
-        env=environment,
+    with output_log.open("x", encoding="utf-8") as log_handle:
+        log_handle.write(f"[profile-command] name={name}\n")
+        log_handle.write(
+            "[profile-command] argv=" + json.dumps(command) + "\n"
+        )
+        log_handle.write(f"[profile-command] cwd={cwd}\n")
+        log_handle.write(f"[profile-command] started_at={started_at}\n")
+        if environment is not None:
+            for variable in (
+                EXECUTOR_POOL_DIR_ENV,
+                EXECUTOR_AGGRESSIVENESS_ENV,
+            ):
+                if variable in environment:
+                    log_handle.write(
+                        f"[profile-command] env.{variable}="
+                        f"{environment[variable]}\n"
+                    )
+        log_handle.flush()
+        if dry_run:
+            exit_code = 0
+        else:
+            completed = subprocess.run(
+                command,
+                check=False,
+                cwd=cwd,
+                env=environment,
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
+            )
+            exit_code = completed.returncode
+        wall_seconds = time.monotonic() - started
+        log_handle.write(
+            f"[profile-command] exit={exit_code} elapsed={wall_seconds:.6f}s "
+            f"ended_at={datetime.now(tz=UTC).isoformat()}\n"
+        )
+    print(
+        f"[profile] {name}: exit={exit_code} elapsed={wall_seconds:.2f}s "
+        f"log={output_log}"
     )
     return CommandResult(
         name=name,
         command=command,
-        wall_seconds=time.monotonic() - started,
-        exit_code=completed.returncode,
+        wall_seconds=wall_seconds,
+        exit_code=exit_code,
         worktree_path=worktree_path,
+        output_log_path=str(output_log),
     )
 
 
@@ -407,6 +500,7 @@ def prepare_worktree(
     name: str,
     worktree: Path,
     dry_run: bool,
+    artifacts: ProfileArtifactStore,
 ) -> CommandResult:
     """Prepare a fresh worktree exactly like a real agent or user worktree."""
     return run_command(
@@ -415,6 +509,7 @@ def prepare_worktree(
         dry_run=dry_run,
         cwd=worktree,
         worktree_path=str(worktree),
+        artifacts=artifacts,
     )
 
 
@@ -428,6 +523,7 @@ def run_in_isolated_worktree(
     jobs: int | None,
     executor_pool_dir: Path,
     executor_aggressiveness_percent: int,
+    artifacts: ProfileArtifactStore,
 ) -> CommandResult:
     """Provision, measure, and remove one isolated detached worktree."""
     temporary_root = Path(tempfile.mkdtemp(prefix="io-validate-profile-"))
@@ -450,6 +546,7 @@ def run_in_isolated_worktree(
             dry_run=dry_run,
             cwd=None,
             worktree_path=None,
+            artifacts=artifacts,
         )
         if add_result.exit_code != 0:
             return CommandResult(
@@ -458,6 +555,7 @@ def run_in_isolated_worktree(
                 wall_seconds=add_result.wall_seconds,
                 exit_code=add_result.exit_code,
                 worktree_path=str(worktree),
+                output_log_path=add_result.output_log_path,
             )
         add_succeeded = True
 
@@ -466,6 +564,7 @@ def run_in_isolated_worktree(
             name=name,
             worktree=worktree,
             dry_run=dry_run,
+            artifacts=artifacts,
         )
         if setup_result.exit_code != 0:
             return CommandResult(
@@ -474,6 +573,7 @@ def run_in_isolated_worktree(
                 wall_seconds=setup_result.wall_seconds,
                 exit_code=setup_result.exit_code,
                 worktree_path=str(worktree),
+                output_log_path=setup_result.output_log_path,
             )
 
         make_arguments = [make_bin]
@@ -497,6 +597,7 @@ def run_in_isolated_worktree(
             dry_run=dry_run,
             cwd=worktree,
             worktree_path=str(worktree),
+            artifacts=artifacts,
             environment=environment,
         )
     finally:
@@ -515,6 +616,7 @@ def run_in_isolated_worktree(
                 dry_run=dry_run,
                 cwd=None,
                 worktree_path=None,
+                artifacts=artifacts,
             )
             if removal.exit_code != 0:
                 raise RuntimeError(
@@ -607,6 +709,20 @@ def capture_executor_status(
     selected_aggressiveness: ProfileAggressiveness,
 ) -> ProfileExecutorStatus:
     """Query the executor through its monitor port under the profiled policy."""
+    with profiled_executor_monitor(
+        executor_pool_dir,
+        selected_aggressiveness,
+    ) as monitor:
+        status = monitor.status()
+    return project_executor_status(status)
+
+
+@contextmanager
+def profiled_executor_monitor(
+    executor_pool_dir: Path,
+    selected_aggressiveness: ProfileAggressiveness,
+) -> Iterator[ExecutorMonitor]:
+    """Bind one monitor to the temporary pool and restore process state."""
     previous_pool = os.environ.get(EXECUTOR_POOL_DIR_ENV)
     previous_aggressiveness = os.environ.get(EXECUTOR_AGGRESSIVENESS_ENV)
     os.environ[EXECUTOR_POOL_DIR_ENV] = str(executor_pool_dir)
@@ -614,7 +730,7 @@ def capture_executor_status(
         selected_aggressiveness.percent
     )
     try:
-        status = build_executor_monitor().status()
+        yield build_executor_monitor()
     finally:
         if previous_pool is None:
             del os.environ[EXECUTOR_POOL_DIR_ENV]
@@ -624,7 +740,35 @@ def capture_executor_status(
             del os.environ[EXECUTOR_AGGRESSIVENESS_ENV]
         else:
             os.environ[EXECUTOR_AGGRESSIVENESS_ENV] = previous_aggressiveness
-    return project_executor_status(status)
+
+
+def capture_executor_events(
+    executor_pool_dir: Path,
+    selected_aggressiveness: ProfileAggressiveness,
+    *,
+    recorded_since_unix: float,
+) -> ProfileExecutorEventCapture:
+    """Retain typed events produced during one aggregate measurement."""
+    if type(recorded_since_unix) is not float or recorded_since_unix <= 0:
+        raise ValueError("recorded_since_unix must be a positive float")
+    with profiled_executor_monitor(
+        executor_pool_dir,
+        selected_aggressiveness,
+    ) as monitor:
+        unfiltered = monitor.recent_events(
+            ExecutorRecentEventsQuery(EXECUTOR_EVENT_CAPTURE_LIMIT)
+        )
+    return ProfileExecutorEventCapture(
+        query_limit=EXECUTOR_EVENT_CAPTURE_LIMIT,
+        possibly_truncated=len(unfiltered.events) == EXECUTOR_EVENT_CAPTURE_LIMIT,
+        timeline=ExecutorEventTimeline(
+            tuple(
+                event
+                for event in unfiltered.events
+                if event.metadata.recorded_at_unix >= recorded_since_unix
+            )
+        ),
+    )
 
 
 def project_executor_status(status: ExecutorStatus) -> ProfileExecutorStatus:
@@ -666,8 +810,10 @@ def run_profile_aggregate(
     jobs: int,
     executor_pool_dir: Path,
     aggressiveness: ProfileAggressiveness,
+    artifacts: ProfileArtifactStore,
 ) -> ProfileAggregateRun:
     """Measure one aggregate with learning provenance on both boundaries."""
+    recorded_since_unix = time.time()
     before = capture_executor_status(executor_pool_dir, aggressiveness)
     command_result = run_in_isolated_worktree(
         repo_root=repo_root,
@@ -678,18 +824,28 @@ def run_profile_aggregate(
         jobs=jobs,
         executor_pool_dir=executor_pool_dir,
         executor_aggressiveness_percent=aggressiveness.percent,
+        artifacts=artifacts,
     )
     after = capture_executor_status(executor_pool_dir, aggressiveness)
-    return ProfileAggregateRun(command_result, before, after)
+    events = capture_executor_events(
+        executor_pool_dir,
+        aggressiveness,
+        recorded_since_unix=recorded_since_unix,
+    )
+    return ProfileAggregateRun(command_result, before, after, events)
 
 
 def main() -> int:
     arguments = parse_args()
     repo_root = arguments.repo_root.resolve()
     output_path = resolve_output_path(arguments, repo_root)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
     profiled_commit_sha = resolve_profiled_commit(repo_root)
     dirty = source_worktree_is_dirty(repo_root)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    artifacts = ProfileArtifactStore(
+        output_path.parent / f"{output_path.stem}-artifacts"
+    )
+    artifacts.initialize()
     host = profile_host()
     aggressiveness = resolve_aggressiveness(arguments)
 
@@ -708,6 +864,7 @@ def main() -> int:
             jobs=arguments.jobs,
             executor_pool_dir=executor_pool_dir,
             aggressiveness=aggressiveness,
+            artifacts=artifacts,
         )
         target_results = tuple(
             run_in_isolated_worktree(
@@ -719,6 +876,7 @@ def main() -> int:
                 jobs=None,
                 executor_pool_dir=executor_pool_dir,
                 executor_aggressiveness_percent=aggressiveness.percent,
+                artifacts=artifacts,
             )
             for target in targets
         )
@@ -730,6 +888,7 @@ def main() -> int:
             jobs=arguments.jobs,
             executor_pool_dir=executor_pool_dir,
             aggressiveness=aggressiveness,
+            artifacts=artifacts,
         )
     finally:
         shutil.rmtree(profile_root)
@@ -740,7 +899,7 @@ def main() -> int:
         jobs=arguments.jobs,
     )
     report = ValidateProfileReport(
-        schema_version=2,
+        schema_version=3,
         config=ValidateProfileConfiguration(
             make_bin=arguments.make_bin,
             repo_root=str(repo_root),
@@ -757,6 +916,7 @@ def main() -> int:
                 "one fresh pool: cold aggregate, lane training, learned aggregate"
             ),
             external_caches="preserved",
+            artifact_directory=str(artifacts.root),
         ),
         cold_validate_pr_raw_run=cold_aggregate,
         target_runs=target_results,
